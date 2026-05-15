@@ -21,6 +21,7 @@ import { NotificationTemplateEditor } from '../components/NotificationTemplateEd
 import { NotificationLogViewer } from '../components/NotificationLogViewer';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { CreateUserAdvancedAuthModal } from '../components/CreateUserAdvancedAuthModal';
+import { LdapUserPicker } from '../components/LdapUserPicker';
 import { SpoolmanSettings } from '../components/SpoolmanSettings';
 import { SpoolCatalogSettings } from '../components/SpoolCatalogSettings';
 import { ColorCatalogSettings } from '../components/ColorCatalogSettings';
@@ -219,6 +220,8 @@ export function SettingsPage() {
 
   // User management state
   const [showCreateUserModal, setShowCreateUserModal] = useState(false);
+  // Local / LDAP tab inside the create-user modal (#1298).
+  const [createUserTab, setCreateUserTab] = useState<'local' | 'ldap'>('local');
   const [showEditUserModal, setShowEditUserModal] = useState(false);
   const [editingUserId, setEditingUserId] = useState<number | null>(null);
   const [deleteUserId, setDeleteUserId] = useState<number | null>(null);
@@ -5304,6 +5307,66 @@ export function SettingsPage() {
               </div>
             </CardHeader>
             <CardContent>
+              {ldapStatus?.ldap_enabled && (
+                <div
+                  className="mb-4 flex items-center gap-1 p-1 bg-bambu-dark-secondary rounded-lg"
+                  role="tablist"
+                  aria-label={t('users.modal.tabsAriaLabel')}
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={createUserTab === 'local'}
+                    onClick={() => setCreateUserTab('local')}
+                    className={`flex-1 px-3 py-2 text-sm rounded-md transition-colors ${
+                      createUserTab === 'local'
+                        ? 'bg-bambu-green/15 text-bambu-green'
+                        : 'text-bambu-gray hover:text-white'
+                    }`}
+                  >
+                    {t('users.modal.localTab')}
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={createUserTab === 'ldap'}
+                    onClick={() => setCreateUserTab('ldap')}
+                    className={`flex-1 px-3 py-2 text-sm rounded-md transition-colors ${
+                      createUserTab === 'ldap'
+                        ? 'bg-bambu-green/15 text-bambu-green'
+                        : 'text-bambu-gray hover:text-white'
+                    }`}
+                  >
+                    {t('users.modal.ldapTab')}
+                  </button>
+                </div>
+              )}
+
+              {createUserTab === 'ldap' && ldapStatus?.ldap_enabled ? (
+                <>
+                  <LdapUserPicker
+                    onSuccess={(user) => {
+                      setShowCreateUserModal(false);
+                      setCreateUserTab('local');
+                      setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
+                      showToast(t('users.toast.ldapProvisioned', { username: user.username }));
+                    }}
+                  />
+                  <div className="mt-6 flex justify-end">
+                    <Button
+                      variant="secondary"
+                      onClick={() => {
+                        setShowCreateUserModal(false);
+                        setCreateUserTab('local');
+                        setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
+                      }}
+                    >
+                      {t('common.cancel')}
+                    </Button>
+                  </div>
+                </>
+              ) : (
+              <>
               <div className="space-y-3">
                 <div>
                   <label className="block text-sm font-medium text-white mb-2">{t('settings.username')}</label>
@@ -5401,6 +5464,8 @@ export function SettingsPage() {
                   )}
                 </Button>
               </div>
+              </>
+              )}
             </CardContent>
           </Card>
         </div>
@@ -5419,6 +5484,12 @@ export function SettingsPage() {
           onCreate={handleCreateUser}
           isCreating={createUserMutation.isPending}
           isCreateButtonDisabled={createUserMutation.isPending || !userFormData.username || !userFormData.email}
+          ldapEnabled={ldapStatus?.ldap_enabled}
+          onLdapProvisioned={(user) => {
+            setShowCreateUserModal(false);
+            setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
+            showToast(t('users.toast.ldapProvisioned', { username: user.username }));
+          }}
         />
       )}
 

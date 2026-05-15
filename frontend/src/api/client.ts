@@ -2911,6 +2911,14 @@ export interface LDAPTestResponse {
   message: string;
 }
 
+export interface LDAPSearchResult {
+  username: string;
+  email: string | null;
+  display_name: string | null;
+  dn: string;
+  already_provisioned: boolean;
+}
+
 export interface SetupResponse {
   auth_enabled: boolean;
   admin_created?: boolean;
@@ -2972,6 +2980,13 @@ export const api = {
   testLDAP: () =>
     request<LDAPTestResponse>('/auth/ldap/test', {
       method: 'POST',
+    }),
+  searchLDAPDirectory: (q: string) =>
+    request<LDAPSearchResult[]>(`/auth/ldap/search?q=${encodeURIComponent(q)}`),
+  provisionLDAPUser: (username: string) =>
+    request<UserResponse>('/auth/ldap/provision', {
+      method: 'POST',
+      body: JSON.stringify({ username }),
     }),
   forgotPassword: (data: ForgotPasswordRequest) =>
     request<ForgotPasswordResponse>('/auth/forgot-password', {

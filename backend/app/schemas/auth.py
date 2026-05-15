@@ -93,6 +93,24 @@ class UserResponse(BaseModel):
         from_attributes = True
 
 
+class LDAPSearchResultResponse(BaseModel):
+    """One match from GET /auth/ldap/search — surfaced in the admin UI."""
+
+    username: str
+    email: str | None = None
+    display_name: str | None = None
+    dn: str
+    already_provisioned: bool = False  # True if this username already exists as a BamBuddy user
+
+
+class LDAPProvisionRequest(BaseModel):
+    """Body for POST /auth/ldap/provision. Username is re-resolved via the
+    service-account bind, so the request only carries the directory username
+    the admin picked from the search results."""
+
+    username: str = Field(..., max_length=150)
+
+
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(..., max_length=256)  # M-NEW-3: cap before pbkdf2
     new_password: str = Field(..., min_length=8, max_length=256)
