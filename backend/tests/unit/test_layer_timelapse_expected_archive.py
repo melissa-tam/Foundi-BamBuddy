@@ -75,7 +75,7 @@ def _build_mocks(*, external_camera_enabled: bool, external_camera_url: str | No
     mock_archive.printer_id = 1
     mock_archive.print_name = "Universal Spirit Level Holder"
     mock_archive.status = "pending"
-    mock_archive.file_path = "/tmp/fake.3mf"
+    mock_archive.file_path = "/test/archives/fake.3mf"
 
     return mock_printer, mock_archive
 
