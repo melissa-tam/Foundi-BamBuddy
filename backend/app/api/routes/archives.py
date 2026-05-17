@@ -415,38 +415,45 @@ async def list_archives_slim(
     db: AsyncSession = Depends(get_db),
     current_user: User | None = RequirePermissionIfAuthEnabled(Permission.ARCHIVES_READ),
 ):
-    """Lightweight archive listing for stats/dashboard widgets.
+    """Per-event listing for stats/dashboard widgets.
 
-    Returns only the fields needed for client-side aggregation,
-    skipping duplicate detection, file paths, and extra_data.
+    Reads from print_log_entries so reprints contribute each run and
+    orphaned events (archive deleted, log row survived via ON DELETE
+    SET NULL) still aggregate consistently with Quick Stats. The sliced
+    print_time_seconds is joined from the archive when available; for
+    orphan events it is null and downstream widgets fall back to the
+    measured duration_seconds.
     """
+    from backend.app.models.print_log import PrintLogEntry
+
     _validate_user_filter_permission(current_user, created_by_id)
     filters = []
     if date_from:
         dt_from = datetime.combine(date_from, time.min, tzinfo=timezone.utc)
-        filters.append(PrintArchive.created_at >= dt_from)
+        filters.append(PrintLogEntry.created_at >= dt_from)
     if date_to:
         dt_to = datetime.combine(date_to, time.max, tzinfo=timezone.utc)
-        filters.append(PrintArchive.created_at <= dt_to)
-    _apply_user_filter(filters, created_by_id)
+        filters.append(PrintLogEntry.created_at <= dt_to)
+    _apply_run_user_filter(filters, created_by_id)
 
     query = (
         select(
-            PrintArchive.printer_id,
-            PrintArchive.print_name,
+            PrintLogEntry.printer_id,
+            PrintLogEntry.print_name,
             PrintArchive.print_time_seconds,
-            PrintArchive.started_at,
-            PrintArchive.completed_at,
-            PrintArchive.filament_used_grams,
-            PrintArchive.filament_type,
-            PrintArchive.filament_color,
-            PrintArchive.status,
-            PrintArchive.cost,
-            PrintArchive.quantity,
-            PrintArchive.created_at,
+            PrintLogEntry.started_at,
+            PrintLogEntry.completed_at,
+            PrintLogEntry.duration_seconds,
+            PrintLogEntry.filament_used_grams,
+            PrintLogEntry.filament_type,
+            PrintLogEntry.filament_color,
+            PrintLogEntry.status,
+            PrintLogEntry.cost,
+            PrintLogEntry.created_at,
         )
+        .outerjoin(PrintArchive, PrintArchive.id == PrintLogEntry.archive_id)
         .where(*filters)
-        .order_by(PrintArchive.created_at.desc())
+        .order_by(PrintLogEntry.created_at.desc())
         .limit(limit)
         .offset(offset)
     )
@@ -459,12 +466,16 @@ async def list_archives_slim(
             "print_name": r.print_name,
             "print_time_seconds": r.print_time_seconds,
             "actual_time_seconds": (
-                int((r.completed_at - r.started_at).total_seconds())
-                if r.started_at
-                and r.completed_at
-                and r.status == "completed"
-                and (r.completed_at - r.started_at).total_seconds() > 0
-                else None
+                r.duration_seconds
+                if r.duration_seconds and r.duration_seconds > 0 and r.status == "completed"
+                else (
+                    int((r.completed_at - r.started_at).total_seconds())
+                    if r.started_at
+                    and r.completed_at
+                    and r.status == "completed"
+                    and (r.completed_at - r.started_at).total_seconds() > 0
+                    else None
+                )
             ),
             "filament_used_grams": r.filament_used_grams,
             "filament_type": r.filament_type,
@@ -473,7 +484,7 @@ async def list_archives_slim(
             "started_at": r.started_at,
             "completed_at": r.completed_at,
             "cost": r.cost,
-            "quantity": r.quantity,
+            "quantity": 1,
             "created_at": r.created_at,
         }
         for r in rows
