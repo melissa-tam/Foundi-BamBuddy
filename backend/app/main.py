@@ -2016,6 +2016,15 @@ async def on_print_start(printer_id: int, data: dict):
                 archive.started_at = datetime.now(timezone.utc)
                 if subtask_id and not archive.subtask_id:
                     archive.subtask_id = subtask_id
+                # #1403 follow-up: VP-queue archives are created with
+                # printer_id=None at queue-add time (we don't know which
+                # printer will run the job yet). When the print actually
+                # starts on a specific printer the expected-archive lookup
+                # used to skip this assignment, leaving printer_id=None
+                # forever — which then disables the "Scan for timelapse"
+                # button in ArchivesPage (gated on !archive.printer_id).
+                if archive.printer_id != printer_id:
+                    archive.printer_id = printer_id
                 await db.commit()
 
                 # Track as active print
