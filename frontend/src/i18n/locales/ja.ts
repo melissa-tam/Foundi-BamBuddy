@@ -3822,6 +3822,8 @@ export default {
     slot: 'スロット',
     empty: '<空>',
     emptySlot: '空のスロット',
+    slotEmpty: '空',
+    emptySlotReset: 'スプール未割当',
     unknown: '不明',
     humidity: '湿度',
     temperature: '温度',

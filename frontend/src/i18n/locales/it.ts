@@ -3810,6 +3810,8 @@ export default {
     slot: 'Slot',
     empty: 'Vuoto',
     emptySlot: 'Slot vuoto',
+    slotEmpty: 'Vuoto',
+    emptySlotReset: 'Nessuna bobina assegnata',
     unknown: 'Sconosciuto',
     humidity: 'Umidità',
     temperature: 'Temperatura',

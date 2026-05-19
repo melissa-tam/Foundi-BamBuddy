@@ -3822,6 +3822,8 @@ export default {
     slot: 'Slot',
     empty: 'Leer',
     emptySlot: 'Leerer Slot',
+    slotEmpty: 'Leer',
+    emptySlotReset: 'Keine Spule zugewiesen',
     unknown: 'Unbekannt',
     humidity: 'Luftfeuchtigkeit',
     temperature: 'Temperatur',

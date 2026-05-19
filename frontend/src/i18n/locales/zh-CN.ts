@@ -3810,6 +3810,8 @@ export default {
     slot: '槽位',
     empty: '空',
     emptySlot: '空槽位',
+    slotEmpty: '空',
+    emptySlotReset: '未分配料盘',
     unknown: '未知',
     humidity: '湿度',
     temperature: '温度',

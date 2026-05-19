@@ -3811,6 +3811,8 @@ export default {
     slot: 'Emplacement',
     empty: 'Vide',
     emptySlot: 'Slot vide',
+    slotEmpty: 'Vide',
+    emptySlotReset: 'Aucune bobine assignée',
     unknown: 'Inconnu',
     humidity: 'Humidité',
     temperature: 'Température',
