@@ -443,6 +443,15 @@ export function SliceModal({ source, onClose }: SliceModalProps) {
     // retry tight loops in that case.
     retry: false,
   });
+  // Canonical Bambu printer-model registry — drives the @BBL <code> name
+  // fallback in slicerPrinterMatch when no slicer bundle covers a cloud /
+  // standard preset (#1325 follow-up). Long staleTime: the registry only
+  // changes across backend releases.
+  const printerModelsQuery = useQuery({
+    queryKey: ['slicerPrinterModels'],
+    queryFn: api.getSlicerPrinterModels,
+    staleTime: Infinity,
+  });
   const selectedBundle: SlicerBundle | null = useMemo(() => {
     if (!selectedBundleId || !bundlesQuery.data) return null;
     return bundlesQuery.data.find((b) => b.id === selectedBundleId) ?? null;
@@ -454,12 +463,14 @@ export function SliceModal({ source, onClose }: SliceModalProps) {
     if (!presetsQuery.data || !printerPreset) return null;
     return findPreset(presetsQuery.data, printerPreset, 'printer')?.name ?? null;
   }, [presetsQuery.data, printerPreset]);
-  // Compatibility ground truth, derived from the user's uploaded Slicer
-  // Bundles (#1325) — empty until at least one bundle is imported, in which
-  // case no process / filament gets filtered (nothing to filter against).
+  // Compatibility ground truth: the user's uploaded Slicer Bundles plus the
+  // backend Bambu printer-model registry (#1325 + follow-up). The bundle
+  // path handles imported / custom presets; the registry-driven @BBL name
+  // fallback inside slicerPrinterMatch picks up cloud / standard presets
+  // for users who haven't uploaded bundles yet.
   const compatIndex = useMemo<PrinterCompatibilityIndex>(
-    () => buildCompatibilityIndex(bundlesQuery.data ?? []),
-    [bundlesQuery.data],
+    () => buildCompatibilityIndex(bundlesQuery.data ?? [], printerModelsQuery.data ?? {}),
+    [bundlesQuery.data, printerModelsQuery.data],
   );
 
   // Printer / process preset names the source 3MF was prepared with. The
