@@ -930,6 +930,15 @@ export default {
     title: 'Print Queue',
     subtitle: 'Schedule and manage your print jobs',
     addToQueue: 'Add to Queue',
+    filamentShort: {
+      rowBadge: 'Insufficient filament for the assigned spool',
+      rowTooltip: 'The dispatch scheduler flagged this item. Click Play to see the per-slot deficit and decide whether to print anyway.',
+      confirmTitle: 'Insufficient filament',
+      confirmIntro: 'The assigned spool cannot satisfy at least one slot. Print anyway?',
+      lineItem: 'Slot {{slot}}: needs {{required}} g, {{remaining}} g remaining',
+      unknown: 'unknown',
+      printAnyway: 'Print Anyway',
+    },
     // Print modal
     print: 'Print',
     reprint: 'Re-print',

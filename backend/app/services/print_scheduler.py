@@ -25,6 +25,7 @@ from backend.app.services.bambu_ftp import (
     upload_file_async,
     with_ftp_retry,
 )
+from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager, supports_drying
 from backend.app.services.smart_plug_manager import smart_plug_manager
@@ -300,6 +301,13 @@ class PrintScheduler:
                             )
                             await db.commit()
 
+                    # Filament-deficit pre-dispatch check (#1496). If the
+                    # assigned spool can't satisfy any required slot grams,
+                    # promote the item to manual_start so the user must
+                    # acknowledge via the ▶ button (which re-checks live).
+                    if await self._block_on_filament_deficit(db, item):
+                        continue
+
                     # Start the print
                     await self._start_print(db, item)
                     busy_printers.add(item.printer_id)
@@ -422,6 +430,10 @@ class PrintScheduler:
                                     f"Queue item {item.id}: Computed AMS mapping for printer {printer_id}: {computed_mapping}"
                                 )
                                 await db.commit()
+
+                        # Filament-deficit pre-dispatch check (#1496).
+                        if await self._block_on_filament_deficit(db, item):
+                            continue
 
                         await self._start_print(db, item)
                         busy_printers.add(printer_id)
@@ -1647,6 +1659,55 @@ class PrintScheduler:
         """Get printer by ID."""
         result = await db.execute(select(Printer).where(Printer.id == printer_id))
         return result.scalar_one_or_none()
+
+    async def _block_on_filament_deficit(
+        self,
+        db: AsyncSession,
+        item: PrintQueueItem,
+    ) -> bool:
+        """Promote the item to manual_start when the assigned spool is short (#1496).
+
+        Returns True when this dispatch attempt was blocked, False when the
+        item is clear to start. A previously-flagged item whose spool has
+        since been swapped to one with enough material clears the flag here
+        so the next scheduler tick dispatches it.
+        """
+        try:
+            deficit = await compute_deficit_for_queue_item(db, item)
+        except Exception as e:
+            # Never let a flaky deficit check wedge the queue — log and let
+            # dispatch proceed. The PrintModal-side check still runs on the
+            # manual paths.
+            logger.warning("Filament deficit check failed for item %s: %s", item.id, e)
+            return False
+
+        if deficit:
+            item.filament_short = True
+            item.manual_start = True
+            await db.commit()
+            job_name = await self._get_job_name(db, item)
+            printer = await self._get_printer(db, item.printer_id) if item.printer_id else None
+            logger.info(
+                "Queue item %s blocked on filament deficit (%d slot(s)) — promoted to manual_start",
+                item.id,
+                len(deficit),
+            )
+            try:
+                await notification_service.on_queue_job_waiting(
+                    job_name=job_name,
+                    target_model=(printer.model if printer else "") or "",
+                    waiting_reason="filament_short",
+                    db=db,
+                )
+            except Exception as e:
+                logger.debug("filament_short notification failed for item %s: %s", item.id, e)
+            return True
+
+        # No deficit — clear any stale flag from a previous tick.
+        if item.filament_short:
+            item.filament_short = False
+            await db.commit()
+        return False
 
     async def _start_print(self, db: AsyncSession, item: PrintQueueItem):
         """Upload file and start print for a queue item.

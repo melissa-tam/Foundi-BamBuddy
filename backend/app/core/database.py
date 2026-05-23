@@ -906,6 +906,15 @@ async def run_migrations(conn):
     # Migration: Add ams_mapping column to print_queue for storing filament slot assignments
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN ams_mapping TEXT")
 
+    # Migration: filament_short flag on print_queue (#1496). Set by the
+    # dispatch scheduler when the assigned spool can't satisfy the print's
+    # per-slot weight; surfaced as a "filament short" badge on the queue row.
+    # Postgres rejects `DEFAULT 0` for BOOLEAN — branch on dialect.
+    if is_sqlite():
+        await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN filament_short BOOLEAN DEFAULT 0")
+    else:
+        await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN filament_short BOOLEAN DEFAULT false")
+
     # Migration: Add queue_force_color_match column to virtual_printers (#1188).
     # Opt-in flag: when true, VP queue-mode uploads pin the per-slot type+color
     # from the 3MF onto the queue item's filament_overrides so the scheduler

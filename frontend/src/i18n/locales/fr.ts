@@ -927,6 +927,15 @@ export default {
 
   // Queue page
   queue: {
+    filamentShort: {
+      rowBadge: 'Filament insuffisant pour la bobine assignee',
+      rowTooltip: "Le planificateur a signale cet element. Cliquez sur Lecture pour voir le deficit par emplacement et decider de lancer quand meme l'impression.",
+      confirmTitle: 'Filament insuffisant',
+      confirmIntro: 'La bobine assignee ne peut pas couvrir au moins un emplacement. Imprimer quand meme ?',
+      lineItem: 'Emplacement {{slot}} : besoin de {{required}} g, {{remaining}} g restants',
+      unknown: 'inconnu',
+      printAnyway: 'Imprimer quand meme',
+    },
     title: 'File d\'attente',
     subtitle: 'Gérez vos travaux d\'impression',
     addToQueue: 'Ajouter à la file',

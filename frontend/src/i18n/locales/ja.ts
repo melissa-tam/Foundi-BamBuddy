@@ -926,6 +926,15 @@ export default {
 
   // Queue page
   queue: {
+    filamentShort: {
+      rowBadge: '割り当てられたスプールのフィラメントが不足しています',
+      rowTooltip: 'スケジューラーがこのアイテムをフラグしました。再生ボタンをクリックしてスロットごとの不足量を確認し、それでも印刷するか判断してください。',
+      confirmTitle: 'フィラメント不足',
+      confirmIntro: '割り当てられたスプールでは少なくとも 1 つのスロットを賄えません。それでも印刷しますか？',
+      lineItem: 'スロット {{slot}}：必要 {{required}} g、残り {{remaining}} g',
+      unknown: '不明',
+      printAnyway: 'それでも印刷',
+    },
     title: '印刷キュー',
     subtitle: '印刷ジョブのスケジュールと管理',
     addToQueue: 'キューに追加',

@@ -927,6 +927,15 @@ export default {
 
   // Queue page
   queue: {
+    filamentShort: {
+      rowBadge: '所分配料盘的耀丝不足',
+      rowTooltip: '调度程序已标记该项。点击播放查看各插槽的赤字并决定是否仍要打印。',
+      confirmTitle: '耀丝不足',
+      confirmIntro: '所分配的料盘至少有一个插槽无法满足。仍要打印吗？',
+      lineItem: '插槽 {{slot}}：需要 {{required}} g，剩余 {{remaining}} g',
+      unknown: '未知',
+      printAnyway: '仍要打印',
+    },
     title: '打印队列',
     subtitle: '排程和管理您的打印任务',
     addToQueue: '添加到队列',

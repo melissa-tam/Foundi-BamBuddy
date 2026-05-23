@@ -927,6 +927,15 @@ export default {
 
   // Queue page
   queue: {
+    filamentShort: {
+      rowBadge: 'Filamento insuficiente para a bobina atribuida',
+      rowTooltip: 'O escalonador sinalizou este item. Clique em Play para ver o deficit por slot e decidir se quer imprimir mesmo assim.',
+      confirmTitle: 'Filamento insuficiente',
+      confirmIntro: 'A bobina atribuida nao pode cobrir pelo menos um slot. Imprimir mesmo assim?',
+      lineItem: 'Slot {{slot}}: precisa de {{required}} g, restam {{remaining}} g',
+      unknown: 'desconhecido',
+      printAnyway: 'Imprimir mesmo assim',
+    },
     title: 'Fila de Impressão',
     subtitle: 'Agende e gerencie seus trabalhos de impressão',
     addToQueue: 'Adicionar à Fila',

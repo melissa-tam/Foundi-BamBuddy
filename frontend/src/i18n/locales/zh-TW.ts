@@ -927,6 +927,15 @@ export default {
 
   // Queue page
   queue: {
+    filamentShort: {
+      rowBadge: '所分配料盤的線材不足',
+      rowTooltip: '調度程式已標記此項目。點擊播放查看各槽位的不足量，並決定是否仍要列印。',
+      confirmTitle: '線材不足',
+      confirmIntro: '所分配的料盤至少有一個槽位無法滿足。仍要列印嗎？',
+      lineItem: '槽位 {{slot}}：需要 {{required}} g，剩餘 {{remaining}} g',
+      unknown: '不明',
+      printAnyway: '仍要列印',
+    },
     title: '列印佇列',
     subtitle: '排程和管理您的列印任務',
     addToQueue: '新增到佇列',

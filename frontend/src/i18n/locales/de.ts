@@ -927,6 +927,15 @@ export default {
 
   // Queue page
   queue: {
+    filamentShort: {
+      rowBadge: 'Filament fuer die zugewiesene Spule reicht nicht',
+      rowTooltip: 'Der Dispatcher hat diese Position markiert. Klicke auf Play, um den Pro-Slot-Fehlbestand zu sehen und zu entscheiden, ob trotzdem gedruckt werden soll.',
+      confirmTitle: 'Filament reicht nicht',
+      confirmIntro: 'Die zugewiesene Spule kann mindestens einen Slot nicht versorgen. Trotzdem drucken?',
+      lineItem: 'Slot {{slot}}: benoetigt {{required}} g, {{remaining}} g verbleibend',
+      unknown: 'unbekannt',
+      printAnyway: 'Trotzdem drucken',
+    },
     title: 'Druckwarteschlange',
     subtitle: 'Planen und verwalten Sie Ihre Druckaufträge',
     addToQueue: 'Zur Warteschlange hinzufügen',

@@ -927,6 +927,15 @@ export default {
 
   // Queue page
   queue: {
+    filamentShort: {
+      rowBadge: 'Filamento insufficiente per la bobina assegnata',
+      rowTooltip: 'Lo scheduler ha segnalato questo elemento. Premi Play per vedere il deficit per slot e decidere se stampare comunque.',
+      confirmTitle: 'Filamento insufficiente',
+      confirmIntro: 'La bobina assegnata non puo coprire almeno uno slot. Stampare comunque?',
+      lineItem: 'Slot {{slot}}: servono {{required}} g, rimangono {{remaining}} g',
+      unknown: 'sconosciuto',
+      printAnyway: 'Stampa comunque',
+    },
     title: 'Coda di stampa',
     subtitle: 'Programma e gestisci i tuoi lavori di stampa',
     addToQueue: 'Aggiungi alla coda',

@@ -8,11 +8,21 @@ export class ApiError extends Error {
    *  Frontend uses this to look up an i18n key instead of showing the raw
    *  English fallback. Null when the backend returned a plain-string detail. */
   code: string | null;
-  constructor(message: string, status: number, code: string | null = null) {
+  /** Full structured detail object when the backend returned `{code, ...}`
+   *  with additional fields (e.g. the deficit list for 409s on queue
+   *  start, #1496). Null for plain-string or array-shaped details. */
+  detail: Record<string, unknown> | null;
+  constructor(
+    message: string,
+    status: number,
+    code: string | null = null,
+    detail: Record<string, unknown> | null = null,
+  ) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
+    this.detail = detail;
   }
 }
 
@@ -129,13 +139,17 @@ async function request<T>(
         .join('; ');
       message = joined || JSON.stringify(detail) || `HTTP ${response.status}`;
     } else if (detail && typeof detail === 'object') {
-      // Structured detail `{code, message}` — frontend uses the code to
-      // pick an i18n key, message is the English fallback.
+      // Structured detail `{code, message, ...}` — frontend uses the code
+      // to pick an i18n key, message is the English fallback, any extra
+      // fields land on ApiError.detail (e.g. `deficit` for #1496).
       code = typeof detail.code === 'string' ? detail.code : null;
       message = typeof detail.message === 'string' ? detail.message : `HTTP ${response.status}`;
     } else {
       message = `HTTP ${response.status}`;
     }
+    const structuredDetail = detail && typeof detail === 'object' && !Array.isArray(detail)
+      ? (detail as Record<string, unknown>)
+      : null;
 
     // Handle 401 Unauthorized - only clear token if it's actually invalid
     // Don't clear on "Authentication required" which might be a timing issue
@@ -152,7 +166,7 @@ async function request<T>(
       }
     }
 
-    throw new ApiError(message, response.status, code);
+    throw new ApiError(message, response.status, code, structuredDetail);
   }
 
   // Handle empty responses (204 No Content, etc.)
@@ -1783,6 +1797,10 @@ export interface PrintQueueItem {
   require_previous_success: boolean;
   auto_off_after: boolean;
   manual_start: boolean;  // Requires manual trigger to start (staged)
+  // Set by the dispatch scheduler when the assigned spool can't satisfy
+  // any required slot's grams (#1496). Surfaced on the queue row as a
+  // "filament short" badge; cleared on a successful ▶ click (live recheck).
+  filament_short: boolean;
   ams_mapping: number[] | null;  // AMS slot mapping for multi-color prints
   filament_overrides: Array<{ slot_id: number; type: string; color: string; color_name?: string; force_color_match?: boolean }> | null;  // Filament overrides for model-based assignment
   plate_id: number | null;  // Plate ID for multi-plate 3MF files
@@ -4458,8 +4476,16 @@ export const api = {
     request<{ message: string }>(`/queue/${id}/cancel`, { method: 'POST' }),
   stopQueueItem: (id: number) =>
     request<{ message: string }>(`/queue/${id}/stop`, { method: 'POST' }),
-  startQueueItem: (id: number) =>
-    request<PrintQueueItem>(`/queue/${id}/start`, { method: 'POST' }),
+  /**
+   * Start a staged queue item. The backend re-checks live filament deficit
+   * for the assigned spool and, when short, returns 409 with a structured
+   * payload so the caller can confirm and retry. Pass `skipFilamentCheck`
+   * after the user confirms "Print Anyway" (#1496).
+   */
+  startQueueItem: (id: number, opts?: { skipFilamentCheck?: boolean }) => {
+    const qs = opts?.skipFilamentCheck ? '?skip_filament_check=true' : '';
+    return request<PrintQueueItem>(`/queue/${id}/start${qs}`, { method: 'POST' });
+  },
   bulkUpdateQueue: (data: PrintQueueBulkUpdate) =>
     request<PrintQueueBulkUpdateResponse>('/queue/bulk', {
       method: 'PATCH',

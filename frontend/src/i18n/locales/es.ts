@@ -927,6 +927,15 @@ export default {
 
   // Queue page
   queue: {
+    filamentShort: {
+      rowBadge: 'Filamento insuficiente para la bobina asignada',
+      rowTooltip: 'El planificador marco este elemento. Pulsa Reproducir para ver el deficit por slot y decidir si imprimir de todos modos.',
+      confirmTitle: 'Filamento insuficiente',
+      confirmIntro: 'La bobina asignada no puede cubrir al menos un slot. Imprimir de todos modos?',
+      lineItem: 'Slot {{slot}}: necesita {{required}} g, quedan {{remaining}} g',
+      unknown: 'desconocido',
+      printAnyway: 'Imprimir de todos modos',
+    },
     title: 'Cola de impresión',
     subtitle: 'Programe y gestione sus trabajos de impresión',
     addToQueue: 'Añadir a la cola',
