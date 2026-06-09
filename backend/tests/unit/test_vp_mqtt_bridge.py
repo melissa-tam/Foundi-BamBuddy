@@ -1277,7 +1277,7 @@ class TestNotArmedDiagnosticLogging:
         assert "no ip_address" in not_armed[0].getMessage()
 
     def test_no_matching_host_interface_logs_specific_reason(self, caplog):
-        server = _make_server(bind_address="0.0.0.0")
+        server = _make_server(bind_address="0.0.0.0")  # nosec B104
         bridge = _make_bridge(server)
         with (
             patch(
