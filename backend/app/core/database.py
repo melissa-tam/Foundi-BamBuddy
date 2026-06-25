@@ -2655,9 +2655,12 @@ async def run_migrations(conn):
         await _safe_execute(
             conn, "ALTER TABLE filament_sku_settings ADD COLUMN alerts_snoozed BOOLEAN NOT NULL DEFAULT 0"
         )
-        # Migration: add color_name so forecasts distinguish colours within a SKU.
+        # Migration: add color_name to filament_sku_settings so forecasts
+        # distinguish colours within a SKU. The matching ALTER for
+        # filament_shopping_list runs AFTER that table's CREATE below — on
+        # fresh installs the table doesn't exist yet at this point and
+        # _safe_execute does not swallow "no such table".
         await _safe_execute(conn, "ALTER TABLE filament_sku_settings ADD COLUMN color_name VARCHAR(100)")
-        await _safe_execute(conn, "ALTER TABLE filament_shopping_list ADD COLUMN color_name VARCHAR(100)")
         # Backfill and drop legacy safety_margin_days column — SQLite requires a table rebuild.
         # Only run if the stale column still exists.
         cols_result = await conn.execute(text("PRAGMA table_info(filament_sku_settings)"))
@@ -2766,6 +2769,10 @@ async def run_migrations(conn):
                 added_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )""",
         )
+        # Backfill color_name on pre-#1814 upgrades — the CREATE above already
+        # has it for fresh installs; the ALTER is the upgrade path. "duplicate
+        # column name" is swallowed by _safe_execute, so re-runs are no-ops.
+        await _safe_execute(conn, "ALTER TABLE filament_shopping_list ADD COLUMN color_name VARCHAR(100)")
         # SQLite has no implicit updated_at trigger — add one so the column stays current.
         await _safe_execute(
             conn,
@@ -2806,10 +2813,12 @@ async def run_migrations(conn):
             conn,
             "ALTER TABLE filament_sku_settings ADD COLUMN IF NOT EXISTS alerts_snoozed BOOLEAN NOT NULL DEFAULT FALSE",
         )
-        # Migration: add color_name and widen the unique key to include it so
-        # forecasts distinguish colours within a SKU (#forecast-color-grouping).
+        # Migration: add color_name to filament_sku_settings and widen the
+        # unique key to include it so forecasts distinguish colours within a
+        # SKU (#forecast-color-grouping). The matching ALTER for
+        # filament_shopping_list runs AFTER that table's CREATE below — on
+        # fresh installs the table doesn't exist yet at this point.
         await _safe_execute(conn, "ALTER TABLE filament_sku_settings ADD COLUMN IF NOT EXISTS color_name VARCHAR(100)")
-        await _safe_execute(conn, "ALTER TABLE filament_shopping_list ADD COLUMN IF NOT EXISTS color_name VARCHAR(100)")
         # Widen UNIQUE (material, subtype, brand) → (material, subtype, brand, color_name).
         # The original constraint was declared with name="uq_filament_sku" in the
         # model, so we drop/re-add by that name. Gated on a pg_constraint lookup so
@@ -2868,6 +2877,9 @@ async def run_migrations(conn):
             "ALTER TABLE filament_shopping_list ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'pending'",
         )
         await _safe_execute(conn, "ALTER TABLE filament_shopping_list ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMP")
+        # Backfill color_name on pre-#1814 upgrades — the CREATE above already
+        # has it for fresh installs; the ALTER is the upgrade path.
+        await _safe_execute(conn, "ALTER TABLE filament_shopping_list ADD COLUMN IF NOT EXISTS color_name VARCHAR(100)")
 
     # Migration: Add inventory stock alert columns to notification_providers.
     # Postgres rejects `DEFAULT 0` for BOOLEAN columns.
