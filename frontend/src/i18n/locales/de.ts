@@ -204,12 +204,21 @@ export default {
       snap: 'Foto',
       off: 'Aus',
       summary: '{{live}} live, {{snap}} Schnappschüsse, {{total}} insgesamt',
+      layer: 'Schicht {{cur}}/{{total}}',
+      timeLeft: 'noch {{time}}',
+      statusMode: {
+        off: 'Aus',
+        compact: 'Kompakt',
+        full: 'Voll',
+      },
       settings: {
         title: 'Kamera-Wand-Einstellungen',
         maxLive: 'Max. Live-Streams',
         maxLiveHint: 'Wie viele Kacheln gleichzeitig live streamen. Andere aktualisieren als Schnappschüsse.',
         snapshotInterval: 'Schnappschuss-Intervall (Sekunden)',
         snapshotIntervalHint: 'Wie oft Nicht-Live-Kacheln einen neuen Schnappschuss abrufen.',
+        statusOverlay: 'Status-Overlay',
+        statusOverlayHint: 'Kompakt: nur Status-Plakette. Voll: + Fortschritt, Schicht, Restzeit.',
       },
     },
     // Controls

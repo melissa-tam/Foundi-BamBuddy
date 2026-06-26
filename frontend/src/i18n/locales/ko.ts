@@ -191,12 +191,21 @@ export default {
       snap: '스냅',
       off: '꺼짐',
       summary: '라이브 {{live}}개, 스냅 {{snap}}개, 총 {{total}}개',
+      layer: '레이어 {{cur}}/{{total}}',
+      timeLeft: '{{time}} 남음',
+      statusMode: {
+        off: '꺼짐',
+        compact: '간단',
+        full: '전체'
+      },
       settings: {
         title: '카메라 월 설정',
         maxLive: '최대 라이브 스트림',
         maxLiveHint: '동시에 라이브 스트리밍할 타일 수. 나머지는 스냅샷으로 갱신됩니다.',
         snapshotInterval: '스냅샷 간격(초)',
-        snapshotIntervalHint: '비라이브 타일이 새 스냅샷을 가져오는 주기.'
+        snapshotIntervalHint: '비라이브 타일이 새 스냅샷을 가져오는 주기.',
+        statusOverlay: '상태 표시',
+        statusOverlayHint: '간단: 상태 배지만 표시. 전체: + 진행률, 레이어, 남은 시간.'
       }
     },
     hideOffline: '오프라인 숨기기',

@@ -207,6 +207,7 @@ const FR_COGNATES = [
   'Cancelling upload...', 'Backup in progress...', 'Searching directory...',
   'EC984C,#6CD4BC,A66EB9,D87694',
   'Proxy', 'Navigation', 'Budget', 'Commit', 'Designer',
+  'Compact',  // cam-wall status overlay mode — same word in French
   'ntfy, Pushover, Discord, etc.',
   '{{filament}} @ {{temp}}°C',  // drying badge: filament code + universal °C
 ];
@@ -237,6 +238,7 @@ const IT_COGNATES = [
   'Hex: #{{hex}}',
   'EC984C,#6CD4BC,A66EB9,D87694',
   'Proxy', 'Designer',
+  'Off',  // cam-wall status overlay mode — common loanword in Italian UI
   '{{filament}} @ {{temp}}°C',  // drying badge: filament code + universal °C
 ];
 

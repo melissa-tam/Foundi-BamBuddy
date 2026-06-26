@@ -2,30 +2,36 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQueries } from '@tanstack/react-query';
 import { Settings as SettingsIcon } from 'lucide-react';
-import { CameraTile, type CameraTileMode } from './CameraTile';
-import { api, type Printer } from '../api/client';
+import { CameraTile, type CameraTileMode, type CameraTileStatusMode } from './CameraTile';
+import { filterKnownHMSErrors } from './HMSErrorModal';
+import { api, type Printer, type PrinterStatus } from '../api/client';
 
 interface CameraWallProps {
   printers: Printer[];
   maxLive: number;
   snapshotIntervalSec: number;
+  statusMode: CameraTileStatusMode;
   onTileClick: (printerId: number, printerName: string) => void;
   onChangeMaxLive: (next: number) => void;
   onChangeSnapshotIntervalSec: (next: number) => void;
+  onChangeStatusMode: (next: CameraTileStatusMode) => void;
 }
 
 const MIN_MAX_LIVE = 1;
 const MAX_MAX_LIVE = 16;
 const MIN_SNAPSHOT_SEC = 2;
 const MAX_SNAPSHOT_SEC = 60;
+const STATUS_MODES: CameraTileStatusMode[] = ['off', 'compact', 'full'];
 
 export function CameraWall({
   printers,
   maxLive,
   snapshotIntervalSec,
+  statusMode,
   onTileClick,
   onChangeMaxLive,
   onChangeSnapshotIntervalSec,
+  onChangeStatusMode,
 }: CameraWallProps) {
   const { t } = useTranslation();
   const tileRefs = useRef<Map<number, HTMLDivElement | null>>(new Map());
@@ -39,10 +45,10 @@ export function CameraWall({
       staleTime: 5000,
     })),
   });
-  const printerConnected = useMemo(() => {
-    const map = new Map<number, boolean>();
+  const statusByPrinter = useMemo(() => {
+    const map = new Map<number, PrinterStatus | undefined>();
     printers.forEach((p, i) => {
-      map.set(p.id, statusQueries[i]?.data?.connected ?? false);
+      map.set(p.id, statusQueries[i]?.data);
     });
     return map;
   }, [printers, statusQueries]);
@@ -89,12 +95,15 @@ export function CameraWall({
 
   // Live slot allocation: visible tiles get live up to `maxLive`, in printer
   // list order so the assignment is stable. Visible-but-over-cap fall back to
-  // snapshot polling. Off-screen tiles render paused (no network).
+  // snapshot polling. Off-screen tiles render paused (no network). Disconnected
+  // printers also render paused regardless of visibility — there's nothing to
+  // stream and burning a live-budget slot on them would starve a working tile.
   const modeByPrinter = useMemo(() => {
     const map = new Map<number, CameraTileMode>();
     let liveBudget = Math.max(0, maxLive);
     for (const p of printers) {
-      if (!visibleIds.has(p.id)) {
+      const connected = statusByPrinter.get(p.id)?.connected ?? false;
+      if (!visibleIds.has(p.id) || !connected) {
         map.set(p.id, 'paused');
         continue;
       }
@@ -106,7 +115,7 @@ export function CameraWall({
       }
     }
     return map;
-  }, [printers, visibleIds, maxLive]);
+  }, [printers, visibleIds, maxLive, statusByPrinter]);
 
   if (printers.length === 0) {
     return (
@@ -182,6 +191,36 @@ export function CameraWall({
                   {t('printers.camWall.settings.snapshotIntervalHint')}
                 </span>
               </label>
+              <div className="space-y-1">
+                <span className="block text-xs font-medium text-white">
+                  {t('printers.camWall.settings.statusOverlay')}
+                </span>
+                <div
+                  role="radiogroup"
+                  aria-label={t('printers.camWall.settings.statusOverlay')}
+                  className="flex overflow-hidden rounded-md border border-bambu-dark-tertiary"
+                >
+                  {STATUS_MODES.map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      role="radio"
+                      aria-checked={statusMode === m}
+                      onClick={() => onChangeStatusMode(m)}
+                      className={`flex-1 px-2 py-1 text-xs ${
+                        statusMode === m
+                          ? 'bg-bambu-green text-black font-semibold'
+                          : 'bg-bambu-dark text-white hover:bg-bambu-dark-tertiary'
+                      }`}
+                    >
+                      {t(`printers.camWall.statusMode.${m}`)}
+                    </button>
+                  ))}
+                </div>
+                <span className="block text-[11px] text-bambu-gray">
+                  {t('printers.camWall.settings.statusOverlayHint')}
+                </span>
+              </div>
             </div>
           )}
         </div>
@@ -204,7 +243,21 @@ export function CameraWall({
                 cameraRotation={p.camera_rotation}
                 mode={mode}
                 snapshotIntervalMs={snapshotIntervalSec * 1000}
-                connected={printerConnected.get(p.id) ?? false}
+                connected={statusByPrinter.get(p.id)?.connected ?? false}
+                statusMode={statusMode}
+                printerState={statusByPrinter.get(p.id)?.state ?? null}
+                progress={statusByPrinter.get(p.id)?.progress ?? null}
+                remainingMin={statusByPrinter.get(p.id)?.remaining_time ?? null}
+                layerNum={statusByPrinter.get(p.id)?.layer_num ?? null}
+                totalLayers={statusByPrinter.get(p.id)?.total_layers ?? null}
+                printName={
+                  statusByPrinter.get(p.id)?.subtask_name ??
+                  statusByPrinter.get(p.id)?.gcode_file ??
+                  null
+                }
+                hmsErrorCount={
+                  filterKnownHMSErrors(statusByPrinter.get(p.id)?.hms_errors ?? []).length
+                }
                 onClick={() => onTileClick(p.id, p.name)}
               />
             </div>

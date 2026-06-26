@@ -7627,6 +7627,14 @@ export function PrintersPage() {
     const saved = parseInt(localStorage.getItem('camWallSnapshotSec') || '', 10);
     return Number.isFinite(saved) && saved > 0 ? saved : 8;
   });
+  // 'off' hides the printer-state overlay; 'compact' shows only a state chip;
+  // 'full' adds progress, layer, and time-left on printing/paused tiles.
+  // Defaulting to 'full' because the cards already show this info — users who
+  // pick cam-wall view still want to glance the same details without flipping.
+  const [camWallStatusMode, setCamWallStatusMode] = useState<'off' | 'compact' | 'full'>(() => {
+    const saved = localStorage.getItem('camWallStatusMode');
+    return saved === 'off' || saved === 'compact' || saved === 'full' ? saved : 'full';
+  });
   // Derive viewMode from cardSize: S=compact, M/L/XL=expanded
   const viewMode: ViewMode = cardSize === 1 ? 'compact' : 'expanded';
   const [compactDrilldownPrinterId, setCompactDrilldownPrinterId] = useState<number | null>(null);
@@ -8618,6 +8626,7 @@ export function PrintersPage() {
               window.open(`/camera/${id}`, `camera-${id}`, features);
             }
           }}
+          statusMode={camWallStatusMode}
           onChangeMaxLive={(next) => {
             setCamWallMaxLive(next);
             localStorage.setItem('camWallMaxLive', String(next));
@@ -8625,6 +8634,10 @@ export function PrintersPage() {
           onChangeSnapshotIntervalSec={(next) => {
             setCamWallSnapshotSec(next);
             localStorage.setItem('camWallSnapshotSec', String(next));
+          }}
+          onChangeStatusMode={(next) => {
+            setCamWallStatusMode(next);
+            localStorage.setItem('camWallStatusMode', next);
           }}
         />
       ) : groupedPrinters ? (
