@@ -88,7 +88,11 @@ class TestExecuteHmsActionDispatch:
         # tail — just confirm no command went out by inspecting the helper.
         assert self._published_commands(client) == []
 
-    def test_resume_carries_err_param_and_job_id(self, client):
+    def test_resume_is_plain_no_err_no_job_id(self, client):
+        # Verified against a live H2D — the `err`-bearing shape is silently
+        # rejected by Bambu firmware. BambuStudio sends a plain resume; we
+        # match that. job_id is accepted on the call for symmetry with the
+        # catalog but deliberately dropped from the wire. See #1830 §(2).
         ok = client.execute_hms_action("03008070", HMSAction.RESUME_PRINTING, job_id="task-42")
         assert ok is True
         cmds = self._published_commands(client)
@@ -96,27 +100,56 @@ class TestExecuteHmsActionDispatch:
             {
                 "print": {
                     "command": "resume",
-                    "err": "03008070",
-                    "param": "reserve",
-                    "job_id": "task-42",
+                    "param": "",
                     "sequence_id": "0",
                 }
             }
         ]
+        assert "err" not in cmds[0]["print"]
+        assert "job_id" not in cmds[0]["print"]
 
     def test_proceed_falls_through_to_resume(self, client):
         client.execute_hms_action("03008070", HMSAction.PROCEED, job_id="task-1")
         cmds = self._published_commands(client)
         assert cmds[0]["print"]["command"] == "resume"
-        assert cmds[0]["print"]["err"] == "03008070"
+        # Same plain shape as RESUME_PRINTING — no err.
+        assert "err" not in cmds[0]["print"]
 
-    def test_stop_carries_err_and_job_id(self, client):
+    def test_stop_is_plain_no_err_no_job_id(self, client):
+        # Same firmware silent-rejection class as resume — the `err` variant
+        # was confirmed broken on H2D-1 (PAUSE → PAUSE), the plain shape
+        # transitions to FAILED within ~2s.
         client.execute_hms_action("03008070", HMSAction.STOP_PRINTING, job_id="task-1")
         cmds = self._published_commands(client)
-        assert cmds[0]["print"]["command"] == "stop"
-        assert cmds[0]["print"]["job_id"] == "task-1"
+        assert cmds[0] == {
+            "print": {
+                "command": "stop",
+                "param": "",
+                "sequence_id": "0",
+            }
+        }
+        assert "err" not in cmds[0]["print"]
+        assert "job_id" not in cmds[0]["print"]
 
-    def test_ignore_resume_uses_idle_ignore_type_zero(self, client):
+    def test_ignore_resume_dispatches_resume_when_print_paused(self, client):
+        # Verified on H2D: idle_ignore is silently rejected while gcode_state
+        # is PAUSE. The user's intent on a paused HMS modal is to continue,
+        # so IGNORE_RESUME dispatches a plain resume instead. See #1830 §(2).
+        client.state.state = "PAUSE"
+        client.execute_hms_action("03008070", HMSAction.IGNORE_RESUME)
+        cmds = self._published_commands(client)
+        assert cmds[0] == {
+            "print": {
+                "command": "resume",
+                "param": "",
+                "sequence_id": "0",
+            }
+        }
+
+    def test_ignore_resume_uses_idle_ignore_when_not_paused(self, client):
+        # For non-pause warnings (e.g. AMS-side prompts during printing),
+        # idle_ignore IS the correct command and the firmware honours it.
+        client.state.state = "RUNNING"
         client.execute_hms_action("03008070", HMSAction.IGNORE_RESUME)
         cmds = self._published_commands(client)
         assert cmds[0] == {
@@ -128,13 +161,31 @@ class TestExecuteHmsActionDispatch:
             }
         }
 
-    def test_dont_remind_uses_idle_ignore_type_one(self, client):
-        # DONT_REMIND_NEXT_TIME and IGNORE_NO_REMINDER_NEXT_TIME are the
-        # persistent variants — Bambu hides the warning for future prints.
+    def test_dont_remind_dispatches_resume_when_paused(self, client):
+        # The persistent variant still degrades to resume on a paused print —
+        # the "don't remind" flag can't ride along on a resume, but the user
+        # clicked an action whose top-level intent is to continue, so we
+        # honour that. The behavioural contract is documented in hms_ignore.
+        client.state.state = "PAUSE"
+        client.execute_hms_action("03008070", HMSAction.DONT_REMIND_NEXT_TIME)
+        cmds = self._published_commands(client)
+        assert cmds[0]["print"]["command"] == "resume"
+
+    def test_dont_remind_uses_idle_ignore_type_one_when_not_paused(self, client):
+        client.state.state = "RUNNING"
         client.execute_hms_action("03008070", HMSAction.DONT_REMIND_NEXT_TIME)
         cmds = self._published_commands(client)
         assert cmds[0]["print"]["command"] == "idle_ignore"
         assert cmds[0]["print"]["type"] == 1
+
+    def test_idle_ignore_accepts_16_char_full_code(self, client):
+        # hms[]-array faults carry a 16-char full identifier. The firmware
+        # matches against the full 64-bit code; the truncated 8-char form
+        # (used pre-#1830) was silently rejected on H2C.
+        client.state.state = "RUNNING"
+        client.execute_hms_action("0C00030000020010", HMSAction.IGNORE_RESUME)
+        cmds = self._published_commands(client)
+        assert cmds[0]["print"]["err"] == "0C00030000020010"
 
     def test_filament_extruded_sends_ams_done(self, client):
         client.execute_hms_action("07008029", HMSAction.FILAMENT_EXTRUDED)

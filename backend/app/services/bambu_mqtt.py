@@ -180,6 +180,13 @@ class HMSError:
     # The `subtask_id` snapshotted from PrinterState when this error surfaced; Bambu's
     # HMS-aware commands echo it back as `job_id`. None for idle errors with no job.
     job_id: str | None = None
+    # Canonical hex identifier for the firmware's `err` matching: 16 chars for the
+    # 64-bit `hms[]` array path (`f"{attr:08X}{code:08X}"`), 8 chars for the
+    # 32-bit `print_error` path. The frontend echoes this back to
+    # execute_hms_action; the truncated 8-char short code that `_parse_status`
+    # used to send caused the firmware to silently reject HMS commands on H2C
+    # (#1830) and on `hms[]`-sourced faults generally.
+    full_code: str = ""
 
 
 # HMS short codes the firmware emits during normal user-cancel sequences.
@@ -2740,7 +2747,15 @@ class BambuMQTTClient:
                         short_code = f"{(attr >> 16) & 0xFFFF:04X}_{code & 0xFFFF:04X}"
                         if short_code in _HMS_USER_ACTION_CODES:
                             continue
-                        actions = get_actions_for_error_code(self.serial_number[:3], short_code.replace("_", ""))
+                        # Catalog has both 8-char keys (base class) and 16-char keys
+                        # (specific variants). The full 16-char identifier preserves
+                        # the 32 bits of `attr_low` + `code_high` that the short_code
+                        # discards — that's the firmware's matching key, so try it
+                        # first and fall back to the short form.
+                        full_code = f"{attr:08X}{code:08X}"
+                        actions = get_actions_for_error_code(self.serial_number[:3], full_code)
+                        if not actions:
+                            actions = get_actions_for_error_code(self.serial_number[:3], short_code.replace("_", ""))
                         self.state.hms_errors.append(
                             HMSError(
                                 code=f"0x{code:x}" if code else "0x0",
@@ -2749,6 +2764,7 @@ class BambuMQTTClient:
                                 severity=severity if severity > 0 else 2,
                                 actions=actions,
                                 job_id=self.state.subtask_id,
+                                full_code=full_code,
                             )
                         )
 
@@ -2820,6 +2836,9 @@ class BambuMQTTClient:
                                     severity=3,  # Warning level for print_error
                                     actions=actions,
                                     job_id=job_id,
+                                    # print_error is already 32-bit — `f"{print_error:08X}"`
+                                    # is the firmware's matching key with no truncation.
+                                    full_code=f"{print_error:08X}",
                                 )
                             )
 
@@ -5417,13 +5436,17 @@ class BambuMQTTClient:
         """Dispatch the user's choice from the HMS-error modal as a printer command.
 
         Args:
-            print_error: 8-char hex short code with no separator (e.g. "05000070").
-                The frontend strips the underscore from the displayed `MMMM_EEEE`
-                before sending.
+            print_error: Canonical hex identifier for the fault — 8 chars for the
+                32-bit `print_error` path, 16 chars for the 64-bit `hms[]` path
+                (HMSError.full_code). Carried through unchanged from the route.
+                Only the `idle_ignore` branch puts it on the wire; resume / stop
+                use BambuStudio's plain shape (verified against a live H2D, the
+                `err`-bearing shape is silently rejected by the firmware).
             action: One of HMSAction's string values.
             job_id: The `subtask_id` snapshotted onto the HMSError at parse-time.
-                Bambu's HMS-aware commands echo it back as `job_id`. May be None
-                for idle errors that never had a job.
+                Preserved for symmetry with the catalog but no longer sent —
+                BambuStudio's actual resume/stop commands are plain and the
+                firmware doesn't echo `job_id` back on the response either.
 
         Returns False when the MQTT client is offline or when `action` is unknown
         so the route surfaces it as a 4xx rather than a silent no-op.
@@ -5442,34 +5465,52 @@ class BambuMQTTClient:
             )
 
         def hms_resume():
+            # BambuStudio's actual shape — plain resume, no err / no job_id.
+            # The `err`-bearing shape (`err`, `param: "reserve"`, `job_id`) is
+            # silently rejected by Bambu firmware on print_error- and hms[]-sourced
+            # faults alike; verified by injecting candidate shapes against a live
+            # H2D paused on a wrong-plate HMS. See #1830 §(2).
             publish(
                 {
                     "print": {
                         "command": "resume",
-                        "err": print_error,
-                        "param": "reserve",
-                        "job_id": job_id,
+                        "param": "",
                         "sequence_id": "0",
                     }
                 }
             )
 
         def hms_stop():
+            # Same as hms_resume — BambuStudio's actual shape is plain. The
+            # `err`-bearing variant is silently rejected; verified on the H2D.
             publish(
                 {
                     "print": {
                         "command": "stop",
-                        "err": print_error,
-                        "param": "reserve",
-                        "job_id": job_id,
+                        "param": "",
                         "sequence_id": "0",
                     }
                 }
             )
 
         def hms_ignore(persistent: bool = False):
-            # `idle_ignore` is BambuStudio's "dismiss this warning" command.
-            # type=0 dismisses once, type=1 hides the same warning permanently.
+            # `idle_ignore` is BambuStudio's "dismiss this warning" command for
+            # non-pause warnings. type=0 dismisses once, type=1 hides the same
+            # warning permanently.
+            #
+            # For HMS-paused state, `idle_ignore` is silently rejected by the
+            # firmware regardless of `err` (verified on a live H2D — see
+            # #1830 §(2)). The user-facing intent of "Ignore and resume" on a
+            # paused print is to continue, so we dispatch a plain resume
+            # instead. The `persistent` flag is informational in that branch —
+            # firmware can't honour "don't remind" through a resume — but the
+            # button still does what the user expects.
+            #
+            # NB: PrinterState's `state` field carries the MQTT `gcode_state`
+            # value verbatim — line 2144 stores `data["gcode_state"]` onto it.
+            if self.state.state == "PAUSE":
+                hms_resume()
+                return
             publish(
                 {
                     "print": {
