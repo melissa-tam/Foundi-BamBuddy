@@ -5795,6 +5795,65 @@ class TestPrintRunningObservedCallback:
         }
 
 
+class TestTotalLayersPreservation:
+    """#1771: P1S firmware resets `total_layer_num` to 0 at print end. Without
+    this guard, the usage tracker's split path saw `state.total_layers = 0` at
+    completion and dumped the whole print onto the last spool.
+
+    These tests pin the preservation pattern (mirror of `_last_valid_layer_num`)
+    and the explicit reset on new print start so the previous print's total
+    can't bleed into the next.
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        client = BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST123",
+            access_code="12345678",
+        )
+        return client
+
+    def test_nonzero_total_layer_num_sets_state(self, mqtt_client):
+        # Baseline: a fresh push with the slicer's total updates state.total_layers.
+        mqtt_client._process_message({"print": {"total_layer_num": 260}})
+        assert mqtt_client.state.total_layers == 260
+
+    def test_zero_total_layer_num_does_not_clobber_cached_value(self, mqtt_client):
+        # Firmware-reset frame: total_layer_num=0 arrives mid- or end-of-print.
+        # The guard must NOT overwrite the previously-captured 260.
+        mqtt_client._process_message({"print": {"total_layer_num": 260}})
+        mqtt_client._process_message({"print": {"total_layer_num": 0}})
+        assert mqtt_client.state.total_layers == 260
+
+    def test_print_start_explicitly_resets_total_layers(self, mqtt_client):
+        # Without the explicit reset on print start, the previous print's total
+        # would persist into the new print until its first total_layer_num push
+        # arrived — which is exactly the kind of cross-print bleed the
+        # preservation guard above otherwise opens up.
+        mqtt_client._process_message({"print": {"total_layer_num": 260}})
+        assert mqtt_client.state.total_layers == 260
+
+        # Simulate the new-print-start trigger shape (is_new_print path):
+        # state was previously RUNNING on an old file; now we observe a
+        # different file going RUNNING.
+        mqtt_client._previous_gcode_state = "RUNNING"
+        mqtt_client._previous_gcode_file = "/data/Metadata/old_print.gcode"
+        mqtt_client._was_running = True
+        mqtt_client._process_message(
+            {
+                "print": {
+                    "gcode_state": "RUNNING",
+                    "gcode_file": "/data/Metadata/new_print.gcode",
+                    "subtask_name": "new_print",
+                }
+            }
+        )
+        assert mqtt_client.state.total_layers == 0
+
+
 class TestAmsFilamentBackupHoldTimer:
     """Regression: stale push_status arriving within the hold window after a
     toggle command MUST NOT flip ams_filament_backup back to the printer's

@@ -2133,7 +2133,14 @@ class BambuMQTTClient:
             if new_layer > old_layer and self.on_layer_change:
                 self.on_layer_change(new_layer)
         if "total_layer_num" in data:
-            self.state.total_layers = int(data["total_layer_num"])
+            # Some firmware (P1S observed) resets `total_layer_num` to 0 at
+            # print end — same shape as the `layer_num` reset guarded above.
+            # Preserve the last known good value so the usage-tracker split
+            # path (#1771) has a denominator that survives the reset frame.
+            # Explicit reset to 0 happens on print start (`_handle_print_start`).
+            new_total = int(data["total_layer_num"])
+            if new_total > 0:
+                self.state.total_layers = new_total
 
         # Fan speeds (MQTT sends as string "0"-"15" representing speed levels, or percentage)
         # Convert to 0-100 percentage for display
@@ -3120,6 +3127,12 @@ class BambuMQTTClient:
             self.state.hms_errors = []
             # Reset layer tracking for new print (needed for layer-based timelapse)
             self.state.layer_num = 0
+            # Reset total_layers so the previous print's value can't bleed into
+            # this print's usage-tracker split before the new push_status arrives
+            # with the slicer's total (#1771 follow-on to the preservation guard
+            # above at line ~2135 — the guard now ignores firmware-reset 0s, so
+            # the explicit reset has to happen here instead).
+            self.state.total_layers = 0
             # Reset completion tracking for new print
             self._was_running = True
             self._completion_triggered = False
