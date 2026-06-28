@@ -1144,6 +1144,7 @@ def printer_state_to_dict(
                 "severity": e.severity,
                 "actions": e.actions,
                 "job_id": e.job_id,
+                "full_code": e.full_code,
             }
             for e in (state.hms_errors or [])
         ],

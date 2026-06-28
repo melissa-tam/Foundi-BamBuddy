@@ -1770,13 +1770,32 @@ class TestExecuteHMSActionAPI:
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_execute_hms_action_success(self, async_client: AsyncClient, printer_factory):
-        """200 happy path — dispatcher returns True, body forwarded verbatim."""
+        """200 happy path — dispatcher returns True AND printer state moves
+        within the ack-wait window. The state delta is the firmware's only
+        proof that the command landed (publish success is necessary but not
+        sufficient; see #1830 §(3))."""
         printer = await printer_factory(name="Test Printer")
 
         mock_client = MagicMock()
-        mock_client.execute_hms_action.return_value = True
+        # Pre-action state — paused with a fault.
+        mock_client.state.state = "PAUSE"
+        mock_client.state.print_error = 0x05008051
+        mock_client.state.hms_errors = [object()]
 
-        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+        def _act(*_a, **_kw):
+            # Simulate the printer accepting the command and clearing the fault
+            # by the time the ack-wait expires.
+            mock_client.state.state = "FAILED"
+            mock_client.state.print_error = 0
+            mock_client.state.hms_errors = []
+            return True
+
+        mock_client.execute_hms_action.side_effect = _act
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.01),
+        ):
             mock_pm.get_client.return_value = mock_client
 
             body = {"print_error": "07008029", "action": "FILAMENT_EXTRUDED", "job_id": "task-7"}
@@ -1810,15 +1829,80 @@ class TestExecuteHMSActionAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_execute_hms_action_no_printer_ack_returns_502(self, async_client: AsyncClient, printer_factory):
+        """502 when publish succeeded but printer state didn't move within the
+        ack-wait window. This is the silent-rejection failure mode #1830
+        identifies: the broker ACKs the publish at QoS 1 but the firmware
+        drops the command (err mismatch, wrong shape, state mismatch).
+        Surfacing this as 502 instead of 200 stops the UI from claiming
+        success while the modal sticks."""
+        printer = await printer_factory(name="Test Printer")
+
+        mock_client = MagicMock()
+        mock_client.state.state = "PAUSE"
+        mock_client.state.print_error = 0x05008051
+        mock_client.state.hms_errors = [object()]
+        mock_client.execute_hms_action.return_value = True  # publish "succeeded"
+        # Crucially: state does NOT change → ack-wait detects no movement.
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.01),
+        ):
+            mock_pm.get_client.return_value = mock_client
+
+            response = await async_client.post(
+                f"/api/v1/printers/{printer.id}/hms/execute-action", json=self._VALID_BODY
+            )
+
+            assert response.status_code == 502
+            assert "acknowledge" in response.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_execute_hms_action_accepts_16_char_full_code(self, async_client: AsyncClient, printer_factory):
+        """200 for a 16-char full_code (hms[]-array-sourced fault). The
+        schema's relaxed pattern allows both 8-char (print_error) and
+        16-char (hms[]) shapes."""
+        printer = await printer_factory(name="Test Printer")
+
+        mock_client = MagicMock()
+        mock_client.state.state = "RUNNING"
+        mock_client.state.print_error = 0
+        mock_client.state.hms_errors = [object()]
+
+        def _act(*_a, **_kw):
+            mock_client.state.hms_errors = []
+            return True
+
+        mock_client.execute_hms_action.side_effect = _act
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.01),
+        ):
+            mock_pm.get_client.return_value = mock_client
+
+            body = {"print_error": "0C00030000020010", "action": "IGNORE_RESUME"}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+            assert response.status_code == 200
+            mock_client.execute_hms_action.assert_called_once_with("0C00030000020010", "IGNORE_RESUME", None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_execute_hms_action_rejects_malformed_print_error(self, async_client: AsyncClient, printer_factory):
-        """422 when print_error fails the ^[0-9A-Fa-f]{8}$ pattern — stray
+        """422 when print_error fails the relaxed pattern (8 OR 16 hex chars).
+        Lengths in between (9-15) and outside (7, 17+) are invalid; stray
         input can't reach the dispatcher's match statement."""
         printer = await printer_factory(name="Test Printer")
 
         bad_bodies = [
             {"print_error": "0300_8070", "action": "OK_BUTTON"},  # underscore
-            {"print_error": "0300807", "action": "OK_BUTTON"},  # 7 chars
-            {"print_error": "030080700", "action": "OK_BUTTON"},  # 9 chars
+            {"print_error": "0300807", "action": "OK_BUTTON"},  # 7 chars (too short)
+            {"print_error": "030080700", "action": "OK_BUTTON"},  # 9 chars (between)
+            {"print_error": "030080700300807", "action": "OK_BUTTON"},  # 15 chars (between)
+            {"print_error": "0300807003008070A", "action": "OK_BUTTON"},  # 17 chars (too long)
             {"print_error": "0300GGGG", "action": "OK_BUTTON"},  # non-hex
         ]
         for body in bad_bodies:

@@ -335,6 +335,11 @@ export interface HMSError {
   severity: number;  // 1=fatal, 2=serious, 3=common, 4=info
   actions?: string[];  // List of user-facing action keys (e.g. "CHECK_FILAMENT")
   job_id?: string;  // Optional job ID for actions that require it (e.g. "CHECK_ASSISTANT")
+  // Canonical hex identifier the firmware matches against — 8 chars for
+  // print_error-sourced faults, 16 chars for hms[]-array-sourced faults. Send
+  // this back as HmsActionBody.print_error so we don't truncate the 64-bit
+  // identifier into the silent-rejection short code (#1830).
+  full_code?: string;
 }
 
 export interface HMSActionBody {

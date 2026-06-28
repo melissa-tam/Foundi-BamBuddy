@@ -4928,6 +4928,83 @@ class TestHMSUserActionFiltering:
         assert mqtt_client.state.hms_errors[0].code == "0x8061"
 
 
+class TestHMSFullCode:
+    """full_code is the firmware-matching key for HMS-related commands.
+    Truncating it to the 8-char short code is what caused #1830's silent
+    rejection on H2C, and the H2D wrong-plate path needs the print_error
+    32-bit form. Both branches must populate full_code consistently."""
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST_FULLCODE",
+            access_code="12345678",
+        )
+
+    def test_hms_array_path_populates_16_char_full_code(self, mqtt_client):
+        """hms[] entries carry a 64-bit identifier (attr + code, 32 bits each).
+        The full 16-char hex is what BambuStudio uses to match err on
+        idle_ignore — the truncated short_code drops 32 bits and the firmware
+        silently rejects (#1830). Verifies the parser preserves the full
+        identifier on HMSError.full_code."""
+        # 0x07FF0200 / 0x8011 → displayed as 07FF_0200_0000_8011 in the wiki
+        mqtt_client._update_state({"hms": [{"attr": 0x07FF0200, "code": 0x8011}]})
+        assert len(mqtt_client.state.hms_errors) == 1
+        assert mqtt_client.state.hms_errors[0].full_code == "07FF02000000" + "8011"
+
+    def test_print_error_path_populates_8_char_full_code(self, mqtt_client):
+        """print_error is already 32 bits — no truncation. full_code is the
+        8-char hex form, which is exactly what the firmware matches against."""
+        mqtt_client._update_state({"print_error": 0x05008051})
+        assert len(mqtt_client.state.hms_errors) == 1
+        assert mqtt_client.state.hms_errors[0].full_code == "05008051"
+
+    def test_hms_array_catalog_lookup_tries_16_char_first(self, mqtt_client, monkeypatch):
+        """When the catalog has both an 8-char and a 16-char entry for the
+        same fault family, the 16-char (specific variant) wins. The 8-char
+        is the fallback for codes that aren't in the long-form catalog."""
+        from backend.app.services import bambu_mqtt as mod
+
+        calls = []
+
+        def fake_lookup(device, code):
+            calls.append((device, code))
+            if len(code) == 16:
+                return ["RESUME_PRINTING"]
+            return []
+
+        monkeypatch.setattr(mod, "get_actions_for_error_code", fake_lookup)
+        # SN prefix "TES" — irrelevant for the test, we mocked the lookup.
+        mqtt_client._update_state({"hms": [{"attr": 0x07FF0200, "code": 0x8011}]})
+        # 16-char lookup attempted first, then 8-char only if 16-char missed.
+        assert calls[0][1] == "07FF020000008011"
+        assert mqtt_client.state.hms_errors[0].actions == ["RESUME_PRINTING"]
+
+    def test_hms_array_catalog_falls_back_to_8_char(self, mqtt_client, monkeypatch):
+        """If the catalog has no 16-char entry, fall back to the 8-char short
+        code — that's where base-class HMS codes live."""
+        from backend.app.services import bambu_mqtt as mod
+
+        calls = []
+
+        def fake_lookup(device, code):
+            calls.append((device, code))
+            if len(code) == 16:
+                return []  # no specific variant
+            return ["CHECK_ASSISTANT"]  # base class hit
+
+        monkeypatch.setattr(mod, "get_actions_for_error_code", fake_lookup)
+        mqtt_client._update_state({"hms": [{"attr": 0x07FF0200, "code": 0x8011}]})
+        # Two lookups: 16-char miss, then 8-char hit.
+        assert len(calls) == 2
+        assert calls[0][1] == "07FF020000008011"
+        assert calls[1][1] == "07FF8011"
+        assert mqtt_client.state.hms_errors[0].actions == ["CHECK_ASSISTANT"]
+
+
 class TestForceReconnectRouting:
     """#1136 — force_reconnect_stale_session routes between hard-reset (full
     paho-client teardown, wipes the QoS 1 queue) and socket-close (the legacy

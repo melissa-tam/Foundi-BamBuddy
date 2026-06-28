@@ -155,6 +155,13 @@ class HMSErrorResponse(BaseModel):
     severity: int  # 1=fatal, 2=serious, 3=common, 4=info
     actions: list[str] = []  # List of user-facing action keys (e.g. "CHECK_FILAMENT")
     job_id: str | None = None  # Optional job ID for actions that require it (e.g. "CHECK_ASSISTANT")
+    # Canonical hex identifier the firmware uses to match HMS-related commands.
+    # 16 chars for `hms[]`-array faults (full 64-bit attr+code), 8 chars for
+    # `print_error` faults. The frontend echoes this back as
+    # HmsActionBody.print_error so we send the firmware-recognised key, not the
+    # truncated short_code that historically caused silent command rejection
+    # (#1830, H2D wrong-plate verification).
+    full_code: str = ""
 
 
 class AMSTray(BaseModel):
@@ -219,9 +226,11 @@ class AmsLabelBody(BaseModel):
 
 
 class HmsActionBody(BaseModel):
-    # 8-char hex short code without separator (e.g. "05000070") — frontend strips
-    # the underscore from the displayed `MMMM_EEEE` before sending.
-    print_error: str = Field(..., min_length=8, max_length=8, pattern=r"^[0-9A-Fa-f]{8}$")
+    # Canonical hex identifier (HMSErrorResponse.full_code): 8 chars for
+    # `print_error`-sourced faults, 16 chars for `hms[]`-array faults whose
+    # full 64-bit code is the firmware's matching key. Length-bounded to
+    # those two valid shapes to keep stray input from reaching the dispatcher.
+    print_error: str = Field(..., min_length=8, max_length=16, pattern=r"^[0-9A-Fa-f]{8}([0-9A-Fa-f]{8})?$")
     # One of the HMSAction enum values. Length-capped to keep stray input from
     # reaching the dispatcher's `match` statement.
     action: str = Field(..., min_length=1, max_length=64)

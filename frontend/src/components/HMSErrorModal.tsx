@@ -1023,9 +1023,14 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
                               <button
                                 key={action}
                                 onClick={() => {
+                                  // full_code is the firmware-matching key (16
+                                  // chars for hms[]-array faults, 8 chars for
+                                  // print_error). Fall back to the 8-char
+                                  // shortCode for older backends that haven't
+                                  // populated it. See #1830.
                                   activateActionMutation.mutate({
                                     action,
-                                    print_error: shortCode.replace("_", ""),
+                                    print_error: error.full_code || shortCode.replace("_", ""),
                                     job_id: error.job_id ?? null,
                                   });
                                 }}

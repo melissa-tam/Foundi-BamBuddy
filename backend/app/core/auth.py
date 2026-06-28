@@ -112,13 +112,21 @@ _APIKEY_SCOPE_BY_PERMISSION: dict[Permission, str] = {
     Permission.PRINTERS_AMS_RFID: "can_control_printer",
     Permission.PRINTERS_CLEAR_PLATE: "can_control_printer",
     Permission.SMART_PLUGS_CONTROL: "can_control_printer",
-    # can_manage_library — file-manager scope (upload/rename/delete OWN library
+    # can_manage_library — file-manager scope (upload/rename/delete library
     # entries + MakerWorld import which downloads files into the library).
-    # Bulk/ALL-ownership library ops (UPDATE_ALL / DELETE_ALL / PURGE) stay
-    # admin-only because they cross the user boundary.
+    # OWN and ALL ownership variants map to the same scope so the
+    # `require_ownership_permission` checker (which gates on `all_perm`)
+    # passes the API key through. This matches `can_queue` and the
+    # archives/inventory scopes — API keys have no per-row ownership identity
+    # (line 1663), so splitting OWN/ALL across allowlist/denylist made the
+    # whole library curation surface unreachable for API keys (#1832).
+    # LIBRARY_PURGE stays admin-only as a genuinely destructive op that
+    # bypasses the soft-delete window.
     Permission.LIBRARY_UPLOAD: "can_manage_library",
     Permission.LIBRARY_UPDATE_OWN: "can_manage_library",
+    Permission.LIBRARY_UPDATE_ALL: "can_manage_library",
     Permission.LIBRARY_DELETE_OWN: "can_manage_library",
+    Permission.LIBRARY_DELETE_ALL: "can_manage_library",
     Permission.MAKERWORLD_IMPORT: "can_manage_library",
     # can_manage_inventory — inventory write scope. Covers the documented
     # spool/catalog/forecast write surface AND the SpoolBuddy kiosk endpoints
@@ -183,8 +191,11 @@ _APIKEY_DENIED_PERMISSIONS: frozenset[Permission] = frozenset(
         Permission.ARCHIVES_DELETE_OWN,
         Permission.ARCHIVES_DELETE_ALL,
         Permission.ARCHIVES_PURGE,
-        Permission.LIBRARY_UPDATE_ALL,
-        Permission.LIBRARY_DELETE_ALL,
+        # LIBRARY_UPDATE_ALL / LIBRARY_DELETE_ALL moved to the allowlist
+        # under `can_manage_library` (#1832) — split between allow/deny made
+        # the whole library curation surface unreachable for API keys via
+        # `require_ownership_permission`. Purge stays denied as a genuinely
+        # destructive op.
         Permission.LIBRARY_PURGE,
         Permission.PROJECTS_CREATE,
         Permission.PROJECTS_UPDATE,
