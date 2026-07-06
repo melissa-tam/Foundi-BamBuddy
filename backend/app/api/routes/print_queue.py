@@ -8,7 +8,7 @@ from pathlib import Path
 
 import defusedxml.ElementTree as ET
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -37,6 +37,7 @@ from backend.app.schemas.print_queue import (
 )
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
+from backend.app.services.queue_builder import create_queue_items
 from backend.app.utils.printer_models import normalize_printer_model, normalize_printer_model_id
 from backend.app.utils.threemf_tools import (
     extract_bed_type_from_3mf,
@@ -192,6 +193,9 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
         "completed_at": item.completed_at,
         "error_message": item.error_message,
         "created_at": item.created_at,
+        # Farm retry lineage
+        "retry_of_id": item.retry_of_id,
+        "retry_count": item.retry_count or 0,
         # User tracking (Issue #206)
         "created_by_id": item.created_by_id,
         "created_by_username": item.created_by.username if item.created_by else None,
@@ -528,60 +532,6 @@ async def add_to_queue(
         await db.flush()  # Get batch.id before creating items
         batch_id = batch.id
 
-    # Get queue scope for this printer (or for unassigned/model-based items).
-    if data.printer_id is not None:
-        queue_scope = (
-            PrintQueueItem.printer_id == data.printer_id,
-            PrintQueueItem.status == "pending",
-        )
-    else:
-        # For unassigned/model-based items, scope across all unassigned.
-        queue_scope = (
-            PrintQueueItem.printer_id.is_(None),
-            PrintQueueItem.status == "pending",
-        )
-
-    # Serialize concurrent queue inserts to the same scope (#1625-followup).
-    # The race: two concurrent ASAP inserts both compute MAX(position) before
-    # either commits; in an empty scope, both INSERT at position 1 (duplicate).
-    # In a non-empty scope, Postgres's row-level locks on the UPDATE shift
-    # serialize naturally, but the empty-scope path has no rows to lock.
-    # A transaction-scoped advisory lock keyed on the printer_id closes that
-    # window; the lock is released automatically at commit/rollback. Different
-    # printers don't contend. SQLite serializes writes implicitly so this is a
-    # no-op there.
-    #
-    # Dialect is checked against the actual session binding, NOT the
-    # `is_sqlite()` helper, because the test fixture overrides `get_db` with a
-    # SQLite engine while `settings.database_url` still points at Postgres
-    # (the helper reads settings). Inspecting the connection directly is the
-    # right shape for any code that mutates SQL based on the live dialect.
-    from sqlalchemy import text
-
-    bind = db.get_bind()
-    if bind.dialect.name == "postgresql":
-        scope_key = data.printer_id if data.printer_id is not None else 0
-        # 1625 namespaces the lock so it can't collide with other advisory
-        # locks elsewhere in the codebase.
-        await db.execute(text("SELECT pg_advisory_xact_lock(1625, :k)"), {"k": scope_key})
-
-    insert_position = max(1, data.insert_position or 1)
-    if data.insert_at_top or data.insert_position is not None:
-        result = await db.execute(select(func.max(PrintQueueItem.position)).where(*queue_scope))
-        max_pos = result.scalar() or 0
-        insert_position = min(insert_position, max_pos + 1)
-        await db.execute(
-            update(PrintQueueItem)
-            .where(*queue_scope)
-            .where(PrintQueueItem.position >= insert_position)
-            .values(position=PrintQueueItem.position + quantity)
-        )
-        start_position = insert_position
-    else:
-        result = await db.execute(select(func.max(PrintQueueItem.position)).where(*queue_scope))
-        max_pos = result.scalar() or 0
-        start_position = max_pos + 1
-
     # Resolve print_time_seconds for SJF scheduling (cache on item at creation)
     cached_print_time = None
     if archive:
@@ -610,41 +560,46 @@ async def add_to_queue(
             raise HTTPException(status_code=404, detail="Project not found")
 
     ams_mapping_json = json.dumps(data.ams_mapping) if data.ams_mapping else None
-    items = []
-    for i in range(quantity):
-        item = PrintQueueItem(
-            printer_id=data.printer_id,
-            target_model=target_model_norm,
-            target_location=data.target_location,
-            required_filament_types=required_filament_types,
-            filament_overrides=filament_overrides_json,
-            archive_id=data.archive_id,
-            library_file_id=data.library_file_id,
-            scheduled_time=data.scheduled_time,
-            require_previous_success=data.require_previous_success,
-            auto_off_after=data.auto_off_after,
-            manual_start=data.manual_start,
-            skip_filament_check=data.skip_filament_check,
-            ams_mapping=ams_mapping_json,
-            plate_id=data.plate_id,
-            bed_levelling=data.bed_levelling,
-            flow_cali=data.flow_cali,
-            vibration_cali=data.vibration_cali,
-            layer_inspect=data.layer_inspect,
-            timelapse=data.timelapse,
-            use_ams=data.use_ams,
-            nozzle_offset_cali=data.nozzle_offset_cali,
-            gcode_injection=data.gcode_injection,
-            cleanup_library_after_dispatch=data.cleanup_library_after_dispatch,
-            project_id=data.project_id,
-            position=start_position + i,
-            status="pending",
-            created_by_id=current_user.id if current_user else None,
-            batch_id=batch_id,
-            print_time_seconds=cached_print_time,
-        )
-        db.add(item)
-        items.append(item)
+    # Position allocation + row construction is shared with the production-run
+    # creator via services.queue_builder so the two never drift (#Phase2).
+    items = await create_queue_items(
+        db,
+        count=quantity,
+        printer_id=data.printer_id,
+        insert_position=data.insert_position,
+        insert_at_top=data.insert_at_top,
+        fields={
+            "printer_id": data.printer_id,
+            "target_model": target_model_norm,
+            "target_location": data.target_location,
+            "required_filament_types": required_filament_types,
+            "filament_overrides": filament_overrides_json,
+            "archive_id": data.archive_id,
+            "library_file_id": data.library_file_id,
+            "scheduled_time": data.scheduled_time,
+            "require_previous_success": data.require_previous_success,
+            "auto_off_after": data.auto_off_after,
+            "manual_start": data.manual_start,
+            "skip_filament_check": data.skip_filament_check,
+            "ams_mapping": ams_mapping_json,
+            "plate_id": data.plate_id,
+            "bed_levelling": data.bed_levelling,
+            "flow_cali": data.flow_cali,
+            "vibration_cali": data.vibration_cali,
+            "layer_inspect": data.layer_inspect,
+            "timelapse": data.timelapse,
+            "use_ams": data.use_ams,
+            "nozzle_offset_cali": data.nozzle_offset_cali,
+            "gcode_injection": data.gcode_injection,
+            "eject_profile_id": data.eject_profile_id,
+            "cleanup_library_after_dispatch": data.cleanup_library_after_dispatch,
+            "project_id": data.project_id,
+            "status": "pending",
+            "created_by_id": current_user.id if current_user else None,
+            "batch_id": batch_id,
+            "print_time_seconds": cached_print_time,
+        },
+    )
 
     await db.commit()
 

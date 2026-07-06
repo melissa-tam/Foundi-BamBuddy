@@ -4,6 +4,7 @@ from backend.app.models.api_key import APIKey
 from backend.app.models.archive import PrintArchive
 from backend.app.models.auth_ephemeral import AuthEphemeralToken, AuthRateLimitEvent
 from backend.app.models.color_catalog import ColorCatalogEntry
+from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.filament import Filament
 from backend.app.models.github_backup import GitHubBackupConfig, GitHubBackupLog
 from backend.app.models.group import Group, user_groups
@@ -23,6 +24,7 @@ from backend.app.models.printer import Printer
 from backend.app.models.printer_sensor_history import PrinterSensorHistory
 from backend.app.models.project import Project
 from backend.app.models.settings import Settings
+from backend.app.models.sku import Sku, SkuFile
 from backend.app.models.smart_plug import SmartPlug
 from backend.app.models.smart_plug_energy_snapshot import SmartPlugEnergySnapshot
 from backend.app.models.sponsor_toast_state import SponsorToastState
@@ -57,9 +59,12 @@ __all__ = [
     "AmsLabel",
     "PendingUpload",
     "PrintBatch",
+    "Sku",
+    "SkuFile",
     "LibraryFolder",
     "LibraryFile",
     "Location",
+    "EjectProfile",
     "User",
     "Group",
     "user_groups",

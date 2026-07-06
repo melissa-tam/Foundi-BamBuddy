@@ -34,6 +34,14 @@ class PrintQueueItem(Base):
     )
     project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
     batch_id: Mapped[int | None] = mapped_column(ForeignKey("print_batches.id", ondelete="SET NULL"), nullable=True)
+    # Farm auto-eject: when set, the scheduler generates a cooldown→sweep→park
+    # block from this profile and injects it as the machine-end snippet
+    # (superseding the global per-model end snippet) so the part is cleared off
+    # the plate before the next unit dispatches. SET NULL so deleting a profile
+    # leaves historical/queued items intact (they revert to no auto-eject).
+    eject_profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("eject_profiles.id", ondelete="SET NULL"), nullable=True
+    )
 
     # Scheduling
     position: Mapped[int] = mapped_column(Integer, default=0)  # Queue order
@@ -57,6 +65,21 @@ class PrintQueueItem(Base):
 
     # Plate ID for multi-plate 3MF files (1-indexed, None = auto-detect/plate 1)
     plate_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # --- Farm first-article + retry policy (Phase 3) --------------------------
+    # True for the run's first-article plate: the eject block is NOT injected (the
+    # part stays on the plate for inspection) and the plate-clear monitor never
+    # auto-clears the gate for it. Cleared (False) on every other plate.
+    first_article: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Automatic-retry generation for this unit: 0 = original attempt, N = the Nth
+    # retry after a failure. Bounded by the run's retry_max_per_unit.
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Lineage link to the failed item this row is a retry of. Makes retry
+    # creation idempotent (exactly one retry per failure event) and traceable.
+    # SET NULL so deleting the original leaves the retry standing.
+    retry_of_id: Mapped[int | None] = mapped_column(
+        ForeignKey("print_queue.id", ondelete="SET NULL"), nullable=True
+    )
 
     # Shortest-job-first scheduling
     print_time_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Cached from archive/library
@@ -136,9 +159,11 @@ class PrintQueueItem(Base):
     project: Mapped["Project | None"] = relationship(back_populates="queue_items")
     batch: Mapped["PrintBatch | None"] = relationship(back_populates="queue_items")
     created_by: Mapped["User | None"] = relationship()
+    eject_profile: Mapped["EjectProfile | None"] = relationship()
 
 
 from backend.app.models.archive import PrintArchive  # noqa: E402
+from backend.app.models.eject_profile import EjectProfile  # noqa: E402
 from backend.app.models.library import LibraryFile  # noqa: E402
 from backend.app.models.print_batch import PrintBatch  # noqa: E402
 from backend.app.models.printer import Printer  # noqa: E402

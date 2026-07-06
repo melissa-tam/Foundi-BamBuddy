@@ -118,6 +118,24 @@ class Permission(StrEnum):
     NOTIFICATION_TEMPLATES_READ = "notification_templates:read"
     NOTIFICATION_TEMPLATES_UPDATE = "notification_templates:update"
 
+    # Eject Profiles (farm auto-eject)
+    EJECT_PROFILES_READ = "eject_profiles:read"
+    EJECT_PROFILES_CREATE = "eject_profiles:create"
+    EJECT_PROFILES_UPDATE = "eject_profiles:update"
+    EJECT_PROFILES_DELETE = "eject_profiles:delete"
+
+    # SKU catalog (farm product/part catalog)
+    SKUS_READ = "skus:read"
+    SKUS_CREATE = "skus:create"
+    SKUS_UPDATE = "skus:update"
+    SKUS_DELETE = "skus:delete"
+
+    # Production runs (farm SKU production)
+    PRODUCTION_RUNS_READ = "production_runs:read"
+    PRODUCTION_RUNS_CREATE = "production_runs:create"
+    PRODUCTION_RUNS_UPDATE = "production_runs:update"
+    PRODUCTION_RUNS_DELETE = "production_runs:delete"
+
     # External Links
     EXTERNAL_LINKS_READ = "external_links:read"
     EXTERNAL_LINKS_CREATE = "external_links:create"
@@ -281,6 +299,24 @@ PERMISSION_CATEGORIES = {
         Permission.NOTIFICATION_TEMPLATES_READ,
         Permission.NOTIFICATION_TEMPLATES_UPDATE,
     ],
+    "Eject Profiles": [
+        Permission.EJECT_PROFILES_READ,
+        Permission.EJECT_PROFILES_CREATE,
+        Permission.EJECT_PROFILES_UPDATE,
+        Permission.EJECT_PROFILES_DELETE,
+    ],
+    "SKUs": [
+        Permission.SKUS_READ,
+        Permission.SKUS_CREATE,
+        Permission.SKUS_UPDATE,
+        Permission.SKUS_DELETE,
+    ],
+    "Production Runs": [
+        Permission.PRODUCTION_RUNS_READ,
+        Permission.PRODUCTION_RUNS_CREATE,
+        Permission.PRODUCTION_RUNS_UPDATE,
+        Permission.PRODUCTION_RUNS_DELETE,
+    ],
     "External Links": [
         Permission.EXTERNAL_LINKS_READ,
         Permission.EXTERNAL_LINKS_CREATE,
@@ -436,6 +472,21 @@ DEFAULT_GROUPS = {
             Permission.NOTIFICATIONS_USER_EMAIL.value,
             Permission.NOTIFICATION_TEMPLATES_READ.value,
             Permission.NOTIFICATION_TEMPLATES_UPDATE.value,
+            # Eject Profiles - full access (operators manage the farm auto-eject)
+            Permission.EJECT_PROFILES_READ.value,
+            Permission.EJECT_PROFILES_CREATE.value,
+            Permission.EJECT_PROFILES_UPDATE.value,
+            Permission.EJECT_PROFILES_DELETE.value,
+            # SKU catalog - full access (operators manage the farm product catalog)
+            Permission.SKUS_READ.value,
+            Permission.SKUS_CREATE.value,
+            Permission.SKUS_UPDATE.value,
+            Permission.SKUS_DELETE.value,
+            # Production runs - full access (operators run the farm)
+            Permission.PRODUCTION_RUNS_READ.value,
+            Permission.PRODUCTION_RUNS_CREATE.value,
+            Permission.PRODUCTION_RUNS_UPDATE.value,
+            Permission.PRODUCTION_RUNS_DELETE.value,
             # External Links - full access
             Permission.EXTERNAL_LINKS_READ.value,
             Permission.EXTERNAL_LINKS_CREATE.value,
@@ -476,6 +527,9 @@ DEFAULT_GROUPS = {
             Permission.KPROFILES_READ.value,
             Permission.NOTIFICATIONS_READ.value,
             Permission.NOTIFICATION_TEMPLATES_READ.value,
+            Permission.EJECT_PROFILES_READ.value,
+            Permission.SKUS_READ.value,
+            Permission.PRODUCTION_RUNS_READ.value,
             Permission.EXTERNAL_LINKS_READ.value,
             Permission.FIRMWARE_READ.value,
             Permission.AMS_HISTORY_READ.value,

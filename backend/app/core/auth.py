@@ -85,6 +85,9 @@ _APIKEY_SCOPE_BY_PERMISSION: dict[Permission, str] = {
     Permission.KPROFILES_READ: "can_read_status",
     Permission.NOTIFICATIONS_READ: "can_read_status",
     Permission.NOTIFICATION_TEMPLATES_READ: "can_read_status",
+    Permission.EJECT_PROFILES_READ: "can_read_status",
+    Permission.SKUS_READ: "can_read_status",
+    Permission.PRODUCTION_RUNS_READ: "can_read_status",
     Permission.EXTERNAL_LINKS_READ: "can_read_status",
     Permission.FIRMWARE_READ: "can_read_status",
     Permission.AMS_HISTORY_READ: "can_read_status",
@@ -209,6 +212,21 @@ _APIKEY_DENIED_PERMISSIONS: frozenset[Permission] = frozenset(
         Permission.KPROFILES_CREATE,
         Permission.KPROFILES_UPDATE,
         Permission.KPROFILES_DELETE,
+        # Eject-profile mutation is admin/operator-console only: these values
+        # parameterise physical toolhead sweeps, so no API-key scope covers
+        # editing them (reads stay under can_read_status).
+        Permission.EJECT_PROFILES_CREATE,
+        Permission.EJECT_PROFILES_UPDATE,
+        Permission.EJECT_PROFILES_DELETE,
+        # SKU-catalog + production-run mutation is admin/operator-console only:
+        # creating a run enqueues physical prints that drive toolhead sweeps, so
+        # no API-key scope covers it (reads stay under can_read_status).
+        Permission.SKUS_CREATE,
+        Permission.SKUS_UPDATE,
+        Permission.SKUS_DELETE,
+        Permission.PRODUCTION_RUNS_CREATE,
+        Permission.PRODUCTION_RUNS_UPDATE,
+        Permission.PRODUCTION_RUNS_DELETE,
         Permission.NOTIFICATIONS_CREATE,
         Permission.NOTIFICATIONS_UPDATE,
         Permission.NOTIFICATIONS_DELETE,

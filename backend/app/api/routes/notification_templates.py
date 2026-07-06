@@ -43,6 +43,11 @@ EVENT_NAMES = {
     "queue_job_skipped": "Queue Job Skipped",
     "queue_job_failed": "Queue Job Failed",
     "queue_completed": "Queue Completed",
+    # Farm production run notifications
+    "first_article_pending": "First Article Pending Approval",
+    "printer_quarantined": "Printer Quarantined",
+    "run_paused": "Production Run Paused",
+    "run_completed": "Production Run Completed",
     # User management
     "user_created": "Welcome Email",
     "password_reset": "Password Reset",

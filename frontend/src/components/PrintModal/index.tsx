@@ -93,6 +93,13 @@ export function PrintModal({
   // Quantity — number of copies (creates a batch if > 1)
   const [quantity, setQuantity] = useState(1);
 
+  // Eject profile for automatic part removal (farm feature). Optional; "None"
+  // (null) by default. Persisted on the queue item so the scheduler can inject
+  // the sweep snippet at dispatch time.
+  const [ejectProfileId, setEjectProfileId] = useState<number | null>(() =>
+    mode === 'edit-queue-item' ? queueItem?.eject_profile_id ?? null : null,
+  );
+
   const [printOptions, setPrintOptions] = useState<PrintOptions>(() => {
     if (mode === 'edit-queue-item' && queueItem) {
       return {
@@ -260,6 +267,12 @@ export function PrintModal({
   const { data: printers, isLoading: loadingPrinters } = useQuery({
     queryKey: ['printers'],
     queryFn: api.getPrinters,
+  });
+
+  // Eject profiles for the optional auto part-removal select.
+  const { data: ejectProfiles } = useQuery({
+    queryKey: ['eject-profiles'],
+    queryFn: api.getEjectProfiles,
   });
 
   const { data: spoolAssignments } = useQuery({
@@ -765,6 +778,7 @@ export function PrintModal({
         ? new Date(scheduleOptions.scheduledTime).toISOString()
         : undefined,
       ...printOptions,
+      eject_profile_id: ejectProfileId,
       project_id: projectId ?? undefined,
       batch_id: autoBatchId ?? undefined,
       cleanup_library_after_dispatch: cleanupLibraryAfterDispatch,
@@ -796,6 +810,7 @@ export function PrintModal({
                 ? new Date(scheduleOptions.scheduledTime).toISOString()
                 : null,
               ...printOptions,
+              eject_profile_id: ejectProfileId,
             };
             await updateQueueMutation.mutateAsync(updateData);
           } else {
@@ -851,6 +866,7 @@ export function PrintModal({
                   ? new Date(scheduleOptions.scheduledTime).toISOString()
                   : null,
                 ...printOptions,
+                eject_profile_id: ejectProfileId,
               };
               await updateQueueMutation.mutateAsync(updateData);
             } else {
@@ -1193,6 +1209,27 @@ export function PrintModal({
                 )}
               </div>
             )}
+
+            {/* Eject profile (auto part removal) — optional, defaults to None */}
+            <div>
+              <label htmlFor="ejectProfile" className="block text-sm text-bambu-gray mb-1">
+                {t('ejectProfiles.queueLabel')}
+              </label>
+              <select
+                id="ejectProfile"
+                value={ejectProfileId ?? ''}
+                onChange={(e) => setEjectProfileId(e.target.value ? Number(e.target.value) : null)}
+                className="w-full px-3 py-2 text-sm bg-bambu-dark border border-bambu-dark-tertiary rounded text-white focus:outline-none focus:ring-1 focus:ring-bambu-green"
+              >
+                <option value="">{t('common.none')}</option>
+                {(ejectProfiles ?? []).map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {profile.name}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-bambu-gray mt-1">{t('ejectProfiles.queueHelp')}</p>
+            </div>
 
             {/* Schedule options */}
             <ScheduleOptionsPanel

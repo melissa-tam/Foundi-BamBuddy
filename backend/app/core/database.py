@@ -173,6 +173,7 @@ async def init_db():
         auth_ephemeral,
         bug_report,
         color_catalog,
+        eject_profile,
         external_link,
         filament,
         filament_sku_settings,
@@ -198,6 +199,7 @@ async def init_db():
         project_bom,
         settings,
         shopping_list,
+        sku,
         slot_preset,
         smart_plug,
         smart_plug_energy_snapshot,
@@ -746,6 +748,34 @@ async def run_migrations(conn):
             )
     except (OperationalError, ProgrammingError):
         pass  # Already applied
+
+    # Migration: Add eject_profile_id column to print_queue (farm auto-eject).
+    # The eject_profiles table is created by create_all before run_migrations, so
+    # the FK reference resolves on both SQLite and Postgres.
+    try:
+        async with conn.begin_nested():
+            await conn.execute(
+                text(
+                    "ALTER TABLE print_queue ADD COLUMN eject_profile_id INTEGER "
+                    "REFERENCES eject_profiles(id) ON DELETE SET NULL"
+                )
+            )
+    except (OperationalError, ProgrammingError):
+        pass  # Already applied
+
+    # Migration: Add eject-sweep tuning columns to eject_profiles (farm eject).
+    # Optional X sub-band (both NULL = full-width sweep) + descending-sweep start
+    # fraction of the part height (1.0 = start at the part top, prior behaviour).
+    # NOT NULL DEFAULT 1.0 is valid ADD COLUMN on both SQLite and Postgres.
+    await _safe_execute(conn, "ALTER TABLE eject_profiles ADD COLUMN sweep_x_min_mm FLOAT")
+    await _safe_execute(conn, "ALTER TABLE eject_profiles ADD COLUMN sweep_x_max_mm FLOAT")
+    await _safe_execute(conn, "ALTER TABLE eject_profiles ADD COLUMN sweep_start_frac FLOAT NOT NULL DEFAULT 1.0")
+
+    # Migration: Add final_skim toggle to eject_profiles (farm eject). True
+    # (default, prior behaviour) appends a final slow skim pass at the z_offset
+    # floor; False pushes exactly once. NOT NULL DEFAULT 1 is valid ADD COLUMN on
+    # both SQLite and Postgres (mirrors the sweep_start_frac neighbour above).
+    await _safe_execute(conn, "ALTER TABLE eject_profiles ADD COLUMN final_skim BOOLEAN NOT NULL DEFAULT 1")
 
     # Migration: Enforce uniqueness on user_oidc_links for existing rows.
     # create_all() is idempotent and does not add constraints to existing tables,
@@ -3238,6 +3268,57 @@ async def run_migrations(conn):
         await _safe_execute(conn, "ALTER TABLE oidc_providers ADD COLUMN is_autologin BOOLEAN DEFAULT 0")
     else:
         await _safe_execute(conn, "ALTER TABLE oidc_providers ADD COLUMN is_autologin BOOLEAN DEFAULT false")
+
+    # Migration: Farm production-run fields on print_batches (Phase 2). The
+    # ``skus`` and ``sku_files`` tables are created by create_all() before
+    # run_migrations, so the ``sku_files`` FK reference resolves on both SQLite
+    # and Postgres. Non-farm/legacy batches leave these NULL.
+    await _safe_execute(
+        conn,
+        "ALTER TABLE print_batches ADD COLUMN sku_file_id INTEGER REFERENCES sku_files(id) ON DELETE SET NULL",
+    )
+    await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN target_units INTEGER")
+    await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN cooldown_temp_c_override REAL")
+
+    # Migration: Farm first-article + failure policy (Phase 3). BOOLEAN literals
+    # are dialect-branched (Postgres rejects DEFAULT 1 on a BOOLEAN column).
+    if is_sqlite():
+        await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN require_first_article BOOLEAN DEFAULT 1")
+    else:
+        await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN require_first_article BOOLEAN DEFAULT TRUE")
+    await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN first_article_state VARCHAR(20)")
+    await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN first_article_reject_reason TEXT")
+    await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN retry_max_per_unit INTEGER DEFAULT 1")
+    await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN escalate_consecutive_failures INTEGER DEFAULT 2")
+    await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN first_article_plan TEXT")
+
+    if is_sqlite():
+        await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN first_article BOOLEAN DEFAULT 0")
+    else:
+        await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN first_article BOOLEAN DEFAULT FALSE")
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN retry_count INTEGER DEFAULT 0")
+    await _safe_execute(
+        conn,
+        "ALTER TABLE print_queue ADD COLUMN retry_of_id INTEGER REFERENCES print_queue(id) ON DELETE SET NULL",
+    )
+
+    if is_sqlite():
+        await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN quarantined BOOLEAN DEFAULT 0")
+    else:
+        await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN quarantined BOOLEAN DEFAULT FALSE")
+    await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN quarantine_reason TEXT")
+
+    # Farm notification event toggles on notification providers.
+    for _col, _sqlite_default, _pg_default in (
+        ("on_first_article_pending", "1", "TRUE"),
+        ("on_printer_quarantined", "1", "TRUE"),
+        ("on_run_paused", "1", "TRUE"),
+        ("on_run_completed", "0", "FALSE"),
+    ):
+        _default = _sqlite_default if is_sqlite() else _pg_default
+        await _safe_execute(
+            conn, f"ALTER TABLE notification_providers ADD COLUMN {_col} BOOLEAN DEFAULT {_default}"
+        )
 
     # Migration: Disambiguate the four ``user_print_*`` notification template
     # names by appending " Email" (#1792). See ``_migrate_rename_user_print_template_names``.

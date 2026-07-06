@@ -89,6 +89,8 @@ class PrinterResponse(PrinterBase):
     camera_rotation: int = 0  # 0, 90, 180, 270 degrees
     plate_detection_enabled: bool = False
     plate_detection_roi: PlateDetectionROI | None = None
+    quarantined: bool = False
+    quarantine_reason: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -115,6 +117,8 @@ class PrinterResponse(PrinterBase):
             "nozzle_count": printer.nozzle_count,
             "print_hours_offset": printer.print_hours_offset,
             "plate_detection_enabled": printer.plate_detection_enabled,
+            "quarantined": printer.quarantined,
+            "quarantine_reason": printer.quarantine_reason,
             "created_at": printer.created_at,
             "updated_at": printer.updated_at,
         }
@@ -356,6 +360,10 @@ class PrinterStatus(BaseModel):
     # Queue: printer is awaiting the user to acknowledge the build plate is cleared
     # after a finished/failed print. Persisted across restarts (#961).
     awaiting_plate_clear: bool = False
+    # Farm failure policy: printer quarantined after consecutive failures, excluded
+    # from dispatch until an operator clears it (Phase 3).
+    quarantined: bool = False
+    quarantine_reason: str | None = None
     # AMS drying support
     supports_drying: bool = False
     # AMS "Print While Drying" — drying mid-print. Verified per Bambu wiki release notes;

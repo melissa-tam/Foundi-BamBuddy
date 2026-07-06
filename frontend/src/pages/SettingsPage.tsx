@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Loader2, Plus, Plug, AlertTriangle, RotateCcw, Bell, Download, RefreshCw, ExternalLink, Globe, Droplets, Thermometer, FileText, Edit2, Send, CheckCircle, XCircle, History, Trash2, Zap, TrendingUp, Calendar, DollarSign, Power, PowerOff, Key, Copy, Database, X, Shield, Printer, Cylinder, Wifi, Home, Video, Users, Lock, Unlock, ChevronDown, Save, Mail, Flame, Layers, ListOrdered, Code, Search, Scale, Settings as SettingsIcon, ScanEye, Cog, QrCode, Heart } from 'lucide-react';
+import { Loader2, Plus, Plug, AlertTriangle, RotateCcw, Bell, Download, RefreshCw, ExternalLink, Globe, Droplets, Thermometer, FileText, Edit2, Send, CheckCircle, XCircle, History, Trash2, Zap, TrendingUp, Calendar, DollarSign, Power, PowerOff, Key, Copy, Database, X, Shield, Printer, Cylinder, Wifi, Home, Video, Users, Lock, Unlock, ChevronDown, Save, Mail, Flame, Layers, ListOrdered, Code, Search, Scale, Settings as SettingsIcon, ScanEye, Cog, QrCode, Heart, Factory } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api } from '../api/client';
@@ -989,6 +989,8 @@ export function SettingsPage() {
       (settings.stagger_group_size ?? 2) !== (localSettings.stagger_group_size ?? 2) ||
       (settings.stagger_interval_minutes ?? 5) !== (localSettings.stagger_interval_minutes ?? 5) ||
       (settings.require_plate_clear ?? false) !== (localSettings.require_plate_clear ?? false) ||
+      (settings.farm_retry_max_per_unit ?? 1) !== (localSettings.farm_retry_max_per_unit ?? 1) ||
+      (settings.farm_escalate_consecutive_failures ?? 3) !== (localSettings.farm_escalate_consecutive_failures ?? 3) ||
       (settings.nozzle_temp_presets ?? '') !== (localSettings.nozzle_temp_presets ?? '') ||
       (settings.bed_temp_presets ?? '') !== (localSettings.bed_temp_presets ?? '') ||
       (settings.chamber_temp_presets ?? '') !== (localSettings.chamber_temp_presets ?? '') ||
@@ -1083,6 +1085,8 @@ export function SettingsPage() {
         stagger_group_size: localSettings.stagger_group_size,
         stagger_interval_minutes: localSettings.stagger_interval_minutes,
         require_plate_clear: localSettings.require_plate_clear,
+        farm_retry_max_per_unit: localSettings.farm_retry_max_per_unit,
+        farm_escalate_consecutive_failures: localSettings.farm_escalate_consecutive_failures,
         nozzle_temp_presets: localSettings.nozzle_temp_presets,
         bed_temp_presets: localSettings.bed_temp_presets,
         chamber_temp_presets: localSettings.chamber_temp_presets,
@@ -4261,6 +4265,55 @@ export function SettingsPage() {
                   />
                   <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
                 </label>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Farm Production defaults (Phase 3) */}
+          <Card id="card-farm-production">
+            <CardHeader>
+              <h3 className="text-base font-semibold text-white flex items-center gap-2">
+                <Factory className="w-4 h-4 text-bambu-green" />
+                {t('settings.farmProduction', 'Farm Production')}
+              </h3>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-xs text-bambu-gray">
+                {t('settings.farmProductionDescription', 'Default retry and quarantine policy prefilled into the Start Run dialog. Can be overridden per run.')}
+              </p>
+              <div className="flex gap-4">
+                <div className="flex-1">
+                  <label className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmRetryMaxPerUnit', 'Retries per plate')}
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={5}
+                    value={localSettings.farm_retry_max_per_unit ?? 1}
+                    onChange={(e) => updateSetting('farm_retry_max_per_unit', Math.max(0, Math.min(5, parseInt(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmRetryMaxPerUnitHelp', 'Automatic retries before a plate is marked failed (0–5)')}
+                  </p>
+                </div>
+                <div className="flex-1">
+                  <label className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmEscalateConsecutiveFailures', 'Quarantine after failures')}
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={localSettings.farm_escalate_consecutive_failures ?? 3}
+                    onChange={(e) => updateSetting('farm_escalate_consecutive_failures', Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmEscalateConsecutiveFailuresHelp', 'Consecutive failures on a printer that trip a quarantine (1–10)')}
+                  </p>
+                </div>
               </div>
             </CardContent>
           </Card>

@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -37,6 +37,7 @@ from backend.app.services.printer_manager import (
     supports_drying_while_printing,
 )
 from backend.app.services.smart_plug_manager import smart_plug_manager
+from backend.app.utils.filament_types import canonical_filament_type as _canonical_filament_type
 from backend.app.utils.filename import derive_remote_filename
 from backend.app.utils.printer_models import normalize_printer_model
 
@@ -51,22 +52,9 @@ logger = logging.getLogger(__name__)
 # briefly in SLICING between PREPARE and RUNNING while parsing the g-code.
 _ACTIVE_PRINT_STATES: frozenset[str] = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
 
-# Filament type equivalence groups — types within the same group are
-# interchangeable on the printer side (Bambu Lab firmware treats them as compatible).
-_FILAMENT_TYPE_GROUPS: list[list[str]] = [
-    ["PA-CF", "PA12-CF", "PAHT-CF"],
-]
-_FILAMENT_EQUIV_MAP: dict[str, str] = {}
-for _group in _FILAMENT_TYPE_GROUPS:
-    _canonical = _group[0].upper()
-    for _t in _group:
-        _FILAMENT_EQUIV_MAP[_t.upper()] = _canonical
-
-
-def _canonical_filament_type(ftype: str) -> str:
-    """Return canonical type for equivalence matching."""
-    upper = ftype.upper()
-    return _FILAMENT_EQUIV_MAP.get(upper, upper)
+# Filament-type equivalence + canonicalisation is shared with the farm capability
+# gate — single source of truth in ``utils.filament_types`` (imported above as
+# ``_canonical_filament_type`` to preserve the existing call sites).
 
 
 class PrintScheduler:
@@ -201,6 +189,14 @@ class PrintScheduler:
                 if self._printer_in_dispatch_hold(held_printer_id):
                     busy_printers.add(held_printer_id)
 
+            # Power-stagger budget (#Phase4): how many more prints may BEGIN
+            # heating this tick without exceeding stagger_group_size starts inside
+            # the current stagger_interval_minutes window. Derived by query from
+            # started_at so it's restart-safe. Decremented on each real start
+            # below; when it hits 0 the remaining eligible items simply wait for a
+            # later tick (logged at debug).
+            stagger_remaining = await self._stagger_budget(db)
+
             # Log skip reasons once per queue check (not per item)
             skip_reasons: dict[str, int] = {}
 
@@ -317,9 +313,18 @@ class PrintScheduler:
                     if await self._block_on_filament_deficit(db, item):
                         continue
 
+                    # Power-stagger gate: hold if this window's start budget is
+                    # spent. The item stays pending and is retried next tick.
+                    if stagger_remaining <= 0:
+                        skip_reasons["stagger_window"] = skip_reasons.get("stagger_window", 0) + 1
+                        logger.debug("Queue item %s: holding — stagger window budget exhausted", item.id)
+                        continue
+
                     # Start the print
                     await self._start_print(db, item)
                     busy_printers.add(item.printer_id)
+                    if item.status == "printing":
+                        stagger_remaining -= 1
 
                     # SJF starvation guard: mark items that were jumped
                     if sjf_enabled and item.print_time_seconds is not None:
@@ -392,6 +397,17 @@ class PrintScheduler:
                             )
 
                     if printer_id:
+                        # Power-stagger gate: hold BEFORE claiming the printer if
+                        # this window's start budget is spent, leaving the item
+                        # pending + unassigned so a later tick can pick any printer.
+                        if stagger_remaining <= 0:
+                            skip_reasons["stagger_window"] = skip_reasons.get("stagger_window", 0) + 1
+                            logger.debug(
+                                "Queue item %s: holding model-based dispatch — stagger window budget exhausted",
+                                item.id,
+                            )
+                            continue
+
                         # Check condition (previous print success) before assigning
                         if item.require_previous_success:
                             if not await self._check_previous_success(db, item):
@@ -446,6 +462,8 @@ class PrintScheduler:
 
                         await self._start_print(db, item)
                         busy_printers.add(printer_id)
+                        if item.status == "printing":
+                            stagger_remaining -= 1
 
                         # SJF starvation guard: mark model-based items that were jumped
                         if sjf_enabled and item.print_time_seconds is not None:
@@ -522,6 +540,7 @@ class PrintScheduler:
             select(Printer)
             .where(func.lower(Printer.model) == normalized_model.lower())
             .where(Printer.is_active == True)  # noqa: E712
+            .where(Printer.quarantined == False)  # noqa: E712 — farm quarantine excludes from dispatch
         )
 
         # Add location filter if specified
@@ -1445,6 +1464,12 @@ class PrintScheduler:
             logger.debug("Printer %d: not connected", printer_id)
             return False
 
+        # Quarantined printers (farm failure policy) are excluded from ALL
+        # dispatch until an operator clears the quarantine (#Phase3).
+        if printer_manager.is_quarantined(printer_id):
+            logger.debug("Printer %d: not idle — quarantined", printer_id)
+            return False
+
         state = printer_manager.get_status(printer_id)
         if not state:
             logger.debug("Printer %d: no status available", printer_id)
@@ -1481,6 +1506,40 @@ class PrintScheduler:
         if setting:
             return setting.value.lower() == "true"
         return default
+
+    async def _get_int_setting(self, db: AsyncSession, key: str, default: int) -> int:
+        """Read an integer setting from the database, falling back to ``default``."""
+        result = await db.execute(select(Settings).where(Settings.key == key))
+        setting = result.scalar_one_or_none()
+        if setting and setting.value is not None:
+            try:
+                return int(setting.value)
+            except (TypeError, ValueError):
+                return default
+        return default
+
+    async def _stagger_budget(self, db: AsyncSession) -> int:
+        """How many more prints may START this stagger window (power management).
+
+        Consumes the persisted ``stagger_group_size`` (max printers allowed to
+        begin heating within one window) and ``stagger_interval_minutes`` (window
+        length). Recent starts are derived BY QUERY from ``print_queue.started_at``
+        so a backend restart can't unleash a thundering herd — the sliding window
+        is reconstructed from durable state, not in-memory counters. A large
+        ``stagger_group_size`` effectively disables staggering (the window budget
+        is never reached). Returns the remaining budget (>= 0) for this tick.
+        """
+        group_size = await self._get_int_setting(db, "stagger_group_size", default=2)
+        interval_minutes = await self._get_int_setting(db, "stagger_interval_minutes", default=5)
+        if group_size <= 0 or interval_minutes <= 0:
+            # Defensive: schema clamps these to >=1, but a hand-edited row could
+            # slip through — treat non-positive config as "staggering off".
+            return group_size if group_size > 0 else 1_000_000
+        window_start = datetime.now(timezone.utc) - timedelta(minutes=interval_minutes)
+        recent_starts = await db.scalar(
+            select(func.count(PrintQueueItem.id)).where(PrintQueueItem.started_at >= window_start)
+        )
+        return max(0, group_size - int(recent_starts or 0))
 
     async def _get_drying_presets(self, db: AsyncSession) -> dict[str, dict[str, int]]:
         """Get drying presets (user-configured or built-in defaults)."""
@@ -2112,6 +2171,26 @@ class PrintScheduler:
             await self._power_off_if_needed(db, item)
             return
 
+        # Farm capability-matching gate (#Phase4). Non-farm items bypass it. A
+        # BLOCK is NOT a failure: record the reason on waiting_reason (surfaced in
+        # the queue UI), leave the item pending, and let a later tick re-evaluate
+        # (a swapped spool / corrected assignment clears it). This is the single
+        # call from the scheduler's dispatch path.
+        from backend.app.services.capability_gate import check_dispatch_capability
+
+        capability = await check_dispatch_capability(db, item, printer)
+        if not capability.ok:
+            if item.waiting_reason != capability.reason:
+                item.waiting_reason = capability.reason
+                await db.commit()
+            logger.info("Queue item %s: capability gate held dispatch — %s", item.id, capability.reason)
+            return
+        if capability.warn:
+            logger.warning("Queue item %s: capability warn-dispatch — %s", item.id, capability.reason)
+        if item.waiting_reason:
+            # Cleared to dispatch: drop any stale capability waiting reason.
+            item.waiting_reason = None
+
         # Determine source: archive or library file
         archive = None
         library_file = None
@@ -2231,31 +2310,73 @@ class PrintScheduler:
             await self._power_off_if_needed(db, item)
             return
 
-        # G-code injection for auto-print systems (#422)
+        # G-code injection for auto-print systems (#422) + farm auto-eject.
         injected_path = None
+        start_gc: str | None = None
+        end_gc: str | None = None
         if item.gcode_injection:
             try:
                 snippets_raw = await self._get_setting(db, "gcode_snippets")
                 if snippets_raw:
                     snippets = json.loads(snippets_raw)
                     model_snippets = snippets.get(printer.model, {})
-                    start_gc = (model_snippets.get("start_gcode") or "").strip()
-                    end_gc = (model_snippets.get("end_gcode") or "").strip()
-                    if start_gc or end_gc:
-                        from backend.app.utils.threemf_tools import inject_gcode_into_3mf
-
-                        injected_path = inject_gcode_into_3mf(
-                            file_path, item.plate_id or 1, start_gc or None, end_gc or None
-                        )
-                        if injected_path:
-                            file_path = injected_path
-                            logger.info("Queue item %s: G-code injected for model %s", item.id, printer.model)
-                        else:
-                            logger.warning(
-                                "Queue item %s: G-code injection returned no result, using original", item.id
-                            )
+                    start_gc = (model_snippets.get("start_gcode") or "").strip() or None
+                    end_gc = (model_snippets.get("end_gcode") or "").strip() or None
             except Exception as e:
-                logger.warning("Queue item %s: G-code injection failed, using original: %s", item.id, e)
+                logger.warning("Queue item %s: G-code snippet load failed, using original: %s", item.id, e)
+                start_gc = end_gc = None
+
+        # Farm auto-eject: the generated block SUPERSEDES the global per-model end
+        # snippet (start snippet is unchanged) and is injected regardless of the
+        # per-item gcode_injection flag. A block that can't be generated or fails
+        # validation must never dispatch unprotected — fail the item instead.
+        if item.eject_profile_id:
+            from backend.app.services.eject.dispatch import build_eject_snippet
+
+            eject_snippet, eject_error = await build_eject_snippet(db, item, printer, file_path)
+            if eject_error:
+                item.status = "failed"
+                item.error_message = f"Auto-eject blocked: {eject_error}"
+                item.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+                logger.error("Queue item %s: auto-eject refused — %s", item.id, eject_error)
+                await self._power_off_if_needed(db, item)
+                return
+            # A (None, None) result is a deliberate SKIP (first-article items): the
+            # part must stay on the plate for inspection, so no eject supersede.
+            if eject_snippet is not None:
+                end_gc = eject_snippet  # supersede the global end snippet
+                logger.info(
+                    "Queue item %s: auto-eject block generated from profile %s", item.id, item.eject_profile_id
+                )
+            else:
+                logger.info("Queue item %s: first-article — eject injection skipped", item.id)
+
+        if start_gc or end_gc:
+            try:
+                from backend.app.utils.threemf_tools import inject_gcode_into_3mf
+
+                injected_path = inject_gcode_into_3mf(file_path, item.plate_id or 1, start_gc, end_gc)
+            except Exception as e:
+                injected_path = None
+                logger.warning("Queue item %s: G-code injection failed: %s", item.id, e)
+
+            if injected_path:
+                file_path = injected_path
+                logger.info("Queue item %s: G-code injected for model %s", item.id, printer.model)
+            elif item.eject_profile_id:
+                # Auto-eject was required but the block couldn't be applied — do
+                # NOT dispatch a job the plate-clear monitor would later auto-clear
+                # without an actual sweep having run.
+                item.status = "failed"
+                item.error_message = "Auto-eject blocked: G-code injection failed"
+                item.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+                logger.error("Queue item %s: auto-eject injection failed, not dispatching", item.id)
+                await self._power_off_if_needed(db, item)
+                return
+            else:
+                logger.warning("Queue item %s: G-code injection returned no result, using original", item.id)
 
         # Upload to root directory (not /cache/) - the start_print command references
         # files by name only (ftp://{filename}), so they must be in the root

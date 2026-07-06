@@ -86,6 +86,25 @@ EVENT_VARIABLES: dict[str, list[str]] = {
     "queue_job_skipped": ["printer", "job_name", "reason", "timestamp", "app_name"],
     "queue_job_failed": ["printer", "job_name", "reason", "timestamp", "app_name"],
     "queue_completed": ["completed_count", "timestamp", "app_name"],
+    # Farm production run notifications
+    "first_article_pending": [
+        "printer",
+        "run_name",
+        "sku_code",
+        "finish_photo_url",
+        "timestamp",
+        "app_name",
+    ],
+    "printer_quarantined": ["printer", "failure_count", "reason", "timestamp", "app_name"],
+    "run_paused": ["run_name", "sku_code", "reason", "timestamp", "app_name"],
+    "run_completed": [
+        "run_name",
+        "sku_code",
+        "units_completed",
+        "plates_completed",
+        "timestamp",
+        "app_name",
+    ],
     # User management notifications
     "user_created": ["username", "password", "login_url", "app_name", "timestamp"],
     "password_reset": ["username", "password", "login_url", "app_name", "timestamp"],
@@ -254,6 +273,37 @@ SAMPLE_DATA: dict[str, dict[str, str]] = {
     },
     "queue_completed": {
         "completed_count": "5",
+        "timestamp": "2024-01-15 18:30",
+        "app_name": "Bambuddy",
+    },
+    # Farm production run notifications
+    "first_article_pending": {
+        "printer": "Bambu H2S #1",
+        "run_name": "SKU007.01 — Impact Driver ×3",
+        "sku_code": "SKU007.01",
+        "finish_photo_url": "/api/v1/archives/123/photos/finish_20240115_154800_abc12345.jpg",
+        "timestamp": "2024-01-15 15:48",
+        "app_name": "Bambuddy",
+    },
+    "printer_quarantined": {
+        "printer": "Bambu H2S #2",
+        "failure_count": "2",
+        "reason": "2 consecutive farm print failures",
+        "timestamp": "2024-01-15 16:00",
+        "app_name": "Bambuddy",
+    },
+    "run_paused": {
+        "run_name": "SKU007.01 — Impact Driver ×3",
+        "sku_code": "SKU007.01",
+        "reason": "First article rejected: warping on the front edge",
+        "timestamp": "2024-01-15 16:05",
+        "app_name": "Bambuddy",
+    },
+    "run_completed": {
+        "run_name": "SKU007.01 — Impact Driver ×3",
+        "sku_code": "SKU007.01",
+        "units_completed": "3",
+        "plates_completed": "3",
         "timestamp": "2024-01-15 18:30",
         "app_name": "Bambuddy",
     },

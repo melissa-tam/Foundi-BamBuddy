@@ -19,6 +19,7 @@ from backend.app.utils.threemf_tools import (
     get_cumulative_usage_at_layer,
     mm_to_grams,
     parse_gcode_layer_filament_usage,
+    read_plate_gcode_machine_end,
 )
 
 
@@ -941,3 +942,55 @@ class TestExtractPrintTimeFrom3mf:
 
         assert extract_print_time_from_3mf(file_path) is None
         assert extract_print_time_from_3mf(file_path, plate_id=2) is None
+
+
+class TestReadPlateGcodeMachineEnd:
+    """Tests for read_plate_gcode_machine_end() — the stock machine-end tail
+    reader used by the eject dry-run machine-end splice."""
+
+    @staticmethod
+    def _write_plate(tmp_path, gcode: str, *, plate_id: int = 1, name: str = "p.gcode.3mf"):
+        path = tmp_path / name
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"Metadata/plate_{plate_id}.gcode", gcode)
+            zf.writestr("3D/3dmodel.model", "<model/>")
+        return path
+
+    def test_returns_machine_end_through_eof_verbatim(self, tmp_path):
+        gcode = (
+            "; HEADER_BLOCK_START\n; max_z_height: 20.00\n; HEADER_BLOCK_END\n"
+            "; EXECUTABLE_BLOCK_START\n"
+            "M104 S220\nG1 X100 Y100 E5\n"
+            "; MACHINE_END_GCODE_START\n"
+            "M104 S0\nM140 S0\nM18\n"
+            "; EXECUTABLE_BLOCK_END\n"
+        )
+        path = self._write_plate(tmp_path, gcode)
+        tail = read_plate_gcode_machine_end(path, 1)
+        # Starts exactly at the marker line, ends at EOF, verbatim.
+        assert tail == ("; MACHINE_END_GCODE_START\nM104 S0\nM140 S0\nM18\n; EXECUTABLE_BLOCK_END\n")
+        # Print body before the marker is NOT included.
+        assert "G1 X100 Y100 E5" not in tail
+        assert tail.count("; EXECUTABLE_BLOCK_END") == 1
+
+    def test_returns_none_when_marker_absent(self, tmp_path):
+        gcode = "; EXECUTABLE_BLOCK_START\nG1 X100 Y100 E5\n; EXECUTABLE_BLOCK_END\n"
+        path = self._write_plate(tmp_path, gcode)
+        assert read_plate_gcode_machine_end(path, 1) is None
+
+    def test_returns_none_when_no_gcode_member(self, tmp_path):
+        path = tmp_path / "empty.3mf"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("3D/3dmodel.model", "<model/>")
+        assert read_plate_gcode_machine_end(path, 1) is None
+
+    def test_streams_only_tail_of_large_body(self, tmp_path):
+        # A multi-MB print body before the marker must be skipped, and only the
+        # small machine-end tail returned — proves the reader doesn't depend on a
+        # bounded prefix read.
+        big_body = "".join(f"G1 X{i % 300} Y{i % 300} E0.1\n" for i in range(300_000))
+        gcode = "; EXECUTABLE_BLOCK_START\n" + big_body + "; MACHINE_END_GCODE_START\nM18\n; EXECUTABLE_BLOCK_END\n"
+        assert len(gcode) > 4 * 1024 * 1024  # body dwarfs any prefix window
+        path = self._write_plate(tmp_path, gcode)
+        tail = read_plate_gcode_machine_end(path, 1)
+        assert tail == "; MACHINE_END_GCODE_START\nM18\n; EXECUTABLE_BLOCK_END\n"

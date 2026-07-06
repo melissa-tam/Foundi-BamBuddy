@@ -102,6 +102,12 @@ class NotificationProvider(Base):
     on_queue_job_failed = Column(Boolean, default=True)  # Job failed to start
     on_queue_completed = Column(Boolean, default=False)  # All pending jobs finished
 
+    # Event triggers - Farm production (Phase 3)
+    on_first_article_pending = Column(Boolean, default=True)  # First article printed, awaiting approval
+    on_printer_quarantined = Column(Boolean, default=True)  # Printer quarantined after consecutive failures
+    on_run_paused = Column(Boolean, default=True)  # Production run paused (reject / no printers)
+    on_run_completed = Column(Boolean, default=False)  # Production run finished all plates
+
     # Quiet hours (do not disturb)
     quiet_hours_enabled = Column(Boolean, default=False)
     quiet_hours_start = Column(String(5), nullable=True)  # HH:MM format, e.g., "22:00"

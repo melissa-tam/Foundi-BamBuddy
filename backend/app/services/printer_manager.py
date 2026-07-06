@@ -268,6 +268,12 @@ class PrinterManager:
         # Persisted to DB (printers.awaiting_plate_clear) so the gate survives restarts/power
         # cycles — see issue #961. Loaded into this set at startup via load_awaiting_plate_clear_from_db().
         self._awaiting_plate_clear: set[int] = set()
+        # Printers quarantined by the farm failure policy (Phase 3). DB-backed
+        # (printers.quarantined) is the source of truth; this set is the fast
+        # in-memory cache the synchronous scheduler idle-gate consults. Kept in
+        # sync by farm_policy / the clear-quarantine route via set_quarantined,
+        # and rehydrated from the DB on startup via load_quarantine_from_db().
+        self._quarantined: set[int] = set()
 
     def get_printer(self, printer_id: int) -> PrinterInfo | None:
         """Get printer info by ID."""
@@ -388,6 +394,44 @@ class PrinterManager:
                     logger.info("Loaded %d printer(s) awaiting plate-clear acknowledgment: %s", len(ids), sorted(ids))
         except Exception as e:
             logger.warning("Failed to load awaiting_plate_clear from DB: %s", e)
+
+    def is_quarantined(self, printer_id: int) -> bool:
+        """Return True when the printer is quarantined by the farm failure policy.
+
+        Quarantined printers are excluded from ALL scheduler dispatch until an
+        operator clears the quarantine.
+        """
+        return printer_id in self._quarantined
+
+    def set_quarantined(self, printer_id: int, quarantined: bool) -> None:
+        """Update the in-memory quarantine cache and broadcast a status change.
+
+        DB persistence is owned by the caller (farm_policy / the clear-quarantine
+        route) inside its own transaction, so this method only touches the fast
+        in-memory set the synchronous scheduler gate consults plus the WebSocket
+        broadcast — mirroring how ``set_awaiting_plate_clear`` keeps subscribers
+        in sync for a Bambuddy-side flag the printer never pushes over MQTT.
+        """
+        if quarantined:
+            self._quarantined.add(printer_id)
+        else:
+            self._quarantined.discard(printer_id)
+        if self._loop and self._loop.is_running():
+            self._schedule_async(self._broadcast_status_change(printer_id))
+
+    async def load_quarantine_from_db(self):
+        """Rehydrate the quarantine set from the printers table on startup."""
+        from backend.app.core.database import async_session
+
+        try:
+            async with async_session() as db:
+                result = await db.execute(select(Printer.id).where(Printer.quarantined.is_(True)))
+                ids = {row[0] for row in result.all()}
+                self._quarantined = ids
+                if ids:
+                    logger.info("Loaded %d quarantined printer(s): %s", len(ids), sorted(ids))
+        except Exception as e:
+            logger.warning("Failed to load quarantine state from DB: %s", e)
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         """Set the event loop for async callbacks."""
@@ -1210,6 +1254,7 @@ def printer_state_to_dict(
         # so surface it here — without this, WebSocket merges drop the flag and the
         # "Clear Plate" button only appears when the 30 s REST fallback poll runs.
         "awaiting_plate_clear": printer_manager.is_awaiting_plate_clear(printer_id) if printer_id else False,
+        "quarantined": printer_manager.is_quarantined(printer_id) if printer_id else False,
     }
     # Add cover URL if there's an active print and printer_id is provided
     # Include PAUSE state so skip objects modal can show cover

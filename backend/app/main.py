@@ -27,6 +27,7 @@ from backend.app.api.routes import (
     camera,
     cloud,
     discovery,
+    eject_profiles,
     external_links,
     filaments,
     firmware,
@@ -53,8 +54,10 @@ from backend.app.api.routes import (
     print_queue,
     printer_sensor_history,
     printers,
+    production_runs,
     projects,
     settings as settings_routes,
+    skus,
     slice_jobs,
     slicer_presets,
     smart_plugs,
@@ -90,6 +93,7 @@ from backend.app.services.bambu_ftp import (
     with_ftp_retry,
 )
 from backend.app.services.bambu_mqtt import PrinterState
+from backend.app.services.eject.monitor import eject_cooldown_monitor
 from backend.app.services.github_backup import github_backup_service
 from backend.app.services.homeassistant import homeassistant_service
 from backend.app.services.library_trash import library_trash_service
@@ -4022,6 +4026,9 @@ async def on_print_complete(printer_id: int, data: dict):
     _final_status = data.get("status", "completed")
     if _final_status in ("completed", "failed", "aborted", "cancelled"):
         printer_manager.set_awaiting_plate_clear(printer_id, True)
+        # Farm auto-eject: on a successful eject job, watch the bed cool below the
+        # profile threshold and auto-release this gate; failures leave it set.
+        eject_cooldown_monitor.on_terminal_status(printer_id, _final_status)
 
     # MQTT relay - publish print complete
     try:
@@ -4543,6 +4550,17 @@ async def on_print_complete(printer_id: int, data: dict):
                         printer_id, p_name, ps, data, db, archive_data=no_archive_data
                     )
 
+                    # Farm policy hook for the no-archive path (Phase 3): covers
+                    # remote first-article eject completions (dispatched without a
+                    # registered archive) plus any farm item that finished without
+                    # an archive. Mutually exclusive with the archive path above.
+                    try:
+                        from backend.app.services.farm_policy import on_terminal as farm_on_terminal
+
+                        await farm_on_terminal(db, printer_id, queue_item_id, ps, archive_data=no_archive_data)
+                    except Exception as farm_err:
+                        logger.warning("[NOTIFY-BG] farm policy hook (no-archive) failed: %s", farm_err)
+
                     # Send user-specific email if we have a created_by_id
                     if no_archive_data and no_archive_data.get("created_by_id"):
                         raw_filename = data.get("subtask_name") or data.get("filename", "Unknown")
@@ -5059,6 +5077,17 @@ async def on_print_complete(printer_id: int, data: dict):
                 await notification_service.on_print_complete(
                     printer_id, printer_name, print_status, data, db, archive_data=archive_data
                 )
+
+                # Farm first-article + failure/quarantine policy (Phase 3). Single
+                # hook — all logic lives in services.farm_policy. Runs here (not at
+                # the earlier terminal-status site) so the finish photo captured for
+                # the notification is available to attach to first_article_pending.
+                try:
+                    from backend.app.services.farm_policy import on_terminal as farm_on_terminal
+
+                    await farm_on_terminal(db, printer_id, queue_item_id, print_status, archive_data=archive_data)
+                except Exception as farm_err:
+                    logger.warning("[NOTIFY-BG] farm policy hook failed: %s", farm_err)
 
                 # Send user-specific email notification
                 if archive_data:
@@ -6030,6 +6059,11 @@ async def lifespan(app: FastAPI):
 
     # Rehydrate persisted awaiting-plate-clear gate (#961) so prompts survive restarts
     await printer_manager.load_awaiting_plate_clear_from_db()
+    await printer_manager.load_quarantine_from_db()
+
+    # Farm auto-eject: re-arm cooldown watches lost to the restart (a gate left
+    # set by a successful eject job would otherwise stall the queue forever).
+    await eject_cooldown_monitor.rearm_on_startup()
 
     # Layer change callback for external camera timelapse
     async def on_layer_change(printer_id: int, layer_num: int):
@@ -6745,6 +6779,9 @@ app.include_router(sponsor_prompt.router, prefix=app_settings.api_prefix)
 app.include_router(maintenance.router, prefix=app_settings.api_prefix)
 app.include_router(camera.router, prefix=app_settings.api_prefix)
 app.include_router(external_links.router, prefix=app_settings.api_prefix)
+app.include_router(eject_profiles.router, prefix=app_settings.api_prefix)
+app.include_router(skus.router, prefix=app_settings.api_prefix)
+app.include_router(production_runs.router, prefix=app_settings.api_prefix)
 app.include_router(projects.router, prefix=app_settings.api_prefix)
 app.include_router(library.router, prefix=app_settings.api_prefix)
 app.include_router(library_tags.router, prefix=app_settings.api_prefix)

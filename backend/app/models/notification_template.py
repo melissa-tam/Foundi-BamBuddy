@@ -170,6 +170,31 @@ DEFAULT_TEMPLATES = [
         "title_template": "Queue Complete",
         "body_template": "All {completed_count} queued jobs have finished",
     },
+    # Farm production run notifications (Phase 3)
+    {
+        "event_type": "first_article_pending",
+        "name": "First Article Pending Approval",
+        "title_template": "First Article Ready — {sku_code}",
+        "body_template": "{printer}: first article for run '{run_name}' printed and is awaiting approval.\nApprove or reject to continue the run.",
+    },
+    {
+        "event_type": "printer_quarantined",
+        "name": "Printer Quarantined",
+        "title_template": "Printer Quarantined: {printer}",
+        "body_template": "{printer} was quarantined after {failure_count} consecutive failures.\nReason: {reason}\nIt is excluded from dispatch until cleared.",
+    },
+    {
+        "event_type": "run_paused",
+        "name": "Production Run Paused",
+        "title_template": "Run Paused — {sku_code}",
+        "body_template": "Run '{run_name}' was paused.\nReason: {reason}",
+    },
+    {
+        "event_type": "run_completed",
+        "name": "Production Run Completed",
+        "title_template": "Run Complete — {sku_code}",
+        "body_template": "Run '{run_name}' finished: {units_completed} unit(s) across {plates_completed} plate(s).",
+    },
     {
         "event_type": "user_created",
         "name": "Welcome Email",

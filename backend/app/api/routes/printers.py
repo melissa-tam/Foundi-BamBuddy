@@ -776,6 +776,8 @@ async def get_printer_status(
         developer_mode=state.developer_mode if state else None,
         ams_filament_backup=state.ams_filament_backup if state else None,
         awaiting_plate_clear=printer_manager.is_awaiting_plate_clear(printer_id),
+        quarantined=printer.quarantined,
+        quarantine_reason=printer.quarantine_reason,
         supports_drying=supports_drying(printer.model, state.firmware_version),
         supports_drying_while_printing=supports_drying_while_printing(printer.model, state.firmware_version),
         supports_chamber_heater=supports_chamber_heater(printer.model),
@@ -2837,6 +2839,24 @@ async def clear_plate(
     printer_manager.set_awaiting_plate_clear(printer_id, False)
 
     return {"success": True, "message": "Plate cleared, next print will start shortly"}
+
+
+@router.post("/{printer_id}/clear-quarantine")
+async def clear_quarantine(
+    printer_id: int,
+    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_UPDATE),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clear a printer's farm quarantine so the scheduler may dispatch to it again.
+
+    A printer is quarantined automatically after N consecutive farm print
+    failures (run policy). This resets the ``quarantined`` flag + reason. No MQTT
+    command is sent. Returns the printer's new quarantine state.
+    """
+    from backend.app.services.farm_policy import clear_quarantine as _clear_quarantine
+
+    printer = await _clear_quarantine(db, printer_id)
+    return {"id": printer.id, "quarantined": printer.quarantined}
 
 
 @router.post("/{printer_id}/print/pause")

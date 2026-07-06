@@ -1,4 +1,27 @@
 import type { ArchivePlatesResponse, LibraryFilePlatesResponse } from '../types/plates';
+import type {
+  EjectProfile,
+  EjectProfileCreate,
+  EjectProfileUpdate,
+  EjectProfilePreviewRequest,
+  EjectProfilePreviewResponse,
+  EjectProfileDryRunDispatchRequest,
+  EjectProfileDryRunDispatchResponse,
+} from '../types/ejectProfiles';
+import type {
+  Sku,
+  SkuCreate,
+  SkuUpdate,
+  SkuFileLinkCreate,
+  SkuSuggest,
+  SkuStats,
+} from '../types/skus';
+import type {
+  ProductionRun,
+  ProductionRunCreate,
+  FirstArticleApproveRequest,
+  FirstArticleRejectRequest,
+} from '../types/productionRuns';
 
 const API_BASE = '/api/v1';
 
@@ -324,6 +347,11 @@ export interface Printer {
   camera_rotation: number;  // 0, 90, 180, 270 degrees
   plate_detection_enabled: boolean;  // Check plate before print
   plate_detection_roi?: PlateDetectionROI;  // ROI for plate detection
+  // Farm auto-recovery (Phase 3): a printer is quarantined after too many
+  // consecutive dispatch failures and is skipped by the scheduler until an
+  // operator clears it.
+  quarantined: boolean;
+  quarantine_reason: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -1207,6 +1235,10 @@ export interface AppSettings {
   stagger_interval_minutes: number;
   // Plate-clear confirmation
   require_plate_clear: boolean;
+  // Farm production defaults (Phase 3) — prefill the start-run dialog's
+  // retry / quarantine policy fields.
+  farm_retry_max_per_unit: number;
+  farm_escalate_consecutive_failures: number;
   // Shortest job first scheduling
   queue_shortest_first: boolean;
   // User-configurable presets for the printer-card popovers (JSON arrays of 3 ints).
@@ -1971,6 +2003,8 @@ export interface PrintQueueItem {
   been_jumped?: boolean;
   // Auto-print G-code injection
   gcode_injection?: boolean;
+  // Eject profile applied for automatic part removal after the print cools.
+  eject_profile_id?: number | null;
   cleanup_library_after_dispatch?: boolean;
 }
 
@@ -2023,6 +2057,8 @@ export interface PrintQueueItemCreate {
   quantity?: number;
   // Existing batch to add this item into (multi-plate auto-batch flow).
   batch_id?: number | null;
+  // Eject profile applied for automatic part removal after the print cools.
+  eject_profile_id?: number | null;
   // Project to associate the resulting archive with
   project_id?: number;
   // Delete transient uploaded library file after scheduler creates the archive
@@ -2061,6 +2097,8 @@ export interface PrintQueueItemUpdate {
   nozzle_offset_cali?: boolean;
   // Auto-print G-code injection
   gcode_injection?: boolean;
+  // Eject profile applied for automatic part removal after the print cools.
+  eject_profile_id?: number | null;
 }
 
 export interface PrintQueueBulkUpdate {
@@ -2994,6 +3032,9 @@ export type Permission =
   | 'firmware:read' | 'firmware:update'
   | 'ams_history:read'
   | 'stats:read' | 'stats:filter_by_user'
+  | 'eject_profiles:read' | 'eject_profiles:create' | 'eject_profiles:update' | 'eject_profiles:delete'
+  | 'skus:read' | 'skus:create' | 'skus:update' | 'skus:delete'
+  | 'production_runs:read' | 'production_runs:create' | 'production_runs:update' | 'production_runs:delete'
   | 'system:read'
   | 'settings:read' | 'settings:update' | 'settings:backup' | 'settings:restore'
   | 'github:backup' | 'github:restore'
@@ -3594,6 +3635,12 @@ export const api = {
     }),
   clearPlate: (printerId: number) =>
     request<{ success: boolean; message: string }>(`/printers/${printerId}/clear-plate`, {
+      method: 'POST',
+    }),
+  // Farm auto-recovery (Phase 3): lift a printer's quarantine so the scheduler
+  // resumes dispatching to it.
+  clearQuarantine: (printerId: number) =>
+    request<Printer>(`/printers/${printerId}/clear-quarantine`, {
       method: 'POST',
     }),
 
@@ -4740,6 +4787,118 @@ export const api = {
     request<{ success: boolean; error: string | null }>('/smart-plugs/rest/test-connection', {
       method: 'POST',
       body: JSON.stringify({ url, method, headers }),
+    }),
+
+  // Eject Profiles (farm auto part-removal, Phase 1)
+  getEjectProfiles: () => request<EjectProfile[]>('/eject-profiles'),
+  getEjectProfile: (id: number) => request<EjectProfile>(`/eject-profiles/${id}`),
+  createEjectProfile: (data: EjectProfileCreate) =>
+    request<EjectProfile>('/eject-profiles', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateEjectProfile: (id: number, data: EjectProfileUpdate) =>
+    request<EjectProfile>(`/eject-profiles/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  deleteEjectProfile: (id: number) =>
+    request<void>(`/eject-profiles/${id}`, { method: 'DELETE' }),
+  previewEjectProfile: (id: number, data: EjectProfilePreviewRequest) =>
+    request<EjectProfilePreviewResponse>(`/eject-profiles/${id}/preview`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  /** Queue a geometry-only eject dry-run onto a connected printer (EMPTY BED). */
+  dispatchEjectProfileDryRun: (id: number, data: EjectProfileDryRunDispatchRequest) =>
+    request<EjectProfileDryRunDispatchResponse>(`/eject-profiles/${id}/dry-run/dispatch`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  /** Download the dry-run 3MF (thermal-less eject block over the source plate).
+   *  Raw fetch + blob so the browser saves the file, mirroring downloadArchive. */
+  downloadEjectProfileDryRun: async (
+    id: number,
+    data: EjectProfilePreviewRequest,
+    filename?: string,
+  ): Promise<void> => {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
+    const response = await fetch(`${API_BASE}/eject-profiles/${id}/dry-run`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.detail || `HTTP ${response.status}`);
+    }
+    const disposition = response.headers.get('Content-Disposition');
+    const downloadFilename =
+      parseContentDispositionFilename(disposition) || filename || `dryrun_${id}.gcode.3mf`;
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = downloadFilename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  },
+
+  // SKU catalog (farm production, Phase 2)
+  getSkus: () => request<Sku[]>('/skus'),
+  getSku: (id: number) => request<Sku>(`/skus/${id}`),
+  createSku: (data: SkuCreate) =>
+    request<Sku>('/skus', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateSku: (id: number, data: SkuUpdate) =>
+    request<Sku>(`/skus/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  deleteSku: (id: number) => request<void>(`/skus/${id}`, { method: 'DELETE' }),
+  addSkuFile: (id: number, data: SkuFileLinkCreate) =>
+    request<Sku>(`/skus/${id}/files`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  deleteSkuFile: (id: number, linkId: number) =>
+    request<void>(`/skus/${id}/files/${linkId}`, { method: 'DELETE' }),
+  suggestSku: (libraryFileId: number) =>
+    request<SkuSuggest>(`/skus/suggest?library_file_id=${libraryFileId}`),
+  getSkuStats: (id: number) => request<SkuStats>(`/skus/${id}/stats`),
+
+  // Production runs (farm production, Phase 2)
+  getProductionRuns: () => request<ProductionRun[]>('/production-runs'),
+  getProductionRun: (id: number) => request<ProductionRun>(`/production-runs/${id}`),
+  createProductionRun: (data: ProductionRunCreate) =>
+    request<ProductionRun>('/production-runs', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  pauseProductionRun: (id: number) =>
+    request<ProductionRun>(`/production-runs/${id}/pause`, { method: 'POST' }),
+  resumeProductionRun: (id: number) =>
+    request<ProductionRun>(`/production-runs/${id}/resume`, { method: 'POST' }),
+  abortProductionRun: (id: number) =>
+    request<ProductionRun>(`/production-runs/${id}/abort`, { method: 'POST' }),
+  deleteProductionRun: (id: number) =>
+    request<void>(`/production-runs/${id}`, { method: 'DELETE' }),
+  approveFirstArticle: (id: number, data: FirstArticleApproveRequest) =>
+    request<ProductionRun>(`/production-runs/${id}/first-article/approve`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  rejectFirstArticle: (id: number, data: FirstArticleRejectRequest) =>
+    request<ProductionRun>(`/production-runs/${id}/first-article/reject`, {
+      method: 'POST',
+      body: JSON.stringify(data),
     }),
 
   // Print Queue

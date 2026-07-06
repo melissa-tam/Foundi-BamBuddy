@@ -84,6 +84,7 @@ import {
   LineChart as LineChartIcon,
   LayoutGrid,
   MonitorPlay,
+  ShieldAlert,
 } from 'lucide-react';
 
 import { useNavigate } from 'react-router-dom';
@@ -1803,6 +1804,7 @@ function PrinterCard({
   const { hasPermission } = useAuth();
   const [showMenu, setShowMenu] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showClearQuarantineConfirm, setShowClearQuarantineConfirm] = useState(false);
   const [deleteArchives, setDeleteArchives] = useState(true);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showFileManager, setShowFileManager] = useState(false);
@@ -2302,6 +2304,17 @@ function PrinterCard({
       );
       queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
       queryClient.invalidateQueries({ queryKey: ['queue', printer.id] });
+    },
+    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
+  });
+
+  // Farm auto-recovery (Phase 3): lift a printer's quarantine.
+  const clearQuarantineMutation = useMutation({
+    mutationFn: () => api.clearQuarantine(printer.id),
+    onSuccess: () => {
+      showToast(t('printers.quarantine.cleared'));
+      setShowClearQuarantineConfirm(false);
+      queryClient.invalidateQueries({ queryKey: ['printers'] });
     },
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
   });
@@ -3162,6 +3175,42 @@ function PrinterCard({
         </div>
       )}
       <CardContent className={`${cardSize >= 3 ? 'p-5' : ''} flex flex-1 flex-col`}>
+        {/* Quarantine banner (farm auto-recovery, Phase 3) — the scheduler skips
+            a quarantined printer until an operator clears it. */}
+        {printer.quarantined && (
+          <div className="mb-3 rounded-lg border border-red-500/40 bg-red-500/10 p-2.5">
+            <div className="flex items-start gap-2">
+              <ShieldAlert className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-400" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex items-center rounded-full bg-red-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-red-300">
+                    {t('printers.quarantine.badge')}
+                  </span>
+                </div>
+                {printer.quarantine_reason ? (
+                  <p
+                    className="mt-1 text-xs text-red-200/90"
+                    title={printer.quarantine_reason}
+                  >
+                    {printer.quarantine_reason}
+                  </p>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); setShowClearQuarantineConfirm(true); }}
+                disabled={!hasPermission('printers:update') || clearQuarantineMutation.isPending}
+                title={!hasPermission('printers:update') ? t('printers.permission.noEdit') : t('printers.quarantine.clear')}
+                className="flex-shrink-0 inline-flex items-center gap-1 rounded-md border border-red-400/40 bg-red-500/20 px-2 py-1 text-xs font-medium text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50"
+              >
+                {clearQuarantineMutation.isPending ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : null}
+                {t('printers.quarantine.clear')}
+              </button>
+            </div>
+          </div>
+        )}
         {/* Header */}
         <div className={getSpacing()}>
           {/* Top row: Image, Name, Menu */}
@@ -5996,6 +6045,23 @@ function PrinterCard({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Clear Quarantine Confirmation (farm auto-recovery, Phase 3) */}
+      {showClearQuarantineConfirm && (
+        <ConfirmModal
+          title={t('printers.quarantine.clearTitle')}
+          message={
+            printer.quarantine_reason
+              ? t('printers.quarantine.clearMessageWithReason', { name: printer.name, reason: printer.quarantine_reason })
+              : t('printers.quarantine.clearMessage', { name: printer.name })
+          }
+          confirmText={t('printers.quarantine.clear')}
+          variant="warning"
+          isLoading={clearQuarantineMutation.isPending}
+          onConfirm={() => clearQuarantineMutation.mutate()}
+          onCancel={() => setShowClearQuarantineConfirm(false)}
+        />
       )}
 
       {/* Power On Confirmation */}

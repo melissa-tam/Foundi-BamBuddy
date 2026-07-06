@@ -6,6 +6,7 @@ accurate partial usage reporting for multi-material prints.
 """
 
 import hashlib
+import io
 import json
 import logging
 import math
@@ -606,6 +607,7 @@ _HEADER_KEY_RE = re.compile(r"^;\s*([^:]+?)\s*:\s*(.+?)\s*$")
 _PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 _START_GCODE_END_MARKER = "; MACHINE_START_GCODE_END"
 _EXECUTABLE_BLOCK_END_MARKER = "; EXECUTABLE_BLOCK_END"
+_MACHINE_END_GCODE_START_MARKER = "; MACHINE_END_GCODE_START"
 
 
 def _parse_3mf_gcode_header(content: str) -> dict[str, str]:
@@ -729,31 +731,16 @@ def inject_gcode_into_3mf(
         Path to temp file with injected G-code, or None if injection failed.
         Caller is responsible for cleaning up the temp file.
     """
-    import tempfile
-
     if not start_gcode and not end_gcode:
         return None
 
     try:
-        # Find the target gcode file inside the 3MF
+        # Find the target gcode file inside the 3MF and inject into a copy of it.
         with zipfile.ZipFile(source_path, "r") as zf:
-            all_gcode = [f for f in zf.namelist() if f.endswith(".gcode")]
-            if not all_gcode:
+            target_gcode = _find_target_gcode_name(zf.namelist(), plate_id)
+            if target_gcode is None:
                 return None
 
-            # Try plate-specific gcode file first
-            target_gcode = None
-            plate_pattern = f"plate_{plate_id}.gcode"
-            for f in all_gcode:
-                if f.endswith(plate_pattern):
-                    target_gcode = f
-                    break
-
-            # Fall back to first gcode file
-            if target_gcode is None:
-                target_gcode = all_gcode[0]
-
-            # Read and modify gcode content
             gcode_content = zf.read(target_gcode).decode("utf-8", errors="ignore")
             header = _parse_3mf_gcode_header(gcode_content)
 
@@ -768,37 +755,138 @@ def inject_gcode_into_3mf(
                 logger.debug("G-code injection [%s]: resolved END snippet:\n%s", target_gcode, resolved)
                 gcode_content = _inject_end_before_marker(gcode_content, resolved)
 
-            # The printer validates the plate gcode against an embedded
-            # `<plate>.gcode.md5` sidecar (uppercase hex, no trailing newline).
-            # Rewriting the gcode without refreshing this hash makes firmware
-            # reject the file at load (P1S: HMS 0500-4003 "unable to parse"),
-            # so recompute it from the exact bytes we're about to write.
-            gcode_bytes = gcode_content.encode("utf-8")
-            md5_name = target_gcode + ".md5"
-            # Not a security hash — this reproduces Bambu's `.gcode.md5` sidecar
-            # format, so flag it as non-security for the linters (ruff S324 / bandit B324).
-            md5_value = hashlib.md5(gcode_bytes, usedforsecurity=False).hexdigest().upper().encode("ascii")
-
-            # Write modified 3MF to temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".3mf") as tmp:
-                tmp_path = Path(tmp.name)
-
-            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf_write:
-                for item in zf.namelist():
-                    info = zf.getinfo(item)
-                    if item == target_gcode:
-                        zf_write.writestr(info, gcode_bytes)
-                    elif item == md5_name:
-                        zf_write.writestr(info, md5_value)
-                    else:
-                        zf_write.writestr(info, zf.read(item))
-
-        return tmp_path
+        return _write_repacked_3mf(source_path, target_gcode, gcode_content.encode("utf-8"))
 
     except Exception:
-        # Clean up temp file on error
-        if "tmp_path" in locals() and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        return None
+
+
+def _find_target_gcode_name(namelist: list[str], plate_id: int) -> str | None:
+    """Pick the gcode member for `plate_id` (falling back to the first gcode)."""
+    all_gcode = [f for f in namelist if f.endswith(".gcode")]
+    if not all_gcode:
+        return None
+    plate_pattern = f"plate_{plate_id}.gcode"
+    for f in all_gcode:
+        if f.endswith(plate_pattern):
+            return f
+    return all_gcode[0]
+
+
+def _write_repacked_3mf(source_path: Path, target_gcode: str, gcode_bytes: bytes) -> Path:
+    """Copy `source_path` to a new temp 3MF with `target_gcode` replaced by
+    `gcode_bytes`.
+
+    The printer validates the plate gcode against an embedded `<plate>.gcode.md5`
+    sidecar (uppercase hex, no trailing newline); rewriting the gcode without
+    refreshing this hash makes firmware reject the file at load (P1S: HMS
+    0500-4003 "unable to parse"). The sidecar is recomputed from the exact bytes
+    written — but only when the source already carries one (a file without the
+    sidecar shouldn't gain one). Every other member is copied verbatim, keeping
+    its original compression. Caller owns the returned temp file.
+    """
+    import tempfile
+
+    md5_name = target_gcode + ".md5"
+    # Not a security hash — this reproduces Bambu's `.gcode.md5` sidecar format,
+    # so flag it as non-security for the linters (ruff S324 / bandit B324).
+    md5_value = hashlib.md5(gcode_bytes, usedforsecurity=False).hexdigest().upper().encode("ascii")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".3mf") as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        with (
+            zipfile.ZipFile(source_path, "r") as zf,
+            zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf_write,
+        ):
+            for item in zf.namelist():
+                info = zf.getinfo(item)
+                if item == target_gcode:
+                    zf_write.writestr(info, gcode_bytes)
+                elif item == md5_name:
+                    zf_write.writestr(info, md5_value)
+                else:
+                    zf_write.writestr(info, zf.read(item))
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    return tmp_path
+
+
+def repack_3mf_with_gcode(source_path: Path, plate_id: int, new_gcode_content: str):
+    """Write a temp copy of `source_path` whose plate `plate_id` G-code is
+    REPLACED ENTIRELY by `new_gcode_content`, recomputing the `.gcode.md5`
+    sidecar. Used by the eject dry-run to ship an eject-only executable file.
+
+    Returns the temp file :class:`Path`, or None if the plate has no gcode member
+    or repacking fails. Caller is responsible for cleaning up the temp file.
+    """
+    try:
+        with zipfile.ZipFile(source_path, "r") as zf:
+            target_gcode = _find_target_gcode_name(zf.namelist(), plate_id)
+        if target_gcode is None:
+            return None
+        return _write_repacked_3mf(source_path, target_gcode, new_gcode_content.encode("utf-8"))
+    except Exception:
+        return None
+
+
+def read_plate_gcode_header(source_path: Path, plate_id: int, max_bytes: int = 65536) -> dict[str, str]:
+    """Parse the HEADER_BLOCK of plate `plate_id`'s G-code into a normalised dict.
+
+    Only the leading `max_bytes` of the (potentially hundreds-of-MB) gcode member
+    are decompressed — the header block sits at the very top of the file — so this
+    is cheap even on large sliced files. Returns an empty dict if the plate/header
+    can't be read.
+    """
+    try:
+        with zipfile.ZipFile(source_path, "r") as zf:
+            target = _find_target_gcode_name(zf.namelist(), plate_id)
+            if target is None:
+                return {}
+            with zf.open(target, "r") as fh:
+                prefix = fh.read(max_bytes)
+        return _parse_3mf_gcode_header(prefix.decode("utf-8", errors="ignore"))
+    except Exception:
+        return {}
+
+
+def read_plate_gcode_machine_end(source_path: Path, plate_id: int) -> str | None:
+    """Return plate `plate_id`'s stock machine-end block, verbatim.
+
+    The returned text starts at the ``; MACHINE_END_GCODE_START`` line and runs
+    through the end of the gcode member, so it includes the closing
+    ``; EXECUTABLE_BLOCK_END`` marker and anything the slicer emitted after it.
+    Returns ``None`` if the plate has no gcode member or the machine-end marker
+    is absent.
+
+    The plate gcode can be hundreds of MB (the print body), so the member is
+    consumed as a line stream and everything BEFORE the marker is discarded —
+    only the (small) machine-end tail is accumulated in memory. Line endings are
+    preserved (``newline=""``) so the block round-trips byte-for-byte.
+    """
+    try:
+        with zipfile.ZipFile(source_path, "r") as zf:
+            target = _find_target_gcode_name(zf.namelist(), plate_id)
+            if target is None:
+                return None
+            with zf.open(target, "r") as fh:
+                stream = io.TextIOWrapper(fh, encoding="utf-8", errors="ignore", newline="")
+                tail: list[str] = []
+                found = False
+                for line in stream:
+                    if not found:
+                        if line.startswith(_MACHINE_END_GCODE_START_MARKER):
+                            found = True
+                            tail.append(line)
+                    else:
+                        tail.append(line)
+        if not found:
+            return None
+        return "".join(tail)
+    except Exception:
         return None
 
 

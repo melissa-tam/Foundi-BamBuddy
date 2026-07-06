@@ -416,6 +416,21 @@ class AppSettings(BaseModel):
         description="JSON object with 'order' key containing array of sidebar item IDs (empty = no default)",
     )
 
+    # Farm failure policy defaults (Phase 3) — applied to a production run when
+    # the run doesn't specify its own values.
+    farm_retry_max_per_unit: int = Field(
+        default=1,
+        ge=0,
+        le=10,
+        description="Default maximum automatic retries per failed farm unit",
+    )
+    farm_escalate_consecutive_failures: int = Field(
+        default=2,
+        ge=1,
+        le=20,
+        description="Default consecutive farm failures on one printer that trip quarantine",
+    )
+
 
 class AppSettingsUpdate(BaseModel):
     """Schema for updating settings (all fields optional)."""
@@ -534,6 +549,8 @@ class AppSettingsUpdate(BaseModel):
     obico_enabled_printers: str | None = None
     default_sidebar_order: str | None = None
     forecast_global_lead_time_days: int | None = Field(default=None, ge=0)
+    farm_retry_max_per_unit: int | None = Field(default=None, ge=0, le=10)
+    farm_escalate_consecutive_failures: int | None = Field(default=None, ge=1, le=20)
 
     @field_validator("gcode_snippets")
     @classmethod

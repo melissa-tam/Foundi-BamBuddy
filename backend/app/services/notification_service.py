@@ -1819,6 +1819,131 @@ class NotificationService:
         title, message = await self._build_message_from_template(db, "queue_completed", variables)
         await self._send_to_providers(providers, title, message, db, "queue_completed", variables=variables)
 
+    # ==================== Farm Production Run Events ====================
+
+    async def on_first_article_pending(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        run_name: str,
+        sku_code: str | None,
+        db: AsyncSession,
+        finish_photo_url: str | None = None,
+        image_data: bytes | None = None,
+    ):
+        """Fire when a run's first article finished and awaits operator approval.
+
+        The finish/cover photo is attached exactly like ``print_complete`` — the
+        rendered ``{finish_photo_url}`` inline-embeds for email and the raw bytes
+        ride along for image-capable channels (Pushover/Discord/Telegram/ntfy)."""
+        providers = await self._get_providers_for_event(db, "on_first_article_pending", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer": printer_name,
+            "run_name": run_name,
+            "sku_code": sku_code or "",
+        }
+        if finish_photo_url:
+            variables["finish_photo_url"] = finish_photo_url
+
+        title, message = await self._build_message_from_template(db, "first_article_pending", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "first_article_pending",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            image_data=image_data,
+            variables=variables,
+        )
+
+    async def on_printer_quarantined(
+        self,
+        printer_id: int,
+        printer_name: str,
+        failure_count: int,
+        reason: str,
+        db: AsyncSession,
+    ):
+        """Fire when a printer is quarantined after consecutive farm failures."""
+        providers = await self._get_providers_for_event(db, "on_printer_quarantined", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer": printer_name,
+            "failure_count": str(failure_count),
+            "reason": reason,
+        }
+
+        title, message = await self._build_message_from_template(db, "printer_quarantined", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "printer_quarantined",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_run_paused(
+        self,
+        run_name: str,
+        sku_code: str | None,
+        reason: str,
+        db: AsyncSession,
+        printer_id: int | None = None,
+    ):
+        """Fire when a production run is paused (first-article reject or no printers)."""
+        providers = await self._get_providers_for_event(db, "on_run_paused", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "run_name": run_name,
+            "sku_code": sku_code or "",
+            "reason": reason,
+        }
+
+        title, message = await self._build_message_from_template(db, "run_paused", variables)
+        await self._send_to_providers(
+            providers, title, message, db, "run_paused", printer_id, variables=variables
+        )
+
+    async def on_run_completed(
+        self,
+        run_name: str,
+        sku_code: str | None,
+        units_completed: int,
+        plates_completed: int,
+        db: AsyncSession,
+        printer_id: int | None = None,
+    ):
+        """Fire when a production run finishes all its plates successfully."""
+        providers = await self._get_providers_for_event(db, "on_run_completed", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "run_name": run_name,
+            "sku_code": sku_code or "",
+            "units_completed": str(units_completed),
+            "plates_completed": str(plates_completed),
+        }
+
+        title, message = await self._build_message_from_template(db, "run_completed", variables)
+        await self._send_to_providers(
+            providers, title, message, db, "run_completed", printer_id, variables=variables
+        )
+
     # ==================== Inventory Stock Alerts ====================
 
     async def on_stock_reorder_alert(

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Globe, type LucideIcon } from 'lucide-react';
+import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Globe, PackageOpen, Package, Factory, type LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '../contexts/ThemeContext';
 import { KeyboardShortcutsModal } from './KeyboardShortcutsModal';
@@ -46,6 +46,9 @@ export const defaultNavItems: NavItem[] = [
   { id: 'files', to: '/files', icon: FolderOpen, labelKey: 'nav.files' },
   { id: 'makerworld', to: '/makerworld', icon: Globe, labelKey: 'nav.makerworld' },
   { id: 'profiles', to: '/profiles', icon: Cloud, labelKey: 'nav.profiles' },
+  { id: 'eject-profiles', to: '/eject-profiles', icon: PackageOpen, labelKey: 'ejectProfiles.nav' },
+  { id: 'skus', to: '/skus', icon: Package, labelKey: 'skus.nav' },
+  { id: 'production-runs', to: '/production-runs', icon: Factory, labelKey: 'productionRuns.nav' },
   { id: 'maintenance', to: '/maintenance', icon: Wrench, labelKey: 'nav.maintenance' },
   { id: 'stats', to: '/stats', icon: BarChart3, labelKey: 'nav.stats' },
   { id: 'settings', to: '/settings', icon: Settings, labelKey: 'nav.settings' },
@@ -290,6 +293,9 @@ export function Layout() {
       queue: ['queue:read', 'queue:read_own', 'queue:read_all'],
       stats: 'stats:read',
       profiles: 'kprofiles:read',
+      'eject-profiles': 'eject_profiles:read',
+      skus: 'skus:read',
+      'production-runs': 'production_runs:read',
       maintenance: 'maintenance:read',
       projects: 'projects:read',
       inventory: 'inventory:read',

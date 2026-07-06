@@ -20,7 +20,7 @@ export function CameraPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { showToast } = useToast();
-  const { hasPermission, authEnabled, user } = useAuth();
+  const { hasPermission, authEnabled, loading: authLoading, user } = useAuth();
   const { printerId } = useParams<{ printerId: string }>();
   const id = parseInt(printerId || '0', 10);
   const [searchParams] = useSearchParams();
@@ -598,7 +598,12 @@ export function CameraPage() {
   // the token directly from the reactive query value instead of relying on the
   // module-level cache in withStreamToken(), because that cache is updated in a
   // useEffect that runs after render.
-  const waitingForStreamToken = authEnabled && !streamTokenValue;
+  // Also hold while auth status is still loading: in a fresh popup boot
+  // AuthContext initialises authEnabled=false and only flips it true after the
+  // async auth-status fetch resolves, so `authEnabled` alone would let the
+  // tokenless URL through during that window and trip the 401 → reconnect
+  // banner on the very first open. Treat "still loading" like "enabled".
+  const waitingForStreamToken = (authEnabled || authLoading) && !streamTokenValue;
   const appendToken = (url: string) =>
     streamTokenValue ? `${url}&token=${encodeURIComponent(streamTokenValue)}` : withStreamToken(url);
   const currentUrl = transitioning || waitingForStreamToken

@@ -52,6 +52,10 @@ class PrintQueueItemCreate(BaseModel):
     nozzle_offset_cali: bool = True
     # Auto-print G-code injection
     gcode_injection: bool = False
+    # Farm auto-eject: when set, the scheduler generates+injects the eject block
+    # from this profile as the machine-end snippet (superseding the global end
+    # snippet) and dispatch requires it to pass validation.
+    eject_profile_id: int | None = None
     # Batch: create multiple copies (creates a batch if > 1)
     quantity: int = 1
     # Existing batch to add this item into. When set, the item's batch_id is
@@ -131,6 +135,10 @@ class PrintQueueItemResponse(BaseModel):
     completed_at: UTCDatetime
     error_message: str | None
     created_at: UTCDatetime
+    # Farm retry lineage (farm_policy): which failed item this one re-covers,
+    # and how many retries deep the chain is. Null/0 for non-retry items.
+    retry_of_id: int | None = None
+    retry_count: int = 0
 
     # Nested info for UI (populated in route)
     archive_name: str | None = None
@@ -171,6 +179,8 @@ class PrintQueueItemResponse(BaseModel):
 
     # Auto-print G-code injection
     gcode_injection: bool = False
+    # Farm auto-eject profile applied to this unit (None = no auto-eject).
+    eject_profile_id: int | None = None
     cleanup_library_after_dispatch: bool = False
 
     # H2C dual-nozzle-rack slicer pick (#1780). Surface for any future

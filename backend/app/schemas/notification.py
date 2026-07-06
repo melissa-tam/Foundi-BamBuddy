@@ -78,6 +78,12 @@ class NotificationProviderBase(BaseModel):
     on_queue_job_failed: bool = Field(default=True, description="Notify when job fails to start")
     on_queue_completed: bool = Field(default=False, description="Notify when all queue jobs finish")
 
+    # Event triggers - Farm production (Phase 3)
+    on_first_article_pending: bool = Field(default=True, description="Notify when a first article awaits approval")
+    on_printer_quarantined: bool = Field(default=True, description="Notify when a printer is quarantined")
+    on_run_paused: bool = Field(default=True, description="Notify when a production run is paused")
+    on_run_completed: bool = Field(default=False, description="Notify when a production run finishes")
+
     # Quiet hours
     quiet_hours_enabled: bool = Field(default=False, description="Enable quiet hours")
     quiet_hours_start: str | None = Field(default=None, description="Start time in HH:MM format")
@@ -161,6 +167,12 @@ class NotificationProviderUpdate(BaseModel):
     on_queue_job_skipped: bool | None = None
     on_queue_job_failed: bool | None = None
     on_queue_completed: bool | None = None
+
+    # Event triggers - Farm production (Phase 3)
+    on_first_article_pending: bool | None = None
+    on_printer_quarantined: bool | None = None
+    on_run_paused: bool | None = None
+    on_run_completed: bool | None = None
 
     # Quiet hours
     quiet_hours_enabled: bool | None = None

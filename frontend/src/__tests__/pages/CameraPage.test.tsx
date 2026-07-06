@@ -177,14 +177,70 @@ describe('CameraPage', () => {
       });
     });
 
-    it('renders image src immediately when auth is disabled (no token required)', async () => {
+    it('renders the stream src when auth is disabled (not held waiting for a token)', async () => {
       renderCameraPage(1);
 
+      // With auth disabled the guard must release once auth status resolves so
+      // the stream actually renders (an empty src here would mean the img is
+      // stuck waiting). A stream token may still be cached by then; appending
+      // it is harmless because the backend serves the stream regardless when
+      // auth is off, so we assert the stream URL is present rather than the
+      // absence of a token (which only reflected a pre-fix render-timing race).
       await waitFor(() => {
         const src = (document.querySelector('img') as HTMLImageElement | null)?.getAttribute('src') || '';
         expect(src).toContain(`/api/v1/printers/1/camera/stream`);
-        expect(src).not.toContain('token=');
       });
+    });
+
+    it('holds the image src while auth status is still loading (fresh popup boot)', async () => {
+      // Regression for the first-open reconnect banner: a fresh popup boots
+      // AuthContext with authEnabled=false and only flips it true after the
+      // async auth-status fetch resolves. During that window authEnabled alone
+      // is an unreliable signal, so the guard must also hold on `loading`.
+      // Block BOTH auth-status and the stream-token so the async-false window
+      // is observable with no token yet present.
+      let resolveAuthStatus!: (value: unknown) => void;
+      const authStatusPromise = new Promise((resolve) => {
+        resolveAuthStatus = resolve;
+      });
+      let resolveToken!: (value: unknown) => void;
+      const tokenPromise = new Promise((resolve) => {
+        resolveToken = resolve;
+      });
+
+      server.use(
+        http.get('*/api/v1/auth/status', async () => {
+          await authStatusPromise;
+          return HttpResponse.json({ auth_enabled: false, requires_setup: false });
+        }),
+        http.post('*/api/v1/printers/camera/stream-token', async () => {
+          await tokenPromise;
+          return HttpResponse.json({ token: 'tok-late' });
+        })
+      );
+
+      renderCameraPage(1);
+
+      // Printer name comes from its own auth-independent query, so it renders
+      // while auth status is still pending (loading=true, authEnabled=false).
+      await waitFor(() => {
+        expect(screen.getByText('X1 Carbon')).toBeInTheDocument();
+      });
+
+      // The guard must hold: with only `authEnabled` the tokenless URL would
+      // fire here and 401 → reconnect banner on the very first open.
+      const srcWhileLoading =
+        (document.querySelector('img') as HTMLImageElement | null)?.getAttribute('src') || '';
+      expect(srcWhileLoading).not.toContain('/camera/stream');
+
+      // Auth resolves as disabled → loading flips false → tokenless URL proceeds.
+      resolveAuthStatus(undefined);
+      await waitFor(() => {
+        const src = (document.querySelector('img') as HTMLImageElement | null)?.getAttribute('src') || '';
+        expect(src).toContain('/api/v1/printers/1/camera/stream');
+      });
+
+      resolveToken(undefined);
     });
   });
 
