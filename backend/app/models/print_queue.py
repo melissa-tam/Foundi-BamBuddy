@@ -71,15 +71,19 @@ class PrintQueueItem(Base):
     # part stays on the plate for inspection) and the plate-clear monitor never
     # auto-clears the gate for it. Cleared (False) on every other plate.
     first_article: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # True for a dry-run eject dispatch: a thermal-less empty-bed sweep test that
+    # deposits NOTHING on the plate by construction. Lets the terminal-status
+    # handler treat a stopped/finished dry run as a no-deposit finish (no
+    # plate-clear gate, not a failure) regardless of any progress the non-print
+    # gcode reported. Cleared (False) on every ordinary print. Mirrors first_article.
+    is_dry_run: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # Automatic-retry generation for this unit: 0 = original attempt, N = the Nth
     # retry after a failure. Bounded by the run's retry_max_per_unit.
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # Lineage link to the failed item this row is a retry of. Makes retry
     # creation idempotent (exactly one retry per failure event) and traceable.
     # SET NULL so deleting the original leaves the retry standing.
-    retry_of_id: Mapped[int | None] = mapped_column(
-        ForeignKey("print_queue.id", ondelete="SET NULL"), nullable=True
-    )
+    retry_of_id: Mapped[int | None] = mapped_column(ForeignKey("print_queue.id", ondelete="SET NULL"), nullable=True)
 
     # Shortest-job-first scheduling
     print_time_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Cached from archive/library

@@ -188,6 +188,11 @@ _APIKEY_DENIED_PERMISSIONS: frozenset[Permission] = frozenset(
         Permission.PRINTERS_CREATE,
         Permission.PRINTERS_UPDATE,
         Permission.PRINTERS_DELETE,
+        # Farm recovery override: composes clear-plate + clear-quarantine
+        # (PRINTERS_UPDATE, admin-only above) + run-resume. A privileged compound
+        # action inherits the strictest component's gate, so it is session/admin
+        # only and not automatable via a scoped API key.
+        Permission.PRINTERS_RECOVER,
         Permission.ARCHIVES_CREATE,
         Permission.ARCHIVES_UPDATE_OWN,
         Permission.ARCHIVES_UPDATE_ALL,

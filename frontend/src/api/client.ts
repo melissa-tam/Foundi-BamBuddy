@@ -3007,7 +3007,7 @@ export interface ExternalLinkUpdate {
 
 // Permission type - all available permissions
 export type Permission =
-  | 'printers:read' | 'printers:create' | 'printers:update' | 'printers:delete' | 'printers:control' | 'printers:files' | 'printers:ams_rfid' | 'printers:clear_plate'
+  | 'printers:read' | 'printers:create' | 'printers:update' | 'printers:delete' | 'printers:control' | 'printers:files' | 'printers:ams_rfid' | 'printers:clear_plate' | 'printers:recover'
   | 'archives:read' | 'archives:read_own' | 'archives:read_all' | 'archives:create'
   | 'archives:update_own' | 'archives:update_all' | 'archives:delete_own' | 'archives:delete_all'
   | 'archives:reprint_own' | 'archives:reprint_all' | 'archives:purge'
@@ -3637,12 +3637,15 @@ export const api = {
     request<{ success: boolean; message: string }>(`/printers/${printerId}/clear-plate`, {
       method: 'POST',
     }),
-  // Farm auto-recovery (Phase 3): lift a printer's quarantine so the scheduler
-  // resumes dispatching to it.
-  clearQuarantine: (printerId: number) =>
-    request<Printer>(`/printers/${printerId}/clear-quarantine`, {
-      method: 'POST',
-    }),
+  // Farm one-click recovery: lift the plate-clear hold, clear quarantine, and
+  // resume any paused production run on this printer in a single operator action
+  // (composes the three canonical mutators server-side). Replaces the separate
+  // clear-quarantine affordance on the printer card.
+  recoverPrinter: (printerId: number) =>
+    request<{ plate_cleared: boolean; quarantine_cleared: boolean; runs_resumed: number[] }>(
+      `/printers/${printerId}/recover`,
+      { method: 'POST' }
+    ),
 
   // Get current print user (for reprint tracking - Issue #206)
   getCurrentPrintUser: (printerId: number) =>

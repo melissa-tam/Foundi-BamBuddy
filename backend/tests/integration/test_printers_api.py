@@ -288,6 +288,45 @@ class TestPrintersAPI:
         assert response.status_code == 404
 
     # ========================================================================
+    # One-click recover endpoint (farm no-deposit / failure recovery)
+    # ========================================================================
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_recover_printer_returns_summary(self, async_client: AsyncClient, printer_factory, db_session):
+        """POST /{id}/recover clears the plate gate + quarantine and returns a summary."""
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Recover Printer", model="H2S")
+        printer.quarantined = True
+        printer.quarantine_reason = "boom"
+        await db_session.commit()
+        printer_manager.set_quarantined(printer.id, True)
+        printer_manager.set_awaiting_plate_clear(printer.id, True)
+
+        try:
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/recover")
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["plate_cleared"] is True
+            assert body["quarantine_cleared"] is True
+            assert body["runs_resumed"] == []
+
+            await db_session.refresh(printer)
+            assert printer.quarantined is False
+            assert printer_manager.is_awaiting_plate_clear(printer.id) is False
+        finally:
+            printer_manager.set_quarantined(printer.id, False)
+            printer_manager.set_awaiting_plate_clear(printer.id, False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_recover_unknown_printer_404(self, async_client: AsyncClient):
+        """POST /{id}/recover on an unknown printer returns 404."""
+        response = await async_client.post("/api/v1/printers/9999/recover")
+        assert response.status_code == 404
+
+    # ========================================================================
     # File download endpoint — non-ASCII filename regression (#1245)
     # ========================================================================
 

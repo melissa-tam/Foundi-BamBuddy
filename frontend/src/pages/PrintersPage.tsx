@@ -1804,7 +1804,7 @@ function PrinterCard({
   const { hasPermission } = useAuth();
   const [showMenu, setShowMenu] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [showClearQuarantineConfirm, setShowClearQuarantineConfirm] = useState(false);
+  const [showRecoverConfirm, setShowRecoverConfirm] = useState(false);
   const [deleteArchives, setDeleteArchives] = useState(true);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showFileManager, setShowFileManager] = useState(false);
@@ -2308,15 +2308,25 @@ function PrinterCard({
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
   });
 
-  // Farm auto-recovery (Phase 3): lift a printer's quarantine.
-  const clearQuarantineMutation = useMutation({
-    mutationFn: () => api.clearQuarantine(printer.id),
-    onSuccess: () => {
-      showToast(t('printers.quarantine.cleared'));
-      setShowClearQuarantineConfirm(false);
+  // Farm one-click recovery: clears the plate hold, lifts quarantine, and resumes
+  // any paused production run on this printer in a single action. Replaces the
+  // separate clear-quarantine affordance on the card.
+  const recoverMutation = useMutation({
+    mutationFn: () => api.recoverPrinter(printer.id),
+    onSuccess: (result) => {
+      showToast(
+        t('printers.quarantine.recoverSuccess', { count: result.runs_resumed.length })
+      );
+      setShowRecoverConfirm(false);
+      queryClient.setQueryData(['printerStatus', printer.id], (old: PrinterStatus | undefined) =>
+        old ? { ...old, awaiting_plate_clear: false } : old
+      );
       queryClient.invalidateQueries({ queryKey: ['printers'] });
+      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
+      queryClient.invalidateQueries({ queryKey: ['queue', printer.id] });
+      queryClient.invalidateQueries({ queryKey: ['production-runs'] });
     },
-    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
+    onError: (error: Error) => showToast(error.message || t('printers.quarantine.recoverError'), 'error'),
   });
 
   const nozzleTemperatureMutation = useMutation({
@@ -3198,15 +3208,15 @@ function PrinterCard({
               </div>
               <button
                 type="button"
-                onClick={(e) => { e.stopPropagation(); setShowClearQuarantineConfirm(true); }}
-                disabled={!hasPermission('printers:update') || clearQuarantineMutation.isPending}
-                title={!hasPermission('printers:update') ? t('printers.permission.noEdit') : t('printers.quarantine.clear')}
-                className="flex-shrink-0 inline-flex items-center gap-1 rounded-md border border-red-400/40 bg-red-500/20 px-2 py-1 text-xs font-medium text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50"
+                onClick={(e) => { e.stopPropagation(); setShowRecoverConfirm(true); }}
+                disabled={!hasPermission('printers:recover') || recoverMutation.isPending}
+                title={!hasPermission('printers:recover') ? t('printers.permission.noControl') : t('printers.quarantine.recover')}
+                className="flex-shrink-0 inline-flex items-center gap-1 rounded-md border border-red-400/40 bg-red-500/20 px-2 py-1 text-xs font-medium text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
               >
-                {clearQuarantineMutation.isPending ? (
+                {recoverMutation.isPending ? (
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
                 ) : null}
-                {t('printers.quarantine.clear')}
+                {t('printers.quarantine.recover')}
               </button>
             </div>
           </div>
@@ -6047,20 +6057,25 @@ function PrinterCard({
         </div>
       )}
 
-      {/* Clear Quarantine Confirmation (farm auto-recovery, Phase 3) */}
-      {showClearQuarantineConfirm && (
+      {/* Recover & resume confirmation (farm one-click recovery). Lists the three
+          effects so the operator confirms an explicit override of the plate gate. */}
+      {showRecoverConfirm && (
         <ConfirmModal
-          title={t('printers.quarantine.clearTitle')}
+          title={t('printers.quarantine.recoverTitle')}
           message={
-            printer.quarantine_reason
-              ? t('printers.quarantine.clearMessageWithReason', { name: printer.name, reason: printer.quarantine_reason })
-              : t('printers.quarantine.clearMessage', { name: printer.name })
+            (printer.quarantine_reason
+              ? t('printers.quarantine.recoverMessageWithReason', { name: printer.name, reason: printer.quarantine_reason })
+              : t('printers.quarantine.recoverMessage', { name: printer.name }))
+            + '\n\n'
+            + t('printers.quarantine.recoverEffectPlate')
+            + '\n' + t('printers.quarantine.recoverEffectQuarantine')
+            + '\n' + t('printers.quarantine.recoverEffectResume')
           }
-          confirmText={t('printers.quarantine.clear')}
+          confirmText={t('printers.quarantine.recover')}
           variant="warning"
-          isLoading={clearQuarantineMutation.isPending}
-          onConfirm={() => clearQuarantineMutation.mutate()}
-          onCancel={() => setShowClearQuarantineConfirm(false)}
+          isLoading={recoverMutation.isPending}
+          onConfirm={() => recoverMutation.mutate()}
+          onCancel={() => setShowRecoverConfirm(false)}
         />
       )}
 

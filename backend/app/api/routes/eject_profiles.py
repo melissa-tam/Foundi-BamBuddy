@@ -347,10 +347,11 @@ async def dispatch_dry_run_eject_profile(
     an ASAP print-queue item for it with bed levelling / vibration-cali / AMS off
     and the filament check skipped.
 
-    The plate-clear interlock still applies after this: dispatch does NOT
-    auto-clear it. The operator must confirm the bed is EMPTY by clearing the
-    plate hold before the item is allowed to start — that hold is the safety gate
-    for a job that homes Z against the plate centre.
+    No-deposit handling: a dry run deposits nothing, so its own terminal status
+    never raises the plate-clear gate (see ``main.on_print_complete``) — a chain
+    of dry runs runs without wedging the queue. Dispatch still does NOT auto-clear
+    a gate raised by a PRIOR real print; that pre-existing hold (if any) must be
+    cleared by the operator before this bed-homing test can start.
 
     Guards: 404 for an unknown profile / library file / printer; 409 if the
     target printer is live-RUNNING or PAUSEd (dispatching a bed-homing test into
@@ -414,6 +415,7 @@ async def dispatch_dry_run_eject_profile(
             "vibration_cali": False,
             "use_ams": False,
             "skip_filament_check": True,
+            "is_dry_run": True,
             "status": "pending",
             "created_by_id": current_user.id if current_user else None,
         },
@@ -426,7 +428,6 @@ async def dispatch_dry_run_eject_profile(
         queue_item_id=queue_item.id,
         library_file_id=library_file.id,
         message=(
-            f"Dry run queued on {printer.name!r} (plate {body.plate_index}). Confirm the bed is EMPTY, "
-            "then clear the plate hold to let it start — the plate-clear interlock is NOT auto-cleared."
+            f"Dry run queued on {printer.name!r} (plate {body.plate_index}). Confirm the bed is EMPTY before it starts."
         ),
     )

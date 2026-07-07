@@ -4014,6 +4014,42 @@ async def on_print_complete(printer_id: int, data: dict):
         data = {**data, "status": "cancelled"}
     _user_stopped_printers.discard(printer_id)
 
+    # Farm no-deposit handling: a job that deposited NOTHING on the plate cannot
+    # have fouled the bed and is not a print failure. Two cases — a dry-run eject
+    # (deposits nothing by construction) and any print that reached terminal having
+    # produced zero layers AND zero progress (stopped in PREPARE/heating). Resolve
+    # the single finished queue item ONCE (still 'printing' here — the busy-guard
+    # guarantees exactly one; None for a non-queue print) to read its purpose flags,
+    # then classify via the shared predicate.
+    _finished_item = None
+    try:
+        from backend.app.models.print_queue import PrintQueueItem as _NoDepositQItem
+
+        async with async_session() as _nd_db:
+            _nd_result = await _nd_db.execute(
+                select(_NoDepositQItem)
+                .where(_NoDepositQItem.printer_id == printer_id)
+                .where(_NoDepositQItem.status == "printing")
+            )
+            _finished_item = _nd_result.scalars().first()
+    except Exception as e:  # noqa: BLE001 — a lookup failure must not crash the callback
+        logger.warning("[CALLBACK] no-deposit item lookup failed for printer %s: %s", printer_id, e)
+
+    from backend.app.services.eject.monitor import deposited_nothing
+
+    no_deposit = deposited_nothing(
+        is_dry_run=bool(_finished_item and _finished_item.is_dry_run),
+        last_layer_num=data.get("last_layer_num"),
+        last_progress=data.get("last_progress"),
+    )
+    # A NON-first-article no-deposit stop is benign — normalise the terminal status
+    # to "cancelled" (mirroring the _user_stopped_printers override above) so the
+    # queue records "cancelled" (not "failed"), farm_policy.on_terminal no-ops, and
+    # quarantine (keyed on "failed") excludes it. A first-article no-deposit stop
+    # deliberately keeps "failed" so the run still retries its first article.
+    if no_deposit and not (_finished_item and _finished_item.first_article):
+        data = {**data, "status": "cancelled"}
+
     # Raise the plate-clear gate for queued dispatch (#961). Any terminal status
     # may have left material on the bed: a user can cancel ten hours into a
     # twelve-hour print, a printer can self-abort mid-job after a clog, and a
@@ -4025,10 +4061,21 @@ async def on_print_complete(printer_id: int, data: dict):
     # Auto Off power cycles and Bambuddy restarts.
     _final_status = data.get("status", "completed")
     if _final_status in ("completed", "failed", "aborted", "cancelled"):
-        printer_manager.set_awaiting_plate_clear(printer_id, True)
-        # Farm auto-eject: on a successful eject job, watch the bed cool below the
-        # profile threshold and auto-release this gate; failures leave it set.
-        eject_cooldown_monitor.on_terminal_status(printer_id, _final_status)
+        if no_deposit:
+            # Nothing was deposited (dry-run eject, or stopped pre-first-layer) — the
+            # bed cannot be fouled, so do NOT raise the plate-clear gate or arm the
+            # cooldown watch. Applies even to a first-article no-deposit stop.
+            logger.info(
+                "[CALLBACK] printer %s: no-deposit terminal (%s, layer=%s) — not gating queue",
+                printer_id,
+                _final_status,
+                data.get("last_layer_num"),
+            )
+        else:
+            printer_manager.set_awaiting_plate_clear(printer_id, True)
+            # Farm auto-eject: on a successful eject job, watch the bed cool below the
+            # profile threshold and auto-release this gate; failures leave it set.
+            eject_cooldown_monitor.on_terminal_status(printer_id, _final_status)
 
     # MQTT relay - publish print complete
     try:

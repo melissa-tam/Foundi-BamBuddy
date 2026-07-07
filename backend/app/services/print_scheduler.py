@@ -215,14 +215,36 @@ class PrintScheduler:
                     skip_reasons["manual_start"] = skip_reasons.get("manual_start", 0) + 1
                     continue
 
+                # Farm-dispatched items (those carrying an eject profile) MUST gate
+                # on awaiting_plate_clear regardless of the global convenience
+                # toggle — the eject-verified plate-clear is the farm loop's safety
+                # contract, not a preference. Plain items keep upstream behaviour.
+                effective_require_plate_clear = require_plate_clear or item.eject_profile_id is not None
+
                 if item.printer_id:
                     # Specific printer assignment (existing behavior)
                     if item.printer_id in busy_printers:
                         continue
 
                     # Check if printer is idle
-                    printer_idle = self._is_printer_idle(item.printer_id, require_plate_clear)
+                    printer_idle = self._is_printer_idle(item.printer_id, effective_require_plate_clear)
                     printer_connected = printer_manager.is_connected(item.printer_id)
+
+                    # Observability for exactly the incident this enforcement fixes:
+                    # a farm item held by the plate-clear gate that the global
+                    # setting alone would have skipped (would be idle under the
+                    # global flag, held under the farm-enforced flag).
+                    if (
+                        not require_plate_clear
+                        and item.eject_profile_id is not None
+                        and not printer_idle
+                        and self._is_printer_idle(item.printer_id, require_plate_clear)
+                    ):
+                        logger.info(
+                            "Queue item %s: held by plate-clear gate (farm eject item; "
+                            "global require_plate_clear is off)",
+                            item.id,
+                        )
 
                     # If printer not connected, try to power on via smart plug
                     if not printer_connected:
@@ -244,7 +266,7 @@ class PrintScheduler:
                                     except Exception as e:
                                         logger.warning("Failed to power on extra plug '%s': %s", extra_plug.name, e)
                                 printer_connected = True
-                                printer_idle = self._is_printer_idle(item.printer_id, require_plate_clear)
+                                printer_idle = self._is_printer_idle(item.printer_id, effective_require_plate_clear)
                             else:
                                 logger.warning("Could not power on printer %s via smart plug", item.printer_id)
                                 busy_printers.add(item.printer_id)
@@ -267,7 +289,7 @@ class PrintScheduler:
                                 # Print takes priority — stop drying
                                 await self._stop_drying(item.printer_id)
                                 # Re-check idle after stopping drying
-                                printer_idle = self._is_printer_idle(item.printer_id, require_plate_clear)
+                                printer_idle = self._is_printer_idle(item.printer_id, effective_require_plate_clear)
                                 if not printer_idle:
                                     busy_printers.add(item.printer_id)
                                     continue
@@ -376,7 +398,7 @@ class PrintScheduler:
                         effective_types,
                         item.target_location,
                         filament_overrides=filament_overrides,
-                        require_plate_clear=require_plate_clear,
+                        require_plate_clear=effective_require_plate_clear,
                     )
 
                     # Update waiting_reason if changed and send notification when first waiting
@@ -2346,9 +2368,7 @@ class PrintScheduler:
             # part must stay on the plate for inspection, so no eject supersede.
             if eject_snippet is not None:
                 end_gc = eject_snippet  # supersede the global end snippet
-                logger.info(
-                    "Queue item %s: auto-eject block generated from profile %s", item.id, item.eject_profile_id
-                )
+                logger.info("Queue item %s: auto-eject block generated from profile %s", item.id, item.eject_profile_id)
             else:
                 logger.info("Queue item %s: first-article — eject injection skipped", item.id)
 

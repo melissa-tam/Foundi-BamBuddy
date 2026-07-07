@@ -2859,6 +2859,29 @@ async def clear_quarantine(
     return {"id": printer.id, "quarantined": printer.quarantined}
 
 
+@router.post("/{printer_id}/recover")
+async def recover_printer(
+    printer_id: int,
+    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_RECOVER),
+    db: AsyncSession = Depends(get_db),
+):
+    """One-click farm recovery for a wedged printer.
+
+    Collapses the three-step manual recovery into one explicit operator override:
+    clears the plate-clear gate, clears any farm quarantine, and resumes every
+    paused run with a queue item on this printer. Idempotent — a repeat call is a
+    no-op. Returns a summary of what was actually changed. 404 if the printer is
+    unknown.
+    """
+    from backend.app.services.farm_policy import recover_printer as _recover_printer
+
+    result = await db.execute(select(Printer).where(Printer.id == printer_id))
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(404, "Printer not found")
+
+    return await _recover_printer(db, printer_id)
+
+
 @router.post("/{printer_id}/print/pause")
 async def pause_print(
     printer_id: int,

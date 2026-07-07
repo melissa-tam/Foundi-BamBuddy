@@ -354,3 +354,91 @@ class TestSchedulerQueueCheckLogging:
 
         queue_logs = [r for r in caplog.records if "Queue check" in r.message]
         assert len(queue_logs) == 0
+
+
+class TestFarmItemEnforcesPlateClearGate:
+    """Farm-dispatched items (eject_profile_id set) must gate on
+    awaiting_plate_clear even when the global require_plate_clear setting is off —
+    while plain items keep upstream behaviour. (Incident PCO-M18-2904: unit 2
+    dispatched 6 s after unit 1's FINISH because the global toggle was false.)"""
+
+    async def _run_check_queue(self, *, eject_profile_id, awaiting, caplog=None):
+        """Drive check_queue against a real in-memory DB with one FINISH printer
+        (awaiting_plate_clear as given) and require_plate_clear=False. Returns the
+        _start_print mock so callers assert dispatch or hold."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+        import backend.app.models  # noqa: F401
+        from backend.app.core.database import Base
+        from backend.app.models.print_queue import PrintQueueItem
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        async with session_maker() as db:
+            db.add(
+                PrintQueueItem(
+                    printer_id=1,
+                    status="pending",
+                    position=1,
+                    archive_id=84,
+                    eject_profile_id=eject_profile_id,
+                )
+            )
+            await db.commit()
+
+        scheduler = PrintScheduler()
+        start_print_mock = AsyncMock()
+
+        with (
+            patch("backend.app.services.print_scheduler.async_session", session_maker),
+            # require_plate_clear (and every other bool setting) resolves False —
+            # the global toggle is OFF, the exact incident condition.
+            patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=False)),
+            patch.object(scheduler, "_check_auto_drying", AsyncMock()),
+            patch.object(scheduler, "_stagger_budget", AsyncMock(return_value=99)),
+            patch.object(scheduler, "_compute_ams_mapping_for_printer", AsyncMock(return_value=None)),
+            patch.object(scheduler, "_block_on_filament_deficit", AsyncMock(return_value=False)),
+            patch.object(scheduler, "_start_print", start_print_mock),
+            patch("backend.app.services.print_scheduler.printer_manager") as mock_pm,
+        ):
+            # Real _is_printer_idle runs: FINISH + connected + not quarantined, so
+            # the ONLY thing that can hold the printer is the plate-clear gate.
+            mock_pm.is_connected.return_value = True
+            mock_pm.is_quarantined.return_value = False
+            mock_pm.get_status.return_value = MagicMock(state="FINISH")
+            mock_pm.is_awaiting_plate_clear.return_value = awaiting
+            if caplog is not None:
+                with caplog.at_level(logging.INFO, logger="backend.app.services.print_scheduler"):
+                    await scheduler.check_queue()
+            else:
+                await scheduler.check_queue()
+
+        await engine.dispose()
+        return start_print_mock
+
+    @pytest.mark.asyncio
+    async def test_farm_item_held_by_gate_when_global_off(self, caplog):
+        """(a) Farm item + require_plate_clear=False + awaiting=True → NOT dispatched."""
+        start_print_mock = await self._run_check_queue(eject_profile_id=2, awaiting=True, caplog=caplog)
+        start_print_mock.assert_not_called()
+        # And the observability log fired exactly once for this hold.
+        held_logs = [r for r in caplog.records if "held by plate-clear gate" in r.message]
+        assert len(held_logs) == 1
+
+    @pytest.mark.asyncio
+    async def test_plain_item_dispatches_when_global_off(self):
+        """(b) Plain item (no eject profile), same conditions → dispatched
+        (upstream require_plate_clear=False behaviour preserved)."""
+        start_print_mock = await self._run_check_queue(eject_profile_id=None, awaiting=True)
+        start_print_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_farm_item_dispatches_when_gate_released(self):
+        """(c) Farm item with the plate-clear gate released → dispatched."""
+        start_print_mock = await self._run_check_queue(eject_profile_id=2, awaiting=False)
+        start_print_mock.assert_called_once()

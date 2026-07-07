@@ -69,7 +69,11 @@ class TestPlateClearGate:
     the next queue item onto a fouled bed two seconds later."""
 
     @staticmethod
-    def _setup_mocks(stack):
+    def _setup_mocks(stack, finished_item=None):
+        """Patch on_print_complete's collaborators. ``finished_item`` is what the
+        finished-queue-item lookup (``scalars().first()``) resolves to — None for
+        a non-queue print, or a SimpleNamespace carrying is_dry_run/first_article
+        for the farm no-deposit branch."""
         mock_session_maker = stack.enter_context(patch("backend.app.main.async_session"))
         stack.enter_context(patch("backend.app.main.notification_service")).on_print_complete = AsyncMock()
         stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
@@ -82,12 +86,32 @@ class TestPlateClearGate:
         # Real method under test — track each call so the test can assert on it.
         mock_pm.set_awaiting_plate_clear = MagicMock()
 
+        # Result mock shared by every execute() call: the finished-item lookup
+        # reads scalars().first(); the queue-status update reads scalars().all()
+        # (kept empty so no farm policy fires); everything else uses
+        # scalar_one_or_none() → None.
+        result_mock = MagicMock()
+        result_mock.scalar_one_or_none = MagicMock(return_value=None)
+        scalars_mock = MagicMock()
+        scalars_mock.first = MagicMock(return_value=finished_item)
+        scalars_mock.all = MagicMock(return_value=[])
+        result_mock.scalars = MagicMock(return_value=scalars_mock)
+
         mock_session = AsyncMock()
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=None)))
+        mock_session.execute = AsyncMock(return_value=result_mock)
         mock_session_maker.return_value = mock_session
         return mock_pm
+
+    @staticmethod
+    async def _drain(tasks_before):
+        for task in asyncio.all_tasks() - tasks_before:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -100,7 +124,8 @@ class TestPlateClearGate:
         on the bed must raise the gate. Pre-fix the gate was raised only for
         completed/failed, so aborted (printer touchscreen stop, self-abort) and
         cancelled (Bambuddy queue stop) auto-dispatched the next queue item
-        onto a fouled bed."""
+        onto a fouled bed. The payload carries produced layers/progress so the
+        no-deposit classifier does NOT suppress the gate (a real deposited job)."""
         from contextlib import ExitStack
 
         tasks_before = set(asyncio.all_tasks())
@@ -117,17 +142,83 @@ class TestPlateClearGate:
                     "filename": "/data/Metadata/test.gcode",
                     "subtask_name": "Test",
                     "timelapse_was_active": False,
+                    "last_layer_num": 10,
+                    "last_progress": 55.0,
                 },
             )
 
-            for task in asyncio.all_tasks() - tasks_before:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await self._drain(tasks_before)
 
         mock_pm.set_awaiting_plate_clear.assert_any_call(1, True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "finished_item, payload_extra, ids",
+        [
+            (None, {"last_layer_num": 0, "last_progress": 0}, "zero-layer-print"),
+            (None, {}, "no-progress-data"),
+        ],
+    )
+    async def test_plate_clear_gate_not_raised_for_no_deposit_finish(self, finished_item, payload_extra, ids):
+        """A print that reached terminal having deposited nothing (zero layers AND
+        zero progress — stopped in PREPARE/heating) must NOT raise the plate-clear
+        gate: the bed cannot be fouled."""
+        from contextlib import ExitStack
+
+        tasks_before = set(asyncio.all_tasks())
+
+        with ExitStack() as stack:
+            mock_pm = self._setup_mocks(stack, finished_item=finished_item)
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                1,
+                {
+                    "status": "failed",
+                    "filename": "/data/Metadata/test.gcode",
+                    "subtask_name": "Test",
+                    "timelapse_was_active": False,
+                    **payload_extra,
+                },
+            )
+
+            await self._drain(tasks_before)
+
+        true_calls = [c for c in mock_pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
+        assert true_calls == [], f"Gate must stay clear for a no-deposit finish; got {len(true_calls)} raise(s)."
+
+    @pytest.mark.asyncio
+    async def test_plate_clear_gate_not_raised_for_dry_run(self):
+        """A dry-run eject deposits nothing by construction — even if its non-print
+        gcode reported progress, the is_dry_run flag suppresses the gate."""
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+
+        tasks_before = set(asyncio.all_tasks())
+
+        with ExitStack() as stack:
+            dry_item = SimpleNamespace(is_dry_run=True, first_article=False)
+            mock_pm = self._setup_mocks(stack, finished_item=dry_item)
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                1,
+                {
+                    "status": "cancelled",
+                    "filename": "/data/Metadata/test.gcode",
+                    "subtask_name": "Test",
+                    "timelapse_was_active": False,
+                    "last_layer_num": 3,
+                    "last_progress": 12.0,
+                },
+            )
+
+            await self._drain(tasks_before)
+
+        true_calls = [c for c in mock_pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
+        assert true_calls == [], f"Gate must stay clear for a dry-run finish; got {len(true_calls)} raise(s)."
 
     @pytest.mark.asyncio
     async def test_plate_clear_gate_not_raised_for_unknown_status(self):

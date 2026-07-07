@@ -44,6 +44,24 @@ def _parse_max_z_height(source_path: Path, plate_id: int) -> float | None:
         return None
 
 
+async def resolve_cooldown_override(db: AsyncSession, batch_id: int | None) -> float | None:
+    """Return the run-level cooldown override for ``batch_id``, or ``None``.
+
+    Farm production runs may override the eject cooldown gate per-run; the value
+    lives on the run's :class:`PrintBatch` (``cooldown_temp_c_override``). When
+    set it supersedes the profile's ``cooldown_temp_c`` for the eject block's
+    ``M190 R`` threshold — the single source of truth shared by dispatch (block
+    generation + validation) and the cooldown monitor's release threshold, so the
+    in-file wait and the server-side gate never disagree. Returns ``None`` when
+    the item has no batch or the run set no override (caller falls back to the
+    profile value).
+    """
+    if batch_id is None:
+        return None
+    result = await db.execute(select(PrintBatch.cooldown_temp_c_override).where(PrintBatch.id == batch_id))
+    return result.scalar_one_or_none()
+
+
 async def build_eject_snippet(
     db: AsyncSession,
     item: PrintQueueItem,
@@ -78,16 +96,10 @@ async def build_eject_snippet(
     if max_z is None:
         return None, "Could not parse max_z_height from the 3MF gcode header"
 
-    # Farm production runs may override the cooldown gate per-run. The override
-    # lives on the run's PrintBatch; when set it supersedes the profile's
-    # cooldown_temp_c for THIS item's eject block (generation + validation share
-    # the effective value so the M190 R threshold check stays consistent).
-    cooldown_override = None
-    if item.batch_id is not None:
-        batch_result = await db.execute(
-            select(PrintBatch.cooldown_temp_c_override).where(PrintBatch.id == item.batch_id)
-        )
-        cooldown_override = batch_result.scalar_one_or_none()
+    # Farm production runs may override the cooldown gate per-run; the override
+    # (when set) supersedes the profile's cooldown_temp_c for THIS item's eject
+    # block so generation + validation share the effective M190 R threshold.
+    cooldown_override = await resolve_cooldown_override(db, item.batch_id)
 
     try:
         gcode = generate_eject_gcode(profile, max_z, model, cooldown_temp_c=cooldown_override)

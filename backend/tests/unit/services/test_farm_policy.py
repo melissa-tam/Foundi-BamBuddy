@@ -364,7 +364,11 @@ class TestRunCompletion:
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[9], require_fa=False)
         db_session.add(
             PrintQueueItem(
-                batch_id=batch.id, printer_id=9, status="completed", plate_id=1, position=500,
+                batch_id=batch.id,
+                printer_id=9,
+                status="completed",
+                plate_id=1,
+                position=500,
                 completed_at=datetime.now(timezone.utc),
             )
         )
@@ -373,3 +377,97 @@ class TestRunCompletion:
         await farm_policy._maybe_complete_run(db_session, batch)
         await db_session.refresh(batch)
         assert batch.status == "active"
+
+
+class TestRecoverPrinter:
+    """One-click recovery: clear plate + quarantine + resume paused runs, idempotently."""
+
+    async def _mk_printer(self, db, pid_name="R"):
+        p = Printer(name=pid_name, serial_number=f"S{pid_name}", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(p)
+        await db.flush()
+        return p
+
+    async def test_recover_clears_gate_quarantine_and_resumes_run(self, db_session):
+        printer = await self._mk_printer(db_session, "REC1")
+        # A paused farm run with a pending, manual_start item on this printer.
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        batch.status = "paused"
+        item = PrintQueueItem(
+            batch_id=batch.id,
+            printer_id=printer.id,
+            status="pending",
+            manual_start=True,
+            plate_id=1,
+            position=600,
+        )
+        db_session.add(item)
+        # Raise the gate + quarantine the printer.
+        printer.quarantined = True
+        printer.quarantine_reason = "boom"
+        await db_session.commit()
+        printer_manager.set_quarantined(printer.id, True)
+        printer_manager.set_awaiting_plate_clear(printer.id, True)
+
+        try:
+            summary = await farm_policy.recover_printer(db_session, printer.id)
+
+            assert summary["plate_cleared"] is True
+            assert summary["quarantine_cleared"] is True
+            assert summary["runs_resumed"] == [batch.id]
+
+            await db_session.refresh(printer)
+            await db_session.refresh(batch)
+            await db_session.refresh(item)
+            assert printer.quarantined is False
+            assert printer.quarantine_reason is None
+            assert printer_manager.is_awaiting_plate_clear(printer.id) is False
+            assert printer_manager.is_quarantined(printer.id) is False
+            assert batch.status == "active"
+            assert item.manual_start is False  # resume un-staged the pending item
+
+            # Idempotent: a second call is a no-op with no error.
+            summary2 = await farm_policy.recover_printer(db_session, printer.id)
+            assert summary2["plate_cleared"] is False
+            assert summary2["quarantine_cleared"] is False
+            assert summary2["runs_resumed"] == []
+        finally:
+            # Clean up shared in-memory singleton state.
+            printer_manager.set_quarantined(printer.id, False)
+            printer_manager.set_awaiting_plate_clear(printer.id, False)
+
+    async def test_recover_unknown_printer_404(self, db_session):
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc:
+            await farm_policy.recover_printer(db_session, 987654)
+        assert exc.value.status_code == 404
+
+    async def test_recover_excludes_fa_rejected_run(self, db_session):
+        """A run paused by a first-article REJECT is NOT resumed by recover: the
+        rejected part is still on the plate and resuming re-dispatches a fresh
+        first article (transition_run), which would silently undo the operator's
+        rejection. That run keeps its own run-page resume affordance."""
+        printer = await self._mk_printer(db_session, "REC3")
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=True)
+        batch.status = "paused"
+        batch.first_article_state = "rejected"
+        db_session.add(
+            PrintQueueItem(
+                batch_id=batch.id,
+                printer_id=printer.id,
+                status="pending",
+                manual_start=True,
+                plate_id=1,
+                position=610,
+            )
+        )
+        await db_session.commit()
+
+        summary = await farm_policy.recover_printer(db_session, printer.id)
+
+        # The FA-rejected run is left untouched — not swept into recovery.
+        assert summary["runs_resumed"] == []
+        await db_session.refresh(batch)
+        assert batch.status == "paused"
+        assert batch.first_article_state == "rejected"

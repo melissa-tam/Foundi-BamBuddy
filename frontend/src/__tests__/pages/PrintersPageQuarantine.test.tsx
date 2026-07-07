@@ -1,7 +1,8 @@
 /**
- * Tests for the farm auto-recovery quarantine surfacing on the Printers page
- * (Phase 3): a quarantined printer shows a badge + reason, and the
- * "Clear quarantine" action is gated behind a confirmation before it POSTs.
+ * Tests for the farm auto-recovery quarantine surfacing on the Printers page:
+ * a quarantined printer shows a badge + reason, and the one-click
+ * "Recover & resume" action (which clears the plate hold, lifts quarantine, and
+ * resumes any paused run) is gated behind a confirmation before it POSTs.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -64,12 +65,12 @@ describe('PrintersPage quarantine surfacing', () => {
     expect(screen.getByText('3 consecutive dispatch failures')).toBeInTheDocument();
   });
 
-  it('gates clear-quarantine behind a confirmation, then POSTs', async () => {
-    let clearCalled = false;
+  it('gates recover behind a confirmation, then POSTs to /recover', async () => {
+    let recoverCalled = false;
     server.use(
-      http.post('/api/v1/printers/:id/clear-quarantine', () => {
-        clearCalled = true;
-        return HttpResponse.json({ ...quarantinedPrinter, quarantined: false, quarantine_reason: null });
+      http.post('/api/v1/printers/:id/recover', () => {
+        recoverCalled = true;
+        return HttpResponse.json({ plate_cleared: true, quarantine_cleared: true, runs_resumed: [7] });
       }),
     );
 
@@ -78,18 +79,18 @@ describe('PrintersPage quarantine surfacing', () => {
 
     await screen.findByText('Quarantined');
 
-    // The card-level "Clear quarantine" button opens the confirmation; no POST yet.
-    const clearButtons = screen.getAllByRole('button', { name: /clear quarantine/i });
-    await user.click(clearButtons[0]);
+    // The card-level "Recover & resume" button opens the confirmation; no POST yet.
+    const recoverButtons = screen.getAllByRole('button', { name: /recover & resume/i });
+    await user.click(recoverButtons[0]);
 
-    expect(await screen.findByText('Clear quarantine?')).toBeInTheDocument();
-    expect(clearCalled).toBe(false);
+    expect(await screen.findByText('Recover & resume?')).toBeInTheDocument();
+    expect(recoverCalled).toBe(false);
 
     // The confirm modal's confirm button carries the same label; it is the last
     // matching button in the DOM (modal overlays the card).
-    const confirmButtons = screen.getAllByRole('button', { name: /clear quarantine/i });
+    const confirmButtons = screen.getAllByRole('button', { name: /recover & resume/i });
     await user.click(confirmButtons[confirmButtons.length - 1]);
 
-    await waitFor(() => expect(clearCalled).toBe(true));
+    await waitFor(() => expect(recoverCalled).toBe(true));
   });
 });

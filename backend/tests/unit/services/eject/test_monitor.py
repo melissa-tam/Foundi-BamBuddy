@@ -6,10 +6,34 @@ import pytest
 
 from backend.app.services.eject.monitor import (
     EjectCooldownMonitor,
+    deposited_nothing,
     should_auto_clear,
     should_rearm,
     watch_bed_and_clear,
 )
+
+
+class TestDepositedNothing:
+    """Truth table for the no-deposit classifier used by the plate-clear gate."""
+
+    def test_dry_run_is_always_no_deposit(self):
+        # is_dry_run wins regardless of any progress the non-print gcode reported.
+        assert deposited_nothing(is_dry_run=True, last_layer_num=None, last_progress=None) is True
+        assert deposited_nothing(is_dry_run=True, last_layer_num=5, last_progress=99.0) is True
+
+    def test_zero_layers_zero_progress_is_no_deposit(self):
+        assert deposited_nothing(is_dry_run=False, last_layer_num=0, last_progress=0) is True
+
+    def test_both_none_is_no_deposit(self):
+        assert deposited_nothing(is_dry_run=False, last_layer_num=None, last_progress=None) is True
+
+    def test_zero_layers_but_progress_deposited(self):
+        # Lag-by-one guard: layer 0 but nonzero progress means a print started.
+        assert deposited_nothing(is_dry_run=False, last_layer_num=0, last_progress=3.2) is False
+
+    def test_layers_produced_deposited(self):
+        assert deposited_nothing(is_dry_run=False, last_layer_num=5, last_progress=0) is False
+        assert deposited_nothing(is_dry_run=False, last_layer_num=5, last_progress=50.0) is False
 
 
 class _FakeManager:
@@ -123,40 +147,87 @@ class TestResolveEjectThresholdFirstArticle:
         assert threshold is None
 
 
+class _NotifyRecorder:
+    """Injectable notify callable: records printer_ids and optionally raises."""
+
+    def __init__(self, raise_exc: bool = False):
+        self.calls: list[int] = []
+        self._raise = raise_exc
+
+    async def __call__(self, printer_id):
+        self.calls.append(printer_id)
+        if self._raise:
+            raise RuntimeError("notify boom")
+
+
 class TestWatchBedAndClear:
     async def test_clears_when_bed_reaches_threshold(self):
         mgr = _FakeManager([_status(60), _status(40), _status(27)])
-        outcome = await watch_bed_and_clear(7, 28.0, manager=mgr, timeout_s=100, check_interval_s=10, sleep=_noop_sleep)
+        notify = _NotifyRecorder()
+        outcome = await watch_bed_and_clear(
+            7, 28.0, manager=mgr, escalate_s=100, check_interval_s=20, sleep=_noop_sleep, notify=notify
+        )
         assert outcome == "cleared"
         assert mgr.clear_calls == [(7, False)]
+        assert notify.calls == []  # crossed well before escalation
 
     async def test_clears_at_exact_threshold(self):
         mgr = _FakeManager([_status(28.0)])
-        outcome = await watch_bed_and_clear(3, 28.0, manager=mgr, timeout_s=100, check_interval_s=10, sleep=_noop_sleep)
+        notify = _NotifyRecorder()
+        outcome = await watch_bed_and_clear(
+            3, 28.0, manager=mgr, escalate_s=100, check_interval_s=20, sleep=_noop_sleep, notify=notify
+        )
         assert outcome == "cleared"
         assert mgr.clear_calls == [(3, False)]
 
     async def test_stale_when_status_none(self):
         mgr = _FakeManager([None])
-        outcome = await watch_bed_and_clear(9, 28.0, manager=mgr, timeout_s=100, check_interval_s=10, sleep=_noop_sleep)
+        outcome = await watch_bed_and_clear(
+            9, 28.0, manager=mgr, escalate_s=100, check_interval_s=20, sleep=_noop_sleep
+        )
         assert outcome == "stale"
         assert mgr.clear_calls == []  # gate left SET
 
     async def test_stale_when_disconnected(self):
         mgr = _FakeManager([_status(60, connected=False)])
-        outcome = await watch_bed_and_clear(9, 28.0, manager=mgr, timeout_s=100, check_interval_s=10, sleep=_noop_sleep)
+        outcome = await watch_bed_and_clear(
+            9, 28.0, manager=mgr, escalate_s=100, check_interval_s=20, sleep=_noop_sleep
+        )
         assert outcome == "stale"
         assert mgr.clear_calls == []
 
-    async def test_timeout_when_never_cools(self):
-        mgr = _FakeManager([_status(60)])
-        outcome = await watch_bed_and_clear(9, 28.0, manager=mgr, timeout_s=30, check_interval_s=10, sleep=_noop_sleep)
-        assert outcome == "timeout"
-        assert mgr.clear_calls == []  # gate left SET
+    async def test_escalates_once_then_keeps_watching_until_crossing(self):
+        # Hot past the escalate window, THEN cools. escalate_s=40, interval=20 →
+        # escalation fires at the tick where elapsed==40, watch continues, and the
+        # later crossing still releases the gate.
+        mgr = _FakeManager([_status(60), _status(60), _status(60), _status(27)])
+        notify = _NotifyRecorder()
+        outcome = await watch_bed_and_clear(
+            5, 33.0, manager=mgr, escalate_s=40, check_interval_s=20, sleep=_noop_sleep, notify=notify
+        )
+        assert outcome == "cleared"  # watch did NOT stop at the escalate window
+        assert mgr.clear_calls == [(5, False)]
+        assert notify.calls == [5]  # fired exactly once
 
-    async def test_missing_bed_reading_keeps_waiting_then_times_out(self):
-        # bed key absent -> treated as "not yet cool", never clears.
-        mgr = _FakeManager([SimpleNamespace(connected=True, temperatures={})])
-        outcome = await watch_bed_and_clear(9, 28.0, manager=mgr, timeout_s=20, check_interval_s=10, sleep=_noop_sleep)
-        assert outcome == "timeout"
+    async def test_escalation_notify_failure_does_not_kill_watch(self):
+        # A notify that raises must be swallowed — the watch keeps polling and the
+        # later crossing still releases the gate.
+        mgr = _FakeManager([_status(60), _status(60), _status(60), _status(27)])
+        notify = _NotifyRecorder(raise_exc=True)
+        outcome = await watch_bed_and_clear(
+            6, 33.0, manager=mgr, escalate_s=40, check_interval_s=20, sleep=_noop_sleep, notify=notify
+        )
+        assert outcome == "cleared"
+        assert mgr.clear_calls == [(6, False)]
+        assert notify.calls == [6]  # attempted once, exception did not propagate
+
+    async def test_stale_exit_still_bounds_a_never_cooling_watch(self):
+        # A never-cooling bed that later goes offline still ends the watch (the
+        # stale exit is what bounds the now-unbounded loop).
+        mgr = _FakeManager([_status(60), _status(60), _status(60, connected=False)])
+        notify = _NotifyRecorder()
+        outcome = await watch_bed_and_clear(
+            9, 28.0, manager=mgr, escalate_s=40, check_interval_s=20, sleep=_noop_sleep, notify=notify
+        )
+        assert outcome == "stale"
         assert mgr.clear_calls == []

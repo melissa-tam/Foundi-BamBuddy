@@ -37,10 +37,14 @@ logger = logging.getLogger(__name__)
 # auto-release the plate-clear gate; everything else leaves it set.
 _SUCCESS_TERMINAL = {"completed"}
 
-# Watch bounds. Cooldown from print temp to ~28 °C can take a while, so the
-# window is generous; each tick re-reads the live MQTT bed temp.
-_WATCH_TIMEOUT_S = 1800
-_CHECK_INTERVAL_S = 10
+# Watch bounds. Cooldown from print temp to the release threshold can take a
+# while, so each tick re-reads the live MQTT bed temp.
+_CHECK_INTERVAL_S = 20
+# Escalation, not a stop: if the bed is still above threshold after this long we
+# warn + notify ONCE, then keep polling. The watch only ever exits on release
+# ("cleared") or printer stale/offline ("stale") — a permanent stop here would
+# strand the plate-clear gate and silently stall the farm.
+_WATCH_ESCALATE_S = 5400
 
 
 def should_auto_clear(final_status: str) -> bool:
@@ -48,25 +52,56 @@ def should_auto_clear(final_status: str) -> bool:
     return final_status in _SUCCESS_TERMINAL
 
 
+def deposited_nothing(*, is_dry_run: bool, last_layer_num: int | None, last_progress: float | None) -> bool:
+    """A terminal job left nothing on the plate: a dry-run eject (never deposits), OR a print
+    that reached terminal having produced zero layers AND zero progress. Uses the reset-surviving
+    peaks from the on_print_complete payload."""
+    return bool(is_dry_run) or ((last_layer_num or 0) == 0 and (last_progress or 0) == 0)
+
+
+async def _default_notify_plate_not_empty(printer_id: int) -> None:
+    """Fire the plate-not-empty notification for a stuck-plate escalation.
+
+    Opens its own session (mirroring the rest of this module) and resolves the
+    printer name for the message. Kept side-effect-only; callers wrap it so a
+    notification failure never kills the watch.
+    """
+    from backend.app.core.database import async_session
+    from backend.app.models.printer import Printer
+    from backend.app.services.notification_service import notification_service
+
+    async with async_session() as db:
+        result = await db.execute(select(Printer.name).where(Printer.id == printer_id))
+        printer_name = result.scalar_one_or_none() or f"printer {printer_id}"
+        await notification_service.on_plate_not_empty(printer_id, printer_name, db)
+
+
 async def watch_bed_and_clear(
     printer_id: int,
     threshold_c: float,
     *,
     manager=printer_manager,
-    timeout_s: int = _WATCH_TIMEOUT_S,
+    escalate_s: int = _WATCH_ESCALATE_S,
     check_interval_s: int = _CHECK_INTERVAL_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    notify: Callable[[int], Awaitable[None]] = _default_notify_plate_not_empty,
 ) -> str:
     """Poll the live bed temperature until it drops below `threshold_c`.
 
-    On success, releases the plate-clear gate via
+    On release, clears the plate-clear gate via
     ``manager.set_awaiting_plate_clear(printer_id, False)`` and returns
     ``"cleared"``. Returns ``"stale"`` if the printer disconnects / goes stale
-    mid-watch (gate left set) and ``"timeout"`` if the bed never cools within the
-    window (gate left set). ``manager`` and ``sleep`` are injectable for testing.
+    mid-watch (gate left set) — the only other exit.
+
+    The watch never stops on time. If the bed is still above ``threshold_c``
+    after ``escalate_s`` elapsed, it emits ONE warning and fires ``notify`` (the
+    plate-not-empty escalation) — tolerating any notify failure — then keeps
+    polling so the gate still releases within one tick of the temp finally
+    crossing. ``manager``, ``sleep`` and ``notify`` are injectable for testing.
     """
     elapsed = 0
-    while elapsed < timeout_s:
+    escalated = False
+    while True:
         state = manager.get_status(printer_id)
         if not state or not getattr(state, "connected", False):
             logger.info("Eject monitor: printer %s stale/offline during cooldown watch — aborting", printer_id)
@@ -83,16 +118,22 @@ async def watch_bed_and_clear(
             )
             return "cleared"
 
+        if not escalated and elapsed >= escalate_s:
+            escalated = True
+            logger.warning(
+                "Eject monitor: printer %s bed still above %.1f°C after %ss — escalating "
+                "(plate-not-empty), gate stays set but watch continues",
+                printer_id,
+                threshold_c,
+                escalate_s,
+            )
+            try:
+                await notify(printer_id)
+            except Exception:  # noqa: BLE001 — a notify failure must not kill the watch
+                logger.exception("Eject monitor: plate-not-empty escalation notify for printer %s failed", printer_id)
+
         await sleep(check_interval_s)
         elapsed += check_interval_s
-
-    logger.warning(
-        "Eject monitor: printer %s bed did not reach %.1f°C within %ss — leaving plate gate set",
-        printer_id,
-        threshold_c,
-        timeout_s,
-    )
-    return "timeout"
 
 
 def should_rearm(
@@ -134,9 +175,15 @@ async def _latest_started_item(db, printer_id: int):
 
 async def _resolve_eject_threshold(printer_id: int) -> float | None:
     """Return the finished job's eject cooldown threshold, or None if the most
-    recently started job on this printer did not use an eject profile."""
+    recently started job on this printer did not use an eject profile.
+
+    The run-level ``PrintBatch.cooldown_temp_c_override`` wins over the profile's
+    ``cooldown_temp_c`` (same precedence dispatch/generator/validator apply to
+    the emitted ``M190 R``) so the server-side release gate matches the threshold
+    the in-file cooldown wait was generated with."""
     from backend.app.core.database import async_session
     from backend.app.models.eject_profile import EjectProfile
+    from backend.app.services.eject.dispatch import resolve_cooldown_override
 
     async with async_session() as db:
         item = await _latest_started_item(db, printer_id)
@@ -152,7 +199,8 @@ async def _resolve_eject_threshold(printer_id: int) -> float | None:
         profile = prof_result.scalar_one_or_none()
         if profile is None:
             return None
-        return profile.cooldown_temp_c
+        override = await resolve_cooldown_override(db, item.batch_id)
+        return override if override is not None else profile.cooldown_temp_c
 
 
 class EjectCooldownMonitor:

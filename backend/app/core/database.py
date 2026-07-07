@@ -763,6 +763,11 @@ async def run_migrations(conn):
     except (OperationalError, ProgrammingError):
         pass  # Already applied
 
+    # Migration: Add is_dry_run column to print_queue (farm no-deposit handling).
+    # Marks dry-run eject dispatches so a stopped/finished dry run is treated as a
+    # no-deposit finish. Default 0 is correct for all history; no backfill needed.
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN is_dry_run BOOLEAN DEFAULT 0")
+
     # Migration: Add eject-sweep tuning columns to eject_profiles (farm eject).
     # Optional X sub-band (both NULL = full-width sweep) + descending-sweep start
     # fraction of the part height (1.0 = start at the part top, prior behaviour).
@@ -3316,9 +3321,7 @@ async def run_migrations(conn):
         ("on_run_completed", "0", "FALSE"),
     ):
         _default = _sqlite_default if is_sqlite() else _pg_default
-        await _safe_execute(
-            conn, f"ALTER TABLE notification_providers ADD COLUMN {_col} BOOLEAN DEFAULT {_default}"
-        )
+        await _safe_execute(conn, f"ALTER TABLE notification_providers ADD COLUMN {_col} BOOLEAN DEFAULT {_default}")
 
     # Migration: Disambiguate the four ``user_print_*`` notification template
     # names by appending " Email" (#1792). See ``_migrate_rename_user_print_template_names``.

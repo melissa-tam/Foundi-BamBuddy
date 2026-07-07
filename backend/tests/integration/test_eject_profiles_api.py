@@ -222,9 +222,7 @@ class TestEjectProfileCrud:
 
     async def test_update_final_skim(self, async_client: AsyncClient):
         # Default (True) profile -> PUT flips final_skim to False and back.
-        pid = (
-            await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="updskim"))
-        ).json()["id"]
+        pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="updskim"))).json()["id"]
         resp = await async_client.put(f"/api/v1/eject-profiles/{pid}", json={"final_skim": False})
         assert resp.status_code == 200, resp.text
         assert resp.json()["final_skim"] is False
@@ -429,8 +427,9 @@ class TestEjectDryRunDispatch:
         data = resp.json()
         assert data["queue_item_id"]
         assert data["library_file_id"]
-        # Response reminds the operator the plate-clear hold is NOT auto-cleared.
-        assert "clear the plate" in data["message"].lower()
+        # Response guides the operator to confirm the bed is empty (softened: the
+        # dry run is now handled as a no-deposit finish, so no plate-clear caveat).
+        assert "empty" in data["message"].lower()
 
         # Library file persisted under the canonical DRY-RUN name.
         created = (
@@ -453,6 +452,8 @@ class TestEjectDryRunDispatch:
         assert qi.manual_start is False
         assert qi.scheduled_time is None
         assert qi.status == "pending"
+        # Marked as a dry run so a stop/finish is treated as a no-deposit finish.
+        assert qi.is_dry_run is True
 
     async def test_dispatch_replaces_prior_dryrun_file(
         self, async_client: AsyncClient, db_session, tmp_path, printer_factory, monkeypatch

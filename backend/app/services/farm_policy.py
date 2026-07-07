@@ -125,7 +125,7 @@ def _find_fa_item(run: PrintBatch) -> PrintQueueItem | None:
         candidates = [i for i in run.queue_items if i.first_article]
     if not candidates:
         return None
-    return sorted(candidates, key=lambda i: (i.completed_at or i.created_at or 0))[-1]
+    return sorted(candidates, key=lambda i: i.completed_at or i.created_at or 0)[-1]
 
 
 # --------------------------------------------------------------------------- #
@@ -183,9 +183,7 @@ async def create_remaining_plates(db: AsyncSession, run: PrintBatch) -> int:
         # Continue the round-robin from index 1 — index 0 seeded the FA plate.
         assignments = [printer_ids[(i + 1) % len(printer_ids)] for i in range(remaining)]
         for pid, count in Counter(assignments).items():
-            await create_queue_items(
-                db, count=count, printer_id=pid, fields={**fields_common, "printer_id": pid}
-            )
+            await create_queue_items(db, count=count, printer_id=pid, fields={**fields_common, "printer_id": pid})
     else:
         await create_queue_items(
             db,
@@ -393,6 +391,81 @@ async def clear_quarantine(db: AsyncSession, printer_id: int) -> Printer:
     return printer
 
 
+async def recover_printer(db: AsyncSession, printer_id: int) -> dict:
+    """One-click operator recovery for a wedged farm printer.
+
+    Collapses the genuine-failure cascade's three manual actions (clear plate →
+    clear quarantine → resume run) into one explicit operator override, composing
+    the canonical service mutators — no new recovery logic, no dual path. Every
+    step is idempotent, so a repeat call is a no-op returning the same shape.
+
+    1. Force-clear the plate-clear gate via the canonical setter, deliberately
+       WITHOUT the routine clear-plate route's live-connection / FINISH-FAILED
+       guard: recover is an explicit "I've handled the printer" override, gated by
+       its own UI confirm, distinct from the everyday empty-bed ack.
+    2. Clear any farm quarantine on the printer.
+    3. Resume every ``paused`` run that has a queue item on this printer (only
+       paused runs — ``transition_run`` 409s otherwise, so filter first).
+
+    Returns ``{"plate_cleared": bool, "quarantine_cleared": bool,
+    "runs_resumed": [ids]}`` — the booleans report whether that state was actually
+    changed (was set/quarantined before). 404 if the printer is unknown. Each
+    per-run resume is wrapped so one failure can't abort the whole recovery.
+    """
+    # Function-level import avoids a circular import (production_run imports
+    # farm_policy helpers), matching the fork's style.
+    from backend.app.services.production_run import transition_run
+
+    printer = await db.get(Printer, printer_id)
+    if printer is None:
+        raise HTTPException(status_code=404, detail="Printer not found")
+
+    # 1. Plate-clear gate — explicit override, no connection/state guard.
+    plate_cleared = printer_manager.is_awaiting_plate_clear(printer_id)
+    printer_manager.set_awaiting_plate_clear(printer_id, False)
+
+    # 2. Quarantine — idempotent; report whether it was actually set.
+    quarantine_cleared = bool(printer.quarantined)
+    if quarantine_cleared:
+        await clear_quarantine(db, printer_id)
+
+    # 3. Resume runs paused because THIS printer became unavailable (quarantine /
+    #    offline). A run paused by a first-article REJECT is deliberately excluded:
+    #    reject leaves the rejected part on the plate and resuming re-dispatches a
+    #    brand-new first article (transition_run), which would silently undo the
+    #    operator's rejection — that run has its own resume affordance on the run
+    #    page. Exclude in Python (dialect-safe: first_article_state is NULL for
+    #    non-FA runs, which a SQL ``!= 'rejected'`` would wrongly drop).
+    result = await db.execute(
+        select(PrintBatch.id, PrintBatch.first_article_state)
+        .join(PrintQueueItem, PrintQueueItem.batch_id == PrintBatch.id)
+        .where(PrintQueueItem.printer_id == printer_id)
+        .where(PrintBatch.status == "paused")
+        .distinct()
+    )
+    paused_batch_ids = [bid for bid, fa_state in result.all() if fa_state != "rejected"]
+    runs_resumed: list[int] = []
+    for batch_id in paused_batch_ids:
+        try:
+            await transition_run(db, batch_id, "resume")
+            runs_resumed.append(batch_id)
+        except Exception:  # noqa: BLE001 — one run's failure must not abort recovery
+            logger.exception("farm_policy: failed to resume run %s while recovering printer %s", batch_id, printer_id)
+
+    logger.info(
+        "farm_policy: recovered printer %s (plate_cleared=%s, quarantine_cleared=%s, runs_resumed=%s)",
+        printer_id,
+        plate_cleared,
+        quarantine_cleared,
+        runs_resumed,
+    )
+    return {
+        "plate_cleared": plate_cleared,
+        "quarantine_cleared": quarantine_cleared,
+        "runs_resumed": runs_resumed,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Run pause / completion
 # --------------------------------------------------------------------------- #
@@ -425,10 +498,7 @@ async def _maybe_pause_run_no_printers(db: AsyncSession, batch: PrintBatch) -> N
     if not printer_ids:
         return  # model-based / unassigned — scheduler's waiting_reason owns this
 
-    printers = {
-        p.id: p
-        for p in (await db.execute(select(Printer).where(Printer.id.in_(printer_ids)))).scalars().all()
-    }
+    printers = {p.id: p for p in (await db.execute(select(Printer).where(Printer.id.in_(printer_ids)))).scalars().all()}
     if not all(_printer_unavailable(printers.get(pid)) for pid in printer_ids):
         return
 

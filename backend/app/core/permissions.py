@@ -23,6 +23,7 @@ class Permission(StrEnum):
     PRINTERS_FILES = "printers:files"  # Send files to printer
     PRINTERS_AMS_RFID = "printers:ams_rfid"  # Re-read AMS RFID tags
     PRINTERS_CLEAR_PLATE = "printers:clear_plate"  # Confirm plate cleared for next print
+    PRINTERS_RECOVER = "printers:recover"  # One-click farm recovery: clear plate + quarantine + resume run
 
     # Archives
     # ARCHIVES_READ kept for backward-compat with legacy custom roles, but new
@@ -211,6 +212,7 @@ PERMISSION_CATEGORIES = {
         Permission.PRINTERS_FILES,
         Permission.PRINTERS_AMS_RFID,
         Permission.PRINTERS_CLEAR_PLATE,
+        Permission.PRINTERS_RECOVER,
     ],
     "Archives": [
         Permission.ARCHIVES_READ,  # legacy — kept for back-compat with custom roles
@@ -402,6 +404,7 @@ DEFAULT_GROUPS = {
             Permission.PRINTERS_FILES.value,
             Permission.PRINTERS_AMS_RFID.value,
             Permission.PRINTERS_CLEAR_PLATE.value,
+            Permission.PRINTERS_RECOVER.value,
             # Archives - own items only
             Permission.ARCHIVES_READ_OWN.value,
             Permission.ARCHIVES_CREATE.value,
