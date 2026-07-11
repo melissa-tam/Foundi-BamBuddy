@@ -1273,6 +1273,12 @@ def printer_state_to_dict(
         "wifi_signal": state.wifi_signal,
         "wired_network": state.wired_network,
         "door_open": state.door_open,
+        # USB/SD storage presence (#F8). REST already serializes this; mirror it
+        # onto the WS payload so the "No USB drive" card chip flips without waiting
+        # for the 30 s REST poll. On the H2S (no microSD slot) this reflects the
+        # required USB-A drive — no drive means FTPS 553 on every dispatch. The
+        # chip is fail-safe: it renders only on an explicit reported False.
+        "sdcard": state.sdcard,
         # AMS Filament Backup state (auto-switch to second spool). Tri-state:
         # True / False / None. None = unknown or unsupported (A1 family). UI
         # uses this to drive the small status icon next to the AMS drying icon.

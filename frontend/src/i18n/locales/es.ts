@@ -1025,6 +1025,8 @@ export default {
       open: 'Abierta',
       closed: 'Cerrada',
     },
+    noUsb: 'Sin unidad USB',
+    noUsbHint: 'El envío fallará — inserte una unidad USB-A (FAT32/exFAT)',
     // Fans
     fans: {
       partCooling: 'Ventilador de refrigeración de piezas',

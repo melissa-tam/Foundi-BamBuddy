@@ -983,6 +983,8 @@ export default {
       open: '열림',
       closed: '닫힘'
     },
+    noUsb: 'USB 드라이브 없음',
+    noUsbHint: '전송이 실패합니다 — USB-A 드라이브(FAT32/exFAT)를 삽입하세요',
     fans: {
       partCooling: '파트 냉각 팬',
       auxiliary: '보조 팬',

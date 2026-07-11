@@ -1025,6 +1025,8 @@ export default {
       open: 'Aberta',
       closed: 'Fechada',
     },
+    noUsb: 'Sem pendrive USB',
+    noUsbHint: 'O envio vai falhar — insira um pendrive USB-A (FAT32/exFAT)',
     // Fans
     fans: {
       partCooling: 'Ventilador de resfriamento da peça',

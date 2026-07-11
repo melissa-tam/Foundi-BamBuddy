@@ -1025,6 +1025,8 @@ export default {
       open: 'Offen',
       closed: 'Zu',
     },
+    noUsb: 'Kein USB-Stick',
+    noUsbHint: 'Druckauftrag schlägt fehl — USB-A-Stick (FAT32/exFAT) einstecken',
     // Fans
     fans: {
       partCooling: 'Bauteilkühlung',

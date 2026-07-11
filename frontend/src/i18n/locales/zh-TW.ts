@@ -1025,6 +1025,8 @@ export default {
       open: '開',
       closed: '關',
     },
+    noUsb: '無 USB 隨身碟',
+    noUsbHint: '派送將失敗 — 請插入 USB-A 隨身碟（FAT32/exFAT）',
     // Fans
     fans: {
       partCooling: '零件冷卻風扇',

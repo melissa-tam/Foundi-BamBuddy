@@ -75,6 +75,7 @@ import {
   Gauge,
   DoorOpen,
   DoorClosed,
+  Usb,
   Move,
   LogIn,
   LogOut,
@@ -104,6 +105,7 @@ import { HMSErrorModal } from '../components/HMSErrorModal';
 import { HMSErrorSummary } from '../components/HMSErrorSummary';
 import { FarmUnitChip } from '../components/FarmUnitChip';
 import { hmsTone } from '../utils/hmsTone';
+import { showNoUsbChip } from '../utils/noUsbChip';
 import { PrinterQueueWidget } from '../components/PrinterQueueWidget';
 import { AMSHistoryModal } from '../components/AMSHistoryModal';
 import { AmsBackupModal } from '../components/AmsBackupModal';
@@ -3578,6 +3580,20 @@ function PrinterCard({
                   title={status.door_open ? t('printers.door.open') : t('printers.door.closed')}
                 >
                   {status.door_open ? <DoorOpen className="w-3 h-3" /> : <DoorClosed className="w-3 h-3" />}
+                </span>
+              )}
+
+              {/* No-USB-drive warning (#F8). Fail-safe: renders ONLY on an
+                  explicit reported sdcard===false. The H2S has no microSD slot,
+                  so this reflects the required USB-A drive — no drive → FTPS 553
+                  on every dispatch. Pre-warns before a run stalls. */}
+              {showNoUsbChip(status) && (
+                <span
+                  className="flex items-center gap-1 px-2 py-1 rounded-full text-xs bg-status-error/20 text-status-error"
+                  title={t('printers.noUsbHint')}
+                >
+                  <Usb className="w-3 h-3" />
+                  {t('printers.noUsb')}
                 </span>
               )}
               </div>

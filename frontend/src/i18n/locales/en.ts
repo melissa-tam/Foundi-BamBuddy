@@ -1031,6 +1031,8 @@ export default {
       open: 'Open',
       closed: 'Closed',
     },
+    noUsb: 'No USB drive',
+    noUsbHint: 'Dispatch will fail — insert a USB-A drive (FAT32/exFAT)',
     // Fans
     fans: {
       partCooling: 'Part Cooling Fan',

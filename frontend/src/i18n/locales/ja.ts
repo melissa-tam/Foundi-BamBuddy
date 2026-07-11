@@ -1024,6 +1024,8 @@ export default {
       open: '開',
       closed: '閉',
     },
+    noUsb: 'USBドライブなし',
+    noUsbHint: '送信に失敗します — USB-Aドライブ（FAT32/exFAT）を挿入してください',
     // Fans
     fans: {
       partCooling: 'パーツ冷却ファン',

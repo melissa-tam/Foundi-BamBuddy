@@ -1169,6 +1169,20 @@ class TestPrinterStateToDict:
         finally:
             printer_manager.set_awaiting_plate_clear(12345, False)
 
+    def test_sdcard_true_rides_ws_payload(self, mock_state):
+        """sdcard=True must ride the WS dict (F8) — REST already carries it, so
+        the WebSocket path must stay in lockstep or the No-USB chip flaps."""
+        mock_state.sdcard = True
+        result = printer_state_to_dict(mock_state)
+        assert result["sdcard"] is True
+
+    def test_sdcard_false_rides_ws_payload(self, mock_state):
+        """sdcard=False (no USB drive on the H2S) must ride the WS dict so the
+        fail-safe No-USB chip can render before the 30 s REST poll."""
+        mock_state.sdcard = False
+        result = printer_state_to_dict(mock_state)
+        assert result["sdcard"] is False
+
     def test_name_and_model_surfaced_when_registered(self, mock_state):
         """Registered PrinterInfo name + model arg should land in the WS payload.
 

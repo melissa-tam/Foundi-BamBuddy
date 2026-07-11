@@ -1025,6 +1025,8 @@ export default {
       open: 'Açık',
       closed: 'Kapalı',
     },
+    noUsb: 'USB sürücü yok',
+    noUsbHint: 'Gönderim başarısız olacak — bir USB-A sürücü (FAT32/exFAT) takın',
     // Fanlar
     fans: {
       partCooling: 'Parça Soğutma Fanı',

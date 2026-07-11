@@ -1025,6 +1025,8 @@ export default {
       open: 'Ouverte',
       closed: 'Fermée',
     },
+    noUsb: 'Pas de clé USB',
+    noUsbHint: 'L\'envoi échouera — insérez une clé USB-A (FAT32/exFAT)',
     // Fans
     fans: {
       partCooling: 'Ventilateur pièce',

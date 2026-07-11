@@ -1025,6 +1025,8 @@ export default {
       open: '开',
       closed: '关',
     },
+    noUsb: '无 USB 驱动器',
+    noUsbHint: '派发将失败 — 请插入 USB-A 驱动器（FAT32/exFAT）',
     // Fans
     fans: {
       partCooling: '零件冷却风扇',

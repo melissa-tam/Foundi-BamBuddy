@@ -1025,6 +1025,8 @@ export default {
       open: 'Aperta',
       closed: 'Chiusa',
     },
+    noUsb: 'Nessuna chiavetta USB',
+    noUsbHint: 'L\'invio fallirà — inserisci una chiavetta USB-A (FAT32/exFAT)',
     // Fans
     fans: {
       partCooling: 'Ventola raffreddamento parte',
