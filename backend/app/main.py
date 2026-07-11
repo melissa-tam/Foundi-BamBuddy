@@ -477,16 +477,6 @@ for _occ_code in _HMS_PLATE_OCCUPANCY_CODES:
     _HMS_FAILURE_REASONS.setdefault(_occ_code, "Plate not empty (printer vision)")
 
 
-def _hms_short_code(attr: int, code: int | str) -> str:
-    """Build the canonical "MMMM_CCCC" HMS short code from raw attr/code values."""
-    if isinstance(code, str):
-        code_int = int(code.replace("0x", ""), 16) if code else 0
-    else:
-        code_int = int(code or 0)
-    attr_int = int(attr or 0)
-    return f"{(attr_int >> 16) & 0xFFFF:04X}_{code_int & 0xFFFF:04X}"
-
-
 def derive_failure_reason(status: str, hms_errors: list[dict] | None) -> str | None:
     """Derive a human-readable failure_reason for an archived print.
 
@@ -498,8 +488,10 @@ def derive_failure_reason(status: str, hms_errors: list[dict] | None) -> str | N
         return "User cancelled"
     if status != "failed":
         return None
+    from backend.app.services.hms_errors import hms_short_code
+
     for err in hms_errors or []:
-        short_code = _hms_short_code(err.get("attr", 0), err.get("code", 0))
+        short_code = hms_short_code(err.get("attr", 0), err.get("code", 0))
         if short_code in _HMS_FAILURE_REASONS:
             return _HMS_FAILURE_REASONS[short_code]
     return None
@@ -1396,8 +1388,10 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             # a farm unit is printing here, raise a human-clear-only plate gate + flag
             # the unit so the loop shows the hold instead of silently stalling. Own
             # session, fully guarded — the codes stay in hms_errors (they ARE faults).
+            from backend.app.services.hms_errors import hms_short_code
+
             _new_occupancy = {
-                _hms_short_code(e.attr, e.code) for e in current_hms_errors if f"{e.attr:08x}" in new_error_codes
+                hms_short_code(e.attr, e.code) for e in current_hms_errors if f"{e.attr:08x}" in new_error_codes
             } & _HMS_PLATE_OCCUPANCY_CODES
             if _new_occupancy:
                 try:

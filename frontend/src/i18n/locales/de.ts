@@ -2980,6 +2980,13 @@ export default {
   hmsErrors: {
     title: 'Fehler - {{name}}',
     noErrors: 'Keine Fehler',
+    unknownDescription: 'Unbekannter Druckerfehler — nicht in der Datenbank bekannter Codes. Prüfen Sie diesen Code im Bambu-Wiki.',
+    severity: {
+      fatal: 'Kritisch',
+      serious: 'Schwerwiegend',
+      warning: 'Warnung',
+      info: 'Hinweis',
+    },
     viewOnWiki: 'Im Bambu Lab Wiki ansehen',
     clearInstructions: 'Löschen Sie die Fehler am Drucker, um sie hier zu entfernen.',
     clearErrors: 'Fehler löschen',

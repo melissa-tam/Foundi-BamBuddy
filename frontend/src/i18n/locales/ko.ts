@@ -2832,6 +2832,13 @@ export default {
   hmsErrors: {
     title: '오류 - {{name}}',
     noErrors: '오류 없음',
+    unknownDescription: '알 수 없는 프린터 오류 — 알려진 코드 데이터베이스에 없습니다. 이 코드를 Bambu 위키에서 확인하세요.',
+    severity: {
+      fatal: '치명적',
+      serious: '심각',
+      warning: '경고',
+      info: '정보',
+    },
     viewOnWiki: 'Bambu Lab 위키에서 보기',
     clearInstructions: '오류를 해제하려면 프린터에서 오류를 지우세요.',
     clearErrors: '오류 지우기',

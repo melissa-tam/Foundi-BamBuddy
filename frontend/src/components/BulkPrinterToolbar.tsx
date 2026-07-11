@@ -12,7 +12,7 @@ import {
   Eraser,
 } from 'lucide-react';
 import { Button } from './Button';
-import { filterKnownHMSErrors } from './HMSErrorModal';
+import { hmsTone } from '../utils/hmsTone';
 import type { Printer, HMSError } from '../api/client';
 
 export type BulkAction = 'stop' | 'pause' | 'resume' | 'clearPlate' | 'clearHMS';
@@ -80,7 +80,7 @@ export function BulkPrinterToolbar({
   );
   const anyWithHMS = selectedStatuses.some(({ status }) => {
     if (!status?.connected || !status.hms_errors) return false;
-    return filterKnownHMSErrors(status.hms_errors).length > 0;
+    return status.hms_errors.length > 0;
   });
 
   const canControl = hasPermission('printers:control');
@@ -94,16 +94,18 @@ export function BulkPrinterToolbar({
   printers.forEach(p => {
     const status = queryClient.getQueryData<PrinterStatus>(['printerStatus', p.id]);
     if (!status || !status.connected) { stateCounts.offline++; return; }
-    const hasKnownHms = status.hms_errors ? filterKnownHMSErrors(status.hms_errors).length > 0 : false;
-    if (hasKnownHms) stateCounts.error++;
+    // Error tone = fatal/serious code, or a FAILED print carrying any error.
+    // Unknown codes are no longer filtered out (H1).
+    const isError = hmsTone(status.hms_errors, status.state) === 'error';
+    if (isError) stateCounts.error++;
     switch (status.state) {
       case 'RUNNING': stateCounts.printing++; break;
       case 'PAUSE': stateCounts.paused++; break;
       case 'FINISH': stateCounts.finished++; break;
-      // FAILED without an active HMS error is the post-cancel terminal state —
-      // group with FINISH. When HMS is active the error bucket is already
+      // FAILED without an error-level fault is the post-cancel terminal state —
+      // group with FINISH. When the tone is error the bucket is already
       // incremented above; don't double-count.
-      case 'FAILED': if (!hasKnownHms) stateCounts.finished++; break;
+      case 'FAILED': if (!isError) stateCounts.finished++; break;
       default: stateCounts.idle++; break;
     }
   });

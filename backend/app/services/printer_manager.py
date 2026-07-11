@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models.printer import Printer
 from backend.app.services.bambu_mqtt import BambuMQTTClient, MQTTLogEntry, PrinterState, get_stage_name
+from backend.app.services.hms_errors import hms_error_payload
 from backend.app.utils.printer_models import canon_model
 
 logger = logging.getLogger(__name__)
@@ -1256,18 +1257,9 @@ def printer_state_to_dict(
         "layer_num": state.layer_num,
         "total_layers": state.total_layers,
         "temperatures": temperatures,
-        "hms_errors": [
-            {
-                "code": e.code,
-                "attr": e.attr,
-                "module": e.module,
-                "severity": e.severity,
-                "actions": e.actions,
-                "job_id": e.job_id,
-                "full_code": e.full_code,
-            }
-            for e in (state.hms_errors or [])
-        ],
+        # hms_error_payload is the single enrichment site (short_code/description/
+        # wiki_url) shared with the REST route — keeps WS and REST in lockstep.
+        "hms_errors": [hms_error_payload(e) for e in (state.hms_errors or [])],
         # AMS data for filament colors
         "ams": ams_units if ams_units else None,
         "vt_tray": vt_tray,

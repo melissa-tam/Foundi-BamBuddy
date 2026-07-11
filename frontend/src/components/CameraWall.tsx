@@ -3,7 +3,6 @@ import { useTranslation } from 'react-i18next';
 import { useQueries } from '@tanstack/react-query';
 import { Settings as SettingsIcon } from 'lucide-react';
 import { CameraTile, type CameraTileMode, type CameraTileStatusMode } from './CameraTile';
-import { filterKnownHMSErrors } from './HMSErrorModal';
 import { api, type Printer, type PrinterStatus } from '../api/client';
 
 interface CameraWallProps {
@@ -255,9 +254,7 @@ export function CameraWall({
                   statusByPrinter.get(p.id)?.gcode_file ??
                   null
                 }
-                hmsErrorCount={
-                  filterKnownHMSErrors(statusByPrinter.get(p.id)?.hms_errors ?? []).length
-                }
+                hmsErrorCount={statusByPrinter.get(p.id)?.hms_errors?.length ?? 0}
                 onClick={() => onTileClick(p.id, p.name)}
               />
             </div>

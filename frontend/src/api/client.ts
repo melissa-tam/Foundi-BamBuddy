@@ -373,6 +373,13 @@ export interface HMSError {
   // this back as HmsActionBody.print_error so we don't truncate the 64-bit
   // identifier into the silent-rejection short code (#1830).
   full_code?: string;
+  // Serialization-time enrichment from the backend (services.hms_errors) — the
+  // frontend no longer holds its own code→description table. short_code is the
+  // canonical "MMMM_CCCC"; description is the vendor fault text (null/absent when
+  // the code is unknown); wiki_url is the Bambu HMS wiki link.
+  short_code?: string;
+  description?: string | null;
+  wiki_url?: string;
 }
 
 export interface HMSActionBody {

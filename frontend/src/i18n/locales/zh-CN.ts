@@ -2968,6 +2968,13 @@ export default {
   hmsErrors: {
     title: '错误 - {{name}}',
     noErrors: '无错误',
+    unknownDescription: '未知打印机错误 — 不在已知代码数据库中。请在拓竹 Wiki 上查看此代码。',
+    severity: {
+      fatal: '致命',
+      serious: '严重',
+      warning: '警告',
+      info: '信息',
+    },
     viewOnWiki: '在拓竹 Wiki 上查看',
     clearInstructions: '在打印机上清除错误以在此处消除它们。',
     clearErrors: '清除错误',

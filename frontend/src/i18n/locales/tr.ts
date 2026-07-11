@@ -2984,6 +2984,13 @@ export default {
   hmsErrors: {
     title: 'Hatalar - {{name}}',
     noErrors: 'Hata yok',
+    unknownDescription: 'Bilinmeyen yazıcı hatası — bilinen kod veritabanında yok. Bu kodu Bambu wiki\'sinde kontrol edin.',
+    severity: {
+      fatal: 'Ölümcül',
+      serious: 'Ciddi',
+      warning: 'Uyarı',
+      info: 'Bilgi',
+    },
     viewOnWiki: 'Bambu Lab Wiki\'de görüntüle',
     clearInstructions: 'Buradan kapatmak için yazıcıdaki hataları temizleyin.',
     clearErrors: 'Hataları Temizle',

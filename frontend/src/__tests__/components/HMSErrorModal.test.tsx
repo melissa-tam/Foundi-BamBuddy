@@ -1,5 +1,10 @@
 /**
  * Tests for the HMSErrorModal component.
+ *
+ * Post-Phase-2: the modal renders EVERY error (descriptions, short code, and
+ * wiki link ride the API payload). Unknown/novel codes are no longer hidden —
+ * they render with a translated fallback so a lights-out farm never shows a
+ * faulting printer as "OK".
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
@@ -11,18 +16,28 @@ import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
 import type { HMSError } from '../../api/client';
 
-// Error code 0300_400C = "The task was canceled." (known code in the database)
+const WIKI = 'https://wiki.bambulab.com/en/hms/home';
+
+// Error code 0300_400C = "The task was canceled." (known code — backend
+// resolves the description and short_code and hands them to the client).
 const knownError: HMSError = {
   attr: 0x0300,
   code: '0x400C',
   severity: 2,
+  short_code: '0300_400C',
+  description: 'The task was canceled.',
+  wiki_url: WIKI,
 };
 
-// Error code FFFF_FFFF = unknown (not in the database)
+// Error code FFFF_FFFF = unknown — backend resolves no description (null) but
+// STILL sends the short code and wiki link so the fault stays visible.
 const unknownError: HMSError = {
   attr: 0xFFFF,
   code: '0xFFFF',
   severity: 1,
+  short_code: 'FFFF_FFFF',
+  description: null,
+  wiki_url: WIKI,
 };
 
 describe('HMSErrorModal', () => {
@@ -50,9 +65,20 @@ describe('HMSErrorModal', () => {
       expect(screen.getByText('The task was canceled.')).toBeInTheDocument();
     });
 
-    it('shows no errors message when all errors are unknown', () => {
+    it('renders the severity label via i18n', () => {
+      render(<HMSErrorModal {...defaultProps} />);
+      // severity 2 => hmsErrors.severity.serious
+      expect(screen.getByText('Serious')).toBeInTheDocument();
+    });
+
+    it('renders unknown codes with the fallback description AND their short code', () => {
       render(<HMSErrorModal {...defaultProps} errors={[unknownError]} />);
-      expect(screen.getByText('No errors')).toBeInTheDocument();
+      // The fallback description is shown (i18n), not hidden.
+      expect(screen.getByText(/Unknown printer error/)).toBeInTheDocument();
+      // The short code is still visible (rendered as MMMM-CCCC).
+      expect(screen.getByText('[FFFF-FFFF]')).toBeInTheDocument();
+      // "No errors" is NOT shown — the error is rendered.
+      expect(screen.queryByText('No errors')).not.toBeInTheDocument();
     });
 
     it('shows no errors message when errors array is empty', () => {
@@ -62,19 +88,19 @@ describe('HMSErrorModal', () => {
   });
 
   describe('clear errors button', () => {
-    it('shows clear button when there are known errors', () => {
+    it('shows clear button when there are errors', () => {
       render(<HMSErrorModal {...defaultProps} />);
       expect(screen.getByText('Clear Errors')).toBeInTheDocument();
     });
 
-    it('hides clear button when there are no known errors', () => {
+    it('hides clear button when there are no errors', () => {
       render(<HMSErrorModal {...defaultProps} errors={[]} />);
       expect(screen.queryByText('Clear Errors')).not.toBeInTheDocument();
     });
 
-    it('hides clear button when all errors are unknown codes', () => {
+    it('shows clear button when errors are unknown codes (still clearable)', () => {
       render(<HMSErrorModal {...defaultProps} errors={[unknownError]} />);
-      expect(screen.queryByText('Clear Errors')).not.toBeInTheDocument();
+      expect(screen.getByText('Clear Errors')).toBeInTheDocument();
     });
 
     it('disables clear button when user lacks permission', () => {

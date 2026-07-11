@@ -402,6 +402,82 @@ class TestPrintersAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_get_printer_status_enriches_hms_errors(self, async_client: AsyncClient, printer_factory, db_session):
+        """The status response must carry the serialization-time enrichment
+        (short_code/description/wiki_url) for each HMS error, so the frontend
+        never re-derives the code or holds its own description table (Phase 2)."""
+        from unittest.mock import MagicMock, patch
+
+        from backend.app.services.bambu_mqtt import HMSError, PrinterState
+
+        printer = await printer_factory()
+
+        state = PrinterState()
+        state.connected = True
+        state.state = "PAUSE"
+        # 0300_400C = "The task was canceled." (a known code)
+        state.hms_errors = [
+            HMSError(
+                code="0x400C",
+                attr=0x03000000,
+                module=3,
+                severity=2,
+                full_code="030000000000400C",
+            )
+        ]
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_status = MagicMock(return_value=state)
+            mock_pm.is_awaiting_plate_clear = MagicMock(return_value=False)
+            mock_pm.is_model_mismatch = MagicMock(return_value=False)
+            mock_pm.model_mismatch_reason = MagicMock(return_value=None)
+
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+
+        assert response.status_code == 200
+        errors = response.json()["hms_errors"]
+        assert len(errors) == 1
+        assert errors[0]["short_code"] == "0300_400C"
+        assert errors[0]["description"] == "The task was canceled."
+        assert errors[0]["wiki_url"] == "https://wiki.bambulab.com/en/hms/home"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_get_printer_status_unknown_hms_error_visible(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """A novel/unknown HMS code must still surface in the status response
+        with a null description (never silently dropped) — the lights-out
+        farm's worst failure mode is a card that reads "OK" during a fault."""
+        from unittest.mock import MagicMock, patch
+
+        from backend.app.services.bambu_mqtt import HMSError, PrinterState
+
+        printer = await printer_factory()
+
+        state = PrinterState()
+        state.connected = True
+        state.state = "FAILED"
+        state.hms_errors = [
+            HMSError(code="0xFFFF", attr=0xFFFF0000, module=0xFF, severity=1, full_code="FFFFFFFFFFFFFFFF")
+        ]
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_status = MagicMock(return_value=state)
+            mock_pm.is_awaiting_plate_clear = MagicMock(return_value=False)
+            mock_pm.is_model_mismatch = MagicMock(return_value=False)
+            mock_pm.model_mismatch_reason = MagicMock(return_value=None)
+
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+
+        assert response.status_code == 200
+        errors = response.json()["hms_errors"]
+        assert len(errors) == 1
+        assert errors[0]["short_code"] == "FFFF_FFFF"
+        assert errors[0]["description"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_get_printer_status_includes_fila_switch_when_installed(
         self, async_client: AsyncClient, printer_factory, db_session
     ):

@@ -100,7 +100,9 @@ import { FileManagerModal } from '../components/FileManagerModal';
 import { EmbeddedCameraViewer } from '../components/EmbeddedCameraViewer';
 import { CameraWall } from '../components/CameraWall';
 import { MQTTDebugModal } from '../components/MQTTDebugModal';
-import { HMSErrorModal, filterKnownHMSErrors } from '../components/HMSErrorModal';
+import { HMSErrorModal } from '../components/HMSErrorModal';
+import { HMSErrorSummary } from '../components/HMSErrorSummary';
+import { hmsTone } from '../utils/hmsTone';
 import { PrinterQueueWidget } from '../components/PrinterQueueWidget';
 import { AMSHistoryModal } from '../components/AMSHistoryModal';
 import { AmsBackupModal } from '../components/AmsBackupModal';
@@ -994,10 +996,11 @@ function StatusSummaryBar({ printers }: { printers: Printer[] | undefined }) {
       } else if (!status.connected) {
         offline++;
       } else {
-        // Count printers with active HMS errors as problems
-        const knownHmsCount =
-          status.hms_errors ? filterKnownHMSErrors(status.hms_errors).length : 0;
-        if (knownHmsCount > 0) {
+        // Count printers whose HMS tone is error-level (fatal/serious code, or a
+        // FAILED print carrying any error) as problems. Unknown codes count too —
+        // they're no longer filtered out (H1).
+        const tone = hmsTone(status.hms_errors, status.state);
+        if (tone === 'error') {
           error++;
         }
         switch (status.state) {
@@ -1020,10 +1023,10 @@ function StatusSummaryBar({ printers }: { printers: Printer[] | undefined }) {
           case 'FAILED':
             // FAILED is the printer's terminal gcode_state after a print stops —
             // including user cancellations, where there's no actual fault. Only
-            // count it as a "problem" when an HMS error is also active; otherwise
-            // it's just a print that ended unsuccessfully and the plate needs
-            // clearing (same as FINISH from the operator's perspective).
-            if (knownHmsCount > 0) {
+            // count it as a "problem" when an HMS error is also active (tone is
+            // then 'error'); otherwise it's just a print that ended unsuccessfully
+            // and the plate needs clearing (same as FINISH from the operator's view).
+            if (tone === 'error') {
               // Already counted above
             } else {
               finished++;
@@ -1416,16 +1419,17 @@ function classifyPrinterStatus(
   status: { connected: boolean; state: string | null; hms_errors?: HMSError[] } | undefined,
 ): PrinterState {
   if (!status?.connected) return 'offline';
-  const hmsErrors = status.hms_errors ? filterKnownHMSErrors(status.hms_errors) : [];
-  if (hmsErrors.length > 0) return 'error';
+  // Error bucket = error-level HMS tone (fatal/serious code, or a FAILED print
+  // carrying any error). Unknown codes are no longer filtered out (H1).
+  if (hmsTone(status.hms_errors, status.state) === 'error') return 'error';
   switch (status.state) {
     case 'RUNNING': return 'printing';
     case 'PAUSE':   return 'paused';
     case 'FINISH':  return 'finished';
-    // FAILED without an active HMS error is the printer's terminal state after
+    // FAILED without an error-level fault is the printer's terminal state after
     // any unsuccessful end — including user-cancellations. Treat the same as
-    // FINISH for grouping/badging purposes; only escalate to "error" when an
-    // HMS code is actually attached (handled by the early-return above).
+    // FINISH for grouping/badging purposes; the error escalation is the
+    // early-return above.
     case 'FAILED':  return 'finished';
     default:        return 'idle';
   }
@@ -3342,19 +3346,18 @@ function PrinterCard({
                     <h3 className={`font-semibold text-white ${getTitleSize()}`}>{printer.name}</h3>
                     {/* Connection indicator dot for compact mode */}
                     {viewMode === 'compact' && (() => {
-                      const hmsErrors = status?.connected && status.hms_errors ? filterKnownHMSErrors(status.hms_errors) : [];
-                      const hasSevere = hmsErrors.some(e => e.severity <= 2);
-                      const hasWarning = hmsErrors.length > 0;
+                      const hmsErrors = status?.connected && status.hms_errors ? status.hms_errors : [];
+                      const tone = hmsTone(hmsErrors, status?.state);
                       const pipColor = !status?.connected
                         ? 'bg-status-error'
-                        : hasSevere
+                        : tone === 'error'
                           ? 'bg-status-error'
-                          : hasWarning
+                          : tone === 'warning'
                             ? 'bg-status-warning'
                             : 'bg-status-ok';
                       const pipTitle = !status?.connected
                         ? t('printers.connection.offline')
-                        : hasWarning
+                        : hmsErrors.length > 0
                           ? `${hmsErrors.length} HMS ${hmsErrors.length === 1 ? 'error' : 'errors'}`
                           : t('printers.connection.connected');
                       return (
@@ -3478,21 +3481,22 @@ function PrinterCard({
               )}
               {/* HMS Status Indicator */}
               {status?.connected && (() => {
-                const knownErrors = status.hms_errors ? filterKnownHMSErrors(status.hms_errors) : [];
+                const hmsErrors = status.hms_errors ?? [];
+                const tone = hmsTone(hmsErrors, status.state);
                 return (
                   <button
                     onClick={() => setShowHMSModal(true)}
                     className={`flex items-center gap-1 px-2 py-1 rounded-full text-xs cursor-pointer hover:opacity-80 transition-opacity ${
-                      knownErrors.length > 0
-                        ? knownErrors.some(e => e.severity <= 2)
-                          ? 'bg-status-error/20 text-status-error'
-                          : 'bg-status-warning/20 text-status-warning'
-                        : 'bg-status-ok/20 text-status-ok'
+                      tone === 'error'
+                        ? 'bg-status-error/20 text-status-error'
+                        : tone === 'warning'
+                          ? 'bg-status-warning/20 text-status-warning'
+                          : 'bg-status-ok/20 text-status-ok'
                     }`}
                     title={t('printers.clickToViewHmsErrors')}
                   >
                     <AlertTriangle className="w-3 h-3" />
-                    {knownErrors.length > 0 ? knownErrors.length : 'OK'}
+                    {hmsErrors.length > 0 ? hmsErrors.length : 'OK'}
                   </button>
                 );
               })()}
@@ -3568,6 +3572,15 @@ function PrinterCard({
                 </span>
               )}
               </div>
+              {/* One-line HMS summary under the badge row — names the fault (incl.
+                  unknown codes) without opening the modal (H1/F3). Self-hides when
+                  there are no errors. */}
+              {status?.connected && (
+                <HMSErrorSummary
+                  errors={status.hms_errors ?? []}
+                  onOpen={() => setShowHMSModal(true)}
+                />
+              )}
             </div>
           )}
         </div>
@@ -3685,7 +3698,7 @@ function PrinterCard({
             {/* Compact: Simple status bar */}
             {viewMode === 'compact' ? (
               (() => {
-                const hmsErrors = status.hms_errors ? filterKnownHMSErrors(status.hms_errors) : [];
+                const hmsErrors = status.hms_errors ?? [];
                 const hasProblem = status.state === 'FAILED' || hmsErrors.length > 0;
                 const compactProgress = status.state === 'RUNNING' || status.state === 'PAUSE'
                   ? Math.max(0, Math.min(100, status.progress || 0))
@@ -8144,7 +8157,7 @@ export function PrintersPage() {
         case 'pause': return status.state === 'RUNNING';
         case 'resume': return status.state === 'PAUSE';
         case 'clearPlate': return !!(status as { awaiting_plate_clear?: boolean }).awaiting_plate_clear;
-        case 'clearHMS': return status.hms_errors && filterKnownHMSErrors(status.hms_errors).length > 0;
+        case 'clearHMS': return !!status.hms_errors && status.hms_errors.length > 0;
         default: return false;
       }
     });
@@ -8266,7 +8279,7 @@ export function PrintersPage() {
       result = result.filter(p => {
         const status = queryClient.getQueryData<{ connected: boolean; state: string | null; hms_errors?: HMSError[] }>(['printerStatus', p.id]);
         if (!status?.connected) return statusFilter === 'offline';
-        const hmsErrors = status.hms_errors ? filterKnownHMSErrors(status.hms_errors) : [];
+        const hmsErrors = status.hms_errors ?? [];
         switch (statusFilter) {
           case 'printing': return status.state === 'RUNNING';
           case 'paused':   return status.state === 'PAUSE';
@@ -8318,7 +8331,7 @@ export function PrintersPage() {
 
           const getPriority = (s: typeof statusA) => {
             if (!s?.connected) return 3; // offline
-            const hmsErrors = s.hms_errors ? filterKnownHMSErrors(s.hms_errors) : [];
+            const hmsErrors = s.hms_errors ?? [];
             if (hmsErrors.length > 0) return 0; // HMS errors - top priority
             if (s.state === 'RUNNING') return 1; // printing
             return 2; // idle
@@ -8430,7 +8443,7 @@ export function PrintersPage() {
     }
 
     return groups;
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- classifyPrinterStatus & filterKnownHMSErrors are stable module-level functions, not reactive deps; statusCacheVersion forces recompute on WebSocket status updates
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- classifyPrinterStatus & hmsTone are stable module-level functions, not reactive deps; statusCacheVersion forces recompute on WebSocket status updates
   }, [sortBy, sortedPrinters, queryClient, statusCacheVersion]);
 
   const toolbarRef = useRef<HTMLDivElement>(null);

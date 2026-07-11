@@ -2980,6 +2980,13 @@ export default {
   hmsErrors: {
     title: 'エラー - {{name}}',
     noErrors: 'エラーなし',
+    unknownDescription: '不明なプリンターエラー — 既知コードのデータベースにありません。このコードを Bambu Wiki で確認してください。',
+    severity: {
+      fatal: '致命的',
+      serious: '重大',
+      warning: '警告',
+      info: '情報',
+    },
     viewOnWiki: 'Bambu Lab Wikiで表示',
     clearInstructions: 'プリンターでエラーをクリアするとここからも消えます。',
     clearErrors: 'エラーをクリア',

@@ -2969,6 +2969,13 @@ export default {
   hmsErrors: {
     title: 'Erreurs - {{name}}',
     noErrors: 'Aucune erreur',
+    unknownDescription: 'Erreur d\'imprimante inconnue — absente de la base des codes connus. Consultez ce code sur le wiki Bambu.',
+    severity: {
+      fatal: 'Critique',
+      serious: 'Grave',
+      warning: 'Avertissement',
+      info: 'Information',
+    },
     viewOnWiki: 'Voir sur le Wiki Bambu Lab',
     clearInstructions: 'Effacez les erreurs sur l\'imprimante pour les retirer ici.',
     clearErrors: 'Effacer les erreurs',

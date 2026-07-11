@@ -2997,6 +2997,13 @@ export default {
   hmsErrors: {
     title: 'Errors - {{name}}',
     noErrors: 'No errors',
+    unknownDescription: 'Unknown printer error — not in the known-code database. Check the Bambu wiki for this code.',
+    severity: {
+      fatal: 'Fatal',
+      serious: 'Serious',
+      warning: 'Warning',
+      info: 'Info',
+    },
     viewOnWiki: 'View on Bambu Lab Wiki',
     clearInstructions: 'Clear errors on the printer to dismiss them here.',
     clearErrors: 'Clear Errors',

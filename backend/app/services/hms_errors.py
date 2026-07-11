@@ -873,3 +873,44 @@ def get_error_description(error_code: str) -> str | None:
         Human-readable description or None if not found
     """
     return HMS_ERROR_DESCRIPTIONS.get(error_code.upper())
+
+
+# The fork has no per-code deep link into Bambu's HMS knowledge base, so every
+# error points at the wiki's HMS landing page. Defined once here so the REST and
+# WebSocket payloads share a single source of truth.
+HMS_WIKI_URL = "https://wiki.bambulab.com/en/hms/home"
+
+
+def hms_short_code(attr: int, code: int | str) -> str:
+    """Build the canonical "MMMM_CCCC" HMS short code from raw attr/code values."""
+    if isinstance(code, str):
+        code_int = int(code.replace("0x", ""), 16) if code else 0
+    else:
+        code_int = int(code or 0)
+    attr_int = int(attr or 0)
+    return f"{(attr_int >> 16) & 0xFFFF:04X}_{code_int & 0xFFFF:04X}"
+
+
+def hms_error_payload(e) -> dict:
+    """Serialize an HMSError to the API/WS wire dict.
+
+    Enriches the raw firmware fields (code/attr/module/severity/actions/job_id/
+    full_code) with the canonical ``short_code``, the human-readable
+    ``description`` (None when the code is not in the catalog — the frontend then
+    renders an explicit "unknown code" fallback rather than dropping the error),
+    and the ``wiki_url``. Used by BOTH the REST route and the WebSocket
+    ``printer_state_to_dict`` so the two payloads never drift.
+    """
+    short_code = hms_short_code(e.attr, e.code)
+    return {
+        "code": e.code,
+        "attr": e.attr,
+        "module": e.module,
+        "severity": e.severity,
+        "actions": e.actions,
+        "job_id": e.job_id,
+        "full_code": e.full_code,
+        "short_code": short_code,
+        "description": get_error_description(short_code),
+        "wiki_url": HMS_WIKI_URL,
+    }

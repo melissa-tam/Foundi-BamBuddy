@@ -2983,6 +2983,13 @@ export default {
   hmsErrors: {
     title: 'Errores - {{name}}',
     noErrors: 'No hay errores',
+    unknownDescription: 'Error de impresora desconocido: no está en la base de datos de códigos conocidos. Consulta este código en la wiki de Bambu.',
+    severity: {
+      fatal: 'Crítico',
+      serious: 'Grave',
+      warning: 'Advertencia',
+      info: 'Información',
+    },
     viewOnWiki: 'Ver en la wiki de Bambu Lab',
     clearInstructions: 'Borre los errores en la impresora para descartarlos aquí.',
     clearErrors: 'Borrar errores',

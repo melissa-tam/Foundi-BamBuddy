@@ -166,6 +166,11 @@ class HMSErrorResponse(BaseModel):
     # truncated short_code that historically caused silent command rejection
     # (#1830, H2D wrong-plate verification).
     full_code: str = ""
+    # Serialization-time enrichment (services.hms_errors.hms_error_payload) so the
+    # frontend never re-derives the code or holds its own description table:
+    short_code: str = ""  # Canonical "MMMM_CCCC" (e.g. "0300_400C")
+    description: str | None = None  # Vendor fault text; None when the code is unknown
+    wiki_url: str = ""  # Bambu HMS wiki landing page
 
 
 class AMSTray(BaseModel):

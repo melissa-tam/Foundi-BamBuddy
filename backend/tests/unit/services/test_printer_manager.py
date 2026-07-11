@@ -986,19 +986,31 @@ class TestPrinterStateToDict:
         assert result["vt_tray"] == []
 
     def test_hms_errors_conversion(self, mock_state):
-        """Verify HMS errors are converted correctly."""
+        """Verify HMS errors are converted + enriched (short_code/description/wiki_url).
+
+        printer_state_to_dict routes through hms_error_payload so the WS dict
+        stays in lockstep with the REST HMSErrorResponse.
+        """
         error = MagicMock()
-        error.code = "0700_0100"
-        error.attr = 1
-        error.module = "AMS"
+        error.code = "0x400C"
+        error.attr = 0x03000000  # module 0300, so short_code = 0300_400C
+        error.module = 3
         error.severity = 2
+        error.actions = []
+        error.job_id = None
+        error.full_code = "030000000000400C"
         mock_state.hms_errors = [error]
 
         result = printer_state_to_dict(mock_state)
 
         assert len(result["hms_errors"]) == 1
-        assert result["hms_errors"][0]["code"] == "0700_0100"
-        assert result["hms_errors"][0]["module"] == "AMS"
+        entry = result["hms_errors"][0]
+        assert entry["code"] == "0x400C"
+        assert entry["module"] == 3
+        # New enrichment fields (REST/WS parity).
+        assert entry["short_code"] == "0300_400C"
+        assert entry["description"] == "The task was canceled."
+        assert entry["wiki_url"] == "https://wiki.bambulab.com/en/hms/home"
 
     def test_cover_url_added_for_running_print(self, mock_state):
         """Verify cover_url is added for running prints."""

@@ -48,6 +48,7 @@ from backend.app.services.bambu_ftp import (
     get_storage_info_async,
     list_files_async,
 )
+from backend.app.services.hms_errors import hms_error_payload
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
 from backend.app.services.printer_manager import (
     get_derived_status_name,
@@ -465,19 +466,9 @@ async def get_printer_status(
     if state.state in ("RUNNING", "PAUSE") and state.gcode_file:
         cover_url = f"/api/v1/printers/{printer_id}/cover"
 
-    # Convert HMS errors to response format
-    hms_errors = [
-        HMSErrorResponse(
-            code=e.code,
-            attr=e.attr,
-            module=e.module,
-            severity=e.severity,
-            actions=e.actions,
-            job_id=e.job_id,
-            full_code=e.full_code,
-        )
-        for e in (state.hms_errors or [])
-    ]
+    # Convert HMS errors to response format. hms_error_payload is the single
+    # enrichment site (short_code/description/wiki_url) shared with the WS path.
+    hms_errors = [HMSErrorResponse(**hms_error_payload(e)) for e in (state.hms_errors or [])]
 
     # Parse AMS data from raw_data
     ams_units = []
