@@ -59,6 +59,8 @@ import {
   Ungroup,
   Ban,
   PlayCircle,
+  Loader2,
+  Factory,
 } from 'lucide-react';
 import { api, ApiError } from '../api/client';
 import { type TimeFormat, formatETA, formatDuration, formatRelativeTime, parseUTCDate } from '../utils/date';
@@ -505,6 +507,18 @@ function SortableQueueItem({
               <span className="flex-shrink-0 px-1.5 py-0.5 text-[10px] sm:text-xs bg-cyan-500/20 text-cyan-300 rounded border border-cyan-500/30">
                 {item.batch_name}
               </span>
+            )}
+            {/* Farm run identity (Phase 4.3g): links to the run detail page. */}
+            {item.production_run_id != null && (
+              <Link
+                to={`/production-runs/${item.production_run_id}`}
+                onClick={(e) => e.stopPropagation()}
+                className="flex-shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] sm:text-xs bg-bambu-green/15 text-bambu-green rounded border border-bambu-green/30 hover:bg-bambu-green/25 transition-colors"
+                title={t('queue.farm.runBadgeTitle', { id: item.production_run_id })}
+              >
+                <Factory className="w-3 h-3" />
+                {t('queue.farm.runBadge')}
+              </Link>
             )}
           </div>
 
@@ -1454,6 +1468,23 @@ export function QueuePage() {
     onError: () => showToast(t('queue.toast.resumeAfterFailureFailed'), 'error'),
   });
 
+  // Phase 4.2: re-check every system-staged (low-spool) item against live spool
+  // state and release the resolved ones. Distinct from the per-row Play, which
+  // acknowledges the deficit and prints anyway.
+  const releaseStagedMutation = useMutation({
+    mutationFn: () => api.releaseStagedQueueItems(),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ['queue'] });
+      showToast(
+        result.released > 0
+          ? t('queue.farm.releasedToast', { count: result.released })
+          : t('queue.farm.releasedNone'),
+        result.released > 0 ? 'success' : 'warning',
+      );
+    },
+    onError: () => showToast(t('queue.farm.recheckFailed'), 'error'),
+  });
+
   const createBatchMutation = useMutation({
     mutationFn: (data: { name: string; item_ids: number[] }) => api.createBatch(data),
     onSuccess: (batch) => {
@@ -1850,7 +1881,8 @@ export function QueuePage() {
   // downstream `require_previous_success` items. We surface a per-printer
   // Resume banner above the active queue so the user can clear the gate +
   // restore the skipped jobs in one click, without re-queuing each one.
-  // Detection key: skipped + the scheduler's exact gate string. Other skip
+  // Detection key: skipped + the scheduler's machine code (Phase 4.3f) —
+  // never the English error_message, which is display-only. Other skip
   // reasons (filament deficit, etc.) get their own UX and stay untouched.
   const gateBlockedPrinters = useMemo<
     Array<{ printerId: number; printerName: string; skippedCount: number }>
@@ -1859,7 +1891,7 @@ export function QueuePage() {
     queue?.forEach((item) => {
       if (
         item.status === 'skipped' &&
-        item.error_message === 'Previous print failed or was aborted' &&
+        item.waiting_reason === 'previous_print_failed' &&
         item.printer_id
       ) {
         const existing = counts.get(item.printer_id);
@@ -1881,6 +1913,18 @@ export function QueuePage() {
       }))
       .sort((a, b) => a.printerName.localeCompare(b.printerName));
   }, [queue]);
+
+  // Phase 4.2: rows staged by the low-spool guard (manual_start AND
+  // filament_short — the SYSTEM-staged marker). Grouped under one banner with
+  // a "Re-check and release" action; the per-row Play stays the
+  // acknowledge-the-deficit path ("Print anyway").
+  const systemStagedCount = useMemo(
+    () =>
+      (queue ?? []).filter(
+        (item) => item.status === 'pending' && item.manual_start && item.filament_short,
+      ).length,
+    [queue],
+  );
 
   const aggregateForRows = (rows: QueueRow[]) => {
     let count = 0;
@@ -1984,6 +2028,34 @@ export function QueuePage() {
               </button>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Phase 4.2: low-spool staging banner. Groups the system-staged rows
+          (manual_start + filament_short) under one actionable line: swap the
+          spool, then re-check — only items whose deficit actually cleared are
+          released. The per-row Play stays "Print anyway" (acknowledge). */}
+      {activeTab === 'queue' && systemStagedCount > 0 && hasPermission('queue:update_all' as Permission) && (
+        <div className="mb-4 flex items-center gap-3 px-4 py-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+          <AlertCircle className="w-5 h-5 text-yellow-400 flex-shrink-0" />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm text-yellow-200">{t('queue.farm.stagedBannerTitle')}</div>
+            <div className="text-xs text-yellow-200/70 mt-0.5">
+              {t('queue.farm.stagedBannerBody', { count: systemStagedCount })}
+            </div>
+          </div>
+          <button
+            onClick={() => releaseStagedMutation.mutate()}
+            disabled={releaseStagedMutation.isPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-100 text-sm rounded-md border border-yellow-500/40 transition-colors flex-shrink-0 disabled:opacity-50"
+          >
+            {releaseStagedMutation.isPending ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <RefreshCw className="w-4 h-4" />
+            )}
+            {t('queue.farm.recheckButton')}
+          </button>
         </div>
       )}
 
@@ -2439,13 +2511,26 @@ export function QueuePage() {
             confirmAction.type === 'stop' ? t('queue.confirm.stopTitle') :
             t('queue.confirm.removeTitle')
           }
-          message={
-            confirmAction.type === 'cancel'
-              ? t('queue.confirm.cancelMessage', { name: confirmAction.item.archive_name || confirmAction.item.library_file_name || t('queue.confirm.thisPrint') })
-              : confirmAction.type === 'stop'
-              ? t('queue.confirm.stopMessage', { name: confirmAction.item.archive_name || confirmAction.item.library_file_name || t('queue.confirm.thisPrint') })
-              : t('queue.confirm.removeMessage', { name: confirmAction.item.archive_name || confirmAction.item.library_file_name || t('queue.confirm.thisItem') })
-          }
+          message={(() => {
+            // Farm-aware copy (Phase 4.3g + deferred 3.1 item): a run-managed
+            // item spells out the run consequence — a stop is an operator stop
+            // (no auto-retry, printer held); cancel/remove leave the run short
+            // until the next Resume tops it up.
+            const base =
+              confirmAction.type === 'cancel'
+                ? t('queue.confirm.cancelMessage', { name: confirmAction.item.archive_name || confirmAction.item.library_file_name || t('queue.confirm.thisPrint') })
+                : confirmAction.type === 'stop'
+                ? t('queue.confirm.stopMessage', { name: confirmAction.item.archive_name || confirmAction.item.library_file_name || t('queue.confirm.thisPrint') })
+                : t('queue.confirm.removeMessage', { name: confirmAction.item.archive_name || confirmAction.item.library_file_name || t('queue.confirm.thisItem') });
+            if (confirmAction.item.production_run_id == null) return base;
+            const farmNote =
+              confirmAction.type === 'stop'
+                ? t('queue.farm.stopConsequence')
+                : t('queue.farm.destructiveNote', {
+                    run: confirmAction.item.batch_name || `#${confirmAction.item.production_run_id}`,
+                  });
+            return `${base}\n\n${farmNote}`;
+          })()}
           confirmText={
             confirmAction.type === 'cancel' ? t('queue.confirm.cancelButton') :
             confirmAction.type === 'stop' ? t('queue.confirm.stopButton') :

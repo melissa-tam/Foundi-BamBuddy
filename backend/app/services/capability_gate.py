@@ -5,9 +5,9 @@ Before the scheduler dispatches a FARM queue item (an item whose batch carries a
 the sliced file. This module compares three capability facts and returns a
 verdict the scheduler acts on:
 
-1. **Printer model / bed geometry** (HARD): the printer's model must have eject
-   bed geometry (be a key of the eject generator's ``PRINTER_BED_DIMS``) AND, when
-   the file records the model it was sliced for, that model must match the
+1. **Printer model / bed geometry** (HARD): the printer's model must have a
+   VALIDATED eject geometry row in the ``printer_model_geometry`` registry AND,
+   when the file records the model it was sliced for, that model must match the
    printer. Both sides are normalised through ``utils.printer_models`` so a slice
    ``printer_model_id`` (e.g. ``O1S``), a g-code-header display name (e.g.
    ``Bambu Lab H2S``) and the stored ``Printer.model`` (e.g. ``H2S``) all compare
@@ -40,10 +40,10 @@ from typing import TYPE_CHECKING, Any
 
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
-from backend.app.services.eject.generator import PRINTER_BED_DIMS
+from backend.app.services.eject.geometry import list_geometries
 from backend.app.services.printer_manager import printer_manager
 from backend.app.utils.filament_types import canonical_filament_type
-from backend.app.utils.printer_models import normalize_printer_model, normalize_printer_model_id
+from backend.app.utils.printer_models import canon_model
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -93,20 +93,6 @@ def _parse_float(value: Any) -> float | None:
         return None
 
 
-def _canon_model(value: str | None) -> str | None:
-    """Collapse any model spelling (code / display name / short name) to a key.
-
-    Runs the value through the internal-code map then the display-name map so
-    ``O1S`` → ``H2S``, ``Bambu Lab H2S`` → ``H2S`` and ``H2S`` → ``H2S`` all land
-    on the same uppercase, space-stripped token used for comparison.
-    """
-    if not value or not str(value).strip():
-        return None
-    mapped = normalize_printer_model_id(str(value).strip())
-    mapped = normalize_printer_model(mapped) or mapped
-    return mapped.upper().replace(" ", "") if mapped else None
-
-
 def extract_file_capabilities(file_metadata: dict | None) -> FileCapabilities:
     """Pull the capability facts out of a ``LibraryFile.file_metadata`` blob."""
     meta = file_metadata if isinstance(file_metadata, dict) else {}
@@ -135,20 +121,25 @@ def evaluate_capability(
     ``loaded_filament_types`` is ``None`` when the AMS state is unknown (no live
     status) and a (possibly empty) list when it is known. Only a known,
     non-empty list with zero overlap against the file's requirement blocks.
+
+    ``bed_dims_models`` is the set of canonical model keys that have a VALIDATED
+    eject geometry row (the caller derives it from the registry via
+    ``list_geometries``). It defaults to the empty set — fail-closed: with no
+    allowed models supplied, every printer blocks on the geometry check.
     """
-    bed_models = bed_dims_models if bed_dims_models is not None else set(PRINTER_BED_DIMS)
+    bed_models = bed_dims_models if bed_dims_models is not None else set()
     warnings: list[str] = []
 
     # 1. Printer model / bed geometry (HARD).
-    printer_canon = _canon_model(printer_model)
-    allowed = {_canon_model(m) for m in bed_models}
+    printer_canon = canon_model(printer_model)
+    allowed = {canon_model(m) for m in bed_models}
     allowed.discard(None)
     if printer_canon is None or printer_canon not in allowed:
         return CapabilityDecision(
             ok=False,
             reason=f"{REASON_PREFIX}printer model {printer_model!r} has no eject bed geometry",
         )
-    file_model_canon = _canon_model(file_caps.model)
+    file_model_canon = canon_model(file_caps.model)
     if file_model_canon is None:
         warnings.append("file records no sliced printer model")
     elif file_model_canon != printer_canon:
@@ -239,9 +230,7 @@ def loaded_filament_types(status: Any) -> list[str] | None:
     return types
 
 
-async def check_dispatch_capability(
-    db: AsyncSession, item: PrintQueueItem, printer: Printer
-) -> CapabilityDecision:
+async def check_dispatch_capability(db: AsyncSession, item: PrintQueueItem, printer: Printer) -> CapabilityDecision:
     """Gate a single dispatch. Non-farm items bypass the gate (always ``ok``).
 
     Loads the item's batch to confirm it is a farm run (``sku_file_id`` set), the
@@ -263,10 +252,17 @@ async def check_dispatch_capability(
             file_meta = lib.file_metadata
     file_caps = extract_file_capabilities(file_meta)
 
+    # Allowed models = canonical keys of the VALIDATED geometry rows. Pulled from
+    # the registry here (the DB-touching wrapper) and handed to the pure decision
+    # function, so an unvalidated model (envelope not through the ladder) is never
+    # eligible for farm dispatch.
+    validated_models = {g.model_key for g in await list_geometries(db) if g.validated}
+
     status = printer_manager.get_status(printer.id)
     return evaluate_capability(
         file_caps=file_caps,
         printer_model=printer.model,
         live_nozzle_diameter=live_nozzle_diameter(status),
         loaded_filament_types=loaded_filament_types(status),
+        bed_dims_models=validated_models,
     )

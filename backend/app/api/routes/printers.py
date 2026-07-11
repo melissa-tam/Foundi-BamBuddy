@@ -449,10 +449,15 @@ async def get_printer_status(
 
     state = printer_manager.get_status(printer_id)
     if not state:
+        # The mismatch flag is in-memory sticky until re-evaluated on the next
+        # connected edge — keep reporting it while the printer is offline so the
+        # operator sees WHY the scheduler still skips this printer.
         return PrinterStatus(
             id=printer_id,
             name=printer.name,
             connected=False,
+            model_mismatch=printer_manager.is_model_mismatch(printer_id),
+            model_mismatch_reason=printer_manager.model_mismatch_reason(printer_id),
         )
 
     # Determine cover URL if there's an active print (including paused)
@@ -778,6 +783,8 @@ async def get_printer_status(
         awaiting_plate_clear=printer_manager.is_awaiting_plate_clear(printer_id),
         quarantined=printer.quarantined,
         quarantine_reason=printer.quarantine_reason,
+        model_mismatch=printer_manager.is_model_mismatch(printer_id),
+        model_mismatch_reason=printer_manager.model_mismatch_reason(printer_id),
         supports_drying=supports_drying(printer.model, state.firmware_version),
         supports_drying_while_printing=supports_drying_while_printing(printer.model, state.firmware_version),
         supports_chamber_heater=supports_chamber_heater(printer.model),

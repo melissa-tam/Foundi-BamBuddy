@@ -45,6 +45,7 @@ from backend.app.api.routes import (
     makerworld,
     metrics,
     mfa,
+    model_geometry,
     notification_templates,
     notifications,
     obico,
@@ -92,7 +93,7 @@ from backend.app.services.bambu_ftp import (
     get_ftp_retry_settings,
     with_ftp_retry,
 )
-from backend.app.services.bambu_mqtt import PrinterState
+from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES, PrinterState
 from backend.app.services.eject.monitor import eject_cooldown_monitor
 from backend.app.services.github_backup import github_backup_service
 from backend.app.services.homeassistant import homeassistant_service
@@ -467,6 +468,13 @@ _HMS_FAILURE_REASONS: dict[str, str] = {
     "0701_8013": "Clogged nozzle",
     "0702_8003": "Clogged nozzle",
 }
+
+# Plate-occupancy vision faults (Phase 3.3): a unit that ultimately FAILs carrying
+# the printer's own pre-print plate check is attributed to "plate not empty
+# (printer vision)" instead of a generic failure. Sourced from the single frozenset
+# in services.bambu_mqtt so the set never drifts.
+for _occ_code in _HMS_PLATE_OCCUPANCY_CODES:
+    _HMS_FAILURE_REASONS.setdefault(_occ_code, "Plate not empty (printer vision)")
 
 
 def _hms_short_code(attr: int, code: int | str) -> str:
@@ -1069,6 +1077,7 @@ async def _maybe_notify_printer_offline(printer_id: int) -> None:
 
 async def on_printer_status_change(printer_id: int, state: PrinterState):
     """Handle printer status changes - broadcast via WebSocket."""
+    logger = logging.getLogger(__name__)
     # Connected-edge reconciliation (#1542 follow-up). When the printer
     # transitions disconnected → connected — which covers both Bambuddy
     # startup (no prior connection) and a mid-session MQTT reconnect — fire
@@ -1106,6 +1115,40 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     elif not state.connected and _printer_reconciled_since_connect.get(printer_id, False):
         # Re-arm so the next reconnect triggers reconciliation again.
         _printer_reconciled_since_connect[printer_id] = False
+
+    # Device-vs-declared model reconciliation (Phase 2). Evaluated on any connected
+    # status change; acted on only at a STATE TRANSITION so the one-shot
+    # notification fires once per mismatch (not every tick). An absent device
+    # report (the live H2S reports no model field) ⇒ check returns None ⇒ no-op,
+    # so behaviour is unchanged until a firmware/model actually reports one.
+    if state.connected:
+        _mm_reason = printer_manager.check_model_mismatch(printer_id)
+        _mm_was_set = printer_manager.is_model_mismatch(printer_id)
+        if _mm_reason and not _mm_was_set:
+            printer_manager.set_model_mismatch(printer_id, _mm_reason)
+            logger.warning("[CALLBACK] printer %s model mismatch: %s — blocking dispatch", printer_id, _mm_reason)
+
+            async def _model_mismatch_notify():
+                try:
+                    async with async_session() as _mmdb:
+                        from backend.app.models.printer import Printer as _MMPrinter
+
+                        _mmres = await _mmdb.execute(select(_MMPrinter).where(_MMPrinter.id == printer_id))
+                        _mmp = _mmres.scalar_one_or_none()
+                        _mm_name = _mmp.name if _mmp else f"Printer {printer_id}"
+                        _mm_registered = (_mmp.model if _mmp else None) or "Unknown"
+                        _mm_status = printer_manager.get_status(printer_id)
+                        _mm_reported = getattr(_mm_status, "reported_model", None) or "Unknown"
+                        await notification_service.on_model_mismatch(
+                            printer_id, _mm_name, _mm_reported, _mm_registered, _mmdb
+                        )
+                except Exception as _mme:  # noqa: BLE001
+                    logger.warning("[CALLBACK] model-mismatch notification failed for printer %s: %s", printer_id, _mme)
+
+            spawn_background_task(_model_mismatch_notify(), name=f"model-mismatch-notify-{printer_id}")
+        elif not _mm_reason and _mm_was_set:
+            printer_manager.set_model_mismatch(printer_id, None)
+            logger.info("[CALLBACK] printer %s model mismatch cleared", printer_id)
 
     # Offline-notification edge (#1752): schedule `on_printer_offline` on
     # connected → disconnected. The "back online" channel is already covered
@@ -1346,6 +1389,26 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
 
             except Exception as e:
                 logging.getLogger(__name__).warning(f"HMS error notification failed: {e}")
+
+            # Native plate-occupancy capture (Phase 3.3). The H2-series pre-print
+            # vision check (foreign-objects-on-heatbed / plate-marker) surfaces as an
+            # HMS code and PAUSEs the job on the printer. When such a code is NEW and
+            # a farm unit is printing here, raise a human-clear-only plate gate + flag
+            # the unit so the loop shows the hold instead of silently stalling. Own
+            # session, fully guarded — the codes stay in hms_errors (they ARE faults).
+            _new_occupancy = {
+                _hms_short_code(e.attr, e.code) for e in current_hms_errors if f"{e.attr:08x}" in new_error_codes
+            } & _HMS_PLATE_OCCUPANCY_CODES
+            if _new_occupancy:
+                try:
+                    from backend.app.services.farm_correlation import on_native_plate_detection
+
+                    async with async_session() as _plate_db:
+                        await on_native_plate_detection(_plate_db, printer_id, _new_occupancy)
+                except Exception as _pe:  # noqa: BLE001 — capture must never crash the status flow
+                    logging.getLogger(__name__).warning(
+                        "[PLATE-VISION] native plate-occupancy capture failed for printer %s: %s", printer_id, _pe
+                    )
 
     else:
         # No HMS errors — only clear tracking after a grace period to prevent
@@ -2065,6 +2128,17 @@ async def on_ams_change(printer_id: int, ams_data: list):
     except Exception as e:
         logging.getLogger(__name__).error("Spoolman AMS sync failed for printer %s: %s", printer_id, e)
 
+    # Farm low-spool staging release (Phase 4.2): a tray change (spool swap /
+    # refill) re-checks system-staged items targeting this printer. Debounced by
+    # a tray-signature hash inside farm_staging; guarded — the AMS path must
+    # never break on a farm-side failure.
+    try:
+        from backend.app.services.farm_staging import maybe_release_on_ams_change
+
+        await maybe_release_on_ams_change(printer_id, ams_data)
+    except Exception as e:
+        logging.getLogger(__name__).warning("Farm staging release hook failed for printer %s: %s", printer_id, e)
+
 
 async def _capture_snapshot_for_notification(printer_id: int, printer, logger) -> bytes | None:
     """Capture a camera snapshot for notification image attachment.
@@ -2403,6 +2477,7 @@ async def on_print_start(printer_id: int, data: dict):
                             printer_name=printer.name,
                             db=db,
                             difference_percent=plate_result.difference_percent,
+                            source_detail="Camera comparison detected objects on the plate before printing.",
                         )
                     except Exception as notif_err:
                         logger.warning("[PLATE CHECK] Failed to send notification: %s", notif_err)
@@ -3815,18 +3890,42 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
         # metrics / debug logging). raw_data is the live printer state so
         # the usage tracker can compare end-of-print remain% against the
         # captured start values.
+        #
+        # Downtime-FINISH reconcile (Phase 3.4): when the printer's LIVE state is
+        # terminal (FINISH/FAILED) AND its subtask id matches THIS archive, we have
+        # REAL evidence of the outcome — synthesise the TRUE status with the real
+        # progress/layer/subtask so the ONE normal terminal path (correlation → gate
+        # → monitor → farm_policy) runs on genuine evidence (raises the plate gate,
+        # arms the identity cooldown watch, runs the farm policy idempotently).
+        # IDLE, or a subtask MISMATCH, keeps today's conservative 'aborted' (no proof
+        # of a clean finish; carries no progress/layer keys, so the terminal handler
+        # treats it as a no-deposit cancel — gate NOT raised — and the farm policy
+        # no-ops because a reconcile carries no operator-stop echo/membership).
+        _live_state = (state.state or "").upper()
+        _state_subtask = (getattr(state, "subtask_id", None) or "").strip()
+        _arch_subtask = (archive.subtask_id or "").strip()
+        if _live_state in ("FINISH", "FAILED") and _state_subtask and _state_subtask == _arch_subtask:
+            reconcile_payload = {
+                "status": "completed" if _live_state == "FINISH" else "failed",
+                "filename": archive.filename,
+                "subtask_name": archive.print_name or "",
+                "subtask_id": state.subtask_id,
+                "last_progress": getattr(state, "progress", 0.0),
+                "last_layer_num": getattr(state, "layer_num", 0),
+                "raw_data": state.raw_data or {},
+                "_reconciled": True,
+            }
+        else:
+            reconcile_payload = {
+                "status": "aborted",
+                "filename": archive.filename,
+                "subtask_name": archive.print_name or "",
+                "subtask_id": archive.subtask_id or "",
+                "raw_data": state.raw_data or {},
+                "_reconciled": True,
+            }
         try:
-            await on_print_complete(
-                printer_id,
-                {
-                    "status": "aborted",
-                    "filename": archive.filename,
-                    "subtask_name": archive.print_name or "",
-                    "subtask_id": archive.subtask_id or "",
-                    "raw_data": state.raw_data or {},
-                    "_reconciled": True,
-                },
-            )
+            await on_print_complete(printer_id, reconcile_payload)
             reconciled += 1
         except Exception as e:
             # Catch-all: a reconciliation failure must not block the
@@ -4005,7 +4104,18 @@ async def on_print_complete(printer_id: int, data: dict):
     # report "failed" or "aborted" via MQTT.  Override that to "cancelled" so the
     # correct "print stopped" notification/email is sent instead of a failure alert.
     _raw_status = data.get("status", "completed")
-    if printer_id in _user_stopped_printers and _raw_status in ("failed", "aborted"):
+    # Classify an operator stop (Phase 3.1) BEFORE the discard below mutates the
+    # membership set. 'operator_ui' = Stop pressed in the queue UI (member of
+    # _user_stopped_printers); 'operator_screen' = the firmware's cancel echo
+    # surfaced `user_cancel_observed` (stopped on the printer's touchscreen). The
+    # UI-stop is normalised to 'cancelled' here regardless of deposit (an explicit
+    # queue action); a SCREEN-stop WITH a deposit is normalised later, once the
+    # no-deposit classification is known (a no-deposit screen-stop is handled by the
+    # existing no-deposit path so a first article still retries).
+    from backend.app.services.farm_correlation import classify_stop
+
+    _stop_source = classify_stop(data, printer_id, _user_stopped_printers)
+    if _stop_source == "operator_ui" and _raw_status in ("failed", "aborted"):
         logger.info(
             "[CALLBACK] Overriding status '%s' -> 'cancelled' for printer %s (print was stopped from queue by user)",
             _raw_status,
@@ -4014,31 +4124,69 @@ async def on_print_complete(printer_id: int, data: dict):
         data = {**data, "status": "cancelled"}
     _user_stopped_printers.discard(printer_id)
 
+    # Terminal-status correlation (Phase 1, P1-A). Resolve WHICH queue item this
+    # finish belongs to ONCE, up front, and thread the verdict to BOTH the plate-
+    # clear gate below and the queue-status update later. The old printer_id-only
+    # lookup pinned a foreign/local print's FINISH onto whatever farm unit was
+    # "printing" (S4) — resolve_terminal_item binds on the dispatched subtask_id.
+    # Also reads the finished item's purpose flags (dry-run / first-article) for the
+    # no-deposit classification, whether farm work targets this printer, and the
+    # global require_plate_clear toggle — all in one retry-guarded read.
+    _verdict = "none"
+    _resolved_item_id = None
+    _resolved_is_dry_run = False
+    _resolved_first_article = False
+    _resolved_is_farm = False
+    _farm_targets_printer = False
+    _global_require_plate_clear = True
+    try:
+        from backend.app.api.routes.settings import get_setting
+        from backend.app.core.database import run_with_retry
+        from backend.app.services.farm_correlation import (
+            ATTRIBUTED_VERDICTS,
+            AUTO_CLEAR_VERDICTS,
+            farm_work_targets_printer,
+            resolve_terminal_item,
+        )
+
+        async def _do_resolve(db):
+            resolution = await resolve_terminal_item(db, printer_id, data)
+            item = resolution.item
+            raw_rpc = await get_setting(db, "require_plate_clear")
+            return {
+                "verdict": resolution.verdict,
+                "item_id": item.id if item is not None else None,
+                "is_dry_run": bool(item is not None and item.is_dry_run),
+                "first_article": bool(item is not None and item.first_article),
+                "is_farm": bool(item is not None and item.eject_profile_id is not None),
+                "targets": await farm_work_targets_printer(db, printer_id),
+                "raw_rpc": raw_rpc,
+            }
+
+        _c = await run_with_retry(_do_resolve, label="terminal correlation")
+        _verdict = _c["verdict"]
+        _resolved_item_id = _c["item_id"]
+        _resolved_is_dry_run = _c["is_dry_run"]
+        _resolved_first_article = _c["first_article"]
+        _resolved_is_farm = _c["is_farm"]
+        _farm_targets_printer = _c["targets"]
+        _global_require_plate_clear = True if _c["raw_rpc"] is None else _c["raw_rpc"].strip().lower() == "true"
+    except Exception as e:  # noqa: BLE001 — a correlation failure must not crash the callback
+        logger.warning("[CALLBACK] terminal correlation failed for printer %s: %s", printer_id, e)
+        ATTRIBUTED_VERDICTS = frozenset()  # type: ignore[assignment]
+        AUTO_CLEAR_VERDICTS = frozenset()  # type: ignore[assignment]
+
+    _attributed = _verdict in ATTRIBUTED_VERDICTS
+    _auto_clear_ok = _verdict in AUTO_CLEAR_VERDICTS
+
     # Farm no-deposit handling: a job that deposited NOTHING on the plate cannot
     # have fouled the bed and is not a print failure. Two cases — a dry-run eject
     # (deposits nothing by construction) and any print that reached terminal having
-    # produced zero layers AND zero progress (stopped in PREPARE/heating). Resolve
-    # the single finished queue item ONCE (still 'printing' here — the busy-guard
-    # guarantees exactly one; None for a non-queue print) to read its purpose flags,
-    # then classify via the shared predicate.
-    _finished_item = None
-    try:
-        from backend.app.models.print_queue import PrintQueueItem as _NoDepositQItem
-
-        async with async_session() as _nd_db:
-            _nd_result = await _nd_db.execute(
-                select(_NoDepositQItem)
-                .where(_NoDepositQItem.printer_id == printer_id)
-                .where(_NoDepositQItem.status == "printing")
-            )
-            _finished_item = _nd_result.scalars().first()
-    except Exception as e:  # noqa: BLE001 — a lookup failure must not crash the callback
-        logger.warning("[CALLBACK] no-deposit item lookup failed for printer %s: %s", printer_id, e)
-
+    # produced zero layers AND zero progress (stopped in PREPARE/heating).
     from backend.app.services.eject.monitor import deposited_nothing
 
     no_deposit = deposited_nothing(
-        is_dry_run=bool(_finished_item and _finished_item.is_dry_run),
+        is_dry_run=_resolved_is_dry_run,
         last_layer_num=data.get("last_layer_num"),
         last_progress=data.get("last_progress"),
     )
@@ -4047,19 +4195,22 @@ async def on_print_complete(printer_id: int, data: dict):
     # queue records "cancelled" (not "failed"), farm_policy.on_terminal no-ops, and
     # quarantine (keyed on "failed") excludes it. A first-article no-deposit stop
     # deliberately keeps "failed" so the run still retries its first article.
-    if no_deposit and not (_finished_item and _finished_item.first_article):
+    if no_deposit and not _resolved_first_article:
+        data = {**data, "status": "cancelled"}
+    elif _stop_source == "operator_screen" and not no_deposit and _raw_status in ("failed", "aborted"):
+        # A printer-screen stop that DID deposit a part (the no-deposit branch above
+        # handles the thermal-less case). Normalise to "cancelled" so it records a
+        # stop, not a failure, and farm_policy takes the no-retry / no-quarantine
+        # operator-stop path (Phase 3.1).
         data = {**data, "status": "cancelled"}
 
-    # Raise the plate-clear gate for queued dispatch (#961). Any terminal status
-    # may have left material on the bed: a user can cancel ten hours into a
-    # twelve-hour print, a printer can self-abort mid-job after a clog, and a
-    # touchscreen-stop reports `aborted` rather than `cancelled` because
-    # `_user_stopped_printers` is only populated when the user stops via the
-    # Bambuddy queue UI. Earlier code raised the flag only for completed/failed,
-    # which auto-dispatched the next queued print onto a fouled bed two seconds
-    # after a touchscreen-abort (#1171). Persisted to DB so the gate survives
-    # Auto Off power cycles and Bambuddy restarts.
+    # Raise the plate-clear gate for queued dispatch (#961). Any terminal status may
+    # have left material on the bed: a user can cancel ten hours into a print, a
+    # printer can self-abort after a clog, a touchscreen-stop reports `aborted`, and
+    # a foreign/local print can finish onto the bed. Persisted to DB so the gate
+    # survives Auto Off power cycles and Bambuddy restarts.
     _final_status = data.get("status", "completed")
+    _payload_subtask = data.get("subtask_id")
     if _final_status in ("completed", "failed", "aborted", "cancelled"):
         if no_deposit:
             # Nothing was deposited (dry-run eject, or stopped pre-first-layer) — the
@@ -4071,11 +4222,53 @@ async def on_print_complete(printer_id: int, data: dict):
                 _final_status,
                 data.get("last_layer_num"),
             )
+        elif _verdict == "foreign":
+            # A print Bambuddy did NOT dispatch left material on the plate. Raise the
+            # gate keyed to the foreign subtask, but do NOT arm auto-clear (there is
+            # no farm identity to cool-watch): start the escalation-only watch, alert
+            # the operator, and leave the farm queue untouched.
+            printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=_payload_subtask)
+            eject_cooldown_monitor.start_escalation_only_watch(printer_id)
+            logger.warning(
+                "[CALLBACK] printer %s: FOREIGN terminal (%s, subtask=%s) — gate raised, farm queue "
+                "untouched, auto-clear NOT armed",
+                printer_id,
+                _final_status,
+                _payload_subtask,
+            )
+
+            async def _foreign_notify():
+                try:
+                    async with async_session() as _fdb:
+                        from backend.app.models.printer import Printer as _FPrinter
+
+                        _pres = await _fdb.execute(select(_FPrinter.name).where(_FPrinter.id == printer_id))
+                        _pname = _pres.scalar_one_or_none() or f"Printer {printer_id}"
+                        _job = data.get("subtask_name") or data.get("filename") or "unknown job"
+                        await notification_service.on_foreign_job_detected(printer_id, _pname, _job, _fdb)
+                except Exception as _fe:  # noqa: BLE001
+                    logger.warning("[CALLBACK] foreign-job notification failed for printer %s: %s", printer_id, _fe)
+
+            spawn_background_task(_foreign_notify(), name=f"foreign-job-notify-{printer_id}")
+        elif _global_require_plate_clear or _resolved_is_farm or _farm_targets_printer:
+            # Raise the gate only when it should matter: the global toggle is on, the
+            # finished item is a farm/eject item, or farm work targets this printer.
+            # A pure-upstream toggle-off install is unaffected (no farm work → never
+            # raised). Arm the identity cooldown auto-clear ONLY for an id-/name-
+            # confirmed eject completion; fallback/none don't arm (queue_item_id=None).
+            printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=_payload_subtask)
+            eject_cooldown_monitor.on_terminal_status(
+                printer_id,
+                _final_status,
+                queue_item_id=_resolved_item_id if _auto_clear_ok else None,
+            )
         else:
-            printer_manager.set_awaiting_plate_clear(printer_id, True)
-            # Farm auto-eject: on a successful eject job, watch the bed cool below the
-            # profile threshold and auto-release this gate; failures leave it set.
-            eject_cooldown_monitor.on_terminal_status(printer_id, _final_status)
+            logger.info(
+                "[CALLBACK] printer %s: terminal (%s) with deposit but no farm involvement and "
+                "require_plate_clear off — not gating (upstream toggle-off behaviour)",
+                printer_id,
+                _final_status,
+            )
 
     # MQTT relay - publish print complete
     try:
@@ -4306,20 +4499,15 @@ async def on_print_complete(printer_id: int, data: dict):
 
         async def _update_queue_status(db):
             nonlocal queue_item_id, queue_status, queue_auto_off
-            result = await db.execute(
-                select(PrintQueueItem)
-                .where(PrintQueueItem.printer_id == printer_id)
-                .where(PrintQueueItem.status == "printing")
-            )
-            printing_items = list(result.scalars().all())
-            if len(printing_items) > 1:
-                logger.warning(
-                    "BUG: Multiple queue items in 'printing' status for printer %s: %s",
-                    printer_id,
-                    [(i.id, i.archive_id, i.library_file_id) for i in printing_items],
-                )
-            item = printing_items[0] if printing_items else None
-            if item:
+            # Terminal correlation (Phase 1): only touch the queue item the finish was
+            # positively attributed to (matched / matched_by_name / fallback). A
+            # foreign/none verdict updates NOTHING — a print Bambuddy did not dispatch
+            # never marks a farm unit done; that unit stays 'printing' and is re-
+            # dispatched once the plate is clear (or resolved by reconcile).
+            if not _attributed or _resolved_item_id is None:
+                return
+            item = await db.get(PrintQueueItem, _resolved_item_id)
+            if item is not None and item.status == "printing":
                 queue_status = data.get("status", "completed")
                 # MQTT sends "aborted" for cancelled prints; normalise to
                 # "cancelled" so it matches the queue schema Literal.
@@ -4327,6 +4515,12 @@ async def on_print_complete(printer_id: int, data: dict):
                     queue_status = "cancelled"
                 item.status = queue_status
                 item.completed_at = datetime.now(timezone.utc)
+                # Attribute an operator stop on the resolved unit (Phase 3.1) so the
+                # farm policy skips retry/quarantine for it. Only for a 'cancelled'
+                # verdict with a classified source — a reconcile-synthesised abort
+                # carries no echo/membership → stop_source stays NULL (unknown).
+                if queue_status == "cancelled" and _stop_source is not None:
+                    item.stop_source = _stop_source
                 if queue_status == "failed" and not item.error_message:
                     item.error_message = _format_hms_error_summary(data.get("hms_errors") or [])
 
@@ -4604,7 +4798,14 @@ async def on_print_complete(printer_id: int, data: dict):
                     try:
                         from backend.app.services.farm_policy import on_terminal as farm_on_terminal
 
-                        await farm_on_terminal(db, printer_id, queue_item_id, ps, archive_data=no_archive_data)
+                        await farm_on_terminal(
+                            db,
+                            printer_id,
+                            queue_item_id,
+                            ps,
+                            archive_data=no_archive_data,
+                            completed_subtask_id=data.get("subtask_id"),
+                        )
                     except Exception as farm_err:
                         logger.warning("[NOTIFY-BG] farm policy hook (no-archive) failed: %s", farm_err)
 
@@ -5132,7 +5333,14 @@ async def on_print_complete(printer_id: int, data: dict):
                 try:
                     from backend.app.services.farm_policy import on_terminal as farm_on_terminal
 
-                    await farm_on_terminal(db, printer_id, queue_item_id, print_status, archive_data=archive_data)
+                    await farm_on_terminal(
+                        db,
+                        printer_id,
+                        queue_item_id,
+                        print_status,
+                        archive_data=archive_data,
+                        completed_subtask_id=data.get("subtask_id"),
+                    )
                 except Exception as farm_err:
                     logger.warning("[NOTIFY-BG] farm policy hook failed: %s", farm_err)
 
@@ -6108,6 +6316,32 @@ async def lifespan(app: FastAPI):
     await printer_manager.load_awaiting_plate_clear_from_db()
     await printer_manager.load_quarantine_from_db()
 
+    # Plate-gate startup hygiene (Phase 1, P1-B): the plate gate now blocks dispatch
+    # unconditionally. If the global require_plate_clear toggle is OFF, a historic
+    # gate left on a NON-farm printer would strand it forever. Clear those stale
+    # gates once at startup; a printer that farm work targets keeps its gate (the
+    # cooldown re-arm below decides whether it may ever auto-clear).
+    try:
+        from backend.app.api.routes.settings import get_setting
+        from backend.app.models.printer import Printer as _HygPrinter
+        from backend.app.services.farm_correlation import farm_work_targets_printer
+
+        async with async_session() as _hyg_db:
+            _raw_rpc = await get_setting(_hyg_db, "require_plate_clear")
+            _toggle_on = True if _raw_rpc is None else _raw_rpc.strip().lower() == "true"
+            if not _toggle_on:
+                _gated = await _hyg_db.execute(select(_HygPrinter.id).where(_HygPrinter.awaiting_plate_clear.is_(True)))
+                for (_pid,) in _gated.all():
+                    if not await farm_work_targets_printer(_hyg_db, _pid):
+                        printer_manager.set_awaiting_plate_clear(_pid, False)
+                        logging.getLogger(__name__).info(
+                            "Startup hygiene: cleared stale plate gate on non-farm printer %d "
+                            "(require_plate_clear off, no farm work targets it)",
+                            _pid,
+                        )
+    except Exception as _he:  # noqa: BLE001 — hygiene must never block startup
+        logging.getLogger(__name__).warning("Plate-gate startup hygiene failed: %s", _he)
+
     # Farm auto-eject: re-arm cooldown watches lost to the restart (a gate left
     # set by a successful eject job would otherwise stall the queue forever).
     await eject_cooldown_monitor.rearm_on_startup()
@@ -6827,6 +7061,7 @@ app.include_router(maintenance.router, prefix=app_settings.api_prefix)
 app.include_router(camera.router, prefix=app_settings.api_prefix)
 app.include_router(external_links.router, prefix=app_settings.api_prefix)
 app.include_router(eject_profiles.router, prefix=app_settings.api_prefix)
+app.include_router(model_geometry.router, prefix=app_settings.api_prefix)
 app.include_router(skus.router, prefix=app_settings.api_prefix)
 app.include_router(production_runs.router, prefix=app_settings.api_prefix)
 app.include_router(projects.router, prefix=app_settings.api_prefix)

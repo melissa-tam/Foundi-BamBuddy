@@ -18,10 +18,10 @@ from sqlalchemy import select
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.services.eject.generator import (
-    PRINTER_BED_DIMS,
     EjectGenerationError,
     generate_eject_gcode,
 )
+from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.utils.threemf_tools import read_plate_gcode_header, repack_3mf_with_gcode
 
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
     from backend.app.models.print_queue import PrintQueueItem
     from backend.app.models.printer import Printer
+    from backend.app.services.eject.geometry import ModelGeometry
 
 
 def _parse_max_z_height(source_path: Path, plate_id: int) -> float | None:
@@ -87,9 +88,15 @@ async def build_eject_snippet(
     if profile is None:
         return None, f"Eject profile {item.eject_profile_id} not found"
 
-    model = printer.model or ""
-    if model not in PRINTER_BED_DIMS:
-        return None, f"No eject bed geometry for printer model {model!r}"
+    # Resolve the target model's bed/envelope from the registry — fail-closed on a
+    # model with no geometry row OR a row not yet hardware-validated (production
+    # dispatch requires validation; the reason distinguishes the two causes). This
+    # is the canonical-match replacement for the old raw ``model in PRINTER_BED_DIMS``
+    # membership test, so ``O1S`` and ``H2S`` no longer diverge.
+    try:
+        geometry = await get_geometry_required(db, printer.model, require_validated=True)
+    except GeometryUnavailable as exc:
+        return None, exc.reason
 
     plate_id = item.plate_id or 1
     max_z = _parse_max_z_height(Path(source_path), plate_id)
@@ -102,11 +109,11 @@ async def build_eject_snippet(
     cooldown_override = await resolve_cooldown_override(db, item.batch_id)
 
     try:
-        gcode = generate_eject_gcode(profile, max_z, model, cooldown_temp_c=cooldown_override)
+        gcode = generate_eject_gcode(profile, max_z, geometry, cooldown_temp_c=cooldown_override)
     except EjectGenerationError as exc:
         return None, f"Eject generation refused: {exc}"
 
-    validation = validate_eject_gcode(gcode, profile, max_z, model, cooldown_temp_c=cooldown_override)
+    validation = validate_eject_gcode(gcode, profile, max_z, geometry, cooldown_temp_c=cooldown_override)
     if not validation.ok:
         return None, "Eject validation failed: " + "; ".join(validation.errors)
 
@@ -117,7 +124,7 @@ def build_part_present_eject_file(
     source_path: Path,
     plate_id: int,
     profile: EjectProfile,
-    printer_model: str,
+    geometry: ModelGeometry,
     cooldown_temp_c: float | None = None,
 ) -> Path:
     """Build a standalone PART-PRESENT eject-only ``.gcode.3mf`` for ``plate_id``.
@@ -140,11 +147,9 @@ def build_part_present_eject_file(
     max_z = _parse_max_z_height(Path(source_path), plate_id)
     if max_z is None:
         raise EjectGenerationError("Could not parse max_z_height from the 3MF gcode header")
-    if printer_model not in PRINTER_BED_DIMS:
-        raise EjectGenerationError(f"No eject bed geometry for printer model {printer_model!r}")
 
-    block = generate_eject_gcode(profile, max_z, printer_model, cooldown_temp_c=cooldown_temp_c)
-    validation = validate_eject_gcode(block, profile, max_z, printer_model, cooldown_temp_c=cooldown_temp_c)
+    block = generate_eject_gcode(profile, max_z, geometry, cooldown_temp_c=cooldown_temp_c)
+    validation = validate_eject_gcode(block, profile, max_z, geometry, cooldown_temp_c=cooldown_temp_c)
     if not validation.ok:
         raise EjectGenerationError("Part-present eject validation failed: " + "; ".join(validation.errors))
 

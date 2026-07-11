@@ -91,6 +91,7 @@ import { useNavigate } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
 import { formatDateOnly, formatETA, formatDuration, parseUTCDate } from '../utils/date';
 import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult } from '../api/client';
+import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
@@ -118,6 +119,7 @@ import { PrintModal } from '../components/PrintModal';
 import { PrinterInfoModal } from '../components/PrinterInfoModal';
 import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, isBambuLabSpool } from '../utils/amsHelpers';
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
+import { deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
 import { Collapsible } from '../components/Collapsible';
 import { ConnectionDiagnosticModal, DiagnosticChecklist } from '../components/ConnectionDiagnostic';
@@ -1474,6 +1476,30 @@ const MODELS_WITH_CHAMBER_FAN: ReadonlySet<string> = new Set([
   'H2S',
 ]);
 
+/**
+ * Registry-driven eject-qualification hint (farm eject, Phase 2), rendered
+ * under the printer model dropdowns. A model whose geometry row is missing or
+ * not hardware-validated cannot run production auto-eject — the hint tells the
+ * operator up front instead of surprising them at dispatch time. Renders
+ * nothing while the registry is unavailable or the model is qualified.
+ */
+function EjectQualifiedHint({ model }: { model: string | null | undefined }) {
+  const { t } = useTranslation();
+  const { data: geoData } = useQuery({
+    queryKey: ['model-geometries'],
+    queryFn: api.getModelGeometries,
+    staleTime: 60_000,
+  });
+  if (!model || !geoData) return null;
+  const geometry = findGeometry(geoData.geometries, model);
+  if (geometry?.validated) return null;
+  return (
+    <p role="note" className="text-xs text-yellow-300 mt-1">
+      {t('printers.ejectNotQualified')}
+    </p>
+  );
+}
+
 // Map SSDP model codes to display names
 function mapModelCode(ssdpModel: string | null): string {
   if (!ssdpModel) return '';
@@ -2124,7 +2150,11 @@ function PrinterCard({
   });
   const lastPrint = lastPrints?.[0];
   const isPrintingOrPaused = status?.state === 'RUNNING' || status?.state === 'PAUSE';
-  const needsPlateClear = requirePlateClear && status?.awaiting_plate_clear === true;
+  // Phase 1 (P1-B): the plate gate now blocks dispatch unconditionally, so the
+  // clear-plate affordance must appear whenever the gate is raised — not only when
+  // the global require_plate_clear convenience toggle is on. A raised gate always
+  // means dispatch is held pending a manual clear.
+  const needsPlateClear = status?.awaiting_plate_clear === true;
   const showClearPlateButton = status?.connected && needsPlateClear && !isPrintingOrPaused;
   const activePrintName = status?.current_print && isPrintingOrPaused
     ? formatPrintName(status.subtask_name || status.current_print || null, status.gcode_file, t, activePlateLabel)
@@ -2138,7 +2168,11 @@ function PrinterCard({
     }
   }, [activePrintName, needsPlateClear, status?.cover_url]);
   const plateStatus = (() => {
-    if (!requirePlateClear || !status?.connected) return null;
+    if (!status?.connected) return null;
+    // A raised gate always surfaces its "not cleared" state (it blocks dispatch
+    // regardless of the toggle); the informational In-Use / Cleared pills stay
+    // gated on the toggle so pure-upstream cards aren't cluttered.
+    if (!requirePlateClear && !status.awaiting_plate_clear) return null;
     if (isPrintingOrPaused) {
       return {
         label: t('printers.plateStatus.inUse'),
@@ -2146,6 +2180,28 @@ function PrinterCard({
       };
     }
     if (status.awaiting_plate_clear) {
+      // Cooldown/eject phase (Phase 4.3c): while the farm's cooldown watch is
+      // armed the hold is EXPECTED — show the target vs live bed temperature
+      // instead of the alarming "not cleared" copy. The sweep runs inside the
+      // print file, so it's folded into this phase rather than shown apart.
+      const phase = deriveFarmPhase({
+        state: status.state,
+        awaiting_plate_clear: status.awaiting_plate_clear,
+        eject_watch: status.eject_watch,
+        bed: status.temperatures?.bed,
+      });
+      if (phase?.kind === 'cooling') {
+        return {
+          label:
+            phase.bed != null
+              ? t('printers.phase.cooling', {
+                  threshold: Math.round(phase.threshold),
+                  bed: Math.round(phase.bed),
+                })
+              : t('printers.phase.coolingNoBed', { threshold: Math.round(phase.threshold) }),
+          className: 'bg-blue-500/20 text-blue-400',
+        };
+      }
       return {
         label: t('printers.plateStatus.notCleared'),
         className: 'bg-yellow-500/20 text-yellow-400',
@@ -3011,7 +3067,7 @@ function PrinterCard({
         variant="secondary"
         size="sm"
         onClick={() => setShowMenu(!showMenu)}
-        title={t('common.more', 'More')}
+        title={t('common.moreActions', 'More')}
         className={footerIconButtonClass}
       >
         <MoreVertical className="w-4 h-4" />
@@ -3206,18 +3262,66 @@ function PrinterCard({
                   </p>
                 ) : null}
               </div>
+            </div>
+            {/* Phase 4.3h: Recover & resume is the primary path (lifts the
+                quarantine AND resumes the paused run); Mark plate cleared is
+                the narrower secondary — it only releases the plate gate. */}
+            <div className="mt-2 flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={(e) => { e.stopPropagation(); setShowRecoverConfirm(true); }}
                 disabled={!hasPermission('printers:recover') || recoverMutation.isPending}
                 title={!hasPermission('printers:recover') ? t('printers.permission.noControl') : t('printers.quarantine.recover')}
-                className="flex-shrink-0 inline-flex items-center gap-1 rounded-md border border-red-400/40 bg-red-500/20 px-2 py-1 text-xs font-medium text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
+                className="inline-flex items-center gap-1 rounded-md border border-red-400/40 bg-red-500/20 px-2 py-1 text-xs font-medium text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
               >
                 {recoverMutation.isPending ? (
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
                 ) : null}
                 {t('printers.quarantine.recover')}
               </button>
+              {needsPlateClear && (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); clearPlateMutation.mutate(); }}
+                  disabled={!hasPermission('printers:clear_plate') || clearPlateMutation.isPending}
+                  title={!hasPermission('printers:clear_plate') ? t('printers.permission.noControl') : t('printers.quarantine.markPlateCleared')}
+                  className="inline-flex items-center gap-1 rounded-md border border-bambu-dark-tertiary bg-bambu-dark px-2 py-1 text-xs font-medium text-bambu-gray hover:text-white hover:bg-bambu-dark-tertiary transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
+                >
+                  {clearPlateMutation.isPending ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : null}
+                  {t('printers.quarantine.markPlateCleared')}
+                </button>
+              )}
+            </div>
+            <p className="mt-1.5 text-[11px] leading-snug text-red-200/70">
+              {t('printers.quarantine.actionsHelp')}
+            </p>
+          </div>
+        )}
+        {/* Model-mismatch banner (farm device reconciliation, Phase 2) — the
+            device self-reported a different model than the one declared here;
+            the scheduler blocks dispatch until the declaration is corrected
+            (edit the printer's model). */}
+        {status?.model_mismatch && (
+          <div className="mb-3 rounded-lg border border-yellow-500/40 bg-yellow-500/10 p-2.5">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5 text-yellow-400" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex items-center rounded-full bg-yellow-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-yellow-300">
+                    {t('printers.modelMismatch.badge')}
+                  </span>
+                </div>
+                {status.model_mismatch_reason ? (
+                  <p className="mt-1 text-xs text-yellow-200/90" title={status.model_mismatch_reason}>
+                    {status.model_mismatch_reason}
+                  </p>
+                ) : null}
+                <p className="mt-1 text-xs text-yellow-200/90">
+                  {t('printers.modelMismatch.blocked')}
+                </p>
+              </div>
             </div>
           </div>
         )}
@@ -6150,11 +6254,17 @@ function PrinterCard({
         />
       )}
 
-      {/* Stop Print Confirmation */}
+      {/* Stop Print Confirmation. Farm-aware copy (Phase 4.3g / deferred 3.1):
+          when the printing item belongs to a production run, spell out the
+          operator-stop consequence — no auto-retry, run holds this printer. */}
       {showStopConfirm && (
         <ConfirmModal
           title={t('printers.confirm.stopTitle')}
-          message={t('printers.confirm.stopMessage', { name: printer.name })}
+          message={
+            printingQueueItems?.[0]?.production_run_id != null
+              ? `${t('printers.confirm.stopMessage', { name: printer.name })}\n\n${t('queue.farm.stopConsequence')}`
+              : t('printers.confirm.stopMessage', { name: printer.name })
+          }
           confirmText={t('printers.confirm.stopButton')}
           variant="danger"
           onConfirm={() => {
@@ -6971,6 +7081,7 @@ export function AddPrinterModal({
                   <option value="X2D">X2D</option>
                 </optgroup>
               </select>
+              <EjectQualifiedHint model={form.model} />
             </div>
             <div>
               <label className="block text-sm text-bambu-gray mb-1">{t('printers.modal.locationGroup')}</label>
@@ -7502,6 +7613,7 @@ function EditPrinterModal({
                   <option value="X2D">X2D</option>
                 </optgroup>
               </select>
+              <EjectQualifiedHint model={form.model} />
             </div>
             <div>
               <label className="block text-sm text-bambu-gray mb-1">Location / Group</label>

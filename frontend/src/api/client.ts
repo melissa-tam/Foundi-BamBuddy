@@ -9,6 +9,11 @@ import type {
   EjectProfileDryRunDispatchResponse,
 } from '../types/ejectProfiles';
 import type {
+  ModelGeometry,
+  ModelGeometryList,
+  ModelGeometryUpdate,
+} from '../types/modelGeometries';
+import type {
   Sku,
   SkuCreate,
   SkuUpdate,
@@ -551,6 +556,19 @@ export interface PrinterStatus {
   // Queue: printer is awaiting user ack that the build plate was cleared after a
   // finished/failed print. Persisted across restarts (#961).
   awaiting_plate_clear: boolean;
+  // Farm failure policy (Phase 3): quarantined printers are excluded from all
+  // dispatch until an operator clears them.
+  quarantined?: boolean;
+  quarantine_reason?: string | null;
+  // Farm device reconciliation (Phase 2): the device's self-reported model
+  // differs from the declared Printer.model — the scheduler blocks dispatch to
+  // this printer until the declaration is corrected. Absent report = no mismatch.
+  model_mismatch?: boolean;
+  model_mismatch_reason?: string | null;
+  // Cooldown/eject phase (Phase 4.3c): the in-flight eject cooldown watch's
+  // release threshold. Present while the farm waits for the bed to cool before
+  // auto-clearing the plate gate; null/absent otherwise.
+  eject_watch?: { threshold_c: number } | null;
   // AMS drying support
   supports_drying: boolean;
   // Active chamber heater (responds to M141). True only for H2C/H2D/H2DPro/H2S/X2D.
@@ -1239,6 +1257,14 @@ export interface AppSettings {
   // retry / quarantine policy fields.
   farm_retry_max_per_unit: number;
   farm_escalate_consecutive_failures: number;
+  // Ambient-trap guard (Phase 2): warn in the eject-profile form when a
+  // cooldown threshold sits below this floor (a threshold at/below shop
+  // ambient can never be reached, stalling the eject wait forever).
+  farm_cooldown_warn_floor_c: number;
+  // Offline-stall watch (Phase 3.2): flag a farm unit still 'printing' whose
+  // printer has been offline at least this many minutes (never terminates it —
+  // the reconcile resolves the true outcome on reconnect).
+  farm_offline_stall_minutes: number;
   // Shortest job first scheduling
   queue_shortest_first: boolean;
   // User-configurable presets for the printer-card popovers (JSON arrays of 3 ints).
@@ -1999,6 +2025,9 @@ export interface PrintQueueItem {
   // Batch grouping
   batch_id?: number | null;
   batch_name?: string | null;
+  // Farm run identity (Phase 4.3g): set (= batch_id) when the item's batch is a
+  // production run. Drives the "Run" badge/link and farm-aware confirms.
+  production_run_id?: number | null;
   // Shortest-job-first scheduling
   been_jumped?: boolean;
   // Auto-print G-code injection
@@ -4852,6 +4881,14 @@ export const api = {
     window.URL.revokeObjectURL(url);
   },
 
+  // Printer model-geometry registry (farm eject, Phase 2)
+  getModelGeometries: () => request<ModelGeometryList>('/model-geometry'),
+  updateModelGeometry: (modelKey: string, data: ModelGeometryUpdate) =>
+    request<ModelGeometry>(`/model-geometry/${encodeURIComponent(modelKey)}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+
   // SKU catalog (farm production, Phase 2)
   getSkus: () => request<Sku[]>('/skus'),
   getSku: (id: number) => request<Sku>(`/skus/${id}`),
@@ -4950,6 +4987,16 @@ export const api = {
    * restores skipped items whose error_message matches the gate string
    * back to pending. Returns counts so the UI can render a precise toast.
    */
+  /**
+   * Re-check system-staged (low-spool) queue items against live spool state and
+   * release the ones whose deficit has cleared (Phase 4.2). Optionally scoped to
+   * one printer. Returns the released count for the toast.
+   */
+  releaseStagedQueueItems: (printerId?: number) => {
+    const qs = printerId ? `?printer_id=${printerId}` : '';
+    return request<{ released: number }>(`/queue/release-staged${qs}`, { method: 'POST' });
+  },
+
   resumeQueueAfterFailure: (printerId: number) =>
     request<{ acknowledged: number; restored: number }>(
       `/queue/printer/${printerId}/resume`,

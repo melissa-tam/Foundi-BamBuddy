@@ -11,6 +11,7 @@ import { ProfilesPage } from './pages/ProfilesPage';
 import { EjectProfilesPage } from './pages/EjectProfilesPage';
 import { SkusPage } from './pages/SkusPage';
 import { ProductionRunsPage } from './pages/ProductionRunsPage';
+import { ProductionRunDetailPage } from './pages/ProductionRunDetailPage';
 import { MaintenancePage } from './pages/MaintenancePage';
 import { ProjectsPage } from './pages/ProjectsPage';
 import { ProjectDetailPage } from './pages/ProjectDetailPage';
@@ -205,6 +206,7 @@ function App() {
                   <Route path="eject-profiles" element={<PermissionRoute permission="eject_profiles:read"><EjectProfilesPage /></PermissionRoute>} />
                   <Route path="skus" element={<PermissionRoute permission="skus:read"><SkusPage /></PermissionRoute>} />
                   <Route path="production-runs" element={<PermissionRoute permission="production_runs:read"><ProductionRunsPage /></PermissionRoute>} />
+                  <Route path="production-runs/:id" element={<PermissionRoute permission="production_runs:read"><ProductionRunDetailPage /></PermissionRoute>} />
                   <Route path="maintenance" element={<MaintenancePage />} />
                   <Route path="projects" element={<ProjectsPage />} />
                   <Route path="projects/:id" element={<ProjectDetailPage />} />

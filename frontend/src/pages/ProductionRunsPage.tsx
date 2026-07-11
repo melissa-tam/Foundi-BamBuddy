@@ -11,6 +11,7 @@
  * label-linked (WCAG AA) and keyboard operable.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -31,14 +32,16 @@ import { api } from '../api/client';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
+import {
+  BlockedPrintersChip,
+  PauseReasonChip,
+  RunStagedBanner,
+  RunStatusBadge,
+} from '../components/RunBadges';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { formatDuration } from '../utils/date';
-import type {
-  ProductionRun,
-  ProductionRunCreate,
-  ProductionRunStatus,
-} from '../types/productionRuns';
+import type { ProductionRun, ProductionRunCreate } from '../types/productionRuns';
 
 /** Model value used by the "any printer of this model" strategy. */
 const ANY_MODEL = 'H2S';
@@ -63,28 +66,6 @@ function clampInt(raw: string, min: number, max: number, fallback: number): numb
 const inputClass =
   'w-full px-3 py-2 bg-bambu-dark rounded-md text-white border border-bambu-dark-tertiary ' +
   'focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors';
-
-// ---------------------------------------------------------------------------
-// Status badge
-// ---------------------------------------------------------------------------
-
-const STATUS_STYLES: Record<ProductionRunStatus, string> = {
-  active: 'bg-bambu-green/15 text-bambu-green border-bambu-green/30',
-  paused: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30',
-  completed: 'bg-blue-500/15 text-blue-300 border-blue-500/30',
-  cancelled: 'bg-red-500/15 text-red-300 border-red-500/30',
-};
-
-function StatusBadge({ status }: { status: ProductionRunStatus }) {
-  const { t } = useTranslation();
-  return (
-    <span
-      className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border ${STATUS_STYLES[status]}`}
-    >
-      {t(`productionRuns.status.${status}`)}
-    </span>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Start-run dialog
@@ -177,6 +158,11 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
   }, [runnableSkus]);
 
   const selectedFile = useMemo(() => skuFiles.find((f) => f.id === fileId) ?? null, [skuFiles, fileId]);
+  // The eject profile the cooldown override would supersede (Phase 4.3i).
+  const selectedEjectProfile = useMemo(
+    () => (ejectProfiles ?? []).find((p) => p.id === ejectProfileId) ?? null,
+    [ejectProfiles, ejectProfileId],
+  );
 
   // When the SKU changes, reset the dependent file + eject-profile defaults.
   const onSkuChange = (nextId: number | null) => {
@@ -468,7 +454,17 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
                   value={cooldownOverride}
                   onChange={(e) => setCooldownOverride(e.target.value)}
                   className={inputClass}
+                  aria-describedby={selectedEjectProfile ? 'run-cooldown-default' : undefined}
                 />
+                {/* Phase 4.3i: show what an override would replace, from the
+                    already-fetched profiles list. */}
+                {selectedEjectProfile && (
+                  <p id="run-cooldown-default" className="text-xs text-bambu-gray mt-1">
+                    {t('productionRuns.fields.cooldownProfileDefault', {
+                      value: selectedEjectProfile.cooldown_temp_c,
+                    })}
+                  </p>
+                )}
               </div>
             </div>
 
@@ -888,8 +884,21 @@ function RunCard({
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <h3 className="text-base font-semibold text-white truncate">{run.name}</h3>
-              <StatusBadge status={run.status} />
+              {/* Title links to the per-unit detail page (Phase 4.1); the card
+                  itself stays a plain container so the action buttons keep
+                  their own click targets. */}
+              <h3 className="text-base font-semibold truncate">
+                <Link
+                  to={`/production-runs/${run.id}`}
+                  className="text-white hover:text-bambu-green transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green/60 rounded"
+                  title={t('productionRuns.viewDetails')}
+                >
+                  {run.name}
+                </Link>
+              </h3>
+              <RunStatusBadge status={run.status} />
+              <PauseReasonChip run={run} />
+              <BlockedPrintersChip run={run} />
             </div>
             <p className="text-sm text-bambu-gray mt-0.5">
               {run.sku_code}
@@ -1005,6 +1014,9 @@ function RunCard({
             </p>
           </div>
         </div>
+
+        {/* Staged units (low-spool / other holds, Phase 4.1) */}
+        <RunStagedBanner run={run} />
 
         {/* First-article approval gate (Phase 3) */}
         <FirstArticleBanner run={run} />

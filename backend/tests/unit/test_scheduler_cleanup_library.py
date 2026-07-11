@@ -191,6 +191,25 @@ async def test_cleanup_unlinks_library_file_and_removes_db_row(queue_factory):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_stamps_dispatch_subtask_id(queue_factory):
+    """Phase 1 (P1-A): a successful dispatch stamps the item's dispatch_subtask_id
+    from the client's last_dispatch_subtask_id, in the same session, so a terminal
+    status can later be correlated back to this exact unit."""
+    ctx = await queue_factory(cleanup=False)
+
+    fake_client = SimpleNamespace(last_dispatch_subtask_id="STAMP-1")
+    with patch(
+        "backend.app.services.print_scheduler.printer_manager.get_client",
+        MagicMock(return_value=fake_client),
+    ):
+        await _dispatch_library_item(ctx)
+
+    item, _library_file, _archive = await _queue_snapshot(ctx)
+    assert item.status == "printing"
+    assert item.dispatch_subtask_id == "STAMP-1"
+
+
+@pytest.mark.asyncio
 async def test_external_library_file_skips_cleanup(queue_factory):
     ctx = await queue_factory(cleanup=True, is_external=True)
 

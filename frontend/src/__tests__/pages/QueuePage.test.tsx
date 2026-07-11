@@ -535,3 +535,143 @@ describe('QueuePage', () => {
     });
   });
 });
+
+
+describe('QueuePage farm surfaces (Phase 4)', () => {
+  const farmPending = {
+    ...mockQueueItems[0],
+    id: 10,
+    status: 'pending',
+    batch_id: 7,
+    batch_name: 'SKU007 run',
+    production_run_id: 7,
+    archive_name: 'Farm Unit',
+  };
+  const farmPrinting = {
+    ...mockQueueItems[1],
+    id: 11,
+    status: 'printing',
+    batch_id: 7,
+    batch_name: 'SKU007 run',
+    production_run_id: 7,
+    archive_name: 'Farm Active',
+  };
+
+  beforeEach(() => {
+    vi.mocked(localStorage.getItem).mockImplementation((key: string) => {
+      if (key === 'queue.historyCollapsed') return 'false';
+      if (key === 'queue.viewMode') return 'list';
+      // Batch groups default collapsed; expand run 7's group so its child
+      // rows (and their Run badges) are visible to the queries below.
+      if (key === 'queue.batchCollapsed') return '{"7": false}';
+      return null;
+    });
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json([])),
+    );
+  });
+
+  it('shows the resume-after-failure banner on the machine code, not the English text', async () => {
+    server.use(
+      http.get('/api/v1/queue/', () =>
+        HttpResponse.json([
+          {
+            ...mockQueueItems[0],
+            id: 20,
+            status: 'skipped',
+            waiting_reason: 'previous_print_failed',
+            error_message: 'Texte localisé quelconque',
+            printer_name: 'Test Printer',
+          },
+        ]),
+      ),
+    );
+
+    render(<QueuePage />);
+
+    expect(
+      await screen.findByText(/blocked by a previous-print failure/i),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /resume after failure/i })).toBeInTheDocument();
+  });
+
+  it('does NOT show the banner for a skipped item without the machine code', async () => {
+    server.use(
+      http.get('/api/v1/queue/', () =>
+        HttpResponse.json([
+          {
+            ...mockQueueItems[0],
+            id: 21,
+            status: 'skipped',
+            waiting_reason: null,
+            error_message: 'Previous print failed or was aborted',
+          },
+        ]),
+      ),
+    );
+
+    render(<QueuePage />);
+
+    await screen.findByText('Print Queue');
+    expect(screen.queryByText(/blocked by a previous-print failure/i)).not.toBeInTheDocument();
+  });
+
+  it('renders a Run badge linking to the run detail on farm rows', async () => {
+    server.use(http.get('/api/v1/queue/', () => HttpResponse.json([farmPending])));
+
+    render(<QueuePage />);
+
+    const badge = await screen.findByRole('link', { name: /run/i });
+    expect(badge).toHaveAttribute('href', '/production-runs/7');
+  });
+
+  it('uses farm-aware copy in the stop confirm for run-managed prints', async () => {
+    server.use(http.get('/api/v1/queue/', () => HttpResponse.json([farmPrinting])));
+
+    render(<QueuePage />);
+
+    await screen.findByText('Farm Active');
+    await userEvent.click(screen.getByTitle('Stop Print'));
+
+    expect(await screen.findByText(/counts as an operator stop/i)).toBeInTheDocument();
+    expect(screen.getByText(/no auto-retry/i)).toBeInTheDocument();
+  });
+
+  it('keeps the plain stop confirm for non-farm prints', async () => {
+    server.use(http.get('/api/v1/queue/', () => HttpResponse.json([mockQueueItems[1]])));
+
+    render(<QueuePage />);
+
+    await screen.findByText('Active Print');
+    await userEvent.click(screen.getByTitle('Stop Print'));
+
+    await screen.findByText(/are you sure you want to stop/i);
+    expect(screen.queryByText(/counts as an operator stop/i)).not.toBeInTheDocument();
+  });
+
+  it('groups low-spool staged rows under a banner and releases via re-check', async () => {
+    let releaseCalled = false;
+    server.use(
+      http.get('/api/v1/queue/', () =>
+        HttpResponse.json([
+          { ...farmPending, manual_start: true, filament_short: true },
+        ]),
+      ),
+      http.post('/api/v1/queue/release-staged', () => {
+        releaseCalled = true;
+        return HttpResponse.json({ released: 1 });
+      }),
+    );
+
+    render(<QueuePage />);
+
+    expect(
+      await screen.findByText(/low filament — swap the spool, then press re-check/i),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: /re-check and release/i }));
+
+    await waitFor(() => expect(releaseCalled).toBe(true));
+    expect(await screen.findByText(/released 1 staged item/i)).toBeInTheDocument();
+  });
+});

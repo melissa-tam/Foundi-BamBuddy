@@ -201,6 +201,21 @@ _HMS_USER_ACTION_CODES: frozenset[str] = frozenset(
     }
 )
 
+# H2-series NATIVE pre-print vision checks (single origin for the main.py capture
+# hook, the failure-reason attribution, and the tests). Unlike the cancel echoes
+# above these are ACTIONABLE faults — the printer PAUSEs the job and waits for the
+# operator to clear the bed and Resume — so they stay in ``state.hms_errors``
+# (they drive the printer card's fault badge). The farm layer only needs to detect
+# their ARRIVAL to raise a plate-clear gate; it does NOT filter them.
+#   0300_8017 — foreign objects detected on the heatbed
+#   0300_8006 — build-plate marker check
+_HMS_PLATE_OCCUPANCY_CODES: frozenset[str] = frozenset(
+    {
+        "0300_8017",
+        "0300_8006",
+    }
+)
+
 
 @dataclass
 class KProfile:
@@ -370,6 +385,19 @@ class PrinterState:
     # which uses the old protocol path; field not yet found). Consumers must treat
     # None as "no opinion" — preserving today's behaviour, NOT as "disabled".
     ams_filament_backup: bool | None = None
+    # Monotonic timestamp of the last observed operator-cancel echo (HMS
+    # 0300_400C / 0500_400E) for the current print. Set when the cancel echo is
+    # seen and reset on a new print. Distinguishes an operator screen-stop from a
+    # genuine print failure so the farm policy skips retry/quarantine for it.
+    # Recorded here in Phase 1; the classify/attribution logic consumes it in
+    # Phase 3.
+    user_cancel_seen_at: float | None = None
+    # Device-reported printer model (Phase 2): first non-empty of the device dict's
+    # dev_model_name / dev_product_name / project_name, when the firmware reports
+    # one. None on firmwares that emit none (the live H2S, fw 01.01.02.00, reports
+    # NONE of them) — absent report ⇒ never a model mismatch ⇒ zero behaviour
+    # change. Reconciled against the registered Printer.model on the connected edge.
+    reported_model: str | None = None
 
 
 # Stage name mapping from BambuStudio DeviceManager.cpp
@@ -2302,19 +2330,33 @@ class BambuMQTTClient:
             # diagnosing. INFO level so it shows up without debug logging. Falls
             # back to dumping device.keys() if none of the known fields are present
             # (so a future Bambu rename like `model_name` is still observable).
+            # Store the device-reported model (Phase 2, device-vs-declared
+            # reconciliation): first non-empty of the known id fields. The live
+            # H2S (fw 01.01.02.00) reports NONE of these, so reported_model stays
+            # None there — future firmwares / the H2C may populate one, at which
+            # point the connected-edge check compares it to the registered model.
+            for _mk in ("dev_model_name", "dev_product_name", "project_name"):
+                _mv = device.get(_mk)
+                if _mv:
+                    self.state.reported_model = str(_mv)
+                    break
             if not getattr(self, "_device_id_logged", False):
                 id_fields = {
                     k: device.get(k)
                     for k in ("dev_model_name", "dev_product_name", "dev_id", "project_name")
                     if k in device
                 }
+                # Also surface device.type and device.nozzle VALUES — an H2C-ladder
+                # discovery aid for the tool-changer nozzle shape (not stored yet).
+                _probe = {"type": device.get("type"), "nozzle": device.get("nozzle")}
                 if id_fields:
-                    logger.info("[%s] Device identification: %s", self.serial_number, id_fields)
+                    logger.info("[%s] Device identification: %s; probe=%s", self.serial_number, id_fields, _probe)
                 else:
                     logger.info(
-                        "[%s] Device identification: no known id fields; device.keys=%s",
+                        "[%s] Device identification: no known id fields; device.keys=%s; probe=%s",
                         self.serial_number,
                         sorted(device.keys()),
+                        _probe,
                     )
                 self._device_id_logged = True
             if "extruder" in device and "state" in device["extruder"]:
@@ -2746,6 +2788,10 @@ class BambuMQTTClient:
                         # already suppresses 0500_400E for the same reason.
                         short_code = f"{(attr >> 16) & 0xFFFF:04X}_{code & 0xFFFF:04X}"
                         if short_code in _HMS_USER_ACTION_CODES:
+                            # Record the operator-cancel observation (Phase 3.1) so the
+                            # farm policy can distinguish a screen-stop from a genuine
+                            # failure — while STILL keeping the echo out of hms_errors.
+                            self.state.user_cancel_seen_at = time.time()
                             continue
                         # Catalog has both 8-char keys (base class) and 16-char keys
                         # (specific variants). The full 16-char identifier preserves
@@ -2799,7 +2845,10 @@ class BambuMQTTClient:
                     # carries the same cancel echoes (e.g. 0500_400E) and they must
                     # not surface as faults on the printer card.
                     if short_code in _HMS_USER_ACTION_CODES:
-                        pass  # cancel echo — silently drop
+                        # Cancel echo — keep it out of hms_errors, but record the
+                        # operator-cancel observation (Phase 3.1) so the farm policy
+                        # can tell a screen-stop from a genuine failure.
+                        self.state.user_cancel_seen_at = time.time()
                     else:
                         # Only add if not already in HMS errors (avoid duplicates)
                         existing_short_codes = set()
@@ -3221,6 +3270,10 @@ class BambuMQTTClient:
             # Reset last valid progress/layer for usage tracking
             self._last_valid_progress = 0.0
             self._last_valid_layer_num = 0
+            # A new print starts fresh: any operator-cancel echo belonged to the
+            # PREVIOUS print (Phase 3.1). Clear so it can't leak into this print's
+            # completion classification.
+            self.state.user_cancel_seen_at = None
             # Clear and seed tray change log for mid-print usage splitting
             self.state.tray_change_log.clear()
             tn = self.state.tray_now
@@ -3245,6 +3298,10 @@ class BambuMQTTClient:
                 {
                     "filename": current_file,
                     "subtask_name": self.state.subtask_name,
+                    # Printer-echoed submission id (matches last_dispatch_subtask_id
+                    # when Bambuddy dispatched the job). Lets the terminal-status
+                    # correlation bind this print to its queue item (Phase 1).
+                    "subtask_id": self.state.subtask_id,
                     "remaining_time": self.state.remaining_time * 60
                     if self.state.remaining_time > 0
                     else None,  # Convert minutes to seconds
@@ -3366,6 +3423,10 @@ class BambuMQTTClient:
                     "status": status,
                     "filename": self._previous_gcode_file or current_file,
                     "subtask_name": self.state.subtask_name,
+                    # Printer-echoed submission id — the terminal-status correlation
+                    # matches it against the queue item's dispatch_subtask_id to bind
+                    # this finish to the exact unit that produced it (Phase 1).
+                    "subtask_id": self.state.subtask_id,
                     "raw_data": data,
                     "timelapse_was_active": timelapse_was_active,
                     "hms_errors": hms_errors_data,
@@ -3373,6 +3434,10 @@ class BambuMQTTClient:
                     # Last valid progress/layer before firmware reset (for partial usage tracking)
                     "last_progress": self._last_valid_progress,
                     "last_layer_num": self._last_valid_layer_num,
+                    # Operator-cancel echo seen during this print (Phase 3.1): lets the
+                    # terminal-status handler classify a screen-stop and skip retry /
+                    # quarantine for it. False on a genuine failure or normal finish.
+                    "user_cancel_observed": bool(self.state.user_cancel_seen_at),
                 }
             )
             self._captured_ams_mapping = None

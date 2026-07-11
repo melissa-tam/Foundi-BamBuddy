@@ -194,6 +194,7 @@ async def init_db():
         print_log,
         print_queue,
         printer,
+        printer_model_geometry,
         printer_sensor_history,
         project,
         project_bom,
@@ -3296,6 +3297,10 @@ async def run_migrations(conn):
     await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN retry_max_per_unit INTEGER DEFAULT 1")
     await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN escalate_consecutive_failures INTEGER DEFAULT 2")
     await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN first_article_plan TEXT")
+    # Run hold reason (Phase 3, 3.1; consumed more broadly in Phase 4). Event-fact
+    # only; run status stays derived. Set to 'operator_stop' when a unit is stopped
+    # by the operator (run stays active, shows the hold); cleared on resume.
+    await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN pause_reason VARCHAR(50)")
 
     if is_sqlite():
         await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN first_article BOOLEAN DEFAULT 0")
@@ -3307,11 +3312,36 @@ async def run_migrations(conn):
         "ALTER TABLE print_queue ADD COLUMN retry_of_id INTEGER REFERENCES print_queue(id) ON DELETE SET NULL",
     )
 
+    # Terminal-status correlation (Phase 1, P1-A): bind a terminal MQTT status to
+    # the exact queue item it came from instead of a printer_id-only lookup.
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN dispatch_subtask_id VARCHAR(32)")
+    # Operator-stop attribution (Phase 3, 3.1): which operator action cancelled a
+    # unit ('operator_ui' / 'operator_screen'); NULL for failures/completions and
+    # for reconcile-synthesised interruptions. Drives no-retry / no-quarantine.
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN stop_source VARCHAR(20)")
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_print_queue_dispatch_subtask_id ON print_queue (dispatch_subtask_id)",
+    )
+    # Back the check-then-insert retry idempotency (#C7) with a DB constraint.
+    # NULLs are allowed (distinct in both SQLite and Postgres) so only actual
+    # duplicate retry lineages are rejected. Existing model unique=True covers
+    # fresh installs; this covers already-migrated databases.
+    await _safe_execute(
+        conn,
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_print_queue_retry_of_id ON print_queue (retry_of_id)",
+    )
+
     if is_sqlite():
         await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN quarantined BOOLEAN DEFAULT 0")
     else:
         await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN quarantined BOOLEAN DEFAULT FALSE")
     await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN quarantine_reason TEXT")
+
+    # Plate-clear gate provenance (Phase 1): the subtask id of the print that
+    # raised the current gate, so the cooldown monitor only auto-clears a gate it
+    # can positively attribute to a farm eject job on restart.
+    await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN plate_gate_subtask_id VARCHAR(64)")
 
     # Farm notification event toggles on notification providers.
     for _col, _sqlite_default, _pg_default in (
@@ -3319,9 +3349,79 @@ async def run_migrations(conn):
         ("on_printer_quarantined", "1", "TRUE"),
         ("on_run_paused", "1", "TRUE"),
         ("on_run_completed", "0", "FALSE"),
+        ("on_foreign_job_detected", "1", "TRUE"),
+        # Phase 2: device-reported model differs from the registered Printer.model.
+        ("on_model_mismatch", "1", "TRUE"),
+        # Phase 3.1: a run unit was stopped by the operator (UI or printer screen).
+        ("on_run_unit_stopped", "1", "TRUE"),
+        # Phase 3.2: a printing unit's printer has been offline past the stall grace.
+        ("on_print_stalled", "1", "TRUE"),
     ):
         _default = _sqlite_default if is_sqlite() else _pg_default
         await _safe_execute(conn, f"ALTER TABLE notification_providers ADD COLUMN {_col} BOOLEAN DEFAULT {_default}")
+
+    # Phase 2: printer model-geometry registry (replaces the eject generator's
+    # in-code PRINTER_BED_DIMS / PRINTER_TRAVEL_ENVELOPE dicts). create_all builds
+    # the table on fresh installs; this CREATE ... IF NOT EXISTS covers the throwaway
+    # migration probe + belt-and-suspenders on existing installs. Idempotent seeds
+    # (INSERT..SELECT..WHERE NOT EXISTS) never clobber operator edits made via the
+    # PUT /model-geometry endpoint. Dialect-safe boolean literal for `validated`.
+    await _safe_execute(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS printer_model_geometry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_key VARCHAR(50) NOT NULL UNIQUE,
+            bed_x FLOAT NOT NULL,
+            bed_y FLOAT NOT NULL,
+            env_x_min FLOAT NOT NULL,
+            env_x_max FLOAT NOT NULL,
+            env_y_min FLOAT NOT NULL,
+            env_y_max FLOAT NOT NULL,
+            max_part_height_mm FLOAT NOT NULL,
+            validated BOOLEAN NOT NULL DEFAULT 0,
+            notes TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+        if is_sqlite()
+        else """
+        CREATE TABLE IF NOT EXISTS printer_model_geometry (
+            id SERIAL PRIMARY KEY,
+            model_key VARCHAR(50) NOT NULL UNIQUE,
+            bed_x DOUBLE PRECISION NOT NULL,
+            bed_y DOUBLE PRECISION NOT NULL,
+            env_x_min DOUBLE PRECISION NOT NULL,
+            env_x_max DOUBLE PRECISION NOT NULL,
+            env_y_min DOUBLE PRECISION NOT NULL,
+            env_y_max DOUBLE PRECISION NOT NULL,
+            max_part_height_mm DOUBLE PRECISION NOT NULL,
+            validated BOOLEAN NOT NULL DEFAULT FALSE,
+            notes TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+    )
+    _true = "1" if is_sqlite() else "TRUE"
+    _false = "0" if is_sqlite() else "FALSE"
+    # H2S — operator-witnessed dry run on 001-H2S (2026-07-04): validated.
+    await _safe_execute(
+        conn,
+        "INSERT INTO printer_model_geometry "
+        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, validated, notes) "
+        "SELECT 'H2S', 340, 320, 0, 340, -16, 325, 42, " + _true + ", 'Operator-witnessed 2026-07-04 dry-run' "
+        "WHERE NOT EXISTS (SELECT 1 FROM printer_model_geometry WHERE model_key = 'H2S')",
+    )
+    # H2C — BambuStudio O1C2 profile, envelope = per-extruder X-zone intersection
+    # (L 0-325, R 25-330). NOT validated: MUST be measured at the hardware ladder.
+    await _safe_execute(
+        conn,
+        "INSERT INTO printer_model_geometry "
+        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, validated, notes) "
+        "SELECT 'H2C', 330, 320, 25, 325, 0, 320, 42, " + _false + ", "
+        "'BambuStudio O1C2 profile; env = per-extruder X-zone intersection (L 0-325, R 25-330); MEASURE AT LADDER' "
+        "WHERE NOT EXISTS (SELECT 1 FROM printer_model_geometry WHERE model_key = 'H2C')",
+    )
 
     # Migration: Disambiguate the four ``user_print_*`` notification template
     # names by appending " Email" (#1792). See ``_migrate_rename_user_print_template_names``.

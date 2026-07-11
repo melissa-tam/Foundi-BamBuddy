@@ -121,6 +121,18 @@ class PrintScheduler:
     async def check_queue(self):
         """Check for prints ready to start."""
         async with async_session() as db:
+            # Offline-stall watch (Phase 3.2): flag farm units still 'printing'
+            # whose printer has been offline past the grace window. One guarded
+            # call, mirroring the stagger consumer — a stall-check failure must
+            # never kill the dispatch tick. Runs before the pending-item gate so a
+            # stall with no pending work is still caught.
+            try:
+                from backend.app.services.farm_stall import check_stalled_prints
+
+                await check_stalled_prints(db)
+            except Exception:
+                logger.exception("Offline-stall watch failed (non-fatal)")
+
             # Check if shortest-job-first scheduling is enabled
             sjf_enabled = await self._get_bool_setting(db, "queue_shortest_first")
 
@@ -148,12 +160,9 @@ class PrintScheduler:
                 )
             items = list(result.scalars().all())
 
-            # Read plate-clear setting once per queue check
-            require_plate_clear = await self._get_bool_setting(db, "require_plate_clear", default=True)
-
             if not items:
                 # No pending items — still check auto-drying on idle printers
-                await self._check_auto_drying(db, [], set(), require_plate_clear=require_plate_clear)
+                await self._check_auto_drying(db, [], set())
                 return
 
             logger.info(
@@ -215,36 +224,16 @@ class PrintScheduler:
                     skip_reasons["manual_start"] = skip_reasons.get("manual_start", 0) + 1
                     continue
 
-                # Farm-dispatched items (those carrying an eject profile) MUST gate
-                # on awaiting_plate_clear regardless of the global convenience
-                # toggle — the eject-verified plate-clear is the farm loop's safety
-                # contract, not a preference. Plain items keep upstream behaviour.
-                effective_require_plate_clear = require_plate_clear or item.eject_profile_id is not None
-
                 if item.printer_id:
                     # Specific printer assignment (existing behavior)
                     if item.printer_id in busy_printers:
                         continue
 
-                    # Check if printer is idle
-                    printer_idle = self._is_printer_idle(item.printer_id, effective_require_plate_clear)
+                    # Check if printer is idle. The plate-clear gate is now
+                    # unconditional (Phase 1, P1-B) — a raised gate blocks dispatch
+                    # regardless of the global convenience toggle.
+                    printer_idle = self._is_printer_idle(item.printer_id)
                     printer_connected = printer_manager.is_connected(item.printer_id)
-
-                    # Observability for exactly the incident this enforcement fixes:
-                    # a farm item held by the plate-clear gate that the global
-                    # setting alone would have skipped (would be idle under the
-                    # global flag, held under the farm-enforced flag).
-                    if (
-                        not require_plate_clear
-                        and item.eject_profile_id is not None
-                        and not printer_idle
-                        and self._is_printer_idle(item.printer_id, require_plate_clear)
-                    ):
-                        logger.info(
-                            "Queue item %s: held by plate-clear gate (farm eject item; "
-                            "global require_plate_clear is off)",
-                            item.id,
-                        )
 
                     # If printer not connected, try to power on via smart plug
                     if not printer_connected:
@@ -266,7 +255,7 @@ class PrintScheduler:
                                     except Exception as e:
                                         logger.warning("Failed to power on extra plug '%s': %s", extra_plug.name, e)
                                 printer_connected = True
-                                printer_idle = self._is_printer_idle(item.printer_id, effective_require_plate_clear)
+                                printer_idle = self._is_printer_idle(item.printer_id)
                             else:
                                 logger.warning("Could not power on printer %s via smart plug", item.printer_id)
                                 busy_printers.add(item.printer_id)
@@ -289,7 +278,7 @@ class PrintScheduler:
                                 # Print takes priority — stop drying
                                 await self._stop_drying(item.printer_id)
                                 # Re-check idle after stopping drying
-                                printer_idle = self._is_printer_idle(item.printer_id, effective_require_plate_clear)
+                                printer_idle = self._is_printer_idle(item.printer_id)
                                 if not printer_idle:
                                     busy_printers.add(item.printer_id)
                                     continue
@@ -302,6 +291,9 @@ class PrintScheduler:
                         if not await self._check_previous_success(db, item):
                             item.status = "skipped"
                             item.error_message = "Previous print failed or was aborted"
+                            # Machine code for the UI (Phase 4.3f): the queue
+                            # banner matches this, never the English message.
+                            item.waiting_reason = "previous_print_failed"
                             item.completed_at = datetime.now(timezone.utc)
                             await db.commit()
                             logger.info("Skipped queue item %s - previous print failed", item.id)
@@ -398,7 +390,6 @@ class PrintScheduler:
                         effective_types,
                         item.target_location,
                         filament_overrides=filament_overrides,
-                        require_plate_clear=effective_require_plate_clear,
                     )
 
                     # Update waiting_reason if changed and send notification when first waiting
@@ -435,6 +426,9 @@ class PrintScheduler:
                             if not await self._check_previous_success(db, item):
                                 item.status = "skipped"
                                 item.error_message = "Previous print failed or was aborted"
+                                # Machine code for the UI (Phase 4.3f) — see the
+                                # assigned-printer skip site above.
+                                item.waiting_reason = "previous_print_failed"
                                 item.completed_at = datetime.now(timezone.utc)
                                 await db.commit()
                                 logger.info("Skipped queue item %s - previous print failed", item.id)
@@ -525,7 +519,7 @@ class PrintScheduler:
                     )
 
             # Auto-drying: start drying on idle printers that have no pending queue items
-            await self._check_auto_drying(db, items, busy_printers, require_plate_clear=require_plate_clear)
+            await self._check_auto_drying(db, items, busy_printers)
 
     async def _find_idle_printer_for_model(
         self,
@@ -535,7 +529,6 @@ class PrintScheduler:
         required_filament_types: list[str] | None = None,
         target_location: str | None = None,
         filament_overrides: list[dict] | None = None,
-        require_plate_clear: bool = True,
     ) -> tuple[int | None, str | None]:
         """Find an idle, connected printer matching the model with compatible filaments.
 
@@ -601,7 +594,7 @@ class PrintScheduler:
                 continue
 
             is_connected = printer_manager.is_connected(printer.id)
-            is_idle = self._is_printer_idle(printer.id, require_plate_clear) if is_connected else False
+            is_idle = self._is_printer_idle(printer.id) if is_connected else False
 
             if not is_connected:
                 printers_offline.append(printer.name)
@@ -1480,7 +1473,7 @@ class PrintScheduler:
 
         return True
 
-    def _is_printer_idle(self, printer_id: int, require_plate_clear: bool = True) -> bool:
+    def _is_printer_idle(self, printer_id: int) -> bool:
         """Check if a printer is connected and idle."""
         if not printer_manager.is_connected(printer_id):
             logger.debug("Printer %d: not connected", printer_id)
@@ -1492,17 +1485,27 @@ class PrintScheduler:
             logger.debug("Printer %d: not idle — quarantined", printer_id)
             return False
 
+        # Device-vs-declared model mismatch (Phase 2): eject geometry keyed on the
+        # wrong model could drive the toolhead outside the real bed, so block ALL
+        # dispatch until the registration is corrected (mirrors the quarantine gate).
+        if printer_manager.is_model_mismatch(printer_id):
+            logger.debug("Printer %d: not idle — model mismatch", printer_id)
+            return False
+
         state = printer_manager.get_status(printer_id)
         if not state:
             logger.debug("Printer %d: no status available", printer_id)
             return False
 
-        # Plate-clear gate: if the printer finished/failed a previous print and the user
-        # hasn't acknowledged the plate was cleared, the queue must not dispatch the next
-        # job — even if the printer currently reports IDLE. After Auto Off cycles the
-        # printer, it boots back into IDLE with no memory of the previous finish; without
-        # the persisted awaiting flag we'd bypass the confirmation prompt (#961).
-        if require_plate_clear and printer_manager.is_awaiting_plate_clear(printer_id):
+        # Plate-clear gate (unconditional — Phase 1, P1-B): if the printer finished/
+        # failed a previous print and the plate hasn't been acknowledged clear, the
+        # queue must NOT dispatch the next job even if the printer reports IDLE. This
+        # no longer keys on the global require_plate_clear convenience toggle — the
+        # gate is only ever RAISED when it should be (farm work involved, or the
+        # toggle on), so honouring it here whenever set is the farm loop's safety
+        # contract, not a preference. After Auto Off cycles the printer it boots back
+        # into IDLE with no memory of the finish; the persisted flag survives (#961).
+        if printer_manager.is_awaiting_plate_clear(printer_id):
             logger.debug(
                 "Printer %d: not idle — awaiting plate-clear acknowledgment (state=%s)",
                 printer_id,
@@ -1671,8 +1674,6 @@ class PrintScheduler:
         db: AsyncSession,
         queue_items: list[PrintQueueItem],
         busy_printers: set[int],
-        *,
-        require_plate_clear: bool = True,
     ):
         """Start drying on idle printers based on humidity.
 
@@ -1769,7 +1770,7 @@ class PrintScheduler:
             if not printer_manager.is_connected(pid):
                 logger.debug("Auto-drying: printer %d skipped — not connected", pid)
                 continue
-            if not mid_print and not self._is_printer_idle(pid, require_plate_clear):
+            if not mid_print and not self._is_printer_idle(pid):
                 logger.debug("Auto-drying: printer %d skipped — not idle", pid)
                 continue
 
@@ -2580,6 +2581,15 @@ class PrintScheduler:
 
         if started:
             logger.info("Queue item %s: Print started successfully - %s", item.id, filename)
+
+            # Correlation (Phase 1, P1-A): stamp the subtask_id minted for THIS
+            # dispatch so a terminal MQTT status can be bound back to this exact
+            # queue item (not a printer_id-only lookup). start_print set it on the
+            # client synchronously above; commit it with the already-'printing' row.
+            item.dispatch_subtask_id = getattr(
+                printer_manager.get_client(item.printer_id), "last_dispatch_subtask_id", None
+            )
+            await db.commit()
 
             # Register the local 3MF in the cover-cache so /cover skips FTP
             # (#1166 follow-up). file_path was resolved earlier from either the

@@ -15,11 +15,11 @@ class TestSchedulerQuarantineExclusion:
 
         # Baseline: a connected, idle, non-quarantined printer IS idle.
         monkeypatch.setattr(pm, "is_quarantined", lambda pid: False)
-        assert scheduler._is_printer_idle(4242, require_plate_clear=True) is True
+        assert scheduler._is_printer_idle(4242) is True
 
         # Quarantined → excluded from dispatch (not idle), even while IDLE.
         monkeypatch.setattr(pm, "is_quarantined", lambda pid: True)
-        assert scheduler._is_printer_idle(4242, require_plate_clear=True) is False
+        assert scheduler._is_printer_idle(4242) is False
 
     def test_is_quarantined_reflects_set_state(self):
         from backend.app.services.printer_manager import printer_manager

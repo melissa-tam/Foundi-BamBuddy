@@ -41,6 +41,27 @@ import {
   type EjectProfileCreate,
   type EjectProfileParams,
 } from '../types/ejectProfiles';
+import type { ModelGeometry } from '../types/modelGeometries';
+
+/**
+ * Shared model-geometry registry query. Drives the model pickers on the
+ * preview/dry-run tools and the geometry-derived validation bounds in the
+ * profile form. Degrades gracefully: when the query fails, geometry-derived
+ * checks are simply skipped (the backend re-validates authoritatively).
+ */
+function useModelGeometries() {
+  return useQuery({
+    queryKey: ['model-geometries'],
+    queryFn: api.getModelGeometries,
+    staleTime: 60_000,
+  });
+}
+
+/** Option label for a registry model: unvalidated rows are marked so an
+ *  operator never mistakes a ladder-pending model for a qualified one. */
+function modelOptionLabel(g: ModelGeometry, unvalidatedText: string): string {
+  return g.validated ? g.model_key : `${g.model_key} — ${unvalidatedText}`;
+}
 
 // Numeric field metadata: the parameter key, its i18n label suffix, and the
 // input min/max/step. Kept in one place so the create/edit grid and its
@@ -144,11 +165,64 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
   );
   const [nameError, setNameError] = useState(false);
 
+  // Geometry-derived validation bounds (Phase 2): registry rows give the bed
+  // width and part-height ceiling; the GET envelope carries the server's
+  // minimum sweep-band width so it is never hardcoded here. Settings give the
+  // cooldown ambient-trap warn floor. All checks degrade to no-ops while the
+  // queries are unavailable — the backend re-validates authoritatively.
+  const { data: geoData } = useModelGeometries();
+  const { data: appSettings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const geometries = geoData?.geometries;
+  const maxBedX =
+    geometries && geometries.length > 0 ? Math.max(...geometries.map((g) => g.bed_x)) : null;
+  const maxCeiling =
+    geometries && geometries.length > 0
+      ? Math.max(...geometries.map((g) => g.max_part_height_mm))
+      : null;
+
+  // Hard error (mirrors the backend 422): inverted band, sub-minimum width, or
+  // a band reaching beyond the widest registered bed. Blocks submit.
+  const bandError = (() => {
+    if (!bandEnabled) return null;
+    const lo = Number(bandMin);
+    const hi = Number(bandMax);
+    if (bandMin === '' || bandMax === '' || !Number.isFinite(lo) || !Number.isFinite(hi)) {
+      return null; // incomplete input — backend rejects a one-sided band
+    }
+    if (lo >= hi) return t('ejectProfiles.geometry.bandInverted');
+    const minWidth = geoData?.sweep_band_min_width_mm;
+    if (minWidth != null && hi - lo < minWidth) {
+      return t('ejectProfiles.geometry.bandTooNarrow', { min: minWidth });
+    }
+    if (maxBedX != null && hi > maxBedX) {
+      return t('ejectProfiles.geometry.bandExceedsBed', { max: maxBedX });
+    }
+    return null;
+  })();
+
+  // Non-blocking warnings: a profile taller than every registered model's
+  // ceiling can never dispatch; a cooldown threshold below the warn floor
+  // risks the ambient trap (a wait that can never complete).
+  const heightWarning = (() => {
+    const h = Number(values.max_part_height_mm);
+    if (!Number.isFinite(h) || maxCeiling == null || h <= maxCeiling) return null;
+    return t('ejectProfiles.geometry.heightExceedsCeiling', { max: maxCeiling });
+  })();
+  const cooldownFloor = appSettings?.farm_cooldown_warn_floor_c;
+  const cooldownWarning = (() => {
+    const c = Number(values.cooldown_temp_c);
+    if (!Number.isFinite(c) || cooldownFloor == null || c >= cooldownFloor) return null;
+    return t('ejectProfiles.geometry.cooldownAmbientTrap', { floor: cooldownFloor });
+  })();
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) {
       setNameError(true);
       return;
+    }
+    if (bandError) {
+      return; // hard geometry error — the inline alert explains the block
     }
     const params = {} as EjectProfileParams;
     for (const f of NUMERIC_FIELDS) {
@@ -257,6 +331,16 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
                       }
                       className={inputClass}
                     />
+                    {f.key === 'cooldown_temp_c' && cooldownWarning && (
+                      <p role="note" className="text-xs text-yellow-300 mt-1">
+                        {cooldownWarning}
+                      </p>
+                    )}
+                    {f.key === 'max_part_height_mm' && heightWarning && (
+                      <p role="note" className="text-xs text-yellow-300 mt-1">
+                        {heightWarning}
+                      </p>
+                    )}
                   </div>
                 );
               })}
@@ -351,6 +435,11 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
                     />
                   </div>
                 </div>
+              )}
+              {bandError && (
+                <p role="alert" className="text-xs text-red-400 mt-2">
+                  {bandError}
+                </p>
               )}
             </div>
 
@@ -456,6 +545,15 @@ function PreviewPanel({ profiles }: { profiles: EjectProfile[] }) {
   const [plateIndex, setPlateIndex] = useState<number>(1);
   const [showGcode, setShowGcode] = useState(false);
 
+  // Geometry target: the backend resolves bed/envelope from a model key.
+  // Defaults to the first hardware-validated registry row; unvalidated models
+  // stay selectable (ladder tools) and are marked in the option label.
+  const { data: geoData } = useModelGeometries();
+  const geometries = useMemo(() => geoData?.geometries ?? [], [geoData]);
+  const [modelChoice, setModelChoice] = useState<string | null>(null);
+  const model =
+    modelChoice ?? geometries.find((g) => g.validated)?.model_key ?? geometries[0]?.model_key ?? null;
+
   // Only 3MF files carry the plate/slice metadata the generator needs.
   const { data: files } = useQuery({
     queryKey: ['library-files', 'eject-preview'],
@@ -479,6 +577,7 @@ function PreviewPanel({ profiles }: { profiles: EjectProfile[] }) {
       api.previewEjectProfile(profileId!, {
         library_file_id: fileId!,
         plate_index: plateIndex,
+        model: model!,
       }),
     onError: (err: Error) => {
       showToast(err.message || t('ejectProfiles.preview.failed'), 'error');
@@ -486,7 +585,8 @@ function PreviewPanel({ profiles }: { profiles: EjectProfile[] }) {
   });
 
   const result = previewMutation.data;
-  const canPreview = profileId !== null && fileId !== null && !previewMutation.isPending;
+  const canPreview =
+    profileId !== null && fileId !== null && model !== null && !previewMutation.isPending;
 
   return (
     <Card className="mt-6">
@@ -498,7 +598,7 @@ function PreviewPanel({ profiles }: { profiles: EjectProfile[] }) {
           <p className="text-sm text-bambu-gray italic">{t('ejectProfiles.preview.noFiles')}</p>
         ) : (
           <>
-            <div className="grid gap-3 sm:grid-cols-3">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               {/* Profile */}
               <div>
                 <label htmlFor="preview-profile" className="block text-sm text-bambu-gray mb-1">
@@ -515,6 +615,30 @@ function PreviewPanel({ profiles }: { profiles: EjectProfile[] }) {
                       {p.name}
                     </option>
                   ))}
+                </select>
+              </div>
+
+              {/* Geometry model */}
+              <div>
+                <label htmlFor="preview-model" className="block text-sm text-bambu-gray mb-1">
+                  {t('ejectProfiles.geometry.model')}
+                </label>
+                <select
+                  id="preview-model"
+                  value={model ?? ''}
+                  onChange={(e) => setModelChoice(e.target.value || null)}
+                  className={inputClass}
+                  disabled={geometries.length === 0}
+                >
+                  {geometries.length === 0 ? (
+                    <option value="">{t('ejectProfiles.geometry.noModels')}</option>
+                  ) : (
+                    geometries.map((g) => (
+                      <option key={g.model_key} value={g.model_key}>
+                        {modelOptionLabel(g, t('ejectProfiles.geometry.unvalidated'))}
+                      </option>
+                    ))
+                  )}
                 </select>
               </div>
 
@@ -590,6 +714,22 @@ function PreviewPanel({ profiles }: { profiles: EjectProfile[] }) {
                     <span>{t('ejectProfiles.preview.ok')}</span>
                   </div>
                 ) : null}
+
+                {/* Geometry warnings (independent of G-code validation) — e.g.
+                    the chosen model's geometry is not hardware-validated yet. */}
+                {(result.warnings ?? []).length > 0 && (
+                  <div className="p-3 bg-yellow-500/10 border border-yellow-500/40 rounded-lg">
+                    <div className="flex items-center gap-2 text-sm font-medium text-yellow-400 mb-1">
+                      <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                      {t('ejectProfiles.geometry.warningsTitle')}
+                    </div>
+                    <ul className="list-disc pl-6 text-sm text-yellow-200 space-y-0.5">
+                      {(result.warnings ?? []).map((msg, i) => (
+                        <li key={i}>{msg}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
 
                 {result.validation.errors.length > 0 && (
                   <div className="p-3 bg-red-500/10 border border-red-500/40 rounded-lg">
@@ -674,6 +814,12 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
   const [printerId, setPrinterId] = useState<number | null>(null);
   const [fileId, setFileId] = useState<number | null>(null);
   const [plateIndex, setPlateIndex] = useState<number>(1);
+  // Download geometry target: '' = use the selected printer's model (the
+  // backend resolves it from printer_id); an explicit registry key lets the
+  // operator build e.g. an H2C ladder file with no H2C printer connected.
+  const [downloadModel, setDownloadModel] = useState<string>('');
+  const { data: geoData } = useModelGeometries();
+  const geometries = useMemo(() => geoData?.geometries ?? [], [geoData]);
 
   // Printers: base list from the shared query, connectivity from live status
   // (the Printer entity itself carries no connection flag — same approach as
@@ -725,14 +871,16 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
     mutationFn: () =>
       api.downloadEjectProfileDryRun(
         profile.id,
-        { library_file_id: fileId!, plate_index: plateIndex },
+        downloadModel
+          ? { library_file_id: fileId!, plate_index: plateIndex, model: downloadModel }
+          : { library_file_id: fileId!, plate_index: plateIndex, printer_id: printerId! },
         `dryrun_${profile.name}.gcode.3mf`,
       ),
   });
 
   const busy = dispatchMutation.isPending || downloadMutation.isPending;
   const canDispatch = printerId !== null && fileId !== null && !busy;
-  const canDownload = fileId !== null && !busy;
+  const canDownload = fileId !== null && (downloadModel !== '' || printerId !== null) && !busy;
 
   return (
     <div
@@ -797,6 +945,29 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
               ) : connectedPrinters.length === 0 ? (
                 <p className="text-xs text-yellow-300 mt-1">{t('ejectProfiles.dryRun.noPrinters')}</p>
               ) : null}
+            </div>
+
+            {/* Download geometry model (optional) — the file download resolves
+                geometry from this key instead of the selected printer, so a
+                ladder file can be built for a model with no printer connected. */}
+            <div>
+              <label htmlFor="dryrun-model" className="block text-sm text-bambu-gray mb-1">
+                {t('ejectProfiles.geometry.downloadModel')}
+              </label>
+              <select
+                id="dryrun-model"
+                value={downloadModel}
+                onChange={(e) => setDownloadModel(e.target.value)}
+                className={inputClass}
+                disabled={geometries.length === 0}
+              >
+                <option value="">{t('ejectProfiles.geometry.downloadModelPlaceholder')}</option>
+                {geometries.map((g) => (
+                  <option key={g.model_key} value={g.model_key}>
+                    {modelOptionLabel(g, t('ejectProfiles.geometry.unvalidated'))}
+                  </option>
+                ))}
+              </select>
             </div>
 
             {/* Library file */}

@@ -17,6 +17,51 @@ class RunPrinterRef(BaseModel):
     name: str
 
 
+class RunPrinterState(BaseModel):
+    """Live blocked-state summary for one printer a run targets (Phase 4.1).
+
+    Fully DERIVED (never stored): quarantine from the printer row, plate gate /
+    model mismatch / connectivity from the live printer manager, stall and
+    printer-vision holds from the run's items' ``waiting_reason`` machine codes.
+    Only present on ``GET /production-runs/{id}`` — the list stays lean.
+    """
+
+    printer_id: int
+    name: str
+    connected: bool = False
+    quarantined: bool = False
+    awaiting_plate_clear: bool = False
+    model_mismatch: bool = False
+    model_mismatch_reason: str | None = None
+    # A unit on this printer carries waiting_reason == "printer_offline_stalled".
+    stalled: bool = False
+    # A unit carries waiting_reason == "plate_not_empty_printer_detected"
+    # (the printer's own pre-print vision check found objects on the bed).
+    vision_hold: bool = False
+
+
+class RunUnit(BaseModel):
+    """One queue item of a run, as shown on the run detail page (Phase 4.1)."""
+
+    id: int
+    status: str
+    # 'operator_ui' / 'operator_screen' when the unit was deliberately stopped
+    # (Phase 3.1); null for normal terminals.
+    stop_source: str | None = None
+    waiting_reason: str | None = None
+    printer_id: int | None = None
+    printer_name: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    # Retry lineage: which failed unit this one re-covers and the chain depth.
+    retry_of_id: int | None = None
+    retry_count: int = 0
+    filament_short: bool = False
+    manual_start: bool = False
+    first_article: bool = False
+    error_message: str | None = None
+
+
 class RunCreate(BaseModel):
     """Create a production run.
 
@@ -64,6 +109,19 @@ class RunResponse(BaseModel):
     plates_failed: int
     plates_pending: int
     status: str
+    # Why the run is held (Phase 4.1): 'operator', 'operator_stop',
+    # 'first_article_rejected' or 'no_available_printers'. Null when not held.
+    pause_reason: str | None = None
+    # Pending units system-staged by the low-spool guard (manual_start AND
+    # filament_short) vs staged for any other reason (manual_start alone).
+    staged_filament_short: int = 0
+    staged_other: int = 0
+    # True when any printer the run targets is blocked (quarantined, plate gate,
+    # model mismatch, offline-stalled, vision hold, or connected-then-lost).
+    has_blocked_printers: bool = False
+    # Detail-only payloads (GET /production-runs/{id}); null on the list.
+    printer_states: list[RunPrinterState] | None = None
+    units: list[RunUnit] | None = None
     # Farm first-article + failure policy (Phase 3).
     require_first_article: bool = True
     first_article_state: str | None = None

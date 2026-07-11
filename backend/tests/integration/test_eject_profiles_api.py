@@ -38,6 +38,42 @@ _PLATE_GCODE_NO_MACHINE_END = (
 )
 
 
+@pytest.fixture(autouse=True)
+async def _seed_geometry(db_session):
+    """Seed H2S (validated) + H2C (unvalidated) geometry — the preview/dry-run/
+    dispatch endpoints resolve geometry from the registry, which the create_all
+    test DB does not seed. Committed via db_session; the route reads it back."""
+    from backend.app.models.printer_model_geometry import PrinterModelGeometry
+
+    db_session.add_all(
+        [
+            PrinterModelGeometry(
+                model_key="H2S",
+                bed_x=340,
+                bed_y=320,
+                env_x_min=0,
+                env_x_max=340,
+                env_y_min=-16,
+                env_y_max=325,
+                max_part_height_mm=42,
+                validated=True,
+            ),
+            PrinterModelGeometry(
+                model_key="H2C",
+                bed_x=330,
+                bed_y=320,
+                env_x_min=25,
+                env_x_max=325,
+                env_y_min=0,
+                env_y_max=320,
+                max_part_height_mm=42,
+                validated=False,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+
 def _valid_profile_body(name="rack-a", **overrides):
     body = {"name": name}
     body.update(overrides)
@@ -241,7 +277,7 @@ class TestEjectProfilePreview:
 
         resp = await async_client.post(
             f"/api/v1/eject-profiles/{pid}/preview",
-            json={"library_file_id": lib.id, "plate_index": 1},
+            json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"},
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -259,7 +295,7 @@ class TestEjectProfilePreview:
         pid = resp.json()["id"]
         lib = await _add_library_file(db_session, tmp_path, name="prevshort.gcode.3mf")
         resp = await async_client.post(
-            f"/api/v1/eject-profiles/{pid}/preview", json={"library_file_id": lib.id, "plate_index": 1}
+            f"/api/v1/eject-profiles/{pid}/preview", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"}
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -269,7 +305,7 @@ class TestEjectProfilePreview:
     async def test_preview_unknown_profile_404(self, async_client: AsyncClient, db_session, tmp_path):
         lib = await _add_library_file(db_session, tmp_path, name="p404.gcode.3mf")
         resp = await async_client.post(
-            "/api/v1/eject-profiles/987654/preview", json={"library_file_id": lib.id, "plate_index": 1}
+            "/api/v1/eject-profiles/987654/preview", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"}
         )
         assert resp.status_code == 404
 
@@ -277,7 +313,7 @@ class TestEjectProfilePreview:
         resp = await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="pf404"))
         pid = resp.json()["id"]
         resp = await async_client.post(
-            f"/api/v1/eject-profiles/{pid}/preview", json={"library_file_id": 987654, "plate_index": 1}
+            f"/api/v1/eject-profiles/{pid}/preview", json={"library_file_id": 987654, "plate_index": 1, "model": "H2S"}
         )
         assert resp.status_code == 404
 
@@ -286,7 +322,7 @@ class TestEjectProfilePreview:
         pid = resp.json()["id"]
         lib = await _add_library_file(db_session, tmp_path, name="empty.3mf", with_gcode=False)
         resp = await async_client.post(
-            f"/api/v1/eject-profiles/{pid}/preview", json={"library_file_id": lib.id, "plate_index": 1}
+            f"/api/v1/eject-profiles/{pid}/preview", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"}
         )
         assert resp.status_code == 422
 
@@ -300,7 +336,7 @@ class TestEjectProfileDryRun:
         lib = await _add_library_file(db_session, tmp_path, name="dry.gcode.3mf")
 
         resp = await async_client.post(
-            f"/api/v1/eject-profiles/{pid}/dry-run", json={"library_file_id": lib.id, "plate_index": 1}
+            f"/api/v1/eject-profiles/{pid}/dry-run", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"}
         )
         assert resp.status_code == 200, resp.text
         assert "dryrun_dry_" in resp.headers.get("content-disposition", "")
@@ -344,7 +380,7 @@ class TestEjectProfileDryRun:
         lib = await _add_library_file(db_session, tmp_path, name="mend.gcode.3mf")
 
         resp = await async_client.post(
-            f"/api/v1/eject-profiles/{pid}/dry-run", json={"library_file_id": lib.id, "plate_index": 1}
+            f"/api/v1/eject-profiles/{pid}/dry-run", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"}
         )
         assert resp.status_code == 200, resp.text
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
@@ -374,7 +410,7 @@ class TestEjectProfileDryRun:
         pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="nomend"))).json()["id"]
         lib = await _add_library_file(db_session, tmp_path, name="nomend.gcode.3mf", gcode=_PLATE_GCODE_NO_MACHINE_END)
         resp = await async_client.post(
-            f"/api/v1/eject-profiles/{pid}/dry-run", json={"library_file_id": lib.id, "plate_index": 1}
+            f"/api/v1/eject-profiles/{pid}/dry-run", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"}
         )
         assert resp.status_code == 422
         assert "machine-end" in resp.json()["detail"].lower()
@@ -382,7 +418,7 @@ class TestEjectProfileDryRun:
     async def test_dry_run_unknown_profile_404(self, async_client: AsyncClient, db_session, tmp_path):
         lib = await _add_library_file(db_session, tmp_path, name="d404.gcode.3mf")
         resp = await async_client.post(
-            "/api/v1/eject-profiles/987654/dry-run", json={"library_file_id": lib.id, "plate_index": 1}
+            "/api/v1/eject-profiles/987654/dry-run", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"}
         )
         assert resp.status_code == 404
 
@@ -391,7 +427,7 @@ class TestEjectProfileDryRun:
         pid = resp.json()["id"]
         lib = await _add_library_file(db_session, tmp_path, name="dempty.3mf", with_gcode=False)
         resp = await async_client.post(
-            f"/api/v1/eject-profiles/{pid}/dry-run", json={"library_file_id": lib.id, "plate_index": 1}
+            f"/api/v1/eject-profiles/{pid}/dry-run", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"}
         )
         assert resp.status_code == 422
 
@@ -599,3 +635,96 @@ class TestEjectDryRunDispatch:
             headers={"X-API-Key": full_key},
         )
         assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+class TestGeometryResolutionMatrix:
+    """P1-C: preview/dry-run take exactly one of printer_id|model; dispatch
+    resolves the TARGET printer's model with the validated gate."""
+
+    async def test_preview_neither_param_422(self, async_client: AsyncClient, db_session, tmp_path):
+        pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="gm-neither"))).json()[
+            "id"
+        ]
+        lib = await _add_library_file(db_session, tmp_path, name="gm1.gcode.3mf")
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/preview",
+            json={"library_file_id": lib.id, "plate_index": 1},  # no printer_id, no model
+        )
+        assert resp.status_code == 422
+
+    async def test_preview_both_params_422(self, async_client: AsyncClient, db_session, tmp_path):
+        pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="gm-both"))).json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="gm2.gcode.3mf")
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/preview",
+            json={"library_file_id": lib.id, "plate_index": 1, "printer_id": 1, "model": "H2S"},
+        )
+        assert resp.status_code == 422
+
+    async def test_preview_unvalidated_model_allowed_with_warning(
+        self, async_client: AsyncClient, db_session, tmp_path
+    ):
+        pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="gm-h2c"))).json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="gm3.gcode.3mf")
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/preview",
+            json={"library_file_id": lib.id, "plate_index": 1, "model": "H2C"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Unvalidated geometry is ALLOWED for the ladder tools, WITH a warning.
+        assert any("not hardware-validated" in w for w in body["warnings"]), body["warnings"]
+
+    async def test_preview_unknown_model_422(self, async_client: AsyncClient, db_session, tmp_path):
+        pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="gm-x1c"))).json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="gm4.gcode.3mf")
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/preview",
+            json={"library_file_id": lib.id, "plate_index": 1, "model": "X1C"},
+        )
+        assert resp.status_code == 422
+
+    async def test_dispatch_unvalidated_model_409(
+        self, async_client: AsyncClient, db_session, tmp_path, printer_factory, monkeypatch
+    ):
+        _isolate_library_dir(monkeypatch, tmp_path)
+        printer = await printer_factory(model="H2C", name="H2C-U1")
+        pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="gm-u1"))).json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="gmu1.gcode.3mf")
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/dry-run/dispatch",
+            json={"library_file_id": lib.id, "plate_index": 1, "printer_id": printer.id},
+        )
+        assert resp.status_code == 409
+        assert "not hardware-validated" in resp.json()["detail"]
+
+    async def test_dispatch_unvalidated_allow_flag_dispatches(
+        self, async_client: AsyncClient, db_session, tmp_path, printer_factory, monkeypatch
+    ):
+        _isolate_library_dir(monkeypatch, tmp_path)
+        printer = await printer_factory(model="H2C", name="H2C-U2")
+        pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="gm-u2"))).json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="gmu2.gcode.3mf")
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/dry-run/dispatch",
+            json={"library_file_id": lib.id, "plate_index": 1, "printer_id": printer.id, "allow_unvalidated": True},
+        )
+        # allow_unvalidated clears the validation gate (ladder step 4) — dispatches.
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["queue_item_id"]
+
+    async def test_dispatch_no_geometry_row_422(
+        self, async_client: AsyncClient, db_session, tmp_path, printer_factory, monkeypatch
+    ):
+        _isolate_library_dir(monkeypatch, tmp_path)
+        printer = await printer_factory(model="X1C", name="X1C-NG")
+        pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="gm-ng"))).json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="gmng.gcode.3mf")
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/dry-run/dispatch",
+            json={"library_file_id": lib.id, "plate_index": 1, "printer_id": printer.id, "allow_unvalidated": True},
+        )
+        # No geometry row for X1C at all → 422 even with allow_unvalidated.
+        assert resp.status_code == 422

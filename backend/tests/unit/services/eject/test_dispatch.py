@@ -11,6 +11,14 @@ import pytest
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.dispatch import build_eject_snippet
 
+
+@pytest.fixture(autouse=True)
+def _auto_seed_geometry(seed_geometry):
+    """Every dispatch test resolves the target model's geometry from the DB, which
+    the create_all-only test DB does not seed — pull the shared seed fixture."""
+    return seed_geometry
+
+
 _PLATE_GCODE = (
     "; HEADER_BLOCK_START\n"
     "; BambuStudio 02.07.01.57\n"
@@ -81,9 +89,7 @@ class TestBuildEjectSnippet:
         # plate for inspection. build_eject_snippet returns (None, None): a skip,
         # not an error.
         profile = await _add_profile(db_session, name="disp-fa")
-        item = SimpleNamespace(
-            eject_profile_id=profile.id, plate_id=1, batch_id=None, first_article=True
-        )
+        item = SimpleNamespace(eject_profile_id=profile.id, plate_id=1, batch_id=None, first_article=True)
         printer = SimpleNamespace(model="H2S")
         source = _make_3mf()
         try:
@@ -114,7 +120,8 @@ class TestBuildEjectSnippet:
         finally:
             source.unlink(missing_ok=True)
         assert snippet is None
-        assert error and "bed geometry" in error
+        # X1C has no geometry row → fail-closed with the accessor's reason.
+        assert error and "geometry" in error
 
     async def test_missing_max_z(self, db_session):
         profile = await _add_profile(db_session, name="disp-nohdr")

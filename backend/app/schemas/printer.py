@@ -261,6 +261,13 @@ class FilaSwitchResponse(BaseModel):
     info: int = 0
 
 
+class EjectWatchInfo(BaseModel):
+    """In-flight eject cooldown watch summary (Phase 4.3c): the bed temperature
+    (°C) the server-side plate-clear gate releases at."""
+
+    threshold_c: float
+
+
 class PrintOptionsResponse(BaseModel):
     """AI detection and print options from xcam data."""
 
@@ -364,6 +371,15 @@ class PrinterStatus(BaseModel):
     # from dispatch until an operator clears it (Phase 3).
     quarantined: bool = False
     quarantine_reason: str | None = None
+    # Farm device reconciliation (Phase 2): the device's self-reported model differs
+    # from the declared Printer.model — the scheduler blocks dispatch until the
+    # declaration is corrected. Absent device report ⇒ never a mismatch.
+    model_mismatch: bool = False
+    model_mismatch_reason: str | None = None
+    # Cooldown/eject phase (Phase 4.3c): the in-flight eject cooldown watch's
+    # release threshold; the UI renders "Cooling to T °C (bed B °C)" while set.
+    # None when no threshold-bearing watch is armed.
+    eject_watch: EjectWatchInfo | None = None
     # AMS drying support
     supports_drying: bool = False
     # AMS "Print While Drying" — drying mid-print. Verified per Bambu wiki release notes;

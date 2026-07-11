@@ -36,6 +36,10 @@ function run(overrides: Partial<ProductionRun> = {}): ProductionRun {
     plates_failed: 0,
     plates_pending: 2,
     status: 'active',
+    pause_reason: null,
+    staged_filament_short: 0,
+    staged_other: 0,
+    has_blocked_printers: false,
     require_first_article: true,
     first_article_state: null,
     retry_max_per_unit: 1,
@@ -347,5 +351,82 @@ describe('ProductionRunsPage', () => {
     expect(alert).toHaveTextContent('run is not awaiting approval');
     expect(rejectCalls).toBe(1);
     expect(dialog).toBeInTheDocument();
+  });
+  // -------------------------------------------------------------------------
+  // Phase 4.1: run-card hold visibility + detail link
+  // -------------------------------------------------------------------------
+
+  it('links the run card title to the detail page and shows hold chips', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () =>
+        HttpResponse.json([
+          run({
+            status: 'paused',
+            pause_reason: 'no_available_printers',
+            has_blocked_printers: true,
+          }),
+        ]),
+      ),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+    );
+
+    render(<ProductionRunsPage />);
+
+    const title = await screen.findByRole('link', { name: 'WID-001 run' });
+    expect(title).toHaveAttribute('href', '/production-runs/1');
+    expect(screen.getByText('No available printers')).toBeInTheDocument();
+    expect(screen.getByText('Printer blocked')).toBeInTheDocument();
+  });
+
+  it('shows the low-filament staged banner on the run card', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () =>
+        HttpResponse.json([run({ staged_filament_short: 2 })]),
+      ),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+    );
+
+    render(<ProductionRunsPage />);
+
+    expect(await screen.findByText(/low filament — swap the spool/i)).toBeInTheDocument();
+  });
+
+  it('hides hold chips on healthy runs', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () => HttpResponse.json([run()])),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+    );
+
+    render(<ProductionRunsPage />);
+
+    await screen.findByRole('link', { name: 'WID-001 run' });
+    expect(screen.queryByText('Printer blocked')).not.toBeInTheDocument();
+    expect(screen.queryByText(/low filament/i)).not.toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 4.3i: cooldown override shows the profile default it would replace
+  // -------------------------------------------------------------------------
+
+  it("shows the selected eject profile's cooldown default under the override input", async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () => HttpResponse.json([])),
+      http.get('*/api/v1/skus', () =>
+        HttpResponse.json([skuWithFile({ default_eject_profile_id: 5 })]),
+      ),
+      http.get('*/api/v1/eject-profiles', () =>
+        HttpResponse.json([{ id: 5, name: 'PETG default', cooldown_temp_c: 33 }]),
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<ProductionRunsPage />);
+
+    await screen.findByText('No production runs yet');
+    await user.click(screen.getByRole('button', { name: /start run/i }));
+    await screen.findByRole('dialog');
+
+    // The dialog seeds the SKU default profile → the hint names its default.
+    expect(await screen.findByText('Overrides profile default 33°C')).toBeInTheDocument();
   });
 });

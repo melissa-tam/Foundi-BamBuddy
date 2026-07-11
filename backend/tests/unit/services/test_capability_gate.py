@@ -24,9 +24,16 @@ from backend.app.services.capability_gate import (
 _H2S_PETG = FileCapabilities(model="H2S", nozzle_diameter=0.6, filament_types=("PETG",))
 
 
+# The pure gate now takes the allowed (validated) model keys explicitly — the
+# caller derives them from the geometry registry. Default the matrix to {"H2S"}.
+def _eval(**kwargs):
+    kwargs.setdefault("bed_dims_models", {"H2S"})
+    return evaluate_capability(**kwargs)
+
+
 class TestEvaluateCapabilityMatrix:
     def test_all_match_passes_without_warning(self):
-        d = evaluate_capability(
+        d = _eval(
             file_caps=_H2S_PETG,
             printer_model="H2S",
             live_nozzle_diameter="0.6",
@@ -37,7 +44,7 @@ class TestEvaluateCapabilityMatrix:
         assert d.reason is None
 
     def test_model_mismatch_blocks(self):
-        d = evaluate_capability(
+        d = _eval(
             file_caps=FileCapabilities(model="X1C", nozzle_diameter=0.6, filament_types=("PETG",)),
             printer_model="H2S",
             live_nozzle_diameter="0.6",
@@ -47,8 +54,8 @@ class TestEvaluateCapabilityMatrix:
         assert "sliced for" in d.reason
 
     def test_printer_without_bed_geometry_blocks(self):
-        # X1C has no eject bed geometry (not a PRINTER_BED_DIMS key) → hard block.
-        d = evaluate_capability(
+        # X1C has no validated eject geometry (no registry row) → hard block.
+        d = _eval(
             file_caps=FileCapabilities(model="X1C", nozzle_diameter=0.4, filament_types=("PLA",)),
             printer_model="X1C",
             live_nozzle_diameter="0.4",
@@ -60,7 +67,7 @@ class TestEvaluateCapabilityMatrix:
     def test_model_normalisation_slice_code_and_display_name_match(self):
         # File carries a slice code (O1S) / display name; printer stores "H2S".
         for file_model in ("O1S", "Bambu Lab H2S", "H2S"):
-            d = evaluate_capability(
+            d = _eval(
                 file_caps=FileCapabilities(model=file_model, nozzle_diameter=0.6, filament_types=("PETG",)),
                 printer_model="H2S",
                 live_nozzle_diameter="0.6",
@@ -69,7 +76,7 @@ class TestEvaluateCapabilityMatrix:
             assert d.ok is True, f"{file_model} should match H2S"
 
     def test_nozzle_mismatch_blocks(self):
-        d = evaluate_capability(
+        d = _eval(
             file_caps=_H2S_PETG,  # needs 0.6
             printer_model="H2S",
             live_nozzle_diameter="0.4",
@@ -80,7 +87,7 @@ class TestEvaluateCapabilityMatrix:
 
     def test_nozzle_unknown_warn_dispatches(self):
         # Printer reports no nozzle diameter → UNKNOWN → proceed with a warning.
-        d = evaluate_capability(
+        d = _eval(
             file_caps=_H2S_PETG,
             printer_model="H2S",
             live_nozzle_diameter=None,
@@ -91,7 +98,7 @@ class TestEvaluateCapabilityMatrix:
         assert "does not report nozzle" in d.reason
 
     def test_filament_mismatch_blocks(self):
-        d = evaluate_capability(
+        d = _eval(
             file_caps=_H2S_PETG,  # needs PETG
             printer_model="H2S",
             live_nozzle_diameter="0.6",
@@ -102,7 +109,7 @@ class TestEvaluateCapabilityMatrix:
 
     def test_filament_unknown_does_not_block(self):
         # AMS state unavailable (None) → cannot determine → proceed (no block).
-        d = evaluate_capability(
+        d = _eval(
             file_caps=_H2S_PETG,
             printer_model="H2S",
             live_nozzle_diameter="0.6",
@@ -112,7 +119,7 @@ class TestEvaluateCapabilityMatrix:
 
     def test_filament_empty_known_does_not_block(self):
         # Trays present but unspooled (known-empty) → proceed, don't block.
-        d = evaluate_capability(
+        d = _eval(
             file_caps=_H2S_PETG,
             printer_model="H2S",
             live_nozzle_diameter="0.6",
@@ -122,7 +129,7 @@ class TestEvaluateCapabilityMatrix:
 
     def test_filament_equivalence_group_matches(self):
         # File needs PA-CF; printer has PA12-CF (same equivalence group) → pass.
-        d = evaluate_capability(
+        d = _eval(
             file_caps=FileCapabilities(model="H2S", nozzle_diameter=0.6, filament_types=("PA-CF",)),
             printer_model="H2S",
             live_nozzle_diameter="0.6",
@@ -132,7 +139,7 @@ class TestEvaluateCapabilityMatrix:
 
     def test_filament_overlap_when_multiple_required(self):
         # File lists PETG,PLA; printer has only PLA → overlap → pass (not disjoint).
-        d = evaluate_capability(
+        d = _eval(
             file_caps=FileCapabilities(model="H2S", nozzle_diameter=0.6, filament_types=("PETG", "PLA")),
             printer_model="H2S",
             live_nozzle_diameter="0.6",
@@ -142,7 +149,7 @@ class TestEvaluateCapabilityMatrix:
 
     def test_missing_file_facts_warn_but_pass(self):
         # File records neither model nor nozzle nor filament → warn-dispatch.
-        d = evaluate_capability(
+        d = _eval(
             file_caps=FileCapabilities(model=None, nozzle_diameter=None, filament_types=()),
             printer_model="H2S",
             live_nozzle_diameter="0.6",
@@ -154,7 +161,7 @@ class TestEvaluateCapabilityMatrix:
         assert "no nozzle diameter" in d.reason
 
     def test_nozzle_tolerance_allows_float_string_equality(self):
-        d = evaluate_capability(
+        d = _eval(
             file_caps=FileCapabilities(model="H2S", nozzle_diameter=0.4, filament_types=("PLA",)),
             printer_model="H2S",
             live_nozzle_diameter="0.40",
@@ -259,6 +266,21 @@ class TestCheckDispatchCapability:
         db_session.add(lib)
         sku = Sku(code="SKU-CAP", name="cap")
         db_session.add(sku)
+        from backend.app.models.printer_model_geometry import PrinterModelGeometry
+
+        db_session.add(
+            PrinterModelGeometry(
+                model_key="H2S",
+                bed_x=340,
+                bed_y=320,
+                env_x_min=0,
+                env_x_max=340,
+                env_y_min=-16,
+                env_y_max=325,
+                max_part_height_mm=42,
+                validated=True,
+            )
+        )
         await db_session.commit()
         await db_session.refresh(lib)
         await db_session.refresh(sku)

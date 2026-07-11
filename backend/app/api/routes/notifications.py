@@ -75,6 +75,10 @@ def _provider_to_dict(provider: NotificationProvider) -> dict:
         "on_printer_quarantined": provider.on_printer_quarantined,
         "on_run_paused": provider.on_run_paused,
         "on_run_completed": provider.on_run_completed,
+        "on_foreign_job_detected": provider.on_foreign_job_detected,
+        "on_model_mismatch": provider.on_model_mismatch,
+        "on_run_unit_stopped": provider.on_run_unit_stopped,
+        "on_print_stalled": provider.on_print_stalled,
         # Quiet hours
         "quiet_hours_enabled": provider.quiet_hours_enabled,
         "quiet_hours_start": provider.quiet_hours_start,
@@ -161,6 +165,10 @@ async def create_notification_provider(
         on_printer_quarantined=provider_data.on_printer_quarantined,
         on_run_paused=provider_data.on_run_paused,
         on_run_completed=provider_data.on_run_completed,
+        on_foreign_job_detected=provider_data.on_foreign_job_detected,
+        on_model_mismatch=provider_data.on_model_mismatch,
+        on_run_unit_stopped=provider_data.on_run_unit_stopped,
+        on_print_stalled=provider_data.on_print_stalled,
         # Quiet hours
         quiet_hours_enabled=provider_data.quiet_hours_enabled,
         quiet_hours_start=provider_data.quiet_hours_start,

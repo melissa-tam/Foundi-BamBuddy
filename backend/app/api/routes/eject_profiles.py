@@ -46,17 +46,14 @@ from backend.app.services.eject.generator import (
     EjectGenerationError,
     generate_eject_gcode,
 )
+from backend.app.services.eject.geometry import ModelGeometry, get_geometry
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
+from backend.app.utils.printer_models import canon_model
 from backend.app.utils.threemf_tools import read_plate_gcode_header, repack_3mf_with_gcode
 
 router = APIRouter(prefix="/eject-profiles", tags=["eject-profiles"])
-
-# The eject dry-run and generator target the H2S today; the generator's
-# PRINTER_BED_DIMS is the source of truth. Preview/dry-run resolve geometry for
-# this model — extend when more farm models are qualified.
-_PREVIEW_PRINTER_MODEL = "H2S"
 
 _EXEC_BLOCK_START = "; EXECUTABLE_BLOCK_START"
 _EXEC_BLOCK_END = "; EXECUTABLE_BLOCK_END"
@@ -92,6 +89,32 @@ def _read_max_z_or_422(source_path: Path, plate_index: int) -> float:
         return float(raw)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=f"Unparseable max_z_height {raw!r} in the 3MF") from exc
+
+
+async def _resolve_preview_geometry(db: AsyncSession, body: EjectPreviewRequest) -> tuple[ModelGeometry, list[str]]:
+    """Resolve geometry for a preview / dry-run (download) request from EXACTLY ONE
+    of ``body.model`` or ``body.printer_id`` (the schema enforces exactly-one).
+
+    These are hardware-ladder tools, so an UNVALIDATED geometry row is ALLOWED;
+    the returned warnings name a model whose row is not hardware-validated yet.
+    Raises 404 (unknown printer) or 422 (the model has no geometry row at all).
+    """
+    if body.model is not None:
+        model_str: str | None = body.model
+    else:
+        result = await db.execute(select(Printer.model).where(Printer.id == body.printer_id))
+        row = result.first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Printer not found")
+        model_str = row[0]
+    geometry = await get_geometry(db, model_str)
+    if geometry is None:
+        label = canon_model(model_str) or (model_str or "<unknown>")
+        raise HTTPException(status_code=422, detail=f"No eject geometry for model {label!r}")
+    warnings: list[str] = []
+    if not geometry.validated:
+        warnings.append(f"geometry for {geometry.model_key} not hardware-validated")
+    return geometry, warnings
 
 
 def _build_dryrun_gcode(source_path: Path, plate_index: int, eject_block: str) -> str:
@@ -250,11 +273,12 @@ async def preview_eject_profile(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.EJECT_PROFILES_READ),
 ):
     profile = await _get_profile_or_404(db, profile_id)
+    geometry, geo_warnings = await _resolve_preview_geometry(db, body)
     source_path = await _resolve_source_3mf(db, body.library_file_id)
     max_z = _read_max_z_or_422(source_path, body.plate_index)
 
     try:
-        gcode = generate_eject_gcode(profile, max_z, _PREVIEW_PRINTER_MODEL)
+        gcode = generate_eject_gcode(profile, max_z, geometry)
     except EjectGenerationError as exc:
         # A refused generation (e.g. part too tall) is a validation failure, not
         # an HTTP error — surface it in the body so the UI can show the reason.
@@ -262,17 +286,21 @@ async def preview_eject_profile(
             gcode="",
             validation=EjectValidationResponse(ok=False, errors=[str(exc)], warnings=[]),
             max_z_height=max_z,
+            warnings=geo_warnings,
         )
 
-    result = validate_eject_gcode(gcode, profile, max_z, _PREVIEW_PRINTER_MODEL)
+    result = validate_eject_gcode(gcode, profile, max_z, geometry)
     return EjectPreviewResponse(
         gcode=gcode,
         validation=EjectValidationResponse(ok=result.ok, errors=result.errors, warnings=result.warnings),
         max_z_height=max_z,
+        warnings=geo_warnings,
     )
 
 
-def _build_dryrun_3mf(source_path: Path, plate_index: int, profile: EjectProfile, max_z: float) -> Path:
+def _build_dryrun_3mf(
+    source_path: Path, plate_index: int, profile: EjectProfile, max_z: float, geometry: ModelGeometry
+) -> Path:
     """Generate + validate the thermal-less eject block, splice in the source's
     machine-end block, and repack into a temp dry-run ``.gcode.3mf``.
 
@@ -290,11 +318,11 @@ def _build_dryrun_3mf(source_path: Path, plate_index: int, profile: EjectProfile
     Production dispatch keeps the full thermal gate.
     """
     try:
-        eject_block = generate_eject_gcode(profile, max_z, _PREVIEW_PRINTER_MODEL, include_cooldown=False)
+        eject_block = generate_eject_gcode(profile, max_z, geometry, include_cooldown=False)
     except EjectGenerationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    result = validate_eject_gcode(eject_block, profile, max_z, _PREVIEW_PRINTER_MODEL, require_cooldown=False)
+    result = validate_eject_gcode(eject_block, profile, max_z, geometry, require_cooldown=False)
     if not result.ok:
         raise HTTPException(status_code=422, detail="Eject validation failed: " + "; ".join(result.errors))
     if BLOCK_END_MARKER not in eject_block:  # defensive — generator always emits it
@@ -315,19 +343,25 @@ async def dry_run_eject_profile(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.EJECT_PROFILES_READ),
 ):
     profile = await _get_profile_or_404(db, profile_id)
+    geometry, geo_warnings = await _resolve_preview_geometry(db, body)
     source_path = await _resolve_source_3mf(db, body.library_file_id)
     max_z = _read_max_z_or_422(source_path, body.plate_index)
 
-    out_path = _build_dryrun_3mf(source_path, body.plate_index, profile, max_z)
+    out_path = _build_dryrun_3mf(source_path, body.plate_index, profile, max_z, geometry)
 
     safe_profile = re.sub(r"[^A-Za-z0-9_.-]+", "_", profile.name).strip("_") or "profile"
     safe_file = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(source_path).stem).strip("_") or "file"
     download_name = f"dryrun_{safe_profile}_{safe_file}.gcode.3mf"
 
+    # Unvalidated-geometry warning rides in a header (the body is the file). The
+    # ladder tooling reads it; a validated model sends no header.
+    headers = {"X-Geometry-Warnings": "; ".join(geo_warnings)} if geo_warnings else None
+
     return FileResponse(
         path=str(out_path),
         media_type="application/octet-stream",
         filename=download_name,
+        headers=headers,
         background=BackgroundTask(lambda: out_path.unlink(missing_ok=True)),
     )
 
@@ -353,10 +387,12 @@ async def dispatch_dry_run_eject_profile(
     a gate raised by a PRIOR real print; that pre-existing hold (if any) must be
     cleared by the operator before this bed-homing test can start.
 
-    Guards: 404 for an unknown profile / library file / printer; 409 if the
-    target printer is live-RUNNING or PAUSEd (dispatching a bed-homing test into
-    an active print is the one unrecoverable mistake); 422 if the plate has no
-    sliced G-code or the eject block can't be generated/validated.
+    Guards: 404 for an unknown profile / library file / printer; 422 if the
+    target printer's model has no eject geometry row; 409 if that geometry is not
+    hardware-validated (unless ``allow_unvalidated=true``, ladder step 4); 409 if
+    the target printer is live-RUNNING or PAUSEd (dispatching a bed-homing test
+    into an active print is the one unrecoverable mistake); 422 if the plate has
+    no sliced G-code or the eject block can't be generated/validated.
     """
     profile = await _get_profile_or_404(db, profile_id)
     source_path = await _resolve_source_3mf(db, body.library_file_id)
@@ -365,6 +401,22 @@ async def dispatch_dry_run_eject_profile(
     printer = printer_result.scalar_one_or_none()
     if printer is None:
         raise HTTPException(status_code=404, detail="Printer not found")
+
+    # Resolve geometry from the TARGET printer's registered model: 422 when the
+    # model has no geometry row, 409 when the row is not hardware-validated unless
+    # the caller explicitly opts in with allow_unvalidated (ladder step 4).
+    geometry = await get_geometry(db, printer.model)
+    if geometry is None:
+        label = canon_model(printer.model) or (printer.model or "<unknown>")
+        raise HTTPException(status_code=422, detail=f"No eject geometry for model {label!r}")
+    if not geometry.validated and not body.allow_unvalidated:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"geometry for {geometry.model_key} is not hardware-validated — "
+                "set allow_unvalidated=true to dispatch (hardware-ladder step 4 only)"
+            ),
+        )
 
     # 409: never dispatch a bed-homing sweep test into an active print. Read the
     # live state the same way the scheduler/other routes do (printer_manager).
@@ -376,7 +428,7 @@ async def dispatch_dry_run_eject_profile(
         )
 
     max_z = _read_max_z_or_422(source_path, body.plate_index)
-    out_path = _build_dryrun_3mf(source_path, body.plate_index, profile, max_z)
+    out_path = _build_dryrun_3mf(source_path, body.plate_index, profile, max_z, geometry)
 
     try:
         file_bytes = out_path.read_bytes()

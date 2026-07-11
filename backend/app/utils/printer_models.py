@@ -284,3 +284,23 @@ def normalize_printer_model(raw_model: str | None) -> str | None:
     # Strip "Bambu Lab " prefix for unknown models
     stripped = raw_model.replace("Bambu Lab ", "").strip()
     return stripped or None
+
+
+def canon_model(value: str | None) -> str | None:
+    """Collapse any model spelling (code / display name / short name) to one key.
+
+    Runs the value through the internal-code map then the display-name map so a
+    slice ``printer_model_id`` (e.g. ``O1S``), a g-code-header display name (e.g.
+    ``Bambu Lab H2S``) and a stored ``Printer.model`` (e.g. ``H2S``) all land on
+    the same uppercase, space-stripped token used for comparison and as the
+    ``PrinterModelGeometry.model_key``. Returns ``None`` for empty/blank input.
+
+    Single source of truth for model canonicalisation — the capability gate, the
+    model-geometry accessor and the device-vs-declared mismatch check all use it,
+    so ``O1S`` and ``H2S`` are never treated as different printers.
+    """
+    if not value or not str(value).strip():
+        return None
+    mapped = normalize_printer_model_id(str(value).strip())
+    mapped = normalize_printer_model(mapped) or mapped
+    return mapped.upper().replace(" ", "") if mapped else None

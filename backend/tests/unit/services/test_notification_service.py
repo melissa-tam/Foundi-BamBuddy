@@ -2542,3 +2542,78 @@ class TestEmailProvider:
         # contain BOTH the escaped URL AND the cid img (we swapped, not duplicated).
         # The plain-text part still has the URL; check it's there at least once.
         assert self.PHOTO_URL in raw
+
+
+class TestPlateNotEmptySourceDetail:
+    """Source disambiguation + legacy-template tolerance for on_plate_not_empty (3.3)."""
+
+    @pytest.fixture
+    def service(self):
+        return NotificationService()
+
+    @pytest.fixture
+    def mock_db(self):
+        db = AsyncMock()
+        db.commit = AsyncMock()
+        return db
+
+    def test_render_drops_missing_placeholder(self, service):
+        # Base rendering behaviour: a body WITHOUT {source_detail} drops the value.
+        out = service._render_template("{printer}: hello", {"printer": "P", "source_detail": "DETAIL"})
+        assert out == "P: hello"
+        assert "DETAIL" not in out
+
+    def test_render_uses_placeholder_when_present(self, service):
+        out = service._render_template("{printer}: {source_detail}", {"printer": "P", "source_detail": "DETAIL"})
+        assert out == "P: DETAIL"
+
+    @pytest.mark.asyncio
+    async def test_legacy_template_appends_source_detail(self, service, mock_db):
+        from types import SimpleNamespace
+
+        legacy = SimpleNamespace(
+            title_template="Plate Not Empty - Print Paused",
+            body_template="{printer}: Objects detected on build plate. Clear plate and resume.",
+        )
+        provider = MagicMock()
+        provider.printer_id = None
+        captured = {}
+
+        async def _fake_send(providers, title, message, *a, **k):
+            captured["message"] = message
+
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock, return_value=[provider]),
+            patch.object(service, "_get_template", new_callable=AsyncMock, return_value=legacy),
+            patch.object(service, "_send_to_providers", new=_fake_send),
+        ):
+            await service.on_plate_not_empty(1, "P", mock_db, source_detail="Printer vision saw objects.")
+
+        # The legacy body has no {source_detail} slot → the detail is appended so it
+        # is never silently lost on an older install.
+        assert "Printer vision saw objects." in captured["message"]
+
+    @pytest.mark.asyncio
+    async def test_new_template_renders_without_double_append(self, service, mock_db):
+        from types import SimpleNamespace
+
+        new_tmpl = SimpleNamespace(
+            title_template="Plate Not Empty — {printer}",
+            body_template="{printer}: {source_detail}",
+        )
+        provider = MagicMock()
+        provider.printer_id = None
+        captured = {}
+
+        async def _fake_send(providers, title, message, *a, **k):
+            captured["message"] = message
+
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock, return_value=[provider]),
+            patch.object(service, "_get_template", new_callable=AsyncMock, return_value=new_tmpl),
+            patch.object(service, "_send_to_providers", new=_fake_send),
+        ):
+            await service.on_plate_not_empty(1, "P", mock_db, source_detail="Detail X.")
+
+        # Rendered once via the placeholder; NOT appended a second time.
+        assert captured["message"].count("Detail X.") == 1

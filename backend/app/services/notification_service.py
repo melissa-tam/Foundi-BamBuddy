@@ -1253,8 +1253,23 @@ class NotificationService:
         printer_name: str,
         db: AsyncSession,
         difference_percent: float | None = None,
+        *,
+        source_detail: str = "",
     ):
-        """Handle plate not empty event - objects detected on build plate before print."""
+        """Handle plate not empty event — the plate may be occupied before/at print.
+
+        ``source_detail`` disambiguates the three sources that raise this one event
+        with an honest, source-specific sentence (Phase 3.3):
+          - ``printer_vision``  — the printer's own pre-print HMS plate check,
+          - ``camera_cv``       — Bambuddy's OpenCV pre-print camera diff,
+          - ``cooldown_timeout``— the eject cooldown watch's 90-min escalation
+            (which actually means "bed never cooled", not "objects on the plate").
+
+        Rendering tolerates an OLDER install whose seeded ``plate_not_empty`` body
+        predates the ``{source_detail}`` placeholder (seeds are insert-if-absent, so
+        the row is never rewritten): the detail is appended to the rendered body so
+        the disambiguation is never silently lost.
+        """
         providers = await self._get_providers_for_event(db, "on_plate_not_empty", printer_id)
         if not providers:
             return
@@ -1262,9 +1277,17 @@ class NotificationService:
         variables = {
             "printer": printer_name,
             "difference_percent": f"{difference_percent:.1f}" if difference_percent else "N/A",
+            "source_detail": source_detail or "",
         }
 
         title, message = await self._build_message_from_template(db, "plate_not_empty", variables)
+        # Legacy-DB tolerance: if the stored body lacks the {source_detail} slot the
+        # detail would be dropped — append it so it still reaches the operator.
+        if source_detail:
+            template = await self._get_template(db, "plate_not_empty")
+            if template is None or "{source_detail}" not in template.body_template:
+                message = f"{message}\n{source_detail}".strip()
+
         await self._send_to_providers(
             providers,
             title,
@@ -1894,6 +1917,153 @@ class NotificationService:
             variables=variables,
         )
 
+    async def on_foreign_job_detected(
+        self,
+        printer_id: int,
+        printer_name: str,
+        subtask_name: str,
+        db: AsyncSession,
+    ):
+        """Fire when a printer finishes a job Bambuddy did not dispatch (foreign print).
+
+        The terminal-status correlation raised the plate-clear gate for the
+        deposit but left the farm queue untouched (no farm unit is attributed to
+        a print Bambuddy never sent). Alerts the operator to clear the plate so
+        dispatch can resume.
+        """
+        providers = await self._get_providers_for_event(db, "on_foreign_job_detected", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer": printer_name,
+            "subtask_name": subtask_name or "Unknown",
+        }
+
+        title, message = await self._build_message_from_template(db, "foreign_job_detected", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "foreign_job_detected",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_model_mismatch(
+        self,
+        printer_id: int,
+        printer_name: str,
+        reported_model: str,
+        registered_model: str,
+        db: AsyncSession,
+    ):
+        """Fire when a printer's device-reported model differs from its registered model.
+
+        The MQTT device reports one model while ``Printer.model`` (operator-selected)
+        says another — eject geometry keyed on the wrong model could drive the
+        toolhead outside the real bed, so dispatch is blocked until an operator
+        corrects the registration.
+        """
+        providers = await self._get_providers_for_event(db, "on_model_mismatch", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer": printer_name,
+            "reported_model": reported_model or "Unknown",
+            "registered_model": registered_model or "Unknown",
+        }
+
+        title, message = await self._build_message_from_template(db, "model_mismatch", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "model_mismatch",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_run_unit_stopped(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        run_name: str,
+        db: AsyncSession,
+    ):
+        """Fire when a run unit is stopped by the operator (UI or printer screen).
+
+        Distinct from the generic upstream ``on_print_stopped``: this carries the
+        run identity and the farm-specific recovery guidance (no auto-retry; clear
+        the plate, then Resume the run to top it back up). Both may fire for one
+        stop and are independently toggleable — their templates don't duplicate.
+        """
+        providers = await self._get_providers_for_event(db, "on_run_unit_stopped", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "run_name": run_name,
+        }
+
+        title, message = await self._build_message_from_template(db, "run_unit_stopped", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "run_unit_stopped",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_print_stalled(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        job_name: str,
+        minutes: int,
+        db: AsyncSession,
+    ):
+        """Fire when a printing unit's printer has been offline past the stall grace.
+
+        The item stays ``printing`` (never fabricate a terminal); when the printer
+        reconnects the connected-edge reconcile resolves the true outcome. One-shot
+        per incident — the caller dedupes so a persistent offline doesn't re-fire.
+        """
+        providers = await self._get_providers_for_event(db, "on_print_stalled", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "job_name": job_name,
+            "minutes": str(minutes),
+        }
+
+        title, message = await self._build_message_from_template(db, "print_stalled", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "print_stalled",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
     async def on_run_paused(
         self,
         run_name: str,
@@ -1914,9 +2084,7 @@ class NotificationService:
         }
 
         title, message = await self._build_message_from_template(db, "run_paused", variables)
-        await self._send_to_providers(
-            providers, title, message, db, "run_paused", printer_id, variables=variables
-        )
+        await self._send_to_providers(providers, title, message, db, "run_paused", printer_id, variables=variables)
 
     async def on_run_completed(
         self,
@@ -1940,9 +2108,7 @@ class NotificationService:
         }
 
         title, message = await self._build_message_from_template(db, "run_completed", variables)
-        await self._send_to_providers(
-            providers, title, message, db, "run_completed", printer_id, variables=variables
-        )
+        await self._send_to_providers(providers, title, message, db, "run_completed", printer_id, variables=variables)
 
     # ==================== Inventory Stock Alerts ====================
 

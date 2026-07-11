@@ -32,6 +32,56 @@ export interface ProductionRunPrinter {
   name: string;
 }
 
+/**
+ * Why a run is currently held (Phase 4.1). `operator` = manual pause,
+ * `operator_stop` = a unit was deliberately stopped (run stays active but
+ * holds that printer), `first_article_rejected` and `no_available_printers`
+ * are the automatic pauses. `null` when not held.
+ */
+export type RunPauseReason =
+  | 'operator'
+  | 'operator_stop'
+  | 'first_article_rejected'
+  | 'no_available_printers';
+
+/**
+ * Live blocked-state summary for one printer a run targets. Only present on
+ * the run DETAIL response (`GET /production-runs/{id}`).
+ */
+export interface RunPrinterState {
+  printer_id: number;
+  name: string;
+  connected: boolean;
+  quarantined: boolean;
+  awaiting_plate_clear: boolean;
+  model_mismatch: boolean;
+  model_mismatch_reason: string | null;
+  /** A unit on this printer is flagged printer_offline_stalled. */
+  stalled: boolean;
+  /** The printer's own pre-print vision check found objects on the bed. */
+  vision_hold: boolean;
+}
+
+/** One queue item of a run, as shown on the run detail page. */
+export interface RunUnit {
+  id: number;
+  status: 'pending' | 'printing' | 'completed' | 'failed' | 'skipped' | 'cancelled';
+  /** 'operator_ui' / 'operator_screen' when deliberately stopped; else null. */
+  stop_source: string | null;
+  waiting_reason: string | null;
+  printer_id: number | null;
+  printer_name: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  /** Retry lineage: the failed unit this one re-covers, and the chain depth. */
+  retry_of_id: number | null;
+  retry_count: number;
+  filament_short: boolean;
+  manual_start: boolean;
+  first_article: boolean;
+  error_message: string | null;
+}
+
 /** A persisted production run as returned by the API. */
 export interface ProductionRun {
   id: number;
@@ -49,6 +99,19 @@ export interface ProductionRun {
   plates_failed: number;
   plates_pending: number;
   status: ProductionRunStatus;
+  /** Why the run is held; null when not held (Phase 4.1). */
+  pause_reason: RunPauseReason | null;
+  /** Pending units staged by the low-spool guard (swap spool, then release). */
+  staged_filament_short: number;
+  /** Pending units staged for any other reason (pause / manual staging). */
+  staged_other: number;
+  /** True when any printer the run targets is blocked (quarantine, plate gate,
+   *  model mismatch, offline stall, vision hold, or connection lost). */
+  has_blocked_printers: boolean;
+  /** Per-printer blocked states — detail response only, null on the list. */
+  printer_states?: RunPrinterState[] | null;
+  /** Per-unit list — detail response only, null on the list. */
+  units?: RunUnit[] | null;
   /** Whether this run gates on first-article approval before mass dispatch. */
   require_first_article: boolean;
   /** First-article gate state, or null when the run does not require it. */

@@ -108,9 +108,7 @@ class TestRunCreateNewFields:
         assert body["plates_pending"] == 3
 
     async def test_create_without_gate_creates_all_plates(self, async_client, db_session, tmp_path):
-        body = await _create_run(
-            async_client, db_session, tmp_path, "SKU201.01", require_first_article=False
-        )
+        body = await _create_run(async_client, db_session, tmp_path, "SKU201.01", require_first_article=False)
         assert body["require_first_article"] is False
         assert body["first_article_state"] is None
         items = await _run_items(db_session, body["id"])
@@ -175,9 +173,7 @@ class TestFirstArticleEndpoints:
     async def test_reject_then_resume_new_first_article(self, async_client, db_session, tmp_path):
         body = await _create_run(async_client, db_session, tmp_path, "SKU214.01")
         await _drive_fa_to_awaiting(db_session, body["id"])
-        await async_client.post(
-            f"/api/v1/production-runs/{body['id']}/first-article/reject", json={"reason": "bad"}
-        )
+        await async_client.post(f"/api/v1/production-runs/{body['id']}/first-article/reject", json={"reason": "bad"})
         r = await async_client.post(f"/api/v1/production-runs/{body['id']}/resume")
         assert r.status_code == 200, r.text
         payload = r.json()
@@ -188,9 +184,7 @@ class TestFirstArticleEndpoints:
     async def test_reject_reason_length_validation(self, async_client, db_session, tmp_path):
         body = await _create_run(async_client, db_session, tmp_path, "SKU215.01")
         await _drive_fa_to_awaiting(db_session, body["id"])
-        r = await async_client.post(
-            f"/api/v1/production-runs/{body['id']}/first-article/reject", json={"reason": ""}
-        )
+        r = await async_client.post(f"/api/v1/production-runs/{body['id']}/first-article/reject", json={"reason": ""})
         assert r.status_code == 422  # min_length=1
 
 
@@ -280,11 +274,24 @@ class TestFarmSettings:
         s = r.json()
         assert s["farm_retry_max_per_unit"] == 1
         assert s["farm_escalate_consecutive_failures"] == 2
+        # Phase 2 ambient-trap guard: warn floor defaults to 30 °C.
+        assert s["farm_cooldown_warn_floor_c"] == 30
 
         put = await async_client.put(
             "/api/v1/settings/",
-            json={"farm_retry_max_per_unit": 2, "farm_escalate_consecutive_failures": 3},
+            json={
+                "farm_retry_max_per_unit": 2,
+                "farm_escalate_consecutive_failures": 3,
+                "farm_cooldown_warn_floor_c": 33,
+            },
         )
         assert put.status_code == 200, put.text
         assert put.json()["farm_retry_max_per_unit"] == 2
         assert put.json()["farm_escalate_consecutive_failures"] == 3
+        assert put.json()["farm_cooldown_warn_floor_c"] == 33
+
+    async def test_cooldown_warn_floor_bounds_rejected(self, async_client):
+        # ge=15 le=50 — out-of-range values are a 422, not silently clamped.
+        for bad in (14, 51):
+            r = await async_client.put("/api/v1/settings/", json={"farm_cooldown_warn_floor_c": bad})
+            assert r.status_code == 422, r.text

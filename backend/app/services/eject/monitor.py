@@ -15,11 +15,21 @@ elsewhere is untouched.
 
 The bed-watch loop mirrors ``PrinterManager.wait_for_cooldown`` (the proven
 cooldown-wait pattern) but keys on ``"bed"`` and clears the gate on success.
+
+Identity (Phase 1): the auto-clear watch is armed only with a positively
+correlated ``queue_item_id`` and resolves its release threshold from THAT item —
+never from "the most recently started print on the printer", which let a foreign
+or local print lend its threshold to the wrong plate (S4/P1-A). A terminal we
+cannot attribute (foreign/none), and a gate whose persisted source we cannot tie
+to the eject job on restart, never auto-clear — they wait for a human.
+``watch_gate_escalation_only`` covers the foreign-deposit case: it holds the gate
+(never releases) and just escalates once, exiting when the operator clears it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from typing import TYPE_CHECKING
 
@@ -59,12 +69,14 @@ def deposited_nothing(*, is_dry_run: bool, last_layer_num: int | None, last_prog
     return bool(is_dry_run) or ((last_layer_num or 0) == 0 and (last_progress or 0) == 0)
 
 
-async def _default_notify_plate_not_empty(printer_id: int) -> None:
+async def _default_notify_plate_not_empty(printer_id: int, *, source_detail: str = "") -> None:
     """Fire the plate-not-empty notification for a stuck-plate escalation.
 
     Opens its own session (mirroring the rest of this module) and resolves the
-    printer name for the message. Kept side-effect-only; callers wrap it so a
-    notification failure never kills the watch.
+    printer name for the message. ``source_detail`` disambiguates the escalation
+    source (Phase 3.3) — the two watches below bake in their own sentence via a
+    ``functools.partial`` before handing this to the loop. Kept side-effect-only;
+    callers wrap it so a notification failure never kills the watch.
     """
     from backend.app.core.database import async_session
     from backend.app.models.printer import Printer
@@ -73,7 +85,7 @@ async def _default_notify_plate_not_empty(printer_id: int) -> None:
     async with async_session() as db:
         result = await db.execute(select(Printer.name).where(Printer.id == printer_id))
         printer_name = result.scalar_one_or_none() or f"printer {printer_id}"
-        await notification_service.on_plate_not_empty(printer_id, printer_name, db)
+        await notification_service.on_plate_not_empty(printer_id, printer_name, db, source_detail=source_detail)
 
 
 async def watch_bed_and_clear(
@@ -84,7 +96,7 @@ async def watch_bed_and_clear(
     escalate_s: int = _WATCH_ESCALATE_S,
     check_interval_s: int = _CHECK_INTERVAL_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    notify: Callable[[int], Awaitable[None]] = _default_notify_plate_not_empty,
+    notify: Callable[[int], Awaitable[None]] | None = None,
 ) -> str:
     """Poll the live bed temperature until it drops below `threshold_c`.
 
@@ -99,6 +111,14 @@ async def watch_bed_and_clear(
     polling so the gate still releases within one tick of the temp finally
     crossing. ``manager``, ``sleep`` and ``notify`` are injectable for testing.
     """
+    if notify is None:
+        # cooldown_timeout source (Phase 3.3): the escalation actually means "bed
+        # never reached the release threshold", NOT "objects detected" — say so.
+        cooldown_detail = (
+            f"Bed still above {threshold_c:.0f} °C after {escalate_s // 60} minutes — a part may remain "
+            "on the plate, or the cooldown threshold is set at/below shop ambient."
+        )
+        notify = functools.partial(_default_notify_plate_not_empty, source_detail=cooldown_detail)
     elapsed = 0
     escalated = False
     while True:
@@ -131,6 +151,64 @@ async def watch_bed_and_clear(
                 await notify(printer_id)
             except Exception:  # noqa: BLE001 — a notify failure must not kill the watch
                 logger.exception("Eject monitor: plate-not-empty escalation notify for printer %s failed", printer_id)
+
+        await sleep(check_interval_s)
+        elapsed += check_interval_s
+
+
+async def watch_gate_escalation_only(
+    printer_id: int,
+    *,
+    manager=printer_manager,
+    escalate_s: int = _WATCH_ESCALATE_S,
+    check_interval_s: int = _CHECK_INTERVAL_S,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    notify: Callable[[int], Awaitable[None]] | None = None,
+) -> str:
+    """Escalation-only gate watch for a FOREIGN deposit — a terminal print Bambuddy
+    did not dispatch that left material on the plate.
+
+    Unlike :func:`watch_bed_and_clear` this NEVER releases the gate: the plate is
+    held by an unknown job and only a human clearing it (which NULLs the gate) may
+    resume dispatch. Same poll cadence and escalation constant as the cooldown
+    watch; fires ONE plate-not-empty notification at ``escalate_s`` then keeps
+    polling. Exits ``"cleared"`` when the gate is cleared externally (operator) or
+    ``"stale"`` when the printer disconnects/goes stale. ``manager``, ``sleep`` and
+    ``notify`` are injectable for testing.
+    """
+    if notify is None:
+        # Foreign-deposit escalation — distinct from the cooldown_timeout source: a
+        # print the farm did not dispatch left a part on the plate.
+        notify = functools.partial(
+            _default_notify_plate_not_empty,
+            source_detail="A print the farm did not dispatch left a part on the plate. Clear the bed to resume dispatch.",
+        )
+    elapsed = 0
+    escalated = False
+    while True:
+        if not manager.is_awaiting_plate_clear(printer_id):
+            logger.info(
+                "Eject monitor: printer %s foreign-gate cleared externally — escalation watch exiting", printer_id
+            )
+            return "cleared"
+
+        state = manager.get_status(printer_id)
+        if not state or not getattr(state, "connected", False):
+            logger.info("Eject monitor: printer %s stale/offline during foreign-gate watch — aborting", printer_id)
+            return "stale"
+
+        if not escalated and elapsed >= escalate_s:
+            escalated = True
+            logger.warning(
+                "Eject monitor: printer %s foreign deposit still gated after %ss — escalating "
+                "(plate-not-empty), gate stays set until an operator clears it",
+                printer_id,
+                escalate_s,
+            )
+            try:
+                await notify(printer_id)
+            except Exception:  # noqa: BLE001 — a notify failure must not kill the watch
+                logger.exception("Eject monitor: foreign-gate plate-not-empty notify for printer %s failed", printer_id)
 
         await sleep(check_interval_s)
         elapsed += check_interval_s
@@ -173,9 +251,13 @@ async def _latest_started_item(db, printer_id: int):
     return result.scalar_one_or_none()
 
 
-async def _resolve_eject_threshold(printer_id: int) -> float | None:
-    """Return the finished job's eject cooldown threshold, or None if the most
-    recently started job on this printer did not use an eject profile.
+async def _resolve_eject_threshold(queue_item_id: int) -> float | None:
+    """Return the eject cooldown threshold for the queue item that raised the gate,
+    or None if that item did not use an eject profile (nothing to auto-clear).
+
+    Resolved from the SPECIFIC item bound to this watch (``db.get``) — not the most
+    recently started item on the printer — so a foreign/local print that finished
+    after the farm unit can never lend its threshold to the wrong plate (S4/P1-A).
 
     The run-level ``PrintBatch.cooldown_temp_c_override`` wins over the profile's
     ``cooldown_temp_c`` (same precedence dispatch/generator/validator apply to
@@ -183,10 +265,11 @@ async def _resolve_eject_threshold(printer_id: int) -> float | None:
     the in-file cooldown wait was generated with."""
     from backend.app.core.database import async_session
     from backend.app.models.eject_profile import EjectProfile
+    from backend.app.models.print_queue import PrintQueueItem
     from backend.app.services.eject.dispatch import resolve_cooldown_override
 
     async with async_session() as db:
-        item = await _latest_started_item(db, printer_id)
+        item = await db.get(PrintQueueItem, queue_item_id)
         if item is None or item.eject_profile_id is None:
             return None
         # First-article items carry an eject profile but their eject block is
@@ -195,8 +278,7 @@ async def _resolve_eject_threshold(printer_id: int) -> float | None:
         if getattr(item, "first_article", False):
             return None
 
-        prof_result = await db.execute(select(EjectProfile).where(EjectProfile.id == item.eject_profile_id))
-        profile = prof_result.scalar_one_or_none()
+        profile = await db.get(EjectProfile, item.eject_profile_id)
         if profile is None:
             return None
         override = await resolve_cooldown_override(db, item.batch_id)
@@ -213,63 +295,116 @@ class EjectCooldownMonitor:
     """
 
     def __init__(self) -> None:
-        # Printers with an in-flight watch, so a duplicate terminal callback
-        # doesn't spawn a second watcher for the same finish.
-        self._watching: set[int] = set()
+        # printer_id -> release threshold (°C) of the in-flight watch, so a
+        # duplicate terminal callback doesn't spawn a second watcher for the
+        # same finish AND the UI can surface the cooldown phase (Phase 4.3c).
+        # None = watch armed but with no release threshold: either the
+        # escalation-only foreign-gate watch, or a cooldown watch still
+        # resolving its item's threshold.
+        self._watching: dict[int, float | None] = {}
 
-    def on_terminal_status(self, printer_id: int, final_status: str) -> None:
-        """Hook called once from ``main.on_print_complete`` for every terminal
-        status. Spawns a background cooldown watch when the finished job used an
-        eject profile and completed successfully; otherwise does nothing (the
-        plate-clear gate stays as-is)."""
-        if not should_auto_clear(final_status):
+    def active_watch(self, printer_id: int) -> float | None:
+        """The in-flight cooldown watch's release threshold (°C), or None.
+
+        None both when no watch is armed and when the armed watch carries no
+        threshold (escalation-only / still resolving) — callers surface the
+        cooldown phase only when a real release temperature exists."""
+        return self._watching.get(printer_id)
+
+    def on_terminal_status(self, printer_id: int, final_status: str, queue_item_id: int | None = None) -> None:
+        """Hook called once from ``main.on_print_complete`` for every terminal status.
+
+        Arms a background cooldown watch ONLY when the finished job was positively
+        correlated to a queue item (``queue_item_id`` is not None) AND completed
+        successfully; the watch then keys its release threshold off THAT item. A
+        terminal that could not be attributed to the dispatched unit (foreign/none,
+        or an upgrade-day NULL-key fallback → ``queue_item_id`` None) never
+        auto-clears — the plate-clear gate stays set for a human."""
+        if not should_auto_clear(final_status) or queue_item_id is None:
             return
-        self._start_watch(printer_id)
+        self._start_watch(printer_id, queue_item_id)
+
+    def start_escalation_only_watch(self, printer_id: int) -> bool:
+        """Arm the foreign-deposit gate watch: holds the gate (never auto-clears),
+        escalates once, and exits when the operator clears it or the printer goes
+        stale. Deduped against any in-flight watch on the same printer."""
+        if printer_id in self._watching:
+            return False
+        # Sentinel None: the foreign-gate watch never releases, so it exposes
+        # no cooldown threshold to the UI.
+        self._watching[printer_id] = None
+        spawn_background_task(self._escalation_only(printer_id), name=f"eject-gate-escalation-{printer_id}")
+        return True
 
     async def rearm_on_startup(self) -> int:
         """Re-arm cooldown watches lost to a restart. Returns the count re-armed.
 
         For every printer whose persisted ``awaiting_plate_clear`` gate is set,
-        re-spawn the watch iff the most-recently-started job was a successful
-        eject job (see :func:`should_rearm`)."""
+        re-spawn the watch iff the most-recently-started job was a successful eject
+        job (see :func:`should_rearm`) AND that item's ``dispatch_subtask_id``
+        matches the printer's persisted ``plate_gate_subtask_id`` (both non-null).
+        A gate whose source we cannot positively tie to the eject job — a foreign
+        deposit, or a pre-migration NULL-source gate — never auto-clears on restart;
+        it is left set for a human."""
         from backend.app.core.database import async_session
         from backend.app.models.printer import Printer
 
         rearmed = 0
         async with async_session() as db:
-            result = await db.execute(select(Printer.id).where(Printer.awaiting_plate_clear.is_(True)))
-            gated_printer_ids = [row[0] for row in result.all()]
-            for printer_id in gated_printer_ids:
+            result = await db.execute(
+                select(Printer.id, Printer.plate_gate_subtask_id).where(Printer.awaiting_plate_clear.is_(True))
+            )
+            for printer_id, gate_subtask_id in result.all():
                 item = await _latest_started_item(db, printer_id)
                 if item is None or not should_rearm(
                     True, item.status, item.eject_profile_id, getattr(item, "first_article", False)
                 ):
                     continue
-                if self._start_watch(printer_id):
+                if not gate_subtask_id or item.dispatch_subtask_id != gate_subtask_id:
+                    logger.info(
+                        "Eject monitor: printer %s gate NOT re-armed — source subtask %r != last dispatch %r "
+                        "(left gated for manual clear)",
+                        printer_id,
+                        gate_subtask_id,
+                        item.dispatch_subtask_id,
+                    )
+                    continue
+                if self._start_watch(printer_id, item.id):
                     rearmed += 1
         if rearmed:
             logger.info("Eject monitor: re-armed %d cooldown watch(es) after restart", rearmed)
         return rearmed
 
-    def _start_watch(self, printer_id: int) -> bool:
-        """Spawn the cooldown watch unless one is already in flight."""
+    def _start_watch(self, printer_id: int, queue_item_id: int) -> bool:
+        """Spawn the identity-bound cooldown watch unless one is already in flight."""
         if printer_id in self._watching:
             return False
-        self._watching.add(printer_id)
-        spawn_background_task(self._watch(printer_id), name=f"eject-cooldown-watch-{printer_id}")
+        # Threshold not resolved yet (needs the item's profile/override) — the
+        # spawned watch records it once known so active_watch() can expose it.
+        self._watching[printer_id] = None
+        spawn_background_task(self._watch(printer_id, queue_item_id), name=f"eject-cooldown-watch-{printer_id}")
         return True
 
-    async def _watch(self, printer_id: int) -> None:
+    async def _watch(self, printer_id: int, queue_item_id: int) -> None:
         try:
-            threshold = await _resolve_eject_threshold(printer_id)
+            threshold = await _resolve_eject_threshold(queue_item_id)
             if threshold is None:
                 # Not an eject job — leave the manual plate-clear behaviour intact.
                 return
+            self._watching[printer_id] = threshold
             await watch_bed_and_clear(printer_id, threshold)
         except Exception:  # noqa: BLE001 — a watch failure must not crash the callback loop
             logger.exception("Eject monitor: cooldown watch for printer %s failed", printer_id)
         finally:
-            self._watching.discard(printer_id)
+            self._watching.pop(printer_id, None)
+
+    async def _escalation_only(self, printer_id: int) -> None:
+        try:
+            await watch_gate_escalation_only(printer_id)
+        except Exception:  # noqa: BLE001 — a watch failure must not crash the callback loop
+            logger.exception("Eject monitor: foreign-gate escalation watch for printer %s failed", printer_id)
+        finally:
+            self._watching.pop(printer_id, None)
 
 
 # Module-level singleton, mirroring the other service singletons.

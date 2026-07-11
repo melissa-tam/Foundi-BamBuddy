@@ -69,13 +69,25 @@ class TestPlateClearGate:
     the next queue item onto a fouled bed two seconds later."""
 
     @staticmethod
-    def _setup_mocks(stack, finished_item=None):
-        """Patch on_print_complete's collaborators. ``finished_item`` is what the
-        finished-queue-item lookup (``scalars().first()``) resolves to — None for
-        a non-queue print, or a SimpleNamespace carrying is_dry_run/first_article
-        for the farm no-deposit branch."""
-        mock_session_maker = stack.enter_context(patch("backend.app.main.async_session"))
-        stack.enter_context(patch("backend.app.main.notification_service")).on_print_complete = AsyncMock()
+    def _setup_mocks(stack, test_engine):
+        """Patch on_print_complete's collaborators and back its DB access with the
+        REAL test engine so the Phase-1 terminal correlation runs for real (the old
+        MagicMock single-item lookup can't satisfy resolve_terminal_item). Returns a
+        namespace exposing the mocked printer_manager, eject monitor and notification
+        service so a test can assert on the gate/arm/notify calls."""
+        from types import SimpleNamespace
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        stack.enter_context(patch("backend.app.main.async_session", maker))
+        stack.enter_context(patch("backend.app.core.database.async_session", maker))
+
+        mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+        mock_notif.on_print_complete = AsyncMock()
+        mock_notif.on_queue_completed = AsyncMock()
+        mock_notif.on_foreign_job_detected = AsyncMock()
+        mock_notif._get_providers_for_event = AsyncMock(return_value=[])
         stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
         mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
         mock_ws.send_print_complete = AsyncMock()
@@ -83,26 +95,45 @@ class TestPlateClearGate:
         stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
         mock_pm = stack.enter_context(patch("backend.app.main.printer_manager"))
         mock_pm.get_printer.return_value = None
-        # Real method under test — track each call so the test can assert on it.
+        mock_pm.get_current_print_user.return_value = None
+        # Real methods under test — track each call so the test can assert on it.
         mock_pm.set_awaiting_plate_clear = MagicMock()
+        mock_pm.clear_current_print_user = MagicMock()
+        # The farm eject monitor is patched so no real background watch spawns; the
+        # test asserts whether auto-clear (on_terminal_status) was armed.
+        mock_monitor = stack.enter_context(patch("backend.app.main.eject_cooldown_monitor"))
+        mock_monitor.on_terminal_status = MagicMock()
+        mock_monitor.start_escalation_only_watch = MagicMock()
+        return SimpleNamespace(pm=mock_pm, monitor=mock_monitor, notif=mock_notif, maker=maker)
 
-        # Result mock shared by every execute() call: the finished-item lookup
-        # reads scalars().first(); the queue-status update reads scalars().all()
-        # (kept empty so no farm policy fires); everything else uses
-        # scalar_one_or_none() → None.
-        result_mock = MagicMock()
-        result_mock.scalar_one_or_none = MagicMock(return_value=None)
-        scalars_mock = MagicMock()
-        scalars_mock.first = MagicMock(return_value=finished_item)
-        scalars_mock.all = MagicMock(return_value=[])
-        result_mock.scalars = MagicMock(return_value=scalars_mock)
+    @staticmethod
+    async def _seed_printing_item(maker, *, serial, dispatch_subtask_id=None, is_dry_run=False):
+        """Seed a connected printer with one printing (non-farm) queue item and
+        return (printer_id, item_id)."""
+        from datetime import datetime, timezone
 
-        mock_session = AsyncMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock()
-        mock_session.execute = AsyncMock(return_value=result_mock)
-        mock_session_maker.return_value = mock_session
-        return mock_pm
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.models.printer import Printer
+
+        async with maker() as s:
+            printer = Printer(
+                name=f"P-{serial}", serial_number=serial, ip_address="10.0.0.9", access_code="0000", model="H2S"
+            )
+            s.add(printer)
+            await s.commit()
+            await s.refresh(printer)
+            item = PrintQueueItem(
+                printer_id=printer.id,
+                status="printing",
+                first_article=False,
+                is_dry_run=is_dry_run,
+                dispatch_subtask_id=dispatch_subtask_id,
+                started_at=datetime.now(timezone.utc),
+            )
+            s.add(item)
+            await s.commit()
+            await s.refresh(item)
+            return printer.id, item.id
 
     @staticmethod
     async def _drain(tasks_before):
@@ -119,19 +150,17 @@ class TestPlateClearGate:
         ["completed", "failed", "aborted", "cancelled"],
         ids=["completed", "failed", "aborted-1171", "cancelled-1171"],
     )
-    async def test_plate_clear_gate_raised_for_every_terminal_status(self, status):
-        """Regression for #1171. Every terminal status that can leave material
-        on the bed must raise the gate. Pre-fix the gate was raised only for
-        completed/failed, so aborted (printer touchscreen stop, self-abort) and
-        cancelled (Bambuddy queue stop) auto-dispatched the next queue item
-        onto a fouled bed. The payload carries produced layers/progress so the
-        no-deposit classifier does NOT suppress the gate (a real deposited job)."""
+    async def test_plate_clear_gate_raised_for_every_terminal_status(self, status, test_engine):
+        """Regression for #1171. Every terminal status that can leave material on
+        the bed raises the gate (require_plate_clear defaults ON when unset). The
+        payload carries produced layers/progress so the no-deposit classifier does
+        NOT suppress the gate."""
         from contextlib import ExitStack
 
         tasks_before = set(asyncio.all_tasks())
 
         with ExitStack() as stack:
-            mock_pm = self._setup_mocks(stack)
+            env = self._setup_mocks(stack, test_engine)
 
             from backend.app.main import on_print_complete
 
@@ -149,26 +178,26 @@ class TestPlateClearGate:
 
             await self._drain(tasks_before)
 
-        mock_pm.set_awaiting_plate_clear.assert_any_call(1, True)
+        true_calls = [c for c in env.pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
+        assert true_calls, "Gate must be raised for a deposit-bearing terminal (toggle defaults on)."
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "finished_item, payload_extra, ids",
+        "payload_extra, ids",
         [
-            (None, {"last_layer_num": 0, "last_progress": 0}, "zero-layer-print"),
-            (None, {}, "no-progress-data"),
+            ({"last_layer_num": 0, "last_progress": 0}, "zero-layer-print"),
+            ({}, "no-progress-data"),
         ],
     )
-    async def test_plate_clear_gate_not_raised_for_no_deposit_finish(self, finished_item, payload_extra, ids):
+    async def test_plate_clear_gate_not_raised_for_no_deposit_finish(self, payload_extra, ids, test_engine):
         """A print that reached terminal having deposited nothing (zero layers AND
-        zero progress — stopped in PREPARE/heating) must NOT raise the plate-clear
-        gate: the bed cannot be fouled."""
+        zero progress) must NOT raise the plate-clear gate: the bed cannot be fouled."""
         from contextlib import ExitStack
 
         tasks_before = set(asyncio.all_tasks())
 
         with ExitStack() as stack:
-            mock_pm = self._setup_mocks(stack, finished_item=finished_item)
+            env = self._setup_mocks(stack, test_engine)
 
             from backend.app.main import on_print_complete
 
@@ -185,30 +214,32 @@ class TestPlateClearGate:
 
             await self._drain(tasks_before)
 
-        true_calls = [c for c in mock_pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
+        true_calls = [c for c in env.pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
         assert true_calls == [], f"Gate must stay clear for a no-deposit finish; got {len(true_calls)} raise(s)."
 
     @pytest.mark.asyncio
-    async def test_plate_clear_gate_not_raised_for_dry_run(self):
+    async def test_plate_clear_gate_not_raised_for_dry_run(self, test_engine):
         """A dry-run eject deposits nothing by construction — even if its non-print
         gcode reported progress, the is_dry_run flag suppresses the gate."""
         from contextlib import ExitStack
-        from types import SimpleNamespace
 
         tasks_before = set(asyncio.all_tasks())
 
         with ExitStack() as stack:
-            dry_item = SimpleNamespace(is_dry_run=True, first_article=False)
-            mock_pm = self._setup_mocks(stack, finished_item=dry_item)
+            env = self._setup_mocks(stack, test_engine)
+            pid, _iid = await self._seed_printing_item(
+                env.maker, serial="DRY-1", dispatch_subtask_id="DR-1", is_dry_run=True
+            )
 
             from backend.app.main import on_print_complete
 
             await on_print_complete(
-                1,
+                pid,
                 {
                     "status": "cancelled",
                     "filename": "/data/Metadata/test.gcode",
                     "subtask_name": "Test",
+                    "subtask_id": "DR-1",
                     "timelapse_was_active": False,
                     "last_layer_num": 3,
                     "last_progress": 12.0,
@@ -217,20 +248,19 @@ class TestPlateClearGate:
 
             await self._drain(tasks_before)
 
-        true_calls = [c for c in mock_pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
+        true_calls = [c for c in env.pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
         assert true_calls == [], f"Gate must stay clear for a dry-run finish; got {len(true_calls)} raise(s)."
 
     @pytest.mark.asyncio
-    async def test_plate_clear_gate_not_raised_for_unknown_status(self):
-        """Defence in depth: an unknown / not-terminal status string from a
-        future firmware revision must not silently raise the gate. The flag is
-        only meaningful when the print actually ended."""
+    async def test_plate_clear_gate_not_raised_for_unknown_status(self, test_engine):
+        """Defence in depth: an unknown / not-terminal status string from a future
+        firmware revision must not silently raise the gate."""
         from contextlib import ExitStack
 
         tasks_before = set(asyncio.all_tasks())
 
         with ExitStack() as stack:
-            mock_pm = self._setup_mocks(stack)
+            env = self._setup_mocks(stack, test_engine)
 
             from backend.app.main import on_print_complete
 
@@ -244,19 +274,58 @@ class TestPlateClearGate:
                 },
             )
 
-            for task in asyncio.all_tasks() - tasks_before:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await self._drain(tasks_before)
 
-        # The mock records every call; assert no True-call landed.
-        true_calls = [c for c in mock_pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
+        true_calls = [c for c in env.pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
         assert true_calls == [], (
-            "Gate must not be raised for an unrecognised terminal status; "
-            f"set_awaiting_plate_clear({1}, True) was called {len(true_calls)} time(s)."
+            f"Gate must not be raised for an unrecognised terminal status; raised {len(true_calls)} time(s)."
         )
+
+    @pytest.mark.asyncio
+    async def test_foreign_terminal_leaves_item_and_raises_gate(self, test_engine):
+        """Phase 1 P1-A: a terminal whose subtask_id matches NO printing item (a
+        LOCAL print started from the touchscreen) is FOREIGN — the farm item stays
+        'printing', the gate is raised keyed to the foreign subtask, the escalation-
+        only watch is started (NOT the auto-clear), and the foreign notification
+        fires. The farm queue is left untouched."""
+        from contextlib import ExitStack
+
+        from backend.app.models.print_queue import PrintQueueItem
+
+        tasks_before = set(asyncio.all_tasks())
+
+        with ExitStack() as stack:
+            env = self._setup_mocks(stack, test_engine)
+            pid, iid = await self._seed_printing_item(env.maker, serial="FGN-1", dispatch_subtask_id="DISPATCHED-1")
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "local.gcode",
+                    "subtask_name": "OperatorLocalPrint",
+                    "subtask_id": "FOREIGN-9",  # != the item's DISPATCHED-1 → foreign
+                    "timelapse_was_active": False,
+                    "last_layer_num": 20,
+                    "last_progress": 88.0,
+                },
+            )
+
+            await self._drain(tasks_before)
+
+        # 1. Farm unit untouched — still printing (a foreign print never marks it done).
+        async with env.maker() as s:
+            refetched = await s.get(PrintQueueItem, iid)
+            assert refetched.status == "printing"
+        # 2. Gate raised, keyed to the FOREIGN subtask.
+        env.pm.set_awaiting_plate_clear.assert_any_call(pid, True, source_subtask_id="FOREIGN-9")
+        # 3. Auto-clear NOT armed; escalation-only watch started instead.
+        env.monitor.on_terminal_status.assert_not_called()
+        env.monitor.start_escalation_only_watch.assert_called_once_with(pid)
+        # 4. Foreign notification fired.
+        env.notif.on_foreign_job_detected.assert_awaited()
 
 
 class TestPrintCompleteLogic:

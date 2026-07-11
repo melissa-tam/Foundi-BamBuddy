@@ -35,6 +35,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from backend.app.core.websocket import broadcast_production_run_changed
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
@@ -242,20 +243,41 @@ async def on_terminal(
     queue_item_id: int | None,
     final_status: str,
     archive_data: dict | None = None,
+    completed_subtask_id: str | None = None,
 ) -> None:
     """React to a terminal print status. Non-farm prints are a no-op.
 
     Called once from ``main.on_print_complete`` (the notification flow, where the
     finish photo is available). Wraps each sub-action so a notification failure
     can never abort a committed state change.
+
+    ``completed_subtask_id`` is the terminal payload's subtask_id, used to confirm
+    that a "completed" is really the remote first-article eject Bambuddy dispatched
+    (which echoes ``last_dispatch_subtask_id``) before consuming the pending eject —
+    a foreign completion must not finalise someone else's approval (Phase 1).
     """
     try:
-        # 1. Remote first-article eject completion (no queue item involved).
+        # 1. Remote first-article eject completion (no queue item involved). The FA
+        #    eject is dispatched via start_print, so the printer echoes its
+        #    submission id back. Only finalise when the completed job IS that eject:
+        #    on a positive mismatch (both ids known and different) treat the
+        #    completion as foreign and leave the pending eject for the real finish.
         if final_status == "completed" and printer_id is not None:
-            run_id = _pop_pending_remote_eject(printer_id)
-            if run_id is not None:
-                await _finalize_remote_eject(db, run_id, printer_id)
-                return
+            client = printer_manager.get_client(printer_id)
+            expected_subtask = getattr(client, "last_dispatch_subtask_id", None) if client else None
+            if completed_subtask_id and expected_subtask and completed_subtask_id != expected_subtask:
+                logger.info(
+                    "farm_policy: printer %s completion subtask %r != dispatched eject subtask %r — "
+                    "foreign, not popping pending remote eject",
+                    printer_id,
+                    completed_subtask_id,
+                    expected_subtask,
+                )
+            else:
+                run_id = _pop_pending_remote_eject(printer_id)
+                if run_id is not None:
+                    await _finalize_remote_eject(db, run_id, printer_id)
+                    return
 
         # 2. Item-based policy.
         if queue_item_id is None:
@@ -271,6 +293,13 @@ async def on_terminal(
             await _on_item_completed(db, batch, item, archive_data)
         elif final_status == "failed":
             await _on_item_failed(db, batch, item)
+        elif final_status == "cancelled" and item.stop_source:
+            # Operator stop (UI or printer screen), attributed by the terminal
+            # handler. NOT a failure: no retry, no quarantine contribution — just
+            # a visible hold + notification (Phase 3.1). A 'cancelled' with NO
+            # stop_source (e.g. a run-abort or an unattributed interruption) is a
+            # deliberate no-op here.
+            await on_operator_stop(db, batch, item)
     except Exception:  # noqa: BLE001 — policy must never crash the callback chain
         logger.exception("farm_policy.on_terminal failed for item=%s status=%s", queue_item_id, final_status)
 
@@ -281,6 +310,7 @@ async def _on_item_completed(
     if item.first_article and batch.first_article_state == "pending_print":
         batch.first_article_state = "awaiting_approval"
         await db.commit()
+        broadcast_production_run_changed(batch.id)
         await _notify_first_article_pending(db, batch, item, archive_data)
         return
     await _maybe_complete_run(db, batch)
@@ -292,6 +322,43 @@ async def _on_item_failed(db: AsyncSession, batch: PrintBatch, item: PrintQueueI
         await create_retry_if_absent(db, item)
     await maybe_quarantine_printer(db, batch, item)
     await _maybe_pause_run_no_printers(db, batch)
+
+
+async def on_operator_stop(db: AsyncSession, batch: PrintBatch, item: PrintQueueItem) -> None:
+    """A farm unit was deliberately stopped by the operator (Phase 3.1).
+
+    Called from :func:`on_terminal` when a farm item lands terminal ``cancelled``
+    WITH ``stop_source`` set. Deliberately does the OPPOSITE of a failure:
+
+    - NO auto-retry (the operator chose to stop this unit);
+    - NOT counted toward quarantine — ``cancelled`` is already outside
+      ``_TERMINAL_RUN_OUTCOMES`` (kept that way), so ``recent_terminal_farm_items``
+      never sees it;
+    - the plate-clear gate is left exactly as the deposit path set it (the part is
+      on the plate for the operator to clear);
+    - the run STAYS ``active`` but records ``pause_reason='operator_stop'`` as a
+      visible hold — RESUME clears it and tops the run back up (``top_up_run``);
+    - fires the run-scoped ``on_run_unit_stopped`` notification. The generic
+      upstream ``on_print_stopped`` may also fire independently — their templates
+      don't duplicate content.
+    """
+    batch.pause_reason = "operator_stop"
+    await db.commit()
+    broadcast_production_run_changed(batch.id)
+
+    printer_name = "Unknown"
+    if item.printer_id is not None:
+        printer = await db.get(Printer, item.printer_id)
+        if printer is not None:
+            printer_name = printer.name
+    run = await _load_run(db, batch.id)
+    await notification_service.on_run_unit_stopped(item.printer_id, printer_name, run.name, db)
+    logger.info(
+        "farm_policy: unit %s stopped by operator (%s) on run %s — no retry, no quarantine, run held (active)",
+        item.id,
+        item.stop_source,
+        batch.id,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -503,7 +570,11 @@ async def _maybe_pause_run_no_printers(db: AsyncSession, batch: PrintBatch) -> N
         return
 
     batch.status = "paused"
+    # Machine-readable hold reason (Phase 4.1): the run card must distinguish this
+    # auto-pause from a manual one. Cleared on resume (transition_run).
+    batch.pause_reason = "no_available_printers"
     await db.commit()
+    broadcast_production_run_changed(batch.id)
     run = await _load_run(db, batch.id)
     await notification_service.on_run_paused(
         run.name, _sku_code(run), "All selected printers are quarantined or offline", db
@@ -530,6 +601,7 @@ async def _maybe_complete_run(db: AsyncSession, batch: PrintBatch) -> None:
 
     batch.status = "completed"
     await db.commit()
+    broadcast_production_run_changed(batch.id)
     run = await _load_run(db, batch.id)
     upp = _units_per_plate(run)
     await notification_service.on_run_completed(run.name, _sku_code(run), completed * upp, completed, db)
@@ -588,6 +660,7 @@ async def approve_first_article(db: AsyncSession, run_id: int, eject_remotely: b
 
     run.first_article_state = "approved"
     await db.commit()
+    broadcast_production_run_changed(run_id)
     if fa_item is not None and fa_item.printer_id is not None:
         printer_manager.set_awaiting_plate_clear(fa_item.printer_id, False)
     run = await _load_run(db, run_id)
@@ -611,7 +684,11 @@ async def reject_first_article(db: AsyncSession, run_id: int, reason: str) -> Pr
     run.first_article_state = "rejected"
     run.first_article_reject_reason = reason
     run.status = "paused"
+    # Machine-readable hold reason (Phase 4.1); cleared on resume (which
+    # re-dispatches a fresh first article).
+    run.pause_reason = "first_article_rejected"
     await db.commit()
+    broadcast_production_run_changed(run_id)
     run = await _load_run(db, run_id)
     await notification_service.on_run_paused(run.name, _sku_code(run), f"First article rejected: {reason}", db)
     return run
@@ -623,6 +700,7 @@ async def _finalize_remote_eject(db: AsyncSession, run_id: int, printer_id: int)
         return
     run.first_article_state = "approved"
     await db.commit()
+    broadcast_production_run_changed(run_id)
     printer_manager.set_awaiting_plate_clear(printer_id, False)
     run = await _load_run(db, run_id)
     await create_remaining_plates(db, run)
@@ -646,7 +724,7 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
         with_ftp_retry,
     )
     from backend.app.services.eject.dispatch import build_part_present_eject_file
-    from backend.app.services.eject.generator import PRINTER_BED_DIMS
+    from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
     from backend.app.utils.filename import derive_remote_filename
 
     if fa_item is None or fa_item.printer_id is None:
@@ -659,9 +737,13 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
         raise HTTPException(status_code=409, detail="First-article printer not found")
     if not printer_manager.is_connected(printer.id):
         raise HTTPException(status_code=409, detail="Printer is not connected; cannot eject remotely")
-    model = printer.model or ""
-    if model not in PRINTER_BED_DIMS:
-        raise HTTPException(status_code=409, detail=f"No eject bed geometry for printer model {model!r}")
+    # Resolve validated eject geometry for the target model (canonical match, via
+    # the registry) — fail-closed on a missing/unvalidated row with the accessor's
+    # actionable reason.
+    try:
+        geometry = await get_geometry_required(db, printer.model, require_validated=True)
+    except GeometryUnavailable as exc:
+        raise HTTPException(status_code=409, detail=exc.reason) from exc
 
     profile = await db.get(EjectProfile, fa_item.eject_profile_id)
     if profile is None:
@@ -678,7 +760,7 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
     plate_id = fa_item.plate_id or 1
     try:
         eject_path = build_part_present_eject_file(
-            source_path, plate_id, profile, model, cooldown_temp_c=run.cooldown_temp_c_override
+            source_path, plate_id, profile, geometry, cooldown_temp_c=run.cooldown_temp_c_override
         )
     except Exception as exc:  # noqa: BLE001 — surface as an actionable 409
         raise HTTPException(status_code=409, detail=f"Failed to build part-present eject file: {exc}") from exc

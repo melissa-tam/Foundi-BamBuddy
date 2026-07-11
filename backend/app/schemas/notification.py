@@ -83,6 +83,18 @@ class NotificationProviderBase(BaseModel):
     on_printer_quarantined: bool = Field(default=True, description="Notify when a printer is quarantined")
     on_run_paused: bool = Field(default=True, description="Notify when a production run is paused")
     on_run_completed: bool = Field(default=False, description="Notify when a production run finishes")
+    on_foreign_job_detected: bool = Field(
+        default=True, description="Notify when a printer finishes a job Bambuddy did not dispatch"
+    )
+    on_model_mismatch: bool = Field(
+        default=True, description="Notify when a printer's device-reported model differs from its registered model"
+    )
+    on_run_unit_stopped: bool = Field(
+        default=True, description="Notify when a run unit is stopped by the operator (UI or printer screen)"
+    )
+    on_print_stalled: bool = Field(
+        default=True, description="Notify when a printing unit's printer is offline past the stall grace window"
+    )
 
     # Quiet hours
     quiet_hours_enabled: bool = Field(default=False, description="Enable quiet hours")
@@ -173,6 +185,10 @@ class NotificationProviderUpdate(BaseModel):
     on_printer_quarantined: bool | None = None
     on_run_paused: bool | None = None
     on_run_completed: bool | None = None
+    on_foreign_job_detected: bool | None = None
+    on_model_mismatch: bool | None = None
+    on_run_unit_stopped: bool | None = None
+    on_print_stalled: bool | None = None
 
     # Quiet hours
     quiet_hours_enabled: bool | None = None

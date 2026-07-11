@@ -4,12 +4,11 @@ import pytest
 
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.generator import (
-    PRINTER_BED_DIMS,
-    PRINTER_TRAVEL_ENVELOPE,
     EjectGenerationError,
     generate_eject_gcode,
 )
 from backend.app.services.eject.validator import validate_eject_gcode
+from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
 
 
 def _profile(**overrides) -> EjectProfile:
@@ -88,18 +87,18 @@ def _all_xy(gcode: str) -> tuple[list[float], list[float]]:
 class TestDefaultsProfile:
     def test_generates_and_self_validates(self):
         profile = _profile()
-        gcode = generate_eject_gcode(profile, 30.0, "H2S")
-        result = validate_eject_gcode(gcode, profile, 30.0, "H2S")
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY)
         assert result.ok, result.errors
         assert result.warnings == []
 
     def test_block_markers_and_profile_name(self):
-        gcode = generate_eject_gcode(_profile(name="widget"), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(name="widget"), 30.0, H2S_GEOMETRY)
         assert gcode.startswith("; ===== FARM EJECT BLOCK profile=widget =====")
         assert gcode.rstrip().endswith("; ===== FARM EJECT BLOCK END =====")
 
     def test_prologue_reengages_without_z_home(self):
-        gcode = generate_eject_gcode(_profile(), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
         lines = [ln.strip() for ln in gcode.splitlines()]
         assert "M17" in lines
         assert "G28 X Y" in lines
@@ -109,27 +108,27 @@ class TestDefaultsProfile:
         assert not any(ln.startswith("G28") and "Z" in ln for ln in lines)
 
     def test_clearance_z_is_max_z_plus_clearance(self):
-        gcode = generate_eject_gcode(_profile(clearance_mm=10.0), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(clearance_mm=10.0), 30.0, H2S_GEOMETRY)
         assert "G1 Z40 F900" in gcode  # 30 + 10
 
     def test_cooldown_retries_and_threshold(self):
-        gcode = generate_eject_gcode(_profile(), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
         assert gcode.count("M190 R28") == 5
         assert "M140 S0" in gcode
 
     def test_fan_assist_toggles_m106(self):
-        with_fan = generate_eject_gcode(_profile(cooling_fan_assist=True), 30.0, "H2S")
-        without_fan = generate_eject_gcode(_profile(cooling_fan_assist=False), 30.0, "H2S")
+        with_fan = generate_eject_gcode(_profile(cooling_fan_assist=True), 30.0, H2S_GEOMETRY)
+        without_fan = generate_eject_gcode(_profile(cooling_fan_assist=False), 30.0, H2S_GEOMETRY)
         assert "M106 S255" in with_fan
         assert "M106 S255" not in without_fan
 
     def test_parks_centre_at_safe_z(self):
-        gcode = generate_eject_gcode(_profile(), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
         # H2S bed 340x320 -> centre 170,160
         assert "G1 X170 Y160 Z10 F9000" in gcode
 
     def test_no_move_below_z_offset(self):
-        gcode = generate_eject_gcode(_profile(z_offset_mm=0.4), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(z_offset_mm=0.4), 30.0, H2S_GEOMETRY)
         for line in gcode.splitlines():
             code = line.split(";", 1)[0].strip()
             for tok in code.split():
@@ -147,13 +146,13 @@ class TestThermalLessDryRunMode:
     """
 
     def test_omits_all_m190_and_cooldown_fan(self):
-        gcode = generate_eject_gcode(_profile(), 30.0, "H2S", include_cooldown=False)
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY, include_cooldown=False)
         assert "M190" not in gcode  # zero release waits of any kind
         assert "M106 S255" not in gcode  # no cooldown fan wait paired with M190
         assert "M140 S0" in gcode  # heater safety-off is still emitted
 
     def test_still_emits_prologue_and_full_sweep(self):
-        gcode = generate_eject_gcode(_profile(), 30.0, "H2S", include_cooldown=False)
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY, include_cooldown=False)
         lines = [ln.strip() for ln in gcode.splitlines()]
         # Prologue re-engage (still never a bare G28 / G28 Z inside the block).
         assert "M17" in lines
@@ -166,15 +165,15 @@ class TestThermalLessDryRunMode:
 
     def test_self_validates_as_dry_run(self):
         profile = _profile()
-        gcode = generate_eject_gcode(profile, 30.0, "H2S", include_cooldown=False)
-        result = validate_eject_gcode(gcode, profile, 30.0, "H2S", require_cooldown=False)
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY, include_cooldown=False)
+        result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY, require_cooldown=False)
         assert result.ok, result.errors
 
     def test_geometry_identical_to_production_minus_thermal(self):
         # Same sweep lanes/levels; only the thermal section differs.
         profile = _profile(x_passes=3, descent_steps=2)
-        prod = generate_eject_gcode(profile, 25.0, "H2S")
-        dry = generate_eject_gcode(profile, 25.0, "H2S", include_cooldown=False)
+        prod = generate_eject_gcode(profile, 25.0, H2S_GEOMETRY)
+        dry = generate_eject_gcode(profile, 25.0, H2S_GEOMETRY, include_cooldown=False)
         sweep_prefixes = ("G1 X", "G1 Y", "G1 Z")
         prod_moves = [ln for ln in prod.splitlines() if ln.startswith(sweep_prefixes)]
         dry_moves = [ln for ln in dry.splitlines() if ln.startswith(sweep_prefixes)]
@@ -182,7 +181,7 @@ class TestThermalLessDryRunMode:
 
     def test_production_default_keeps_full_thermal_gate(self):
         # Explicit contrast: the default (production) path is unchanged.
-        gcode = generate_eject_gcode(_profile(), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
         assert "M140 S0" in gcode
         assert "M106 S255" in gcode
         assert gcode.count("M190 R28") == 5
@@ -191,14 +190,14 @@ class TestThermalLessDryRunMode:
 class TestCustomThresholdRetries:
     def test_cold_release_eight_retries(self):
         profile = _profile(name="cryonix", cooldown_temp_c=35.0, cooldown_retries=8)
-        gcode = generate_eject_gcode(profile, 20.0, "H2S")
+        gcode = generate_eject_gcode(profile, 20.0, H2S_GEOMETRY)
         assert gcode.count("M190 R35") == 8
-        assert validate_eject_gcode(gcode, profile, 20.0, "H2S").ok
+        assert validate_eject_gcode(gcode, profile, 20.0, H2S_GEOMETRY).ok
 
     def test_single_retry_and_lane(self):
         profile = _profile(name="fast", cooldown_retries=1, x_passes=1, descent_steps=1)
-        gcode = generate_eject_gcode(profile, 15.0, "H2S")
-        result = validate_eject_gcode(gcode, profile, 15.0, "H2S")
+        gcode = generate_eject_gcode(profile, 15.0, H2S_GEOMETRY)
+        result = validate_eject_gcode(gcode, profile, 15.0, H2S_GEOMETRY)
         assert result.ok, result.errors
         assert gcode.count("M190 R28") == 1
 
@@ -206,72 +205,75 @@ class TestCustomThresholdRetries:
 class TestRejections:
     def test_tall_part_rejected(self):
         with pytest.raises(EjectGenerationError, match="exceeds"):
-            generate_eject_gcode(_profile(max_part_height_mm=42.0), 50.1, "H2S")
+            generate_eject_gcode(_profile(max_part_height_mm=42.0), 50.1, H2S_GEOMETRY)
 
     def test_part_at_exactly_limit_is_allowed(self):
-        gcode = generate_eject_gcode(_profile(max_part_height_mm=42.0), 42.0, "H2S")
+        gcode = generate_eject_gcode(_profile(max_part_height_mm=42.0), 42.0, H2S_GEOMETRY)
         assert "FARM EJECT BLOCK" in gcode
 
-    def test_unknown_printer_model_rejected(self):
-        with pytest.raises(EjectGenerationError, match="bed geometry"):
-            generate_eject_gcode(_profile(), 20.0, "X1C")
+    def test_generation_uses_geometry_bed_centre(self):
+        # The generator keys coordinates on the PASSED geometry: an H2C block
+        # (bed 330x320) parks at the H2C centre (165,160), not the H2S centre.
+        # Unknown-model rejection now lives in the geometry accessor (test_geometry).
+        gcode = generate_eject_gcode(_profile(), 20.0, H2C_GEOMETRY)
+        assert "G1 X165 Y160 Z10 F9000" in gcode
 
     def test_h2s_geometry_present(self):
-        assert PRINTER_BED_DIMS["H2S"] == (340.0, 320.0)
+        assert H2S_GEOMETRY.bed == (340.0, 320.0)
 
 
 class TestSweepBand:
     def test_band_bounds_the_lanes(self):
         # Both bounds set -> sweep lanes span exactly [min, max].
         profile = _profile(sweep_x_min_mm=50.0, sweep_x_max_mm=200.0, x_passes=11)
-        gcode = generate_eject_gcode(profile, 30.0, "H2S")
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         xs = _sweep_x_values(gcode)
         assert min(xs) == pytest.approx(50.0)
         assert max(xs) == pytest.approx(200.0)
         assert all(50.0 - 1e-9 <= x <= 200.0 + 1e-9 for x in xs)
-        assert validate_eject_gcode(gcode, profile, 30.0, "H2S").ok
+        assert validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).ok
 
     def test_default_full_width_spans_margin_inset_bed(self):
         # No band -> margin-inset full width span (3 .. bed_x-3 = 337). The
         # permissive envelope must not narrow it: this exact span was operator-
         # witnessed sweeping a full plate on a real H2S (2026-07-04, dry-run v1).
-        gcode = generate_eject_gcode(_profile(x_margin_mm=3.0, x_passes=11), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(x_margin_mm=3.0, x_passes=11), 30.0, H2S_GEOMETRY)
         xs = _sweep_x_values(gcode)
         assert min(xs) == pytest.approx(3.0)
         assert max(xs) == pytest.approx(337.0)
 
     def test_one_sided_band_min_only_rejected(self):
         with pytest.raises(EjectGenerationError, match="both be set or both be null"):
-            generate_eject_gcode(_profile(sweep_x_min_mm=50.0, sweep_x_max_mm=None), 30.0, "H2S")
+            generate_eject_gcode(_profile(sweep_x_min_mm=50.0, sweep_x_max_mm=None), 30.0, H2S_GEOMETRY)
 
     def test_one_sided_band_max_only_rejected(self):
         with pytest.raises(EjectGenerationError, match="both be set or both be null"):
-            generate_eject_gcode(_profile(sweep_x_min_mm=None, sweep_x_max_mm=200.0), 30.0, "H2S")
+            generate_eject_gcode(_profile(sweep_x_min_mm=None, sweep_x_max_mm=200.0), 30.0, H2S_GEOMETRY)
 
     def test_band_width_below_minimum_rejected(self):
         with pytest.raises(EjectGenerationError, match="below the 10"):
-            generate_eject_gcode(_profile(sweep_x_min_mm=50.0, sweep_x_max_mm=55.0), 30.0, "H2S")
+            generate_eject_gcode(_profile(sweep_x_min_mm=50.0, sweep_x_max_mm=55.0), 30.0, H2S_GEOMETRY)
 
     def test_inverted_band_rejected(self):
         with pytest.raises(EjectGenerationError, match="0 <= sweep_x_min_mm"):
-            generate_eject_gcode(_profile(sweep_x_min_mm=200.0, sweep_x_max_mm=50.0), 30.0, "H2S")
+            generate_eject_gcode(_profile(sweep_x_min_mm=200.0, sweep_x_max_mm=50.0), 30.0, H2S_GEOMETRY)
 
     def test_band_past_bed_edge_rejected(self):
         with pytest.raises(EjectGenerationError, match="exceeds bed width"):
-            generate_eject_gcode(_profile(sweep_x_min_mm=50.0, sweep_x_max_mm=400.0), 30.0, "H2S")
+            generate_eject_gcode(_profile(sweep_x_min_mm=50.0, sweep_x_max_mm=400.0), 30.0, H2S_GEOMETRY)
 
 
 class TestSweepStartFrac:
     def test_top_level_is_fraction_of_part_height(self):
         # max_z 50.1, frac 0.5 -> top sweep level 25.05.
         profile = _profile(sweep_start_frac=0.5, max_part_height_mm=60.0)
-        gcode = generate_eject_gcode(profile, 50.1, "H2S")
+        gcode = generate_eject_gcode(profile, 50.1, H2S_GEOMETRY)
         assert "G1 Z25.05 F600" in gcode
         # Prologue clearance STILL clears the full part top (50.1 + 10 = 60.1).
         assert "G1 Z60.1 F900" in gcode
 
     def test_default_frac_starts_at_part_top(self):
-        gcode = generate_eject_gcode(_profile(sweep_start_frac=1.0), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(sweep_start_frac=1.0), 30.0, H2S_GEOMETRY)
         # Descent top level equals the part top (30).
         assert "G1 Z30 F600" in gcode
 
@@ -280,14 +282,14 @@ class TestSweepStartFrac:
         # max_part_height_mm must clear the 50 mm part or generation is refused
         # by the height guard before the frac logic runs (cf. the sibling test).
         profile = _profile(sweep_start_frac=0.001, z_offset_mm=0.4, max_part_height_mm=60.0)
-        gcode = generate_eject_gcode(profile, 50.0, "H2S")
+        gcode = generate_eject_gcode(profile, 50.0, H2S_GEOMETRY)
         for z in _sweep_z_values(gcode):
             assert z >= 0.4 - 1e-9
 
     def test_none_frac_treated_as_full_top(self):
         # A transient profile with the attribute unset behaves like frac=1.0.
         profile = _profile(sweep_start_frac=None)
-        gcode = generate_eject_gcode(profile, 30.0, "H2S")
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         assert "G1 Z30 F600" in gcode
 
 
@@ -301,7 +303,7 @@ class TestFinalSkim:
 
     def test_default_keeps_final_skim(self):
         # Default profile (final_skim True) keeps the skim marker + a skim-speed pass.
-        gcode = generate_eject_gcode(_profile(), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
         assert "; --- final skim ---" in gcode
         assert "F1500" in gcode  # skim_speed_mm_min default -> a skim-speed push
 
@@ -316,17 +318,17 @@ class TestFinalSkim:
             descent_steps=1,
             sweep_start_frac=0.5,
         )
-        gcode = generate_eject_gcode(profile, 30.0, "H2S")
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         assert "; --- final skim ---" not in gcode
         assert "F1500" not in gcode  # no skim-speed pass emitted at all
         push_lines = [ln for ln in gcode.splitlines() if ln.startswith("G1 Y-2 ")]
         assert push_lines == ["G1 Y-2 F3000"]  # one Y-to-front push at eject speed
-        assert validate_eject_gcode(gcode, profile, 30.0, "H2S").ok
+        assert validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).ok
 
     def test_none_final_skim_treated_as_true(self):
         # A transient profile with the attribute unset behaves like final_skim=True.
         profile = _profile(final_skim=None)
-        gcode = generate_eject_gcode(profile, 30.0, "H2S")
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         assert "; --- final skim ---" in gcode
         assert "F1500" in gcode
 
@@ -335,14 +337,14 @@ class TestFinalSkim:
         # marker + pass; the descent sweeps at eject speed are unchanged.
         on_profile = _profile(x_passes=3, descent_steps=2)
         off_profile = _profile(name="noskim", final_skim=False, x_passes=3, descent_steps=2)
-        on = generate_eject_gcode(on_profile, 30.0, "H2S")
-        off = generate_eject_gcode(off_profile, 30.0, "H2S")
+        on = generate_eject_gcode(on_profile, 30.0, H2S_GEOMETRY)
+        off = generate_eject_gcode(off_profile, 30.0, H2S_GEOMETRY)
         assert on.count("; --- final skim ---") == 1
         assert off.count("; --- final skim ---") == 0
         # Descent (eject-speed) pushes identical; only the extra skim pass differs.
         assert off.count("G1 Y-2 F3000") == on.count("G1 Y-2 F3000")
         assert off.count("F1500") == 0
-        assert validate_eject_gcode(off, off_profile, 30.0, "H2S").ok
+        assert validate_eject_gcode(off, off_profile, 30.0, H2S_GEOMETRY).ok
 
 
 class TestTravelEnvelopeClamp:
@@ -357,11 +359,11 @@ class TestTravelEnvelopeClamp:
 
     def test_h2s_envelope_constant(self):
         # Permissive gross-guard bounds (x_min, x_max, y_min, y_max).
-        assert PRINTER_TRAVEL_ENVELOPE["H2S"] == (0.0, 340.0, -16.0, 325.0)
+        assert H2S_GEOMETRY.envelope == (0.0, 340.0, -16.0, 325.0)
 
     def test_default_profile_emits_nothing_outside_envelope(self):
-        x_min, x_max, y_min, y_max = PRINTER_TRAVEL_ENVELOPE["H2S"]
-        gcode = generate_eject_gcode(_profile(), 30.0, "H2S")
+        x_min, x_max, y_min, y_max = H2S_GEOMETRY.envelope
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
         xs, ys = _all_xy(gcode)
         assert xs and ys
         assert min(xs) >= x_min - 1e-9
@@ -373,7 +375,7 @@ class TestTravelEnvelopeClamp:
         # The operator-witnessed working geometry: outer lanes at the margin
         # (X 3 / 337) and lanes spanning front push-off to back overhang
         # (Y -2 / 322). The permissive envelope must pass all of it through.
-        gcode = generate_eject_gcode(_profile(), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
         xs, ys = _all_xy(gcode)
         assert 3.0 in xs
         assert 337.0 in xs
@@ -385,21 +387,21 @@ class TestTravelEnvelopeClamp:
         # Band [50, 335] is legal vs the 340 bed and inside the permissive
         # envelope -> passes through unchanged.
         profile = _profile(sweep_x_min_mm=50.0, sweep_x_max_mm=335.0, x_passes=11)
-        gcode = generate_eject_gcode(profile, 30.0, "H2S")
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         xs = _sweep_x_values(gcode)
         assert min(xs) == pytest.approx(50.0)
         assert max(xs) == pytest.approx(335.0)
-        assert validate_eject_gcode(gcode, profile, 30.0, "H2S").ok
+        assert validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).ok
 
     def test_gross_config_front_overhang_clamped(self):
         # Gross-guard engagement: an absurd front overhang (Y -30) is clamped to
         # the envelope floor (-16) instead of reaching the firmware.
-        gcode = generate_eject_gcode(_profile(front_overhang_mm=30.0), 30.0, "H2S")
+        gcode = generate_eject_gcode(_profile(front_overhang_mm=30.0), 30.0, H2S_GEOMETRY)
         _xs, ys = _all_xy(gcode)
         assert min(ys) == pytest.approx(-16.0)
 
     def test_generated_block_passes_validator(self):
         # Independent-defense round trip: what the generator emits must validate.
         profile = _profile()
-        gcode = generate_eject_gcode(profile, 30.0, "H2S")
-        assert validate_eject_gcode(gcode, profile, 30.0, "H2S").ok
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        assert validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).ok

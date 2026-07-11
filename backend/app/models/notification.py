@@ -107,6 +107,10 @@ class NotificationProvider(Base):
     on_printer_quarantined = Column(Boolean, default=True)  # Printer quarantined after consecutive failures
     on_run_paused = Column(Boolean, default=True)  # Production run paused (reject / no printers)
     on_run_completed = Column(Boolean, default=False)  # Production run finished all plates
+    on_foreign_job_detected = Column(Boolean, default=True)  # Terminal print Bambuddy did not dispatch (foreign)
+    on_model_mismatch = Column(Boolean, default=True)  # Device-reported model differs from registered Printer.model
+    on_run_unit_stopped = Column(Boolean, default=True)  # Run unit stopped by the operator (UI or printer screen)
+    on_print_stalled = Column(Boolean, default=True)  # Printing unit's printer offline past the stall grace window
 
     # Quiet hours (do not disturb)
     quiet_hours_enabled = Column(Boolean, default=False)

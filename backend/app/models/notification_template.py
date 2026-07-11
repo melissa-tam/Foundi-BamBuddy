@@ -82,8 +82,12 @@ DEFAULT_TEMPLATES = [
     {
         "event_type": "plate_not_empty",
         "name": "Plate Not Empty",
-        "title_template": "Plate Not Empty - Print Paused",
-        "body_template": "{printer}: Objects detected on build plate. Print has been paused. Clear plate and resume.",
+        "title_template": "Plate Not Empty — {printer}",
+        # {source_detail} carries the source-specific sentence (printer vision /
+        # camera comparison / cooldown timeout). Rendering is tolerant of an older
+        # install whose seeded body lacks this placeholder — the detail is appended
+        # (see NotificationService.on_plate_not_empty).
+        "body_template": "{printer}: {source_detail}",
     },
     {
         "event_type": "filament_low",
@@ -194,6 +198,30 @@ DEFAULT_TEMPLATES = [
         "name": "Production Run Completed",
         "title_template": "Run Complete — {sku_code}",
         "body_template": "Run '{run_name}' finished: {units_completed} unit(s) across {plates_completed} plate(s).",
+    },
+    {
+        "event_type": "foreign_job_detected",
+        "name": "Foreign Print Detected",
+        "title_template": "Foreign print detected: {printer}",
+        "body_template": "{printer} finished '{subtask_name}' that Bambuddy did not dispatch.\nPlate gate raised; farm queue untouched. Clear the plate to resume dispatch.",
+    },
+    {
+        "event_type": "model_mismatch",
+        "name": "Printer Model Mismatch",
+        "title_template": "Model mismatch: {printer}",
+        "body_template": "{printer} reports model {reported_model} but is registered as {registered_model}.\nFarm dispatch is blocked — correct the printer's model so eject geometry matches the real bed.",
+    },
+    {
+        "event_type": "run_unit_stopped",
+        "name": "Run Unit Stopped",
+        "title_template": "Unit stopped — {printer_name}",
+        "body_template": "{printer_name}: unit stopped by the operator during run '{run_name}'. No auto-retry; clear the plate, then Resume the run to top it back up.",
+    },
+    {
+        "event_type": "print_stalled",
+        "name": "Print Stalled (printer offline)",
+        "title_template": "Print stalled — {printer_name}",
+        "body_template": "{printer_name} has been offline {minutes} min with '{job_name}' still marked printing. It will reconcile automatically when the printer reconnects.",
     },
     {
         "event_type": "user_created",

@@ -991,6 +991,8 @@ export function SettingsPage() {
       (settings.require_plate_clear ?? false) !== (localSettings.require_plate_clear ?? false) ||
       (settings.farm_retry_max_per_unit ?? 1) !== (localSettings.farm_retry_max_per_unit ?? 1) ||
       (settings.farm_escalate_consecutive_failures ?? 3) !== (localSettings.farm_escalate_consecutive_failures ?? 3) ||
+      (settings.farm_cooldown_warn_floor_c ?? 30) !== (localSettings.farm_cooldown_warn_floor_c ?? 30) ||
+      (settings.farm_offline_stall_minutes ?? 30) !== (localSettings.farm_offline_stall_minutes ?? 30) ||
       (settings.nozzle_temp_presets ?? '') !== (localSettings.nozzle_temp_presets ?? '') ||
       (settings.bed_temp_presets ?? '') !== (localSettings.bed_temp_presets ?? '') ||
       (settings.chamber_temp_presets ?? '') !== (localSettings.chamber_temp_presets ?? '') ||
@@ -1087,6 +1089,8 @@ export function SettingsPage() {
         require_plate_clear: localSettings.require_plate_clear,
         farm_retry_max_per_unit: localSettings.farm_retry_max_per_unit,
         farm_escalate_consecutive_failures: localSettings.farm_escalate_consecutive_failures,
+        farm_cooldown_warn_floor_c: localSettings.farm_cooldown_warn_floor_c,
+        farm_offline_stall_minutes: localSettings.farm_offline_stall_minutes,
         nozzle_temp_presets: localSettings.nozzle_temp_presets,
         bed_temp_presets: localSettings.bed_temp_presets,
         chamber_temp_presets: localSettings.chamber_temp_presets,
@@ -4312,6 +4316,38 @@ export function SettingsPage() {
                   />
                   <p className="text-xs text-bambu-gray mt-1">
                     {t('settings.farmEscalateConsecutiveFailuresHelp', 'Consecutive failures on a printer that trip a quarantine (1–10)')}
+                  </p>
+                </div>
+                <div className="flex-1">
+                  <label className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmCooldownWarnFloor', 'Cooldown warn floor (°C)')}
+                  </label>
+                  <input
+                    type="number"
+                    min={15}
+                    max={50}
+                    value={localSettings.farm_cooldown_warn_floor_c ?? 30}
+                    onChange={(e) => updateSetting('farm_cooldown_warn_floor_c', Math.max(15, Math.min(50, parseInt(e.target.value) || 30)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownWarnFloorHelp', 'Warn when an eject profile cooldown threshold is below this — a threshold at or below shop ambient never completes (15–50)')}
+                  </p>
+                </div>
+                <div className="flex-1">
+                  <label className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmOfflineStallMinutes', 'Offline stall (min)')}
+                  </label>
+                  <input
+                    type="number"
+                    min={5}
+                    max={720}
+                    value={localSettings.farm_offline_stall_minutes ?? 30}
+                    onChange={(e) => updateSetting('farm_offline_stall_minutes', Math.max(5, Math.min(720, parseInt(e.target.value) || 30)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmOfflineStallMinutesHelp', 'Flag a unit still printing whose printer has been offline this long — it never terminates, just shows the stall (5–720)')}
                   </p>
                 </div>
               </div>

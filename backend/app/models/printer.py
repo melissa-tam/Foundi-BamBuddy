@@ -46,6 +46,14 @@ class Printer(Base):
     # Queue: True after a print finishes/fails, until user acknowledges the plate is cleared.
     # Persisted so the gate survives crashes and power cycles (issue #961).
     awaiting_plate_clear: Mapped[bool] = mapped_column(Boolean, default=False)
+    # The subtask id of the print that RAISED the current plate-clear gate (the
+    # payload subtask_id at terminal). Persisted alongside the flag so a restart
+    # can tell WHICH job's finish gated the plate: the cooldown monitor only
+    # re-arms auto-clear when the last-started item's dispatch_subtask_id matches
+    # this (Phase 1). A gate raised from a source we can't identify (foreign print,
+    # or a pre-migration NULL) never auto-clears — it waits for a human. NULLed
+    # whenever the gate is cleared.
+    plate_gate_subtask_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Farm failure policy (Phase 3): when a printer racks up N consecutive
     # terminal failures on farm jobs it is quarantined — excluded from ALL
     # dispatch until an operator clears it. quarantine_reason holds the

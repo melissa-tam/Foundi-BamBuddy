@@ -21,6 +21,7 @@ from backend.app.models.orca_base_cache import OrcaBaseProfile
 from backend.app.models.pending_upload import PendingUpload
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.printer import Printer
+from backend.app.models.printer_model_geometry import PrinterModelGeometry
 from backend.app.models.printer_sensor_history import PrinterSensorHistory
 from backend.app.models.project import Project
 from backend.app.models.settings import Settings
@@ -59,6 +60,7 @@ __all__ = [
     "AmsLabel",
     "PendingUpload",
     "PrintBatch",
+    "PrinterModelGeometry",
     "Sku",
     "SkuFile",
     "LibraryFolder",

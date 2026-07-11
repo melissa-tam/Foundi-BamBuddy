@@ -430,6 +430,18 @@ class AppSettings(BaseModel):
         le=20,
         description="Default consecutive farm failures on one printer that trip quarantine",
     )
+    farm_cooldown_warn_floor_c: int = Field(
+        default=30,
+        ge=15,
+        le=50,
+        description="Warn when an eject cooldown target is at/below this °C — at/below shop ambient the M190 R wait never completes",
+    )
+    farm_offline_stall_minutes: int = Field(
+        default=30,
+        ge=5,
+        le=720,
+        description="Flag a farm unit still 'printing' whose printer has been offline this many minutes (5–720)",
+    )
 
 
 class AppSettingsUpdate(BaseModel):
@@ -551,6 +563,8 @@ class AppSettingsUpdate(BaseModel):
     forecast_global_lead_time_days: int | None = Field(default=None, ge=0)
     farm_retry_max_per_unit: int | None = Field(default=None, ge=0, le=10)
     farm_escalate_consecutive_failures: int | None = Field(default=None, ge=1, le=20)
+    farm_cooldown_warn_floor_c: int | None = Field(default=None, ge=15, le=50)
+    farm_offline_stall_minutes: int | None = Field(default=None, ge=5, le=720)
 
     @field_validator("gcode_snippets")
     @classmethod

@@ -27,13 +27,23 @@ import pytest
 from backend.app.main import _is_active_archive_stale
 
 
-def _state(state: str, *, subtask_id: str = "", subtask_name: str = "", connected: bool = True) -> SimpleNamespace:
+def _state(
+    state: str,
+    *,
+    subtask_id: str = "",
+    subtask_name: str = "",
+    connected: bool = True,
+    progress: float = 0.0,
+    layer_num: int = 0,
+) -> SimpleNamespace:
     """Minimal PrinterState stub for the pure decision function."""
     return SimpleNamespace(
         state=state,
         subtask_id=subtask_id,
         subtask_name=subtask_name,
         connected=connected,
+        progress=progress,
+        layer_num=layer_num,
         raw_data={},
     )
 
@@ -239,6 +249,74 @@ class TestReconcileStaleActivePrints:
                     count = await reconcile_stale_active_prints(printer_id=1)
         assert count == 0
         mock_complete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_finish_matching_subtask_synthesises_completed_with_real_evidence(self):
+        """Phase 3.4: live FINISH + subtask matching THIS archive → synthesise the
+        TRUE 'completed' with real progress/layers/subtask so the normal terminal
+        path (correlation → gate → monitor → farm_policy) runs on real evidence."""
+        from backend.app.main import reconcile_stale_active_prints
+
+        stale = _archive(subtask_id="MATCH", filename="done.3mf", print_name="done")
+        with patch("backend.app.main.printer_manager") as mock_pm:
+            mock_pm.get_status.return_value = _state(
+                "FINISH", subtask_id="MATCH", subtask_name="done", progress=100.0, layer_num=250
+            )
+            with patch("backend.app.main.async_session") as mock_session:
+                session_ctx = AsyncMock()
+                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
+                mock_session.return_value.__aenter__.return_value = session_ctx
+                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
+                    count = await reconcile_stale_active_prints(printer_id=1)
+        assert count == 1
+        payload = mock_complete.call_args[0][1]
+        assert payload["status"] == "completed"
+        assert payload["subtask_id"] == "MATCH"
+        assert payload["last_progress"] == 100.0
+        assert payload["last_layer_num"] == 250
+        assert payload["_reconciled"] is True
+
+    @pytest.mark.asyncio
+    async def test_failed_matching_subtask_synthesises_failed(self):
+        from backend.app.main import reconcile_stale_active_prints
+
+        stale = _archive(subtask_id="MATCH", filename="bad.3mf", print_name="bad")
+        with patch("backend.app.main.printer_manager") as mock_pm:
+            mock_pm.get_status.return_value = _state(
+                "FAILED", subtask_id="MATCH", subtask_name="bad", progress=42.0, layer_num=88
+            )
+            with patch("backend.app.main.async_session") as mock_session:
+                session_ctx = AsyncMock()
+                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
+                mock_session.return_value.__aenter__.return_value = session_ctx
+                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
+                    count = await reconcile_stale_active_prints(printer_id=1)
+        assert count == 1
+        payload = mock_complete.call_args[0][1]
+        assert payload["status"] == "failed"
+        assert payload["last_layer_num"] == 88
+
+    @pytest.mark.asyncio
+    async def test_finish_mismatched_subtask_keeps_aborted(self):
+        """A live FINISH whose subtask does NOT match this archive is not proof of
+        THIS print's outcome → keep today's conservative 'aborted' (no progress)."""
+        from backend.app.main import reconcile_stale_active_prints
+
+        stale = _archive(subtask_id="ARCHIVE_ID", filename="ghost.3mf", print_name="ghost")
+        with patch("backend.app.main.printer_manager") as mock_pm:
+            mock_pm.get_status.return_value = _state(
+                "FINISH", subtask_id="DIFFERENT", subtask_name="other", progress=100.0, layer_num=200
+            )
+            with patch("backend.app.main.async_session") as mock_session:
+                session_ctx = AsyncMock()
+                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
+                mock_session.return_value.__aenter__.return_value = session_ctx
+                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
+                    count = await reconcile_stale_active_prints(printer_id=1)
+        assert count == 1
+        payload = mock_complete.call_args[0][1]
+        assert payload["status"] == "aborted"
+        assert "last_progress" not in payload  # conservative — no fabricated evidence
 
     @pytest.mark.asyncio
     async def test_on_print_complete_failure_does_not_block_rest(self):

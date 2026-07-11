@@ -315,9 +315,7 @@ class TestProductionRunDelete:
 
         db_session.expire_all()
         # Batch row gone…
-        batch = (
-            await db_session.execute(select(PrintBatch).where(PrintBatch.id == run_id))
-        ).scalar_one_or_none()
+        batch = (await db_session.execute(select(PrintBatch).where(PrintBatch.id == run_id))).scalar_one_or_none()
         assert batch is None
         # …and every queue item with it.
         assert await _pending_items(db_session, run_id) == []
@@ -417,9 +415,7 @@ class TestProductionRunDelete:
         assert login.status_code == 200, login.text
         token = login.json()["access_token"]
         # Viewers carry production_runs:read but NOT :delete → 403.
-        resp = await async_client.delete(
-            "/api/v1/production-runs/987654", headers={"Authorization": f"Bearer {token}"}
-        )
+        resp = await async_client.delete("/api/v1/production-runs/987654", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 403, resp.text
 
 
@@ -464,3 +460,233 @@ class TestQueueRetryLineageExposure:
         body = resp.json()
         assert body["retry_of_id"] is None
         assert body["retry_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+class TestRunDetailPhase4:
+    """Run visibility (Phase 4.1): lean list vs full detail, pause_reason
+    lifecycle over HTTP, staged counts, and the queue rows' run identity."""
+
+    async def _make_run(self, async_client, db_session, tmp_path, code, *, target_units=2):
+        eject = await _make_eject_profile(async_client, name=f"ep-{code}")
+        _, file_link_id = await _make_sku_with_file(async_client, db_session, tmp_path, code=code)
+        r = await async_client.post(
+            "/api/v1/production-runs",
+            json={
+                "sku_file_id": file_link_id,
+                "target_units": target_units,
+                "target_model": "H2S",
+                "eject_profile_id": eject,
+                "require_first_article": False,
+            },
+        )
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+    async def test_list_is_lean_and_detail_is_full(self, async_client, db_session, tmp_path):
+        run_id = await self._make_run(async_client, db_session, tmp_path, "SKU401.01")
+
+        lean = (await async_client.get("/api/v1/production-runs")).json()
+        row = next(r for r in lean if r["id"] == run_id)
+        assert row["pause_reason"] is None
+        assert row["staged_filament_short"] == 0
+        assert row["staged_other"] == 0
+        assert row["has_blocked_printers"] is False
+        assert row["printer_states"] is None  # detail-only payloads stay null
+        assert row["units"] is None
+
+        detail = (await async_client.get(f"/api/v1/production-runs/{run_id}")).json()
+        assert isinstance(detail["printer_states"], list)
+        assert len(detail["units"]) == 2
+        unit = detail["units"][0]
+        for key in (
+            "id",
+            "status",
+            "stop_source",
+            "waiting_reason",
+            "printer_id",
+            "printer_name",
+            "retry_of_id",
+            "retry_count",
+            "filament_short",
+            "manual_start",
+            "first_article",
+            "error_message",
+            "started_at",
+            "completed_at",
+        ):
+            assert key in unit
+
+    async def test_pause_reason_lifecycle_over_http(self, async_client, db_session, tmp_path):
+        run_id = await self._make_run(async_client, db_session, tmp_path, "SKU402.01")
+
+        paused = (await async_client.post(f"/api/v1/production-runs/{run_id}/pause")).json()
+        assert paused["status"] == "paused"
+        assert paused["pause_reason"] == "operator"
+
+        resumed = (await async_client.post(f"/api/v1/production-runs/{run_id}/resume")).json()
+        assert resumed["status"] == "active"
+        assert resumed["pause_reason"] is None
+
+    async def test_staged_counts_and_unit_flags_in_detail(self, async_client, db_session, tmp_path):
+        run_id = await self._make_run(async_client, db_session, tmp_path, "SKU403.01")
+        items = await _pending_items(db_session, run_id)
+        items[0].manual_start = True
+        items[0].filament_short = True  # system-staged (low spool)
+        items[1].manual_start = True  # operator-staged
+        await db_session.commit()
+
+        detail = (await async_client.get(f"/api/v1/production-runs/{run_id}")).json()
+        assert detail["staged_filament_short"] == 1
+        assert detail["staged_other"] == 1
+        flagged = next(u for u in detail["units"] if u["id"] == items[0].id)
+        assert flagged["filament_short"] is True and flagged["manual_start"] is True
+
+    async def test_detail_units_carry_retry_lineage_and_stop_source(self, async_client, db_session, tmp_path):
+        run_id = await self._make_run(async_client, db_session, tmp_path, "SKU404.01")
+        items = await _pending_items(db_session, run_id)
+        original, second = items[0], items[1]
+        original.status = "failed"
+        second.retry_of_id = original.id
+        second.retry_count = 1
+        second.stop_source = "operator_screen"
+        await db_session.commit()
+
+        detail = (await async_client.get(f"/api/v1/production-runs/{run_id}")).json()
+        units = {u["id"]: u for u in detail["units"]}
+        assert units[second.id]["retry_of_id"] == original.id
+        assert units[second.id]["retry_count"] == 1
+        assert units[second.id]["stop_source"] == "operator_screen"
+
+    async def test_queue_rows_carry_production_run_id(self, async_client, db_session, tmp_path):
+        run_id = await self._make_run(async_client, db_session, tmp_path, "SKU405.01")
+        items = await _pending_items(db_session, run_id)
+
+        resp = await async_client.get(f"/api/v1/queue/{items[0].id}")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["production_run_id"] == run_id
+
+    async def test_plain_batch_items_have_null_production_run_id(self, async_client, db_session, tmp_path):
+        # A non-farm batch (no sku_file_id) must NOT masquerade as a run.
+        from backend.app.models.print_batch import PrintBatch
+        from backend.app.models.print_queue import PrintQueueItem
+
+        lib = await _add_library_file(db_session, tmp_path, name="plain.gcode.3mf")
+        batch = PrintBatch(name="plain", quantity=1, status="active")
+        db_session.add(batch)
+        await db_session.flush()
+        item = PrintQueueItem(batch_id=batch.id, library_file_id=lib.id, status="pending", position=1)
+        db_session.add(item)
+        await db_session.commit()
+
+        resp = await async_client.get(f"/api/v1/queue/{item.id}")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["batch_id"] == batch.id
+        assert body["production_run_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+class TestReleaseStagedRoute:
+    """POST /queue/release-staged (Phase 4.2): re-checks system-staged items and
+    releases only the resolved ones. Queue-update permission required."""
+
+    async def _stage_run_items(self, async_client, db_session, tmp_path, code):
+        eject = await _make_eject_profile(async_client, name=f"ep-{code}")
+        _, file_link_id = await _make_sku_with_file(async_client, db_session, tmp_path, code=code)
+        r = await async_client.post(
+            "/api/v1/production-runs",
+            json={
+                "sku_file_id": file_link_id,
+                "target_units": 2,
+                "target_model": "H2S",
+                "eject_profile_id": eject,
+                "require_first_article": False,
+            },
+        )
+        assert r.status_code == 201, r.text
+        items = await _pending_items(db_session, r.json()["id"])
+        for i, item in enumerate(items):
+            item.printer_id = 100 + i
+            item.manual_start = True
+            item.filament_short = True
+        await db_session.commit()
+        return items
+
+    async def test_release_all_when_deficits_cleared(self, async_client, db_session, tmp_path, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from backend.app.services import farm_staging
+
+        items = await self._stage_run_items(async_client, db_session, tmp_path, "SKU410.01")
+        item_ids = [item.id for item in items]
+        monkeypatch.setattr(farm_staging, "compute_deficit_for_queue_item", AsyncMock(return_value=[]))
+
+        resp = await async_client.post("/api/v1/queue/release-staged")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"released": 2}
+
+        for item_id in item_ids:
+            row = (await async_client.get(f"/api/v1/queue/{item_id}")).json()
+            assert row["manual_start"] is False
+            assert row["filament_short"] is False
+
+    async def test_release_scoped_to_printer(self, async_client, db_session, tmp_path, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from backend.app.services import farm_staging
+
+        items = await self._stage_run_items(async_client, db_session, tmp_path, "SKU411.01")
+        monkeypatch.setattr(farm_staging, "compute_deficit_for_queue_item", AsyncMock(return_value=[]))
+
+        resp = await async_client.post(f"/api/v1/queue/release-staged?printer_id={items[0].printer_id}")
+        assert resp.json() == {"released": 1}
+        other = (await async_client.get(f"/api/v1/queue/{items[1].id}")).json()
+        assert other["manual_start"] is True  # untouched — other printer
+
+    async def test_still_short_items_stay_staged(self, async_client, db_session, tmp_path, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from backend.app.services import farm_staging
+
+        items = await self._stage_run_items(async_client, db_session, tmp_path, "SKU412.01")
+        monkeypatch.setattr(farm_staging, "compute_deficit_for_queue_item", AsyncMock(return_value=[{"slot_id": 1}]))
+        resp = await async_client.post("/api/v1/queue/release-staged")
+        assert resp.json() == {"released": 0}
+        row = (await async_client.get(f"/api/v1/queue/{items[0].id}")).json()
+        assert row["manual_start"] is True and row["filament_short"] is True
+
+    async def test_requires_auth_401(self, async_client):
+        await _enable_auth(async_client, username="rs_admin")
+        resp = await async_client.post("/api/v1/queue/release-staged")
+        assert resp.status_code == 401, resp.text
+
+    async def test_forbidden_for_viewer_403(self, async_client, db_session):
+        from sqlalchemy import insert
+
+        from backend.app.core.auth import get_password_hash
+        from backend.app.models.group import Group, user_groups
+        from backend.app.models.user import User
+
+        await _enable_auth(async_client, username="rs_admin2")
+        viewer = User(
+            username="rs_viewer",
+            email="rs_viewer@example.com",
+            password_hash=get_password_hash("RsViewer!1"),
+            role="user",
+            is_active=True,
+        )
+        db_session.add(viewer)
+        await db_session.flush()
+        viewers = (await db_session.execute(select(Group).where(Group.name == "Viewers"))).scalar_one()
+        await db_session.execute(insert(user_groups).values(user_id=viewer.id, group_id=viewers.id))
+        await db_session.commit()
+
+        login = await async_client.post("/api/v1/auth/login", json={"username": "rs_viewer", "password": "RsViewer!1"})
+        assert login.status_code == 200, login.text
+        token = login.json()["access_token"]
+        # Viewers lack queue:update_all -> 403.
+        resp = await async_client.post("/api/v1/queue/release-staged", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 403, resp.text

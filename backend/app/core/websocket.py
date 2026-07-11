@@ -1,8 +1,11 @@
 import asyncio
 import json
+import logging
 from typing import Any
 
 from fastapi import WebSocket
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectionManager:
@@ -110,3 +113,33 @@ class ConnectionManager:
 
 # Global connection manager
 ws_manager = ConnectionManager()
+
+
+def broadcast_production_run_changed(run_id: int) -> None:
+    """Fire-and-forget farm event: a production run's derived state changed (Phase 4).
+
+    ONE event type covers every run mutation (pause/resume/abort, operator stop,
+    quarantine auto-pause, first-article transitions, completion, top-up, stall
+    flag changes) — the frontend reacts with a single debounced
+    ``['production-runs']`` invalidation, mirroring how the printer flags reuse
+    ``printer_status``. Module-level (not a ConnectionManager method) so farm
+    services can import ONE name and tests can spy on it per call site.
+
+    Guarded twice: no running event loop (sync unit tests, CLI) → silent no-op
+    without ever creating the coroutine (avoids "never awaited" warnings), and
+    any scheduling error is logged, never raised — a WS hiccup must not abort a
+    committed run transition.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no loop → nothing to notify (sync test / script context)
+    try:
+        from backend.app.core.tasks import spawn_background_task
+
+        spawn_background_task(
+            ws_manager.broadcast({"type": "production_run_changed", "run_id": run_id}),
+            name=f"ws-production-run-changed-{run_id}",
+        )
+    except Exception as e:  # noqa: BLE001 — a broadcast failure must never break the caller
+        logger.warning("Failed to broadcast production_run_changed for run %d: %s", run_id, e)

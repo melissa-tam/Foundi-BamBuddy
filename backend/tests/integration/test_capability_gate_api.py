@@ -62,6 +62,24 @@ class TestCapabilityGateBlockSurfacesReason:
 
         # H2S printer; file sliced for H2S needing a 0.6 nozzle + PETG.
         printer = await printer_factory(model="H2S", name="H2S-1")
+        # Seed the H2S validated geometry the gate now resolves (create_all test DB
+        # has no run_migrations seed) so the block reason is the nozzle, not geometry.
+        from backend.app.models.printer_model_geometry import PrinterModelGeometry
+
+        db_session.add(
+            PrinterModelGeometry(
+                model_key="H2S",
+                bed_x=340,
+                bed_y=320,
+                env_x_min=0,
+                env_x_max=340,
+                env_y_min=-16,
+                env_y_max=325,
+                max_part_height_mm=42,
+                validated=True,
+            )
+        )
+        await db_session.commit()
         lib = await _add_library_file(
             db_session,
             tmp_path,
@@ -122,9 +140,7 @@ class TestCapabilityGateBlockSurfacesReason:
 @pytest.mark.asyncio
 @pytest.mark.integration
 class TestStaggerLimitsStartsPerTick:
-    async def test_group_size_one_starts_only_one_per_tick(
-        self, test_engine, db_session, printer_factory, monkeypatch
-    ):
+    async def test_group_size_one_starts_only_one_per_tick(self, test_engine, db_session, printer_factory, monkeypatch):
         from backend.app.models.print_queue import PrintQueueItem
         from backend.app.models.settings import Settings
         from backend.app.services import print_scheduler as ps
@@ -172,9 +188,7 @@ class TestStaggerLimitsStartsPerTick:
         result = await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.status == "printing"))
         assert len(list(result.scalars().all())) == 1
 
-    async def test_budget_two_starts_two_per_tick(
-        self, test_engine, db_session, printer_factory, monkeypatch
-    ):
+    async def test_budget_two_starts_two_per_tick(self, test_engine, db_session, printer_factory, monkeypatch):
         from backend.app.models.print_queue import PrintQueueItem
         from backend.app.models.settings import Settings
         from backend.app.services import print_scheduler as ps

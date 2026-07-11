@@ -86,8 +86,10 @@ async def get_run(
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.PRODUCTION_RUNS_READ),
 ):
+    """Full run detail: the list payload plus per-printer blocked states and the
+    per-unit list (status, stop_source, waiting_reason, retry lineage)."""
     run = await _load_run_or_404(db, run_id)
-    return await build_run_response(db, run)
+    return await build_run_response(db, run, detail=True)
 
 
 @router.delete("/{run_id}", status_code=status.HTTP_204_NO_CONTENT)

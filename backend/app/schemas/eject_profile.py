@@ -122,10 +122,24 @@ class EjectProfileResponse(EjectProfileBase):
 
 
 class EjectPreviewRequest(BaseModel):
-    """Body for the preview and dry-run endpoints."""
+    """Body for the preview and dry-run (download) endpoints.
+
+    Geometry is resolved from EXACTLY ONE of ``printer_id`` (the target printer's
+    registered model) or ``model`` (an explicit model key) — supplying both or
+    neither is a 422. These are ladder tools, so an UNVALIDATED geometry row is
+    allowed; the response carries a warning naming the model.
+    """
 
     library_file_id: int
     plate_index: int = Field(default=1, ge=1)
+    printer_id: int | None = None
+    model: str | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_target(self) -> "EjectPreviewRequest":
+        if (self.printer_id is None) == (self.model is None):
+            raise ValueError("provide exactly one of printer_id or model")
+        return self
 
 
 class EjectDryRunDispatchRequest(BaseModel):
@@ -133,11 +147,15 @@ class EjectDryRunDispatchRequest(BaseModel):
 
     Builds the thermal-less eject dry-run 3MF for ``(library_file_id,
     plate_index)`` and queues it on ``printer_id`` for an empty-bed sweep test.
+    Geometry is resolved from the TARGET printer's model: 422 when that model has
+    no geometry row, 409 when the row is not hardware-validated UNLESS
+    ``allow_unvalidated`` is set (hardware-ladder step 4 only).
     """
 
     library_file_id: int
     plate_index: int = Field(default=1, ge=1)
     printer_id: int
+    allow_unvalidated: bool = False
 
 
 class EjectDryRunDispatchResponse(BaseModel):
@@ -158,3 +176,6 @@ class EjectPreviewResponse(BaseModel):
     gcode: str
     validation: EjectValidationResponse
     max_z_height: float
+    # Geometry-level warnings independent of G-code validation — e.g. the target
+    # model's geometry row is not hardware-validated yet (ladder pending).
+    warnings: list[str] = []

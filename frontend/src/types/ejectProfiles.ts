@@ -84,10 +84,17 @@ export const DEFAULT_EJECT_PROFILE_PARAMS: EjectProfileParams = {
   sweep_start_frac: 1,
 };
 
-/** Request body for the preview endpoint. */
+/** Request body for the preview and dry-run (download) endpoints.
+ *
+ * Geometry is resolved from EXACTLY ONE of `printer_id` (that printer's
+ * registered model) or `model` (an explicit registry model key) — the backend
+ * rejects both-or-neither with a 422. Unvalidated geometry is allowed for
+ * these ladder tools; the response carries a warning naming the model. */
 export interface EjectProfilePreviewRequest {
   library_file_id: number;
   plate_index: number;
+  printer_id?: number | null;
+  model?: string | null;
 }
 
 /** Validation block returned alongside the generated preview G-code. */
@@ -102,6 +109,9 @@ export interface EjectProfilePreviewResponse {
   gcode: string;
   validation: EjectProfileValidation;
   max_z_height: number;
+  /** Geometry-level warnings independent of G-code validation — e.g. the
+   *  target model's geometry is not hardware-validated yet (ladder pending). */
+  warnings: string[];
 }
 
 /**
@@ -114,6 +124,9 @@ export interface EjectProfileDryRunDispatchRequest {
   library_file_id: number;
   plate_index: number;
   printer_id: number;
+  /** Bypass the geometry hardware-validation gate (hardware-ladder step 4
+   *  ONLY). Default false: dispatch onto an unvalidated model is a 409. */
+  allow_unvalidated?: boolean;
 }
 
 /** Response from POST /eject-profiles/{id}/dry-run/dispatch. */

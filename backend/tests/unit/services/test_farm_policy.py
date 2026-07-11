@@ -1,6 +1,7 @@
 """Unit tests for the farm first-article + failure/quarantine policy (Phase 3)."""
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -337,6 +338,129 @@ class TestQuarantine:
         assert cleared.quarantined is False
         assert cleared.quarantine_reason is None
         assert printer_manager.is_quarantined(printer.id) is False
+
+
+class TestOperatorStop:
+    """Operator-stop policy (Phase 3.1): a farm unit cancelled WITH a stop_source
+    takes the no-retry / no-quarantine path, holds the run (active), notifies once."""
+
+    async def _mk_printer(self, db, name="OS"):
+        p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(p)
+        await db.flush()
+        return p
+
+    async def test_operator_stop_no_retry_holds_run_notifies_once(self, db_session):
+        batch, prof = await _mk_run(db_session, quantity=3, printer_ids=[3], require_fa=False)
+        item = PrintQueueItem(
+            batch_id=batch.id,
+            status="cancelled",
+            first_article=False,
+            printer_id=3,
+            eject_profile_id=prof.id,
+            plate_id=1,
+            retry_count=0,
+            position=99,
+            stop_source="operator_screen",
+            completed_at=datetime.now(timezone.utc),
+        )
+        db_session.add(item)
+        await db_session.commit()
+
+        with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock) as mock_n:
+            await farm_policy.on_terminal(db_session, 3, item.id, "cancelled")
+            mock_n.assert_awaited_once()
+
+        # No retry row for an operator stop.
+        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
+        assert retries == []
+        await db_session.refresh(batch)
+        assert batch.pause_reason == "operator_stop"
+        assert batch.status == "active"  # run STAYS active with a visible hold
+
+    async def test_cancelled_without_stop_source_is_noop(self, db_session):
+        # A run-abort cancel (no stop_source) must NOT trigger operator-stop handling.
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False)
+        item = PrintQueueItem(
+            batch_id=batch.id,
+            status="cancelled",
+            first_article=False,
+            printer_id=3,
+            eject_profile_id=prof.id,
+            plate_id=1,
+            position=98,
+            stop_source=None,
+            completed_at=datetime.now(timezone.utc),
+        )
+        db_session.add(item)
+        await db_session.commit()
+
+        with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock) as mock_n:
+            await farm_policy.on_terminal(db_session, 3, item.id, "cancelled")
+            mock_n.assert_not_awaited()
+        await db_session.refresh(batch)
+        assert batch.pause_reason is None
+
+    async def test_operator_stop_not_counted_toward_quarantine(self, db_session):
+        # A prior failure + an operator stop must NOT quarantine (cancelled is
+        # outside the terminal-outcome window that quarantine counts).
+        batch, prof = await _mk_run(db_session, quantity=5, printer_ids=[0], require_fa=False, escalate=2)
+        printer = await self._mk_printer(db_session, "OSQ")
+        base = datetime.now(timezone.utc)
+        db_session.add(
+            PrintQueueItem(
+                batch_id=batch.id,
+                printer_id=printer.id,
+                status="failed",
+                eject_profile_id=prof.id,
+                plate_id=1,
+                position=700,
+                completed_at=base,
+            )
+        )
+        stop_item = PrintQueueItem(
+            batch_id=batch.id,
+            printer_id=printer.id,
+            status="cancelled",
+            eject_profile_id=prof.id,
+            plate_id=1,
+            position=701,
+            stop_source="operator_ui",
+            completed_at=base + timedelta(minutes=1),
+        )
+        db_session.add(stop_item)
+        await db_session.commit()
+
+        with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock):
+            await farm_policy.on_terminal(db_session, printer.id, stop_item.id, "cancelled")
+
+        # The quarantine window only sees completed/failed — the cancelled stop is
+        # invisible to it, so the printer is NOT quarantined off one real failure.
+        recent = await farm_policy.recent_terminal_farm_items(db_session, printer.id, 2)
+        assert all(r.status == "failed" for r in recent)
+        assert len(recent) == 1
+        await db_session.refresh(printer)
+        assert printer.quarantined is False
+
+    async def test_true_failed_path_unchanged(self, db_session):
+        # A genuine FAILED (no stop_source) still spawns a retry — regression guard.
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False, retry_max=1)
+        item = PrintQueueItem(
+            batch_id=batch.id,
+            status="failed",
+            first_article=False,
+            printer_id=3,
+            eject_profile_id=prof.id,
+            plate_id=1,
+            retry_count=0,
+            position=99,
+            completed_at=datetime.now(timezone.utc),
+        )
+        db_session.add(item)
+        await db_session.commit()
+        await farm_policy.on_terminal(db_session, 3, item.id, "failed")
+        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
+        assert len(retries) == 1
 
 
 class TestRunCompletion:

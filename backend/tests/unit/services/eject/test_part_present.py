@@ -11,6 +11,7 @@ import pytest
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.dispatch import build_part_present_eject_file
 from backend.app.services.eject.generator import EjectGenerationError
+from backend.tests.unit.services.eject.geometry_fixtures import H2S_GEOMETRY
 
 _PLATE_GCODE = (
     "; HEADER_BLOCK_START\n"
@@ -65,7 +66,7 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf()
         out = None
         try:
-            out = build_part_present_eject_file(src, 1, _profile(), "H2S")
+            out = build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
             gcode = _read_plate_gcode(out)
         finally:
             src.unlink(missing_ok=True)
@@ -91,7 +92,7 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf()
         out = None
         try:
-            out = build_part_present_eject_file(src, 1, _profile(), "H2S")
+            out = build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
             with zipfile.ZipFile(out, "r") as zf:
                 gcode_bytes = zf.read("Metadata/plate_1.gcode")
                 md5 = zf.read("Metadata/plate_1.gcode.md5").decode("ascii")
@@ -108,7 +109,7 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf()
         out = None
         try:
-            out = build_part_present_eject_file(src, 1, _profile(), "H2S", cooldown_temp_c=22.0)
+            out = build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY, cooldown_temp_c=22.0)
             gcode = _read_plate_gcode(out)
         finally:
             src.unlink(missing_ok=True)
@@ -121,14 +122,6 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf("; EXECUTABLE_BLOCK_START\nG1 X1\n; EXECUTABLE_BLOCK_END\n")
         try:
             with pytest.raises(EjectGenerationError):
-                build_part_present_eject_file(src, 1, _profile(), "H2S")
-        finally:
-            src.unlink(missing_ok=True)
-
-    def test_unknown_model_raises(self):
-        src = _make_3mf()
-        try:
-            with pytest.raises(EjectGenerationError):
-                build_part_present_eject_file(src, 1, _profile(), "X1C")
+                build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
         finally:
             src.unlink(missing_ok=True)

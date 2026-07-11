@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models.printer import Printer
 from backend.app.services.bambu_mqtt import BambuMQTTClient, MQTTLogEntry, PrinterState, get_stage_name
+from backend.app.utils.printer_models import canon_model
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +275,11 @@ class PrinterManager:
         # sync by farm_policy / the clear-quarantine route via set_quarantined,
         # and rehydrated from the DB on startup via load_quarantine_from_db().
         self._quarantined: set[int] = set()
+        # Printers whose device-reported model differs from the registered model
+        # (Phase 2). In-memory only ({printer_id: reason}) — re-derived from the
+        # live device report on every connected edge, so no DB persistence is
+        # needed. The synchronous scheduler idle-gate consults it like quarantine.
+        self._model_mismatch: dict[int, str] = {}
 
     def get_printer(self, printer_id: int) -> PrinterInfo | None:
         """Get printer info by ID."""
@@ -297,8 +303,14 @@ class PrinterManager:
         """
         return printer_id in self._awaiting_plate_clear
 
-    def set_awaiting_plate_clear(self, printer_id: int, awaiting: bool):
+    def set_awaiting_plate_clear(self, printer_id: int, awaiting: bool, source_subtask_id: str | None = None):
         """Set/clear the awaiting-plate-clear gate and persist it to DB.
+
+        ``source_subtask_id`` records WHICH print raised the gate (the payload
+        subtask_id at terminal) into ``printers.plate_gate_subtask_id``. Stored only
+        while ``awaiting`` is True; clearing the gate NULLs it. The cooldown monitor's
+        restart re-arm reads that column to decide whether a persisted gate may
+        auto-clear — a gate raised with no source (None) is human-clear-only (Phase 1).
 
         Persisted so the gate survives Bambuddy/printer restarts (#961): after Auto Off
         cycles the printer, the printer boots into IDLE with no memory of the previous
@@ -323,7 +335,7 @@ class PrinterManager:
         # Only create the coroutine when there is a loop to run it on — otherwise Python
         # emits "coroutine was never awaited" warnings (e.g. in sync unit tests).
         if self._loop and self._loop.is_running():
-            self._schedule_async(self._persist_awaiting_plate_clear(printer_id, awaiting))
+            self._schedule_async(self._persist_awaiting_plate_clear(printer_id, awaiting, source_subtask_id))
             self._schedule_async(self._broadcast_status_change(printer_id))
 
     async def _broadcast_status_change(self, printer_id: int) -> None:
@@ -367,13 +379,18 @@ class PrinterManager:
                 e,
             )
 
-    async def _persist_awaiting_plate_clear(self, printer_id: int, awaiting: bool):
+    async def _persist_awaiting_plate_clear(
+        self, printer_id: int, awaiting: bool, source_subtask_id: str | None = None
+    ):
         from backend.app.core.database import run_with_retry
 
         async def _do(db):
             printer = await db.get(Printer, printer_id)
             if printer is not None:
                 printer.awaiting_plate_clear = awaiting
+                # The gate's source is meaningful only while it's raised; clearing
+                # NULLs it so a later re-arm can't mistake a stale id for a live gate.
+                printer.plate_gate_subtask_id = source_subtask_id if awaiting else None
                 await db.commit()
 
         try:
@@ -382,7 +399,14 @@ class PrinterManager:
             logger.warning("Failed to persist awaiting_plate_clear for printer %d: %s", printer_id, e)
 
     async def load_awaiting_plate_clear_from_db(self):
-        """Rehydrate the awaiting-plate-clear set from the printers table on startup."""
+        """Rehydrate the awaiting-plate-clear set from the printers table on startup.
+
+        Only the boolean gate is cached in memory (the fast synchronous scheduler
+        gate consults it). The gate's source subtask id lives in
+        ``printers.plate_gate_subtask_id`` and is read straight from the DB by the
+        cooldown monitor's ``rearm_on_startup`` — the sole consumer — so there is no
+        second in-memory copy to keep in sync.
+        """
         from backend.app.core.database import async_session
 
         try:
@@ -418,6 +442,47 @@ class PrinterManager:
             self._quarantined.discard(printer_id)
         if self._loop and self._loop.is_running():
             self._schedule_async(self._broadcast_status_change(printer_id))
+
+    def is_model_mismatch(self, printer_id: int) -> bool:
+        """Return True when the printer's device-reported model differs from its
+        registered model. The synchronous scheduler idle-gate consults this to
+        block dispatch, exactly like the quarantine check."""
+        return printer_id in self._model_mismatch
+
+    def model_mismatch_reason(self, printer_id: int) -> str | None:
+        """The reason string for a model mismatch, or None when there is none."""
+        return self._model_mismatch.get(printer_id)
+
+    def set_model_mismatch(self, printer_id: int, reason: str | None) -> None:
+        """Set (``reason`` truthy) or clear (``reason`` None) the model-mismatch
+        flag and broadcast a status change.
+
+        In-memory + WebSocket only, mirroring :meth:`set_quarantined`: the flag is
+        re-derived from the live device report on every connected edge, so it needs
+        no DB persistence (a backend restart re-evaluates on reconnect).
+        """
+        if reason:
+            self._model_mismatch[printer_id] = reason
+        else:
+            self._model_mismatch.pop(printer_id, None)
+        if self._loop and self._loop.is_running():
+            self._schedule_async(self._broadcast_status_change(printer_id))
+
+    def check_model_mismatch(self, printer_id: int) -> str | None:
+        """Compare the device-reported model against the registered model.
+
+        Returns a reason string when ``canon_model(reported_model)`` and
+        ``canon_model(registered model)`` are BOTH non-null and differ, else None.
+        An absent device report (the live H2S, fw 01.01.02.00, reports no model
+        field) ⇒ ``reported`` is None ⇒ never a mismatch ⇒ zero behaviour change.
+        Canonicalisation means ``O1S`` and ``H2S`` are not treated as a mismatch.
+        """
+        state = self.get_status(printer_id)
+        reported = canon_model(getattr(state, "reported_model", None)) if state is not None else None
+        registered = canon_model(self.get_model(printer_id))
+        if reported is None or registered is None or reported == registered:
+            return None
+        return f"device reports {reported}, registered as {registered}"
 
     async def load_quarantine_from_db(self):
         """Rehydrate the quarantine set from the printers table on startup."""
@@ -957,6 +1022,17 @@ def resolve_plate_id(state) -> int | None:
     return parse_plate_id(state.gcode_file)
 
 
+def _eject_watch_payload(printer_id: int | None) -> dict | None:
+    """``{"threshold_c": t}`` for the printer's in-flight eject cooldown watch,
+    or None when no threshold-bearing watch is armed (Phase 4.3c)."""
+    if not printer_id:
+        return None
+    from backend.app.services.eject.monitor import eject_cooldown_monitor
+
+    threshold = eject_cooldown_monitor.active_watch(printer_id)
+    return {"threshold_c": threshold} if threshold is not None else None
+
+
 def printer_state_to_dict(
     state: PrinterState,
     printer_id: int | None = None,
@@ -1255,6 +1331,16 @@ def printer_state_to_dict(
         # "Clear Plate" button only appears when the 30 s REST fallback poll runs.
         "awaiting_plate_clear": printer_manager.is_awaiting_plate_clear(printer_id) if printer_id else False,
         "quarantined": printer_manager.is_quarantined(printer_id) if printer_id else False,
+        # Device-vs-declared model mismatch (Phase 2): blocks farm dispatch and
+        # drives the printer-card banner. reason is null when there is no mismatch.
+        "model_mismatch": printer_manager.is_model_mismatch(printer_id) if printer_id else False,
+        "model_mismatch_reason": printer_manager.model_mismatch_reason(printer_id) if printer_id else None,
+        # Cooldown/eject phase (Phase 4.3c): the in-flight eject cooldown watch's
+        # release threshold, so the UI can render "Cooling to T °C (bed B °C)"
+        # instead of an opaque plate hold. Null when no watch (or an
+        # escalation-only watch) is armed. Lazy import: the monitor imports this
+        # module at import time, so the reverse edge must resolve at call time.
+        "eject_watch": _eject_watch_payload(printer_id),
     }
     # Add cover URL if there's an active print and printer_id is provided
     # Include PAUSE state so skip objects modal can show cover

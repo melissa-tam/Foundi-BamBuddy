@@ -13,14 +13,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from backend.app.services.eject.generator import (
-    PRINTER_BED_DIMS,
-    PRINTER_TRAVEL_ENVELOPE,
     SWEEP_BAND_MIN_WIDTH_MM,
     block_start_marker,
 )
 
 if TYPE_CHECKING:
     from backend.app.models.eject_profile import EjectProfile
+    from backend.app.services.eject.geometry import ModelGeometry
 
 _EPS = 1e-6
 # One word/param token, e.g. "X170", "Z0.4", "R28", "F9000".
@@ -54,19 +53,20 @@ def validate_eject_gcode(
     gcode: str,
     profile: EjectProfile,
     max_z_height: float,
-    printer_model: str,
+    geometry: ModelGeometry,
     cooldown_temp_c: float | None = None,
     *,
     require_cooldown: bool = True,
 ) -> ValidationResult:
-    """Validate `gcode` against `profile`'s guards for `printer_model`.
+    """Validate `gcode` against `profile`'s guards for `geometry`.
 
     Returns a :class:`ValidationResult`; ``ok`` is True only when there are no
-    errors. Checks: printer model known; part not taller than the guard; no move
-    below the z_offset floor; all X/Y inside the model's machine travel envelope
-    (``PRINTER_TRAVEL_ENVELOPE``); exactly ``cooldown_retries`` ``M190 R`` waits
-    at the effective threshold; prologue present with no bare ``G28`` and no
-    ``G28 Z``.
+    errors. Checks: part not taller than the guard; no move below the z_offset
+    floor; all X/Y inside the model's machine travel envelope (``geometry.envelope``);
+    exactly ``cooldown_retries`` ``M190 R`` waits at the effective threshold;
+    prologue present with no bare ``G28`` and no ``G28 Z``. ``geometry`` is the
+    resolved :class:`~backend.app.services.eject.geometry.ModelGeometry` — the
+    caller resolves it from the registry, so the validator does no model lookup.
 
     ``cooldown_temp_c`` is the effective release temperature — pass the same
     per-run override handed to :func:`generate_eject_gcode` so the ``M190 R``
@@ -86,16 +86,8 @@ def validate_eject_gcode(
     warnings: list[str] = []
     effective_cooldown = cooldown_temp_c if cooldown_temp_c is not None else profile.cooldown_temp_c
 
-    dims = PRINTER_BED_DIMS.get(printer_model)
-    if dims is None:
-        errors.append(f"Unknown printer model {printer_model!r}: no bed geometry")
-        return ValidationResult(ok=False, errors=errors, warnings=warnings)
-    bed_x, bed_y = dims
-    env = PRINTER_TRAVEL_ENVELOPE.get(printer_model)
-    if env is None:
-        errors.append(f"Unknown printer model {printer_model!r}: no travel envelope")
-        return ValidationResult(ok=False, errors=errors, warnings=warnings)
-    env_x_min, env_x_max, env_y_min, env_y_max = env
+    bed_x, bed_y = geometry.bed
+    env_x_min, env_x_max, env_y_min, env_y_max = geometry.envelope
 
     # Guard 1: part-height ceiling.
     if max_z_height > profile.max_part_height_mm:
@@ -169,11 +161,11 @@ def validate_eject_gcode(
                 errors.append(f"Move Z{params['Z']:g} is below the z_offset floor {profile.z_offset_mm:g}")
             if "X" in params and not (x_lo <= params["X"] <= x_hi):
                 errors.append(
-                    f"Move X{params['X']:g} is outside the {printer_model} travel envelope [{env_x_min:g}, {env_x_max:g}]"
+                    f"Move X{params['X']:g} is outside the {geometry.model_key} travel envelope [{env_x_min:g}, {env_x_max:g}]"
                 )
             if "Y" in params and not (y_lo <= params["Y"] <= y_hi):
                 errors.append(
-                    f"Move Y{params['Y']:g} is outside the {printer_model} travel envelope [{env_y_min:g}, {env_y_max:g}]"
+                    f"Move Y{params['Y']:g} is outside the {geometry.model_key} travel envelope [{env_y_min:g}, {env_y_max:g}]"
                 )
 
     # Guard 3: cooldown retry count must match the profile exactly — enforced

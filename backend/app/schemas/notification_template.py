@@ -105,6 +105,7 @@ EVENT_VARIABLES: dict[str, list[str]] = {
         "timestamp",
         "app_name",
     ],
+    "model_mismatch": ["printer", "reported_model", "registered_model", "timestamp", "app_name"],
     # User management notifications
     "user_created": ["username", "password", "login_url", "app_name", "timestamp"],
     "password_reset": ["username", "password", "login_url", "app_name", "timestamp"],
@@ -305,6 +306,13 @@ SAMPLE_DATA: dict[str, dict[str, str]] = {
         "units_completed": "3",
         "plates_completed": "3",
         "timestamp": "2024-01-15 18:30",
+        "app_name": "Bambuddy",
+    },
+    "model_mismatch": {
+        "printer": "Bambu H2S #2",
+        "reported_model": "H2C",
+        "registered_model": "H2S",
+        "timestamp": "2024-01-15 16:10",
         "app_name": "Bambuddy",
     },
     # User management notifications

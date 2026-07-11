@@ -432,6 +432,8 @@ class TestPrintersAPI:
         with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
             mock_pm.get_status = MagicMock(return_value=state)
             mock_pm.is_awaiting_plate_clear = MagicMock(return_value=False)
+            mock_pm.is_model_mismatch = MagicMock(return_value=False)
+            mock_pm.model_mismatch_reason = MagicMock(return_value=None)
 
             response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
 
@@ -598,12 +600,41 @@ class TestPrintersAPI:
         with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
             mock_pm.get_status = MagicMock(return_value=state)
             mock_pm.is_awaiting_plate_clear = MagicMock(return_value=False)
+            mock_pm.is_model_mismatch = MagicMock(return_value=False)
+            mock_pm.model_mismatch_reason = MagicMock(return_value=None)
 
             response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
 
         assert response.status_code == 200
         result = response.json()
         assert result["fila_switch"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_get_printer_status_reports_model_mismatch(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """The REST status surface must carry the Phase 2 model-mismatch flag so
+        the Printers page banner works from the first poll (not only after a WS
+        push) — including while the printer is offline (the flag is in-memory
+        sticky and the scheduler keeps skipping the printer)."""
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(model="H2S")
+        printer_manager.set_model_mismatch(printer.id, "device reports H2C, registered as H2S")
+        try:
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+            assert response.status_code == 200
+            result = response.json()
+            assert result["model_mismatch"] is True
+            assert result["model_mismatch_reason"] == "device reports H2C, registered as H2S"
+        finally:
+            printer_manager.set_model_mismatch(printer.id, None)
+
+        # Cleared -> flag drops off the surface again.
+        response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+        assert response.status_code == 200
+        assert response.json()["model_mismatch"] is False
 
     # ========================================================================
     # Test connection endpoint

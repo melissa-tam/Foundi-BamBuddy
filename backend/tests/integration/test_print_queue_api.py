@@ -1512,6 +1512,18 @@ class TestAbortedStatusNormalisation:
         mock_session.__aexit__ = AsyncMock(return_value=False)
         mock_session.execute = AsyncMock(return_value=mock_result)
         mock_session.commit = AsyncMock()
+        # Terminal correlation (Phase 1) resolves the finished item by
+        # subtask/name before touching it, and the status update re-fetches it
+        # by id. Model-aware ``db.get``: the real queue item for PrintQueueItem,
+        # None for archive/library lookups — a bare AsyncMock here would leak
+        # coroutine-attribute mocks into the name normaliser and crash the
+        # correlation instead.
+        from backend.app.models.print_queue import PrintQueueItem as _PQI
+
+        async def _model_aware_get(model, pk, *a, **k):
+            return item if (model is _PQI and pk == item.id) else None
+
+        mock_session.get = AsyncMock(side_effect=_model_aware_get)
 
         tasks_before = set(asyncio.all_tasks())
 
@@ -1541,6 +1553,11 @@ class TestAbortedStatusNormalisation:
                     "filename": "test.gcode",
                     "subtask_name": "Test",
                     "timelapse_was_active": False,
+                    # Deposit evidence: without layer/progress peaks the Phase-3
+                    # no-deposit path would normalise the status instead of the
+                    # aborted→cancelled mapping under test here.
+                    "last_layer_num": 42,
+                    "last_progress": 37.0,
                 },
             )
 
@@ -1608,6 +1625,15 @@ class TestAbortedStatusNormalisation:
         mock_session.__aexit__ = AsyncMock(return_value=False)
         mock_session.execute = AsyncMock(return_value=mock_result)
         mock_session.commit = AsyncMock()
+        # See the aborted-normalisation test above: model-aware db.get keeps
+        # the Phase-1 terminal correlation on its fallback attribution path
+        # while the status update can still re-fetch the queue item by id.
+        from backend.app.models.print_queue import PrintQueueItem as _PQI
+
+        async def _model_aware_get(model, pk, *a, **k):
+            return item if (model is _PQI and pk == item.id) else None
+
+        mock_session.get = AsyncMock(side_effect=_model_aware_get)
 
         tasks_before = set(asyncio.all_tasks())
 
@@ -1637,6 +1663,12 @@ class TestAbortedStatusNormalisation:
                     "filename": "test.gcode",
                     "subtask_name": "Test",
                     "timelapse_was_active": False,
+                    # Deposit evidence: a completed print with zero layers AND
+                    # zero progress is (correctly) normalised to 'cancelled' by
+                    # the Phase-3 no-deposit path — this test asserts the
+                    # pass-through of a REAL completed print.
+                    "last_layer_num": 100,
+                    "last_progress": 100.0,
                 },
             )
 
@@ -2684,6 +2716,57 @@ class TestResumeQueueAfterFailure:
 
         second = await async_client.post(f"/api/v1/queue/printer/{printer.id}/resume")
         assert second.json() == {"acknowledged": 0, "restored": 0}
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_resume_matches_machine_code_and_clears_it(
+        self, async_client: AsyncClient, printer_factory, archive_factory, db_session
+    ):
+        """Phase 4.3f: the skip site stamps waiting_reason="previous_print_failed";
+        restore matches THAT machine code (error_message is display-only and may
+        change) and clears it so the pending row doesn't render a stale code."""
+        from sqlalchemy import select
+
+        from backend.app.models.print_queue import PrintQueueItem
+
+        printer = await printer_factory()
+        skipped = await self._add_item(
+            db_session,
+            printer,
+            archive_factory,
+            status="skipped",
+            error_message="Localized or reworded copy",
+            waiting_reason="previous_print_failed",
+        )
+
+        resp = await async_client.post(f"/api/v1/queue/printer/{printer.id}/resume")
+        assert resp.json() == {"acknowledged": 0, "restored": 1}
+
+        skipped_id = skipped.id
+        db_session.expire_all()
+        row = (await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == skipped_id))).scalar_one()
+        assert row.status == "pending"
+        assert row.waiting_reason is None
+        assert row.error_message is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_resume_still_restores_legacy_english_rows(
+        self, async_client: AsyncClient, printer_factory, archive_factory, db_session
+    ):
+        """Rows skipped by builds BEFORE the machine code existed carry only the
+        English error_message — they must remain restorable."""
+        printer = await printer_factory()
+        await self._add_item(
+            db_session,
+            printer,
+            archive_factory,
+            status="skipped",
+            error_message="Previous print failed or was aborted",
+            waiting_reason=None,
+        )
+        resp = await async_client.post(f"/api/v1/queue/printer/{printer.id}/resume")
+        assert resp.json() == {"acknowledged": 0, "restored": 1}
 
 
 class TestReorderEndpoint:

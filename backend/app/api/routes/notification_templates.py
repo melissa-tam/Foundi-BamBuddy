@@ -48,6 +48,7 @@ EVENT_NAMES = {
     "printer_quarantined": "Printer Quarantined",
     "run_paused": "Production Run Paused",
     "run_completed": "Production Run Completed",
+    "model_mismatch": "Printer Model Mismatch",
     # User management
     "user_created": "Welcome Email",
     "password_reset": "Password Reset",

@@ -185,6 +185,7 @@ class TestSchedulerIdleCheckWithPlateCleared:
         """IDLE state with no awaiting flag → idle."""
         mock_pm.is_connected.return_value = True
         mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
         mock_pm.get_status.return_value = MagicMock(state="IDLE")
         mock_pm.is_awaiting_plate_clear.return_value = False
         assert scheduler._is_printer_idle(1) is True
@@ -194,6 +195,7 @@ class TestSchedulerIdleCheckWithPlateCleared:
         """RUNNING state is never idle."""
         mock_pm.is_connected.return_value = True
         mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
         mock_pm.get_status.return_value = MagicMock(state="RUNNING")
         mock_pm.is_awaiting_plate_clear.return_value = False
         assert scheduler._is_printer_idle(1) is False
@@ -203,6 +205,7 @@ class TestSchedulerIdleCheckWithPlateCleared:
         """FINISH + awaiting plate-clear ack → NOT idle."""
         mock_pm.is_connected.return_value = True
         mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
         mock_pm.get_status.return_value = MagicMock(state="FINISH")
         mock_pm.is_awaiting_plate_clear.return_value = True
         assert scheduler._is_printer_idle(1) is False
@@ -212,6 +215,7 @@ class TestSchedulerIdleCheckWithPlateCleared:
         """FINISH with flag cleared → idle."""
         mock_pm.is_connected.return_value = True
         mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
         mock_pm.get_status.return_value = MagicMock(state="FINISH")
         mock_pm.is_awaiting_plate_clear.return_value = False
         assert scheduler._is_printer_idle(1) is True
@@ -221,6 +225,7 @@ class TestSchedulerIdleCheckWithPlateCleared:
         """FAILED + awaiting → NOT idle."""
         mock_pm.is_connected.return_value = True
         mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
         mock_pm.get_status.return_value = MagicMock(state="FAILED")
         mock_pm.is_awaiting_plate_clear.return_value = True
         assert scheduler._is_printer_idle(1) is False
@@ -230,6 +235,7 @@ class TestSchedulerIdleCheckWithPlateCleared:
         """FAILED with flag cleared → idle."""
         mock_pm.is_connected.return_value = True
         mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
         mock_pm.get_status.return_value = MagicMock(state="FAILED")
         mock_pm.is_awaiting_plate_clear.return_value = False
         assert scheduler._is_printer_idle(1) is True
@@ -242,6 +248,7 @@ class TestSchedulerIdleCheckWithPlateCleared:
         """
         mock_pm.is_connected.return_value = True
         mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
         mock_pm.get_status.return_value = MagicMock(state="IDLE")
         mock_pm.is_awaiting_plate_clear.return_value = True
         assert scheduler._is_printer_idle(1) is False
@@ -255,41 +262,24 @@ class TestSchedulerIdleCheckWithPlateCleared:
     def test_no_status_not_idle(self, mock_pm, scheduler):
         mock_pm.is_connected.return_value = True
         mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
         mock_pm.get_status.return_value = None
         assert scheduler._is_printer_idle(1) is False
 
     @patch("backend.app.services.print_scheduler.printer_manager")
-    def test_finish_state_idle_when_require_plate_clear_disabled(self, mock_pm, scheduler):
-        """FINISH is idle when require_plate_clear=False, regardless of awaiting flag."""
+    @pytest.mark.parametrize("state", ["FINISH", "FAILED", "IDLE"])
+    def test_gate_blocks_unconditionally(self, mock_pm, scheduler, state):
+        """Phase 1 (P1-B): the plate-clear gate is now UNCONDITIONAL — there is no
+        require_plate_clear parameter to bypass it. Any idle-shaped state with the
+        awaiting flag set is NOT idle. (The global toggle now only governs whether
+        the gate is RAISED, in main.on_print_complete — not whether the scheduler
+        honours it.)"""
         mock_pm.is_connected.return_value = True
         mock_pm.is_quarantined.return_value = False
-        mock_pm.get_status.return_value = MagicMock(state="FINISH")
+        mock_pm.is_model_mismatch.return_value = False
+        mock_pm.get_status.return_value = MagicMock(state=state)
         mock_pm.is_awaiting_plate_clear.return_value = True
-        assert scheduler._is_printer_idle(1, require_plate_clear=False) is True
-
-    @patch("backend.app.services.print_scheduler.printer_manager")
-    def test_failed_state_idle_when_require_plate_clear_disabled(self, mock_pm, scheduler):
-        mock_pm.is_connected.return_value = True
-        mock_pm.is_quarantined.return_value = False
-        mock_pm.get_status.return_value = MagicMock(state="FAILED")
-        mock_pm.is_awaiting_plate_clear.return_value = True
-        assert scheduler._is_printer_idle(1, require_plate_clear=False) is True
-
-    @patch("backend.app.services.print_scheduler.printer_manager")
-    def test_running_state_not_idle_even_when_require_plate_clear_disabled(self, mock_pm, scheduler):
-        mock_pm.is_connected.return_value = True
-        mock_pm.is_quarantined.return_value = False
-        mock_pm.get_status.return_value = MagicMock(state="RUNNING")
-        mock_pm.is_awaiting_plate_clear.return_value = False
-        assert scheduler._is_printer_idle(1, require_plate_clear=False) is False
-
-    @patch("backend.app.services.print_scheduler.printer_manager")
-    def test_idle_state_unaffected_by_require_plate_clear(self, mock_pm, scheduler):
-        mock_pm.is_connected.return_value = True
-        mock_pm.is_quarantined.return_value = False
-        mock_pm.get_status.return_value = MagicMock(state="IDLE")
-        mock_pm.is_awaiting_plate_clear.return_value = False
-        assert scheduler._is_printer_idle(1, require_plate_clear=False) is True
+        assert scheduler._is_printer_idle(1) is False
 
 
 class TestSchedulerQueueCheckLogging:
@@ -314,6 +304,7 @@ class TestSchedulerQueueCheckLogging:
 
         mock_pm.is_connected.return_value = True
         mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
         mock_pm.get_status.return_value = MagicMock(state="RUNNING")
 
         mock_result = MagicMock()
@@ -357,10 +348,13 @@ class TestSchedulerQueueCheckLogging:
 
 
 class TestFarmItemEnforcesPlateClearGate:
-    """Farm-dispatched items (eject_profile_id set) must gate on
-    awaiting_plate_clear even when the global require_plate_clear setting is off —
-    while plain items keep upstream behaviour. (Incident PCO-M18-2904: unit 2
-    dispatched 6 s after unit 1's FINISH because the global toggle was false.)"""
+    """Phase 1 (P1-B): the scheduler's plate-clear gate is now UNCONDITIONAL — a
+    raised awaiting_plate_clear flag holds EVERY item on that printer, farm or plain,
+    regardless of the global require_plate_clear setting. (The toggle now only
+    decides whether the gate is RAISED, in main.on_print_complete; the scheduler
+    always honours a raised gate.) Incident PCO-M18-2904: unit 2 dispatched 6 s
+    after unit 1's FINISH because the global toggle was false — the fix is that a
+    raised gate is never bypassed here."""
 
     async def _run_check_queue(self, *, eject_profile_id, awaiting, caplog=None):
         """Drive check_queue against a real in-memory DB with one FINISH printer
@@ -410,6 +404,7 @@ class TestFarmItemEnforcesPlateClearGate:
             # the ONLY thing that can hold the printer is the plate-clear gate.
             mock_pm.is_connected.return_value = True
             mock_pm.is_quarantined.return_value = False
+            mock_pm.is_model_mismatch.return_value = False
             mock_pm.get_status.return_value = MagicMock(state="FINISH")
             mock_pm.is_awaiting_plate_clear.return_value = awaiting
             if caplog is not None:
@@ -422,23 +417,28 @@ class TestFarmItemEnforcesPlateClearGate:
         return start_print_mock
 
     @pytest.mark.asyncio
-    async def test_farm_item_held_by_gate_when_global_off(self, caplog):
-        """(a) Farm item + require_plate_clear=False + awaiting=True → NOT dispatched."""
-        start_print_mock = await self._run_check_queue(eject_profile_id=2, awaiting=True, caplog=caplog)
+    async def test_farm_item_held_when_gate_raised(self):
+        """(a) Farm item + awaiting=True → NOT dispatched (gate unconditional)."""
+        start_print_mock = await self._run_check_queue(eject_profile_id=2, awaiting=True)
         start_print_mock.assert_not_called()
-        # And the observability log fired exactly once for this hold.
-        held_logs = [r for r in caplog.records if "held by plate-clear gate" in r.message]
-        assert len(held_logs) == 1
 
     @pytest.mark.asyncio
-    async def test_plain_item_dispatches_when_global_off(self):
-        """(b) Plain item (no eject profile), same conditions → dispatched
-        (upstream require_plate_clear=False behaviour preserved)."""
+    async def test_plain_item_also_held_when_gate_raised(self):
+        """(b) Plain item (no eject profile) + awaiting=True → ALSO NOT dispatched.
+        The scheduler no longer bypasses a raised gate for plain items; the toggle-
+        off "keep dispatching" behaviour now lives on the RAISE side (a plain print
+        under a toggle-off install simply never raises the gate)."""
         start_print_mock = await self._run_check_queue(eject_profile_id=None, awaiting=True)
-        start_print_mock.assert_called_once()
+        start_print_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_farm_item_dispatches_when_gate_released(self):
         """(c) Farm item with the plate-clear gate released → dispatched."""
         start_print_mock = await self._run_check_queue(eject_profile_id=2, awaiting=False)
+        start_print_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_plain_item_dispatches_when_gate_released(self):
+        """(d) Plain item with the plate-clear gate released → dispatched."""
+        start_print_mock = await self._run_check_queue(eject_profile_id=None, awaiting=False)
         start_print_mock.assert_called_once()

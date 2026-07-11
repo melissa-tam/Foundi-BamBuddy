@@ -66,6 +66,29 @@ def log(msg: str) -> None:
     print(f"[build] {msg}", flush=True)
 
 
+def _embedded_env() -> dict:
+    """Environment for subprocesses that run the *embedded* python.exe.
+
+    The embedded distribution's ``._pth`` enables ``import site`` so that
+    pip-installed packages under ``Lib\\site-packages`` are importable. But
+    enabling site also pulls in the build machine's per-user site-packages
+    (``%APPDATA%\\Python\\Python3XX\\site-packages``) onto ``sys.path``. When
+    the build box already has Bambuddy's deps installed there (a dev's
+    ``py -3.13`` environment), pip reports them "already satisfied" and
+    SKIPS installing them into the embedded tree — so numpy, matplotlib,
+    requests, certifi, setuptools, etc. silently go missing from the
+    staged Python and the shipped installer is broken on any clean machine.
+
+    Setting ``PYTHONNOUSERSITE=1`` removes the per-user site directory from
+    ``sys.path`` for these subprocesses, so pip resolves every requirement
+    against the (empty) embedded tree and installs the full closure there,
+    making the staged Python genuinely self-contained.
+    """
+    env = os.environ.copy()
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
 def download(url: str, dest: Path) -> Path:
     """Download ``url`` to ``dest`` if not already present."""
     if dest.exists():
@@ -118,6 +141,7 @@ def stage_embedded_python() -> Path:
     subprocess.run(
         [str(target / "python.exe"), str(get_pip), "--no-warn-script-location"],
         check=True,
+        env=_embedded_env(),
     )
 
     # Install setuptools + wheel. The embedded distribution ships without
@@ -138,6 +162,7 @@ def stage_embedded_python() -> Path:
             "wheel",
         ],
         check=True,
+        env=_embedded_env(),
     )
 
     return target
@@ -159,6 +184,7 @@ def install_requirements(python_dir: Path) -> None:
             str(requirements),
         ],
         check=True,
+        env=_embedded_env(),
     )
 
 

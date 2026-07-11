@@ -2,16 +2,22 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useToast } from '../contexts/ToastContext';
 import { useTranslation } from 'react-i18next';
-import { api } from '../api/client';
+import { api, type Printer } from '../api/client';
 import { inventoryLocationsQueryKey } from '../utils/inventoryQueries';
 
 interface WebSocketMessage {
   type: string;
   printer_id?: number;
+  run_id?: number;
   data?: Record<string, unknown>;
   printer_name?: string;
   missing_slots?: Array<{ slot?: string }>;
 }
+
+/** Farm flags whose set/clear must refetch the ['printers'] list (Phase 4.3b):
+ *  the list never refetches on its own, so quarantine / plate-gate /
+ *  model-mismatch badges rendered from it go stale without this. */
+const FARM_BADGE_FLAGS = ['quarantined', 'awaiting_plate_clear', 'model_mismatch'] as const;
 
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
@@ -214,8 +220,38 @@ export function useWebSocket() {
     switch (message.type) {
       case 'printer_status':
         if (message.printer_id !== undefined && message.data) {
+          // Farm badge liveness (Phase 4.3b): compare the incoming farm flags
+          // against the caches BEFORE merging. The three flags flip rarely, so
+          // a debounced ['printers'] refetch on a real delta is cheap and keeps
+          // list-driven badges (quarantine card, blocked chips) live without
+          // polling. Baseline per flag: the previous printerStatus cache entry,
+          // else the ['printers'] row (which only carries `quarantined`), else
+          // the incoming value itself (no baseline → no delta).
+          const prevStatus = queryClient.getQueryData<Record<string, unknown>>([
+            'printerStatus',
+            message.printer_id,
+          ]);
+          const printersRow = queryClient
+            .getQueryData<Printer[]>(['printers'])
+            ?.find((p) => p.id === message.printer_id);
+          const changed = FARM_BADGE_FLAGS.some((flag) => {
+            const incoming = Boolean(message.data![flag]);
+            let baseline = incoming;
+            if (prevStatus && flag in prevStatus) baseline = Boolean(prevStatus[flag]);
+            else if (flag === 'quarantined' && printersRow) baseline = Boolean(printersRow.quarantined);
+            return incoming !== baseline;
+          });
+          if (changed) {
+            debouncedInvalidate('printers');
+          }
           throttledPrinterStatusUpdate(message.printer_id, message.data);
         }
+        break;
+
+      case 'production_run_changed':
+        // A run's derived state changed server-side (pause/hold/stall/top-up…)
+        // — refetch the runs list AND any open run detail (prefix match).
+        debouncedInvalidate('production-runs');
         break;
 
       case 'print_start':

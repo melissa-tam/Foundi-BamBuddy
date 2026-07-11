@@ -6070,3 +6070,86 @@ class TestTrayNowH2SExternalSpoolOverride:
 
         mqtt_client._process_message(_ams_payload(255))
         assert mqtt_client.state.tray_now == 255
+
+
+class TestOperatorCancelEcho:
+    """Cancel-echo capture (Phase 3.1) + native plate-occupancy retention (3.3).
+
+    The firmware emits HMS cancel echoes (0300_400C / 0500_400E) during a normal
+    user cancel. They stay OUT of ``state.hms_errors`` (they're not faults) but now
+    ALSO stamp ``state.user_cancel_seen_at`` so the terminal handler can tell a
+    screen-stop from a genuine failure. The native pre-print vision codes
+    (0300_8017 / 0300_8006) are the opposite: real faults that MUST remain in
+    hms_errors.
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(ip_address="192.168.1.100", serial_number="TEST123", access_code="12345678")
+
+    def test_hms_cancel_echo_sets_flag_and_stays_out_of_errors(self, mqtt_client):
+        # 0300_400C: attr>>16 == 0x0300, code&0xFFFF == 0x400C.
+        assert mqtt_client.state.user_cancel_seen_at is None
+        mqtt_client._process_message({"print": {"hms": [{"attr": 0x03000000, "code": 0x400C}]}})
+        assert mqtt_client.state.user_cancel_seen_at is not None
+        # The echo is not a fault — it must not surface in hms_errors.
+        codes = [f"{(e.attr >> 16) & 0xFFFF:04X}_{int(e.code, 16) & 0xFFFF:04X}" for e in mqtt_client.state.hms_errors]
+        assert "0300_400C" not in codes
+
+    def test_print_error_cancel_echo_sets_flag(self, mqtt_client):
+        # print_error path carries 0500_400E as a single 32-bit int.
+        mqtt_client._process_message({"print": {"print_error": 0x0500400E}})
+        assert mqtt_client.state.user_cancel_seen_at is not None
+        codes = [f"{(e.attr >> 16) & 0xFFFF:04X}_{int(e.code, 16) & 0xFFFF:04X}" for e in mqtt_client.state.hms_errors]
+        assert "0500_400E" not in codes
+
+    def test_plate_occupancy_codes_stay_in_hms_errors(self, mqtt_client):
+        # 0300_8017 (foreign objects on heatbed) is an ACTIONABLE fault — kept.
+        mqtt_client._process_message({"print": {"hms": [{"attr": 0x03000000, "code": 0x8017}]}})
+        codes = [f"{(e.attr >> 16) & 0xFFFF:04X}_{int(e.code, 16) & 0xFFFF:04X}" for e in mqtt_client.state.hms_errors]
+        assert "0300_8017" in codes
+        # A native vision fault is NOT an operator cancel.
+        assert mqtt_client.state.user_cancel_seen_at is None
+
+    def test_flag_reset_on_new_print(self, mqtt_client):
+        mqtt_client.state.user_cancel_seen_at = 12345.0
+        mqtt_client._previous_gcode_state = "IDLE"
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client._process_message(
+            {"print": {"gcode_state": "RUNNING", "gcode_file": "/data/Metadata/x.gcode", "subtask_name": "X"}}
+        )
+        # is_new_print reset clears the previous print's cancel observation.
+        assert mqtt_client.state.user_cancel_seen_at is None
+
+    def test_user_cancel_observed_surfaces_in_completion_payload(self, mqtt_client):
+        complete_data = {}
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client.on_print_complete = lambda data: complete_data.update(data)
+        mqtt_client._previous_gcode_state = "IDLE"
+
+        # 1. Print starts.
+        mqtt_client._process_message(
+            {"print": {"gcode_state": "RUNNING", "gcode_file": "/data/Metadata/x.gcode", "subtask_name": "X"}}
+        )
+        # 2. Operator cancels on the screen → cancel echo arrives (state still RUNNING).
+        mqtt_client._process_message({"print": {"hms": [{"attr": 0x03000000, "code": 0x400C}]}})
+        # 3. Print goes FAILED (firmware reports failed/aborted for a cancel).
+        mqtt_client._process_message(
+            {"print": {"gcode_state": "FAILED", "gcode_file": "/data/Metadata/x.gcode", "subtask_name": "X"}}
+        )
+        assert complete_data.get("user_cancel_observed") is True
+
+    def test_completion_without_cancel_has_false_flag(self, mqtt_client):
+        complete_data = {}
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client.on_print_complete = lambda data: complete_data.update(data)
+        mqtt_client._previous_gcode_state = "IDLE"
+        mqtt_client._process_message(
+            {"print": {"gcode_state": "RUNNING", "gcode_file": "/data/Metadata/x.gcode", "subtask_name": "X"}}
+        )
+        mqtt_client._process_message(
+            {"print": {"gcode_state": "FINISH", "gcode_file": "/data/Metadata/x.gcode", "subtask_name": "X"}}
+        )
+        assert complete_data.get("user_cancel_observed") is False

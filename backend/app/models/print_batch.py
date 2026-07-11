@@ -67,6 +67,12 @@ class PrintBatch(Base):
     # approved). Persisted (not in-memory) so approval survives a restart. NULL
     # once the plan is consumed or when the run wasn't gated.
     first_article_plan: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Why the run is currently held, when it is (Phase 3, consumed more broadly in
+    # Phase 4). Event-fact only — the run's status is still derived/authoritative;
+    # this is the human-readable reason surfaced on the run card. Set at hold sites
+    # ('operator_stop' when a unit is stopped by the operator — the run stays
+    # ACTIVE but shows the hold) and cleared on resume. NULL when not held.
+    pause_reason: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

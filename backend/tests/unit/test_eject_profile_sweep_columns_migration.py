@@ -157,11 +157,7 @@ async def test_final_skim_defaults_to_true(engine):
             )
         )
     async with engine.connect() as conn:
-        row = (
-            await conn.execute(
-                text("SELECT final_skim FROM eject_profiles WHERE name = 'skimdefault'")
-            )
-        ).fetchone()
+        row = (await conn.execute(text("SELECT final_skim FROM eject_profiles WHERE name = 'skimdefault'"))).fetchone()
     assert row[0] == 1
 
 

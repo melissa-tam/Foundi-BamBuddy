@@ -6,10 +6,11 @@ height and printer model. The block runs *after* the printer's stock shutdown
 only X/Y before cooling the bed and sweeping the part off the front (door side).
 
 Every coordinate is derived from the profile plus the model's bed dimensions,
-then clamped into the model's proven-safe machine travel envelope
-(``PRINTER_TRAVEL_ENVELOPE``) so no generated move can trip the firmware soft
-limits — nothing is hardcoded. Adding a printer model is a one-line entry in
-``PRINTER_BED_DIMS`` and ``PRINTER_TRAVEL_ENVELOPE``.
+then clamped into the model's proven-safe machine travel envelope so no
+generated move can trip the firmware soft limits — nothing is hardcoded. The bed
+rectangle and the envelope both arrive as a :class:`ModelGeometry` resolved from
+the ``printer_model_geometry`` registry (``services.eject.geometry``), so adding
+a printer model is a DB row, not a code change.
 
 Two optional tunings narrow the sweep: an X sub-band (``sweep_x_min_mm`` /
 ``sweep_x_max_mm``) confines the lanes to part of the bed width instead of the
@@ -27,30 +28,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from backend.app.models.eject_profile import EjectProfile
-
-# Bed dimensions (X, Y) in mm, keyed by printer model string. Fail-fast on any
-# model not listed — geometry must be verified per machine before ejecting.
-PRINTER_BED_DIMS: dict[str, tuple[float, float]] = {
-    "H2S": (340.0, 320.0),
-}
-
-# Machine XY travel envelope (x_min, x_max, y_min, y_max) in mm, keyed by printer
-# model. This is the box the toolhead may reach WITHOUT tripping the firmware
-# soft limits — a MACHINE property, distinct from the (larger) bed rectangle and
-# from any profile overhang/margin. Every generated XY move is clamped into it,
-# and the validator independently rejects any move outside it.
-#
-# PERMISSIVE bounds: the full sweep span (X 3..337 from a 3 mm margin, Y -2..322
-# from 2 mm overhangs) was operator-witnessed executing a complete plate sweep on
-# a real H2S (2026-07-04, dry-run v1: ~7 min of lanes, no motion fault), so the
-# envelope must not narrow it. One dispatch (queue 10) faulted at the same
-# coordinates (HMS 0x30001, motion controller) — a single unexplained occurrence,
-# not reproducible evidence of soft limits. These bounds therefore act only as a
-# gross-configuration guard; replace them with MEASURED limits after the live
-# soft-limit probe session.
-PRINTER_TRAVEL_ENVELOPE: dict[str, tuple[float, float, float, float]] = {
-    "H2S": (0.0, 340.0, -16.0, 325.0),
-}
+    from backend.app.services.eject.geometry import ModelGeometry
 
 # Minimum width (mm) of an explicit X sweep sub-band. Narrower than this the
 # toolhead cannot reliably clear a part across the band, so a tighter band is a
@@ -93,7 +71,7 @@ def block_start_marker(profile: EjectProfile) -> str:
 def generate_eject_gcode(
     profile: EjectProfile,
     max_z_height: float,
-    printer_model: str,
+    geometry: ModelGeometry,
     cooldown_temp_c: float | None = None,
     *,
     include_cooldown: bool = True,
@@ -103,7 +81,9 @@ def generate_eject_gcode(
     Args:
         profile: the eject profile (all tunable parameters).
         max_z_height: parsed part top Z from the 3MF gcode header (mm).
-        printer_model: printer model string; must be a key of ``PRINTER_BED_DIMS``.
+        geometry: the target model's :class:`~backend.app.services.eject.geometry.ModelGeometry`
+            (bed rectangle + travel envelope), resolved from the registry by the
+            caller. Pure input — the generator does no DB / model-string lookup.
         cooldown_temp_c: optional per-run override for the bed cooldown gate
             (°C). When None, the profile's ``cooldown_temp_c`` is used. Lets a
             production run tighten/loosen the release temperature without a
@@ -123,25 +103,12 @@ def generate_eject_gcode(
         The complete eject block as a newline-terminated string.
 
     Raises:
-        EjectGenerationError: unknown printer model, or part taller than the
-            profile's ``max_part_height_mm`` guard.
+        EjectGenerationError: part taller than the profile's ``max_part_height_mm``
+            guard, or a degenerate sweep after the travel-envelope clamp.
     """
     effective_cooldown = cooldown_temp_c if cooldown_temp_c is not None else profile.cooldown_temp_c
-    dims = PRINTER_BED_DIMS.get(printer_model)
-    if dims is None:
-        raise EjectGenerationError(
-            f"No eject bed geometry for printer model {printer_model!r}; "
-            f"add it to PRINTER_BED_DIMS (known: {sorted(PRINTER_BED_DIMS)})"
-        )
-    bed_x, bed_y = dims
-
-    env = PRINTER_TRAVEL_ENVELOPE.get(printer_model)
-    if env is None:
-        raise EjectGenerationError(
-            f"No travel envelope for printer model {printer_model!r}; "
-            f"add it to PRINTER_TRAVEL_ENVELOPE (known: {sorted(PRINTER_TRAVEL_ENVELOPE)})"
-        )
-    x_min, x_max, y_min, y_max = env
+    bed_x, bed_y = geometry.bed
+    x_min, x_max, y_min, y_max = geometry.envelope
 
     if max_z_height > profile.max_part_height_mm:
         raise EjectGenerationError(
@@ -167,9 +134,7 @@ def generate_eject_gcode(
     band_lo = profile.sweep_x_min_mm
     band_hi = profile.sweep_x_max_mm
     if (band_lo is None) != (band_hi is None):
-        raise EjectGenerationError(
-            "sweep_x_min_mm and sweep_x_max_mm must both be set or both be null"
-        )
+        raise EjectGenerationError("sweep_x_min_mm and sweep_x_max_mm must both be set or both be null")
     if band_lo is not None:
         if not (0 <= band_lo < band_hi):
             raise EjectGenerationError(
@@ -181,7 +146,7 @@ def generate_eject_gcode(
             )
         if band_hi > bed_x:
             raise EjectGenerationError(
-                f"sweep_x_max_mm {band_hi} mm exceeds bed width {bed_x} mm for {printer_model}"
+                f"sweep_x_max_mm {band_hi} mm exceeds bed width {bed_x} mm for {geometry.model_key}"
             )
         lane_lo, lane_hi = band_lo, band_hi
     else:

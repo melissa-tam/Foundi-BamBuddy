@@ -202,6 +202,10 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
         # Batch grouping
         "batch_id": item.batch_id,
         "batch_name": item.batch.name if item.batch else None,
+        # Farm run identity (Phase 4.3g): a batch with sku_file_id IS a
+        # production run; derived, no column. Drives the queue "Run" badge/link
+        # and the farm-aware destructive confirms.
+        "production_run_id": item.batch_id if (item.batch and item.batch.sku_file_id is not None) else None,
         # SJF scheduling
         "been_jumped": item.been_jumped,
         # Auto-print G-code injection
@@ -1093,6 +1097,26 @@ async def delete_queue_item(
     return {"message": "Queue item deleted"}
 
 
+@router.post("/release-staged")
+async def release_staged_items(
+    printer_id: int | None = Query(default=None, description="Limit the re-check to one printer"),
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_UPDATE_ALL),
+):
+    """Re-check system-staged (low-spool) queue items and release the resolved ones.
+
+    Thin wrapper over ``farm_staging.release_filament_staged`` (Phase 4.2): every
+    pending item flagged ``manual_start`` + ``filament_short`` gets its filament
+    deficit recomputed against live spool state; items whose deficit cleared are
+    un-staged so the next scheduler tick dispatches them. Items still short stay
+    staged. Returns ``{"released": n}``.
+    """
+    from backend.app.services.farm_staging import release_filament_staged
+
+    released = await release_filament_staged(db, printer_id)
+    return {"released": released}
+
+
 @router.post("/reorder")
 async def reorder_queue(
     data: PrintQueueReorder,
@@ -1146,16 +1170,24 @@ async def resume_queue_after_failure(
     for failed_item in to_ack:
         failed_item.gate_acknowledged = True
 
+    # Machine code first (Phase 4.3f); the English error_message match keeps
+    # items skipped by builds before waiting_reason was stamped restorable.
     restore_result = await db.execute(
         select(PrintQueueItem)
         .where(PrintQueueItem.printer_id == printer_id)
         .where(PrintQueueItem.status == "skipped")
-        .where(PrintQueueItem.error_message == "Previous print failed or was aborted")
+        .where(
+            or_(
+                PrintQueueItem.waiting_reason == "previous_print_failed",
+                PrintQueueItem.error_message == "Previous print failed or was aborted",
+            )
+        )
     )
     to_restore = restore_result.scalars().all()
     for skipped_item in to_restore:
         skipped_item.status = "pending"
         skipped_item.error_message = None
+        skipped_item.waiting_reason = None
         skipped_item.completed_at = None
 
     await db.commit()

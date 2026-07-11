@@ -82,8 +82,30 @@ class PrintQueueItem(Base):
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # Lineage link to the failed item this row is a retry of. Makes retry
     # creation idempotent (exactly one retry per failure event) and traceable.
-    # SET NULL so deleting the original leaves the retry standing.
-    retry_of_id: Mapped[int | None] = mapped_column(ForeignKey("print_queue.id", ondelete="SET NULL"), nullable=True)
+    # SET NULL so deleting the original leaves the retry standing. UNIQUE (NULLs
+    # allowed) so the check-then-insert retry guard is backed by a DB constraint —
+    # a race that tried to create two retries for one failure fails the second
+    # insert instead of silently double-printing (#C7 idempotency, Phase 1).
+    retry_of_id: Mapped[int | None] = mapped_column(
+        ForeignKey("print_queue.id", ondelete="SET NULL"), nullable=True, unique=True
+    )
+
+    # Subtask id minted for THIS unit's dispatch (BambuMQTTClient.last_dispatch_subtask_id
+    # at start_print time; the printer echoes it back in push_status). Stamped
+    # post-dispatch by the scheduler and used by services.farm_correlation to bind a
+    # terminal MQTT status to the exact queue item that produced it — instead of the
+    # printer_id-only lookup that misattributed a foreign/local print to a farm unit
+    # (S4/P1-A). NULL for rows dispatched before this field existed (upgrade day) and
+    # for items never dispatched.
+    dispatch_subtask_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # How this unit reached a terminal 'cancelled': 'operator_ui' (Stop pressed in
+    # the Bambuddy queue UI) or 'operator_screen' (stopped on the printer's own
+    # touchscreen — detected from the firmware's cancel-echo HMS codes). NULL for
+    # a genuine failure, a normal completion, or a reconcile-synthesised interruption
+    # (unknown cause). Drives the farm policy: an attributed operator stop takes NO
+    # auto-retry and does NOT count toward quarantine (Phase 3).
+    stop_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Shortest-job-first scheduling
     print_time_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Cached from archive/library

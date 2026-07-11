@@ -166,6 +166,8 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "session_max_hours",
             "farm_retry_max_per_unit",
             "farm_escalate_consecutive_failures",
+            "farm_cooldown_warn_floor_c",
+            "farm_offline_stall_minutes",
         ]:
             settings_dict[setting.key] = int(setting.value)
         elif setting.key == "default_printer_id":

@@ -687,4 +687,132 @@ describe('useWebSocket hook', () => {
       expect(ws.close).toHaveBeenCalled();
     });
   });
+
+  describe('farm events (Phase 4)', () => {
+    it('invalidates production-runs on production_run_changed', async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
+      renderHook(() => useWebSocket(), {
+        wrapper: createWrapper(queryClient),
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      const ws = wsInstances[wsInstances.length - 1]!;
+      act(() => {
+        ws.open();
+      });
+
+      act(() => {
+        ws.simulateMessage({ type: 'production_run_changed', run_id: 3 });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(4000);
+      });
+
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['production-runs'] });
+
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    });
+
+    it('invalidates printers when a farm badge flag flips in printer_status', async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
+      renderHook(() => useWebSocket(), {
+        wrapper: createWrapper(queryClient),
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      const ws = wsInstances[wsInstances.length - 1]!;
+      act(() => {
+        ws.open();
+      });
+
+      // Baseline set right before the message: the test client uses gcTime 0,
+      // so an observer-less cache entry seeded earlier would be collected by
+      // the first timer advance and the delta check would see no baseline.
+      queryClient.setQueryData(['printerStatus', 1], {
+        quarantined: false,
+        awaiting_plate_clear: false,
+        model_mismatch: false,
+      });
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'printer_status',
+          printer_id: 1,
+          data: { quarantined: true, awaiting_plate_clear: false, model_mismatch: false },
+        });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(4000);
+      });
+
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['printers'] });
+
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    });
+
+    it('does NOT invalidate printers when the farm badge flags are unchanged', async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
+      renderHook(() => useWebSocket(), {
+        wrapper: createWrapper(queryClient),
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      const ws = wsInstances[wsInstances.length - 1]!;
+      act(() => {
+        ws.open();
+      });
+
+      // Baseline just before the message (gcTime 0 — see the flip test above).
+      queryClient.setQueryData(['printerStatus', 1], {
+        quarantined: false,
+        awaiting_plate_clear: true,
+        model_mismatch: false,
+      });
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'printer_status',
+          printer_id: 1,
+          data: { quarantined: false, awaiting_plate_clear: true, model_mismatch: false, progress: 42 },
+        });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(4000);
+      });
+
+      expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ['printers'] });
+
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    });
+  });
 });
