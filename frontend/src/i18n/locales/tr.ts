@@ -5582,6 +5582,23 @@ export default {
     jobFailedDescription: 'İş başlatılamadı',
     queueComplete: 'Kuyruk Tamamlandı',
     queueCompleteDescription: 'Tüm kuyruk işleri bitti',
+    // Farm production events (Phase 6)
+    events: {
+      farm: {
+        sectionTitle: 'Çiftlik üretimi',
+      },
+    },
+    firstArticlePending: 'İlk numune bekliyor',
+    firstArticleApproved: 'İlk numune onaylandı',
+    runPaused: 'Seri duraklatıldı',
+    runResumed: 'Seri sürdürüldü',
+    runCompleted: 'Seri tamamlandı',
+    runAborted: 'Seri iptal edildi',
+    printerQuarantined: 'Yazıcı karantinada',
+    foreignJobDetected: 'Harici iş algılandı',
+    modelMismatch: 'Model uyuşmazlığı',
+    runUnitStopped: 'Birim durduruldu',
+    printStalled: 'Baskı takıldı',
     quietHours: 'Sessiz Saatler',
     noNotificationsDuring: 'Bu saatler arasında bildirim yok',
     editProviderToChangeQuietHours: 'Sessiz saatleri değiştirmek için sağlayıcıyı düzenleyin',

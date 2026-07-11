@@ -5617,6 +5617,23 @@ export default {
     jobFailedDescription: 'La tâche n\'a pas pu démarrer',
     queueComplete: 'File d\'attente terminée',
     queueCompleteDescription: 'Toutes les tâches de la file sont terminées',
+    // Farm production events (Phase 6)
+    events: {
+      farm: {
+        sectionTitle: 'Production de la ferme',
+      },
+    },
+    firstArticlePending: 'Premier article en attente',
+    firstArticleApproved: 'Premier article approuvé',
+    runPaused: 'Série en pause',
+    runResumed: 'Série reprise',
+    runCompleted: 'Série terminée',
+    runAborted: 'Série annulée',
+    printerQuarantined: 'Imprimante en quarantaine',
+    foreignJobDetected: 'Tâche externe détectée',
+    modelMismatch: 'Modèle non concordant',
+    runUnitStopped: 'Unité arrêtée',
+    printStalled: 'Impression bloquée',
     // Quiet hours
     quietHours: 'Heures silencieuses',
     noNotificationsDuring: 'Aucune notification pendant ces heures',

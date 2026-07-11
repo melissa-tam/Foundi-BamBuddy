@@ -5616,6 +5616,23 @@ export default {
     jobFailedDescription: 'Avvio del lavoro fallito',
     queueComplete: 'Coda completata',
     queueCompleteDescription: 'Tutti i lavori in coda completati',
+    // Farm production events (Phase 6)
+    events: {
+      farm: {
+        sectionTitle: 'Produzione della farm',
+      },
+    },
+    firstArticlePending: 'Primo articolo in attesa',
+    firstArticleApproved: 'Primo articolo approvato',
+    runPaused: 'Serie in pausa',
+    runResumed: 'Serie ripresa',
+    runCompleted: 'Serie completata',
+    runAborted: 'Serie annullata',
+    printerQuarantined: 'Stampante in quarantena',
+    foreignJobDetected: 'Lavoro esterno rilevato',
+    modelMismatch: 'Modello non corrispondente',
+    runUnitStopped: 'Unità arrestata',
+    printStalled: 'Stampa bloccata',
     // Quiet hours
     quietHours: 'Ore silenziose',
     noNotificationsDuring: 'Nessuna notifica durante queste ore',

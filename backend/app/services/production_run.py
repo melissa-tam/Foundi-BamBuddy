@@ -27,11 +27,13 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.printer import Printer
 from backend.app.models.sku import SkuFile
 from backend.app.services.farm_policy import (
+    _sku_code,
     build_first_article_plan,
     create_new_first_article,
     farm_policy_defaults,
 )
 from backend.app.services.farm_staging import release_filament_staged
+from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
 from backend.app.services.sku_catalog import median_cycle_seconds
@@ -635,7 +637,14 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
             await create_new_first_article(db, run)
             await db.commit()
             run = await _load_run(db, run_id)
-        await top_up_run(db, run)
+        topped_up = await top_up_run(db, run)
+        # Lifecycle notification (Phase 6): tell the other operator the run is
+        # progressing again. Reload first so sku_file/sku are fresh, then read the
+        # identity args BEFORE on_run_resumed's internal commit expires the row
+        # (same ordering the farm_policy notify sites rely on).
+        run = await _load_run(db, run_id)
+        await notification_service.on_run_resumed(run.name, _sku_code(run), topped_up, db)
+        return await _load_run(db, run_id)
     else:
         if action == "pause":
             # Machine-readable hold reason (Phase 4.1): a manual pause is
@@ -643,7 +652,15 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
             run.pause_reason = "operator"
         await db.commit()
         broadcast_production_run_changed(run_id)
-    return await _load_run(db, run_id)
+        # Lifecycle notifications (Phase 6): a manual pause reuses the existing
+        # on_run_paused event; an abort fires the destructive on_run_aborted so the
+        # other operator knows the run is over. Reload for fresh sku_file/sku.
+        run = await _load_run(db, run_id)
+        if action == "pause":
+            await notification_service.on_run_paused(run.name, _sku_code(run), "Paused by operator", db)
+        elif action == "abort":
+            await notification_service.on_run_aborted(run.name, _sku_code(run), db)
+        return await _load_run(db, run_id)
 
 
 async def top_up_run(db: AsyncSession, run: PrintBatch) -> int:

@@ -2302,6 +2302,18 @@ export interface NotificationProvider {
   on_queue_job_skipped: boolean;
   on_queue_job_failed: boolean;
   on_queue_completed: boolean;
+  // Farm production events
+  on_first_article_pending: boolean;
+  on_first_article_approved: boolean;
+  on_printer_quarantined: boolean;
+  on_run_paused: boolean;
+  on_run_resumed: boolean;
+  on_run_completed: boolean;
+  on_run_aborted: boolean;
+  on_foreign_job_detected: boolean;
+  on_model_mismatch: boolean;
+  on_run_unit_stopped: boolean;
+  on_print_stalled: boolean;
   // Quiet hours
   quiet_hours_enabled: boolean;
   quiet_hours_start: string | null;
@@ -2361,6 +2373,18 @@ export interface NotificationProviderCreate {
   on_queue_job_skipped?: boolean;
   on_queue_job_failed?: boolean;
   on_queue_completed?: boolean;
+  // Farm production events
+  on_first_article_pending?: boolean;
+  on_first_article_approved?: boolean;
+  on_printer_quarantined?: boolean;
+  on_run_paused?: boolean;
+  on_run_resumed?: boolean;
+  on_run_completed?: boolean;
+  on_run_aborted?: boolean;
+  on_foreign_job_detected?: boolean;
+  on_model_mismatch?: boolean;
+  on_run_unit_stopped?: boolean;
+  on_print_stalled?: boolean;
   // Quiet hours
   quiet_hours_enabled?: boolean;
   quiet_hours_start?: string | null;
@@ -2413,6 +2437,18 @@ export interface NotificationProviderUpdate {
   on_queue_job_skipped?: boolean;
   on_queue_job_failed?: boolean;
   on_queue_completed?: boolean;
+  // Farm production events
+  on_first_article_pending?: boolean;
+  on_first_article_approved?: boolean;
+  on_printer_quarantined?: boolean;
+  on_run_paused?: boolean;
+  on_run_resumed?: boolean;
+  on_run_completed?: boolean;
+  on_run_aborted?: boolean;
+  on_foreign_job_detected?: boolean;
+  on_model_mismatch?: boolean;
+  on_run_unit_stopped?: boolean;
+  on_print_stalled?: boolean;
   // Quiet hours
   quiet_hours_enabled?: boolean;
   quiet_hours_start?: string | null;

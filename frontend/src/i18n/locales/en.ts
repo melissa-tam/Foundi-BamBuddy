@@ -5654,6 +5654,23 @@ export default {
     jobFailedDescription: 'Job failed to start',
     queueComplete: 'Queue Complete',
     queueCompleteDescription: 'All queue jobs finished',
+    // Farm production events (Phase 6)
+    events: {
+      farm: {
+        sectionTitle: 'Farm production',
+      },
+    },
+    firstArticlePending: 'First article pending',
+    firstArticleApproved: 'First article approved',
+    runPaused: 'Run paused',
+    runResumed: 'Run resumed',
+    runCompleted: 'Run completed',
+    runAborted: 'Run aborted',
+    printerQuarantined: 'Printer quarantined',
+    foreignJobDetected: 'Foreign job detected',
+    modelMismatch: 'Model mismatch',
+    runUnitStopped: 'Unit stopped',
+    printStalled: 'Print stalled',
     // Quiet hours
     quietHours: 'Quiet Hours',
     noNotificationsDuring: 'No notifications during these hours',

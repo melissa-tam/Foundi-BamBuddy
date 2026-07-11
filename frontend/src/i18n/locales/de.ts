@@ -5627,6 +5627,23 @@ export default {
     jobFailedDescription: 'Auftrag konnte nicht gestartet werden',
     queueComplete: 'Warteschlange abgeschlossen',
     queueCompleteDescription: 'Alle Warteschlangenaufträge beendet',
+    // Farm production events (Phase 6)
+    events: {
+      farm: {
+        sectionTitle: 'Farmproduktion',
+      },
+    },
+    firstArticlePending: 'Erstmuster ausstehend',
+    firstArticleApproved: 'Erstmuster freigegeben',
+    runPaused: 'Lauf pausiert',
+    runResumed: 'Lauf fortgesetzt',
+    runCompleted: 'Lauf abgeschlossen',
+    runAborted: 'Lauf abgebrochen',
+    printerQuarantined: 'Drucker in Quarantäne',
+    foreignJobDetected: 'Fremdauftrag erkannt',
+    modelMismatch: 'Modell stimmt nicht überein',
+    runUnitStopped: 'Einheit gestoppt',
+    printStalled: 'Druck blockiert',
     // Quiet hours
     quietHours: 'Ruhezeiten',
     noNotificationsDuring: 'Keine Benachrichtigungen während dieser Zeiten',

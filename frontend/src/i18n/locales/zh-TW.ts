@@ -5616,6 +5616,23 @@ export default {
     jobFailedDescription: '任務啟動失敗',
     queueComplete: '佇列已完成',
     queueCompleteDescription: '所有佇列任務已完成',
+    // Farm production events (Phase 6)
+    events: {
+      farm: {
+        sectionTitle: '農場生產',
+      },
+    },
+    firstArticlePending: '首件待審核',
+    firstArticleApproved: '首件已審核',
+    runPaused: '生產已暫停',
+    runResumed: '生產已恢復',
+    runCompleted: '生產已完成',
+    runAborted: '生產已中止',
+    printerQuarantined: '印表機已隔離',
+    foreignJobDetected: '偵測到外部工作',
+    modelMismatch: '型號不符',
+    runUnitStopped: '單元已停止',
+    printStalled: '列印停滯',
     // Quiet hours
     quietHours: '免打擾時段',
     noNotificationsDuring: '在此時段內不傳送通知',

@@ -79,6 +79,9 @@ def _provider_to_dict(provider: NotificationProvider) -> dict:
         "on_model_mismatch": provider.on_model_mismatch,
         "on_run_unit_stopped": provider.on_run_unit_stopped,
         "on_print_stalled": provider.on_print_stalled,
+        "on_run_aborted": provider.on_run_aborted,
+        "on_run_resumed": provider.on_run_resumed,
+        "on_first_article_approved": provider.on_first_article_approved,
         # Quiet hours
         "quiet_hours_enabled": provider.quiet_hours_enabled,
         "quiet_hours_start": provider.quiet_hours_start,
@@ -169,6 +172,9 @@ async def create_notification_provider(
         on_model_mismatch=provider_data.on_model_mismatch,
         on_run_unit_stopped=provider_data.on_run_unit_stopped,
         on_print_stalled=provider_data.on_print_stalled,
+        on_run_aborted=provider_data.on_run_aborted,
+        on_run_resumed=provider_data.on_run_resumed,
+        on_first_article_approved=provider_data.on_first_article_approved,
         # Quiet hours
         quiet_hours_enabled=provider_data.quiet_hours_enabled,
         quiet_hours_start=provider_data.quiet_hours_start,

@@ -223,6 +223,25 @@ DEFAULT_TEMPLATES = [
         "title_template": "Print stalled — {printer_name}",
         "body_template": "{printer_name} has been offline {minutes} min with '{job_name}' still marked printing. It will reconcile automatically when the printer reconnects.",
     },
+    # Farm production run notifications (Phase 6: manual / lifecycle events)
+    {
+        "event_type": "run_aborted",
+        "name": "Production Run Aborted",
+        "title_template": "Run Aborted — {sku_code}",
+        "body_template": "Run '{run_name}' was aborted by the operator.\nAll remaining plates were cancelled.",
+    },
+    {
+        "event_type": "run_resumed",
+        "name": "Production Run Resumed",
+        "title_template": "Run Resumed — {sku_code}",
+        "body_template": "Run '{run_name}' was resumed by the operator.\nTopped up {topped_up} plate(s) to plan.",
+    },
+    {
+        "event_type": "first_article_approved",
+        "name": "First Article Approved",
+        "title_template": "First Article Approved — {sku_code}",
+        "body_template": "First article for run '{run_name}' was approved on {printer}.\nRemaining plates released to dispatch.",
+    },
     {
         "event_type": "user_created",
         "name": "Welcome Email",

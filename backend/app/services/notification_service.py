@@ -2110,6 +2110,84 @@ class NotificationService:
         title, message = await self._build_message_from_template(db, "run_completed", variables)
         await self._send_to_providers(providers, title, message, db, "run_completed", printer_id, variables=variables)
 
+    async def on_run_aborted(
+        self,
+        run_name: str,
+        sku_code: str | None,
+        db: AsyncSession,
+        printer_id: int | None = None,
+    ):
+        """Fire when a production run is aborted by the operator.
+
+        Destructive (defaults ON): the abort cancelled the run's remaining plates,
+        so the OTHER operator must be told the run is over. Mirrors ``on_run_paused``
+        — same run/sku identity, no ``force_immediate`` (a run-lifecycle event, not
+        a printer alarm)."""
+        providers = await self._get_providers_for_event(db, "on_run_aborted", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "run_name": run_name,
+            "sku_code": sku_code or "",
+        }
+
+        title, message = await self._build_message_from_template(db, "run_aborted", variables)
+        await self._send_to_providers(providers, title, message, db, "run_aborted", printer_id, variables=variables)
+
+    async def on_run_resumed(
+        self,
+        run_name: str,
+        sku_code: str | None,
+        topped_up: int,
+        db: AsyncSession,
+        printer_id: int | None = None,
+    ):
+        """Fire when a paused production run is resumed by the operator.
+
+        Informational (defaults OFF): the run is progressing again and was topped
+        back up to plan. ``topped_up`` is the replacement-plate count from
+        ``top_up_run`` (0 on a clean resume)."""
+        providers = await self._get_providers_for_event(db, "on_run_resumed", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "run_name": run_name,
+            "sku_code": sku_code or "",
+            "topped_up": str(topped_up),
+        }
+
+        title, message = await self._build_message_from_template(db, "run_resumed", variables)
+        await self._send_to_providers(providers, title, message, db, "run_resumed", printer_id, variables=variables)
+
+    async def on_first_article_approved(
+        self,
+        run_name: str,
+        sku_code: str | None,
+        printer_name: str | None,
+        db: AsyncSession,
+        printer_id: int | None = None,
+    ):
+        """Fire when a run's first article is approved (physical or remote eject).
+
+        Closes the loop on the ``on_first_article_pending`` alert the other operator
+        acted on (defaults ON): the remaining plates are now released to dispatch."""
+        providers = await self._get_providers_for_event(db, "on_first_article_approved", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "run_name": run_name,
+            "sku_code": sku_code or "",
+            "printer": printer_name or "",
+        }
+
+        title, message = await self._build_message_from_template(db, "first_article_approved", variables)
+        await self._send_to_providers(
+            providers, title, message, db, "first_article_approved", printer_id, variables=variables
+        )
+
     # ==================== Inventory Stock Alerts ====================
 
     async def on_stock_reorder_alert(

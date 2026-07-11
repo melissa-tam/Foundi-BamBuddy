@@ -96,6 +96,11 @@ class NotificationProviderBase(BaseModel):
         default=True, description="Notify when a printing unit's printer is offline past the stall grace window"
     )
 
+    # Event triggers - Farm production (Phase 6: manual/lifecycle events)
+    on_run_aborted: bool = Field(default=True, description="Notify when a production run is aborted by the operator")
+    on_run_resumed: bool = Field(default=False, description="Notify when a paused production run is resumed")
+    on_first_article_approved: bool = Field(default=True, description="Notify when a run's first article is approved")
+
     # Quiet hours
     quiet_hours_enabled: bool = Field(default=False, description="Enable quiet hours")
     quiet_hours_start: str | None = Field(default=None, description="Start time in HH:MM format")
@@ -189,6 +194,11 @@ class NotificationProviderUpdate(BaseModel):
     on_model_mismatch: bool | None = None
     on_run_unit_stopped: bool | None = None
     on_print_stalled: bool | None = None
+
+    # Event triggers - Farm production (Phase 6: manual/lifecycle events)
+    on_run_aborted: bool | None = None
+    on_run_resumed: bool | None = None
+    on_first_article_approved: bool | None = None
 
     # Quiet hours
     quiet_hours_enabled: bool | None = None

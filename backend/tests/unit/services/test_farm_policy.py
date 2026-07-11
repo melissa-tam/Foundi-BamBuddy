@@ -923,3 +923,116 @@ class TestApproveGuards:
         with pytest.raises(HTTPException) as exc:
             await farm_policy.approve_first_article(db_session, batch.id, eject_remotely=False)
         assert exc.value.status_code == 409
+
+    async def test_approve_local_fires_first_article_approved_once(self, db_session):
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[7])
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "completed"
+        batch.first_article_state = "awaiting_approval"
+        await db_session.commit()
+
+        with patch.object(
+            farm_policy.notification_service, "on_first_article_approved", new_callable=AsyncMock
+        ) as mock_n:
+            run = await farm_policy.approve_first_article(db_session, batch.id, eject_remotely=False)
+
+        assert run.first_article_state == "approved"
+        mock_n.assert_awaited_once()
+        assert mock_n.call_args.args[0] == batch.name  # run_name
+
+    async def test_finalize_remote_eject_fires_first_article_approved_once(self, db_session):
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[7])
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "completed"
+        batch.first_article_state = "awaiting_approval"
+        await db_session.commit()
+
+        with patch.object(
+            farm_policy.notification_service, "on_first_article_approved", new_callable=AsyncMock
+        ) as mock_n:
+            await farm_policy._finalize_remote_eject(db_session, batch.id, 7)
+
+        await db_session.refresh(batch)
+        assert batch.first_article_state == "approved"
+        # Both approval paths (physical + remote eject) close the FA-pending loop.
+        mock_n.assert_awaited_once()
+
+    async def test_approve_on_cancelled_run_fires_no_notification(self, db_session):
+        from fastapi import HTTPException
+
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[7], require_fa=True)
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "completed"
+        batch.first_article_state = "awaiting_approval"
+        batch.status = "cancelled"
+        await db_session.commit()
+
+        with (
+            patch.object(
+                farm_policy.notification_service, "on_first_article_approved", new_callable=AsyncMock
+            ) as mock_n,
+            pytest.raises(HTTPException),
+        ):
+            await farm_policy.approve_first_article(db_session, batch.id, eject_remotely=False)
+        mock_n.assert_not_awaited()
+
+
+class TestLifecycleNotifications:
+    """Phase 6: transition_run pause/abort/resume fire the lifecycle events once."""
+
+    async def test_pause_fires_on_run_paused_operator_reason(self, db_session):
+        from backend.app.services.production_run import transition_run
+
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[1], require_fa=False)
+        with patch.object(farm_policy.notification_service, "on_run_paused", new_callable=AsyncMock) as mock_n:
+            run = await transition_run(db_session, batch.id, "pause")
+
+        assert run.status == "paused"
+        mock_n.assert_awaited_once()
+        # reason is the third positional arg (run_name, sku_code, reason, db).
+        assert mock_n.call_args.args[2] == "Paused by operator"
+
+    async def test_abort_fires_on_run_aborted_once(self, db_session):
+        from backend.app.services.production_run import transition_run
+
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[1], require_fa=False)
+        with (
+            patch.object(farm_policy.notification_service, "on_run_aborted", new_callable=AsyncMock) as mock_ab,
+            patch.object(farm_policy.notification_service, "on_run_paused", new_callable=AsyncMock) as mock_pa,
+        ):
+            run = await transition_run(db_session, batch.id, "abort")
+
+        assert run.status == "cancelled"
+        mock_ab.assert_awaited_once()
+        mock_pa.assert_not_awaited()
+
+    async def test_resume_fires_on_run_resumed_once(self, db_session):
+        from backend.app.services.production_run import transition_run
+
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[1], require_fa=False)
+        batch.status = "paused"
+        batch.pause_reason = "operator"
+        await db_session.commit()
+
+        with patch.object(farm_policy.notification_service, "on_run_resumed", new_callable=AsyncMock) as mock_n:
+            run = await transition_run(db_session, batch.id, "resume")
+
+        assert run.status == "active"
+        mock_n.assert_awaited_once()
+
+    async def test_abort_of_cancelled_run_409_fires_nothing(self, db_session):
+        from fastapi import HTTPException
+
+        from backend.app.services.production_run import transition_run
+
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[1], require_fa=False)
+        batch.status = "cancelled"
+        await db_session.commit()
+
+        with (
+            patch.object(farm_policy.notification_service, "on_run_aborted", new_callable=AsyncMock) as mock_n,
+            pytest.raises(HTTPException) as exc,
+        ):
+            await transition_run(db_session, batch.id, "abort")
+        assert exc.value.status_code == 409
+        mock_n.assert_not_awaited()

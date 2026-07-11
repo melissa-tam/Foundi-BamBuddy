@@ -2617,3 +2617,144 @@ class TestPlateNotEmptySourceDetail:
 
         # Rendered once via the placeholder; NOT appended a second time.
         assert captured["message"].count("Detail X.") == 1
+
+
+class TestFarmLifecycleNotifications:
+    """Phase 6: manual/lifecycle farm events (run aborted/resumed, FA approved).
+
+    Each method mirrors ``on_run_paused`` — provider-boolean gated, no
+    ``force_immediate`` (run-lifecycle events, not printer alarms).
+    """
+
+    @pytest.fixture
+    def service(self):
+        return NotificationService()
+
+    @pytest.fixture
+    def mock_provider(self):
+        provider = MagicMock()
+        provider.id = 1
+        provider.name = "Test Provider"
+        provider.printer_id = None
+        return provider
+
+    @pytest.fixture
+    def mock_db(self):
+        return AsyncMock()
+
+    @pytest.mark.asyncio
+    async def test_on_run_aborted_sends_when_enabled(self, service, mock_provider, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("Run Aborted", "body")
+
+            await service.on_run_aborted("Batch 9", "SKU007", mock_db)
+
+            assert mock_get.call_args.args[1] == "on_run_aborted"
+            mock_send.assert_called_once()
+            # event_type routed positionally; no force_immediate (matches on_run_paused).
+            assert mock_send.call_args.args[4] == "run_aborted"
+            assert mock_send.call_args.kwargs.get("force_immediate") in (None, False)
+            assert mock_send.call_args.kwargs["variables"] == {"run_name": "Batch 9", "sku_code": "SKU007"}
+
+    @pytest.mark.asyncio
+    async def test_on_run_aborted_skipped_when_disabled(self, service, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = []  # provider boolean off → filtered out
+
+            await service.on_run_aborted("Batch 9", "SKU007", mock_db)
+
+            mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_run_resumed_sends_with_topped_up(self, service, mock_provider, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("Run Resumed", "body")
+
+            await service.on_run_resumed("Batch 9", "SKU007", 2, mock_db)
+
+            assert mock_get.call_args.args[1] == "on_run_resumed"
+            mock_send.assert_called_once()
+            assert mock_send.call_args.args[4] == "run_resumed"
+            assert mock_send.call_args.kwargs["variables"]["topped_up"] == "2"
+
+    @pytest.mark.asyncio
+    async def test_on_run_resumed_skipped_when_disabled(self, service, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = []
+
+            await service.on_run_resumed("Batch 9", "SKU007", 0, mock_db)
+
+            mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_first_article_approved_sends_with_printer(self, service, mock_provider, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("First Article Approved", "body")
+
+            await service.on_first_article_approved("Batch 9", "SKU007", "001-H2S", mock_db, printer_id=3)
+
+            assert mock_get.call_args.args[1] == "on_first_article_approved"
+            mock_send.assert_called_once()
+            assert mock_send.call_args.args[4] == "first_article_approved"
+            variables = mock_send.call_args.kwargs["variables"]
+            assert variables["printer"] == "001-H2S"
+            assert variables["run_name"] == "Batch 9"
+
+    @pytest.mark.asyncio
+    async def test_on_first_article_approved_skipped_when_disabled(self, service, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = []
+
+            await service.on_first_article_approved("Batch 9", "SKU007", None, mock_db)
+
+            mock_send.assert_not_called()
+
+    def test_farm_lifecycle_templates_render_with_vars(self, service):
+        """The seeded run_aborted/run_resumed/first_article_approved bodies
+        substitute their variables (proves the template + var contract)."""
+        from backend.app.models.notification_template import DEFAULT_TEMPLATES
+
+        by_type = {t["event_type"]: t for t in DEFAULT_TEMPLATES}
+        for event_type in ("run_aborted", "run_resumed", "first_article_approved"):
+            assert event_type in by_type, f"missing seed for {event_type}"
+
+        aborted = service._render_template(
+            by_type["run_aborted"]["body_template"], {"run_name": "Batch 9", "sku_code": "SKU007"}
+        )
+        assert "Batch 9" in aborted
+
+        resumed = service._render_template(
+            by_type["run_resumed"]["body_template"],
+            {"run_name": "Batch 9", "sku_code": "SKU007", "topped_up": "3"},
+        )
+        assert "Batch 9" in resumed and "3" in resumed
+
+        approved = service._render_template(
+            by_type["first_article_approved"]["body_template"],
+            {"run_name": "Batch 9", "sku_code": "SKU007", "printer": "001-H2S"},
+        )
+        assert "Batch 9" in approved and "001-H2S" in approved

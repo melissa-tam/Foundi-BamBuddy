@@ -750,10 +750,21 @@ async def approve_first_article(db: AsyncSession, run_id: int, eject_remotely: b
     run.first_article_state = "approved"
     await db.commit()
     broadcast_production_run_changed(run_id)
-    if fa_item is not None and fa_item.printer_id is not None:
-        printer_manager.set_awaiting_plate_clear(fa_item.printer_id, False)
+    approve_printer_id = fa_item.printer_id if fa_item is not None else None
+    printer_name: str | None = None
+    if approve_printer_id is not None:
+        printer_manager.set_awaiting_plate_clear(approve_printer_id, False)
+        printer = await db.get(Printer, approve_printer_id)
+        printer_name = printer.name if printer is not None else None
     run = await _load_run(db, run_id)
     await create_remaining_plates(db, run)
+    # Close the loop on the on_first_article_pending alert (Phase 6): the plates
+    # are released. Reload so sku_file/sku are fresh, then read the identity args
+    # before on_first_article_approved's internal commit expires the row.
+    run = await _load_run(db, run_id)
+    await notification_service.on_first_article_approved(
+        run.name, _sku_code(run), printer_name, db, printer_id=approve_printer_id
+    )
     return await _load_run(db, run_id)
 
 
@@ -791,8 +802,15 @@ async def _finalize_remote_eject(db: AsyncSession, run_id: int, printer_id: int)
     await db.commit()
     broadcast_production_run_changed(run_id)
     printer_manager.set_awaiting_plate_clear(printer_id, False)
+    printer = await db.get(Printer, printer_id)
+    printer_name = printer.name if printer is not None else None
     run = await _load_run(db, run_id)
     await create_remaining_plates(db, run)
+    # Same loop-closing notification as the physical-approve path (Phase 6).
+    run = await _load_run(db, run_id)
+    await notification_service.on_first_article_approved(
+        run.name, _sku_code(run), printer_name, db, printer_id=printer_id
+    )
     logger.info("farm_policy: remote eject finalised run %s on printer %s", run_id, printer_id)
 
 

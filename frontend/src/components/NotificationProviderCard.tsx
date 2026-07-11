@@ -270,17 +270,6 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
                 </div>
 
                 <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-sm text-white">{t('notifications.plateNotEmpty')}</p>
-                    <p className="text-xs text-bambu-gray">{t('notifications.plateNotEmptyDescription')}</p>
-                  </div>
-                  <Toggle
-                    checked={provider.on_plate_not_empty ?? true}
-                    onChange={(checked) => updateMutation.mutate({ on_plate_not_empty: checked })}
-                  />
-                </div>
-
-                <div className="flex items-center justify-between">
                   <p className="text-sm text-white">{t('notifications.printCompleted')}</p>
                   <Toggle
                     checked={provider.on_print_complete}
@@ -559,6 +548,110 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
                   <Toggle
                     checked={provider.on_queue_completed ?? false}
                     onChange={(checked) => updateMutation.mutate({ on_queue_completed: checked })}
+                  />
+                </div>
+              </div>
+
+              {/* Farm Production Events */}
+              <div className="space-y-2">
+                <p className="text-xs text-bambu-gray uppercase tracking-wide">{t('notifications.events.farm.sectionTitle')}</p>
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm text-white">{t('notifications.plateNotEmpty')}</p>
+                    <p className="text-xs text-bambu-gray">{t('notifications.plateNotEmptyDescription')}</p>
+                  </div>
+                  <Toggle
+                    checked={provider.on_plate_not_empty ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_plate_not_empty: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.firstArticlePending')}</p>
+                  <Toggle
+                    checked={provider.on_first_article_pending ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_first_article_pending: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.firstArticleApproved')}</p>
+                  <Toggle
+                    checked={provider.on_first_article_approved ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_first_article_approved: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.runPaused')}</p>
+                  <Toggle
+                    checked={provider.on_run_paused ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_run_paused: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.runResumed')}</p>
+                  <Toggle
+                    checked={provider.on_run_resumed ?? false}
+                    onChange={(checked) => updateMutation.mutate({ on_run_resumed: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.runCompleted')}</p>
+                  <Toggle
+                    checked={provider.on_run_completed ?? false}
+                    onChange={(checked) => updateMutation.mutate({ on_run_completed: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.runAborted')}</p>
+                  <Toggle
+                    checked={provider.on_run_aborted ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_run_aborted: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.printerQuarantined')}</p>
+                  <Toggle
+                    checked={provider.on_printer_quarantined ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_printer_quarantined: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.foreignJobDetected')}</p>
+                  <Toggle
+                    checked={provider.on_foreign_job_detected ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_foreign_job_detected: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.modelMismatch')}</p>
+                  <Toggle
+                    checked={provider.on_model_mismatch ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_model_mismatch: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.runUnitStopped')}</p>
+                  <Toggle
+                    checked={provider.on_run_unit_stopped ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_run_unit_stopped: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.printStalled')}</p>
+                  <Toggle
+                    checked={provider.on_print_stalled ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_print_stalled: checked })}
                   />
                 </div>
               </div>

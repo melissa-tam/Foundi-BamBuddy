@@ -3371,6 +3371,12 @@ async def run_migrations(conn):
         ("on_run_unit_stopped", "1", "TRUE"),
         # Phase 3.2: a printing unit's printer has been offline past the stall grace.
         ("on_print_stalled", "1", "TRUE"),
+        # Phase 6: manual/lifecycle events surfaced to the other operator. Aborted
+        # and first-article-approved default ON (they close a loop the other
+        # operator is waiting on); resume is informational and defaults OFF.
+        ("on_run_aborted", "1", "TRUE"),
+        ("on_run_resumed", "0", "FALSE"),
+        ("on_first_article_approved", "1", "TRUE"),
     ):
         _default = _sqlite_default if is_sqlite() else _pg_default
         await _safe_execute(conn, f"ALTER TABLE notification_providers ADD COLUMN {_col} BOOLEAN DEFAULT {_default}")

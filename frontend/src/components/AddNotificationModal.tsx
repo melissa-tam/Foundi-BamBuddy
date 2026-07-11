@@ -45,6 +45,19 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
   const [onStockBreakAlert, setOnStockBreakAlert] = useState(provider?.on_stock_break_alert ?? false);
   const [onBedCooled, setOnBedCooled] = useState(provider?.on_bed_cooled ?? false);
   const [onFirstLayerComplete, setOnFirstLayerComplete] = useState(provider?.on_first_layer_complete ?? false);
+  // Farm production events (Phase 6)
+  const [onPlateNotEmpty, setOnPlateNotEmpty] = useState(provider?.on_plate_not_empty ?? true);
+  const [onFirstArticlePending, setOnFirstArticlePending] = useState(provider?.on_first_article_pending ?? true);
+  const [onFirstArticleApproved, setOnFirstArticleApproved] = useState(provider?.on_first_article_approved ?? true);
+  const [onRunPaused, setOnRunPaused] = useState(provider?.on_run_paused ?? true);
+  const [onRunResumed, setOnRunResumed] = useState(provider?.on_run_resumed ?? false);
+  const [onRunCompleted, setOnRunCompleted] = useState(provider?.on_run_completed ?? false);
+  const [onRunAborted, setOnRunAborted] = useState(provider?.on_run_aborted ?? true);
+  const [onPrinterQuarantined, setOnPrinterQuarantined] = useState(provider?.on_printer_quarantined ?? true);
+  const [onForeignJobDetected, setOnForeignJobDetected] = useState(provider?.on_foreign_job_detected ?? true);
+  const [onModelMismatch, setOnModelMismatch] = useState(provider?.on_model_mismatch ?? true);
+  const [onRunUnitStopped, setOnRunUnitStopped] = useState(provider?.on_run_unit_stopped ?? true);
+  const [onPrintStalled, setOnPrintStalled] = useState(provider?.on_print_stalled ?? true);
 
   // Provider-specific config (scalar fields only — event_priorities is split out
   // into its own state because it's an object, not a string).
@@ -175,6 +188,19 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
       on_stock_break_alert: onStockBreakAlert,
       on_bed_cooled: onBedCooled,
       on_first_layer_complete: onFirstLayerComplete,
+      // Farm production events
+      on_plate_not_empty: onPlateNotEmpty,
+      on_first_article_pending: onFirstArticlePending,
+      on_first_article_approved: onFirstArticleApproved,
+      on_run_paused: onRunPaused,
+      on_run_resumed: onRunResumed,
+      on_run_completed: onRunCompleted,
+      on_run_aborted: onRunAborted,
+      on_printer_quarantined: onPrinterQuarantined,
+      on_foreign_job_detected: onForeignJobDetected,
+      on_model_mismatch: onModelMismatch,
+      on_run_unit_stopped: onRunUnitStopped,
+      on_print_stalled: onPrintStalled,
     };
 
     if (isEditing) {
@@ -581,6 +607,61 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
                     <span className="text-xs text-bambu-gray ml-1">{t('notifications.stockBreakAlertDescription')}</span>
                   </div>
                   <Toggle checked={onStockBreakAlert} onChange={setOnStockBreakAlert} />
+                </div>
+              </div>
+            </div>
+
+            {/* Farm Production Events (Phase 6) */}
+            <div className="space-y-2 p-3 bg-bambu-dark rounded-lg">
+              <p className="text-xs text-bambu-gray uppercase tracking-wide mb-2">{t('notifications.events.farm.sectionTitle')}</p>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.plateNotEmpty')}</span>
+                  <Toggle checked={onPlateNotEmpty} onChange={setOnPlateNotEmpty} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.firstArticlePending')}</span>
+                  <Toggle checked={onFirstArticlePending} onChange={setOnFirstArticlePending} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.firstArticleApproved')}</span>
+                  <Toggle checked={onFirstArticleApproved} onChange={setOnFirstArticleApproved} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.runPaused')}</span>
+                  <Toggle checked={onRunPaused} onChange={setOnRunPaused} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.runResumed')}</span>
+                  <Toggle checked={onRunResumed} onChange={setOnRunResumed} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.runCompleted')}</span>
+                  <Toggle checked={onRunCompleted} onChange={setOnRunCompleted} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.runAborted')}</span>
+                  <Toggle checked={onRunAborted} onChange={setOnRunAborted} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.printerQuarantined')}</span>
+                  <Toggle checked={onPrinterQuarantined} onChange={setOnPrinterQuarantined} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.foreignJobDetected')}</span>
+                  <Toggle checked={onForeignJobDetected} onChange={setOnForeignJobDetected} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.modelMismatch')}</span>
+                  <Toggle checked={onModelMismatch} onChange={setOnModelMismatch} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.runUnitStopped')}</span>
+                  <Toggle checked={onRunUnitStopped} onChange={setOnRunUnitStopped} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.printStalled')}</span>
+                  <Toggle checked={onPrintStalled} onChange={setOnPrintStalled} />
                 </div>
               </div>
             </div>

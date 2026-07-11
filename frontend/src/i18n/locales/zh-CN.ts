@@ -5616,6 +5616,23 @@ export default {
     jobFailedDescription: '任务启动失败',
     queueComplete: '队列已完成',
     queueCompleteDescription: '所有队列任务已完成',
+    // Farm production events (Phase 6)
+    events: {
+      farm: {
+        sectionTitle: '农场生产',
+      },
+    },
+    firstArticlePending: '首件待审批',
+    firstArticleApproved: '首件已审批',
+    runPaused: '生产已暂停',
+    runResumed: '生产已恢复',
+    runCompleted: '生产已完成',
+    runAborted: '生产已中止',
+    printerQuarantined: '打印机已隔离',
+    foreignJobDetected: '检测到外部任务',
+    modelMismatch: '型号不匹配',
+    runUnitStopped: '单元已停止',
+    printStalled: '打印停滞',
     // Quiet hours
     quietHours: '免打扰时段',
     noNotificationsDuring: '在此时段内不发送通知',

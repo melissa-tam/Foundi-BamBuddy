@@ -112,6 +112,11 @@ class NotificationProvider(Base):
     on_run_unit_stopped = Column(Boolean, default=True)  # Run unit stopped by the operator (UI or printer screen)
     on_print_stalled = Column(Boolean, default=True)  # Printing unit's printer offline past the stall grace window
 
+    # Event triggers - Farm production (Phase 6: manual/lifecycle events)
+    on_run_aborted = Column(Boolean, default=True)  # Production run aborted by the operator (destructive)
+    on_run_resumed = Column(Boolean, default=False)  # Paused production run resumed by the operator (informational)
+    on_first_article_approved = Column(Boolean, default=True)  # First article approved (physical or remote eject)
+
     # Quiet hours (do not disturb)
     quiet_hours_enabled = Column(Boolean, default=False)
     quiet_hours_start = Column(String(5), nullable=True)  # HH:MM format, e.g., "22:00"

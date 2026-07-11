@@ -5348,6 +5348,23 @@ export default {
     jobFailedDescription: '작업 시작 실패',
     queueComplete: '대기열 완료',
     queueCompleteDescription: '모든 대기열 작업 완료',
+    // Farm production events (Phase 6)
+    events: {
+      farm: {
+        sectionTitle: '팜 생산',
+      },
+    },
+    firstArticlePending: '초도품 승인 대기',
+    firstArticleApproved: '초도품 승인됨',
+    runPaused: '생산 일시정지',
+    runResumed: '생산 재개',
+    runCompleted: '생산 완료',
+    runAborted: '생산 중단',
+    printerQuarantined: '프린터 격리',
+    foreignJobDetected: '외부 작업 감지',
+    modelMismatch: '모델 불일치',
+    runUnitStopped: '유닛 정지',
+    printStalled: '인쇄 정체',
     quietHours: '방해 금지 시간',
     noNotificationsDuring: '이 시간 동안 알림 없음',
     editProviderToChangeQuietHours: '방해 금지 시간을 변경하려면 제공자를 편집하세요',

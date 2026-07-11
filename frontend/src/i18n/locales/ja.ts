@@ -5628,6 +5628,23 @@ export default {
     jobFailedDescription: 'ジョブの開始に失敗しました',
     queueComplete: 'キュー完了',
     queueCompleteDescription: 'すべてのキュージョブが完了しました',
+    // Farm production events (Phase 6)
+    events: {
+      farm: {
+        sectionTitle: 'ファーム生産',
+      },
+    },
+    firstArticlePending: '初品承認待ち',
+    firstArticleApproved: '初品承認済み',
+    runPaused: '生産一時停止',
+    runResumed: '生産再開',
+    runCompleted: '生産完了',
+    runAborted: '生産中止',
+    printerQuarantined: 'プリンター隔離',
+    foreignJobDetected: '外部ジョブ検出',
+    modelMismatch: 'モデル不一致',
+    runUnitStopped: 'ユニット停止',
+    printStalled: '印刷停滞',
     // Quiet hours
     quietHours: '静音時間',
     noNotificationsDuring: 'この時間帯は通知を送信しません',
