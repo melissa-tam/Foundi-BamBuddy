@@ -47,7 +47,7 @@ export default {
     files: {
       title: '関連付けられたファイル',
       empty: 'まだファイルが関連付けられていません。',
-      createFirst: '先にSKUを保存してから、印刷可能なファイルを関連付けてください。',
+      willLinkOnSave: 'SKUを作成するとファイルが関連付けられます。',
       file: 'ファイル',
       filePlaceholder: 'ファイルを選択…',
       plate: 'プレート',

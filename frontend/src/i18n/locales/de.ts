@@ -47,7 +47,7 @@ export default {
     files: {
       title: 'Verknüpfte Dateien',
       empty: 'Noch keine Dateien verknüpft.',
-      createFirst: 'Speichern Sie den SKU zuerst, dann verknüpfen Sie druckbare Dateien.',
+      willLinkOnSave: 'Die Datei wird beim Erstellen des SKU verknüpft.',
       file: 'Datei',
       filePlaceholder: 'Datei auswählen…',
       plate: 'Platte',

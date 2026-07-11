@@ -47,7 +47,7 @@ export default {
     files: {
       title: 'Arquivos vinculados',
       empty: 'Nenhum arquivo vinculado ainda.',
-      createFirst: 'Salve o SKU primeiro e depois vincule arquivos imprimíveis.',
+      willLinkOnSave: 'O arquivo será vinculado quando você criar o SKU.',
       file: 'Arquivo',
       filePlaceholder: 'Selecione um arquivo…',
       plate: 'Placa',

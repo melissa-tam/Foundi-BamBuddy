@@ -47,7 +47,7 @@ export default {
     files: {
       title: 'Bağlı dosyalar',
       empty: 'Henüz bağlı dosya yok.',
-      createFirst: 'Önce SKU’yu kaydedin, sonra yazdırılabilir dosyaları bağlayın.',
+      willLinkOnSave: 'Dosya, SKU’yu oluşturduğunuzda bağlanacaktır.',
       file: 'Dosya',
       filePlaceholder: 'Bir dosya seçin…',
       plate: 'Plaka',

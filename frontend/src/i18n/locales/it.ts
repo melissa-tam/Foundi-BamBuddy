@@ -47,7 +47,7 @@ export default {
     files: {
       title: 'File collegati',
       empty: 'Nessun file ancora collegato.',
-      createFirst: 'Salva prima lo SKU, poi collega file stampabili.',
+      willLinkOnSave: 'Il file verrà collegato quando crei lo SKU.',
       file: 'File',
       filePlaceholder: 'Seleziona un file…',
       plate: 'Piastra',

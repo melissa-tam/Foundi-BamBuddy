@@ -94,7 +94,126 @@ function SkuStatsCells({ skuId }: { skuId: number }) {
 }
 
 // ---------------------------------------------------------------------------
-// File-link management (edit mode only — links attach to a persisted SKU id)
+// Add-row: file + plate + units picker (shared by create and edit dialogs)
+// ---------------------------------------------------------------------------
+
+interface SkuLinkAddRowProps {
+  /** Controlled selection state, owned by the dialog so Save can commit the
+   *  pending link (and, in edit mode, the "Add file" button can read it). */
+  fileId: number | null;
+  setFileId: (v: number | null) => void;
+  plateIndex: number;
+  setPlateIndex: (v: number) => void;
+  unitsPerPlate: string;
+  setUnitsPerPlate: (v: string) => void;
+  /** Clears a stale link error when the file selection changes. */
+  onClearLinkError: () => void;
+}
+
+/**
+ * The file/plate/units picker. Owns the library-files + plates queries and the
+ * plate-index snap so a SINGLE implementation serves both the edit-mode
+ * SkuFileLinks panel and the create-mode "Files" section — the latter enabling
+ * single-pass SKU creation (pick a file, Save once; the chained
+ * createSku→addSkuFile submit commits it).
+ */
+function SkuLinkAddRow({
+  fileId,
+  setFileId,
+  plateIndex,
+  setPlateIndex,
+  unitsPerPlate,
+  setUnitsPerPlate,
+  onClearLinkError,
+}: SkuLinkAddRowProps) {
+  const { t } = useTranslation();
+
+  const { data: libraryFiles } = useQuery({
+    queryKey: ['library-files', 'sku'],
+    queryFn: () => api.getLibraryFiles(),
+  });
+  const threeMfFiles = useMemo(
+    () => (libraryFiles ?? []).filter((f) => f.filename.toLowerCase().endsWith('.3mf')),
+    [libraryFiles],
+  );
+
+  const { data: platesData } = useQuery({
+    queryKey: ['library-file-plates', fileId],
+    queryFn: () => api.getLibraryFilePlates(fileId!),
+    enabled: fileId !== null,
+  });
+  const plates = useMemo(() => platesData?.plates ?? [], [platesData]);
+  usePlateIndexSync(plates, plateIndex, setPlateIndex);
+
+  return (
+    <div className="grid gap-2 sm:grid-cols-3">
+      <div>
+        <label htmlFor="sku-link-file" className="block text-xs text-bambu-gray mb-1">
+          {t('skus.files.file')}
+        </label>
+        <select
+          id="sku-link-file"
+          value={fileId ?? ''}
+          onChange={(e) => {
+            const next = e.target.value ? Number(e.target.value) : null;
+            setFileId(next);
+            setPlateIndex(1);
+            onClearLinkError();
+          }}
+          className={inputClass}
+        >
+          <option value="">{t('skus.files.filePlaceholder')}</option>
+          {threeMfFiles.map((f) => (
+            <option key={f.id} value={f.id}>
+              {f.filename}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <label htmlFor="sku-link-plate" className="block text-xs text-bambu-gray mb-1">
+          {t('skus.files.plate')}
+        </label>
+        <select
+          id="sku-link-plate"
+          value={plateIndex}
+          onChange={(e) => setPlateIndex(Number(e.target.value))}
+          className={inputClass}
+          disabled={fileId === null}
+        >
+          {plates.length > 0 ? (
+            plates.map((p) => (
+              <option key={p.index} value={p.index}>
+                {p.name || `#${p.index}`}
+              </option>
+            ))
+          ) : (
+            <option value={1}>#1</option>
+          )}
+        </select>
+      </div>
+      <div>
+        <label htmlFor="sku-link-units" className="block text-xs text-bambu-gray mb-1">
+          {t('skus.files.unitsPerPlate')}
+        </label>
+        <input
+          id="sku-link-units"
+          type="number"
+          inputMode="numeric"
+          min={1}
+          max={999}
+          step={1}
+          value={unitsPerPlate}
+          onChange={(e) => setUnitsPerPlate(e.target.value)}
+          className={inputClass}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// File-link management (edit mode — links attach to a persisted SKU id)
 // ---------------------------------------------------------------------------
 
 interface SkuFileLinksProps {
@@ -138,23 +257,6 @@ function SkuFileLinks({
     initialData: sku,
   });
   const files = detail?.files ?? [];
-
-  const { data: libraryFiles } = useQuery({
-    queryKey: ['library-files', 'sku'],
-    queryFn: () => api.getLibraryFiles(),
-  });
-  const threeMfFiles = useMemo(
-    () => (libraryFiles ?? []).filter((f) => f.filename.toLowerCase().endsWith('.3mf')),
-    [libraryFiles],
-  );
-
-  const { data: platesData } = useQuery({
-    queryKey: ['library-file-plates', fileId],
-    queryFn: () => api.getLibraryFilePlates(fileId!),
-    enabled: fileId !== null,
-  });
-  const plates = useMemo(() => platesData?.plates ?? [], [platesData]);
-  usePlateIndexSync(plates, plateIndex, setPlateIndex);
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['sku', sku.id] });
@@ -228,69 +330,15 @@ function SkuFileLinks({
       )}
 
       {/* Add-link sub-form */}
-      <div className="grid gap-2 sm:grid-cols-3">
-        <div>
-          <label htmlFor="sku-link-file" className="block text-xs text-bambu-gray mb-1">
-            {t('skus.files.file')}
-          </label>
-          <select
-            id="sku-link-file"
-            value={fileId ?? ''}
-            onChange={(e) => {
-              const next = e.target.value ? Number(e.target.value) : null;
-              setFileId(next);
-              setPlateIndex(1);
-              onClearLinkError();
-            }}
-            className={inputClass}
-          >
-            <option value="">{t('skus.files.filePlaceholder')}</option>
-            {threeMfFiles.map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.filename}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label htmlFor="sku-link-plate" className="block text-xs text-bambu-gray mb-1">
-            {t('skus.files.plate')}
-          </label>
-          <select
-            id="sku-link-plate"
-            value={plateIndex}
-            onChange={(e) => setPlateIndex(Number(e.target.value))}
-            className={inputClass}
-            disabled={fileId === null}
-          >
-            {plates.length > 0 ? (
-              plates.map((p) => (
-                <option key={p.index} value={p.index}>
-                  {p.name || `#${p.index}`}
-                </option>
-              ))
-            ) : (
-              <option value={1}>#1</option>
-            )}
-          </select>
-        </div>
-        <div>
-          <label htmlFor="sku-link-units" className="block text-xs text-bambu-gray mb-1">
-            {t('skus.files.unitsPerPlate')}
-          </label>
-          <input
-            id="sku-link-units"
-            type="number"
-            inputMode="numeric"
-            min={1}
-            max={999}
-            step={1}
-            value={unitsPerPlate}
-            onChange={(e) => setUnitsPerPlate(e.target.value)}
-            className={inputClass}
-          />
-        </div>
-      </div>
+      <SkuLinkAddRow
+        fileId={fileId}
+        setFileId={setFileId}
+        plateIndex={plateIndex}
+        setPlateIndex={setPlateIndex}
+        unitsPerPlate={unitsPerPlate}
+        setUnitsPerPlate={setUnitsPerPlate}
+        onClearLinkError={onClearLinkError}
+      />
       <div className="mt-2">
         <Button type="button" variant="secondary" size="sm" onClick={() => addMutation.mutate()} disabled={!canAdd}>
           {addMutation.isPending ? (
@@ -607,8 +655,11 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
               />
             </div>
 
-            {/* File links (edit only) */}
-            {isEditing && sku && (
+            {/* File links: edit mode shows the persisted links plus the add
+                row; create mode shows the add row alone so a file can be linked
+                in a single pass — the chained createSku→addSkuFile submit
+                commits it on Save. */}
+            {isEditing && sku ? (
               <SkuFileLinks
                 sku={sku}
                 fileId={linkFileId}
@@ -620,6 +671,20 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
                 saveLinkError={linkError}
                 onClearLinkError={onClearLinkError}
               />
+            ) : (
+              <div className="border-t border-bambu-dark-tertiary pt-4">
+                <h3 className="text-sm font-semibold text-white mb-2">{t('skus.files.title')}</h3>
+                <SkuLinkAddRow
+                  fileId={linkFileId}
+                  setFileId={setLinkFileId}
+                  plateIndex={linkPlateIndex}
+                  setPlateIndex={setLinkPlateIndex}
+                  unitsPerPlate={linkUnitsPerPlate}
+                  setUnitsPerPlate={setLinkUnitsPerPlate}
+                  onClearLinkError={onClearLinkError}
+                />
+                <p className="text-xs text-bambu-gray mt-2">{t('skus.files.willLinkOnSave')}</p>
+              </div>
             )}
 
             {/* Backend rejection (persistent, unlike a toast — the dialog is
@@ -653,9 +718,6 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
                 )}
               </Button>
             </div>
-            {!isEditing && (
-              <p className="text-xs text-bambu-gray">{t('skus.files.createFirst')}</p>
-            )}
           </form>
         </CardContent>
       </Card>

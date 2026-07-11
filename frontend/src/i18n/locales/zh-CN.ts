@@ -47,7 +47,7 @@ export default {
     files: {
       title: '已关联文件',
       empty: '尚未关联任何文件。',
-      createFirst: '请先保存 SKU，然后再关联可打印文件。',
+      willLinkOnSave: '创建 SKU 时将关联该文件。',
       file: '文件',
       filePlaceholder: '选择一个文件…',
       plate: '盘板',

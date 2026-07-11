@@ -47,7 +47,7 @@ export default {
     files: {
       title: '已關聯檔案',
       empty: '尚未關聯任何檔案。',
-      createFirst: '請先儲存 SKU，再關聯可列印檔案。',
+      willLinkOnSave: '建立 SKU 時將關聯該檔案。',
       file: '檔案',
       filePlaceholder: '選擇一個檔案…',
       plate: '盤板',

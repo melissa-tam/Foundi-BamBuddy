@@ -47,7 +47,7 @@ export default {
     files: {
       title: 'Linked files',
       empty: 'No files linked yet.',
-      createFirst: 'Save the SKU first, then link printable files.',
+      willLinkOnSave: 'The file will be linked when you create the SKU',
       file: 'File',
       filePlaceholder: 'Select a file…',
       plate: 'Plate',

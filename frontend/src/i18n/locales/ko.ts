@@ -47,7 +47,7 @@ export default {
     files: {
       title: '연결된 파일',
       empty: '아직 연결된 파일이 없습니다.',
-      createFirst: '먼저 SKU를 저장한 다음 인쇄 가능한 파일을 연결하세요.',
+      willLinkOnSave: 'SKU를 생성하면 파일이 연결됩니다.',
       file: '파일',
       filePlaceholder: '파일 선택…',
       plate: '플레이트',

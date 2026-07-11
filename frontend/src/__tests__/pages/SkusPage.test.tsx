@@ -11,6 +11,10 @@
  * - Save commits a pending add-row file selection (links via POST
  *   /skus/{id}/files without a separate "Add file" click), and when that link
  *   fails after the SKU persisted the dialog stays open with the reason inline.
+ * - Single-pass create: the create dialog exposes the file/plate/units add-row,
+ *   so Save can chain createSku→addSkuFile in one submit; an untouched add-row
+ *   is a plain create; a link failure transitions the dialog into edit mode
+ *   with the reason inline.
  */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
@@ -392,5 +396,182 @@ describe('SkusPage', () => {
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     // Re-submittable: Save is re-enabled after the failed link attempt.
     expect(screen.getByRole('button', { name: /^save$/i })).toBeEnabled();
+  });
+
+  it('renders the file/plate/units add-row and link-on-save hint in the create dialog', async () => {
+    server.use(
+      http.get('*/api/v1/skus', () => HttpResponse.json([])),
+      emptyEjectProfiles,
+      http.get('*/api/v1/library/files', () => HttpResponse.json([libraryFile])),
+      http.get('*/api/v1/library/files/:id/plates', () => HttpResponse.json(platesResponse)),
+    );
+
+    const user = userEvent.setup();
+    render(<SkusPage />);
+
+    await screen.findByText('No SKUs yet');
+    await user.click(screen.getByRole('button', { name: /new sku/i }));
+    const dialog = await screen.findByRole('dialog');
+
+    // The add-row picker (extracted SkuLinkAddRow) renders in create mode...
+    expect(within(dialog).getByLabelText('File')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Plate')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Units per plate')).toBeInTheDocument();
+    // ...under the "link on save" hint that replaces the old "save first" copy.
+    expect(
+      within(dialog).getByText(/will be linked when you create the sku/i),
+    ).toBeInTheDocument();
+    // No standalone "Add file" button in create mode — Save commits the link.
+    expect(within(dialog).queryByRole('button', { name: /add file/i })).not.toBeInTheDocument();
+  });
+
+  it('links a buffered add-row file in one pass on create (createSku then addSkuFile)', async () => {
+    let createBody: Record<string, unknown> | null = null;
+    let linkBody: Record<string, unknown> | null = null;
+    const created = sku({ id: 7, code: 'NEW-7', name: 'New Seven', part_number: null, files: [] });
+
+    server.use(
+      http.get('*/api/v1/skus', () => HttpResponse.json([])),
+      emptyStats,
+      emptyEjectProfiles,
+      http.get('*/api/v1/library/files', () => HttpResponse.json([libraryFile])),
+      http.get('*/api/v1/library/files/:id/plates', () => HttpResponse.json(platesResponse)),
+      http.post('*/api/v1/skus', async ({ request }) => {
+        createBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(created, { status: 201 });
+      }),
+      http.post('*/api/v1/skus/:id/files', async ({ request }) => {
+        linkBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(created, { status: 201 });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<SkusPage />);
+
+    await screen.findByText('No SKUs yet');
+    await user.click(screen.getByRole('button', { name: /new sku/i }));
+    const dialog = await screen.findByRole('dialog');
+
+    await user.type(within(dialog).getByLabelText(/^code$/i), 'NEW-7');
+    await user.type(within(dialog).getByLabelText(/^name$/i), 'New Seven');
+    await user.selectOptions(await within(dialog).findByLabelText('File'), '5');
+    const units = within(dialog).getByLabelText('Units per plate');
+    await user.clear(units);
+    await user.type(units, '3');
+    await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+    // The SKU is created first, then its link attaches through the SAME POST
+    // /skus/{id}/files call as the "Add file" button — one submit, no reopen.
+    await waitFor(() => expect(createBody).not.toBeNull());
+    expect(createBody).toMatchObject({ code: 'NEW-7', name: 'New Seven' });
+    await waitFor(() => expect(linkBody).not.toBeNull());
+    expect(linkBody).toMatchObject({ library_file_id: 5, plate_index: 1, units_per_plate: 3 });
+    // Full success (create + link) closes the dialog.
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
+  it('creates a SKU with no addSkuFile call when the create add-row is untouched', async () => {
+    let linkCalled = false;
+    const created = sku({ id: 8, code: 'PLAIN-8', name: 'Plain Eight', files: [] });
+
+    server.use(
+      http.get('*/api/v1/skus', () => HttpResponse.json([])),
+      emptyStats,
+      emptyEjectProfiles,
+      http.get('*/api/v1/library/files', () => HttpResponse.json([libraryFile])),
+      http.get('*/api/v1/library/files/:id/plates', () => HttpResponse.json(platesResponse)),
+      http.get('*/api/v1/skus/:id', () => HttpResponse.json(created)),
+      http.post('*/api/v1/skus', () => HttpResponse.json(created, { status: 201 })),
+      http.post('*/api/v1/skus/:id/files', () => {
+        linkCalled = true;
+        return HttpResponse.json(created, { status: 201 });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<SkusPage />);
+
+    await screen.findByText('No SKUs yet');
+    await user.click(screen.getByRole('button', { name: /new sku/i }));
+    const dialog = await screen.findByRole('dialog');
+
+    await user.type(within(dialog).getByLabelText(/^code$/i), 'PLAIN-8');
+    await user.type(within(dialog).getByLabelText(/^name$/i), 'Plain Eight');
+    await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+    // Plain create: the dialog transitions to edit mode (Add-file button
+    // appears) so files can be attached — and no file link was posted.
+    expect(await screen.findByRole('button', { name: /add file/i })).toBeInTheDocument();
+    expect(linkCalled).toBe(false);
+  });
+
+  it('keeps the create dialog open (in edit mode) with an inline error when the link fails', async () => {
+    const created = sku({ id: 9, code: 'FAIL-9', name: 'Fail Nine', files: [] });
+    let postCalled = false;
+
+    server.use(
+      http.get('*/api/v1/skus', () => HttpResponse.json([])),
+      emptyStats,
+      emptyEjectProfiles,
+      http.get('*/api/v1/library/files', () => HttpResponse.json([libraryFile])),
+      http.get('*/api/v1/library/files/:id/plates', () => HttpResponse.json(platesResponse)),
+      http.get('*/api/v1/skus/:id', () => HttpResponse.json(created)),
+      http.post('*/api/v1/skus', () => {
+        postCalled = true;
+        return HttpResponse.json(created, { status: 201 });
+      }),
+      // Unsliced plate → backend 400 AFTER the SKU was created.
+      http.post('*/api/v1/skus/:id/files', () =>
+        HttpResponse.json({ detail: 'Plate 1 is not sliced' }, { status: 400 }),
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<SkusPage />);
+
+    await screen.findByText('No SKUs yet');
+    await user.click(screen.getByRole('button', { name: /new sku/i }));
+    const dialog = await screen.findByRole('dialog');
+
+    await user.type(within(dialog).getByLabelText(/^code$/i), 'FAIL-9');
+    await user.type(within(dialog).getByLabelText(/^name$/i), 'Fail Nine');
+    await user.selectOptions(await within(dialog).findByLabelText('File'), '5');
+    await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+    // SKU created but the link failed: the dialog transitions to edit mode for
+    // the retry and surfaces the reason inline, never exiting as if it linked.
+    await waitFor(() => expect(postCalled).toBe(true));
+    const alert = await screen.findByText(/but linking the file failed/i);
+    expect(alert).toHaveTextContent('Plate 1 is not sliced');
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+  });
+
+  it('renders the links list and the extracted add-row together in edit mode', async () => {
+    const withFile = sku(); // seeded with one linked file
+
+    server.use(
+      http.get('*/api/v1/skus', () => HttpResponse.json([withFile])),
+      http.get('*/api/v1/skus/:id', () => HttpResponse.json(withFile)),
+      emptyStats,
+      emptyEjectProfiles,
+      http.get('*/api/v1/library/files', () => HttpResponse.json([libraryFile])),
+      http.get('*/api/v1/library/files/:id/plates', () => HttpResponse.json(platesResponse)),
+    );
+
+    const user = userEvent.setup();
+    render(<SkusPage />);
+
+    await screen.findByText('WID-001');
+    await user.click(screen.getByRole('button', { name: /edit wid-001/i }));
+    const dialog = await screen.findByRole('dialog');
+
+    // Existing linked file is listed (its remove control is unique to the list).
+    expect(
+      await within(dialog).findByRole('button', { name: /remove widget\.gcode\.3mf/i }),
+    ).toBeInTheDocument();
+    // ...and the extracted add-row + its Add-file button still render.
+    expect(within(dialog).getByLabelText('File')).toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: /add file/i })).toBeInTheDocument();
   });
 });

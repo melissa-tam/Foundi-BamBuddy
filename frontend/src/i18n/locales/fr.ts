@@ -47,7 +47,7 @@ export default {
     files: {
       title: 'Fichiers liés',
       empty: 'Aucun fichier lié pour le moment.',
-      createFirst: 'Enregistrez d\'abord le SKU, puis liez des fichiers imprimables.',
+      willLinkOnSave: 'Le fichier sera lié lors de la création du SKU.',
       file: 'Fichier',
       filePlaceholder: 'Sélectionnez un fichier…',
       plate: 'Plaque',
