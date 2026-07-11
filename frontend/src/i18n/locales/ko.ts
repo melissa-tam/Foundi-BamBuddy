@@ -215,6 +215,11 @@ export default {
       rejected: '초도품이 거부되었습니다',
       approveFailed: '초도품 승인에 실패했습니다',
       rejectFailed: '초도품 거부에 실패했습니다',
+      photoAlt: '초도품 완성 사진',
+      photoUnavailable: '완성 사진을 사용할 수 없습니다',
+      viewCamera: '카메라 보기',
+      hideCamera: '카메라 숨기기',
+      printerLabel: '프린터: {{name}}',
     },
   },
 

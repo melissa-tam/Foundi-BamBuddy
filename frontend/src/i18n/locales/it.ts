@@ -215,6 +215,11 @@ export default {
       rejected: 'Primo pezzo rifiutato',
       approveFailed: 'Impossibile approvare il primo pezzo',
       rejectFailed: 'Impossibile rifiutare il primo pezzo',
+      photoAlt: 'Foto finale del primo pezzo',
+      photoUnavailable: 'Foto finale non disponibile',
+      viewCamera: 'Mostra fotocamera',
+      hideCamera: 'Nascondi fotocamera',
+      printerLabel: 'Stampante: {{name}}',
     },
   },
 

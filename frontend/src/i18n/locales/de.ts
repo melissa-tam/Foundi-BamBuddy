@@ -215,6 +215,11 @@ export default {
       rejected: 'Erstmuster abgelehnt',
       approveFailed: 'Erstmuster-Freigabe fehlgeschlagen',
       rejectFailed: 'Ablehnung des Erstmusters fehlgeschlagen',
+      photoAlt: 'Abschlussfoto des Erstmusters',
+      photoUnavailable: 'Abschlussfoto nicht verfügbar',
+      viewCamera: 'Kamera anzeigen',
+      hideCamera: 'Kamera ausblenden',
+      printerLabel: 'Drucker: {{name}}',
     },
   },
 

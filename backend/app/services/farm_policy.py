@@ -120,16 +120,6 @@ def _units_per_plate(run: PrintBatch) -> int:
     return (run.sku_file.units_per_plate if run.sku_file else 1) or 1
 
 
-def _find_fa_item(run: PrintBatch) -> PrintQueueItem | None:
-    """The most-recently-completed first-article item for the run, if any."""
-    candidates = [i for i in run.queue_items if i.first_article and i.status == "completed"]
-    if not candidates:
-        candidates = [i for i in run.queue_items if i.first_article]
-    if not candidates:
-        return None
-    return sorted(candidates, key=lambda i: i.completed_at or i.created_at or 0)[-1]
-
-
 # --------------------------------------------------------------------------- #
 # Plan (deferred remaining plates) serialisation
 # --------------------------------------------------------------------------- #
@@ -746,6 +736,11 @@ async def approve_first_article(db: AsyncSession, run_id: int, eject_remotely: b
         # An aborted run must never materialise dispatchable plates from an approval
         # (R6: the abort cancelled its pending items; approval would resurrect it).
         raise HTTPException(status_code=409, detail="Cannot approve a first article on a cancelled run")
+    # Function-level import avoids a circular import (production_run imports
+    # farm_policy helpers), matching the fork's style; _find_fa_item now lives in
+    # production_run as the single shared home.
+    from backend.app.services.production_run import _find_fa_item
+
     fa_item = _find_fa_item(run)
 
     if eject_remotely:

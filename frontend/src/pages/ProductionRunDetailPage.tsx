@@ -25,6 +25,7 @@ import {
 import { api, type PrinterStatus } from '../api/client';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
+import { FirstArticleBanner } from '../components/FirstArticleBanner';
 import {
   BlockedPrintersChip,
   PauseReasonChip,
@@ -340,6 +341,11 @@ export function ProductionRunDetailPage() {
               </div>
 
               <RunStagedBanner run={run} />
+
+              {/* First-article approval gate (Phase 4, F1): self-contained here
+                  with the part photo + collapsible camera so a remote approver
+                  can act without leaving the run detail. */}
+              <FirstArticleBanner run={run} />
             </CardContent>
           </Card>
 

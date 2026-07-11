@@ -215,6 +215,11 @@ export default {
       rejected: '初品を拒否しました',
       approveFailed: '初品の承認に失敗しました',
       rejectFailed: '初品の拒否に失敗しました',
+      photoAlt: '初品の完成写真',
+      photoUnavailable: '完成写真は利用できません',
+      viewCamera: 'カメラを表示',
+      hideCamera: 'カメラを非表示',
+      printerLabel: 'プリンター: {{name}}',
     },
   },
 

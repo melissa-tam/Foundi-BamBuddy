@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import select
 
+from backend.app.models.archive import PrintArchive
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
@@ -457,3 +458,106 @@ class TestBuildFarmPrinterContexts:
         assert by_pid[p.id]["run_id"] == older.id  # live unit wins over the newer run
         assert by_pid[p.id]["unit_status"] == "printing"
         assert p2.id not in by_pid  # completed run excluded
+
+
+async def _mk_archive(db, photos):
+    arch = PrintArchive(filename="fa.gcode.3mf", file_path="/tmp/fa.gcode.3mf", file_size=1, photos=photos)
+    db.add(arch)
+    await db.flush()
+    return arch
+
+
+class TestFirstArticlePhoto:
+    """build_run_response first-article inspection payload (Phase 4, F1).
+
+    Only ``awaiting_approval`` / ``rejected`` runs carry the finish-photo URL +
+    the producing printer; the newest ``finish_*`` archive photo is selected,
+    mirroring main.py (the capture path appends the fresh finish photo LAST).
+    """
+
+    async def test_awaiting_approval_picks_finish_photo_and_printer(self, db_session):
+        batch = await _mk_run(db_session, quantity=2, fa_state="awaiting_approval")
+        p = await _mk_printer(db_session)
+        arch = await _mk_archive(db_session, ["foo.jpg", "finish_1.jpg"])
+        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=arch.id)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        assert resp["first_article_photo_url"] == f"/api/v1/archives/{arch.id}/photos/finish_1.jpg"
+        assert resp["first_article_photo_url"].endswith("/photos/finish_1.jpg")
+        assert resp["first_article_printer_id"] == p.id
+        assert resp["first_article_printer_name"] == p.name
+
+    async def test_multiple_finish_photos_pick_newest(self, db_session):
+        batch = await _mk_run(db_session, quantity=2, fa_state="awaiting_approval")
+        p = await _mk_printer(db_session)
+        arch = await _mk_archive(
+            db_session,
+            [
+                "thumb.png",
+                "finish_20260706_100000_aaaa.jpg",
+                "midprint.jpg",
+                "finish_20260706_120000_bbbb.jpg",
+            ],
+        )
+        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=arch.id)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        # The last finish_* entry (newest captured) wins.
+        assert resp["first_article_photo_url"].endswith("/photos/finish_20260706_120000_bbbb.jpg")
+
+    async def test_no_finish_photo_yields_null_url_but_keeps_printer(self, db_session):
+        batch = await _mk_run(db_session, quantity=2, fa_state="awaiting_approval")
+        p = await _mk_printer(db_session)
+        arch = await _mk_archive(db_session, ["foo.jpg", "thumb.png"])
+        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=arch.id)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        assert resp["first_article_photo_url"] is None
+        assert resp["first_article_printer_id"] == p.id
+        assert resp["first_article_printer_name"] == p.name
+
+    async def test_rejected_state_populates_fields(self, db_session):
+        batch = await _mk_run(db_session, quantity=2, fa_state="rejected")
+        p = await _mk_printer(db_session)
+        arch = await _mk_archive(db_session, ["finish_x.jpg"])
+        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=arch.id)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        assert resp["first_article_photo_url"] == f"/api/v1/archives/{arch.id}/photos/finish_x.jpg"
+        assert resp["first_article_printer_id"] == p.id
+        assert resp["first_article_printer_name"] == p.name
+
+    async def test_approved_state_yields_all_null(self, db_session):
+        # A completed FA item with a finish photo exists, but once approved the
+        # inspection payload is suppressed (nothing left to approve).
+        batch = await _mk_run(db_session, quantity=2, fa_state="approved")
+        p = await _mk_printer(db_session)
+        arch = await _mk_archive(db_session, ["finish_x.jpg"])
+        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=arch.id)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        assert resp["first_article_photo_url"] is None
+        assert resp["first_article_printer_id"] is None
+        assert resp["first_article_printer_name"] is None
+
+    async def test_no_fa_gate_yields_all_null(self, db_session):
+        batch = await _mk_run(db_session, quantity=2)  # first_article_state None
+        p = await _mk_printer(db_session)
+        await _add(db_session, batch, printer_id=p.id, status="completed")
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        assert resp["first_article_photo_url"] is None
+        assert resp["first_article_printer_id"] is None
+        assert resp["first_article_printer_name"] is None

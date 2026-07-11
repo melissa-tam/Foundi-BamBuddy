@@ -215,6 +215,11 @@ export default {
       rejected: 'İlk parça reddedildi',
       approveFailed: 'İlk parça onaylanamadı',
       rejectFailed: 'İlk parça reddedilemedi',
+      photoAlt: 'İlk parça bitiş fotoğrafı',
+      photoUnavailable: 'Bitiş fotoğrafı kullanılamıyor',
+      viewCamera: 'Kamerayı göster',
+      hideCamera: 'Kamerayı gizle',
+      printerLabel: 'Yazıcı: {{name}}',
     },
   },
 

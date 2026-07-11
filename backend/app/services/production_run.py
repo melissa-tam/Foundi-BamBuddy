@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import broadcast_production_run_changed
+from backend.app.models.archive import PrintArchive
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.printer import Printer
@@ -84,6 +85,21 @@ async def _load_run(db: AsyncSession, run_id: int) -> PrintBatch:
     if run is None or run.sku_file_id is None:
         raise HTTPException(status_code=404, detail="Production run not found")
     return run
+
+
+def _find_fa_item(run: PrintBatch) -> PrintQueueItem | None:
+    """The most-recently-completed first-article item for the run, if any.
+
+    Single implementation shared by ``build_run_response`` (below) and the
+    first-article approve/reject policy in ``farm_policy`` (which imports it
+    function-locally to avoid the production_run↔farm_policy import cycle).
+    """
+    candidates = [i for i in run.queue_items if i.first_article and i.status == "completed"]
+    if not candidates:
+        candidates = [i for i in run.queue_items if i.first_article]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda i: i.completed_at or i.created_at or 0)[-1]
 
 
 async def create_production_run(db: AsyncSession, data: RunCreate, current_user: User | None) -> PrintBatch:
@@ -444,8 +460,34 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
         result = await db.execute(select(Printer).where(Printer.id.in_(printer_ids)))
         printer_rows = sorted(result.scalars().all(), key=lambda p: p.id)
     printers = [{"id": p.id, "name": p.name} for p in printer_rows]
+    name_by_id = {p.id: p.name for p in printer_rows}
 
     printer_states, has_blocked_printers = _build_printer_states(printer_rows, items)
+
+    # First-article inspection payload (Phase 4, F1): only while the run is
+    # awaiting approval or after a reject does the operator need the finished
+    # part's photo + the printer to view its camera. Fetch the FA item's archive
+    # ONLY in those states (cheap on the common path). The photo URL is relative
+    # on purpose — same-origin session/stream-token auth; the frontend degrades
+    # gracefully (photoUnavailable) if the photo was pruned or is forbidden.
+    first_article_photo_url: str | None = None
+    first_article_printer_id: int | None = None
+    first_article_printer_name: str | None = None
+    if run.first_article_state in ("awaiting_approval", "rejected"):
+        fa_item = _find_fa_item(run)
+        if fa_item is not None:
+            first_article_printer_id = fa_item.printer_id
+            if fa_item.printer_id is not None:
+                first_article_printer_name = name_by_id.get(fa_item.printer_id)
+            if fa_item.archive_id is not None:
+                archive = await db.get(PrintArchive, fa_item.archive_id)
+                if archive is not None and archive.photos:
+                    # Mirror main.py's finish-photo selection: the capture path
+                    # appends the freshly-taken ``finish_*`` photo last, so the
+                    # newest finish photo is the last such entry.
+                    finish_photos = [p for p in archive.photos if isinstance(p, str) and p.startswith("finish_")]
+                    if finish_photos:
+                        first_article_photo_url = f"/api/v1/archives/{fa_item.archive_id}/photos/{finish_photos[-1]}"
 
     # ETA: median cycle × remaining plates ÷ distinct printers. Null when we
     # lack a cycle estimate or have no printer to run the remainder.
@@ -478,6 +520,9 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
         "require_first_article": run.require_first_article,
         "first_article_state": run.first_article_state,
         "first_article_reject_reason": run.first_article_reject_reason,
+        "first_article_photo_url": first_article_photo_url,
+        "first_article_printer_id": first_article_printer_id,
+        "first_article_printer_name": first_article_printer_name,
         "retry_max_per_unit": run.retry_max_per_unit,
         "escalate_consecutive_failures": run.escalate_consecutive_failures,
         "eta_seconds": eta_seconds,
@@ -485,7 +530,6 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
         "created_at": run.created_at,
     }
     if detail:
-        name_by_id = {p.id: p.name for p in printer_rows}
         response["printer_states"] = printer_states
         response["units"] = [
             {

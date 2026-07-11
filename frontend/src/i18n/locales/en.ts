@@ -215,6 +215,11 @@ export default {
       rejected: 'First article rejected',
       approveFailed: 'Failed to approve first article',
       rejectFailed: 'Failed to reject first article',
+      photoAlt: 'First article finish photo',
+      photoUnavailable: 'Finish photo unavailable',
+      viewCamera: 'View camera',
+      hideCamera: 'Hide camera',
+      printerLabel: 'Printer: {{name}}',
     },
   },
 

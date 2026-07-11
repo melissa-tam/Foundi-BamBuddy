@@ -125,6 +125,13 @@ export interface ProductionRun {
   escalate_consecutive_failures: number;
   /** Operator's rejection reason; present when first_article_state is 'rejected'. */
   first_article_reject_reason?: string | null;
+  /** Relative URL of the first article's newest finish photo — populated only
+   *  while awaiting_approval or rejected; null otherwise (Phase 4, F1). */
+  first_article_photo_url?: string | null;
+  /** The printer that produced the first article (for the inline camera view);
+   *  populated only while awaiting_approval or rejected. */
+  first_article_printer_id?: number | null;
+  first_article_printer_name?: string | null;
   /** Estimated seconds remaining, or null when not computable. */
   eta_seconds: number | null;
   printers: ProductionRunPrinter[];

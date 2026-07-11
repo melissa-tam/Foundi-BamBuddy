@@ -127,6 +127,12 @@ class RunResponse(BaseModel):
     require_first_article: bool = True
     first_article_state: str | None = None
     first_article_reject_reason: str | None = None
+    # First-article inspection payload (Phase 4, F1): populated only while the run
+    # is awaiting_approval or rejected; null otherwise. The photo URL is relative
+    # (same-origin) — the finished part's newest ``finish_*`` archive photo.
+    first_article_photo_url: str | None = None
+    first_article_printer_id: int | None = None
+    first_article_printer_name: str | None = None
     retry_max_per_unit: int = 1
     escalate_consecutive_failures: int = 2
     # median cycle × remaining plates ÷ distinct printers; null when unknown.

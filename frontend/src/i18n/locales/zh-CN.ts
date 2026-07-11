@@ -215,6 +215,11 @@ export default {
       rejected: '首件已拒绝',
       approveFailed: '批准首件失败',
       rejectFailed: '拒绝首件失败',
+      photoAlt: '首件完成照片',
+      photoUnavailable: '完成照片不可用',
+      viewCamera: '查看摄像头',
+      hideCamera: '隐藏摄像头',
+      printerLabel: '打印机：{{name}}',
     },
   },
 

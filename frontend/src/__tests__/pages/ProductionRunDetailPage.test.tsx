@@ -227,4 +227,31 @@ describe('ProductionRunDetailPage', () => {
     expect(within(table).getByText('#101')).toBeInTheDocument();
     expect(within(table).getByText('#104')).toBeInTheDocument();
   });
+
+  it('renders the first-article banner in the header when awaiting approval (Phase 4, F1)', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs/1', () =>
+        HttpResponse.json(
+          detailRun({
+            require_first_article: true,
+            first_article_state: 'awaiting_approval',
+            first_article_photo_url: '/api/v1/archives/9/photos/finish_1.jpg',
+            first_article_printer_id: 1,
+            first_article_printer_name: 'H2S-Alpha',
+          }),
+        ),
+      ),
+      printerStatusHandler,
+    );
+
+    renderDetail();
+
+    // The self-contained approval banner (not just the per-unit badge) now
+    // lives on the detail page: its heading, actions, and finish photo.
+    expect(await screen.findByText('First article awaiting approval')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /I removed the part/i })).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: /first article finish photo/i })).toBeInTheDocument();
+    // Camera stays collapsed until requested.
+    expect(screen.getByRole('button', { name: /view camera/i })).toBeInTheDocument();
+  });
 });
