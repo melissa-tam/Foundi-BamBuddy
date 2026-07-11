@@ -19,6 +19,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.sku import SkuFile
 from backend.app.models.user import User
 from backend.app.schemas.production_run import (
+    FarmPrinterContext,
     FirstArticleApprove,
     FirstArticleReject,
     RunCreate,
@@ -26,6 +27,7 @@ from backend.app.schemas.production_run import (
 )
 from backend.app.services.farm_policy import approve_first_article, reject_first_article
 from backend.app.services.production_run import (
+    build_farm_printer_contexts,
     build_run_response,
     create_production_run,
     delete_production_run,
@@ -78,6 +80,21 @@ async def list_runs(
     )
     runs = result.scalars().all()
     return [await build_run_response(db, run) for run in runs]
+
+
+@router.get("/printer-states", response_model=list[FarmPrinterContext])
+async def get_farm_printer_states(
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.PRODUCTION_RUNS_READ),
+):
+    """Fleet-scoped per-printer farm context for the Printers page (F2).
+
+    One entry per printer assigned to an active/paused run explaining why it is
+    doing (or blocked on) farm work — the owning run/SKU plus the printer's
+    live/last unit. Registered BEFORE ``/{run_id}`` so the literal path is not
+    captured by the int path param.
+    """
+    return await build_farm_printer_contexts(db)
 
 
 @router.get("/{run_id}", response_model=RunResponse)

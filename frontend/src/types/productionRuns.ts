@@ -131,6 +131,38 @@ export interface ProductionRun {
   created_at: string;
 }
 
+/**
+ * Fleet-scoped "why is this printer on farm work" context (Phase 3, F2).
+ *
+ * One entry per printer assigned to an active/paused production run, surfaced on
+ * the Printers page (`GET /production-runs/printer-states`) so an operator sees
+ * why a printer is blocked/idle without opening the run detail. Field names and
+ * nullability mirror the backend `FarmPrinterContext` schema exactly.
+ */
+export interface FarmPrinterContext {
+  printer_id: number;
+  run_id: number;
+  run_name: string;
+  sku_code: string | null;
+  run_status: ProductionRunStatus;
+  pause_reason: RunPauseReason | null;
+  /** The printer's representative unit id, or null when it holds none. */
+  unit_id: number | null;
+  /** 'printing' | 'pending' | 'failed', or null when the printer holds no unit. */
+  unit_status: 'printing' | 'pending' | 'failed' | null;
+  /** Machine code from the live unit; map with the shared waitingReason util. */
+  waiting_reason: string | null;
+  /** Last failed unit's error — present ONLY when there is no live unit. */
+  error_message: string | null;
+  /** A live pending unit held by the scheduler/operator (manual_start). */
+  staged: boolean;
+  /** The hold is the low-spool guard (swap the spool, then release/resume). */
+  filament_short: boolean;
+  /** This printer holds the run's first-article unit. */
+  first_article: boolean;
+  first_article_state: FirstArticleState;
+}
+
 /** Body for POST /production-runs/{id}/first-article/approve. */
 export interface FirstArticleApproveRequest {
   /** When true the toolhead sweeps the part off the bed; when false the

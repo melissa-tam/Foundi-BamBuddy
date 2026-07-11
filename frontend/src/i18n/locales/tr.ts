@@ -754,6 +754,14 @@ export default {
       coolingNoBed: '{{threshold}}°C\'ye soğutuluyor — süpürme dosya içinde çalışır',
       awaitingPlateClear: 'Plakanın temizlenmesi bekleniyor',
     },
+    // Farm production context surfaced on the printer card (Phase 3, F2).
+    farm: {
+      run: 'Çalışma: {{name}}',
+      printingUnit: '{{id}} numaralı birim yazdırılıyor',
+      stagedLowSpool: 'Birim bekletildi: filament az — makarayı değiştirin veya Kuyruktan serbest bırakın',
+      staged: 'Birim bekletildi — serbest bırakmak için çalışmayı sürdürün',
+      lastUnitFailed: 'Son birim başarısız: {{error}}',
+    },
     modelMismatch: {
       badge: 'Model uyuşmazlığı',
       blocked: 'Bildirilen model düzeltilene kadar gönderim engellenir.',

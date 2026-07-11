@@ -35,6 +35,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { formatDateTime } from '../utils/date';
+import { waitingReasonText } from '../utils/waitingReason';
 import type { ProductionRun, RunPrinterState, RunUnit } from '../types/productionRuns';
 
 // ---------------------------------------------------------------------------
@@ -59,27 +60,6 @@ function UnitStatusPill({ status }: { status: RunUnit['status'] }) {
       {t(`productionRuns.detail.unitStatus.${status}`)}
     </span>
   );
-}
-
-// ---------------------------------------------------------------------------
-// Waiting-reason copy (machine codes → i18n; anything else is already a
-// human-readable backend sentence, e.g. a capability-gate reason)
-// ---------------------------------------------------------------------------
-
-function waitingReasonText(reason: string | null, t: (k: string) => string): string | null {
-  if (!reason) return null;
-  switch (reason) {
-    case 'printer_offline_stalled':
-      return t('productionRuns.detail.waiting.printerOfflineStalled');
-    case 'plate_not_empty_printer_detected':
-      return t('productionRuns.detail.waiting.visionHold');
-    case 'previous_print_failed':
-      return t('productionRuns.detail.waiting.previousPrintFailed');
-    case 'filament_short':
-      return t('productionRuns.detail.waiting.filamentShort');
-    default:
-      return reason;
-  }
 }
 
 // ---------------------------------------------------------------------------

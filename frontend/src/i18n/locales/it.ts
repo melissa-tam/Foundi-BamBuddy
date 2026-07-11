@@ -754,6 +754,14 @@ export default {
       coolingNoBed: 'Raffreddamento fino a {{threshold}}°C — la spazzata è nel file',
       awaitingPlateClear: 'In attesa che il piatto venga liberato',
     },
+    // Farm production context surfaced on the printer card (Phase 3, F2).
+    farm: {
+      run: 'Serie: {{name}}',
+      printingUnit: 'Stampa unità n. {{id}}',
+      stagedLowSpool: 'Unità trattenuta: filamento insufficiente — sostituisci la bobina o rilasciala dalla coda',
+      staged: 'Unità trattenuta — riprendi la serie per rilasciarla',
+      lastUnitFailed: 'Ultima unità non riuscita: {{error}}',
+    },
     modelMismatch: {
       badge: 'Modello non corrispondente',
       blocked: "L'invio è bloccato finché il modello dichiarato non viene corretto.",

@@ -754,6 +754,14 @@ export default {
       coolingNoBed: 'Refroidissement jusqu\'à {{threshold}}°C — le balayage s\'exécute dans le fichier',
       awaitingPlateClear: 'En attente du dégagement du plateau',
     },
+    // Farm production context surfaced on the printer card (Phase 3, F2).
+    farm: {
+      run: 'Série : {{name}}',
+      printingUnit: 'Impression de l\'unité n°{{id}}',
+      stagedLowSpool: 'Unité retenue : filament insuffisant — changez la bobine ou libérez-la depuis la file',
+      staged: 'Unité en attente — reprenez la série pour la libérer',
+      lastUnitFailed: 'Dernière unité en échec : {{error}}',
+    },
     modelMismatch: {
       badge: 'Modèle discordant',
       blocked: "L'envoi est bloqué jusqu'à correction du modèle déclaré.",

@@ -754,6 +754,14 @@ export default {
       coolingNoBed: 'Resfriando até {{threshold}}°C — a varredura roda no arquivo',
       awaitingPlateClear: 'Aguardando liberação da placa',
     },
+    // Farm production context surfaced on the printer card (Phase 3, F2).
+    farm: {
+      run: 'Série: {{name}}',
+      printingUnit: 'Imprimindo unidade nº {{id}}',
+      stagedLowSpool: 'Unidade retida: filamento insuficiente — troque a bobina ou libere pela fila',
+      staged: 'Unidade retida — retome a série para liberar',
+      lastUnitFailed: 'Última unidade falhou: {{error}}',
+    },
     modelMismatch: {
       badge: 'Modelo divergente',
       blocked: 'O envio fica bloqueado até o modelo declarado ser corrigido.',

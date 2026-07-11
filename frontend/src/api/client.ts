@@ -24,9 +24,11 @@ import type {
 import type {
   ProductionRun,
   ProductionRunCreate,
+  FarmPrinterContext,
   FirstArticleApproveRequest,
   FirstArticleRejectRequest,
 } from '../types/productionRuns';
+export type { FarmPrinterContext } from '../types/productionRuns';
 
 const API_BASE = '/api/v1';
 
@@ -4923,6 +4925,8 @@ export const api = {
 
   // Production runs (farm production, Phase 2)
   getProductionRuns: () => request<ProductionRun[]>('/production-runs'),
+  // Fleet-scoped per-printer farm context for the Printers page (Phase 3, F2).
+  getFarmPrinterStates: () => request<FarmPrinterContext[]>('/production-runs/printer-states'),
   getProductionRun: (id: number) => request<ProductionRun>(`/production-runs/${id}`),
   createProductionRun: (data: ProductionRunCreate) =>
     request<ProductionRun>('/production-runs', {

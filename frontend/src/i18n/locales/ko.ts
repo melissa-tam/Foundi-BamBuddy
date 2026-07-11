@@ -728,6 +728,14 @@ export default {
       coolingNoBed: '{{threshold}}°C까지 냉각 중 — 배출 스윕은 파일 내에서 실행됩니다',
       awaitingPlateClear: '플레이트 비움 대기 중',
     },
+    // Farm production context surfaced on the printer card (Phase 3, F2).
+    farm: {
+      run: '런: {{name}}',
+      printingUnit: '유닛 #{{id}} 인쇄 중',
+      stagedLowSpool: '유닛 보류됨: 필라멘트 부족 — 스풀을 교체하거나 대기열에서 해제하세요',
+      staged: '유닛 보류됨 — 런을 재개하여 해제하세요',
+      lastUnitFailed: '마지막 유닛 실패: {{error}}',
+    },
     modelMismatch: {
       badge: '모델 불일치',
       blocked: '선언된 모델이 수정될 때까지 디스패치가 차단됩니다.',

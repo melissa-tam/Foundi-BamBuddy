@@ -754,6 +754,14 @@ export default {
       coolingNoBed: 'Enfriando hasta {{threshold}}°C — el barrido se ejecuta en el archivo',
       awaitingPlateClear: 'Esperando despeje de la cama',
     },
+    // Farm production context surfaced on the printer card (Phase 3, F2).
+    farm: {
+      run: 'Serie: {{name}}',
+      printingUnit: 'Imprimiendo unidad n.º {{id}}',
+      stagedLowSpool: 'Unidad retenida: filamento insuficiente — cambia la bobina o libérala desde la cola',
+      staged: 'Unidad retenida — reanuda la serie para liberarla',
+      lastUnitFailed: 'Última unidad fallida: {{error}}',
+    },
     modelMismatch: {
       badge: 'Modelo no coincide',
       blocked: 'El envío está bloqueado hasta corregir el modelo declarado.',

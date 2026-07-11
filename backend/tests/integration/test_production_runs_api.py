@@ -690,3 +690,137 @@ class TestReleaseStagedRoute:
         # Viewers lack queue:update_all -> 403.
         resp = await async_client.post("/api/v1/queue/release-staged", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+class TestFarmPrinterStates:
+    """GET /production-runs/printer-states (Phase 3, F2): fleet-scoped per-printer
+    farm context surfaced on the Printers page."""
+
+    async def _run_on_printers(self, async_client, db_session, tmp_path, code, printer_ids, *, target_units):
+        eject = await _make_eject_profile(async_client, name=f"ep-{code}")
+        _, file_link_id = await _make_sku_with_file(
+            async_client, db_session, tmp_path, code=code, name=f"{code}.gcode.3mf"
+        )
+        resp = await async_client.post(
+            "/api/v1/production-runs",
+            json={
+                "sku_file_id": file_link_id,
+                "target_units": target_units,
+                "printer_ids": printer_ids,
+                "eject_profile_id": eject,
+                # No FA gate so all plates are created and printer-assigned up front.
+                "require_first_article": False,
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["id"]
+
+    async def test_printing_unit_context_shape(self, async_client, db_session, tmp_path, printer_factory):
+        p = await printer_factory(name="FP1", model="H2S")
+        run_id = await self._run_on_printers(async_client, db_session, tmp_path, "SKU500.01", [p.id], target_units=1)
+        items = await _pending_items(db_session, run_id)
+        items[0].status = "printing"
+        await db_session.commit()
+
+        resp = await async_client.get("/api/v1/production-runs/printer-states")
+        assert resp.status_code == 200, resp.text
+        ctx = next(r for r in resp.json() if r["printer_id"] == p.id)
+        for key in (
+            "printer_id",
+            "run_id",
+            "run_name",
+            "sku_code",
+            "run_status",
+            "pause_reason",
+            "unit_id",
+            "unit_status",
+            "waiting_reason",
+            "error_message",
+            "staged",
+            "filament_short",
+            "first_article",
+            "first_article_state",
+        ):
+            assert key in ctx
+        assert ctx["run_id"] == run_id
+        assert ctx["sku_code"] == "SKU500.01"
+        assert ctx["unit_status"] == "printing"
+        assert ctx["unit_id"] == items[0].id
+        assert ctx["run_status"] == "active"
+        assert ctx["error_message"] is None
+
+    async def test_waiting_reason_surfaces(self, async_client, db_session, tmp_path, printer_factory):
+        p = await printer_factory(name="FP2", model="H2S")
+        run_id = await self._run_on_printers(async_client, db_session, tmp_path, "SKU501.01", [p.id], target_units=1)
+        items = await _pending_items(db_session, run_id)
+        items[0].status = "printing"
+        items[0].waiting_reason = "printer_offline_stalled"
+        await db_session.commit()
+
+        rows = (await async_client.get("/api/v1/production-runs/printer-states")).json()
+        ctx = next(r for r in rows if r["printer_id"] == p.id)
+        assert ctx["waiting_reason"] == "printer_offline_stalled"
+
+    async def test_failed_error_only_when_no_live_unit(self, async_client, db_session, tmp_path, printer_factory):
+        p = await printer_factory(name="FP3", model="H2S")
+        run_id = await self._run_on_printers(async_client, db_session, tmp_path, "SKU502.01", [p.id], target_units=2)
+        items = sorted(await _pending_items(db_session, run_id), key=lambda i: i.id)
+        # A failed unit alongside a live printing unit → error suppressed.
+        items[0].status = "failed"
+        items[0].error_message = "HMS 0300_8017"
+        items[1].status = "printing"
+        await db_session.commit()
+        rows = (await async_client.get("/api/v1/production-runs/printer-states")).json()
+        ctx = next(r for r in rows if r["printer_id"] == p.id)
+        assert ctx["unit_status"] == "printing"
+        assert ctx["error_message"] is None
+
+        # No live unit → the last failure explains the idle printer.
+        items[1].status = "completed"
+        await db_session.commit()
+        rows = (await async_client.get("/api/v1/production-runs/printer-states")).json()
+        ctx = next(r for r in rows if r["printer_id"] == p.id)
+        assert ctx["unit_status"] == "failed"
+        assert ctx["error_message"] == "HMS 0300_8017"
+
+    async def test_non_farm_batch_excluded(self, async_client, db_session, tmp_path, printer_factory):
+        from backend.app.models.print_batch import PrintBatch
+        from backend.app.models.print_queue import PrintQueueItem
+
+        p = await printer_factory(name="FP4", model="H2S")
+        lib = await _add_library_file(db_session, tmp_path, name="plain2.gcode.3mf")
+        batch = PrintBatch(name="plain", quantity=1, status="active")
+        db_session.add(batch)
+        await db_session.flush()
+        item = PrintQueueItem(batch_id=batch.id, library_file_id=lib.id, printer_id=p.id, status="printing", position=1)
+        db_session.add(item)
+        await db_session.commit()
+
+        rows = (await async_client.get("/api/v1/production-runs/printer-states")).json()
+        assert all(r["printer_id"] != p.id for r in rows)
+
+    async def test_paused_run_included_with_reason(self, async_client, db_session, tmp_path, printer_factory):
+        p = await printer_factory(name="FP5", model="H2S")
+        run_id = await self._run_on_printers(async_client, db_session, tmp_path, "SKU503.01", [p.id], target_units=1)
+        assert (await async_client.post(f"/api/v1/production-runs/{run_id}/pause")).status_code == 200
+
+        rows = (await async_client.get("/api/v1/production-runs/printer-states")).json()
+        ctx = next(r for r in rows if r["printer_id"] == p.id)
+        assert ctx["run_status"] == "paused"
+        assert ctx["pause_reason"] == "operator"
+        assert ctx["staged"] is True  # pause staged the pending unit (manual_start)
+
+    async def test_printer_states_not_captured_by_run_id(self, async_client, db_session, tmp_path, printer_factory):
+        # Route-ordering regression pair: an int id still routes to the detail
+        # handler, AND the literal /printer-states path resolves to the fleet
+        # endpoint (a list) rather than 404/422 from int coercion.
+        p = await printer_factory(name="FP6", model="H2S")
+        run_id = await self._run_on_printers(async_client, db_session, tmp_path, "SKU504.01", [p.id], target_units=1)
+        by_id = await async_client.get(f"/api/v1/production-runs/{run_id}")
+        assert by_id.status_code == 200
+        assert by_id.json()["id"] == run_id
+        states = await async_client.get("/api/v1/production-runs/printer-states")
+        assert states.status_code == 200
+        assert isinstance(states.json(), list)

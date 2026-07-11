@@ -753,6 +753,14 @@ export default {
       coolingNoBed: '{{threshold}}°C まで冷却中 — 排出スイープはファイル内で実行されます',
       awaitingPlateClear: 'プレートのクリア待ち',
     },
+    // Farm production context surfaced on the printer card (Phase 3, F2).
+    farm: {
+      run: 'ラン: {{name}}',
+      printingUnit: 'ユニット #{{id}} を印刷中',
+      stagedLowSpool: 'ユニット保留中: フィラメント不足 — スプールを交換するか、キューから解放してください',
+      staged: 'ユニット保留中 — ランを再開して解放してください',
+      lastUnitFailed: '前回のユニットが失敗: {{error}}',
+    },
     modelMismatch: {
       badge: 'モデル不一致',
       blocked: '申告モデルが修正されるまでディスパッチはブロックされます。',

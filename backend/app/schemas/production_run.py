@@ -138,6 +138,41 @@ class RunResponse(BaseModel):
         from_attributes = True
 
 
+class FarmPrinterContext(BaseModel):
+    """Fleet-scoped "why is this printer on farm work" context (Phase 3, F2).
+
+    One entry per printer assigned to an active/paused production run, surfaced on
+    the Printers page so an operator sees why a printer is blocked/idle without
+    opening the run detail. Fully DERIVED (never stored): the owning run + SKU plus
+    the printer's live/last unit and its ``waiting_reason`` machine code — the same
+    vocabulary as ``RunPrinterState`` / ``RunUnit``, no new reason codes.
+    """
+
+    printer_id: int
+    run_id: int
+    run_name: str
+    sku_code: str | None = None
+    run_status: str
+    pause_reason: str | None = None
+    # The printer's representative unit: a live printing/pending unit, else the
+    # most recent failed one. Null when the printer holds no unit in this run.
+    unit_id: int | None = None
+    # 'printing' | 'pending' | 'failed' | None.
+    unit_status: str | None = None
+    # Machine code from the live unit (e.g. 'printer_offline_stalled'); the
+    # frontend maps it via the shared waitingReason util. Null when not waiting.
+    waiting_reason: str | None = None
+    # Last failed unit's error — present ONLY when the printer has no live unit.
+    error_message: str | None = None
+    # A live pending unit held by the scheduler/operator (manual_start).
+    staged: bool = False
+    # The hold is the low-spool guard (swap the spool, then release/resume).
+    filament_short: bool = False
+    # This printer holds the run's first-article unit.
+    first_article: bool = False
+    first_article_state: str | None = None
+
+
 class FirstArticleApprove(BaseModel):
     """Body for ``POST /production-runs/{id}/first-article/approve``."""
 

@@ -754,6 +754,14 @@ export default {
       coolingNoBed: 'Kühlt auf {{threshold}}°C ab — Abstreifen läuft in der Druckdatei',
       awaitingPlateClear: 'Wartet auf Plattenfreigabe',
     },
+    // Farm production context surfaced on the printer card (Phase 3, F2).
+    farm: {
+      run: 'Lauf: {{name}}',
+      printingUnit: 'Druckt Einheit #{{id}}',
+      stagedLowSpool: 'Einheit angehalten: Filament knapp — Spule wechseln oder in der Warteschlange freigeben',
+      staged: 'Einheit zurückgestellt — Lauf fortsetzen zum Freigeben',
+      lastUnitFailed: 'Letzte Einheit fehlgeschlagen: {{error}}',
+    },
     modelMismatch: {
       badge: 'Modellkonflikt',
       blocked: 'Der Versand ist blockiert, bis das deklarierte Modell korrigiert wurde.',

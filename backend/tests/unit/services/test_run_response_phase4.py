@@ -10,6 +10,7 @@ broadcast (spied per call site). FK enforcement is off in the test engine.
 """
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -22,7 +23,13 @@ from backend.app.models.printer import Printer
 from backend.app.models.sku import Sku, SkuFile
 from backend.app.services import farm_policy, farm_stall, production_run
 from backend.app.services.notification_service import notification_service
-from backend.app.services.production_run import _load_run, build_run_response, transition_run
+from backend.app.services.production_run import (
+    _derive_printer_unit_context,
+    _load_run,
+    build_farm_printer_contexts,
+    build_run_response,
+    transition_run,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -348,3 +355,105 @@ class TestRunChangedBroadcastSites:
             await farm_stall.check_stalled_prints(db_session, manager=_Down(), now=0.0)
             await farm_stall.check_stalled_prints(db_session, manager=_Down(), now=31 * 60)
         assert run_changed_spy == []
+
+
+def _fake_item(**kw):
+    """A lightweight stand-in with the fields ``_derive_printer_unit_context``
+    reads — no DB session needed for the pure derivation logic."""
+    base = {
+        "id": 1,
+        "printer_id": 1,
+        "status": "pending",
+        "position": 1,
+        "waiting_reason": None,
+        "manual_start": False,
+        "filament_short": False,
+        "first_article": False,
+        "error_message": None,
+    }
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+class TestDerivePrinterUnitContext:
+    """The shared per-printer unit derivation used by BOTH the run-detail printer
+    states and the fleet-scoped printer contexts (single reason vocabulary)."""
+
+    async def test_printing_unit_wins_over_pending(self):
+        items = [
+            _fake_item(id=1, status="pending", position=1),
+            _fake_item(id=2, status="printing", position=2),
+        ]
+        ctx = _derive_printer_unit_context(1, items)
+        assert ctx["unit_id"] == 2
+        assert ctx["unit_status"] == "printing"
+        assert ctx["rank"] == 3
+        assert ctx["staged"] is False
+
+    async def test_pending_manual_start_is_staged_low_spool(self):
+        items = [_fake_item(id=5, status="pending", manual_start=True, filament_short=True)]
+        ctx = _derive_printer_unit_context(1, items)
+        assert ctx["unit_status"] == "pending"
+        assert ctx["staged"] is True
+        assert ctx["filament_short"] is True
+        assert ctx["rank"] == 2
+
+    async def test_waiting_reason_from_live_unit(self):
+        items = [_fake_item(id=1, status="printing", waiting_reason="printer_offline_stalled")]
+        assert _derive_printer_unit_context(1, items)["waiting_reason"] == "printer_offline_stalled"
+
+    async def test_failed_error_only_without_live_unit(self):
+        failed = _fake_item(id=1, status="failed", error_message="boom")
+        # A live printing unit suppresses the failed error_message.
+        ctx = _derive_printer_unit_context(1, [failed, _fake_item(id=2, status="printing")])
+        assert ctx["unit_status"] == "printing"
+        assert ctx["error_message"] is None
+        # No live unit → the last failure explains the idle printer.
+        ctx2 = _derive_printer_unit_context(1, [failed, _fake_item(id=2, status="completed")])
+        assert ctx2["unit_status"] == "failed"
+        assert ctx2["error_message"] == "boom"
+        assert ctx2["rank"] == 1
+
+    async def test_last_failed_picks_highest_id(self):
+        items = [
+            _fake_item(id=1, status="failed", error_message="first"),
+            _fake_item(id=9, status="failed", error_message="latest"),
+        ]
+        assert _derive_printer_unit_context(1, items)["error_message"] == "latest"
+
+    async def test_no_unit_for_printer(self):
+        # Only another printer's unit present → this printer holds nothing.
+        ctx = _derive_printer_unit_context(1, [_fake_item(id=1, printer_id=99, status="printing")])
+        assert ctx == {
+            "unit_id": None,
+            "unit_status": None,
+            "waiting_reason": None,
+            "error_message": None,
+            "staged": False,
+            "filament_short": False,
+            "first_article": False,
+            "rank": 0,
+        }
+
+
+class TestBuildFarmPrinterContexts:
+    async def test_only_active_paused_farm_runs_and_live_unit_wins(self, db_session):
+        # Older run: printer P holds a live printing unit. Newer run: same printer
+        # only has a completed unit. Live unit must win the printer.
+        older = await _mk_run(db_session, quantity=1)
+        p = await _mk_printer(db_session, name="Shared")
+        await _add(db_session, older, printer_id=p.id, status="printing", pos=1)
+        newer = await _mk_run(db_session, quantity=1)
+        await _add(db_session, newer, printer_id=p.id, status="completed", pos=1)
+        # A completed run must be excluded entirely.
+        done = await _mk_run(db_session, quantity=1, status="completed")
+        p2 = await _mk_printer(db_session, name="Done")
+        await _add(db_session, done, printer_id=p2.id, status="printing", pos=1)
+        await db_session.commit()
+
+        contexts = await build_farm_printer_contexts(db_session)
+        by_pid = {c["printer_id"]: c for c in contexts}
+        assert p.id in by_pid
+        assert by_pid[p.id]["run_id"] == older.id  # live unit wins over the newer run
+        assert by_pid[p.id]["unit_status"] == "printing"
+        assert p2.id not in by_pid  # completed run excluded

@@ -759,6 +759,14 @@ export default {
       coolingNoBed: 'Cooling to {{threshold}}°C — sweep runs in-file',
       awaitingPlateClear: 'Awaiting plate clear',
     },
+    // Farm production context surfaced on the printer card (Phase 3, F2).
+    farm: {
+      run: 'Run: {{name}}',
+      printingUnit: 'Printing unit #{{id}}',
+      stagedLowSpool: 'Unit held: filament low — swap spool or release from Queue',
+      staged: 'Unit staged — resume the run to release',
+      lastUnitFailed: 'Last unit failed: {{error}}',
+    },
     modelMismatch: {
       badge: 'Model mismatch',
       blocked: 'Dispatch is blocked until the declared model is corrected.',

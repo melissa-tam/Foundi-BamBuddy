@@ -90,7 +90,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
 import { formatDateOnly, formatETA, formatDuration, parseUTCDate } from '../utils/date';
-import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult } from '../api/client';
+import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext } from '../api/client';
 import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
@@ -102,6 +102,7 @@ import { CameraWall } from '../components/CameraWall';
 import { MQTTDebugModal } from '../components/MQTTDebugModal';
 import { HMSErrorModal } from '../components/HMSErrorModal';
 import { HMSErrorSummary } from '../components/HMSErrorSummary';
+import { FarmUnitChip } from '../components/FarmUnitChip';
 import { hmsTone } from '../utils/hmsTone';
 import { PrinterQueueWidget } from '../components/PrinterQueueWidget';
 import { AMSHistoryModal } from '../components/AMSHistoryModal';
@@ -1788,6 +1789,7 @@ function PrinterCard({
   bedTempPresets = BED_TEMP_DEFAULTS,
   chamberTempPresets = CHAMBER_TEMP_DEFAULTS,
   fanSpeedPresets = FAN_SPEED_DEFAULTS,
+  farmContext,
 }: {
   printer: Printer;
   hideIfDisconnected?: boolean;
@@ -1826,6 +1828,9 @@ function PrinterCard({
   bedTempPresets?: readonly [number, number, number];
   chamberTempPresets?: readonly [number, number, number];
   fanSpeedPresets?: readonly [number, number, number];
+  /** Farm production context for this printer (Phase 3, F2); absent when the
+   *  printer isn't on a farm run or the fleet query is unavailable/403. */
+  farmContext?: FarmPrinterContext | null;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -3329,6 +3334,10 @@ function PrinterCard({
             </div>
           </div>
         )}
+        {/* Farm production chip (Phase 3, F2) — why this printer is on (or blocked
+            on) farm work: the owning run link + one status line. Absent for
+            non-farm printers. */}
+        <FarmUnitChip ctx={farmContext} />
         {/* Header */}
         <div className={getSpacing()}>
           {/* Top row: Image, Name, Menu */}
@@ -7918,6 +7927,22 @@ export function PrintersPage() {
     queryFn: api.getPrinters,
   });
 
+  // Fleet-scoped farm context per printer (Phase 3, F2) — powers the FarmUnitChip
+  // on each card. Rides the existing `production_run_changed` WS prefix
+  // invalidation of ['production-runs'] (useWebSocket.ts) so chips update live;
+  // the 15 s refetch is a fallback. On error/403 `data` is undefined and the
+  // chips are simply absent (supplementary data, no error UI).
+  const { data: farmPrinterStates } = useQuery({
+    queryKey: ['production-runs', 'printer-states'],
+    queryFn: api.getFarmPrinterStates,
+    refetchInterval: 15000,
+  });
+  const farmContextByPrinter = useMemo(() => {
+    const map = new Map<number, FarmPrinterContext>();
+    for (const ctx of farmPrinterStates ?? []) map.set(ctx.printer_id, ctx);
+    return map;
+  }, [farmPrinterStates]);
+
   // Fetch the UI-rendering subset of settings. Uses /ui-preferences (not /settings)
   // so users with printers:read but no settings:read still get the values needed
   // to render the clear-plate button, drying presets, AMS thresholds, etc. (#1293).
@@ -8937,6 +8962,7 @@ export function PrintersPage() {
                       isSelected={selectedPrinterIds.has(printer.id)}
                       onToggleSelect={toggleSelect}
                       onOpenCompactCard={openCompactCard}
+                      farmContext={farmContextByPrinter.get(printer.id)}
                     />
                   ))}
                 </div>
@@ -8986,6 +9012,7 @@ export function PrintersPage() {
               isSelected={selectedPrinterIds.has(printer.id)}
               onToggleSelect={toggleSelect}
               onOpenCompactCard={openCompactCard}
+              farmContext={farmContextByPrinter.get(printer.id)}
             />
           ))}
         </div>

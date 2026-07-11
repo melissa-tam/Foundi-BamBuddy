@@ -754,6 +754,14 @@ export default {
       coolingNoBed: '正在冷却至 {{threshold}}°C — 扫除在文件内执行',
       awaitingPlateClear: '等待清理打印板',
     },
+    // Farm production context surfaced on the printer card (Phase 3, F2).
+    farm: {
+      run: '运行：{{name}}',
+      printingUnit: '正在打印第 {{id}} 号单元',
+      stagedLowSpool: '单元已搁置：耗材不足 — 请更换料盘或在队列中释放',
+      staged: '单元已暂存 — 恢复运行以释放',
+      lastUnitFailed: '上一单元失败：{{error}}',
+    },
     modelMismatch: {
       badge: '型号不匹配',
       blocked: '在修正声明的型号之前，派发已被阻止。',

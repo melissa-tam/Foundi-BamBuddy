@@ -222,29 +222,99 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
     return await _load_run(db, batch.id)
 
 
+# Farm waiting-reason machine codes surfaced as per-printer flags. This is the
+# ONE place the vocabulary is mapped — both the run-detail printer states and the
+# fleet-scoped printer contexts derive from ``_derive_printer_unit_context`` so no
+# parallel mapping (and no new reason codes) can drift in.
+_WAIT_STALLED = "printer_offline_stalled"
+_WAIT_VISION = "plate_not_empty_printer_detected"
+
+
+def _derive_printer_unit_context(printer_id: int, items: list[PrintQueueItem]) -> dict:
+    """Resolve a printer's representative farm unit from a run's items (Phase 3).
+
+    Shared by ``_build_printer_states`` (run detail) and
+    ``build_farm_printer_contexts`` (Printers page) so the unit/waiting-reason
+    vocabulary has a single home — no parallel mapping, no invented reason codes.
+
+    Picks the printer's representative unit — a live PRINTING unit, else a live
+    PENDING one — and surfaces its ``waiting_reason`` machine code plus the
+    ``staged`` / ``filament_short`` / ``first_article`` flags. When the printer
+    has no live unit, the most recent FAILED unit's ``error_message`` explains the
+    last failure so an idle printer can still say what went wrong.
+
+    ``rank`` orders which run "owns" a printer when it appears in several
+    (printing 3 > pending 2 > failed 1 > none 0): a live unit wins; the caller's
+    most-recent-first iteration breaks ties toward the newest run.
+    """
+    on_printer = [it for it in items if it.printer_id == printer_id]
+    printing = [it for it in on_printer if it.status == "printing"]
+    pending = [it for it in on_printer if it.status == "pending"]
+    live = None
+    if printing:
+        live = min(printing, key=lambda i: (i.position, i.id))
+    elif pending:
+        live = min(pending, key=lambda i: (i.position, i.id))
+
+    if live is not None:
+        is_pending = live.status == "pending"
+        return {
+            "unit_id": live.id,
+            "unit_status": live.status,  # 'printing' or 'pending'
+            "waiting_reason": live.waiting_reason,
+            "error_message": None,
+            "staged": bool(live.manual_start) and is_pending,
+            "filament_short": bool(live.filament_short) and is_pending,
+            "first_article": bool(live.first_article),
+            "rank": 2 if is_pending else 3,
+        }
+
+    failed = [it for it in on_printer if it.status == "failed"]
+    if failed:
+        # Highest id ≈ most recent failure (retries are minted after the original
+        # and carry a higher id) — avoids naive/aware datetime comparison on
+        # ``completed_at``.
+        last = max(failed, key=lambda i: i.id)
+        return {
+            "unit_id": last.id,
+            "unit_status": "failed",
+            "waiting_reason": None,
+            "error_message": last.error_message,
+            "staged": False,
+            "filament_short": False,
+            "first_article": bool(last.first_article),
+            "rank": 1,
+        }
+
+    return {
+        "unit_id": None,
+        "unit_status": None,
+        "waiting_reason": None,
+        "error_message": None,
+        "staged": False,
+        "filament_short": False,
+        "first_article": False,
+        "rank": 0,
+    }
+
+
 def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueItem]) -> tuple[list[dict], bool]:
     """Derive the per-printer blocked-state entries for a run (Phase 4.1).
 
     Everything here is DERIVED per 3NF — DB flags (quarantine) plus the live
     ``printer_manager`` flags the scheduler actually gates on (plate-clear gate,
     model mismatch, connectivity; model_mismatch has no DB column at all) plus
-    per-item waiting_reason machine codes (offline stall, printer-vision hold).
+    the representative unit's waiting_reason machine codes (offline stall,
+    printer-vision hold) resolved by the shared ``_derive_printer_unit_context``.
     Returns ``(states, any_blocked)``. Mirrors ``farm_policy._printer_unavailable``
     for the never-connected case: a printer with no live status yet is *unknown*,
     not offline, so tests/startup don't spuriously report every printer blocked.
     """
-    stalled_pids = {
-        it.printer_id for it in items if it.printer_id is not None and it.waiting_reason == "printer_offline_stalled"
-    }
-    vision_pids = {
-        it.printer_id
-        for it in items
-        if it.printer_id is not None and it.waiting_reason == "plate_not_empty_printer_detected"
-    }
     states: list[dict] = []
     any_blocked = False
     for p in printer_rows:
         connected = printer_manager.is_connected(p.id)
+        waiting_reason = _derive_printer_unit_context(p.id, items)["waiting_reason"]
         state = {
             "printer_id": p.id,
             "name": p.name,
@@ -253,8 +323,8 @@ def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueIte
             "awaiting_plate_clear": printer_manager.is_awaiting_plate_clear(p.id),
             "model_mismatch": printer_manager.is_model_mismatch(p.id),
             "model_mismatch_reason": printer_manager.model_mismatch_reason(p.id),
-            "stalled": p.id in stalled_pids,
-            "vision_hold": p.id in vision_pids,
+            "stalled": waiting_reason == _WAIT_STALLED,
+            "vision_hold": waiting_reason == _WAIT_VISION,
         }
         disconnected = printer_manager.get_status(p.id) is not None and not connected
         if (
@@ -268,6 +338,66 @@ def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueIte
             any_blocked = True
         states.append(state)
     return states, any_blocked
+
+
+async def build_farm_printer_contexts(db: AsyncSession) -> list[dict]:
+    """Fleet-scoped "why is this printer doing (or not doing) farm work" contexts.
+
+    Answers finding F2 (Phase 3): the Printers page can explain a printer sitting
+    idle on a blocked farm unit without opening the run detail. ONE query over the
+    active/paused farm runs (a run is a ``PrintBatch`` with ``sku_file_id`` set),
+    with queue items and the SKU eager-loaded, resolves per assigned printer: the
+    owning run + SKU, and the printer's live/last unit via the shared
+    ``_derive_printer_unit_context`` (same reason vocabulary as the run-detail
+    printer states — no parallel mapping). A printer appearing in several active
+    runs is attributed to the run where it has a live unit (printing before
+    pending), else its most recent run. Returns one dict per assigned printer,
+    sorted by printer id — the ``FarmPrinterContext`` shape.
+    """
+    result = await db.execute(
+        select(PrintBatch)
+        .where(PrintBatch.sku_file_id.is_not(None), PrintBatch.status.in_(("active", "paused")))
+        .options(
+            selectinload(PrintBatch.queue_items),
+            selectinload(PrintBatch.sku_file).selectinload(SkuFile.sku),
+        )
+        .order_by(PrintBatch.created_at.desc())
+    )
+    runs = result.scalars().all()
+
+    best: dict[int, dict] = {}
+    for run in runs:  # most recent first (created_at desc)
+        items = list(run.queue_items)
+        sku_code = run.sku_file.sku.code if (run.sku_file and run.sku_file.sku) else None
+        for pid in {it.printer_id for it in items if it.printer_id is not None}:
+            unit_ctx = _derive_printer_unit_context(pid, items)
+            existing = best.get(pid)
+            # Most-recent-first: keep the newest run on a tie; a strictly higher
+            # rank (a live unit) from an older run takes the printer.
+            if existing is not None and unit_ctx["rank"] <= existing["_rank"]:
+                continue
+            best[pid] = {
+                "printer_id": pid,
+                "run_id": run.id,
+                "run_name": run.name,
+                "sku_code": sku_code,
+                "run_status": run.status,
+                "pause_reason": run.pause_reason,
+                "unit_id": unit_ctx["unit_id"],
+                "unit_status": unit_ctx["unit_status"],
+                "waiting_reason": unit_ctx["waiting_reason"],
+                "error_message": unit_ctx["error_message"],
+                "staged": unit_ctx["staged"],
+                "filament_short": unit_ctx["filament_short"],
+                "first_article": unit_ctx["first_article"],
+                "first_article_state": run.first_article_state,
+                "_rank": unit_ctx["rank"],
+            }
+
+    contexts = sorted(best.values(), key=lambda c: c["printer_id"])
+    for c in contexts:
+        del c["_rank"]
+    return contexts
 
 
 async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool = False) -> dict:
