@@ -135,6 +135,13 @@ class RunResponse(BaseModel):
     first_article_printer_name: str | None = None
     retry_max_per_unit: int = 1
     escalate_consecutive_failures: int = 2
+    # Prefill values for "Run again" (Phase 5, F9): the run's eject profile and
+    # target model are uniform across its items (first non-null); the cooldown
+    # override is the batch column. Null when not applicable — a specific-printer
+    # run has no target_model, and a run may carry no cooldown override.
+    eject_profile_id: int | None = None
+    cooldown_temp_c_override: float | None = None
+    target_model: str | None = None
     # median cycle × remaining plates ÷ distinct printers; null when unknown.
     eta_seconds: float | None = None
     printers: list[RunPrinterRef] = Field(default_factory=list)

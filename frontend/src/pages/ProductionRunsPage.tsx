@@ -16,11 +16,13 @@ import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertCircle,
+  ChevronDown,
   Factory,
   Loader2,
   Pause,
   Play,
   Plus,
+  RotateCcw,
   Square,
   Trash2,
   X,
@@ -39,10 +41,7 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { formatDuration } from '../utils/date';
-import type { ProductionRun, ProductionRunCreate } from '../types/productionRuns';
-
-/** Model value used by the "any printer of this model" strategy. */
-const ANY_MODEL = 'H2S';
+import type { ProductionRun, ProductionRunCreate, RunPrefill } from '../types/productionRuns';
 
 /** First-article run-policy bounds (mirror the backend validation). */
 const RETRY_MIN = 0;
@@ -74,11 +73,14 @@ interface StartRunDialogProps {
   /** Backend failure detail from the last start attempt; rendered inline so a
    *  rejected run (e.g. 422 policy errors) never dead-ends silently. */
   error: string | null;
+  /** Seed values from a finished run ("Run again", Phase 5, F9). When present the
+   *  dialog seeds once from these instead of the first-runnable-SKU auto-seed. */
+  initial?: RunPrefill;
   onStart: (data: ProductionRunCreate) => void;
   onClose: () => void;
 }
 
-function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps) {
+function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDialogProps) {
   const { t } = useTranslation();
 
   // All SKUs (including those with zero linked files), fetched here rather than
@@ -103,12 +105,14 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
   const [fileId, setFileId] = useState<number | null>(null);
   const [targetUnits, setTargetUnits] = useState<string>('1');
   const [mode, setMode] = useState<'specific' | 'model'>('model');
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [printerIds, setPrinterIds] = useState<number[]>([]);
   const [ejectProfileId, setEjectProfileId] = useState<number | null>(null);
   const [cooldownOverride, setCooldownOverride] = useState<string>('');
   const [requireFirstArticle, setRequireFirstArticle] = useState(true);
   const [retriesPerPlate, setRetriesPerPlate] = useState<string>(String(RETRY_FALLBACK));
   const [escalateFailures, setEscalateFailures] = useState<string>(String(ESCALATE_FALLBACK));
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [fileError, setFileError] = useState(false);
   const [targetError, setTargetError] = useState(false);
   const [printerError, setPrinterError] = useState(false);
@@ -117,6 +121,13 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
     queryKey: ['printers'],
     queryFn: api.getPrinters,
   });
+  // Distinct printer models across the fleet — the "any model" target options.
+  // Derived (never hardcoded): an H2C fleet is targetable the moment its printers
+  // are registered, with no code change (F5 removes the old hardcoded 'H2S').
+  const models = useMemo(
+    () => [...new Set((printers ?? []).map((p) => p.model).filter((m): m is string => !!m))].sort(),
+    [printers],
+  );
   const { data: ejectProfiles } = useQuery({
     queryKey: ['eject-profiles'],
     queryFn: api.getEjectProfiles,
@@ -128,9 +139,45 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
     queryFn: api.getSettings,
   });
 
+  // One-shot seed guards: each ref lets a value seed once so a later query
+  // refetch or operator edit is never clobbered. A Run-again prefill seeds first
+  // and marks the fresh-dialog auto-seeds done so they don't overwrite it.
+  const policyPrefilled = useRef(false);
+  const skuSeeded = useRef(false);
+  const modelTouched = useRef(false);
+  const initialSeeded = useRef(false);
+
+  // Run again (Phase 5, F9): seed the whole form from a finished run's prefill
+  // exactly once. Resolve the owning SKU from the prefill's file id via the skus
+  // query; if that file was since deleted the prefill can't resolve — fall back
+  // to the fresh-dialog auto-seed (no dead end: the SKU picker + "no files"
+  // notice still render). Declared BEFORE the auto-seed effects so, on the commit
+  // where skus resolve, it can mark them done before they run.
+  useEffect(() => {
+    if (!initial || initialSeeded.current || skus.length === 0) return;
+    const owner = skus.find((s) => s.files.some((f) => f.id === initial.skuFileId)) ?? null;
+    initialSeeded.current = true;
+    if (owner === null) return; // deleted file → let the fresh-dialog seed run
+    policyPrefilled.current = true;
+    skuSeeded.current = true;
+    setSkuId(owner.id);
+    setFileId(initial.skuFileId);
+    setTargetUnits(String(initial.targetUnits));
+    setMode(initial.mode);
+    setPrinterIds(initial.printerIds);
+    setEjectProfileId(initial.ejectProfileId);
+    setCooldownOverride(initial.cooldownOverride != null ? String(initial.cooldownOverride) : '');
+    setRequireFirstArticle(initial.requireFirstArticle);
+    setRetriesPerPlate(String(initial.retryMaxPerUnit));
+    setEscalateFailures(String(initial.escalateConsecutiveFailures));
+    if (initial.targetModel) {
+      setSelectedModel(initial.targetModel);
+      modelTouched.current = true; // don't re-default off the file model
+    }
+  }, [initial, skus]);
+
   // Seed the two policy fields from settings exactly once, the first time they
   // resolve, so a later re-fetch never clobbers the operator's edits.
-  const policyPrefilled = useRef(false);
   useEffect(() => {
     if (policyPrefilled.current || !settings) return;
     policyPrefilled.current = true;
@@ -144,8 +191,7 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
 
   // Seed the SKU/file/eject defaults from the first *runnable* SKU once the list
   // resolves — a file-less SKU is never auto-selected (it can't run). Runs once
-  // so it never clobbers a later operator selection.
-  const skuSeeded = useRef(false);
+  // so it never clobbers a later operator selection (or a Run-again prefill).
   useEffect(() => {
     if (skuSeeded.current || runnableSkus.length === 0) return;
     skuSeeded.current = true;
@@ -156,11 +202,75 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
   }, [runnableSkus]);
 
   const selectedFile = useMemo(() => skuFiles.find((f) => f.id === fileId) ?? null, [skuFiles, fileId]);
+  const fileModel = selectedFile?.printer_model ?? null;
+
+  // Default the target model to the selected file's slice model when the fleet
+  // has it, else the first available model. Re-defaults when the file changes,
+  // but only until the operator picks a model themselves (modelTouched) — and a
+  // Run-again prefill that carried an explicit model already set modelTouched.
+  useEffect(() => {
+    if (modelTouched.current) return;
+    setSelectedModel(fileModel && models.includes(fileModel) ? fileModel : (models[0] ?? null));
+  }, [fileModel, models]);
+
   // The eject profile the cooldown override would supersede (Phase 4.3i).
   const selectedEjectProfile = useMemo(
     () => (ejectProfiles ?? []).find((p) => p.id === ejectProfileId) ?? null,
     [ejectProfiles, ejectProfileId],
   );
+
+  // Farm capability gate owns enforcement server-side; the dialog only WARNS
+  // when the file's slice model differs from where it's about to run — in model
+  // mode against the chosen model, in specific mode against any checked printer.
+  const modelMismatch = useMemo<string | null>(() => {
+    if (!fileModel) return null;
+    if (mode === 'model') {
+      return selectedModel && selectedModel !== fileModel ? selectedModel : null;
+    }
+    const mismatched = (printers ?? []).find(
+      (p) => printerIds.includes(p.id) && p.model && p.model !== fileModel,
+    );
+    return mismatched?.model ?? null;
+  }, [fileModel, mode, selectedModel, printers, printerIds]);
+
+  // Settings-seeded defaults for the advanced policy fields — used to decide
+  // whether an advanced value is a non-default override worth surfacing.
+  const retryDefault = settings?.farm_retry_max_per_unit ?? RETRY_FALLBACK;
+  const escalateDefault = settings?.farm_escalate_consecutive_failures ?? ESCALATE_FALLBACK;
+
+  // One-line summary of the non-default advanced values, shown next to the
+  // collapsed "Advanced" label so an override is never invisible (F5). Composed
+  // from the existing field labels (all i18n) — no new copy to translate.
+  const advancedSummary = useMemo<string[]>(() => {
+    const parts: string[] = [];
+    if (ejectProfileId !== (selectedSku?.default_eject_profile_id ?? null)) {
+      parts.push(
+        `${t('productionRuns.fields.ejectProfile')}: ${
+          selectedEjectProfile?.name ?? t('productionRuns.fields.noEjectProfile')
+        }`,
+      );
+    }
+    if (cooldownOverride.trim() !== '') {
+      parts.push(`${t('productionRuns.fields.cooldownOverride')}: ${cooldownOverride.trim()}`);
+    }
+    if (clampInt(retriesPerPlate, RETRY_MIN, RETRY_MAX, RETRY_FALLBACK) !== retryDefault) {
+      parts.push(`${t('productionRuns.firstArticle.retriesLabel')}: ${retriesPerPlate}`);
+    }
+    if (clampInt(escalateFailures, ESCALATE_MIN, ESCALATE_MAX, ESCALATE_FALLBACK) !== escalateDefault) {
+      parts.push(`${t('productionRuns.firstArticle.escalateLabel')}: ${escalateFailures}`);
+    }
+    return parts;
+  }, [
+    t,
+    ejectProfileId,
+    selectedSku,
+    selectedEjectProfile,
+    cooldownOverride,
+    retriesPerPlate,
+    escalateFailures,
+    retryDefault,
+    escalateDefault,
+  ]);
 
   // When the SKU changes, reset the dependent file + eject-profile defaults.
   const onSkuChange = (nextId: number | null) => {
@@ -222,7 +332,7 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
       ),
     };
     if (mode === 'specific') payload.printer_ids = printerIds;
-    else payload.target_model = ANY_MODEL;
+    else if (selectedModel) payload.target_model = selectedModel;
 
     onStart(payload);
   };
@@ -364,19 +474,50 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
                 {t('productionRuns.fields.printers')}
               </legend>
               <div className="space-y-2">
-                <label className="flex items-center gap-2 text-sm text-white cursor-pointer">
-                  <input
-                    type="radio"
-                    name="run-printer-mode"
-                    checked={mode === 'model'}
-                    onChange={() => {
-                      setMode('model');
-                      setPrinterError(false);
-                    }}
-                    className="accent-bambu-green"
-                  />
-                  {t('productionRuns.fields.anyModel', { model: ANY_MODEL })}
-                </label>
+                {/* "Any printer of model X" — the model list is derived from the
+                    fleet (F5), so an H2C fleet is targetable with no code change.
+                    >1 model → a picker; exactly 1 → static text; 0 printers →
+                    the option is disabled (nothing to target). */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <label htmlFor="run-mode-model" className="flex items-center gap-2 text-sm text-white cursor-pointer">
+                    <input
+                      id="run-mode-model"
+                      type="radio"
+                      name="run-printer-mode"
+                      checked={mode === 'model'}
+                      onChange={() => {
+                        setMode('model');
+                        setPrinterError(false);
+                      }}
+                      disabled={models.length === 0}
+                      className="accent-bambu-green"
+                    />
+                    {models.length > 1
+                      ? t('productionRuns.fields.modelSelect')
+                      : models.length === 1
+                        ? t('productionRuns.fields.anyModel', { model: models[0] })
+                        : t('common.noPrinters')}
+                  </label>
+                  {models.length > 1 && (
+                    <select
+                      aria-label={t('productionRuns.fields.modelSelect')}
+                      value={selectedModel ?? ''}
+                      onChange={(e) => {
+                        setSelectedModel(e.target.value);
+                        modelTouched.current = true;
+                        setMode('model');
+                        setPrinterError(false);
+                      }}
+                      className="px-2 py-1 bg-bambu-dark rounded-md text-white border border-bambu-dark-tertiary text-sm focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors"
+                    >
+                      {models.map((m) => (
+                        <option key={m} value={m}>
+                          {t('productionRuns.fields.anyModel', { model: m })}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
                 <label className="flex items-center gap-2 text-sm text-white cursor-pointer">
                   <input
                     type="radio"
@@ -412,62 +553,24 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
                   )}
                 </div>
               )}
+
+              {/* Soft slice-model mismatch note (never a block — the server-side
+                  capability gate holds mismatched printers). Warns in either
+                  strategy when the file's slice model differs from the target. */}
+              {modelMismatch && (
+                <p className="text-xs text-yellow-300 mt-2">
+                  {t('productionRuns.fields.modelMismatchWarning', {
+                    fileModel,
+                    model: modelMismatch,
+                  })}
+                </p>
+              )}
             </fieldset>
 
-            {/* Eject profile override + cooldown override */}
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div>
-                <label htmlFor="run-eject" className="block text-sm text-bambu-gray mb-1">
-                  {t('productionRuns.fields.ejectProfile')}
-                </label>
-                <select
-                  id="run-eject"
-                  value={ejectProfileId ?? ''}
-                  onChange={(e) => setEjectProfileId(e.target.value ? Number(e.target.value) : null)}
-                  className={inputClass}
-                >
-                  <option value="">{t('productionRuns.fields.noEjectProfile')}</option>
-                  {(ejectProfiles ?? []).map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                      {selectedSku?.default_eject_profile_id === p.id
-                        ? ` (${t('productionRuns.fields.skuDefault')})`
-                        : ''}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label htmlFor="run-cooldown" className="block text-sm text-bambu-gray mb-1">
-                  {t('productionRuns.fields.cooldownOverride')}
-                </label>
-                <input
-                  id="run-cooldown"
-                  type="number"
-                  inputMode="decimal"
-                  min={15}
-                  max={60}
-                  step={0.5}
-                  placeholder={t('productionRuns.fields.cooldownPlaceholder')}
-                  value={cooldownOverride}
-                  onChange={(e) => setCooldownOverride(e.target.value)}
-                  className={inputClass}
-                  aria-describedby={selectedEjectProfile ? 'run-cooldown-default' : undefined}
-                />
-                {/* Phase 4.3i: show what an override would replace, from the
-                    already-fetched profiles list. */}
-                {selectedEjectProfile && (
-                  <p id="run-cooldown-default" className="text-xs text-bambu-gray mt-1">
-                    {t('productionRuns.fields.cooldownProfileDefault', {
-                      value: selectedEjectProfile.cooldown_temp_c,
-                    })}
-                  </p>
-                )}
-              </div>
-            </div>
-
-            {/* First-article approval + run policy (Phase 3) */}
-            <fieldset className="rounded-lg border border-bambu-dark-tertiary p-3 space-y-3">
+            {/* First-article approval (Phase 3) — stays in the primary flow;
+                it changes what the run DOES, unlike the rarely-touched policy
+                overrides now grouped under Advanced (F5). */}
+            <fieldset className="rounded-lg border border-bambu-dark-tertiary p-3">
               <legend className="px-1 text-sm font-medium text-white">
                 {t('productionRuns.firstArticle.sectionTitle')}
               </legend>
@@ -487,42 +590,122 @@ function StartRunDialog({ saving, error, onStart, onClose }: StartRunDialogProps
                   </span>
                 </span>
               </label>
-
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div>
-                  <label htmlFor="run-retries" className="block text-sm text-bambu-gray mb-1">
-                    {t('productionRuns.firstArticle.retriesLabel')}
-                  </label>
-                  <input
-                    id="run-retries"
-                    type="number"
-                    inputMode="numeric"
-                    min={RETRY_MIN}
-                    max={RETRY_MAX}
-                    step={1}
-                    value={retriesPerPlate}
-                    onChange={(e) => setRetriesPerPlate(e.target.value)}
-                    className={inputClass}
-                  />
-                </div>
-                <div>
-                  <label htmlFor="run-escalate" className="block text-sm text-bambu-gray mb-1">
-                    {t('productionRuns.firstArticle.escalateLabel')}
-                  </label>
-                  <input
-                    id="run-escalate"
-                    type="number"
-                    inputMode="numeric"
-                    min={ESCALATE_MIN}
-                    max={ESCALATE_MAX}
-                    step={1}
-                    value={escalateFailures}
-                    onChange={(e) => setEscalateFailures(e.target.value)}
-                    className={inputClass}
-                  />
-                </div>
-              </div>
             </fieldset>
+
+            {/* Advanced overrides — collapsed by default (eject/cooldown/retry
+                policy is rarely changed). When collapsed, any non-default value
+                is surfaced in a one-line summary so an override is never hidden. */}
+            <div>
+              <button
+                type="button"
+                onClick={() => setAdvancedOpen((o) => !o)}
+                aria-expanded={advancedOpen}
+                aria-controls="run-advanced-section"
+                className="w-full flex items-center justify-between gap-2 text-left rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green/60"
+              >
+                <span className="flex items-center gap-2 min-w-0">
+                  <span className="text-sm font-medium text-white">{t('productionRuns.advanced')}</span>
+                  {!advancedOpen && advancedSummary.length > 0 && (
+                    <span className="text-xs text-bambu-gray truncate">{advancedSummary.join(' · ')}</span>
+                  )}
+                </span>
+                <ChevronDown
+                  className={`w-4 h-4 text-bambu-gray flex-shrink-0 transition-transform ${advancedOpen ? 'rotate-180' : ''}`}
+                />
+              </button>
+
+              {advancedOpen && (
+                <div id="run-advanced-section" className="mt-3 space-y-4">
+                  {/* Eject profile override + cooldown override */}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div>
+                      <label htmlFor="run-eject" className="block text-sm text-bambu-gray mb-1">
+                        {t('productionRuns.fields.ejectProfile')}
+                      </label>
+                      <select
+                        id="run-eject"
+                        value={ejectProfileId ?? ''}
+                        onChange={(e) => setEjectProfileId(e.target.value ? Number(e.target.value) : null)}
+                        className={inputClass}
+                      >
+                        <option value="">{t('productionRuns.fields.noEjectProfile')}</option>
+                        {(ejectProfiles ?? []).map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name}
+                            {selectedSku?.default_eject_profile_id === p.id
+                              ? ` (${t('productionRuns.fields.skuDefault')})`
+                              : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label htmlFor="run-cooldown" className="block text-sm text-bambu-gray mb-1">
+                        {t('productionRuns.fields.cooldownOverride')}
+                      </label>
+                      <input
+                        id="run-cooldown"
+                        type="number"
+                        inputMode="decimal"
+                        min={15}
+                        max={60}
+                        step={0.5}
+                        placeholder={t('productionRuns.fields.cooldownPlaceholder')}
+                        value={cooldownOverride}
+                        onChange={(e) => setCooldownOverride(e.target.value)}
+                        className={inputClass}
+                        aria-describedby={selectedEjectProfile ? 'run-cooldown-default' : undefined}
+                      />
+                      {/* Phase 4.3i: show what an override would replace, from the
+                          already-fetched profiles list. */}
+                      {selectedEjectProfile && (
+                        <p id="run-cooldown-default" className="text-xs text-bambu-gray mt-1">
+                          {t('productionRuns.fields.cooldownProfileDefault', {
+                            value: selectedEjectProfile.cooldown_temp_c,
+                          })}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Retry / quarantine policy */}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div>
+                      <label htmlFor="run-retries" className="block text-sm text-bambu-gray mb-1">
+                        {t('productionRuns.firstArticle.retriesLabel')}
+                      </label>
+                      <input
+                        id="run-retries"
+                        type="number"
+                        inputMode="numeric"
+                        min={RETRY_MIN}
+                        max={RETRY_MAX}
+                        step={1}
+                        value={retriesPerPlate}
+                        onChange={(e) => setRetriesPerPlate(e.target.value)}
+                        className={inputClass}
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="run-escalate" className="block text-sm text-bambu-gray mb-1">
+                        {t('productionRuns.firstArticle.escalateLabel')}
+                      </label>
+                      <input
+                        id="run-escalate"
+                        type="number"
+                        inputMode="numeric"
+                        min={ESCALATE_MIN}
+                        max={ESCALATE_MAX}
+                        step={1}
+                        value={escalateFailures}
+                        onChange={(e) => setEscalateFailures(e.target.value)}
+                        className={inputClass}
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
 
             {/* Backend rejection (persistent, unlike a toast — the dialog is
                 the surface the user is looking at when the POST fails). */}
@@ -572,7 +755,9 @@ function RunCard({
   onResume,
   onAbort,
   onDelete,
+  onRunAgain,
   canDelete,
+  canRunAgain,
   mutatingId,
 }: {
   run: ProductionRun;
@@ -580,7 +765,9 @@ function RunCard({
   onResume: (id: number) => void;
   onAbort: (run: ProductionRun) => void;
   onDelete: (run: ProductionRun) => void;
+  onRunAgain: (run: ProductionRun) => void;
   canDelete: boolean;
+  canRunAgain: boolean;
   mutatingId: number | null;
 }) {
   const { t } = useTranslation();
@@ -653,6 +840,20 @@ function RunCard({
               >
                 <Square className="w-4 h-4" />
                 {t('productionRuns.abort')}
+              </Button>
+            )}
+            {/* Run again re-opens the start dialog prefilled from this finished
+                run (F9); offered on terminal runs to operators who can create. */}
+            {isTerminal && canRunAgain && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => onRunAgain(run)}
+                disabled={busy}
+                aria-label={t('productionRuns.runAgain')}
+              >
+                <RotateCcw className="w-4 h-4" />
+                {t('productionRuns.runAgain')}
               </Button>
             )}
             {/* Delete is offered only once a run is finished (cancelled /
@@ -747,8 +948,11 @@ export function ProductionRunsPage() {
   const queryClient = useQueryClient();
 
   const canDelete = hasPermission('production_runs:delete');
+  const canCreate = hasPermission('production_runs:create');
 
   const [dialogOpen, setDialogOpen] = useState(false);
+  // Seed values for a "Run again" (F9); null for a fresh start.
+  const [prefill, setPrefill] = useState<RunPrefill | null>(null);
   const [pendingAbort, setPendingAbort] = useState<ProductionRun | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ProductionRun | null>(null);
 
@@ -778,6 +982,7 @@ export function ProductionRunsPage() {
       showToast(t('productionRuns.started'));
       invalidate();
       setDialogOpen(false);
+      setPrefill(null);
     },
     // No error toast: the failure detail renders inline inside the open
     // dialog (StartRunDialog `error` prop) so it cannot be missed/dismissed.
@@ -785,9 +990,35 @@ export function ProductionRunsPage() {
 
   const openStartDialog = () => {
     // Clear any error left over from a previous failed attempt so the dialog
-    // opens clean.
+    // opens clean; a fresh start carries no prefill.
     startMutation.reset();
+    setPrefill(null);
     setDialogOpen(true);
+  };
+
+  // Run again (F9): reopen the dialog seeded from a finished run. Model-targeted
+  // runs carry target_model (no printers); specific-printer runs carry printers.
+  const openRunAgain = (run: ProductionRun) => {
+    startMutation.reset();
+    const hasModel = run.target_model != null && run.target_model !== '';
+    setPrefill({
+      skuFileId: run.sku_file_id,
+      targetUnits: run.target_units,
+      mode: hasModel ? 'model' : 'specific',
+      printerIds: hasModel ? [] : run.printers.map((p) => p.id),
+      targetModel: run.target_model ?? null,
+      ejectProfileId: run.eject_profile_id,
+      cooldownOverride: run.cooldown_temp_c_override,
+      requireFirstArticle: run.require_first_article,
+      retryMaxPerUnit: run.retry_max_per_unit,
+      escalateConsecutiveFailures: run.escalate_consecutive_failures,
+    });
+    setDialogOpen(true);
+  };
+
+  const closeStartDialog = () => {
+    setDialogOpen(false);
+    setPrefill(null);
   };
 
   const pauseMutation = useMutation({
@@ -908,7 +1139,9 @@ export function ProductionRunsPage() {
                 deleteMutation.reset();
                 setPendingDelete(r);
               }}
+              onRunAgain={openRunAgain}
               canDelete={canDelete}
+              canRunAgain={canCreate}
               mutatingId={mutatingId}
             />
           ))}
@@ -923,8 +1156,9 @@ export function ProductionRunsPage() {
               ? startMutation.error.message || t('productionRuns.startFailed')
               : null
           }
+          initial={prefill ?? undefined}
           onStart={(data) => startMutation.mutate(data)}
-          onClose={() => setDialogOpen(false)}
+          onClose={closeStartDialog}
         />
       )}
 

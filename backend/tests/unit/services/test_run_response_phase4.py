@@ -561,3 +561,47 @@ class TestFirstArticlePhoto:
         assert resp["first_article_photo_url"] is None
         assert resp["first_article_printer_id"] is None
         assert resp["first_article_printer_name"] is None
+
+
+class TestRunAgainPrefillFields:
+    """build_run_response surfaces the "Run again" prefill fields (Phase 5, F9):
+    eject_profile_id + target_model derived from the items (first non-null,
+    uniform per run) and cooldown_temp_c_override from the batch column. Present
+    on BOTH the list and detail shapes so a terminal run card can reopen the
+    dialog pre-filled. FK enforcement is off in the test engine, so a bare
+    eject_profile_id needs no real profile row."""
+
+    async def test_specific_printer_run_derives_eject_and_cooldown_no_model(self, db_session):
+        batch = await _mk_run(db_session, quantity=2)
+        batch.cooldown_temp_c_override = 34.5
+        p = await _mk_printer(db_session)
+        await _add(db_session, batch, printer_id=p.id, status="pending", eject_profile_id=7, pos=1)
+        await _add(db_session, batch, printer_id=p.id, status="pending", eject_profile_id=7, pos=2)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        assert resp["eject_profile_id"] == 7
+        assert resp["cooldown_temp_c_override"] == 34.5
+        assert resp["target_model"] is None  # specific-printer run
+
+    async def test_model_run_derives_target_model(self, db_session):
+        batch = await _mk_run(db_session, quantity=1)
+        await _add(db_session, batch, status="pending", target_model="H2C", eject_profile_id=3)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        assert resp["target_model"] == "H2C"
+        assert resp["eject_profile_id"] == 3
+
+    async def test_prefill_fields_null_when_absent(self, db_session):
+        batch = await _mk_run(db_session, quantity=1)  # no cooldown override
+        await _add(db_session, batch, status="pending")  # no eject profile / target_model
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        assert resp["eject_profile_id"] is None
+        assert resp["cooldown_temp_c_override"] is None
+        assert resp["target_model"] is None

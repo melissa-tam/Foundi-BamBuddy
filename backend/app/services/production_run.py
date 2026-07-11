@@ -489,6 +489,13 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
                     if finish_photos:
                         first_article_photo_url = f"/api/v1/archives/{fa_item.archive_id}/photos/{finish_photos[-1]}"
 
+    # Prefill values for "Run again" (Phase 5, F9): the eject profile and target
+    # model are uniform across a run's items — take the first non-null; the
+    # cooldown override is a batch-level column. Surfaced on BOTH the list and
+    # detail responses so a terminal run card can reopen the dialog pre-filled.
+    prefill_eject_profile_id = next((it.eject_profile_id for it in items if it.eject_profile_id is not None), None)
+    prefill_target_model = next((it.target_model for it in items if it.target_model), None)
+
     # ETA: median cycle × remaining plates ÷ distinct printers. Null when we
     # lack a cycle estimate or have no printer to run the remainder.
     rows = [{"printer_id": it.printer_id, "started_at": it.started_at} for it in items]
@@ -525,6 +532,9 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
         "first_article_printer_name": first_article_printer_name,
         "retry_max_per_unit": run.retry_max_per_unit,
         "escalate_consecutive_failures": run.escalate_consecutive_failures,
+        "eject_profile_id": prefill_eject_profile_id,
+        "cooldown_temp_c_override": run.cooldown_temp_c_override,
+        "target_model": prefill_target_model,
         "eta_seconds": eta_seconds,
         "printers": printers,
         "created_at": run.created_at,

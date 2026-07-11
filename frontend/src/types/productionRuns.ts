@@ -132,10 +132,38 @@ export interface ProductionRun {
    *  populated only while awaiting_approval or rejected. */
   first_article_printer_id?: number | null;
   first_article_printer_name?: string | null;
+  /** Eject profile the run's plates use (uniform per run), or null. Seeds the
+   *  "Run again" dialog (Phase 5, F9). */
+  eject_profile_id: number | null;
+  /** Per-run cooldown override (°C) applied to eject generation, or null. */
+  cooldown_temp_c_override: number | null;
+  /** Target printer model for a model-targeted run, or null for a
+   *  specific-printers run (its printers are in `printers`). */
+  target_model: string | null;
   /** Estimated seconds remaining, or null when not computable. */
   eta_seconds: number | null;
   printers: ProductionRunPrinter[];
   created_at: string;
+}
+
+/**
+ * Seed values for re-opening the start dialog from a finished run ("Run again",
+ * Phase 5, F9). Carries the run's SKU file plus the printer strategy and policy
+ * overrides so a repeat run needs no re-entry. The dialog resolves the owning
+ * SKU from `skuFileId` via its skus query; if the file was since deleted it
+ * falls back to the unprefilled dialog (no dead end).
+ */
+export interface RunPrefill {
+  skuFileId: number;
+  targetUnits: number;
+  mode: 'specific' | 'model';
+  printerIds: number[];
+  targetModel: string | null;
+  ejectProfileId: number | null;
+  cooldownOverride: number | null;
+  requireFirstArticle: boolean;
+  retryMaxPerUnit: number;
+  escalateConsecutiveFailures: number;
 }
 
 /**
