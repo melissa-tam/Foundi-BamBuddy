@@ -35,14 +35,17 @@ export interface ProductionRunPrinter {
 /**
  * Why a run is currently held (Phase 4.1). `operator` = manual pause,
  * `operator_stop` = a unit was deliberately stopped (run stays active but
- * holds that printer), `first_article_rejected` and `no_available_printers`
- * are the automatic pauses. `null` when not held.
+ * holds that printer), `first_article_rejected`, `no_available_printers` and
+ * `retries_exhausted` (a unit failed with no retries left and no work in
+ * flight — resume mints replacement plates) are the automatic pauses. `null`
+ * when not held.
  */
 export type RunPauseReason =
   | 'operator'
   | 'operator_stop'
   | 'first_article_rejected'
-  | 'no_available_printers';
+  | 'no_available_printers'
+  | 'retries_exhausted';
 
 /**
  * Live blocked-state summary for one printer a run targets. Only present on

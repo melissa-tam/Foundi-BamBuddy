@@ -131,6 +131,7 @@ export default {
       operator_stop: 'Unità fermata dall\'operatore — libera il piatto, poi Riprendi',
       first_article_rejected: 'Primo pezzo respinto',
       no_available_printers: 'Nessuna stampante disponibile',
+      retries_exhausted: 'Tentativi esauriti — un\'unità è fallita senza tentativi rimasti. Riprendi per stampare i sostituti',
     },
     stagedBanner: {
       lowSpool: '{{count}} unità trattenute: filamento insufficiente — sostituisci la bobina, poi premi Riprendi (o Ricontrolla nella pagina Coda).',

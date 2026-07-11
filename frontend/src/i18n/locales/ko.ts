@@ -131,6 +131,7 @@ export default {
       operator_stop: '운영자가 유닛을 중지함 — 플레이트를 비운 뒤 재개하세요',
       first_article_rejected: '초도품 거부됨',
       no_available_printers: '사용 가능한 프린터 없음',
+      retries_exhausted: '재시도 소진됨 — 남은 재시도 없이 유닛이 실패했습니다. 재개하면 대체품을 인쇄합니다',
     },
     stagedBanner: {
       lowSpool: '{{count}}개 유닛 보류 중: 필라멘트 부족 — 스풀을 교체한 뒤 재개(또는 대기열 페이지에서 재확인)를 누르세요.',

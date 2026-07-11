@@ -595,3 +595,331 @@ class TestRecoverPrinter:
         await db_session.refresh(batch)
         assert batch.status == "paused"
         assert batch.first_article_state == "rejected"
+
+
+async def _mk_failed_item(db, batch, prof, *, printer_id=3, retry_count=0, target_model=None, pos=99):
+    item = PrintQueueItem(
+        batch_id=batch.id,
+        status="failed",
+        first_article=False,
+        printer_id=printer_id,
+        target_model=target_model,
+        eject_profile_id=prof.id,
+        plate_id=1,
+        retry_count=retry_count,
+        position=pos,
+        completed_at=datetime.now(timezone.utc),
+    )
+    db.add(item)
+    await db.commit()
+    return item
+
+
+class TestFailurePolicyBatchGate:
+    """The batch-status gate on `_on_item_failed` (Phase 1, R1/R2/R3)."""
+
+    async def _mk_printer(self, db, name="BG"):
+        p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(p)
+        await db.flush()
+        return p
+
+    async def test_paused_run_failure_stages_retry_and_resume_releases(self, db_session):
+        """R1: a failure on a paused run mints a STAGED retry; resume releases it."""
+        from backend.app.services.production_run import transition_run
+
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False)
+        batch.status = "paused"
+        batch.pause_reason = "operator"
+        db_session.add(
+            PrintQueueItem(
+                batch_id=batch.id,
+                printer_id=3,
+                status="completed",
+                eject_profile_id=prof.id,
+                plate_id=1,
+                position=1,
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+        failed = await _mk_failed_item(db_session, batch, prof, printer_id=3, pos=2)
+
+        await farm_policy.on_terminal(db_session, 3, failed.id, "failed")
+
+        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == failed.id]
+        assert len(retries) == 1
+        assert retries[0].status == "pending"
+        assert retries[0].manual_start is True  # staged — can't dispatch while paused
+
+        run = await transition_run(db_session, batch.id, "resume")
+        assert run.status == "active"
+        released = [i for i in await _items(db_session, batch.id) if i.retry_of_id == failed.id][0]
+        assert released.manual_start is False  # resume swept it un-staged
+
+    async def test_cancelled_run_failure_no_retry(self, db_session):
+        """R2: a failure on an aborted run mints NO retry; batch stays cancelled."""
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False)
+        batch.status = "cancelled"
+        failed = await _mk_failed_item(db_session, batch, prof, printer_id=3, pos=2)
+
+        await farm_policy.on_terminal(db_session, 3, failed.id, "failed")
+
+        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == failed.id]
+        assert retries == []
+        await db_session.refresh(batch)
+        assert batch.status == "cancelled"
+
+    async def test_completed_run_failure_no_retry(self, db_session):
+        """A late failure on a completed run mints NO retry."""
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False)
+        batch.status = "completed"
+        failed = await _mk_failed_item(db_session, batch, prof, printer_id=3, pos=2)
+
+        await farm_policy.on_terminal(db_session, 3, failed.id, "failed")
+
+        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == failed.id]
+        assert retries == []
+        await db_session.refresh(batch)
+        assert batch.status == "completed"
+
+    async def test_cancelled_run_failure_still_quarantines(self, db_session):
+        """A cancelled run's failure still counts toward quarantine (printer health
+        is independent of run intent) — the 2nd consecutive failure trips it."""
+        printer = await self._mk_printer(db_session, "BGQ")
+        batch, prof = await _mk_run(db_session, quantity=5, printer_ids=[0], require_fa=False, escalate=2)
+        batch.status = "cancelled"
+        base = datetime.now(timezone.utc)
+        db_session.add(
+            PrintQueueItem(
+                batch_id=batch.id,
+                printer_id=printer.id,
+                status="failed",
+                eject_profile_id=prof.id,
+                plate_id=1,
+                position=1,
+                completed_at=base,
+            )
+        )
+        second = PrintQueueItem(
+            batch_id=batch.id,
+            printer_id=printer.id,
+            status="failed",
+            eject_profile_id=prof.id,
+            plate_id=1,
+            position=2,
+            completed_at=base + timedelta(minutes=1),
+        )
+        db_session.add(second)
+        await db_session.commit()
+
+        try:
+            await farm_policy.on_terminal(db_session, printer.id, second.id, "failed")
+            await db_session.refresh(printer)
+            assert printer.quarantined is True
+            # ...but no retry was minted for the cancelled run.
+            retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == second.id]
+            assert retries == []
+        finally:
+            printer_manager.set_quarantined(printer.id, False)
+
+
+class TestRetryRebalance:
+    """Retry rebalance (Phase 1, F7): model-targeted retries return to the pool."""
+
+    async def test_model_targeted_retry_returns_to_unassigned_pool(self, db_session):
+        batch, prof = await _mk_run(db_session, quantity=2, target_model="H2S", require_fa=False)
+        item = await _mk_failed_item(db_session, batch, prof, printer_id=7, target_model="H2S", pos=1)
+
+        created = await farm_policy.create_retry_if_absent(db_session, item)
+        assert created is not None
+        assert created.printer_id is None  # rebalanced off the failing printer
+        assert created.target_model == "H2S"  # model target preserved
+
+    async def test_printer_pinned_retry_keeps_pin(self, db_session):
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[7], require_fa=False)
+        item = await _mk_failed_item(db_session, batch, prof, printer_id=7, target_model=None, pos=1)
+
+        created = await farm_policy.create_retry_if_absent(db_session, item)
+        assert created is not None
+        assert created.printer_id == 7  # operator-pinned run keeps its printer
+
+
+class TestRetryRaceLoser:
+    """R4: the unique-constraint loser returns None and the caller still runs."""
+
+    async def _mk_printer(self, db, name="RACE"):
+        p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(p)
+        await db.flush()
+        return p
+
+    async def test_integrity_error_loser_returns_none_and_quarantine_still_evaluated(self, db_session):
+        from sqlalchemy.exc import IntegrityError
+
+        printer = await self._mk_printer(db_session, "RACE1")
+        batch, prof = await _mk_run(db_session, quantity=5, printer_ids=[0], require_fa=False, escalate=2)
+        base = datetime.now(timezone.utc)
+        db_session.add(
+            PrintQueueItem(
+                batch_id=batch.id,
+                printer_id=printer.id,
+                status="failed",
+                eject_profile_id=prof.id,
+                plate_id=1,
+                position=1,
+                completed_at=base,
+            )
+        )
+        failing = PrintQueueItem(
+            batch_id=batch.id,
+            printer_id=printer.id,
+            status="failed",
+            eject_profile_id=prof.id,
+            plate_id=1,
+            position=2,
+            retry_count=0,
+            completed_at=base + timedelta(minutes=1),
+        )
+        db_session.add(failing)
+        await db_session.commit()
+
+        raiser = AsyncMock(side_effect=IntegrityError("INSERT", {}, Exception("UNIQUE constraint failed")))
+        try:
+            with patch.object(farm_policy, "create_queue_items", new=raiser):
+                # Direct call: the loser returns None (no duplicate retry).
+                created = await farm_policy.create_retry_if_absent(db_session, failing)
+                assert created is None
+                # Session still usable after the rollback — a fresh query works.
+                still = await _items(db_session, batch.id)
+                assert any(i.id == failing.id for i in still)
+                # And the whole failure path still reaches quarantine evaluation.
+                await farm_policy._on_item_failed(db_session, batch, failing)
+            await db_session.refresh(printer)
+            assert printer.quarantined is True
+        finally:
+            printer_manager.set_quarantined(printer.id, False)
+
+
+class TestExhaustedRunPause:
+    """R3: an active run whose last unit exhausts retries with no work left pauses."""
+
+    async def _mk_printer(self, db, name="EX"):
+        p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(p)
+        await db.flush()
+        return p
+
+    async def test_exhausted_last_unit_pauses_and_notifies_once(self, db_session):
+        batch, prof = await _mk_run(db_session, quantity=1, printer_ids=[3], require_fa=False, retry_max=1)
+        # retry_count already at max → no retry minted; no other live items.
+        failed = await _mk_failed_item(db_session, batch, prof, printer_id=3, retry_count=1, pos=1)
+
+        with patch.object(farm_policy.notification_service, "on_run_paused", new_callable=AsyncMock) as mock_p:
+            await farm_policy.on_terminal(db_session, 3, failed.id, "failed")
+            mock_p.assert_awaited_once()
+
+        await db_session.refresh(batch)
+        assert batch.status == "paused"
+        assert batch.pause_reason == "retries_exhausted"
+
+    async def test_live_retry_suppresses_pause(self, db_session):
+        # A real printer row (available: no live MQTT status) so the no-printers
+        # auto-pause doesn't fire — isolating the exhausted-pause suppression.
+        printer = await self._mk_printer(db_session, "EXLIVE")
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False, retry_max=1)
+        failed = await _mk_failed_item(db_session, batch, prof, printer_id=printer.id, retry_count=0, pos=1)
+
+        await farm_policy.on_terminal(db_session, printer.id, failed.id, "failed")
+
+        # A retry was minted (pending) → work in flight → the run stays active.
+        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == failed.id]
+        assert len(retries) == 1
+        await db_session.refresh(batch)
+        assert batch.status == "active"
+        assert batch.pause_reason is None
+
+    async def test_awaiting_approval_zero_live_items_stays_active(self, db_session):
+        """A gated run awaiting approval is NORMAL with zero live items — not paused
+        even when a stale FA failure event arrives with no retry left."""
+        batch, prof = await _mk_run(db_session, quantity=3, printer_ids=[3], require_fa=True, retry_max=1)
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "failed"
+        fa.retry_count = 1  # at max → no retry, so zero live items after this event
+        fa.completed_at = datetime.now(timezone.utc)
+        batch.first_article_state = "awaiting_approval"
+        await db_session.commit()
+
+        await farm_policy.on_terminal(db_session, 3, fa.id, "failed")
+
+        await db_session.refresh(batch)
+        assert batch.status == "active"
+        assert batch.pause_reason is None
+
+    async def test_dead_fa_chain_pauses_then_resume_redispatches_fa(self, db_session):
+        """A gated run whose entire FA chain died at max retries pauses; resume
+        re-dispatches a fresh first article and leaves the plan intact."""
+        from backend.app.services.production_run import transition_run
+
+        batch, prof = await _mk_run(db_session, quantity=3, printer_ids=[5], require_fa=True, retry_max=1)
+        plan_before = batch.first_article_plan
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "failed"
+        fa.retry_count = 1  # dead chain (state never left pending_print)
+        fa.completed_at = datetime.now(timezone.utc)
+        await db_session.commit()
+
+        await farm_policy.on_terminal(db_session, 5, fa.id, "failed")
+        await db_session.refresh(batch)
+        assert batch.status == "paused"
+        assert batch.pause_reason == "retries_exhausted"
+
+        run = await transition_run(db_session, batch.id, "resume")
+        assert run.status == "active"
+        items = await _items(db_session, batch.id)
+        assert any(i.first_article and i.status == "pending" for i in items)  # fresh FA
+        await db_session.refresh(batch)
+        assert batch.first_article_plan == plan_before  # plan intact for approval
+
+
+class TestApproveGuards:
+    """R6: FA approval respects the run's paused/cancelled status."""
+
+    async def test_approve_on_paused_run_stages_plates_resume_releases(self, db_session):
+        from backend.app.services.production_run import transition_run
+
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[7], require_fa=True)
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "completed"
+        fa.completed_at = datetime.now(timezone.utc)
+        batch.first_article_state = "awaiting_approval"
+        batch.status = "paused"
+        batch.pause_reason = "operator"
+        await db_session.commit()
+
+        run = await farm_policy.approve_first_article(db_session, batch.id, eject_remotely=False)
+        assert run.first_article_state == "approved"
+        plates = [i for i in await _items(db_session, batch.id) if not i.first_article]
+        assert len(plates) == 2
+        assert all(i.manual_start is True for i in plates)  # staged while paused
+
+        # Production runs resume in a fresh session; detach so the reload rebuilds
+        # queue_items (approve created the plates on a now-stale identity-map row).
+        db_session.expunge_all()
+        run2 = await transition_run(db_session, batch.id, "resume")
+        assert run2.status == "active"
+        plates2 = [i for i in await _items(db_session, batch.id) if not i.first_article]
+        assert all(i.manual_start is False for i in plates2)  # released on resume
+
+    async def test_approve_on_cancelled_run_409(self, db_session):
+        from fastapi import HTTPException
+
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[7], require_fa=True)
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "completed"
+        batch.first_article_state = "awaiting_approval"
+        batch.status = "cancelled"
+        await db_session.commit()
+
+        with pytest.raises(HTTPException) as exc:
+            await farm_policy.approve_first_article(db_session, batch.id, eject_remotely=False)
+        assert exc.value.status_code == 409

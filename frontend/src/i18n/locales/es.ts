@@ -131,6 +131,7 @@ export default {
       operator_stop: 'Unidad detenida por el operador — despeje la cama y luego Reanude',
       first_article_rejected: 'Primera pieza rechazada',
       no_available_printers: 'No hay impresoras disponibles',
+      retries_exhausted: 'Reintentos agotados — una unidad falló sin reintentos restantes. Reanude para imprimir reemplazos',
     },
     stagedBanner: {
       lowSpool: '{{count}} unidad(es) retenida(s): filamento insuficiente — cambie la bobina y pulse Reanudar (o Volver a comprobar en la página de cola).',

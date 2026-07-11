@@ -180,3 +180,20 @@ class TestTransitionResumeWiring:
 
         await transition_run(db_session, batch.id, "resume")
         assert await _pending_count(db_session, batch.id) == 1  # only the original pending
+
+    async def test_resume_after_retries_exhausted_tops_up_deficit(self, db_session):
+        """Phase 1 R3: a run paused with retries_exhausted resumes and tops up
+        exactly the dead-chain deficit."""
+        batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=3)
+        batch.status = "paused"
+        batch.pause_reason = "retries_exhausted"
+        await _add(db_session, batch, printer_id=3, status="completed", pos=1)
+        # A dead chain: failed primary + failed retry → 1 replacement is owed.
+        failed = await _add(db_session, batch, printer_id=3, status="failed", pos=2)
+        await _add(db_session, batch, printer_id=3, status="failed", retry_of_id=failed.id, retry_count=1, pos=3)
+        await db_session.commit()
+
+        run = await transition_run(db_session, batch.id, "resume")
+        assert run.status == "active"
+        assert run.pause_reason is None
+        assert await _pending_count(db_session, batch.id) == 1  # exactly the deficit

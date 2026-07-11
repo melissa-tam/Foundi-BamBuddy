@@ -131,6 +131,7 @@ export default {
       operator_stop: 'Unit stopped by operator — clear the plate, then Resume',
       first_article_rejected: 'First article rejected',
       no_available_printers: 'No available printers',
+      retries_exhausted: 'Retries exhausted — a unit failed with no retries left. Resume to print replacements',
     },
     stagedBanner: {
       lowSpool: '{{count}} unit(s) held: low filament — swap the spool, then press Resume (or Re-check on the Queue page).',

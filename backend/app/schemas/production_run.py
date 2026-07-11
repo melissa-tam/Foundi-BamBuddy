@@ -110,7 +110,8 @@ class RunResponse(BaseModel):
     plates_pending: int
     status: str
     # Why the run is held (Phase 4.1): 'operator', 'operator_stop',
-    # 'first_article_rejected' or 'no_available_printers'. Null when not held.
+    # 'first_article_rejected', 'no_available_printers' or 'retries_exhausted'
+    # (Phase 1). Null when not held.
     pause_reason: str | None = None
     # Pending units system-staged by the low-spool guard (manual_start AND
     # filament_short) vs staged for any other reason (manual_start alone).

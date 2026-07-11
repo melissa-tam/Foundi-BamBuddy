@@ -131,6 +131,7 @@ export default {
       operator_stop: '单元已被操作员停止 — 清理打印板后按继续',
       first_article_rejected: '首件被拒绝',
       no_available_printers: '没有可用的打印机',
+      retries_exhausted: '重试已用尽 — 某个单元在没有剩余重试次数的情况下失败。继续以打印替换件',
     },
     stagedBanner: {
       lowSpool: '{{count}} 个单元被搁置：耗材不足 — 更换料卷后按继续（或在队列页面重新检查）。',

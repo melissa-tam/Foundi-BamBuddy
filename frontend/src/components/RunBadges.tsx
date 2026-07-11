@@ -32,6 +32,7 @@ const PAUSE_REASON_KEYS: Record<RunPauseReason, string> = {
   operator_stop: 'productionRuns.pauseReason.operator_stop',
   first_article_rejected: 'productionRuns.pauseReason.first_article_rejected',
   no_available_printers: 'productionRuns.pauseReason.no_available_printers',
+  retries_exhausted: 'productionRuns.pauseReason.retries_exhausted',
 };
 
 /** Why-is-this-held chip. Rendered only while the run is active/paused —

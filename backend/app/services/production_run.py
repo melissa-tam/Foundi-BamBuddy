@@ -438,6 +438,19 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
         await db.commit()
         broadcast_production_run_changed(run_id)
         run = await _load_run(db, run_id)
+        # FA-zombie guard (Phase 1): a gated run whose entire first-article chain
+        # died at max retries paused with its remaining plates still deferred to the
+        # plan. Resuming must re-dispatch a fresh first article from that plan, else
+        # the run goes 'active' with zero live items and never progresses (top_up is
+        # a deliberate no-op while gated). The plan is left intact for approval.
+        if (
+            run.first_article_state == "pending_print"
+            and run.first_article_plan
+            and not any(it.first_article and it.status in ("pending", "printing") for it in run.queue_items)
+        ):
+            await create_new_first_article(db, run)
+            await db.commit()
+            run = await _load_run(db, run_id)
         await top_up_run(db, run)
     else:
         if action == "pause":

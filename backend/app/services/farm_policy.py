@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import broadcast_production_run_changed
@@ -178,7 +179,16 @@ async def create_remaining_plates(db: AsyncSession, run: PrintBatch) -> int:
     base.pop("printer_id", None)
     base.pop("target_model", None)
     base.pop("first_article", None)
-    fields_common = {**base, "batch_id": run.id, "status": "pending", "first_article": False}
+    # Approve-while-paused stages the materialised plates (manual_start=True) so
+    # resume releases them together (R6, same class as R1); an active-run approval
+    # dispatches immediately. Covers the _finalize_remote_eject path too.
+    fields_common = {
+        **base,
+        "batch_id": run.id,
+        "status": "pending",
+        "first_article": False,
+        "manual_start": run.status == "paused",
+    }
 
     if printer_ids:
         # Continue the round-robin from index 1 — index 0 seeded the FA plate.
@@ -317,11 +327,23 @@ async def _on_item_completed(
 
 
 async def _on_item_failed(db: AsyncSession, batch: PrintBatch, item: PrintQueueItem) -> None:
+    # A terminal run (aborted/completed) still counts this failure toward printer
+    # health — quarantine is independent of run intent — but must NOT mint a
+    # dispatchable retry (R1/R2: a cancelled run would silently print an extra
+    # plate) nor evaluate the run-pause helpers.
+    if batch.status in ("cancelled", "completed"):
+        await maybe_quarantine_printer(db, batch, item)
+        return
+
     retry_max = batch.retry_max_per_unit if batch.retry_max_per_unit is not None else 1
     if (item.retry_count or 0) < retry_max:
-        await create_retry_if_absent(db, item)
+        # A paused run keeps re-queuing failed units, but STAGED (manual_start=True)
+        # so the retry can't dispatch while paused; resume's manual_start sweep
+        # releases it (R1). An active run's retry dispatches as today.
+        await create_retry_if_absent(db, item, stage_manual=batch.status == "paused")
     await maybe_quarantine_printer(db, batch, item)
     await _maybe_pause_run_no_printers(db, batch)
+    await _maybe_pause_run_exhausted(db, batch)
 
 
 async def on_operator_stop(db: AsyncSession, batch: PrintBatch, item: PrintQueueItem) -> None:
@@ -364,18 +386,29 @@ async def on_operator_stop(db: AsyncSession, batch: PrintBatch, item: PrintQueue
 # --------------------------------------------------------------------------- #
 # Retry
 # --------------------------------------------------------------------------- #
-async def create_retry_if_absent(db: AsyncSession, item: PrintQueueItem) -> PrintQueueItem | None:
+async def create_retry_if_absent(
+    db: AsyncSession, item: PrintQueueItem, *, stage_manual: bool = False
+) -> PrintQueueItem | None:
     """Create exactly one retry for a failed ``item`` (idempotent via retry_of_id).
 
     The retry preserves the ``first_article`` flag (a failed first article is
-    re-attempted as a first article) and the plate/profile/printer/model target.
+    re-attempted as a first article) and the plate/profile target. ``stage_manual``
+    stages the retry (``manual_start=True``) so it can't dispatch onto a paused run;
+    the resume sweep releases it.
+
+    Rebalance (F7): a model-targeted unit's retry returns to the unassigned pool
+    (``printer_id=None``) so the scheduler can pick a healthy sibling of the same
+    model and recompute its AMS mapping — a printer-pinned unit keeps its pin
+    (operator intent; the failing printer's own quarantine→pause→recover path owns
+    that). The per-printer plate-clear gate is unaffected either way.
     """
     existing = await db.execute(select(PrintQueueItem.id).where(PrintQueueItem.retry_of_id == item.id))
     if existing.first() is not None:
         return None  # already retried this failure event
 
+    retry_printer_id = None if item.target_model else item.printer_id
     fields = {
-        "printer_id": item.printer_id,
+        "printer_id": retry_printer_id,
         "target_model": item.target_model,
         "target_location": item.target_location,
         "required_filament_types": item.required_filament_types,
@@ -387,12 +420,25 @@ async def create_retry_if_absent(db: AsyncSession, item: PrintQueueItem) -> Prin
         "print_time_seconds": item.print_time_seconds,
         "created_by_id": item.created_by_id,
         "status": "pending",
+        "manual_start": stage_manual,
         "first_article": item.first_article,
         "retry_count": (item.retry_count or 0) + 1,
         "retry_of_id": item.id,
     }
-    created = await create_queue_items(db, count=1, printer_id=item.printer_id, fields=fields)
-    await db.commit()
+    try:
+        # SAVEPOINT (not a bare rollback): the unique-``retry_of_id`` violation of a
+        # race loser (R4) is contained to the savepoint, so the outer transaction and
+        # the loaded ``batch``/``item`` ORM state survive — the caller then still
+        # evaluates quarantine/pause. A full ``db.rollback()`` here would expire those
+        # objects and the caller's next attribute access would raise MissingGreenlet.
+        # Precedent: services/location_service.py:74-106.
+        async with db.begin_nested():
+            created = await create_queue_items(db, count=1, printer_id=retry_printer_id, fields=fields)
+            await db.flush()
+        await db.commit()
+    except IntegrityError:
+        logger.info("farm_policy: retry for item %s lost the idempotency race (unique retry_of_id)", item.id)
+        return None
     logger.info("farm_policy: created retry #%d for failed item %s", fields["retry_count"], item.id)
     return created[0] if created else None
 
@@ -582,6 +628,50 @@ async def _maybe_pause_run_no_printers(db: AsyncSession, batch: PrintBatch) -> N
     logger.warning("farm_policy: paused run %s — no available printers", batch.id)
 
 
+async def _maybe_pause_run_exhausted(db: AsyncSession, batch: PrintBatch) -> None:
+    """Pause an active run whose last unit exhausted its retries with no work left (R3).
+
+    Without this, a run whose final plate fails past ``retry_max`` sits ``active``
+    forever with nothing pending/printing and no notification. Deliberately NOT
+    ``_maybe_complete_run`` — completing would hide the shortfall; pausing surfaces a
+    Resume affordance whose ``top_up_run`` mints the replacement plates.
+
+    Guards: only an active run; a run still awaiting first-article approval is
+    NORMAL with zero live items (operator-gated), so it's exempt; and if ANY item is
+    still pending/printing (a just-created retry, or a duplicate failure event racing
+    a live retry) there's work in flight — no pause.
+    """
+    if batch.status != "active":
+        return
+    if batch.first_article_state == "awaiting_approval":
+        return
+    result = await db.execute(
+        select(PrintQueueItem.id)
+        .where(
+            PrintQueueItem.batch_id == batch.id,
+            PrintQueueItem.status.in_(("pending", "printing")),
+        )
+        .limit(1)
+    )
+    if result.first() is not None:
+        return
+
+    batch.status = "paused"
+    # Machine-readable hold reason (Phase 1): distinguishes retry-exhaustion from the
+    # other auto-pauses on the run card. Cleared on resume (transition_run).
+    batch.pause_reason = "retries_exhausted"
+    await db.commit()
+    broadcast_production_run_changed(batch.id)
+    run = await _load_run(db, batch.id)
+    await notification_service.on_run_paused(
+        run.name,
+        _sku_code(run),
+        "A unit failed with no retries left and the run has no work in flight — Resume creates replacement plates",
+        db,
+    )
+    logger.warning("farm_policy: paused run %s — retries exhausted, no work in flight", batch.id)
+
+
 async def _maybe_complete_run(db: AsyncSession, batch: PrintBatch) -> None:
     if batch.status != "active":
         return
@@ -652,6 +742,10 @@ async def approve_first_article(db: AsyncSession, run_id: int, eject_remotely: b
             status_code=409,
             detail=f"First article is not awaiting approval (state={run.first_article_state})",
         )
+    if run.status == "cancelled":
+        # An aborted run must never materialise dispatchable plates from an approval
+        # (R6: the abort cancelled its pending items; approval would resurrect it).
+        raise HTTPException(status_code=409, detail="Cannot approve a first article on a cancelled run")
     fa_item = _find_fa_item(run)
 
     if eject_remotely:

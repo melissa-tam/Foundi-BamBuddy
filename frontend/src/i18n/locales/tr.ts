@@ -131,6 +131,7 @@ export default {
       operator_stop: 'Ünite operatör tarafından durduruldu — plakayı temizleyin, sonra Sürdürün',
       first_article_rejected: 'İlk parça reddedildi',
       no_available_printers: 'Kullanılabilir yazıcı yok',
+      retries_exhausted: 'Yeniden denemeler tükendi — bir ünite kalan deneme olmadan başarısız oldu. Yerine yenilerini yazdırmak için Sürdürün',
     },
     stagedBanner: {
       lowSpool: '{{count}} ünite bekletiliyor: filament az — bobini değiştirin, sonra Sürdür\'e basın (veya Kuyruk sayfasından yeniden denetleyin).',

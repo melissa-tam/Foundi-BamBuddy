@@ -3323,6 +3323,21 @@ async def run_migrations(conn):
         conn,
         "CREATE INDEX IF NOT EXISTS ix_print_queue_dispatch_subtask_id ON print_queue (dispatch_subtask_id)",
     )
+    # Dedup pre-constraint duplicate retry lineages BEFORE creating the unique index
+    # (Phase 1, R4): a DB migrated before the idempotency guard existed may hold two
+    # retries for one failure event. SQLite raises IntegrityError on the CREATE UNIQUE
+    # INDEX below for such rows — and _safe_execute does NOT swallow that (it isn't an
+    # "already exists" error), so startup would abort. Keep the oldest lineage (MIN id)
+    # and null the rest. DML → conn.execute inside begin_nested (not _safe_execute, per
+    # the module DML convention); no-op when clean; both dialects support this form.
+    async with conn.begin_nested():
+        await conn.execute(
+            text(
+                "UPDATE print_queue SET retry_of_id = NULL WHERE retry_of_id IS NOT NULL "
+                "AND id NOT IN (SELECT MIN(id) FROM print_queue WHERE retry_of_id IS NOT NULL GROUP BY retry_of_id)"
+            )
+        )
+
     # Back the check-then-insert retry idempotency (#C7) with a DB constraint.
     # NULLs are allowed (distinct in both SQLite and Postgres) so only actual
     # duplicate retry lineages are rejected. Existing model unique=True covers

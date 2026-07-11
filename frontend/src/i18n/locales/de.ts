@@ -131,6 +131,7 @@ export default {
       operator_stop: 'Einheit vom Bediener gestoppt — Platte freigeben, dann Fortsetzen',
       first_article_rejected: 'Erstmuster abgelehnt',
       no_available_printers: 'Keine verfügbaren Drucker',
+      retries_exhausted: 'Wiederholungen erschöpft — eine Einheit ist ohne verbleibende Versuche fehlgeschlagen. Zum Drucken von Ersatz fortsetzen',
     },
     stagedBanner: {
       lowSpool: '{{count}} Einheit(en) zurückgehalten: Filament knapp — Spule wechseln, dann Fortsetzen drücken (oder auf der Warteschlangen-Seite neu prüfen).',

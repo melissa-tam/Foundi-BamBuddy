@@ -131,6 +131,7 @@ export default {
       operator_stop: 'Unité arrêtée par l\'opérateur — dégagez le plateau, puis Reprendre',
       first_article_rejected: 'Première pièce rejetée',
       no_available_printers: 'Aucune imprimante disponible',
+      retries_exhausted: 'Tentatives épuisées — une unité a échoué sans réessai restant. Reprenez pour imprimer les remplacements',
     },
     stagedBanner: {
       lowSpool: '{{count}} unité(s) retenue(s) : filament insuffisant — changez la bobine, puis appuyez sur Reprendre (ou Revérifier sur la page File d\'attente).',

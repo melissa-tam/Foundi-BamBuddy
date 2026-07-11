@@ -131,6 +131,7 @@ export default {
       operator_stop: 'Unidade parada pelo operador — libere a placa e depois Retome',
       first_article_rejected: 'Primeira peça rejeitada',
       no_available_printers: 'Nenhuma impressora disponível',
+      retries_exhausted: 'Novas tentativas esgotadas — uma unidade falhou sem tentativas restantes. Retome para imprimir substitutos',
     },
     stagedBanner: {
       lowSpool: '{{count}} unidade(s) retida(s): filamento insuficiente — troque a bobina e pressione Retomar (ou Verificar novamente na página da fila).',

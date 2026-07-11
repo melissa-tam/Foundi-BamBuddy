@@ -131,6 +131,7 @@ export default {
       operator_stop: '單元已被操作員停止 — 清理列印板後按繼續',
       first_article_rejected: '首件被拒絕',
       no_available_printers: '沒有可用的印表機',
+      retries_exhausted: '重試已用盡 — 某個單元在沒有剩餘重試次數的情況下失敗。繼續以列印替換件',
     },
     stagedBanner: {
       lowSpool: '{{count}} 個單元被擱置：線材不足 — 更換線材卷後按繼續（或在佇列頁面重新檢查）。',

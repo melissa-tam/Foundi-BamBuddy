@@ -131,6 +131,7 @@ export default {
       operator_stop: 'オペレーターがユニットを停止 — プレートを片付けてから再開してください',
       first_article_rejected: '初品が却下されました',
       no_available_printers: '利用可能なプリンターがありません',
+      retries_exhausted: '再試行の上限に達しました — 残りの再試行がないままユニットが失敗しました。再開すると代替品を印刷します',
     },
     stagedBanner: {
       lowSpool: '{{count}} 個のユニットが保留中: フィラメント不足 — スプールを交換してから再開（またはキューページで再チェック）してください。',
