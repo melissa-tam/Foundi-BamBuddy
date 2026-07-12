@@ -226,6 +226,12 @@ def classify_stop(payload: dict, printer_id: int, user_stopped_printer_ids: set[
     - ``None``            — neither signal (a genuine failure, a normal finish, or a
       reconcile-synthesised interruption that carries no echo/membership).
 
+    CAVEAT (observed live 2026-07-12, 007-H2C): H2C firmware emitted NO cancel-echo
+    HMS on a touchscreen stop, so an H2C screen stop classifies as ``None`` — i.e.
+    a genuine failure that feeds retry + quarantine accounting. Pending a deliberate
+    wire-capture session hunting an alternative echo code on this firmware line,
+    prefer stopping H2C farm units from the Bambuddy UI (membership wins).
+
     Pure — no DB, no I/O — so it is directly unit-testable and callable before the
     ``_user_stopped_printers`` set is mutated by the surrounding handler.
     """
