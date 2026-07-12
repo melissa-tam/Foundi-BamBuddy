@@ -52,6 +52,13 @@ logger = logging.getLogger(__name__)
 # briefly in SLICING between PREPARE and RUNNING while parsing the g-code.
 _ACTIVE_PRINT_STATES: frozenset[str] = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
 
+# USB pre-flight settle window. The H2 fleet reports USB presence (state.sdcard)
+# ONLY inside a full status report, which we must explicitly request
+# (request_status_update → MQTT pushall) — so after asking we wait briefly for
+# the fresh report to land before reading the flag. 2.5 s comfortably covers the
+# observed pushall round-trip on H2S/H2C without materially delaying dispatch.
+_USB_PREFLIGHT_WAIT_S = 2.5
+
 # Filament-type equivalence + canonicalisation is shared with the farm capability
 # gate — single source of truth in ``utils.filament_types`` (imported above as
 # ``_canonical_filament_type`` to preserve the existing call sites).
@@ -2209,6 +2216,51 @@ class PrintScheduler:
             await self._fail_queue_item(db, item, "Printer not connected")
             logger.error("Queue item %s: Printer %s not connected", item.id, item.printer_id)
             await self._power_off_if_needed(db, item)
+            return
+
+        # USB pre-flight (every item — farm and non-farm; the USB stick is
+        # universal). The H2 fleet has NO usable internal storage for LAN
+        # dispatch, so an absent USB drive turns every FTPS upload into an
+        # opaque 553. The firmware only reports USB presence (state.sdcard) in a
+        # FULL status report, which Bambuddy requests on connect / manual
+        # refresh — so a stick pulled while the printer idles goes unnoticed
+        # until dispatch fails. Ask for a fresh full report, wait briefly for it
+        # to land, then read the live flag. Fail-OPEN: ONLY an explicit False
+        # (drive confirmed absent) holds dispatch; None/missing (never reported /
+        # stale) proceeds, mirroring the UI chip's fail-safe. This is a WAIT, not
+        # a failure — the item stays pending, no manual_start, no retry burn; the
+        # next tick requests another fresh report and self-clears it when the
+        # drive returns (via the capability gate's existing waiting_reason reset
+        # below, since this block sits BEFORE it on the dispatch path).
+        printer_manager.request_status_update(item.printer_id)
+        await asyncio.sleep(_USB_PREFLIGHT_WAIT_S)
+        usb_status = printer_manager.get_status(item.printer_id)
+        if usb_status is not None and getattr(usb_status, "sdcard", None) is False:
+            # Dedupe like the low-spool waiting notification: only fire on the
+            # transition INTO the hold (waiting_reason wasn't already
+            # no_usb_drive), so a stick left out across many ticks notifies once.
+            # We can't reuse the low-spool path's manual_start-based once-guard
+            # because this must stay a self-clearing pending wait.
+            already_waiting = item.waiting_reason == "no_usb_drive"
+            if not already_waiting:
+                item.waiting_reason = "no_usb_drive"
+                await db.commit()
+            logger.info(
+                "Queue item %s: USB pre-flight held dispatch — no USB drive in printer %s",
+                item.id,
+                item.printer_id,
+            )
+            if not already_waiting:
+                job_name = await self._get_job_name(db, item)
+                try:
+                    await notification_service.on_queue_job_waiting(
+                        job_name=job_name,
+                        target_model=(printer.model if printer else "") or "",
+                        waiting_reason="no_usb_drive",
+                        db=db,
+                    )
+                except Exception as e:
+                    logger.debug("no_usb_drive notification failed for item %s: %s", item.id, e)
             return
 
         # Farm capability-matching gate (#Phase4). Non-farm items bypass it. A

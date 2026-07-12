@@ -171,6 +171,7 @@ export default {
         visionHold: '打印机视觉检测：打印板不为空 — 清理热床后在打印机上继续',
         previousPrintFailed: '已搁置：上一次打印失败',
         filamentShort: '耗材不足',
+        no_usb_drive: '打印机中没有 USB 驱动器 — 请插入 USB-A 驱动器（FAT32/exFAT）',
       },
       printerState: {
         ok: '就绪',

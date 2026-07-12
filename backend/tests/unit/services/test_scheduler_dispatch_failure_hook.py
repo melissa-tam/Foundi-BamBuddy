@@ -9,7 +9,9 @@ unaffected. FK enforcement is off in the test engine, so rows may reference
 arbitrary ids without seeding parents.
 """
 
-from unittest.mock import AsyncMock, patch
+import contextlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -20,7 +22,9 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.sku import Sku, SkuFile
+from backend.app.services import print_scheduler as ps_module
 from backend.app.services.print_scheduler import scheduler
+from backend.app.services.printer_manager import printer_manager
 
 pytestmark = pytest.mark.asyncio
 
@@ -115,3 +119,149 @@ class TestFailQueueItemHook:
         assert item.status == "failed"
         r = await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.retry_of_id == item.id))
         assert r.scalars().first() is None
+
+
+@contextlib.contextmanager
+def _usb_preflight_env(*, status):
+    """Patch the printer_manager surface + FTP / notification / power sinks the
+    USB pre-flight and its downstream dispatch touch.
+
+    ``status`` is the object ``printer_manager.get_status`` returns (or ``None``
+    to simulate 'no live status at all'). The 2.5 s settle wait is zeroed so the
+    test doesn't actually sleep. Yields the mocks for assertions.
+    """
+    req = MagicMock(return_value=True)
+    notif = AsyncMock()
+    upload = AsyncMock(return_value=True)
+    ftp_retry = AsyncMock(return_value=True)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(printer_manager, "is_connected", return_value=True))
+        stack.enter_context(patch.object(printer_manager, "request_status_update", req))
+        stack.enter_context(patch.object(printer_manager, "get_status", MagicMock(return_value=status)))
+        stack.enter_context(patch.object(ps_module, "_USB_PREFLIGHT_WAIT_S", 0))
+        stack.enter_context(patch.object(ps_module.notification_service, "on_queue_job_waiting", notif))
+        stack.enter_context(patch.object(ps_module, "upload_file_async", upload))
+        stack.enter_context(patch.object(ps_module, "with_ftp_retry", ftp_retry))
+        stack.enter_context(patch.object(scheduler, "_power_off_if_needed", AsyncMock()))
+        yield SimpleNamespace(request_status_update=req, notif=notif, upload=upload, ftp_retry=ftp_retry)
+
+
+class TestUsbPreflight:
+    """Dispatch-time USB pre-flight (fail-open, self-clearing).
+
+    The H2 fleet needs a USB stick for LAN dispatch (no usable internal
+    storage); the firmware reports USB presence (``state.sdcard``) only in a
+    full status report. Before dispatching, ``_start_print`` requests a fresh
+    report and — ONLY if the drive is confirmed absent (``sdcard`` is
+    explicitly False) — holds the item pending with ``waiting_reason =
+    "no_usb_drive"`` instead of letting the upload fail with an opaque FTPS 553.
+    """
+
+    async def test_no_usb_holds_dispatch_without_uploading(self, db_session):
+        printer = await _mk_printer(db_session, "USB1")
+        item = PrintQueueItem(printer_id=printer.id, status="pending", plate_id=1, position=1)
+        db_session.add(item)
+        await db_session.commit()
+
+        with _usb_preflight_env(status=SimpleNamespace(sdcard=False)) as m:
+            await scheduler._start_print(db_session, item)
+
+        await db_session.refresh(item)
+        assert item.waiting_reason == "no_usb_drive"
+        assert item.status == "pending"  # a WAIT, not a failure — no retry burn
+        m.request_status_update.assert_called_once_with(printer.id)
+        m.notif.assert_awaited_once()
+        assert m.notif.await_args.kwargs["waiting_reason"] == "no_usb_drive"
+        m.upload.assert_not_awaited()  # no dispatch attempted
+        m.ftp_retry.assert_not_awaited()
+
+    async def test_notifies_once_across_repeated_ticks(self, db_session):
+        printer = await _mk_printer(db_session, "USB2")
+        item = PrintQueueItem(printer_id=printer.id, status="pending", plate_id=1, position=1)
+        db_session.add(item)
+        await db_session.commit()
+
+        with _usb_preflight_env(status=SimpleNamespace(sdcard=False)) as m:
+            await scheduler._start_print(db_session, item)
+            await scheduler._start_print(db_session, item)
+
+        m.notif.assert_awaited_once()  # deduped on the 2nd tick (already waiting)
+        assert m.request_status_update.call_count == 2  # a fresh report every pass
+        await db_session.refresh(item)
+        assert item.waiting_reason == "no_usb_drive"
+        assert item.status == "pending"
+
+    async def test_usb_present_proceeds_and_clears_stale_reason(self, db_session):
+        printer = await _mk_printer(db_session, "USB3")
+        # Stale hold from a prior tick — the capability gate's existing
+        # waiting_reason reset must clear it once dispatch proceeds.
+        item = PrintQueueItem(
+            printer_id=printer.id, status="pending", plate_id=1, position=1, waiting_reason="no_usb_drive"
+        )
+        db_session.add(item)
+        await db_session.commit()
+
+        with _usb_preflight_env(status=SimpleNamespace(sdcard=True)) as m:
+            await scheduler._start_print(db_session, item)
+
+        m.request_status_update.assert_called_once_with(printer.id)
+        m.notif.assert_not_awaited()  # not held → no waiting notification
+        await db_session.refresh(item)
+        assert item.waiting_reason is None  # self-cleared via the existing pattern
+        # Proceeded past the USB gate: with no source file the item reaches the
+        # downstream "no source" failure — proof it did NOT hold on USB.
+        assert item.status == "failed"
+        assert item.error_message == "No source file specified"
+
+    async def test_status_missing_fails_open(self, db_session):
+        printer = await _mk_printer(db_session, "USB4")
+        item = PrintQueueItem(printer_id=printer.id, status="pending", plate_id=1, position=1)
+        db_session.add(item)
+        await db_session.commit()
+
+        # No live status object at all → fail-open (proceed).
+        with _usb_preflight_env(status=None) as m:
+            await scheduler._start_print(db_session, item)
+
+        m.notif.assert_not_awaited()
+        await db_session.refresh(item)
+        assert item.waiting_reason != "no_usb_drive"
+        assert item.status == "failed"  # proceeded to downstream no-source failure
+
+    async def test_sdcard_none_fails_open(self, db_session):
+        printer = await _mk_printer(db_session, "USB5")
+        item = PrintQueueItem(printer_id=printer.id, status="pending", plate_id=1, position=1)
+        db_session.add(item)
+        await db_session.commit()
+
+        # Live status present but sdcard flag not reported (None) → fail-open.
+        with _usb_preflight_env(status=SimpleNamespace(sdcard=None)) as m:
+            await scheduler._start_print(db_session, item)
+
+        m.notif.assert_not_awaited()
+        await db_session.refresh(item)
+        assert item.waiting_reason != "no_usb_drive"
+        assert item.status == "failed"
+
+    async def test_self_clears_false_then_true(self, db_session):
+        printer = await _mk_printer(db_session, "USB6")
+        item = PrintQueueItem(printer_id=printer.id, status="pending", plate_id=1, position=1)
+        db_session.add(item)
+        await db_session.commit()
+
+        # Tick 1 — USB absent → held.
+        with _usb_preflight_env(status=SimpleNamespace(sdcard=False)) as m1:
+            await scheduler._start_print(db_session, item)
+        await db_session.refresh(item)
+        assert item.waiting_reason == "no_usb_drive"
+        assert item.status == "pending"
+        m1.notif.assert_awaited_once()
+
+        # Tick 2 — USB restored → dispatch proceeds, reason self-clears.
+        with _usb_preflight_env(status=SimpleNamespace(sdcard=True)) as m2:
+            await scheduler._start_print(db_session, item)
+        await db_session.refresh(item)
+        assert item.waiting_reason is None
+        assert item.status == "failed"  # proceeded past the USB gate
+        m2.notif.assert_not_awaited()
+        m2.request_status_update.assert_called_once_with(printer.id)

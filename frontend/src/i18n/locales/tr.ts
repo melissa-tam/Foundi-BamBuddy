@@ -171,6 +171,7 @@ export default {
         visionHold: 'Yazıcı görüşü: plaka boş değil — yatağı temizleyin, sonra yazıcıdan sürdürün',
         previousPrintFailed: 'Bekletildi: önceki baskı başarısız oldu',
         filamentShort: 'Filament az',
+        no_usb_drive: 'Yazıcıda USB sürücü yok — bir USB-A sürücü (FAT32/exFAT) takın',
       },
       printerState: {
         ok: 'Hazır',

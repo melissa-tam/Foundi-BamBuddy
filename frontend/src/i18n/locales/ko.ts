@@ -171,6 +171,7 @@ export default {
         visionHold: '프린터 비전: 플레이트가 비어 있지 않습니다 — 베드를 비운 뒤 프린터에서 재개하세요',
         previousPrintFailed: '보류됨: 이전 인쇄가 실패했습니다',
         filamentShort: '필라멘트 부족',
+        no_usb_drive: '프린터에 USB 드라이브가 없습니다 — USB-A 드라이브(FAT32/exFAT)를 삽입하세요',
       },
       printerState: {
         ok: '준비됨',

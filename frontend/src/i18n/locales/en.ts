@@ -171,6 +171,7 @@ export default {
         visionHold: 'Printer vision: plate not empty — clear the bed, then resume on the printer',
         previousPrintFailed: 'Held: previous print failed',
         filamentShort: 'Low filament',
+        no_usb_drive: 'No USB drive in the printer — insert a USB-A drive (FAT32/exFAT)',
       },
       printerState: {
         ok: 'Ready',

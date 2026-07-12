@@ -171,6 +171,7 @@ export default {
         visionHold: '印表機視覺偵測：列印板不為空 — 清理熱床後在印表機上繼續',
         previousPrintFailed: '已擱置：上一次列印失敗',
         filamentShort: '線材不足',
+        no_usb_drive: '印表機中沒有 USB 隨身碟 — 請插入 USB-A 隨身碟（FAT32/exFAT）',
       },
       printerState: {
         ok: '就緒',

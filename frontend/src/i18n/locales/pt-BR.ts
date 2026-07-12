@@ -171,6 +171,7 @@ export default {
         visionHold: 'Visão da impressora: placa não vazia — libere a placa e retome na impressora',
         previousPrintFailed: 'Retida: a impressão anterior falhou',
         filamentShort: 'Filamento insuficiente',
+        no_usb_drive: 'Nenhuma unidade USB na impressora — insira uma unidade USB-A (FAT32/exFAT)',
       },
       printerState: {
         ok: 'Pronta',

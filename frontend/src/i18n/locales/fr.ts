@@ -171,6 +171,7 @@ export default {
         visionHold: 'Vision de l\'imprimante : plateau non vide — dégagez le plateau, puis reprenez sur l\'imprimante',
         previousPrintFailed: 'Retenue : l\'impression précédente a échoué',
         filamentShort: 'Filament insuffisant',
+        no_usb_drive: 'Aucune clé USB dans l\'imprimante — insérez une clé USB-A (FAT32/exFAT)',
       },
       printerState: {
         ok: 'Prête',

@@ -171,6 +171,7 @@ export default {
         visionHold: 'Visión de la impresora: cama no vacía — despeje la cama y reanude en la impresora',
         previousPrintFailed: 'Retenida: la impresión anterior falló',
         filamentShort: 'Filamento insuficiente',
+        no_usb_drive: 'No hay unidad USB en la impresora — inserte una unidad USB-A (FAT32/exFAT)',
       },
       printerState: {
         ok: 'Lista',

@@ -171,6 +171,7 @@ export default {
         visionHold: 'Visione della stampante: piatto non vuoto — libera il piatto, poi riprendi sulla stampante',
         previousPrintFailed: 'Trattenuta: la stampa precedente non è riuscita',
         filamentShort: 'Filamento insufficiente',
+        no_usb_drive: 'Nessuna chiavetta USB nella stampante — inserisci un\'unità USB-A (FAT32/exFAT)',
       },
       printerState: {
         ok: 'Pronta',

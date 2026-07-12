@@ -171,6 +171,7 @@ export default {
         visionHold: 'プリンターの検知: プレートが空ではありません — ベッドを片付けてからプリンター側で再開してください',
         previousPrintFailed: '保留中: 前の印刷が失敗しました',
         filamentShort: 'フィラメント不足',
+        no_usb_drive: 'プリンターにUSBドライブがありません — USB-Aドライブ（FAT32/exFAT）を挿入してください',
       },
       printerState: {
         ok: '準備完了',

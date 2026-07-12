@@ -171,6 +171,7 @@ export default {
         visionHold: 'Druckererkennung: Platte nicht leer — Bett freiräumen, dann am Drucker fortsetzen',
         previousPrintFailed: 'Angehalten: vorheriger Druck fehlgeschlagen',
         filamentShort: 'Filament knapp',
+        no_usb_drive: 'Kein USB-Stick im Drucker — USB-A-Laufwerk (FAT32/exFAT) einstecken',
       },
       printerState: {
         ok: 'Bereit',

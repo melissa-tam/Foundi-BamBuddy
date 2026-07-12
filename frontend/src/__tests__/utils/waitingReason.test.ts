@@ -26,6 +26,7 @@ describe('waitingReasonText', () => {
       'productionRuns.detail.waiting.previousPrintFailed',
     );
     expect(waitingReasonText('filament_short', t)).toBe('productionRuns.detail.waiting.filamentShort');
+    expect(waitingReasonText('no_usb_drive', t)).toBe('productionRuns.detail.waiting.no_usb_drive');
   });
 
   it('passes an unknown (already human-readable) reason through verbatim', () => {
