@@ -4,6 +4,7 @@ import pytest
 
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.generator import (
+    DUAL_NOZZLE_HOME,
     EjectGenerationError,
     generate_eject_gcode,
 )
@@ -220,6 +221,56 @@ class TestRejections:
 
     def test_h2s_geometry_present(self):
         assert H2S_GEOMETRY.bed == (340.0, 320.0)
+
+
+class TestDualNozzleHoming:
+    """Dual-nozzle (Vortek) prologue homing — 007-H2C incident, 2026-07-12.
+
+    An unparameterized `G28` / `G28 X Y` stall-loops on dual-nozzle H2 firmware
+    (failed sensorless X-homing: the carriage rams the X-homing wall nonstop).
+    Dual models must home with the stock torque-parameterized forms
+    (DUAL_NOZZLE_HOME); single-nozzle models keep `G28 X Y` byte-identical.
+    """
+
+    def test_dual_geometry_emits_parameterized_home_lines(self):
+        gcode = generate_eject_gcode(_profile(), 30.0, H2C_GEOMETRY)
+        lines = [ln.strip() for ln in gcode.splitlines()]
+        for home in DUAL_NOZZLE_HOME:
+            assert home in lines
+        # In order, directly after M17, before G90.
+        m17_idx = lines.index("M17")
+        x_idx = lines.index("G28 X T300")
+        y_idx = lines.index("G28 Y T300")
+        g90_idx = lines.index("G90")
+        assert m17_idx < x_idx < y_idx < g90_idx
+
+    def test_dual_geometry_never_emits_g28_x_y(self):
+        gcode = generate_eject_gcode(_profile(), 30.0, H2C_GEOMETRY)
+        lines = [ln.strip() for ln in gcode.splitlines()]
+        assert "G28 X Y" not in lines
+        # And never a bare / Z-touching home either.
+        assert not any(ln == "G28" for ln in lines)
+        assert not any(ln.startswith("G28") and "Z" in ln for ln in lines)
+
+    def test_h2s_geometry_keeps_g28_x_y_and_no_parameterized_forms(self):
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
+        lines = [ln.strip() for ln in gcode.splitlines()]
+        assert "G28 X Y" in lines
+        for home in DUAL_NOZZLE_HOME:
+            assert home not in lines
+        assert "T300" not in gcode
+
+    def test_dual_block_self_validates(self):
+        profile = _profile()
+        gcode = generate_eject_gcode(profile, 30.0, H2C_GEOMETRY)
+        result = validate_eject_gcode(gcode, profile, 30.0, H2C_GEOMETRY)
+        assert result.ok, result.errors
+
+    def test_dual_dryrun_block_self_validates(self):
+        profile = _profile()
+        gcode = generate_eject_gcode(profile, 30.0, H2C_GEOMETRY, include_cooldown=False)
+        result = validate_eject_gcode(gcode, profile, 30.0, H2C_GEOMETRY, require_cooldown=False)
+        assert result.ok, result.errors
 
 
 class TestSweepBand:

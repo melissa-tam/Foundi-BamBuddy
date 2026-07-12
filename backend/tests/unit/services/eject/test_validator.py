@@ -1,7 +1,9 @@
 """Negative tests for the eject G-code validator — one guard per test."""
 
+import pytest
+
 from backend.app.models.eject_profile import EjectProfile
-from backend.app.services.eject.generator import generate_eject_gcode
+from backend.app.services.eject.generator import DUAL_NOZZLE_HOME, generate_eject_gcode
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
 
@@ -229,3 +231,90 @@ class TestCooldownRequirement:
         result = validate_eject_gcode(bad, profile, 30.0, H2S_GEOMETRY, require_cooldown=False)
         assert not result.ok
         assert any("envelope" in e and "X" in e for e in result.errors)
+
+
+def _valid_dual(profile=None, max_z=30.0):
+    """A freshly generated dual-nozzle (H2C) block + its profile."""
+    profile = profile or _profile()
+    return generate_eject_gcode(profile, max_z, H2C_GEOMETRY), profile
+
+
+class TestDualNozzleHomeRequirement:
+    """Dual-nozzle models must home with BOTH parameterized stock forms
+    (DUAL_NOZZLE_HOME) — 007-H2C stall-loop incident, 2026-07-12. The bare
+    `G28 X Y` requirement applies only to non-dual models."""
+
+    def test_dual_generated_block_validates(self):
+        gcode, profile = _valid_dual()
+        result = validate_eject_gcode(gcode, profile, 30.0, H2C_GEOMETRY)
+        assert result.ok, result.errors
+
+    @pytest.mark.parametrize("missing", DUAL_NOZZLE_HOME)
+    def test_dual_block_missing_a_home_line_rejected(self, missing):
+        gcode, profile = _valid_dual()
+        stripped = "\n".join(ln for ln in gcode.splitlines() if ln.strip() != missing) + "\n"
+        result = validate_eject_gcode(stripped, profile, 30.0, H2C_GEOMETRY)
+        assert not result.ok
+        assert any(f"missing dual-nozzle home '{missing}'" in e for e in result.errors), result.errors
+
+    def test_dual_block_missing_both_home_lines_names_both(self):
+        gcode, profile = _valid_dual()
+        stripped = "\n".join(ln for ln in gcode.splitlines() if not ln.strip().startswith("G28")) + "\n"
+        result = validate_eject_gcode(stripped, profile, 30.0, H2C_GEOMETRY)
+        assert not result.ok
+        for home in DUAL_NOZZLE_HOME:
+            assert any(f"missing dual-nozzle home '{home}'" in e for e in result.errors), result.errors
+
+    def test_dual_block_with_g28_x_y_instead_rejected(self):
+        # Swapping the parameterized homes for the single-nozzle `G28 X Y` (the
+        # exact line that stall-loops on this firmware) must fail.
+        gcode, profile = _valid_dual()
+        lines = gcode.splitlines()
+        lines = [ln for ln in lines if ln.strip() not in DUAL_NOZZLE_HOME]
+        m17 = lines.index("M17")
+        lines.insert(m17 + 1, "G28 X Y")
+        result = validate_eject_gcode("\n".join(lines) + "\n", profile, 30.0, H2C_GEOMETRY)
+        assert not result.ok
+        assert any("missing dual-nozzle home" in e for e in result.errors)
+
+    def test_g28_x_t300_not_misparsed_as_bare_g28(self):
+        # `G28 X T300` homes exactly one axis (X); the T300 is a stall-torque
+        # PARAMETER. It must trip neither the bare-G28 nor the G28-Z rejection —
+        # on ANY geometry (the parse is model-independent).
+        gcode, profile = _valid_dual()
+        for geometry in (H2C_GEOMETRY, H2S_GEOMETRY):
+            result = validate_eject_gcode(gcode, profile, 30.0, geometry)
+            assert not any("all axes" in e for e in result.errors), result.errors
+            assert not any("bed centre" in e for e in result.errors), result.errors
+
+    def test_h2s_block_not_required_to_carry_dual_homes(self):
+        # Non-dual geometry: the existing `G28 X Y` requirement, no dual demand.
+        gcode, profile = _valid()
+        result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY)
+        assert result.ok, result.errors
+        assert not any("dual-nozzle home" in e for e in result.errors)
+
+
+class TestStandaloneToolChangeGuard:
+    """A standalone tool-change (first token `T<digits>`) drives the AMS/Vortek
+    tool state machine and is forbidden in eject blocks on ALL models."""
+
+    @pytest.mark.parametrize("tool_line", ["T0", "T65535"])
+    @pytest.mark.parametrize(
+        "geometry", [H2S_GEOMETRY, H2C_GEOMETRY], ids=[g.model_key for g in (H2S_GEOMETRY, H2C_GEOMETRY)]
+    )
+    def test_standalone_tool_change_rejected(self, tool_line, geometry):
+        profile = _profile()
+        gcode = generate_eject_gcode(profile, 30.0, geometry)
+        bad = gcode + tool_line + "\n"
+        result = validate_eject_gcode(bad, profile, 30.0, geometry)
+        assert not result.ok
+        assert any("tool-change commands are forbidden" in e for e in result.errors), result.errors
+
+    def test_t_parameter_inside_g28_does_not_trip_guard(self):
+        # The dual block's own `G28 X T300` lines: T300 is a parameter, not a
+        # first-token tool select — the guard must stay silent.
+        gcode, profile = _valid_dual()
+        result = validate_eject_gcode(gcode, profile, 30.0, H2C_GEOMETRY)
+        assert result.ok, result.errors
+        assert not any("tool-change" in e for e in result.errors)

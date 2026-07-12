@@ -62,7 +62,7 @@ async def _seed_geometry(db_session):
                 model_key="H2C",
                 bed_x=330,
                 bed_y=320,
-                env_x_min=25,
+                env_x_min=0,
                 env_x_max=325,
                 env_y_min=0,
                 env_y_max=320,
@@ -414,6 +414,44 @@ class TestEjectProfileDryRun:
         )
         assert resp.status_code == 422
         assert "machine-end" in resp.json()["detail"].lower()
+
+    async def test_dry_run_h2c_uses_dual_nozzle_parameterized_home(
+        self, async_client: AsyncClient, db_session, tmp_path
+    ):
+        # Dual-nozzle (H2C) dry-run: the prepended homing must be the THREE
+        # parameterized stock forms — an unparameterized `G28` stall-loops on this
+        # firmware (007-H2C incident, 2026-07-12). The eject block itself homes
+        # with the two X/Y torque forms and never emits `G28 X Y`.
+        pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="dryh2c"))).json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="dryh2c.gcode.3mf")
+
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/dry-run", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2C"}
+        )
+        assert resp.status_code == 200, resp.text
+        # Unvalidated H2C geometry is allowed for the ladder tools, with a warning.
+        assert "not hardware-validated" in resp.headers.get("x-geometry-warnings", "")
+
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            gcode = zf.read("Metadata/plate_1.gcode").decode()
+        lines = [ln.strip() for ln in gcode.splitlines()]
+
+        # The prepended dry-run home: all three parameterized forms, in order,
+        # BEFORE the eject block starts; NO unparameterized G28 anywhere.
+        block_start_idx = lines.index("; ===== FARM EJECT BLOCK profile=dryh2c =====")
+        x_idx = lines.index("G28 X T300")
+        y_idx = lines.index("G28 Y T300")
+        z_idx = lines.index("G28 Z P0 T250")
+        assert x_idx < y_idx < z_idx < block_start_idx
+        assert not any(ln == "G28" for ln in lines)
+        assert "G28 X Y" not in lines
+        # The eject block repeats the X/Y torque homes (its own prologue).
+        assert lines.count("G28 X T300") == 2
+        assert lines.count("G28 Y T300") == 2
+        assert lines.count("G28 Z P0 T250") == 1  # dry-run prepend only, never in-block
+        # Thermal-less dry-run shape unchanged; H2C centre park (bed 330x320).
+        assert "M190" not in gcode
+        assert "G1 X165 Y160 Z10 F9000" in gcode
 
     async def test_dry_run_unknown_profile_404(self, async_client: AsyncClient, db_session, tmp_path):
         lib = await _add_library_file(db_session, tmp_path, name="d404.gcode.3mf")

@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from backend.app.utils.printer_models import is_dual_nozzle_model
+
 if TYPE_CHECKING:
     from backend.app.models.eject_profile import EjectProfile
     from backend.app.services.eject.geometry import ModelGeometry
@@ -34,6 +36,27 @@ if TYPE_CHECKING:
 # toolhead cannot reliably clear a part across the band, so a tighter band is a
 # safety error (schema-validated and re-checked here + in the validator).
 SWEEP_BAND_MIN_WIDTH_MM = 10.0
+
+# Dual-nozzle (Vortek) homing forms — shared source of truth for the generator
+# and the validator (like SWEEP_BAND_MIN_WIDTH_MM above).
+#
+# INCIDENT (007-H2C, 2026-07-12): a bare `G28` / `G28 X Y` in the post-print
+# no-tool state stall-loops on dual-nozzle H2-series firmware — the sensorless
+# X-homing stall threshold is unsuited to the dual carriage, so the carriage rams
+# the X-homing wall nonstop until emergency-stopped. The stock O1C2 start block
+# NEVER homes unparameterized: it uses these torque-parameterized forms, where
+# `T` is the stall-torque threshold. Copied VERBATIM from that stock start block;
+# homes X then Y in two SEPARATE parameterized commands. Validated calm by the
+# supervised motion-smoke ladder (2026-07-12).
+DUAL_NOZZLE_HOME: tuple[str, str] = ("G28 X T300", "G28 Y T300")
+
+# Dry-run (EMPTY BED) full home for dual-nozzle models: the two X/Y forms plus the
+# stock Z-home form. A Z-home probes the bed centre — safe ONLY on the
+# by-definition-empty dry-run bed (hardware-ladder step 1), never in a production
+# block. The `G28 Z P0 T250` form is ATTESTED in the O1C2 stock start block but was
+# NOT individually micro-probed; it gets its first live exercise at the supervised
+# dry run.
+DUAL_NOZZLE_DRYRUN_HOME: tuple[str, ...] = ("G28 X T300", "G28 Y T300", "G28 Z P0 T250")
 
 # Marker comments wrapping the generated block so it is unambiguously locatable
 # in an injected file (and greppable in dry-run downloads).
@@ -176,7 +199,12 @@ def generate_eject_gcode(
     # part still sits. Home X/Y only, then lift the bed clear of the part.
     lines.append("; --- prologue: re-engage motors, home X/Y (never Z) ---")
     lines.append("M17")
-    lines.append("G28 X Y")
+    if is_dual_nozzle_model(geometry.model_key):
+        # Dual-nozzle firmware stall-loops on unparameterized homing (see
+        # DUAL_NOZZLE_HOME) — home X then Y with the stock parameterized forms.
+        lines.extend(DUAL_NOZZLE_HOME)
+    else:
+        lines.append("G28 X Y")
     lines.append("G90")
     lines.append(f"G1 Z{_fmt(max_z_height + profile.clearance_mm)} F900")
 

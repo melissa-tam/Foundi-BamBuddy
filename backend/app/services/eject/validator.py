@@ -13,9 +13,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from backend.app.services.eject.generator import (
+    DUAL_NOZZLE_HOME,
     SWEEP_BAND_MIN_WIDTH_MM,
     block_start_marker,
 )
+from backend.app.utils.printer_models import is_dual_nozzle_model
 
 if TYPE_CHECKING:
     from backend.app.models.eject_profile import EjectProfile
@@ -24,6 +26,13 @@ if TYPE_CHECKING:
 _EPS = 1e-6
 # One word/param token, e.g. "X170", "Z0.4", "R28", "F9000".
 _TOKEN_RE = re.compile(r"^([A-Za-z])(-?\d+(?:\.\d+)?)$")
+# A standalone tool-change command whose FIRST token selects a tool (T0, T65535).
+# `T300` inside `G28 X T300` is a PARAMETER (never the first token) — not matched.
+_TOOLCHANGE_RE = re.compile(r"^T\d+$")
+# G28 axis letters only — X/Y/Z. Any other trailing address word (e.g. the
+# stall-torque `T300`, the `P0` on the Z-home form) is a PARAMETER, not an axis,
+# and must not be mistaken for one when deciding "bare G28" / "G28 Z".
+_G28_AXES = ("X", "Y", "Z")
 
 
 @dataclass
@@ -122,6 +131,14 @@ def validate_eject_gcode(
     y_hi = env_y_max + _EPS
     z_floor = profile.z_offset_mm - _EPS
 
+    dual = is_dual_nozzle_model(geometry.model_key)
+    # Token-tuple -> original line for each required dual-nozzle home command, so
+    # presence is a token-level match (whitespace/case independent), mirroring the
+    # G28-form parsing below. A dual block homes X and Y in two SEPARATE
+    # parameterized commands, so both must be present.
+    required_home = {tuple(tok.upper() for tok in line.split()): line for line in DUAL_NOZZLE_HOME}
+    found_home: set[tuple[str, ...]] = set()
+
     m190_count = 0
     has_m17 = False
     has_g90 = False
@@ -133,14 +150,26 @@ def validate_eject_gcode(
             continue
         cmd = tokens[0].upper()
 
+        # Guard (ALL models): a standalone tool-change command — first token
+        # T<digits> (e.g. T0, T65535) — drives the AMS / Vortek tool state
+        # machine; an eject block must stay tool-state-neutral. `T300` inside
+        # `G28 X T300` is a parameter (not the first token), so it never trips.
+        if _TOOLCHANGE_RE.match(cmd):
+            errors.append("tool-change commands are forbidden in eject blocks")
+
         if cmd == "M17":
             has_m17 = True
         elif cmd == "G90":
             has_g90 = True
         elif cmd == "G28":
-            # Guard: never home Z (probes the bed centre under the part) and
-            # never bare G28 (homes all axes, including Z).
-            axes = {t[0].upper() for t in tokens[1:] if t and t[0].isalpha()}
+            # Only X/Y/Z are axes; trailing T/P address words are PARAMETERS (the
+            # dual-nozzle torque forms `G28 X T300` / `G28 Y T300` each home one
+            # axis). Never home Z (probes the bed centre under the part) and never
+            # bare G28 (homes all axes, including Z).
+            axes = {t[0].upper() for t in tokens[1:] if t and t[0].upper() in _G28_AXES}
+            norm = tuple(t.upper() for t in tokens)
+            if norm in required_home:
+                found_home.add(norm)
             if not axes:
                 errors.append("G28 with no axis letters homes all axes (incl. Z) — forbidden with a part on the plate")
             elif "Z" in axes:
@@ -183,7 +212,13 @@ def validate_eject_gcode(
         errors.append("Prologue missing 'M17' (motors not re-engaged)")
     if not has_g90:
         errors.append("Prologue missing 'G90' (absolute positioning)")
-    if not has_g28_xy:
+    if dual:
+        # Dual-nozzle firmware stall-loops on a bare `G28 X Y`; the block homes X
+        # and Y with the two parameterized forms instead — require both present.
+        for norm, line in required_home.items():
+            if norm not in found_home:
+                errors.append(f"Prologue missing dual-nozzle home {line!r}")
+    elif not has_g28_xy:
         errors.append("Prologue missing 'G28 X Y' home")
 
     return ValidationResult(ok=not errors, errors=errors, warnings=warnings)

@@ -10,8 +10,8 @@ import pytest
 
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.dispatch import build_part_present_eject_file
-from backend.app.services.eject.generator import EjectGenerationError
-from backend.tests.unit.services.eject.geometry_fixtures import H2S_GEOMETRY
+from backend.app.services.eject.generator import DUAL_NOZZLE_HOME, EjectGenerationError
+from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
 
 _PLATE_GCODE = (
     "; HEADER_BLOCK_START\n"
@@ -125,3 +125,30 @@ class TestBuildPartPresentEjectFile:
                 build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
         finally:
             src.unlink(missing_ok=True)
+
+    def test_h2c_dual_nozzle_home_flows_through_shared_path(self):
+        # The part-present builder flows through the SAME generator + validator as
+        # production injection: an H2C build must carry the dual-nozzle
+        # parameterized homes (007-H2C stall-loop incident, 2026-07-12) and pass
+        # the dual-aware validation the builder runs internally (a validation
+        # failure would have raised EjectGenerationError).
+        src = _make_3mf()
+        out = None
+        try:
+            out = build_part_present_eject_file(src, 1, _profile(), H2C_GEOMETRY)
+            gcode = _read_plate_gcode(out)
+        finally:
+            src.unlink(missing_ok=True)
+            if out:
+                out.unlink(missing_ok=True)
+
+        lines = [ln.strip() for ln in gcode.splitlines()]
+        for home in DUAL_NOZZLE_HOME:
+            assert home in lines
+        # The single-nozzle form is gone, along with any bare / Z home.
+        assert "G28 X Y" not in lines
+        assert not re.search(r"^G28\s*$", gcode, re.MULTILINE)
+        assert not any(ln.startswith("G28") and " Z" in ln for ln in lines)
+        # Standard block content still present (cooldown gate, markers).
+        assert gcode.count("M190 R28") == 5
+        assert "FARM EJECT BLOCK" in gcode

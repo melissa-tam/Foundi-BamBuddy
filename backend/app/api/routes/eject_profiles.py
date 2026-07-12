@@ -43,6 +43,7 @@ from backend.app.schemas.eject_profile import (
 )
 from backend.app.services.eject.generator import (
     BLOCK_END_MARKER,
+    DUAL_NOZZLE_DRYRUN_HOME,
     EjectGenerationError,
     generate_eject_gcode,
 )
@@ -50,7 +51,7 @@ from backend.app.services.eject.geometry import ModelGeometry, get_geometry
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
-from backend.app.utils.printer_models import canon_model
+from backend.app.utils.printer_models import canon_model, is_dual_nozzle_model
 from backend.app.utils.threemf_tools import read_plate_gcode_header, repack_3mf_with_gcode
 
 router = APIRouter(prefix="/eject-profiles", tags=["eject-profiles"])
@@ -117,7 +118,7 @@ async def _resolve_preview_geometry(db: AsyncSession, body: EjectPreviewRequest)
     return geometry, warnings
 
 
-def _build_dryrun_gcode(source_path: Path, plate_index: int, eject_block: str) -> str:
+def _build_dryrun_gcode(source_path: Path, plate_index: int, eject_block: str, geometry: ModelGeometry) -> str:
     """Wrap the eject-only block into an executable dry-run body that still ends
     with the source's STOCK machine-end block.
 
@@ -127,6 +128,12 @@ def _build_dryrun_gcode(source_path: Path, plate_index: int, eject_block: str) -
         ; DRY-RUN full home (incl. Z — safe on the empty bed)
         [thermal-less eject block]
         [source ; MACHINE_END_GCODE_START .. EOF, verbatim]
+
+    ``geometry`` selects the prepended homing dialect: dual-nozzle models
+    (``is_dual_nozzle_model``) home with the parameterized stock forms
+    (``DUAL_NOZZLE_DRYRUN_HOME``) because an unparameterized ``G28`` stall-loops on
+    that firmware (007-H2C incident, 2026-07-12); single-nozzle models keep the
+    bare ``G28``.
 
     The eject block deliberately precedes the machine-end here — the OPPOSITE of
     production injection (which splices the eject block AFTER the machine-end).
@@ -180,11 +187,20 @@ def _build_dryrun_gcode(source_path: Path, plate_index: int, eject_block: str) -
 
     # Unlike a real print (whose start G-code homed Z long before the eject
     # block runs), the dry-run body starts cold — Z is unhomed, so the block's
-    # `G1 Z...` would move against an unknown datum. A full G28 (including Z)
+    # `G1 Z...` would move against an unknown datum. A full home (including Z)
     # is safe HERE ONLY because the dry run is by definition run on an EMPTY
     # bed (hardware-ladder step 1): there is no part for the Z-probe to hit.
-    # Never emit a bare G28 inside a production eject block.
-    homing = "; DRY-RUN ONLY: full home incl. Z - safe because the bed is EMPTY by definition of the dry run\nG28\n"
+    # Never emit a bare / unparameterized home inside a production eject block.
+    #
+    # Dual-nozzle firmware stall-loops on the unparameterized `G28` (007-H2C
+    # incident, 2026-07-12), so dual models get the parameterized stock forms
+    # (X/Y torque homes + `G28 Z P0 T250`); single-nozzle models keep the bare
+    # `G28` (H2S dry-run bytes unchanged).
+    homing_comment = "; DRY-RUN ONLY: full home incl. Z - safe because the bed is EMPTY by definition of the dry run\n"
+    if is_dual_nozzle_model(geometry.model_key):
+        homing = homing_comment + "\n".join(DUAL_NOZZLE_DRYRUN_HOME) + "\n"
+    else:
+        homing = homing_comment + "G28\n"
     # [G28 prologue] + [thermal-less eject block] + [machine-end .. EOF verbatim].
     body = homing + eject_block.rstrip("\n") + "\n" + machine_end
     if head:
@@ -328,7 +344,7 @@ def _build_dryrun_3mf(
     if BLOCK_END_MARKER not in eject_block:  # defensive — generator always emits it
         raise HTTPException(status_code=422, detail="Generated eject block is malformed")
 
-    dryrun_gcode = _build_dryrun_gcode(source_path, plate_index, eject_block)
+    dryrun_gcode = _build_dryrun_gcode(source_path, plate_index, eject_block, geometry)
     out_path = repack_3mf_with_gcode(source_path, plate_index, dryrun_gcode)
     if out_path is None:
         raise HTTPException(status_code=422, detail=f"Plate {plate_index} has no G-code to replace")

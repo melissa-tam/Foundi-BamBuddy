@@ -1,14 +1,20 @@
-"""Golden byte-equality guard for the ModelGeometry refactor (Phase 2).
+"""Golden byte-equality guard for the eject generator.
 
-The eject generator moved from two in-code dicts (``PRINTER_BED_DIMS`` /
-``PRINTER_TRAVEL_ENVELOPE``) to a ``ModelGeometry`` resolved from the registry.
-The golden ``.gcode`` fixtures in ``golden/`` were captured from the PRE-refactor
-generator (H2S). This test regenerates the same matrix through the NEW geometry
-path and asserts BYTE-IDENTICAL output.
+Two kinds of golden ``.gcode`` fixtures live in ``golden/``:
 
-RED LINE: any drift here means the refactor changed H2S eject G-code — the
-hardware ladder must be re-run before any dispatch. NEVER regenerate the goldens
-to make this pass; fix the generator so it reproduces them exactly.
+* **H2S goldens** (``*_h2s_*``) were captured from the PRE-refactor generator and
+  lock its exact bytes through the ``ModelGeometry`` path. RED LINE: any drift
+  here means the generator changed H2S eject G-code — the hardware ladder must be
+  re-run before any dispatch. NEVER regenerate the H2S goldens to make this pass;
+  fix the generator so it reproduces them exactly.
+* **H2C goldens** (``*_h2c_*``, added 2026-07-12) lock the ladder-validated
+  dual-nozzle recipe: the prologue homes with the parameterized stock forms
+  (``M17`` → ``G28 X T300`` → ``G28 Y T300`` → ``G90``) instead of the bare
+  ``G28 X Y`` that stall-loops on that firmware (007-H2C incident). They are
+  (re)generated from the CURRENT generator by ``capture_golden.py``.
+
+``capture_golden.py`` regenerates every fixture below (it imports this ``MATRIX``
+and ``_profile``), so the two never drift.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import pytest
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.generator import generate_eject_gcode
 from backend.app.services.eject.geometry import ModelGeometry
+from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY
 
 GOLDEN_DIR = pathlib.Path(__file__).parent / "golden"
 
@@ -64,22 +71,26 @@ def _profile(**overrides) -> EjectProfile:
     return profile
 
 
-# (golden_name, profile_overrides, max_z, cooldown_override, include_cooldown)
+# (golden_name, geometry, profile_overrides, max_z, cooldown_override, include_cooldown)
 # Must match capture_golden.py exactly — the goldens were captured from these.
+# H2S rows keep the module-local H2S_GEOMETRY (pre-refactor byte-lock); the H2C
+# rows use the shared H2C_GEOMETRY fixture (ladder-validated recipe lock).
 MATRIX = [
-    ("default_h2s_z30", {}, 30.0, None, True),
-    ("default_h2s_z42", {}, 42.0, None, True),
+    ("default_h2s_z30", H2S_GEOMETRY, {}, 30.0, None, True),
+    ("default_h2s_z42", H2S_GEOMETRY, {}, 42.0, None, True),
     (
         "band_h2s_z30",
+        H2S_GEOMETRY,
         {"name": "band", "sweep_x_min_mm": 50.0, "sweep_x_max_mm": 200.0, "x_passes": 11},
         30.0,
         None,
         True,
     ),
-    ("override_h2s_z25", {}, 25.0, 33.0, True),
-    ("dryrun_h2s_z30", {}, 30.0, None, False),
+    ("override_h2s_z25", H2S_GEOMETRY, {}, 25.0, 33.0, True),
+    ("dryrun_h2s_z30", H2S_GEOMETRY, {}, 30.0, None, False),
     (
         "startfrac_skimoff_h2s_z50",
+        H2S_GEOMETRY,
         {
             "name": "tall",
             "sweep_start_frac": 0.5,
@@ -92,22 +103,26 @@ MATRIX = [
         None,
         True,
     ),
+    # H2C dual-nozzle goldens (2026-07-12): mirror their H2S namesakes' parameters;
+    # the prologue locks the ladder-validated parameterized homing recipe.
+    ("default_h2c_z30", H2C_GEOMETRY, {}, 30.0, None, True),
+    ("dryrun_h2c_z30", H2C_GEOMETRY, {}, 30.0, None, False),
 ]
 
 
-@pytest.mark.parametrize("name,overrides,max_z,override,include_cooldown", MATRIX, ids=[m[0] for m in MATRIX])
-def test_h2s_geometry_path_is_byte_identical(name, overrides, max_z, override, include_cooldown):
+@pytest.mark.parametrize("name,geometry,overrides,max_z,override,include_cooldown", MATRIX, ids=[m[0] for m in MATRIX])
+def test_eject_gcode_is_byte_identical(name, geometry, overrides, max_z, override, include_cooldown):
     golden = (GOLDEN_DIR / f"{name}.gcode").read_bytes()
     produced = generate_eject_gcode(
         _profile(**overrides),
         max_z,
-        H2S_GEOMETRY,
+        geometry,
         cooldown_temp_c=override,
         include_cooldown=include_cooldown,
     ).encode("utf-8")
     assert produced == golden, (
-        f"H2S eject G-code DRIFTED for {name!r} through the ModelGeometry path. "
-        "The geometry refactor changed output — re-run the hardware ladder; do NOT regenerate goldens."
+        f"Eject G-code DRIFTED for {name!r} ({geometry.model_key}). "
+        "Generator output changed — re-run the hardware ladder; do NOT regenerate the H2S goldens."
     )
 
 

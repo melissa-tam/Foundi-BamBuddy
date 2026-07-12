@@ -30,7 +30,7 @@ async def seed_geometry(db_session):
             model_key="H2C",
             bed_x=330,
             bed_y=320,
-            env_x_min=25,
+            env_x_min=0,
             env_x_max=325,
             env_y_min=0,
             env_y_max=320,

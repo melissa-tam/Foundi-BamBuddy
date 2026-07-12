@@ -18,11 +18,14 @@ H2S_GEOMETRY = ModelGeometry(
     validated=True,
 )
 
-# H2C — provisional (unvalidated) geometry, conservative per-extruder intersection.
+# H2C — provisional (unvalidated) geometry. Envelope = the LEFT-extruder frame
+# measured live on 007-H2C (2026-07-12): the post-print no-tool state maps as the
+# left frame, printable X 0-325, Y 0-320 (matches Bambu's extruder_printable_area).
+# Replaces the earlier conservative 25-325 per-extruder intersection guess.
 H2C_GEOMETRY = ModelGeometry(
     model_key="H2C",
     bed=(330.0, 320.0),
-    envelope=(25.0, 325.0, 0.0, 320.0),
+    envelope=(0.0, 325.0, 0.0, 320.0),
     max_part_height_mm=42.0,
     validated=False,
 )
