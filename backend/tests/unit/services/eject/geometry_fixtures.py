@@ -18,14 +18,16 @@ H2S_GEOMETRY = ModelGeometry(
     validated=True,
 )
 
-# H2C — provisional (unvalidated) geometry. Envelope = the LEFT-extruder frame
-# measured live on 007-H2C (2026-07-12): the post-print no-tool state maps as the
-# left frame, printable X 0-325, Y 0-320 (matches Bambu's extruder_printable_area).
-# Replaces the earlier conservative 25-325 per-extruder intersection guess.
+# H2C — provisional (unvalidated) geometry. Envelope measured live on 007-H2C
+# (hardware ladder 2026-07-12): X-min step-probed 25→20→15 clean at mid-bed; the
+# no-tool carriage's reachable left limit sits INSIDE the left-extruder printable
+# 0-325 (a commanded X3 sweep lane contacted the left wall — incident 2), so the
+# left bound is the PROBED 15, operator-ruled. X-max 325 / Y 0-320 walked clean
+# at both edges.
 H2C_GEOMETRY = ModelGeometry(
     model_key="H2C",
     bed=(330.0, 320.0),
-    envelope=(0.0, 325.0, 0.0, 320.0),
+    envelope=(15.0, 325.0, 0.0, 320.0),
     max_part_height_mm=42.0,
     validated=False,
 )
