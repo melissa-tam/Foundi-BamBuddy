@@ -299,7 +299,17 @@ describe('formatTimeOnly', () => {
     const result = formatTimeOnly(date, '12h');
     // Locale-agnostic: separator is "." in en_DK, " " (NBSP) in some, ":" elsewhere.
     expect(result).toMatch(/\b0?2\D+30\b/);
-    expect(result.toUpperCase()).toContain('PM');
+    // Contract: 12h mode converts the 24h hour and renders the locale's own
+    // day-period marker ("PM", "p.m.", "午後", …) — never coupled to a spelling.
+    expect(result).not.toContain('14');
+    const dayPeriod = new Intl.DateTimeFormat(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+    })
+      .formatToParts(date)
+      .find((p) => p.type === 'dayPeriod')?.value;
+    if (dayPeriod) expect(result).toContain(dayPeriod);
   });
 
   it('formats time with 24h format', () => {
