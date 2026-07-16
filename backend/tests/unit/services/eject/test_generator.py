@@ -1,14 +1,16 @@
 """Golden-structure tests for the eject G-code generator."""
 
+from dataclasses import replace
+
 import pytest
 
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.generator import (
-    DUAL_NOZZLE_HOME,
     EjectGenerationError,
     generate_eject_gcode,
 )
 from backend.app.services.eject.validator import validate_eject_gcode
+from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
 from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
 
 
@@ -17,7 +19,6 @@ def _profile(**overrides) -> EjectProfile:
     defaults = {
         "name": "default",
         "cooldown_temp_c": 28.0,
-        "cooldown_retries": 5,
         "clearance_mm": 10.0,
         "z_offset_mm": 0.4,
         "descent_steps": 4,
@@ -33,6 +34,7 @@ def _profile(**overrides) -> EjectProfile:
         "sweep_x_min_mm": None,
         "sweep_x_max_mm": None,
         "sweep_start_frac": 1.0,
+        "bed_drop_clearance_mm": None,
     }
     defaults.update(overrides)
     profile = EjectProfile()
@@ -112,16 +114,26 @@ class TestDefaultsProfile:
         gcode = generate_eject_gcode(_profile(clearance_mm=10.0), 30.0, H2S_GEOMETRY)
         assert "G1 Z40 F900" in gcode  # 30 + 10
 
-    def test_cooldown_retries_and_threshold(self):
+    def test_motion_only_no_cooldown_wait(self):
+        # The eject block is motion-only now: the bed heater is commanded off but
+        # there is NO in-file cooldown wait (that moved into the eject monitor).
         gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
-        assert gcode.count("M190 R28") == 5
         assert "M140 S0" in gcode
+        assert "M190" not in gcode  # no cooldown release wait of any kind
+        assert "M106 S255" not in gcode  # no cooldown fan
 
-    def test_fan_assist_toggles_m106(self):
-        with_fan = generate_eject_gcode(_profile(cooling_fan_assist=True), 30.0, H2S_GEOMETRY)
-        without_fan = generate_eject_gcode(_profile(cooling_fan_assist=False), 30.0, H2S_GEOMETRY)
-        assert "M106 S255" in with_fan
-        assert "M106 S255" not in without_fan
+    def test_completion_epilogue_makes_block_self_completing(self):
+        # A standalone eject file must end FINISH, so the block carries the stock
+        # machine-end finish tail: progress reset + the judge-flag finish sequence
+        # + M400 + M18.
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
+        assert "M1002 judge_flag print_finish_air_filt_flag" in gcode
+        assert "M73 P100 R0" in gcode
+        assert "M400" in gcode
+        assert "M18" in gcode
+        # The epilogue sits after the sweep/park, before the block-end marker.
+        lines = gcode.splitlines()
+        assert lines.index("M18") < lines.index("; ===== FARM EJECT BLOCK END =====")
 
     def test_parks_centre_at_safe_z(self):
         gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
@@ -135,72 +147,6 @@ class TestDefaultsProfile:
             for tok in code.split():
                 if tok.startswith("Z"):
                     assert float(tok[1:]) >= 0.4 - 1e-9
-
-
-class TestThermalLessDryRunMode:
-    """include_cooldown=False strips the thermal gate for the empty-bed dry run.
-
-    The dry run validates sweep GEOMETRY on an ambient empty bed, where an
-    `M190 R` release wait can never complete (heater off, bed below target) and
-    would hang the job forever. The block keeps its M140 S0 safety-off but emits
-    no cooling fan and NO M190 waits.
-    """
-
-    def test_omits_all_m190_and_cooldown_fan(self):
-        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY, include_cooldown=False)
-        assert "M190" not in gcode  # zero release waits of any kind
-        assert "M106 S255" not in gcode  # no cooldown fan wait paired with M190
-        assert "M140 S0" in gcode  # heater safety-off is still emitted
-
-    def test_still_emits_prologue_and_full_sweep(self):
-        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY, include_cooldown=False)
-        lines = [ln.strip() for ln in gcode.splitlines()]
-        # Prologue re-engage (still never a bare G28 / G28 Z inside the block).
-        assert "M17" in lines
-        assert "G28 X Y" in lines
-        assert "G90" in lines
-        assert not any(ln == "G28" for ln in lines)
-        # Sweep + park geometry is unchanged from production.
-        assert any(ln.startswith("G1 Y") for ln in lines)
-        assert "G1 X170 Y160 Z10 F9000" in gcode  # centre park (bed 340x320)
-
-    def test_self_validates_as_dry_run(self):
-        profile = _profile()
-        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY, include_cooldown=False)
-        result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY, require_cooldown=False)
-        assert result.ok, result.errors
-
-    def test_geometry_identical_to_production_minus_thermal(self):
-        # Same sweep lanes/levels; only the thermal section differs.
-        profile = _profile(x_passes=3, descent_steps=2)
-        prod = generate_eject_gcode(profile, 25.0, H2S_GEOMETRY)
-        dry = generate_eject_gcode(profile, 25.0, H2S_GEOMETRY, include_cooldown=False)
-        sweep_prefixes = ("G1 X", "G1 Y", "G1 Z")
-        prod_moves = [ln for ln in prod.splitlines() if ln.startswith(sweep_prefixes)]
-        dry_moves = [ln for ln in dry.splitlines() if ln.startswith(sweep_prefixes)]
-        assert prod_moves == dry_moves
-
-    def test_production_default_keeps_full_thermal_gate(self):
-        # Explicit contrast: the default (production) path is unchanged.
-        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
-        assert "M140 S0" in gcode
-        assert "M106 S255" in gcode
-        assert gcode.count("M190 R28") == 5
-
-
-class TestCustomThresholdRetries:
-    def test_cold_release_eight_retries(self):
-        profile = _profile(name="cryonix", cooldown_temp_c=35.0, cooldown_retries=8)
-        gcode = generate_eject_gcode(profile, 20.0, H2S_GEOMETRY)
-        assert gcode.count("M190 R35") == 8
-        assert validate_eject_gcode(gcode, profile, 20.0, H2S_GEOMETRY).ok
-
-    def test_single_retry_and_lane(self):
-        profile = _profile(name="fast", cooldown_retries=1, x_passes=1, descent_steps=1)
-        gcode = generate_eject_gcode(profile, 15.0, H2S_GEOMETRY)
-        result = validate_eject_gcode(gcode, profile, 15.0, H2S_GEOMETRY)
-        assert result.ok, result.errors
-        assert gcode.count("M190 R28") == 1
 
 
 class TestRejections:
@@ -264,12 +210,6 @@ class TestDualNozzleHoming:
         profile = _profile()
         gcode = generate_eject_gcode(profile, 30.0, H2C_GEOMETRY)
         result = validate_eject_gcode(gcode, profile, 30.0, H2C_GEOMETRY)
-        assert result.ok, result.errors
-
-    def test_dual_dryrun_block_self_validates(self):
-        profile = _profile()
-        gcode = generate_eject_gcode(profile, 30.0, H2C_GEOMETRY, include_cooldown=False)
-        result = validate_eject_gcode(gcode, profile, 30.0, H2C_GEOMETRY, require_cooldown=False)
         assert result.ok, result.errors
 
 
@@ -456,3 +396,86 @@ class TestTravelEnvelopeClamp:
         profile = _profile()
         gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         assert validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).ok
+
+
+class TestBedDropReleaseAssist:
+    """Farm eject v2: the optional bed-drop release assist drives the bed all the
+    way DOWN (bigger Z) then back to the lift height, between the heater-off and the
+    sweep. NULL clearance = off (the v1 goldens stay byte-identical)."""
+
+    def test_drop_emits_down_then_return_between_heater_off_and_sweep(self):
+        # H2S z_travel 340, clearance 50 -> drop to 290; max_z 30 + clearance 10 ->
+        # return to lift 40. The pair sits after M140 S0, before the sweep comment.
+        profile = _profile(bed_drop_clearance_mm=50.0)
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        lines = [ln.strip() for ln in gcode.splitlines()]
+        # The drop (Z290) + return (Z40) are the two lines right after the marker,
+        # which itself sits between M140 S0 and the sweep. (Z40 also appears in the
+        # prologue clearance lift, so anchor positionally on the unique marker.)
+        heater_idx = lines.index("M140 S0")
+        marker_idx = lines.index("; --- bed-drop release assist: full down + return ---")
+        sweep_idx = lines.index("; --- sweep: push part off the front edge ---")
+        assert heater_idx < marker_idx < sweep_idx
+        assert lines[marker_idx + 1] == "G1 Z290 F900"
+        assert lines[marker_idx + 2] == "G1 Z40 F900"
+
+    def test_drop_zero_clearance_goes_to_full_travel(self):
+        # clearance 0 (still "set", not None) -> drop to the machine bottom z_travel.
+        profile = _profile(bed_drop_clearance_mm=0.0)
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        assert "G1 Z340 F900" in gcode  # 340 - 0
+        assert "G1 Z40 F900" in gcode  # return to lift
+
+    def test_disabled_emits_no_drop_marker(self):
+        gcode = generate_eject_gcode(_profile(bed_drop_clearance_mm=None), 30.0, H2S_GEOMETRY)
+        assert "bed-drop release assist" not in gcode
+
+    def test_missing_z_travel_fails_closed(self):
+        geom = replace(H2S_GEOMETRY, z_travel_mm=None)
+        with pytest.raises(EjectGenerationError, match="z_travel_mm"):
+            generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, geom)
+
+    def test_degenerate_drop_rejected(self):
+        # clearance so large the drop target is not below the lift height -> refuse.
+        # H2S z_travel 340, lift 40 -> clearance 305 gives drop 35 <= 40.
+        with pytest.raises(EjectGenerationError, match="degenerate drop"):
+            generate_eject_gcode(_profile(bed_drop_clearance_mm=305.0), 30.0, H2S_GEOMETRY)
+
+    def test_drop_block_self_validates_on_both_geometries(self):
+        for geometry, drop_z in ((H2S_GEOMETRY, "G1 Z290 F900"), (H2C_GEOMETRY, "G1 Z275 F900")):
+            profile = _profile(bed_drop_clearance_mm=50.0)
+            gcode = generate_eject_gcode(profile, 30.0, geometry)
+            assert drop_z in gcode
+            result = validate_eject_gcode(gcode, profile, 30.0, geometry)
+            assert result.ok, result.errors
+
+
+class TestBedslingerBedDropGuard:
+    """A bed-slinger's bed is fixed in Z (the gantry carries Z), so the bed-drop
+    release assist is physically meaningless and the generator must fail closed —
+    BEFORE the z_travel-None check, so the operator sees the bedslinger reason even
+    when z_travel is also absent."""
+
+    def test_bedslinger_with_bed_drop_raises(self):
+        # z_travel None (as seeded for A2L): the bedslinger guard fires first, so the
+        # message names the kinematics, not the missing z_travel.
+        geom = replace(H2S_GEOMETRY, model_key="A2L", z_travel_mm=None)
+        with pytest.raises(EjectGenerationError, match="bedslinger"):
+            generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, geom)
+
+    def test_bedslinger_guard_wins_even_when_z_travel_present(self):
+        # Even with a (nonsensical) z_travel set, a bedslinger + bed-drop is refused.
+        geom = replace(H2S_GEOMETRY, model_key="A2L", z_travel_mm=325.0)
+        with pytest.raises(EjectGenerationError, match="bedslinger"):
+            generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, geom)
+
+    def test_bedslinger_without_bed_drop_generates_fine(self):
+        # No bed-drop → the whole drop branch is skipped; a plain eject block for a
+        # bed-slinger generates and self-validates (the bedslinger warning does not
+        # make it invalid).
+        geom = replace(H2S_GEOMETRY, model_key="A2L", z_travel_mm=None)
+        profile = _profile(bed_drop_clearance_mm=None)
+        gcode = generate_eject_gcode(profile, 30.0, geom)
+        assert "bed-drop release assist" not in gcode
+        result = validate_eject_gcode(gcode, profile, 30.0, geom)
+        assert result.ok, result.errors

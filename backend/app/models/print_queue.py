@@ -107,6 +107,15 @@ class PrintQueueItem(Base):
     # auto-retry and does NOT count toward quarantine (Phase 3).
     stop_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
+    # Durable mirror of the in-memory PendingEject (services/eject/remote.py): the
+    # UTC timestamp at which THIS unit's server-dispatched part-present eject was
+    # started. NON-NULL == an eject is in flight for this unit (one eject per printer
+    # by construction); resolution (terminal / reconcile) NULLs it. A timestamp
+    # rather than a boolean so the startup hydrator can drop stale stamps past the
+    # 24h TTL. Survives a restart between eject dispatch and eject terminal so the
+    # plate-clear gate can still auto-clear on the eject's FINISH (W1).
+    eject_dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     # Shortest-job-first scheduling
     print_time_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Cached from archive/library
     been_jumped: Mapped[bool] = mapped_column(Boolean, default=False)  # Starvation guard for SJF

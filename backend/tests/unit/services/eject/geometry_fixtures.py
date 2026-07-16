@@ -16,6 +16,7 @@ H2S_GEOMETRY = ModelGeometry(
     envelope=(0.0, 340.0, -16.0, 325.0),
     max_part_height_mm=42.0,
     validated=True,
+    z_travel_mm=340.0,
 )
 
 # H2C — provisional (unvalidated) geometry. Envelope measured live on 007-H2C
@@ -30,4 +31,5 @@ H2C_GEOMETRY = ModelGeometry(
     envelope=(15.0, 325.0, 0.0, 320.0),
     max_part_height_mm=42.0,
     validated=False,
+    z_travel_mm=325.0,
 )

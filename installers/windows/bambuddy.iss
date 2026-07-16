@@ -25,12 +25,16 @@
   #include "build\staging\version.iss"
 #else
   #define MyAppVersion "0.0.0+dev"
+  #define MyAppVersionInfo "0.0.0.0"
 #endif
 
 [Setup]
 AppId={{8C9C9E1A-7C5A-4F2A-9F1B-BAMBUDDY00001}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+; Numeric x.x.x.x file-version resource — MyAppVersion carries the local
+; +<build id> suffix which VersionInfoVersion can't, so this uses the base.
+VersionInfoVersion={#MyAppVersionInfo}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
@@ -78,18 +82,23 @@ Source: "build\staging\app\*"; DestDir: "{app}\app"; Flags: recursesubdirs ignor
 Source: "build\staging\bin\*"; DestDir: "{app}\bin"; Flags: recursesubdirs ignoreversion
 ; Service install/uninstall scripts
 Source: "build\staging\service\*"; DestDir: "{app}\service"; Flags: recursesubdirs ignoreversion
-; Version stamp
-Source: "build\staging\VERSION"; DestDir: "{app}"; Flags: ignoreversion
 ; App icon — used by UninstallDisplayIcon (Add/Remove Programs) and the
 ; Start Menu / desktop shortcuts. Lives at the install root so the
 ; UninstallDisplayIcon path stays stable when the [Files] tree changes.
 Source: "bambuddy.ico"; DestDir: "{app}"; Flags: ignoreversion
+; Optional ERP deploy secrets — only bundled when installers/windows/erp.env
+; was present at build time. skipifsourcedoesntexist makes this a no-op
+; otherwise, so a build without the file installs cleanly.
+Source: "build\staging\config\erp.env"; DestDir: "{commonappdata}\Bambuddy\config"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Dirs]
 ; ProgramData layout — created with permissions LocalSystem can write to
 Name: "{commonappdata}\Bambuddy"; Permissions: users-modify
 Name: "{commonappdata}\Bambuddy\data"; Permissions: users-modify
 Name: "{commonappdata}\Bambuddy\logs"; Permissions: users-modify
+; config/ holds deploy secrets (erp.env). NO users-modify — the admin/SYSTEM
+; default ACL keeps standard users from reading/altering the ERP credentials.
+Name: "{commonappdata}\Bambuddy\config"
 
 [Icons]
 Name: "{group}\Open Bambuddy Dashboard"; Filename: "http://localhost:{#DefaultPort}"; IconFilename: "{app}\bambuddy.ico"

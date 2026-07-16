@@ -58,6 +58,8 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
   const [onModelMismatch, setOnModelMismatch] = useState(provider?.on_model_mismatch ?? true);
   const [onRunUnitStopped, setOnRunUnitStopped] = useState(provider?.on_run_unit_stopped ?? true);
   const [onPrintStalled, setOnPrintStalled] = useState(provider?.on_print_stalled ?? true);
+  const [onStorageLow, setOnStorageLow] = useState(provider?.on_storage_low ?? true);
+  const [onCooldownEscalation, setOnCooldownEscalation] = useState(provider?.on_cooldown_escalation ?? true);
 
   // Provider-specific config (scalar fields only — event_priorities is split out
   // into its own state because it's an object, not a string).
@@ -201,6 +203,8 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
       on_model_mismatch: onModelMismatch,
       on_run_unit_stopped: onRunUnitStopped,
       on_print_stalled: onPrintStalled,
+      on_storage_low: onStorageLow,
+      on_cooldown_escalation: onCooldownEscalation,
     };
 
     if (isEditing) {
@@ -662,6 +666,14 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
                 <div className="flex items-center justify-between">
                   <span className="text-sm text-white">{t('notifications.printStalled')}</span>
                   <Toggle checked={onPrintStalled} onChange={setOnPrintStalled} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.storageLow')}</span>
+                  <Toggle checked={onStorageLow} onChange={setOnStorageLow} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.cooldownEscalation')}</span>
+                  <Toggle checked={onCooldownEscalation} onChange={setOnCooldownEscalation} />
                 </div>
               </div>
             </div>

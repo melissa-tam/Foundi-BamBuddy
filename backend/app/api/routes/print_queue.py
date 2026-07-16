@@ -1404,6 +1404,23 @@ async def start_queue_item(
                     "deficit": [d.to_dict() for d in deficit],
                 },
             )
+        # Minimum-start-weight floor (#spool-selection): the assigned spool can
+        # cover the print but is below the start floor (it may only finish a job
+        # already in progress). Surface a distinct 409 so the UI can offer
+        # "Print Anyway" (retry with skip_filament_check=true) rather than a
+        # generic deficit dialog. Only applies to pinned items.
+        if item.printer_id is not None:
+            from backend.app.services import spool_selection
+
+            blocked_slots = await spool_selection.start_rule_blocked_slots(db, item)
+            if blocked_slots:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "start_spool_below_minimum",
+                        "slots": blocked_slots,
+                    },
+                )
 
     # Print Anyway / no deficit: clear the flags and let the scheduler dispatch.
     item.manual_start = False

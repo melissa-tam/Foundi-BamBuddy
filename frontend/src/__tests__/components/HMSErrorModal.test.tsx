@@ -24,7 +24,10 @@ const knownError: HMSError = {
   attr: 0x0300,
   code: '0x400C',
   severity: 2,
-  short_code: '0300_400C',
+  // 16-hex hms[]-array full code — the modal renders it as four hyphen-groups,
+  // not the lossy two-group short code.
+  full_code: '0500010000030004',
+  short_code: '0500_0004',
   description: 'The task was canceled.',
   wiki_url: WIKI,
 };
@@ -63,6 +66,11 @@ describe('HMSErrorModal', () => {
     it('shows error description for known error codes', () => {
       render(<HMSErrorModal {...defaultProps} />);
       expect(screen.getByText('The task was canceled.')).toBeInTheDocument();
+    });
+
+    it('renders the full 16-hex code as four hyphen-groups (not the lossy short code)', () => {
+      render(<HMSErrorModal {...defaultProps} />);
+      expect(screen.getByText('[0500-0100-0003-0004]')).toBeInTheDocument();
     });
 
     it('renders the severity label via i18n', () => {

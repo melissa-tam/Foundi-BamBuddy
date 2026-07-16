@@ -70,6 +70,8 @@ function buildProvider(overrides: Partial<NotificationProvider> = {}): Notificat
     on_model_mismatch: true,
     on_run_unit_stopped: true,
     on_print_stalled: true,
+    on_storage_low: true,
+    on_cooldown_escalation: true,
     quiet_hours_enabled: false,
     quiet_hours_start: null,
     quiet_hours_end: null,
@@ -119,12 +121,15 @@ describe('NotificationProviderCard — Farm production section', () => {
       'Model mismatch',
       'Unit stopped',
       'Print stalled',
+      'USB storage low',
+      'Cooldown running long',
     ];
     for (const label of labels) {
       expect(within(section).getByText(label)).toBeInTheDocument();
     }
-    // 12 farm toggles: moved plate-not-empty + 8 Phase-3 + 3 Phase-6.
-    expect(within(section).getAllByRole('switch')).toHaveLength(12);
+    // 14 farm toggles: moved plate-not-empty + 8 Phase-3 + 3 Phase-6 + USB storage
+    // low + cooldown escalation.
+    expect(within(section).getAllByRole('switch')).toHaveLength(14);
   });
 
   it('renders on_plate_not_empty exactly once (single home in the farm section)', async () => {

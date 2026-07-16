@@ -1,11 +1,13 @@
-"""Scheduler dispatch helper for the auto-eject pipeline.
+"""Helpers for the (server-dispatched) auto-eject pipeline.
 
-Keeps the eject-specific logic out of the print scheduler: given a queue item
-with an ``eject_profile_id``, resolve the profile, parse the part height from the
-3MF header, generate the eject block and validate it. The scheduler injects the
-returned snippet as the machine-end block (superseding any global per-model end
-snippet). On any failure this returns an error string so the scheduler fails the
-item instead of dispatching an unprotected (or unsafe) eject.
+The eject sweep is a SEPARATE motion-only job now — print files dispatch
+unmodified and never carry an injected eject block. This module keeps the two
+pure, reusable pieces that survived that move:
+
+- :func:`build_part_present_eject_file` — build a standalone, motion-only
+  eject-only ``.gcode.3mf`` (the file the shared remote dispatcher uploads).
+- :func:`resolve_cooldown_override` — the run-level cooldown-release override the
+  eject MONITOR reads for its server-side release threshold.
 """
 
 from __future__ import annotations
@@ -15,21 +17,18 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
-from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.services.eject.generator import (
     EjectGenerationError,
     generate_eject_gcode,
 )
-from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.utils.threemf_tools import read_plate_gcode_header, repack_3mf_with_gcode
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from backend.app.models.print_queue import PrintQueueItem
-    from backend.app.models.printer import Printer
+    from backend.app.models.eject_profile import EjectProfile
     from backend.app.services.eject.geometry import ModelGeometry
 
 
@@ -63,80 +62,25 @@ async def resolve_cooldown_override(db: AsyncSession, batch_id: int | None) -> f
     return result.scalar_one_or_none()
 
 
-async def build_eject_snippet(
-    db: AsyncSession,
-    item: PrintQueueItem,
-    printer: Printer,
-    source_path: Path,
-) -> tuple[str | None, str | None]:
-    """Build the validated eject end-snippet for `item`.
-
-    Assumes ``item.eject_profile_id`` is set (caller checks). Returns
-    ``(snippet, None)`` on success or ``(None, error_message)`` on failure — the
-    scheduler must fail the item on an error rather than dispatch it.
-
-    First-article items get ``(None, None)`` — a deliberate *skip*, not an error:
-    the eject block must NOT be injected so the printed part stays on the plate
-    for operator inspection. The scheduler treats a ``(None, None)`` result as
-    "dispatch with no eject supersede".
-    """
-    if getattr(item, "first_article", False):
-        return None, None
-
-    result = await db.execute(select(EjectProfile).where(EjectProfile.id == item.eject_profile_id))
-    profile = result.scalar_one_or_none()
-    if profile is None:
-        return None, f"Eject profile {item.eject_profile_id} not found"
-
-    # Resolve the target model's bed/envelope from the registry — fail-closed on a
-    # model with no geometry row OR a row not yet hardware-validated (production
-    # dispatch requires validation; the reason distinguishes the two causes). This
-    # is the canonical-match replacement for the old raw ``model in PRINTER_BED_DIMS``
-    # membership test, so ``O1S`` and ``H2S`` no longer diverge.
-    try:
-        geometry = await get_geometry_required(db, printer.model, require_validated=True)
-    except GeometryUnavailable as exc:
-        return None, exc.reason
-
-    plate_id = item.plate_id or 1
-    max_z = _parse_max_z_height(Path(source_path), plate_id)
-    if max_z is None:
-        return None, "Could not parse max_z_height from the 3MF gcode header"
-
-    # Farm production runs may override the cooldown gate per-run; the override
-    # (when set) supersedes the profile's cooldown_temp_c for THIS item's eject
-    # block so generation + validation share the effective M190 R threshold.
-    cooldown_override = await resolve_cooldown_override(db, item.batch_id)
-
-    try:
-        gcode = generate_eject_gcode(profile, max_z, geometry, cooldown_temp_c=cooldown_override)
-    except EjectGenerationError as exc:
-        return None, f"Eject generation refused: {exc}"
-
-    validation = validate_eject_gcode(gcode, profile, max_z, geometry, cooldown_temp_c=cooldown_override)
-    if not validation.ok:
-        return None, "Eject validation failed: " + "; ".join(validation.errors)
-
-    return gcode, None
-
-
 def build_part_present_eject_file(
     source_path: Path,
     plate_id: int,
     profile: EjectProfile,
     geometry: ModelGeometry,
-    cooldown_temp_c: float | None = None,
 ) -> Path:
-    """Build a standalone PART-PRESENT eject-only ``.gcode.3mf`` for ``plate_id``.
+    """Build a standalone PART-PRESENT, MOTION-ONLY eject-only ``.gcode.3mf`` for ``plate_id``.
 
     The plate's G-code is REPLACED ENTIRELY (via ``repack_3mf_with_gcode``, MD5
-    recomputed) by the generated eject block: prologue ``M17`` → ``G28 X Y`` only
-    (NEVER a bare ``G28`` / ``G28 Z`` — the part sits on the plate, so the block
-    relies on the retained Z datum), then the cooldown loop (``M190 R`` retries at
-    the effective threshold — the bed is already cooling from the finished
-    print), the sweep and the park. The generator already emits exactly that
-    shape; the validator's existing rules (forbid bare ``G28``, enforce the
-    ``M190 R`` count/threshold and the sweep envelope) re-check it.
+    recomputed) by the generated eject block: prologue ``M17`` → home X/Y only —
+    single-nozzle models use ``G28 X Y``, dual-nozzle (H2C/H2D/X2D) models use the
+    torque-parameterized ``G28 X T300`` / ``G28 Y T300`` forms (a bare ``G28 X Y``
+    stall-loops that firmware). NEVER a bare ``G28`` / ``G28 Z`` — the part sits on
+    the plate, so the block relies on the retained Z datum. Then ``M140 S0``, the
+    optional bed-drop release assist, the sweep, the park, then the completion
+    epilogue. There is NO in-file cooldown wait: the eject monitor
+    already held the plate gate until the live bed reached the release threshold
+    before this motion-only job is dispatched. The generator emits exactly that
+    shape; the validator re-checks geometry / homing / tool-state.
 
     HARDWARE LADDER: the retained-Z assumption MUST be validated on an empty-bed
     dry run before this is used unattended in production.
@@ -148,8 +92,8 @@ def build_part_present_eject_file(
     if max_z is None:
         raise EjectGenerationError("Could not parse max_z_height from the 3MF gcode header")
 
-    block = generate_eject_gcode(profile, max_z, geometry, cooldown_temp_c=cooldown_temp_c)
-    validation = validate_eject_gcode(block, profile, max_z, geometry, cooldown_temp_c=cooldown_temp_c)
+    block = generate_eject_gcode(profile, max_z, geometry)
+    validation = validate_eject_gcode(block, profile, max_z, geometry)
     if not validation.ok:
         raise EjectGenerationError("Part-present eject validation failed: " + "; ".join(validation.errors))
 

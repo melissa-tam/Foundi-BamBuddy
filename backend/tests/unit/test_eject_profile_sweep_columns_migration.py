@@ -81,9 +81,12 @@ async def engine():
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Simulate a pre-migration schema: drop the columns the current model
-        # created so run_migrations actually has to re-add them (SQLite 3.35+).
+        # created so run_migrations actually has to re-add them (SQLite 3.35+)...
         for col in _NEW_COLUMNS:
             await conn.execute(text(f"ALTER TABLE eject_profiles DROP COLUMN {col}"))
+        # ...and RE-ADD the legacy cooldown_retries column the drop-migration removes
+        # (the current model no longer has it, so create_all won't create it).
+        await conn.execute(text("ALTER TABLE eject_profiles ADD COLUMN cooldown_retries INTEGER NOT NULL DEFAULT 5"))
     yield eng
     await eng.dispose()
 
@@ -121,10 +124,10 @@ async def test_sweep_start_frac_defaults_to_one(engine):
         await conn.execute(
             text(
                 "INSERT INTO eject_profiles "
-                "(name, cooldown_temp_c, cooldown_retries, clearance_mm, z_offset_mm, "
+                "(name, cooldown_temp_c, clearance_mm, z_offset_mm, "
                 "descent_steps, x_passes, x_margin_mm, front_overhang_mm, back_overhang_mm, "
                 "eject_speed_mm_min, skim_speed_mm_min, cooling_fan_assist, max_part_height_mm) "
-                "VALUES ('migrated', 28, 5, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 1, 42)"
+                "VALUES ('migrated', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 1, 42)"
             )
         )
     async with engine.connect() as conn:
@@ -150,15 +153,29 @@ async def test_final_skim_defaults_to_true(engine):
         await conn.execute(
             text(
                 "INSERT INTO eject_profiles "
-                "(name, cooldown_temp_c, cooldown_retries, clearance_mm, z_offset_mm, "
+                "(name, cooldown_temp_c, clearance_mm, z_offset_mm, "
                 "descent_steps, x_passes, x_margin_mm, front_overhang_mm, back_overhang_mm, "
                 "eject_speed_mm_min, skim_speed_mm_min, cooling_fan_assist, max_part_height_mm) "
-                "VALUES ('skimdefault', 28, 5, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 1, 42)"
+                "VALUES ('skimdefault', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 1, 42)"
             )
         )
     async with engine.connect() as conn:
         row = (await conn.execute(text("SELECT final_skim FROM eject_profiles WHERE name = 'skimdefault'"))).fetchone()
     assert row[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_migration_drops_cooldown_retries(engine):
+    """The eject went server-dispatched motion-only: run_migrations DROPs the
+    legacy cooldown_retries column (cooldown_temp_c stays as the release threshold)."""
+    async with engine.connect() as conn:
+        assert "cooldown_retries" in await _columns(conn)  # fixture seeded the legacy column
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        cols = await _columns(conn)
+    assert "cooldown_retries" not in cols  # dropped
+    assert "cooldown_temp_c" in cols  # release threshold retained
 
 
 @pytest.mark.asyncio
@@ -172,3 +189,4 @@ async def test_migration_is_idempotent(engine):
         cols = await _columns(conn)
     for col in _NEW_COLUMNS:
         assert col in cols
+    assert "cooldown_retries" not in cols  # stays dropped across re-runs

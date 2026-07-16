@@ -1,10 +1,13 @@
 """Negative tests for the eject G-code validator — one guard per test."""
 
+from dataclasses import replace
+
 import pytest
 
 from backend.app.models.eject_profile import EjectProfile
-from backend.app.services.eject.generator import DUAL_NOZZLE_HOME, generate_eject_gcode
+from backend.app.services.eject.generator import generate_eject_gcode
 from backend.app.services.eject.validator import validate_eject_gcode
+from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
 from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
 
 
@@ -12,7 +15,6 @@ def _profile(**overrides) -> EjectProfile:
     defaults = {
         "name": "default",
         "cooldown_temp_c": 28.0,
-        "cooldown_retries": 5,
         "clearance_mm": 10.0,
         "z_offset_mm": 0.4,
         "descent_steps": 4,
@@ -27,6 +29,7 @@ def _profile(**overrides) -> EjectProfile:
         "sweep_x_min_mm": None,
         "sweep_x_max_mm": None,
         "sweep_start_frac": 1.0,
+        "bed_drop_clearance_mm": None,
     }
     defaults.update(overrides)
     profile = EjectProfile()
@@ -88,20 +91,12 @@ class TestValidatorGuards:
         result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY)
         assert result.ok and result.errors == []
 
-    def test_wrong_m190_count(self):
+    def test_stray_m190_is_ignored_not_rejected(self):
+        # The block is motion-only; the validator has NO thermal rules, so a stray
+        # M190 (hand-edited) is neither required nor rejected.
         gcode, profile = _valid()
-        bad = gcode + "M190 R28\n"  # one extra retry
-        result = validate_eject_gcode(bad, profile, 30.0, H2S_GEOMETRY)
-        assert not result.ok
-        assert any("M190" in e for e in result.errors)
-
-    def test_m190_wrong_threshold(self):
-        # Build with 5 retries at 28, then hand-edit one to a different temp.
-        gcode, profile = _valid()
-        bad = gcode.replace("M190 R28", "M190 R40", 1)
-        result = validate_eject_gcode(bad, profile, 30.0, H2S_GEOMETRY)
-        assert not result.ok
-        assert any("threshold" in e for e in result.errors)
+        result = validate_eject_gcode(gcode + "M190 R28\n", profile, 30.0, H2S_GEOMETRY)
+        assert result.ok, result.errors
 
     def test_bare_g28_forbidden(self):
         gcode, profile = _valid()
@@ -119,10 +114,7 @@ class TestValidatorGuards:
 
     def test_missing_prologue(self):
         # A block with no prologue commands at all.
-        stub = (
-            "; ===== FARM EJECT BLOCK profile=default =====\n"
-            "M140 S0\n" + "M190 R28\n" * 5 + "; ===== FARM EJECT BLOCK END =====\n"
-        )
+        stub = "; ===== FARM EJECT BLOCK profile=default =====\nM140 S0\n; ===== FARM EJECT BLOCK END =====\n"
         profile = _profile()
         result = validate_eject_gcode(stub, profile, 30.0, H2S_GEOMETRY)
         assert not result.ok
@@ -191,46 +183,6 @@ class TestSweepBandAndFracGuards:
         result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY)
         assert not result.ok
         assert any("sweep_start_frac" in e for e in result.errors)
-
-
-class TestCooldownRequirement:
-    """The M190 retry-count guard is skipped ONLY via require_cooldown=False."""
-
-    def test_thermal_less_block_passes_when_cooldown_not_required(self):
-        # A dry-run block (no M190 waits) validates when the caller opts out of
-        # the retry-count guard — but every geometry guard still ran.
-        profile = _profile()
-        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY, include_cooldown=False)
-        result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY, require_cooldown=False)
-        assert result.ok, result.errors
-
-    def test_thermal_less_block_rejected_as_production(self):
-        # The SAME thermal-less block fails under production validation
-        # (default require_cooldown=True): a production eject snippet missing its
-        # M190 release waits must never pass.
-        profile = _profile()
-        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY, include_cooldown=False)
-        result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY)
-        assert not result.ok
-        assert any("M190" in e for e in result.errors)
-
-    def test_production_block_with_zero_retries_still_fails(self):
-        # Strip the M190 waits out of a production block by hand — it must fail
-        # even though require_cooldown defaults True (no global loosening).
-        gcode, profile = _valid()
-        stripped = "\n".join(ln for ln in gcode.splitlines() if not ln.startswith("M190")) + "\n"
-        result = validate_eject_gcode(stripped, profile, 30.0, H2S_GEOMETRY)
-        assert not result.ok
-        assert any("expected cooldown_retries" in e for e in result.errors)
-
-    def test_dry_run_opt_out_does_not_disable_geometry_guards(self):
-        # require_cooldown=False must NOT loosen envelope/z-floor/G28 checks.
-        gcode, profile = _valid()
-        thermal_less = "\n".join(ln for ln in gcode.splitlines() if not ln.startswith("M190"))
-        bad = thermal_less + "\nG1 X999 F9000\n"
-        result = validate_eject_gcode(bad, profile, 30.0, H2S_GEOMETRY, require_cooldown=False)
-        assert not result.ok
-        assert any("envelope" in e and "X" in e for e in result.errors)
 
 
 def _valid_dual(profile=None, max_z=30.0):
@@ -318,3 +270,85 @@ class TestStandaloneToolChangeGuard:
         result = validate_eject_gcode(gcode, profile, 30.0, H2C_GEOMETRY)
         assert result.ok, result.errors
         assert not any("tool-change" in e for e in result.errors)
+
+
+class TestUpperZCeilingGuard:
+    """Guard 1d: no move above the eject Z ceiling. Non-drop blocks bound at the
+    lift height (floored at PARK_Z_MM); the bed-drop assist opens the ceiling to
+    the drop target and fails closed on a missing/degenerate drop."""
+
+    def test_high_z_in_non_drop_block_rejected(self):
+        # A hand-edited G1 Z300 in a 30mm-part non-drop block (ceiling = lift 40)
+        # must fail even though the machine could physically reach Z300.
+        gcode, profile = _valid()
+        bad = gcode + "G1 Z300 F900\n"
+        result = validate_eject_gcode(bad, profile, 30.0, H2S_GEOMETRY)
+        assert not result.ok
+        assert any("Z ceiling" in e for e in result.errors), result.errors
+
+    def test_drop_enabled_block_passes(self):
+        profile = _profile(bed_drop_clearance_mm=50.0)
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY)
+        assert result.ok, result.errors
+
+    def test_z_above_drop_target_rejected(self):
+        # Drop to 290 opens the ceiling to 290; a Z300 still exceeds it.
+        profile = _profile(bed_drop_clearance_mm=50.0)
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        bad = gcode + "G1 Z300 F900\n"
+        result = validate_eject_gcode(bad, profile, 30.0, H2S_GEOMETRY)
+        assert not result.ok
+        assert any("Z ceiling" in e for e in result.errors), result.errors
+
+    def test_drop_with_missing_z_travel_rejected(self):
+        geom = replace(H2S_GEOMETRY, z_travel_mm=None)
+        profile = _profile(bed_drop_clearance_mm=50.0)
+        # Generate against a WITH-z_travel geometry, validate against the None one.
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        result = validate_eject_gcode(gcode, profile, 30.0, geom)
+        assert not result.ok
+        assert any("z_travel_mm" in e for e in result.errors), result.errors
+
+    def test_zero_clearance_tiny_part_park_z10_still_passes(self):
+        # clearance_mm 0 + a 5mm part -> lift 5, but the park move is Z10. The
+        # PARK_Z_MM floor keeps the ceiling at 10 so the legal park is not rejected.
+        profile = _profile(clearance_mm=0.0)
+        gcode = generate_eject_gcode(profile, 5.0, H2S_GEOMETRY)
+        assert "Z10 F9000" in gcode  # the centre park at PARK_Z_MM
+        result = validate_eject_gcode(gcode, profile, 5.0, H2S_GEOMETRY)
+        assert result.ok, result.errors
+
+
+class TestBedslingerGuard:
+    """Bed-slinger kinematics: the bed-drop assist is an ERROR (mirrors the
+    generator's fail-closed) and a plain bed-slinger block carries a WARNING (sweep
+    speeds unproven until the ladder) regardless of the bed-drop setting."""
+
+    def test_bedslinger_with_bed_drop_errors(self):
+        # Generate a valid H2S bed-drop block, then validate it against a bedslinger
+        # geometry + the same bed-drop profile: the validator flags the bedslinger.
+        profile = _profile(bed_drop_clearance_mm=50.0)
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        geom = replace(H2S_GEOMETRY, model_key="A2L")
+        result = validate_eject_gcode(gcode, profile, 30.0, geom)
+        assert not result.ok
+        assert any("bedslinger" in e for e in result.errors), result.errors
+
+    def test_bedslinger_plain_block_ok_but_warns(self):
+        # A no-bed-drop block for a bed-slinger validates OK but must carry the
+        # kinematics warning.
+        profile = _profile(bed_drop_clearance_mm=None)
+        geom = replace(H2S_GEOMETRY, model_key="A2L", z_travel_mm=None)
+        gcode = generate_eject_gcode(profile, 30.0, geom)
+        result = validate_eject_gcode(gcode, profile, 30.0, geom)
+        assert result.ok, result.errors
+        assert any("bedslinger kinematics" in w for w in result.warnings), result.warnings
+
+    def test_bed_on_z_model_has_no_bedslinger_warning(self):
+        # Regression guard: H2S (bed-on-Z) must NOT get the bedslinger warning.
+        profile = _profile()
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY)
+        assert result.ok
+        assert not any("bedslinger" in w for w in result.warnings)

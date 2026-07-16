@@ -225,7 +225,11 @@ export function SystemInfoPage() {
           <StatCard
             icon={Server}
             label={t('system.version', 'Version')}
-            value={`v${systemInfo.app.version}`}
+            value={
+              systemInfo.app.build && systemInfo.app.build !== systemInfo.app.version
+                ? `v${systemInfo.app.version}${systemInfo.app.build.slice(systemInfo.app.version.length)}`
+                : `v${systemInfo.app.version}`
+            }
           />
           <StatCard
             icon={Clock}

@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Circle, Check, AlertTriangle, RefreshCw, ChevronDown, ChevronUp, Palette } from 'lucide-react';
 import { api } from '../../api/client';
 import { useFilamentMapping } from '../../hooks/useFilamentMapping';
-import { getGlobalTrayId, effectivePreferLowest } from '../../utils/amsHelpers';
+import { getGlobalTrayId, effectiveSelectionPolicy, type SelectionOptions } from '../../utils/amsHelpers';
 import { getColorName } from '../../utils/colors';
 import { useFilamentLabels } from './useFilamentLabels';
 import type { FilamentMappingProps } from './types';
@@ -42,9 +42,9 @@ export function FilamentMapping({
     enabled: !!printerId,
   });
 
-  // Settings + inventory map drive the same prefer-lowest + AMS-backup gate
-  // the dispatcher uses (#1766). Without this, the per-slot dropdown's
-  // auto-suggestion could disagree with what actually gets dispatched.
+  // Settings + inventory maps drive the same selection policy + AMS-backup gate
+  // the dispatcher uses. Without this, the per-slot dropdown's auto-suggestion
+  // could disagree with what actually gets dispatched.
   const { data: settings } = useQuery({
     queryKey: ['settings'],
     queryFn: api.getSettings,
@@ -64,13 +64,26 @@ export function FilamentMapping({
     });
     return map;
   }, [inventoryRemain]);
-  const gatedPreferLowest = effectivePreferLowest(
-    settings?.prefer_lowest_filament,
-    printerStatus?.ams_filament_backup,
-  );
+  const firstLoadedByTrayId = useMemo(() => {
+    if (!inventoryRemain?.first_loaded) return undefined;
+    const map = new Map<number, number>();
+    Object.entries(inventoryRemain.first_loaded).forEach(([key, iso]) => {
+      const gtid = Number(key);
+      if (Number.isNaN(gtid) || iso == null) return;
+      const ms = Date.parse(iso);
+      if (!Number.isNaN(ms)) map.set(gtid, ms);
+    });
+    return map;
+  }, [inventoryRemain]);
+  const selection: SelectionOptions = useMemo(() => ({
+    policy: effectiveSelectionPolicy(settings?.spool_selection_policy, printerStatus?.ams_filament_backup),
+    inventoryByTrayId,
+    firstLoadedByTrayId,
+    minStartG: settings?.min_start_spool_g,
+  }), [settings?.spool_selection_policy, settings?.min_start_spool_g, printerStatus?.ams_filament_backup, inventoryByTrayId, firstLoadedByTrayId]);
 
   const { loadedFilaments, filamentComparison, hasTypeMismatch, hasColorMismatch } =
-    useFilamentMapping(filamentReqs, printerStatus, manualMappings, gatedPreferLowest, inventoryByTrayId);
+    useFilamentMapping(filamentReqs, printerStatus, manualMappings, selection);
 
   // Per-slot sub-brand + material-disambiguated colour labels (#1718). Same
   // shared hook the model-mode FilamentOverride uses so both panels render

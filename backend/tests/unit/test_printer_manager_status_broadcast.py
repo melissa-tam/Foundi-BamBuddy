@@ -100,6 +100,10 @@ def _fake_state(**overrides):
         "wifi_signal": None,
         "wired_network": None,
         "ams_filament_backup": None,
+        # USB/SD presence — printer_state_to_dict reads state.sdcard unconditionally
+        # (line ~1281, #F8). The mock omitted it, so the happy-path broadcast raised
+        # AttributeError before reaching send_printer_status (pre-existing red).
+        "sdcard": None,
     }
     base.update(overrides)
     return SimpleNamespace(**base)

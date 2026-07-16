@@ -7,6 +7,12 @@ spool can't cover the print. That combination is the SYSTEM-staged marker
 swapping the spool did NOT un-stage the item, so the queue looked stuck with no
 recovery short of pressing "Print anyway" per row (P2-C).
 
+Staging comes in two shapes and this path releases BOTH: pinned items (staged
+on their assigned printer) and UNPINNED all-short items (``printer_id IS NULL``)
+that the model-based candidate loop stages when every eligible printer is short.
+A printer-scoped release therefore also re-checks unpinned items — a spool swap
+on any one printer re-opens the fleet-wide candidate search on the next tick.
+
 This module is the single release path. :func:`release_filament_staged`
 re-runs the same ``compute_deficit_for_queue_item`` the scheduler used and
 un-stages only the items whose deficit is actually gone — a still-short item
@@ -32,6 +38,7 @@ from sqlalchemy import select
 
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
+from backend.app.services import spool_selection
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 
 if TYPE_CHECKING:
@@ -77,12 +84,15 @@ async def _has_staged_farm_items(db: AsyncSession, printer_id: int) -> bool:
 
     Farm = the item's batch has ``sku_file_id`` set. Keeps the AMS hook from
     paying the (3MF-parsing) deficit recompute on printers with nothing staged.
+    Matches both pinned items (``printer_id == pid``) and UNPINNED all-short
+    items (``printer_id IS NULL``) staged by the model-based candidate loop — a
+    spool swap on ANY printer must re-open a fleet-wide redistribution.
     """
     result = await db.execute(
         select(PrintQueueItem.id)
         .join(PrintBatch, PrintQueueItem.batch_id == PrintBatch.id)
         .where(PrintBatch.sku_file_id.is_not(None))
-        .where(PrintQueueItem.printer_id == printer_id)
+        .where((PrintQueueItem.printer_id == printer_id) | (PrintQueueItem.printer_id.is_(None)))
         .where(PrintQueueItem.status == "pending")
         .where(PrintQueueItem.manual_start.is_(True))
         .where(PrintQueueItem.filament_short.is_(True))
@@ -110,7 +120,12 @@ async def release_filament_staged(db: AsyncSession, printer_id: int | None = Non
         .where(PrintQueueItem.filament_short.is_(True))
     )
     if printer_id is not None:
-        query = query.where(PrintQueueItem.printer_id == printer_id)
+        # Include UNPINNED all-short items (printer_id NULL) staged by the
+        # model-based candidate loop: they have no printer to scope by, and a
+        # spool swap on ANY printer should re-open the fleet-wide search. Their
+        # deficit recomputes to [] (no printer → filament_deficit returns []),
+        # so they release and the next scheduler tick re-runs the candidate loop.
+        query = query.where((PrintQueueItem.printer_id == printer_id) | (PrintQueueItem.printer_id.is_(None)))
     result = await db.execute(query)
     items = list(result.scalars().all())
     if not items:
@@ -125,9 +140,19 @@ async def release_filament_staged(db: AsyncSession, printer_id: int | None = Non
             continue
         if deficit:
             continue  # still short — stays staged
+        # A pinned item can have an empty deficit yet still be blocked by the
+        # minimum-start floor (its only matching spool is a below-floor backup
+        # donor). Releasing it here would let the scheduler re-stage it next tick
+        # forever — so keep it staged until the start rule clears too.
+        try:
+            if await spool_selection.start_rule_blocks_item(db, item):
+                continue
+        except Exception as e:  # noqa: BLE001 — unknown state: keep it staged (fail-safe)
+            logger.warning("farm_staging: start-rule re-check failed for item %s — left staged: %s", item.id, e)
+            continue
         item.manual_start = False
         item.filament_short = False
-        if item.waiting_reason == "filament_short":
+        if item.waiting_reason in ("filament_short", spool_selection.WAITING_REASON_START_MIN):
             item.waiting_reason = None
         released += 1
         logger.info(

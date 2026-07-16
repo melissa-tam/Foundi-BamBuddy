@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useToast } from '../contexts/ToastContext';
 import { useTranslation } from 'react-i18next';
-import { api, type Printer } from '../api/client';
+import { api, type Printer, type RespoolPromptMessage, type SpoolRespooledMessage } from '../api/client';
 import { inventoryLocationsQueryKey } from '../utils/inventoryQueries';
 
 interface WebSocketMessage {
@@ -375,6 +375,54 @@ export function useWebSocket() {
             tray_count: m.tray_count,
           }
         }));
+        break;
+      }
+
+      case 'respool_prompt': {
+        // Reused Bambu tag on a spool the backend isn't hardware-certain is
+        // spent — ask the operator to confirm a fresh re-spool. Mirrors the
+        // `unknown_tag` window-event bridge; the backend ships the tray data
+        // and donor/prefill fields so the modal needs no cache lookup.
+        const m = message as unknown as RespoolPromptMessage;
+        window.dispatchEvent(new CustomEvent<RespoolPromptMessage>('respool-prompt', {
+          detail: {
+            printer_id: m.printer_id,
+            ams_id: m.ams_id,
+            tray_id: m.tray_id,
+            tag_uid: m.tag_uid,
+            tray_uuid: m.tray_uuid,
+            tray_type: m.tray_type,
+            tray_color: m.tray_color,
+            tray_sub_brands: m.tray_sub_brands,
+            tray_count: m.tray_count,
+            donor_spool_id: m.donor_spool_id,
+            donor_remaining_g: m.donor_remaining_g,
+            brand_prefill: m.brand_prefill,
+            label_weight_prefill: m.label_weight_prefill,
+          },
+        }));
+        break;
+      }
+
+      case 'spool_respooled': {
+        // Hardware-certain automatic re-spool ran without an operator — surface
+        // it and refresh the inventory / assignment / printer caches so the
+        // fresh spool and rewired slot show without a manual reload.
+        const m = message as unknown as SpoolRespooledMessage;
+        const printerName = queryClient
+          .getQueryData<Printer[]>(['printers'])
+          ?.find(p => p.id === m.printer_id)?.name ?? `Printer ${m.printer_id}`;
+        showToast(
+          t('inventory.respool.autoToast', {
+            brand: m.brand,
+            printer: printerName,
+            slot: (m.tray_id ?? 0) + 1,
+          }),
+          'success',
+        );
+        debouncedInvalidate('inventory-spools');
+        debouncedInvalidate('spool-assignments');
+        queryClient.invalidateQueries({ queryKey: ['printerStatus', m.printer_id] });
         break;
       }
 

@@ -654,6 +654,22 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
                     onChange={(checked) => updateMutation.mutate({ on_print_stalled: checked })}
                   />
                 </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.storageLow')}</p>
+                  <Toggle
+                    checked={provider.on_storage_low ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_storage_low: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.cooldownEscalation')}</p>
+                  <Toggle
+                    checked={provider.on_cooldown_escalation ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_cooldown_escalation: checked })}
+                  />
+                </div>
               </div>
 
               {/* Quiet Hours */}

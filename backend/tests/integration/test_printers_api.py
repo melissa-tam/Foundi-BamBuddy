@@ -402,6 +402,50 @@ class TestPrintersAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_get_printer_status_serializes_eject_watch(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """C5: REST /status must carry eject_watch (armed → threshold_c present;
+        unarmed → null) so the UI does not flip Cooling↔Plate-not-Clear between the
+        REST poll and the WS push, which DOES include it."""
+        from unittest.mock import MagicMock, patch
+
+        from backend.app.services.bambu_mqtt import PrinterState
+        from backend.app.services.eject.monitor import eject_cooldown_monitor
+
+        printer = await printer_factory()
+
+        state = PrinterState()
+        state.connected = True
+        state.state = "IDLE"
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch.object(eject_cooldown_monitor, "active_watch", return_value=33.0),
+        ):
+            mock_pm.get_status = MagicMock(return_value=state)
+            mock_pm.is_awaiting_plate_clear = MagicMock(return_value=True)
+            mock_pm.is_model_mismatch = MagicMock(return_value=False)
+            mock_pm.model_mismatch_reason = MagicMock(return_value=None)
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+        assert response.status_code == 200
+        assert response.json()["eject_watch"] == {"threshold_c": 33.0}
+
+        # Unarmed watch → null (mirrors _eject_watch_payload returning None).
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch.object(eject_cooldown_monitor, "active_watch", return_value=None),
+        ):
+            mock_pm.get_status = MagicMock(return_value=state)
+            mock_pm.is_awaiting_plate_clear = MagicMock(return_value=False)
+            mock_pm.is_model_mismatch = MagicMock(return_value=False)
+            mock_pm.model_mismatch_reason = MagicMock(return_value=None)
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+        assert response.status_code == 200
+        assert response.json()["eject_watch"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_get_printer_status_enriches_hms_errors(self, async_client: AsyncClient, printer_factory, db_session):
         """The status response must carry the serialization-time enrichment
         (short_code/description/wiki_url) for each HMS error, so the frontend

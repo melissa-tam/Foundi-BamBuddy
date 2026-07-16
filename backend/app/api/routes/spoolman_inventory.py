@@ -65,6 +65,7 @@ from backend.app.utils.filament_ids import (
     filament_id_to_setting_id,
     normalize_slicer_filament,
 )
+from backend.app.utils.printer_models import extruder_for_ams, nozzle_for_ams_unit
 
 logger = logging.getLogger(__name__)
 
@@ -1539,20 +1540,13 @@ async def assign_spoolman_slot(
             # K-profile cascade silently skipped state.kprofiles, defaulted
             # nozzle_diameter to 0.4, and left slot_extruder unset.
             state = printer_manager.get_status(body.printer_id)
-            nozzle_diameter = "0.4"
-            if state and state.nozzles:
-                nd = state.nozzles[0].nozzle_diameter
-                if nd:
-                    nozzle_diameter = nd
+            nozzle_diameter = nozzle_for_ams_unit(state, body.ams_id, body.tray_id)
 
-            slot_extruder = None
-            if state and state.ams_extruder_map:
-                if body.ams_id == 255:
-                    # External slots: ext-L (tray 0) → extruder 1, ext-R (tray 1) → extruder 0
-                    # tray_id 0→1, 1→0
-                    slot_extruder = 1 - body.tray_id
-                else:
-                    slot_extruder = state.ams_extruder_map.get(str(body.ams_id))
+            slot_extruder = (
+                extruder_for_ams(state.ams_extruder_map, body.ams_id, body.tray_id)
+                if (state and state.ams_extruder_map)
+                else None
+            )
 
             # Prefer exact extruder match, fall back to extruder-agnostic kp
             # for the same nozzle. Hard-skipping on mismatch silently dropped

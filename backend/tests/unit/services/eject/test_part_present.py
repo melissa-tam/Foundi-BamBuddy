@@ -10,7 +10,8 @@ import pytest
 
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.dispatch import build_part_present_eject_file
-from backend.app.services.eject.generator import DUAL_NOZZLE_HOME, EjectGenerationError
+from backend.app.services.eject.generator import EjectGenerationError
+from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
 from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
 
 _PLATE_GCODE = (
@@ -39,7 +40,6 @@ def _profile(**overrides):
     defaults = {
         "name": "pp",
         "cooldown_temp_c": 28.0,
-        "cooldown_retries": 5,
         "clearance_mm": 10.0,
         "z_offset_mm": 0.4,
         "descent_steps": 4,
@@ -62,7 +62,7 @@ def _read_plate_gcode(path, plate_id=1):
 
 
 class TestBuildPartPresentEjectFile:
-    def test_content_has_part_present_prologue_and_cooldown(self):
+    def test_content_is_part_present_motion_only(self):
         src = _make_3mf()
         out = None
         try:
@@ -80,9 +80,13 @@ class TestBuildPartPresentEjectFile:
         # G28 must have been replaced entirely by the eject block.
         assert not re.search(r"^G28\s*$", gcode, re.MULTILINE)
         assert not re.search(r"^G28 .*Z", gcode, re.MULTILINE)
-        # Cooldown block: 5 M190 R waits at the threshold, bed heater off.
-        assert gcode.count("M190 R28") == 5
+        # Motion-only: bed heater off, NO in-file cooldown wait (that moved to the
+        # eject monitor, which gates this dispatch on the live bed already).
         assert "M140 S0" in gcode
+        assert "M190" not in gcode
+        # Self-completing: the stock machine-end FINISH epilogue is appended.
+        assert "M18" in gcode
+        assert "M73 P100 R0" in gcode
         # Sweep + park markers present.
         assert "FARM EJECT BLOCK" in gcode
         # The original print body is gone (fully replaced).
@@ -104,19 +108,6 @@ class TestBuildPartPresentEjectFile:
 
         assert md5 == hashlib.md5(gcode_bytes, usedforsecurity=False).hexdigest().upper()
         assert md5 != "STALE"
-
-    def test_cooldown_override_flows_through(self):
-        src = _make_3mf()
-        out = None
-        try:
-            out = build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY, cooldown_temp_c=22.0)
-            gcode = _read_plate_gcode(out)
-        finally:
-            src.unlink(missing_ok=True)
-            if out:
-                out.unlink(missing_ok=True)
-        assert gcode.count("M190 R22") == 5
-        assert "M190 R28" not in gcode
 
     def test_missing_header_raises(self):
         src = _make_3mf("; EXECUTABLE_BLOCK_START\nG1 X1\n; EXECUTABLE_BLOCK_END\n")
@@ -149,6 +140,7 @@ class TestBuildPartPresentEjectFile:
         assert "G28 X Y" not in lines
         assert not re.search(r"^G28\s*$", gcode, re.MULTILINE)
         assert not any(ln.startswith("G28") and " Z" in ln for ln in lines)
-        # Standard block content still present (cooldown gate, markers).
-        assert gcode.count("M190 R28") == 5
+        # Standard block content still present (motion-only, markers, epilogue).
+        assert "M140 S0" in gcode
+        assert "M190" not in gcode
         assert "FARM EJECT BLOCK" in gcode

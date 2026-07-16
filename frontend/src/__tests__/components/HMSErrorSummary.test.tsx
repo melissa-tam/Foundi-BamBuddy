@@ -9,7 +9,12 @@ import { render } from '../utils';
 import { HMSErrorSummary } from '../../components/HMSErrorSummary';
 import type { HMSError } from '../../api/client';
 
-function mk(severity: number, description: string | null, short_code: string): HMSError {
+function mk(
+  severity: number,
+  description: string | null,
+  short_code: string,
+  full_code?: string,
+): HMSError {
   return {
     code: '0x0',
     attr: 0,
@@ -17,6 +22,7 @@ function mk(severity: number, description: string | null, short_code: string): H
     severity,
     description,
     short_code,
+    full_code,
     wiki_url: 'https://wiki.bambulab.com/en/hms/home',
   };
 }
@@ -57,9 +63,19 @@ describe('HMSErrorSummary', () => {
     expect(screen.getByText(long).closest('button')).toHaveAttribute('title', long);
   });
 
-  it('falls back to the short code when the description is unknown (null)', () => {
+  it('falls back to the short code (as MMMM-CCCC) when the description is unknown (null)', () => {
     render(<HMSErrorSummary errors={[mk(3, null, 'FFFF_FFFF')]} onOpen={() => {}} />);
-    expect(screen.getByText('FFFF_FFFF')).toBeInTheDocument();
+    expect(screen.getByText('FFFF-FFFF')).toBeInTheDocument();
+  });
+
+  it('falls back to the FULL 16-hex code when description is null and full_code is present', () => {
+    render(
+      <HMSErrorSummary
+        errors={[mk(3, null, '0500_0004', '0500010000030004')]}
+        onOpen={() => {}}
+      />,
+    );
+    expect(screen.getByText('0500-0100-0003-0004')).toBeInTheDocument();
   });
 
   it('calls onOpen when clicked', async () => {

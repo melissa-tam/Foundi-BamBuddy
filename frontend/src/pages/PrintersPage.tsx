@@ -1,8 +1,9 @@
-import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from 'react';
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, Fragment } from 'react';
 import { createPortal } from 'react-dom';
 import { compareFwVersions } from '../utils/firmwareVersion';
 import { formatPrintName } from '../utils/printName';
 import { computePopoverPosition } from '../utils/popoverPosition';
+import { mapModelCode } from '../utils/printerModels';
 import {
   BED_TEMP_DEFAULTS,
   CHAMBER_TEMP_DEFAULTS,
@@ -91,7 +92,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
 import { formatDateOnly, formatETA, formatDuration, parseUTCDate } from '../utils/date';
-import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext } from '../api/client';
+import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, RespoolPromptMessage } from '../api/client';
 import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
@@ -114,6 +115,7 @@ import type { HeaterSensorKind } from '../api/client';
 import { FilamentHoverCard, EmptySlotHoverCard } from '../components/FilamentHoverCard';
 import { LinkSpoolModal } from '../components/LinkSpoolModal';
 import { AssignSpoolModal } from '../components/AssignSpoolModal';
+import { RespoolTagModal } from '../components/RespoolTagModal';
 import { ConfigureAmsSlotModal } from '../components/ConfigureAmsSlotModal';
 import { useToast } from '../contexts/ToastContext';
 import { ChamberLight } from '../components/icons/ChamberLight';
@@ -1507,51 +1509,6 @@ function EjectQualifiedHint({ model }: { model: string | null | undefined }) {
   );
 }
 
-// Map SSDP model codes to display names
-function mapModelCode(ssdpModel: string | null): string {
-  if (!ssdpModel) return '';
-  const modelMap: Record<string, string> = {
-    // H2 Series
-    'O1D': 'H2D',
-    'O1E': 'H2D Pro',
-    'O2D': 'H2D Pro',
-    'O1C': 'H2C',
-    'O1C2': 'H2C',
-    'O1S': 'H2S',
-    // X1 Series
-    'BL-P001': 'X1C',
-    'BL-P002': 'X1',
-    'BL-P003': 'X1E',
-    // X2 Series
-    'N6': 'X2D',
-    // A2 Series
-    'N9': 'A2L',
-    // P Series
-    'C11': 'P1S',
-    'C12': 'P1P',
-    'C13': 'P2S',
-    // A1 Series
-    'N2S': 'A1',
-    'N1': 'A1 Mini',
-    // Direct matches
-    'X1C': 'X1C',
-    'X1': 'X1',
-    'X1E': 'X1E',
-    'X2D': 'X2D',
-    'P1S': 'P1S',
-    'P1P': 'P1P',
-    'P2S': 'P2S',
-    'A1': 'A1',
-    'A1 Mini': 'A1 Mini',
-    'A2L': 'A2L',
-    'H2D': 'H2D',
-    'H2D Pro': 'H2D Pro',
-    'H2C': 'H2C',
-    'H2S': 'H2S',
-  };
-  return modelMap[ssdpModel] || ssdpModel;
-}
-
 // ─── AMS Name Hover Card ──────────────────────────────────────────────────────
 // Wraps the AMS label (e.g. "AMS-A") and shows a popup with:
 //  • User-defined friendly name (editable, protected by printers:update)
@@ -1842,6 +1799,10 @@ function PrinterCard({
   const [showMenu, setShowMenu] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showRecoverConfirm, setShowRecoverConfirm] = useState(false);
+  // W2 manual eject: when the bed is above the release threshold the backend
+  // 409s with `bed_hot` + live temps; we stash them here to drive the explicit
+  // hot-bed confirm dialog, then re-call the eject with allow_hot=true.
+  const [ejectHotConfirm, setEjectHotConfirm] = useState<{ bed_c: number; threshold_c: number } | null>(null);
   const [deleteArchives, setDeleteArchives] = useState(true);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showFileManager, setShowFileManager] = useState(false);
@@ -1901,6 +1862,8 @@ function PrinterCard({
     trayId: number;
     trayInfo: { type: string; color: string; location: string; material?: string; profile?: string };
   } | null>(null);
+  // Manual "Re-spool tag…" tray action — opens RespoolTagModal for the slot.
+  const [respoolContext, setRespoolContext] = useState<RespoolPromptMessage | null>(null);
   const [configureSlotModal, setConfigureSlotModal] = useState<{
     amsId: number;
     trayId: number;
@@ -2167,6 +2130,17 @@ function PrinterCard({
   // means dispatch is held pending a manual clear.
   const needsPlateClear = status?.awaiting_plate_clear === true;
   const showClearPlateButton = status?.connected && needsPlateClear && !isPrintingOrPaused;
+  // W3: while a cooldown eject watch is armed, marking the plate cleared cancels
+  // the pending auto-eject (the watch exits without sweeping). Surface that as a
+  // hint on the mark-cleared button so the operator isn't surprised.
+  const ejectWatchActive = !!status?.eject_watch;
+  const markClearedTitle = (perm: boolean): string =>
+    !perm
+      ? t('printers.permission.noControl')
+      : ejectWatchActive
+        ? t('printers.plateStatus.markClearedCancelsEject')
+        : t('printers.plateStatus.markCleared');
+
   const activePrintName = status?.current_print && isPrintingOrPaused
     ? formatPrintName(status.subtask_name || status.current_print || null, status.gcode_file, t, activePlateLabel)
     : null;
@@ -2199,17 +2173,10 @@ function PrinterCard({
         state: status.state,
         awaiting_plate_clear: status.awaiting_plate_clear,
         eject_watch: status.eject_watch,
-        bed: status.temperatures?.bed,
       });
       if (phase?.kind === 'cooling') {
         return {
-          label:
-            phase.bed != null
-              ? t('printers.phase.cooling', {
-                  threshold: Math.round(phase.threshold),
-                  bed: Math.round(phase.bed),
-                })
-              : t('printers.phase.coolingNoBed', { threshold: Math.round(phase.threshold) }),
+          label: t('printers.phase.cooling', { threshold: Math.round(phase.threshold) }),
           className: 'bg-blue-500/20 text-blue-400',
         };
       }
@@ -2373,6 +2340,39 @@ function PrinterCard({
       queryClient.invalidateQueries({ queryKey: ['queue', printer.id] });
     },
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
+  });
+
+  // W2 manual eject: trigger the part-present eject for this printer's
+  // farm-known completed unit. The mutate arg is `allowHot` — the first click
+  // sends false; a `bed_hot` 409 opens the confirm dialog, whose confirm
+  // re-mutates with true. Any other error (or a bed_hot on the confirmed call)
+  // surfaces as a toast and closes the dialog.
+  const ejectMutation = useMutation({
+    mutationFn: (allowHot: boolean) => api.ejectNow(printer.id, allowHot),
+    onSuccess: () => {
+      setEjectHotConfirm(null);
+      showToast(t('printers.eject.dispatched'));
+      queryClient.invalidateQueries({ queryKey: ['printers'] });
+      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
+      queryClient.invalidateQueries({ queryKey: ['queue', printer.id] });
+    },
+    onError: (error: Error, allowHot) => {
+      if (
+        !allowHot &&
+        error instanceof ApiError &&
+        error.code === 'bed_hot' &&
+        error.detail
+      ) {
+        const bed = Number(error.detail.bed_c);
+        const threshold = Number(error.detail.threshold_c);
+        if (Number.isFinite(bed) && Number.isFinite(threshold)) {
+          setEjectHotConfirm({ bed_c: bed, threshold_c: threshold });
+          return;
+        }
+      }
+      setEjectHotConfirm(null);
+      showToast(error.message || t('printers.toast.failedToSendCommand'), 'error');
+    },
   });
 
   // Farm one-click recovery: clears the plate hold, lifts quarantine, and resumes
@@ -3380,30 +3380,80 @@ function PrinterCard({
                     })()}
                   </div>
                   {viewMode === 'compact' && showClearPlateButton && (
-                    <button
-                      type="button"
-                      onClick={() => clearPlateMutation.mutate()}
-                      disabled={clearPlateMutation.isPending || !hasPermission('printers:clear_plate')}
-                      aria-label={t('printers.plateStatus.markCleared')}
-                      className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md bg-yellow-500/20 border border-yellow-400/40 text-yellow-400 hover:bg-yellow-500/30 transition-colors disabled:opacity-50"
-                      title={!hasPermission('printers:clear_plate') ? t('printers.permission.noControl') : t('printers.plateStatus.markCleared')}
-                    >
-                      {clearPlateMutation.isPending ? (
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                      ) : (
-                        <PlateClearedIcon className="w-3 h-3" />
+                    <div className="flex flex-shrink-0 items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => clearPlateMutation.mutate()}
+                        disabled={clearPlateMutation.isPending || !hasPermission('printers:clear_plate')}
+                        aria-label={markClearedTitle(hasPermission('printers:clear_plate'))}
+                        className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md bg-yellow-500/20 border border-yellow-400/40 text-yellow-400 hover:bg-yellow-500/30 transition-colors disabled:opacity-50"
+                        title={markClearedTitle(hasPermission('printers:clear_plate'))}
+                      >
+                        {clearPlateMutation.isPending ? (
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                        ) : (
+                          <PlateClearedIcon className="w-3 h-3" />
+                        )}
+                      </button>
+                      {/* W2: compact icon-only eject — accessible name via
+                          aria-label + title = printers.eject.now. */}
+                      {hasPermission('printers:control') && (
+                        <button
+                          type="button"
+                          onClick={() => ejectMutation.mutate(false)}
+                          disabled={ejectMutation.isPending}
+                          aria-label={t('printers.eject.now')}
+                          className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors disabled:opacity-50"
+                          title={t('printers.eject.now')}
+                        >
+                          {ejectMutation.isPending ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <Wind className="w-3 h-3" />
+                          )}
+                        </button>
                       )}
-                    </button>
+                    </div>
                   )}
                 </div>
                 <p className="text-sm text-bambu-gray">
                   {printer.model || 'Unknown Model'}
-                  {/* Nozzle Info - only in expanded */}
-                  {viewMode === 'expanded' && status?.nozzles && status.nozzles[0]?.nozzle_diameter && (
-                    <span className="ml-1.5 text-bambu-gray" title={status.nozzles[0].nozzle_type || 'Nozzle'}>
-                      • {status.nozzles[0].nozzle_diameter}mm
-                    </span>
-                  )}
+                  {/* Nozzle Info — expanded only. Dual-nozzle printers (H2C)
+                      report BOTH hotends: index 0 = right, index 1 = left.
+                      Single-nozzle printers (H2S fleet) populate only index 0;
+                      the state is a fixed 2-slot list where unused slots carry
+                      an empty nozzle_diameter, so filter those out. One nozzle →
+                      unchanged unlabeled display; more than one → per-side R/L
+                      labels, each keeping its nozzle_type tooltip. */}
+                  {viewMode === 'expanded' && (() => {
+                    const populatedNozzles = (status?.nozzles ?? [])
+                      .map((nozzle, index) => ({ nozzle, index }))
+                      .filter(({ nozzle }) => nozzle?.nozzle_diameter);
+                    if (populatedNozzles.length === 0) return null;
+                    // Single nozzle: preserve the original unlabeled display exactly.
+                    if (populatedNozzles.length === 1) {
+                      const { nozzle } = populatedNozzles[0];
+                      return (
+                        <span className="ml-1.5 text-bambu-gray" title={nozzle.nozzle_type || 'Nozzle'}>
+                          • {nozzle.nozzle_diameter}mm
+                        </span>
+                      );
+                    }
+                    // Dual nozzle: label each side (index 0 = right, index 1 = left).
+                    return (
+                      <span className="ml-1.5 text-bambu-gray">
+                        {'• '}
+                        {populatedNozzles.map(({ nozzle, index }, i) => (
+                          <Fragment key={index}>
+                            {i > 0 && ' · '}
+                            <span title={nozzle.nozzle_type || 'Nozzle'}>
+                              {index === 0 ? t('printModal.rightNozzle') : t('printModal.leftNozzle')} {nozzle.nozzle_diameter}mm
+                            </span>
+                          </Fragment>
+                        ))}
+                      </span>
+                    );
+                  })()}
                   {viewMode === 'expanded' && maintenanceInfo && maintenanceInfo.total_print_hours > 0 && (
                     <span className="ml-2 text-bambu-gray">
                       <Clock className="w-3 h-3 inline-block mr-1" />
@@ -4192,20 +4242,42 @@ function PrinterCard({
             })()}
 
             {viewMode === 'expanded' && showClearPlateButton && (
-              <button
-                type="button"
-                onClick={() => clearPlateMutation.mutate()}
-                disabled={clearPlateMutation.isPending || !hasPermission('printers:clear_plate')}
-                className="mt-2 w-full inline-flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg bg-yellow-500/20 border border-yellow-400/40 text-yellow-400 hover:bg-yellow-500/30 transition-colors text-xs font-medium disabled:opacity-50"
-                title={!hasPermission('printers:clear_plate') ? t('printers.permission.noControl') : t('printers.plateStatus.markCleared')}
-              >
-                {clearPlateMutation.isPending ? (
-                  <Loader2 className="w-3 h-3 animate-spin" />
-                ) : (
-                  <PlateClearedIcon className="w-4 h-4" />
+              <div className="mt-2 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => clearPlateMutation.mutate()}
+                  disabled={clearPlateMutation.isPending || !hasPermission('printers:clear_plate')}
+                  className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg bg-yellow-500/20 border border-yellow-400/40 text-yellow-400 hover:bg-yellow-500/30 transition-colors text-xs font-medium disabled:opacity-50"
+                  title={markClearedTitle(hasPermission('printers:clear_plate'))}
+                >
+                  {clearPlateMutation.isPending ? (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <PlateClearedIcon className="w-4 h-4" />
+                  )}
+                  {t('printers.plateStatus.markCleared')}
+                </button>
+                {/* W2: manual eject beside mark-cleared — same visibility
+                    predicate, additionally gated on printers:control. Red
+                    destructive styling; the hot-bed 409 opens a confirm. */}
+                {hasPermission('printers:control') && (
+                  <button
+                    type="button"
+                    onClick={() => ejectMutation.mutate(false)}
+                    disabled={ejectMutation.isPending}
+                    aria-label={t('printers.eject.now')}
+                    className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors text-xs font-medium disabled:opacity-50"
+                    title={t('printers.eject.now')}
+                  >
+                    {ejectMutation.isPending ? (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : (
+                      <Wind className="w-4 h-4" />
+                    )}
+                    {t('printers.eject.now')}
+                  </button>
                 )}
-                {t('printers.plateStatus.markCleared')}
-              </button>
+              </div>
             )}
 
             {/* Controls */}
@@ -4985,6 +5057,21 @@ function PrinterCard({
                                               },
                                             }),
                                             onUnassignSpool: (assignment && !isBambuLabSpool(tray)) ? () => onUnassignSpool?.(printer.id, ams.id, slotIdx) : undefined,
+                                            onRespoolTag: isBambuLabSpool(tray) ? () => setRespoolContext({
+                                              printer_id: printer.id,
+                                              ams_id: ams.id,
+                                              tray_id: slotIdx,
+                                              tag_uid: tray?.tag_uid ?? null,
+                                              tray_uuid: tray?.tray_uuid ?? null,
+                                              tray_type: tray?.tray_type ?? null,
+                                              tray_color: tray?.tray_color ?? null,
+                                              tray_sub_brands: tray?.tray_sub_brands ?? null,
+                                              tray_count: ams.tray.length,
+                                              donor_spool_id: null,
+                                              donor_remaining_g: null,
+                                              brand_prefill: null,
+                                              label_weight_prefill: null,
+                                            }) : undefined,
                                             isAssigned: !!assignment || isBambuLabSpool(tray),
                                           };
                                         })()}
@@ -5340,6 +5427,21 @@ function PrinterCard({
                                           },
                                         }),
                                         onUnassignSpool: (assignment && !isBambuLabSpool(tray)) ? () => onUnassignSpool?.(printer.id, ams.id, htSlotId) : undefined,
+                                        onRespoolTag: isBambuLabSpool(tray) ? () => setRespoolContext({
+                                          printer_id: printer.id,
+                                          ams_id: ams.id,
+                                          tray_id: htSlotId,
+                                          tag_uid: tray?.tag_uid ?? null,
+                                          tray_uuid: tray?.tray_uuid ?? null,
+                                          tray_type: tray?.tray_type ?? null,
+                                          tray_color: tray?.tray_color ?? null,
+                                          tray_sub_brands: tray?.tray_sub_brands ?? null,
+                                          tray_count: ams.tray.length,
+                                          donor_spool_id: null,
+                                          donor_remaining_g: null,
+                                          brand_prefill: null,
+                                          label_weight_prefill: null,
+                                        }) : undefined,
                                         isAssigned: !!assignment || isBambuLabSpool(tray),
                                       };
                                     })()}
@@ -5612,6 +5714,21 @@ function PrinterCard({
                                             },
                                           }),
                                           onUnassignSpool: (assignment && !isBambuLabSpool(extTray)) ? () => onUnassignSpool?.(printer.id, 255, slotTrayId) : undefined,
+                                          onRespoolTag: isBambuLabSpool(extTray) ? () => setRespoolContext({
+                                            printer_id: printer.id,
+                                            ams_id: 255,
+                                            tray_id: slotTrayId,
+                                            tag_uid: extTray.tag_uid ?? null,
+                                            tray_uuid: extTray.tray_uuid ?? null,
+                                            tray_type: extTray.tray_type ?? null,
+                                            tray_color: extTray.tray_color ?? null,
+                                            tray_sub_brands: extTray.tray_sub_brands ?? null,
+                                            tray_count: null,
+                                            donor_spool_id: null,
+                                            donor_remaining_g: null,
+                                            brand_prefill: null,
+                                            label_weight_prefill: null,
+                                          }) : undefined,
                                           isAssigned: !!assignment || isBambuLabSpool(extTray),
                                         };
                                       })()}
@@ -6221,6 +6338,27 @@ function PrinterCard({
         />
       )}
 
+      {/* W2 hot-bed eject confirmation: the backend refused the eject because
+          the bed is above the release threshold; the operator explicitly
+          confirms sweeping while hot, and we re-call with allow_hot=true.
+          Mirrors the recover-confirm's Esc/click-outside/Enter semantics via
+          the shared ConfirmModal. */}
+      {ejectHotConfirm && (
+        <ConfirmModal
+          title={t('printers.eject.confirmTitle')}
+          message={t('printers.eject.confirmBody', {
+            bed: Math.round(ejectHotConfirm.bed_c),
+            threshold: Math.round(ejectHotConfirm.threshold_c),
+          })}
+          confirmText={t('printers.eject.confirm')}
+          cancelText={t('printers.eject.cancel')}
+          variant="danger"
+          isLoading={ejectMutation.isPending}
+          onConfirm={() => ejectMutation.mutate(true)}
+          onCancel={() => setEjectHotConfirm(null)}
+        />
+      )}
+
       {/* Power On Confirmation */}
       {showPowerOnConfirm && smartPlug && (
         <ConfirmModal
@@ -6474,6 +6612,12 @@ function PrinterCard({
           spoolmanEnabled={!!spoolmanEnabled}
         />
       )}
+
+      {/* Re-spool Tag Modal (manual tray action) */}
+      <RespoolTagModal
+        context={respoolContext}
+        onClose={() => setRespoolContext(null)}
+      />
 
       {/* Configure AMS Slot Modal */}
       {configureSlotModal && (
@@ -6868,7 +7012,7 @@ export function AddPrinterModal({
     }
   };
 
-  // Reuse module-level mapModelCode
+  // Reuse the shared mapModelCode util (imported at module top)
 
   const selectPrinter = (printer: DiscoveredPrinter) => {
     // Don't pre-fill serial if it's a placeholder (unknown-*) - user needs to enter actual serial

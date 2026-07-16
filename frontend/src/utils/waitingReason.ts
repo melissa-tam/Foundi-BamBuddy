@@ -18,8 +18,12 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
       return t('productionRuns.detail.waiting.previousPrintFailed');
     case 'filament_short':
       return t('productionRuns.detail.waiting.filamentShort');
+    case 'start_spool_below_minimum':
+      return t('productionRuns.detail.waiting.startSpoolBelowMinimum');
     case 'no_usb_drive':
       return t('productionRuns.detail.waiting.no_usb_drive');
+    case 'stagger_hold':
+      return t('productionRuns.detail.waiting.staggerHold');
     default:
       return reason;
   }

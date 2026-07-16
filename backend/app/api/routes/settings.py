@@ -32,6 +32,7 @@ _SENSITIVE_FIELDS_FOR_API_KEY = (
     "prometheus_token",
     "virtual_printer_access_code",
     "ldap_bind_password",
+    "erp_db_password",
 )
 
 
@@ -113,7 +114,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "spoolman_report_partial_usage",
             "auto_add_unknown_rfid",
             "disable_filament_warnings",
-            "prefer_lowest_filament",
+            "auto_add_untagged",
             "check_updates",
             "check_printer_firmware",
             "include_beta_updates",
@@ -130,6 +131,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "ambient_drying_enabled",
             "print_drying_enabled",
             "require_plate_clear",
+            "farm_usb_auto_cleanup",
             "queue_shortest_first",
             "default_bed_levelling",
             "default_flow_cali",
@@ -140,6 +142,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "ldap_enabled",
             "ldap_auto_provision",
             "local_login_enabled",
+            "erp_db_ssl",
         ]:
             settings_dict[setting.key] = setting.value.lower() == "true"
         elif setting.key in [
@@ -149,6 +152,8 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "ams_temp_fair",
             "library_disk_warning_gb",
             "low_stock_threshold",
+            "farm_cooldown_stall_epsilon_c",
+            "farm_cooldown_plateau_eject_margin_c",
         ]:
             settings_dict[setting.key] = float(setting.value)
         elif setting.key in [
@@ -164,10 +169,15 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "stagger_interval_minutes",
             "forecast_global_lead_time_days",
             "session_max_hours",
+            "min_start_spool_g",
             "farm_retry_max_per_unit",
             "farm_escalate_consecutive_failures",
             "farm_cooldown_warn_floor_c",
             "farm_offline_stall_minutes",
+            "farm_cooldown_stall_window_minutes",
+            "farm_cooldown_max_hold_minutes",
+            "respool_prompt_threshold_g",
+            "erp_db_port",
         ]:
             settings_dict[setting.key] = int(setting.value)
         elif setting.key == "default_printer_id":
@@ -185,6 +195,14 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
 
     # ldap_bind_password is never returned to any caller
     settings_dict["ldap_bind_password"] = ""
+    # erp_db_password is never returned to any caller
+    settings_dict["erp_db_password"] = ""
+    # erp_login_active is DERIVED (read-only): true when ERP connection config
+    # resolves from the deploy erp.env file or DB overrides. Computed via the
+    # single resolver so the status matches exactly what the login path uses.
+    from backend.app.services.erp_directory import parse_erp_config, resolve_erp_settings
+
+    settings_dict["erp_login_active"] = parse_erp_config(await resolve_erp_settings(db)) is not None
 
     if is_api_key:
         for field in _SENSITIVE_FIELDS_FOR_API_KEY:

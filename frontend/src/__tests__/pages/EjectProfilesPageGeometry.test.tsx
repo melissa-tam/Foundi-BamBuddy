@@ -28,6 +28,7 @@ const geometryRows = [
     env_y_min: -16,
     env_y_max: 325,
     max_part_height_mm: 42,
+    z_travel_mm: 340,
     validated: true,
     notes: null,
     updated_at: '2026-07-01T00:00:00Z',
@@ -41,6 +42,7 @@ const geometryRows = [
     env_y_min: 0,
     env_y_max: 320,
     max_part_height_mm: 42,
+    z_travel_mm: 325,
     validated: false,
     notes: null,
     updated_at: '2026-07-01T00:00:00Z',
@@ -52,7 +54,6 @@ function profile(overrides: Partial<Record<string, unknown>> = {}) {
     id: 1,
     name: 'Fast sweep',
     cooldown_temp_c: 28,
-    cooldown_retries: 5,
     clearance_mm: 10,
     z_offset_mm: 0.4,
     descent_steps: 4,
@@ -68,6 +69,7 @@ function profile(overrides: Partial<Record<string, unknown>> = {}) {
     sweep_x_min_mm: null,
     sweep_x_max_mm: null,
     sweep_start_frac: 1,
+    bed_drop_clearance_mm: null,
     created_at: '2026-07-01T10:00:00Z',
     updated_at: '2026-07-01T10:00:00Z',
     ...overrides,
@@ -201,6 +203,96 @@ describe('EjectProfilesPage geometry-derived form validation', () => {
 
     expect(
       await screen.findByText(/height ceiling of every registered model \(max 42 mm\)/i),
+    ).toBeInTheDocument();
+  });
+
+  it('reveals the bed-drop clearance input prefilled at 50 when the assist is toggled on', async () => {
+    server.use(http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])));
+
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+    await openCreateDialog(user);
+
+    // Hidden until the assist is enabled.
+    expect(screen.queryByLabelText('Bottom clearance (mm)')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('switch', { name: 'Bed-drop release assist' }));
+
+    const clearance = await screen.findByLabelText('Bottom clearance (mm)');
+    expect(clearance).toHaveValue(50);
+  });
+
+  it('sends bed_drop_clearance_mm: null when the bed-drop assist stays off', async () => {
+    let postedBody: Record<string, unknown> | null = null;
+    server.use(
+      http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
+      http.post('*/api/v1/eject-profiles', async ({ request }) => {
+        postedBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(profile({ id: 8, name: 'no drop' }), { status: 201 });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+    await openCreateDialog(user);
+
+    await user.type(screen.getByLabelText('Name'), 'no drop');
+    await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+    await waitFor(() => expect(postedBody).not.toBeNull());
+    expect(postedBody).toMatchObject({ bed_drop_clearance_mm: null });
+  });
+
+  it('sends bed_drop_clearance_mm: 50 when the bed-drop assist is toggled on', async () => {
+    let postedBody: Record<string, unknown> | null = null;
+    server.use(
+      http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
+      http.post('*/api/v1/eject-profiles', async ({ request }) => {
+        postedBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(profile({ id: 9, name: 'with drop' }), { status: 201 });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+    await openCreateDialog(user);
+
+    await user.type(screen.getByLabelText('Name'), 'with drop');
+    await user.click(screen.getByRole('switch', { name: 'Bed-drop release assist' }));
+    await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+    await waitFor(() => expect(postedBody).not.toBeNull());
+    expect(postedBody).toMatchObject({ bed_drop_clearance_mm: 50 });
+  });
+
+  it('warns when the bed-drop assist is on but a model lacks a registered Z travel', async () => {
+    server.use(
+      http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
+      http.get('*/api/v1/model-geometry', () =>
+        HttpResponse.json({
+          geometries: [
+            { ...geometryRows[0], z_travel_mm: 340 },
+            { ...geometryRows[1], z_travel_mm: null },
+          ],
+          sweep_band_min_width_mm: 10,
+        }),
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+    await openCreateDialog(user);
+
+    // No warning until the assist is enabled.
+    expect(screen.queryByText(/cannot generate this profile/i)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('switch', { name: 'Bed-drop release assist' }));
+
+    // The warning names the model(s) missing z_travel_mm (H2C here).
+    expect(
+      await screen.findByText(
+        /Models without a registered Z travel \(H2C\) cannot generate this profile/i,
+      ),
     ).toBeInTheDocument();
   });
 });

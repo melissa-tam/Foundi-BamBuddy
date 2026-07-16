@@ -477,6 +477,115 @@ class TestTrackFrom3MF:
         assert results[0]["tray_id"] == 0
 
 
+class TestTaglessAmsAutoSpools:
+    """Auto-minted tagless spools (data_origin='ams_auto') in usage tracking.
+
+    The tagless lifecycle mints full spool records for non-RFID trays; those
+    rows must flow through Path-1 (3MF per-filament grams) like any bound
+    spool, and the remain%-delta fallback must NEVER charge them — tagless
+    trays report remain=-1 (firmware "unknown"), which the :594 guard rejects
+    before any DB lookup.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_sessions(self):
+        _active_sessions.clear()
+        yield
+        _active_sessions.clear()
+
+    @pytest.fixture(autouse=True)
+    def _mock_get_setting(self):
+        with patch(
+            "backend.app.api.routes.settings.get_setting",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_updates_ams_auto_tagless_spool_from_3mf(self):
+        """An auto-minted tagless spool gets the 3MF Path-1 decrement."""
+        spool = _make_spool(id=9, label_weight=1000, weight_used=40, tag_uid=None, tray_uuid=None)
+        spool.data_origin = "ams_auto"
+        assignment = _make_assignment(spool_id=9)
+        archive = MagicMock()
+        archive.file_path = "archives/tagless.3mf"
+
+        db = AsyncMock()
+        # archive, queue_item(None), assignment, spool
+        db.execute = AsyncMock(
+            side_effect=[
+                MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=None)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assignment)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool)),
+            ]
+        )
+
+        pm = _make_printer_manager(_make_printer_state([], tray_now=0))
+        filament_usage = [{"slot_id": 1, "used_g": 30.0, "type": "PETG", "color": "#000000"}]
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
+        ):
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="completed",
+                print_name="tagless_print",
+                handled_trays=set(),
+                printer_manager=pm,
+                db=db,
+            )
+
+        assert len(results) == 1
+        assert results[0]["spool_id"] == 9
+        assert results[0]["weight_used"] == 30.0
+        # weight_used = old (40) + 3MF (30)
+        assert spool.weight_used == 70.0
+
+    @pytest.mark.asyncio
+    async def test_remain_fallback_never_charges_tagless_unknown_remain(self):
+        """remain=-1 at completion (tagless tray) skips the fallback entirely.
+
+        Even with a plausible start snapshot and the tray in the print's
+        mapping, the invalid-remain guard must bail before any assignment or
+        spool DB lookup is issued — an ams_auto spool is never charged by the
+        remain%-delta path.
+        """
+        _active_sessions[1] = PrintSession(
+            printer_id=1,
+            print_name="tagless",
+            started_at=datetime.now(timezone.utc),
+            tray_remain_start={(0, 0): 100},
+            tray_now_at_start=0,
+            ams_mapping=[0],
+        )
+
+        # Tagless tray reports remain=-1 (firmware unknown) at completion.
+        ams_data = [{"id": 0, "tray": [{"id": 0, "remain": -1}]}]
+        state = _make_printer_state(ams_data, tray_now=0)
+        state.tray_change_log = [(0, 0)]
+        pm = _make_printer_manager(state)
+
+        db = AsyncMock()
+        # Only the two _find_3mf_by_filename searches may hit the DB; the
+        # remain guard must skip before the assignment/spool lookups.
+        db.execute = AsyncMock(side_effect=[MagicMock(), MagicMock()])
+
+        results = await on_print_complete(1, {"status": "completed"}, pm, db)
+
+        assert results == []
+        db.commit.assert_not_called()
+        # Guard fired before any assignment/spool query (only 3MF searches ran).
+        assert db.execute.await_count <= 2
+
+
 class TestSpoolAssignmentSnapshot:
     """Tests for spool assignment snapshotting at print start (#459).
 

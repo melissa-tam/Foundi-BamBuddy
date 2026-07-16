@@ -10,6 +10,7 @@ from backend.app.utils.printer_models import (
     get_rod_type,
     has_ethernet,
     has_external_storage,
+    is_bedslinger_model,
     is_dual_nozzle_model,
     normalize_printer_model,
     normalize_printer_model_id,
@@ -34,6 +35,10 @@ class TestGetRodType:
     def test_p2s_internal_code_is_steel_rod(self):
         """N7 (P2S internal code) uses steel rods."""
         assert get_rod_type("N7") == "steel_rod"
+
+    def test_n7_id_map_resolves_to_p2s(self):
+        """N7 is the SSDP/device code for P2S — it now canonicalises via the ID map."""
+        assert normalize_printer_model_id("N7") == "P2S"
 
     @pytest.mark.parametrize("model", ["A1", "A1 Mini", "H2D", "H2D Pro", "H2C", "H2S"])
     def test_linear_rail_models(self, model: str):
@@ -242,3 +247,46 @@ class TestHasExternalStorage:
     def test_none_and_empty_default_to_true(self):
         assert has_external_storage(None) is True
         assert has_external_storage("") is True
+
+
+class TestIsBedslingerModel:
+    """is_bedslinger_model — the single source of truth for the bed-slinger class
+    (bed on Y, gantry on Z). Relocated here from test_printer_manager.py when the
+    helper moved from services.printer_manager into utils.printer_models (#1334),
+    and extended for the A2L cutter/plotter hybrid (also a bed-slinger)."""
+
+    def test_a1_series_is_bedslinger(self):
+        """A1 / A1 Mini are open-frame bed-slingers — the Z axis is the toolhead."""
+        assert is_bedslinger_model("A1") is True
+        assert is_bedslinger_model("A1 Mini") is True
+        assert is_bedslinger_model("A1MINI") is True
+        assert is_bedslinger_model("A1-MINI") is True
+
+    def test_a1_internal_codes_recognised(self):
+        """Internal MQTT/SSDP codes for the A1 family classify as bed-slinger."""
+        assert is_bedslinger_model("N1") is True  # A1 Mini
+        assert is_bedslinger_model("N2S") is True  # A1
+
+    def test_a2l_is_bedslinger(self):
+        """A2L (single FDM + cutter/plotter) is also bed-on-Y / gantry-on-Z."""
+        assert is_bedslinger_model("A2L") is True
+        assert is_bedslinger_model("Bambu Lab A2L") is True
+        assert is_bedslinger_model("N9") is True  # A2L SSDP/device code
+
+    def test_bed_on_z_models_not_bedslingers(self):
+        """X1 / P1 / H2 / H2C / H2D / H2S / P2S / X2D all have the bed on Z."""
+        for model in ("X1", "X1C", "X1E", "P1P", "P1S", "P2S", "H2C", "H2D", "H2DPRO", "H2S", "X2D"):
+            assert is_bedslinger_model(model) is False, f"{model} should NOT be a bed-slinger"
+
+    def test_dual_nozzle_h2d_is_not_bedslinger(self):
+        assert is_bedslinger_model("H2D") is False
+
+    def test_none_and_empty_return_false(self):
+        assert is_bedslinger_model(None) is False
+        assert is_bedslinger_model("") is False
+
+    def test_case_insensitive(self):
+        assert is_bedslinger_model("a1") is True
+        assert is_bedslinger_model("a1 mini") is True
+        assert is_bedslinger_model("a2l") is True
+        assert is_bedslinger_model("x1c") is False

@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 
 from backend.app.services.hms_actions import HMSAction, get_actions_for_error_code
+from backend.app.services.hms_errors import hms_severity
 
 logger = logging.getLogger(__name__)
 
@@ -209,10 +210,13 @@ _HMS_USER_ACTION_CODES: frozenset[str] = frozenset(
 # their ARRIVAL to raise a plate-clear gate; it does NOT filter them.
 #   0300_8017 — foreign objects detected on the heatbed
 #   0300_8006 — build-plate marker check
+#   0500_808C — build-plate offset / debris detected (H2-series; PAUSEs at layer 0,
+#               human must clear + realign the plate before Resume — same reaction)
 _HMS_PLATE_OCCUPANCY_CODES: frozenset[str] = frozenset(
     {
         "0300_8017",
         "0300_8006",
+        "0500_808C",
     }
 )
 
@@ -308,7 +312,7 @@ class PrinterState:
     wifi_signal: int | None = None  # WiFi signal strength in dBm
     wired_network: bool = False  # Ethernet connection detected (home_flag bit 18)
     door_open: bool = False  # Enclosure door open (home_flag bit 23, X1/P1S/P2S/H2*)
-    # Nozzle hardware info (for dual nozzle printers, index 0 = left, 1 = right)
+    # Nozzle hardware info (for dual nozzle printers, index 0 = right/main, 1 = left/deputy — pinned by live H2C hardware capture 2026-07-16)
     nozzles: list = field(default_factory=lambda: [NozzleInfo(), NozzleInfo()])
     # AI detection and print options
     print_options: PrintOptions = field(default_factory=PrintOptions)
@@ -2143,14 +2147,38 @@ class BambuMQTTClient:
                 if self.on_drying_complete:
                     self.on_drying_complete(ams_id)
 
-        # Create a hash of relevant AMS data to detect changes
+        # Create a hash of relevant AMS data to detect changes.
+        #
+        # Two invariants (W6 mid-run refill recognition):
+        #  1. MERGED basis (not the raw incremental ams_list): a partial MQTT
+        #     update that omits fields — state, remain — would flap the hash and
+        #     storm the callback. merged_ams is the authoritative merged tray
+        #     state already persisted to raw_data above; the callback below also
+        #     passes merged_ams for the same reason.
+        #  2. Presence BIT only (not the raw state): a tagless third-party spool
+        #     inserted into an empty slot changes no tray_type/tag/remain, so the
+        #     old hash never fired for it. We append a presence token so a
+        #     physical insert/remove fires on_ams_change even for tagless spools.
+        #     'p' = spool physically seated (state ∈ {10, 11}); everything else
+        #     ('a') is treated absent — positive-evidence-only, so state 9 / None
+        #     / unknown dialect codes (H2C idle empties report state=0) never read
+        #     as present. The raw `state` is deliberately NOT hashed: mid-print
+        #     tool changes flip 10↔11 on every load/unload and would storm the
+        #     callback; only the insert/remove-driven presence bit is.
         ams_hash_data = []
-        for ams_unit in ams_list:
+        for ams_unit in merged_ams:
             for tray in ams_unit.get("tray", []):
-                # Include fields that matter for filament tracking
+                # state may arrive as int or str depending on firmware/merge path
+                # — normalize before the membership test.
+                try:
+                    tray_state = int(tray.get("state"))
+                except (TypeError, ValueError):
+                    tray_state = None
+                presence = "p" if tray_state in (10, 11) else "a"
+                # Include fields that matter for filament tracking + presence
                 ams_hash_data.append(
                     f"{ams_unit.get('id')}:{tray.get('id')}:"
-                    f"{tray.get('tray_type')}:{tray.get('tag_uid')}:{tray.get('remain')}"
+                    f"{tray.get('tray_type')}:{tray.get('tag_uid')}:{tray.get('remain')}:{presence}"
                 )
         ams_hash = hashlib.md5(":".join(ams_hash_data).encode(), usedforsecurity=False).hexdigest()
 
@@ -2772,8 +2800,10 @@ class BambuMQTTClient:
                             attr = int(attr.replace("0x", ""), 16) if attr else 0
                         if isinstance(code, str):
                             code = int(code.replace("0x", ""), 16) if code else 0
-                        # Severity is in attr byte 1 (bits 8-15)
-                        severity = (attr >> 8) & 0xF
+                        # Severity is the high 16 bits of `code`
+                        # (1=fatal 2=serious 3=common 4=info) — decoded once in
+                        # hms_severity so the wire/notification paths agree.
+                        severity = hms_severity(code)
                         # Module is in attr byte 3 (bits 24-31)
                         module = (attr >> 24) & 0xFF
                         # Skip non-error status codes — all real HMS errors
@@ -2807,7 +2837,7 @@ class BambuMQTTClient:
                                 code=f"0x{code:x}" if code else "0x0",
                                 attr=attr,
                                 module=module,
-                                severity=severity if severity > 0 else 2,
+                                severity=severity,
                                 actions=actions,
                                 job_id=self.state.subtask_id,
                                 full_code=full_code,
@@ -3048,6 +3078,9 @@ class BambuMQTTClient:
             self.state.nozzles[0].nozzle_diameter = str(data["nozzle_diameter"])
 
         # Parse nozzle hardware info (dual nozzle printers - H2D series)
+        # DIALECT CONFLICT (unresolved upstream): this legacy long-form maps left→[0],
+        # which contradicts device.nozzle.info id semantics (id 0 = right/main, pinned on
+        # H2C 2026-07-16). No fleet printer emits this form; re-pin on real H2D before trusting.
         # Left nozzle
         if "left_nozzle_type" in data:
             self.state.nozzles[0].nozzle_type = str(data["left_nozzle_type"])
@@ -3412,7 +3445,13 @@ class BambuMQTTClient:
             # Include HMS errors for failure reason detection
             hms_errors_data = (
                 [
-                    {"code": e.code, "attr": e.attr, "module": e.module, "severity": e.severity}
+                    {
+                        "code": e.code,
+                        "attr": e.attr,
+                        "module": e.module,
+                        "severity": e.severity,
+                        "full_code": e.full_code,
+                    }
                     for e in self.state.hms_errors
                 ]
                 if self.state.hms_errors
@@ -4920,14 +4959,29 @@ class BambuMQTTClient:
         return True
 
     def home_axes(self, axes: str = "XYZ") -> bool:
-        """Run the printer's full auto-home sequence.
+        """Run the printer's full auto-home sequence, model-aware.
 
-        The ``axes`` argument is ignored: a bare ``G28`` is always sent so
-        Bambu firmware runs its safe multi-step routine (park toolhead →
-        home XY → home Z). Partial-axis variants like ``G28 Z`` skip the
-        toolhead-park step and can crash the bed into the toolhead on H2C
-        / H2D / H2S / X1 where Z-home moves the bed UP — see #1052.
+        The ``axes`` argument is ignored — a full home is always run.
+
+        Single-nozzle models send a bare ``G28`` so Bambu firmware runs its safe
+        multi-step routine (park toolhead → home XY → home Z). Partial-axis
+        variants like ``G28 Z`` skip the toolhead-park step and can crash the bed
+        into the toolhead on H2C / H2D / H2S / X1 where Z-home moves the bed UP —
+        see #1052.
+
+        Dual-nozzle (Vortek) models — H2C / H2D / X2D — CANNOT take a bare ``G28``:
+        the sensorless X-homing stall threshold is unsuited to the dual carriage,
+        so a bare ``G28`` stall-loops the carriage into the X wall (007-H2C ram
+        incident, 2026-07-12). They get the stock torque-parameterized forms
+        (``G28 X T300`` / ``G28 Y T300`` / ``G28 Z P0 T250``) in one publish. Detect
+        the nozzle class from runtime device.extruder.info first, falling back to
+        the model name (the established ``_is_dual_nozzle or is_dual_nozzle_model``
+        idiom) so a mis-modelled real dual is never bare-G28'd.
         """
+        from backend.app.utils.printer_models import DUAL_NOZZLE_FULL_HOME, is_dual_nozzle_model
+
+        if self._is_dual_nozzle or is_dual_nozzle_model(self.model):
+            return self.send_gcode("\n".join(DUAL_NOZZLE_FULL_HOME))
         return self.send_gcode("G28")
 
     def move_axis(self, axis: str, distance: float, speed: int = 3000) -> bool:

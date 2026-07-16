@@ -67,6 +67,7 @@ from backend.app.utils.filament_ids import (
     filament_id_to_setting_id,
     normalize_slicer_filament,
 )
+from backend.app.utils.printer_models import extruder_for_ams, nozzle_for_ams_unit
 from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid
 
 logger = logging.getLogger(__name__)
@@ -178,18 +179,11 @@ async def apply_spool_to_slot_via_mqtt(
     if spool.nozzle_temp_max is not None:
         temp_max = spool.nozzle_temp_max
 
-    nozzle_diameter = "0.4"
-    if state and state.nozzles:
-        nd = state.nozzles[0].nozzle_diameter
-        if nd:
-            nozzle_diameter = nd
+    nozzle_diameter = nozzle_for_ams_unit(state, ams_id, tray_id)
 
-    slot_extruder = None
-    if state and state.ams_extruder_map:
-        if ams_id == 255:
-            slot_extruder = 1 - tray_id  # ext-L (tray 0) → extruder 1, ext-R (tray 1) → extruder 0
-        else:
-            slot_extruder = state.ams_extruder_map.get(str(ams_id))
+    slot_extruder = (
+        extruder_for_ams(state.ams_extruder_map, ams_id, tray_id) if (state and state.ams_extruder_map) else None
+    )
 
     # Prefer exact extruder match, fall back to extruder-agnostic kp for the
     # same nozzle. Hard-skipping on mismatch silently drops valid stored
@@ -1751,6 +1745,10 @@ async def assign_spool(
         fingerprint_type=fingerprint_type,
     )
     db.add(assignment)
+    # First-in-service stamp (FIFO substrate) — idempotent, single stamping origin.
+    from backend.app.services.spool_tag_matcher import stamp_first_loaded
+
+    stamp_first_loaded(spool)
     await db.commit()
     await db.refresh(assignment)
 
@@ -1840,6 +1838,20 @@ async def assign_spool(
             "tray_id": data.tray_id,
         }
     )
+
+    # W6.3: release low-spool staged units immediately on a manual assign,
+    # without waiting for the printer's MQTT echo. A manual assign changes the
+    # deficit via the new DB assignment WITHOUT changing any tray field, so the
+    # tray-signature-debounced `maybe_release_on_ams_change` would no-op — call
+    # the un-debounced `release_filament_staged` directly (exactly what the
+    # wrapper calls after its debounce). Idempotent deficit recompute; a
+    # still-short item stays staged. Guarded — never fail the assign on this.
+    try:
+        from backend.app.services.farm_staging import release_filament_staged
+
+        await release_filament_staged(db, data.printer_id)
+    except Exception as e:
+        logger.warning("Staged-unit release after assign failed for printer %s: %s", data.printer_id, e)
 
     return response
 

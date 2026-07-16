@@ -45,6 +45,10 @@ class ModelGeometry:
     envelope: tuple[float, float, float, float]
     max_part_height_mm: float
     validated: bool
+    # Commandable Z ceiling (mm) — the machine bottom the bed-drop release assist
+    # drives to. ``None`` ⇒ a profile with the drop enabled fails closed. Defaulted
+    # so existing constructions (test fixtures, transient geometries) still compile.
+    z_travel_mm: float | None = None
 
 
 class GeometryUnavailable(Exception):
@@ -64,6 +68,7 @@ def _to_geometry(row: PrinterModelGeometry) -> ModelGeometry:
         envelope=(row.env_x_min, row.env_x_max, row.env_y_min, row.env_y_max),
         max_part_height_mm=row.max_part_height_mm,
         validated=bool(row.validated),
+        z_travel_mm=row.z_travel_mm,
     )
 
 

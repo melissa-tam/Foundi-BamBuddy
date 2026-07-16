@@ -23,6 +23,7 @@ from backend.app.schemas.production_run import (
     FirstArticleApprove,
     FirstArticleReject,
     RunCreate,
+    RunReschedule,
     RunResponse,
 )
 from backend.app.services.farm_policy import approve_first_article, reject_first_article
@@ -31,6 +32,7 @@ from backend.app.services.production_run import (
     build_run_response,
     create_production_run,
     delete_production_run,
+    reschedule_run,
     transition_run,
 )
 
@@ -151,6 +153,24 @@ async def abort_run(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.PRODUCTION_RUNS_UPDATE),
 ):
     run = await transition_run(db, run_id, "abort")
+    return await build_run_response(db, run)
+
+
+@router.post("/{run_id}/reschedule", response_model=RunResponse)
+async def reschedule_production_run(
+    run_id: int,
+    body: RunReschedule,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.PRODUCTION_RUNS_UPDATE),
+):
+    """Change or clear a not-yet-started run's deferred start time.
+
+    A future ``scheduled_start_at`` re-stamps the run's pending plates; a value
+    at/before now, or null, clears the gate (start now). Returns 404 (unknown
+    run) and 409 when the run has already started or is not active (resume it
+    first if paused, or abort it).
+    """
+    run = await reschedule_run(db, run_id, body.scheduled_start_at)
     return await build_run_response(db, run)
 
 

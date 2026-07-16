@@ -248,3 +248,26 @@ class TestNativePlateDetection:
         flagged = await on_native_plate_detection(db_session, 14, {"0300_8017"})
         assert flagged is False
         assert printer_manager.is_awaiting_plate_clear(14) is False
+
+    async def test_plate_offset_808c_triggers_reaction(self, db_session):
+        """C4: HMS 0500_808C (build-plate offset / debris) is a plate-occupancy code
+        and drives the same human-clear-only gate + waiting_reason as 0300_8017."""
+        batch = await _add_farm_batch(db_session)
+        item = await _add_eject_item(db_session, printer_id=15, batch_id=batch.id)
+        try:
+            flagged = await on_native_plate_detection(db_session, 15, {"0500_808C"})
+            assert flagged is True
+            await db_session.refresh(item)
+            assert item.waiting_reason == "plate_not_empty_printer_detected"
+            assert item.status == "printing"
+            assert printer_manager.is_awaiting_plate_clear(15) is True
+        finally:
+            printer_manager.set_awaiting_plate_clear(15, False)
+
+    def test_808c_is_in_plate_occupancy_set(self):
+        """0500_808C joined the single-origin plate-occupancy frozenset, so BOTH the
+        main.py capture hook and the failure-reason attribution pick it up."""
+        from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
+
+        assert "0500_808C" in _HMS_PLATE_OCCUPANCY_CODES
+        assert {"0300_8017", "0300_8006"} <= _HMS_PLATE_OCCUPANCY_CODES

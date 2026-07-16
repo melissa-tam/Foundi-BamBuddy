@@ -4,6 +4,8 @@ Auto-generated from frontend/src/components/HMSErrorModal.tsx
 Source: https://github.com/greghesp/ha-bambulab
 """
 
+from backend.app.services.hms_catalog import lookup_full_code, lookup_wiki_path
+
 # HMS error code to human-readable description mapping
 # Format: "XXXX_YYYY" where XXXX is module code, YYYY is error code
 HMS_ERROR_DESCRIPTIONS: dict[str, str] = {
@@ -875,10 +877,29 @@ def get_error_description(error_code: str) -> str | None:
     return HMS_ERROR_DESCRIPTIONS.get(error_code.upper())
 
 
-# The fork has no per-code deep link into Bambu's HMS knowledge base, so every
-# error points at the wiki's HMS landing page. Defined once here so the REST and
-# WebSocket payloads share a single source of truth.
-HMS_WIKI_URL = "https://wiki.bambulab.com/en/hms/home"
+def hms_severity(code: int | str) -> int:
+    """Decode HMS severity from the firmware's error ``code`` word.
+
+    Bambu encodes severity in the high 16 bits of the 32-bit ``code``:
+    1=fatal, 2=serious, 3=common, 4=info. (The legacy path incorrectly read
+    ``(attr >> 8) & 0xF``, which decoded every real fault as fatal.) Accepts a
+    hex string like ``hms_short_code`` does. Anything outside {1,2,3,4} falls
+    back to 2 (serious) so an unrecognised value never silences a fault.
+    """
+    if isinstance(code, str):
+        code_int = int(code.replace("0x", ""), 16) if code else 0
+    else:
+        code_int = int(code or 0)
+    sev = (code_int >> 16) & 0xFFFF
+    return sev if sev in (1, 2, 3, 4) else 2
+
+
+# The wiki origin. Per-code deep links come from the vendored catalog
+# (hms_catalog.lookup_wiki_path); codes with no deep link fall back to the HMS
+# landing page. Defined once here so the REST and WebSocket payloads share a
+# single source of truth.
+HMS_WIKI_URL_ORIGIN = "https://wiki.bambulab.com"
+HMS_WIKI_URL = HMS_WIKI_URL_ORIGIN + "/en/hms/home"
 
 
 def hms_short_code(attr: int, code: int | str) -> str:
@@ -891,17 +912,43 @@ def hms_short_code(attr: int, code: int | str) -> str:
     return f"{(attr_int >> 16) & 0xFFFF:04X}_{code_int & 0xFFFF:04X}"
 
 
+def lookup_description_any(attr: int | str, code: int | str) -> str | None:
+    """Resolve HMS fault text from raw attr/code for dict-shaped consumers.
+
+    Tries the lossless full ``ecode`` (16-hex ``attr``+``code``) against the
+    vendored catalog first, then falls back to the legacy 2-group
+    ``MMMM_CCCC`` table. Returns None when neither matches. Accepts hex strings
+    the same way ``hms_short_code`` does.
+    """
+    if isinstance(attr, str):
+        attr_int = int(attr.replace("0x", ""), 16) if attr else 0
+    else:
+        attr_int = int(attr or 0)
+    if isinstance(code, str):
+        code_int = int(code.replace("0x", ""), 16) if code else 0
+    else:
+        code_int = int(code or 0)
+    full_code = f"{attr_int:08X}{code_int:08X}"
+    return lookup_full_code(full_code) or get_error_description(hms_short_code(attr, code))
+
+
 def hms_error_payload(e) -> dict:
     """Serialize an HMSError to the API/WS wire dict.
 
     Enriches the raw firmware fields (code/attr/module/severity/actions/job_id/
     full_code) with the canonical ``short_code``, the human-readable
-    ``description`` (None when the code is not in the catalog — the frontend then
-    renders an explicit "unknown code" fallback rather than dropping the error),
-    and the ``wiki_url``. Used by BOTH the REST route and the WebSocket
-    ``printer_state_to_dict`` so the two payloads never drift.
+    ``description`` and the ``wiki_url``. The description prefers the lossless
+    ``full_code`` against the vendored catalog and falls back to the legacy
+    2-group table (None when neither has it — the frontend then renders an
+    explicit "unknown code" fallback rather than dropping the error). The wiki
+    URL is the vendored per-code deep link when available, else the HMS landing
+    page. Used by BOTH the REST route and the WebSocket ``printer_state_to_dict``
+    so the two payloads never drift.
     """
     short_code = hms_short_code(e.attr, e.code)
+    description = lookup_full_code(e.full_code) or get_error_description(short_code)
+    wiki_path = lookup_wiki_path(e.full_code)
+    wiki_url = (HMS_WIKI_URL_ORIGIN + wiki_path) if wiki_path else HMS_WIKI_URL
     return {
         "code": e.code,
         "attr": e.attr,
@@ -911,6 +958,6 @@ def hms_error_payload(e) -> dict:
         "job_id": e.job_id,
         "full_code": e.full_code,
         "short_code": short_code,
-        "description": get_error_description(short_code),
-        "wiki_url": HMS_WIKI_URL,
+        "description": description,
+        "wiki_url": wiki_url,
     }

@@ -7,6 +7,7 @@ import pytest
 
 from backend.app.services.print_scheduler import PrintScheduler
 from backend.app.services.printer_manager import PrinterManager
+from backend.app.services.spool_selection import MatchOutcome
 
 
 class TestPrinterManagerPlateCleared:
@@ -395,7 +396,7 @@ class TestFarmItemEnforcesPlateClearGate:
             patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=False)),
             patch.object(scheduler, "_check_auto_drying", AsyncMock()),
             patch.object(scheduler, "_stagger_budget", AsyncMock(return_value=99)),
-            patch.object(scheduler, "_compute_ams_mapping_for_printer", AsyncMock(return_value=None)),
+            patch.object(scheduler, "_compute_ams_mapping_for_printer", AsyncMock(return_value=MatchOutcome(mapping=None))),
             patch.object(scheduler, "_block_on_filament_deficit", AsyncMock(return_value=False)),
             patch.object(scheduler, "_start_print", start_print_mock),
             patch("backend.app.services.print_scheduler.printer_manager") as mock_pm,

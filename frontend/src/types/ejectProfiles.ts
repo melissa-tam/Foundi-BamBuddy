@@ -11,10 +11,9 @@
 
 /** The numeric/boolean parameter set shared by create, update, and read. */
 export interface EjectProfileParams {
-  /** Bed temperature (°C) the part must cool below before the sweep runs. */
+  /** Bed temperature (°C) the part must cool below before the server dispatches
+   *  the eject job (the release threshold). */
   cooldown_temp_c: number;
-  /** How many times to re-poll the bed temperature before giving up. */
-  cooldown_retries: number;
   /** Vertical clearance (mm) the toolhead keeps above the part while sweeping. */
   clearance_mm: number;
   /** Z offset (mm) applied to the sweep pass height. */
@@ -45,6 +44,12 @@ export interface EjectProfileParams {
   sweep_x_max_mm: number | null;
   /** Fraction (0-1] of the part height the descending sweep starts at (1 = top). */
   sweep_start_frac: number;
+  /** Bottom clearance (mm) for the bed-drop release assist: after the eject job
+   *  lifts clear of the part, the bed drops to (the model's Z travel − this
+   *  clearance) and returns to the lift height, jolting a stuck part loose
+   *  before the sweep. null = feature off. Requires the target model's
+   *  `z_travel_mm` geometry to be set, else generation fails closed. */
+  bed_drop_clearance_mm: number | null;
 }
 
 /** A persisted eject profile as returned by the API. */
@@ -66,7 +71,6 @@ export type EjectProfileUpdate = EjectProfileCreate;
 /** Backend default parameter set, prefilled into the create form. */
 export const DEFAULT_EJECT_PROFILE_PARAMS: EjectProfileParams = {
   cooldown_temp_c: 28,
-  cooldown_retries: 5,
   clearance_mm: 10,
   z_offset_mm: 0.4,
   descent_steps: 4,
@@ -82,7 +86,13 @@ export const DEFAULT_EJECT_PROFILE_PARAMS: EjectProfileParams = {
   sweep_x_min_mm: null,
   sweep_x_max_mm: null,
   sweep_start_frac: 1,
+  bed_drop_clearance_mm: null,
 };
+
+/** UX prefill for the bed-drop clearance input when an operator first enables
+ *  the assist (mm). This is the ONLY place the 50 lives; the persisted default
+ *  is null (off) — this value only seeds the field once the toggle is on. */
+export const DEFAULT_BED_DROP_CLEARANCE_MM = 50;
 
 /** Request body for the preview and dry-run (download) endpoints.
  *

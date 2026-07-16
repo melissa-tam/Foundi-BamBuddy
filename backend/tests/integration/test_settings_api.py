@@ -62,6 +62,22 @@ class TestSettingsAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_update_farm_usb_auto_cleanup(self, async_client: AsyncClient):
+        """Verify farm_usb_auto_cleanup round-trips (default True → False → back)."""
+        # Defaults ON when never written.
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_usb_auto_cleanup"] is True
+
+        response = await async_client.put("/api/v1/settings/", json={"farm_usb_auto_cleanup": False})
+        assert response.status_code == 200
+        assert response.json()["farm_usb_auto_cleanup"] is False
+
+        # Persisted read-back through the boolean-parse whitelist.
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_usb_auto_cleanup"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_update_currency(self, async_client: AsyncClient):
         """Verify currency can be updated."""
         response = await async_client.put("/api/v1/settings/", json={"currency": "EUR"})
@@ -428,7 +444,7 @@ class TestSettingsAPI:
         result = response.json()
 
         assert result["stagger_group_size"] == 2
-        assert result["stagger_interval_minutes"] == 5
+        assert result["stagger_interval_minutes"] == 3
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -800,6 +816,97 @@ class TestSettingsAPI:
         assert result["ha_enabled"] is True
         assert result["ha_url"] == "http://192.168.1.100:8123"
         assert result["ha_token"] == "my-long-lived-token"
+
+
+class TestSpoolSelectionSettings:
+    """WI-5: prefer_lowest_filament retired; spool_selection_policy /
+    min_start_spool_g / auto_add_untagged / tagless_default_filament added.
+    Full PUT→GET round-trip through the route whitelist."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_defaults(self, async_client: AsyncClient):
+        response = await async_client.get("/api/v1/settings/")
+        assert response.status_code == 200
+        result = response.json()
+        assert result["spool_selection_policy"] == "first_loaded"
+        assert result["min_start_spool_g"] == 120
+        assert result["auto_add_untagged"] is True
+        import json as _json
+
+        parsed = _json.loads(result["tagless_default_filament"])
+        assert parsed["material"] == "PETG"
+        # Retired field is gone.
+        assert "prefer_lowest_filament" not in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_policy_round_trips(self, async_client: AsyncClient):
+        response = await async_client.put("/api/v1/settings/", json={"spool_selection_policy": "lowest_remaining"})
+        assert response.status_code == 200
+        assert response.json()["spool_selection_policy"] == "lowest_remaining"
+        # Persisted through the string branch.
+        get_resp = await async_client.get("/api/v1/settings/")
+        assert get_resp.json()["spool_selection_policy"] == "lowest_remaining"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_policy_rejects_invalid(self, async_client: AsyncClient):
+        response = await async_client.put("/api/v1/settings/", json={"spool_selection_policy": "bogus"})
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_min_start_spool_g_round_trips(self, async_client: AsyncClient):
+        response = await async_client.put("/api/v1/settings/", json={"min_start_spool_g": 250})
+        assert response.status_code == 200
+        assert response.json()["min_start_spool_g"] == 250
+        get_resp = await async_client.get("/api/v1/settings/")
+        # Read-back coerced to int through the int whitelist.
+        assert get_resp.json()["min_start_spool_g"] == 250
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_min_start_spool_g_rejects_out_of_range(self, async_client: AsyncClient):
+        assert (await async_client.put("/api/v1/settings/", json={"min_start_spool_g": -1})).status_code == 422
+        assert (await async_client.put("/api/v1/settings/", json={"min_start_spool_g": 10001})).status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_auto_add_untagged_round_trips(self, async_client: AsyncClient):
+        response = await async_client.put("/api/v1/settings/", json={"auto_add_untagged": False})
+        assert response.status_code == 200
+        assert response.json()["auto_add_untagged"] is False
+        # Read-back coerced to bool through the bool whitelist.
+        get_resp = await async_client.get("/api/v1/settings/")
+        assert get_resp.json()["auto_add_untagged"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_tagless_default_filament_round_trips(self, async_client: AsyncClient):
+        import json as _json
+
+        blob = _json.dumps({"brand": "Polymaker", "material": "PLA", "rgba": "FF0000FF"})
+        response = await async_client.put("/api/v1/settings/", json={"tagless_default_filament": blob})
+        assert response.status_code == 200
+        assert _json.loads(response.json()["tagless_default_filament"])["brand"] == "Polymaker"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_tagless_default_filament_clear(self, async_client: AsyncClient):
+        response = await async_client.put("/api/v1/settings/", json={"tagless_default_filament": ""})
+        assert response.status_code == 200
+        assert response.json()["tagless_default_filament"] == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_tagless_default_filament_rejects_bad_shape(self, async_client: AsyncClient):
+        import json as _json
+
+        # Missing required 'brand'.
+        blob = _json.dumps({"material": "PLA", "rgba": "FF0000FF"})
+        response = await async_client.put("/api/v1/settings/", json={"tagless_default_filament": blob})
+        assert response.status_code == 422
 
 
 class TestOpenInSlicerOverride:

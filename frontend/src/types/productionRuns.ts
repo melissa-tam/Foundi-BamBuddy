@@ -63,6 +63,17 @@ export interface RunPrinterState {
   stalled: boolean;
   /** The printer's own pre-print vision check found objects on the bed. */
   vision_hold: boolean;
+  /** Live per-printer filament deficit vs a representative pending unit of the
+   *  run — this printer can't currently satisfy the plate's filament need. */
+  filament_short_live: boolean;
+  /** Human-readable grams detail for `filament_short_live` (e.g. "needs 455 g,
+   *  260 g on spool"), or null when not short / not computable. */
+  filament_short_detail: string | null;
+  /** The printer reports no USB drive inserted (LAN dispatch impossible). */
+  no_usb_drive: boolean;
+  /** A capability-gate failure sentence (geometry / sliced-model / nozzle /
+   *  filament type), already human-readable; null when the printer is capable. */
+  capability_reason: string | null;
 }
 
 /** One queue item of a run, as shown on the run detail page. */
@@ -72,6 +83,8 @@ export interface RunUnit {
   /** 'operator_ui' / 'operator_screen' when deliberately stopped; else null. */
   stop_source: string | null;
   waiting_reason: string | null;
+  /** One-time deferred start (UTC ISO); future = held until then, null = ASAP. */
+  scheduled_time: string | null;
   printer_id: number | null;
   printer_name: string | null;
   started_at: string | null;
@@ -119,9 +132,9 @@ export interface ProductionRun {
   require_first_article: boolean;
   /** First-article gate state, or null when the run does not require it. */
   first_article_state: FirstArticleState;
-  /** Automatic retries per plate before a plate is marked failed (0–5). */
+  /** Automatic retries per plate before a plate is marked failed (0–10). */
   retry_max_per_unit: number;
-  /** Consecutive per-printer failures that trip an automatic quarantine (1–10). */
+  /** Consecutive per-printer failures that trip an automatic quarantine (1–20). */
   escalate_consecutive_failures: number;
   /** Operator's rejection reason; present when first_article_state is 'rejected'. */
   first_article_reject_reason?: string | null;
@@ -143,6 +156,10 @@ export interface ProductionRun {
   /** Estimated seconds remaining, or null when not computable. */
   eta_seconds: number | null;
   printers: ProductionRunPrinter[];
+  /** Derived deferred start (UTC ISO): the earliest not-yet-started plate's
+   *  scheduled_time. Future => the run is "scheduled"; null/past => normal
+   *  active run. Stored on the plates, not the run (Phase 5). */
+  scheduled_start_at: string | null;
   created_at: string;
 }
 
@@ -227,8 +244,11 @@ export interface ProductionRunCreate {
   cooldown_temp_c_override?: number | null;
   /** Gate the run on first-article approval. Defaults to true server-side. */
   require_first_article?: boolean;
-  /** Automatic retries per plate before a plate is marked failed (0–5). */
+  /** Automatic retries per plate before a plate is marked failed (0–10). */
   retry_max_per_unit?: number;
-  /** Consecutive per-printer failures that trip a quarantine (1–10). */
+  /** Consecutive per-printer failures that trip a quarantine (1–20). */
   escalate_consecutive_failures?: number;
+  /** One-time deferred start (UTC ISO with Z). Future = hold all plates until
+   *  then (non-blocking); null or at/before now = start ASAP (Phase 5). */
+  scheduled_start_at?: string | null;
 }

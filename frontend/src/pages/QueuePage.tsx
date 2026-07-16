@@ -1379,6 +1379,15 @@ export function QueuePage() {
     }>;
   } | null>(null);
 
+  // Distinct 409 (#spool-selection): the assigned spool can COVER the print but
+  // sits below the minimum-start floor. Its own confirm surfaces the slots and
+  // re-issues the start with skipFilamentCheck=true (which bypasses this floor
+  // too, per the backend start route).
+  const [startBelowMinConfirm, setStartBelowMinConfirm] = useState<{
+    itemId: number;
+    slots: number[];
+  } | null>(null);
+
   const startMutation = useMutation({
     mutationFn: ({ id, skipFilamentCheck }: { id: number; skipFilamentCheck?: boolean }) =>
       api.startQueueItem(id, { skipFilamentCheck }),
@@ -1386,6 +1395,7 @@ export function QueuePage() {
       queryClient.invalidateQueries({ queryKey: ['queue'] });
       showToast(t('queue.toast.released'));
       setFilamentShortConfirm(null);
+      setStartBelowMinConfirm(null);
     },
     onError: (error: unknown, variables) => {
       if (error instanceof ApiError && error.status === 409 && error.code === 'insufficient_filament') {
@@ -1396,6 +1406,11 @@ export function QueuePage() {
           filament_type?: string | null;
         }>;
         setFilamentShortConfirm({ itemId: variables.id, deficit: deficitRaw });
+        return;
+      }
+      if (error instanceof ApiError && error.status === 409 && error.code === 'start_spool_below_minimum') {
+        const slotsRaw = (error.detail?.slots ?? []) as number[];
+        setStartBelowMinConfirm({ itemId: variables.id, slots: slotsRaw });
         return;
       }
       showToast(t('queue.toast.startFailed'), 'error');
@@ -2501,6 +2516,28 @@ export function QueuePage() {
             startMutation.mutate({ id: filamentShortConfirm.itemId, skipFilamentCheck: true });
           }}
           onCancel={() => setFilamentShortConfirm(null)}
+        />
+      )}
+
+      {/* Minimum-start-weight confirmation (#spool-selection) */}
+      {startBelowMinConfirm && (
+        <ConfirmModal
+          title={t('queue.startBelowMin.confirmTitle')}
+          message={
+            t('queue.startBelowMin.confirmIntro') +
+            (startBelowMinConfirm.slots.length > 0
+              ? '\n\n' +
+                t('queue.startBelowMin.slots', {
+                  slots: startBelowMinConfirm.slots.join(', '),
+                })
+              : '')
+          }
+          confirmText={t('queue.startBelowMin.printAnyway')}
+          variant="warning"
+          onConfirm={() => {
+            startMutation.mutate({ id: startBelowMinConfirm.itemId, skipFilamentCheck: true });
+          }}
+          onCancel={() => setStartBelowMinConfirm(null)}
         />
       )}
 

@@ -38,6 +38,18 @@ class RunPrinterState(BaseModel):
     # A unit carries waiting_reason == "plate_not_empty_printer_detected"
     # (the printer's own pre-print vision check found objects on the bed).
     vision_hold: bool = False
+    # Live per-printer filament deficit vs a representative pending unit of the
+    # run: this printer's assigned spool can't currently cover the plate's need.
+    filament_short_live: bool = False
+    # Human-readable grams for filament_short_live (e.g. "needs 455 g, 260 g
+    # available"); null when not short / not computable.
+    filament_short_detail: str | None = None
+    # The printer reports no USB drive inserted (LAN dispatch impossible); only a
+    # live, explicit "absent" raises it (unknown/offline = False, fail-open).
+    no_usb_drive: bool = False
+    # A capability-gate BLOCK sentence (geometry / sliced-model / nozzle /
+    # filament type), already human-readable; null when the printer is capable.
+    capability_reason: str | None = None
 
 
 class RunUnit(BaseModel):
@@ -49,6 +61,9 @@ class RunUnit(BaseModel):
     # (Phase 3.1); null for normal terminals.
     stop_source: str | None = None
     waiting_reason: str | None = None
+    # One-time deferred start (Phase 5): when in the future the scheduler holds
+    # this plate until then; null = ASAP. UTC.
+    scheduled_time: datetime | None = None
     printer_id: int | None = None
     printer_name: str | None = None
     started_at: datetime | None = None
@@ -83,6 +98,10 @@ class RunCreate(BaseModel):
     require_first_article: bool | None = Field(default=None, description="Gate the run on first-article approval")
     retry_max_per_unit: int | None = Field(default=None, ge=0, le=10)
     escalate_consecutive_failures: int | None = Field(default=None, ge=1, le=20)
+    # One-time deferred start (Phase 5). A future time holds every plate until
+    # then (non-blocking — the run then competes for a free printer). A value at
+    # or before now, or null, means start ASAP. UTC (ISO string with Z).
+    scheduled_start_at: datetime | None = None
 
     @model_validator(mode="after")
     def _validate_target(self) -> RunCreate:
@@ -93,6 +112,16 @@ class RunCreate(BaseModel):
         if not has_printers and not has_model:
             raise ValueError("Provide either printer_ids or target_model")
         return self
+
+
+class RunReschedule(BaseModel):
+    """Body for ``POST /production-runs/{id}/reschedule``.
+
+    A future ``scheduled_start_at`` re-stamps the run's not-yet-started plates; a
+    value at/before now, or null, clears the gate (= start now). UTC.
+    """
+
+    scheduled_start_at: datetime | None = None
 
 
 class RunResponse(BaseModel):
@@ -145,6 +174,10 @@ class RunResponse(BaseModel):
     # median cycle × remaining plates ÷ distinct printers; null when unknown.
     eta_seconds: float | None = None
     printers: list[RunPrinterRef] = Field(default_factory=list)
+    # Derived run-level deferred start (Phase 5): the earliest not-yet-started
+    # plate's scheduled_time. Future => the run is "scheduled"; null/past => it is
+    # a normal active run. Stored on the items, not the batch. UTC.
+    scheduled_start_at: datetime | None = None
     created_at: datetime
 
     class Config:

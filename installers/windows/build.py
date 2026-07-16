@@ -32,6 +32,7 @@ import subprocess
 import sys
 import urllib.request
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Repo root: installers/windows/build.py -> ../../
@@ -294,6 +295,31 @@ def stage_service_scripts() -> None:
     shutil.copytree(service_src, service_dst)
 
 
+def stage_erp_config() -> None:
+    """Optionally bundle the ERP deploy-secrets file (``erp.env``).
+
+    If ``installers/windows/erp.env`` exists it is copied into the staged
+    ``config/`` tree so the installer lays it down at
+    ``C:\\ProgramData\\Bambuddy\\config\\erp.env`` — read at runtime to
+    pre-configure ERP directory login with zero post-install steps.
+
+    The file is OPTIONAL: a build without it must still succeed (the .iss
+    [Files] entry uses ``skipifsourcedoesntexist``), so this NEVER fails. A
+    stale copy from a previous build is removed when the source is absent so
+    an unrelated build never ships someone else's secrets.
+    """
+    src = INSTALLER_DIR / "erp.env"
+    dst = STAGING / "config" / "erp.env"
+    if not src.exists():
+        if dst.exists():
+            dst.unlink()
+        log("no erp.env present — ERP login not pre-configured in this build")
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    log(f"staging erp.env -> {dst}")
+    shutil.copy(src, dst)
+
+
 def _read_app_version() -> str:
     """Read APP_VERSION from backend/app/core/config.py (the canonical
     source used by every other Bambuddy surface — FastAPI OpenAPI title,
@@ -310,6 +336,26 @@ def _read_app_version() -> str:
     return "0.0.0+dev"
 
 
+def _git_short_sha() -> str:
+    """Return the short git SHA of HEAD, or ``""`` if git is unavailable.
+
+    Used only to make LOCAL build IDs traceable to a commit. Any failure
+    (git not installed, not a repo, detached/empty state) degrades to an
+    empty string — the timestamp alone still uniquely stamps the build.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(REPO_ROOT),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return out.stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
 def _resolve_installer_version() -> str:
     """Decide what version string the installer carries.
 
@@ -320,8 +366,10 @@ def _resolve_installer_version() -> str:
          shape, and we want the installer filename + Inno Setup AppVersion
          to match the GitHub release exactly so dailies stay distinguishable
          from each other and from the eventual stable.
-      2. ``APP_VERSION`` from config.py for manual workflow_dispatch runs
-         (no tag) and for local builds.
+      2. Local builds: ``APP_VERSION`` + a unique ``+<build id>`` suffix so a
+         stale exe left on disk is never mistaken for a fresh one. The build
+         id is a UTC timestamp plus the short git SHA (SHA omitted when git
+         is unavailable), e.g. ``0.2.4.8+20260713142530.5ac21b9c``.
 
     Strips the leading ``v`` from tags so the installer filename is
     ``bambuddy-0.2.5b1-daily.20260610-windows-x64-setup.exe``, not
@@ -333,21 +381,43 @@ def _resolve_installer_version() -> str:
         if tag.startswith("v"):
             tag = tag[1:]
         return tag or _read_app_version()
-    return _read_app_version()
+
+    base = _read_app_version()
+    build_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    sha = _git_short_sha()
+    if sha:
+        build_id = f"{build_id}.{sha}"
+    return f"{base}+{build_id}"
 
 
 def write_version_file() -> None:
     """Write the installer version as both a plain VERSION file and an
     Inno Setup include file so the .iss script can pick it up at compile
     time without a fragile file-read hack.
+
+    The plain VERSION file is staged INSIDE the app tree (``staging/app``) so
+    the recursive ``{app}\\app`` copy ships it to ``{app}\\app\\VERSION`` — the
+    location the backend reads at runtime (``config._resolve_build_version``)
+    to report the deployed build. This runs after the app tree is staged, so
+    the file survives.
     """
     version = _resolve_installer_version()
-    (STAGING / "VERSION").write_text(version)
+    (STAGING / "app" / "VERSION").write_text(version)
+
+    # Inno Setup's VersionInfoVersion (the binary FILEVERSION resource) must be
+    # a plain numeric x.x.x.x — it can't carry the local ``+<build id>`` suffix.
+    # Emit it from the canonical APP_VERSION base with any ``+suffix`` stripped,
+    # while MyAppVersion keeps the full (unique) string for the filename +
+    # displayed AppVersion.
+    numeric = _read_app_version().split("+", 1)[0]
 
     # Inno Setup include — bambuddy.iss does `#include "build\staging\version.iss"`
     iss_version = STAGING / "version.iss"
-    iss_version.write_text(f'#define MyAppVersion "{version}"\n')
-    log(f"staged VERSION = {version}")
+    iss_version.write_text(
+        f'#define MyAppVersion "{version}"\n'
+        f'#define MyAppVersionInfo "{numeric}"\n'
+    )
+    log(f"staged VERSION = {version} (VersionInfo {numeric})")
 
 
 def main() -> int:
@@ -410,6 +480,7 @@ def main() -> int:
     stage_nssm()
     stage_ffmpeg()
     stage_service_scripts()
+    stage_erp_config()
     write_version_file()
 
     log("")

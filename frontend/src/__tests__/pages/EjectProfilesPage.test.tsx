@@ -22,7 +22,6 @@ function profile(overrides: Partial<Record<string, unknown>> = {}) {
     id: 1,
     name: 'Fast sweep',
     cooldown_temp_c: 28,
-    cooldown_retries: 5,
     clearance_mm: 10,
     z_offset_mm: 0.4,
     descent_steps: 4,
@@ -33,7 +32,12 @@ function profile(overrides: Partial<Record<string, unknown>> = {}) {
     eject_speed_mm_min: 3000,
     skim_speed_mm_min: 1500,
     cooling_fan_assist: true,
+    final_skim: true,
     max_part_height_mm: 42,
+    sweep_x_min_mm: null,
+    sweep_x_max_mm: null,
+    sweep_start_frac: 1,
+    bed_drop_clearance_mm: null,
     created_at: '2026-07-01T10:00:00Z',
     updated_at: '2026-07-01T10:00:00Z',
     ...overrides,
@@ -136,5 +140,27 @@ describe('EjectProfilesPage', () => {
     // The row appears after the invalidated list re-fetches.
     expect(await screen.findByText('Gentle sweep')).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
+  it('seeds the bed-drop toggle and clearance from an existing profile on edit', async () => {
+    server.use(
+      http.get('*/api/v1/eject-profiles', () =>
+        HttpResponse.json([profile({ id: 3, name: 'Drop sweep', bed_drop_clearance_mm: 50 })]),
+      ),
+      emptyLibraryFiles,
+    );
+
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+
+    await screen.findByText('Drop sweep');
+    await user.click(screen.getByRole('button', { name: /edit drop sweep/i }));
+
+    await screen.findByRole('dialog');
+    // The switch reflects the persisted (non-null) clearance, and the input is
+    // seeded from the stored value rather than the prefill default.
+    const dropSwitch = screen.getByRole('switch', { name: 'Bed-drop release assist' });
+    expect(dropSwitch).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByLabelText('Bottom clearance (mm)')).toHaveValue(50);
   });
 });

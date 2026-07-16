@@ -6,11 +6,13 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { renderHook } from '@testing-library/react';
 import {
   buildLoadedFilaments,
   computeAmsMapping,
+  useFilamentMapping,
 } from '../../hooks/useFilamentMapping';
-import { effectivePreferLowest } from '../../utils/amsHelpers';
+import { effectiveSelectionPolicy, type SelectionOptions } from '../../utils/amsHelpers';
 import type { PrinterStatus } from '../../api/client';
 
 // Helper to create a minimal printer status with AMS data
@@ -994,8 +996,11 @@ describe('X1C model tests (single nozzle, real data)', () => {
   });
 });
 
-describe('computeAmsMapping preferLowest', () => {
-  it('picks spool with lowest remain when enabled', () => {
+const lowest = (over: Partial<SelectionOptions> = {}): SelectionOptions => ({ policy: 'lowest_remaining', ...over });
+const fifo = (over: Partial<SelectionOptions> = {}): SelectionOptions => ({ policy: 'first_loaded', ...over });
+
+describe('computeAmsMapping lowest_remaining policy', () => {
+  it('picks spool with lowest remain when policy is lowest_remaining', () => {
     const reqs = {
       filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
     };
@@ -1009,11 +1014,11 @@ describe('computeAmsMapping preferLowest', () => {
       },
     ]);
 
-    const result = computeAmsMapping(reqs, status, true);
+    const result = computeAmsMapping(reqs, status, lowest());
     expect(result).toEqual([1]); // Tray 1 has 25% remain
   });
 
-  it('picks first match when disabled', () => {
+  it('picks first match under slot_order policy', () => {
     const reqs = {
       filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
     };
@@ -1027,8 +1032,26 @@ describe('computeAmsMapping preferLowest', () => {
       },
     ]);
 
-    const result = computeAmsMapping(reqs, status, false);
-    expect(result).toEqual([0]); // First match (default)
+    const result = computeAmsMapping(reqs, status, { policy: 'slot_order' });
+    expect(result).toEqual([0]); // Slot order — no reorder
+  });
+
+  it('picks first match when no selection is passed (default = slot order)', () => {
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
+    };
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: 80 },
+          { id: 1, tray_type: 'PLA', tray_color: 'FF0000', remain: 25 },
+        ],
+      },
+    ]);
+
+    const result = computeAmsMapping(reqs, status);
+    expect(result).toEqual([0]);
   });
 
   it('sorts unknown remain to end', () => {
@@ -1045,22 +1068,17 @@ describe('computeAmsMapping preferLowest', () => {
       },
     ]);
 
-    const result = computeAmsMapping(reqs, status, true);
+    const result = computeAmsMapping(reqs, status, lowest());
     expect(result).toEqual([1]); // Known 60% over unknown
   });
 });
 
-// #1766: the user reported that "Prefer lowest remaining filament" picked the
-// wrong spool when two identical-material/color spools differed only in the
-// inventory-tracked grams (not the printer's `remain%`). The pre-fix sort
-// looked at `remain%` only and ignored Bambuddy's bound inventory entirely;
-// now we pass a globalTrayId -> grams map and the sort lifts inventory-bound
-// spools to tier 0 (matching backend _prefer_lowest_sort_key).
-describe('computeAmsMapping preferLowest with inventory map (#1766)', () => {
+// #1766: the user reported that "lowest remaining" picked the wrong spool when
+// two identical-material/color spools differed only in the inventory-tracked
+// grams (not the printer's `remain%`). The sort lifts inventory-bound spools to
+// tier 0 (matching backend selection sort).
+describe('computeAmsMapping lowest_remaining with inventory map (#1766)', () => {
   it('picks spool with lower inventory grams when both spools report same remain%', () => {
-    // Reporter's scenario: two identical Bambu-branded spools, both report
-    // `remain=100` because they were freshly inserted, but inventory has them
-    // at 950 g vs 50 g remaining. Pre-fix sort ties and picks the first.
     const reqs = {
       filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10, tray_info_idx: 'GFA00' }],
     };
@@ -1073,17 +1091,13 @@ describe('computeAmsMapping preferLowest with inventory map (#1766)', () => {
         ],
       },
     ]);
-    const inventory = new Map<number, number>([[0, 950], [1, 50]]);
+    const inventoryByTrayId = new Map<number, number>([[0, 950], [1, 50]]);
 
-    const result = computeAmsMapping(reqs, status, true, inventory);
+    const result = computeAmsMapping(reqs, status, lowest({ inventoryByTrayId }));
     expect(result).toEqual([1]); // Inventory says tray 1 is nearly empty — use it first.
   });
 
   it('prefers inventory-tracked spool over non-tracked one even when remain% would order them differently', () => {
-    // Two spools both match by type+color, both have the same tray_info_idx
-    // (identical SKU). Tray 0 has no inventory binding but reports remain=20.
-    // Tray 1 has an inventory binding with 100 g remaining. Tier 0 (bound)
-    // always beats tier 1 (MQTT-only) regardless of value — matches backend.
     const reqs = {
       filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10, tray_info_idx: 'GFA00' }],
     };
@@ -1096,16 +1110,13 @@ describe('computeAmsMapping preferLowest with inventory map (#1766)', () => {
         ],
       },
     ]);
-    const inventory = new Map<number, number>([[1, 100]]); // Only tray 1 bound
+    const inventoryByTrayId = new Map<number, number>([[1, 100]]); // Only tray 1 bound
 
-    const result = computeAmsMapping(reqs, status, true, inventory);
+    const result = computeAmsMapping(reqs, status, lowest({ inventoryByTrayId }));
     expect(result).toEqual([1]);
   });
 
-  it('falls back to remain% sort when no inventory map provided (pre-#1766 behaviour)', () => {
-    // Regression guard: callers that haven't yet wired the map must get the
-    // same sort they always got. None of the existing tests in this file pass
-    // a map; this asserts the default path is unchanged.
+  it('falls back to remain% sort when no inventory map provided', () => {
     const reqs = {
       filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
     };
@@ -1119,61 +1130,167 @@ describe('computeAmsMapping preferLowest with inventory map (#1766)', () => {
       },
     ]);
 
-    const result = computeAmsMapping(reqs, status, true, undefined);
-    expect(result).toEqual([1]); // Same as the existing no-inventory case.
+    const result = computeAmsMapping(reqs, status, lowest());
+    expect(result).toEqual([1]);
   });
 });
 
-// #1766 safety gate: when the printer has AMS Filament Backup OFF, the sort
-// MUST NOT run, even with the user setting on. Otherwise the dispatch picks a
-// near-empty spool the printer can't switch off of when it runs out mid-print.
-// Mirrors backend `_compute_ams_mapping_for_printer` gate.
-describe('effectivePreferLowest gate (#1766)', () => {
-  it('coerces to false when backup is OFF', () => {
-    expect(effectivePreferLowest(true, false)).toBe(false);
-  });
-
-  it('passes through when backup is ON', () => {
-    expect(effectivePreferLowest(true, true)).toBe(true);
-  });
-
-  it('passes through when backup is unknown (null/undefined — A1 family)', () => {
-    expect(effectivePreferLowest(true, null)).toBe(true);
-    expect(effectivePreferLowest(true, undefined)).toBe(true);
-  });
-
-  it('stays false when the user setting is off, regardless of backup state', () => {
-    expect(effectivePreferLowest(false, true)).toBe(false);
-    expect(effectivePreferLowest(false, false)).toBe(false);
-    expect(effectivePreferLowest(undefined, true)).toBe(false);
-  });
-
-  it('slot-priority tie-break: external/VT spools sort AFTER regular AMS', () => {
-    // Mirrors backend `_slot_priority` banding. When tier and value tie, slot
-    // position decides — external (ams_id = -1) must clamp to 10_000 so it
-    // can't beat AMS slot 0 (priority 0).
+// first_loaded (FIFO): spools with a first-loaded timestamp (tier 0, oldest
+// first) beat those without; slot position is the tie-break.
+describe('computeAmsMapping first_loaded policy (FIFO)', () => {
+  it('auto-match picks the oldest first_loaded spool', () => {
     const reqs = {
       filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
     };
-    const status = createPrinterStatus(
-      [
-        {
-          id: 0,
-          tray: [
-            { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: -1 },  // priority 0
-          ],
-        },
-      ],
-      [{ id: 254, tray_type: 'PLA', tray_color: 'FF0000', remain: -1 }],  // priority 10_000
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: 90 },
+          { id: 1, tray_type: 'PLA', tray_color: 'FF0000', remain: 90 },
+        ],
+      },
+    ]);
+    // Tray 1 was loaded earlier (smaller epoch) → it wins FIFO.
+    const firstLoadedByTrayId = new Map<number, number>([[0, 2000], [1, 1000]]);
+
+    const result = computeAmsMapping(reqs, status, fifo({ firstLoadedByTrayId }));
+    expect(result).toEqual([1]);
+  });
+
+  it('spools with a timestamp sort before untracked ones', () => {
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
+    };
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: 90 },  // no timestamp
+          { id: 1, tray_type: 'PLA', tray_color: 'FF0000', remain: 90 },  // has timestamp
+        ],
+      },
+    ]);
+    const firstLoadedByTrayId = new Map<number, number>([[1, 5000]]); // only tray 1 tracked
+
+    const result = computeAmsMapping(reqs, status, fifo({ firstLoadedByTrayId }));
+    expect(result).toEqual([1]); // Tier 0 (has timestamp) beats tier 1 (untracked)
+  });
+});
+
+// Minimum-start floor: a KNOWN-low spool is dropped from AUTO selection; a spool
+// with unknown (untracked) grams stays eligible. Manual overrides are unrestricted.
+describe('computeAmsMapping min-start floor', () => {
+  it('drops a known-low candidate from auto-match', () => {
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
+    };
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: 90 }, // 50 g — below floor
+          { id: 1, tray_type: 'PLA', tray_color: 'FF0000', remain: 90 }, // 500 g — above floor
+        ],
+      },
+    ]);
+    const inventoryByTrayId = new Map<number, number>([[0, 50], [1, 500]]);
+
+    const result = computeAmsMapping(reqs, status, { policy: 'slot_order', inventoryByTrayId, minStartG: 120 });
+    expect(result).toEqual([1]); // Tray 0 dropped (50 g < 120 g), tray 1 auto-picked.
+  });
+
+  it('keeps a candidate whose inventory grams are unknown', () => {
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
+    };
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: 90 }, // untracked — eligible
+        ],
+      },
+    ]);
+    const inventoryByTrayId = new Map<number, number>(); // nothing tracked
+
+    const result = computeAmsMapping(reqs, status, { policy: 'slot_order', inventoryByTrayId, minStartG: 120 });
+    expect(result).toEqual([0]); // Unknown grams are not dropped.
+  });
+
+  it('leaves the auto-picked slot unmatched when the only candidate is below the floor', () => {
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
+    };
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: 90 }, // 50 g — below floor
+        ],
+      },
+    ]);
+    const inventoryByTrayId = new Map<number, number>([[0, 50]]);
+
+    const result = computeAmsMapping(reqs, status, { policy: 'slot_order', inventoryByTrayId, minStartG: 120 });
+    expect(result).toEqual([-1]); // Below-floor spool is not auto-selected.
+  });
+});
+
+// A manual per-slot override is honored even for a below-floor spool: the
+// min-start filter only touches AUTO selection.
+describe('useFilamentMapping manual override vs min-start floor', () => {
+  it('honors a manual mapping onto a below-floor spool', () => {
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
+    };
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: 90 }, // 50 g — below floor
+          { id: 1, tray_type: 'PLA', tray_color: 'FF0000', remain: 90 }, // 500 g — above floor
+        ],
+      },
+    ]);
+    const selection: SelectionOptions = {
+      policy: 'slot_order',
+      inventoryByTrayId: new Map<number, number>([[0, 50], [1, 500]]),
+      minStartG: 120,
+    };
+    // Operator manually pinned slot 1 → tray 0 (the below-floor spool).
+    const { result } = renderHook(() =>
+      useFilamentMapping(reqs, status, { 1: 0 }, selection),
     );
-    const result = computeAmsMapping(reqs, status, true);
-    expect(result).toEqual([0]); // AMS slot wins the tie; VT does not.
+    expect(result.current.amsMapping).toEqual([0]); // Manual pick wins; floor not applied.
+  });
+});
+
+// Backup-gated policy resolution (#1766): 'lowest_remaining' falls back to
+// 'slot_order' when AMS Filament Backup is OFF; 'first_loaded' is never gated.
+describe('effectiveSelectionPolicy gate (#1766)', () => {
+  it('coerces lowest_remaining to slot_order when backup is OFF', () => {
+    expect(effectiveSelectionPolicy('lowest_remaining', false)).toBe('slot_order');
+  });
+
+  it('keeps lowest_remaining when backup is ON or unknown', () => {
+    expect(effectiveSelectionPolicy('lowest_remaining', true)).toBe('lowest_remaining');
+    expect(effectiveSelectionPolicy('lowest_remaining', null)).toBe('lowest_remaining');
+    expect(effectiveSelectionPolicy('lowest_remaining', undefined)).toBe('lowest_remaining');
+  });
+
+  it('never gates first_loaded or slot_order', () => {
+    expect(effectiveSelectionPolicy('first_loaded', false)).toBe('first_loaded');
+    expect(effectiveSelectionPolicy('slot_order', false)).toBe('slot_order');
+  });
+
+  it('defaults an unknown/undefined policy to first_loaded', () => {
+    expect(effectiveSelectionPolicy(undefined, true)).toBe('first_loaded');
+    expect(effectiveSelectionPolicy('', true)).toBe('first_loaded');
+    expect(effectiveSelectionPolicy('bogus', true)).toBe('first_loaded');
   });
 
   it('end-to-end: backup OFF prevents lowest-pick at dispatch (caller-coerced)', () => {
-    // PrintModal computes the effective flag and passes it to computeAmsMapping.
-    // This pins that flow: with backup=false the flag becomes false, the sort
-    // doesn't run, and the first matching tray wins (today's behaviour).
     const reqs = {
       filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
     };
@@ -1186,8 +1303,8 @@ describe('effectivePreferLowest gate (#1766)', () => {
         ],
       },
     ]);
-    const gated = effectivePreferLowest(true, false);
-    const result = computeAmsMapping(reqs, status, gated);
+    const gated = effectiveSelectionPolicy('lowest_remaining', false);
+    const result = computeAmsMapping(reqs, status, { policy: gated });
     expect(result).toEqual([0]); // First match wins; the 5%-remain spool is NOT selected.
   });
 });

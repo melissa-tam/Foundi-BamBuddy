@@ -185,7 +185,10 @@ DEFAULT_TEMPLATES = [
         "event_type": "printer_quarantined",
         "name": "Printer Quarantined",
         "title_template": "Printer Quarantined: {printer}",
-        "body_template": "{printer} was quarantined after {failure_count} consecutive failures.\nReason: {reason}\nIt is excluded from dispatch until cleared.",
+        # {quarantine_summary} is reason-led for a single-event quarantine
+        # (failure_count == 1) and only claims "N consecutive failures" when the
+        # count actually exceeds one — the service builds it from failure_count.
+        "body_template": "{quarantine_summary}\nReason: {reason}\nIt is excluded from dispatch until cleared.",
     },
     {
         "event_type": "run_paused",
@@ -222,6 +225,22 @@ DEFAULT_TEMPLATES = [
         "name": "Print Stalled (printer offline)",
         "title_template": "Print stalled — {printer_name}",
         "body_template": "{printer_name} has been offline {minutes} min with '{job_name}' still marked printing. It will reconcile automatically when the printer reconnects.",
+    },
+    {
+        "event_type": "storage_low",
+        "name": "USB Storage Low (auto-cleanup)",
+        "title_template": "USB storage low — {printer_name}",
+        "body_template": "{printer_name}: {detail}",
+    },
+    # Post-print eject cooldown running long. A NEW event (not a reword of
+    # plate_not_empty) so an existing install picks up this honest copy on
+    # restart — seeding only INSERTs missing event types. {detail} carries the
+    # live bed / target / cap sentence built by NotificationService.
+    {
+        "event_type": "cooldown_escalation",
+        "name": "Cooldown Running Long",
+        "title_template": "Cooldown running long — {printer}",
+        "body_template": "{printer}: {detail}",
     },
     # Farm production run notifications (Phase 6: manual / lifecycle events)
     {

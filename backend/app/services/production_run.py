@@ -14,18 +14,27 @@ import json
 import logging
 import math
 from collections import Counter
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import broadcast_production_run_changed
 from backend.app.models.archive import PrintArchive
 from backend.app.models.eject_profile import EjectProfile
+from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.printer import Printer
 from backend.app.models.sku import SkuFile
+from backend.app.services.capability_gate import (
+    evaluate_capability,
+    extract_file_capabilities,
+    loaded_filament_types,
+    read_live_nozzles,
+)
+from backend.app.services.eject.geometry import list_geometries
 from backend.app.services.farm_policy import (
     _sku_code,
     build_first_article_plan,
@@ -33,11 +42,16 @@ from backend.app.services.farm_policy import (
     farm_policy_defaults,
 )
 from backend.app.services.farm_staging import release_filament_staged
+from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
 from backend.app.services.sku_catalog import median_cycle_seconds
-from backend.app.utils.printer_models import normalize_printer_model, normalize_printer_model_id
+from backend.app.utils.printer_models import (
+    is_dual_nozzle_model,
+    normalize_printer_model,
+    normalize_printer_model_id,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,6 +85,40 @@ def plates_needed(target_units: int, units_per_plate: int) -> int:
 def can_transition(current_status: str, action: str) -> bool:
     """Whether ``action`` (pause/resume/abort) is valid from ``current_status``."""
     return current_status in ALLOWED_TRANSITIONS.get(action, set())
+
+
+def _now_naive() -> datetime:
+    """Current UTC time as a naive datetime, matching the ``scheduled_time`` column
+    convention (stored naive-UTC; the scheduler coerces a naive value to UTC)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """Normalise an inbound datetime to naive-UTC for storage/comparison.
+
+    Pydantic parses an ISO string with a ``Z``/offset into an *aware* datetime,
+    while ``PrintQueueItem.scheduled_time`` stores naive-UTC (the scheduler treats
+    a naive value as UTC — ``print_scheduler`` coerces it). Coerce aware→UTC-naive;
+    assume a naive value is already UTC. None passes through unchanged (= ASAP).
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def resolve_scheduled_start(dt: datetime | None) -> datetime | None:
+    """Normalise an operator-supplied start time to a stored value.
+
+    A future time (naive-UTC) is kept; ``None`` or a time at/​before now collapses
+    to ``None`` = start ASAP (no confusing 422 for a near-now race). Shared by run
+    creation and rescheduling so the future-vs-immediate rule has one home.
+    """
+    value = _as_utc(dt)
+    if value is not None and value > _now_naive():
+        return value
+    return None
 
 
 async def _load_run(db: AsyncSession, run_id: int) -> PrintBatch:
@@ -197,7 +245,19 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
         "required_filament_types": required_filament_types,
         "created_by_id": current_user.id if current_user else None,
     }
-    base_fields = {**plate_fields, "batch_id": batch.id, "status": "pending"}
+    # One-time deferred start (Phase 5): stamp the operator's chosen start onto
+    # every plate item's scheduled_time so the existing scheduler gate holds
+    # dispatch until then (non-blocking; None => ASAP). ``plate_fields`` — the
+    # FA-plan template passed to build_first_article_plan below — deliberately
+    # OMITS it, so plates materialised AFTER first-article approval (necessarily
+    # after the start time) dispatch ASAP.
+    scheduled_start = resolve_scheduled_start(data.scheduled_start_at)
+    base_fields = {
+        **plate_fields,
+        "batch_id": batch.id,
+        "status": "pending",
+        "scheduled_time": scheduled_start,
+    }
 
     if require_fa:
         # Gated run: create ONLY the first-article plate now; the remaining
@@ -358,6 +418,109 @@ def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueIte
     return states, any_blocked
 
 
+async def _build_printer_eligibility(
+    db: AsyncSession,
+    states: list[dict],
+    printer_rows: list[Printer],
+    items: list[PrintQueueItem],
+) -> None:
+    """Merge the three live dispatch-eligibility dimensions into each state dict.
+
+    Detail-only companion to :func:`_build_printer_states` (kept sync/live-flag-
+    only because it is reused by the Printers page): mutates each entry in
+    ``states`` IN PLACE, adding ``filament_short_live`` (+ ``filament_short_detail``
+    grams), ``no_usb_drive`` and ``capability_reason`` so the run-detail
+    eligibility panel can say WHY a printer won't take the next plate.
+
+    Computed only against the run's PENDING work — a representative pending item
+    (lowest position/id) drives a per-candidate deficit check
+    (``compute_deficit_for_queue_item`` with the ``printer_id_override`` /
+    ``ams_mapping_override`` params, so the item is never mutated) and the pure
+    capability gate. With no pending item there is nothing left to dispatch, so
+    every new flag stays at its default. File capabilities + the validated-model
+    set are parsed/queried ONCE and reused across the (≤10) printers.
+
+    Each per-printer computation is wrapped fail-safe (mirrors
+    ``farm_staging.release_filament_staged``): an exception on one dimension
+    leaves that printer's flag at its default and is logged — the detail endpoint
+    must never 500 on a malformed 3MF or a missing live status.
+    """
+    # Seed defaults so every state carries the full shape even on early return.
+    for st in states:
+        st.setdefault("filament_short_live", False)
+        st.setdefault("filament_short_detail", None)
+        st.setdefault("no_usb_drive", False)
+        st.setdefault("capability_reason", None)
+
+    pending = [it for it in items if it.status == "pending"]
+    if not pending:
+        return  # nothing left to dispatch — all flags stay at defaults
+    rep = min(pending, key=lambda i: (i.position, i.id))
+
+    # File capability facts + the validated-geometry model set: parsed/queried
+    # once, reused across all candidate printers.
+    file_meta = None
+    lib_id = getattr(rep, "library_file_id", None)
+    if lib_id is not None:
+        lib = await db.get(LibraryFile, lib_id)
+        if lib is not None:
+            file_meta = lib.file_metadata
+    file_caps = extract_file_capabilities(file_meta, getattr(rep, "plate_id", None))
+    validated_models = {g.model_key for g in await list_geometries(db) if g.validated}
+
+    # Function-local singleton import (matches settings.py): the scheduler is a
+    # heavy module and this keeps production_run import-cheap / cycle-free.
+    from backend.app.services.print_scheduler import scheduler as print_scheduler
+
+    by_id = {p.id: p for p in printer_rows}
+    for st in states:
+        printer = by_id.get(st["printer_id"])
+        if printer is None:
+            continue
+        status = printer_manager.get_status(printer.id)
+
+        # 1. Filament deficit against THIS candidate printer (no item mutation).
+        try:
+            outcome = await print_scheduler._compute_ams_mapping_for_printer(db, printer.id, rep)
+            mapping = outcome.mapping
+            mapping_override = json.dumps(mapping) if mapping is not None else None
+            deficit = await compute_deficit_for_queue_item(
+                db, rep, printer_id_override=printer.id, ams_mapping_override=mapping_override
+            )
+            if deficit:
+                needs = sum(d.required_grams for d in deficit)
+                available = sum(d.remaining_grams for d in deficit if d.remaining_grams is not None)
+                st["filament_short_live"] = True
+                st["filament_short_detail"] = f"needs {needs:.0f} g, {available:.0f} g available"
+        except Exception as e:  # noqa: BLE001 — malformed 3MF / stale spool data: default, don't 500
+            logger.warning("eligibility: filament deficit check failed for printer %s: %s", printer.id, e)
+
+        # 2. USB drive: ONLY an explicit live "absent" holds (fail-open on
+        # unknown/offline, mirroring the dispatch pre-flight, scheduler :2384).
+        try:
+            if status is not None and getattr(status, "sdcard", None) is False:
+                st["no_usb_drive"] = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("eligibility: usb check failed for printer %s: %s", printer.id, e)
+
+        # 3. Capability gate (pure): geometry / sliced-model / nozzle / filament.
+        # Only a BLOCK (ok False) surfaces a reason; a non-fatal warn is not a
+        # block, so it stays None.
+        try:
+            decision = evaluate_capability(
+                file_caps=file_caps,
+                printer_model=printer.model,
+                live_nozzles=read_live_nozzles(status),
+                loaded_filament_types=loaded_filament_types(status),
+                bed_dims_models=validated_models,
+                printer_is_dual=is_dual_nozzle_model(printer.model),
+            )
+            if not decision.ok:
+                st["capability_reason"] = decision.reason
+        except Exception as e:  # noqa: BLE001
+            logger.warning("eligibility: capability check failed for printer %s: %s", printer.id, e)
+
+
 async def build_farm_printer_contexts(db: AsyncSession) -> list[dict]:
     """Fleet-scoped "why is this printer doing (or not doing) farm work" contexts.
 
@@ -464,7 +627,37 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
     printers = [{"id": p.id, "name": p.name} for p in printer_rows]
     name_by_id = {p.id: p.name for p in printer_rows}
 
-    printer_states, has_blocked_printers = _build_printer_states(printer_rows, items)
+    # Candidate printers for the per-printer blocked-state / eligibility panel.
+    # The pinned printers always count; for a model-targeted run whose staged
+    # items are UNPINNED (printer_id NULL, target_model set) there are NO pinned
+    # printers, so a run-detail panel built from ``printer_rows`` alone would be
+    # empty exactly when the operator needs the feedback. Union in every ACTIVE
+    # printer of the run's target model(s) — quarantined ones kept (they surface
+    # AS blocked). Explicit-printer runs carry no item ``target_model`` and are
+    # unchanged. The assigned-printer list (``printers``) + ETA stay pinned-only.
+    state_rows: list[Printer] = printer_rows
+    target_models = {normalize_printer_model(it.target_model) or it.target_model for it in items if it.target_model}
+    if target_models:
+        lowered = {m.lower() for m in target_models if m}
+        model_result = await db.execute(
+            select(Printer).where(func.lower(Printer.model).in_(lowered), Printer.is_active == True)  # noqa: E712
+        )
+        merged = {p.id: p for p in printer_rows}
+        merged.update({p.id: p for p in model_result.scalars().all()})
+        state_rows = sorted(merged.values(), key=lambda p: p.id)
+
+    printer_states, has_blocked_printers = _build_printer_states(state_rows, items)
+
+    # Live dispatch-eligibility (deficit / USB / capability) is detail-only — it
+    # parses the 3MF and runs per-printer DB deficit queries, so the list
+    # endpoint stays lean. Merge it into the states and fold the three new
+    # dimensions into the single ``has_blocked_printers`` summary.
+    if detail:
+        await _build_printer_eligibility(db, printer_states, state_rows, items)
+        has_blocked_printers = has_blocked_printers or any(
+            st["filament_short_live"] or st["no_usb_drive"] or st["capability_reason"] is not None
+            for st in printer_states
+        )
 
     # First-article inspection payload (Phase 4, F1): only while the run is
     # awaiting approval or after a reject does the operator need the finished
@@ -508,6 +701,15 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
     if median_cycle is not None and distinct_printers > 0 and remaining_plates > 0:
         eta_seconds = median_cycle * remaining_plates / distinct_printers
 
+    # Derived run-level scheduled start (Phase 5): the earliest not-yet-started
+    # plate's scheduled_time. STORED on the items (scheduled_time), never on the
+    # batch — the run-level view is derived like every other count here. Null once
+    # the run has started (its remaining pending plates carry a past time or none).
+    scheduled_start_at = min(
+        (it.scheduled_time for it in items if it.status == "pending" and it.scheduled_time is not None),
+        default=None,
+    )
+
     response = {
         "id": run.id,
         "name": run.name,
@@ -539,6 +741,7 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
         "target_model": prefill_target_model,
         "eta_seconds": eta_seconds,
         "printers": printers,
+        "scheduled_start_at": scheduled_start_at,
         "created_at": run.created_at,
     }
     if detail:
@@ -549,6 +752,7 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
                 "status": it.status,
                 "stop_source": it.stop_source,
                 "waiting_reason": it.waiting_reason,
+                "scheduled_time": it.scheduled_time,
                 "printer_id": it.printer_id,
                 "printer_name": name_by_id.get(it.printer_id) if it.printer_id is not None else None,
                 "started_at": it.started_at,
@@ -661,6 +865,42 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
         elif action == "abort":
             await notification_service.on_run_aborted(run.name, _sku_code(run), db)
         return await _load_run(db, run_id)
+
+
+async def reschedule_run(db: AsyncSession, run_id: int, scheduled_start_at: datetime | None) -> PrintBatch:
+    """Change (or clear) a not-yet-started run's deferred start time (Phase 5).
+
+    Unifies **Start now** (``scheduled_start_at`` None/past → clear the gate) and
+    **Reschedule** (a future time → re-stamp). The start time is STORED on the
+    run's pending plate items (``scheduled_time``), not the batch, so this is a
+    single pass over those items; the run-level ``scheduled_start_at`` in the
+    response is derived from them.
+
+    Guard: a run is reschedulable only while it is ``active`` and NO item has
+    started (``started_at`` None on every item) — reschedulable right up until it
+    actually begins. This is race-free against a just-passed clock and unambiguous
+    versus a paused run (409 → resume/abort instead). Raises 404 (unknown run) and
+    409 (already started / not active) as HTTPExceptions.
+    """
+    run = await _load_run(db, run_id)
+    if run.status != "active" or any(it.started_at is not None for it in run.queue_items):
+        raise HTTPException(
+            status_code=409,
+            detail="Only a run that hasn't started yet can be rescheduled; resume it first if paused, or abort it.",
+        )
+
+    value = resolve_scheduled_start(scheduled_start_at)
+    for item in run.queue_items:
+        if item.status == "pending":
+            item.scheduled_time = value
+    await db.commit()
+    broadcast_production_run_changed(run_id)
+    logger.info(
+        "production_run: rescheduled run %s to %s",
+        run_id,
+        value.isoformat() if value else "ASAP (start now)",
+    )
+    return await _load_run(db, run_id)
 
 
 async def top_up_run(db: AsyncSession, run: PrintBatch) -> int:

@@ -328,6 +328,372 @@ class TestPlateClearGate:
         env.notif.on_foreign_job_detected.assert_awaited()
 
 
+class TestEjectJobCallbacks:
+    """C2: a server-dispatched eject sweep (a PendingEject, NO queue item, NO
+    archive) must be exempt from the no-deposit status rewrite and the user-facing
+    print notification, must NOT create archives at start, yet its farm terminal
+    hook + SD-card cleanup must still fire. A dry-run (a queue item, NOT a
+    PendingEject) keeps its existing no-deposit path."""
+
+    @staticmethod
+    async def _seed_printer(maker, serial):
+        from backend.app.models.printer import Printer
+
+        async with maker() as s:
+            printer = Printer(
+                name=f"P-{serial}", serial_number=serial, ip_address="10.0.0.9", access_code="0000", model="H2S"
+            )
+            s.add(printer)
+            await s.commit()
+            await s.refresh(printer)
+            return printer.id
+
+    @staticmethod
+    async def _settle(tasks_before):
+        new = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
+        if new:
+            await asyncio.wait(new, timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_eject_start_creates_no_archive_and_no_notification(self, test_engine):
+        """on_print_start for a pending eject returns early: no PrintArchive row is
+        created and no print-start notification is emitted (junk-archive fix)."""
+        from contextlib import ExitStack
+
+        from sqlalchemy import func, select
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from backend.app.models.archive import PrintArchive
+        from backend.app.services.eject import remote
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await self._seed_printer(maker, "EJ-START")
+        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 2))
+        tasks_before = set(asyncio.all_tasks())
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch("backend.app.main.async_session", maker))
+                stack.enter_context(patch("backend.app.core.database.async_session", maker))
+                mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+                mock_notif.on_print_start = AsyncMock()
+                mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+                mock_ws.send_print_start = AsyncMock()
+
+                from backend.app.main import on_print_start
+
+                await on_print_start(
+                    pid,
+                    {
+                        "filename": "eject_production_item2.gcode.3mf",
+                        "subtask_name": "eject_production_item2",
+                        "subtask_id": "SUB-E",
+                    },
+                )
+                await self._settle(tasks_before)
+
+            async with maker() as s:
+                count = await s.scalar(select(func.count(PrintArchive.id)).where(PrintArchive.printer_id == pid))
+            assert count == 0, "An eject job start must NOT create an archive."
+            mock_notif.on_print_start.assert_not_called()
+            mock_ws.send_print_start.assert_not_called()  # early-returned before the WS emit
+        finally:
+            remote.pop_pending_eject(pid)
+
+    @pytest.mark.asyncio
+    async def test_eject_completed_no_rewrite_notification_suppressed_farm_finalises(self, test_engine):
+        """A clean eject FINISH reaches farm_policy as 'completed' (NOT rewritten to
+        'cancelled'), emits NO print notification, yet the farm hook + SD-card
+        cleanup still run."""
+        from contextlib import ExitStack
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from backend.app.services.bambu_ftp import DeleteResult
+        from backend.app.services.eject import remote
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await self._seed_printer(maker, "EJ-DONE")
+        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 2))
+        tasks_before = set(asyncio.all_tasks())
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch("backend.app.main.async_session", maker))
+                stack.enter_context(patch("backend.app.core.database.async_session", maker))
+                mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+                mock_notif.on_print_complete = AsyncMock()
+                mock_notif.on_queue_completed = AsyncMock()
+                mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+                stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+                mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+                mock_ws.send_print_complete = AsyncMock()
+                mock_ws.broadcast = AsyncMock()
+                stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+                mock_del = stack.enter_context(
+                    patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
+                )
+                mock_del.return_value = DeleteResult.DELETED
+                farm_hook = stack.enter_context(
+                    patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
+                )
+
+                from backend.app.main import on_print_complete
+
+                await on_print_complete(
+                    pid,
+                    {
+                        "status": "completed",
+                        "filename": "eject_production_item2.gcode.3mf",
+                        "subtask_name": "eject_production_item2",
+                        "subtask_id": "SUB-E",
+                        "timelapse_was_active": False,
+                        "last_layer_num": 0,
+                        "last_progress": 0,
+                    },
+                )
+                await self._settle(tasks_before)
+
+            # Farm hook ran with the UN-rewritten 'completed' status + the echo id.
+            farm_hook.assert_awaited_once()
+            assert farm_hook.await_args.args[3] == "completed"
+            assert farm_hook.await_args.kwargs["completed_subtask_id"] == "SUB-E"
+            # No "Print Complete/Stopped" notification for the sweep.
+            mock_notif.on_print_complete.assert_not_awaited()
+            # SD-card cleanup of the uploaded eject file still happened.
+            mock_del.assert_awaited()
+        finally:
+            remote.pop_pending_eject(pid)
+
+    @pytest.mark.asyncio
+    async def test_dry_run_terminal_untouched_not_treated_as_eject(self, test_engine):
+        """A dry-run (queue item, NO PendingEject) is NOT an eject job: its no-deposit
+        terminal is still rewritten to 'cancelled' and STILL emits a notification —
+        proving the eject exemption does not bleed into the dry-run path."""
+        from contextlib import ExitStack
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from backend.app.services.bambu_ftp import DeleteResult
+        from backend.app.services.eject import remote
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await self._seed_printer(maker, "DRY-EJ")
+        # Explicitly NO PendingEject registered for this printer.
+        assert remote.peek_pending_eject(pid) is None
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            stack.enter_context(patch("backend.app.main.async_session", maker))
+            stack.enter_context(patch("backend.app.core.database.async_session", maker))
+            mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+            mock_notif.on_print_complete = AsyncMock()
+            mock_notif.on_queue_completed = AsyncMock()
+            mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+            stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+            mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+            mock_ws.send_print_complete = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+            stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+            mock_del = stack.enter_context(
+                patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
+            )
+            mock_del.return_value = DeleteResult.DELETED
+            farm_hook = stack.enter_context(
+                patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
+            )
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "dryrun.gcode.3mf",
+                    "subtask_name": "dryrun",
+                    "subtask_id": "DR-1",
+                    "timelapse_was_active": False,
+                    "last_layer_num": 0,
+                    "last_progress": 0,
+                },
+            )
+            await self._settle(tasks_before)
+
+        # No PendingEject → NOT an eject job → status rewritten to 'cancelled' and the
+        # notification is NOT suppressed.
+        farm_hook.assert_awaited_once()
+        assert farm_hook.await_args.args[3] == "cancelled"
+        mock_notif.on_print_complete.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_eject_named_terminal_empty_registry_never_gates_or_notifies(self, test_engine):
+        """W1 name evidence: an eject-NAMED terminal that arrives with an EMPTY pending
+        registry (a foreign instance's sweep after our restart lost the registry, or a
+        cross-instance eject) is still recognised as an eject by name — even with
+        motion progress reported. It must NOT be rewritten, NOT raise the plate gate,
+        NOT fire the foreign-job notification, and NOT emit a print notification."""
+        from contextlib import ExitStack
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from backend.app.services.bambu_ftp import DeleteResult
+        from backend.app.services.eject import remote
+        from backend.app.services.printer_manager import printer_manager
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await self._seed_printer(maker, "EJ-NAME")
+        # Empty registry on purpose — only the echoed NAME identifies this as an eject.
+        assert remote.peek_pending_eject(pid) is None
+        assert not printer_manager.is_awaiting_plate_clear(pid)
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            stack.enter_context(patch("backend.app.main.async_session", maker))
+            stack.enter_context(patch("backend.app.core.database.async_session", maker))
+            mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+            mock_notif.on_print_complete = AsyncMock()
+            mock_notif.on_queue_completed = AsyncMock()
+            mock_notif.on_foreign_job_detected = AsyncMock()
+            mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+            stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+            mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+            mock_ws.send_print_complete = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+            stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+            stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock))
+            farm_hook = stack.enter_context(
+                patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
+            )
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "eject_production_item2.gcode.3mf",
+                    "subtask_name": "eject_production_item2",
+                    "subtask_id": "FOREIGN-SUB",
+                    "timelapse_was_active": False,
+                    # Nonzero motion progress — proves the name (not no-deposit) carries it.
+                    "last_layer_num": 3,
+                    "last_progress": 40.0,
+                },
+            )
+            await self._settle(tasks_before)
+
+        # Not rewritten (still 'completed'), notification + foreign-notify suppressed.
+        farm_hook.assert_awaited_once()
+        assert farm_hook.await_args.args[3] == "completed"
+        assert farm_hook.await_args.kwargs["completed_subtask_name"] == "eject_production_item2"
+        mock_notif.on_print_complete.assert_not_awaited()
+        mock_notif.on_foreign_job_detected.assert_not_awaited()
+        # Gate NEVER raised for an eject-named terminal.
+        assert not printer_manager.is_awaiting_plate_clear(pid)
+
+    @pytest.mark.asyncio
+    async def test_eject_terminal_skips_ams_reread_sweep(self, test_engine):
+        """W6.4: an eject-job terminal must NOT trigger the AMS RFID re-read sweep —
+        each unit cycle sweeps once at the PRINT terminal, not again at the eject."""
+        from contextlib import ExitStack
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from backend.app.services.eject import remote
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await self._seed_printer(maker, "EJ-SWEEP")
+        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 2))
+        tasks_before = set(asyncio.all_tasks())
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch("backend.app.main.async_session", maker))
+                stack.enter_context(patch("backend.app.core.database.async_session", maker))
+                mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+                mock_notif.on_print_complete = AsyncMock()
+                mock_notif.on_queue_completed = AsyncMock()
+                mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+                stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+                mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+                mock_ws.send_print_complete = AsyncMock()
+                mock_ws.broadcast = AsyncMock()
+                stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+                stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock))
+                stack.enter_context(patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock))
+                sweep = stack.enter_context(
+                    patch("backend.app.services.ams_presence.on_printer_terminal", new_callable=AsyncMock)
+                )
+
+                from backend.app.main import on_print_complete
+
+                await on_print_complete(
+                    pid,
+                    {
+                        "status": "completed",
+                        "filename": "eject_production_item2.gcode.3mf",
+                        "subtask_name": "eject_production_item2",
+                        "subtask_id": "SUB-E",
+                        "timelapse_was_active": False,
+                        "last_layer_num": 0,
+                        "last_progress": 0,
+                    },
+                )
+                await self._settle(tasks_before)
+
+            sweep.assert_not_awaited()
+        finally:
+            remote.pop_pending_eject(pid)
+
+    @pytest.mark.asyncio
+    async def test_print_terminal_schedules_ams_reread_sweep(self, test_engine):
+        """A NON-eject terminal DOES schedule the AMS RFID re-read sweep (once) — the
+        mid-print-refill recognition path. Proves the eject exemption does not
+        suppress the sweep for ordinary prints."""
+        from contextlib import ExitStack
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from backend.app.services.eject import remote
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await self._seed_printer(maker, "PRINT-SWEEP")
+        assert remote.peek_pending_eject(pid) is None  # NOT an eject
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            stack.enter_context(patch("backend.app.main.async_session", maker))
+            stack.enter_context(patch("backend.app.core.database.async_session", maker))
+            mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+            mock_notif.on_print_complete = AsyncMock()
+            mock_notif.on_queue_completed = AsyncMock()
+            mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+            stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+            mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+            mock_ws.send_print_complete = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+            stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+            stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock))
+            stack.enter_context(patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock))
+            sweep = stack.enter_context(
+                patch("backend.app.services.ams_presence.on_printer_terminal", new_callable=AsyncMock)
+            )
+
+            from backend.app.main import on_print_complete
+
+            # No-deposit dry-run-style terminal (no PendingEject, non-eject name): keeps
+            # the gate untouched but STILL schedules the sweep (guard is `not _is_eject_job`).
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "dryrun.gcode.3mf",
+                    "subtask_name": "dryrun",
+                    "subtask_id": "DR-SWEEP",
+                    "timelapse_was_active": False,
+                    "last_layer_num": 0,
+                    "last_progress": 0,
+                },
+            )
+            await self._settle(tasks_before)
+
+        sweep.assert_awaited_once_with(pid)
+
+
 class TestPrintCompleteLogic:
     """Test print complete callback logic."""
 

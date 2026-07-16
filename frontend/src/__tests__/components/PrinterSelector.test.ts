@@ -200,27 +200,27 @@ describe('autoMatchFilament', () => {
   });
 });
 
-// -- autoMatchFilament with preferLowest ------------------------------------
+// -- autoMatchFilament with lowest_remaining policy -------------------------
 
-describe('autoMatchFilament preferLowest', () => {
-  it('picks spool with lowest remain when enabled', () => {
+describe('autoMatchFilament lowest_remaining policy', () => {
+  it('picks spool with lowest remain when policy is lowest_remaining', () => {
     const filaments = [
       makeFilament({ globalTrayId: 0, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 80 }),
       makeFilament({ globalTrayId: 1, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 30 }),
     ];
     const req = makeReq({ type: 'PLA', color: '#FF0000' });
-    const result = autoMatchFilament(req, filaments, new Set(), true);
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'lowest_remaining' });
     expect(result).toBeDefined();
     expect(result!.globalTrayId).toBe(1); // 30% < 80%
   });
 
-  it('picks first spool when disabled (default behavior)', () => {
+  it('picks first spool under slot_order policy', () => {
     const filaments = [
       makeFilament({ globalTrayId: 0, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 80 }),
       makeFilament({ globalTrayId: 1, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 30 }),
     ];
     const req = makeReq({ type: 'PLA', color: '#FF0000' });
-    const result = autoMatchFilament(req, filaments, new Set(), false);
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'slot_order' });
     expect(result).toBeDefined();
     expect(result!.globalTrayId).toBe(0); // First match
   });
@@ -231,18 +231,18 @@ describe('autoMatchFilament preferLowest', () => {
       makeFilament({ globalTrayId: 1, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 50 }),
     ];
     const req = makeReq({ type: 'PLA', color: '#FF0000' });
-    const result = autoMatchFilament(req, filaments, new Set(), true);
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'lowest_remaining' });
     expect(result).toBeDefined();
     expect(result!.globalTrayId).toBe(1); // Known 50% over unknown
   });
 
-  it('still respects nozzle constraint with preferLowest', () => {
+  it('still respects nozzle constraint with lowest_remaining', () => {
     const filaments = [
       makeFilament({ globalTrayId: 0, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 10, extruderId: 1 }),
       makeFilament({ globalTrayId: 1, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 80, extruderId: 0 }),
     ];
     const req = makeReq({ type: 'PLA', color: '#FF0000', nozzle_id: 0 });
-    const result = autoMatchFilament(req, filaments, new Set(), true);
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'lowest_remaining' });
     expect(result).toBeDefined();
     expect(result!.globalTrayId).toBe(1); // Only tray on correct nozzle
   });
@@ -251,15 +251,15 @@ describe('autoMatchFilament preferLowest', () => {
 // #1766: identical-material spools that only differ in inventory grams used to
 // tie at the printer's `remain%` and the first one always won. The map lets
 // the sort see the bound spool's `label_weight - weight_used` instead.
-describe('autoMatchFilament preferLowest with inventory map (#1766)', () => {
+describe('autoMatchFilament lowest_remaining with inventory map (#1766)', () => {
   it('picks lower inventory grams when remain% ties', () => {
     const filaments = [
       makeFilament({ globalTrayId: 0, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 100 }),
       makeFilament({ globalTrayId: 1, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 100 }),
     ];
     const req = makeReq({ type: 'PLA', color: '#FF0000' });
-    const inventory = new Map<number, number>([[0, 900], [1, 60]]);
-    const result = autoMatchFilament(req, filaments, new Set(), true, inventory);
+    const inventoryByTrayId = new Map<number, number>([[0, 900], [1, 60]]);
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'lowest_remaining', inventoryByTrayId });
     expect(result!.globalTrayId).toBe(1); // 60 g < 900 g
   });
 
@@ -269,8 +269,8 @@ describe('autoMatchFilament preferLowest with inventory map (#1766)', () => {
       makeFilament({ globalTrayId: 1, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 90 }),
     ];
     const req = makeReq({ type: 'PLA', color: '#FF0000' });
-    const inventory = new Map<number, number>([[1, 200]]); // Only tray 1 bound.
-    const result = autoMatchFilament(req, filaments, new Set(), true, inventory);
+    const inventoryByTrayId = new Map<number, number>([[1, 200]]); // Only tray 1 bound.
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'lowest_remaining', inventoryByTrayId });
     expect(result!.globalTrayId).toBe(1); // Tier 0 always beats tier 1.
   });
 
@@ -280,7 +280,78 @@ describe('autoMatchFilament preferLowest with inventory map (#1766)', () => {
       makeFilament({ globalTrayId: 1, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 30 }),
     ];
     const req = makeReq({ type: 'PLA', color: '#FF0000' });
-    const result = autoMatchFilament(req, filaments, new Set(), true, undefined);
-    expect(result!.globalTrayId).toBe(1); // Same as the pre-#1766 path.
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'lowest_remaining' });
+    expect(result!.globalTrayId).toBe(1); // Same as the no-inventory path.
+  });
+});
+
+// -- autoMatchFilament with first_loaded (FIFO) policy ----------------------
+
+describe('autoMatchFilament first_loaded policy', () => {
+  it('picks the oldest first_loaded spool', () => {
+    const filaments = [
+      makeFilament({ globalTrayId: 0, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 90 }),
+      makeFilament({ globalTrayId: 1, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 90 }),
+    ];
+    const req = makeReq({ type: 'PLA', color: '#FF0000' });
+    const firstLoadedByTrayId = new Map<number, number>([[0, 2000], [1, 1000]]);
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'first_loaded', firstLoadedByTrayId });
+    expect(result!.globalTrayId).toBe(1); // 1000 (older) < 2000
+  });
+
+  it('a spool with a timestamp beats an untracked one', () => {
+    const filaments = [
+      makeFilament({ globalTrayId: 0, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 90 }),
+      makeFilament({ globalTrayId: 1, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 90 }),
+    ];
+    const req = makeReq({ type: 'PLA', color: '#FF0000' });
+    const firstLoadedByTrayId = new Map<number, number>([[1, 5000]]); // only tray 1 tracked
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'first_loaded', firstLoadedByTrayId });
+    expect(result!.globalTrayId).toBe(1); // Tier 0 (tracked) beats tier 1 (untracked)
+  });
+});
+
+// -- autoMatchFilament min-start floor --------------------------------------
+
+describe('autoMatchFilament min-start floor', () => {
+  it('drops a known-low candidate from auto-match', () => {
+    const filaments = [
+      makeFilament({ globalTrayId: 0, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 90 }),
+      makeFilament({ globalTrayId: 1, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 90 }),
+    ];
+    const req = makeReq({ type: 'PLA', color: '#FF0000' });
+    const inventoryByTrayId = new Map<number, number>([[0, 50], [1, 500]]);
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'slot_order', inventoryByTrayId, minStartG: 120 });
+    expect(result!.globalTrayId).toBe(1); // Tray 0 dropped (50 g < 120 g).
+  });
+
+  it('keeps a candidate whose inventory grams are unknown', () => {
+    const filaments = [
+      makeFilament({ globalTrayId: 0, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 90 }),
+    ];
+    const req = makeReq({ type: 'PLA', color: '#FF0000' });
+    const inventoryByTrayId = new Map<number, number>(); // untracked
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'slot_order', inventoryByTrayId, minStartG: 120 });
+    expect(result!.globalTrayId).toBe(0); // Unknown grams stay eligible.
+  });
+
+  it('returns undefined when the only candidate is below the floor', () => {
+    const filaments = [
+      makeFilament({ globalTrayId: 0, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 90 }),
+    ];
+    const req = makeReq({ type: 'PLA', color: '#FF0000' });
+    const inventoryByTrayId = new Map<number, number>([[0, 50]]);
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'slot_order', inventoryByTrayId, minStartG: 120 });
+    expect(result).toBeUndefined(); // Below-floor spool is not auto-selected.
+  });
+
+  it('does not filter when minStartG is 0 (disabled)', () => {
+    const filaments = [
+      makeFilament({ globalTrayId: 0, type: 'PLA', color: '#FF0000', colorName: 'Red', remain: 90 }),
+    ];
+    const req = makeReq({ type: 'PLA', color: '#FF0000' });
+    const inventoryByTrayId = new Map<number, number>([[0, 50]]);
+    const result = autoMatchFilament(req, filaments, new Set(), { policy: 'slot_order', inventoryByTrayId, minStartG: 0 });
+    expect(result!.globalTrayId).toBe(0); // Floor disabled — low spool eligible.
   });
 });

@@ -13,11 +13,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from backend.app.services.eject.generator import (
-    DUAL_NOZZLE_HOME,
+    PARK_Z_MM,
     SWEEP_BAND_MIN_WIDTH_MM,
     block_start_marker,
 )
-from backend.app.utils.printer_models import is_dual_nozzle_model
+from backend.app.utils.printer_models import DUAL_NOZZLE_HOME, is_bedslinger_model, is_dual_nozzle_model
 
 if TYPE_CHECKING:
     from backend.app.models.eject_profile import EjectProfile
@@ -63,37 +63,25 @@ def validate_eject_gcode(
     profile: EjectProfile,
     max_z_height: float,
     geometry: ModelGeometry,
-    cooldown_temp_c: float | None = None,
-    *,
-    require_cooldown: bool = True,
 ) -> ValidationResult:
-    """Validate `gcode` against `profile`'s guards for `geometry`.
+    """Validate a MOTION-ONLY eject block against `profile`'s guards for `geometry`.
 
     Returns a :class:`ValidationResult`; ``ok`` is True only when there are no
     errors. Checks: part not taller than the guard; no move below the z_offset
-    floor; all X/Y inside the model's machine travel envelope (``geometry.envelope``);
-    exactly ``cooldown_retries`` ``M190 R`` waits at the effective threshold;
-    prologue present with no bare ``G28`` and no ``G28 Z``. ``geometry`` is the
+    floor; no move above the eject Z ceiling (the lift height, or the bed-drop
+    target when the release assist is on — floored at ``PARK_Z_MM``); all X/Y
+    inside the model's machine travel envelope (``geometry.envelope``); prologue
+    present with no bare ``G28`` and no ``G28 Z`` (dual-nozzle models require both
+    parameterized home forms); no standalone tool-change. ``geometry`` is the
     resolved :class:`~backend.app.services.eject.geometry.ModelGeometry` — the
     caller resolves it from the registry, so the validator does no model lookup.
 
-    ``cooldown_temp_c`` is the effective release temperature — pass the same
-    per-run override handed to :func:`generate_eject_gcode` so the ``M190 R``
-    threshold check validates against the value actually emitted, not the
-    profile default. When None, the profile's ``cooldown_temp_c`` is used.
-
-    ``require_cooldown`` gates ONLY the ``M190 R`` retry-count check. Keep it
-    True for every PRODUCTION block (a snippet missing its release waits must
-    still fail). Pass False to validate a thermal-less dry-run block generated
-    with ``include_cooldown=False`` — that body deliberately omits the ``M190 R``
-    waits (they cannot complete on an empty ambient bed), so the count check is
-    skipped while EVERY geometry guard above (envelope, z-floor, forbidden bare
-    ``G28`` / ``G28 Z``, prologue integrity) is still enforced. This is an
-    explicit per-call opt-out, never a global loosening.
+    There is NO thermal check: the eject block is motion-only (the cooldown wait
+    moved into the eject monitor), so a stray ``M190`` is neither required nor
+    rejected — only the geometry/homing/tool-state guards apply.
     """
     errors: list[str] = []
     warnings: list[str] = []
-    effective_cooldown = cooldown_temp_c if cooldown_temp_c is not None else profile.cooldown_temp_c
 
     bed_x, bed_y = geometry.bed
     env_x_min, env_x_max, env_y_min, env_y_max = geometry.envelope
@@ -131,6 +119,42 @@ def validate_eject_gcode(
     y_hi = env_y_max + _EPS
     z_floor = profile.z_offset_mm - _EPS
 
+    # Guard 1d: upper-Z ceiling. Bounded by the profile's OWN expectation, not the
+    # machine ceiling — a hand-edited ``G1 Z300`` in a 42 mm-part non-drop block must
+    # fail even though the machine could reach it. Base = the lift height (clearance
+    # above the part), floored at PARK_Z_MM so a legal ``clearance_mm=0`` + tiny part
+    # still admits the park Z10. When the bed-drop release assist is on, the ceiling
+    # opens up to the (deeper) drop target; a missing z_travel_mm or a drop that is
+    # not below the lift is itself an error (mirrors the generator's fail-closed).
+    lift_z = max_z_height + profile.clearance_mm
+    z_ceiling = max(lift_z, PARK_Z_MM)
+    bed_drop = getattr(profile, "bed_drop_clearance_mm", None)
+    if bed_drop is not None:
+        if is_bedslinger_model(geometry.model_key):
+            # Mirrors the generator's fail-closed: a bed-slinger's bed is fixed in Z
+            # (the gantry carries Z), so a bed-drop release assist is meaningless.
+            errors.append(
+                f"bed-drop release assist is enabled but {geometry.model_key!r} is a bedslinger "
+                "(bed does not move in Z) — disable bed_drop_clearance_mm in this profile or pick a bed-on-Z model"
+            )
+        if geometry.z_travel_mm is None:
+            errors.append(f"bed-drop release assist is enabled but model {geometry.model_key!r} has no z_travel_mm")
+        else:
+            drop_z = geometry.z_travel_mm - bed_drop
+            if drop_z <= lift_z:
+                errors.append(f"bed-drop target Z{drop_z:g} is not below the lift height Z{lift_z:g} — degenerate drop")
+            else:
+                z_ceiling = max(drop_z, z_ceiling)
+    z_hi = z_ceiling + _EPS
+
+    # Bed-slinger kinematics warning (independent of the bed-drop assist): on these
+    # machines the bed moves in Y, so a sweep pushes the part by translating the BED,
+    # not the toolhead — the sweep speeds are unproven until the hardware ladder.
+    if is_bedslinger_model(geometry.model_key):
+        warnings.append(
+            "bedslinger kinematics: Y moves drive the bed — sweep speeds unproven until the hardware ladder"
+        )
+
     dual = is_dual_nozzle_model(geometry.model_key)
     # Token-tuple -> original line for each required dual-nozzle home command, so
     # presence is a token-level match (whitespace/case independent), mirroring the
@@ -139,7 +163,6 @@ def validate_eject_gcode(
     required_home = {tuple(tok.upper() for tok in line.split()): line for line in DUAL_NOZZLE_HOME}
     found_home: set[tuple[str, ...]] = set()
 
-    m190_count = 0
     has_m17 = False
     has_g90 = False
     has_g28_xy = False
@@ -176,18 +199,12 @@ def validate_eject_gcode(
                 errors.append("G28 Z probes the bed centre under the part — forbidden")
             elif {"X", "Y"} <= axes:
                 has_g28_xy = True
-        elif cmd == "M190":
-            params = _params(tokens)
-            if "R" in params:
-                m190_count += 1
-                if abs(params["R"] - effective_cooldown) > _EPS:
-                    errors.append(
-                        f"M190 R{params['R']:g} threshold != effective cooldown_temp_c {effective_cooldown:g}"
-                    )
         elif cmd in ("G0", "G1"):
             params = _params(tokens)
             if "Z" in params and params["Z"] < z_floor:
                 errors.append(f"Move Z{params['Z']:g} is below the z_offset floor {profile.z_offset_mm:g}")
+            if "Z" in params and params["Z"] > z_hi:
+                errors.append(f"Move Z{params['Z']:g} exceeds the eject Z ceiling {z_ceiling:g} mm")
             if "X" in params and not (x_lo <= params["X"] <= x_hi):
                 errors.append(
                     f"Move X{params['X']:g} is outside the {geometry.model_key} travel envelope [{env_x_min:g}, {env_x_max:g}]"
@@ -196,14 +213,6 @@ def validate_eject_gcode(
                 errors.append(
                     f"Move Y{params['Y']:g} is outside the {geometry.model_key} travel envelope [{env_y_min:g}, {env_y_max:g}]"
                 )
-
-    # Guard 3: cooldown retry count must match the profile exactly — enforced
-    # for production blocks only. A thermal-less dry-run block (validated with
-    # require_cooldown=False) legitimately omits the M190 R waits; the geometry
-    # guards above still apply. The M190 R *threshold* check inside the loop
-    # always runs, so any stray wait at the wrong temperature is still rejected.
-    if require_cooldown and m190_count != profile.cooldown_retries:
-        errors.append(f"Found {m190_count} 'M190 R' waits, expected cooldown_retries={profile.cooldown_retries}")
 
     # Guard 5: prologue integrity.
     if block_start_marker(profile) not in gcode:

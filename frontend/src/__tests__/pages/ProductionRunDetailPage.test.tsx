@@ -25,6 +25,10 @@ function printerState(overrides: Partial<RunPrinterState> = {}): RunPrinterState
     model_mismatch_reason: null,
     stalled: false,
     vision_hold: false,
+    filament_short_live: false,
+    filament_short_detail: null,
+    no_usb_drive: false,
+    capability_reason: null,
     ...overrides,
   };
 }
@@ -35,6 +39,7 @@ function unit(overrides: Partial<RunUnit> = {}): RunUnit {
     status: 'completed',
     stop_source: null,
     waiting_reason: null,
+    scheduled_time: null,
     printer_id: 1,
     printer_name: 'H2S-Alpha',
     started_at: '2026-07-06T10:00:00Z',
@@ -77,6 +82,7 @@ function detailRun(overrides: Partial<ProductionRun> = {}): ProductionRun {
     escalate_consecutive_failures: 2,
     eta_seconds: null,
     printers: [{ id: 1, name: 'H2S-Alpha' }],
+    scheduled_start_at: null,
     created_at: '2026-07-06T09:00:00Z',
     ...overrides,
   };
@@ -173,11 +179,60 @@ describe('ProductionRunDetailPage', () => {
     // Staged banners (low-spool actionable + generic)
     expect(screen.getByText(/low filament — swap the spool/i)).toBeInTheDocument();
     expect(screen.getByText(/1 unit\(s\) staged — press Resume/i)).toBeInTheDocument();
-    // Per-printer reasons
-    expect(screen.getByText('Quarantined')).toBeInTheDocument();
-    expect(screen.getByText(/device reports H2C, registered as H2S/)).toBeInTheDocument();
+    // Per-printer reasons (now appear in both the chip and the not-eligible
+    // panel, so the quarantine label + mismatch reason are non-unique).
+    expect(screen.getAllByText('Quarantined').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/device reports H2C, registered as H2S/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('Offline-stalled mid-print')).toBeInTheDocument();
     expect(screen.getByText('Plate not empty (printer vision)')).toBeInTheDocument();
+    // Not-eligible panel lists the two blocked printers up front.
+    expect(screen.getByText('Printers not participating')).toBeInTheDocument();
+  });
+
+  it('lists live filament / USB / capability blocks in the not-eligible panel and chips', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs/1', () =>
+        HttpResponse.json(
+          detailRun({
+            printer_states: [
+              printerState({
+                filament_short_live: true,
+                filament_short_detail: 'needs 455 g, 260 g on spool',
+              }),
+              printerState({
+                printer_id: 2,
+                name: 'H2S-Beta',
+                no_usb_drive: true,
+                capability_reason: 'Nozzle 0.4 != required 0.6',
+              }),
+            ],
+          }),
+        ),
+      ),
+      printerStatusHandler,
+    );
+
+    renderDetail();
+    await screen.findByText('WID-001 run');
+
+    expect(screen.getByText('Printers not participating')).toBeInTheDocument();
+    // Live filament detail renders verbatim (backend-authored grams sentence).
+    expect(screen.getAllByText(/needs 455 g, 260 g on spool/).length).toBeGreaterThanOrEqual(1);
+    // No-USB label + capability sentence surface as blocked reasons.
+    expect(screen.getAllByText('No USB drive').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Nozzle 0.4 != required 0.6').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('renders no not-eligible panel when every targeted printer is eligible', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs/1', () => HttpResponse.json(detailRun())),
+      printerStatusHandler,
+    );
+
+    renderDetail();
+    await screen.findByText('WID-001 run');
+
+    expect(screen.queryByText('Printers not participating')).not.toBeInTheDocument();
   });
 
   it('renders the unit table with stop attribution, waiting copy and retry lineage', async () => {

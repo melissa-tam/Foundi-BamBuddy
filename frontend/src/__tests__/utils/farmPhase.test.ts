@@ -1,7 +1,7 @@
 /**
- * Phase derivation for the farm loop (Phase 4.3c): printing / cooling (with
- * target + live bed) / awaiting plate clear / nothing. Pure function — the
- * printer card pill and the run-detail chips both consume it.
+ * Phase derivation for the farm loop (Phase 4.3c): printing / cooling (release
+ * target only) / awaiting plate clear / nothing. Pure function — the printer
+ * card pill and the run-detail chips both consume it.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -18,21 +18,14 @@ describe('deriveFarmPhase', () => {
     ).toEqual({ kind: 'printing' });
   });
 
-  it('reports cooling with the watch threshold and live bed temperature', () => {
+  it('reports cooling with the watch threshold while the watch is armed', () => {
     expect(
       deriveFarmPhase({
         state: 'FINISH',
         awaiting_plate_clear: true,
         eject_watch: { threshold_c: 33 },
-        bed: 61.4,
       }),
-    ).toEqual({ kind: 'cooling', threshold: 33, bed: 61.4 });
-  });
-
-  it('reports cooling with a null bed when the temperature is unknown', () => {
-    expect(
-      deriveFarmPhase({ state: 'FINISH', awaiting_plate_clear: true, eject_watch: { threshold_c: 28 } }),
-    ).toEqual({ kind: 'cooling', threshold: 28, bed: null });
+    ).toEqual({ kind: 'cooling', threshold: 33 });
   });
 
   it('reports awaiting plate clear when the gate is raised with NO watch', () => {

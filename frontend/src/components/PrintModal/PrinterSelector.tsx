@@ -18,7 +18,7 @@ import {
   colorsAreSimilar,
   autoMatchFilament,
   filterFilamentsByNozzle,
-  effectivePreferLowest,
+  effectiveSelectionPolicy,
 } from '../../utils/amsHelpers';
 import type { PrinterSelectorProps, AssignmentMode } from './types';
 import type { PrinterMappingResult, PerPrinterConfig } from '../../hooks/useMultiPrinterFilamentMapping';
@@ -108,13 +108,17 @@ function InlineMappingEditor({
       isManual = true;
     } else {
       const usedTrayIds = new Set<number>(Object.values(printerResult.config.manualMappings));
-      const cachedSettings = queryClient.getQueryData<{ prefer_lowest_filament?: boolean }>(['settings']);
+      const cachedSettings = queryClient.getQueryData<{ spool_selection_policy?: string; min_start_spool_g?: number }>(['settings']);
       loaded = autoMatchFilament(
         req,
         printerResult.loadedFilaments,
         usedTrayIds,
-        effectivePreferLowest(cachedSettings?.prefer_lowest_filament, printerResult.status?.ams_filament_backup),
-        printerResult.inventoryByTrayId,
+        {
+          policy: effectiveSelectionPolicy(cachedSettings?.spool_selection_policy, printerResult.status?.ams_filament_backup),
+          inventoryByTrayId: printerResult.inventoryByTrayId,
+          firstLoadedByTrayId: printerResult.firstLoadedByTrayId,
+          minStartG: cachedSettings?.min_start_spool_g,
+        },
       ) as LoadedFilament | undefined;
     }
 

@@ -46,6 +46,12 @@ class PrinterModelGeometry(Base):
     # Physical part-height ceiling (mm) for the door-open sweep on this model.
     max_part_height_mm: Mapped[float] = mapped_column(Float, nullable=False)
 
+    # Commandable Z travel (mm) — the machine bottom (printable height) the bed-drop
+    # release assist drives the bed down to. NULL ⇒ the assist fails closed for this
+    # model until an operator sets it (PUT /model-geometry). Never hardcoded in code:
+    # the value lives here (migration seed/backfill), like the bed dims.
+    z_travel_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # Hardware-ladder gate: False until an operator has witnessed the empty-bed
     # dry run + thermal cycle for this model. Production dispatch requires True;
     # the preview/dry-run ladder tools allow False (with a warning).

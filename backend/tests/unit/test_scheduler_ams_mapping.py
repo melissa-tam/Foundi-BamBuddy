@@ -7,7 +7,18 @@ import zipfile
 import pytest
 
 from backend.app.services.print_scheduler import PrintScheduler
+from backend.app.services.spool_selection import SlotInventory, match_filaments_to_slots
 from backend.app.utils.threemf_tools import extract_nozzle_mapping_from_3mf
+
+
+def _lowest_remaining(required, loaded, overrides=None):
+    """Drive the canonical matcher under the ``lowest_remaining`` policy, building
+    the slot inventory from a ``{global_tray_id: grams}`` override map (as the
+    legacy ``prefer_lowest`` path did). Returns the mapping array."""
+    inv = {gtid: SlotInventory(remaining_g=g, first_loaded_ord=None) for gtid, g in (overrides or {}).items()}
+    return match_filaments_to_slots(
+        required, loaded, policy="lowest_remaining", inv=inv, backup_on=True, min_start_g=0
+    ).mapping
 
 
 class TestSchedulerAmsMappingHelpers:
@@ -415,58 +426,51 @@ class TestMatchFilamentsToSlots:
         assert result == [-1, 3]
 
 
-class TestPreferLowestFilament:
-    """Test prefer_lowest_filament sorting in _match_filaments_to_slots."""
+class TestLowestRemainingPolicy:
+    """The ``lowest_remaining`` policy (formerly the ``prefer_lowest_filament``
+    boolean) sorts matching trays by remaining filament ascending, exercised
+    here through the canonical ``spool_selection.match_filaments_to_slots``."""
 
-    @pytest.fixture
-    def scheduler(self):
-        return PrintScheduler()
-
-    def test_prefer_lowest_picks_lower_remain(self, scheduler):
-        """When enabled, should pick the spool with lower remaining filament."""
+    def test_picks_lower_remain(self):
+        """Should pick the spool with lower remaining filament."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 0, "remain": 80},
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 1, "remain": 30},
         ]
+        assert _lowest_remaining(required, loaded) == [1]  # tray 1 (30% remaining)
 
-        result = scheduler._match_filaments_to_slots(required, loaded, prefer_lowest=True)
-        assert result == [1]  # Should pick tray 1 (30% remaining)
-
-    def test_prefer_lowest_disabled_picks_first(self, scheduler):
-        """When disabled, should pick the first matching spool (default behavior)."""
+    def test_slot_order_policy_picks_first(self):
+        """The slot_order policy (legacy 'preference off') picks the first match."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 0, "remain": 80},
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 1, "remain": 30},
         ]
+        result = match_filaments_to_slots(
+            required, loaded, policy="slot_order", inv={}, backup_on=True, min_start_g=0
+        ).mapping
+        assert result == [0]  # first match
 
-        result = scheduler._match_filaments_to_slots(required, loaded, prefer_lowest=False)
-        assert result == [0]  # Should pick tray 0 (first match)
-
-    def test_prefer_lowest_unknown_remain_sorted_last(self, scheduler):
-        """Spools with remain=-1 (unknown) should be sorted to end."""
+    def test_unknown_remain_sorted_last(self):
+        """Spools with remain=-1 (unknown) sort to the end."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 0, "remain": -1},
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 1, "remain": 50},
         ]
+        assert _lowest_remaining(required, loaded) == [1]
 
-        result = scheduler._match_filaments_to_slots(required, loaded, prefer_lowest=True)
-        assert result == [1]  # Should pick tray 1 (known 50%) over unknown
-
-    def test_prefer_lowest_missing_remain_sorted_last(self, scheduler):
-        """Spools without remain field should be sorted to end."""
+    def test_missing_remain_sorted_last(self):
+        """Spools without a remain field sort to the end."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 0},  # No remain field
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 1, "remain": 50},
         ]
+        assert _lowest_remaining(required, loaded) == [1]
 
-        result = scheduler._match_filaments_to_slots(required, loaded, prefer_lowest=True)
-        assert result == [1]  # Should pick tray 1 (known 50%) over missing
-
-    def test_prefer_lowest_multiple_slots(self, scheduler):
+    def test_multiple_slots(self):
         """Should pick lowest remain for each slot independently."""
         required = [
             {"slot_id": 1, "type": "PLA", "color": "#FF0000"},
@@ -477,242 +481,97 @@ class TestPreferLowestFilament:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 1, "remain": 30},
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 2, "remain": 60},
         ]
-
-        result = scheduler._match_filaments_to_slots(required, loaded, prefer_lowest=True)
         # Slot 1 gets tray 1 (30%), slot 2 gets tray 2 (60%) — tray 0 (80%) unused
-        assert result == [1, 2]
+        assert _lowest_remaining(required, loaded) == [1, 2]
 
-    def test_prefer_lowest_with_tray_info_idx(self, scheduler):
-        """Should sort within tray_info_idx subset too."""
+    def test_with_tray_info_idx(self):
+        """Should sort within the tray_info_idx subset too."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FFFFFF", "tray_info_idx": "GFA00"}]
         loaded = [
             {"type": "PLA", "color": "#FFFFFF", "global_tray_id": 0, "tray_info_idx": "GFA00", "remain": 80},
             {"type": "PLA", "color": "#FFFFFF", "global_tray_id": 1, "tray_info_idx": "GFA00", "remain": 20},
         ]
+        assert _lowest_remaining(required, loaded) == [1]
 
-        result = scheduler._match_filaments_to_slots(required, loaded, prefer_lowest=True)
-        assert result == [1]  # Should pick tray 1 (20%) within idx subset
-
-    def test_prefer_lowest_external_spool(self, scheduler):
-        """External spool with low remain should be preferred over AMS spool."""
+    def test_external_spool(self):
+        """External spool with low remain is preferred over a fuller AMS spool."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 0, "remain": 80, "is_external": False},
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 254, "remain": 10, "is_external": True},
         ]
-
-        result = scheduler._match_filaments_to_slots(required, loaded, prefer_lowest=True)
-        assert result == [254]  # Should pick external spool (10%) over AMS (80%)
+        assert _lowest_remaining(required, loaded) == [254]
 
 
-class TestPreferLowestInventoryOverride:
-    """Tests for the #1508 inventory-aware sort: when the user has bound a
-    Bambuddy inventory spool to an AMS slot, that spool's remaining weight
-    becomes the sort signal instead of the MQTT ``remain`` percentage.
+class TestLowestRemainingInventoryOverride:
+    """The #1508 inventory-aware sort: when the user has bound a Bambuddy
+    inventory spool to an AMS slot, that spool's remaining weight (passed via the
+    slot inventory) becomes the sort signal instead of the MQTT ``remain`` %.
 
-    The fix is two-tier: inventory-tracked spools always sort before
-    MQTT-only ones, then ascending by remaining within each tier, then
-    ascending by AMS slot position. See
-    ``print_scheduler._prefer_lowest_sort_key`` for the rationale.
+    Two-tier: inventory-tracked spools always sort before MQTT-only ones, then
+    ascending by remaining within each tier, then ascending by AMS slot position.
     """
 
-    @pytest.fixture
-    def scheduler(self):
-        return PrintScheduler()
-
-    def test_inventory_override_beats_mqtt_remain(self, scheduler):
-        """Slot 4's inventory shows 50 g remaining; slot 1's clone has 950 g.
-        MQTT ``remain`` is -1 for both (non-RFID spools), so without the
-        override the sort collapses to AMS-slot order and slot 1 wins.
-        With the override slot 4 (the original, nearly empty) wins. This is
-        the literal reporter scenario in #1508.
-        """
+    def test_inventory_override_beats_mqtt_remain(self):
+        """Slot 4's inventory shows 50 g; slot 1's clone has 950 g. MQTT remain is
+        -1 for both, so without the inventory the sort collapses to slot order and
+        slot 1 wins; with it, the nearly-empty slot 4 wins (#1508 scenario)."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 0,
-                "global_tray_id": 0,
-                "remain": -1,
-            },
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 3,
-                "global_tray_id": 3,
-                "remain": -1,
-            },
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 0, "global_tray_id": 0, "remain": -1},
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 3, "global_tray_id": 3, "remain": -1},
         ]
-        # Slot 1 (gtid 0) is the fresh clone at 950 g; slot 4 (gtid 3) is the
-        # nearly-empty original at 50 g.
-        overrides = {0: 950.0, 3: 50.0}
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_lowest=True, inventory_remain_overrides=overrides
-        )
-        assert result == [3]
+        assert _lowest_remaining(required, loaded, overrides={0: 950.0, 3: 50.0}) == [3]
 
-    def test_inventory_override_with_zero_grams_still_wins(self, scheduler):
-        """An inventory-tracked spool at 0 g must still sort first within
-        its tier — the user wants to finish what's left (or be told there's
-        a deficit) rather than skip to the fresh one. The clamp-to-101
-        legacy logic only fires on negative values, so 0 g stays 0.0.
-        """
+    def test_inventory_override_with_zero_grams_still_wins(self):
+        """An inventory-tracked spool at 0 g still sorts first within its tier
+        (finish what's left / surface the deficit); 0 g is not clamped to 101."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 0,
-                "global_tray_id": 0,
-                "remain": -1,
-            },
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 1,
-                "global_tray_id": 1,
-                "remain": -1,
-            },
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 0, "global_tray_id": 0, "remain": -1},
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 1, "global_tray_id": 1, "remain": -1},
         ]
-        overrides = {0: 500.0, 1: 0.0}
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_lowest=True, inventory_remain_overrides=overrides
-        )
-        assert result == [1]
+        assert _lowest_remaining(required, loaded, overrides={0: 500.0, 1: 0.0}) == [1]
 
-    def test_inventory_tier_beats_mqtt_tier_regardless_of_value(self, scheduler):
-        """Mixed mode: one slot is inventory-tracked at 800 g (high), the
-        other has only a MQTT remain of 10 (very low). The inventory tier
-        wins because the user has explicitly told us to manage that slot —
-        unit-mixing across tiers is intentional and resolved by the tier
-        flag, not value comparison.
-        """
+    def test_inventory_tier_beats_mqtt_tier_regardless_of_value(self):
+        """A high-grams inventory-tracked slot beats a low-percent MQTT-only slot —
+        the tier flag dominates, so grams/percent never compare."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 0,
-                "global_tray_id": 0,
-                "remain": 10,
-            },
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 1,
-                "global_tray_id": 1,
-                "remain": -1,
-            },
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 0, "global_tray_id": 0, "remain": 10},
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 1, "global_tray_id": 1, "remain": -1},
         ]
-        overrides = {1: 800.0}  # only slot 2 has an inventory binding
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_lowest=True, inventory_remain_overrides=overrides
-        )
-        assert result == [1]
+        assert _lowest_remaining(required, loaded, overrides={1: 800.0}) == [1]
 
-    def test_two_tracked_spools_tied_at_same_grams_lower_slot_wins(self, scheduler):
-        """Two inventory-tracked spools with genuinely equal remaining
-        weight — slot tie-breaker decides. Lower AMS slot wins to match
-        the user's mental model of "use the lower slot first when equal."
-        """
+    def test_two_tracked_spools_tied_lower_slot_wins(self):
+        """Equal remaining weight → lower AMS slot wins the tie-break."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 1,
-                "global_tray_id": 1,
-                "remain": -1,
-            },
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 0,
-                "global_tray_id": 0,
-                "remain": -1,
-            },
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 1, "global_tray_id": 1, "remain": -1},
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 0, "global_tray_id": 0, "remain": -1},
         ]
-        overrides = {0: 500.0, 1: 500.0}
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_lowest=True, inventory_remain_overrides=overrides
-        )
-        assert result == [0]
+        assert _lowest_remaining(required, loaded, overrides={0: 500.0, 1: 500.0}) == [0]
 
-    def test_no_override_falls_back_to_mqtt_remain(self, scheduler):
-        """When no slots are inventory-bound the override map is empty
-        and behaviour is identical to the pre-#1508 MQTT-only sort.
-        Regression guard for the un-tracked-spool case.
-        """
+    def test_no_override_falls_back_to_mqtt_remain(self):
+        """Empty inventory → identical to the pre-#1508 MQTT-only sort."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 0,
-                "global_tray_id": 0,
-                "remain": 80,
-            },
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 1,
-                "global_tray_id": 1,
-                "remain": 30,
-            },
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 0, "global_tray_id": 0, "remain": 80},
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 1, "global_tray_id": 1, "remain": 30},
         ]
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_lowest=True, inventory_remain_overrides={}
-        )
-        assert result == [1]
+        assert _lowest_remaining(required, loaded, overrides={}) == [1]
 
-    def test_no_override_unknown_remain_sorts_after_known(self, scheduler):
-        """In the no-binding case, ``remain = -1`` (non-RFID, unknown) must
-        still sort *after* a slot the printer knows something about — the
-        legacy sentinel-101 behaviour is preserved.
-        """
+    def test_no_override_unknown_remain_sorts_after_known(self):
+        """No binding: remain=-1 sorts after a slot with a known percentage."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 0,
-                "global_tray_id": 0,
-                "remain": -1,
-            },
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 1,
-                "global_tray_id": 1,
-                "remain": 50,
-            },
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 0, "global_tray_id": 0, "remain": -1},
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 1, "global_tray_id": 1, "remain": 50},
         ]
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_lowest=True, inventory_remain_overrides=None
-        )
-        assert result == [1]
+        assert _lowest_remaining(required, loaded) == [1]
 
-    def test_external_with_negative_ams_id_does_not_outrank_ams_on_tie(self, scheduler):
-        """``_build_loaded_filaments`` emits external/VT trays with
-        ``ams_id = -1``. A naive ``ams_id * 4 + tray_id`` slot-priority
-        formula would compute -4 for an external and 0 for AMS slot 0 —
-        flipping the legacy stable-sort baseline (which kept AMS first
-        because it's emitted before externals). When ``remain`` ties
-        between the two, AMS slot 0 must still win.
-        """
+    def test_external_negative_ams_id_does_not_outrank_ams_on_tie(self):
+        """External/VT trays (ams_id=-1) must not beat AMS slot 0 on a remain tie."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
             {
@@ -734,39 +593,16 @@ class TestPreferLowestInventoryOverride:
                 "is_external": True,
             },
         ]
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_lowest=True, inventory_remain_overrides=None
-        )
-        assert result == [0]
+        assert _lowest_remaining(required, loaded) == [0]
 
-    def test_ams_ht_does_not_outrank_regular_ams_on_tie(self, scheduler):
-        """AMS-HT units use ``ams_id`` >= 128 with a single tray. On a tied
-        ``remain`` value, regular AMS slot 0 (slot_priority 0) must beat
-        AMS-HT (slot_priority 1000+).
-        """
+    def test_ams_ht_does_not_outrank_regular_ams_on_tie(self):
+        """AMS-HT (ams_id>=128) must not beat regular AMS slot 0 on a remain tie."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
         loaded = [
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 0,
-                "tray_id": 0,
-                "global_tray_id": 0,
-                "remain": 50,
-            },
-            {
-                "type": "PLA",
-                "color": "#FF0000",
-                "ams_id": 128,
-                "tray_id": 0,
-                "global_tray_id": 128,
-                "remain": 50,
-            },
+            {"type": "PLA", "color": "#FF0000", "ams_id": 0, "tray_id": 0, "global_tray_id": 0, "remain": 50},
+            {"type": "PLA", "color": "#FF0000", "ams_id": 128, "tray_id": 0, "global_tray_id": 128, "remain": 50},
         ]
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_lowest=True, inventory_remain_overrides=None
-        )
-        assert result == [0]
+        assert _lowest_remaining(required, loaded) == [0]
 
 
 class TestBuildLoadedFilamentsTrayInfoIdx:

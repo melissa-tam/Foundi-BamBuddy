@@ -31,8 +31,9 @@ def _validate_band_pair(lo: float | None, hi: float | None) -> None:
 
 class EjectProfileBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
+    # Server-side cooldown release threshold: the eject monitor holds the plate
+    # gate until the live bed drops here, then dispatches the motion-only eject.
     cooldown_temp_c: float = Field(default=28.0, gt=0, le=100)
-    cooldown_retries: int = Field(default=5, ge=1, le=30)
     clearance_mm: float = Field(default=10.0, ge=0)
     z_offset_mm: float = Field(default=0.4, gt=0)
     descent_steps: int = Field(default=4, ge=1, le=100)
@@ -47,6 +48,9 @@ class EjectProfileBase(BaseModel):
     # behaviour); False pushes exactly once.
     final_skim: bool = True
     max_part_height_mm: float = Field(default=42.0, gt=0)
+    # Optional bed-drop release assist (mm). NULL = off; the clearance is kept from
+    # the machine bottom (model z_travel_mm) during the drop.
+    bed_drop_clearance_mm: float | None = Field(default=None, ge=0, le=200)
     # Optional X sweep sub-band (mm); both null = full-width sweep (default).
     sweep_x_min_mm: float | None = Field(default=None, ge=0)
     sweep_x_max_mm: float | None = Field(default=None, ge=0)
@@ -75,7 +79,6 @@ class EjectProfileUpdate(BaseModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=100)
     cooldown_temp_c: float | None = Field(default=None, gt=0, le=100)
-    cooldown_retries: int | None = Field(default=None, ge=1, le=30)
     clearance_mm: float | None = Field(default=None, ge=0)
     z_offset_mm: float | None = Field(default=None, gt=0)
     descent_steps: int | None = Field(default=None, ge=1, le=100)
@@ -88,6 +91,8 @@ class EjectProfileUpdate(BaseModel):
     cooling_fan_assist: bool | None = None
     final_skim: bool | None = None
     max_part_height_mm: float | None = Field(default=None, gt=0)
+    # NULL = off; explicit null in an update clears the bed-drop assist.
+    bed_drop_clearance_mm: float | None = Field(default=None, ge=0, le=200)
     sweep_x_min_mm: float | None = Field(default=None, ge=0)
     sweep_x_max_mm: float | None = Field(default=None, ge=0)
     sweep_start_frac: float | None = Field(default=None, gt=0, le=1)

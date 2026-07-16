@@ -20,13 +20,22 @@ still clears the full part top regardless of either tuning. A third tuning,
 ``final_skim`` (default True), gates the trailing slow skim pass at the
 z_offset floor — set it False to push exactly once (e.g. one mid-height lane
 for a tall part).
+
+An optional ``bed_drop_clearance_mm`` (NULL = off) adds a mechanical release
+assist after the bed heater is commanded off: the bed drives all the way DOWN
+to the machine bottom minus that clearance (bigger Z = bed farther from the
+nozzle), then returns to the lift height before the sweep runs — jolting a
+stuck part loose without changing the sweep itself. The machine bottom is the
+target model's ``z_travel_mm`` (from the geometry registry, never hardcoded);
+a profile that enables the assist against a model with no ``z_travel_mm`` fails
+closed.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from backend.app.utils.printer_models import is_dual_nozzle_model
+from backend.app.utils.printer_models import DUAL_NOZZLE_HOME, is_bedslinger_model, is_dual_nozzle_model
 
 if TYPE_CHECKING:
     from backend.app.models.eject_profile import EjectProfile
@@ -37,31 +46,84 @@ if TYPE_CHECKING:
 # safety error (schema-validated and re-checked here + in the validator).
 SWEEP_BAND_MIN_WIDTH_MM = 10.0
 
-# Dual-nozzle (Vortek) homing forms — shared source of truth for the generator
-# and the validator (like SWEEP_BAND_MIN_WIDTH_MM above).
-#
-# INCIDENT (007-H2C, 2026-07-12): a bare `G28` / `G28 X Y` in the post-print
-# no-tool state stall-loops on dual-nozzle H2-series firmware — the sensorless
-# X-homing stall threshold is unsuited to the dual carriage, so the carriage rams
-# the X-homing wall nonstop until emergency-stopped. The stock O1C2 start block
-# NEVER homes unparameterized: it uses these torque-parameterized forms, where
-# `T` is the stall-torque threshold. Copied VERBATIM from that stock start block;
-# homes X then Y in two SEPARATE parameterized commands. Validated calm by the
-# supervised motion-smoke ladder (2026-07-12).
-DUAL_NOZZLE_HOME: tuple[str, str] = ("G28 X T300", "G28 Y T300")
+# Safe Z (mm) the toolhead parks at after the sweep, above the plate — a module
+# constant (not an inline literal) so the same value is the validator's park-Z
+# floor for the upper-Z ceiling guard (``_fmt(10.0)`` == "10", byte-identical).
+PARK_Z_MM = 10.0
 
-# Dry-run (EMPTY BED) full home for dual-nozzle models: the two X/Y forms plus the
-# stock Z-home form. A Z-home probes the bed centre — safe ONLY on the
-# by-definition-empty dry-run bed (hardware-ladder step 1), never in a production
-# block. The `G28 Z P0 T250` form is ATTESTED in the O1C2 stock start block but was
-# NOT individually micro-probed; it gets its first live exercise at the supervised
-# dry run.
-DUAL_NOZZLE_DRYRUN_HOME: tuple[str, ...] = ("G28 X T300", "G28 Y T300", "G28 Z P0 T250")
+# The dual-nozzle homing forms (``DUAL_NOZZLE_HOME`` / ``DUAL_NOZZLE_FULL_HOME``)
+# live in ``utils.printer_models`` — the single canonical source of truth shared
+# with the dry-run wrapper and ``BambuMQTTClient.home_axes``. The generator's
+# eject prologue homes X/Y only (never Z — a part sits on the plate), so it uses
+# ``DUAL_NOZZLE_HOME`` (the X/Y torque pair) directly.
 
 # Marker comments wrapping the generated block so it is unambiguously locatable
 # in an injected file (and greppable in dry-run downloads).
 BLOCK_START_PREFIX = "; ===== FARM EJECT BLOCK profile="
 BLOCK_END_MARKER = "; ===== FARM EJECT BLOCK END ====="
+
+# Completion epilogue — the stock machine-end FINISH TAIL, copied verbatim from a
+# production H2S plate (foundi-FarmManager/Print Files/
+# _6_Half_Shell_PCO-M18-2656_top_surface_gcode.3mf → Metadata/plate_3.gcode), the
+# segment from the feedrate/acc/time resets through the final `M73 P100 R0`.
+#
+# The eject sweep is now a STANDALONE, server-dispatched motion-only job whose file
+# REPLACES the plate G-code entirely — it no longer splices after a real print's
+# stock machine-end block. A standalone file WITHOUT that block ends FAILED at EOF
+# even after clean motion (cosmetic, live-observed on a real H2S 2026-07-04). This
+# tail is the firmware's job-completion handshake — progress/feedrate/accel resets,
+# the air-filtration `M1002 judge_flag` conditional (J1/J2 fire only when the
+# firmware set the flag; otherwise skipped), the finish chime, then `M400`/`M18` —
+# so appending it makes the eject job register FINISH instead of FAILED-at-EOF.
+# Verbatim: no commands the stock file lacks are invented; only insignificant
+# trailing whitespace on the melody lines is normalised.
+COMPLETION_EPILOGUE = """\
+M220 S100  ; Reset feedrate magnitude
+M201.2 K1.0 ; Reset acc magnitude
+M73.2   R1.0 ;Reset left time magnitude
+
+M1015.4 S0 K0 ;disable air printing detect
+
+;=====printer finish air purification=========
+M622.1 S0
+M1002 judge_flag print_finish_air_filt_flag
+
+M622 J1
+M1002 gcode_claim_action : 66
+M145 P1
+M106 P6 S255
+M400 S180
+M106 P6 S0
+M623
+
+M622 J2
+M1002 gcode_claim_action : 66
+M145 P0
+M106 P3 S127
+M400 S180
+M106 P3 S0
+M623
+;=====printer finish air purification=========
+
+;=====printer finish  sound=========
+M17
+M400 S1
+M1006 S1
+M1006 A53 B10 L99 C53 D10 M99 E53 F10 N99
+M1006 A57 B10 L99 C57 D10 M99 E57 F10 N99
+M1006 A0 B15 L0 C0 D15 M0 E0 F15 N0
+M1006 A53 B10 L99 C53 D10 M99 E53 F10 N99
+M1006 A57 B10 L99 C57 D10 M99 E57 F10 N99
+M1006 A0 B15 L0 C0 D15 M0 E0 F15 N0
+M1006 A48 B10 L99 C48 D10 M99 E48 F10 N99
+M1006 A0 B15 L0 C0 D15 M0 E0 F15 N0
+M1006 A60 B10 L99 C60 D10 M99 E60 F10 N99
+M1006 W
+;=====printer finish  sound=========
+M400
+M18
+
+M73 P100 R0"""
 
 
 class EjectGenerationError(ValueError):
@@ -95,11 +157,19 @@ def generate_eject_gcode(
     profile: EjectProfile,
     max_z_height: float,
     geometry: ModelGeometry,
-    cooldown_temp_c: float | None = None,
-    *,
-    include_cooldown: bool = True,
 ) -> str:
-    """Build the eject G-code block for `profile` at a part height of `max_z_height`.
+    """Build the MOTION-ONLY eject G-code block for `profile` at part height `max_z_height`.
+
+    The block is a self-contained, self-completing eject-only job: prologue
+    (re-engage + home X/Y), bed-heater off, the descending sweep + park, then the
+    :data:`COMPLETION_EPILOGUE` (stock machine-end finish tail) so the standalone
+    file ends FINISH rather than FAILED-at-EOF.
+
+    There is NO in-file cooldown wait: the bed-cooldown gate moved OUT of the
+    G-code into the eject monitor, which holds the plate-clear gate until the live
+    ``bed_temper`` reaches the profile's ``cooldown_temp_c`` and only THEN dispatches
+    this motion-only job. ``M140 S0`` (heater off) is still emitted defensively; the
+    old ``M106``/``M190 R`` thermal block is gone.
 
     Args:
         profile: the eject profile (all tunable parameters).
@@ -107,29 +177,17 @@ def generate_eject_gcode(
         geometry: the target model's :class:`~backend.app.services.eject.geometry.ModelGeometry`
             (bed rectangle + travel envelope), resolved from the registry by the
             caller. Pure input — the generator does no DB / model-string lookup.
-        cooldown_temp_c: optional per-run override for the bed cooldown gate
-            (°C). When None, the profile's ``cooldown_temp_c`` is used. Lets a
-            production run tighten/loosen the release temperature without a
-            dedicated profile — the ``M190 R`` waits are emitted at this value.
-        include_cooldown: emit the thermal gate (fan + ``M190 R`` release waits).
-            True for every PRODUCTION path — the bed always approaches the
-            threshold from ABOVE (cooling from a finished print), so the wait
-            completes. Pass False ONLY for the empty-bed dry run: there the bed
-            sits at ambient with the heater off, so an ``M190 R`` toward the
-            release threshold can never be reached from below (``M190 R`` waits
-            from EITHER direction) — it would hang the job forever and the sweep
-            the dry run exists to validate would never run. The ``M140 S0``
-            heater-off is emitted either way; only the fan + ``M190 R`` waits are
-            dropped, so the dry-run body validates GEOMETRY, not thermals.
 
     Returns:
         The complete eject block as a newline-terminated string.
 
     Raises:
         EjectGenerationError: part taller than the profile's ``max_part_height_mm``
-            guard, or a degenerate sweep after the travel-envelope clamp.
+            guard; a degenerate sweep after the travel-envelope clamp; or the
+            bed-drop release assist is enabled but the model has no
+            ``z_travel_mm`` in its geometry row, or the drop target is not below
+            the lift height (degenerate drop).
     """
-    effective_cooldown = cooldown_temp_c if cooldown_temp_c is not None else profile.cooldown_temp_c
     bed_x, bed_y = geometry.bed
     x_min, x_max, y_min, y_max = geometry.envelope
 
@@ -206,23 +264,48 @@ def generate_eject_gcode(
     else:
         lines.append("G28 X Y")
     lines.append("G90")
-    lines.append(f"G1 Z{_fmt(max_z_height + profile.clearance_mm)} F900")
+    # Lift the bed clear of the part; reused as the return height of the optional
+    # bed-drop assist and as the validator's expected Z ceiling for a non-drop block.
+    lift_z = max_z_height + profile.clearance_mm
+    lines.append(f"G1 Z{_fmt(lift_z)} F900")
 
     # --- bed heater off ---------------------------------------------------
-    # Always command the bed heater off. In the full (production) mode this is
-    # the front of a thermal gate that HOLDS until the bed reaches the release
-    # threshold; in the thermal-less dry-run mode it is the whole thermal
-    # handling — no fan, no M190 wait (see the include_cooldown arg docstring).
+    # Command the bed heater off defensively. The cooldown WAIT is no longer in
+    # the G-code — the eject monitor already held the plate gate until the live
+    # bed reached cooldown_temp_c before dispatching this motion-only job — so no
+    # fan / M190 R loop is emitted here.
     lines.append("; --- bed heater off ---")
     lines.append("M140 S0")
-    if include_cooldown:
-        lines.append("; --- cooldown: hold until the bed reaches the release threshold ---")
-        if profile.cooling_fan_assist:
-            lines.append("M106 S255")
-        # One M190 R stalls early on the cooling slope, so re-arm it N times.
-        for _ in range(profile.cooldown_retries):
-            lines.append(f"M190 R{_fmt(effective_cooldown)}")
-        lines.append("M106 S0")
+
+    # --- bed-drop release assist (optional) -------------------------------
+    # Drive the bed all the way DOWN to the machine bottom minus the profile's
+    # clearance (bigger Z = bed farther from the nozzle), then return to the lift
+    # height — a mechanical jolt to release a part the sweep alone can't shift.
+    # NULL clearance = assist off (the 5 golden fixtures stay byte-identical).
+    bed_drop = profile.bed_drop_clearance_mm
+    if bed_drop is not None:
+        if is_bedslinger_model(geometry.model_key):
+            # A bed-slinger's bed is fixed in Z (the gantry carries Z), so there is
+            # no bed-on-Z travel to open a part↔nozzle gap — the drop is physically
+            # meaningless and driving Z would move the TOOLHEAD toward the part.
+            raise EjectGenerationError(
+                f"bed-drop release assist is enabled but {geometry.model_key!r} is a bedslinger "
+                "(bed does not move in Z) — disable bed_drop_clearance_mm in this profile or pick a bed-on-Z model"
+            )
+        if geometry.z_travel_mm is None:
+            raise EjectGenerationError(
+                f"bed-drop release assist is enabled but model {geometry.model_key!r} has no "
+                "z_travel_mm — set it via PUT /model-geometry before ejecting with this profile"
+            )
+        drop_z = geometry.z_travel_mm - bed_drop
+        if drop_z <= lift_z:
+            raise EjectGenerationError(
+                f"bed-drop target Z{drop_z:g} (z_travel {geometry.z_travel_mm:g} - clearance "
+                f"{bed_drop:g}) is not below the lift height Z{lift_z:g} — degenerate drop"
+            )
+        lines.append("; --- bed-drop release assist: full down + return ---")
+        lines.append(f"G1 Z{_fmt(drop_z)} F900")
+        lines.append(f"G1 Z{_fmt(lift_z)} F900")
 
     # --- sweep: push the part off the FRONT (door side) -------------------
     lines.append("; --- sweep: push part off the front edge ---")
@@ -255,7 +338,13 @@ def generate_eject_gcode(
     # for every real bed, but clamp for the same single-source guarantee).
     park_x = _clamp(bed_x / 2, x_min, x_max)
     park_y = _clamp(bed_y / 2, y_min, y_max)
-    lines.append(f"G1 X{_fmt(park_x)} Y{_fmt(park_y)} Z10 F9000")
+    lines.append(f"G1 X{_fmt(park_x)} Y{_fmt(park_y)} Z{_fmt(PARK_Z_MM)} F9000")
+
+    # --- completion epilogue ----------------------------------------------
+    # Stock machine-end finish tail so this standalone motion-only file ends
+    # FINISH, not FAILED-at-EOF (see COMPLETION_EPILOGUE). Emitted verbatim.
+    lines.append("; --- completion epilogue: stock machine-end finish tail (job ends FINISH) ---")
+    lines.append(COMPLETION_EPILOGUE)
 
     lines.append(BLOCK_END_MARKER)
     return "\n".join(lines) + "\n"

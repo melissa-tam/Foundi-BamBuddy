@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useLayoutEffect, type ReactNode } from 're
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { Droplets, Copy, Check, Settings2, Package, Unlink } from 'lucide-react';
+import { Droplets, Copy, Check, Settings2, Package, Unlink, RefreshCw } from 'lucide-react';
 import { isLightColor } from '../utils/colors';
 
 interface FilamentData {
@@ -31,6 +31,9 @@ interface InventoryConfig {
   onUnassignSpool?: () => void;
   assignedSpool?: { id: number; material: string; brand: string | null; color_name: string | null; remainingWeightGrams?: number | null } | null;
   isAssigned?: boolean;
+  // Reused-tag re-spool: set only when the tray carries a valid RFID identity
+  // (tag_uid / tray_uuid). Opens the manual re-spool modal for the slot.
+  onRespoolTag?: () => void;
 }
 
 interface ConfigureSlotConfig {
@@ -417,6 +420,21 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                       {t('inventory.assignSpool')}
                     </button>
                   ) : null}
+                  {/* Re-spool a reused Bambu tag now on a fresh third-party
+                      spool — shown only when the tray has a valid RFID
+                      identity (parent gates via isBambuLabSpool). */}
+                  {inventory.onRespoolTag && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        inventory.onRespoolTag?.();
+                      }}
+                      className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      {t('inventory.respool.action')}
+                    </button>
+                  )}
                 </div>
               )}
 

@@ -37,12 +37,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import broadcast_production_run_changed
-from backend.app.models.eject_profile import EjectProfile
-from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.sku import SkuFile
+from backend.app.services.eject import remote as eject_remote
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
@@ -53,20 +52,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _TERMINAL_RUN_OUTCOMES = ("completed", "failed")
-
-# printer_id -> run_id for an in-flight remote first-article eject. In-memory:
-# a restart between dispatch and completion drops the finalisation (the run
-# stays 'awaiting_approval' with its plate gate set, so the operator simply
-# re-approves — no bad state, just a repeat click).
-_pending_remote_eject: dict[int, int] = {}
-
-
-def _register_pending_remote_eject(printer_id: int, run_id: int) -> None:
-    _pending_remote_eject[printer_id] = run_id
-
-
-def _pop_pending_remote_eject(printer_id: int) -> int | None:
-    return _pending_remote_eject.pop(printer_id, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -244,6 +229,7 @@ async def on_terminal(
     final_status: str,
     archive_data: dict | None = None,
     completed_subtask_id: str | None = None,
+    completed_subtask_name: str | None = None,
 ) -> None:
     """React to a terminal print status. Non-farm prints are a no-op.
 
@@ -251,33 +237,79 @@ async def on_terminal(
     finish photo is available). Wraps each sub-action so a notification failure
     can never abort a committed state change.
 
-    ``completed_subtask_id`` is the terminal payload's subtask_id, used to confirm
-    that a "completed" is really the remote first-article eject Bambuddy dispatched
-    (which echoes ``last_dispatch_subtask_id``) before consuming the pending eject —
-    a foreign completion must not finalise someone else's approval (Phase 1).
+    ``completed_subtask_id`` / ``completed_subtask_name`` are the terminal payload's
+    subtask id + name, used to confirm that a terminal is really the server-dispatched
+    eject job Bambuddy started before consuming the pending eject — a foreign terminal
+    must not finalise / clear someone else's plate (Phase 1). After a restart the id
+    check turns lenient (the client's ``last_dispatch_subtask_id`` is gone), so the
+    name check re-establishes positive identity for a HYDRATED pending (W1/R2).
     """
     try:
-        # 1. Remote first-article eject completion (no queue item involved). The FA
-        #    eject is dispatched via start_print, so the printer echoes its
-        #    submission id back. Only finalise when the completed job IS that eject:
-        #    on a positive mismatch (both ids known and different) treat the
-        #    completion as foreign and leave the pending eject for the real finish.
-        if final_status == "completed" and printer_id is not None:
-            client = printer_manager.get_client(printer_id)
-            expected_subtask = getattr(client, "last_dispatch_subtask_id", None) if client else None
-            if completed_subtask_id and expected_subtask and completed_subtask_id != expected_subtask:
+        # 1. Server-dispatched eject job terminal (production OR first-article). The
+        #    eject is started via start_print (no queue item), so the printer echoes
+        #    the submission id back; a registered PendingEject on this printer whose
+        #    echo matches means THIS terminal is that eject ending. Accept "completed"
+        #    AND the failed-at-EOF cosmetic — matching the echo IS the signal the job
+        #    ended (a standalone eject file can end FAILED at EOF even after a clean
+        #    sweep). A positive echo MISMATCH = foreign; leave the pending eject for
+        #    the real terminal and fall through.
+        if printer_id is not None and eject_remote.peek_pending_eject(printer_id) is not None:
+            if not eject_remote.matches_pending_eject(
+                printer_id, completed_subtask_id, subtask_name=completed_subtask_name
+            ):
                 logger.info(
-                    "farm_policy: printer %s completion subtask %r != dispatched eject subtask %r — "
-                    "foreign, not popping pending remote eject",
+                    "farm_policy: printer %s terminal subtask %r/%r != dispatched eject — foreign, pending eject kept",
                     printer_id,
                     completed_subtask_id,
-                    expected_subtask,
+                    completed_subtask_name,
                 )
+                # fall through to item-based policy
             else:
-                run_id = _pop_pending_remote_eject(printer_id)
-                if run_id is not None:
-                    await _finalize_remote_eject(db, run_id, printer_id)
+                # Resolve the pending: pop the registry AND NULL the durable stamp
+                # atomically so a restart never re-hydrates a resolved eject (W1).
+                pending = await eject_remote.clear_pending_eject(db, printer_id)
+                logger.info(
+                    "farm_policy: %s eject job on printer %s ended '%s'", pending.purpose, printer_id, final_status
+                )
+                if pending.purpose == "fa":
+                    if final_status == "completed":
+                        if pending.run_id is not None:
+                            await _finalize_remote_eject(db, pending.run_id, printer_id)
+                    else:
+                        # Sweep unverified: do NOT approve or materialise plates. The
+                        # gate stays set and the run stays awaiting_approval (a
+                        # re-approve after recovery re-dispatches). Quarantine mirrors
+                        # the production branch — a failed sweep needs eyes either way.
+                        await quarantine_printer(
+                            db,
+                            printer_id,
+                            reason=(
+                                f"First-article eject job ended '{final_status}' — sweep unverified, "
+                                "plate kept gated; recover, then re-approve"
+                            ),
+                            failure_count=1,
+                        )
                     return
+                # production eject
+                if final_status == "completed":
+                    printer_manager.set_awaiting_plate_clear(printer_id, False)
+                    logger.info(
+                        "farm_policy: production eject on printer %s completed — plate-clear gate released", printer_id
+                    )
+                else:
+                    # Sweep unverified: KEEP the gate, quarantine the printer, and
+                    # pause the unit's run if it now has no available printers.
+                    await quarantine_printer(
+                        db,
+                        printer_id,
+                        reason=f"Eject job ended '{final_status}' — sweep unverified, plate kept gated",
+                        failure_count=1,
+                    )
+                    if pending.run_id is not None:
+                        batch = await db.get(PrintBatch, pending.run_id)
+                        if batch is not None:
+                            await _maybe_pause_run_no_printers(db, batch)
+                return
 
         # 2. Item-based policy.
         if queue_item_id is None:
@@ -454,10 +486,34 @@ async def recent_terminal_farm_items(db: AsyncSession, printer_id: int, limit: i
     return list(result.scalars().all())
 
 
+async def quarantine_printer(db: AsyncSession, printer_id: int, reason: str, *, failure_count: int) -> bool:
+    """Idempotently quarantine ``printer_id`` with ``reason``.
+
+    Sets the DB flags + reason, commits, mirrors the in-memory
+    ``printer_manager`` flag, WARNING-logs, and fires the quarantine notification
+    (``failure_count`` = how many failures drove it — the consecutive-failure
+    count, or 1 for an immediate cause like an unverified eject). Returns False —
+    doing nothing — when the printer is missing or already quarantined. The one
+    canonical quarantine mutator shared by the consecutive-failure policy below
+    and the eject-verification / cooldown-stall paths.
+    """
+    printer = await db.get(Printer, printer_id)
+    if printer is None or printer.quarantined:
+        return False
+    printer.quarantined = True
+    printer.quarantine_reason = reason
+    await db.commit()
+    printer_manager.set_quarantined(printer_id, True)
+    logger.warning("farm_policy: quarantined printer %s — %s", printer_id, reason)
+    await notification_service.on_printer_quarantined(printer_id, printer.name, failure_count, reason, db)
+    return True
+
+
 async def maybe_quarantine_printer(db: AsyncSession, batch: PrintBatch, item: PrintQueueItem) -> bool:
     """Quarantine ``item.printer_id`` when the last N farm outcomes all failed.
 
     N = the run's ``escalate_consecutive_failures``. Returns True if it tripped.
+    Delegates the actual mutation to :func:`quarantine_printer` (the single path).
     """
     printer_id = item.printer_id
     if printer_id is None:
@@ -467,18 +523,8 @@ async def maybe_quarantine_printer(db: AsyncSession, batch: PrintBatch, item: Pr
     if len(recent) < threshold or not all(r.status == "failed" for r in recent):
         return False
 
-    printer = await db.get(Printer, printer_id)
-    if printer is None or printer.quarantined:
-        return False
-
     reason = f"{threshold} consecutive farm print failures"
-    printer.quarantined = True
-    printer.quarantine_reason = reason
-    await db.commit()
-    printer_manager.set_quarantined(printer_id, True)
-    logger.warning("farm_policy: quarantined printer %s — %s", printer_id, reason)
-    await notification_service.on_printer_quarantined(printer_id, printer.name, threshold, reason, db)
-    return True
+    return await quarantine_printer(db, printer_id, reason, failure_count=threshold)
 
 
 async def clear_quarantine(db: AsyncSession, printer_id: int) -> Printer:
@@ -815,105 +861,58 @@ async def _finalize_remote_eject(db: AsyncSession, run_id: int, printer_id: int)
 
 
 async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: PrintQueueItem | None) -> None:
-    """FTPS-upload + project_file dispatch a part-present eject for the FA plate.
+    """FA path: eject the first-article plate, honouring the cooldown threshold.
 
-    Reuses ``build_part_present_eject_file`` (generator + validator + repack) and
-    the existing FTP/MQTT primitives. Raises 409 on a bad precondition, 502 on a
-    dispatch failure — never leaves the run in a half state (state stays
-    ``awaiting_approval`` and the caller reports the error).
+    The eject file is MOTION-ONLY — the thermal wait that used to live in its
+    G-code is now server policy — so an approval that lands while the bed is
+    still hot must NOT sweep immediately. Live bed already at/below the unit's
+    release threshold (the common case: the bed cooled during inspection) →
+    dispatch NOW through the shared ``eject_remote.dispatch_part_present_eject``
+    (dispatch errors surface to the operator as 409/502, exactly as before).
+    Bed still hot or unreadable → arm the FA cooldown watch, which dispatches
+    the same eject when the threshold is reached (plateau/cap policy applies);
+    the run stays ``awaiting_approval`` and the UI shows the cooldown phase.
+
+    The plate-clear gate is NOT dropped here: it clears when the eject job's
+    terminal arrives (``_finalize_remote_eject`` via ``on_terminal`` step 1).
+    An unfinished eject is simply re-approvable, never a half state.
     """
-    from pathlib import Path
-
-    from backend.app.core.config import settings
-    from backend.app.services.bambu_ftp import (
-        get_ftp_retry_settings,
-        upload_file_async,
-        with_ftp_retry,
-    )
-    from backend.app.services.eject.dispatch import build_part_present_eject_file
-    from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
-    from backend.app.utils.filename import derive_remote_filename
+    from backend.app.services.eject.monitor import _resolve_eject_threshold, eject_cooldown_monitor
 
     if fa_item is None or fa_item.printer_id is None:
         raise HTTPException(status_code=409, detail="First-article printer is unknown; cannot eject remotely")
-    if fa_item.eject_profile_id is None:
-        raise HTTPException(status_code=409, detail="First article has no eject profile; cannot eject remotely")
-
-    printer = await db.get(Printer, fa_item.printer_id)
-    if printer is None:
-        raise HTTPException(status_code=409, detail="First-article printer not found")
-    if not printer_manager.is_connected(printer.id):
+    if not printer_manager.is_connected(fa_item.printer_id):
+        # Immediate, actionable feedback — a deferred watch on a dead printer would
+        # just exit "stale" with the operator none the wiser.
         raise HTTPException(status_code=409, detail="Printer is not connected; cannot eject remotely")
-    # Resolve validated eject geometry for the target model (canonical match, via
-    # the registry) — fail-closed on a missing/unvalidated row with the accessor's
-    # actionable reason.
+
+    threshold = await _resolve_eject_threshold(fa_item.id, for_first_article=True)
+    state = printer_manager.get_status(fa_item.printer_id)
+    bed = state.temperatures.get("bed") if state and getattr(state, "connected", False) else None
+
+    if threshold is not None and (bed is None or bed > threshold):
+        armed = eject_cooldown_monitor.start_fa_eject_watch(fa_item.printer_id, fa_item.id, run.id)
+        if armed:
+            logger.info(
+                "farm_policy: FA eject for run %s deferred — bed %s > release %.1f°C; cooldown watch armed",
+                run.id,
+                f"{bed:.1f}°C" if bed is not None else "unreadable",
+                threshold,
+            )
+            return
+        # A watch is already in flight on this printer (e.g. a re-approve while the
+        # deferred eject is still cooling) — nothing further to do; it will release.
+        logger.info("farm_policy: FA eject for run %s already pending on printer %s", run.id, fa_item.printer_id)
+        return
+
     try:
-        geometry = await get_geometry_required(db, printer.model, require_validated=True)
-    except GeometryUnavailable as exc:
-        raise HTTPException(status_code=409, detail=exc.reason) from exc
-
-    profile = await db.get(EjectProfile, fa_item.eject_profile_id)
-    if profile is None:
-        raise HTTPException(status_code=409, detail="Eject profile not found")
-
-    lib = await db.get(LibraryFile, fa_item.library_file_id) if fa_item.library_file_id else None
-    if lib is None:
-        raise HTTPException(status_code=409, detail="First-article source file not found")
-    lib_path = Path(lib.file_path)
-    source_path = lib_path if lib_path.is_absolute() else settings.base_dir / lib.file_path
-    if not source_path.exists():
-        raise HTTPException(status_code=409, detail="First-article source file is missing on disk")
-
-    plate_id = fa_item.plate_id or 1
-    try:
-        eject_path = build_part_present_eject_file(
-            source_path, plate_id, profile, geometry, cooldown_temp_c=run.cooldown_temp_c_override
+        await eject_remote.dispatch_part_present_eject(
+            db,
+            printer_id=fa_item.printer_id,
+            queue_item_id=fa_item.id,
+            purpose="fa",
+            run_id=run.id,
         )
-    except Exception as exc:  # noqa: BLE001 — surface as an actionable 409
-        raise HTTPException(status_code=409, detail=f"Failed to build part-present eject file: {exc}") from exc
-
-    remote_filename = derive_remote_filename(f"fa_eject_{run.id}.gcode.3mf")
-    remote_path = f"/{remote_filename}"
-    ftp_retry_enabled, ftp_retry_count, ftp_retry_delay, ftp_timeout = await get_ftp_retry_settings()
-    try:
-        if ftp_retry_enabled:
-            uploaded = await with_ftp_retry(
-                upload_file_async,
-                printer.ip_address,
-                printer.access_code,
-                eject_path,
-                remote_path,
-                socket_timeout=ftp_timeout,
-                printer_model=printer.model,
-                max_retries=ftp_retry_count,
-                retry_delay=ftp_retry_delay,
-                operation_name=f"Upload FA eject to {printer.name}",
-            )
-        else:
-            uploaded = await upload_file_async(
-                printer.ip_address,
-                printer.access_code,
-                eject_path,
-                remote_path,
-                socket_timeout=ftp_timeout,
-                printer_model=printer.model,
-            )
-    except Exception as exc:  # noqa: BLE001
-        uploaded = False
-        logger.error("farm_policy: FA eject upload error: %s", exc)
-    finally:
-        try:
-            eject_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    if not uploaded:
-        raise HTTPException(status_code=502, detail="Failed to upload the eject file to the printer")
-
-    started = printer_manager.start_print(printer.id, remote_filename, plate_id=plate_id, use_ams=False)
-    if not started:
-        raise HTTPException(status_code=502, detail="Failed to send the eject command to the printer")
-
-    _register_pending_remote_eject(printer.id, run.id)
-    printer_manager.set_awaiting_plate_clear(printer.id, False)
-    logger.info("farm_policy: dispatched remote FA eject for run %s on printer %s", run.id, printer.id)
+    except eject_remote.EjectDispatchError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    logger.info("farm_policy: dispatched remote FA eject for run %s on printer %s", run.id, fa_item.printer_id)

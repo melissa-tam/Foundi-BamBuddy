@@ -11,11 +11,12 @@
  * label-linked (WCAG AA) and keyboard operable.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertCircle,
+  CalendarClock,
   ChevronDown,
   Factory,
   Loader2,
@@ -26,6 +27,7 @@ import {
   Square,
   Trash2,
   X,
+  Zap,
 } from 'lucide-react';
 import { api } from '../api/client';
 import { Card, CardContent } from '../components/Card';
@@ -34,10 +36,13 @@ import { ConfirmModal } from '../components/ConfirmModal';
 import { FirstArticleBanner } from '../components/FirstArticleBanner';
 import {
   BlockedPrintersChip,
+  isScheduled,
   PauseReasonChip,
   RunStagedBanner,
   RunStatusBadge,
+  ScheduledChip,
 } from '../components/RunBadges';
+import { ScheduledStartField } from '../components/ScheduledStartField';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { formatDuration } from '../utils/date';
@@ -116,6 +121,10 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
   const [fileError, setFileError] = useState(false);
   const [targetError, setTargetError] = useState(false);
   const [printerError, setPrinterError] = useState(false);
+  // One-time deferred start (Phase 5): null = start ASAP. ``scheduleValid`` blocks
+  // submit while the operator's typed date/time is in the past or malformed.
+  const [scheduledStartAt, setScheduledStartAt] = useState<string | null>(null);
+  const [scheduleValid, setScheduleValid] = useState(true);
 
   const { data: printers } = useQuery({
     queryKey: ['printers'],
@@ -313,6 +322,8 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
       setPrinterError(true);
       invalid = true;
     }
+    // A scheduled start in the past / malformed blocks submit (the field shows why).
+    if (!scheduleValid) invalid = true;
     if (invalid) return;
 
     const cooldown = cooldownOverride.trim() === '' ? null : Number(cooldownOverride);
@@ -330,6 +341,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
         ESCALATE_MAX,
         ESCALATE_FALLBACK,
       ),
+      scheduled_start_at: scheduledStartAt,
     };
     if (mode === 'specific') payload.printer_ids = printerIds;
     else if (selectedModel) payload.target_model = selectedModel;
@@ -592,6 +604,21 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
               </label>
             </fieldset>
 
+            {/* One-time deferred start (Phase 5). null => start ASAP. */}
+            <fieldset className="rounded-lg border border-bambu-dark-tertiary p-3">
+              <legend className="px-1 text-sm font-medium text-white">
+                {t('productionRuns.schedule.sectionTitle')}
+              </legend>
+              <ScheduledStartField
+                value={scheduledStartAt}
+                onChange={setScheduledStartAt}
+                onValidityChange={setScheduleValid}
+                dateFormat={settings?.date_format || 'system'}
+                timeFormat={settings?.time_format || 'system'}
+                idPrefix="run-create-schedule"
+              />
+            </fieldset>
+
             {/* Advanced overrides — collapsed by default (eject/cooldown/retry
                 policy is rarely changed). When collapsed, any non-default value
                 is surfaced in a one-line summary so an override is never hidden. */}
@@ -746,6 +773,82 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
 }
 
 // ---------------------------------------------------------------------------
+// Reschedule dialog — change (or clear) a scheduled run's start time (Phase 5)
+// ---------------------------------------------------------------------------
+
+function RescheduleDialog({
+  run,
+  saving,
+  error,
+  onSubmit,
+  onClose,
+}: {
+  run: ProductionRun;
+  saving: boolean;
+  error: string | null;
+  onSubmit: (at: string | null) => void;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const [value, setValue] = useState<string | null>(run.scheduled_start_at);
+  const [valid, setValid] = useState(true);
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
+      onClick={saving ? undefined : onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label={t('productionRuns.reschedule')}
+    >
+      <Card className="w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+        <CardContent className="p-0">
+          <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
+            <div className="flex items-center gap-2">
+              <CalendarClock className="w-5 h-5 text-bambu-green" />
+              <h2 className="text-lg font-semibold text-white">{t('productionRuns.rescheduleTitle')}</h2>
+            </div>
+            <Button variant="ghost" size="sm" onClick={onClose} disabled={saving} aria-label={t('common.close')}>
+              <X className="w-5 h-5" />
+            </Button>
+          </div>
+          <div className="p-4 space-y-4">
+            <p className="text-sm text-bambu-gray">{run.name}</p>
+            <ScheduledStartField
+              value={value}
+              onChange={setValue}
+              onValidityChange={setValid}
+              dateFormat={settings?.date_format || 'system'}
+              timeFormat={settings?.time_format || 'system'}
+              idPrefix="run-reschedule-schedule"
+            />
+            {error && (
+              <div
+                role="alert"
+                className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/40 rounded-lg text-sm text-red-300"
+              >
+                <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-400" />
+                <span>{error}</span>
+              </div>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button variant="secondary" onClick={onClose} disabled={saving}>
+                {t('common.cancel')}
+              </Button>
+              <Button onClick={() => onSubmit(value)} disabled={saving || !valid}>
+                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                {t('common.save')}
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Run card
 // ---------------------------------------------------------------------------
 
@@ -756,8 +859,11 @@ function RunCard({
   onAbort,
   onDelete,
   onRunAgain,
+  onStartNow,
+  onReschedule,
   canDelete,
   canRunAgain,
+  canUpdate,
   mutatingId,
 }: {
   run: ProductionRun;
@@ -766,12 +872,16 @@ function RunCard({
   onAbort: (run: ProductionRun) => void;
   onDelete: (run: ProductionRun) => void;
   onRunAgain: (run: ProductionRun) => void;
+  onStartNow: (id: number) => void;
+  onReschedule: (run: ProductionRun) => void;
   canDelete: boolean;
   canRunAgain: boolean;
+  canUpdate: boolean;
   mutatingId: number | null;
 }) {
   const { t } = useTranslation();
   const busy = mutatingId === run.id;
+  const scheduled = isScheduled(run);
   const platePct =
     run.plates_total > 0 ? Math.min(100, Math.round((run.plates_completed / run.plates_total) * 100)) : 0;
   const isTerminal = run.status === 'completed' || run.status === 'cancelled';
@@ -794,9 +904,10 @@ function RunCard({
                   {run.name}
                 </Link>
               </h3>
-              <RunStatusBadge status={run.status} />
+              <RunStatusBadge status={run.status} scheduledStartAt={run.scheduled_start_at} />
               <PauseReasonChip run={run} />
               <BlockedPrintersChip run={run} />
+              <ScheduledChip run={run} />
             </div>
             <p className="text-sm text-bambu-gray mt-0.5">
               {run.sku_code}
@@ -806,7 +917,33 @@ function RunCard({
             </p>
           </div>
           <div className="flex items-center gap-1 shrink-0">
-            {run.status === 'active' && (
+            {/* Scheduled run: launch early or move the start time (Phase 5). The
+                underlying status is 'active', so Pause/Abort below still apply. */}
+            {scheduled && canUpdate && (
+              <>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => onStartNow(run.id)}
+                  disabled={busy}
+                  aria-label={t('productionRuns.startNow')}
+                >
+                  {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+                  {t('productionRuns.startNow')}
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => onReschedule(run)}
+                  disabled={busy}
+                  aria-label={t('productionRuns.reschedule')}
+                >
+                  <CalendarClock className="w-4 h-4" />
+                  {t('productionRuns.reschedule')}
+                </Button>
+              </>
+            )}
+            {run.status === 'active' && !scheduled && (
               <Button
                 variant="secondary"
                 size="sm"
@@ -946,15 +1083,19 @@ export function ProductionRunsPage() {
   const { showToast } = useToast();
   const { hasPermission } = useAuth();
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
 
   const canDelete = hasPermission('production_runs:delete');
   const canCreate = hasPermission('production_runs:create');
+  const canUpdate = hasPermission('production_runs:update');
 
   const [dialogOpen, setDialogOpen] = useState(false);
   // Seed values for a "Run again" (F9); null for a fresh start.
   const [prefill, setPrefill] = useState<RunPrefill | null>(null);
   const [pendingAbort, setPendingAbort] = useState<ProductionRun | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ProductionRun | null>(null);
+  // The run whose start time is being edited in the reschedule dialog (Phase 5).
+  const [pendingReschedule, setPendingReschedule] = useState<ProductionRun | null>(null);
 
   const {
     data: runs,
@@ -978,11 +1119,14 @@ export function ProductionRunsPage() {
 
   const startMutation = useMutation({
     mutationFn: (data: ProductionRunCreate) => api.createProductionRun(data),
-    onSuccess: () => {
+    onSuccess: (created) => {
       showToast(t('productionRuns.started'));
       invalidate();
       setDialogOpen(false);
       setPrefill(null);
+      // Land on the new run's detail page so the eligibility feedback is
+      // immediate on send (the one UX flow change).
+      navigate(`/production-runs/${created.id}`);
     },
     // No error toast: the failure detail renders inline inside the open
     // dialog (StartRunDialog `error` prop) so it cannot be missed/dismissed.
@@ -1064,6 +1208,18 @@ export function ProductionRunsPage() {
     // persistent role="alert" rather than a dismissible toast.
   });
 
+  // Reschedule / Start-now share one endpoint (Phase 5): a future ISO reschedules,
+  // null starts the run now. Start-now toasts differently and needs no dialog.
+  const rescheduleMutation = useMutation({
+    mutationFn: ({ id, at }: { id: number; at: string | null }) => api.rescheduleProductionRun(id, at),
+    onSuccess: (_run, vars) => {
+      showToast(vars.at ? t('productionRuns.rescheduled') : t('productionRuns.startedNow'));
+      invalidate();
+      setPendingReschedule(null);
+    },
+    onError: (err: Error) => showToast(err.message || t('productionRuns.actionFailed'), 'error'),
+  });
+
   const mutatingId =
     pauseMutation.isPending
       ? (pauseMutation.variables as number)
@@ -1071,7 +1227,9 @@ export function ProductionRunsPage() {
         ? (resumeMutation.variables as number)
         : abortMutation.isPending
           ? (abortMutation.variables as number)
-          : null;
+          : rescheduleMutation.isPending
+            ? (rescheduleMutation.variables as { id: number }).id
+            : null;
 
   const list = runs ?? [];
   const skuList = skus ?? [];
@@ -1140,8 +1298,11 @@ export function ProductionRunsPage() {
                 setPendingDelete(r);
               }}
               onRunAgain={openRunAgain}
+              onStartNow={(id) => rescheduleMutation.mutate({ id, at: null })}
+              onReschedule={(r) => setPendingReschedule(r)}
               canDelete={canDelete}
               canRunAgain={canCreate}
+              canUpdate={canUpdate}
               mutatingId={mutatingId}
             />
           ))}
@@ -1159,6 +1320,23 @@ export function ProductionRunsPage() {
           initial={prefill ?? undefined}
           onStart={(data) => startMutation.mutate(data)}
           onClose={closeStartDialog}
+        />
+      )}
+
+      {pendingReschedule && (
+        <RescheduleDialog
+          run={pendingReschedule}
+          saving={rescheduleMutation.isPending}
+          error={
+            rescheduleMutation.error
+              ? rescheduleMutation.error.message || t('productionRuns.actionFailed')
+              : null
+          }
+          onSubmit={(at) => rescheduleMutation.mutate({ id: pendingReschedule.id, at })}
+          onClose={() => {
+            rescheduleMutation.reset();
+            setPendingReschedule(null);
+          }}
         />
       )}
 

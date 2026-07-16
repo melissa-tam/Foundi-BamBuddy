@@ -25,8 +25,8 @@ _PLATE_GCODE = (
     "; EXECUTABLE_BLOCK_END\n"
 )
 
-# Same shape but with the machine-end markers absent — used to prove the dry-run
-# builder refuses to produce a file that would end FAILED-at-EOF on the printer.
+# Same shape but with the machine-end markers absent — the dry-run builder no
+# longer needs them (the eject block's own FINISH epilogue completes the job).
 _PLATE_GCODE_NO_MACHINE_END = (
     "; HEADER_BLOCK_START\n"
     "; max_z_height: 20.00\n"
@@ -56,6 +56,7 @@ async def _seed_geometry(db_session):
                 env_y_min=-16,
                 env_y_max=325,
                 max_part_height_mm=42,
+                z_travel_mm=340,
                 validated=True,
             ),
             PrinterModelGeometry(
@@ -67,6 +68,7 @@ async def _seed_geometry(db_session):
                 env_y_min=0,
                 env_y_max=320,
                 max_part_height_mm=42,
+                z_travel_mm=325,
                 validated=False,
             ),
         ]
@@ -117,8 +119,8 @@ class TestEjectProfileCrud:
         created = resp.json()
         pid = created["id"]
         assert created["name"] == "rack-a"
-        assert created["cooldown_temp_c"] == 28.0
-        assert created["cooldown_retries"] == 5
+        assert created["cooldown_temp_c"] == 28.0  # server-side release threshold
+        assert "cooldown_retries" not in created  # dropped: no in-file cooldown loop anymore
 
         # LIST -> 200 includes it
         resp = await async_client.get("/api/v1/eject-profiles")
@@ -152,9 +154,11 @@ class TestEjectProfileCrud:
         resp = await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="lowz", z_offset_mm=0.1))
         assert resp.status_code == 422
 
-    async def test_invalid_retries_422(self, async_client: AsyncClient):
+    async def test_invalid_cooldown_temp_422(self, async_client: AsyncClient):
+        # cooldown_temp_c is bounded (0 < t <= 100); the old cooldown_retries bound
+        # is gone (the column was dropped with the in-file cooldown loop).
         resp = await async_client.post(
-            "/api/v1/eject-profiles", json=_valid_profile_body(name="manyretry", cooldown_retries=99)
+            "/api/v1/eject-profiles", json=_valid_profile_body(name="hottemp", cooldown_temp_c=200.0)
         )
         assert resp.status_code == 422
 
@@ -266,6 +270,46 @@ class TestEjectProfileCrud:
         assert resp.status_code == 200, resp.text
         assert resp.json()["final_skim"] is True
 
+    async def test_bed_drop_round_trips(self, async_client: AsyncClient):
+        # Create with the bed-drop assist on; CREATE and GET echo the clearance back.
+        body = _valid_profile_body(name="dropcrud", bed_drop_clearance_mm=50.0)
+        resp = await async_client.post("/api/v1/eject-profiles", json=body)
+        assert resp.status_code == 201, resp.text
+        created = resp.json()
+        assert created["bed_drop_clearance_mm"] == 50.0
+        got = (await async_client.get(f"/api/v1/eject-profiles/{created['id']}")).json()
+        assert got["bed_drop_clearance_mm"] == 50.0
+
+    async def test_bed_drop_defaults_null(self, async_client: AsyncClient):
+        # Omitting bed_drop_clearance_mm -> null (assist off, unchanged behaviour).
+        resp = await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="dropnull"))
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["bed_drop_clearance_mm"] is None
+
+    async def test_update_bed_drop_to_null_clears(self, async_client: AsyncClient):
+        # Enable then clear via explicit null (assist back off).
+        pid = (
+            await async_client.post(
+                "/api/v1/eject-profiles", json=_valid_profile_body(name="dropclear", bed_drop_clearance_mm=50.0)
+            )
+        ).json()["id"]
+        resp = await async_client.put(f"/api/v1/eject-profiles/{pid}", json={"bed_drop_clearance_mm": None})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["bed_drop_clearance_mm"] is None
+
+    async def test_bed_drop_negative_422(self, async_client: AsyncClient):
+        resp = await async_client.post(
+            "/api/v1/eject-profiles", json=_valid_profile_body(name="dropneg", bed_drop_clearance_mm=-1.0)
+        )
+        assert resp.status_code == 422
+
+    async def test_bed_drop_over_max_422(self, async_client: AsyncClient):
+        # Bounded le=200 (a sane machine-travel ceiling for the clearance).
+        resp = await async_client.post(
+            "/api/v1/eject-profiles", json=_valid_profile_body(name="dropbig", bed_drop_clearance_mm=201.0)
+        )
+        assert resp.status_code == 422
+
 
 @pytest.mark.asyncio
 @pytest.mark.integration
@@ -285,7 +329,10 @@ class TestEjectProfilePreview:
         assert body["validation"]["ok"] is True
         assert body["validation"]["errors"] == []
         assert "; ===== FARM EJECT BLOCK profile=prev =====" in body["gcode"]
-        assert body["gcode"].count("M190 R28") == 5
+        # Motion-only block: heater off, NO in-file cooldown wait, self-completing.
+        assert "M140 S0" in body["gcode"]
+        assert "M190" not in body["gcode"]
+        assert "M18" in body["gcode"]  # completion epilogue
 
     async def test_preview_tall_part_validation_false(self, async_client: AsyncClient, db_session, tmp_path):
         # Profile guard below the file's 20mm part -> generation refused, surfaced as ok=false.
@@ -326,6 +373,55 @@ class TestEjectProfilePreview:
         )
         assert resp.status_code == 422
 
+    async def test_preview_bed_drop_emits_down_return(self, async_client: AsyncClient, db_session, tmp_path):
+        # Bed-drop assist on: H2S z_travel 340 - 50 = 290; the preview G-code carries
+        # the drop move and validates ok (20mm part -> lift 30, drop 290 well below it).
+        resp = await async_client.post(
+            "/api/v1/eject-profiles", json=_valid_profile_body(name="prevdrop", bed_drop_clearance_mm=50.0)
+        )
+        pid = resp.json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="prevdrop.gcode.3mf")
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/preview", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"}
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["validation"]["ok"] is True, body["validation"]["errors"]
+        assert "G1 Z290 F900" in body["gcode"]
+
+    async def test_preview_bed_drop_without_z_travel_ok_false(self, async_client: AsyncClient, db_session, tmp_path):
+        # A geometry row that lacks z_travel_mm + a drop-enabled profile -> generation
+        # fails closed, surfaced as validation ok=false naming z_travel (not a 500).
+        from backend.app.models.printer_model_geometry import PrinterModelGeometry
+
+        db_session.add(
+            PrinterModelGeometry(
+                model_key="P1S",
+                bed_x=256,
+                bed_y=256,
+                env_x_min=0,
+                env_x_max=256,
+                env_y_min=-16,
+                env_y_max=256,
+                max_part_height_mm=42,
+                z_travel_mm=None,  # the machine bottom is unknown -> assist can't run
+                validated=True,
+            )
+        )
+        await db_session.commit()
+        resp = await async_client.post(
+            "/api/v1/eject-profiles", json=_valid_profile_body(name="prevnoz", bed_drop_clearance_mm=50.0)
+        )
+        pid = resp.json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="prevnoz.gcode.3mf")
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/preview", json={"library_file_id": lib.id, "plate_index": 1, "model": "P1S"}
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["validation"]["ok"] is False
+        assert any("z_travel_mm" in e for e in body["validation"]["errors"]), body["validation"]["errors"]
+
 
 @pytest.mark.asyncio
 @pytest.mark.integration
@@ -348,9 +444,8 @@ class TestEjectProfileDryRun:
         # Eject block replaced the executable body; the original print move is gone.
         assert "; ===== FARM EJECT BLOCK profile=dry =====" in gcode
         assert "G1 X100 Y100 E5" not in gcode
-        # Dry run validates GEOMETRY on an empty ambient bed, so the thermal gate
-        # is stripped: NO M190 release waits (they could never complete and would
-        # hang the job) and no cooldown fan wait. The heater safety-off stays.
+        # The eject block is motion-only now (the cooldown wait lives in the eject
+        # monitor, not the G-code): NO M190 waits, no cooldown fan; heater-off stays.
         assert "M190" not in gcode
         assert "M106 S255" not in gcode
         assert "M140 S0" in gcode
@@ -358,7 +453,10 @@ class TestEjectProfileDryRun:
         assert "G1 X170 Y160 Z10 F9000" in gcode
         # Header/config comment block preserved.
         assert "; max_z_height: 20.00" in gcode
-        assert gcode.rstrip().endswith("; EXECUTABLE_BLOCK_END")
+        # The block self-completes via its stock machine-end FINISH epilogue, so the
+        # file ends at the eject block-end marker (no source machine-end splice).
+        assert "M18" in gcode
+        assert gcode.rstrip().endswith("; ===== FARM EJECT BLOCK END =====")
         # Dry-run homing safety: a FULL G28 (incl. Z — safe only on the dry
         # run's by-definition-empty bed) is prepended BEFORE the eject block so
         # the block's G1 Z moves run against a homed Z, not an unknown datum.
@@ -371,11 +469,10 @@ class TestEjectProfileDryRun:
         expected = hashlib.md5(gcode_bytes, usedforsecurity=False).hexdigest().upper().encode("ascii")
         assert sidecar == expected
 
-    async def test_dry_run_splices_machine_end_block(self, async_client: AsyncClient, db_session, tmp_path):
-        # The stock machine-end block (MACHINE_END_GCODE_START..EXECUTABLE_BLOCK_END)
-        # must be spliced in VERBATIM after the eject block so the printer sees the
-        # job-completion handshake (else it ends FAILED at EOF). The eject block
-        # comes BEFORE the machine-end (opposite of production injection).
+    async def test_dry_run_block_self_completes_via_epilogue(self, async_client: AsyncClient, db_session, tmp_path):
+        # The eject block now carries its OWN stock machine-end FINISH epilogue, so
+        # the dry-run no longer splices the source's machine-end block: the file ends
+        # at the eject block-end marker and still registers FINISH (not FAILED-at-EOF).
         pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="mend"))).json()["id"]
         lib = await _add_library_file(db_session, tmp_path, name="mend.gcode.3mf")
 
@@ -388,32 +485,30 @@ class TestEjectProfileDryRun:
             sidecar = zf.read("Metadata/plate_1.gcode.md5")
         gcode = gcode_bytes.decode()
 
-        # The source machine-end block is present, in full, exactly once.
-        assert "; MACHINE_END_GCODE_START" in gcode
-        assert gcode.count("; EXECUTABLE_BLOCK_END") == 1
-        assert "M104 S0" in gcode  # a line unique to the stock machine-end block
-        # Ordering: eject block, THEN machine-end block, THEN the closing marker.
-        eject_idx = gcode.index("; ===== FARM EJECT BLOCK profile=mend =====")
-        mend_idx = gcode.index("; MACHINE_END_GCODE_START")
-        end_idx = gcode.index("; EXECUTABLE_BLOCK_END")
-        assert eject_idx < mend_idx < end_idx
-        # Thermal gate still stripped, file still ends at the completion marker.
+        # The source machine-end block is NOT spliced anymore; the block's own
+        # completion epilogue (M18 + M73 P100 R0) provides the FINISH handshake.
+        assert "; MACHINE_END_GCODE_START" not in gcode
+        assert "M18" in gcode
+        assert "M73 P100 R0" in gcode
+        assert gcode.rstrip().endswith("; ===== FARM EJECT BLOCK END =====")
         assert "M190" not in gcode
-        assert gcode.rstrip().endswith("; EXECUTABLE_BLOCK_END")
         # MD5 sidecar tracks the rewritten bytes (uppercase hex).
         expected = hashlib.md5(gcode_bytes, usedforsecurity=False).hexdigest().upper().encode("ascii")
         assert sidecar == expected
 
-    async def test_dry_run_missing_machine_end_markers_422(self, async_client: AsyncClient, db_session, tmp_path):
-        # A source without the machine-end markers can't be given a completion
-        # handshake — the builder must refuse rather than ship a FAILED-at-EOF file.
+    async def test_dry_run_without_machine_end_markers_succeeds(self, async_client: AsyncClient, db_session, tmp_path):
+        # A source without the machine-end markers is now fine: the eject block's own
+        # FINISH epilogue completes the job, so no source machine-end splice is needed.
         pid = (await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="nomend"))).json()["id"]
         lib = await _add_library_file(db_session, tmp_path, name="nomend.gcode.3mf", gcode=_PLATE_GCODE_NO_MACHINE_END)
         resp = await async_client.post(
             f"/api/v1/eject-profiles/{pid}/dry-run", json={"library_file_id": lib.id, "plate_index": 1, "model": "H2S"}
         )
-        assert resp.status_code == 422
-        assert "machine-end" in resp.json()["detail"].lower()
+        assert resp.status_code == 200, resp.text
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            gcode = zf.read("Metadata/plate_1.gcode").decode()
+        assert "; ===== FARM EJECT BLOCK profile=nomend =====" in gcode
+        assert "M18" in gcode  # self-completing epilogue, no source machine-end needed
 
     async def test_dry_run_h2c_uses_dual_nozzle_parameterized_home(
         self, async_client: AsyncClient, db_session, tmp_path
@@ -528,6 +623,51 @@ class TestEjectDryRunDispatch:
         assert qi.status == "pending"
         # Marked as a dry run so a stop/finish is treated as a no-deposit finish.
         assert qi.is_dry_run is True
+
+    async def test_dispatch_bedslinger_bed_drop_422(
+        self, async_client: AsyncClient, db_session, tmp_path, printer_factory, monkeypatch
+    ):
+        # Dispatching a bed-drop profile to a bed-slinger (A2L) must fail closed:
+        # the bed is fixed in Z, so the release assist is physically meaningless.
+        from backend.app.models.printer_model_geometry import PrinterModelGeometry
+
+        db_session.add(
+            PrinterModelGeometry(
+                model_key="A2L",
+                bed_x=330,
+                bed_y=320,
+                env_x_min=0,
+                env_x_max=330,
+                env_y_min=0,
+                env_y_max=320,
+                max_part_height_mm=42,
+                z_travel_mm=None,
+                validated=False,
+            )
+        )
+        await db_session.commit()
+        printer = await printer_factory(model="A2L", name="A2L-1")
+        pid = (
+            await async_client.post(
+                "/api/v1/eject-profiles",
+                json=_valid_profile_body(name="dropbs", bed_drop_clearance_mm=50.0),
+            )
+        ).json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="dropbs.gcode.3mf")
+
+        resp = await async_client.post(
+            f"/api/v1/eject-profiles/{pid}/dry-run/dispatch",
+            # allow_unvalidated=True clears the (separate) unvalidated-geometry 409 so
+            # the build is reached and the bedslinger guard is what returns the 422.
+            json={
+                "library_file_id": lib.id,
+                "plate_index": 1,
+                "printer_id": printer.id,
+                "allow_unvalidated": True,
+            },
+        )
+        assert resp.status_code == 422, resp.text
+        assert "bedslinger" in resp.json()["detail"].lower()
 
     async def test_dispatch_replaces_prior_dryrun_file(
         self, async_client: AsyncClient, db_session, tmp_path, printer_factory, monkeypatch

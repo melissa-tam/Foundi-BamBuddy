@@ -153,17 +153,31 @@ class TestHomeAxesAPI:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("axes", ["z", "xy", "all"])
     async def test_home_axes_always_runs_full_home(self, async_client: AsyncClient, printer_factory, axes):
-        # Regression for #1052: regardless of the axes argument, the endpoint must send a bare
-        # `G28` so the printer's safe auto-home sequence (toolhead park → XY home → Z home) runs.
-        # Sending `G28 Z` alone on H2C/H2D/H2S/X1 can crash the bed into the toolhead.
+        # Regardless of the axes argument, the endpoint delegates to the model-aware
+        # client.home_axes() (always a full home). #1052: a bare `G28 Z` can crash the
+        # bed into the toolhead; 007-H2C: a bare `G28` stall-loops dual-nozzle firmware.
+        # home_axes() picks the safe form per model, so the route must CALL it — never
+        # a raw send_gcode("G28") that would bare-G28 every model.
         printer = await printer_factory(name="P1")
         mock_client = MagicMock()
-        mock_client.send_gcode.return_value = True
+        mock_client.home_axes.return_value = True
         with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/home-axes?axes={axes}")
             assert response.status_code == 200
-            mock_client.send_gcode.assert_called_once_with("G28")
+            mock_client.home_axes.assert_called_once_with()
+            mock_client.send_gcode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_home_axes_send_failure(self, async_client: AsyncClient, printer_factory):
+        # home_axes() returning False (the MQTT publish failed) -> 500.
+        printer = await printer_factory(name="P1")
+        mock_client = MagicMock()
+        mock_client.home_axes.return_value = False
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/home-axes?axes=all")
+            assert response.status_code == 500
 
     @pytest.mark.asyncio
     async def test_home_axes_not_connected(self, async_client: AsyncClient, printer_factory):

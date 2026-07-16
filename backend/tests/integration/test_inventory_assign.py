@@ -1275,3 +1275,63 @@ class TestAssignSpoolPfcnCloudPreset:
             # original PFCN (which the slicer needs separately).
             assert call_kwargs.kwargs["tray_info_idx"] == "GFL05"
             assert call_kwargs.kwargs["setting_id"] == "PFCN80e80c1f79db85"
+
+
+class TestAssignSpoolReleasesStaged:
+    """W6.3: a successful manual assign releases low-spool staged (``filament_short``)
+    units immediately — the deficit changes via the new DB assignment, so it must
+    NOT wait for the printer's MQTT tray echo."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_assign_releases_staged_unit(self, async_client, printer_factory, spool_factory, db_session):
+        from unittest.mock import AsyncMock
+
+        from sqlalchemy import select
+
+        from backend.app.models.print_queue import PrintQueueItem
+
+        printer = await printer_factory(name="H2S")
+        spool = await spool_factory(material="PETG")
+
+        staged = PrintQueueItem(
+            printer_id=printer.id,
+            status="pending",
+            manual_start=True,
+            filament_short=True,
+            waiting_reason="filament_short",
+            plate_id=1,
+            position=1,
+        )
+        db_session.add(staged)
+        await db_session.commit()
+        staged_id = staged.id
+
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+        status = _make_mock_status(ams_data=[{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PETG"}]}])
+
+        with (
+            patch("backend.app.services.printer_manager.printer_manager") as mock_pm,
+            patch(
+                "backend.app.services.farm_staging.compute_deficit_for_queue_item", new_callable=AsyncMock
+            ) as mock_deficit,
+        ):
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = status
+            mock_deficit.return_value = []  # the new assignment clears the deficit
+
+            response = await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 0, "tray_id": 0},
+            )
+            assert response.status_code == 200
+
+        db_session.expire_all()
+        refreshed = (
+            await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == staged_id))
+        ).scalar_one()
+        # Released without any MQTT echo — no on_ams_change fired in this test.
+        assert refreshed.manual_start is False
+        assert refreshed.filament_short is False
+        assert refreshed.waiting_reason is None

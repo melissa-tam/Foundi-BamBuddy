@@ -1,22 +1,19 @@
 """Unit tests for the per-run cooldown override on the eject pipeline (Phase 2).
 
-Covers the shared ``resolve_cooldown_override`` helper and the fact that BOTH
-the dispatch block generation AND the cooldown monitor's release threshold key
-off the same override — so the in-file ``M190 R`` wait and the server-side gate
-never disagree (incident PCO-M18-2904 BUG B)."""
+Covers the shared ``resolve_cooldown_override`` helper and the fact that the
+cooldown MONITOR's server-side release threshold keys off the same override — so
+the value that gates dispatch matches the run's intent (incident PCO-M18-2904
+BUG B). The eject block is motion-only now, so the override no longer affects the
+G-code — only the monitor's release threshold."""
 
 import contextlib
 
 import pytest
 
 from backend.app.models.eject_profile import EjectProfile
-from backend.app.services.eject.generator import generate_eject_gcode
-from backend.app.services.eject.validator import validate_eject_gcode
-from backend.tests.unit.services.eject.geometry_fixtures import H2S_GEOMETRY
 
 _PROFILE_DEFAULTS = {
     "cooldown_temp_c": 28.0,
-    "cooldown_retries": 5,
     "clearance_mm": 10.0,
     "z_offset_mm": 0.4,
     "descent_steps": 4,
@@ -29,15 +26,6 @@ _PROFILE_DEFAULTS = {
     "cooling_fan_assist": True,
     "max_part_height_mm": 60.0,
 }
-
-
-def _profile(**overrides) -> EjectProfile:
-    defaults = {"name": "override", **_PROFILE_DEFAULTS}
-    defaults.update(overrides)
-    profile = EjectProfile()
-    for key, value in defaults.items():
-        setattr(profile, key, value)
-    return profile
 
 
 async def _add_profile(db_session, **overrides) -> EjectProfile:
@@ -58,31 +46,6 @@ async def _add_batch(db_session, override):
     await db_session.commit()
     await db_session.refresh(batch)
     return batch
-
-
-class TestCooldownOverride:
-    def test_none_uses_profile_value(self):
-        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY, cooldown_temp_c=None)
-        assert gcode.count("M190 R28") == 5
-
-    def test_override_changes_emitted_threshold(self):
-        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY, cooldown_temp_c=22.0)
-        assert gcode.count("M190 R22") == 5
-        assert "M190 R28" not in gcode
-
-    def test_generate_and_validate_share_override(self):
-        # The generated block validates only when the validator is told the same
-        # effective temp — proving generation + validation stay consistent.
-        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY, cooldown_temp_c=22.0)
-        ok = validate_eject_gcode(gcode, _profile(), 30.0, H2S_GEOMETRY, cooldown_temp_c=22.0)
-        assert ok.ok, ok.errors
-
-    def test_validator_flags_mismatched_threshold(self):
-        # Block emitted at 22 but validated against the profile default (28) fails.
-        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY, cooldown_temp_c=22.0)
-        result = validate_eject_gcode(gcode, _profile(), 30.0, H2S_GEOMETRY, cooldown_temp_c=None)
-        assert not result.ok
-        assert any("threshold" in e for e in result.errors)
 
 
 @pytest.mark.asyncio

@@ -23,11 +23,12 @@ class EjectProfile(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
 
-    # Cooldown gate — bed must reach this before the sweep runs. A single
-    # `M190 R` stalls ~42 °C (Marlin cooling-slope timeout), so the generator
-    # emits `cooldown_retries` consecutive waits.
+    # Server-side cooldown release threshold (°C). The eject sweep is now a
+    # SEPARATE server-dispatched motion-only job; the cooldown wait moved OUT of
+    # the G-code into the eject monitor, which holds the plate gate until the live
+    # bed_temper drops to this value, then dispatches the motion-only eject. No
+    # in-file `M190 R` loop exists anymore, so there is no retry count to store.
     cooldown_temp_c: Mapped[float] = mapped_column(Float, default=28.0, nullable=False)
-    cooldown_retries: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
 
     # Sweep geometry (mm).
     clearance_mm: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
@@ -65,6 +66,12 @@ class EjectProfile(Base):
 
     # Safety guard — refuse to eject parts taller than this (bottom-biased sweep).
     max_part_height_mm: Mapped[float] = mapped_column(Float, default=42.0, nullable=False)
+
+    # Optional bed-drop release assist (mm): after the bed heater is off, drive the
+    # bed DOWN to the model's z_travel_mm minus this clearance, then return to the
+    # lift height, before sweeping — a mechanical jolt to release a stuck part. NULL
+    # = off. The clearance is kept from the machine bottom during the drop.
+    bed_drop_clearance_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

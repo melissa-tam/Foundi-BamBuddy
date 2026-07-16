@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { AlertTriangle, AlertCircle } from 'lucide-react';
 import type { HMSError } from '../api/client';
 import { hmsTone } from '../utils/hmsTone';
+import { formatHmsCode } from '../utils/hmsCode';
 
 interface HMSErrorSummaryProps {
   errors: HMSError[];
@@ -18,8 +19,9 @@ export function HMSErrorSummary({ errors, onOpen }: HMSErrorSummaryProps) {
 
   // Highest severity = lowest severity number (1=fatal … 4=info).
   const top = errors.reduce((worst, e) => (e.severity < worst.severity ? e : worst));
-  const shortCode = top.short_code ?? '';
-  const text = top.description ?? shortCode ?? '';
+  // Fall back to the FULL firmware code (not the lossy short code) when the
+  // fault has no human-readable description.
+  const text = top.description ?? formatHmsCode(top.full_code, top.short_code);
 
   // The summary can't see gcode_state under its prop contract, so its alert-role
   // keys off code severity; the card badge (which has state) owns the FAILED-state

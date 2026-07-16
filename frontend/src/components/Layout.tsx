@@ -14,6 +14,8 @@ import { useColorCatalogVersion } from '../hooks/useColorCatalogVersion';
 import { useSponsorPrompt } from '../hooks/useSponsorPrompt';
 import { useUnknownTagPrompt } from '../hooks/useUnknownTagPrompt';
 import { UnknownSpoolModal } from './UnknownSpoolModal';
+import { useRespoolPrompt } from '../hooks/useRespoolPrompt';
+import { RespoolTagModal } from './RespoolTagModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { Card, CardHeader, CardContent } from './Card';
@@ -124,6 +126,7 @@ export function Layout() {
   // Unknown-spool prompt — surfaces a confirmation modal when the AMS reports a
   // tag with no inventory match (only when `auto_add_unknown_rfid` is off).
   const unknownSpool = useUnknownTagPrompt();
+  const respoolPrompt = useRespoolPrompt();
 
   // Fetch default sidebar order via a public endpoint (no settings:read needed)
   const { data: defaultSidebarData } = useQuery({
@@ -724,18 +727,23 @@ export function Layout() {
                   </>
                 )}
               </div>
-              {/* Bottom row: version */}
-              <div className="flex items-center justify-center gap-2">
-                <span className="text-sm text-bambu-gray">v{versionInfo?.version || '...'}</span>
-                {updateCheck?.update_available && (
-                  <button
-                    onClick={() => navigate('/settings')}
-                    className="flex items-center gap-1 text-xs text-bambu-green hover:text-bambu-green/80 transition-colors"
-                    title={t('nav.updateAvailable', { version: updateCheck.latest_version })}
-                  >
-                    <ArrowUpCircle className="w-4 h-4" />
-                    <span>{t('nav.update')}</span>
-                  </button>
+              {/* Bottom row: version (+ full build stamp when available) */}
+              <div className="flex flex-col items-center gap-0.5">
+                <div className="flex items-center justify-center gap-2">
+                  <span className="text-sm text-bambu-gray">v{versionInfo?.version || '...'}</span>
+                  {updateCheck?.update_available && (
+                    <button
+                      onClick={() => navigate('/settings')}
+                      className="flex items-center gap-1 text-xs text-bambu-green hover:text-bambu-green/80 transition-colors"
+                      title={t('nav.updateAvailable', { version: updateCheck.latest_version })}
+                    >
+                      <ArrowUpCircle className="w-4 h-4" />
+                      <span>{t('nav.update')}</span>
+                    </button>
+                  )}
+                </div>
+                {versionInfo?.build && versionInfo.build !== versionInfo.version && (
+                  <span className="text-xs text-bambu-gray break-all text-center">{versionInfo.build}</span>
                 )}
               </div>
             </div>
@@ -912,6 +920,11 @@ export function Layout() {
         isPending={unknownSpool.isPending}
         onConfirm={unknownSpool.confirm}
         onCancel={unknownSpool.cancel}
+      />
+
+      <RespoolTagModal
+        context={respoolPrompt.prompt}
+        onClose={respoolPrompt.dismiss}
       />
 
       {/* Keyboard Shortcuts Modal */}

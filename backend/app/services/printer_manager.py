@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.models.printer import Printer
 from backend.app.services.bambu_mqtt import BambuMQTTClient, MQTTLogEntry, PrinterState, get_stage_name
 from backend.app.services.hms_errors import hms_error_payload
-from backend.app.utils.printer_models import canon_model
+from backend.app.utils.printer_models import A1_FAMILY_MODELS, canon_model
 
 logger = logging.getLogger(__name__)
 
@@ -44,21 +44,12 @@ CHAMBER_TEMP_SUPPORTED_MODELS = frozenset(
     ]
 )
 
-# Models that may incorrectly report stg_cur=0 when idle (firmware bug)
-# Based on Home Assistant Bambu Lab integration observations
-# See: https://github.com/greghesp/ha-bambulab/blob/main/custom_components/bambu_lab/pybambu/models.py
-A1_MODELS = frozenset(
-    [
-        # Display names
-        "A1",
-        "A1 MINI",
-        "A1-MINI",
-        "A1MINI",
-        # Internal codes (from MQTT/SSDP)
-        "N1",  # A1 Mini
-        "N2S",  # A1
-    ]
-)
+# The A1-family model set (bed-slingers; also the models that may incorrectly
+# report stg_cur=0 when idle — firmware bug, per the Home Assistant Bambu Lab
+# integration) now lives in ``utils.printer_models`` as the single source of
+# truth, shared with the eject bed-drop guard. Kept as a module-local alias so
+# ``STG_CUR_IDLE_BUG_MODELS`` below reads unchanged.
+A1_MODELS = A1_FAMILY_MODELS
 
 # Models affected by the stg_cur=0 idle bug (firmware reports stg_cur=0 when idle,
 # which maps to "Printing" in STAGE_NAMES and overrides the correct IDLE state)
@@ -135,24 +126,6 @@ def has_stg_cur_idle_bug(model: str | None) -> bool:
         return False
     model_upper = model.strip().upper()
     return model_upper in STG_CUR_IDLE_BUG_MODELS
-
-
-def is_bed_slinger(model: str | None) -> bool:
-    """Whether the printer's Z axis controls the *toolhead*, not the bed.
-
-    Bambu's A1 family (A1, A1 Mini; internal codes N1 / N2S) are open-frame
-    bed-slingers: the bed moves on Y, the toolhead moves on X+Z. On every
-    other current model (X1, P1, H2, H2C, H2D, H2S, P2S, ...) the bed moves
-    on Z and the toolhead is fixed in Z.
-
-    G-code direction is opposite on these two families. `G1 Z-10` reduces
-    the nozzle-bed gap on both, but on bed-on-Z machines it does so by
-    moving the BED up, while on bed-slingers it does so by moving the
-    TOOLHEAD down — which is what crashed the nozzle in #1334.
-    """
-    if not model:
-        return False
-    return model.strip().upper() in A1_MODELS
 
 
 # Minimum firmware versions for AMS drying support (confirmed via capture testing)

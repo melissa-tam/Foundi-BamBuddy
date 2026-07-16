@@ -35,6 +35,7 @@ from backend.app.utils.filament_ids import (
     MATERIAL_TEMPS,
     normalize_slicer_filament,
 )
+from backend.app.utils.printer_models import extruder_for_ams, nozzle_for_ams_unit
 
 logger = logging.getLogger(__name__)
 
@@ -933,11 +934,7 @@ async def link_spool(
                 # was a non-existent attribute — the hasattr check silently
                 # returned None, defeating every state-based lookup below).
                 state = printer_manager.get_status(p_id)
-                nozzle_diameter = "0.4"
-                if state and state.nozzles:
-                    nd = state.nozzles[0].nozzle_diameter
-                    if nd:
-                        nozzle_diameter = nd
+                nozzle_diameter = nozzle_for_ams_unit(state, a_id, t_id)
 
                 kp_result = await db.execute(
                     select(SpoolmanKProfile).where(
@@ -946,12 +943,9 @@ async def link_spool(
                     )
                 )
                 kp_rows = kp_result.scalars().all()
-                slot_extruder = None
-                if state and state.ams_extruder_map:
-                    if a_id == 255:
-                        slot_extruder = 1 - t_id
-                    else:
-                        slot_extruder = state.ams_extruder_map.get(str(a_id))
+                slot_extruder = (
+                    extruder_for_ams(state.ams_extruder_map, a_id, t_id) if (state and state.ams_extruder_map) else None
+                )
 
                 # Prefer exact extruder match, fall back to extruder-agnostic kp
                 # for the same nozzle. Hard-skip on extruder mismatch silently

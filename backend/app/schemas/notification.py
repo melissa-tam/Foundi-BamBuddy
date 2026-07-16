@@ -95,6 +95,9 @@ class NotificationProviderBase(BaseModel):
     on_print_stalled: bool = Field(
         default=True, description="Notify when a printing unit's printer is offline past the stall grace window"
     )
+    on_storage_low: bool = Field(
+        default=True, description="Notify when a printer's USB fills up and the farm runs auto-cleanup"
+    )
 
     # Event triggers - Farm production (Phase 6: manual/lifecycle events)
     on_run_aborted: bool = Field(default=True, description="Notify when a production run is aborted by the operator")
@@ -194,6 +197,7 @@ class NotificationProviderUpdate(BaseModel):
     on_model_mismatch: bool | None = None
     on_run_unit_stopped: bool | None = None
     on_print_stalled: bool | None = None
+    on_storage_low: bool | None = None
 
     # Event triggers - Farm production (Phase 6: manual/lifecycle events)
     on_run_aborted: bool | None = None

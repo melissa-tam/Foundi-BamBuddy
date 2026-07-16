@@ -41,6 +41,11 @@ firmware/
 # Virtual printer (auto-generated certs and uploads at repo root)
 /virtual_printer/
 
+# Installer build stamp (written to staging/app/VERSION by build.py; a stray
+# dev-root VERSION file must never be committed — the backend reads it at
+# runtime to report the deployed build)
+/VERSION
+
 # IDE
 .idea/
 .vscode/
@@ -72,6 +77,10 @@ data/
 
 # MFA encryption key file (#1219) — same protection as .jwt_secret
 .mfa_encryption_key
+
+# ERP deploy secrets bundled into the Windows installer (optional). The real
+# erp.env carries a DB password — never commit it; the .example twin is tracked.
+installers/windows/erp.env
 
 # SpoolBuddy SSH keys (generated at runtime for remote updates)
 spoolbuddy/ssh/

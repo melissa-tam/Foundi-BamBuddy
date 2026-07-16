@@ -128,6 +128,13 @@ class OIDCProvider(Base):
     # authorize-URL fetch fails or times out, and ``/login?fallback=local``
     # plus ``BAMBUDDY_LOCAL_LOGIN=true`` provide a documented recovery path.
     is_autologin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # Optional JWT claim carrying the user's group/role values (e.g. "groups",
+    # "roles"). When set together with group_mapping, the callback maps the
+    # claim values onto Bambuddy groups. NULL disables claim-based grouping.
+    groups_claim: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
+    # JSON dict {claim_value: bambuddy_group_name}. Stored as text; parsed at
+    # use. NULL/empty disables claim-based grouping (default_group fallback).
+    group_mapping: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
 
     @property
     def has_icon(self) -> bool:

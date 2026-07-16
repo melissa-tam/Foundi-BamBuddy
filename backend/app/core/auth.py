@@ -680,11 +680,44 @@ async def verify_camera_stream_token(token: str) -> bool:
         return record is not None
 
 
+# bcrypt hash-format prefixes ($2a$ = ERP/MariaDB, $2b$/$2y$ = modern/PHP variants).
+_BCRYPT_HASH_PREFIXES = ("$2a$", "$2b$", "$2y$")
+# bcrypt truncates plaintext at 72 bytes; bcrypt>=4 raises instead of truncating,
+# so truncate explicitly to match how the original hash was computed.
+_BCRYPT_MAX_BYTES = 72
+
+
+def verify_bcrypt_password(plain_password: str, hashed_password: str | None) -> bool:
+    """Verify a plaintext password against a bcrypt ``$2a$``/``$2b$``/``$2y$`` hash.
+
+    Canonical bcrypt verifier for the whole app (ERP-mirrored hashes live in
+    ``user.password_hash``). Uses the ``bcrypt`` library directly because this
+    environment's passlib bcrypt backend is broken against bcrypt >= 4
+    (``__about__`` removed). Returns False on malformed input rather than
+    raising, so re-auth branches can call it inline.
+    """
+    if not plain_password or not hashed_password:
+        return False
+    import bcrypt
+
+    try:
+        secret = plain_password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
+        return bcrypt.checkpw(secret, hashed_password.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
+
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against a hash.
 
-    Uses pbkdf2_sha256 which handles long passwords automatically.
+    Hash-agnostic: local users carry pbkdf2_sha256 hashes (verified via
+    passlib), while ERP-managed users carry a mirrored bcrypt ``$2a$`` hash
+    (verified via the bcrypt library — passlib's pbkdf2-only context raises
+    ``UnknownHashError`` on bcrypt input, which surfaced as HTTP 500 on the
+    C6/Nit-3 re-auth endpoints and change-password before this dispatch).
     """
+    if hashed_password and hashed_password.startswith(_BCRYPT_HASH_PREFIXES):
+        return verify_bcrypt_password(plain_password, hashed_password)
     return pwd_context.verify(plain_password, hashed_password)
 
 
@@ -791,8 +824,8 @@ async def authenticate_user(db: AsyncSession, username: str, password: str) -> U
     user = await get_user_by_username(db, username)
     if not user:
         return None
-    if getattr(user, "auth_source", "local") in ("ldap", "oidc"):
-        return None  # LDAP/OIDC users must authenticate via their provider
+    if getattr(user, "auth_source", "local") in ("ldap", "oidc", "erp"):
+        return None  # LDAP/OIDC/ERP users must authenticate via their provider (never via a cached local hash here)
     if not user.password_hash or not verify_password(password, user.password_hash):
         return None
     if not user.is_active:
@@ -809,8 +842,8 @@ async def authenticate_user_by_email(db: AsyncSession, email: str, password: str
     user = await get_user_by_email(db, email)
     if not user:
         return None
-    if getattr(user, "auth_source", "local") in ("ldap", "oidc"):
-        return None  # LDAP/OIDC users must authenticate via their provider
+    if getattr(user, "auth_source", "local") in ("ldap", "oidc", "erp"):
+        return None  # LDAP/OIDC/ERP users must authenticate via their provider (never via a cached local hash here)
     if not user.password_hash or not verify_password(password, user.password_hash):
         return None
     if not user.is_active:

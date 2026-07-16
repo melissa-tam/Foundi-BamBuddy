@@ -11,7 +11,7 @@ broadcast (spied per call site). FK enforcement is off in the test engine.
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -23,7 +23,11 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.sku import Sku, SkuFile
 from backend.app.services import farm_policy, farm_stall, production_run
+from backend.app.services.capability_gate import CapabilityDecision, evaluate_capability as _real_evaluate_capability
+from backend.app.services.filament_deficit import FilamentDeficit
 from backend.app.services.notification_service import notification_service
+from backend.app.services.print_scheduler import scheduler as _scheduler
+from backend.app.services.printer_manager import printer_manager
 from backend.app.services.production_run import (
     _derive_printer_unit_context,
     _load_run,
@@ -31,6 +35,7 @@ from backend.app.services.production_run import (
     build_run_response,
     transition_run,
 )
+from backend.app.services.spool_selection import MatchOutcome
 
 pytestmark = pytest.mark.asyncio
 
@@ -561,6 +566,219 @@ class TestFirstArticlePhoto:
         assert resp["first_article_photo_url"] is None
         assert resp["first_article_printer_id"] is None
         assert resp["first_article_printer_name"] is None
+
+
+@pytest.fixture
+def elig_env(monkeypatch):
+    """Patch the three eligibility collaborators to an "all-eligible" baseline.
+
+    Every dimension defaults to OK (empty deficit, capable, no live status) so a
+    test can raise ONE flag by reconfiguring its mock. ``status_map`` feeds the
+    real ``printer_manager.get_status`` used by both ``_build_printer_states`` and
+    the eligibility helper.
+    """
+    deficit_mock = AsyncMock(return_value=[])
+    cap_mock = MagicMock(return_value=CapabilityDecision(ok=True))
+    status_map: dict[int, object] = {}
+    monkeypatch.setattr(production_run, "compute_deficit_for_queue_item", deficit_mock)
+    monkeypatch.setattr(production_run, "evaluate_capability", cap_mock)
+    monkeypatch.setattr(production_run, "list_geometries", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        _scheduler, "_compute_ams_mapping_for_printer", AsyncMock(return_value=MatchOutcome(mapping=None))
+    )
+    monkeypatch.setattr(printer_manager, "get_status", lambda pid: status_map.get(pid))
+    return SimpleNamespace(deficit=deficit_mock, capability=cap_mock, status_map=status_map)
+
+
+class TestPrinterEligibility:
+    """Per-printer live dispatch-eligibility merged onto the run-detail printer
+    states: filament deficit, USB presence and the capability gate. Detail-only;
+    each per-printer computation is fail-safe (defaults on error)."""
+
+    async def test_deficit_sets_filament_short_live_and_detail(self, db_session, elig_env):
+        elig_env.deficit.return_value = [
+            FilamentDeficit(
+                slot_id=1, ams_id=0, tray_id=1, filament_type="PETG", required_grams=455.1, remaining_grams=260.0
+            )
+        ]
+        batch = await _mk_run(db_session, quantity=1)
+        p = await _mk_printer(db_session)
+        await _add(db_session, batch, printer_id=p.id, status="pending")
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run, detail=True)
+        st = resp["printer_states"][0]
+        assert st["filament_short_live"] is True
+        assert st["filament_short_detail"] == "needs 455 g, 260 g available"
+        # A single new flag alone raises the run-level blocked summary.
+        assert resp["has_blocked_printers"] is True
+
+    async def test_sdcard_false_sets_no_usb_drive(self, db_session, elig_env):
+        batch = await _mk_run(db_session, quantity=1)
+        p = await _mk_printer(db_session)
+        elig_env.status_map[p.id] = SimpleNamespace(sdcard=False)
+        await _add(db_session, batch, printer_id=p.id, status="pending")
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run, detail=True)
+        st = resp["printer_states"][0]
+        assert st["no_usb_drive"] is True
+        assert resp["has_blocked_printers"] is True
+
+    async def test_unvalidated_geometry_sets_capability_reason(self, db_session, elig_env, monkeypatch):
+        # Use the REAL capability gate with an empty validated-model set (no
+        # seeded geometry) → every printer blocks on missing eject geometry.
+        monkeypatch.setattr(production_run, "evaluate_capability", _real_evaluate_capability)
+        batch = await _mk_run(db_session, quantity=1)
+        p = await _mk_printer(db_session)  # model "H2S"
+        await _add(db_session, batch, printer_id=p.id, status="pending")
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run, detail=True)
+        st = resp["printer_states"][0]
+        assert st["capability_reason"] is not None
+        assert "eject bed geometry" in st["capability_reason"]
+        assert resp["has_blocked_printers"] is True
+
+    async def test_nozzle_mismatch_sets_capability_reason(self, db_session, elig_env, monkeypatch):
+        # Real gate, H2S geometry VALIDATED (geometry passes), but the file needs a
+        # 0.6 nozzle and the printer reports 0.4 → the nozzle arm blocks. Pins the
+        # eligibility wiring (plate-scoped file caps + live-nozzle reader) end to end.
+        monkeypatch.setattr(production_run, "evaluate_capability", _real_evaluate_capability)
+        monkeypatch.setattr(
+            production_run,
+            "list_geometries",
+            AsyncMock(return_value=[SimpleNamespace(model_key="H2S", validated=True)]),
+        )
+        batch = await _mk_run(db_session, quantity=1)
+        p = await _mk_printer(db_session)  # model "H2S"
+        lib = LibraryFile(
+            filename="n.gcode.3mf",
+            file_path="/tmp/n.gcode.3mf",
+            file_type="gcode.3mf",
+            file_size=1,
+            file_metadata={"nozzle_diameter": 0.6},
+        )
+        db_session.add(lib)
+        await db_session.flush()
+        elig_env.status_map[p.id] = SimpleNamespace(nozzles=[SimpleNamespace(nozzle_diameter="0.4")], raw_data={})
+        await _add(db_session, batch, printer_id=p.id, status="pending", library_file_id=lib.id)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run, detail=True)
+        st = resp["printer_states"][0]
+        assert st["capability_reason"] is not None
+        assert "nozzle mismatch" in st["capability_reason"]
+        assert resp["has_blocked_printers"] is True
+
+    async def test_fully_eligible_printer_all_defaults(self, db_session, elig_env):
+        batch = await _mk_run(db_session, quantity=1)
+        p = await _mk_printer(db_session)
+        await _add(db_session, batch, printer_id=p.id, status="pending")
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run, detail=True)
+        st = resp["printer_states"][0]
+        assert st["filament_short_live"] is False
+        assert st["filament_short_detail"] is None
+        assert st["no_usb_drive"] is False
+        assert st["capability_reason"] is None
+        assert resp["has_blocked_printers"] is False
+
+    async def test_no_pending_units_defaults_and_skips_deficit(self, db_session, elig_env):
+        batch = await _mk_run(db_session, quantity=1)
+        p = await _mk_printer(db_session)
+        await _add(db_session, batch, printer_id=p.id, status="completed", completed_at=datetime.now(timezone.utc))
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run, detail=True)
+        st = resp["printer_states"][0]
+        assert st["filament_short_live"] is False
+        assert st["no_usb_drive"] is False
+        assert st["capability_reason"] is None
+        # No pending work → the deficit path is never entered.
+        assert elig_env.deficit.await_count == 0
+
+    async def test_model_targeted_run_lists_active_model_printers(self, db_session, elig_env):
+        # A model-targeted run whose staged items are UNPINNED (printer_id NULL):
+        # the panel must list every ACTIVE printer of the target model.
+        batch = await _mk_run(db_session, quantity=1)
+        h2s_a = await _mk_printer(db_session, name="H2S-A")
+        h2s_b = await _mk_printer(db_session, name="H2S-B")
+        # An inactive H2S and an active non-H2S must NOT appear.
+        inactive = Printer(
+            name="H2S-off",
+            serial_number="SN-off",
+            ip_address="192.0.2.9",
+            access_code="1",
+            model="H2S",
+            is_active=False,
+        )
+        other = Printer(
+            name="P1S-A", serial_number="SN-p1s", ip_address="192.0.2.8", access_code="1", model="P1S", is_active=True
+        )
+        db_session.add_all([inactive, other])
+        await db_session.flush()
+        await _add(db_session, batch, printer_id=None, target_model="H2S", status="pending")
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run, detail=True)
+        ids = {s["printer_id"] for s in resp["printer_states"]}
+        assert ids == {h2s_a.id, h2s_b.id}
+
+    async def test_per_printer_exception_defaults_and_no_raise(self, db_session, elig_env):
+        elig_env.deficit.side_effect = RuntimeError("malformed 3MF")
+        batch = await _mk_run(db_session, quantity=1)
+        p = await _mk_printer(db_session)
+        await _add(db_session, batch, printer_id=p.id, status="pending")
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        # Must not propagate; the deficit flag stays at its default.
+        resp = await build_run_response(db_session, run, detail=True)
+        st = resp["printer_states"][0]
+        assert st["filament_short_live"] is False
+        assert st["filament_short_detail"] is None
+
+    async def test_busy_printer_not_flagged(self, db_session, elig_env):
+        # A printing (busy) printer is not ineligibility: with filament/USB/
+        # capability all OK it carries no eligibility flag.
+        batch = await _mk_run(db_session, quantity=2)
+        busy = await _mk_printer(db_session, name="Busy")
+        await _add(db_session, batch, printer_id=busy.id, status="printing", pos=1)
+        await _add(db_session, batch, printer_id=busy.id, status="pending", pos=2)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run, detail=True)
+        st = next(s for s in resp["printer_states"] if s["printer_id"] == busy.id)
+        assert st["filament_short_live"] is False
+        assert st["no_usb_drive"] is False
+        assert st["capability_reason"] is None
+
+    async def test_list_endpoint_skips_eligibility(self, db_session, elig_env):
+        # detail=False must not compute eligibility (lean list path).
+        elig_env.deficit.return_value = [
+            FilamentDeficit(
+                slot_id=1, ams_id=0, tray_id=1, filament_type="PETG", required_grams=455.0, remaining_grams=10.0
+            )
+        ]
+        batch = await _mk_run(db_session, quantity=1)
+        p = await _mk_printer(db_session)
+        await _add(db_session, batch, printer_id=p.id, status="pending")
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        lean = await build_run_response(db_session, run)  # detail defaults False
+        assert "printer_states" not in lean
+        assert elig_env.deficit.await_count == 0
 
 
 class TestRunAgainPrefillFields:

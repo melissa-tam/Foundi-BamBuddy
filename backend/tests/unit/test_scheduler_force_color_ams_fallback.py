@@ -14,6 +14,11 @@ import pytest
 
 from backend.app.services.print_scheduler import PrintScheduler
 
+# The direct-mapping helper is now policy-aware. These tests exercise the
+# simple slot_order / no-floor path, which never touches the DB for inventory.
+_SLOT_ORDER = "slot_order"
+_NO_FLOOR = 0
+
 
 class TestBuildOverrideDirectMapping:
     """Unit tests for ``_build_override_direct_mapping``."""
@@ -26,52 +31,38 @@ class TestBuildOverrideDirectMapping:
         raw: dict = {"ams": ams}
         if vt_tray is not None:
             raw["vt_tray"] = vt_tray
-        return MagicMock(raw_data=raw)
+        return MagicMock(raw_data=raw, ams_filament_backup=None)
 
-    def test_single_force_override_matches_ams_slot(self, scheduler):
+    async def _direct(self, scheduler, overrides, status):
+        return await scheduler._build_override_direct_mapping(MagicMock(), 5, overrides, status, _SLOT_ORDER, _NO_FLOOR)
+
+    @pytest.mark.asyncio
+    async def test_single_force_override_matches_ams_slot(self, scheduler):
         """Override with type+color matches the correct AMS tray."""
-        status = self._status(
-            ams=[
-                {
-                    "id": 0,
-                    "tray": [
-                        {"id": 0, "tray_type": "PLA", "tray_color": "CBC6B8FF"},
-                    ],
-                }
-            ]
-        )
+        status = self._status(ams=[{"id": 0, "tray": [{"id": 0, "tray_type": "PLA", "tray_color": "CBC6B8FF"}]}])
         overrides = [{"slot_id": 1, "type": "PLA", "color": "#CBC6B8", "force_color_match": True}]
-        result = scheduler._build_override_direct_mapping(overrides, status)
-        assert result == [0]  # global_tray_id 0 (AMS 0, tray 0)
+        result = await self._direct(scheduler, overrides, status)
+        assert result.mapping == [0]  # global_tray_id 0 (AMS 0, tray 0)
 
-    def test_no_loaded_filaments_returns_none(self, scheduler):
+    @pytest.mark.asyncio
+    async def test_no_loaded_filaments_returns_none(self, scheduler):
         """Empty AMS → cannot compute mapping, return None."""
         status = self._status(ams=[{"id": 0, "tray": [{"id": 0}]}])  # empty tray
         overrides = [{"slot_id": 1, "type": "PLA", "color": "#CBC6B8", "force_color_match": True}]
-        result = scheduler._build_override_direct_mapping(overrides, status)
-        assert result is None
+        result = await self._direct(scheduler, overrides, status)
+        assert result.mapping is None
 
-    def test_no_color_match_returns_minus_one(self, scheduler):
-        """Override color not present → slot mapped to -1 (no match)."""
-        status = self._status(
-            ams=[
-                {
-                    "id": 0,
-                    "tray": [
-                        {"id": 0, "tray_type": "PLA", "tray_color": "FF0000FF"},
-                    ],
-                }
-            ]
-        )
+    @pytest.mark.asyncio
+    async def test_no_color_match_returns_type_only(self, scheduler):
+        """Override color not present → type-only fallback still yields a mapping."""
+        status = self._status(ams=[{"id": 0, "tray": [{"id": 0, "tray_type": "PLA", "tray_color": "FF0000FF"}]}])
         overrides = [{"slot_id": 1, "type": "PLA", "color": "#CBC6B8", "force_color_match": True}]
-        result = scheduler._build_override_direct_mapping(overrides, status)
-        # Type matches but color is far off (red vs beige) → type-only fallback → [0]
-        # If colour threshold is exceeded, falls back to type-only, which IS a match.
-        # The important thing: result is not None and has the right length.
-        assert result is not None
-        assert len(result) == 1
+        result = await self._direct(scheduler, overrides, status)
+        assert result.mapping is not None
+        assert len(result.mapping) == 1
 
-    def test_multiple_overrides_map_multiple_slots(self, scheduler):
+    @pytest.mark.asyncio
+    async def test_multiple_overrides_map_multiple_slots(self, scheduler):
         """Two overrides with different slot_ids produce a two-element mapping."""
         status = self._status(
             ams=[
@@ -88,20 +79,19 @@ class TestBuildOverrideDirectMapping:
             {"slot_id": 1, "type": "PLA", "color": "#CBC6B8", "force_color_match": True},
             {"slot_id": 2, "type": "PETG", "color": "#000000", "force_color_match": True},
         ]
-        result = scheduler._build_override_direct_mapping(overrides, status)
-        assert result == [0, 1]  # slot 1 → tray 0, slot 2 → tray 1
+        result = await self._direct(scheduler, overrides, status)
+        assert result.mapping == [0, 1]  # slot 1 → tray 0, slot 2 → tray 1
 
-    def test_external_spool_matched(self, scheduler):
+    @pytest.mark.asyncio
+    async def test_external_spool_matched(self, scheduler):
         """Override matching an external spool returns global_tray_id 254."""
-        status = self._status(
-            ams=[],
-            vt_tray=[{"tray_type": "TPU", "tray_color": "CBC6B8FF"}],
-        )
+        status = self._status(ams=[], vt_tray=[{"tray_type": "TPU", "tray_color": "CBC6B8FF"}])
         overrides = [{"slot_id": 1, "type": "TPU", "color": "#CBC6B8", "force_color_match": True}]
-        result = scheduler._build_override_direct_mapping(overrides, status)
-        assert result == [254]
+        result = await self._direct(scheduler, overrides, status)
+        assert result.mapping == [254]
 
-    def test_tray_info_idx_is_not_used_for_direct_mapping(self, scheduler):
+    @pytest.mark.asyncio
+    async def test_tray_info_idx_is_not_used_for_direct_mapping(self, scheduler):
         """Direct-override mapping clears tray_info_idx so matching falls back
         to colour rather than pinning to a specific spool ID from the 3MF."""
         status = self._status(
@@ -109,20 +99,14 @@ class TestBuildOverrideDirectMapping:
                 {
                     "id": 0,
                     "tray": [
-                        {
-                            "id": 0,
-                            "tray_type": "PLA",
-                            "tray_color": "CBC6B8FF",
-                            "tray_info_idx": "GFA00",
-                        },
+                        {"id": 0, "tray_type": "PLA", "tray_color": "CBC6B8FF", "tray_info_idx": "GFA00"},
                     ],
                 }
             ]
         )
         overrides = [{"slot_id": 1, "type": "PLA", "color": "#CBC6B8", "force_color_match": True}]
-        result = scheduler._build_override_direct_mapping(overrides, status)
-        # Should match by colour (#CBC6B8 ≈ CBC6B8FF after strip), not by tray_info_idx.
-        assert result == [0]
+        result = await self._direct(scheduler, overrides, status)
+        assert result.mapping == [0]
 
 
 class TestComputeAmsMappingFallback:
@@ -140,20 +124,20 @@ class TestComputeAmsMappingFallback:
         item.plate_id = None
         item.filament_overrides = filament_overrides_json
         item.printer_id = 5
+        item.skip_filament_check = False
         return item
 
     def _make_status(self) -> MagicMock:
         return MagicMock(
-            raw_data={
-                "ams": [
-                    {
-                        "id": 0,
-                        "tray": [
-                            {"id": 0, "tray_type": "PLA", "tray_color": "CBC6B8FF"},
-                        ],
-                    }
-                ]
-            }
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "tray_type": "PLA", "tray_color": "CBC6B8FF"}]}]},
+            ams_filament_backup=None,
+        )
+
+    def _policy_patches(self, scheduler):
+        """Pin the settings reads to slot_order / no floor (no inventory DB access)."""
+        return (
+            patch.object(scheduler, "_get_setting", new=AsyncMock(return_value=_SLOT_ORDER)),
+            patch.object(scheduler, "_get_int_setting", new=AsyncMock(return_value=_NO_FLOOR)),
         )
 
     @pytest.mark.asyncio
@@ -162,45 +146,38 @@ class TestComputeAmsMappingFallback:
         """When _get_filament_requirements returns None but force-color overrides
         are set, the fallback builds a mapping directly from the overrides."""
         mock_pm.get_status.return_value = self._make_status()
-
         item = self._make_item(
             filament_overrides_json='[{"slot_id": 1, "type": "PLA", "color": "#CBC6B8", "force_color_match": true}]'
         )
-
         db = AsyncMock()
-
-        with patch.object(scheduler, "_get_filament_requirements", return_value=None):
+        p1, p2 = self._policy_patches(scheduler)
+        with p1, p2, patch.object(scheduler, "_get_filament_requirements", return_value=None):
             result = await scheduler._compute_ams_mapping_for_printer(db, 5, item)
-
-        assert result == [0]  # global_tray_id 0 (AMS 0, tray 0)
+        assert result.mapping == [0]  # global_tray_id 0 (AMS 0, tray 0)
 
     @pytest.mark.asyncio
     @patch("backend.app.services.print_scheduler.printer_manager")
     async def test_fallback_not_used_when_no_force_color(self, mock_pm, scheduler):
         """When overrides have no force_color_match, the fallback is not triggered."""
         mock_pm.get_status.return_value = self._make_status()
-
         item = self._make_item(filament_overrides_json='[{"slot_id": 1, "type": "PLA", "color": "#CBC6B8"}]')
         db = AsyncMock()
-
-        with patch.object(scheduler, "_get_filament_requirements", return_value=None):
+        p1, p2 = self._policy_patches(scheduler)
+        with p1, p2, patch.object(scheduler, "_get_filament_requirements", return_value=None):
             result = await scheduler._compute_ams_mapping_for_printer(db, 5, item)
-
-        assert result is None
+        assert result.mapping is None
 
     @pytest.mark.asyncio
     @patch("backend.app.services.print_scheduler.printer_manager")
     async def test_fallback_not_used_when_no_overrides(self, mock_pm, scheduler):
         """When filament_overrides is None, the fallback is not triggered."""
         mock_pm.get_status.return_value = self._make_status()
-
         item = self._make_item(filament_overrides_json=None)
         db = AsyncMock()
-
-        with patch.object(scheduler, "_get_filament_requirements", return_value=None):
+        p1, p2 = self._policy_patches(scheduler)
+        with p1, p2, patch.object(scheduler, "_get_filament_requirements", return_value=None):
             result = await scheduler._compute_ams_mapping_for_printer(db, 5, item)
-
-        assert result is None
+        assert result.mapping is None
 
     @pytest.mark.asyncio
     @patch("backend.app.services.print_scheduler.printer_manager")
@@ -208,36 +185,26 @@ class TestComputeAmsMappingFallback:
         """When filament requirements are available, the normal path is used
         (overrides applied to reqs, then matched)."""
         mock_pm.get_status.return_value = self._make_status()
-
         item = self._make_item(
             filament_overrides_json='[{"slot_id": 1, "type": "PLA", "color": "#CBC6B8", "force_color_match": true}]'
         )
         db = AsyncMock()
-
-        # 3MF says slot 1 is PLA with a different color; override will change it.
         filament_reqs = [{"slot_id": 1, "type": "PLA", "color": "#000000", "tray_info_idx": "GFA00"}]
-
-        with (
-            patch.object(scheduler, "_get_filament_requirements", return_value=filament_reqs),
-            patch.object(scheduler, "_get_bool_setting", new=AsyncMock(return_value=False)),
-        ):
+        p1, p2 = self._policy_patches(scheduler)
+        with p1, p2, patch.object(scheduler, "_get_filament_requirements", return_value=filament_reqs):
             result = await scheduler._compute_ams_mapping_for_printer(db, 5, item)
-
         # After override, slot 1 becomes PLA #CBC6B8 → matches tray 0.
-        assert result == [0]
+        assert result.mapping == [0]
 
     @pytest.mark.asyncio
     @patch("backend.app.services.print_scheduler.printer_manager")
     async def test_fallback_returns_none_when_printer_status_unavailable(self, mock_pm, scheduler):
         """When the printer has no status, the fallback also returns None gracefully."""
         mock_pm.get_status.return_value = None
-
         item = self._make_item(
             filament_overrides_json='[{"slot_id": 1, "type": "PLA", "color": "#CBC6B8", "force_color_match": true}]'
         )
         db = AsyncMock()
-
         with patch.object(scheduler, "_get_filament_requirements", return_value=None):
             result = await scheduler._compute_ams_mapping_for_printer(db, 5, item)
-
-        assert result is None
+        assert result.mapping is None

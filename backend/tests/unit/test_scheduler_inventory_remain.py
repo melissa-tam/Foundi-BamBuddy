@@ -1,22 +1,27 @@
-"""Tests for the inventory-remain override builder in print_scheduler (#1508).
+"""Tests for the slot-inventory builder in spool_selection (#1508 + FIFO).
 
 The MQTT ``remain`` field on an AMS tray is the printer firmware's
 RFID-tracked value, which is ``-1`` for non-Bambu spools (and even when
 set diverges from Bambuddy's inventory). When the user has bound an
 inventory spool to an AMS slot, that inventory record's
 ``label_weight - weight_used`` (or Spoolman's ``remaining_weight``) is
-the authoritative remaining-weight signal. These tests verify
-``_build_inventory_remain_overrides`` surfaces those values keyed by
-``global_tray_id`` so the "Prefer Lowest Remaining Filament" sort can
-consume them.
+the authoritative remaining-weight signal, and ``COALESCE(first_loaded_at,
+created_at)`` (Spoolman: ``first_used``) is the FIFO ordinal. These tests
+verify ``build_slot_inventory`` surfaces both, keyed by ``global_tray_id``.
+
+``PrintScheduler._build_inventory_remain_overrides`` is now a thin delegate
+that projects the remaining-grams side of this map; a couple of cases pin
+that delegate to guard the external key/shape it still returns.
 """
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from backend.app.services.print_scheduler import PrintScheduler
+from backend.app.services.spool_selection import SlotInventory, build_slot_inventory
 
 
 @pytest.fixture
@@ -37,88 +42,52 @@ def _make_async_session_returning(rows: list):
     return db
 
 
+def _spool(*, label_weight, weight_used, first_loaded_at=None, created_at=None):
+    """Internal-mode spool stub with the attributes build_slot_inventory reads."""
+    return SimpleNamespace(
+        label_weight=label_weight,
+        weight_used=weight_used,
+        first_loaded_at=first_loaded_at,
+        created_at=created_at or datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+
 class TestInternalInventoryOverrides:
     @pytest.mark.asyncio
-    async def test_returns_remaining_grams_for_bound_slots(self, scheduler):
+    async def test_returns_remaining_grams_for_bound_slots(self):
         """Two slots bound; both come back keyed by global_tray_id with the
-        correct ``label_weight - weight_used`` in grams. This is the
-        reporter scenario in #1508: slot 1 has a 950 g clone, slot 4 has
-        a 50 g original — the sort can now actually pick the 50 g spool.
-
-        The override builder uses ``select(SpoolAssignment).options(
-        selectinload(SpoolAssignment.spool))`` (matching the rest of the
-        codebase), so the rows it iterates expose ``.ams_id``, ``.tray_id``
-        and ``.spool`` directly — the test stubs the same shape.
-        """
-        spool_a = SimpleNamespace(label_weight=1000, weight_used=50)  # 950 g remaining
-        spool_b = SimpleNamespace(label_weight=1000, weight_used=950)  # 50 g remaining
+        correct ``label_weight - weight_used`` in grams (reporter scenario #1508:
+        slot 1 has a 950 g clone, slot 4 a 50 g original)."""
         rows = [
-            SimpleNamespace(ams_id=0, tray_id=0, spool=spool_a),
-            SimpleNamespace(ams_id=0, tray_id=3, spool=spool_b),
+            SimpleNamespace(ams_id=0, tray_id=0, spool=_spool(label_weight=1000, weight_used=50)),
+            SimpleNamespace(ams_id=0, tray_id=3, spool=_spool(label_weight=1000, weight_used=950)),
         ]
         loaded = [
             {"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False},
             {"ams_id": 0, "tray_id": 3, "global_tray_id": 3, "is_external": False},
         ]
         db = _make_async_session_returning(rows)
-        with patch.object(PrintScheduler, "_is_spoolman_mode", new=AsyncMock(return_value=False)):
-            out = await scheduler._build_inventory_remain_overrides(db, printer_id=1, loaded=loaded)
-        assert out == {0: 950.0, 3: 50.0}
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        assert out[0].remaining_g == 950.0
+        assert out[3].remaining_g == 50.0
 
     @pytest.mark.asyncio
-    async def test_skips_external_slots(self, scheduler):
-        """VT / external slots are tracked separately from AMS inventory
-        bindings — the override builder must not assign them an inventory
-        remaining value even if (somehow) an assignment row exists.
-        """
-        loaded = [
-            {"ams_id": -1, "tray_id": 0, "global_tray_id": 254, "is_external": True},
-        ]
-        db = _make_async_session_returning([])
-        with patch.object(PrintScheduler, "_is_spoolman_mode", new=AsyncMock(return_value=False)):
-            out = await scheduler._build_inventory_remain_overrides(db, printer_id=1, loaded=loaded)
-        # DB shouldn't even be queried — nothing AMS-side to look up.
-        db.execute.assert_not_called()
-        assert out == {}
-
-    @pytest.mark.asyncio
-    async def test_empty_loaded_returns_empty(self, scheduler):
-        """No loaded filaments → no overrides. The scheduler short-circuits
-        before this is called in practice, but the function must be
-        defensive — it's used in any prefer_lowest dispatch path."""
-        db = _make_async_session_returning([])
-        with patch.object(PrintScheduler, "_is_spoolman_mode", new=AsyncMock(return_value=False)):
-            out = await scheduler._build_inventory_remain_overrides(db, printer_id=1, loaded=[])
-        assert out == {}
-        db.execute.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_negative_remaining_clamped_to_zero(self, scheduler):
-        """An over-consumed spool (weight_used > label_weight) shouldn't
-        produce a negative grams value — clamped to 0 so the sort treats
-        it as fully empty rather than "more empty than zero."
-        """
-        spool = SimpleNamespace(label_weight=1000, weight_used=1100)
-        rows = [
-            SimpleNamespace(ams_id=0, tray_id=0, spool=spool),
-        ]
-        loaded = [{"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False}]
-        db = _make_async_session_returning(rows)
-        with patch.object(PrintScheduler, "_is_spoolman_mode", new=AsyncMock(return_value=False)):
-            out = await scheduler._build_inventory_remain_overrides(db, printer_id=1, loaded=loaded)
-        assert out == {0: 0.0}
-
-    @pytest.mark.asyncio
-    async def test_slot_without_binding_absent_from_overrides(self, scheduler):
-        """A slot that has loaded filament but no inventory binding must
-        not appear in the override map — the sort then falls back to MQTT
-        ``remain`` for that one slot, preserving pre-#1508 behaviour.
-        """
+    async def test_first_loaded_ordinal_prefers_first_loaded_at(self):
+        """``first_loaded_at`` wins over ``created_at`` for the FIFO ordinal;
+        when NULL the builder falls back to ``created_at``."""
+        first = datetime(2026, 2, 1, tzinfo=timezone.utc)
+        created = datetime(2026, 3, 1, tzinfo=timezone.utc)
         rows = [
             SimpleNamespace(
                 ams_id=0,
                 tray_id=0,
-                spool=SimpleNamespace(label_weight=1000, weight_used=100),
+                spool=_spool(label_weight=1000, weight_used=0, first_loaded_at=first, created_at=created),
+            ),
+            SimpleNamespace(
+                ams_id=0,
+                tray_id=1,
+                spool=_spool(label_weight=1000, weight_used=0, first_loaded_at=None, created_at=created),
             ),
         ]
         loaded = [
@@ -126,20 +95,79 @@ class TestInternalInventoryOverrides:
             {"ams_id": 0, "tray_id": 1, "global_tray_id": 1, "is_external": False},
         ]
         db = _make_async_session_returning(rows)
-        with patch.object(PrintScheduler, "_is_spoolman_mode", new=AsyncMock(return_value=False)):
-            out = await scheduler._build_inventory_remain_overrides(db, printer_id=1, loaded=loaded)
-        assert out == {0: 900.0}
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        assert out[0].first_loaded_ord == first.timestamp()
+        assert out[1].first_loaded_ord == created.timestamp()
+
+    @pytest.mark.asyncio
+    async def test_skips_external_slots(self):
+        """VT / external slots are tracked separately — never assigned an
+        inventory value even if an assignment row somehow exists."""
+        loaded = [{"ams_id": -1, "tray_id": 0, "global_tray_id": 254, "is_external": True}]
+        db = _make_async_session_returning([])
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        db.execute.assert_not_called()
+        assert out == {}
+
+    @pytest.mark.asyncio
+    async def test_empty_loaded_returns_empty(self):
+        """No loaded filaments → no inventory."""
+        db = _make_async_session_returning([])
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await build_slot_inventory(db, printer_id=1, loaded=[])
+        assert out == {}
+        db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_negative_remaining_clamped_to_zero(self):
+        """An over-consumed spool clamps remaining to 0, not negative."""
+        rows = [SimpleNamespace(ams_id=0, tray_id=0, spool=_spool(label_weight=1000, weight_used=1100))]
+        loaded = [{"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False}]
+        db = _make_async_session_returning(rows)
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        assert out[0].remaining_g == 0.0
+
+    @pytest.mark.asyncio
+    async def test_slot_without_binding_absent(self):
+        """A loaded slot with no inventory binding is absent from the map —
+        the sort falls back to MQTT ``remain`` for it."""
+        rows = [SimpleNamespace(ams_id=0, tray_id=0, spool=_spool(label_weight=1000, weight_used=100))]
+        loaded = [
+            {"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False},
+            {"ams_id": 0, "tray_id": 1, "global_tray_id": 1, "is_external": False},
+        ]
+        db = _make_async_session_returning(rows)
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        assert out[0].remaining_g == 900.0
         assert 1 not in out
+
+    @pytest.mark.asyncio
+    async def test_delegate_projects_remaining_grams(self, scheduler):
+        """The retained ``_build_inventory_remain_overrides`` delegate projects
+        the remaining-grams side, preserving its external ``{gtid: grams}`` shape."""
+        rows = [
+            SimpleNamespace(ams_id=0, tray_id=0, spool=_spool(label_weight=1000, weight_used=50)),
+            SimpleNamespace(ams_id=0, tray_id=3, spool=_spool(label_weight=1000, weight_used=950)),
+        ]
+        loaded = [
+            {"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False},
+            {"ams_id": 0, "tray_id": 3, "global_tray_id": 3, "is_external": False},
+        ]
+        db = _make_async_session_returning(rows)
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await scheduler._build_inventory_remain_overrides(db, printer_id=1, loaded=loaded)
+        assert out == {0: 950.0, 3: 50.0}
 
 
 class TestSpoolmanModeOverrides:
     @pytest.mark.asyncio
-    async def test_spoolman_remaining_grams_used_when_available(self, scheduler):
-        """Spoolman mode: each bound slot's spoolman_spool_id is fetched
-        through ``_spoolman_remaining_grams``; the result is the same
-        global-tray-id-keyed grams map. Parity rule with internal mode
-        (feedback_inventory_modes_parity).
-        """
+    async def test_spoolman_remaining_and_first_used_used_when_available(self):
+        """Spoolman mode: each bound slot's spoolman_spool_id is fetched once,
+        yielding both remaining grams and the first_used ordinal."""
         rows = [
             SimpleNamespace(printer_id=1, ams_id=0, tray_id=0, spoolman_spool_id=42),
             SimpleNamespace(printer_id=1, ams_id=0, tray_id=2, spoolman_spool_id=99),
@@ -150,25 +178,22 @@ class TestSpoolmanModeOverrides:
         ]
         db = _make_async_session_returning(rows)
 
-        async def _fake_grams(spool_id: int):
-            return {42: 720.0, 99: 80.0}[spool_id]
+        async def _fake_fetch(spool_id: int):
+            return {42: (720.0, 1000.0), 99: (80.0, 2000.0)}[spool_id]
 
         with (
-            patch.object(PrintScheduler, "_is_spoolman_mode", new=AsyncMock(return_value=True)),
-            patch(
-                "backend.app.services.filament_deficit._spoolman_remaining_grams",
-                new=AsyncMock(side_effect=_fake_grams),
-            ),
+            patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=True)),
+            patch("backend.app.services.spool_selection._fetch_spoolman_slot", new=AsyncMock(side_effect=_fake_fetch)),
         ):
-            out = await scheduler._build_inventory_remain_overrides(db, printer_id=1, loaded=loaded)
-        assert out == {0: 720.0, 2: 80.0}
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        assert out[0].remaining_g == 720.0
+        assert out[0].first_loaded_ord == 1000.0
+        assert out[2].remaining_g == 80.0
 
     @pytest.mark.asyncio
-    async def test_spoolman_unreachable_skips_silently(self, scheduler):
-        """If Spoolman is unreachable for one spool, ``_spoolman_remaining_grams``
-        returns None and that slot is omitted from the override map —
-        sorting then falls back to MQTT remain for that slot only.
-        """
+    async def test_spoolman_unreachable_skips_silently(self):
+        """If Spoolman is unreachable for one spool, ``_fetch_spoolman_slot``
+        returns (None, None) and that slot is omitted."""
         rows = [
             SimpleNamespace(printer_id=1, ams_id=0, tray_id=0, spoolman_spool_id=42),
             SimpleNamespace(printer_id=1, ams_id=0, tray_id=1, spoolman_spool_id=99),
@@ -179,16 +204,15 @@ class TestSpoolmanModeOverrides:
         ]
         db = _make_async_session_returning(rows)
 
-        async def _fake_grams(spool_id: int):
-            return 500.0 if spool_id == 42 else None
+        async def _fake_fetch(spool_id: int):
+            return (500.0, None) if spool_id == 42 else (None, None)
 
         with (
-            patch.object(PrintScheduler, "_is_spoolman_mode", new=AsyncMock(return_value=True)),
-            patch(
-                "backend.app.services.filament_deficit._spoolman_remaining_grams",
-                new=AsyncMock(side_effect=_fake_grams),
-            ),
+            patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=True)),
+            patch("backend.app.services.spool_selection._fetch_spoolman_slot", new=AsyncMock(side_effect=_fake_fetch)),
         ):
-            out = await scheduler._build_inventory_remain_overrides(db, printer_id=1, loaded=loaded)
-        assert out == {0: 500.0}
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        assert out[0].remaining_g == 500.0
         assert 1 not in out
+        # Sanity: the retained delegate omits the None-remaining slot too.
+        assert isinstance(out[0], SlotInventory)

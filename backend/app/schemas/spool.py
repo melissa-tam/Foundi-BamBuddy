@@ -213,6 +213,12 @@ class SpoolResponse(SpoolBase):
     data_origin: str | None = None
     tag_type: str | None = None
     archived_at: datetime | None = None
+    # Hardware-observed spent marker (reused-tag re-spool). NULL = never observed
+    # spent; set only by a runout/backup-swap signal, never by gram estimates.
+    spent_at: datetime | None = None
+    # FIFO substrate: when this spool FIRST entered service. Read-only; stamped
+    # server-side on first assignment. NULL = never loaded.
+    first_loaded_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     k_profiles: list[SpoolKProfileResponse] = []

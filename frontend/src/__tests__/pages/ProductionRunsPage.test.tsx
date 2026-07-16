@@ -50,9 +50,15 @@ function run(overrides: Partial<ProductionRun> = {}): ProductionRun {
     target_model: null,
     eta_seconds: 7200,
     printers: [{ id: 1, name: 'H2S-Alpha' }],
+    scheduled_start_at: null,
     created_at: '2026-07-02T10:00:00Z',
     ...overrides,
   };
+}
+
+/** A future ISO string, N hours out — a run scheduled to start later. */
+function futureIso(hours = 3): string {
+  return new Date(Date.now() + hours * 3600_000).toISOString();
 }
 
 function skuWithFile(overrides: Partial<Sku> = {}): Sku {
@@ -629,5 +635,102 @@ describe('ProductionRunsPage', () => {
       escalate_consecutive_failures: 4,
     });
     expect(posted).not.toHaveProperty('printer_ids');
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 5: scheduled runs (one-time deferred start)
+  // -------------------------------------------------------------------------
+
+  it('shows the Scheduled badge and Start-now / Reschedule actions on a scheduled run', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () =>
+        HttpResponse.json([run({ scheduled_start_at: futureIso(3) })]),
+      ),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+    );
+
+    render(<ProductionRunsPage />);
+
+    await screen.findByText('WID-001 run');
+    expect(screen.getByText('Scheduled')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /start now/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /reschedule/i })).toBeInTheDocument();
+    // A scheduled run offers Start-now instead of Pause (it hasn't started).
+    expect(screen.queryByRole('button', { name: /^pause$/i })).not.toBeInTheDocument();
+  });
+
+  it('Start now posts a reschedule with a null start time', async () => {
+    let body: Record<string, unknown> | null = null;
+    server.use(
+      http.get('*/api/v1/production-runs', () =>
+        HttpResponse.json([run({ scheduled_start_at: futureIso(3) })]),
+      ),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+      http.post('*/api/v1/production-runs/:id/reschedule', async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(run());
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<ProductionRunsPage />);
+
+    await screen.findByText('WID-001 run');
+    await user.click(screen.getByRole('button', { name: /start now/i }));
+    await waitFor(() => expect(body).not.toBeNull());
+    expect(body).toEqual({ scheduled_start_at: null });
+  });
+
+  it('a fresh (ASAP) run posts a null scheduled_start_at', async () => {
+    let posted: Record<string, unknown> | null = null;
+    server.use(
+      http.get('*/api/v1/production-runs', () => HttpResponse.json([])),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+      twoModelFleet,
+      emptyEjectProfiles,
+      http.post('*/api/v1/production-runs', async ({ request }) => {
+        posted = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(run(), { status: 201 });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<ProductionRunsPage />);
+    const dialog = await openDialog(user);
+    const target = screen.getByLabelText(/target units/i);
+    await user.clear(target);
+    await user.type(target, '10');
+    await user.click(within(dialog).getByRole('button', { name: /start run/i }));
+
+    await waitFor(() => expect(posted).not.toBeNull());
+    expect(posted).toMatchObject({ scheduled_start_at: null });
+  });
+
+  it('scheduling for later posts a future scheduled_start_at', async () => {
+    let posted: Record<string, unknown> | null = null;
+    server.use(
+      http.get('*/api/v1/production-runs', () => HttpResponse.json([])),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+      twoModelFleet,
+      emptyEjectProfiles,
+      http.post('*/api/v1/production-runs', async ({ request }) => {
+        posted = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(run(), { status: 201 });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<ProductionRunsPage />);
+    const dialog = await openDialog(user);
+    const target = screen.getByLabelText(/target units/i);
+    await user.clear(target);
+    await user.type(target, '10');
+    // Switch to "Schedule for later" → the field seeds now+1h and emits an ISO.
+    await user.click(within(dialog).getByRole('button', { name: /schedule for later/i }));
+    await user.click(within(dialog).getByRole('button', { name: /start run/i }));
+
+    await waitFor(() => expect(posted).not.toBeNull());
+    expect(typeof posted!.scheduled_start_at).toBe('string');
+    expect(new Date(posted!.scheduled_start_at as string).getTime()).toBeGreaterThan(Date.now());
   });
 });

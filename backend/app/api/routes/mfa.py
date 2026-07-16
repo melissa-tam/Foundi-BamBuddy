@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -84,6 +85,7 @@ from backend.app.schemas.auth import (
     UserResponse,
 )
 from backend.app.services.email_service import get_smtp_settings, send_email
+from backend.app.services.oidc_groups import apply_group_mapping, resolve_claim_groups
 from backend.app.services.oidc_icon import OIDCIconError, fetch_icon
 
 logger = logging.getLogger(__name__)
@@ -1389,6 +1391,8 @@ async def create_oidc_provider(
         icon_etag=icon_etag,
         default_group_id=body.default_group_id,
         is_autologin=body.is_autologin,
+        groups_claim=body.groups_claim,
+        group_mapping=json.dumps(body.group_mapping) if body.group_mapping else None,
     )
     # SEC-1 + SEC-6: runtime guard mirrors the OIDCProviderCreate model_validator in schemas/auth.py.
     # Catches any future path that bypasses Pydantic validation (direct ORM, scripts).
@@ -1436,6 +1440,12 @@ async def update_oidc_provider(
             )
 
     dumped = body.model_dump(exclude_none=True)
+
+    # group_mapping arrives as a dict but persists as JSON text — serialize it
+    # out of the generic setattr loop below.
+    if "group_mapping" in dumped:
+        gm = dumped.pop("group_mapping")
+        provider.group_mapping = json.dumps(gm) if gm else None
 
     # Decide whether an icon refetch is needed BEFORE mutating the ORM object,
     # so the comparison sees provider.icon_url / icon_content_type as they are
@@ -1905,6 +1915,17 @@ async def oidc_callback(
                     select(User).where(User.id == link.user_id).options(selectinload(User.groups))
                 )
                 user = user_result.scalar_one_or_none()
+                # Re-sync group membership from the token's group claim when the
+                # provider is configured for it. A missing/unconfigured claim
+                # returns None and leaves the user's groups untouched.
+                if user is not None:
+                    mapped_group_names = resolve_claim_groups(provider, claims)
+                    if mapped_group_names and await apply_group_mapping(db, user, mapped_group_names, source="oidc"):
+                        await db.commit()
+                        refreshed = await db.execute(
+                            select(User).where(User.id == user.id).options(selectinload(User.groups))
+                        )
+                        user = refreshed.scalar_one()
             else:
                 # 2. No OIDC link yet — check for an existing user with the same email.
                 # Use case-insensitive matching (func.lower) so that "User@Example.com"
@@ -1915,7 +1936,43 @@ async def oidc_callback(
                 if provider_email:
                     email_user = await get_user_by_email(db, provider_email)
 
-                if email_user and provider.auto_link_existing_accounts:
+                # Identity convergence: an ERP-provisioned local user
+                # (auth_source=="erp") whose username equals the sanitized
+                # preferred_username claim is the SAME first-party person — link
+                # the OIDC identity to it instead of minting a duplicate account.
+                # This trusts that the OIDC provider and the ERP directory are the
+                # same first-party store (both operator-controlled). It is scoped
+                # strictly to auth_source=="erp" users and does not weaken the
+                # email-based auto-link guards below for any other user.
+                converged_user: User | None = None
+                _pref_claim = claims.get("preferred_username")
+                if isinstance(_pref_claim, str):
+                    _san_username = re.sub(r"[^a-zA-Z0-9._-]", "", _pref_claim.strip())[:30]
+                    if _san_username:
+                        _cand = await get_user_by_username(db, _san_username)
+                        if _cand is not None and _cand.auth_source == "erp":
+                            converged_user = _cand
+
+                if converged_user is not None:
+                    db.add(
+                        UserOIDCLink(
+                            user_id=converged_user.id,
+                            provider_id=provider_id,
+                            provider_user_id=provider_sub,
+                            provider_email=provider_email,
+                        )
+                    )
+                    await db.commit()
+                    user_result = await db.execute(
+                        select(User).where(User.id == converged_user.id).options(selectinload(User.groups))
+                    )
+                    user = user_result.scalar_one()
+                    logger.info(
+                        "Converged OIDC identity onto existing ERP user '%s' (provider %d)",
+                        converged_user.username,
+                        provider_id,
+                    )
+                elif email_user and provider.auto_link_existing_accounts:
                     # M-4: Only auto-link when the provider has auto_link_existing_accounts
                     # enabled.  Operators can disable this to require explicit account linking,
                     # preventing an attacker-controlled IdP from hijacking local accounts.
@@ -2001,13 +2058,26 @@ async def oidc_callback(
                     #   3. no group (last resort if Viewers was deleted)
                     # SQLite does not enforce ON DELETE SET NULL, so a dangling
                     # default_group_id returns None here and falls through to Viewers.
-                    default_group: Group | None = None
-                    if provider.default_group_id is not None:
-                        dg_result = await db.execute(select(Group).where(Group.id == provider.default_group_id))
-                        default_group = dg_result.scalar_one_or_none()
-                    if default_group is None:
-                        viewers_result = await db.execute(select(Group).where(Group.name == "Viewers"))
-                        default_group = viewers_result.scalar_one_or_none()
+                    # Claim-mapped groups take precedence over the default-group
+                    # fallback when the provider is configured for claim grouping
+                    # AND at least one claim value resolves to a real group.
+                    # Otherwise (unconfigured / claim absent / unmatched) fall back
+                    # to the existing default_group -> Viewers behavior unchanged.
+                    mapped_group_names = resolve_claim_groups(provider, claims)
+                    initial_groups: list[Group] = []
+                    if mapped_group_names:
+                        mgr_result = await db.execute(select(Group).where(Group.name.in_(mapped_group_names)))
+                        initial_groups = list(mgr_result.scalars().all())
+
+                    if not initial_groups:
+                        default_group: Group | None = None
+                        if provider.default_group_id is not None:
+                            dg_result = await db.execute(select(Group).where(Group.id == provider.default_group_id))
+                            default_group = dg_result.scalar_one_or_none()
+                        if default_group is None:
+                            viewers_result = await db.execute(select(Group).where(Group.name == "Viewers"))
+                            default_group = viewers_result.scalar_one_or_none()
+                        initial_groups = [default_group] if default_group else []
 
                     new_user = User(
                         username=username,
@@ -2018,7 +2088,7 @@ async def oidc_callback(
                         password_hash=None,  # OIDC users never use password auth
                         role="user",
                         is_active=True,
-                        groups=[default_group] if default_group else [],
+                        groups=initial_groups,
                     )
                     db.add(new_user)
                     await db.flush()

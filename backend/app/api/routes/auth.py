@@ -435,6 +435,62 @@ async def login(raw_request: Request, request: LoginRequest, response: Response,
             logging.getLogger(__name__).warning("LDAP authentication error, falling back to local: %s", e)
             ldap_user = None
 
+    # ── ERP directory login ────────────────────────────────────────────────
+    # A delegated first-party directory (Foundi ERP identity store). Runs only
+    # when LDAP did not already claim this login. Mirrors the LDAP seam:
+    # authenticate against the ERP, then find-or-create a local mirror user and
+    # sync it. On an ERP outage an existing erp-managed user can authenticate
+    # from the cached (mirrored) credential. All the logic lives in
+    # services/erp_directory.py; this hook only wires the result to the local
+    # user model.
+    erp_authenticated = False
+    if not ldap_user:
+        erp_settings = await _get_erp_settings(db)
+        if erp_settings:
+            from backend.app.core.auth import verify_bcrypt_password
+            from backend.app.services.erp_directory import (
+                ErpAuthStatus,
+                authenticate_erp_user,
+                parse_erp_config,
+            )
+
+            erp_config = parse_erp_config(erp_settings)
+            if erp_config:
+                erp_result = await authenticate_erp_user(erp_config, request.username, request.password)
+                existing = await get_user_by_username(db, request.username)
+
+                if erp_result.status == ErpAuthStatus.OK:
+                    if existing is not None and existing.auth_source != "erp":
+                        # A same-username non-ERP account (local/ldap/oidc) exists —
+                        # don't hijack it. Fall through to the normal paths, exactly
+                        # like the LDAP guard above.
+                        pass
+                    else:
+                        user = await _provision_or_sync_erp_user(db, existing, erp_result.erp_user, erp_config)
+                        erp_authenticated = True
+                elif erp_result.status == ErpAuthStatus.REJECTED:
+                    # ERP is reachable and says no. For an erp-managed user this is
+                    # final — leave `user` unset so we reach the generic 401 below.
+                    # authenticate_user() also excludes auth_source=="erp", so a
+                    # stale cached hash can never authenticate here. Non-erp users
+                    # (no row / different provider) simply fall through.
+                    pass
+                elif erp_result.status == ErpAuthStatus.UNREACHABLE:
+                    # Offline cache fallback: only for an existing, ACTIVE
+                    # erp-managed user, verified against the mirrored bcrypt
+                    # hash. The is_active check mirrors authenticate_user()'s
+                    # semantics — a locally deactivated mirror (operator kill
+                    # switch) must not receive a token during an ERP outage.
+                    if existing is not None and existing.auth_source == "erp" and existing.is_active:
+                        if verify_bcrypt_password(request.password, existing.password_hash):
+                            _logger.warning(
+                                "ERP directory unreachable — authenticated user '%s' from cached credentials",
+                                existing.username,
+                            )
+                            user = existing
+                            erp_authenticated = True
+                        # Wrong cached password -> deny (user stays None -> 401).
+
     # #1589: local username/password gate. LDAP keeps its own switch
     # (ldap_enabled) and is not affected — a delegated directory has its
     # own policy and lockouts and is closer to SSO than to local creds.
@@ -453,12 +509,12 @@ async def login(raw_request: Request, request: LoginRequest, response: Response,
         # so fresh installs and tests behave like every release before #1589.
         local_login_allowed = row is None or row.value.lower() == "true"
 
-    # Try username-based authentication (skip if already authenticated via LDAP)
-    if not ldap_user and local_login_allowed:
+    # Try username-based authentication (skip if already authenticated via LDAP or ERP)
+    if not ldap_user and not erp_authenticated and local_login_allowed:
         user = await authenticate_user(db, request.username, request.password)
 
     # If username auth failed and advanced auth is enabled, try email-based authentication
-    if not user and not ldap_user and local_login_allowed:
+    if not user and not ldap_user and not erp_authenticated and local_login_allowed:
         advanced_auth = await is_advanced_auth_enabled(db)
         if advanced_auth:
             user = await authenticate_user_by_email(db, request.username, request.password)
@@ -1029,8 +1085,8 @@ async def forgot_password(
     # Find user by email — always return success to prevent email enumeration.
     user = await get_user_by_email(db, request.email)
 
-    # M-1: exclude LDAP and OIDC users — they must use their respective provider.
-    if user and user.is_active and user.auth_source not in ("ldap", "oidc"):
+    # M-1: exclude LDAP, OIDC, and ERP users — they must use their respective provider.
+    if user and user.is_active and user.auth_source not in ("ldap", "oidc", "erp"):
         try:
             # Record email-level slot only for local users who will actually receive
             # the reset email (Nit7: don't waste the user's quota for LDAP/OIDC no-ops).
@@ -1116,8 +1172,8 @@ async def forgot_password_confirm(request: ForgotPasswordConfirmRequest, db: Asy
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired password reset token")
 
     user = await get_user_by_username(db, username)
-    # M-1: block LDAP/OIDC users — they authenticate via their provider, not local password.
-    if not user or not user.is_active or user.auth_source in ("ldap", "oidc"):
+    # M-1: block LDAP/OIDC/ERP users — they authenticate via their provider, not local password.
+    if not user or not user.is_active or user.auth_source in ("ldap", "oidc", "erp"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired password reset token")
 
     user.password_hash = get_password_hash(request.new_password)
@@ -1171,11 +1227,11 @@ async def reset_user_password(
             detail="User not found",
         )
 
-    # M-1: block LDAP/OIDC users — passwords are managed by their respective providers.
-    if user.auth_source in ("ldap", "oidc"):
+    # M-1: block LDAP/OIDC/ERP users — passwords are managed by their respective providers.
+    if user.auth_source in ("ldap", "oidc", "erp"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot reset password for LDAP/OIDC users — authentication is managed by their provider",
+            detail="Cannot reset password for LDAP/OIDC/ERP users — authentication is managed by their provider",
         )
 
     if not user.email:
@@ -1256,6 +1312,73 @@ async def _get_ldap_settings(db: AsyncSession) -> dict[str, str] | None:
     if settings.get("ldap_enabled", "false").lower() != "true":
         return None
     return settings
+
+
+async def _get_erp_settings(db: AsyncSession) -> dict[str, str] | None:
+    """Resolve effective ERP directory settings (deploy env-file defaults +
+    DB overrides) via the single owner in ``services/erp_directory``.
+
+    Returns None when no connection config resolves, so the ERP branch skips
+    cleanly. There is no enable flag — presence of host/name/user is the
+    switch (enforced downstream by ``parse_erp_config``)."""
+    from backend.app.services.erp_directory import resolve_erp_settings
+
+    settings = await resolve_erp_settings(db)
+    return settings or None
+
+
+async def _provision_or_sync_erp_user(db: AsyncSession, existing: User | None, erp_user, erp_config) -> User:
+    """Provision a new local mirror user from an ERP login, or sync an existing one.
+
+    The ERP is authoritative: the fetched bcrypt hash is mirrored verbatim (no
+    recompute), is_active follows the ERP account, and group membership is
+    re-synced from ``erp_role_group_mapping`` via the shared replace helper.
+    """
+    from backend.app.services.ldap_service import resolve_group_mapping
+    from backend.app.services.oidc_groups import apply_group_mapping
+
+    mapped_group_names = resolve_group_mapping([erp_user.role], erp_config.role_group_mapping)
+
+    if existing is None:
+        # Resolve group rows BEFORE constructing the user so the collection is
+        # set at construction time — avoids an async lazy-load on a pending row.
+        new_groups: list[Group] = []
+        if mapped_group_names:
+            groups_result = await db.execute(select(Group).where(Group.name.in_(mapped_group_names)))
+            new_groups = list(groups_result.scalars().all())
+        new_user = User(
+            username=erp_user.username,
+            email=None,
+            password_hash=erp_user.password_hash,
+            role="user",
+            auth_source="erp",
+            is_active=erp_user.active,
+            groups=new_groups,
+        )
+        db.add(new_user)
+        await db.commit()
+        await db.refresh(new_user, attribute_names=["groups"])
+        _logger.info(
+            "Provisioned ERP user '%s' (role=%s, groups=%s)",
+            new_user.username,
+            erp_user.role,
+            [g.name for g in new_groups],
+        )
+        return new_user
+
+    # Sync existing erp-managed user.
+    changed = False
+    if erp_user.password_hash and existing.password_hash != erp_user.password_hash:
+        existing.password_hash = erp_user.password_hash
+        changed = True
+    if existing.is_active != erp_user.active:
+        existing.is_active = erp_user.active
+        changed = True
+    groups_changed = await apply_group_mapping(db, existing, mapped_group_names, source="erp")
+    if changed or groups_changed:
+        await db.commit()
+        await db.refresh(existing, attribute_names=["groups"])
+    return existing
 
 
 async def _provision_ldap_user(db: AsyncSession, ldap_user, ldap_config) -> User:

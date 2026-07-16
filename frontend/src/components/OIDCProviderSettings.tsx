@@ -24,7 +24,31 @@ const EMPTY_FORM: OIDCProviderCreate = {
   icon_url: undefined,
   default_group_id: null,
   is_autologin: false,
+  groups_claim: null,
+  group_mapping: null,
 };
+
+interface MappingRow {
+  claim: string;
+  group: string;
+}
+
+// Convert a claim-value -> group-name map into ordered editor rows.
+function mappingToRows(mapping: Record<string, string> | null | undefined): MappingRow[] {
+  if (!mapping) return [];
+  return Object.entries(mapping).map(([claim, group]) => ({ claim, group }));
+}
+
+// Collapse editor rows back to the API shape. Rows with a blank claim value are
+// dropped; an empty result becomes null so the backend clears the stored mapping.
+function rowsToMapping(rows: MappingRow[]): Record<string, string> | null {
+  const out: Record<string, string> = {};
+  for (const { claim, group } of rows) {
+    const key = claim.trim();
+    if (key && group) out[key] = group;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
 
 // ─── Provider form (create / edit) ───────────────────────────────────────────
 function ProviderForm({
@@ -45,8 +69,14 @@ function ProviderForm({
   const { t } = useTranslation();
   const [form, setForm] = useState<OIDCProviderCreate>(initial);
   const [secretChanged, setSecretChanged] = useState(false);
+  const [mappingRows, setMappingRows] = useState<MappingRow[]>(() => mappingToRows(initial.group_mapping));
   const set = (key: keyof OIDCProviderCreate, value: unknown) =>
     setForm((prev) => ({ ...prev, [key]: value }));
+
+  const updateRow = (index: number, patch: Partial<MappingRow>) =>
+    setMappingRows((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  const addRow = () => setMappingRows((prev) => [...prev, { claim: '', group: '' }]);
+  const removeRow = (index: number) => setMappingRows((prev) => prev.filter((_, i) => i !== index));
 
   const inputCls =
     'w-full px-4 py-3 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors text-sm';
@@ -57,6 +87,11 @@ function ProviderForm({
     if (isEdit && !secretChanged) {
       delete (payload as Partial<OIDCProviderCreate>).client_secret;
     }
+    // Normalize the group-sync fields: blank claim -> null (disables sync),
+    // empty mapping -> null so the backend clears any stored mapping.
+    const claim = (form.groups_claim ?? '').trim();
+    payload.groups_claim = claim === '' ? null : claim;
+    payload.group_mapping = rowsToMapping(mappingRows);
     onSave(payload);
   };
 
@@ -186,6 +221,70 @@ function ProviderForm({
           ))}
         </select>
         <p className="text-bambu-gray text-xs mt-1">{t('settings.oidc.form.defaultGroupDesc')}</p>
+      </div>
+
+      <div>
+        <label className={labelCls}>{t('settings.oidc.form.groupsClaim')}</label>
+        <input
+          className={inputCls}
+          value={form.groups_claim ?? ''}
+          onChange={(e) => set('groups_claim', e.target.value)}
+          placeholder={t('settings.oidc.form.groupsClaimPlaceholder')}
+        />
+        <p className="text-bambu-gray text-xs mt-1">{t('settings.oidc.form.groupsClaimDesc')}</p>
+      </div>
+
+      <div>
+        <label className={labelCls}>{t('settings.oidc.form.groupMapping')}</label>
+        <p className="text-bambu-gray text-xs mb-2">{t('settings.oidc.form.groupMappingDesc')}</p>
+        <div className="space-y-2">
+          {mappingRows.length === 0 && (
+            <p className="text-bambu-gray text-xs italic">{t('settings.oidc.form.groupMappingNone')}</p>
+          )}
+          {mappingRows.map((row, index) => (
+            <div key={index} className="flex items-center gap-2">
+              <input
+                className={inputCls}
+                value={row.claim}
+                onChange={(e) => updateRow(index, { claim: e.target.value })}
+                placeholder={t('settings.oidc.form.groupMappingClaimValue')}
+                aria-label={t('settings.oidc.form.groupMappingClaimValue')}
+              />
+              <span className="text-bambu-gray text-sm shrink-0">→</span>
+              <select
+                className={inputCls}
+                value={row.group}
+                onChange={(e) => updateRow(index, { group: e.target.value })}
+                aria-label={t('settings.oidc.form.groupMappingGroup')}
+              >
+                <option value="">{t('settings.oidc.form.groupMappingSelectGroup')}</option>
+                {groups.map((g) => (
+                  <option key={g.id} value={g.name}>{g.name}</option>
+                ))}
+              </select>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => removeRow(index)}
+                title={t('settings.oidc.form.groupMappingRemove')}
+                aria-label={t('settings.oidc.form.groupMappingRemove')}
+              >
+                <Trash2 className="w-4 h-4" />
+              </Button>
+            </div>
+          ))}
+        </div>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          onClick={addRow}
+          className="mt-2 inline-flex items-center gap-2"
+        >
+          <Plus className="w-4 h-4" />
+          {t('settings.oidc.form.groupMappingAdd')}
+        </Button>
       </div>
 
       <div className="flex gap-3 pt-2">
@@ -456,6 +555,8 @@ export function OIDCProviderSettings() {
                     icon_url: provider.icon_url ?? undefined,
                     default_group_id: provider.default_group_id ?? null,
                     is_autologin: provider.is_autologin,
+                    groups_claim: provider.groups_claim ?? null,
+                    group_mapping: provider.group_mapping ?? null,
                   }}
                   onSave={(data) => updateMutation.mutate({ id: provider.id, data })}
                   onCancel={() => setEditingId(null)}
@@ -506,6 +607,26 @@ export function OIDCProviderSettings() {
                       : t('settings.oidc.form.defaultGroupViewersFallback')}
                   </dd>
                 </div>
+                {provider.groups_claim && (
+                  <div>
+                    <dt className="text-bambu-gray">{t('settings.oidc.form.groupsClaim')}</dt>
+                    <dd className="text-white font-mono">{provider.groups_claim}</dd>
+                  </div>
+                )}
+                {provider.group_mapping && Object.keys(provider.group_mapping).length > 0 && (
+                  <div className="col-span-2 sm:col-span-3">
+                    <dt className="text-bambu-gray">{t('settings.oidc.form.groupMapping')}</dt>
+                    <dd className="text-white">
+                      <ul className="space-y-0.5">
+                        {Object.entries(provider.group_mapping).map(([claim, group]) => (
+                          <li key={claim} className="font-mono text-xs">
+                            {claim} <span className="text-bambu-gray">→</span> {group}
+                          </li>
+                        ))}
+                      </ul>
+                    </dd>
+                  </div>
+                )}
               </dl>
             </CardContent>
           )}

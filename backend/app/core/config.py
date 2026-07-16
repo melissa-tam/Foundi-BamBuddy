@@ -13,6 +13,42 @@ BUG_REPORT_RELAY_URL = os.environ.get("BUG_REPORT_RELAY_URL", "https://bambuddy.
 # App directory - where the application is installed (for static files)
 _app_dir = Path(__file__).resolve().parent.parent.parent.parent
 
+
+def _resolve_build_version(version_file: Path, app_version: str) -> str:
+    """Resolve the deployed build stamp (``APP_VERSION+<UTCts>.<sha>``).
+
+    The Windows installer stages a ``VERSION`` file (written by
+    ``installers/windows/build.py``) alongside the app tree carrying the full,
+    unique build string so an operator can tell which build is actually
+    running. When that file is present AND trustworthy — its content starts
+    with ``APP_VERSION`` so a stale or foreign file can never lie — it is the
+    authoritative build identifier. In dev (no file), or on any read error or
+    prefix mismatch, fall back to ``app_version`` so the reported build never
+    misleads and this module always imports cleanly with no file present.
+    """
+    try:
+        content = version_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return app_version
+    except OSError as exc:
+        logging.warning("Could not read build VERSION file %s: %s", version_file, exc)
+        return app_version
+    if content.startswith(app_version):
+        return content
+    if content:
+        logging.warning(
+            "Ignoring VERSION file %s: content %r does not start with APP_VERSION %r",
+            version_file,
+            content,
+            app_version,
+        )
+    return app_version
+
+
+# Full build stamp of the deployed artifact (installer-written VERSION file, or
+# APP_VERSION in dev). Never fed into the update-check version comparison.
+BUILD_VERSION = _resolve_build_version(_app_dir / "VERSION", APP_VERSION)
+
 # Data directory - for persistent data (database, archives)
 # Use DATA_DIR env var if set (Docker), otherwise use project root (local dev)
 _data_dir_env = os.environ.get("DATA_DIR")
@@ -26,6 +62,13 @@ _plate_cal_dir = Path(_data_dir_env) / "plate_calibration" if _data_dir_env else
 # Log directory - use LOG_DIR env var if set, otherwise use app_dir/logs
 _log_dir_env = os.environ.get("LOG_DIR")
 _log_dir = Path(_log_dir_env) if _log_dir_env else _app_dir / "logs"
+
+# Config directory - deploy-provided config/secrets that must persist across
+# app upgrades (e.g. the ERP directory connection file). On native installs
+# DATA_DIR is INSTALL_ROOT-adjacent (…\Bambuddy\data), so config lives in a
+# sibling …\Bambuddy\config created with an admin/SYSTEM-only ACL — separate
+# from the users-modify data dir. Local dev falls back to app_dir/config.
+_config_dir = Path(_data_dir_env).parent / "config" if _data_dir_env else _app_dir / "config"
 
 
 def _migrate_database() -> Path:
@@ -72,6 +115,9 @@ class Settings(BaseSettings):
     static_dir: Path = _app_dir / "static"  # Static files are part of app, not data
     log_dir: Path = _log_dir
     database_url: str = _external_db_url or f"sqlite+aiosqlite:///{_db_path}"
+    # Deploy-provided ERP directory login connection file (read at runtime by
+    # services/erp_directory.py). Overridable via the ERP_CONFIG_FILE env var.
+    erp_config_file: Path = _config_dir / "erp.env"
 
     # Logging
     log_level: str = "INFO"  # Override with LOG_LEVEL env var or DEBUG=true

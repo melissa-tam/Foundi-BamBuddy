@@ -15,7 +15,7 @@ import { getColorName } from '../../utils/colors';
 import { getCurrencySymbol } from '../../utils/currency';
 import { getBedTypeInfo } from '../../utils/bedType';
 import { toDateTimeLocalValue, parseUTCDate } from '../../utils/date';
-import { getGlobalTrayId, isPlaceholderDate, effectivePreferLowest } from '../../utils/amsHelpers';
+import { getGlobalTrayId, isPlaceholderDate, effectiveSelectionPolicy, type SelectionOptions } from '../../utils/amsHelpers';
 import { FilamentMapping } from './FilamentMapping';
 import { FilamentOverride } from './FilamentOverride';
 import { PlateSelector } from './PlateSelector';
@@ -309,6 +309,25 @@ export function PrintModal({
     });
     return result;
   }, [selectedPrinters, inventoryRemainQueries]);
+  // Companion FIFO map: globalTrayId -> first-loaded epoch ms. Null/unparseable
+  // timestamps are omitted so `.has()` means "has a first_loaded timestamp"
+  // (the tier-0 test in selectionSortKey for the 'first_loaded' policy).
+  const firstLoadedByTrayIdPerPrinter = useMemo(() => {
+    const result = new Map<number, Map<number, number>>();
+    selectedPrinters.forEach((printerId, idx) => {
+      const data = inventoryRemainQueries[idx]?.data?.first_loaded;
+      if (!data) return;
+      const printerMap = new Map<number, number>();
+      Object.entries(data).forEach(([key, iso]) => {
+        const gtid = Number(key);
+        if (Number.isNaN(gtid) || iso == null) return;
+        const ms = Date.parse(iso);
+        if (!Number.isNaN(ms)) printerMap.set(gtid, ms);
+      });
+      result.set(printerId, printerMap);
+    });
+    return result;
+  }, [selectedPrinters, inventoryRemainQueries]);
 
   // Fetch archive details to get sliced_for_model
   const { data: archiveDetails } = useQuery({
@@ -380,13 +399,16 @@ export function PrintModal({
     enabled: !!effectivePrinterId,
   });
 
-  // Single-printer flow: gate prefer_lowest on this printer's backup state.
-  // Multi-printer flow gates per-printer inside the hook (different printers
-  // may have different backup states), so we pass the raw setting down.
-  const singlePrinterPreferLowest = effectivePreferLowest(
-    settings?.prefer_lowest_filament,
-    printerStatus?.ams_filament_backup,
-  );
+  // Single-printer flow: resolve the backup-gated selection policy for this
+  // printer and bundle the FIFO/inventory maps + min-start floor. Multi-printer
+  // flow gates per-printer inside the hook (different printers may have
+  // different backup states), so we pass the raw policy down there.
+  const singlePrinterSelection: SelectionOptions = useMemo(() => ({
+    policy: effectiveSelectionPolicy(settings?.spool_selection_policy, printerStatus?.ams_filament_backup),
+    inventoryByTrayId: effectivePrinterId ? inventoryByTrayIdPerPrinter.get(effectivePrinterId) : undefined,
+    firstLoadedByTrayId: effectivePrinterId ? firstLoadedByTrayIdPerPrinter.get(effectivePrinterId) : undefined,
+    minStartG: settings?.min_start_spool_g,
+  }), [settings?.spool_selection_policy, settings?.min_start_spool_g, printerStatus?.ams_filament_backup, effectivePrinterId, inventoryByTrayIdPerPrinter, firstLoadedByTrayIdPerPrinter]);
 
   const isPrinterCurrentlyDispatchable = (status: PrinterStatus | undefined): boolean => {
     if (!status?.connected) return false;
@@ -420,8 +442,7 @@ export function PrintModal({
     effectiveFilamentReqs,
     printerStatus,
     manualMappings,
-    singlePrinterPreferLowest,
-    effectivePrinterId ? inventoryByTrayIdPerPrinter.get(effectivePrinterId) : undefined,
+    singlePrinterSelection,
   );
 
   // Multi-printer filament mapping (for per-printer configuration)
@@ -432,8 +453,10 @@ export function PrintModal({
     manualMappings,
     perPrinterConfigs,
     setPerPrinterConfigs,
-    settings?.prefer_lowest_filament,
+    settings?.spool_selection_policy,
     inventoryByTrayIdPerPrinter,
+    firstLoadedByTrayIdPerPrinter,
+    settings?.min_start_spool_g,
   );
 
   // Auto-select first plate when plates load (single or multi-plate)

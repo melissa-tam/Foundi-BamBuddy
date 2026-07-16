@@ -23,6 +23,7 @@ async def _seed_geometry(db_session):
                 env_y_min=-16,
                 env_y_max=325,
                 max_part_height_mm=42,
+                z_travel_mm=340,
                 validated=True,
                 notes="seed",
             ),
@@ -35,6 +36,7 @@ async def _seed_geometry(db_session):
                 env_y_min=0,
                 env_y_max=320,
                 max_part_height_mm=42,
+                z_travel_mm=325,
                 validated=False,
                 notes="MEASURE AT LADDER",
             ),
@@ -57,8 +59,11 @@ class TestModelGeometryGet:
         assert set(by_key) == {"H2S", "H2C"}
         assert by_key["H2S"]["validated"] is True
         assert by_key["H2S"]["bed_x"] == 340.0
+        # z_travel_mm (machine bottom for the bed-drop assist) rides in the response.
+        assert by_key["H2S"]["z_travel_mm"] == 340.0
         assert by_key["H2C"]["validated"] is False
         assert by_key["H2C"]["env_x_min"] == 25.0
+        assert by_key["H2C"]["z_travel_mm"] == 325.0
 
 
 @pytest.mark.asyncio
@@ -94,6 +99,72 @@ class TestModelGeometryPut:
     async def test_put_rejects_nonpositive_bed(self, async_client: AsyncClient):
         resp = await async_client.put("/api/v1/model-geometry/H2S", json={"bed_x": 0})
         assert resp.status_code == 422
+
+    async def test_put_z_travel_updates_and_logs_warning(self, async_client: AsyncClient, caplog):
+        with caplog.at_level(logging.WARNING, logger="backend.app.api.routes.model_geometry"):
+            resp = await async_client.put("/api/v1/model-geometry/H2S", json={"z_travel_mm": 350.0})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["z_travel_mm"] == 350.0
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("model-geometry H2S" in m and "z_travel_mm" in m for m in warnings), warnings
+
+    async def test_put_z_travel_explicit_null_clears(self, async_client: AsyncClient):
+        # The column is nullable — an explicit null legitimately clears it (the
+        # bed-drop assist then fails closed for the model until re-set).
+        resp = await async_client.put("/api/v1/model-geometry/H2S", json={"z_travel_mm": None})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["z_travel_mm"] is None
+
+    async def test_put_z_travel_zero_422(self, async_client: AsyncClient):
+        # z_travel_mm must be positive (gt=0) — 0 is rejected before the row is touched.
+        resp = await async_client.put("/api/v1/model-geometry/H2S", json={"z_travel_mm": 0})
+        assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+class TestModelGeometryBedslinger:
+    async def test_get_carries_bedslinger_flag(self, async_client: AsyncClient, db_session):
+        # Add an A2L bed-slinger row (the shared fixture seeds only H2S/H2C).
+        from backend.app.models.printer_model_geometry import PrinterModelGeometry
+
+        db_session.add(
+            PrinterModelGeometry(
+                model_key="A2L",
+                bed_x=330,
+                bed_y=320,
+                env_x_min=0,
+                env_x_max=330,
+                env_y_min=0,
+                env_y_max=320,
+                max_part_height_mm=42,
+                z_travel_mm=None,
+                validated=False,
+                notes="bedslinger seed",
+            )
+        )
+        await db_session.commit()
+
+        resp = await async_client.get("/api/v1/model-geometry")
+        assert resp.status_code == 200, resp.text
+        by_key = {g["model_key"]: g for g in resp.json()["geometries"]}
+        # bedslinger is a derived response field (from model_key), never a DB column.
+        assert by_key["A2L"]["bedslinger"] is True
+        assert by_key["H2S"]["bedslinger"] is False
+        assert by_key["H2C"]["bedslinger"] is False
+
+    async def test_put_ignores_bedslinger_in_body(self, async_client: AsyncClient):
+        # bedslinger is NOT part of ModelGeometryUpdate — Pydantic ignores the
+        # unknown key (no 500 / no 422), the row is unchanged, and the response
+        # still carries the value derived from model_key (H2S is bed-on-Z → False).
+        resp = await async_client.put(
+            "/api/v1/model-geometry/H2S",
+            json={"bedslinger": True, "notes": "still h2s"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["bedslinger"] is False
+        assert body["notes"] == "still h2s"
 
 
 @pytest.mark.asyncio

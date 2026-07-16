@@ -430,6 +430,27 @@ async def _api_keys_column_exists(conn, column_name: str) -> bool:
     return result.scalar_one_or_none() is not None
 
 
+async def _column_exists(conn, table_name: str, column_name: str) -> bool:
+    """Return True if ``column_name`` exists on ``table_name`` (dialect-aware).
+
+    Guards a DROP COLUMN migration for cross-dialect idempotency: SQLite's
+    ``ALTER TABLE ... DROP COLUMN`` has no ``IF EXISTS`` clause, and PostgreSQL's
+    "column does not exist" is not in the ``_safe_execute`` swallow set — so the
+    only portable idempotent drop is to check presence first and skip when absent.
+    SQLite has no ``information_schema``, so ``PRAGMA table_info`` is used there.
+    """
+    from sqlalchemy import text
+
+    if is_sqlite():
+        result = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+        return any(row[1] == column_name for row in result)
+    result = await conn.execute(
+        text("SELECT 1 FROM information_schema.columns WHERE table_name = :table AND column_name = :col"),
+        {"table": table_name, "col": column_name},
+    )
+    return result.scalar_one_or_none() is not None
+
+
 async def _migrate_normalize_printer_ids(conn) -> None:
     from sqlalchemy import text
 
@@ -782,6 +803,24 @@ async def run_migrations(conn):
     # floor; False pushes exactly once. NOT NULL DEFAULT 1 is valid ADD COLUMN on
     # both SQLite and Postgres (mirrors the sweep_start_frac neighbour above).
     await _safe_execute(conn, "ALTER TABLE eject_profiles ADD COLUMN final_skim BOOLEAN NOT NULL DEFAULT 1")
+
+    # Migration: Add bed_drop_clearance_mm to eject_profiles (farm eject v2, the
+    # bed-drop release assist). Nullable — NULL = off (unchanged behaviour, the
+    # golden fixtures stay byte-identical); a set value drives the bed down to the
+    # model's z_travel_mm minus this clearance before the sweep. Idempotent ADD
+    # COLUMN (SQLite swallows "duplicate column name", Postgres "already exists").
+    await _safe_execute(conn, "ALTER TABLE eject_profiles ADD COLUMN bed_drop_clearance_mm FLOAT")
+
+    # Migration: Drop eject_profiles.cooldown_retries (farm eject went
+    # server-dispatched motion-only). The cooldown wait moved OUT of the injected
+    # G-code into the eject monitor, which holds the plate gate until the live bed
+    # reaches cooldown_temp_c and then dispatches a motion-only eject job — so there
+    # is no in-file `M190 R` loop and no retry count to store. cooldown_temp_c STAYS
+    # (now purely the server-side release threshold). Presence-guarded because
+    # SQLite's DROP COLUMN has no IF EXISTS and PG's "does not exist" is outside the
+    # _safe_execute swallow set (see _column_exists).
+    if await _column_exists(conn, "eject_profiles", "cooldown_retries"):
+        await _safe_execute(conn, "ALTER TABLE eject_profiles DROP COLUMN cooldown_retries")
 
     # Migration: Enforce uniqueness on user_oidc_links for existing rows.
     # create_all() is idempotent and does not add constraints to existing tables,
@@ -3275,6 +3314,11 @@ async def run_migrations(conn):
     else:
         await _safe_execute(conn, "ALTER TABLE oidc_providers ADD COLUMN is_autologin BOOLEAN DEFAULT false")
 
+    # Migration: OIDC claim->group mapping (groups_claim + group_mapping JSON).
+    # Both nullable TEXT/VARCHAR — SQLite and Postgres safe, no default clause.
+    await _safe_execute(conn, "ALTER TABLE oidc_providers ADD COLUMN groups_claim VARCHAR(64)")
+    await _safe_execute(conn, "ALTER TABLE oidc_providers ADD COLUMN group_mapping TEXT")
+
     # Migration: Farm production-run fields on print_batches (Phase 2). The
     # ``skus`` and ``sku_files`` tables are created by create_all() before
     # run_migrations, so the ``sku_files`` FK reference resolves on both SQLite
@@ -3371,6 +3415,11 @@ async def run_migrations(conn):
         ("on_run_unit_stopped", "1", "TRUE"),
         # Phase 3.2: a printing unit's printer has been offline past the stall grace.
         ("on_print_stalled", "1", "TRUE"),
+        # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
+        ("on_storage_low", "1", "TRUE"),
+        # Cooldown escalation: post-print eject cooldown is running long (bed still
+        # above the release threshold past the escalation window).
+        ("on_cooldown_escalation", "1", "TRUE"),
         # Phase 6: manual/lifecycle events surfaced to the other operator. Aborted
         # and first-article-approved default ON (they close a loop the other
         # operator is waiting on); resume is informational and defaults OFF.
@@ -3400,6 +3449,7 @@ async def run_migrations(conn):
             env_y_min FLOAT NOT NULL,
             env_y_max FLOAT NOT NULL,
             max_part_height_mm FLOAT NOT NULL,
+            z_travel_mm FLOAT,
             validated BOOLEAN NOT NULL DEFAULT 0,
             notes TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -3417,36 +3467,177 @@ async def run_migrations(conn):
             env_y_min DOUBLE PRECISION NOT NULL,
             env_y_max DOUBLE PRECISION NOT NULL,
             max_part_height_mm DOUBLE PRECISION NOT NULL,
+            z_travel_mm DOUBLE PRECISION,
             validated BOOLEAN NOT NULL DEFAULT FALSE,
             notes TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """,
     )
+    # Ordering trap (verified): this ALTER MUST run BEFORE the seed INSERTs below,
+    # which name z_travel_mm explicitly — _safe_execute does NOT swallow an
+    # INSERT-time "has no column named z_travel_mm", so on an existing DB whose
+    # table predates this column the seed would abort startup without it. Idempotent
+    # ADD COLUMN (swallows "duplicate column name" / "already exists"); nullable so
+    # the assist fails closed until the backfill / an operator PUT sets it.
+    await _safe_execute(conn, "ALTER TABLE printer_model_geometry ADD COLUMN z_travel_mm FLOAT")
     _true = "1" if is_sqlite() else "TRUE"
     _false = "0" if is_sqlite() else "FALSE"
     # H2S — operator-witnessed dry run on 001-H2S (2026-07-04): validated.
+    # z_travel_mm 340 = printable height (spec); machine bottom for the bed-drop assist.
     await _safe_execute(
         conn,
         "INSERT INTO printer_model_geometry "
-        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, validated, notes) "
-        "SELECT 'H2S', 340, 320, 0, 340, -16, 325, 42, " + _true + ", 'Operator-witnessed 2026-07-04 dry-run' "
+        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, z_travel_mm, "
+        "validated, notes) "
+        "SELECT 'H2S', 340, 320, 0, 340, -16, 325, 42, 340, " + _true + ", 'Operator-witnessed 2026-07-04 dry-run' "
         "WHERE NOT EXISTS (SELECT 1 FROM printer_model_geometry WHERE model_key = 'H2S')",
     )
     # H2C — BambuStudio O1C2 profile, envelope = per-extruder X-zone intersection
     # (L 0-325, R 25-330). NOT validated: MUST be measured at the hardware ladder.
+    # z_travel_mm 325 = printable height (spec).
     await _safe_execute(
         conn,
         "INSERT INTO printer_model_geometry "
-        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, validated, notes) "
-        "SELECT 'H2C', 330, 320, 25, 325, 0, 320, 42, " + _false + ", "
+        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, z_travel_mm, "
+        "validated, notes) "
+        "SELECT 'H2C', 330, 320, 25, 325, 0, 320, 42, 325, " + _false + ", "
         "'BambuStudio O1C2 profile; env = per-extruder X-zone intersection (L 0-325, R 25-330); MEASURE AT LADDER' "
         "WHERE NOT EXISTS (SELECT 1 FROM printer_model_geometry WHERE model_key = 'H2C')",
     )
+    # Backfill z_travel_mm for pre-existing rows the seeds skipped (WHERE NOT EXISTS
+    # never clobbers operator PUT edits — an operator-set value is not NULL, so it
+    # survives). DML → conn.execute inside begin_nested (per the _safe_execute rule),
+    # idempotent via the IS NULL guard: once set (here or via PUT), re-runs no-op.
+    async with conn.begin_nested():
+        await conn.execute(
+            text("UPDATE printer_model_geometry SET z_travel_mm = 340 WHERE model_key = 'H2S' AND z_travel_mm IS NULL")
+        )
+        await conn.execute(
+            text("UPDATE printer_model_geometry SET z_travel_mm = 325 WHERE model_key = 'H2C' AND z_travel_mm IS NULL")
+        )
+
+    # Additional fleet geometry rows (published-spec provisional envelopes, all
+    # validated=FALSE — MUST be measured at the hardware ladder before unattended
+    # dispatch). Same idempotent INSERT..SELECT..WHERE NOT EXISTS shape as the H2S/
+    # H2C seeds: an operator PUT-edit survives a re-run because the row then exists.
+    # A2L is a BEDSLINGER (bed on Y, gantry on Z) — its z_travel_mm is a literal NULL
+    # so the bed-drop assist fails closed independently of the bedslinger guard.
+    await _safe_execute(
+        conn,
+        "INSERT INTO printer_model_geometry "
+        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, z_travel_mm, "
+        "validated, notes) "
+        "SELECT 'P1S', 256, 256, 0, 256, 0, 256, 42, 256, " + _false + ", "
+        "'Published spec 2026-07 (256x256x256, CoreXY bed-on-Z, single nozzle); no edge overhang assumed; "
+        "MEASURE AT LADDER' "
+        "WHERE NOT EXISTS (SELECT 1 FROM printer_model_geometry WHERE model_key = 'P1S')",
+    )
+    await _safe_execute(
+        conn,
+        "INSERT INTO printer_model_geometry "
+        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, z_travel_mm, "
+        "validated, notes) "
+        "SELECT 'P2S', 256, 256, 0, 256, 0, 256, 42, 256, " + _false + ", "
+        "'Published spec 2026-07 (256x256x256); SSDP code N7; MEASURE AT LADDER' "
+        "WHERE NOT EXISTS (SELECT 1 FROM printer_model_geometry WHERE model_key = 'P2S')",
+    )
+    await _safe_execute(
+        conn,
+        "INSERT INTO printer_model_geometry "
+        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, z_travel_mm, "
+        "validated, notes) "
+        "SELECT 'H2D', 350, 320, 25, 325, 0, 320, 42, 325, " + _false + ", "
+        "'Published spec 2026-07; single-mode X=325 of 350 bed => per-side offset 25, L 0-325 / R 25-350 "
+        "(H2C zone convention), intersection 25-325; MEASURE AT LADDER' "
+        "WHERE NOT EXISTS (SELECT 1 FROM printer_model_geometry WHERE model_key = 'H2D')",
+    )
+    await _safe_execute(
+        conn,
+        "INSERT INTO printer_model_geometry "
+        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, z_travel_mm, "
+        "validated, notes) "
+        "SELECT 'X2D', 256, 256, 20.5, 235.5, 0, 256, 42, 256, " + _false + ", "
+        "'Published spec 2026-07; dual-mode X=235.5 of 256 => per-side offset 20.5, intersection 20.5-235.5; "
+        "z_travel 256 = conservative floor of published 260 max height; MEASURE AT LADDER' "
+        "WHERE NOT EXISTS (SELECT 1 FROM printer_model_geometry WHERE model_key = 'X2D')",
+    )
+    await _safe_execute(
+        conn,
+        "INSERT INTO printer_model_geometry "
+        "(model_key, bed_x, bed_y, env_x_min, env_x_max, env_y_min, env_y_max, max_part_height_mm, z_travel_mm, "
+        "validated, notes) "
+        "SELECT 'A2L', 330, 320, 0, 330, 0, 320, 42, NULL, " + _false + ", "
+        "'Published spec 2026-07 (330x320x325); BEDSLINGER - bed moves in Y, gantry carries Z: bed-drop physically "
+        "meaningless, z_travel NULL = independent fail-close; derate sweep speeds at ladder; MEASURE AT LADDER' "
+        "WHERE NOT EXISTS (SELECT 1 FROM printer_model_geometry WHERE model_key = 'A2L')",
+    )
+
+    # Reused-tag auto re-spool: hardware-observed spent marker on spool. Set ONLY
+    # by a runout HMS / AMS backup-swap signal, never by gram estimates. Idempotent
+    # ADD COLUMN — SQLite swallows "duplicate column name", Postgres "already
+    # exists". TIMESTAMP is dialect-safe on both (SQLAlchemy DateTime round-trips
+    # ISO strings on SQLite regardless of affinity).
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN spent_at TIMESTAMP NULL")
+
+    # Restart-safe eject terminal handling (W1): durable per-unit mirror of the
+    # in-memory PendingEject registry. NON-NULL == a server-dispatched part-present
+    # eject is in flight for this unit; resolution NULLs it. A timestamp (not a
+    # boolean) so the startup hydrator can drop stamps older than the 24h TTL.
+    # Idempotent ADD COLUMN, dialect-safe on SQLite + Postgres.
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN eject_dispatched_at TIMESTAMP NULL")
 
     # Migration: Disambiguate the four ``user_print_*`` notification template
     # names by appending " Email" (#1792). See ``_migrate_rename_user_print_template_names``.
     await _migrate_rename_user_print_template_names(conn)
+
+    # Migration: Make the default ``printer_quarantined`` body reason-led so a
+    # single-event quarantine no longer falsely claims "1 consecutive failures".
+    await _migrate_quarantine_template_reason_led(conn)
+
+    # Migration (WI-1, FIFO substrate): record when a spool FIRST entered service.
+    # TIMESTAMP (not DATETIME) so the ADD COLUMN is valid on both SQLite and
+    # Postgres for existing-DB upgrades — matches the adjacent ``spent_at``
+    # column's dialect-safe choice above. Idempotent ADD COLUMN (_safe_execute
+    # swallows "duplicate column name" / "already exists").
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN first_loaded_at TIMESTAMP NULL")
+
+    # Backfill: any spool that has ever been in service gets first_loaded_at =
+    # created_at (best available proxy — the true first-assignment timestamp was
+    # never recorded pre-migration). "In service" = has an assignment, has usage
+    # history, was last_used, or has consumed grams. Pristine, never-assigned
+    # inventory spools stay NULL. Idempotent via the IS NULL guard: once stamped
+    # (here or later by the assignment hook), re-running never overwrites. Plain
+    # conn.execute (DML) so a failure is fatal, never swallowed. Table names
+    # verified: spool_assignment, spool_usage_history.
+    await conn.execute(
+        text(
+            "UPDATE spool SET first_loaded_at = created_at "
+            "WHERE first_loaded_at IS NULL AND ("
+            "id IN (SELECT spool_id FROM spool_assignment) "
+            "OR id IN (SELECT spool_id FROM spool_usage_history) "
+            "OR last_used IS NOT NULL "
+            "OR COALESCE(weight_used, 0) > 0)"
+        )
+    )
+
+    # Migration (WI-5): the boolean ``prefer_lowest_filament`` setting is replaced
+    # by the tri-state ``spool_selection_policy``. Remap an enabled legacy flag to
+    # the equivalent policy, then drop the old key. Guarded INSERT ... SELECT (no
+    # ON CONFLICT — dialect-neutral on SQLite + Postgres): insert the policy row
+    # ONLY IF prefer_lowest_filament was truthy AND no policy row exists yet.
+    # Bool settings are stored as the string 'true'/'false' (route serializes
+    # lowercase); LOWER(value) = 'true' is the case-insensitive match. false or
+    # absent maps to nothing → the new 'first_loaded' default applies.
+    await conn.execute(
+        text(
+            "INSERT INTO settings (key, value) "
+            "SELECT 'spool_selection_policy', 'lowest_remaining' "
+            "WHERE EXISTS (SELECT 1 FROM settings WHERE key = 'prefer_lowest_filament' AND LOWER(value) = 'true') "
+            "AND NOT EXISTS (SELECT 1 FROM settings WHERE key = 'spool_selection_policy')"
+        )
+    )
+    await conn.execute(text("DELETE FROM settings WHERE key = 'prefer_lowest_filament'"))
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
@@ -3477,6 +3668,39 @@ async def _migrate_rename_user_print_template_names(conn) -> None:
                 text("UPDATE notification_templates SET name = :new WHERE event_type = :et AND name = :old"),
                 {"new": new_name, "et": event_type, "old": old_name},
             )
+
+
+# The exact pre-fix default body — the migration only rewrites a row still holding
+# this text (an untouched default), never a user-customised template.
+_QUARANTINE_TEMPLATE_OLD_BODY = (
+    "{printer} was quarantined after {failure_count} consecutive failures.\n"
+    "Reason: {reason}\nIt is excluded from dispatch until cleared."
+)
+_QUARANTINE_TEMPLATE_NEW_BODY = "{quarantine_summary}\nReason: {reason}\nIt is excluded from dispatch until cleared."
+
+
+async def _migrate_quarantine_template_reason_led(conn) -> None:
+    """Rewrite the default ``printer_quarantined`` notification body so a single-event
+    quarantine (failure_count == 1) no longer claims "1 consecutive failures".
+
+    ``seed_notification_templates`` only INSERTS missing event types — it never
+    updates an existing row — so installs that already seeded the old default keep
+    the wrong copy without this backfill. Updates ONLY the untouched default row
+    (``is_default`` set AND body still equal to the old default text); a template an
+    admin customised is left alone. Bound parameters keep it SQLite + Postgres safe
+    (``is_default`` adapts to 1 / true per dialect).
+    """
+    from sqlalchemy import text
+
+    async with conn.begin_nested():
+        await conn.execute(
+            text(
+                "UPDATE notification_templates SET body_template = :new "
+                "WHERE event_type = 'printer_quarantined' "
+                "AND is_default = :isdef AND body_template = :old"
+            ),
+            {"new": _QUARANTINE_TEMPLATE_NEW_BODY, "old": _QUARANTINE_TEMPLATE_OLD_BODY, "isdef": True},
+        )
 
 
 async def seed_notification_templates():

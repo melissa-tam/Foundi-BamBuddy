@@ -111,6 +111,12 @@ class NotificationProvider(Base):
     on_model_mismatch = Column(Boolean, default=True)  # Device-reported model differs from registered Printer.model
     on_run_unit_stopped = Column(Boolean, default=True)  # Run unit stopped by the operator (UI or printer screen)
     on_print_stalled = Column(Boolean, default=True)  # Printing unit's printer offline past the stall grace window
+    on_storage_low = Column(
+        Boolean, default=True
+    )  # Printer USB storage FAILURE — auto-cleanup could not free space, FTPS/USB unreachable, or the drive dropped mid-print (successful cleanups are silent)
+    on_cooldown_escalation = Column(
+        Boolean, default=True
+    )  # Post-print eject cooldown running long (bed still above threshold past the escalation window)
 
     # Event triggers - Farm production (Phase 6: manual/lifecycle events)
     on_run_aborted = Column(Boolean, default=True)  # Production run aborted by the operator (destructive)

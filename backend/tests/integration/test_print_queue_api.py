@@ -577,6 +577,72 @@ class TestQueueStartEndpoint:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_start_returns_409_on_start_spool_below_minimum(
+        self,
+        async_client: AsyncClient,
+        queue_item_factory,
+        db_session,
+        monkeypatch,
+    ):
+        """A pinned item with no deficit but a below-floor STARTING spool surfaces
+        the distinct 409 so the UI can offer Print Anyway (spool-selection WI)."""
+        item = await queue_item_factory(manual_start=True)
+
+        async def _no_deficit(_db, _item):
+            return []
+
+        async def _blocked(_db, _item):
+            return [1]
+
+        monkeypatch.setattr(
+            "backend.app.api.routes.print_queue.compute_deficit_for_queue_item",
+            _no_deficit,
+        )
+        monkeypatch.setattr(
+            "backend.app.services.spool_selection.start_rule_blocked_slots",
+            _blocked,
+        )
+
+        response = await async_client.post(f"/api/v1/queue/{item.id}/start")
+        assert response.status_code == 409
+        body = response.json()
+        assert body["detail"]["code"] == "start_spool_below_minimum"
+        assert body["detail"]["slots"] == [1]
+
+        # Item still pending, unchanged.
+        await db_session.refresh(item)
+        assert item.status == "pending"
+        assert item.manual_start is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_start_skip_flag_bypasses_start_spool_floor(
+        self,
+        async_client: AsyncClient,
+        queue_item_factory,
+        db_session,
+        monkeypatch,
+    ):
+        """skip_filament_check=true bypasses the start-spool floor check entirely."""
+        item = await queue_item_factory(manual_start=True, filament_short=True)
+        called = {}
+
+        async def _blocked(_db, _item):
+            called["start_rule"] = True
+            return [1]
+
+        monkeypatch.setattr(
+            "backend.app.services.spool_selection.start_rule_blocked_slots",
+            _blocked,
+        )
+
+        response = await async_client.post(f"/api/v1/queue/{item.id}/start?skip_filament_check=true")
+        assert response.status_code == 200
+        # The floor check is never consulted on the acknowledged-bypass path.
+        assert called == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_start_with_skip_flag_bypasses_deficit_check(
         self,
         async_client: AsyncClient,

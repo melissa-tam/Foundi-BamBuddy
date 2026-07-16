@@ -52,3 +52,13 @@ def test_tolerates_malformed_entry_and_skips_it():
 
 def test_all_malformed_returns_none():
     assert _format([{"code": "not-hex", "attr": "also-not-int"}]) is None
+
+
+def test_full_code_wins_over_two_group_lookup():
+    """The live MicroSD fault: short_code 0500_0004 is NOT in the legacy table,
+    but the full ecode 0500010000030004 IS in the vendored catalog. The summary
+    must resolve text via the full code while keeping the [MMMM_CCCC] shape."""
+    summary = _format([{"code": "0x30004", "attr": 0x05000100, "module": 0x5, "severity": 3}])
+    assert summary is not None
+    assert summary.startswith("[0500_0004]")
+    assert "Not enough space" in summary

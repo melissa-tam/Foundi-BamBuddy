@@ -34,6 +34,7 @@ import { GitHubBackupSettings } from '../components/GitHubBackupSettings';
 import { FailureDetectionSettings } from '../components/FailureDetectionSettings';
 import { EmailSettings } from '../components/EmailSettings';
 import { LDAPSettings } from '../components/LDAPSettings';
+import { ERPDirectorySettings } from '../components/ERPDirectorySettings';
 import { TwoFactorSettings } from '../components/TwoFactorSettings';
 import { OIDCProviderSettings } from '../components/OIDCProviderSettings';
 import { SecurityStatusCard } from '../components/SecurityStatusCard';
@@ -72,7 +73,8 @@ registerSettingsSearch({ labelKey: 'settings.plateClear', labelFallback: 'Plate-
 registerSettingsSearch({ labelKey: 'settings.gcodeInjection', labelFallback: 'G-code Injection', tab: 'queue', keywords: 'gcode injection start end autoprint farmloop swapmod autoclear printflow', anchor: 'card-gcode' });
 registerSettingsSearch({ labelKey: 'settings.slicerCard', labelFallback: 'Slicer', tab: 'queue', keywords: 'slicer orcaslicer bambustudio orca bambu api sidecar url docker preferred', anchor: 'card-slicer' });
 registerSettingsSearch({ labelKey: 'settings.queueDrying', tab: 'queue', keywords: 'drying presets temperature time humidity ams', anchor: 'card-drying' });
-registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining', anchor: 'card-filamentchecks' });
+registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'queue', keywords: 'farm retry quarantine consecutive failures cooldown stall window epsilon min cooling max hold release threshold offline stalled usb cleanup warn floor eject', anchor: 'card-farm-production' });
+registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray', anchor: 'card-filamentchecks' });
 registerSettingsSearch({ labelKey: 'settings.printModal', tab: 'filament', keywords: 'print modal custom mapping', anchor: 'card-printmodal' });
 registerSettingsSearch({ labelKey: 'settings.amsDisplayThresholds', tab: 'filament', keywords: 'ams humidity temperature threshold history retention', anchor: 'card-amsthresholds' });
 registerSettingsSearch({ labelKey: 'settings.externalUrl', tab: 'network', keywords: 'external url reverse proxy public notification link', anchor: 'card-externalurl' });
@@ -943,7 +945,10 @@ export function SettingsPage() {
       settings.ams_temp_fair !== localSettings.ams_temp_fair ||
       settings.ams_history_retention_days !== localSettings.ams_history_retention_days ||
       settings.disable_filament_warnings !== localSettings.disable_filament_warnings ||
-      settings.prefer_lowest_filament !== localSettings.prefer_lowest_filament ||
+      (settings.spool_selection_policy ?? 'first_loaded') !== (localSettings.spool_selection_policy ?? 'first_loaded') ||
+      (settings.min_start_spool_g ?? 120) !== (localSettings.min_start_spool_g ?? 120) ||
+      (settings.auto_add_untagged ?? true) !== (localSettings.auto_add_untagged ?? true) ||
+      (settings.tagless_default_filament ?? '') !== (localSettings.tagless_default_filament ?? '') ||
       (settings.queue_drying_enabled ?? false) !== (localSettings.queue_drying_enabled ?? false) ||
       (settings.queue_drying_block ?? false) !== (localSettings.queue_drying_block ?? false) ||
       (settings.ambient_drying_enabled ?? false) !== (localSettings.ambient_drying_enabled ?? false) ||
@@ -990,9 +995,15 @@ export function SettingsPage() {
       (settings.stagger_interval_minutes ?? 5) !== (localSettings.stagger_interval_minutes ?? 5) ||
       (settings.require_plate_clear ?? false) !== (localSettings.require_plate_clear ?? false) ||
       (settings.farm_retry_max_per_unit ?? 1) !== (localSettings.farm_retry_max_per_unit ?? 1) ||
-      (settings.farm_escalate_consecutive_failures ?? 3) !== (localSettings.farm_escalate_consecutive_failures ?? 3) ||
+      (settings.farm_escalate_consecutive_failures ?? 2) !== (localSettings.farm_escalate_consecutive_failures ?? 2) ||
       (settings.farm_cooldown_warn_floor_c ?? 30) !== (localSettings.farm_cooldown_warn_floor_c ?? 30) ||
       (settings.farm_offline_stall_minutes ?? 30) !== (localSettings.farm_offline_stall_minutes ?? 30) ||
+      (settings.respool_prompt_threshold_g ?? 30) !== (localSettings.respool_prompt_threshold_g ?? 30) ||
+      (settings.farm_cooldown_stall_window_minutes ?? 15) !== (localSettings.farm_cooldown_stall_window_minutes ?? 15) ||
+      (settings.farm_cooldown_stall_epsilon_c ?? 1) !== (localSettings.farm_cooldown_stall_epsilon_c ?? 1) ||
+      (settings.farm_cooldown_max_hold_minutes ?? 180) !== (localSettings.farm_cooldown_max_hold_minutes ?? 180) ||
+      (settings.farm_cooldown_plateau_eject_margin_c ?? 3) !== (localSettings.farm_cooldown_plateau_eject_margin_c ?? 3) ||
+      (settings.farm_usb_auto_cleanup ?? true) !== (localSettings.farm_usb_auto_cleanup ?? true) ||
       (settings.nozzle_temp_presets ?? '') !== (localSettings.nozzle_temp_presets ?? '') ||
       (settings.bed_temp_presets ?? '') !== (localSettings.bed_temp_presets ?? '') ||
       (settings.chamber_temp_presets ?? '') !== (localSettings.chamber_temp_presets ?? '') ||
@@ -1041,7 +1052,10 @@ export function SettingsPage() {
         ams_temp_fair: localSettings.ams_temp_fair,
         ams_history_retention_days: localSettings.ams_history_retention_days,
         disable_filament_warnings: localSettings.disable_filament_warnings,
-        prefer_lowest_filament: localSettings.prefer_lowest_filament,
+        spool_selection_policy: localSettings.spool_selection_policy,
+        min_start_spool_g: localSettings.min_start_spool_g,
+        auto_add_untagged: localSettings.auto_add_untagged,
+        tagless_default_filament: localSettings.tagless_default_filament,
         queue_drying_enabled: localSettings.queue_drying_enabled,
         queue_drying_block: localSettings.queue_drying_block,
         ambient_drying_enabled: localSettings.ambient_drying_enabled,
@@ -1091,6 +1105,12 @@ export function SettingsPage() {
         farm_escalate_consecutive_failures: localSettings.farm_escalate_consecutive_failures,
         farm_cooldown_warn_floor_c: localSettings.farm_cooldown_warn_floor_c,
         farm_offline_stall_minutes: localSettings.farm_offline_stall_minutes,
+        respool_prompt_threshold_g: localSettings.respool_prompt_threshold_g,
+        farm_cooldown_stall_window_minutes: localSettings.farm_cooldown_stall_window_minutes,
+        farm_cooldown_stall_epsilon_c: localSettings.farm_cooldown_stall_epsilon_c,
+        farm_cooldown_max_hold_minutes: localSettings.farm_cooldown_max_hold_minutes,
+        farm_cooldown_plateau_eject_margin_c: localSettings.farm_cooldown_plateau_eject_margin_c,
+        farm_usb_auto_cleanup: localSettings.farm_usb_auto_cleanup,
         nozzle_temp_presets: localSettings.nozzle_temp_presets,
         bed_temp_presets: localSettings.bed_temp_presets,
         chamber_temp_presets: localSettings.chamber_temp_presets,
@@ -4230,7 +4250,7 @@ export function SettingsPage() {
                     type="number"
                     min={1}
                     max={60}
-                    value={localSettings.stagger_interval_minutes ?? 5}
+                    value={localSettings.stagger_interval_minutes ?? 3}
                     onChange={(e) => updateSetting('stagger_interval_minutes', Math.max(1, Math.min(60, parseInt(e.target.value) || 1)))}
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
@@ -4293,13 +4313,13 @@ export function SettingsPage() {
                   <input
                     type="number"
                     min={0}
-                    max={5}
+                    max={10}
                     value={localSettings.farm_retry_max_per_unit ?? 1}
-                    onChange={(e) => updateSetting('farm_retry_max_per_unit', Math.max(0, Math.min(5, parseInt(e.target.value) || 0)))}
+                    onChange={(e) => updateSetting('farm_retry_max_per_unit', Math.max(0, Math.min(10, parseInt(e.target.value) || 0)))}
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
                   <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmRetryMaxPerUnitHelp', 'Automatic retries before a plate is marked failed (0–5)')}
+                    {t('settings.farmRetryMaxPerUnitHelp', 'Automatic retries before a plate is marked failed (0–10)')}
                   </p>
                 </div>
                 <div className="flex-1">
@@ -4309,13 +4329,13 @@ export function SettingsPage() {
                   <input
                     type="number"
                     min={1}
-                    max={10}
-                    value={localSettings.farm_escalate_consecutive_failures ?? 3}
-                    onChange={(e) => updateSetting('farm_escalate_consecutive_failures', Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
+                    max={20}
+                    value={localSettings.farm_escalate_consecutive_failures ?? 2}
+                    onChange={(e) => updateSetting('farm_escalate_consecutive_failures', Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))}
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
                   <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmEscalateConsecutiveFailuresHelp', 'Consecutive failures on a printer that trip a quarantine (1–10)')}
+                    {t('settings.farmEscalateConsecutiveFailuresHelp', 'Consecutive failures on a printer that trip a quarantine (1–20)')}
                   </p>
                 </div>
                 <div className="flex-1">
@@ -4348,6 +4368,114 @@ export function SettingsPage() {
                   />
                   <p className="text-xs text-bambu-gray mt-1">
                     {t('settings.farmOfflineStallMinutesHelp', 'Flag a unit still printing whose printer has been offline this long — it never terminates, just shows the stall (5–720)')}
+                  </p>
+                </div>
+              </div>
+              {/* Eject-cooldown stall detection (server-dispatched eject) */}
+              <div className="flex gap-4">
+                <div className="flex-1">
+                  <label className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmCooldownStallWindow', 'Cooldown stall window (min)')}
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={180}
+                    value={localSettings.farm_cooldown_stall_window_minutes ?? 15}
+                    onChange={(e) => updateSetting('farm_cooldown_stall_window_minutes', Math.max(0, Math.min(180, parseInt(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownStallWindowHelp', 'During eject cooldown the bed must keep cooling; two consecutive windows without progress quarantine the printer (0 disables)')}
+                  </p>
+                </div>
+                <div className="flex-1">
+                  <label className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmCooldownStallEpsilon', 'Min cooling per window (°C)')}
+                  </label>
+                  <input
+                    type="number"
+                    min={0.1}
+                    max={20}
+                    step={0.1}
+                    value={localSettings.farm_cooldown_stall_epsilon_c ?? 1}
+                    onChange={(e) => updateSetting('farm_cooldown_stall_epsilon_c', Math.max(0.1, Math.min(20, parseFloat(e.target.value) || 1)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownStallEpsilonHelp', 'Minimum cooling (°C) per window that counts as progress')}
+                  </p>
+                </div>
+                <div className="flex-1">
+                  <label className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmCooldownMaxHold', 'Max cooldown hold (min)')}
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={720}
+                    value={localSettings.farm_cooldown_max_hold_minutes ?? 180}
+                    onChange={(e) => updateSetting('farm_cooldown_max_hold_minutes', Math.max(0, Math.min(720, parseInt(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownMaxHoldHelp', 'After this many minutes above the release threshold the eject runs anyway (0 = wait for threshold indefinitely)')}
+                  </p>
+                </div>
+                <div className="flex-1">
+                  <label className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmCooldownPlateauMargin', 'Plateau eject margin (°C)')}
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={50}
+                    step={0.5}
+                    value={localSettings.farm_cooldown_plateau_eject_margin_c ?? 3}
+                    onChange={(e) => updateSetting('farm_cooldown_plateau_eject_margin_c', Math.max(0, Math.min(50, parseFloat(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownPlateauMarginHelp', 'If cooling plateaus within this many °C of the release threshold, eject (bed has settled at ambient) instead of quarantining. Above threshold + margin the bed is genuinely stuck hot and the printer is quarantined')}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center justify-between pt-1">
+                <div className="flex-1 mr-4">
+                  <p className="text-sm text-white">
+                    {t('settings.farmUsbAutoCleanup', 'Auto-clean USB when full')}
+                  </p>
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmUsbAutoCleanupHelp', 'On a USB-storage-low fault, automatically delete old camera recordings first, then the oldest unused print files, so dispatch keeps working')}
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={localSettings.farm_usb_auto_cleanup ?? true}
+                    onChange={(e) => updateSetting('farm_usb_auto_cleanup', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
+              </div>
+              {/* Reused-tag re-spool prompt threshold */}
+              <div className="flex gap-4">
+                <div className="flex-1">
+                  <label htmlFor="respool-prompt-threshold" className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.respoolPromptThreshold', 'Re-spool prompt threshold (g)')}
+                  </label>
+                  <input
+                    id="respool-prompt-threshold"
+                    type="number"
+                    min={0}
+                    max={1000}
+                    value={localSettings.respool_prompt_threshold_g ?? 30}
+                    onChange={(e) => updateSetting('respool_prompt_threshold_g', Math.max(0, Math.min(1000, parseInt(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.respoolPromptThresholdHelp', 'Prompt to re-spool a reused Bambu tag when the donor spool has this many grams or fewer left and no hardware-certain spent marker (0–1000)')}
                   </p>
                 </div>
               </div>
@@ -4918,26 +5046,181 @@ export function SettingsPage() {
                     <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
                   </label>
                 </div>
+                {/* Spool selection policy — replaces the legacy prefer-lowest toggle */}
+                <div>
+                  <label htmlFor="spoolSelectionPolicy" className="block text-white mb-1">
+                    {t('settings.spoolSelectionPolicy')}
+                  </label>
+                  <p className="text-sm text-bambu-gray mb-1">
+                    {t('settings.spoolSelectionPolicyDesc')}
+                  </p>
+                  <div className="relative">
+                    <select
+                      id="spoolSelectionPolicy"
+                      value={localSettings.spool_selection_policy ?? 'first_loaded'}
+                      onChange={(e) => updateSetting('spool_selection_policy', e.target.value as AppSettings['spool_selection_policy'])}
+                      className="w-full px-3 py-2 pr-10 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none appearance-none cursor-pointer"
+                    >
+                      <option value="first_loaded">{t('settings.spoolPolicyFirstLoaded')}</option>
+                      <option value="lowest_remaining">{t('settings.spoolPolicyLowestRemaining')}</option>
+                      <option value="slot_order">{t('settings.spoolPolicySlotOrder')}</option>
+                    </select>
+                    <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-bambu-gray pointer-events-none" />
+                  </div>
+                  {localSettings.spool_selection_policy === 'lowest_remaining' && (
+                    <p className="text-xs text-bambu-gray/70 mt-1">
+                      {t('settings.spoolPolicyBackupNote')}
+                    </p>
+                  )}
+                </div>
+                {/* Minimum start spool weight */}
+                <div>
+                  <label htmlFor="minStartSpool" className="block text-white mb-1">
+                    {t('settings.minStartSpool')}
+                  </label>
+                  <p className="text-sm text-bambu-gray mb-1">
+                    {t('settings.minStartSpoolDesc')}
+                  </p>
+                  <input
+                    id="minStartSpool"
+                    type="number"
+                    min={0}
+                    max={10000}
+                    value={localSettings.min_start_spool_g ?? 120}
+                    onChange={(e) => updateSetting('min_start_spool_g', Math.max(0, Math.min(10000, parseInt(e.target.value) || 0)))}
+                    className="w-32 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                </div>
+                {/* Auto-add untagged trays */}
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-white">{t('settings.preferLowestFilament')}</p>
+                    <p className="text-white">{t('settings.autoAddUntagged')}</p>
                     <p className="text-sm text-bambu-gray">
-                      {t('settings.preferLowestFilamentDesc')}
-                    </p>
-                    <p className="text-xs text-bambu-gray/70 mt-1">
-                      {t('settings.preferLowestFilamentBackupNote')}
+                      {t('settings.autoAddUntaggedDesc')}
                     </p>
                   </div>
                   <label className="relative inline-flex items-center cursor-pointer">
                     <input
                       type="checkbox"
-                      checked={localSettings.prefer_lowest_filament}
-                      onChange={(e) => updateSetting('prefer_lowest_filament', e.target.checked)}
+                      checked={localSettings.auto_add_untagged ?? true}
+                      onChange={(e) => updateSetting('auto_add_untagged', e.target.checked)}
                       className="sr-only peer"
                     />
                     <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
                   </label>
                 </div>
+                {/* Default filament for bare tagless trays (JSON-string setting,
+                    mirrors gcode_snippets serialization; empty = feature off). */}
+                {(() => {
+                  const parseTagless = (raw: string | null | undefined) => {
+                    if (!raw) return null;
+                    try {
+                      const o = JSON.parse(raw);
+                      if (o && typeof o === 'object' && !Array.isArray(o)) {
+                        return {
+                          brand: typeof o.brand === 'string' ? o.brand : '',
+                          material: typeof o.material === 'string' ? o.material : '',
+                          subtype: typeof o.subtype === 'string' ? o.subtype : '',
+                          rgba: typeof o.rgba === 'string' ? o.rgba : '000000FF',
+                          slicer_filament: typeof o.slicer_filament === 'string' && o.slicer_filament ? o.slicer_filament : undefined,
+                        } as { brand: string; material: string; subtype: string; rgba: string; slicer_filament?: string };
+                      }
+                    } catch { /* malformed JSON — treat as off */ }
+                    return null;
+                  };
+                  const current = parseTagless(localSettings.tagless_default_filament);
+                  const enabled = current !== null;
+                  const writeTagless = (patch: Partial<{ brand: string; material: string; subtype: string; rgba: string; slicer_filament?: string }>) => {
+                    const base = current ?? { brand: 'Bambu Lab', material: 'PETG', subtype: 'HF', rgba: '000000FF' };
+                    const next = { ...base, ...patch };
+                    if (!next.slicer_filament) delete next.slicer_filament;
+                    updateSetting('tagless_default_filament', JSON.stringify(next));
+                  };
+                  const colorHex = `#${(current?.rgba || '000000FF').slice(0, 6)}`;
+                  const alpha = (current?.rgba || '000000FF').slice(6, 8) || 'FF';
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-white">{t('settings.taglessDefaultFilament')}</p>
+                          <p className="text-sm text-bambu-gray">
+                            {t('settings.taglessDefaultFilamentDesc')}
+                          </p>
+                        </div>
+                        <label className="relative inline-flex items-center cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={enabled}
+                            onChange={(e) =>
+                              updateSetting(
+                                'tagless_default_filament',
+                                e.target.checked
+                                  ? JSON.stringify({ brand: 'Bambu Lab', material: 'PETG', subtype: 'HF', rgba: '000000FF' })
+                                  : '',
+                              )
+                            }
+                            className="sr-only peer"
+                          />
+                          <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                        </label>
+                      </div>
+                      {enabled && current && (
+                        <div className="mt-3 grid grid-cols-2 gap-3">
+                          <div>
+                            <label htmlFor="taglessBrand" className="block text-xs text-bambu-gray mb-1">{t('settings.taglessBrand')}</label>
+                            <input
+                              id="taglessBrand"
+                              type="text"
+                              value={current.brand}
+                              onChange={(e) => writeTagless({ brand: e.target.value })}
+                              className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                            />
+                          </div>
+                          <div>
+                            <label htmlFor="taglessMaterial" className="block text-xs text-bambu-gray mb-1">{t('settings.taglessMaterial')}</label>
+                            <input
+                              id="taglessMaterial"
+                              type="text"
+                              value={current.material}
+                              onChange={(e) => writeTagless({ material: e.target.value })}
+                              className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                            />
+                          </div>
+                          <div>
+                            <label htmlFor="taglessSubtype" className="block text-xs text-bambu-gray mb-1">{t('settings.taglessSubtype')}</label>
+                            <input
+                              id="taglessSubtype"
+                              type="text"
+                              value={current.subtype}
+                              onChange={(e) => writeTagless({ subtype: e.target.value })}
+                              className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                            />
+                          </div>
+                          <div>
+                            <label htmlFor="taglessColor" className="block text-xs text-bambu-gray mb-1">{t('settings.taglessColor')}</label>
+                            <input
+                              id="taglessColor"
+                              type="color"
+                              value={colorHex}
+                              onChange={(e) => writeTagless({ rgba: `${e.target.value.slice(1).toUpperCase()}${alpha}` })}
+                              className="w-full h-9 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg cursor-pointer"
+                            />
+                          </div>
+                          <div className="col-span-2">
+                            <label htmlFor="taglessSlicerFilament" className="block text-xs text-bambu-gray mb-1">{t('settings.taglessSlicerFilament')}</label>
+                            <input
+                              id="taglessSlicerFilament"
+                              type="text"
+                              value={current.slicer_filament ?? ''}
+                              onChange={(e) => writeTagless({ slicer_filament: e.target.value })}
+                              className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </CardContent>
             </Card>
 
@@ -5299,20 +5582,22 @@ export function SettingsPage() {
                 <span className="w-2 h-2 rounded-full bg-green-400" />
               )}
             </button>
-            <button
-              onClick={() => setUsersSubTab('ldap')}
-              className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-                usersSubTab === 'ldap'
-                  ? 'text-bambu-green border-bambu-green'
-                  : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-              }`}
-            >
-              <Shield className="w-4 h-4" />
-              {t('settings.tabs.ldap') || 'LDAP'}
-              {ldapStatus?.ldap_enabled && (
-                <span className="w-2 h-2 rounded-full bg-green-400" />
-              )}
-            </button>
+            {isAdmin && (
+              <button
+                onClick={() => setUsersSubTab('ldap')}
+                className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
+                  usersSubTab === 'ldap'
+                    ? 'text-bambu-green border-bambu-green'
+                    : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
+                }`}
+              >
+                <Shield className="w-4 h-4" />
+                {t('settings.tabs.ldap') || 'LDAP'}
+                {ldapStatus?.ldap_enabled && (
+                  <span className="w-2 h-2 rounded-full bg-green-400" />
+                )}
+              </button>
+            )}
             <button
               onClick={() => setUsersSubTab('twofa')}
               className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px flex items-center gap-2 ${
@@ -5750,9 +6035,10 @@ export function SettingsPage() {
             </div>
           )}
 
-          {usersSubTab === 'ldap' && (
-            <div className="max-w-5xl" id="card-ldap">
+          {usersSubTab === 'ldap' && isAdmin && (
+            <div className="max-w-5xl space-y-3" id="card-ldap">
               <LDAPSettings />
+              <ERPDirectorySettings />
             </div>
           )}
 

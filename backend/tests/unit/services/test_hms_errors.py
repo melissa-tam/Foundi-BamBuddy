@@ -7,7 +7,9 @@ from backend.app.services.hms_errors import (
     HMS_WIKI_URL,
     get_error_description,
     hms_error_payload,
+    hms_severity,
     hms_short_code,
+    lookup_description_any,
 )
 
 
@@ -175,3 +177,93 @@ class TestHmsErrorPayload:
         assert payload["short_code"] == "0500_8061"
         assert payload["severity"] == 3
         assert payload["description"] == "No print plate detected. Please make sure it is placed correctly."
+
+
+class TestHmsSeverity:
+    """hms_severity decodes the high 16 bits of the error `code` word.
+
+    1=fatal, 2=serious, 3=common, 4=info; anything else degrades to 2 (serious)
+    so an unrecognised value never silences a fault. Replaces the legacy
+    ``(attr >> 8) & 0xF`` decode which read every real fault as fatal(1)."""
+
+    def test_fatal(self):
+        assert hms_severity(0x00010000) == 1
+
+    def test_serious(self):
+        assert hms_severity(0x00020000) == 2
+
+    def test_common_live_microsd_code(self):
+        # The live-fleet MicroSD fault code — must decode to 3, not 1.
+        assert hms_severity(0x00030004) == 3
+
+    def test_info(self):
+        assert hms_severity(0x00040000) == 4
+
+    def test_zero_degrades_to_serious(self):
+        assert hms_severity(0) == 2
+
+    def test_out_of_range_degrades_to_serious(self):
+        assert hms_severity(0x00090000) == 2
+
+    def test_hex_string_input(self):
+        assert hms_severity("0x00030004") == 3
+        assert hms_severity("30004") == 3
+        assert hms_severity("") == 2
+
+
+class TestLookupDescriptionAny:
+    """Full-code (vendored catalog) first, then legacy 2-group table."""
+
+    def test_full_code_hit(self):
+        # attr 0x05000100 + code 0x00030004 → ecode 0500010000030004 (MicroSD).
+        result = lookup_description_any(0x05000100, 0x00030004)
+        assert result is not None
+        assert "Not enough space" in result
+
+    def test_falls_back_to_two_group(self):
+        # 030000000000400C isn't a real ecode, but 0300_400C is in the legacy table.
+        assert lookup_description_any(0x03000000, 0x400C) == "The task was canceled."
+
+    def test_none_when_both_miss(self):
+        assert lookup_description_any(0xFFFF0000, 0xFFFF) is None
+
+    def test_hex_string_code(self):
+        assert lookup_description_any(0x05000100, "0x00030004") is not None
+
+
+class TestHmsErrorPayloadCatalog:
+    """hms_error_payload: full-code description precedence + wiki deep link."""
+
+    def test_full_code_description_wins_over_two_group(self):
+        # short_code 0500_0004 is NOT in the legacy table, but the full ecode
+        # 0500010000030004 IS in the vendored catalog — full-code must win.
+        err = _fake_hms_error(
+            code="0x30004", attr=0x05000100, module=5, severity=3, full_code="0500010000030004"
+        )
+        payload = hms_error_payload(err)
+        assert payload["short_code"] == "0500_0004"
+        assert get_error_description("0500_0004") is None
+        assert "Not enough space" in payload["description"]
+
+    def test_falls_back_to_two_group_description(self):
+        err = _fake_hms_error(code="0x400C", attr=0x03000000, full_code="030000000000400C")
+        payload = hms_error_payload(err)
+        assert payload["description"] == "The task was canceled."
+
+    def test_description_none_when_both_miss(self):
+        err = _fake_hms_error(code="0xFFFF", attr=0xFFFF0000, full_code="FFFF00000000FFFF")
+        payload = hms_error_payload(err)
+        assert payload["description"] is None
+
+    def test_wiki_deep_link_for_known_code(self):
+        err = _fake_hms_error(
+            code="0x30004", attr=0x05000100, module=5, severity=3, full_code="0500010000030004"
+        )
+        payload = hms_error_payload(err)
+        assert payload["wiki_url"].startswith("https://wiki.bambulab.com/en/")
+        assert "/hmscode/" in payload["wiki_url"]
+
+    def test_wiki_falls_back_to_landing_page(self):
+        err = _fake_hms_error(code="0xFFFF", attr=0xFFFF0000, full_code="FFFF00000000FFFF")
+        payload = hms_error_payload(err)
+        assert payload["wiki_url"] == HMS_WIKI_URL

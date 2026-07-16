@@ -478,6 +478,16 @@ async def change_own_password(
             detail="Cannot change password for LDAP users — passwords are managed by the LDAP server",
         )
 
+    # Block password change for ERP users BEFORE the hash check: unlike OIDC
+    # users (password_hash=None), ERP users carry a mirrored bcrypt hash and
+    # would otherwise fall through and overwrite the mirror with a local
+    # pbkdf2 hash — desyncing the offline credential cache from the ERP.
+    if getattr(current_user, "auth_source", "local") == "erp":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot change password for ERP users — passwords are managed in the Foundi ERP",
+        )
+
     # Verify current password
     if not current_user.password_hash:
         raise HTTPException(

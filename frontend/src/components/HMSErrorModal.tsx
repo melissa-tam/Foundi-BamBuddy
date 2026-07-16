@@ -12,6 +12,7 @@ import { X, AlertTriangle, AlertCircle, Info, ExternalLink, Loader2, Trash2 } fr
 import type { HMSError, Permission } from '../api/client';
 import { api } from '../api/client';
 import { useToast } from '../contexts/ToastContext';
+import { formatHmsCode } from '../utils/hmsCode';
 
 interface HMSErrorModalProps {
   printerName: string;
@@ -127,7 +128,9 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
                 // Backend descriptions are vendor fault strings (kept English, like
                 // the printer's own screen); the fallback below IS translated.
                 const description = error.description ?? t('hmsErrors.unknownDescription');
-                const displayCode = shortCode.replace('_', '-');
+                // Show the FULL firmware code (16-hex hms[]-array faults render as
+                // four hyphen-groups) instead of the lossy two-group short code.
+                const displayCode = formatHmsCode(error.full_code, error.short_code);
 
                 return (
                   <div

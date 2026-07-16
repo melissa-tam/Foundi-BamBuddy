@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import select
 
 from backend.app.models.eject_profile import EjectProfile
@@ -1036,3 +1037,331 @@ class TestLifecycleNotifications:
             await transition_run(db_session, batch.id, "abort")
         assert exc.value.status_code == 409
         mock_n.assert_not_awaited()
+
+
+class TestQuarantinePrinterHelper:
+    """The extracted idempotent quarantine mutator shared by the consecutive-failure
+    policy and the eject-verification / cooldown-stall paths."""
+
+    async def _mk_printer(self, db, name="QP"):
+        p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(p)
+        await db.flush()
+        return p
+
+    async def test_idempotent_and_notifies_once(self, db_session):
+        printer = await self._mk_printer(db_session, "QP1")
+        with (
+            patch.object(farm_policy.printer_manager, "set_quarantined") as sq,
+            patch.object(farm_policy.notification_service, "on_printer_quarantined", new_callable=AsyncMock) as notif,
+        ):
+            first = await farm_policy.quarantine_printer(db_session, printer.id, "boom", failure_count=1)
+            second = await farm_policy.quarantine_printer(db_session, printer.id, "boom again", failure_count=1)
+        assert first is True
+        assert second is False  # already quarantined → no-op
+        await db_session.refresh(printer)
+        assert printer.quarantined is True
+        assert printer.quarantine_reason == "boom"  # first reason kept
+        notif.assert_awaited_once()
+        sq.assert_called_once_with(printer.id, True)
+
+    async def test_missing_printer_returns_false(self, db_session):
+        assert await farm_policy.quarantine_printer(db_session, 999999, "x", failure_count=1) is False
+
+
+class TestPendingEjectRegistry:
+    """The typed pending-eject registry (moved to eject.remote) round-trips."""
+
+    async def test_register_peek_pop(self):
+        from backend.app.services.eject import remote
+
+        pe = remote.PendingEject(purpose="production", run_id=5, queue_item_id=7)
+        remote.register_pending_eject(42, pe)
+        try:
+            assert remote.peek_pending_eject(42) == pe
+            assert remote.peek_pending_eject(42).purpose == "production"
+            assert remote.pop_pending_eject(42) == pe
+            assert remote.peek_pending_eject(42) is None
+            assert remote.pop_pending_eject(42) is None  # idempotent pop
+        finally:
+            remote.pop_pending_eject(42)
+
+
+class TestOnTerminalEjectHandling:
+    """on_terminal step 1: a server-dispatched eject job's terminal, matched by the
+    printer's subtask echo, is consumed here (production clears/keeps the gate; FA
+    finalises) and never falls through to item-based policy."""
+
+    async def _mk_printer(self, db, name="EJ"):
+        p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(p)
+        await db.flush()
+        return p
+
+    @staticmethod
+    def _fake_client(subtask):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(last_dispatch_subtask_id=subtask)
+
+    async def test_production_completed_clears_gate(self, db_session):
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "PEok")
+        batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        remote.register_pending_eject(printer.id, remote.PendingEject("production", batch.id, 111))
+        cleared = []
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+                patch.object(
+                    farm_policy.printer_manager,
+                    "set_awaiting_plate_clear",
+                    side_effect=lambda pid, v, **kw: cleared.append((pid, v)),
+                ),
+            ):
+                await farm_policy.on_terminal(db_session, printer.id, None, "completed", completed_subtask_id="SUB-E")
+            assert remote.peek_pending_eject(printer.id) is None  # popped
+            assert cleared == [(printer.id, False)]  # gate released
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+    async def test_production_failed_keeps_gate_and_quarantines(self, db_session):
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "PEfail")
+        batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        remote.register_pending_eject(printer.id, remote.PendingEject("production", batch.id, 222))
+        cleared = []
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+                patch.object(
+                    farm_policy.printer_manager,
+                    "set_awaiting_plate_clear",
+                    side_effect=lambda pid, v, **kw: cleared.append((pid, v)),
+                ),
+                patch.object(farm_policy.printer_manager, "set_quarantined"),
+                patch.object(farm_policy.notification_service, "on_printer_quarantined", new_callable=AsyncMock),
+            ):
+                await farm_policy.on_terminal(db_session, printer.id, None, "failed", completed_subtask_id="SUB-E")
+            assert remote.peek_pending_eject(printer.id) is None  # job ended → popped
+            assert cleared == []  # gate KEPT — sweep unverified
+            await db_session.refresh(printer)
+            assert printer.quarantined is True
+            assert "sweep unverified" in (printer.quarantine_reason or "")
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+    async def test_echo_mismatch_keeps_pending(self, db_session):
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "PEmis")
+        remote.register_pending_eject(printer.id, remote.PendingEject("production", 1, 333))
+        try:
+            with patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")):
+                await farm_policy.on_terminal(db_session, printer.id, None, "completed", completed_subtask_id="OTHER")
+            assert remote.peek_pending_eject(printer.id) is not None  # foreign — pending kept
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+    async def test_fa_eject_terminal_finalizes(self, db_session):
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "FAej")
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[printer.id], require_fa=True)
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "completed"
+        batch.first_article_state = "awaiting_approval"
+        await db_session.commit()
+        remote.register_pending_eject(printer.id, remote.PendingEject("fa", batch.id, fa.id))
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+                patch.object(farm_policy.printer_manager, "set_awaiting_plate_clear"),
+                patch.object(farm_policy.notification_service, "on_first_article_approved", new_callable=AsyncMock),
+            ):
+                await farm_policy.on_terminal(db_session, printer.id, None, "completed", completed_subtask_id="SUB-E")
+            assert remote.peek_pending_eject(printer.id) is None
+            await db_session.refresh(batch)
+            assert batch.first_article_state == "approved"
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+    async def test_fa_eject_failed_terminal_keeps_awaiting_and_quarantines(self, db_session):
+        """A FAILED FA eject must NOT approve/materialise: the run stays
+        awaiting_approval (re-approvable after recovery), the gate is untouched,
+        and the printer is quarantined like the production branch."""
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "FAfail")
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[printer.id], require_fa=True)
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "completed"
+        batch.first_article_state = "awaiting_approval"
+        await db_session.commit()
+        remote.register_pending_eject(printer.id, remote.PendingEject("fa", batch.id, fa.id))
+        cleared = []
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+                patch.object(
+                    farm_policy.printer_manager,
+                    "set_awaiting_plate_clear",
+                    side_effect=lambda pid, v, **kw: cleared.append((pid, v)),
+                ),
+                patch.object(farm_policy.printer_manager, "set_quarantined"),
+                patch.object(farm_policy.notification_service, "on_printer_quarantined", new_callable=AsyncMock),
+                patch.object(
+                    farm_policy.notification_service, "on_first_article_approved", new_callable=AsyncMock
+                ) as approved_note,
+            ):
+                await farm_policy.on_terminal(db_session, printer.id, None, "failed", completed_subtask_id="SUB-E")
+            assert remote.peek_pending_eject(printer.id) is None  # job ended → popped
+            assert cleared == []  # gate untouched
+            approved_note.assert_not_awaited()
+            await db_session.refresh(batch)
+            assert batch.first_article_state == "awaiting_approval"  # NOT finalised
+            await db_session.refresh(printer)
+            assert printer.quarantined is True
+            assert "First-article eject job ended 'failed'" in (printer.quarantine_reason or "")
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+    async def test_name_mismatch_during_pending_keeps_pending(self, db_session):
+        # W1/R2: a foreign terminal whose echoed NAME is not our eject stem is a
+        # positive mismatch even when the id path is lenient (no client) — the
+        # pending is kept for the real eject terminal.
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "PEname")
+        remote.register_pending_eject(printer.id, remote.PendingEject("production", 1, 444))
+        try:
+            with patch.object(farm_policy.printer_manager, "get_client", return_value=None):
+                await farm_policy.on_terminal(
+                    db_session,
+                    printer.id,
+                    None,
+                    "completed",
+                    completed_subtask_id=None,
+                    completed_subtask_name="OperatorLocalPrint",
+                )
+            assert remote.peek_pending_eject(printer.id) is not None  # foreign name — kept
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+    async def test_completed_clears_gate_and_nulls_stamp(self, db_session):
+        # A name-matched production eject completion clears the gate AND NULLs the
+        # durable eject_dispatched_at stamp (atomic resolution, W1).
+        from datetime import datetime, timezone
+
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "PEstamp")
+        item = PrintQueueItem(
+            printer_id=printer.id,
+            status="completed",
+            plate_id=1,
+            position=1,
+            eject_dispatched_at=datetime.now(timezone.utc),
+        )
+        db_session.add(item)
+        await db_session.commit()
+        await db_session.refresh(item)
+        remote.register_pending_eject(printer.id, remote.PendingEject("production", None, item.id))
+        cleared = []
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=None),
+                patch.object(
+                    farm_policy.printer_manager,
+                    "set_awaiting_plate_clear",
+                    side_effect=lambda pid, v, **kw: cleared.append((pid, v)),
+                ),
+            ):
+                await farm_policy.on_terminal(
+                    db_session,
+                    printer.id,
+                    None,
+                    "completed",
+                    completed_subtask_id=None,
+                    completed_subtask_name=f"eject_production_item{item.id}",
+                )
+            assert remote.peek_pending_eject(printer.id) is None  # popped
+            assert cleared == [(printer.id, False)]  # gate released
+            await db_session.refresh(item)
+            assert item.eject_dispatched_at is None  # durable stamp NULLed
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+
+class TestFaEjectCooldownGate:
+    """approve-with-remote-eject honours the release threshold: hot bed defers to
+    the FA cooldown watch (motion-only file must not sweep a hot plate); cold bed
+    dispatches immediately (old UX, incl. 409s); disconnected printer is a 409."""
+
+    async def _fa_fixture(self, db):
+        printer = Printer(name="FAgate", serial_number="SFAg", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(printer)
+        await db.flush()
+        batch, _ = await _mk_run(db, quantity=3, printer_ids=[printer.id], require_fa=True)
+        fa = (await _items(db, batch.id))[0]
+        fa.status = "completed"
+        batch.first_article_state = "awaiting_approval"
+        await db.commit()
+        return printer, batch, fa
+
+    @staticmethod
+    def _state(bed):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(connected=True, temperatures={"bed": bed})
+
+    async def test_hot_bed_arms_fa_watch_instead_of_dispatching(self, db_session):
+        import backend.app.services.eject.monitor as monitor_mod
+        from backend.app.services.eject import remote
+
+        printer, batch, fa = await self._fa_fixture(db_session)
+        armed = []
+        with (
+            patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
+            patch.object(farm_policy.printer_manager, "get_status", return_value=self._state(80.0)),
+            patch.object(monitor_mod, "_resolve_eject_threshold", new=AsyncMock(return_value=33.0)),
+            patch.object(
+                monitor_mod.eject_cooldown_monitor,
+                "start_fa_eject_watch",
+                side_effect=lambda pid, qid, rid: armed.append((pid, qid, rid)) or True,
+            ),
+            patch.object(remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
+        ):
+            await farm_policy._dispatch_remote_eject(db_session, batch, fa)
+        assert armed == [(printer.id, fa.id, batch.id)]
+        direct.assert_not_awaited()
+
+    async def test_cold_bed_dispatches_immediately(self, db_session):
+        import backend.app.services.eject.monitor as monitor_mod
+
+        printer, batch, fa = await self._fa_fixture(db_session)
+        with (
+            patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
+            patch.object(farm_policy.printer_manager, "get_status", return_value=self._state(30.5)),
+            patch.object(monitor_mod, "_resolve_eject_threshold", new=AsyncMock(return_value=33.0)),
+            patch.object(
+                monitor_mod.eject_cooldown_monitor, "start_fa_eject_watch", side_effect=AssertionError
+            ) as watch,
+            patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
+        ):
+            await farm_policy._dispatch_remote_eject(db_session, batch, fa)
+        direct.assert_awaited_once()
+        assert direct.await_args.kwargs["purpose"] == "fa"
+        assert not watch.called
+
+    async def test_disconnected_printer_409s_up_front(self, db_session):
+        printer, batch, fa = await self._fa_fixture(db_session)
+        with (
+            patch.object(farm_policy.printer_manager, "is_connected", return_value=False),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await farm_policy._dispatch_remote_eject(db_session, batch, fa)
+        assert exc.value.status_code == 409
+        assert "not connected" in exc.value.detail

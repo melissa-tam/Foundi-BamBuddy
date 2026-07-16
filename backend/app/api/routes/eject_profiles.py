@@ -4,10 +4,9 @@
 - ``/{id}/preview`` — generate + validate an eject block against a real library
   3MF, returning the G-code and validation report (no file produced).
 - ``/{id}/dry-run`` — download a copy of the source 3MF whose plate G-code is
-  replaced by the THERMAL-LESS eject block (hardware-ladder step 1: run on an
-  EMPTY bed). The bed cooldown waits are stripped (an ambient empty bed can
-  never reach the release threshold from below, so they would hang the job) —
-  the dry run validates sweep GEOMETRY, not thermals.
+  replaced by the motion-only eject block (hardware-ladder step 1: run on an
+  EMPTY bed). The eject block is motion-only now (the bed-cooldown wait lives in
+  the eject monitor, not the G-code), so the dry run validates sweep GEOMETRY.
 """
 
 from __future__ import annotations
@@ -43,7 +42,6 @@ from backend.app.schemas.eject_profile import (
 )
 from backend.app.services.eject.generator import (
     BLOCK_END_MARKER,
-    DUAL_NOZZLE_DRYRUN_HOME,
     EjectGenerationError,
     generate_eject_gcode,
 )
@@ -51,14 +49,12 @@ from backend.app.services.eject.geometry import ModelGeometry, get_geometry
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
-from backend.app.utils.printer_models import canon_model, is_dual_nozzle_model
+from backend.app.utils.printer_models import canon_model, full_home_lines
 from backend.app.utils.threemf_tools import read_plate_gcode_header, repack_3mf_with_gcode
 
 router = APIRouter(prefix="/eject-profiles", tags=["eject-profiles"])
 
 _EXEC_BLOCK_START = "; EXECUTABLE_BLOCK_START"
-_EXEC_BLOCK_END = "; EXECUTABLE_BLOCK_END"
-_MACHINE_END_GCODE_START = "; MACHINE_END_GCODE_START"
 _DUPLICATE_NAME = "An eject profile with that name already exists"
 
 
@@ -119,44 +115,30 @@ async def _resolve_preview_geometry(db: AsyncSession, body: EjectPreviewRequest)
 
 
 def _build_dryrun_gcode(source_path: Path, plate_index: int, eject_block: str, geometry: ModelGeometry) -> str:
-    """Wrap the eject-only block into an executable dry-run body that still ends
-    with the source's STOCK machine-end block.
+    """Wrap the motion-only eject block into an executable EMPTY-BED dry-run body.
 
     Layout of the produced body::
 
         [source header/config comment block .. ; EXECUTABLE_BLOCK_START]
         ; DRY-RUN full home (incl. Z — safe on the empty bed)
-        [thermal-less eject block]
-        [source ; MACHINE_END_GCODE_START .. EOF, verbatim]
+        [eject block, including its own completion epilogue]
 
-    ``geometry`` selects the prepended homing dialect: dual-nozzle models
-    (``is_dual_nozzle_model``) home with the parameterized stock forms
-    (``DUAL_NOZZLE_DRYRUN_HOME``) because an unparameterized ``G28`` stall-loops on
-    that firmware (007-H2C incident, 2026-07-12); single-nozzle models keep the
-    bare ``G28``.
+    The eject block now carries the stock machine-end FINISH tail itself (the
+    generator's ``COMPLETION_EPILOGUE``), so — unlike the earlier implementation —
+    the dry run does NOT splice the source's machine-end block: the block
+    self-completes (the job ends FINISH, not FAILED-at-EOF). ``geometry`` selects
+    the prepended homing dialect via ``full_home_lines``: dual-nozzle models home
+    with the parameterized stock forms (``G28 X T300`` / ``G28 Y T300`` /
+    ``G28 Z P0 T250``) because an unparameterized ``G28`` stall-loops on that
+    firmware (007-H2C incident, 2026-07-12); single-nozzle models keep the bare ``G28``.
 
-    The eject block deliberately precedes the machine-end here — the OPPOSITE of
-    production injection (which splices the eject block AFTER the machine-end).
-    A dry run has no print to shut down, so the stock machine-end runs purely as
-    the printer's job-completion handshake plus the final park / motor-off. Ending
-    the file at the eject block (as the previous implementation did) left the job
-    with no completion signal, so the printer marked it FAILED at EOF instead of
-    FINISH — live-observed on a real H2S twice (2026-07-04).
-
-    The caller must validate `eject_block` BEFORE this wrapping: the body here
+    The caller must validate ``eject_block`` BEFORE this wrapping: the body here
     prepends a full ``G28`` homing line that the eject-block validator rightly
     forbids inside the block itself.
-
-    Raises ``HTTPException(422)`` if the source plate G-code lacks the
-    ``; MACHINE_END_GCODE_START`` .. ``; EXECUTABLE_BLOCK_END`` machine-end
-    markers (nothing to splice as the completion handshake).
     """
     import zipfile
 
-    from backend.app.utils.threemf_tools import (
-        _find_target_gcode_name,
-        read_plate_gcode_machine_end,
-    )
+    from backend.app.utils.threemf_tools import _find_target_gcode_name
 
     head = ""
     with zipfile.ZipFile(source_path, "r") as zf:
@@ -171,42 +153,24 @@ def _build_dryrun_gcode(source_path: Path, plate_index: int, eject_block: str, g
                 line_end = prefix.find("\n", idx)
                 head = prefix[: len(prefix) if line_end == -1 else line_end + 1]
 
-    # Stock machine-end block (bed drop, M18, filament retract, the firmware
-    # completion handshake), spliced in verbatim so the dry-run job ends FINISH.
-    machine_end = read_plate_gcode_machine_end(source_path, plate_index)
-    if machine_end is None or _EXEC_BLOCK_END not in machine_end:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Plate {plate_index} G-code lacks the '{_MACHINE_END_GCODE_START}' .. "
-                f"'{_EXEC_BLOCK_END}' machine-end markers, so the dry-run file cannot "
-                "end with the stock completion handshake — refusing to build a file "
-                "that would end the job as FAILED at EOF."
-            ),
-        )
-
-    # Unlike a real print (whose start G-code homed Z long before the eject
-    # block runs), the dry-run body starts cold — Z is unhomed, so the block's
-    # `G1 Z...` would move against an unknown datum. A full home (including Z)
-    # is safe HERE ONLY because the dry run is by definition run on an EMPTY
-    # bed (hardware-ladder step 1): there is no part for the Z-probe to hit.
-    # Never emit a bare / unparameterized home inside a production eject block.
+    # Unlike a real print (whose start G-code homed Z long before the eject block
+    # runs), the dry-run body starts cold — Z is unhomed, so the block's `G1 Z...`
+    # would move against an unknown datum. A full home (including Z) is safe HERE
+    # ONLY because the dry run is by definition run on an EMPTY bed (hardware-ladder
+    # step 1): there is no part for the Z-probe to hit. Never emit a bare /
+    # unparameterized home inside a production eject block.
     #
     # Dual-nozzle firmware stall-loops on the unparameterized `G28` (007-H2C
     # incident, 2026-07-12), so dual models get the parameterized stock forms
-    # (X/Y torque homes + `G28 Z P0 T250`); single-nozzle models keep the bare
-    # `G28` (H2S dry-run bytes unchanged).
+    # (X/Y torque homes + `G28 Z P0 T250`); single-nozzle models keep the bare `G28`.
     homing_comment = "; DRY-RUN ONLY: full home incl. Z - safe because the bed is EMPTY by definition of the dry run\n"
-    if is_dual_nozzle_model(geometry.model_key):
-        homing = homing_comment + "\n".join(DUAL_NOZZLE_DRYRUN_HOME) + "\n"
-    else:
-        homing = homing_comment + "G28\n"
-    # [G28 prologue] + [thermal-less eject block] + [machine-end .. EOF verbatim].
-    body = homing + eject_block.rstrip("\n") + "\n" + machine_end
+    homing = homing_comment + "\n".join(full_home_lines(geometry.model_key)) + "\n"
+    # [G28 prologue] + [motion-only eject block with its own FINISH epilogue].
+    body = homing + eject_block.rstrip("\n") + "\n"
     if head:
         return head + body
     # No executable-block markers found up top — ship a minimal standalone file
-    # (still terminated by the source's verbatim machine-end block).
+    # (the eject block's epilogue still ends the job FINISH).
     return _EXEC_BLOCK_START + "\n" + body
 
 
@@ -317,28 +281,25 @@ async def preview_eject_profile(
 def _build_dryrun_3mf(
     source_path: Path, plate_index: int, profile: EjectProfile, max_z: float, geometry: ModelGeometry
 ) -> Path:
-    """Generate + validate the thermal-less eject block, splice in the source's
-    machine-end block, and repack into a temp dry-run ``.gcode.3mf``.
+    """Generate + validate the motion-only eject block and repack into a temp
+    dry-run ``.gcode.3mf``.
 
     The single canonical build path shared by the download dry-run and the
     one-click dispatch so the two never drift. Returns the temp file :class:`Path`
     (caller owns cleanup). Raises ``HTTPException(422)`` on any generation,
-    validation, machine-end-splice or repack failure.
+    validation or repack failure.
 
-    Dry run = geometry validation on an EMPTY bed (hardware-ladder step 1). The
-    eject block is built WITHOUT the thermal gate: the empty bed sits at ambient
-    with the heater off, so the production block's ``M190 R`` release waits could
-    never be reached from below and would hang the job forever, never running the
-    sweep this dry run exists to validate. The M190-count guard is correspondingly
-    skipped (``require_cooldown=False``); every geometry guard still runs.
-    Production dispatch keeps the full thermal gate.
+    Dry run = sweep GEOMETRY validation on an EMPTY bed (hardware-ladder step 1).
+    The eject block is motion-only (no thermal gate at all now — the cooldown wait
+    lives in the eject monitor), so nothing here could hang an ambient empty bed;
+    the block self-completes via its FINISH epilogue.
     """
     try:
-        eject_block = generate_eject_gcode(profile, max_z, geometry, include_cooldown=False)
+        eject_block = generate_eject_gcode(profile, max_z, geometry)
     except EjectGenerationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    result = validate_eject_gcode(eject_block, profile, max_z, geometry, require_cooldown=False)
+    result = validate_eject_gcode(eject_block, profile, max_z, geometry)
     if not result.ok:
         raise HTTPException(status_code=422, detail="Eject validation failed: " + "; ".join(result.errors))
     if BLOCK_END_MARKER not in eject_block:  # defensive — generator always emits it
@@ -389,7 +350,7 @@ async def dispatch_dry_run_eject_profile(
     db: AsyncSession = Depends(get_db),
     current_user: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE),
 ):
-    """One-click dry-run: build the thermal-less eject 3MF and queue it on a
+    """One-click dry-run: build the motion-only eject 3MF and queue it on a
     printer for an EMPTY-BED sweep test (hardware-ladder step 1).
 
     Saves the built file as the library file ``DRY-RUN {profile.name}.gcode.3mf``

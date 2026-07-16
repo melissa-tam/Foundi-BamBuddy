@@ -10,8 +10,18 @@ from httpx import AsyncClient
 class TestUpdatesAPI:
     @pytest.mark.asyncio
     async def test_get_version(self, async_client: AsyncClient):
+        # Reachable without authentication (needed to render the version in the
+        # UI before login) and carries version, repo, AND the build stamp so an
+        # operator can verify which installer build is deployed.
         response = await async_client.get("/api/v1/updates/version")
         assert response.status_code == 200
+        body = response.json()
+        assert "version" in body
+        assert "repo" in body
+        assert "build" in body
+        # In dev / with no staged VERSION file, build falls back to the plain
+        # app version — never empty.
+        assert body["build"]
 
     @pytest.mark.asyncio
     async def test_apply_update_docker_rejection(self, async_client: AsyncClient):

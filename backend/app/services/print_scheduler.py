@@ -9,7 +9,6 @@ from pathlib import Path
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from backend.app.core.config import settings
 from backend.app.core.database import async_session, run_with_retry
@@ -20,8 +19,6 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.settings import Settings
 from backend.app.models.smart_plug import SmartPlug
-from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
     delete_file_async,
@@ -37,6 +34,19 @@ from backend.app.services.printer_manager import (
     supports_drying_while_printing,
 )
 from backend.app.services.smart_plug_manager import smart_plug_manager
+from backend.app.services.spool_selection import (
+    DEFAULT_MIN_START_SPOOL_G,
+    DEFAULT_SELECTION_POLICY,
+    SELECTION_POLICIES,
+    WAITING_REASON_START_MIN,
+    MatchOutcome,
+    SlotInventory,
+    build_slot_inventory,
+    colors_are_similar,
+    effective_policy,
+    match_filaments_to_slots,
+    normalize_color_for_compare,
+)
 from backend.app.utils.filament_types import canonical_filament_type as _canonical_filament_type
 from backend.app.utils.filename import derive_remote_filename
 from backend.app.utils.printer_models import normalize_printer_model
@@ -106,6 +116,16 @@ class PrintScheduler:
         # Matches the watchdog timeout (90 s) plus a safety margin so the
         # watchdog runs first on the unhappy path.
         self._dispatch_max_hold = 180.0
+        # Queue-item ids whose scheduler-made pin was released by a hold gate
+        # (USB pre-flight / capability) in _start_print. While an id is in here,
+        # the model path suppresses the per-assignment on_queue_job_assigned
+        # notification — a sole-idle sick printer is re-selected every 30 s tick,
+        # and without this once-guard each re-assignment notifies (an "assigned"
+        # message every 30 s, for hours, in a lights-out farm). In-memory only:
+        # lost on restart, worst case one duplicate assigned-notification after a
+        # server restart — acceptable. Discarded on real dispatch; pruned each
+        # tick against the pending set so terminal items drop out.
+        self._hold_unpinned_items: set[int] = set()
 
     async def run(self):
         """Main loop - check queue every interval."""
@@ -167,6 +187,11 @@ class PrintScheduler:
                 )
             items = list(result.scalars().all())
 
+            # Prune the hold-unpinned once-guard against the live pending set so
+            # it can't grow unbounded — cancelled/failed/completed ids drop out
+            # automatically (their items are no longer pending).
+            self._hold_unpinned_items &= {i.id for i in items}
+
             if not items:
                 # No pending items — still check auto-drying on idle printers
                 await self._check_auto_drying(db, [], set())
@@ -215,6 +240,17 @@ class PrintScheduler:
 
             # Log skip reasons once per queue check (not per item)
             skip_reasons: dict[str, int] = {}
+
+            # Tick-local head-of-line state (2026-07-12 fix): printers found short
+            # on filament THIS tick are excluded from further candidate searches so
+            # one short low-id printer no longer swallows the whole model-based run.
+            # Never persisted — it dies with the tick, so a spool swap re-opens the
+            # printer on the very next tick (this is what makes recovery automatic).
+            deficit_blocked: set[int] = set()
+            # (batch_id, target_model) groups already sent an all-short waiting
+            # notification this tick — so a 20-unit run sends ONE notification, not
+            # one per unit (the incident sent 10).
+            notified_short_groups: set[tuple[int | None, str | None]] = set()
 
             for item in items:
                 # Check scheduled time first (scheduled_time is stored in UTC from ISO string)
@@ -319,11 +355,38 @@ class PrintScheduler:
 
                     # Compute AMS mapping if not already set
                     if not item.ams_mapping:
-                        computed_mapping = await self._compute_ams_mapping_for_printer(db, item.printer_id, item)
-                        if computed_mapping:
-                            item.ams_mapping = json.dumps(computed_mapping)
+                        outcome = await self._compute_ams_mapping_for_printer(db, item.printer_id, item)
+                        if outcome.start_blocked_slots:
+                            # The only matching spool(s) sit below the minimum-start
+                            # floor — hold the job with a distinct reason (they stay
+                            # loaded as firmware backup donors). Do NOT persist a
+                            # mapping. Notify once per transition, mirroring the
+                            # filament-deficit path.
+                            was_blocked = item.waiting_reason == WAITING_REASON_START_MIN
+                            await self._stage_filament_short(db, item, unpin=False, reason=WAITING_REASON_START_MIN)
                             logger.info(
-                                f"Queue item {item.id}: Computed AMS mapping for printer {item.printer_id}: {computed_mapping}"
+                                "Queue item %s: start spool below minimum on printer %s (slots %s) — staged",
+                                item.id,
+                                item.printer_id,
+                                outcome.start_blocked_slots,
+                            )
+                            if not was_blocked:
+                                job_name = await self._get_job_name(db, item)
+                                printer = await self._get_printer(db, item.printer_id)
+                                try:
+                                    await notification_service.on_queue_job_waiting(
+                                        job_name=job_name,
+                                        target_model=(printer.model if printer else "") or "",
+                                        waiting_reason=WAITING_REASON_START_MIN,
+                                        db=db,
+                                    )
+                                except Exception as e:
+                                    logger.debug("start-min notification failed for item %s: %s", item.id, e)
+                            continue
+                        if outcome.mapping:
+                            item.ams_mapping = json.dumps(outcome.mapping)
+                            logger.info(
+                                f"Queue item {item.id}: Computed AMS mapping for printer {item.printer_id}: {outcome.mapping}"
                             )
                             await db.commit()
 
@@ -335,25 +398,47 @@ class PrintScheduler:
                         continue
 
                     # Power-stagger gate: hold if this window's start budget is
-                    # spent. The item stays pending and is retried next tick.
+                    # spent. The item stays pending, marked stagger_hold for UI
+                    # visibility (self-clearing token — NEVER notified), and is
+                    # retried next tick.
                     if stagger_remaining <= 0:
                         skip_reasons["stagger_window"] = skip_reasons.get("stagger_window", 0) + 1
+                        if item.waiting_reason != "stagger_hold":
+                            item.waiting_reason = "stagger_hold"
+                            await db.commit()
                         logger.debug("Queue item %s: holding — stagger window budget exhausted", item.id)
                         continue
 
+                    # Clear a stale stagger_hold before dispatch (self-clearing token;
+                    # _start_print commits it). Other tokens are managed elsewhere.
+                    if item.waiting_reason == "stagger_hold":
+                        item.waiting_reason = None
+                    # Capture the assignment BEFORE dispatch: _start_print releases a
+                    # model-targeted unit's scheduler-made pin (printer_id→None) when it
+                    # holds at the USB/capability gate, so item.printer_id may be None on
+                    # return. For a genuinely user-pinned unit (no target_model) this
+                    # local equals item.printer_id throughout, so behaviour is unchanged.
+                    dispatch_printer_id = item.printer_id
                     # Start the print
                     await self._start_print(db, item)
-                    busy_printers.add(item.printer_id)
+                    busy_printers.add(dispatch_printer_id)
                     if item.status == "printing":
                         stagger_remaining -= 1
+                        # A legacy-pinned model unit whose printer recovered
+                        # dispatches through THIS path — end its hold-unpinned
+                        # notification-suppression window too.
+                        self._hold_unpinned_items.discard(item.id)
 
-                    # SJF starvation guard: mark items that were jumped
+                    # SJF starvation guard: mark items that were jumped. Compare against
+                    # the captured pre-dispatch printer id — never item.printer_id, which
+                    # a held model unit will have nulled (None would match every
+                    # still-unassigned item and wrongly flag it been_jumped).
                     if sjf_enabled and item.print_time_seconds is not None:
                         for other in items:
                             if (
                                 other.id != item.id
                                 and other.status == "pending"
-                                and other.printer_id == item.printer_id
+                                and other.printer_id == dispatch_printer_id
                                 and not other.been_jumped
                                 and other.position < item.position
                                 and (
@@ -390,38 +475,87 @@ class PrintScheduler:
                             # Merge: keep original types for non-overridden slots, add override types
                             effective_types = sorted(set(required_types or []) | set(override_types))
 
-                    printer_id, waiting_reason = await self._find_idle_printer_for_model(
-                        db,
-                        item.target_model,
-                        busy_printers,
-                        effective_types,
-                        item.target_location,
-                        filament_overrides=filament_overrides,
-                    )
+                    # Head-of-line fix (2026-07-12): evaluate candidate printers one
+                    # at a time, excluding both busy printers and any candidate found
+                    # short on filament THIS tick. A candidate is only claimed once it
+                    # passes its OWN deficit check, so a short low-id printer no longer
+                    # swallows the whole run by staging every unit onto itself.
+                    assigned_printer_id: int | None = None
+                    assigned_mapping: str | None = None
+                    last_waiting_reason: str | None = None
+                    candidates_deficit_blocked = 0
+                    candidates_start_blocked = 0
+                    while True:
+                        candidate_id, last_waiting_reason = await self._find_idle_printer_for_model(
+                            db,
+                            item.target_model,
+                            busy_printers | deficit_blocked,
+                            effective_types,
+                            item.target_location,
+                            filament_overrides=filament_overrides,
+                        )
+                        if not candidate_id:
+                            break
 
-                    # Update waiting_reason if changed and send notification when first waiting
-                    if item.waiting_reason != waiting_reason:
-                        was_waiting = item.waiting_reason is not None
-                        item.waiting_reason = waiting_reason
-                        await db.commit()
+                        # Compute this candidate's AMS mapping WITHOUT persisting it —
+                        # a losing candidate must leave no trace on the item.
+                        if item.ams_mapping:
+                            candidate_mapping = item.ams_mapping
+                            candidate_start_blocked: list[int] = []
+                        else:
+                            outcome = await self._compute_ams_mapping_for_printer(db, candidate_id, item)
+                            candidate_mapping = json.dumps(outcome.mapping) if outcome.mapping else None
+                            candidate_start_blocked = outcome.start_blocked_slots
 
-                        # Send waiting notification only when transitioning to waiting state
-                        # and the reason requires user action (not just "all printers busy")
-                        if waiting_reason and not was_waiting and not self._is_busy_only(waiting_reason):
-                            job_name = await self._get_job_name(db, item)
-                            await notification_service.on_queue_job_waiting(
-                                job_name=job_name,
-                                target_model=item.target_model,
-                                waiting_reason=waiting_reason,
-                                db=db,
+                        # Deficit-check against THIS candidate via the override params
+                        # (the item is never mutated). Print-Anyway skips the check.
+                        if item.skip_filament_check:
+                            deficit: list = []
+                        else:
+                            deficit = await self._compute_deficit_safe(
+                                db,
+                                item,
+                                printer_id_override=candidate_id,
+                                ams_mapping_override=candidate_mapping,
                             )
+                        if deficit:
+                            deficit_blocked.add(candidate_id)
+                            candidates_deficit_blocked += 1
+                            logger.info(
+                                "Queue item %s: candidate printer %s short on filament (%d slot(s)) — trying next",
+                                item.id,
+                                candidate_id,
+                                len(deficit),
+                            )
+                            continue
 
-                    if printer_id:
-                        # Power-stagger gate: hold BEFORE claiming the printer if
-                        # this window's start budget is spent, leaving the item
-                        # pending + unassigned so a later tick can pick any printer.
+                        # Start-spool floor: this candidate's only matching spool(s)
+                        # are below the minimum-start weight. Skip it like a deficit
+                        # (it can still finish other prints / serve as a backup donor).
+                        if candidate_start_blocked and not item.skip_filament_check:
+                            deficit_blocked.add(candidate_id)
+                            candidates_start_blocked += 1
+                            logger.info(
+                                "Queue item %s: candidate printer %s start spool below minimum (slots %s) — trying next",
+                                item.id,
+                                candidate_id,
+                                candidate_start_blocked,
+                            )
+                            continue
+
+                        assigned_printer_id = candidate_id
+                        assigned_mapping = candidate_mapping
+                        break
+
+                    if assigned_printer_id:
+                        # Power-stagger gate — now AFTER candidate selection + deficit
+                        # check so shortages surface even during held windows. A held
+                        # item is marked stagger_hold (self-clearing, NEVER notified).
                         if stagger_remaining <= 0:
                             skip_reasons["stagger_window"] = skip_reasons.get("stagger_window", 0) + 1
+                            if item.waiting_reason != "stagger_hold":
+                                item.waiting_reason = "stagger_hold"
+                                await db.commit()
                             logger.debug(
                                 "Queue item %s: holding model-based dispatch — stagger window budget exhausted",
                                 item.id,
@@ -442,51 +576,66 @@ class PrintScheduler:
 
                                 # Send notification
                                 job_name = await self._get_job_name(db, item)
-                                printer = await self._get_printer(db, printer_id)
+                                printer = await self._get_printer(db, assigned_printer_id)
                                 await notification_service.on_queue_job_skipped(
                                     job_name=job_name,
-                                    printer_id=printer_id,
+                                    printer_id=assigned_printer_id,
                                     printer_name=printer.name if printer else "Unknown",
                                     reason="Previous print failed or was aborted",
                                     db=db,
                                 )
                                 continue
 
-                        # Assign printer and start - clear waiting reason
-                        item.printer_id = printer_id
-                        item.waiting_reason = None
-                        logger.info("Model-based assignment: queue item %s assigned to printer %s", item.id, printer_id)
-
-                        # Send assignment notification
-                        job_name = await self._get_job_name(db, item)
-                        printer = await self._get_printer(db, printer_id)
-                        await notification_service.on_queue_job_assigned(
-                            job_name=job_name,
-                            printer_id=printer_id,
-                            printer_name=printer.name if printer else "Unknown",
-                            target_model=item.target_model,
-                            db=db,
+                        # Assign printer + persist its mapping. Clear a stale
+                        # assignment-time waiting reason, but PRESERVE a live
+                        # "no_usb_drive" hold: _start_print owns that token and
+                        # self-clears it on a successful dispatch (past the capability
+                        # gate below). When a model unit keeps landing on USB-less
+                        # printers, preserving it here keeps the USB hold's
+                        # once-per-transition waiting notification deduped across ticks —
+                        # this optimistic clear would otherwise make every tick look like
+                        # a fresh transition and re-notify.
+                        item.printer_id = assigned_printer_id
+                        if assigned_mapping and not item.ams_mapping:
+                            item.ams_mapping = assigned_mapping
+                            logger.info(
+                                "Queue item %s: Computed AMS mapping for printer %s: %s",
+                                item.id,
+                                assigned_printer_id,
+                                assigned_mapping,
+                            )
+                        if item.waiting_reason != "no_usb_drive":
+                            item.waiting_reason = None
+                        logger.info(
+                            "Model-based assignment: queue item %s assigned to printer %s",
+                            item.id,
+                            assigned_printer_id,
                         )
 
-                        # Compute AMS mapping for the assigned printer if not already set
-                        # This is critical for model-based jobs where mapping wasn't computed upfront
-                        if not item.ams_mapping:
-                            computed_mapping = await self._compute_ams_mapping_for_printer(db, printer_id, item)
-                            if computed_mapping:
-                                item.ams_mapping = json.dumps(computed_mapping)
-                                logger.info(
-                                    f"Queue item {item.id}: Computed AMS mapping for printer {printer_id}: {computed_mapping}"
-                                )
-                                await db.commit()
-
-                        # Filament-deficit pre-dispatch check (#1496).
-                        if await self._block_on_filament_deficit(db, item):
-                            continue
+                        # Send assignment notification — suppressed while the item
+                        # sits in the hold-unpinned once-guard: a sole-idle sick
+                        # printer is re-selected every tick after the hold gates
+                        # release the pin, and on_queue_job_assigned has no dedupe
+                        # of its own. First assignment notified; re-assignments
+                        # born from a hold-release stay silent.
+                        if item.id not in self._hold_unpinned_items:
+                            job_name = await self._get_job_name(db, item)
+                            printer = await self._get_printer(db, assigned_printer_id)
+                            await notification_service.on_queue_job_assigned(
+                                job_name=job_name,
+                                printer_id=assigned_printer_id,
+                                printer_name=printer.name if printer else "Unknown",
+                                target_model=item.target_model,
+                                db=db,
+                            )
 
                         await self._start_print(db, item)
-                        busy_printers.add(printer_id)
+                        busy_printers.add(assigned_printer_id)
                         if item.status == "printing":
                             stagger_remaining -= 1
+                            # Real dispatch ends the suppression window — a later
+                            # hold on a NEW assignment is a new transition.
+                            self._hold_unpinned_items.discard(item.id)
 
                         # SJF starvation guard: mark model-based items that were jumped
                         if sjf_enabled and item.print_time_seconds is not None:
@@ -506,6 +655,43 @@ class PrintScheduler:
                                 ):
                                     other.been_jumped = True
                             await db.commit()
+
+                    elif candidates_deficit_blocked > 0 or candidates_start_blocked > 0:
+                        # Every candidate that could have run was blocked on filament →
+                        # stage the item UNPINNED so a later tick re-runs the full
+                        # candidate search once any printer's spool is topped up. One
+                        # notification per (batch, model) group per tick — the incident
+                        # sent one per unit (10 for a 10-plate run). When the blocks
+                        # were PURELY the start-spool floor (no true deficit), surface
+                        # the distinct reason; a mix stays generic.
+                        stage_reason = (
+                            WAITING_REASON_START_MIN
+                            if candidates_deficit_blocked == 0 and candidates_start_blocked > 0
+                            else "filament_short"
+                        )
+                        await self._stage_model_item_filament_short(
+                            db, item, notified_short_groups, reason=stage_reason
+                        )
+
+                    else:
+                        # No eligible printer for a non-filament reason (all busy /
+                        # offline / none configured). Preserve the transition-notify
+                        # behaviour; the self-clearing tokens never notify.
+                        if item.waiting_reason != last_waiting_reason:
+                            was_waiting = item.waiting_reason is not None
+                            item.waiting_reason = last_waiting_reason
+                            await db.commit()
+
+                            # Send waiting notification only when transitioning to
+                            # waiting and the reason requires user action.
+                            if last_waiting_reason and not was_waiting and not self._is_busy_only(last_waiting_reason):
+                                job_name = await self._get_job_name(db, item)
+                                await notification_service.on_queue_job_waiting(
+                                    job_name=job_name,
+                                    target_model=item.target_model,
+                                    waiting_reason=last_waiting_reason,
+                                    db=db,
+                                )
 
             # Log summary of skip reasons (helps diagnose why queue items aren't starting)
             if skip_reasons:
@@ -831,11 +1017,14 @@ class PrintScheduler:
 
     async def _compute_ams_mapping_for_printer(
         self, db: AsyncSession, printer_id: int, item: PrintQueueItem
-    ) -> list[int] | None:
-        """Compute AMS mapping for a printer based on filament requirements.
+    ) -> MatchOutcome:
+        """Compute the AMS mapping + start-block outcome for a printer.
 
         Called when a queue item has no ams_mapping set — either for model-based
         items after printer assignment, or printer-specific items (e.g. from VP).
+        Applies the configured spool-selection policy (``spool_selection_policy``)
+        and the minimum-start-weight floor (``min_start_spool_g``) via the
+        ``spool_selection`` module.
 
         Args:
             db: Database session
@@ -843,13 +1032,26 @@ class PrintScheduler:
             item: The queue item (contains archive_id or library_file_id)
 
         Returns:
-            AMS mapping array or None if no mapping needed/possible
+            A ``MatchOutcome`` whose ``mapping`` is the AMS mapping array (or None
+            when no mapping is needed/possible) and whose ``start_blocked_slots``
+            names any slot held back purely by the minimum-start floor.
         """
         # Get printer status
         status = printer_manager.get_status(printer_id)
         if not status:
             logger.warning("Cannot compute AMS mapping: printer %s status unavailable", printer_id)
-            return None
+            return MatchOutcome(mapping=None)
+
+        # Resolve the selection policy + minimum-start floor once. Print-Anyway
+        # (skip_filament_check) disables the floor so an acknowledged low spool
+        # can still start. The AMS-Backup gate (#1766) is applied by
+        # ``effective_policy``.
+        policy_raw = await self._get_setting(db, "spool_selection_policy")
+        policy = policy_raw if policy_raw in SELECTION_POLICIES else DEFAULT_SELECTION_POLICY
+        min_start_g = await self._get_int_setting(db, "min_start_spool_g", default=DEFAULT_MIN_START_SPOOL_G)
+        if item.skip_filament_check:
+            min_start_g = 0
+        eff_policy = effective_policy(policy, status.ams_filament_backup)
 
         # Get filament requirements from source file
         filament_reqs = await self._get_filament_requirements(db, item)
@@ -867,11 +1069,13 @@ class PrintScheduler:
                             item.id,
                             len(force_overrides),
                         )
-                        return self._build_override_direct_mapping(force_overrides, status)
+                        return await self._build_override_direct_mapping(
+                            db, printer_id, force_overrides, status, eff_policy, min_start_g
+                        )
                 except (json.JSONDecodeError, KeyError, TypeError) as e:
                     logger.warning("Queue item %s: Force-color fallback mapping failed: %s", item.id, e)
             logger.debug("No filament requirements found for queue item %s", item.id)
-            return None
+            return MatchOutcome(mapping=None)
 
         # Apply filament overrides if present
         if item.filament_overrides:
@@ -900,49 +1104,46 @@ class PrintScheduler:
         loaded_filaments = self._build_loaded_filaments(status)
         if not loaded_filaments:
             logger.debug("No filaments loaded on printer %s", printer_id)
-            return None
+            return MatchOutcome(mapping=None)
 
-        # Check if user prefers lowest remaining filament when multiple spools match
-        prefer_lowest = await self._get_bool_setting(db, "prefer_lowest_filament")
+        # Inventory facts (remaining grams + first-loaded ordinal) are only needed
+        # when the policy sorts or the floor is active — skip the lookup otherwise.
+        inv: dict[int, SlotInventory] = {}
+        if eff_policy != "slot_order" or min_start_g > 0:
+            inv = await build_slot_inventory(db, printer_id, loaded_filaments)
 
-        # Gate prefer_lowest on the printer's AMS Filament Backup state (#1766).
-        # Without backup, the printer will not switch to a second spool when the
-        # picked one runs out — so sorting toward the lowest leaves the print
-        # at risk of running dry mid-job. None (unknown / A1 family) preserves
-        # today's behaviour intentionally.
-        if prefer_lowest and status.ams_filament_backup is False:
-            logger.info("[prefer-lowest] skipped (AMS Backup OFF on printer %s)", printer_id)
-            prefer_lowest = False
-
-        # When the preference is on, surface Bambuddy's inventory-side
-        # remaining for each slot that's bound to a tracked spool, so the
-        # sort beats the MQTT-only blind spot (#1508). Skip the lookup
-        # entirely when the preference is off — no behaviour change for
-        # users who haven't opted in.
-        inventory_remain_overrides: dict[int, float] | None = None
-        if prefer_lowest:
-            inventory_remain_overrides = await self._build_inventory_remain_overrides(db, printer_id, loaded_filaments)
-
-        # Compute mapping: match required filaments to available slots
-        return self._match_filaments_to_slots(
-            filament_reqs, loaded_filaments, prefer_lowest, inventory_remain_overrides
+        return match_filaments_to_slots(
+            filament_reqs,
+            loaded_filaments,
+            policy=eff_policy,
+            inv=inv,
+            backup_on=status.ams_filament_backup,
+            min_start_g=min_start_g,
         )
 
-    def _build_override_direct_mapping(self, force_overrides: list[dict], status) -> list[int] | None:
+    async def _build_override_direct_mapping(
+        self,
+        db: AsyncSession,
+        printer_id: int,
+        force_overrides: list[dict],
+        status,
+        policy: str,
+        min_start_g: int,
+    ) -> MatchOutcome:
         """Build an AMS mapping directly from force-color overrides without a 3MF.
 
         Used when ``_get_filament_requirements`` returns nothing (e.g. the 3MF's
         slice_info is missing or unreadable) but ``force_color_match`` overrides
         are present. Each override's ``slot_id``, ``type``, and ``color`` are
         treated as the filament requirement for that slot and matched against the
-        current AMS state of the printer.
+        current AMS state of the printer, threading the same policy / floor as the
+        normal path.
 
-        Returns the same format as ``_match_filaments_to_slots``, or None when
-        the AMS has no loaded filaments.
+        Returns a ``MatchOutcome`` (mapping None when the AMS has no filaments).
         """
         loaded = self._build_loaded_filaments(status)
         if not loaded:
-            return None
+            return MatchOutcome(mapping=None)
 
         reqs = [
             {
@@ -953,7 +1154,17 @@ class PrintScheduler:
             }
             for o in force_overrides
         ]
-        return self._match_filaments_to_slots(reqs, loaded)
+        inv: dict[int, SlotInventory] = {}
+        if policy != "slot_order" or min_start_g > 0:
+            inv = await build_slot_inventory(db, printer_id, loaded)
+        return match_filaments_to_slots(
+            reqs,
+            loaded,
+            policy=policy,
+            inv=inv,
+            backup_on=getattr(status, "ams_filament_backup", None),
+            min_start_g=min_start_g,
+        )
 
     async def _get_filament_requirements(self, db: AsyncSession, item: PrintQueueItem) -> list[dict] | None:
         """Resolve the queue item's source 3MF and parse the per-slot
@@ -1062,359 +1273,36 @@ class PrintScheduler:
         return f"#{hex_color}"
 
     def _normalize_color_for_compare(self, color: str | None) -> str:
-        """Normalize color for comparison (lowercase, no hash)."""
-        if not color:
-            return ""
-        return color.replace("#", "").lower()[:6]
+        """Normalize color for comparison (lowercase, no hash). Delegates to the
+        canonical ``spool_selection`` implementation."""
+        return normalize_color_for_compare(color)
 
     def _colors_are_similar(self, color1: str | None, color2: str | None, threshold: int = 40) -> bool:
-        """Check if two colors are visually similar within a threshold."""
-        hex1 = self._normalize_color_for_compare(color1)
-        hex2 = self._normalize_color_for_compare(color2)
-        if not hex1 or not hex2 or len(hex1) < 6 or len(hex2) < 6:
-            return False
-
-        try:
-            r1 = int(hex1[0:2], 16)
-            g1 = int(hex1[2:4], 16)
-            b1 = int(hex1[4:6], 16)
-            r2 = int(hex2[0:2], 16)
-            g2 = int(hex2[2:4], 16)
-            b2 = int(hex2[4:6], 16)
-            return abs(r1 - r2) <= threshold and abs(g1 - g2) <= threshold and abs(b1 - b2) <= threshold
-        except ValueError:
-            return False
+        """Check if two colors are visually similar within a threshold. Delegates
+        to the canonical ``spool_selection`` implementation."""
+        return colors_are_similar(color1, color2, threshold)
 
     async def _build_inventory_remain_overrides(
         self, db: AsyncSession, printer_id: int, loaded: list[dict]
     ) -> dict[int, float]:
-        """Return ``{global_tray_id: remaining_grams}`` for AMS slots the user
-        has bound to an inventory spool — Bambuddy-side or Spoolman-side.
-
-        The MQTT ``remain`` field on a tray is the printer firmware's
-        RFID-decremented value, which has two limitations the "Prefer Lowest
-        Remaining Filament" feature has been ignoring (#1508):
-
-        - it's only meaningful for Bambu RFID spools; everything else reports
-          ``-1`` (then clamped to a sentinel), so multiple non-RFID trays
-          compare equal and the sort collapses to AMS-slot order — the user
-          who's curating inventory weights gets the lower-slot pick instead
-          of the lower-remaining pick;
-        - even when set, it's the *printer's* counter, not Bambuddy's
-          ``label_weight - weight_used`` (internal mode) or Spoolman's
-          ``remaining_weight`` (Spoolman mode) — the two diverge any time the
-          user re-spools, swaps cardboard, or runs a print outside Bambuddy.
-
-        When the user has bound a spool to a slot, their own inventory
-        tracking is authoritative; this helper surfaces that value so the
-        sort can prefer it. Slots without a binding are absent from the
-        returned map — the caller then falls back to MQTT ``remain`` for
-        those, preserving the pre-#1508 behaviour for un-tracked spools.
-
-        Returns an empty map on any failure (no inventory bindings, DB
-        error, Spoolman unreachable). A best-effort lookup; "Prefer Lowest"
-        is a preference, not a guarantee.
+        """Thin delegate: ``{global_tray_id: remaining_grams}`` for inventory-bound
+        AMS slots, sourced from ``spool_selection.build_slot_inventory`` (single
+        source with the dispatcher). Kept for external callers that only need the
+        remaining-grams map; slots without a known remaining are omitted.
         """
-        if not loaded:
-            return {}
-        # External / virtual-tray slots are tracked separately from AMS — skip
-        # them so a VT-loaded spool doesn't accidentally inherit a tracked
-        # AMS binding (the tables use ams_id 254/255 for VT, but the cross
-        # match is fiddly and out of scope for this fix).
-        tracked_slots = [(f["ams_id"], f["tray_id"], f["global_tray_id"]) for f in loaded if not f.get("is_external")]
-        if not tracked_slots:
-            return {}
+        inv = await build_slot_inventory(db, printer_id, loaded)
+        return {gtid: si.remaining_g for gtid, si in inv.items() if si.remaining_g is not None}
 
-        is_spoolman = await self._is_spoolman_mode(db)
-        overrides: dict[int, float] = {}
-
-        if is_spoolman:
-            result = await db.execute(
-                select(SpoolmanSlotAssignment).where(SpoolmanSlotAssignment.printer_id == printer_id)
-            )
-            assignments = list(result.scalars().all())
-            by_slot = {(a.ams_id, a.tray_id): a.spoolman_spool_id for a in assignments}
-            from backend.app.services.filament_deficit import _spoolman_remaining_grams
-
-            for ams_id, tray_id, gtid in tracked_slots:
-                spoolman_id = by_slot.get((ams_id, tray_id))
-                if spoolman_id is None:
-                    continue
-                grams = await _spoolman_remaining_grams(spoolman_id)
-                if grams is not None:
-                    overrides[gtid] = grams
-            return overrides
-
-        # Internal inventory mode (default). selectinload matches the pattern
-        # used elsewhere (inventory.py, spoolman.py routes) — a single query
-        # plus an eager-loaded relationship rather than an explicit join, so
-        # the row-attribute shape is exactly what those routes already rely on.
-        result = await db.execute(
-            select(SpoolAssignment)
-            .options(selectinload(SpoolAssignment.spool))
-            .where(SpoolAssignment.printer_id == printer_id)
-        )
-        assignments = list(result.scalars().all())
-        by_slot = {(a.ams_id, a.tray_id): a.spool for a in assignments}
-        for ams_id, tray_id, gtid in tracked_slots:
-            spool = by_slot.get((ams_id, tray_id))
-            if spool is None:
-                continue
-            label = float(spool.label_weight or 0)
-            used = float(spool.weight_used or 0)
-            overrides[gtid] = max(0.0, label - used)
-        return overrides
-
-    @staticmethod
-    async def _is_spoolman_mode(db: AsyncSession) -> bool:
-        """Mirror of ``filament_deficit._is_spoolman_mode`` — kept private
-        here to avoid making this module import-dependent on that private
-        helper's signature."""
-        try:
-            from backend.app.api.routes.settings import get_setting
-
-            v = await get_setting(db, "spoolman_enabled")
-            return bool(v) and v.lower() == "true"
-        except Exception:
-            return False
-
-    @staticmethod
-    def _slot_priority(ams_id: int | None, tray_id: int | None) -> int:
-        """Deterministic slot-position tie-breaker for the prefer-lowest sort.
-
-        Three bands, matched to the emission order in ``_build_loaded_filaments``
-        so a tied sort produces the same physical-position order the pre-#1508
-        stable sort did (preserves the regression-free baseline):
-
-        - Regular AMS (``ams_id`` 0..7): ``ams_id * 4 + tray_id`` → 0..31
-        - AMS-HT (``ams_id`` >= 128, single tray): ``1000 + (ams_id - 128) * 4``
-        - External / VT (``ams_id`` < 0, or ``None``): ``10_000``
-
-        Banding ensures regular AMS < AMS-HT < external on ties, regardless of
-        what the raw ``ams_id`` happens to be (in particular, ``ams_id = -1``
-        for VT must NOT sort to a negative number or it would beat AMS slot 0).
+    def _match_filaments_to_slots(self, required: list[dict], loaded: list[dict]) -> list[int] | None:
+        """Thin delegate to ``spool_selection.match_filaments_to_slots`` for the
+        default (slot-order, no floor) case — bucket precedence unchanged. Policy
+        selection and the minimum-start floor live in
+        ``_compute_ams_mapping_for_printer``; this preserves the simple
+        two-argument entry point external callers use. Returns the mapping array.
         """
-        if ams_id is None or ams_id < 0:
-            return 10_000
-        if ams_id >= 128:
-            return 1_000 + (ams_id - 128) * 4 + (tray_id or 0)
-        return ams_id * 4 + (tray_id or 0)
-
-    @staticmethod
-    def _prefer_lowest_sort_key(f: dict, overrides: dict[int, float] | None) -> tuple[int, float, int]:
-        """Sort key for the "Prefer Lowest Remaining Filament" preference.
-
-        Two-tier ordering: inventory-tracked spools always sort BEFORE
-        non-tracked spools (the user has told us they care about these
-        specifically), then ascending by remaining within each tier, then
-        ascending by AMS slot position as the deterministic tie-breaker.
-
-        Tiers are flagged by the first tuple element (0 = inventory-tracked,
-        1 = MQTT-only / unknown). Cross-tier value comparisons never run
-        because the tier flag dominates — which is what lets us mix grams
-        (inventory) and percent (MQTT) without a unit conversion.
-
-        Within the MQTT tier ``remain = -1`` (unknown) is mapped to 101 so
-        spools the printer DOES know something about sort ahead of those
-        it knows nothing about — preserves pre-#1508 behaviour for the
-        no-inventory-binding case.
-
-        Slot tie-breaker via ``_slot_priority`` so regular AMS < AMS-HT <
-        external on ties, matching the legacy emission-order stable sort.
-        """
-        gtid = f.get("global_tray_id")
-        slot_order = PrintScheduler._slot_priority(f.get("ams_id"), f.get("tray_id"))
-        if overrides and gtid in overrides:
-            return (0, overrides[gtid], slot_order)
-        remain = f.get("remain", -1)
-        return (1, float(remain) if remain is not None and remain >= 0 else 101.0, slot_order)
-
-    def _match_filaments_to_slots(
-        self,
-        required: list[dict],
-        loaded: list[dict],
-        prefer_lowest: bool = False,
-        inventory_remain_overrides: dict[int, float] | None = None,
-    ) -> list[int] | None:
-        """Match required filaments to loaded filaments and build AMS mapping.
-
-        Priority: unique tray_info_idx match > exact color match > similar color match > type-only match
-
-        The tray_info_idx is a filament type identifier stored in the 3MF file when the user
-        slices (e.g., "GFA00" for generic PLA, "P4d64437" for custom presets). If the same
-        tray_info_idx appears in only ONE available tray, we use that tray. If multiple trays
-        have the same tray_info_idx (e.g., two spools of generic PLA), we fall back to color
-        matching among those trays.
-
-        Args:
-            required: List of required filaments with slot_id, type, color, tray_info_idx
-            loaded: List of loaded filaments with type, color, tray_info_idx, global_tray_id
-
-        Returns:
-            AMS mapping array (position = slot_id - 1, value = global_tray_id or -1)
-        """
-        if not required:
-            return None
-
-        # Track used trays to avoid duplicate assignment
-        used_tray_ids: set[int] = set()
-        comparisons = []
-
-        for req in required:
-            req_type = (req.get("type") or "").upper()
-            req_color = req.get("color", "")
-            req_tray_info_idx = req.get("tray_info_idx", "")
-
-            # Find best match: unique tray_info_idx > exact color > similar color > type-only
-            idx_match = None
-            exact_match = None
-            similar_match = None
-            type_only_match = None
-
-            # Get available trays (not already used)
-            available = [f for f in loaded if f["global_tray_id"] not in used_tray_ids]
-
-            # Nozzle-aware filtering: restrict to trays on the correct nozzle.
-            # Hard filter — cross-nozzle assignment causes print failures
-            # ("position of left hotend is abnormal"), so never fall back.
-            req_nozzle_id = req.get("nozzle_id")
-            if req_nozzle_id is not None:
-                available = [f for f in available if f.get("extruder_id") == req_nozzle_id]
-
-            # Sort by remaining filament (ascending) so lowest-remain spool wins .find().
-            # Inventory-tracked spools sort before MQTT-only ones (#1508); see
-            # _prefer_lowest_sort_key for the full rationale.
-            if prefer_lowest:
-                available.sort(key=lambda f: self._prefer_lowest_sort_key(f, inventory_remain_overrides))
-                # INFO-level decision trace for "Prefer Lowest Filament" #1766.
-                # One line per filament req so a bug report can be diagnosed
-                # without enabling debug logging: shows what the matcher saw
-                # (req shape + sorted candidate trays with their remain values
-                # and any inventory override that was applied). Mirrored by
-                # the picked-match log at the bottom of the loop.
-                logger.info(
-                    "[prefer-lowest] req slot=%s type=%r color=%r tii=%r nozzle=%s; available (sorted lowest-first): %s",
-                    req.get("slot_id"),
-                    req_type,
-                    req_color,
-                    req_tray_info_idx,
-                    req_nozzle_id,
-                    [
-                        {
-                            "gtid": f.get("global_tray_id"),
-                            "type": f.get("type"),
-                            "color": f.get("color"),
-                            "tii": f.get("tray_info_idx"),
-                            "remain": f.get("remain"),
-                            "inv_g": (
-                                inventory_remain_overrides.get(f.get("global_tray_id"))
-                                if inventory_remain_overrides
-                                else None
-                            ),
-                        }
-                        for f in available
-                    ],
-                )
-
-            # Check if tray_info_idx is unique among available trays
-            if req_tray_info_idx:
-                idx_matches = [f for f in available if f.get("tray_info_idx") == req_tray_info_idx]
-                if len(idx_matches) == 1:
-                    # Unique tray_info_idx - use it as definitive match
-                    idx_match = idx_matches[0]
-                    logger.debug(
-                        f"Matched filament slot {req.get('slot_id')} by unique tray_info_idx={req_tray_info_idx} "
-                        f"-> tray {idx_match['global_tray_id']}"
-                    )
-                elif len(idx_matches) > 1:
-                    # Multiple trays with same tray_info_idx - use color matching among them
-                    logger.debug(
-                        f"Non-unique tray_info_idx={req_tray_info_idx} found in {len(idx_matches)} trays, "
-                        f"using color matching among trays: {[f['global_tray_id'] for f in idx_matches]}"
-                    )
-                    if prefer_lowest:
-                        idx_matches.sort(key=lambda f: self._prefer_lowest_sort_key(f, inventory_remain_overrides))
-                    # Use color matching within this subset
-                    for f in idx_matches:
-                        f_color = f.get("color", "")
-                        if self._normalize_color_for_compare(f_color) == self._normalize_color_for_compare(req_color):
-                            if not exact_match:
-                                exact_match = f
-                        elif self._colors_are_similar(f_color, req_color):
-                            if not similar_match:
-                                similar_match = f
-                        elif not type_only_match:
-                            type_only_match = f
-
-            # If no idx_match yet, do standard type/color matching on all available trays
-            if not idx_match and not exact_match and not similar_match and not type_only_match:
-                for f in available:
-                    f_type = (f.get("type") or "").upper()
-                    if _canonical_filament_type(f_type) != _canonical_filament_type(req_type):
-                        continue
-
-                    # Type matches - check color
-                    f_color = f.get("color", "")
-                    if self._normalize_color_for_compare(f_color) == self._normalize_color_for_compare(req_color):
-                        if not exact_match:
-                            exact_match = f
-                    elif self._colors_are_similar(f_color, req_color):
-                        if not similar_match:
-                            similar_match = f
-                    elif not type_only_match:
-                        type_only_match = f
-
-            match = idx_match or exact_match or similar_match or type_only_match
-            if match:
-                used_tray_ids.add(match["global_tray_id"])
-                comparisons.append({"slot_id": req.get("slot_id", 0), "global_tray_id": match["global_tray_id"]})
-            else:
-                comparisons.append({"slot_id": req.get("slot_id", 0), "global_tray_id": -1})
-            if prefer_lowest:
-                # Pair with the "available (sorted)" log above so the reporter
-                # bundle shows BOTH what the matcher saw AND which match bucket
-                # won — fast triage when "Prefer Lowest Filament" picks the
-                # wrong slot (#1766).
-                if match:
-                    bucket = (
-                        "idx"
-                        if idx_match is not None
-                        else "exact_color"
-                        if exact_match is not None
-                        else "similar_color"
-                        if similar_match is not None
-                        else "type_only"
-                    )
-                    logger.info(
-                        "[prefer-lowest] picked gtid=%s via %s for req slot=%s",
-                        match["global_tray_id"],
-                        bucket,
-                        req.get("slot_id"),
-                    )
-                else:
-                    logger.info(
-                        "[prefer-lowest] NO MATCH for req slot=%s (type=%r color=%r tii=%r)",
-                        req.get("slot_id"),
-                        req_type,
-                        req_color,
-                        req_tray_info_idx,
-                    )
-
-        # Build mapping array
-        if not comparisons:
-            return None
-
-        max_slot_id = max(c["slot_id"] for c in comparisons)
-        if max_slot_id <= 0:
-            return None
-
-        mapping = [-1] * max_slot_id
-        for c in comparisons:
-            slot_id = c["slot_id"]
-            if slot_id and slot_id > 0:
-                mapping[slot_id - 1] = c["global_tray_id"]
-
-        return mapping
+        return match_filaments_to_slots(
+            required, loaded, policy="slot_order", inv={}, backup_on=True, min_start_g=0
+        ).mapping
 
     def _mark_printer_dispatched(
         self,
@@ -1562,7 +1450,7 @@ class PrintScheduler:
         is never reached). Returns the remaining budget (>= 0) for this tick.
         """
         group_size = await self._get_int_setting(db, "stagger_group_size", default=2)
-        interval_minutes = await self._get_int_setting(db, "stagger_interval_minutes", default=5)
+        interval_minutes = await self._get_int_setting(db, "stagger_interval_minutes", default=3)
         if group_size <= 0 or interval_minutes <= 0:
             # Defensive: schema clamps these to >=1, but a hand-edited row could
             # slip through — treat non-positive config as "staggering off".
@@ -2088,17 +1976,102 @@ class PrintScheduler:
         result = await db.execute(select(Printer).where(Printer.id == printer_id))
         return result.scalar_one_or_none()
 
+    async def _compute_deficit_safe(
+        self,
+        db: AsyncSession,
+        item: PrintQueueItem,
+        *,
+        printer_id_override: int | None = None,
+        ams_mapping_override: str | None = None,
+    ) -> list:
+        """Deficit compute that never wedges the queue on a flaky check.
+
+        Returns the per-slot shortfall list (empty = clear to dispatch). Any
+        exception (e.g. a Spoolman timeout) is logged and treated as "no
+        deficit" — the PrintModal-side check still runs on the manual paths.
+        The optional overrides let the model-based candidate loop check a
+        printer without mutating the item.
+        """
+        try:
+            return await compute_deficit_for_queue_item(
+                db,
+                item,
+                printer_id_override=printer_id_override,
+                ams_mapping_override=ams_mapping_override,
+            )
+        except Exception as e:
+            logger.warning("Filament deficit check failed for item %s: %s", item.id, e)
+            return []
+
+    async def _stage_filament_short(
+        self, db: AsyncSession, item: PrintQueueItem, *, unpin: bool, reason: str = "filament_short"
+    ) -> None:
+        """Mark a queue item low-spool staged (#1496 / #Phase4).
+
+        ``unpin=False`` keeps the item on its assigned printer (pinned path).
+        ``unpin=True`` clears the pin and its stale mapping — used by the
+        model-based path when EVERY eligible printer is short, so ``farm_staging``
+        releases it and the next tick re-runs the full candidate search across the
+        fleet. ``reason`` is the machine ``waiting_reason`` token (``filament_short``
+        or ``start_spool_below_minimum``), now set on BOTH shapes so QueuePage can
+        tell the operator why a pinned item is held.
+        """
+        item.filament_short = True
+        item.manual_start = True
+        item.waiting_reason = reason
+        if unpin:
+            item.printer_id = None
+            item.ams_mapping = None
+        await db.commit()
+
+    async def _stage_model_item_filament_short(
+        self,
+        db: AsyncSession,
+        item: PrintQueueItem,
+        notified_groups: set,
+        reason: str = "filament_short",
+    ) -> None:
+        """Stage a model-based item UNPINNED when all candidates are blocked, and
+        notify AT MOST ONCE per (batch_id, target_model) group per tick.
+
+        The incident sent one waiting notification per unit (10 for a 10-plate
+        run); dedup by group keeps a large run to a single notification. ``reason``
+        distinguishes a true filament deficit from the start-spool floor.
+        """
+        await self._stage_filament_short(db, item, unpin=True, reason=reason)
+        logger.info(
+            "Queue item %s: every eligible %s printer blocked (%s) — staged UNPINNED",
+            item.id,
+            item.target_model,
+            reason,
+        )
+        group_key = (item.batch_id, item.target_model)
+        if group_key in notified_groups:
+            return
+        notified_groups.add(group_key)
+        job_name = await self._get_job_name(db, item)
+        try:
+            await notification_service.on_queue_job_waiting(
+                job_name=job_name,
+                target_model=item.target_model or "",
+                waiting_reason=reason,
+                db=db,
+            )
+        except Exception as e:
+            logger.debug("filament_short notification failed for item %s: %s", item.id, e)
+
     async def _block_on_filament_deficit(
         self,
         db: AsyncSession,
         item: PrintQueueItem,
     ) -> bool:
-        """Promote the item to manual_start when the assigned spool is short (#1496).
+        """Promote the pinned item to manual_start when the assigned spool is short (#1496).
 
         Returns True when this dispatch attempt was blocked, False when the
         item is clear to start. A previously-flagged item whose spool has
         since been swapped to one with enough material clears the flag here
-        so the next scheduler tick dispatches it.
+        so the next scheduler tick dispatches it. (The model-based path checks
+        candidates inline via ``_compute_deficit_safe`` and does not call this.)
         """
         # User has explicitly acknowledged the deficit ("Print Anyway") —
         # don't re-flag, don't even compute. Without this short-circuit the
@@ -2116,19 +2089,10 @@ class PrintScheduler:
             )
             return False
 
-        try:
-            deficit = await compute_deficit_for_queue_item(db, item)
-        except Exception as e:
-            # Never let a flaky deficit check wedge the queue — log and let
-            # dispatch proceed. The PrintModal-side check still runs on the
-            # manual paths.
-            logger.warning("Filament deficit check failed for item %s: %s", item.id, e)
-            return False
+        deficit = await self._compute_deficit_safe(db, item)
 
         if deficit:
-            item.filament_short = True
-            item.manual_start = True
-            await db.commit()
+            await self._stage_filament_short(db, item, unpin=False)
             job_name = await self._get_job_name(db, item)
             printer = await self._get_printer(db, item.printer_id) if item.printer_id else None
             logger.info(
@@ -2242,13 +2206,35 @@ class PrintScheduler:
             # We can't reuse the low-spool path's manual_start-based once-guard
             # because this must stay a self-clearing pending wait.
             already_waiting = item.waiting_reason == "no_usb_drive"
-            if not already_waiting:
+            held_printer_id = item.printer_id
+            # Release a model-targeted unit's scheduler-made assignment before
+            # holding. target_model set ⇒ the pin was made THIS tick by the
+            # model-based path, never a user choice — so a sick-but-idle printer
+            # (here: no USB stick) must not become the unit's permanent home.
+            # Leaving the pin turns the unit into a "specific printer" item the
+            # model path never rebalances, funnelling the whole run onto one broken
+            # printer, one unit per tick, until the pool drains. Clear ams_mapping
+            # too: it was computed for THIS printer's AMS slot layout and the model
+            # path recomputes it per candidate. Always commit the un-pin (even when
+            # already waiting) so a unit held tick N and re-held tick N+1 still ends
+            # unpinned. A user-pinned unit (no target_model) keeps its printer and,
+            # exactly as before, commits only on the transition into the hold.
+            if item.target_model:
+                item.printer_id = None
+                item.ams_mapping = None
+                item.waiting_reason = "no_usb_drive"
+                # Once-guard for the model path's per-assignment notification —
+                # re-selection of the same sick printer every tick must not
+                # re-notify "assigned" (see _hold_unpinned_items in __init__).
+                self._hold_unpinned_items.add(item.id)
+                await db.commit()
+            elif not already_waiting:
                 item.waiting_reason = "no_usb_drive"
                 await db.commit()
             logger.info(
                 "Queue item %s: USB pre-flight held dispatch — no USB drive in printer %s",
                 item.id,
-                item.printer_id,
+                held_printer_id,
             )
             if not already_waiting:
                 job_name = await self._get_job_name(db, item)
@@ -2272,7 +2258,23 @@ class PrintScheduler:
 
         capability = await check_dispatch_capability(db, item, printer)
         if not capability.ok:
-            if item.waiting_reason != capability.reason:
+            # Same un-pin rationale as the USB hold above: a capability BLOCK on a
+            # sick-but-idle printer (nozzle/model/filament mismatch) must not pin a
+            # model-targeted unit onto it, or the run funnels one unit per tick onto
+            # the mismatched printer. Release the scheduler-made pin + its
+            # per-printer AMS mapping so the model path re-evaluates the fleet next
+            # tick; always commit the un-pin so a re-held unit still ends unpinned. A
+            # user-pinned unit (no target_model) holds in place, committing only on a
+            # reason change, exactly as before.
+            if item.target_model:
+                item.printer_id = None
+                item.ams_mapping = None
+                item.waiting_reason = capability.reason
+                # Once-guard for the model path's per-assignment notification
+                # (see _hold_unpinned_items in __init__).
+                self._hold_unpinned_items.add(item.id)
+                await db.commit()
+            elif item.waiting_reason != capability.reason:
                 item.waiting_reason = capability.reason
                 await db.commit()
             logger.info("Queue item %s: capability gate held dispatch — %s", item.id, capability.reason)
@@ -2384,7 +2386,9 @@ class PrintScheduler:
             await self._power_off_if_needed(db, item)
             return
 
-        # G-code injection for auto-print systems (#422) + farm auto-eject.
+        # G-code injection for auto-print systems (#422): the upstream global
+        # per-model start/end snippets only. Farm auto-eject is NOT injected here
+        # anymore (it is a separate server-dispatched motion-only job).
         injected_path = None
         start_gc: str | None = None
         end_gc: str | None = None
@@ -2400,27 +2404,10 @@ class PrintScheduler:
                 logger.warning("Queue item %s: G-code snippet load failed, using original: %s", item.id, e)
                 start_gc = end_gc = None
 
-        # Farm auto-eject: the generated block SUPERSEDES the global per-model end
-        # snippet (start snippet is unchanged) and is injected regardless of the
-        # per-item gcode_injection flag. A block that can't be generated or fails
-        # validation must never dispatch unprotected — fail the item instead.
-        if item.eject_profile_id:
-            from backend.app.services.eject.dispatch import build_eject_snippet
-
-            eject_snippet, eject_error = await build_eject_snippet(db, item, printer, file_path)
-            if eject_error:
-                await self._fail_queue_item(db, item, f"Auto-eject blocked: {eject_error}")
-                logger.error("Queue item %s: auto-eject refused — %s", item.id, eject_error)
-                await self._power_off_if_needed(db, item)
-                return
-            # A (None, None) result is a deliberate SKIP (first-article items): the
-            # part must stay on the plate for inspection, so no eject supersede.
-            if eject_snippet is not None:
-                end_gc = eject_snippet  # supersede the global end snippet
-                logger.info("Queue item %s: auto-eject block generated from profile %s", item.id, item.eject_profile_id)
-            else:
-                logger.info("Queue item %s: first-article — eject injection skipped", item.id)
-
+        # Farm auto-eject no longer injects anything here: the eject sweep is a
+        # SEPARATE server-dispatched motion-only job (the eject monitor dispatches
+        # it after the unit's cooldown gate releases). Print files ship UNMODIFIED
+        # apart from the upstream global per-model start/end snippets below.
         if start_gc or end_gc:
             try:
                 from backend.app.utils.threemf_tools import inject_gcode_into_3mf
@@ -2433,14 +2420,6 @@ class PrintScheduler:
             if injected_path:
                 file_path = injected_path
                 logger.info("Queue item %s: G-code injected for model %s", item.id, printer.model)
-            elif item.eject_profile_id:
-                # Auto-eject was required but the block couldn't be applied — do
-                # NOT dispatch a job the plate-clear monitor would later auto-clear
-                # without an actual sweep having run.
-                await self._fail_queue_item(db, item, "Auto-eject blocked: G-code injection failed")
-                logger.error("Queue item %s: auto-eject injection failed, not dispatching", item.id)
-                await self._power_off_if_needed(db, item)
-                return
             else:
                 logger.warning("Queue item %s: G-code injection returned no result, using original", item.id)
 

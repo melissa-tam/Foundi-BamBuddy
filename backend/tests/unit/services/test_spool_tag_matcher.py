@@ -302,6 +302,140 @@ async def test_get_spool_by_tag_no_false_positive_different_suffix(db_session):
     assert found is None, "Should not match when suffix differs"
 
 
+# -- variance convergence + different-roll guard (printer-3 flap fix) --------
+
+
+@pytest.mark.asyncio
+async def test_variance_match_converges_scanned_identifiers(db_session):
+    """A converge=True variance match persists BOTH scanned tag_uid and tray_uuid
+    onto the spool, so the next read is an exact match — killing the auto-unlink ⇄
+    re-assign reader-variance loop (printer 3 looped all day 2026-07-14)."""
+    spool = Spool(
+        material="PETG",
+        tag_uid="8C0EF4E700000100",
+        tray_uuid="BBC7BDD79A66407BB334A9472E3717E6",
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.commit()
+
+    # Scan: first-char tag variance + an entirely different tray_uuid (reader drift).
+    found = await get_spool_by_tag(db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A", converge=True)
+    assert found is not None and found.id == spool.id
+    await db_session.commit()
+    await db_session.refresh(spool)
+    # Stored identifiers converged onto the scanned values.
+    assert spool.tag_uid == "1C0EF4E700000100"
+    assert spool.tray_uuid == "C4A25BF1D9054983A9C2E73EE0CF4D5A"
+
+    # The next read is now an EXACT tray_uuid match — no variance branch, loop dead.
+    again = await get_spool_by_tag(db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A")
+    assert again is not None and again.id == spool.id
+
+
+@pytest.mark.asyncio
+async def test_variance_match_read_only_does_not_converge(db_session):
+    """Default (converge=False) callers get the match but NEVER mutate the spool —
+    protecting the SpoolBuddy lookup + re-spool donor-resolution read paths."""
+    spool = Spool(
+        material="PETG",
+        tag_uid="8C0EF4E700000100",
+        tray_uuid="BBC7BDD79A66407BB334A9472E3717E6",
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.commit()
+
+    found = await get_spool_by_tag(db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A")
+    assert found is not None and found.id == spool.id
+    await db_session.commit()
+    await db_session.refresh(spool)
+    # Untouched.
+    assert spool.tag_uid == "8C0EF4E700000100"
+    assert spool.tray_uuid == "BBC7BDD79A66407BB334A9472E3717E6"
+
+
+@pytest.mark.asyncio
+async def test_variance_suppressed_when_scanned_tray_uuid_owned_by_other_spool(db_session):
+    """Different-roll guard: when the scanned tray_uuid already belongs to a
+    DIFFERENT non-archived spool (a reused tag on a fresh roll), the tolerant
+    variance match must NOT hijack — the tray_uuid owner wins and the donor is
+    never converged. Protects the reused-tag re-spool sibling guard."""
+    donor = Spool(
+        material="PETG",
+        tag_uid="8C0EF4E700000100",
+        tray_uuid="BBC7BDD79A66407BB334A9472E3717E6",
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    other = Spool(
+        material="PLA",
+        tag_uid="FFEE00112233AABB",
+        tray_uuid="C4A25BF1D9054983A9C2E73EE0CF4D5A",
+        tag_type="bambulab_reused",
+        label_weight=1000,
+        core_weight=250,
+    )
+    for s in (donor, other):
+        s.k_profiles = []
+        s.assignments = []
+        db_session.add(s)
+    await db_session.commit()
+
+    # tag_uid first-char varies vs donor, but tray_uuid == other's uuid.
+    found = await get_spool_by_tag(db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A", converge=True)
+    # The tray_uuid owner is returned — NOT a variance hijack of the donor.
+    assert found is not None and found.id == other.id
+    await db_session.commit()
+    await db_session.refresh(donor)
+    # Donor never converged (its identifiers are untouched).
+    assert donor.tag_uid == "8C0EF4E700000100"
+    assert donor.tray_uuid == "BBC7BDD79A66407BB334A9472E3717E6"
+
+
+@pytest.mark.asyncio
+async def test_unlink_damping_resolves_scanned_tag_to_assigned_spool(db_session, printer_factory):
+    """The auto-unlink damping decision: on an identifier mismatch, resolving the
+    scanned tag via get_spool_by_tag returns the SAME spool already assigned to the
+    tray (reader variance, not a different roll) → main.py skips the unlink. Models
+    printer 3's live DB row exactly. Convergence then makes the mismatch vanish."""
+    printer = await printer_factory(model="H2S")
+    spool = Spool(
+        material="PETG",
+        tag_uid="8C0EF4E700000100",
+        tray_uuid="BBC7BDD79A66407BB334A9472E3717E6",
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.commit()
+    assignment = SpoolAssignment(spool_id=spool.id, printer_id=printer.id, ams_id=0, tray_id=0)
+    db_session.add(assignment)
+    await db_session.commit()
+
+    # The scan the printer keeps sending (tag first-char variance, drifted uuid).
+    resolved = await get_spool_by_tag(db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A", converge=True)
+    # Damping predicate holds → main.py keeps the assignment (no unlink/re-assign).
+    assert resolved is not None and resolved.id == assignment.spool_id
+    await db_session.commit()
+    await db_session.refresh(spool)
+    # And convergence updated the stored identifiers so the mismatch is gone: the
+    # next auto-unlink tick sees spool.tray_uuid == scanned → spool_matches, no flap.
+    assert spool.tray_uuid == "C4A25BF1D9054983A9C2E73EE0CF4D5A"
+
+
 # -- auto_assign_spool (SpoolAssignment creation) ---------------------------
 
 
@@ -1547,3 +1681,104 @@ async def test_auto_assign_local_preset_uses_local_prefix(db_session, printer_fa
     assert mapping.preset_id == "local_50"
     assert mapping.preset_source == "local"
     assert mapping.preset_name == "My Custom PLA"
+
+
+# -- attract-exclusions (silent tagless tracking) ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_matching_untagged_excludes_assigned_spool(db_session, printer_factory):
+    """An untagged spool already bound to an AMS slot must NOT be attracted by a
+    new Bambu RFID read on another slot (it is in service elsewhere)."""
+    printer = await printer_factory()
+    spool = Spool(
+        material="PLA",
+        subtype="Basic",
+        rgba="FFFFFFFF",
+        brand="Bambu Lab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.flush()
+    db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=printer.id, ams_id=0, tray_id=0))
+    await db_session.commit()
+
+    found = await find_matching_untagged_spool(db_session, SAMPLE_TRAY)
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_find_matching_untagged_excludes_ams_auto_origin(db_session):
+    """An auto-minted tagless row (data_origin='ams_auto') is the farm's own
+    silently-tracked third-party spool — a Bambu tag must never hijack it."""
+    spool = Spool(
+        material="PLA",
+        subtype="Basic",
+        rgba="FFFFFFFF",
+        brand="Bambu Lab",
+        label_weight=1000,
+        core_weight=250,
+        data_origin="ams_auto",
+    )
+    db_session.add(spool)
+    await db_session.commit()
+
+    found = await find_matching_untagged_spool(db_session, SAMPLE_TRAY)
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_find_matching_untagged_still_matches_unassigned_manual(db_session):
+    """Regression guard: a normal unassigned manually-logged spool (no origin, no
+    assignment) is STILL attracted — the exclusions are narrow."""
+    spool = Spool(
+        material="PLA",
+        subtype="Basic",
+        rgba="FFFFFFFF",
+        brand="Bambu Lab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    db_session.add(spool)
+    await db_session.commit()
+
+    found = await find_matching_untagged_spool(db_session, SAMPLE_TRAY)
+    assert found is not None
+    assert found.id == spool.id
+
+
+# -- auto_assign_spool stamps first_loaded_at once --------------------------
+
+
+@pytest.mark.asyncio
+async def test_auto_assign_stamps_first_loaded_once(db_session, printer_factory):
+    """auto_assign_spool stamps first_loaded_at on the first assignment and never
+    re-stamps (a spool pulled and re-assigned keeps its original in-service time)."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    printer = await printer_factory()
+    spool = Spool(material="PLA", label_weight=1000, core_weight=250)
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.flush()
+    assert spool.first_loaded_at is None
+
+    mock_pm = MagicMock()
+    mock_pm.get_status.return_value = None
+    mock_pm.get_client.return_value = None
+
+    await auto_assign_spool(printer.id, 0, 0, spool, mock_pm, db_session)
+    await db_session.commit()
+    stamped = spool.first_loaded_at
+    assert stamped is not None
+
+    await asyncio.sleep(0.01)
+    # Re-assign the same spool to a different slot → timestamp unchanged.
+    await auto_assign_spool(printer.id, 1, 0, spool, mock_pm, db_session)
+    await db_session.commit()
+    assert spool.first_loaded_at == stamped

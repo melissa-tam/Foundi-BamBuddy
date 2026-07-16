@@ -221,7 +221,7 @@ export function isPlaceholderDate(scheduledTime: string | null | undefined): boo
 }
 
 /**
- * Banding tie-break for `preferLowestSortKey`, mirroring backend
+ * Banding tie-break for `selectionSortKey`, mirroring backend
  * `PrintScheduler._slot_priority` so regular AMS < AMS-HT < external on ties
  * regardless of the raw `ams_id`. In particular, `ams_id = -1` (VT / external
  * in `buildLoadedFilaments`) MUST NOT sort to a negative number or it would
@@ -234,24 +234,54 @@ function slotPriority(amsId: number | undefined, trayId: number | undefined): nu
 }
 
 /**
- * Two-tier sort key for the "Prefer Lowest Remaining Filament" preference (#1766).
- *
- * Mirrors backend `_prefer_lowest_sort_key` in `print_scheduler.py:1161` so the
- * client-side sort that PrintModal pre-computes lines up with the dispatch-time
- * sort. Inventory-bound spools sort before MQTT-only ones (tier 0 vs tier 1) so
- * the user's tracked grams beat the printer's per-cent estimate; within each
- * tier the lowest value wins, with the slot-position tie-break above so the
- * order is deterministic across identical spools.
- *
- * `inventoryByTrayId` is the `globalTrayId -> grams_remaining` map derived from
- * the user's spool assignments. Pass `undefined` to fall back to remain%-only
- * sorting (preserves pre-#1766 behaviour for callers that don't yet wire it in).
+ * Spool-selection policy — mirrors the backend `spool_selection_policy` setting
+ * ('slot_order' | 'lowest_remaining' | 'first_loaded'). This is the manual-print
+ * mirror of the scheduler's dispatch-time selection so the PrintModal preview
+ * picks the same spool the dispatcher would.
  */
-export function preferLowestSortKey(
+export type SpoolSelectionPolicy = 'slot_order' | 'lowest_remaining' | 'first_loaded';
+
+/**
+ * Options bundle for the policy-keyed auto-match sort + minimum-start filter.
+ * `policy` is the ALREADY backup-gated policy (see `effectiveSelectionPolicy`).
+ * The two maps are keyed by `globalTrayId`:
+ *  - `inventoryByTrayId`: remaining grams for inventory-bound slots.
+ *  - `firstLoadedByTrayId`: first-in-service epoch ms for slots that have one.
+ * `minStartG` drops KNOWN-low candidates from AUTO selection (0/undefined = off).
+ */
+export interface SelectionOptions {
+  policy: SpoolSelectionPolicy;
+  inventoryByTrayId?: Map<number, number>;
+  firstLoadedByTrayId?: Map<number, number>;
+  minStartG?: number;
+}
+
+/**
+ * Two-tier sort key for a spool-selection policy, mirroring the backend
+ * selection sort so the client-side PrintModal preview lines up with dispatch.
+ *
+ * - 'lowest_remaining' (#1766): inventory-bound spools (tier 0, sorted by tracked
+ *   grams ascending) beat MQTT-only ones (tier 1, sorted by remain% with unknown
+ *   clamped to 101). Slot position is the deterministic tie-break.
+ * - 'first_loaded' (FIFO): spools with a first-loaded timestamp (tier 0, oldest
+ *   first) beat those without one (tier 1). Slot position tie-break.
+ *
+ * 'slot_order' never calls this (no reorder). `slotPriority` clamps external/VT
+ * (ams_id < 0) to 10_000 so it can't beat AMS slot 0.
+ */
+export function selectionSortKey(
   f: { globalTrayId: number; amsId?: number; trayId?: number; remain?: number },
+  policy: SpoolSelectionPolicy,
   inventoryByTrayId: Map<number, number> | undefined,
+  firstLoadedByTrayId: Map<number, number> | undefined,
 ): [number, number, number] {
   const slot = slotPriority(f.amsId, f.trayId);
+  if (policy === 'first_loaded') {
+    const ts = firstLoadedByTrayId?.get(f.globalTrayId);
+    if (ts != null) return [0, ts, slot];
+    return [1, 0, slot];
+  }
+  // 'lowest_remaining'
   if (inventoryByTrayId && inventoryByTrayId.has(f.globalTrayId)) {
     return [0, inventoryByTrayId.get(f.globalTrayId) ?? 0, slot];
   }
@@ -259,7 +289,7 @@ export function preferLowestSortKey(
   return [1, remain >= 0 ? remain : 101, slot];
 }
 
-/** Tuple compare for `preferLowestSortKey` outputs. */
+/** Tuple compare for `selectionSortKey` outputs. */
 export function compareSortKeys(
   a: [number, number, number],
   b: [number, number, number],
@@ -268,44 +298,77 @@ export function compareSortKeys(
 }
 
 /**
- * Effective "Prefer lowest remaining filament" preference for a given printer,
- * gated on its AMS Filament Backup state (#1766).
- *
- * Without backup, the printer can't switch to a second spool when the picked
- * one runs out — so even with the user setting on, sorting toward the lowest
- * leaves the print at risk. Mirrors the backend gate in
- * `print_scheduler.py::_compute_ams_mapping_for_printer`. `null`/`undefined`
- * (unknown state, e.g. A1 family) preserves today's behaviour intentionally.
+ * Effective (backup-gated) selection policy for a printer. The #1766 gate
+ * applies ONLY to 'lowest_remaining': without AMS Filament Backup the printer
+ * can't switch off a near-empty spool mid-print, so we fall back to 'slot_order'.
+ * 'first_loaded' and 'slot_order' are never gated. Mirrors the backend gate in
+ * `print_scheduler.py::_compute_ams_mapping_for_printer`. An unknown/undefined
+ * setting resolves to the backend default 'first_loaded'.
  */
-export function effectivePreferLowest(
-  setting: boolean | undefined,
+export function effectiveSelectionPolicy(
+  policy: string | null | undefined,
   amsFilamentBackup: boolean | null | undefined,
-): boolean {
-  if (!setting) return false;
-  return amsFilamentBackup !== false;
+): SpoolSelectionPolicy {
+  const p: SpoolSelectionPolicy =
+    policy === 'slot_order' || policy === 'lowest_remaining' || policy === 'first_loaded'
+      ? policy
+      : 'first_loaded';
+  if (p === 'lowest_remaining' && amsFilamentBackup === false) return 'slot_order';
+  return p;
 }
 
 /**
- * Auto-match a filament requirement to a loaded filament, respecting nozzle constraints.
- * Used by both single-printer (FilamentMapping) and multi-printer (InlineMappingEditor) paths.
+ * Drop candidates whose KNOWN inventory grams fall below the minimum-start
+ * floor (unknown grams stay eligible). AUTO-match only — mirrors the backend
+ * start-weight floor so a spool too low to START a print is never auto-picked.
+ * Manual per-slot overrides bypass this entirely.
+ */
+export function filterByMinStart<T extends { globalTrayId: number }>(
+  filaments: T[],
+  inventoryByTrayId: Map<number, number> | undefined,
+  minStartG: number | undefined,
+): T[] {
+  if (!minStartG || minStartG <= 0 || !inventoryByTrayId) return filaments;
+  return filaments.filter((f) => {
+    const grams = inventoryByTrayId.get(f.globalTrayId);
+    return grams === undefined || grams >= minStartG;
+  });
+}
+
+/**
+ * Order a candidate pool for AUTO-matching: drop min-start-blocked spools, then
+ * sort by the selection policy. 'slot_order' keeps the incoming order. Returns a
+ * new array when it sorts; never mutates the input.
+ */
+export function orderCandidatesForAutoMatch<
+  T extends { globalTrayId: number; amsId?: number; trayId?: number; remain?: number },
+>(filaments: T[], selection: SelectionOptions | undefined): T[] {
+  if (!selection) return filaments;
+  const filtered = filterByMinStart(filaments, selection.inventoryByTrayId, selection.minStartG);
+  if (selection.policy === 'slot_order') return filtered;
+  return [...filtered].sort((a, b) =>
+    compareSortKeys(
+      selectionSortKey(a, selection.policy, selection.inventoryByTrayId, selection.firstLoadedByTrayId),
+      selectionSortKey(b, selection.policy, selection.inventoryByTrayId, selection.firstLoadedByTrayId),
+    ),
+  );
+}
+
+/**
+ * Auto-match a filament requirement to a loaded filament, respecting nozzle
+ * constraints and the spool-selection policy + min-start floor. Used by both
+ * single-printer (FilamentMapping) and multi-printer (InlineMappingEditor) paths.
  */
 export function autoMatchFilament(
   req: { type?: string; color?: string; nozzle_id?: number | null },
   loadedFilaments: { globalTrayId: number; amsId?: number; trayId?: number; type?: string; color?: string; extruderId?: number; remain?: number }[],
   usedTrayIds: Set<number>,
-  preferLowest?: boolean,
-  inventoryByTrayId?: Map<number, number>,
+  selection?: SelectionOptions,
 ): typeof loadedFilaments[number] | undefined {
-  let nozzleFilaments = filterFilamentsByNozzle(loadedFilaments, req.nozzle_id);
-
-  if (preferLowest) {
-    nozzleFilaments = [...nozzleFilaments].sort((a, b) =>
-      compareSortKeys(
-        preferLowestSortKey(a, inventoryByTrayId),
-        preferLowestSortKey(b, inventoryByTrayId),
-      ),
-    );
-  }
+  const nozzleFilaments = orderCandidatesForAutoMatch(
+    filterFilamentsByNozzle(loadedFilaments, req.nozzle_id),
+    selection,
+  );
 
   const exactMatch = nozzleFilaments.find(
     (f) =>
@@ -407,15 +470,15 @@ function normalizeColorForId(raw: string | null | undefined): string {
 /**
  * Compute backup pairs for the AMS Backup modal (#1762).
  *
- * Strict identity rule (mirrors backend `_material_identity_internal` /
- * `_material_identity_spoolman`): slots pair ONLY when they share the same
- * Bambu preset ID (`tray_info_idx`, e.g. "GFA00") AND the same colour. The
+ * Identity rule (display-side sibling of the backend's live-tray-identity
+ * pooling in `filament_deficit._live_tray_identities`): slots pair ONLY when
+ * they share the same slot-configured preset (`tray_info_idx`, e.g. "GFA00" —
+ * set even for manually-configured no-RFID spools) AND the same colour. The
  * preset identifies the filament profile (PETG HF, PLA Basic, etc.); the
  * colour pins the variant — three PETG HF spools in different colours
- * absolutely don't back each other up. User-tagged spools without a preset
- * never pair — Bambu's firmware backup logic relies on the preset, and
- * pairing on cosmetic name/colour match alone would let two visually-
- * identical but materially-different spools be treated as backups.
+ * absolutely don't back each other up. Slots with no preset configured never
+ * pair here; pairing on cosmetic name/colour match alone would let two
+ * visually-identical but materially-different spools be treated as backups.
  *
  * Empty slots are skipped entirely. Every non-empty slot is returned — slots
  * without a peer come back as 1-member entries so the modal can list them as

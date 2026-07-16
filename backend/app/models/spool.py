@@ -68,8 +68,19 @@ class Spool(Base):
     tag_uid: Mapped[str | None] = mapped_column(String(32))  # RFID tag UID (up to 32 hex chars)
     tray_uuid: Mapped[str | None] = mapped_column(String(32))  # Bambu Lab spool UUID (32 hex chars)
     data_origin: Mapped[str | None] = mapped_column(String(20))  # How data was populated: manual, rfid_auto, nfc_link
-    tag_type: Mapped[str | None] = mapped_column(String(20))  # Tag vendor: bambulab, generic, etc.
+    tag_type: Mapped[str | None] = mapped_column(String(20))  # Tag vendor: bambulab, generic, bambulab_reused, etc.
     archived_at: Mapped[datetime | None] = mapped_column(DateTime)  # NULL = active
+    # Hardware-observed exhaustion marker for the reused-tag auto re-spool flow.
+    # Set ONLY when the AMS physically saw the filament end (runout HMS / seamless
+    # backup-swap) — NEVER by gram estimates or the AMS remain%. It is the
+    # certainty key that gates the automatic re-spool tier; NULL = never observed
+    # spent (falls back to the one-click prompt tier).
+    spent_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # FIFO substrate: when this spool FIRST entered service (first time it got a
+    # SpoolAssignment). Stamped by later work items — the column exists so the
+    # spool-selection policy can order candidates oldest-first. NULL = never
+    # loaded (a pristine, never-assigned inventory spool).
+    first_loaded_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 

@@ -1,3 +1,4 @@
+import json
 import re
 from typing import Literal
 
@@ -327,6 +328,23 @@ def _validate_email_claim_name(v: str) -> str:
     return v
 
 
+def _validate_group_mapping_values(v: dict[str, str] | None) -> dict[str, str] | None:
+    """Validate an OIDC claim-value -> group-name mapping.
+
+    Keys are provider-supplied claim values; values are Bambuddy group names
+    and must be non-empty strings (an empty value would silently strip a user
+    of all groups on sync).
+    """
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise ValueError("group_mapping must be an object mapping claim values to group names")
+    for name in v.values():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("group_mapping values must be non-empty group names")
+    return v
+
+
 def _validate_icon_url(v: str | None) -> str | None:
     """Reject non-HTTPS icon URLs and SSRF-unsafe hosts.
 
@@ -414,6 +432,11 @@ class OIDCProviderCreate(BaseModel):
     icon_url: str | None = None
     default_group_id: int | None = None
     is_autologin: bool = False  # #1589 — at most one provider may carry this
+    # Claim -> group mapping (generic). groups_claim names the token claim that
+    # carries the user's group/role values; group_mapping maps those values to
+    # Bambuddy group names.
+    groups_claim: str | None = Field(default=None, max_length=64)
+    group_mapping: dict[str, str] | None = None
 
     @field_validator("issuer_url")
     @classmethod
@@ -422,6 +445,18 @@ class OIDCProviderCreate(BaseModel):
         if result is None:
             raise ValueError("issuer_url is required")
         return result
+
+    @field_validator("groups_claim")
+    @classmethod
+    def validate_groups_claim(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_email_claim_name(v)
+
+    @field_validator("group_mapping")
+    @classmethod
+    def validate_group_mapping(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return _validate_group_mapping_values(v)
 
     @field_validator("scopes")
     @classmethod
@@ -471,6 +506,8 @@ class OIDCProviderUpdate(BaseModel):
     icon_url: str | None = None
     default_group_id: int | None = None
     is_autologin: bool | None = None  # #1589
+    groups_claim: str | None = Field(default=None, max_length=64)
+    group_mapping: dict[str, str] | None = None
 
     @field_validator("scopes")
     @classmethod
@@ -483,6 +520,18 @@ class OIDCProviderUpdate(BaseModel):
         if v is None:
             return None
         return _validate_email_claim_name(v)
+
+    @field_validator("groups_claim")
+    @classmethod
+    def validate_groups_claim(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_email_claim_name(v)
+
+    @field_validator("group_mapping")
+    @classmethod
+    def validate_group_mapping(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return _validate_group_mapping_values(v)
 
     @field_validator("icon_url")
     @classmethod
@@ -518,12 +567,29 @@ class OIDCProviderResponse(BaseModel):
     icon_url: str | None = None
     default_group_id: int | None = None
     is_autologin: bool = False  # #1589
+    groups_claim: str | None = None
+    group_mapping: dict[str, str] | None = None
     # Set explicitly in the route handler from `icon_content_type is not None`
     # rather than `@computed_field` (project policy) or `icon_data is not None`
     # (would trigger an async lazy-load on the deferred BLOB column).
     # Required (no default) so Pydantic fails loudly if any code path skips
     # `_build_provider_response` and tries `model_validate(provider)` directly.
     has_icon: bool
+
+    @field_validator("group_mapping", mode="before")
+    @classmethod
+    def _parse_group_mapping(cls, v):
+        # The ORM column stores JSON text; from_attributes hands us that string.
+        # Parse it back to a dict for the API (None/empty -> None).
+        if isinstance(v, str):
+            if not v:
+                return None
+            try:
+                parsed = json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return v
 
     class Config:
         from_attributes = True

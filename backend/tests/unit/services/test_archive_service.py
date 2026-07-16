@@ -938,3 +938,213 @@ class TestMultiPlateSliceInfoSum:
         assert meta["print_time_seconds"] == 300
         # Only the second plate's weight contributed.
         assert meta["filament_used_grams"] == 5.0
+
+
+class TestPlateCapabilities:
+    """Per-plate nozzle-requirement capabilities feed the farm capability gate.
+
+    ``ThreeMFParser`` builds ``metadata["plate_capabilities"]`` — a dict keyed
+    by string plate index, each entry carrying any of ``nozzle_diameters`` /
+    ``filament_nozzles`` / ``nozzles_used``. ``extruder_id`` on each used
+    filament is the MQTT extruder id (0=right, 1=left) derived by the canonical
+    ``extract_nozzle_mapping_from_3mf`` (group_id × physical_extruder_map), or
+    None for single-nozzle files.
+    """
+
+    @staticmethod
+    def _make_3mf(slice_info_xml: str | None = None, project_settings: dict | None = None) -> str:
+        """Write a minimal .3mf with optional slice_info + project_settings."""
+        import json
+        import os
+        import tempfile
+        import zipfile
+
+        fd, path = tempfile.mkstemp(suffix=".3mf")
+        os.close(fd)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("3D/3dmodel.model", "<model/>")
+            if slice_info_xml is not None:
+                zf.writestr("Metadata/slice_info.config", slice_info_xml)
+            if project_settings is not None:
+                zf.writestr("Metadata/project_settings.config", json.dumps(project_settings))
+        return path
+
+    def test_h2c_single_plate_capabilities(self):
+        """H2C-shaped dual-nozzle plate: filament group_id 0 maps through
+        physical_extruder_map ["1","0"] to MQTT extruder id 1 (index 0 of the
+        map is "1"), matching the real corpus mapping ``{1: 1}``.
+        """
+        from backend.app.services.archive import ThreeMFParser
+
+        slice_info_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <config>
+            <plate>
+                <metadata key="index" value="1" />
+                <metadata key="nozzle_diameters" value="0.4,0.4" />
+                <metadata key="prediction" value="2288" />
+                <metadata key="weight" value="12.31" />
+                <object identify_id="69" name="Cube" skipped="false" />
+                <filament id="1" type="PETG" color="#000000" used_g="12.31"
+                    group_id="0" nozzle_diameter="0.40" volume_type="Standard"
+                    used_for_object="true" />
+                <nozzle id="0" extruder_id="1" nozzle_diameter="0.4" volume_type="Standard" />
+            </plate>
+        </config>
+        """
+        project_settings = {
+            "physical_extruder_map": ["1", "0"],
+            "extruder_nozzle_stats": ["Standard#1", "Standard#4"],
+            "nozzle_diameter": ["0.4", "0.4"],
+        }
+        meta = ThreeMFParser(self._make_3mf(slice_info_xml, project_settings)).parse()
+
+        caps = meta["plate_capabilities"]["1"]
+        assert caps["nozzle_diameters"] == [0.4, 0.4]
+        # group_id 0 → physical_extruder_map[0] == "1" → MQTT extruder id 1.
+        assert caps["filament_nozzles"] == [
+            {
+                "slot_id": 1,
+                "nozzle_diameter": 0.4,
+                "volume_type": "Standard",
+                "extruder_id": 1,
+            }
+        ]
+        # <nozzle>.extruder_id is the 1-based slicer-internal id, kept verbatim.
+        assert caps["nozzles_used"] == [
+            {
+                "id": 0,
+                "extruder_id": 1,
+                "nozzle_diameter": 0.4,
+                "volume_type": "Standard",
+            }
+        ]
+
+    def test_h2s_multi_plate_capabilities_have_null_extruder(self):
+        """Single-nozzle H2S multi-plate export: physical_extruder_map ["0"]
+        (len 1) means no dual mapping, so every filament's extruder_id is None,
+        and each of the 5 plates gets its own capability row.
+        """
+        from backend.app.services.archive import ThreeMFParser
+
+        plates = "".join(
+            f"""
+            <plate>
+                <metadata key="index" value="{i}" />
+                <metadata key="nozzle_diameters" value="0.6" />
+                <metadata key="prediction" value="1000" />
+                <metadata key="weight" value="10.0" />
+                <filament id="1" type="PETG" color="#000000" used_g="10.0"
+                    group_id="0" nozzle_diameter="0.60" volume_type="High Flow"
+                    used_for_object="true" />
+                <nozzle id="0" extruder_id="1" nozzle_diameter="0.6" volume_type="High Flow" />
+            </plate>"""
+            for i in range(1, 6)
+        )
+        slice_info_xml = f'<?xml version="1.0" encoding="UTF-8"?><config>{plates}</config>'
+        project_settings = {"physical_extruder_map": ["0"], "nozzle_diameter": ["0.6"]}
+        meta = ThreeMFParser(self._make_3mf(slice_info_xml, project_settings)).parse()
+
+        caps = meta["plate_capabilities"]
+        assert set(caps.keys()) == {"1", "2", "3", "4", "5"}
+        for key in caps:
+            entry = caps[key]
+            assert entry["nozzle_diameters"] == [0.6]
+            assert len(entry["filament_nozzles"]) == 1
+            assert entry["filament_nozzles"][0]["slot_id"] == 1
+            assert entry["filament_nozzles"][0]["nozzle_diameter"] == 0.6
+            assert entry["filament_nozzles"][0]["extruder_id"] is None
+
+    def test_comma_split_mixed_diameters(self):
+        """A ``nozzle_diameters`` string with distinct values splits into a
+        float list preserving each entry (mixed-diameter dual)."""
+        from backend.app.services.archive import ThreeMFParser
+
+        slice_info_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <config>
+            <plate>
+                <metadata key="index" value="1" />
+                <metadata key="nozzle_diameters" value="0.4,0.6" />
+                <metadata key="prediction" value="100" />
+                <metadata key="weight" value="10.0" />
+            </plate>
+        </config>
+        """
+        meta = ThreeMFParser(self._make_3mf(slice_info_xml)).parse()
+        assert meta["plate_capabilities"]["1"]["nozzle_diameters"] == [0.4, 0.6]
+
+    def test_project_settings_uniform_nozzle_kept_scalar(self):
+        """project_settings nozzle_diameter ["0.4","0.4"] (all equal) collapses
+        to a scalar 0.4 — the common single-diameter dual case."""
+        from backend.app.services.archive import ThreeMFParser
+
+        slice_info_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <config><plate><metadata key="index" value="1" /></plate></config>
+        """
+        project_settings = {"nozzle_diameter": ["0.4", "0.4"]}
+        meta = ThreeMFParser(self._make_3mf(slice_info_xml, project_settings)).parse()
+        assert meta["nozzle_diameter"] == 0.4
+
+    def test_project_settings_mixed_nozzle_absent_others_parsed(self):
+        """A mixed-diameter list leaves ``nozzle_diameter`` UNSET, but the
+        per-key guard keeps bed/nozzle temperature + printer_model parsing —
+        pre-fix, one blanket try/except dropped them all together."""
+        from backend.app.services.archive import ThreeMFParser
+        from backend.app.utils.printer_models import normalize_printer_model
+
+        # No printer_model_id in slice_info → sliced_for_model can only come
+        # from project_settings, isolating the per-key guard under test.
+        slice_info_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <config><plate><metadata key="index" value="1" /></plate></config>
+        """
+        project_settings = {
+            "nozzle_diameter": ["0.4", "0.6"],
+            "bed_temperature": ["70"],
+            "nozzle_temperature": ["245", "245"],
+            "printer_model": "Bambu Lab H2C",
+        }
+        meta = ThreeMFParser(self._make_3mf(slice_info_xml, project_settings)).parse()
+        assert "nozzle_diameter" not in meta
+        assert meta["bed_temperature"] == 70
+        assert meta["nozzle_temperature"] == 245
+        assert meta["sliced_for_model"] == normalize_printer_model("Bambu Lab H2C")
+
+    def test_no_slice_info_no_plate_capabilities(self):
+        """No slice_info.config → no ``plate_capabilities`` key at all, while
+        project_settings-derived fields still parse."""
+        from backend.app.services.archive import ThreeMFParser
+
+        project_settings = {"nozzle_diameter": ["0.4"], "layer_height": ["0.2"]}
+        meta = ThreeMFParser(self._make_3mf(None, project_settings)).parse()
+        assert "plate_capabilities" not in meta
+        assert meta["nozzle_diameter"] == 0.4
+
+    def test_malformed_filament_attrs_skipped_without_killing_plate(self):
+        """A filament with an unparseable slot id is skipped; a sibling with a
+        bad nozzle_diameter is kept with a null diameter — the plate entry
+        survives either way."""
+        from backend.app.services.archive import ThreeMFParser
+
+        slice_info_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <config>
+            <plate>
+                <metadata key="index" value="1" />
+                <metadata key="nozzle_diameters" value="0.6" />
+                <metadata key="prediction" value="100" />
+                <metadata key="weight" value="10.0" />
+                <filament id="abc" used_g="5.0" nozzle_diameter="0.6" volume_type="High Flow" />
+                <filament id="2" used_g="3.0" nozzle_diameter="notnum" volume_type="High Flow" />
+            </plate>
+        </config>
+        """
+        meta = ThreeMFParser(self._make_3mf(slice_info_xml)).parse()
+        caps = meta["plate_capabilities"]["1"]
+        # Bad-id filament dropped; the id="2" filament kept with null diameter.
+        assert caps["filament_nozzles"] == [
+            {
+                "slot_id": 2,
+                "nozzle_diameter": None,
+                "volume_type": "High Flow",
+                "extruder_id": None,
+            }
+        ]
+        assert caps["nozzle_diameters"] == [0.6]

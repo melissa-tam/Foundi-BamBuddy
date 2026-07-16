@@ -51,6 +51,7 @@ from backend.app.services.bambu_ftp import (
 from backend.app.services.hms_errors import hms_error_payload
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
 from backend.app.services.printer_manager import (
+    _eject_watch_payload,
     get_derived_status_name,
     printer_manager,
     resolve_plate_id,
@@ -459,6 +460,7 @@ async def get_printer_status(
             connected=False,
             model_mismatch=printer_manager.is_model_mismatch(printer_id),
             model_mismatch_reason=printer_manager.model_mismatch_reason(printer_id),
+            eject_watch=_eject_watch_payload(printer_id),
         )
 
     # Determine cover URL if there's an active print (including paused)
@@ -776,6 +778,10 @@ async def get_printer_status(
         quarantine_reason=printer.quarantine_reason,
         model_mismatch=printer_manager.is_model_mismatch(printer_id),
         model_mismatch_reason=printer_manager.model_mismatch_reason(printer_id),
+        # In-flight eject cooldown watch threshold — mirrors the WS payload
+        # (_eject_watch_payload is the single origin) so the UI does not flip
+        # "Cooling" ↔ "Plate not Clear" between the REST poll and the socket push.
+        eject_watch=_eject_watch_payload(printer_id),
         supports_drying=supports_drying(printer.model, state.firmware_version),
         supports_drying_while_printing=supports_drying_while_printing(printer.model, state.firmware_version),
         supports_chamber_heater=supports_chamber_heater(printer.model),
@@ -1956,24 +1962,33 @@ async def get_inventory_remain(
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_READ),
     db: AsyncSession = Depends(get_db),
 ):
-    """Per-globalTrayId remaining grams for slots bound to an inventory spool.
+    """Per-globalTrayId inventory facts for slots bound to an inventory spool.
 
-    Mirrors `_build_inventory_remain_overrides` server-side so the PrintModal
-    client can apply the same two-tier "Prefer Lowest Remaining Filament" sort
-    the dispatcher uses (#1766). Works for both internal inventory and
-    Spoolman; unbound slots are absent from the map (client falls back to the
-    printer's MQTT `remain` for those).
+    Sourced from `spool_selection.build_slot_inventory` — the SAME slot inventory
+    the dispatcher's selection policies consume — so the PrintModal client can
+    apply the matching sort. Returns:
+
+    - `inventory_remain_g`: `{global_tray_id: remaining_grams}` (backward-compatible
+      shape; unbound slots absent, client falls back to MQTT `remain`).
+    - `first_loaded`: `{global_tray_id: iso8601 | null}` — first-in-service time
+      for the FIFO ("first loaded") policy.
+
+    Works for both internal inventory and Spoolman.
     """
     from backend.app.services.print_scheduler import PrintScheduler
+    from backend.app.services.spool_selection import build_slot_inventory, epoch_to_iso
 
     state = printer_manager.get_status(printer_id)
     if not state:
-        return {"inventory_remain_g": {}}
+        return {"inventory_remain_g": {}, "first_loaded": {}}
 
     scheduler = PrintScheduler()
     loaded = scheduler._build_loaded_filaments(state)
-    overrides = await scheduler._build_inventory_remain_overrides(db, printer_id, loaded)
-    return {"inventory_remain_g": {str(k): v for k, v in overrides.items()}}
+    inv = await build_slot_inventory(db, printer_id, loaded)
+    return {
+        "inventory_remain_g": {str(gtid): si.remaining_g for gtid, si in inv.items() if si.remaining_g is not None},
+        "first_loaded": {str(gtid): epoch_to_iso(si.first_loaded_ord) for gtid, si in inv.items()},
+    }
 
 
 # ============================================
@@ -3184,9 +3199,9 @@ async def bed_jog(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    from backend.app.services.printer_manager import is_bed_slinger
+    from backend.app.utils.printer_models import is_bedslinger_model
 
-    gcode_distance = -distance if is_bed_slinger(printer.model) else distance
+    gcode_distance = -distance if is_bedslinger_model(printer.model) else distance
 
     lines = []
     if force:
@@ -3277,7 +3292,7 @@ async def home_axes(
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
 ):
-    """Run the printer's full auto-home sequence via bare `G28`.
+    """Run the printer's full auto-home sequence (model-aware).
 
     Bambu printers (H2C / H2D / H2S / X1 family) home the Z axis by moving
     the BED UP toward an endstop at the top of travel. If the toolhead is
@@ -3286,11 +3301,14 @@ async def home_axes(
     without stopping at a safe height because `G28 Z` skipped the
     toolhead-park step that a full `G28` runs first.
 
-    The endpoint therefore ignores the `axes` argument and always sends a
-    bare `G28`, which the firmware expands into a safe multi-step sequence
-    (park toolhead → home XY → home Z). The argument is kept only for
-    backward-compat with existing clients; sending an invalid value still
-    returns 400 so typos surface instead of silently proceeding.
+    The endpoint ignores the `axes` argument and always runs a full home via
+    `client.home_axes()`, which is model-aware: single-nozzle models get a
+    bare `G28` (firmware expands it into park toolhead → home XY → home Z);
+    dual-nozzle (Vortek) models — H2C / H2D / X2D — get the torque-parameterized
+    stock forms (`G28 X T300` / `G28 Y T300` / `G28 Z P0 T250`) because a bare
+    `G28` stall-loops that firmware (007-H2C ram incident). The argument is kept
+    only for backward-compat with existing clients; sending an invalid value
+    still returns 400 so typos surface instead of silently proceeding.
     """
     axes = axes.lower()
     if axes not in ("z", "xy", "all"):
@@ -3305,7 +3323,7 @@ async def home_axes(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    if not client.send_gcode("G28"):
+    if not client.home_axes():
         raise HTTPException(500, "Failed to send home command")
 
     return {"success": True, "message": "Full auto-home sequence sent"}
@@ -3550,6 +3568,7 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
             ZERO_TRAY_UUID,
             is_bambu_tag,
         )
+        from backend.app.utils.printer_models import extruder_for_ams, nozzle_for_ams_unit
         from backend.app.utils.tag_normalization import (
             normalize_tag_uid,
             normalize_tray_uuid,
@@ -3580,19 +3599,10 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
             return
 
         # Compute nozzle/extruder once — used by both local and Spoolman lookup.
-        nozzle_diameter = "0.4"
-        if state.nozzles:
-            nd = state.nozzles[0].nozzle_diameter
-            if nd:
-                nozzle_diameter = nd
+        # Diameter comes from the SERVING extruder's hotend (mixed-nozzle H2C safe).
+        nozzle_diameter = nozzle_for_ams_unit(state, ams_id, slot_id)
 
-        slot_extruder = None
-        if state.ams_extruder_map:
-            if ams_id == 255:
-                # External slots: ext-L (tray 0) → extruder 1, ext-R (tray 1) → extruder 0
-                slot_extruder = 1 - slot_id
-            else:
-                slot_extruder = state.ams_extruder_map.get(str(ams_id))
+        slot_extruder = extruder_for_ams(state.ams_extruder_map, ams_id, slot_id) if state.ams_extruder_map else None
 
         # 3-stage K-profile cascade: local SpoolKProfile → Spoolman SpoolmanKProfile
         # → live tray.cali_idx fallback. Pre-Phase-13 only handled the local path

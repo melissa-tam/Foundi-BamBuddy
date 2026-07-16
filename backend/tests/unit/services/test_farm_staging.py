@@ -86,6 +86,20 @@ class TestReleaseFilamentStaged:
         assert on_target.manual_start is False
         assert elsewhere.manual_start is True  # untouched — other printer
 
+    async def test_scoped_release_includes_unpinned_items(self, db_session, monkeypatch):
+        """UNPINNED all-short items (printer_id NULL, staged by the model-based
+        candidate loop) are released by ANY printer-scoped pass — a spool swap on
+        one printer re-opens the fleet-wide search. Other pinned printers stay put."""
+        unpinned = await _add_staged(db_session, printer_id=None, pos=1)
+        on_two = await _add_staged(db_session, printer_id=2, pos=2)
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        released = await farm_staging.release_filament_staged(db_session, printer_id=1)
+        assert released == 1  # the unpinned item, even though it targets no printer
+        await db_session.refresh(unpinned)
+        await db_session.refresh(on_two)
+        assert unpinned.manual_start is False
+        assert on_two.manual_start is True  # pinned to printer 2 — untouched
+
     async def test_deficit_failure_leaves_item_staged(self, db_session, monkeypatch):
         item = await _add_staged(db_session, printer_id=1)
         _patch_deficit(monkeypatch, AsyncMock(side_effect=RuntimeError("spoolman down")))
@@ -103,6 +117,63 @@ class TestReleaseFilamentStaged:
         _patch_deficit(monkeypatch, spy)
         assert await farm_staging.release_filament_staged(db_session) == 0
         spy.assert_not_awaited()
+
+
+def _patch_start_rule(monkeypatch, blocks: bool):
+    """Force the start-spool floor re-check to a fixed verdict."""
+    monkeypatch.setattr(
+        farm_staging.spool_selection,
+        "start_rule_blocks_item",
+        AsyncMock(return_value=blocks),
+    )
+
+
+class TestReleaseStartRuleGate:
+    """The release path also honours the minimum-start floor: a pinned item with
+    an empty deficit but a below-floor starting spool must NOT release (it would
+    re-stage next tick, bouncing)."""
+
+    async def test_keeps_still_start_blocked_item_staged(self, db_session, monkeypatch):
+        item = await _add_staged(
+            db_session, printer_id=1, waiting_reason=farm_staging.spool_selection.WAITING_REASON_START_MIN
+        )
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))  # deficit clear...
+        _patch_start_rule(monkeypatch, blocks=True)  # ...but start floor still blocks
+        released = await farm_staging.release_filament_staged(db_session)
+        assert released == 0
+        await db_session.refresh(item)
+        assert item.manual_start is True
+        assert item.filament_short is True
+        assert item.waiting_reason == farm_staging.spool_selection.WAITING_REASON_START_MIN
+
+    async def test_releases_once_start_rule_clears(self, db_session, monkeypatch):
+        item = await _add_staged(
+            db_session, printer_id=1, waiting_reason=farm_staging.spool_selection.WAITING_REASON_START_MIN
+        )
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        _patch_start_rule(monkeypatch, blocks=False)  # floor cleared (spool topped up)
+        released = await farm_staging.release_filament_staged(db_session)
+        assert released == 1
+        await db_session.refresh(item)
+        assert item.manual_start is False
+        assert item.filament_short is False
+        # The new start-min waiting reason is cleared alongside filament_short.
+        assert item.waiting_reason is None
+
+    async def test_start_rule_failure_leaves_item_staged(self, db_session, monkeypatch):
+        item = await _add_staged(
+            db_session, printer_id=1, waiting_reason=farm_staging.spool_selection.WAITING_REASON_START_MIN
+        )
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            farm_staging.spool_selection,
+            "start_rule_blocks_item",
+            AsyncMock(side_effect=RuntimeError("status unavailable")),
+        )
+        released = await farm_staging.release_filament_staged(db_session)
+        assert released == 0  # fail-safe: unknown state never releases
+        await db_session.refresh(item)
+        assert item.manual_start is True
 
 
 class TestTraySignature:
@@ -155,6 +226,22 @@ class TestAmsChangeHook:
 
     async def test_changed_signature_releases_staged_farm_item(self, db_session, sessions, monkeypatch):
         item = await self._seed_farm_staged(db_session)
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        before = [{"id": 0, "tray": [{"id": 0, "tray_type": "PETG", "remain": 5, "tray_uuid": "AA"}]}]
+        after = [{"id": 0, "tray": [{"id": 0, "tray_type": "PETG", "remain": 100, "tray_uuid": "BB"}]}]
+        await farm_staging.maybe_release_on_ams_change(1, before)  # seed
+        assert await farm_staging.maybe_release_on_ams_change(1, after) == 1
+        await db_session.refresh(item)
+        assert item.manual_start is False
+        assert item.filament_short is False
+
+    async def test_changed_signature_releases_unpinned_farm_item(self, db_session, sessions, monkeypatch):
+        """An UNPINNED all-short farm item (printer_id NULL) is released on the
+        AMS-change path — a spool swap on any printer re-opens the candidate loop."""
+        batch = PrintBatch(name="run", quantity=1, status="active", sku_file_id=123)
+        db_session.add(batch)
+        await db_session.flush()
+        item = await _add_staged(db_session, printer_id=None, batch_id=batch.id)
         _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
         before = [{"id": 0, "tray": [{"id": 0, "tray_type": "PETG", "remain": 5, "tray_uuid": "AA"}]}]
         after = [{"id": 0, "tray": [{"id": 0, "tray_type": "PETG", "remain": 100, "tray_uuid": "BB"}]}]

@@ -1,6 +1,32 @@
 import json
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+
+class TaglessDefaultFilament(BaseModel):
+    """Structured default filament pushed to BARE (unconfigured) tagless AMS trays.
+
+    Stored inside the ``tagless_default_filament`` setting as a JSON string
+    (mirrors the ``gcode_snippets`` JSON-blob storage mechanism — settings live
+    in a string KV table). This typed sub-model is the validation vehicle for
+    that blob: the setting's field_validator parses the JSON and constructs this
+    model to enforce the shape. brand/material/rgba are required; subtype and
+    slicer_filament are optional.
+    """
+
+    brand: str
+    material: str
+    subtype: str = ""
+    rgba: str
+    slicer_filament: str | None = None
+
+
+# Default filament for bare tagless trays (Bambu Lab PETG HF), serialized to a
+# JSON string because settings are persisted as strings. Empty string clears the
+# setting (feature off — no default is pushed to bare trays).
+_DEFAULT_TAGLESS_FILAMENT_JSON = TaglessDefaultFilament(
+    brand="Bambu Lab", material="PETG", subtype="HF", rgba="000000FF"
+).model_dump_json()
 
 
 class AppSettings(BaseModel):
@@ -47,9 +73,39 @@ class AppSettings(BaseModel):
         default=False,
         description="Disable insufficient filament warnings when printing or queueing prints",
     )
-    prefer_lowest_filament: bool = Field(
-        default=False,
-        description="When multiple AMS spools match, prefer the one with lowest remaining filament",
+    auto_add_untagged: bool = Field(
+        default=True,
+        description=(
+            "Silently auto-create spool records for AMS trays that have no RFID tag. "
+            "Disable if you pre-create inventory entries manually to avoid duplicates."
+        ),
+    )
+    # Spool selection policy for farm dispatch — replaces the legacy boolean
+    # ``prefer_lowest_filament``. 'slot_order' keeps the AMS slot ordering,
+    # 'lowest_remaining' prefers the most-spent matching spool, 'first_loaded'
+    # (default) is FIFO by first-in-service time (see Spool.first_loaded_at).
+    spool_selection_policy: str = Field(
+        default="first_loaded",
+        description="When multiple AMS spools match: 'slot_order', 'lowest_remaining', or 'first_loaded' (FIFO)",
+    )
+    # A spool whose remaining grams fall below this floor can never be the
+    # STARTING spool of a print (it may still finish one already in progress).
+    # 0 disables the guard.
+    min_start_spool_g: int = Field(
+        default=120,
+        ge=0,
+        le=10000,
+        description="Minimum remaining grams for a spool to START a print; 0 disables the guard",
+    )
+    # Structured default filament pushed to BARE (unconfigured) tagless trays,
+    # stored as a JSON string (mirrors gcode_snippets). Empty string = feature
+    # off (nothing pushed). Shape validated on write against TaglessDefaultFilament.
+    tagless_default_filament: str = Field(
+        default=_DEFAULT_TAGLESS_FILAMENT_JSON,
+        description=(
+            "JSON default filament for bare tagless trays "
+            "{brand, material, subtype, rgba, slicer_filament}. Empty = off."
+        ),
     )
 
     # Updates
@@ -305,7 +361,7 @@ class AppSettings(BaseModel):
         default=2, ge=1, le=50, description="Number of printers to start simultaneously in staggered mode"
     )
     stagger_interval_minutes: int = Field(
-        default=5, ge=1, le=60, description="Minutes between staggered printer groups"
+        default=3, ge=1, le=60, description="Minutes between staggered printer groups"
     )
 
     # Plate-clear confirmation for queue scheduling
@@ -378,6 +434,26 @@ class AppSettings(BaseModel):
         description="Fallback BamBuddy group name assigned when an LDAP user authenticates but has no mapped groups. Empty = no fallback.",
     )
 
+    # ERP directory login (Foundi first-party MariaDB identity store). Operators
+    # authenticate with their ERP credentials; the farm group follows the ERP role.
+    # There is no enable flag — ERP login is active whenever connection config
+    # (host/name/user) resolves from the deploy erp.env file or a DB override.
+    # ``erp_login_active`` is DERIVED and READ-ONLY: server-computed in
+    # ``_build_settings_response``; it is not accepted on the update path.
+    erp_login_active: bool = Field(
+        default=False, description="Read-only: whether ERP directory login is effectively configured"
+    )
+    erp_db_host: str = Field(default="", description="ERP MariaDB host")
+    erp_db_port: int = Field(default=3306, description="ERP MariaDB port")
+    erp_db_name: str = Field(default="", description="ERP database name (e.g. Foundi_management_system)")
+    erp_db_user: str = Field(default="", description="ERP DB read-only user for directory lookups")
+    erp_db_password: str = Field(default="", description="ERP DB password (never returned by the API)")
+    erp_db_ssl: bool = Field(default=False, description="Connect to the ERP DB over TLS")
+    erp_role_group_mapping: str = Field(
+        default='{"ADMIN": "Administrators", "EDITOR": "Operators", "VIEWER": "Viewers"}',
+        description="JSON: ERP role to BamBuddy group mapping {erp_role: bambuddy_group_name}",
+    )
+
     # Obico AI failure detection (#172)
     obico_enabled: bool = Field(default=False, description="Enable Obico AI print failure detection")
     obico_ml_url: str = Field(
@@ -442,6 +518,55 @@ class AppSettings(BaseModel):
         le=720,
         description="Flag a farm unit still 'printing' whose printer has been offline this many minutes (5–720)",
     )
+    farm_cooldown_stall_window_minutes: int = Field(
+        default=15,
+        ge=0,
+        le=180,
+        description="Cooldown-plateau watchdog window (minutes): the bed must cool by at least the stall epsilon "
+        "within each window; two consecutive windows below it quarantine the printer instead of ejecting. 0 disables.",
+    )
+    farm_cooldown_stall_epsilon_c: float = Field(
+        default=1.0,
+        ge=0.1,
+        le=20.0,
+        description="Minimum bed cooling (°C) expected across a plateau window before it counts as a stall strike",
+    )
+    farm_cooldown_max_hold_minutes: int = Field(
+        default=180,
+        ge=0,
+        le=720,
+        description="Cap (minutes) the cooldown watch holds a hot bed above threshold before dispatching the eject "
+        "anyway. 0 = no cap (hold until the bed reaches threshold or the plateau watchdog trips).",
+    )
+    farm_cooldown_plateau_eject_margin_c: float = Field(
+        default=3.0,
+        ge=0.0,
+        le=50.0,
+        description="When cooling plateaus, eject instead of quarantining if the bed has settled within this many "
+        "°C of the release threshold (bed equilibrated at ambient). Above threshold+margin the bed is genuinely "
+        "stuck hot and the printer is quarantined with NO eject.",
+    )
+    farm_usb_auto_cleanup: bool = Field(
+        default=True,
+        description="On a USB-storage-low HMS fault, auto-delete old camera recordings then oldest unused print files",
+    )
+
+    # Reused-tag auto re-spool (peel a spent Bambu RFID tag onto a fresh
+    # third-party spool). `respool_prompt_threshold_g` is the remaining-grams
+    # floor at/below which an uncertain tag arrival raises a one-click prompt.
+    # `respool_last_brand` is server-maintained (last brand used) so the
+    # automatic path can re-spool without operator input; it is NOT a user form
+    # field.
+    respool_prompt_threshold_g: int = Field(
+        default=30,
+        ge=0,
+        le=1000,
+        description="Remaining grams at/below which a reused-tag arrival raises a one-click re-spool prompt",
+    )
+    respool_last_brand: str = Field(
+        default="",
+        description="Last brand applied on a re-spool; server-maintained prefill for the auto/prompt re-spool paths",
+    )
 
 
 class AppSettingsUpdate(BaseModel):
@@ -461,7 +586,10 @@ class AppSettingsUpdate(BaseModel):
     spoolman_report_partial_usage: bool | None = None
     auto_add_unknown_rfid: bool | None = None
     disable_filament_warnings: bool | None = None
-    prefer_lowest_filament: bool | None = None
+    auto_add_untagged: bool | None = None
+    spool_selection_policy: str | None = None
+    min_start_spool_g: int | None = Field(default=None, ge=0, le=10000)
+    tagless_default_filament: str | None = None
     check_updates: bool | None = None
     check_printer_firmware: bool | None = None
     include_beta_updates: bool | None = None
@@ -532,6 +660,7 @@ class AppSettingsUpdate(BaseModel):
     stagger_group_size: int | None = Field(default=None, ge=1, le=50)
     stagger_interval_minutes: int | None = Field(default=None, ge=1, le=60)
     require_plate_clear: bool | None = None
+    farm_usb_auto_cleanup: bool | None = None
     queue_shortest_first: bool | None = None
     nozzle_temp_presets: str | None = None
     bed_temp_presets: str | None = None
@@ -553,6 +682,13 @@ class AppSettingsUpdate(BaseModel):
     ldap_group_mapping: str | None = None
     ldap_auto_provision: bool | None = None
     ldap_default_group: str | None = None
+    erp_db_host: str | None = None
+    erp_db_port: int | None = Field(default=None, ge=1, le=65535)
+    erp_db_name: str | None = None
+    erp_db_user: str | None = None
+    erp_db_password: str | None = None
+    erp_db_ssl: bool | None = None
+    erp_role_group_mapping: str | None = None
     obico_enabled: bool | None = None
     obico_ml_url: str | None = None
     obico_sensitivity: str | None = None
@@ -565,6 +701,12 @@ class AppSettingsUpdate(BaseModel):
     farm_escalate_consecutive_failures: int | None = Field(default=None, ge=1, le=20)
     farm_cooldown_warn_floor_c: int | None = Field(default=None, ge=15, le=50)
     farm_offline_stall_minutes: int | None = Field(default=None, ge=5, le=720)
+    farm_cooldown_stall_window_minutes: int | None = Field(default=None, ge=0, le=180)
+    farm_cooldown_stall_epsilon_c: float | None = Field(default=None, ge=0.1, le=20.0)
+    farm_cooldown_max_hold_minutes: int | None = Field(default=None, ge=0, le=720)
+    farm_cooldown_plateau_eject_margin_c: float | None = Field(default=None, ge=0.0, le=50.0)
+    respool_prompt_threshold_g: int | None = Field(default=None, ge=0, le=1000)
+    respool_last_brand: str | None = None
 
     @field_validator("gcode_snippets")
     @classmethod
@@ -579,6 +721,34 @@ class AppSettingsUpdate(BaseModel):
             raise ValueError("gcode_snippets must be a JSON object keyed by printer model")
         return v
 
+    @field_validator("spool_selection_policy")
+    @classmethod
+    def validate_spool_selection_policy(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if v not in ("slot_order", "lowest_remaining", "first_loaded"):
+            raise ValueError("spool_selection_policy must be 'slot_order', 'lowest_remaining', or 'first_loaded'")
+        return v
+
+    @field_validator("tagless_default_filament")
+    @classmethod
+    def validate_tagless_default_filament(cls, v: str | None) -> str | None:
+        # None or empty string clears the setting (feature off) — mirrors the
+        # gcode_snippets clear-with-empty convention.
+        if v is None or v == "":
+            return v
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as exc:
+            raise ValueError("tagless_default_filament must be valid JSON or empty") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("tagless_default_filament must be a JSON object")
+        try:
+            TaglessDefaultFilament(**parsed)
+        except ValidationError as exc:
+            raise ValueError(f"tagless_default_filament has an invalid filament shape: {exc}") from exc
+        return v
+
     @field_validator("ldap_group_mapping")
     @classmethod
     def validate_ldap_group_mapping(cls, v: str | None) -> str | None:
@@ -590,6 +760,19 @@ class AppSettingsUpdate(BaseModel):
             raise ValueError("ldap_group_mapping must be valid JSON or empty")
         if not isinstance(parsed, dict):
             raise ValueError("ldap_group_mapping must be a JSON object mapping LDAP group DNs to BamBuddy group names")
+        return v
+
+    @field_validator("erp_role_group_mapping")
+    @classmethod
+    def validate_erp_role_group_mapping(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return v
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError:
+            raise ValueError("erp_role_group_mapping must be valid JSON or empty")
+        if not isinstance(parsed, dict):
+            raise ValueError("erp_role_group_mapping must be a JSON object mapping ERP roles to BamBuddy group names")
         return v
 
     @field_validator("obico_enabled_printers")

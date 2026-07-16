@@ -2,6 +2,18 @@
 
 All notable changes to Bambuddy will be documented in this file.
 
+## [Unreleased — farm fork]
+
+### Added
+- **Uniform tagless-spool lifecycle** — non-RFID AMS trays are silently tracked: configured trays auto-mint an inventory spool (`data_origin="ams_auto"`); BARE trays (spool seated, nothing configured) are auto-configured with a default filament (`tagless_default_filament` setting, shipped Bambu Lab PETG HF Black; clearable = off) and work mid-print, joining the firmware backup pool. Pulled-but-not-spent tagless spools sticky-rebind to their ledger on return; ran-dry (runout HMS / backup-swap) always mints new; a spent-then-emptied slot whose leftover config matches the dead spool reverts to the default (stale-config override). Provisional tagless rows are disposed when a real RFID tag claims the slot. Toggle: `auto_add_untagged`.
+- **FIFO spool selection** — new `spool_selection_policy` setting (`first_loaded` default / `lowest_remaining` / `slot_order`): dispatch and the PrintModal auto-match pick the oldest-in-service spool first (`Spool.first_loaded_at`, backfilled from `created_at` for in-service spools). With AMS Backup off, FIFO prefers a candidate that can cover the job's grams. Replaces `prefer_lowest_filament` (migrated: enabled → `lowest_remaining`, then key removed).
+- **Minimum start-spool weight** — `min_start_spool_g` (default 120, 0=off): a spool below the floor can never START a print (it stays loaded as a mid-print refill donor). Blocked items stage with `waiting_reason="start_spool_below_minimum"` and release on spool swap / re-check / run resume; manual start returns 409 `start_spool_below_minimum` with the same Print-Anyway bypass as `insufficient_filament`.
+- `GET /printers/{id}/inventory-remain` now also returns a `first_loaded` map (per-slot ISO timestamp) so the client mirror orders like the dispatcher.
+
+### Removed
+- `new_spool_detected` prompt machinery (WS event, 20 s identity-grace scheduler, PrintersPage banner) — superseded by silent auto-mint.
+- `prefer_lowest_filament` setting (schema, route whitelist, scheduler read, UI toggle) — superseded by `spool_selection_policy`.
+
 ## [0.2.4.8] - 2026-06-28
 
 ### Added

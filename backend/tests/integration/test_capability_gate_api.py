@@ -136,6 +136,84 @@ class TestCapabilityGateBlockSurfacesReason:
         rows = [r for r in listing.json() if r["id"] == item.id]
         assert rows and rows[0]["waiting_reason"] and "Capability" in rows[0]["waiting_reason"]
 
+    async def test_dual_printer_blocked_by_pinned_extruder_nozzle(
+        self, async_client, db_session, tmp_path, printer_factory, monkeypatch
+    ):
+        # H2C (dual-nozzle) printer; file pins a 0.6 nozzle to extruder 0 (right)
+        # but both hotends are 0.4 and the rack is empty → BLOCK naming the side.
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.models.printer_model_geometry import PrinterModelGeometry
+        from backend.app.services.print_scheduler import scheduler
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(model="H2C", name="H2C-1")
+        db_session.add(
+            PrinterModelGeometry(
+                model_key="H2C",
+                bed_x=330,
+                bed_y=320,
+                env_x_min=25,
+                env_x_max=325,
+                env_y_min=0,
+                env_y_max=320,
+                max_part_height_mm=42,
+                validated=True,
+            )
+        )
+        await db_session.commit()
+        lib = await _add_library_file(
+            db_session,
+            tmp_path,
+            {
+                "plate_capabilities": {
+                    "1": {"filament_nozzles": [{"slot_id": 1, "nozzle_diameter": 0.6, "extruder_id": 0}]}
+                }
+            },
+            name="dual.gcode.3mf",
+        )
+
+        eject = (await async_client.post("/api/v1/eject-profiles", json={"name": "cap-ep2"})).json()["id"]
+        sid = (await async_client.post("/api/v1/skus", json={"code": "SKU-CAP.02", "name": "cap2"})).json()["id"]
+        sf = await async_client.post(
+            f"/api/v1/skus/{sid}/files",
+            json={"library_file_id": lib.id, "plate_index": 1, "units_per_plate": 1},
+        )
+        sku_file_id = sf.json()["id"]
+
+        run = await async_client.post(
+            "/api/v1/production-runs",
+            json={
+                "sku_file_id": sku_file_id,
+                "target_units": 1,
+                "printer_ids": [printer.id],
+                "eject_profile_id": eject,
+                "require_first_article": False,
+            },
+        )
+        assert run.status_code == 201, run.text
+        run_id = run.json()["id"]
+
+        result = await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.batch_id == run_id))
+        item = result.scalar_one()
+
+        monkeypatch.setattr(printer_manager, "is_connected", lambda pid: True)
+        monkeypatch.setattr(
+            printer_manager,
+            "get_status",
+            lambda pid: SimpleNamespace(
+                nozzles=[SimpleNamespace(nozzle_diameter="0.4"), SimpleNamespace(nozzle_diameter="0.4")],
+                nozzle_rack=[],
+                raw_data={},
+            ),
+        )
+
+        await scheduler._start_print(db_session, item)
+
+        await db_session.refresh(item)
+        assert item.status == "pending"
+        assert item.waiting_reason and "nozzle mismatch" in item.waiting_reason
+        assert "right" in item.waiting_reason
+
 
 @pytest.mark.asyncio
 @pytest.mark.integration
@@ -178,7 +256,9 @@ class TestStaggerLimitsStartsPerTick:
         monkeypatch.setattr(sched, "_start_print", fake_start)
         monkeypatch.setattr(sched, "_check_auto_drying", AsyncMock())
         monkeypatch.setattr(sched, "_block_on_filament_deficit", AsyncMock(return_value=False))
-        monkeypatch.setattr(sched, "_compute_ams_mapping_for_printer", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            sched, "_compute_ams_mapping_for_printer", AsyncMock(return_value=ps.MatchOutcome(mapping=None))
+        )
 
         await sched.check_queue()
 
@@ -221,7 +301,9 @@ class TestStaggerLimitsStartsPerTick:
         monkeypatch.setattr(sched, "_start_print", fake_start)
         monkeypatch.setattr(sched, "_check_auto_drying", AsyncMock())
         monkeypatch.setattr(sched, "_block_on_filament_deficit", AsyncMock(return_value=False))
-        monkeypatch.setattr(sched, "_compute_ams_mapping_for_printer", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            sched, "_compute_ams_mapping_for_printer", AsyncMock(return_value=ps.MatchOutcome(mapping=None))
+        )
 
         await sched.check_queue()
         assert len(started) == 2, started

@@ -1189,7 +1189,16 @@ export interface AppSettings {
   time_format: 'system' | '12h' | '24h';
   // Filament tracking
   disable_filament_warnings: boolean;  // Disable filament warnings (print insufficiency and assignment mismatch)
-  prefer_lowest_filament: boolean;  // When multiple spools match, prefer lowest remaining filament
+  // Spool-selection policy for dispatch + manual-print preview. Replaces the
+  // legacy lowest-remaining boolean. 'slot_order' | 'lowest_remaining' | 'first_loaded'.
+  spool_selection_policy: 'slot_order' | 'lowest_remaining' | 'first_loaded';
+  // Minimum remaining grams for a spool to START a print (0 disables the floor).
+  min_start_spool_g: number;
+  // Silently auto-create spool records for AMS trays that have no RFID tag.
+  auto_add_untagged: boolean;
+  // JSON string default filament pushed to BARE tagless trays (mirrors
+  // gcode_snippets serialization). Empty string / null = feature off.
+  tagless_default_filament: string | null;
   spoolman_enabled: boolean;  // True when the user has switched filament tracking to Spoolman; backend includes this in the /settings/ response even though earlier consumers read it from the dedicated /settings/spoolman endpoint as a string
   auto_add_unknown_rfid: boolean;  // When false, the backend skips auto-creating inventory spools for unknown RFID tags and instead broadcasts an unknown_tag event for the confirmation modal
   spoolman_url: string;
@@ -1275,6 +1284,21 @@ export interface AppSettings {
   // printer has been offline at least this many minutes (never terminates it —
   // the reconcile resolves the true outcome on reconnect).
   farm_offline_stall_minutes: number;
+  // Eject-cooldown stall detection (server-dispatched eject): during the
+  // post-print cooldown the bed must keep cooling. Over each stall window
+  // (minutes) it must drop at least the epsilon (°C); two consecutive windows
+  // without that progress quarantine the printer (window 0 disables the watch).
+  // After max-hold minutes above the release threshold the eject dispatches
+  // anyway (0 = wait for the threshold indefinitely).
+  farm_cooldown_stall_window_minutes: number;
+  farm_cooldown_stall_epsilon_c: number;
+  farm_cooldown_max_hold_minutes: number;
+  // When cooling plateaus within this many °C of the release threshold, eject
+  // (bed equilibrated at ambient) instead of quarantining the printer.
+  farm_cooldown_plateau_eject_margin_c: number;
+  // USB storage-low auto-cleanup: on a "USB full" HMS fault, auto-delete old
+  // camera recordings then oldest unused print files so dispatch keeps working.
+  farm_usb_auto_cleanup: boolean;
   // Shortest job first scheduling
   queue_shortest_first: boolean;
   // User-configurable presets for the printer-card popovers (JSON arrays of 3 ints).
@@ -1296,6 +1320,20 @@ export interface AppSettings {
   ldap_group_mapping: string;
   ldap_auto_provision: boolean;
   ldap_default_group: string;
+  // ERP directory login (Foundi first-party MariaDB identity store). The
+  // password is write-only: the GET always returns "" and a PUT only changes
+  // it when a non-empty value is sent (mirrors ldap_bind_password).
+  // Read-only, server-derived: true whenever ERP connection config resolves
+  // (from a deploy file or the DB overrides below). There is no on/off toggle —
+  // ERP login is active whenever the connection is configured.
+  erp_login_active: boolean;
+  erp_db_host: string;
+  erp_db_port: number;
+  erp_db_name: string;
+  erp_db_user: string;
+  erp_db_password: string;
+  erp_db_ssl: boolean;
+  erp_role_group_mapping: string;
   obico_enabled: boolean;
   obico_ml_url: string;
   obico_sensitivity: 'low' | 'medium' | 'high';
@@ -1304,6 +1342,10 @@ export interface AppSettings {
   obico_enabled_printers: string;
   // Inventory forecasting global lead time
   forecast_global_lead_time_days: number;
+  // Reused-tag re-spool: when a tag resolves to a spool with no hardware-certain
+  // spent marker, prompt the operator to re-spool once the donor's remaining
+  // grams drop at or below this threshold (default 30).
+  respool_prompt_threshold_g: number;
 }
 
 export type AppSettingsUpdate = Partial<AppSettings>;
@@ -2315,6 +2357,8 @@ export interface NotificationProvider {
   on_model_mismatch: boolean;
   on_run_unit_stopped: boolean;
   on_print_stalled: boolean;
+  on_storage_low: boolean;
+  on_cooldown_escalation: boolean;
   // Quiet hours
   quiet_hours_enabled: boolean;
   quiet_hours_start: string | null;
@@ -2386,6 +2430,8 @@ export interface NotificationProviderCreate {
   on_model_mismatch?: boolean;
   on_run_unit_stopped?: boolean;
   on_print_stalled?: boolean;
+  on_storage_low?: boolean;
+  on_cooldown_escalation?: boolean;
   // Quiet hours
   quiet_hours_enabled?: boolean;
   quiet_hours_start?: string | null;
@@ -2450,6 +2496,8 @@ export interface NotificationProviderUpdate {
   on_model_mismatch?: boolean;
   on_run_unit_stopped?: boolean;
   on_print_stalled?: boolean;
+  on_storage_low?: boolean;
+  on_cooldown_escalation?: boolean;
   // Quiet hours
   quiet_hours_enabled?: boolean;
   quiet_hours_start?: string | null;
@@ -2824,6 +2872,58 @@ export interface SpoolmanBulkCreateResult {
   failed_count: number;
 }
 
+// ── Reused-tag re-spool (spent Bambu RFID tag → fresh third-party spool) ─────
+/** POST body for `POST /inventory/spools/respool`. `brand` is required and
+ *  non-empty; the optional numeric/text fields ride the fresh spool row. */
+export interface RespoolRequest {
+  printer_id: number;
+  ams_id: number;
+  tray_id: number;
+  brand: string;
+  label_weight?: number | null;
+  cost_per_kg?: number | null;
+  note?: string | null;
+}
+
+/** WS `respool_prompt` payload — the uncertain-tier prompt asking the operator
+ *  to confirm a reused Bambu tag now sits on a fresh spool. Nullables mirror
+ *  the tray data the backend broadcasts (same style as `UnknownTagDetail`);
+ *  the `*_prefill` and donor fields are absent on the manual tray-menu path. */
+export interface RespoolPromptMessage {
+  printer_id: number;
+  ams_id: number;
+  tray_id: number;
+  tag_uid: string | null;
+  tray_uuid: string | null;
+  tray_type: string | null;
+  tray_color: string | null;
+  tray_sub_brands: string | null;
+  tray_count: number | null;
+  donor_spool_id: number | null;
+  donor_remaining_g: number | null;
+  brand_prefill: string | null;
+  label_weight_prefill: number | null;
+}
+
+/** WS `spool_respooled` payload — the hardware-certain automatic re-spool that
+ *  ran without an operator; drives the observability toast + cache refresh. */
+export interface SpoolRespooledMessage {
+  printer_id: number;
+  ams_id: number;
+  tray_id: number;
+  donor_spool_id: number | null;
+  new_spool_id: number;
+  brand: string;
+  label_weight: number;
+}
+
+/** Response from `POST /printers/{id}/eject` (W2 manual eject). `released_watch`
+ *  = an already-armed cooldown watch was released to sweep now; `dispatched` =
+ *  a fresh part-present eject job was dispatched onto the printer. */
+export interface EjectNowResponse {
+  mode: 'released_watch' | 'dispatched';
+}
+
 // ── CSV import/export (#1576) ──────────────────────────────────────────────
 /** One row's outcome from the import preview / real import. */
 export interface CsvImportRow {
@@ -2954,6 +3054,7 @@ export interface ShoppingListItemCreate {
 export interface VersionInfo {
   version: string;
   repo: string;
+  build?: string; // full installer build stamp; omitted by older servers
 }
 
 export interface UpdateCheckResult {
@@ -3323,6 +3424,11 @@ export interface OIDCProvider {
   // #1589: when true, the LoginPage redirects unauthenticated visitors
   // straight to this provider on mount. At most one provider may carry this.
   is_autologin: boolean;
+  // Generic group mapping: groups_claim names the token claim that carries the
+  // user's group/role values; group_mapping maps each claim value to a Bambuddy
+  // group name. null/absent = no group sync from this provider.
+  groups_claim?: string | null;
+  group_mapping?: Record<string, string> | null;
 }
 
 export interface OIDCProviderCreate {
@@ -3339,6 +3445,10 @@ export interface OIDCProviderCreate {
   icon_url?: string | null;
   default_group_id?: number | null;
   is_autologin?: boolean;  // #1589
+  // Claim value -> Bambuddy group name mapping (see OIDCProvider). Empty mapping
+  // must be sent as null so the backend clears any stored mapping.
+  groups_claim?: string | null;
+  group_mapping?: Record<string, string> | null;
 }
 
 export interface OIDCLink {
@@ -3712,6 +3822,16 @@ export const api = {
     request<{ success: boolean; message: string }>(`/printers/${printerId}/clear-plate`, {
       method: 'POST',
     }),
+  // Farm manual eject (W2): trigger the part-present eject sweep for a
+  // farm-known completed unit. Call with allowHot=false first; the backend 409s
+  // with `{code:'bed_hot', bed_c, threshold_c}` when the bed is above the
+  // release threshold, and the caller re-invokes with allowHot=true after an
+  // explicit operator confirm. 200 → `{mode}` ('released_watch' | 'dispatched').
+  ejectNow: (printerId: number, allowHot: boolean = false) =>
+    request<EjectNowResponse>(`/printers/${printerId}/eject`, {
+      method: 'POST',
+      body: JSON.stringify({ allow_hot: allowHot }),
+    }),
   // Farm one-click recovery: lift the plate-clear hold, clear quarantine, and
   // resume any paused production run on this printer in a single operator action
   // (composes the three canonical mutators server-side). Replaces the separate
@@ -3810,14 +3930,16 @@ export const api = {
       { method: 'POST' }
     ),
 
-  // Per-globalTrayId remaining grams for this printer's inventory-bound slots
-  // (#1766). Drives the client-side "Prefer Lowest Remaining Filament" sort
-  // when computing the AMS mapping; mirrors backend `_build_inventory_remain_overrides`
-  // so internal and Spoolman modes both work uniformly.
+  // Per-globalTrayId inventory facts for this printer's inventory-bound slots.
+  // `inventory_remain_g` (grams remaining) drives the 'lowest_remaining' sort
+  // (#1766); `first_loaded` (ISO8601 first-in-service time, or null) drives the
+  // 'first_loaded' FIFO sort. Mirrors backend `build_slot_inventory` so the
+  // client-side AMS-mapping preview picks the same spool the dispatcher would.
   getInventoryRemain: (printerId: number) =>
-    request<{ inventory_remain_g: Record<string, number> }>(
-      `/printers/${printerId}/inventory-remain`,
-    ),
+    request<{
+      inventory_remain_g: Record<string, number>;
+      first_loaded: Record<string, string | null>;
+    }>(`/printers/${printerId}/inventory-remain`),
 
   // Skip Objects
   getPrintableObjects: (printerId: number) =>
@@ -4976,6 +5098,13 @@ export const api = {
     request<ProductionRun>(`/production-runs/${id}/resume`, { method: 'POST' }),
   abortProductionRun: (id: number) =>
     request<ProductionRun>(`/production-runs/${id}/abort`, { method: 'POST' }),
+  // Change or clear a not-yet-started run's deferred start (Phase 5). A future
+  // ISO string reschedules; null (or a past time) starts the run now.
+  rescheduleProductionRun: (id: number, scheduled_start_at: string | null) =>
+    request<ProductionRun>(`/production-runs/${id}/reschedule`, {
+      method: 'POST',
+      body: JSON.stringify({ scheduled_start_at }),
+    }),
   deleteProductionRun: (id: number) =>
     request<void>(`/production-runs/${id}`, { method: 'DELETE' }),
   approveFirstArticle: (id: number, data: FirstArticleApproveRequest) =>
@@ -5340,6 +5469,13 @@ export const api = {
     }),
   createSpoolFromSlot: (data: { printer_id: number; ams_id: number; tray_id: number }) =>
     request<InventorySpool>(`/inventory/spools/from-slot`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  // Reused Bambu RFID tag now on a fresh third-party spool: archive/dispose the
+  // spent donor row, create a fresh weight-locked spool, and rewire the slot.
+  respoolTag: (data: RespoolRequest) =>
+    request<InventorySpool>('/inventory/spools/respool', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
@@ -6541,6 +6677,7 @@ export interface PrinterSensorHistoryResponse {
 export interface SystemInfo {
   app: {
     version: string;
+    build?: string; // full installer build stamp; omitted by older servers
     base_dir: string;
     archive_dir: string;
   };

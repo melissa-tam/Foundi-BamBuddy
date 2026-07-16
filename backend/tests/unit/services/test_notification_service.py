@@ -223,6 +223,45 @@ class TestNotificationService:
             assert len(result) == 0
 
     # ========================================================================
+    # Tests for on_printer_quarantined copy (C3: single-event quarantines must NOT
+    # claim "1 consecutive failures")
+    # ========================================================================
+
+    @pytest.mark.asyncio
+    async def test_quarantine_single_event_copy_is_reason_led(self, service, mock_provider, mock_db):
+        """failure_count == 1 (e.g. an unverified eject sweep) renders a reason-led
+        summary that does NOT claim any 'consecutive failures'."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("Printer Quarantined: P1", "body")
+
+            await service.on_printer_quarantined(1, "P1", 1, "Eject job ended 'failed'", mock_db)
+
+            variables = mock_build.call_args[0][2]
+            assert variables["quarantine_summary"] == "P1 was quarantined."
+            assert "consecutive failures" not in variables["quarantine_summary"]
+
+    @pytest.mark.asyncio
+    async def test_quarantine_multi_event_copy_keeps_consecutive_sentence(self, service, mock_provider, mock_db):
+        """failure_count > 1 keeps the escalation sentence naming the count."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("Printer Quarantined: P1", "body")
+
+            await service.on_printer_quarantined(1, "P1", 3, "3 consecutive farm print failures", mock_db)
+
+            variables = mock_build.call_args[0][2]
+            assert variables["quarantine_summary"] == "P1 was quarantined after 3 consecutive failures."
+
+    # ========================================================================
     # Tests for quiet hours
     # ========================================================================
 
@@ -2758,3 +2797,108 @@ class TestFarmLifecycleNotifications:
             {"run_name": "Batch 9", "sku_code": "SKU007", "printer": "001-H2S"},
         )
         assert "Batch 9" in approved and "001-H2S" in approved
+
+
+class TestOnCooldownEscalation:
+    """The dedicated cooldown-escalation event (NOT plate_not_empty): fires the
+    honest 'cooldown running long' copy with the live bed, target and cap."""
+
+    @pytest.fixture
+    def service(self):
+        return NotificationService()
+
+    @pytest.fixture
+    def mock_db(self):
+        db = AsyncMock()
+        db.commit = AsyncMock()
+        return db
+
+    @pytest.mark.asyncio
+    async def test_sends_with_cap_detail(self, service, mock_db):
+        """max_hold_minutes > 0 → detail names the forced-eject cap."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("Cooldown running long — 001-H2S", "body")
+
+            await service.on_cooldown_escalation(
+                1, "001-H2S", bed_c=41.0, threshold_c=33.0, max_hold_minutes=180, db=mock_db
+            )
+
+            mock_get.assert_awaited_once_with(mock_db, "on_cooldown_escalation", 1)
+            _, event, variables = mock_build.call_args.args
+            assert event == "cooldown_escalation"
+            detail = variables["detail"]
+            assert "bed 41 °C" in detail
+            assert "target 33 °C" in detail
+            assert "forced eject at the 180-minute cap" in detail
+            mock_send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sends_with_no_cap_detail(self, service, mock_db):
+        """max_hold_minutes == 0 → detail says no forced-eject cap is set."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "b")
+
+            await service.on_cooldown_escalation(
+                2, "002-H2S", bed_c=35.0, threshold_c=33.0, max_hold_minutes=0, db=mock_db
+            )
+
+            _, _event, variables = mock_build.call_args.args
+            assert "no forced-eject cap is set" in variables["detail"]
+            assert "cap" not in variables["detail"].replace("no forced-eject cap is set", "")
+
+    @pytest.mark.asyncio
+    async def test_unknown_bed_when_none(self, service, mock_db):
+        """An unreadable bed at fire time renders 'unknown', never a crash."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "b")
+
+            await service.on_cooldown_escalation(
+                3, "003-H2S", bed_c=None, threshold_c=33.0, max_hold_minutes=90, db=mock_db
+            )
+
+            _, _event, variables = mock_build.call_args.args
+            assert "bed unknown °C" in variables["detail"]
+
+    @pytest.mark.asyncio
+    async def test_toggle_off_sends_nothing(self, service, mock_db):
+        """No provider subscribes to on_cooldown_escalation → nothing sent."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = []
+
+            await service.on_cooldown_escalation(
+                4, "004-H2S", bed_c=40.0, threshold_c=33.0, max_hold_minutes=180, db=mock_db
+            )
+
+            mock_send.assert_not_called()
+
+    def test_cooldown_escalation_template_seeded_and_renders(self, service):
+        """The cooldown_escalation template exists and substitutes {printer}/{detail}."""
+        from backend.app.models.notification_template import DEFAULT_TEMPLATES
+
+        by_type = {t["event_type"]: t for t in DEFAULT_TEMPLATES}
+        assert "cooldown_escalation" in by_type
+        tmpl = by_type["cooldown_escalation"]
+        title = service._render_template(tmpl["title_template"], {"printer": "001-H2S"})
+        body = service._render_template(
+            tmpl["body_template"], {"printer": "001-H2S", "detail": "Still cooling: bed 40 °C"}
+        )
+        assert "001-H2S" in title
+        assert "001-H2S" in body and "Still cooling: bed 40 °C" in body

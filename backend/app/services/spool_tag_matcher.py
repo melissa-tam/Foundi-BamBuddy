@@ -1,6 +1,8 @@
 """RFID tag matching and auto-assignment for spool inventory."""
 
 import logging
+from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,6 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
+from backend.app.utils.printer_models import nozzle_for_ams_unit
 from backend.app.utils.tag_normalization import (
     normalize_tag_uid as _normalize_tag_uid,
     normalize_tray_uuid as _normalize_tray_uuid,
@@ -18,6 +21,26 @@ logger = logging.getLogger(__name__)
 # Zero-value constants for tag validation
 ZERO_TAG_UID = "0000000000000000"
 ZERO_TRAY_UUID = "00000000000000000000000000000000"
+
+
+def stamp_first_loaded(spool: Spool) -> None:
+    """Stamp ``Spool.first_loaded_at`` the first time a spool enters service.
+
+    Single stamping origin for the FIFO substrate: called wherever a spool
+    acquires its first ``SpoolAssignment`` — the RFID auto-assign path
+    (:func:`auto_assign_spool`), the manual ``POST /assignments`` route, and the
+    tagless bare-tray auto-config (``services.spool_tagless``). Idempotent: only
+    writes when the column is still NULL, so a spool pulled and re-assigned keeps
+    its original in-service timestamp (the spool-selection policy orders
+    candidates oldest-first).
+
+    Lives here — not in ``spool_tagless`` — because this is the lowest module all
+    three assignment-creating callers already import: ``spool_tagless`` imports
+    ``spool_tag_matcher`` (not the reverse) and the inventory route imports it
+    too, so defining it here is the one clean direction with no import cycle.
+    """
+    if spool.first_loaded_at is None:
+        spool.first_loaded_at = datetime.utcnow()
 
 
 def is_valid_tag(tag_uid: str, tray_uuid: str) -> bool:
@@ -37,11 +60,41 @@ def is_bambu_tag(tag_uid: str, tray_uuid: str, tray_info_idx: str) -> bool:
     return uuid_valid or (is_valid_tag(tag_uid, tray_uuid) and has_preset)
 
 
-async def create_spool_from_tray(db: AsyncSession, tray_data: dict) -> Spool:
-    """Create a new Spool inventory entry from AMS tray MQTT data.
+@dataclass
+class ParsedTrayFields:
+    """Identity + metadata resolved from an AMS tray MQTT dict.
 
-    Extracts material, subtype, color, temps, and tag info from the tray dict.
-    Looks up core_weight from the spool catalog if a Bambu Lab entry matches.
+    Shared output of :func:`parse_tray_fields`. Consumed by
+    :func:`create_spool_from_tray` (legacy Bambu auto-create) and the reused-tag
+    re-spool service (``spool_respool``). ``weight_used`` is derived from the AMS
+    remain% and is only meaningful for the legacy auto-create path; the re-spool
+    flow forces a fresh 0 g by definition and ignores it.
+    """
+
+    material: str
+    subtype: str | None
+    color_name: str | None
+    rgba: str | None
+    label_weight: int
+    core_weight: int
+    weight_used: float
+    slicer_filament: str | None
+    slicer_filament_name: str | None
+    nozzle_temp_min: int | None
+    nozzle_temp_max: int | None
+    tag_uid: str | None
+    tray_uuid: str | None
+
+
+async def parse_tray_fields(db: AsyncSession, tray_data: dict) -> ParsedTrayFields:
+    """Resolve material/subtype/color/temps/tag identity from an AMS tray dict.
+
+    Extracted verbatim from :func:`create_spool_from_tray` so both the legacy
+    auto-create path and the reused-tag re-spool service resolve identity the
+    same way (material split, gradient/multi-color subtype upgrade, color-catalog
+    lookup, core-weight catalog, slicer preset name, remain%→weight_used, and the
+    zero-tag normalization). Behaviour of :func:`create_spool_from_tray` is
+    unchanged — it now delegates the parse here and only owns spool construction.
     """
     from backend.app.models.color_catalog import ColorCatalogEntry
     from backend.app.models.spool_catalog import SpoolCatalogEntry
@@ -168,12 +221,11 @@ async def create_spool_from_tray(db: AsyncSession, tray_data: dict) -> Spool:
         remain_pct = 100  # Unknown → assume full
     weight_used = round(label_weight * (100 - remain_pct) / 100.0, 1)
 
-    spool = Spool(
+    return ParsedTrayFields(
         material=material,
         subtype=subtype,
         color_name=color_name,
         rgba=rgba,
-        brand="Bambu Lab",
         label_weight=label_weight,
         core_weight=core_weight,
         weight_used=weight_used,
@@ -183,6 +235,33 @@ async def create_spool_from_tray(db: AsyncSession, tray_data: dict) -> Spool:
         nozzle_temp_max=int(nozzle_max) if nozzle_max else None,
         tag_uid=tag_uid if tag_uid and tag_uid != ZERO_TAG_UID else None,
         tray_uuid=tray_uuid if tray_uuid and tray_uuid != ZERO_TRAY_UUID else None,
+    )
+
+
+async def create_spool_from_tray(db: AsyncSession, tray_data: dict) -> Spool:
+    """Create a new Spool inventory entry from AMS tray MQTT data.
+
+    Extracts material, subtype, color, temps, and tag info from the tray dict
+    (via :func:`parse_tray_fields`). Looks up core_weight from the spool catalog
+    if a Bambu Lab entry matches.
+    """
+    parsed = await parse_tray_fields(db, tray_data)
+
+    spool = Spool(
+        material=parsed.material,
+        subtype=parsed.subtype,
+        color_name=parsed.color_name,
+        rgba=parsed.rgba,
+        brand="Bambu Lab",
+        label_weight=parsed.label_weight,
+        core_weight=parsed.core_weight,
+        weight_used=parsed.weight_used,
+        slicer_filament=parsed.slicer_filament,
+        slicer_filament_name=parsed.slicer_filament_name,
+        nozzle_temp_min=parsed.nozzle_temp_min,
+        nozzle_temp_max=parsed.nozzle_temp_max,
+        tag_uid=parsed.tag_uid,
+        tray_uuid=parsed.tray_uuid,
         data_origin="rfid_auto",
         tag_type="bambulab",
     )
@@ -200,11 +279,11 @@ async def create_spool_from_tray(db: AsyncSession, tray_data: dict) -> Spool:
     logger.info(
         "Auto-created spool %d from AMS tray data: %s %s %s (tag=%s uuid=%s)",
         spool.id,
-        material,
-        subtype or "",
-        color_name or "",
-        tag_uid,
-        tray_uuid,
+        parsed.material,
+        parsed.subtype or "",
+        parsed.color_name or "",
+        parsed.tag_uid or "",
+        parsed.tray_uuid or "",
     )
     return spool
 
@@ -260,6 +339,13 @@ async def find_matching_untagged_spool(db: AsyncSession, tray_data: dict) -> Spo
             subtype = "Tri Color"
 
     # Active, untagged spools matching material + color + Bambu-or-unset brand.
+    #
+    # Two exclusions keep an incoming Bambu RFID tag from hijacking a tagless
+    # row (silent-tracking work item): never attract a spool that is already
+    # bound to an AMS slot (``~assignments.any()``), and never attract an
+    # auto-minted tagless row (``data_origin == "ams_auto"``) — those are the
+    # farm's own silently-tracked third-party spools, not manually-logged Bambu
+    # rolls awaiting their tag.
     query = (
         select(Spool)
         .options(selectinload(Spool.k_profiles), selectinload(Spool.assignments))
@@ -267,6 +353,8 @@ async def find_matching_untagged_spool(db: AsyncSession, tray_data: dict) -> Spo
             Spool.archived_at.is_(None),
             Spool.tag_uid.is_(None),
             Spool.tray_uuid.is_(None),
+            ~Spool.assignments.any(),
+            or_(Spool.data_origin.is_(None), Spool.data_origin != "ams_auto"),
             func.upper(Spool.material) == material.upper(),
             func.upper(Spool.rgba) == tray_color.upper(),
             or_(
@@ -344,16 +432,85 @@ async def link_tag_to_inventory_spool(db: AsyncSession, spool: Spool, tray_data:
     )
 
 
-async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str) -> Spool | None:
+async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str, *, converge: bool = False) -> Spool | None:
     """Look up an active spool by RFID tag UID or Bambu Lab tray UUID.
 
-    Prefers tray_uuid match over tag_uid (more reliable).
+    Prefers tray_uuid match over tag_uid (more reliable). Falls back to first-char /
+    short-UID *variance* matching for the same physical chip read slightly
+    differently across readers (one reader reports "8C0E…", another "1C0E…").
+
+    ``converge`` (write-owning callers ONLY — the RFID auto-assign + unlink-damping
+    paths in ``main.on_ams_change``): on a variance match, persist the SCANNED
+    tag_uid + tray_uuid back onto the matched spool ONCE, so the next read is an
+    exact match and the auto-unlink ⇄ variance-rematch loop cannot recur (printer 3
+    looped all day 2026-07-14). Read-only callers (SpoolBuddy lookup, re-spool donor
+    resolution) leave it False and never write. A genuine different-roll signal —
+    the scanned tray_uuid already owned by a DIFFERENT non-archived spool —
+    suppresses the variance match entirely, protecting the reused-tag re-spool
+    sibling guard (which keys on tray_uuid uniqueness).
     """
     tray_uuid_norm = _normalize_tray_uuid(tray_uuid)
     tag_uid_norm = _normalize_tag_uid(tag_uid)
+    tray_uuid_valid = bool(
+        tray_uuid_norm and tray_uuid_norm != ZERO_TRAY_UUID and tray_uuid_norm != "0" * len(tray_uuid_norm)
+    )
+
+    async def _accept_variance(candidate: Spool, kind: str) -> Spool | None:
+        """Different-roll guard + one-time convergence for a variance match.
+
+        Returns ``candidate`` to accept the match, or None to skip it. When the
+        scanned tray_uuid is valid and already belongs to a DIFFERENT non-archived
+        spool, this is a genuine different-roll signal (a reused tag on a fresh
+        roll): skip the variance match so exact/uuid matching — or the caller's
+        unlink — stands, and never converge onto a colliding tray_uuid. On a real
+        variance match, ``converge`` callers persist the scanned identifiers onto
+        the spool once so the reader-variance loop cannot recur.
+        """
+        if tray_uuid_valid:
+            other = await db.execute(
+                select(Spool.id)
+                .where(
+                    func.upper(Spool.tray_uuid) == tray_uuid_norm,
+                    Spool.archived_at.is_(None),
+                    Spool.id != candidate.id,
+                )
+                .limit(1)
+            )
+            if other.scalar_one_or_none() is not None:
+                logger.warning(
+                    "Skipping %s variance match on spool %d: scanned tray_uuid %s already belongs to a "
+                    "different non-archived spool (different roll — reused tag, one tag per donor)",
+                    kind,
+                    candidate.id,
+                    tray_uuid_norm,
+                )
+                return None
+        logger.warning(
+            "Matched spool %d via %s variance: stored=%s → scanned=%s",
+            candidate.id,
+            kind,
+            _normalize_tag_uid(candidate.tag_uid),
+            tag_uid_norm,
+        )
+        if converge:
+            old_uid = candidate.tag_uid
+            old_uuid = candidate.tray_uuid
+            candidate.tag_uid = tag_uid_norm
+            if tray_uuid_valid:
+                candidate.tray_uuid = tray_uuid_norm
+            await db.flush()
+            logger.warning(
+                "Converged stored tag identifiers on spool %d: tag_uid %s→%s tray_uuid %s→%s",
+                candidate.id,
+                old_uid,
+                candidate.tag_uid,
+                old_uuid,
+                candidate.tray_uuid,
+            )
+        return candidate
 
     # Try tray_uuid first (Bambu Lab spools — more reliable)
-    if tray_uuid_norm and tray_uuid_norm != ZERO_TRAY_UUID and tray_uuid_norm != "0" * len(tray_uuid_norm):
+    if tray_uuid_valid:
         result = await db.execute(
             select(Spool)
             .options(selectinload(Spool.k_profiles), selectinload(Spool.assignments))
@@ -414,27 +571,23 @@ async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str) -> Sp
                 # when remaining characters match. This handles cases where the same
                 # physical tag reports different first bytes across different readers
                 # (e.g., one reader reports "A45012F", another reports "B45012F").
+                # Routed through _accept_variance: a different-roll signal skips the
+                # match; converge callers persist the scanned values so it can't loop.
                 if len(tag_uid_norm) == len(candidate_uid) and len(tag_uid_norm) > 1:
                     # Same length: check if all chars except the first match
                     if candidate_uid[1:] == tag_uid_norm[1:]:
-                        logger.warning(
-                            "Matched spool %d via first-char variance: stored=%s → scanned=%s",
-                            candidate.id,
-                            candidate_uid,
-                            tag_uid_norm,
-                        )
-                        return candidate
+                        matched = await _accept_variance(candidate, "first-char")
+                        if matched is not None:
+                            return matched
+                        continue
                 # Short UID (8 chars) matching: allow first-character mismatch
                 # within the first 8 bytes when remaining 7 chars match.
                 if len(tag_uid_norm) == 8 and len(candidate_uid) >= 8:
                     if candidate_uid[:8][1:] == tag_uid_norm[1:]:
-                        logger.warning(
-                            "Matched spool %d via short UID variance: stored=%s → scanned=%s",
-                            candidate.id,
-                            candidate_uid,
-                            tag_uid_norm,
-                        )
-                        return candidate
+                        matched = await _accept_variance(candidate, "short UID")
+                        if matched is not None:
+                            return matched
+                        continue
 
     return None
 
@@ -499,6 +652,10 @@ async def auto_assign_spool(
     db.add(assignment)
     await db.flush()
 
+    # First-in-service stamp (FIFO substrate). Idempotent — only the first
+    # assignment sets it; a spool pulled and re-assigned keeps its timestamp.
+    stamp_first_loaded(spool)
+
     # Apply K-profile via MQTT (if available)
     # NOTE: Do NOT send ams_set_filament_setting here. This function is only
     # called for BL spools (RFID-detected). The firmware already has the filament
@@ -507,12 +664,9 @@ async def auto_assign_spool(
     try:
         client = printer_manager.get_client(printer_id)
         if client:
-            # Apply K-profile if available
-            nozzle_diameter = "0.4"
-            if state and state.nozzles:
-                nd = state.nozzles[0].nozzle_diameter
-                if nd:
-                    nozzle_diameter = nd
+            # Apply K-profile if available. Diameter comes from the SERVING
+            # extruder's hotend (mixed-nozzle H2C safe).
+            nozzle_diameter = nozzle_for_ams_unit(state, ams_id, tray_id)
 
             matching_kp = None
             for kp in spool.k_profiles:

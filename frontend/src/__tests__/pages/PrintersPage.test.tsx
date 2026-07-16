@@ -1175,6 +1175,64 @@ describe('PrintersPage', () => {
     });
   });
 
+  describe('nozzle diameter display', () => {
+    // Single-nozzle printers (H2S fleet) populate only nozzles[0]; the second
+    // slot is a fixed empty stub. Display must stay unchanged: one unlabeled
+    // diameter, no L/R side label.
+    it('shows a single unlabeled diameter for single-nozzle printers', async () => {
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinters[0]])),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({
+            ...mockPrinterStatus,
+            nozzles: [
+              { nozzle_type: 'hardened_steel', nozzle_diameter: '0.4' },
+              { nozzle_type: '', nozzle_diameter: '' },
+            ],
+          }),
+        ),
+      );
+
+      render(<PrintersPage />);
+
+      const nozzle = await screen.findByTitle('hardened_steel');
+      // Exact text — no side label, matches the pre-existing "• {d}mm" display.
+      expect(nozzle.textContent).toBe('• 0.4mm');
+      expect(screen.queryByText('R 0.4mm')).not.toBeInTheDocument();
+      expect(screen.queryByText('L 0.4mm')).not.toBeInTheDocument();
+    });
+
+    // Dual-nozzle printers (H2C) report BOTH hotends: index 0 = right, index 1
+    // = left. Both diameters render, each labelled by side, each keeping its
+    // own nozzle_type tooltip.
+    it('shows both diameters with R/L side labels for dual-nozzle printers', async () => {
+      server.use(
+        http.get('/api/v1/printers/', () =>
+          HttpResponse.json([{ ...mockPrinters[0], model: 'H2C' }]),
+        ),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({
+            ...mockPrinterStatus,
+            nozzles: [
+              { nozzle_type: 'HH01', nozzle_diameter: '0.6' },        // right
+              { nozzle_type: 'hardened_steel', nozzle_diameter: '0.4' }, // left
+            ],
+          }),
+        ),
+      );
+
+      render(<PrintersPage />);
+
+      const right = await screen.findByText('R 0.6mm');
+      const left = screen.getByText('L 0.4mm');
+      expect(right).toBeInTheDocument();
+      expect(left).toBeInTheDocument();
+      // Per-side nozzle_type tooltip preserved.
+      expect(right).toHaveAttribute('title', 'HH01');
+      expect(left).toHaveAttribute('title', 'hardened_steel');
+    });
+  });
+
 });
 
 /**

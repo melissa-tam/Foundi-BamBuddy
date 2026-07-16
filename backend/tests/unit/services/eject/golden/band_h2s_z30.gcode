@@ -6,14 +6,6 @@ G90
 G1 Z40 F900
 ; --- bed heater off ---
 M140 S0
-; --- cooldown: hold until the bed reaches the release threshold ---
-M106 S255
-M190 R28
-M190 R28
-M190 R28
-M190 R28
-M190 R28
-M106 S0
 ; --- sweep: push part off the front edge ---
 G1 X50 Y322 F9000
 G1 Z30 F600
@@ -188,4 +180,51 @@ G1 X200 F9000
 G1 Y-2 F1500
 G1 Y322 F9000
 G1 X170 Y160 Z10 F9000
+; --- completion epilogue: stock machine-end finish tail (job ends FINISH) ---
+M220 S100  ; Reset feedrate magnitude
+M201.2 K1.0 ; Reset acc magnitude
+M73.2   R1.0 ;Reset left time magnitude
+
+M1015.4 S0 K0 ;disable air printing detect
+
+;=====printer finish air purification=========
+M622.1 S0
+M1002 judge_flag print_finish_air_filt_flag
+
+M622 J1
+M1002 gcode_claim_action : 66
+M145 P1
+M106 P6 S255
+M400 S180
+M106 P6 S0
+M623
+
+M622 J2
+M1002 gcode_claim_action : 66
+M145 P0
+M106 P3 S127
+M400 S180
+M106 P3 S0
+M623
+;=====printer finish air purification=========
+
+;=====printer finish  sound=========
+M17
+M400 S1
+M1006 S1
+M1006 A53 B10 L99 C53 D10 M99 E53 F10 N99
+M1006 A57 B10 L99 C57 D10 M99 E57 F10 N99
+M1006 A0 B15 L0 C0 D15 M0 E0 F15 N0
+M1006 A53 B10 L99 C53 D10 M99 E53 F10 N99
+M1006 A57 B10 L99 C57 D10 M99 E57 F10 N99
+M1006 A0 B15 L0 C0 D15 M0 E0 F15 N0
+M1006 A48 B10 L99 C48 D10 M99 E48 F10 N99
+M1006 A0 B15 L0 C0 D15 M0 E0 F15 N0
+M1006 A60 B10 L99 C60 D10 M99 E60 F10 N99
+M1006 W
+;=====printer finish  sound=========
+M400
+M18
+
+M73 P100 R0
 ; ===== FARM EJECT BLOCK END =====

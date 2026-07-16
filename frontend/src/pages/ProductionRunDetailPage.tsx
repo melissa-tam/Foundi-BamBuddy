@@ -15,7 +15,9 @@ import { useTranslation } from 'react-i18next';
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertCircle,
+  AlertTriangle,
   ArrowLeft,
+  CalendarClock,
   Factory,
   Hand,
   Loader2,
@@ -31,11 +33,12 @@ import {
   PauseReasonChip,
   RunStagedBanner,
   RunStatusBadge,
+  ScheduledChip,
 } from '../components/RunBadges';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { deriveFarmPhase } from '../utils/farmPhase';
-import { formatDateTime } from '../utils/date';
+import { formatDateTime, formatRelativeTime, parseUTCDate } from '../utils/date';
 import { waitingReasonText } from '../utils/waitingReason';
 import type { ProductionRun, RunPrinterState, RunUnit } from '../types/productionRuns';
 
@@ -82,6 +85,16 @@ function PrinterStateChip({ state, status }: { state: RunPrinterState; status?: 
   }
   if (state.stalled) reasons.push(t('productionRuns.detail.printerState.stalled'));
   if (state.vision_hold) reasons.push(t('productionRuns.detail.printerState.visionHold'));
+  if (state.filament_short_live) {
+    reasons.push(
+      state.filament_short_detail
+        ? `${t('productionRuns.detail.printerState.filamentShort')} — ${state.filament_short_detail}`
+        : t('productionRuns.detail.printerState.filamentShort'),
+    );
+  }
+  if (state.no_usb_drive) reasons.push(t('productionRuns.detail.printerState.noUsbDrive'));
+  // Capability-gate reason is already a human-readable backend sentence.
+  if (state.capability_reason) reasons.push(state.capability_reason);
   if (!state.connected) reasons.push(t('productionRuns.detail.printerState.offline'));
 
   // Cooldown/eject phase (Phase 4.3c) from the live status cache.
@@ -89,18 +102,26 @@ function PrinterStateChip({ state, status }: { state: RunPrinterState; status?: 
     state: status?.state,
     awaiting_plate_clear: state.awaiting_plate_clear,
     eject_watch: status?.eject_watch,
-    bed: status?.temperatures?.bed,
   });
   let phaseText: string | null = null;
   if (phase?.kind === 'printing') phaseText = t('printers.phase.printing');
   else if (phase?.kind === 'cooling') {
-    phaseText =
-      phase.bed != null
-        ? t('printers.phase.cooling', { threshold: Math.round(phase.threshold), bed: Math.round(phase.bed) })
-        : t('printers.phase.coolingNoBed', { threshold: Math.round(phase.threshold) });
+    // Never claim "cooling" for a printer we cannot observe — mirror the
+    // printer card, which shows no phase pill while disconnected.
+    if (state.connected) {
+      phaseText = t('printers.phase.cooling', { threshold: Math.round(phase.threshold) });
+    }
   } else if (phase?.kind === 'awaitingPlateClear') phaseText = t('printers.phase.awaitingPlateClear');
 
-  const blocked = state.quarantined || state.model_mismatch || state.stalled || state.vision_hold || !state.connected;
+  const blocked =
+    state.quarantined ||
+    state.model_mismatch ||
+    state.stalled ||
+    state.vision_hold ||
+    state.filament_short_live ||
+    state.no_usb_drive ||
+    state.capability_reason != null ||
+    !state.connected;
   const tone = blocked
     ? 'border-red-500/40 bg-red-500/10'
     : state.awaiting_plate_clear
@@ -131,6 +152,91 @@ function PrinterStateChip({ state, status }: { state: RunPrinterState; status?: 
         !phaseText && <p className="mt-1 text-xs text-gray-400">{t('productionRuns.detail.printerState.ok')}</p>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Not-eligible panel (immediate dispatch feedback)
+// ---------------------------------------------------------------------------
+
+/**
+ * The reasons — as short translated labels — that make one printer ineligible
+ * to take a unit from this run right now. Derived from the SAME live flags the
+ * chips read (no extra API call): offline, quarantined, awaiting-plate-clear,
+ * model mismatch, live filament shortage, no USB drive, and the capability
+ * gate. An empty list means the printer is eligible. Busy / stagger-hold are
+ * NOT listed — they self-resolve. `capability_reason` and `filament_short_detail`
+ * are backend-authored human sentences and render verbatim.
+ */
+function eligibilityReasons(state: RunPrinterState, t: (k: string) => string): string[] {
+  const reasons: string[] = [];
+  if (!state.connected) reasons.push(t('productionRuns.detail.eligibility.offline'));
+  if (state.quarantined) reasons.push(t('productionRuns.detail.eligibility.quarantined'));
+  if (state.awaiting_plate_clear) reasons.push(t('productionRuns.detail.eligibility.awaitingPlateClear'));
+  if (state.model_mismatch) {
+    reasons.push(
+      state.model_mismatch_reason
+        ? `${t('productionRuns.detail.eligibility.modelMismatch')} — ${state.model_mismatch_reason}`
+        : t('productionRuns.detail.eligibility.modelMismatch'),
+    );
+  }
+  if (state.filament_short_live) {
+    reasons.push(
+      state.filament_short_detail
+        ? `${t('productionRuns.detail.eligibility.filamentShort')} — ${state.filament_short_detail}`
+        : t('productionRuns.detail.eligibility.filamentShort'),
+    );
+  }
+  if (state.no_usb_drive) reasons.push(t('productionRuns.detail.eligibility.noUsbDrive'));
+  if (state.capability_reason) reasons.push(state.capability_reason);
+  return reasons;
+}
+
+/**
+ * Banner card listing every printer the run targets that won't participate yet,
+ * with each printer's blocking reasons. Renders nothing when every printer is
+ * eligible (no empty-state card). Mirrors the RunStagedBanner tone/styling and
+ * reuses the chips' red "blocked" palette; the detail query's 5 s poll + WS
+ * invalidation keep it live, so a resolved printer drops off on the next fetch.
+ */
+function NotEligibleBanner({ printerStates }: { printerStates: RunPrinterState[] }) {
+  const { t } = useTranslation();
+  const ineligible = printerStates
+    .map((state) => ({ state, reasons: eligibilityReasons(state, t) }))
+    .filter((entry) => entry.reasons.length > 0);
+
+  if (ineligible.length === 0) return null;
+
+  return (
+    <Card>
+      <CardContent>
+        <div className="flex items-start gap-2 rounded-lg border border-red-500/40 bg-red-500/10 p-3">
+          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-red-300" aria-hidden="true" />
+          <div className="min-w-0">
+            <h2 className="text-sm font-semibold text-red-200">
+              {t('productionRuns.detail.eligibility.title')}
+            </h2>
+            <p className="mt-0.5 text-xs text-red-300/90">
+              {t('productionRuns.detail.eligibility.description')}
+            </p>
+            <ul className="mt-2 space-y-2">
+              {ineligible.map(({ state, reasons }) => (
+                <li key={state.printer_id}>
+                  <span className="text-sm font-medium text-white">{state.name}</span>
+                  <ul className="mt-0.5 space-y-0.5">
+                    {reasons.map((reason) => (
+                      <li key={reason} className="text-xs text-red-300">
+                        {reason}
+                      </li>
+                    ))}
+                  </ul>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -172,6 +278,16 @@ function UnitRow({ unit }: { unit: RunUnit }) {
             {t('productionRuns.detail.retryOf', { count: unit.retry_count, id: unit.retry_of_id })}
           </p>
         )}
+        {unit.status === 'pending' &&
+          unit.scheduled_time &&
+          (parseUTCDate(unit.scheduled_time)?.getTime() ?? 0) > Date.now() && (
+            <p className="mt-1 flex items-center gap-1 text-xs text-indigo-300">
+              <CalendarClock className="h-3 w-3" aria-hidden="true" />
+              {t('productionRuns.schedule.startsIn', {
+                when: formatRelativeTime(unit.scheduled_time, 'system', t),
+              })}
+            </p>
+          )}
         {waiting && <p className="mt-1 text-xs text-purple-300">{waiting}</p>}
         {unit.error_message && (
           <p className="mt-1 max-w-md truncate text-xs text-red-400" title={unit.error_message}>
@@ -284,9 +400,10 @@ export function ProductionRunDetailPage() {
                     <span className="truncate">{run.name}</span>
                   </h1>
                   <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <RunStatusBadge status={run.status} />
+                    <RunStatusBadge status={run.status} scheduledStartAt={run.scheduled_start_at} />
                     <PauseReasonChip run={run} />
                     <BlockedPrintersChip run={run} />
+                    <ScheduledChip run={run} />
                   </div>
                   {run.sku_code && <p className="mt-2 text-sm text-gray-400">{run.sku_code}</p>}
                 </div>
@@ -348,6 +465,11 @@ export function ProductionRunDetailPage() {
               <FirstArticleBanner run={run} />
             </CardContent>
           </Card>
+
+          {/* Not-eligible feedback (immediate on send): which targeted printers
+              won't participate yet, and why. Above the chips per operator
+              placement; self-hides when every printer is eligible. */}
+          <NotEligibleBanner printerStates={printerStates} />
 
           {/* Printer states */}
           <Card>

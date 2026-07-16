@@ -53,10 +53,12 @@ from backend.app.api.routes import (
     pending_uploads,
     print_log,
     print_queue,
+    printer_eject,
     printer_sensor_history,
     printers,
     production_runs,
     projects,
+    respool,
     settings as settings_routes,
     skus,
     slice_jobs,
@@ -121,6 +123,14 @@ from backend.app.services.spoolman_tracking import (
     store_print_data as _store_spoolman_print_data,
 )
 from backend.app.services.tasmota import tasmota_service
+from backend.app.services.usb_storage import (
+    HMS_STORAGE_LOW_FULL_CODES,
+    _deferred_printers,
+    drain_recordings_if_idle,
+    on_storage_low,
+    record_sdcard_and_detect_drop,
+    should_retry_deferred,
+)
 
 
 # =============================================================================
@@ -960,6 +970,17 @@ def _maybe_start_layer_timelapse(printer, printer_id: int, archive_id: int) -> b
     return True
 
 
+def _hms_should_notify_severity(severity: int) -> bool:
+    """Whether an HMS severity warrants a push notification.
+
+    Bambu severity: 1=fatal, 2=serious, 3=common, 4=info. Notify on everything
+    actionable (fatal..common) and drop only info(4). The legacy gate used
+    ``severity >= 2`` under the OLD (wrong) decode where fatal read as 1 — which
+    silently dropped genuine fatal faults; this is the corrected predicate.
+    """
+    return severity <= 3
+
+
 def _format_hms_error_summary(hms_errors: list[dict]) -> str | None:
     """Build a human-readable failure reason from MQTT hms_errors for PrintQueueItem.error_message.
 
@@ -971,18 +992,24 @@ def _format_hms_error_summary(hms_errors: list[dict]) -> str | None:
     """
     if not hms_errors:
         return None
-    from backend.app.services.hms_errors import get_error_description
+    from backend.app.services.hms_errors import lookup_description_any
 
     parts: list[str] = []
     for err in hms_errors:
         try:
             code_str = str(err.get("code", "")).replace("0x", "")
             error_num = int(code_str, 16) if code_str else 0
-            module_num = (int(err.get("attr", 0)) >> 16) & 0xFFFF
-            short_code = f"{module_num:04X}_{error_num:04X}"
+            attr_int = int(err.get("attr", 0))
+            module_num = (attr_int >> 16) & 0xFFFF
+            # Mask to the low 16 bits so a full 32-bit hms[] code (e.g. 0x00030004)
+            # still renders as the canonical MMMM_CCCC shape, matching hms_short_code.
+            short_code = f"{module_num:04X}_{error_num & 0xFFFF:04X}"
         except (TypeError, ValueError):
             continue
-        description = get_error_description(short_code)
+        # Prefer the lossless full_code (via attr+code) against the vendored
+        # catalog, then fall back to the legacy 2-group table. Display shape
+        # stays "[MMMM_CCCC] text".
+        description = lookup_description_any(attr_int, err.get("code", 0))
         parts.append(f"[{short_code}] {description}" if description else f"[{short_code}]")
     return "; ".join(parts) if parts else None
 
@@ -1306,9 +1333,14 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         _hms_last_seen[printer_id] = time.time()
 
         if new_error_codes:
-            # Get the actual new errors for the notification
-            # Filter to severity >= 2 (skip informational/status messages like H2D sends)
-            new_errors = [e for e in current_hms_errors if f"{e.attr:08x}" in new_error_codes and e.severity >= 2]
+            # Get the actual new errors for the notification.
+            # Severity semantics (Bambu): 1=fatal, 2=serious, 3=common, 4=info.
+            # Notify on everything actionable (fatal..common); drop only info(4).
+            new_errors = [
+                e
+                for e in current_hms_errors
+                if f"{e.attr:08x}" in new_error_codes and _hms_should_notify_severity(e.severity)
+            ]
 
             try:
                 async with async_session() as db:
@@ -1328,6 +1360,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         0x12: "Chamber",
                     }
 
+                    from backend.app.services.hms_catalog import lookup_full_code
                     from backend.app.services.hms_errors import get_error_description
 
                     # Capture camera snapshot once for all error notifications
@@ -1346,8 +1379,17 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
 
                         # Only notify for errors with known descriptions — printers
                         # send many undocumented/phantom codes that aren't real errors.
-                        description = get_error_description(short_code)
+                        # Prefer the lossless full_code against the vendored catalog,
+                        # then fall back to the legacy 2-group table.
+                        description = lookup_full_code(error.full_code) or get_error_description(short_code)
                         if not description or short_code in _HMS_NOTIFICATION_SUPPRESS:
+                            continue
+                        # USB-storage-low codes are owned by the dedicated on_storage_low
+                        # event (auto-cleanup + outcome notification) fired below — skip
+                        # them here so the user doesn't also get a generic printer-error
+                        # alert. Matched by full_code (not the lossy 2-group short code,
+                        # which could shadow unrelated codes sharing the truncation).
+                        if error.full_code in HMS_STORAGE_LOW_FULL_CODES:
                             continue
 
                         error_type = f"{module_name} Error"
@@ -1404,6 +1446,46 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         "[PLATE-VISION] native plate-occupancy capture failed for printer %s: %s", printer_id, _pe
                     )
 
+            # USB storage-low capture. When a NEW HMS "USB full" code arrives, the
+            # farm auto-cleans the drive (recordings first, then oldest unused print
+            # files) and fires the dedicated on_storage_low notification with the
+            # outcome. Fire-and-forget so the slow FTP work never blocks the status
+            # flow; the service is fully self-guarded (unreachable FTPS → failure
+            # notification, never an exception).
+            _new_storage = {
+                e.full_code for e in current_hms_errors if f"{e.attr:08x}" in new_error_codes
+            } & HMS_STORAGE_LOW_FULL_CODES
+            if _new_storage:
+                try:
+                    asyncio.create_task(on_storage_low(printer_id, set(_new_storage)))
+                except Exception as _se:  # noqa: BLE001 — hook must never crash the status flow
+                    logging.getLogger(__name__).warning(
+                        "[USB-STORAGE] storage-low hook failed for printer %s: %s", printer_id, _se
+                    )
+
+            # Reused-tag re-spool Tier 1: a NEW hardware runout HMS code stamps
+            # spent_at on the exhausted tray's spool (resolved via the dispatched
+            # farm ams_mapping / live tray_now) so the reused tag re-spools
+            # automatically on refill instead of mapping to the spent donor.
+            # Orchestration lives in spool_respool; this is a guarded hook only.
+            from backend.app.services.spool_respool import (
+                RUNOUT_HMS_CODES as _RUNOUT_HMS_CODES,
+            )
+
+            _new_runout = {
+                hms_short_code(e.attr, e.code) for e in current_hms_errors if f"{e.attr:08x}" in new_error_codes
+            } & _RUNOUT_HMS_CODES
+            if _new_runout:
+                try:
+                    from backend.app.services.spool_respool import mark_spent_on_runout
+
+                    async with async_session() as _respool_db:
+                        await mark_spent_on_runout(_respool_db, printer_id, _new_runout, state)
+                except Exception as _re:  # noqa: BLE001 — capture must never crash the status flow
+                    logging.getLogger(__name__).warning(
+                        "[RESPOOL] spent-on-runout capture failed for printer %s: %s", printer_id, _re
+                    )
+
     else:
         # No HMS errors — only clear tracking after a grace period to prevent
         # flapping errors (brief hms:[] gaps) from re-triggering notifications.
@@ -1414,6 +1496,53 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             if time.time() - last_seen >= _HMS_CLEAR_GRACE_SECONDS:
                 _notified_hms_errors.pop(printer_id, None)
                 _hms_last_seen.pop(printer_id, None)
+
+    # Mid-print USB-drop alert (runs every tick, independent of HMS). The firmware
+    # unmounts a full/failed USB drive and reports sdcard=False (with hms[] often
+    # cleared too), which would otherwise silently strand the printer. The service
+    # owns the True → False edge detection (fires once per transition, never from the
+    # startup default); fire the USB-storage FAILURE notification here. Fully guarded.
+    if record_sdcard_and_detect_drop(printer_id, bool(getattr(state, "sdcard", False))):
+        try:
+
+            async def _notify_usb_drop(pid: int):
+                async with async_session() as _drop_db:
+                    from backend.app.models.printer import Printer
+
+                    _p = await _drop_db.get(Printer, pid)
+                    _name = (_p.name if _p else None) or f"printer {pid}"
+                    await notification_service.on_storage_low(
+                        pid,
+                        _name,
+                        success=False,
+                        freed_bytes=0,
+                        files_deleted=0,
+                        free_bytes=None,
+                        reason="USB drive dropped/unmounted — power-cycle the printer to remount it",
+                        db=_drop_db,
+                    )
+
+            asyncio.create_task(_notify_usb_drop(printer_id))
+        except Exception as _de:  # noqa: BLE001 — alert must never crash the status flow
+            logging.getLogger(__name__).warning(
+                "[USB-STORAGE] USB-drop alert failed for printer %s: %s", printer_id, _de
+            )
+
+    # Deferred-retry path (runs every tick, NOT gated on current HMS errors): a
+    # cleanup deferred by the actively-printing guard must retry once the print
+    # ends — and the storage code may have vanished from hms[] (the firmware drops
+    # it when it unmounts a full drive), so this cannot live inside the HMS block.
+    # The predicate is DB-free and short-circuits on set membership. Clear the
+    # deferral BEFORE create_task so consecutive ticks can't multi-spawn; the task
+    # re-arms it only if the printer is still printing.
+    if should_retry_deferred(printer_id, getattr(state, "state", None)):
+        _deferred_printers.discard(printer_id)
+        try:
+            asyncio.create_task(on_storage_low(printer_id, set(HMS_STORAGE_LOW_FULL_CODES)))
+        except Exception as _se:  # noqa: BLE001 — hook must never crash the status flow
+            logging.getLogger(__name__).warning(
+                "[USB-STORAGE] deferred storage-low retry failed for printer %s: %s", printer_id, _se
+            )
 
     await ws_manager.send_printer_status(
         printer_id,
@@ -1477,6 +1606,12 @@ async def on_ams_change(printer_id: int, ams_data: list):
             from backend.app.api.routes.inventory import _find_tray_in_ams_data
             from backend.app.models.spool import Spool as _Spool
             from backend.app.models.spool_assignment import SpoolAssignment as SA
+            from backend.app.services import spool_tagless
+            from backend.app.services.spool_tag_matcher import get_spool_by_tag
+
+            # Sticky-rebind threshold ("effectively empty" grams) — read once for
+            # the whole cleanup loop.
+            _tagless_threshold = await spool_tagless.effective_threshold(db)
 
             result = await db.execute(
                 select(SA)
@@ -1501,6 +1636,23 @@ async def on_ams_change(printer_id: int, ams_data: list):
                 else:
                     current_tray = _find_tray_in_ams_data(ams_data, assignment.ams_id, assignment.tray_id)
                 if not current_tray:
+                    # Sticky rebind: a tagless spool pulled for drying (not spent,
+                    # not effectively empty) keeps its assignment so it re-binds to
+                    # the SAME ledger row on return. Its fingerprint is left intact
+                    # (blanking it would re-trip the SpoolBuddy replay).
+                    if spool_tagless.should_keep_on_empty(assignment, _tagless_threshold):
+                        logger.info(
+                            "Sticky rebind: keeping tagless assignment spool %d AMS%d-T%d over empty slot",
+                            assignment.spool_id,
+                            assignment.ams_id,
+                            assignment.tray_id,
+                        )
+                        continue
+                    # Departing while spent → record the leftover-config marker so a
+                    # firmware re-read of its stale config isn't mistaken for a new spool.
+                    spool_tagless.record_stale_marker_for_spool(
+                        printer_id, assignment.ams_id, assignment.tray_id, assignment.spool
+                    )
                     logger.info(
                         "Auto-unlink: spool %d AMS%d-T%d — tray not found in AMS data (slot empty?)",
                         assignment.spool_id,
@@ -1541,6 +1693,26 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                 assignment.tray_id,
                             )
                         continue
+                    # Unlink damping: the "different" tray_uuid may be the SAME
+                    # physical tag read with reader variance (first char differs on
+                    # tag_uid, tray_uuid drifts) — printer 3 looped all day
+                    # 2026-07-14 between this unlink and the tolerant variance
+                    # re-assign. Resolve the scanned identifiers exactly as
+                    # auto-assign will; if they still point at the spool already
+                    # assigned here it is NOT a different roll, so skip the unlink.
+                    # converge=True persists the scanned identifiers onto the spool
+                    # once (this block owns the write + commits below) so the next
+                    # read is an exact match and the loop dies at most once per spool.
+                    _resolved = await get_spool_by_tag(db, tag_uid, tray_uuid, converge=True)
+                    if _resolved is not None and _resolved.id == assignment.spool_id:
+                        logger.info(
+                            "Auto-unlink damped: spool %d AMS%d-T%d — scanned tag resolves to the assigned "
+                            "spool (reader variance, not a different roll); keeping assignment",
+                            assignment.spool_id,
+                            assignment.ams_id,
+                            assignment.tray_id,
+                        )
+                        continue
                     # Different BL spool or unrecognized — unlink so auto-assign can match
                     logger.info(
                         "Auto-unlink: spool %d AMS%d-T%d — different Bambu Lab spool detected (uuid=%s)",
@@ -1549,6 +1721,20 @@ async def on_ams_change(printer_id: int, ams_data: list):
                         assignment.tray_id,
                         tray_uuid,
                     )
+                    # Provisional disposal: the departing spool was an auto-minted
+                    # tagless provisional row and a real RFID tag now owns the slot.
+                    # Hard-delete it (cascade removes this assignment) if it never
+                    # accrued a usage ledger, else archive it and unlink normally.
+                    if assignment.spool is not None and assignment.spool.data_origin == "ams_auto":
+                        _disp = await spool_tagless.dispose_provisional_on_tag(db, assignment.spool)
+                        if _disp == "hard-deleted":
+                            logger.info(
+                                "Provisional tagless spool %d hard-deleted on RFID takeover (AMS%d-T%d)",
+                                assignment.spool_id,
+                                assignment.ams_id,
+                                assignment.tray_id,
+                            )
+                            continue  # cascade removed the assignment — don't double-delete
                     stale.append(assignment)
                 else:
                     cur_color = current_tray.get("tray_color", "")
@@ -1609,6 +1795,19 @@ async def on_ams_change(printer_id: int, ams_data: list):
                         assignment.fingerprint_type = cur_type
                         continue
 
+                    if not cur_type.strip():
+                        # Slot cleared (tray dict present but filament type gone) —
+                        # distinct from a different NON-empty filament below. Run the
+                        # sticky-rebind check: keep a live tagless spool, else record
+                        # the spent leftover-config marker and unlink.
+                        if spool_tagless.should_keep_on_empty(assignment, _tagless_threshold):
+                            continue
+                        spool_tagless.record_stale_marker_for_spool(
+                            printer_id, assignment.ams_id, assignment.tray_id, assignment.spool
+                        )
+                        stale.append(assignment)
+                        continue
+
                     if not _colors_similar(cur_color, fp_color) or cur_type.upper() != fp_type.upper():
                         # Fingerprint mismatch — but check if tray now matches the
                         # assigned spool (e.g. auto-configure changed the tray).
@@ -1660,6 +1859,13 @@ async def on_ams_change(printer_id: int, ams_data: list):
             from backend.app.api.routes.settings import get_setting
             from backend.app.models.spool import Spool
             from backend.app.models.spool_assignment import SpoolAssignment as SA
+            from backend.app.services import spool_tagless
+            from backend.app.services.spool_respool import (
+                RESPOOL_TAG_TYPE,
+                capture_backup_swap,
+                clear_respool_prompt_dedup,
+                maybe_auto_or_prompt_respool,
+            )
             from backend.app.services.spool_tag_matcher import (
                 auto_assign_spool,
                 create_spool_from_tray,
@@ -1669,11 +1875,36 @@ async def on_ams_change(printer_id: int, ams_data: list):
                 is_valid_tag,
                 link_tag_to_inventory_spool,
             )
+            from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid
 
             _spoolman_on = await get_setting(db, "spoolman_enabled")
             _auto_add_raw = await get_setting(db, "auto_add_unknown_rfid")
             _auto_add_unknown = _auto_add_raw is None or _auto_add_raw.lower() == "true"
+
+            # Presence-transition tracking (both Spoolman and native modes). On a
+            # presence gain while idle it fires an immediate per-slot RFID re-read
+            # so a Bambu spool resolves via the normal tag path fast; the terminal
+            # sweep handles mid-print refills at print end. Tagless spools are now
+            # auto-minted/configured by services.spool_tagless (Hook B + bare-tray
+            # auto-config below), not prompted. Guarded — never breaks the callback.
+            try:
+                from backend.app.services import ams_presence
+
+                await ams_presence.on_ams_change(printer_id, ams_data, db)
+            except Exception as _ape:  # noqa: BLE001 — must never crash the AMS callback
+                logger.warning("AMS presence tracking failed for printer %s: %s", printer_id, _ape)
+
             if not _spoolman_on or _spoolman_on.lower() != "true":
+                # Reused-tag Tier 1: seamless AMS backup-swap runout detector (a
+                # runout that may raise no HMS). One call per AMS push; the service
+                # owns the tray_now edge state and is guarded so the AMS path never
+                # breaks on a farm-side failure.
+                try:
+                    _swap_state = printer_manager.get_status(printer_id)
+                    if _swap_state is not None:
+                        await capture_backup_swap(db, printer_id, _swap_state)
+                except Exception as _bse:  # noqa: BLE001 — must never crash the AMS callback
+                    logger.warning("Backup-swap capture failed for printer %s: %s", printer_id, _bse)
                 for ams_unit in ams_data:
                     if not isinstance(ams_unit, dict):
                         continue
@@ -1686,9 +1917,40 @@ async def on_ams_change(printer_id: int, ams_data: list):
                         tray_uuid = tray.get("tray_uuid", "")
                         tray_info_idx = tray.get("tray_info_idx", "")
                         if not tray.get("tray_type"):
-                            # Slot reported empty — drop any cached unknown-tag
-                            # broadcast so reinserting the same spool re-prompts.
+                            if spool_tagless.tray_present(tray):
+                                # BARE tray: a spool is physically present but nothing
+                                # is configured. Push the default filament so the slot
+                                # is usable (incl. mid-print backup pool) — D3b.
+                                try:
+                                    await spool_tagless.maybe_autoconfigure_bare_tray(
+                                        db, printer_id, ams_id, tray_id, tray
+                                    )
+                                except Exception as _bte:  # noqa: BLE001 — never crash the AMS callback
+                                    logger.warning(
+                                        "Bare-tray auto-config failed for printer %s AMS%d-T%d: %s",
+                                        printer_id,
+                                        ams_id,
+                                        tray_id,
+                                        _bte,
+                                    )
+                                continue
+                            # Truly empty (state 9 / cleared) — drop any cached
+                            # unknown-tag / re-spool-prompt / bare-config dedup so
+                            # reinserting the same spool re-prompts, and record a
+                            # stale-config marker if the departing spool was spent.
                             _clear_unknown_tag_dedup(printer_id, ams_id, tray_id)
+                            clear_respool_prompt_dedup(printer_id, ams_id, tray_id)
+                            spool_tagless.clear_autoconfig_dedup(printer_id, ams_id, tray_id)
+                            try:
+                                await spool_tagless.record_stale_marker(db, printer_id, ams_id, tray_id)
+                            except Exception as _sme:  # noqa: BLE001 — never crash the AMS callback
+                                logger.warning(
+                                    "Stale-config marker record failed for printer %s AMS%d-T%d: %s",
+                                    printer_id,
+                                    ams_id,
+                                    tray_id,
+                                    _sme,
+                                )
                             continue  # Empty slot
                         # Check if assignment already exists for this slot
                         existing = await db.execute(
@@ -1697,7 +1959,49 @@ async def on_ams_change(printer_id: int, ams_data: list):
                             .where(SA.printer_id == printer_id, SA.ams_id == ams_id, SA.tray_id == tray_id)
                         )
                         existing_assignment = existing.scalar_one_or_none()
+
+                        # Hook B: tagless-slot policy. When the tray carries no valid
+                        # RFID tag, this owns the slot (mint / sticky-rebind /
+                        # spent-replace of the auto-minted tagless spool). It returns
+                        # False for a slot bound to a TAGGED spool so a spent tagged
+                        # spool still reaches the respool gate below.
+                        if not is_valid_tag(tag_uid, tray_uuid):
+                            try:
+                                _tagless_handled = await spool_tagless.handle_tagless_slot(
+                                    db, printer_id, ams_id, tray_id, tray, existing_assignment
+                                )
+                            except Exception as _tse:  # noqa: BLE001 — never crash the AMS callback
+                                logger.warning(
+                                    "Tagless slot handling failed for printer %s AMS%d-T%d: %s",
+                                    printer_id,
+                                    ams_id,
+                                    tray_id,
+                                    _tse,
+                                )
+                                _tagless_handled = False
+                            if _tagless_handled:
+                                continue
+
                         if existing_assignment:
+                            # Reused-tag Tier 2/3 (same-slot swap where the
+                            # assignment survived): if this slot's spool was marked
+                            # spent (hardware runout) and a fresh spool is now
+                            # loaded, auto-respool (or prompt). A completed
+                            # re-spool re-assigns the slot itself, so skip the
+                            # normal weight-sync path below.
+                            if existing_assignment.spool is not None and existing_assignment.spool.spent_at is not None:
+                                try:
+                                    _respooled = await maybe_auto_or_prompt_respool(
+                                        db, printer_id, ams_id, tray_id, tray, existing_assignment.spool
+                                    )
+                                    if _respooled is not None:
+                                        continue
+                                except Exception as _rse:  # noqa: BLE001 — never crash the AMS callback
+                                    logger.warning(
+                                        "Re-spool gate (existing assignment) failed for printer %s: %s",
+                                        printer_id,
+                                        _rse,
+                                    )
                             # Sync spool weight_used from AMS remain — only INCREASE, never decrease.
                             # The AMS remain% is low-resolution (integer %, i.e. 10g steps for 1kg spool)
                             # and must not overwrite precise values from the usage tracker (3MF/G-code).
@@ -1750,17 +2054,17 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                     and spool.k_profiles
                                 ):
                                     state = printer_manager.get_status(printer_id)
-                                    nozzle_diameter = "0.4"
-                                    if state and state.nozzles:
-                                        nd = state.nozzles[0].nozzle_diameter
-                                        if nd:
-                                            nozzle_diameter = nd
-                                    slot_extruder: int | None = None
-                                    if state and state.ams_extruder_map:
-                                        if ams_id == 255:
-                                            slot_extruder = 1 - tray_id
-                                        else:
-                                            slot_extruder = state.ams_extruder_map.get(str(ams_id))
+                                    from backend.app.utils.printer_models import (
+                                        extruder_for_ams,
+                                        nozzle_for_ams_unit,
+                                    )
+
+                                    nozzle_diameter = nozzle_for_ams_unit(state, ams_id, tray_id)
+                                    slot_extruder: int | None = (
+                                        extruder_for_ams(state.ams_extruder_map, ams_id, tray_id)
+                                        if (state and state.ams_extruder_map)
+                                        else None
+                                    )
                                     # Prefer exact extruder match, fall back to
                                     # extruder-agnostic kp for the same printer +
                                     # nozzle. Avoids hard-skipping when the AMS is
@@ -1821,8 +2125,48 @@ async def on_ams_change(printer_id: int, ams_data: list):
                             continue
 
                         if is_bambu_tag(tag_uid, tray_uuid, tray_info_idx):
-                            # BL spool with RFID tag: auto-match → inventory match → auto-create
-                            spool = await get_spool_by_tag(db, tag_uid, tray_uuid)
+                            # BL spool with RFID tag: auto-match → inventory match → auto-create.
+                            # converge=True: this path owns the write, so a first-char/short-UID
+                            # variance match persists the scanned identifiers back onto the spool
+                            # once, ending the auto-unlink ⇄ re-assign reader-variance loop.
+                            spool = await get_spool_by_tag(db, tag_uid, tray_uuid, converge=True)
+                            if spool is not None:
+                                # Sibling-tag observability (3-line hook): the
+                                # donor's SECOND factory tag surfacing on a
+                                # different physical spool (same tray_uuid, other
+                                # tag_uid). Assignment proceeds unchanged; the fix
+                                # is operator discipline (one tag per donor roll).
+                                if (
+                                    spool.tag_type == RESPOOL_TAG_TYPE
+                                    and spool.tray_uuid
+                                    and tray_uuid
+                                    and normalize_tray_uuid(spool.tray_uuid) == normalize_tray_uuid(tray_uuid)
+                                    and spool.tag_uid
+                                    and tag_uid
+                                    and normalize_tag_uid(spool.tag_uid) != normalize_tag_uid(tag_uid)
+                                ):
+                                    logger.warning(
+                                        "Sibling reused-tag on printer %d AMS%d-T%d: spool %d holds a different tag_uid "
+                                        "for the same tray_uuid — use only ONE tag per donor roll, discard the second",
+                                        printer_id,
+                                        ams_id,
+                                        tray_id,
+                                        spool.id,
+                                    )
+                                # Reused-tag Tier 2/3 gate. A completed auto-respool
+                                # re-assigns the slot to the fresh spool, so skip
+                                # the donor auto-assign below.
+                                try:
+                                    _respooled = await maybe_auto_or_prompt_respool(
+                                        db, printer_id, ams_id, tray_id, tray, spool
+                                    )
+                                    if _respooled is not None:
+                                        _clear_unknown_tag_dedup(printer_id, ams_id, tray_id)
+                                        continue
+                                except Exception as _rse:  # noqa: BLE001 — never crash the AMS callback
+                                    logger.warning(
+                                        "Re-spool gate (arrival) failed for printer %s: %s", printer_id, _rse
+                                    )
                             if not spool:
                                 # Try matching an untagged inventory spool (same material/color)
                                 spool = await find_matching_untagged_spool(db, tray)
@@ -1847,8 +2191,11 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                     continue
                             # Slot matched (existing tag, untagged inventory
                             # match, or freshly auto-created spool) — drop any
-                            # stale dedup so a future tag swap re-prompts.
+                            # stale dedup so a future tag swap re-prompts, and
+                            # clear any tagless stale-config marker (an RFID tag
+                            # now owns the slot).
                             _clear_unknown_tag_dedup(printer_id, ams_id, tray_id)
+                            spool_tagless.clear_stale_marker(printer_id, ams_id, tray_id)
                             await auto_assign_spool(
                                 printer_id,
                                 ams_id,
@@ -1876,7 +2223,9 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                 tray_id,
                             )
                         elif is_valid_tag(tag_uid, tray_uuid):
-                            # Non-BL spool with some tag — let user choose
+                            # Non-BL spool with some tag — let user choose. A valid
+                            # tag now owns the slot, so drop any tagless marker.
+                            spool_tagless.clear_stale_marker(printer_id, ams_id, tray_id)
                             await _broadcast_unknown_tag(
                                 printer_id=printer_id,
                                 ams_id=ams_id,
@@ -1888,9 +2237,9 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                 tray_sub_brands=tray.get("tray_sub_brands"),
                                 tray_count=len(ams_unit.get("tray", [])),
                             )
-                        # No-tag slots (generic non-RFID filament) are left alone:
-                        # nothing to identify, prompting "+ Add" would just create
-                        # ghost spools with empty tags on every confirm.
+                        # No-tag slots are handled by Hook B (spool_tagless) above:
+                        # a configured tagless tray is auto-minted + bound, a bare
+                        # tray is auto-configured with the default filament.
     except Exception as e:
         logger.warning("RFID spool auto-assign failed: %s", e, exc_info=True)
 
@@ -2337,6 +2686,37 @@ async def on_print_start(printer_id: int, data: dict):
     from backend.app.api.routes.printers import clear_cover_cache
 
     clear_cover_cache(printer_id)
+
+    # Server-dispatched eject jobs (part-present sweep / FA remote eject) are
+    # motion-only prints with NO queue item and NO archive. They must NOT create
+    # archives (the plate-mismatch retry + no-3MF fallback archive would otherwise
+    # spawn a junk archive per sweep — polluting /archives/stats), run plate
+    # detection, track filament usage, or emit a "Print Started" notification.
+    # Detect the pending eject up front (registered synchronously at dispatch,
+    # before the printer echoes the start) and skip the whole archive/notification
+    # body. on_print_complete's no-archive path + farm_policy.on_terminal still
+    # finalise the sweep, and its SD-card cleanup still removes the uploaded file.
+    from backend.app.services.eject.remote import is_eject_job_name, matches_pending_eject
+
+    _start_subtask_id = data.get("subtask_id")
+    if _start_subtask_id is None:
+        _start_subtask_id = (data.get("raw_data") or {}).get("subtask_id")
+    _start_subtask_id = str(_start_subtask_id).strip() if _start_subtask_id is not None else None
+    if _start_subtask_id in ("", "0"):
+        _start_subtask_id = None
+    # Name evidence (W1): an eject-named start is our sweep even with an empty/lost
+    # registry — never archive/notify it. OR'd with the registry match so a live
+    # dispatch (name not yet echoed) is still caught by the id path.
+    _start_eject_name = data.get("subtask_name") or data.get("filename")
+    if matches_pending_eject(printer_id, _start_subtask_id, subtask_name=data.get("subtask_name")) or is_eject_job_name(
+        _start_eject_name
+    ):
+        logger.info(
+            "[CALLBACK] printer %s: print start is a server-dispatched eject job — "
+            "skipping archive/plate-detection/usage/notification",
+            printer_id,
+        )
+        return
 
     await ws_manager.send_print_start(printer_id, data)
 
@@ -4076,6 +4456,18 @@ async def on_print_complete(printer_id: int, data: dict):
     # handing a stale file to the next print if it reuses the same name.
     clear_3mf_cache(printer_id)
 
+    # Proactive post-print recordings drain: trim the /ipcam camera chunks this
+    # print left behind (a long lights-out run generates ~3 GB/h) BEFORE the USB
+    # ever hits the HMS-full wall. Fire-and-forget, fully self-gated (setting /
+    # not-printing / 6h cooldown / single-flight) and never notifies — opportunistic
+    # only, so a failure stays silent and never blocks the completion flow.
+    try:
+        asyncio.create_task(drain_recordings_if_idle(printer_id))
+    except Exception as _drain_e:  # noqa: BLE001 — drain must never crash the callback
+        logger.warning(
+            "[USB-STORAGE] post-print recordings drain failed to schedule for printer %s: %s", printer_id, _drain_e
+        )
+
     try:
         ws_data = {
             "status": data.get("status"),
@@ -4179,6 +4571,49 @@ async def on_print_complete(printer_id: int, data: dict):
     # produced zero layers AND zero progress (stopped in PREPARE/heating).
     from backend.app.services.eject.monitor import deposited_nothing
 
+    # Server-dispatched eject jobs (part-present sweep / FA remote eject) are
+    # motion-only prints with NO queue item and NO archive that deposit nothing by
+    # construction (layer=0, progress=0). Resolve THIS terminal against the pending
+    # eject registry ONCE, up front — BEFORE farm_policy.on_terminal (which runs
+    # later in the notification flow) pops it. A clean eject FINISH reports wire
+    # status "completed"; without this guard the no-deposit rewrite below would
+    # corrupt it to "cancelled", and farm_policy would then false-quarantine a
+    # printer whose sweep actually succeeded. The captured flag also suppresses the
+    # "Print Complete/Stopped" notification for the sweep (it is farm plumbing, not
+    # a user print). farm_policy still pops the registry and finalises the sweep.
+    from backend.app.services.eject.remote import is_eject_job_name, matches_pending_eject
+
+    # Name evidence (W1): an eject-named terminal is our sweep even if the registry
+    # was lost to a restart — exempt it from the no-deposit rewrite, gate raise, and
+    # print notifications. OR'd with the registry/id match (which additionally gates
+    # the gate-CLEAR / FA-finalise / quarantine actions in farm_policy).
+    _eject_job_name = data.get("subtask_name") or data.get("filename")
+    _is_eject_job = matches_pending_eject(
+        printer_id, data.get("subtask_id"), subtask_name=data.get("subtask_name")
+    ) or is_eject_job_name(_eject_job_name)
+    if _is_eject_job:
+        logger.info(
+            "[CALLBACK] printer %s: terminal is a server-dispatched eject job (status=%s) — "
+            "exempt from no-deposit rewrite + print notification",
+            printer_id,
+            _raw_status,
+        )
+
+    # W6.4: auto RFID re-read sweep at the PRINT terminal so a mid-print AMS
+    # refill (the firmware does not auto-read spools inserted during a print) is
+    # recognized within seconds with zero operator clicks. Skipped for eject-job
+    # terminals — each unit cycle sweeps once at the print terminal, not again at
+    # the eject terminal. Fire-and-forget: the sweep is sequential with per-slot
+    # spacing (~5s each) and must not block the completion callback; it dedupes
+    # duplicate terminal callbacks internally.
+    if not _is_eject_job:
+        try:
+            from backend.app.services import ams_presence
+
+            asyncio.create_task(ams_presence.on_printer_terminal(printer_id))
+        except Exception as _swe:  # noqa: BLE001 — sweep must never crash the callback
+            logger.warning("AMS terminal re-read sweep failed to schedule for printer %s: %s", printer_id, _swe)
+
     no_deposit = deposited_nothing(
         is_dry_run=_resolved_is_dry_run,
         last_layer_num=data.get("last_layer_num"),
@@ -4189,7 +4624,7 @@ async def on_print_complete(printer_id: int, data: dict):
     # queue records "cancelled" (not "failed"), farm_policy.on_terminal no-ops, and
     # quarantine (keyed on "failed") excludes it. A first-article no-deposit stop
     # deliberately keeps "failed" so the run still retries its first article.
-    if no_deposit and not _resolved_first_article:
+    if no_deposit and not _resolved_first_article and not _is_eject_job:
         data = {**data, "status": "cancelled"}
     elif _stop_source == "operator_screen" and not no_deposit and _raw_status in ("failed", "aborted"):
         # A printer-screen stop that DID deposit a part (the no-deposit branch above
@@ -4206,13 +4641,17 @@ async def on_print_complete(printer_id: int, data: dict):
     _final_status = data.get("status", "completed")
     _payload_subtask = data.get("subtask_id")
     if _final_status in ("completed", "failed", "aborted", "cancelled"):
-        if no_deposit:
-            # Nothing was deposited (dry-run eject, or stopped pre-first-layer) — the
-            # bed cannot be fouled, so do NOT raise the plate-clear gate or arm the
-            # cooldown watch. Applies even to a first-article no-deposit stop.
+        if no_deposit or _is_eject_job:
+            # Nothing was deposited (dry-run eject, or stopped pre-first-layer), OR
+            # this terminal is our server-dispatched eject sweep (id- or name-matched)
+            # — the bed cannot be freshly fouled, so NEVER raise the plate-clear gate
+            # or arm a new watch. An eject-named terminal must never raise a gate even
+            # when it reports motion progress or is seen as foreign (dual-control): the
+            # gate CLEAR is owned by farm_policy's positive-identity path, not here.
             logger.info(
-                "[CALLBACK] printer %s: no-deposit terminal (%s, layer=%s) — not gating queue",
+                "[CALLBACK] printer %s: %s terminal (%s, layer=%s) — not gating queue",
                 printer_id,
+                "eject-job" if _is_eject_job else "no-deposit",
                 _final_status,
                 data.get("last_layer_num"),
             )
@@ -4778,12 +5217,21 @@ async def on_print_complete(printer_id: int, data: dict):
                             no_archive_data["print_time_seconds"] = int(mqtt_remaining)
 
                     ps = data.get("status", "completed")
-                    logger.info(
-                        "[NOTIFY-BG] Sending notification without archive: printer=%s, status=%s", printer_id, ps
-                    )
-                    await notification_service.on_print_complete(
-                        printer_id, p_name, ps, data, db, archive_data=no_archive_data
-                    )
+                    # Suppress the user-facing print notification for a server-dispatched
+                    # eject sweep — it is farm plumbing, not a print the operator queued;
+                    # a "Print Complete/Stopped" alert for every eject is pure spam. The
+                    # farm hook below still runs so the sweep is finalised.
+                    if not _is_eject_job:
+                        logger.info(
+                            "[NOTIFY-BG] Sending notification without archive: printer=%s, status=%s", printer_id, ps
+                        )
+                        await notification_service.on_print_complete(
+                            printer_id, p_name, ps, data, db, archive_data=no_archive_data
+                        )
+                    else:
+                        logger.info(
+                            "[NOTIFY-BG] Suppressing print notification for eject job on printer %s", printer_id
+                        )
 
                     # Farm policy hook for the no-archive path (Phase 3): covers
                     # remote first-article eject completions (dispatched without a
@@ -4799,6 +5247,7 @@ async def on_print_complete(printer_id: int, data: dict):
                             ps,
                             archive_data=no_archive_data,
                             completed_subtask_id=data.get("subtask_id"),
+                            completed_subtask_name=data.get("subtask_name"),
                         )
                     except Exception as farm_err:
                         logger.warning("[NOTIFY-BG] farm policy hook (no-archive) failed: %s", farm_err)
@@ -5316,9 +5765,14 @@ async def on_print_complete(printer_id: int, data: dict):
                             except Exception as e:
                                 logger.warning("[NOTIFY-BG] Failed to read finish photo bytes: %s", e)
 
-                await notification_service.on_print_complete(
-                    printer_id, printer_name, print_status, data, db, archive_data=archive_data
-                )
+                # A server-dispatched eject sweep never takes the archive path (it
+                # creates no archive), but guard defensively so an eject can never
+                # emit a "Print Complete/Stopped" notification even if one is somehow
+                # tracked. The farm hook below still finalises the sweep.
+                if not _is_eject_job:
+                    await notification_service.on_print_complete(
+                        printer_id, printer_name, print_status, data, db, archive_data=archive_data
+                    )
 
                 # Farm first-article + failure/quarantine policy (Phase 3). Single
                 # hook — all logic lives in services.farm_policy. Runs here (not at
@@ -5334,6 +5788,7 @@ async def on_print_complete(printer_id: int, data: dict):
                         print_status,
                         archive_data=archive_data,
                         completed_subtask_id=data.get("subtask_id"),
+                        completed_subtask_name=data.get("subtask_name"),
                     )
                 except Exception as farm_err:
                     logger.warning("[NOTIFY-BG] farm policy hook failed: %s", farm_err)
@@ -6336,9 +6791,29 @@ async def lifespan(app: FastAPI):
     except Exception as _he:  # noqa: BLE001 — hygiene must never block startup
         logging.getLogger(__name__).warning("Plate-gate startup hygiene failed: %s", _he)
 
+    # Restart-safe eject terminal handling (W1): hydrate the in-memory pending-eject
+    # registry from durable per-unit stamps BEFORE re-arming cooldown watches, so
+    # rearm_on_startup skips any printer with an eject still in flight (no double
+    # dispatch / false 3-failure quarantine). Then spawn the reconciler to resolve
+    # ejects whose terminal we missed while the server was down.
+    try:
+        from backend.app.services.eject.remote import hydrate_pending_ejects_from_db
+
+        await hydrate_pending_ejects_from_db()
+    except Exception as _hydr_e:  # noqa: BLE001 — hydration must never block startup
+        logging.getLogger(__name__).warning("Pending-eject hydration failed: %s", _hydr_e)
+
     # Farm auto-eject: re-arm cooldown watches lost to the restart (a gate left
     # set by a successful eject job would otherwise stall the queue forever).
     await eject_cooldown_monitor.rearm_on_startup()
+
+    # Reconcile ejects that reached terminal (or failed) during the downtime window:
+    # background task, polls each hydrated printer until connected, then acts on the
+    # missed outcome (clears the gate on FINISH, quarantines on FAILED, never clears
+    # a gate on guesswork). Lives in the eject monitor beside the state it owns.
+    from backend.app.services.eject.monitor import reconcile_pending_ejects_on_startup
+
+    spawn_background_task(reconcile_pending_ejects_on_startup(), name="eject-pending-reconcile")
 
     # Layer change callback for external camera timelapse
     async def on_layer_change(printer_id: int, layer_num: int):
@@ -7032,6 +7507,7 @@ app.include_router(bug_report.router, prefix=app_settings.api_prefix)
 app.include_router(users.router, prefix=app_settings.api_prefix)
 app.include_router(groups.router, prefix=app_settings.api_prefix)
 app.include_router(printers.router, prefix=app_settings.api_prefix)
+app.include_router(printer_eject.router, prefix=app_settings.api_prefix)
 app.include_router(archives.router, prefix=app_settings.api_prefix)
 app.include_router(filaments.router, prefix=app_settings.api_prefix)
 app.include_router(inventory.router, prefix=app_settings.api_prefix)
@@ -7058,6 +7534,7 @@ app.include_router(eject_profiles.router, prefix=app_settings.api_prefix)
 app.include_router(model_geometry.router, prefix=app_settings.api_prefix)
 app.include_router(skus.router, prefix=app_settings.api_prefix)
 app.include_router(production_runs.router, prefix=app_settings.api_prefix)
+app.include_router(respool.router, prefix=app_settings.api_prefix)
 app.include_router(projects.router, prefix=app_settings.api_prefix)
 app.include_router(library.router, prefix=app_settings.api_prefix)
 app.include_router(library_tags.router, prefix=app_settings.api_prefix)

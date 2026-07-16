@@ -19,6 +19,7 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.filament import Filament
 from backend.app.models.printer import Printer
 from backend.app.utils.safe_path import PathTraversalError, safe_join_under
+from backend.app.utils.threemf_tools import extract_nozzle_mapping_from_3mf
 
 logger = logging.getLogger(__name__)
 
@@ -198,12 +199,23 @@ class ThreeMFParser:
                 # of plates (#1593). Per-plate breakdown is still served by
                 # the dedicated `/plates` endpoint.
                 plates = root.findall(".//plate")
+
+                # Per-slot slot→MQTT-extruder mapping (0=right, 1=left).
+                # Dual-nozzle files only; None for single-nozzle. This is the
+                # only correct slot→extruder derivation (group_id ×
+                # physical_extruder_map) so we reuse the canonical helper and
+                # compute it ONCE per parse, reused for every plate below.
+                try:
+                    nozzle_mapping = extract_nozzle_mapping_from_3mf(zf)
+                except Exception:
+                    nozzle_mapping = None
+
                 summed_time = 0
                 summed_grams = 0.0
                 any_time_seen = False
                 any_grams_seen = False
 
-                for plate in plates:
+                for plate_position, plate in enumerate(plates, start=1):
                     # Plate-level fields that only make sense at the file
                     # level when there's exactly one plate. ``plate_number``
                     # / ``_plate_index`` describe which plate the export
@@ -257,6 +269,21 @@ class ThreeMFParser:
                                     pass  # Skip objects with non-numeric identify_id
                         if printable_objects:
                             self.metadata["printable_objects"] = printable_objects
+
+                    # Per-plate nozzle-requirement capabilities (farm capability
+                    # gate input). Wrapped independently so one malformed plate
+                    # can neither disturb the #1593 summation above nor drop
+                    # other plates' capability rows.
+                    try:
+                        plate_caps = self._build_plate_capabilities(plate, nozzle_mapping)
+                        if plate_caps:
+                            plate_key = str(plate_index_value) if plate_index_value is not None else str(plate_position)
+                            self.metadata.setdefault("plate_capabilities", {})[plate_key] = plate_caps
+                    except Exception:
+                        logger.debug(
+                            "ThreeMFParser: plate_capabilities extraction skipped for a plate in %s",
+                            self.file_path,
+                        )
 
                 if any_time_seen:
                     self.metadata["print_time_seconds"] = summed_time
@@ -315,6 +342,106 @@ class ThreeMFParser:
                         self.metadata["filament_slots"] = filament_slots
         except Exception:
             pass  # Skip unparseable slice_info metadata
+
+    @staticmethod
+    def _build_plate_capabilities(plate, nozzle_mapping: dict[int, int] | None) -> dict:
+        """Build one plate's nozzle-requirement capability entry.
+
+        Returns a dict with any of ``nozzle_diameters`` / ``filament_nozzles``
+        / ``nozzles_used`` (only keys that yielded data), or ``{}`` when the
+        plate carries no nozzle information. Every value is JSON-safe so the
+        result can live in ``LibraryFile.file_metadata`` / ``extra_data``.
+
+        ``nozzle_mapping`` is the parse-wide {slot_id: MQTT_extruder_id} from
+        :func:`extract_nozzle_mapping_from_3mf` (None for single-nozzle files),
+        applied to per-filament ``extruder_id``.
+        """
+        entry: dict = {}
+
+        # nozzle_diameters: plate <metadata key="nozzle_diameters" value="0.4,0.4"/>
+        diameters: list[float] = []
+        for meta in plate.findall("metadata"):
+            if meta.get("key") != "nozzle_diameters":
+                continue
+            for token in (meta.get("value") or "").split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    diameters.append(float(token))
+                except (ValueError, TypeError):
+                    pass  # Skip unparseable diameter tokens
+            break
+        if diameters:
+            entry["nozzle_diameters"] = diameters
+
+        # filament_nozzles: one entry per USED <filament> (used_g > 0), same
+        # used-filament criterion as the file-level loop above.
+        filament_nozzles: list[dict] = []
+        for f in plate.findall("filament"):
+            try:
+                used_g = float(f.get("used_g", "0") or "0")
+            except (ValueError, TypeError):
+                used_g = 0.0
+            if used_g <= 0:
+                continue
+            try:
+                slot_id = int(f.get("id"))
+            except (ValueError, TypeError):
+                continue  # No usable slot id → cannot map; skip this filament
+            nd_raw = f.get("nozzle_diameter")
+            try:
+                nozzle_diameter = float(nd_raw) if nd_raw is not None else None
+            except (ValueError, TypeError):
+                nozzle_diameter = None
+            volume_type = f.get("volume_type")
+            if not isinstance(volume_type, str) or not volume_type:
+                volume_type = None
+            extruder_id = nozzle_mapping.get(slot_id) if nozzle_mapping else None
+            filament_nozzles.append(
+                {
+                    "slot_id": slot_id,
+                    "nozzle_diameter": nozzle_diameter,
+                    "volume_type": volume_type,
+                    "extruder_id": extruder_id,
+                }
+            )
+        if filament_nozzles:
+            entry["filament_nozzles"] = filament_nozzles
+
+        # nozzles_used: verbatim <nozzle> elements (diagnostic only). The
+        # <nozzle>.extruder_id here is 1-based slicer-internal, NOT the MQTT id
+        # space — do not confuse it with filament_nozzles.extruder_id.
+        nozzles_used: list[dict] = []
+        for n in plate.findall("nozzle"):
+            try:
+                nozzle_id = int(n.get("id"))
+            except (ValueError, TypeError):
+                continue  # Malformed nozzle element → skip
+            try:
+                n_extruder_id = int(n.get("extruder_id"))
+            except (ValueError, TypeError):
+                n_extruder_id = None
+            nd_raw = n.get("nozzle_diameter")
+            try:
+                n_diameter = float(nd_raw) if nd_raw is not None else None
+            except (ValueError, TypeError):
+                n_diameter = None
+            n_volume_type = n.get("volume_type")
+            if not isinstance(n_volume_type, str) or not n_volume_type:
+                n_volume_type = None
+            nozzles_used.append(
+                {
+                    "id": nozzle_id,
+                    "extruder_id": n_extruder_id,
+                    "nozzle_diameter": n_diameter,
+                    "volume_type": n_volume_type,
+                }
+            )
+        if nozzles_used:
+            entry["nozzles_used"] = nozzles_used
+
+        return entry
 
     def _parse_project_settings(self, zf: zipfile.ZipFile):
         """Parse project settings for print configuration."""
@@ -416,25 +543,52 @@ class ThreeMFParser:
             pass  # Filament info is optional; fall back to slice_info values
 
     def _extract_print_settings(self, data: dict):
-        """Extract print settings from JSON config."""
+        """Extract print settings from JSON config.
+
+        Each extracted key is guarded independently: a single bad key must not
+        abort the rest (pre-fix a lone blanket try/except meant one malformed
+        value silently dropped bed/nozzle temps + printer_model + bed_type too).
+        """
+        # Layer height - usually an array, get first value
         try:
-            # Layer height - usually an array, get first value
             if "layer_height" in data:
                 val = data["layer_height"]
                 if isinstance(val, list) and val:
                     self.metadata["layer_height"] = float(val[0])
                 elif isinstance(val, (int, float, str)):
                     self.metadata["layer_height"] = float(val)
+        except Exception:
+            pass  # Layer height is optional; leave unset on parse failure
 
-            # Nozzle diameter
+        # Nozzle diameter. A list (dual/multi-nozzle) must not silently collapse
+        # to its first entry — that hides mixed-diameter duals. Keep a scalar
+        # ONLY when every parsed entry agrees (within 0.01); leave UNSET when
+        # entries are mixed or any entry is unparseable.
+        try:
             if "nozzle_diameter" in data:
                 val = data["nozzle_diameter"]
-                if isinstance(val, list) and val:
-                    self.metadata["nozzle_diameter"] = float(val[0])
+                if isinstance(val, list):
+                    parsed: list[float] = []
+                    all_parsed = True
+                    for item in val:
+                        try:
+                            parsed.append(float(item))
+                        except (ValueError, TypeError):
+                            all_parsed = False
+                            break
+                    if all_parsed and parsed:
+                        first = parsed[0]
+                        if all(abs(p - first) <= 0.01 for p in parsed):
+                            self.metadata["nozzle_diameter"] = float(first)
+                        # else: mixed diameters → leave unset (dual-nozzle case)
+                    # else: unparseable entry → leave unset
                 elif isinstance(val, (int, float, str)):
                     self.metadata["nozzle_diameter"] = float(val)
+        except Exception:
+            pass  # Nozzle diameter is optional; leave unset on parse failure
 
-            # Bed temperature - first layer or regular
+        # Bed temperature - first layer or regular
+        try:
             for key in ["bed_temperature_initial_layer", "bed_temperature"]:
                 if key in data:
                     val = data[key]
@@ -443,8 +597,11 @@ class ThreeMFParser:
                     elif isinstance(val, (int, float, str)):
                         self.metadata["bed_temperature"] = int(float(val))
                     break
+        except Exception:
+            pass  # Bed temperature is optional; leave unset on parse failure
 
-            # Nozzle temperature
+        # Nozzle temperature
+        try:
             for key in ["nozzle_temperature_initial_layer", "nozzle_temperature"]:
                 if key in data:
                     val = data[key]
@@ -453,21 +610,27 @@ class ThreeMFParser:
                     elif isinstance(val, (int, float, str)):
                         self.metadata["nozzle_temperature"] = int(float(val))
                     break
+        except Exception:
+            pass  # Nozzle temperature is optional; leave unset on parse failure
 
-            # Printer model (extract and normalize)
+        # Printer model (extract and normalize)
+        try:
             if "printer_model" in data:
                 from backend.app.utils.printer_models import normalize_printer_model
 
                 self.metadata["sliced_for_model"] = normalize_printer_model(data["printer_model"])
+        except Exception:
+            pass  # Printer model is optional; leave unset on parse failure
 
-            # Build plate type — only set from project_settings if slice_info didn't already
-            # provide it (slice_info is more authoritative as it reflects the exported plate).
+        # Build plate type — only set from project_settings if slice_info didn't already
+        # provide it (slice_info is more authoritative as it reflects the exported plate).
+        try:
             if "bed_type" not in self.metadata and "curr_bed_type" in data:
                 val = data["curr_bed_type"]
                 if isinstance(val, str) and val.strip():
                     self.metadata["bed_type"] = val.strip()
         except Exception:
-            pass  # Print settings are optional; missing values are left unset
+            pass  # Bed type is optional; leave unset on parse failure
 
     def _extract_settings_from_content(self, content: str):
         """Extract print settings from config content."""

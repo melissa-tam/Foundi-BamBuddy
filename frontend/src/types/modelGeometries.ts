@@ -29,9 +29,18 @@ export interface ModelGeometry {
   env_y_max: number;
   /** Tallest part (mm) the eject sweep is rated for on this model. */
   max_part_height_mm: number;
+  /** Commandable Z ceiling (mm) — the machine's maximum bed-drop travel. Drives
+   *  the eject bed-drop release assist; null ⇒ bed-drop generation fails closed.
+   *  (Backend column `z_travel_mm`.) */
+  z_travel_mm: number | null;
   /** True only after the hardware ladder was operator-witnessed on this model.
    *  Production eject dispatch is blocked while false. */
   validated: boolean;
+  /** Derived (read-only): true when this model is a bed-slinger — the bed is
+   *  FIXED in Z and the gantry carries the Z axis, so the bed-drop release
+   *  assist is physically meaningless and unavailable on it. Computed by the
+   *  backend from `model_key`; NOT a column and NOT part of ModelGeometryUpdate. */
+  bedslinger: boolean;
   notes: string | null;
   updated_at: string;
 }
@@ -52,6 +61,7 @@ export interface ModelGeometryUpdate {
   env_y_min?: number;
   env_y_max?: number;
   max_part_height_mm?: number;
+  z_travel_mm?: number | null;
   validated?: boolean;
   notes?: string | null;
 }

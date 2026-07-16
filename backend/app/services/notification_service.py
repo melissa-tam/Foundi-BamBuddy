@@ -1898,10 +1898,20 @@ class NotificationService:
         if not providers:
             return
 
+        # A single-event quarantine (failure_count == 1 — e.g. an unverified eject
+        # sweep or cooldown stall) is NOT a consecutive-failure escalation, so the
+        # copy must NOT claim "1 consecutive failures". Only count > 1 earns the
+        # consecutive-failure sentence. The template renders {quarantine_summary}.
+        if failure_count > 1:
+            quarantine_summary = f"{printer_name} was quarantined after {failure_count} consecutive failures."
+        else:
+            quarantine_summary = f"{printer_name} was quarantined."
+
         variables = {
             "printer": printer_name,
             "failure_count": str(failure_count),
             "reason": reason,
+            "quarantine_summary": quarantine_summary,
         }
 
         title, message = await self._build_message_from_template(db, "printer_quarantined", variables)
@@ -2058,6 +2068,112 @@ class NotificationService:
             message,
             db,
             "print_stalled",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_storage_low(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        *,
+        success: bool,
+        freed_bytes: int,
+        files_deleted: int,
+        free_bytes: int | None,
+        reason: str | None,
+        db: AsyncSession,
+    ):
+        """Fire when a printer's USB fills up and the farm auto-cleanup runs.
+
+        Carries the outcome either way: on success, how much was freed (and the
+        free space now, if the printer reports it); on failure, a human reason
+        (e.g. FTPS unreachable, nothing cleanable). The ``detail`` phrasing is
+        built here so the template stays a simple ``{printer_name}: {detail}``.
+        """
+        providers = await self._get_providers_for_event(db, "on_storage_low", printer_id)
+        if not providers:
+            return
+
+        freed_mb = freed_bytes // (1024 * 1024)
+        if success:
+            if free_bytes is not None:
+                free_txt = f"{free_bytes / 1024**3:.1f} GB free now"
+            else:
+                free_txt = "free space unreported"
+            detail = f"Auto-cleanup freed {freed_mb} MB across {files_deleted} file(s); {free_txt}."
+        elif files_deleted:
+            detail = (
+                f"Auto-cleanup freed {freed_mb} MB across {files_deleted} file(s) "
+                f"but space is still low: {reason or 'unknown error'}."
+            )
+        else:
+            detail = f"Auto-cleanup could not free space: {reason or 'unknown error'}."
+
+        variables = {
+            "printer_name": printer_name,
+            "detail": detail,
+            "freed_mb": str(freed_mb),
+            "files_deleted": str(files_deleted),
+        }
+
+        title, message = await self._build_message_from_template(db, "storage_low", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "storage_low",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_cooldown_escalation(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        *,
+        bed_c: float | None,
+        threshold_c: float,
+        max_hold_minutes: int,
+        db: AsyncSession,
+    ):
+        """Fire when a post-print eject cooldown is running long.
+
+        Distinct from ``plate_not_empty`` (which means "objects on the plate"):
+        the bed simply has not reached the release threshold yet. The ``detail``
+        states the live bed, the target, and what happens next — a forced eject at
+        the max-hold cap, or, when the cap is disabled, that none is set. Built
+        here so the template stays a simple ``{printer}: {detail}``.
+        """
+        providers = await self._get_providers_for_event(db, "on_cooldown_escalation", printer_id)
+        if not providers:
+            return
+
+        bed_txt = f"{bed_c:.0f}" if bed_c is not None else "unknown"
+        if max_hold_minutes and max_hold_minutes > 0:
+            cap_txt = f"forced eject at the {max_hold_minutes}-minute cap"
+        else:
+            cap_txt = "no forced-eject cap is set"
+        detail = f"Still cooling: bed {bed_txt} °C, target {threshold_c:.0f} °C — {cap_txt}."
+
+        variables = {
+            "printer": printer_name,
+            "printer_name": printer_name,
+            "detail": detail,
+        }
+
+        title, message = await self._build_message_from_template(db, "cooldown_escalation", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "cooldown_escalation",
             printer_id,
             printer_name,
             force_immediate=True,

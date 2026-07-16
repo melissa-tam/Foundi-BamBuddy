@@ -16,6 +16,7 @@ import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/rea
 import {
   AlertCircle,
   AlertTriangle,
+  Check,
   ChevronDown,
   ChevronUp,
   Download,
@@ -25,6 +26,7 @@ import {
   PackageOpen,
   Pencil,
   Plus,
+  Ruler,
   Send,
   Trash2,
   X,
@@ -36,12 +38,14 @@ import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { useToast } from '../contexts/ToastContext';
 import {
+  DEFAULT_BED_DROP_CLEARANCE_MM,
   DEFAULT_EJECT_PROFILE_PARAMS,
   type EjectProfile,
   type EjectProfileCreate,
   type EjectProfileParams,
 } from '../types/ejectProfiles';
-import type { ModelGeometry } from '../types/modelGeometries';
+import { findGeometry, type ModelGeometry, type ModelGeometryUpdate } from '../types/modelGeometries';
+import { useAuth } from '../contexts/AuthContext';
 
 /**
  * Shared model-geometry registry query. Drives the model pickers on the
@@ -76,7 +80,6 @@ interface NumericFieldMeta {
 
 const NUMERIC_FIELDS: NumericFieldMeta[] = [
   { key: 'cooldown_temp_c', i18n: 'cooldownTemp', min: 15, max: 60, step: 0.5 },
-  { key: 'cooldown_retries', i18n: 'cooldownRetries', min: 1, max: 30, step: 1 },
   { key: 'clearance_mm', i18n: 'clearance', min: 0, max: 100, step: 0.1 },
   { key: 'z_offset_mm', i18n: 'zOffset', min: 0.4, max: 20, step: 0.1 },
   { key: 'descent_steps', i18n: 'descentSteps', min: 1, max: 50, step: 1 },
@@ -163,6 +166,17 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
   const [startPct, setStartPct] = useState<string>(
     String(Math.round((profile ? profile.sweep_start_frac : DEFAULT_EJECT_PROFILE_PARAMS.sweep_start_frac) * 100)),
   );
+  // Optional bed-drop release assist: enabled only when a clearance is set
+  // (null = off). Held as a string like the other numeric inputs so decimals
+  // type cleanly; seeds from the profile value or the UX prefill default.
+  const [dropEnabled, setDropEnabled] = useState<boolean>(
+    profile ? profile.bed_drop_clearance_mm != null : false,
+  );
+  const [dropClearance, setDropClearance] = useState<string>(
+    profile?.bed_drop_clearance_mm != null
+      ? String(profile.bed_drop_clearance_mm)
+      : String(DEFAULT_BED_DROP_CLEARANCE_MM),
+  );
   const [nameError, setNameError] = useState(false);
 
   // Geometry-derived validation bounds (Phase 2): registry rows give the bed
@@ -214,6 +228,26 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
     if (!Number.isFinite(c) || cooldownFloor == null || c >= cooldownFloor) return null;
     return t('ejectProfiles.geometry.cooldownAmbientTrap', { floor: cooldownFloor });
   })();
+  // Bed-drop needs a per-model Z travel; warn (non-blocking — the backend is
+  // authoritative and fails closed) when the assist is on but any registry row
+  // lacks z_travel_mm, naming the models so the operator knows which geometry
+  // rows to complete.
+  const bedDropWarning = (() => {
+    if (!dropEnabled || !geometries) return null;
+    const missing = geometries.filter((g) => g.z_travel_mm == null).map((g) => g.model_key);
+    if (missing.length === 0) return null;
+    return t('ejectProfiles.geometry.bedDropNoTravel', { models: missing.join(', ') });
+  })();
+  // Bed-slinger models have a bed that is fixed in Z, so the bed-drop jolt is
+  // physically impossible on them (the backend fails closed regardless). Warn,
+  // naming the affected models, so the operator understands the assist will do
+  // nothing on those printers.
+  const bedDropBedslingerWarning = (() => {
+    if (!dropEnabled || !geometries) return null;
+    const slingers = geometries.filter((g) => g.bedslinger).map((g) => g.model_key);
+    if (slingers.length === 0) return null;
+    return t('ejectProfiles.geometry.bedDropBedslinger', { models: slingers.join(', ') });
+  })();
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -248,6 +282,13 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
       params.sweep_x_min_mm = null;
       params.sweep_x_max_mm = null;
     }
+    // Bed-drop release assist: send the clearance only when enabled; otherwise
+    // clear to null (feature off). Backend re-validates the 0-200 bound.
+    params.bed_drop_clearance_mm = dropEnabled
+      ? Number.isFinite(Number(dropClearance))
+        ? Number(dropClearance)
+        : DEFAULT_BED_DROP_CLEARANCE_MM
+      : null;
     onSave({ name: name.trim(), ...params });
   };
 
@@ -439,6 +480,64 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
               {bandError && (
                 <p role="alert" className="text-xs text-red-400 mt-2">
                   {bandError}
+                </p>
+              )}
+            </div>
+
+            {/* Optional bed-drop release assist */}
+            <div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="flex items-center gap-1.5">
+                  <span className="text-sm text-white">{t('ejectProfiles.fields.bedDrop')}</span>
+                  <InfoHint text={t('ejectProfiles.tooltips.bedDrop')} />
+                </span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={dropEnabled}
+                  aria-label={t('ejectProfiles.fields.bedDrop')}
+                  onClick={() => setDropEnabled((v) => !v)}
+                  className={`relative w-10 h-5 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-bambu-green/50 ${
+                    dropEnabled ? 'bg-bambu-green' : 'bg-bambu-dark-tertiary'
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                      dropEnabled ? 'translate-x-5' : 'translate-x-0.5'
+                    }`}
+                  />
+                </button>
+              </div>
+              <p className="text-xs text-bambu-gray mt-1">{t('ejectProfiles.fields.bedDropHelp')}</p>
+              {dropEnabled && (
+                <div className="mt-3">
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="eject-bed-drop-clearance" className="block text-sm text-bambu-gray">
+                      {t('ejectProfiles.fields.bedDropClearance')}
+                    </label>
+                    <InfoHint text={t('ejectProfiles.tooltips.bedDropClearance')} />
+                  </div>
+                  <input
+                    id="eject-bed-drop-clearance"
+                    type="number"
+                    inputMode="decimal"
+                    min={0}
+                    max={200}
+                    step={5}
+                    value={dropClearance}
+                    onChange={(e) => setDropClearance(e.target.value)}
+                    className={inputClass}
+                  />
+                </div>
+              )}
+              {bedDropWarning && (
+                <p role="note" className="text-xs text-yellow-300 mt-2">
+                  {bedDropWarning}
+                </p>
+              )}
+              {bedDropBedslingerWarning && (
+                <p role="note" className="text-xs text-yellow-300 mt-2">
+                  {bedDropBedslingerWarning}
                 </p>
               )}
             </div>
@@ -814,6 +913,10 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
   const [printerId, setPrinterId] = useState<number | null>(null);
   const [fileId, setFileId] = useState<number | null>(null);
   const [plateIndex, setPlateIndex] = useState<number>(1);
+  // Hardware-ladder step-4 override: dispatch onto a NOT-yet-validated model.
+  // Resets to false on every printer change so the override never carries over
+  // from one printer to another.
+  const [allowUnvalidated, setAllowUnvalidated] = useState(false);
   // Download geometry target: '' = use the selected printer's model (the
   // backend resolves it from printer_id); an explicit registry key lets the
   // operator build e.g. an H2C ladder file with no H2C printer connected.
@@ -838,6 +941,14 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
     () => activePrinters.filter((_, i) => statusQueries[i]?.data?.connected === true),
     [activePrinters, statusQueries],
   );
+
+  // Resolve the selected printer's registry geometry. The unvalidated-override
+  // checkbox is offered ONLY when that model is a known registry row whose
+  // hardware ladder has not been passed (validated === false); a validated or
+  // unknown model never shows it.
+  const selectedPrinter = connectedPrinters.find((p) => p.id === printerId) ?? null;
+  const selectedGeometry = findGeometry(geometries, selectedPrinter?.model);
+  const showAllowUnvalidated = selectedGeometry?.validated === false;
 
   // Only 3MF files carry the plate/slice metadata the generator needs — same
   // filter + query key as the preview card so the data is shared.
@@ -864,6 +975,9 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
         library_file_id: fileId!,
         plate_index: plateIndex,
         printer_id: printerId!,
+        // Only send the override when the checkbox is both shown (unvalidated
+        // model) and ticked; otherwise omit it so the backend gate stays armed.
+        allow_unvalidated: showAllowUnvalidated && allowUnvalidated ? true : undefined,
       }),
   });
 
@@ -928,7 +1042,10 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
               <select
                 id="dryrun-printer"
                 value={printerId ?? ''}
-                onChange={(e) => setPrinterId(e.target.value ? Number(e.target.value) : null)}
+                onChange={(e) => {
+                  setPrinterId(e.target.value ? Number(e.target.value) : null);
+                  setAllowUnvalidated(false);
+                }}
                 className={inputClass}
                 disabled={statusesLoading || connectedPrinters.length === 0}
               >
@@ -945,6 +1062,33 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
               ) : connectedPrinters.length === 0 ? (
                 <p className="text-xs text-yellow-300 mt-1">{t('ejectProfiles.dryRun.noPrinters')}</p>
               ) : null}
+
+              {/* Unvalidated-geometry override — only when the selected printer's
+                  model is a registry row that has NOT passed the hardware ladder.
+                  Native checkbox wrapped in its label for a keyboard-reachable
+                  control whose accessible name is the visible text. */}
+              {showAllowUnvalidated && (
+                <div className="mt-3">
+                  <label className="flex items-start gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={allowUnvalidated}
+                      onChange={(e) => setAllowUnvalidated(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-bambu-dark-tertiary bg-bambu-dark text-bambu-green focus:outline-none focus:ring-2 focus:ring-bambu-green/50"
+                    />
+                    <span className="text-sm text-white">{t('ejectProfiles.dryRun.allowUnvalidated')}</span>
+                  </label>
+                  {allowUnvalidated && (
+                    <div
+                      role="alert"
+                      className="mt-2 flex items-start gap-2 p-3 bg-yellow-500/10 border border-yellow-500/40 rounded-lg text-sm text-yellow-200"
+                    >
+                      <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5 text-yellow-400" />
+                      <span>{t('ejectProfiles.dryRun.allowUnvalidatedWarning')}</span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Download geometry model (optional) — the file download resolves
@@ -1093,6 +1237,431 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
 }
 
 // ---------------------------------------------------------------------------
+// Model geometry registry manager
+// ---------------------------------------------------------------------------
+
+// Editable numeric geometry fields (bed + envelope + ceiling). z_travel_mm is
+// handled separately because it is clearable to null; motion class and
+// validated flag are handled outside this list.
+interface GeometryNumericFieldMeta {
+  key: 'bed_x' | 'bed_y' | 'env_x_min' | 'env_x_max' | 'env_y_min' | 'env_y_max' | 'max_part_height_mm';
+  i18n: string;
+}
+
+const GEOMETRY_NUMERIC_FIELDS: GeometryNumericFieldMeta[] = [
+  { key: 'bed_x', i18n: 'bedX' },
+  { key: 'bed_y', i18n: 'bedY' },
+  { key: 'env_x_min', i18n: 'envXMin' },
+  { key: 'env_x_max', i18n: 'envXMax' },
+  { key: 'env_y_min', i18n: 'envYMin' },
+  { key: 'env_y_max', i18n: 'envYMax' },
+  { key: 'max_part_height_mm', i18n: 'maxPartHeight' },
+];
+
+interface GeometryEditDialogProps {
+  geometry: ModelGeometry;
+  saving: boolean;
+  onSave: (changes: ModelGeometryUpdate) => void;
+  onClose: () => void;
+}
+
+/**
+ * Edit one registry row. Numeric inputs are held as strings so decimals type
+ * cleanly and an emptied z_travel field can send an explicit null (clearing the
+ * bed-drop ceiling). The motion class is derived server-side and is NOT
+ * editable. Only changed fields are sent (the PUT is exclude_unset partial),
+ * and flipping `validated` in either direction routes through a confirm step.
+ */
+function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditDialogProps) {
+  const { t } = useTranslation();
+
+  const [values, setValues] = useState<Record<string, string>>(() => {
+    const seed: Record<string, string> = {};
+    for (const f of GEOMETRY_NUMERIC_FIELDS) seed[f.key] = String(geometry[f.key]);
+    return seed;
+  });
+  const [zTravel, setZTravel] = useState<string>(
+    geometry.z_travel_mm != null ? String(geometry.z_travel_mm) : '',
+  );
+  const [notes, setNotes] = useState<string>(geometry.notes ?? '');
+  const [validated, setValidated] = useState<boolean>(geometry.validated);
+  // Non-null while a validated-flip confirmation is pending; carries the exact
+  // change set so the confirm action dispatches precisely what was reviewed.
+  const [pendingChanges, setPendingChanges] = useState<ModelGeometryUpdate | null>(null);
+
+  const buildChanges = (): ModelGeometryUpdate => {
+    const changes: ModelGeometryUpdate = {};
+    for (const f of GEOMETRY_NUMERIC_FIELDS) {
+      const raw = values[f.key];
+      const parsed = Number(raw);
+      if (raw.trim() !== '' && Number.isFinite(parsed) && parsed !== geometry[f.key]) {
+        (changes[f.key] as number) = parsed;
+      }
+    }
+    // z_travel_mm: empty ⇒ null (clear the ceiling); otherwise a finite number.
+    const zRaw = zTravel.trim();
+    const zNext = zRaw === '' ? null : Number.isFinite(Number(zRaw)) ? Number(zRaw) : geometry.z_travel_mm;
+    if (zNext !== geometry.z_travel_mm) changes.z_travel_mm = zNext;
+    // notes: empty ⇒ null.
+    const notesNext = notes.trim() === '' ? null : notes;
+    if (notesNext !== (geometry.notes ?? null)) changes.notes = notesNext;
+    if (validated !== geometry.validated) changes.validated = validated;
+    return changes;
+  };
+
+  const handleSave = () => {
+    const changes = buildChanges();
+    if (Object.keys(changes).length === 0) {
+      onClose(); // nothing changed — no PUT needed
+      return;
+    }
+    if (changes.validated !== undefined) {
+      setPendingChanges(changes); // validation flip requires confirmation
+    } else {
+      onSave(changes);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
+      onClick={saving ? undefined : onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label={t('ejectProfiles.geometryManager.editTitle', { model: geometry.model_key })}
+    >
+      <Card className="w-full max-w-xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <CardContent className="p-0">
+          <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
+            <div className="flex items-center gap-2">
+              <Ruler className="w-5 h-5 text-bambu-green" />
+              <h2 className="text-lg font-semibold text-white">
+                {t('ejectProfiles.geometryManager.editTitle', { model: geometry.model_key })}
+              </h2>
+            </div>
+            <Button variant="ghost" size="sm" onClick={onClose} disabled={saving} aria-label={t('common.close')}>
+              <X className="w-5 h-5" />
+            </Button>
+          </div>
+
+          <div className="p-4 space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              {GEOMETRY_NUMERIC_FIELDS.map((f) => {
+                const id = `geo-${f.key}`;
+                return (
+                  <div key={f.key}>
+                    <label htmlFor={id} className="block text-sm text-bambu-gray mb-1">
+                      {t(`ejectProfiles.geometryManager.fields.${f.i18n}`)}
+                    </label>
+                    <input
+                      id={id}
+                      type="number"
+                      inputMode="decimal"
+                      step={0.5}
+                      value={values[f.key]}
+                      onChange={(e) => setValues((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                      className={inputClass}
+                    />
+                  </div>
+                );
+              })}
+
+              {/* Z travel — clearable to null (bed-drop assist then fails closed). */}
+              <div>
+                <label htmlFor="geo-z-travel" className="block text-sm text-bambu-gray mb-1">
+                  {t('ejectProfiles.geometryManager.fields.zTravel')}
+                </label>
+                <input
+                  id="geo-z-travel"
+                  type="number"
+                  inputMode="decimal"
+                  step={0.5}
+                  value={zTravel}
+                  onChange={(e) => setZTravel(e.target.value)}
+                  className={inputClass}
+                  aria-describedby="geo-z-travel-help"
+                />
+                <p id="geo-z-travel-help" className="text-xs text-bambu-gray mt-1">
+                  {t('ejectProfiles.geometryManager.fields.zTravelHelp')}
+                </p>
+              </div>
+            </div>
+
+            {/* Notes */}
+            <div>
+              <label htmlFor="geo-notes" className="block text-sm text-bambu-gray mb-1">
+                {t('ejectProfiles.geometryManager.fields.notes')}
+              </label>
+              <textarea
+                id="geo-notes"
+                rows={2}
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                className={inputClass}
+              />
+            </div>
+
+            {/* Validated toggle (motion class is derived and not editable). */}
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-sm text-white">
+                {t('ejectProfiles.geometryManager.fields.validated')}
+              </span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={validated}
+                aria-label={t('ejectProfiles.geometryManager.fields.validated')}
+                onClick={() => setValidated((v) => !v)}
+                className={`relative w-10 h-5 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-bambu-green/50 ${
+                  validated ? 'bg-bambu-green' : 'bg-bambu-dark-tertiary'
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                    validated ? 'translate-x-5' : 'translate-x-0.5'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* Actions */}
+            <div className="flex gap-3 pt-2">
+              <Button type="button" variant="secondary" onClick={onClose} className="flex-1" disabled={saving}>
+                {t('common.cancel')}
+              </Button>
+              <Button type="button" className="flex-1" onClick={handleSave} disabled={saving}>
+                {saving ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    {t('common.saving')}
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-4 h-4" />
+                    {t('common.save')}
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {pendingChanges && (
+        <ConfirmModal
+          title={t(
+            validated
+              ? 'ejectProfiles.geometryManager.confirmValidateTitle'
+              : 'ejectProfiles.geometryManager.confirmUnvalidateTitle',
+          )}
+          message={t(
+            validated
+              ? 'ejectProfiles.geometryManager.confirmValidateBody'
+              : 'ejectProfiles.geometryManager.confirmUnvalidateBody',
+            { model: geometry.model_key },
+          )}
+          cancelText={t('common.cancel')}
+          variant={validated ? 'default' : 'danger'}
+          isLoading={saving}
+          overlayZIndex="z-[110]"
+          onConfirm={() => onSave(pendingChanges)}
+          onCancel={() => setPendingChanges(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Small status pill used by the geometry table for the motion + validated
+ *  columns — state is carried by an icon + text, never by colour alone. */
+function GeometryBadge({
+  tone,
+  icon,
+  children,
+}: {
+  tone: 'green' | 'amber' | 'neutral' | 'violet';
+  icon?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  const toneClass = {
+    green: 'bg-bambu-green/15 text-bambu-green',
+    amber: 'bg-yellow-500/15 text-yellow-300',
+    neutral: 'bg-bambu-dark-tertiary text-bambu-gray',
+    violet: 'bg-purple-500/15 text-purple-300',
+  }[tone];
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${toneClass}`}>
+      {icon}
+      {children}
+    </span>
+  );
+}
+
+/**
+ * Read + edit the printer model-geometry registry. Rows are seeded server-side
+ * (there is deliberately no "add model" action); an operator with
+ * `eject_profiles:update` may correct a row's geometry or flip its
+ * hardware-validation flag. This is the surface that gates unattended
+ * production eject, so it is kept calm and scannable.
+ */
+function GeometryManagerSection() {
+  const { t } = useTranslation();
+  const { showToast } = useToast();
+  const queryClient = useQueryClient();
+  const { hasPermission } = useAuth();
+  const canEdit = hasPermission('eject_profiles:update');
+
+  const { data: geoData, isLoading, isError } = useModelGeometries();
+  const geometries = geoData?.geometries ?? [];
+  const [editing, setEditing] = useState<ModelGeometry | null>(null);
+
+  const saveMutation = useMutation({
+    mutationFn: ({ modelKey, changes }: { modelKey: string; changes: ModelGeometryUpdate }) =>
+      api.updateModelGeometry(modelKey, changes),
+    onSuccess: () => {
+      showToast(t('ejectProfiles.geometryManager.saved'));
+      queryClient.invalidateQueries({ queryKey: ['model-geometries'] });
+      setEditing(null);
+    },
+    onError: (err: Error) => {
+      showToast(err.message || t('ejectProfiles.geometryManager.saveFailed'), 'error');
+    },
+  });
+
+  return (
+    <Card className="mt-6">
+      <CardContent>
+        <div className="flex items-center gap-2 mb-1">
+          <Ruler className="w-5 h-5 text-bambu-green" />
+          <h2 className="text-lg font-semibold text-white">{t('ejectProfiles.geometryManager.title')}</h2>
+        </div>
+        <p className="text-sm text-bambu-gray mb-4 max-w-2xl">
+          {t('ejectProfiles.geometryManager.description')}
+        </p>
+
+        {isLoading ? (
+          <div className="flex items-center py-8 text-bambu-gray" role="status">
+            <Loader2 className="w-5 h-5 animate-spin" />
+            <span className="ml-2">{t('common.loading')}</span>
+          </div>
+        ) : isError ? (
+          <div
+            role="alert"
+            className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500/40 rounded-lg text-sm text-red-300"
+          >
+            <AlertCircle className="w-4 h-4 flex-shrink-0 text-red-400" />
+            <span>{t('ejectProfiles.geometryManager.saveFailed')}</span>
+          </div>
+        ) : geometries.length === 0 ? (
+          <p className="text-sm text-bambu-gray italic">{t('ejectProfiles.geometry.noModels')}</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="text-bambu-gray text-left border-b border-bambu-dark-tertiary">
+                <tr>
+                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.model')}</th>
+                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.bed')}</th>
+                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.envelope')}</th>
+                  <th className="py-3 px-3 font-medium text-right">{t('ejectProfiles.geometryManager.columns.zTravel')}</th>
+                  <th className="py-3 px-3 font-medium text-right">{t('ejectProfiles.geometryManager.columns.maxPartHeight')}</th>
+                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.motion')}</th>
+                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.validated')}</th>
+                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.notes')}</th>
+                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.updated')}</th>
+                  {canEdit && <th className="py-3 px-3 font-medium text-right">{t('common.actions')}</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {geometries.map((g) => (
+                  <tr key={g.model_key} className="border-b border-bambu-dark-tertiary last:border-b-0 align-top">
+                    <td className="py-3 px-3 text-white font-medium">{g.model_key}</td>
+                    <td className="py-3 px-3 text-bambu-gray whitespace-nowrap">
+                      {g.bed_x}×{g.bed_y}
+                    </td>
+                    <td className="py-3 px-3 text-bambu-gray whitespace-nowrap text-xs">
+                      <div>X [{g.env_x_min} – {g.env_x_max}]</div>
+                      <div>Y [{g.env_y_min} – {g.env_y_max}]</div>
+                    </td>
+                    <td className="py-3 px-3 text-bambu-gray text-right">
+                      {g.z_travel_mm == null ? (
+                        <span
+                          className="cursor-help"
+                          title={t('ejectProfiles.geometryManager.zTravelUnset')}
+                          aria-label={t('ejectProfiles.geometryManager.zTravelUnset')}
+                        >
+                          —
+                        </span>
+                      ) : (
+                        g.z_travel_mm
+                      )}
+                    </td>
+                    <td className="py-3 px-3 text-bambu-gray text-right">{g.max_part_height_mm}</td>
+                    <td className="py-3 px-3">
+                      {g.bedslinger ? (
+                        <GeometryBadge tone="violet">
+                          {t('ejectProfiles.geometryManager.motion.bedslinger')}
+                        </GeometryBadge>
+                      ) : (
+                        <GeometryBadge tone="neutral">
+                          {t('ejectProfiles.geometryManager.motion.bedZ')}
+                        </GeometryBadge>
+                      )}
+                    </td>
+                    <td className="py-3 px-3">
+                      {g.validated ? (
+                        <GeometryBadge tone="green" icon={<Check className="w-3 h-3" aria-hidden="true" />}>
+                          {t('ejectProfiles.geometryManager.validatedBadge')}
+                        </GeometryBadge>
+                      ) : (
+                        <GeometryBadge tone="amber" icon={<AlertTriangle className="w-3 h-3" aria-hidden="true" />}>
+                          {t('ejectProfiles.geometryManager.notValidatedBadge')}
+                        </GeometryBadge>
+                      )}
+                    </td>
+                    <td className="py-3 px-3 text-bambu-gray">
+                      <span className="block max-w-[12rem] truncate" title={g.notes ?? ''}>
+                        {g.notes || '—'}
+                      </span>
+                    </td>
+                    <td className="py-3 px-3 text-bambu-gray whitespace-nowrap">
+                      {new Date(g.updated_at).toLocaleDateString()}
+                    </td>
+                    {canEdit && (
+                      <td className="py-3 px-3">
+                        <div className="flex items-center justify-end">
+                          <button
+                            type="button"
+                            onClick={() => setEditing(g)}
+                            className="p-2 rounded text-bambu-gray hover:text-white hover:bg-bambu-dark-tertiary transition-colors focus:outline-none focus:ring-2 focus:ring-bambu-green/50"
+                            aria-label={`${t('ejectProfiles.geometryManager.edit')} ${g.model_key}`}
+                            title={t('ejectProfiles.geometryManager.edit')}
+                          >
+                            <Pencil className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+
+      {editing && canEdit && (
+        <GeometryEditDialog
+          geometry={editing}
+          saving={saveMutation.isPending}
+          onSave={(changes) => saveMutation.mutate({ modelKey: editing.model_key, changes })}
+          onClose={() => setEditing(null)}
+        />
+      )}
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -1214,7 +1783,6 @@ export function EjectProfilesPage() {
                 <tr>
                   <th className="py-3 px-4 font-medium">{t('ejectProfiles.fields.name')}</th>
                   <th className="py-3 px-4 font-medium text-right">{t('ejectProfiles.columns.cooldownTemp')}</th>
-                  <th className="py-3 px-4 font-medium text-right">{t('ejectProfiles.columns.retries')}</th>
                   <th className="py-3 px-4 font-medium text-right">{t('ejectProfiles.columns.passes')}</th>
                   <th className="py-3 px-4 font-medium text-right">{t('ejectProfiles.columns.ejectSpeed')}</th>
                   <th className="py-3 px-4 font-medium text-right">{t('ejectProfiles.columns.maxHeight')}</th>
@@ -1226,7 +1794,6 @@ export function EjectProfilesPage() {
                   <tr key={p.id} className="border-b border-bambu-dark-tertiary last:border-b-0">
                     <td className="py-3 px-4 text-white font-medium">{p.name}</td>
                     <td className="py-3 px-4 text-bambu-gray text-right">{p.cooldown_temp_c}</td>
-                    <td className="py-3 px-4 text-bambu-gray text-right">{p.cooldown_retries}</td>
                     <td className="py-3 px-4 text-bambu-gray text-right">{p.x_passes}</td>
                     <td className="py-3 px-4 text-bambu-gray text-right">{p.eject_speed_mm_min}</td>
                     <td className="py-3 px-4 text-bambu-gray text-right">{p.max_part_height_mm}</td>
@@ -1271,6 +1838,10 @@ export function EjectProfilesPage() {
 
       {/* Preview panel only makes sense once at least one profile exists. */}
       {list.length > 0 && <PreviewPanel profiles={list} />}
+
+      {/* Model geometry registry — independent of profiles; always available so
+          an operator can review/complete the geometry that gates production. */}
+      <GeometryManagerSection />
 
       {dialogState.open && (
         <EjectProfileDialog

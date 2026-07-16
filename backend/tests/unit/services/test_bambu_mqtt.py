@@ -5005,6 +5005,66 @@ class TestHMSFullCode:
         assert mqtt_client.state.hms_errors[0].actions == ["CHECK_ASSISTANT"]
 
 
+class TestHMSSeverityDecode:
+    """Severity is the high 16 bits of `code` (1=fatal 2=serious 3=common
+    4=info) — the legacy ``(attr >> 8) & 0xF`` decode read every real fault as
+    fatal(1). The live-fleet MicroSD fault (attr 0x05000100, code 0x00030004)
+    must decode to severity 3 and survive the 0x4000 status-code filter."""
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST_SEV",
+            access_code="12345678",
+        )
+
+    def test_microsd_fault_decodes_severity_3(self, mqtt_client):
+        mqtt_client._update_state({"hms": [{"attr": 0x05000100, "code": 0x00030004}]})
+        assert len(mqtt_client.state.hms_errors) == 1
+        err = mqtt_client.state.hms_errors[0]
+        assert err.severity == 3
+        assert err.full_code == "0500010000030004"
+
+    def test_serious_fault_decodes_severity_2(self, mqtt_client):
+        # code high16 == 0x0002 → serious.
+        mqtt_client._update_state({"hms": [{"attr": 0x03000100, "code": 0x00024057}]})
+        assert mqtt_client.state.hms_errors[0].severity == 2
+
+    def test_status_code_below_0x4000_still_filtered(self, mqtt_client):
+        # Full 32-bit code below 0x4000 is a status/phase indicator, not a fault.
+        mqtt_client._update_state({"hms": [{"attr": 0x03000100, "code": 0x0002}]})
+        assert mqtt_client.state.hms_errors == []
+
+    def test_cancel_echo_still_filtered(self, mqtt_client):
+        mqtt_client._update_state({"hms": [{"attr": 0x03000300, "code": 0x400C}]})
+        assert mqtt_client.state.hms_errors == []
+
+    def test_completion_event_carries_full_code(self, mqtt_client):
+        """The on_print_complete hms_errors dicts now include full_code so the
+        failure-reason chain can do a lossless catalog lookup."""
+        captured = {}
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client.on_print_complete = lambda data: captured.update(data)
+        mqtt_client._previous_gcode_state = "PREPARE"
+        mqtt_client._was_running = False
+        mqtt_client._process_message(
+            {
+                "print": {
+                    "gcode_state": "FAILED",
+                    "gcode_file": "/data/Metadata/plate_1.gcode",
+                    "hms": [{"attr": 0x05000100, "code": 0x00030004}],
+                }
+            }
+        )
+        assert captured.get("status") == "failed"
+        hms = captured.get("hms_errors") or []
+        assert hms and hms[0]["full_code"] == "0500010000030004"
+        assert hms[0]["severity"] == 3
+
+
 class TestForceReconnectRouting:
     """#1136 — force_reconnect_stale_session routes between hard-reset (full
     paho-client teardown, wipes the QoS 1 queue) and socket-close (the legacy
@@ -6153,3 +6213,69 @@ class TestOperatorCancelEcho:
             {"print": {"gcode_state": "FINISH", "gcode_file": "/data/Metadata/x.gcode", "subtask_name": "X"}}
         )
         assert complete_data.get("user_cancel_observed") is False
+
+
+class TestAmsChangeHashPresence:
+    """W6.1: the AMS change-hash carries a presence bit (state ∈ {10,11} → 'p',
+    else 'a') off the MERGED tray state, so a tagless third-party spool physically
+    inserted/removed fires on_ams_change even though no tray_type/tag/remain
+    changed — while a mid-print 10↔11 tool-change flip does NOT storm the callback.
+    """
+
+    from unittest.mock import Mock
+
+    @pytest.fixture
+    def client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(ip_address="192.168.1.100", serial_number="TEST123", access_code="12345678")
+
+    @staticmethod
+    def _feed(client, state, *, tray_type="", tag="0000000000000000", remain=0):
+        client._handle_ams_data(
+            {"ams": [{"id": 0, "tray": [{"id": 0, "state": state, "tray_type": tray_type, "tag_uid": tag, "remain": remain}]}]}
+        )
+
+    def test_presence_gain_9_to_11_fires(self, client):
+        from unittest.mock import Mock
+
+        client.on_ams_change = Mock()
+        self._feed(client, 9)  # empty (absent)
+        client.on_ams_change.reset_mock()
+        self._feed(client, 11)  # tagless spool inserted — only presence flips a→p
+        assert client.on_ams_change.call_count == 1
+
+    def test_presence_loss_11_to_9_fires(self, client):
+        from unittest.mock import Mock
+
+        client.on_ams_change = Mock()
+        self._feed(client, 11)
+        client.on_ams_change.reset_mock()
+        self._feed(client, 9)  # spool removed — presence flips p→a
+        assert client.on_ams_change.call_count == 1
+
+    def test_tool_change_10_to_11_does_not_fire(self, client):
+        from unittest.mock import Mock
+
+        # A loaded (tagged) spool flips 10↔11 on every load/unload mid-print; its
+        # identity fields are constant so the presence bit ('p') never changes.
+        client.on_ams_change = Mock()
+        self._feed(client, 10, tray_type="PETG", tag="1234567890ABCDEF", remain=50)
+        client.on_ams_change.reset_mock()
+        self._feed(client, 11, tray_type="PETG", tag="1234567890ABCDEF", remain=50)
+        assert client.on_ams_change.call_count == 0
+
+    def test_partial_update_omitting_state_does_not_flap(self, client):
+        from unittest.mock import Mock
+
+        # Merged basis: a partial update that omits `state` (and other fields)
+        # must NOT flap the presence token — the merged tray retains state=11. If
+        # the hash iterated the raw partial, the missing state → 'a' would fire.
+        client.on_ams_change = Mock()
+        client._handle_ams_data(
+            {"ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PETG", "tag_uid": "1234567890ABCDEF", "remain": 80}]}]}
+        )
+        client.on_ams_change.reset_mock()
+        # Partial: only remain re-stated (unchanged), no `state`, no tray_type, no tag.
+        client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "remain": 80}]}]})
+        assert client.on_ams_change.call_count == 0

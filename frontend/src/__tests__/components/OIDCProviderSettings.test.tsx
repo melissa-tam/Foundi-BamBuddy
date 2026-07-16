@@ -228,6 +228,150 @@ describe('OIDCProviderSettings', () => {
     });
   });
 
+  // Groups claim + claim-value -> group mapping editor.
+  describe('Group mapping editor', () => {
+    it('renders the groups-claim input and mapping editor in the create form', async () => {
+      server.use(http.get('/api/v1/auth/oidc/providers/all', () => HttpResponse.json([])));
+      render(<OIDCProviderSettings />);
+
+      await waitFor(() => {
+        expect(screen.getAllByRole('button', { name: /Add Provider/i })[0]).toBeInTheDocument();
+      });
+      await userEvent.click(screen.getAllByRole('button', { name: /Add Provider/i })[0]);
+
+      await waitFor(() => {
+        expect(screen.getByText(/Groups Claim/i)).toBeInTheDocument();
+      });
+      // Empty state message shown until a row is added.
+      expect(screen.getByText(/No mappings configured/i)).toBeInTheDocument();
+      // Placeholder for the claim-name hint.
+      expect(screen.getByPlaceholderText('groups')).toBeInTheDocument();
+    });
+
+    it('submits groups_claim and group_mapping in the create payload', async () => {
+      server.use(http.get('/api/v1/auth/oidc/providers/all', () => HttpResponse.json([])));
+      let captured: Record<string, unknown> | null = null;
+      server.use(
+        http.post('/api/v1/auth/oidc/providers', async ({ request }) => {
+          captured = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockProviders[0], ...captured, id: 7, has_icon: false });
+        })
+      );
+
+      const user = userEvent.setup();
+      render(<OIDCProviderSettings />);
+
+      await waitFor(() => {
+        expect(screen.getAllByRole('button', { name: /Add Provider/i })[0]).toBeInTheDocument();
+      });
+      await user.click(screen.getAllByRole('button', { name: /Add Provider/i })[0]);
+
+      await waitFor(() => expect(screen.getByPlaceholderText('Google')).toBeInTheDocument());
+
+      // Required fields to enable Save.
+      await user.type(screen.getByPlaceholderText('Google'), 'Corp IdP');
+      await user.type(screen.getByPlaceholderText('https://accounts.google.com'), 'https://idp.corp.com');
+      await user.type(screen.getByPlaceholderText('your-client-id'), 'cid');
+      await user.type(screen.getByPlaceholderText('new secret'), 'sekret');
+
+      // Groups claim + one mapping row.
+      await user.type(screen.getByPlaceholderText('groups'), 'roles');
+      await user.click(screen.getByRole('button', { name: /Add mapping/i }));
+      await user.type(screen.getByLabelText('Claim value'), 'farm-admins');
+      await user.selectOptions(screen.getByLabelText('BamBuddy group'), 'Operators');
+
+      await user.click(screen.getByRole('button', { name: /^Save$/i }));
+
+      await waitFor(() => expect(captured).not.toBeNull());
+      expect(captured!.groups_claim).toBe('roles');
+      expect(captured!.group_mapping).toEqual({ 'farm-admins': 'Operators' });
+    });
+
+    it('sends null group_mapping and groups_claim when left empty', async () => {
+      server.use(http.get('/api/v1/auth/oidc/providers/all', () => HttpResponse.json([])));
+      let captured: Record<string, unknown> | null = null;
+      server.use(
+        http.post('/api/v1/auth/oidc/providers', async ({ request }) => {
+          captured = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockProviders[0], id: 8, has_icon: false });
+        })
+      );
+
+      const user = userEvent.setup();
+      render(<OIDCProviderSettings />);
+
+      await waitFor(() => {
+        expect(screen.getAllByRole('button', { name: /Add Provider/i })[0]).toBeInTheDocument();
+      });
+      await user.click(screen.getAllByRole('button', { name: /Add Provider/i })[0]);
+
+      await waitFor(() => expect(screen.getByPlaceholderText('Google')).toBeInTheDocument());
+      await user.type(screen.getByPlaceholderText('Google'), 'Bare IdP');
+      await user.type(screen.getByPlaceholderText('https://accounts.google.com'), 'https://idp.bare.com');
+      await user.type(screen.getByPlaceholderText('your-client-id'), 'cid');
+      await user.type(screen.getByPlaceholderText('new secret'), 'sekret');
+
+      await user.click(screen.getByRole('button', { name: /^Save$/i }));
+
+      await waitFor(() => expect(captured).not.toBeNull());
+      expect(captured!.groups_claim).toBeNull();
+      expect(captured!.group_mapping).toBeNull();
+    });
+
+    it('shows the stored mapping read-only on the provider card', async () => {
+      server.use(
+        http.get('/api/v1/auth/oidc/providers/all', () =>
+          HttpResponse.json([
+            {
+              ...mockProviders[0],
+              groups_claim: 'roles',
+              group_mapping: { 'farm-admins': 'Administrators' },
+            },
+          ])
+        )
+      );
+      render(<OIDCProviderSettings />);
+
+      await waitFor(() => {
+        expect(screen.getByText('TestIdP')).toBeInTheDocument();
+      });
+
+      // Groups Claim label + value, and the mapping row, are visible in the card.
+      expect(screen.getAllByText(/Groups Claim/i).length).toBeGreaterThan(0);
+      expect(screen.getByText('roles')).toBeInTheDocument();
+      expect(screen.getByText(/farm-admins/)).toBeInTheDocument();
+      expect(screen.getByText(/Administrators/)).toBeInTheDocument();
+    });
+
+    it('pre-populates the mapping editor when editing a provider', async () => {
+      server.use(
+        http.get('/api/v1/auth/oidc/providers/all', () =>
+          HttpResponse.json([
+            {
+              ...mockProviders[0],
+              groups_claim: 'roles',
+              group_mapping: { 'farm-admins': 'Operators' },
+            },
+          ])
+        )
+      );
+      const user = userEvent.setup();
+      render(<OIDCProviderSettings />);
+
+      await waitFor(() => expect(screen.getByText('TestIdP')).toBeInTheDocument());
+      // Card action buttons (no icon buttons since icon_url is null): [Add Provider
+      // header, edit pencil, delete trash]. Click the edit button to reveal the form.
+      const actionButtons = screen.getAllByRole('button').filter(
+        (b) => !/Add Provider/i.test(b.textContent ?? '')
+      );
+      // edit precedes delete in the DOM; open it.
+      await user.click(actionButtons[0]);
+
+      expect(await screen.findByDisplayValue('roles')).toBeInTheDocument();
+      expect(screen.getByDisplayValue('farm-admins')).toBeInTheDocument();
+    });
+  });
+
   // #1333: icon proxy — preview uses the backend proxy URL (never icon_url
   // directly) and the admin gets explicit Refresh / Remove buttons.
   describe('Icon proxy (#1333)', () => {

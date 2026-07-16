@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.auth import RequirePermissionIfAuthEnabled
-from backend.app.core.config import APP_VERSION, settings
+from backend.app.core.config import APP_VERSION, BUILD_VERSION, settings
 from backend.app.core.database import get_db
 from backend.app.core.local_config import read_local_toml, read_ntp_gate
 from backend.app.core.permissions import Permission
@@ -516,6 +516,7 @@ async def get_system_info(
     return {
         "app": {
             "version": APP_VERSION,
+            "build": BUILD_VERSION,
             "base_dir": str(settings.base_dir),
             "archive_dir": str(archive_dir),
         },
