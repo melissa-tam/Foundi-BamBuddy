@@ -4763,33 +4763,108 @@ async def on_print_complete(printer_id: int, data: dict):
                 data.get("last_layer_num"),
             )
         elif _verdict == "foreign":
-            # A print Bambuddy did NOT dispatch left material on the plate. Raise the
-            # gate keyed to the foreign subtask, but do NOT arm auto-clear (there is
-            # no farm identity to cool-watch): start the escalation-only watch, alert
-            # the operator, and leave the farm queue untouched.
-            printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=_payload_subtask)
-            eject_cooldown_monitor.start_escalation_only_watch(printer_id)
-            logger.warning(
-                "[CALLBACK] printer %s: FOREIGN terminal (%s, subtask=%s) — gate raised, farm queue "
-                "untouched, auto-clear NOT armed",
-                printer_id,
-                _final_status,
-                _payload_subtask,
-            )
+            # A print Bambuddy did NOT dispatch left material on the plate. Gate + watch
+            # + alert only when this printer is one the farm cares about (same condition
+            # as the generic branch below): the global toggle is on, the item is a
+            # farm/eject item, or farm work targets this printer. A pure-upstream
+            # toggle-off install with no farm involvement is left exactly as upstream
+            # would leave it (no gate) — the foreign path must not out-gate the generic.
+            if _global_require_plate_clear or _resolved_is_farm or _farm_targets_printer:
+                # Raise the gate SYNCHRONOUSLY (dispatch must be blocked NOW), keyed to
+                # the foreign subtask. Then hand the watch + notification to ONE
+                # background task: it decides between an AUTO eject (the plate is
+                # positively the farm's OWN file) and the escalation-only hold (truly
+                # foreign), and NEVER leaves the printer armless — an unarmed gated
+                # printer is precisely the silent stall this fixes.
+                printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=_payload_subtask)
+                logger.warning(
+                    "[CALLBACK] printer %s: FOREIGN terminal (%s, subtask=%s) — gate raised, farm queue "
+                    "untouched; deciding auto-eject vs escalation-only in background",
+                    printer_id,
+                    _final_status,
+                    _payload_subtask,
+                )
+                _foreign_subtask_name = data.get("subtask_name")
+                _foreign_filename = data.get("filename")
 
-            async def _foreign_notify():
-                try:
-                    async with async_session() as _fdb:
-                        from backend.app.models.printer import Printer as _FPrinter
+                async def _foreign_auto_eject():
+                    # 1. Identify whether the foreign plate is the farm's OWN file.
+                    identified = None
+                    try:
+                        from backend.app.services.eject.manual import identify_farm_file_foreign
 
-                        _pres = await _fdb.execute(select(_FPrinter.name).where(_FPrinter.id == printer_id))
-                        _pname = _pres.scalar_one_or_none() or f"Printer {printer_id}"
-                        _job = data.get("subtask_name") or data.get("filename") or "unknown job"
-                        await notification_service.on_foreign_job_detected(printer_id, _pname, _job, _fdb)
-                except Exception as _fe:  # noqa: BLE001
-                    logger.warning("[CALLBACK] foreign-job notification failed for printer %s: %s", printer_id, _fe)
+                        async with async_session() as _idb:
+                            identified = await identify_farm_file_foreign(
+                                _idb,
+                                printer_id,
+                                subtask_name=_foreign_subtask_name,
+                                filename=_foreign_filename,
+                            )
+                    except Exception as _ie:  # noqa: BLE001 — any failure → escalation-only
+                        logger.warning(
+                            "[CALLBACK] printer %s: foreign auto-eject identification failed: %s", printer_id, _ie
+                        )
+                        identified = None
 
-            spawn_background_task(_foreign_notify(), name=f"foreign-job-notify-{printer_id}")
+                    # 2. Identified → arm the auto foreign-eject cooldown watch.
+                    auto_temp = None
+                    if identified is not None:
+                        try:
+                            armed = eject_cooldown_monitor.start_foreign_eject_watch(
+                                printer_id, identified.profile_id, identified.threshold_c
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "[CALLBACK] printer %s: arming foreign auto-eject watch failed", printer_id
+                            )
+                            armed = False
+                        if armed:
+                            auto_temp = identified.threshold_c
+                            logger.warning(
+                                "[CALLBACK] printer %s: FOREIGN plate is the farm's own file — auto-eject armed "
+                                "(profile=%s, cooldown=%.1f°C)",
+                                printer_id,
+                                identified.profile_id,
+                                identified.threshold_c,
+                            )
+                        else:
+                            logger.info(
+                                "[CALLBACK] printer %s: a watch was already armed — foreign auto-eject not (re)armed",
+                                printer_id,
+                            )
+
+                    # 3. Not identified / arming failed / a watch already existed →
+                    #    ensure the printer is NEVER armless: escalation-only hold
+                    #    (deduped against any watch already in flight).
+                    if auto_temp is None:
+                        try:
+                            eject_cooldown_monitor.start_escalation_only_watch(printer_id)
+                        except Exception:  # noqa: BLE001
+                            logger.exception("[CALLBACK] printer %s: arming escalation-only watch failed", printer_id)
+
+                    # 4. Foreign notification fires in BOTH outcomes; names the cooldown
+                    #    target °C when auto-eject was armed.
+                    try:
+                        async with async_session() as _fdb:
+                            from backend.app.models.printer import Printer as _FPrinter
+
+                            _pres = await _fdb.execute(select(_FPrinter.name).where(_FPrinter.id == printer_id))
+                            _pname = _pres.scalar_one_or_none() or f"Printer {printer_id}"
+                            _job = _foreign_subtask_name or _foreign_filename or "unknown job"
+                            await notification_service.on_foreign_job_detected(
+                                printer_id, _pname, _job, _fdb, auto_eject_temp_c=auto_temp
+                            )
+                    except Exception as _fe:  # noqa: BLE001
+                        logger.warning("[CALLBACK] printer %s: foreign-job notification failed: %s", printer_id, _fe)
+
+                spawn_background_task(_foreign_auto_eject(), name=f"foreign-auto-eject-{printer_id}")
+            else:
+                logger.info(
+                    "[CALLBACK] printer %s: FOREIGN terminal (%s) with deposit but no farm involvement and "
+                    "require_plate_clear off — not gating (upstream toggle-off behaviour)",
+                    printer_id,
+                    _final_status,
+                )
         elif _global_require_plate_clear or _resolved_is_farm or _farm_targets_printer:
             # Raise the gate only when it should matter: the global toggle is on, the
             # finished item is a farm/eject item, or farm work targets this printer.

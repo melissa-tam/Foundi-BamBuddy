@@ -13,6 +13,8 @@ import pytest
 
 from backend.app.models.archive import PrintArchive
 from backend.app.models.eject_profile import EjectProfile
+from backend.app.models.library import LibraryFile
+from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.eject import manual, remote as eject_remote
@@ -21,13 +23,13 @@ from backend.app.services.eject.monitor import _ActiveWatch
 pytestmark = pytest.mark.asyncio
 
 
-async def _mk_printer(db, name="MPE", gate="SUB-1"):
+async def _mk_printer(db, name="MPE", gate="SUB-1", model="H2S"):
     p = Printer(
         name=name,
         serial_number=f"S{name}",
         ip_address="1.2.3.4",
         access_code="x",
-        model="H2S",
+        model=model,
         plate_gate_subtask_id=gate,
     )
     db.add(p)
@@ -429,3 +431,178 @@ class TestManualEjectForeignPlate:
             await manual.manual_eject(db_session, printer.id)
         assert exc.value.code == "no_eligible_unit"
         assert "by hand" in str(exc.value)
+
+
+async def _mk_library_file(db, filename):
+    lf = LibraryFile(filename=filename, file_path=f"/lib/{filename}", file_type="3mf", file_size=1)
+    db.add(lf)
+    await db.flush()
+    return lf
+
+
+async def _mk_farm_item(db, *, printer_id, library_file_id=None, eject_profile_id=None, batch_id=None):
+    """A farm queue item (eject_profile_id OR a farm batch) dispatched to a printer —
+    the identity anchor identify_farm_file_foreign matches a foreign echo against."""
+    item = PrintQueueItem(
+        printer_id=printer_id,
+        status="cancelled",  # the incident shape: farm units were cancelled
+        first_article=False,
+        eject_profile_id=eject_profile_id,
+        library_file_id=library_file_id,
+        batch_id=batch_id,
+        started_at=datetime.now(timezone.utc),
+        position=1,
+    )
+    db.add(item)
+    await db.flush()
+    return item
+
+
+class TestCanonicalNames:
+    """The underscore/extension canonicalisation that makes a screen-started print's
+    UNDERSCORED USB echo compare equal to the farm's SPACED library/archive name —
+    the fold farm_correlation._normalize_name deliberately does NOT do."""
+
+    async def test_underscored_echo_matches_spaced_stored_name(self):
+        # (async only to satisfy the module-level asyncio pytestmark; the fn is pure.)
+        echoed = manual._canonical_names(".6_nozzle_(Battery_holders_X2)", None)
+        stored = manual._canonical_names(".6 nozzle (Battery holders X2).gcode.3mf")
+        assert echoed == stored
+        assert echoed == {".6_nozzle_(Battery_holders_X2).3mf"}
+
+    async def test_blanks_skipped_and_basename_stripped(self):
+        assert manual._canonical_names(None, "") == set()
+        # A path-prefixed name is basename-stripped before canonicalising.
+        assert manual._canonical_names("/data/Widget A.3mf") == {"Widget_A.3mf"}
+
+
+class TestIdentifyFarmFileForeign:
+    """F5: a foreign completion is auto-ejected ONLY when positively the farm's OWN
+    file — name match (canonicalised) AND validated geometry AND a suggested profile
+    AND the donor height within that profile's guard. Any miss → None (escalation)."""
+
+    async def test_positive_identification_returns_profile_and_threshold(self, db_session, seed_geometry):
+        source = _make_source_3mf()  # plate max_z 18.0mm, within the 42mm guard
+        try:
+            printer = await _mk_printer(db_session, "IDN", gate="SUB-F")  # H2S → validated
+            prof = EjectProfile(name="idn-ep", cooldown_temp_c=30.0, max_part_height_mm=42.0)
+            db_session.add(prof)
+            await db_session.flush()
+            lf = await _mk_library_file(db_session, "Farm Widget.gcode.3mf")  # SPACED display name
+            await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, eject_profile_id=prof.id)
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            # Echoed name = the UNDERSCORED USB filename a screen-start reports.
+            result = await manual.identify_farm_file_foreign(
+                db_session, printer.id, subtask_name="Farm_Widget", filename="Farm_Widget.gcode.3mf"
+            )
+            assert result is not None
+            assert result.profile_id == prof.id
+            assert result.threshold_c == 30.0
+            assert result.print_name == "Foreign Widget"
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_negative_when_name_is_not_a_farm_file(self, db_session, seed_geometry):
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "IDNEG", gate="SUB-F")
+            prof = EjectProfile(name="idneg-ep")
+            db_session.add(prof)
+            await db_session.flush()
+            lf = await _mk_library_file(db_session, "Some Other File.gcode.3mf")
+            await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, eject_profile_id=prof.id)
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            result = await manual.identify_farm_file_foreign(
+                db_session, printer.id, subtask_name="Totally_Unrelated_Local", filename="local.gcode"
+            )
+            assert result is None
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_negative_when_geometry_unvalidated(self, db_session, seed_geometry):
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "IDU", gate="SUB-F", model="H2C")  # H2C → unvalidated
+            prof = EjectProfile(name="idu-ep")
+            db_session.add(prof)
+            await db_session.flush()
+            lf = await _mk_library_file(db_session, "Farm Widget.gcode.3mf")
+            await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, eject_profile_id=prof.id)
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            # Name matches, but H2C geometry is not hardware-validated → no auto-eject.
+            result = await manual.identify_farm_file_foreign(
+                db_session, printer.id, subtask_name="Farm_Widget", filename=None
+            )
+            assert result is None
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_negative_when_no_suggested_profile(self, db_session, seed_geometry):
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "IDNP", gate="SUB-F")
+            batch = PrintBatch(name="run", sku_file_id=1)  # farm via batch, NOT an eject-profiled unit
+            db_session.add(batch)
+            await db_session.flush()
+            lf = await _mk_library_file(db_session, "Farm Widget.gcode.3mf")
+            await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, batch_id=batch.id)
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            # Name matches + geometry validated, but no eject-profiled unit → no profile.
+            result = await manual.identify_farm_file_foreign(
+                db_session, printer.id, subtask_name="Farm_Widget", filename=None
+            )
+            assert result is None
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_negative_when_height_exceeds_profile_guard(self, db_session, seed_geometry):
+        source = _make_source_3mf()  # 18.0mm part
+        try:
+            printer = await _mk_printer(db_session, "IDH", gate="SUB-F")
+            prof = EjectProfile(name="idh-ep", max_part_height_mm=10.0)  # guard below the 18mm part
+            db_session.add(prof)
+            await db_session.flush()
+            lf = await _mk_library_file(db_session, "Farm Widget.gcode.3mf")
+            await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, eject_profile_id=prof.id)
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            result = await manual.identify_farm_file_foreign(
+                db_session, printer.id, subtask_name="Farm_Widget", filename=None
+            )
+            assert result is None
+        finally:
+            source.unlink(missing_ok=True)
+
+
+class TestDispatchIdentifiedForeignEject:
+    """The auto foreign-eject on_release: resolve the donor fresh and dispatch the
+    foreign-plate sweep exactly as the manual confirm does (no thermal gate)."""
+
+    async def test_dispatches_foreign_eject_for_gate_source(self, db_session, monkeypatch):
+        import contextlib
+
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "IDD", gate="SUB-F")
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+
+            @contextlib.asynccontextmanager
+            async def _fake_session():
+                yield db_session
+
+            # dispatch_identified_foreign_eject opens its OWN session — back it with db_session.
+            monkeypatch.setattr("backend.app.core.database.async_session", _fake_session, raising=False)
+            dispatch = AsyncMock()
+            with patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch):
+                await manual.dispatch_identified_foreign_eject(printer_id=printer.id, profile_id=5)
+            dispatch.assert_awaited_once()
+            assert dispatch.await_args.kwargs["printer_id"] == printer.id
+            assert dispatch.await_args.kwargs["profile_id"] == 5
+            assert dispatch.await_args.kwargs["plate_id"] == 1
+        finally:
+            source.unlink(missing_ok=True)

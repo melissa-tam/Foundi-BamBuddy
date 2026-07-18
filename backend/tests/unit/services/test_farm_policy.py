@@ -14,6 +14,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.sku import Sku, SkuFile
 from backend.app.services import farm_policy
+from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager
 
 pytestmark = pytest.mark.asyncio
@@ -484,6 +485,77 @@ class TestRunCompletion:
         await farm_policy._maybe_complete_run(db_session, batch)
         await db_session.refresh(batch)
         assert batch.status == "completed"
+        # A clean completion (never held) must not leave a hold reason stamped.
+        assert batch.pause_reason is None
+
+    async def test_operator_stop_deficit_holds_run_paused(self, db_session):
+        """F2: a run held by an operator stop must NOT complete while its plate
+        plan is unmet — completing would strand the Resume/top-up affordance
+        (resume of a completed run 409s). It pauses, KEEPING ``operator_stop``."""
+        batch, prof = await _mk_run(db_session, quantity=3, printer_ids=[9], require_fa=False)
+        # 2 completed + 1 operator-cancelled = 3 primaries, but only 2 plates done
+        # against a plan of 3 → one plate short.
+        for i in range(2):
+            db_session.add(
+                PrintQueueItem(
+                    batch_id=batch.id,
+                    printer_id=9,
+                    status="completed",
+                    eject_profile_id=prof.id,
+                    plate_id=1,
+                    position=700 + i,
+                    completed_at=datetime.now(timezone.utc),
+                )
+            )
+        db_session.add(
+            PrintQueueItem(
+                batch_id=batch.id,
+                printer_id=9,
+                status="cancelled",
+                stop_source="operator_screen",
+                eject_profile_id=prof.id,
+                plate_id=1,
+                position=799,
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+        batch.pause_reason = "operator_stop"
+        await db_session.commit()
+
+        with patch.object(notification_service, "on_run_paused", new_callable=AsyncMock) as paused_spy:
+            await farm_policy._maybe_complete_run(db_session, batch)
+
+        await db_session.refresh(batch)
+        assert batch.status == "paused"  # NOT completed
+        assert batch.pause_reason == "operator_stop"  # hold reason preserved
+        paused_spy.assert_awaited_once()
+
+    async def test_operator_stop_topped_up_completes_and_clears_reason(self, db_session):
+        """Once the plate plan is met (the deficit was topped up), a lingering
+        ``operator_stop`` hold must not block completion — the run completes and
+        the stale hold reason is cleared (the prod-18 defect)."""
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[9], require_fa=False)
+        for i in range(2):
+            db_session.add(
+                PrintQueueItem(
+                    batch_id=batch.id,
+                    printer_id=9,
+                    status="completed",
+                    eject_profile_id=prof.id,
+                    plate_id=1,
+                    position=800 + i,
+                    completed_at=datetime.now(timezone.utc),
+                )
+            )
+        batch.pause_reason = "operator_stop"
+        await db_session.commit()
+
+        with patch.object(notification_service, "on_run_completed", new_callable=AsyncMock):
+            await farm_policy._maybe_complete_run(db_session, batch)
+
+        await db_session.refresh(batch)
+        assert batch.status == "completed"
+        assert batch.pause_reason is None  # stale hold reason cleared
 
     async def test_run_not_complete_while_pending_items(self, db_session):
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[9], require_fa=False)

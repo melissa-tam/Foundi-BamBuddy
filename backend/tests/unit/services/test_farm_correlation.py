@@ -1,8 +1,10 @@
 """Verdict-matrix tests for the terminal-status → queue-item correlation (Phase 1).
 
 Covers all five verdicts of :func:`resolve_terminal_item` — including the
-upgrade-day NULL-key single-candidate fallback and the present-id-matches-nothing
-foreign case — plus the farm-work-targets-printer helper that drives the
+upgrade-day NULL-key single-candidate fallback, the present-id-matches-nothing
+foreign case, and the ZERO-candidate-with-echoed-id foreign case (the production
+S4 stall: farm units cancelled, then the farm's own USB file re-started from the
+touchscreen) — plus the farm-work-targets-printer helper that drives the
 conditional plate-gate raise. FK enforcement is off in the test engine, so rows
 reference arbitrary printer/sku ids without seeding those parents.
 """
@@ -123,18 +125,39 @@ class TestResolveTerminalItemVerdicts:
         assert res.verdict == "foreign"
         assert res.item is None
 
-    async def test_none_when_nothing_printing(self, db_session):
-        # A completed row is not a candidate; nothing is printing on this printer.
+    async def test_none_when_nothing_printing_and_no_id(self, db_session):
+        # Zero printing candidates AND no echoed subtask_id → none (a bare state blip
+        # we must never guess a foreign deposit from). A completed row is not a candidate.
         await _add_item(db_session, printer_id=1, status="completed", dispatch_subtask_id="SUB-1")
-        res = await resolve_terminal_item(db_session, 1, {"subtask_id": "SUB-1"})
+        res = await resolve_terminal_item(db_session, 1, {"subtask_name": "Test", "filename": "x.gcode"})
+        assert res.verdict == "none"
+        assert res.item is None
+
+    async def test_foreign_when_nothing_printing_but_id_echoed(self, db_session):
+        # The production S4 case: every farm unit was cancelled (no printing row), then
+        # the operator re-started the farm's own USB file from the touchscreen — a fresh
+        # id echoed with ZERO printing candidates. That is FOREIGN, not silent "none":
+        # the caller must gate + watch + alert, never strand the printer silently.
+        await _add_item(db_session, printer_id=1, status="cancelled", dispatch_subtask_id="OLD-1")
+        res = await resolve_terminal_item(
+            db_session, 1, {"subtask_id": "SCREEN-9", "subtask_name": "FarmFile", "filename": "farmfile.gcode"}
+        )
+        assert res.verdict == "foreign"
+        assert res.item is None
+
+    async def test_none_when_nothing_printing_empty_id_is_blank(self, db_session):
+        # A present-but-blank subtask_id strips to None → treated as no id → none.
+        res = await resolve_terminal_item(db_session, 1, {"subtask_id": "   ", "subtask_name": "Test"})
         assert res.verdict == "none"
         assert res.item is None
 
     async def test_only_considers_target_printer(self, db_session):
-        # A printing item on ANOTHER printer must not be attributed here.
+        # A printing item on ANOTHER printer must not be attributed here. For printer 1
+        # there are ZERO candidates and an id is echoed → foreign (item None), NEVER
+        # reaching over to printer 2's item.
         await _add_item(db_session, printer_id=2, dispatch_subtask_id="SUB-1")
         res = await resolve_terminal_item(db_session, 1, {"subtask_id": "SUB-1"})
-        assert res.verdict == "none"
+        assert res.verdict == "foreign"
         assert res.item is None
 
 

@@ -1933,6 +1933,7 @@ class NotificationService:
         printer_name: str,
         subtask_name: str,
         db: AsyncSession,
+        auto_eject_temp_c: float | None = None,
     ):
         """Fire when a printer finishes a job Bambuddy did not dispatch (foreign print).
 
@@ -1940,6 +1941,11 @@ class NotificationService:
         deposit but left the farm queue untouched (no farm unit is attributed to
         a print Bambuddy never sent). Alerts the operator to clear the plate so
         dispatch can resume.
+
+        When ``auto_eject_temp_c`` is set the foreign plate was positively identified
+        as the farm's OWN file (2026-07-18 auto-eject decision): the message says so
+        and names the cooldown target °C, so the operator knows the farm will clear it
+        automatically once the bed cools rather than waiting on a manual sweep.
         """
         providers = await self._get_providers_for_event(db, "on_foreign_job_detected", printer_id)
         if not providers:
@@ -1951,6 +1957,15 @@ class NotificationService:
         }
 
         title, message = await self._build_message_from_template(db, "foreign_job_detected", variables)
+        if auto_eject_temp_c is not None:
+            # Appended to the rendered body so it reaches EVERY provider (providers send
+            # the final string directly — only webhook/email additionally read variables).
+            auto_note = (
+                f"The farm recognised this as one of its own files and will automatically eject it once the "
+                f"bed cools to {auto_eject_temp_c:.0f}°C. No action needed unless it does not clear."
+            )
+            message = f"{message}\n\n{auto_note}"
+            variables["auto_eject_temp_c"] = f"{auto_eject_temp_c:.0f}"
         await self._send_to_providers(
             providers,
             title,
