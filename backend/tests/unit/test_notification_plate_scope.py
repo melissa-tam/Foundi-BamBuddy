@@ -324,3 +324,32 @@ class TestScopeNotificationArchiveDataToPlate:
 
         assert result["actual_filament_grams"] == 75.0
         assert result["print_time_seconds"] == 2400
+
+    def test_plate_scoped_archive_matches_shim_grams(self, tmp_path):
+        """Consistency guard for #1697 + #1785 together: a plate-scoped archive
+        (parser given plate_number=2) stores plate-2's grams, and the
+        notification shim — which OVERRIDES absolutely — recomputes the SAME
+        plate-2 grams for the same file. The two must agree so a plate-scoped
+        archive passing through the shim yields identical values (no drift
+        between the stored archive column and the notification headline)."""
+        from backend.app.services.archive import ThreeMFParser
+
+        file_path, rel = _write_multi_plate_3mf(tmp_path)
+
+        # What the archive column stores post-#1697 for a plate-2 print.
+        parsed = ThreeMFParser(str(file_path), plate_number=2).parse()
+        assert parsed["filament_used_grams"] == 120.0
+        assert parsed["print_time_seconds"] == 3600
+
+        # What the shim substitutes into the notification payload for plate 2.
+        result = _scope_notification_archive_data_to_plate(
+            _project_totals_archive_data(),
+            rel,
+            plate_id=2,
+            print_status="completed",
+            progress=100,
+            base_dir=tmp_path,
+        )
+
+        assert result["actual_filament_grams"] == parsed["filament_used_grams"]
+        assert result["print_time_seconds"] == parsed["print_time_seconds"]

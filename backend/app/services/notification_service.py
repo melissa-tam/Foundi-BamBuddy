@@ -2074,6 +2074,45 @@ class NotificationService:
             variables=variables,
         )
 
+    async def on_print_paused_stalled(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        job_name: str,
+        minutes: int,
+        db: AsyncSession,
+    ):
+        """Fire when a CONNECTED printer's unit has sat unattended-PAUSEd past grace.
+
+        Unlike ``on_print_stalled`` (offline, reconciles on reconnect), a pause does
+        NOT resolve on its own — an HMS outside the recovery sets, a door-open, or a
+        forgotten manual pause needs a human at the printer. The item stays
+        ``printing`` (never fabricate a terminal). One-shot per incident — the caller
+        dedupes so a persistent pause doesn't re-fire.
+        """
+        providers = await self._get_providers_for_event(db, "on_print_paused_stalled", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "job_name": job_name,
+            "minutes": str(minutes),
+        }
+
+        title, message = await self._build_message_from_template(db, "print_paused_stalled", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "print_paused_stalled",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
     async def on_storage_low(
         self,
         printer_id: int | None,
@@ -2084,6 +2123,7 @@ class NotificationService:
         files_deleted: int,
         free_bytes: int | None,
         reason: str | None,
+        attempted: bool = True,
         db: AsyncSession,
     ):
         """Fire when a printer's USB fills up and the farm auto-cleanup runs.
@@ -2092,13 +2132,22 @@ class NotificationService:
         free space now, if the printer reports it); on failure, a human reason
         (e.g. FTPS unreachable, nothing cleanable). The ``detail`` phrasing is
         built here so the template stays a simple ``{printer_name}: {detail}``.
+
+        ``attempted=False`` means NO cleanup ran (e.g. a bare USB-drop detection):
+        the detail is then the raw ``reason`` alone — never the misleading
+        "Auto-cleanup could not free space:" prefix that implies a failed attempt.
         """
         providers = await self._get_providers_for_event(db, "on_storage_low", printer_id)
         if not providers:
             return
 
         freed_mb = freed_bytes // (1024 * 1024)
-        if success:
+        if not attempted:
+            # No cleanup was attempted — report the raw reason, grammatical with a
+            # trailing period, and NO "Auto-cleanup could not free space:" prefix.
+            base = reason or "USB problem detected"
+            detail = base if base.endswith(".") else f"{base}."
+        elif success:
             if free_bytes is not None:
                 free_txt = f"{free_bytes / 1024**3:.1f} GB free now"
             else:
@@ -2174,6 +2223,139 @@ class NotificationService:
             message,
             db,
             "cooldown_escalation",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_spool_recovery_succeeded(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        job_name: str,
+        layer: int | str,
+        from_spool: str,
+        to_spool: str,
+        db: AsyncSession,
+    ):
+        """Fire when a mid-print spool jam was auto-recovered by the farm.
+
+        The feed fault was cleared by swapping the jammed spool for another loaded
+        spool and resuming the paused print; the donor (``from_spool``) is left out
+        of rotation until it is removed and re-inserted. A printer alarm — defaults
+        ON, ``force_immediate`` (the operator should know an unattended swap
+        happened), mirroring ``on_run_unit_stopped``/``on_storage_low``."""
+        providers = await self._get_providers_for_event(db, "on_spool_recovery_succeeded", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "job_name": job_name,
+            "layer": str(layer),
+            "from_spool": from_spool,
+            "to_spool": to_spool,
+        }
+
+        title, message = await self._build_message_from_template(db, "spool_recovery_succeeded", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "spool_recovery_succeeded",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_spool_recovery_failed(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        job_name: str,
+        detail: str,
+        db: AsyncSession,
+        *,
+        is_feed_fault: bool = True,
+    ):
+        """Fire when a mid-print feed fault / runout could NOT be auto-recovered.
+
+        Recovery escalated and the print is left PAUSED for a human — no other
+        loaded spool satisfied the requirement, or the swap/resume itself failed.
+        ``detail`` carries the human-facing reason. A printer alarm — defaults ON,
+        ``force_immediate`` — mirroring ``on_run_unit_stopped``/``on_storage_low``.
+
+        ``is_feed_fault`` selects the copy: a feed fault (jam / tangle) keeps the
+        seeded jam template; a filament RUNOUT (``is_feed_fault=False``) gets
+        runout-framed copy built in backend English here — there is no runout
+        template seeded and the jam wording ("Spool jam NOT recovered") is wrong
+        for an empty spool."""
+        providers = await self._get_providers_for_event(db, "on_spool_recovery_failed", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "job_name": job_name,
+            "detail": detail,
+        }
+
+        if is_feed_fault:
+            title, message = await self._build_message_from_template(db, "spool_recovery_failed", variables)
+        else:
+            title = f"Filament runout NOT recovered — {printer_name}"
+            message = (
+                f"{printer_name}: '{job_name}' is left PAUSED. Filament ran out and no usable "
+                "replacement spool was found — load filament and resume on the printer."
+            )
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "spool_recovery_failed",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_spool_out_of_rotation(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        spool_desc: str,
+        slot_desc: str,
+        code: str,
+        db: AsyncSession,
+    ):
+        """Fire when a spool is flagged out of rotation after a feed fault.
+
+        The spool triggered a feed fault and will not be auto-selected again until
+        it is physically removed and re-inserted (or cleared in Inventory). A
+        printer alarm — defaults ON, ``force_immediate`` — mirroring
+        ``on_run_unit_stopped``/``on_storage_low``."""
+        providers = await self._get_providers_for_event(db, "on_spool_out_of_rotation", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "spool_desc": spool_desc,
+            "slot_desc": slot_desc,
+            "code": code,
+        }
+
+        title, message = await self._build_message_from_template(db, "spool_out_of_rotation", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "spool_out_of_rotation",
             printer_id,
             printer_name,
             force_immediate=True,

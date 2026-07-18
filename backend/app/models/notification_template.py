@@ -226,11 +226,41 @@ DEFAULT_TEMPLATES = [
         "title_template": "Print stalled — {printer_name}",
         "body_template": "{printer_name} has been offline {minutes} min with '{job_name}' still marked printing. It will reconcile automatically when the printer reconnects.",
     },
+    # Pause-stall: a CONNECTED printer sat unattended-PAUSEd past the grace window.
+    # A NEW event (not a reuse of print_stalled — whose "reconcile automatically on
+    # reconnect" copy is misleading for a pause the operator must physically clear).
+    {
+        "event_type": "print_paused_stalled",
+        "name": "Print Paused (stalled)",
+        "title_template": "Print paused — {printer_name}",
+        "body_template": "{printer_name} has been PAUSEd {minutes} min with '{job_name}' still printing, and nothing is recovering it. Check the printer — it will not resolve on its own.",
+    },
     {
         "event_type": "storage_low",
         "name": "USB Storage Low (auto-cleanup)",
         "title_template": "USB storage low — {printer_name}",
         "body_template": "{printer_name}: {detail}",
+    },
+    # Farm mid-print spool-jam auto-recovery (services/spool_recovery.py). NEW
+    # event types so an existing install seeds them on restart (seeding only
+    # INSERTs missing event types — see the seeder comment below).
+    {
+        "event_type": "spool_recovery_succeeded",
+        "name": "Spool Jam Recovered",
+        "title_template": "Spool jam recovered — {printer_name}",
+        "body_template": "{printer_name}: feed fault at layer {layer} during '{job_name}'. Swapped {from_spool} → {to_spool} and resumed. {from_spool} is out of rotation until it is removed and re-inserted.",
+    },
+    {
+        "event_type": "spool_recovery_failed",
+        "name": "Spool Jam Not Recovered",
+        "title_template": "Spool jam NOT recovered — {printer_name}",
+        "body_template": "{printer_name}: '{job_name}' is left PAUSED. {detail}",
+    },
+    {
+        "event_type": "spool_out_of_rotation",
+        "name": "Spool Out Of Rotation",
+        "title_template": "Spool out of rotation — {printer_name}",
+        "body_template": "{spool_desc} in {slot_desc} triggered feed fault {code}. It will not be auto-selected until removed and re-inserted (or cleared in Inventory).",
     },
     # Post-print eject cooldown running long. A NEW event (not a reword of
     # plate_not_empty) so an existing install picks up this honest copy on

@@ -2902,3 +2902,316 @@ class TestOnCooldownEscalation:
         )
         assert "001-H2S" in title
         assert "001-H2S" in body and "Still cooling: bed 40 °C" in body
+
+
+class TestSpoolRecoveryNotifications:
+    """Farm mid-print spool-jam auto-recovery events (services/spool_recovery.py).
+
+    Three printer-alarm events mirroring ``on_run_unit_stopped``/``on_storage_low``:
+    provider-boolean gated, ``force_immediate`` (a printer alarm, not a run-lifecycle
+    event). Each pair proves the toggle-ON provider receives the message with its
+    template variables rendered and the toggle-OFF provider is filtered out.
+    """
+
+    @pytest.fixture
+    def service(self):
+        return NotificationService()
+
+    @pytest.fixture
+    def mock_provider(self):
+        provider = MagicMock()
+        provider.id = 1
+        provider.name = "Test Provider"
+        provider.printer_id = None
+        return provider
+
+    @pytest.fixture
+    def mock_db(self):
+        db = AsyncMock()
+        db.commit = AsyncMock()
+        return db
+
+    @pytest.mark.asyncio
+    async def test_on_spool_recovery_succeeded_sends_when_enabled(self, service, mock_provider, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("Spool jam recovered — 001-H2S", "body")
+
+            await service.on_spool_recovery_succeeded(
+                7,
+                "001-H2S",
+                "SKU007 plate",
+                142,
+                "Bambu PETG (RFID a1b2)",
+                "Sunlu PETG (slot 3)",
+                mock_db,
+            )
+
+            mock_get.assert_awaited_once_with(mock_db, "on_spool_recovery_succeeded", 7)
+            _, event, variables = mock_build.call_args.args
+            assert event == "spool_recovery_succeeded"
+            assert variables == {
+                "printer_name": "001-H2S",
+                "job_name": "SKU007 plate",
+                "layer": "142",
+                "from_spool": "Bambu PETG (RFID a1b2)",
+                "to_spool": "Sunlu PETG (slot 3)",
+            }
+            mock_send.assert_awaited_once()
+            assert mock_send.call_args.args[4] == "spool_recovery_succeeded"
+            assert mock_send.call_args.args[5] == 7
+            assert mock_send.call_args.kwargs["force_immediate"] is True
+            assert mock_send.call_args.kwargs["variables"] == variables
+
+    @pytest.mark.asyncio
+    async def test_on_spool_recovery_succeeded_skipped_when_disabled(self, service, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = []  # provider boolean off → filtered out
+
+            await service.on_spool_recovery_succeeded(
+                7, "001-H2S", "SKU007 plate", 142, "Bambu PETG", "Sunlu PETG", mock_db
+            )
+
+            mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_spool_recovery_failed_sends_when_enabled(self, service, mock_provider, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("Spool jam NOT recovered — 001-H2S", "body")
+
+            await service.on_spool_recovery_failed(
+                7,
+                "001-H2S",
+                "SKU007 plate",
+                "No other loaded spool matched PETG 0.6.",
+                mock_db,
+            )
+
+            mock_get.assert_awaited_once_with(mock_db, "on_spool_recovery_failed", 7)
+            _, event, variables = mock_build.call_args.args
+            assert event == "spool_recovery_failed"
+            assert variables == {
+                "printer_name": "001-H2S",
+                "job_name": "SKU007 plate",
+                "detail": "No other loaded spool matched PETG 0.6.",
+            }
+            mock_send.assert_awaited_once()
+            assert mock_send.call_args.args[4] == "spool_recovery_failed"
+            assert mock_send.call_args.kwargs["force_immediate"] is True
+
+    @pytest.mark.asyncio
+    async def test_on_spool_recovery_failed_skipped_when_disabled(self, service, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = []
+
+            await service.on_spool_recovery_failed(7, "001-H2S", "SKU007 plate", "reason", mock_db)
+
+            mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_spool_out_of_rotation_sends_when_enabled(self, service, mock_provider, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("Spool out of rotation — 001-H2S", "body")
+
+            await service.on_spool_out_of_rotation(
+                7,
+                "001-H2S",
+                "Bambu PETG (RFID a1b2)",
+                "AMS 1 slot 3",
+                "07C0_2000",
+                mock_db,
+            )
+
+            mock_get.assert_awaited_once_with(mock_db, "on_spool_out_of_rotation", 7)
+            _, event, variables = mock_build.call_args.args
+            assert event == "spool_out_of_rotation"
+            assert variables == {
+                "printer_name": "001-H2S",
+                "spool_desc": "Bambu PETG (RFID a1b2)",
+                "slot_desc": "AMS 1 slot 3",
+                "code": "07C0_2000",
+            }
+            mock_send.assert_awaited_once()
+            assert mock_send.call_args.args[4] == "spool_out_of_rotation"
+            assert mock_send.call_args.kwargs["force_immediate"] is True
+
+    @pytest.mark.asyncio
+    async def test_on_spool_out_of_rotation_skipped_when_disabled(self, service, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = []
+
+            await service.on_spool_out_of_rotation(7, "001-H2S", "Bambu PETG", "AMS 1 slot 3", "07C0_2000", mock_db)
+
+            mock_send.assert_not_called()
+
+    def test_spool_recovery_templates_seeded_and_render(self, service):
+        """The three spool-recovery templates exist and substitute their variables
+        (proves the template + variable contract for each event)."""
+        from backend.app.models.notification_template import DEFAULT_TEMPLATES
+
+        by_type = {t["event_type"]: t for t in DEFAULT_TEMPLATES}
+        for event_type in ("spool_recovery_succeeded", "spool_recovery_failed", "spool_out_of_rotation"):
+            assert event_type in by_type, f"missing seed for {event_type}"
+
+        succeeded = service._render_template(
+            by_type["spool_recovery_succeeded"]["body_template"],
+            {
+                "printer_name": "001-H2S",
+                "job_name": "SKU007 plate",
+                "layer": "142",
+                "from_spool": "Bambu PETG",
+                "to_spool": "Sunlu PETG",
+            },
+        )
+        assert "layer 142" in succeeded and "Bambu PETG" in succeeded and "Sunlu PETG" in succeeded
+
+        failed = service._render_template(
+            by_type["spool_recovery_failed"]["body_template"],
+            {"printer_name": "001-H2S", "job_name": "SKU007 plate", "detail": "No spool matched."},
+        )
+        assert "PAUSED" in failed and "No spool matched." in failed
+
+        out = service._render_template(
+            by_type["spool_out_of_rotation"]["body_template"],
+            {
+                "printer_name": "001-H2S",
+                "spool_desc": "Bambu PETG",
+                "slot_desc": "AMS 1 slot 3",
+                "code": "07C0_2000",
+            },
+        )
+        assert "Bambu PETG" in out and "AMS 1 slot 3" in out and "07C0_2000" in out
+
+
+class TestOnStorageLowWording:
+    """``on_storage_low`` detail composition: honest wording for the ``attempted``
+    flag. ``attempted=False`` means NO cleanup ran (bare USB-drop detection) → the
+    detail is the raw reason, never the misleading 'Auto-cleanup could not free
+    space:' prefix that implies a failed cleanup attempt."""
+
+    @pytest.fixture
+    def service(self):
+        return NotificationService()
+
+    def _detail_for(self, mock_build):
+        # _build_message_from_template(db, "storage_low", variables) — variables 3rd arg.
+        return mock_build.call_args.args[2]["detail"]
+
+    @pytest.mark.asyncio
+    async def test_attempted_false_renders_reason_only_detail(self, service):
+        mock_db = AsyncMock()
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "m")
+            await service.on_storage_low(
+                4,
+                "004-H2S",
+                success=False,
+                freed_bytes=0,
+                files_deleted=0,
+                free_bytes=None,
+                reason="USB drive dropped/unmounted — power-cycle the printer to remount it",
+                attempted=False,
+                db=mock_db,
+            )
+        detail = self._detail_for(mock_build)
+        assert "Auto-cleanup" not in detail
+        # Grammatical: the raw reason with a single trailing period.
+        assert detail == "USB drive dropped/unmounted — power-cycle the printer to remount it."
+
+    @pytest.mark.asyncio
+    async def test_attempted_false_fallback_when_no_reason(self, service):
+        mock_db = AsyncMock()
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "m")
+            await service.on_storage_low(
+                4,
+                "004-H2S",
+                success=False,
+                freed_bytes=0,
+                files_deleted=0,
+                free_bytes=None,
+                reason=None,
+                attempted=False,
+                db=mock_db,
+            )
+        assert self._detail_for(mock_build) == "USB problem detected."
+
+    @pytest.mark.asyncio
+    async def test_attempted_true_failure_keeps_prefix(self, service):
+        """Default attempted=True: a real failed cleanup still reads the prefix."""
+        mock_db = AsyncMock()
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "m")
+            await service.on_storage_low(
+                4,
+                "004-H2S",
+                success=False,
+                freed_bytes=0,
+                files_deleted=0,
+                free_bytes=None,
+                reason="printer FTPS unreachable",
+                db=mock_db,
+            )
+        assert self._detail_for(mock_build) == "Auto-cleanup could not free space: printer FTPS unreachable."
+
+    @pytest.mark.asyncio
+    async def test_attempted_true_success_unchanged(self, service):
+        mock_db = AsyncMock()
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "m")
+            await service.on_storage_low(
+                4,
+                "004-H2S",
+                success=True,
+                freed_bytes=3 * 1024 * 1024,
+                files_deleted=2,
+                free_bytes=5 * 1024**3,
+                reason=None,
+                db=mock_db,
+            )
+        detail = self._detail_for(mock_build)
+        assert detail.startswith("Auto-cleanup freed 3 MB across 2 file(s)")
+        assert "5.0 GB free now" in detail
