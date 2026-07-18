@@ -13,6 +13,7 @@ export type SettingsSearchTab =
   | 'plugs'
   | 'notifications'
   | 'queue'
+  | 'farm'
   | 'filament'
   | 'network'
   | 'apikeys'

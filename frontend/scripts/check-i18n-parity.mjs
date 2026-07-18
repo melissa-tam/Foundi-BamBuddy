@@ -140,6 +140,7 @@ function isAlwaysAllowedIdentical(value) {
 // German loanwords / cognates from English are extensive. Most short technical
 // UI labels are identical in DE. List below curates the legitimate ones.
 const DE_COGNATES = [
+  '{{height}} mm',  // part-height format: universal mm unit + placeholder
   'Name', 'Status', 'Tag', 'Tags', 'Online', 'Offline', 'Standard', 'Modus',
   'Stop', 'Reset', 'Test', 'Code', 'Token', 'Server', 'Port', 'Bug', 'Job',
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
@@ -173,6 +174,7 @@ const DE_COGNATES = [
 
 // French cognates — many UI labels overlap with English exactly.
 const FR_COGNATES = [
+  '{{height}} mm',  // part-height format: universal mm unit + placeholder
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
   'AMS Filament Backup',  // Bambu Lab product/firmware feature name
   'Status', 'Tag', 'Tags', 'Online', 'Offline', 'Standard', 'Filament',
@@ -214,6 +216,7 @@ const FR_COGNATES = [
 
 // Italian cognates.
 const IT_COGNATES = [
+  '{{height}} mm',  // part-height format: universal mm unit + placeholder
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
   'AMS Filament Backup',  // Bambu Lab product/firmware feature name
   'Email',  // common loanword in Italian, used verbatim in UI labels
@@ -245,6 +248,7 @@ const IT_COGNATES = [
 // Japanese: very few cognates because of script difference. Almost
 // everything needs translation. Only true loanwords / proper nouns stay.
 const JA_COGNATES = [
+  '{{height}} mm',  // part-height format: universal mm unit + placeholder
   'OK', 'Bambu', 'Code',
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
   'EU (DD/MM/YYYY)', 'US (MM/DD/YYYY)', 'ON, true, 1',
@@ -258,6 +262,7 @@ const JA_COGNATES = [
 
 // Portuguese (BR) cognates.
 const PT_BR_COGNATES = [
+  '{{height}} mm',  // part-height format: universal mm unit + placeholder
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
   'AMS Filament Backup',  // Bambu Lab product/firmware feature name
   'Status', 'Tag', 'Tags', 'Online', 'Offline', 'Standard', 'Filament',
@@ -311,6 +316,7 @@ const ZH_TW_COGNATES = [
 // Korean: script difference means almost nothing is identical.
 // Allow loanwords/acronyms, format strings, and proper nouns that stay verbatim.
 const KO_COGNATES = [
+  '{{height}} mm',  // part-height format: universal mm unit + placeholder
   'OK', 'Bambu', 'N/A',
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
   '({{count}}/8)', '(25%, 50%, 75%)',
@@ -330,6 +336,7 @@ const KO_COGNATES = [
 
 // Spanish cognates — words/phrases that are genuinely identical in Spanish.
 const ES_COGNATES = [
+  '{{height}} mm',  // part-height format: universal mm unit + placeholder
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
   'AMS Filament Backup',  // Bambu Lab product/firmware feature name
   'Error', 'Firmware', 'General', 'Control', 'Total', 'total', 'Material',
@@ -350,6 +357,7 @@ const ES_COGNATES = [
 // Turkish cognates — technical UI labels that Turkish speakers use verbatim
 // from English (loanwords + acronyms + format strings). Curated, not a shortcut.
 const TR_COGNATES = [
+  '{{height}} mm',  // part-height format: universal mm unit + placeholder
   'Filament', 'Firmware', 'Disk', 'Hex', 'Test', 'Port', 'Model', 'Metal',
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
   'AMS Filament Backup',  // Bambu Lab product/firmware feature name
