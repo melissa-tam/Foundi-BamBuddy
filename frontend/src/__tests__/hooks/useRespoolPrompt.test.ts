@@ -1,20 +1,45 @@
 /**
- * Tests for useRespoolPrompt:
- * - Starts empty
- * - Enqueues on the `respool-prompt` window event
- * - Dedupes repeat events for the same slot
- * - Advances the queue (distinct slots) on dismiss
+ * Tests for useRespoolPrompt (quiet, ask-once re-spool prompting):
+ * - Starts with no open modal
+ * - Raises a persistent toast (NOT the modal) on a `respool-prompt` event
+ * - Dedupes repeat events for the same slot (one toast)
+ * - "Same spool" POSTs the dismissal with the slot triple, then clears the toast
+ * - The `respool-prompt-dismissed` window event clears the matching slot
+ * - "Review…" opens the modal; closeModal clears it
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
-import { renderHook, act } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { renderHook, act, waitFor } from '@testing-library/react';
+import React from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useRespoolPrompt } from '../../hooks/useRespoolPrompt';
+import { api } from '../../api/client';
 import type { RespoolPromptMessage } from '../../api/client';
 
 // Auth-disabled deployment: isAuthed is true so the listener attaches.
 vi.mock('../../contexts/AuthContext', () => ({
   useAuth: () => ({ user: null, authEnabled: false }),
 }));
+
+const showPersistentToast = vi.fn();
+const dismissToast = vi.fn();
+const showToast = vi.fn();
+vi.mock('../../contexts/ToastContext', () => ({
+  useToast: () => ({ showPersistentToast, dismissToast, showToast }),
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key, i18n: {} }),
+}));
+
+vi.mock('../../api/client', () => ({
+  api: { dismissRespoolPrompt: vi.fn().mockResolvedValue({}) },
+}));
+
+interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
 
 function makePrompt(overrides: Partial<RespoolPromptMessage> = {}): RespoolPromptMessage {
   return {
@@ -35,50 +60,98 @@ function makePrompt(overrides: Partial<RespoolPromptMessage> = {}): RespoolPromp
   };
 }
 
+function createWrapper() {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return ({ children }: { children: React.ReactNode }) =>
+    React.createElement(QueryClientProvider, { client: queryClient }, children);
+}
+
 function dispatchPrompt(detail: RespoolPromptMessage) {
   window.dispatchEvent(new CustomEvent('respool-prompt', { detail }));
 }
 
+function actionsOfLastToast(): ToastAction[] {
+  const call = showPersistentToast.mock.calls.at(-1);
+  return (call?.[3]?.actions ?? []) as ToastAction[];
+}
+
 describe('useRespoolPrompt', () => {
-  afterEach(() => vi.restoreAllMocks());
-
-  it('starts with no prompt', () => {
-    const { result } = renderHook(() => useRespoolPrompt());
-    expect(result.current.prompt).toBeNull();
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (api.dismissRespoolPrompt as ReturnType<typeof vi.fn>).mockResolvedValue({});
   });
 
-  it('enqueues the payload on a respool-prompt event', () => {
-    const { result } = renderHook(() => useRespoolPrompt());
+  it('starts with no open modal', () => {
+    const { result } = renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
+    expect(result.current.activeContext).toBeNull();
+  });
+
+  it('raises a persistent toast — not the modal — on a respool-prompt event', () => {
+    const { result } = renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
     act(() => dispatchPrompt(makePrompt()));
-    expect(result.current.prompt).not.toBeNull();
-    expect(result.current.prompt?.printer_id).toBe(1);
-    expect(result.current.prompt?.donor_spool_id).toBe(12);
-    expect(result.current.prompt?.brand_prefill).toBe('Overture');
+
+    expect(showPersistentToast).toHaveBeenCalledTimes(1);
+    const [id, message, type, options] = showPersistentToast.mock.calls[0];
+    expect(id).toBe('respool-1-0-2');
+    expect(message).toBe('inventory.respool.promptToast');
+    expect(type).toBe('warning');
+    expect(options.actions).toHaveLength(2);
+    // The modal stays closed — the toast is the surface now.
+    expect(result.current.activeContext).toBeNull();
   });
 
-  it('dedupes a repeat event for the same slot', () => {
-    const { result } = renderHook(() => useRespoolPrompt());
+  it('dedupes a repeat event for the same slot to a single toast', () => {
+    renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
     act(() => {
       dispatchPrompt(makePrompt());
       dispatchPrompt(makePrompt({ brand_prefill: 'Sunlu' }));
     });
-    // Same slot → still the first payload, not the second.
-    expect(result.current.prompt?.brand_prefill).toBe('Overture');
-    // A single dismiss empties the queue (proving only one entry was queued).
-    act(() => result.current.dismiss());
-    expect(result.current.prompt).toBeNull();
+    expect(showPersistentToast).toHaveBeenCalledTimes(1);
   });
 
-  it('queues distinct slots and advances on dismiss', () => {
-    const { result } = renderHook(() => useRespoolPrompt());
-    act(() => {
-      dispatchPrompt(makePrompt({ tray_id: 0 }));
-      dispatchPrompt(makePrompt({ tray_id: 1 }));
+  it('"Same spool" POSTs the dismissal with the slot triple and clears the toast', async () => {
+    renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
+    act(() => dispatchPrompt(makePrompt()));
+
+    await act(async () => {
+      actionsOfLastToast()[0].onClick();
     });
-    expect(result.current.prompt?.tray_id).toBe(0);
-    act(() => result.current.dismiss());
-    expect(result.current.prompt?.tray_id).toBe(1);
-    act(() => result.current.dismiss());
-    expect(result.current.prompt).toBeNull();
+
+    expect(api.dismissRespoolPrompt).toHaveBeenCalledWith(12, {
+      printer_id: 1,
+      ams_id: 0,
+      tray_id: 2,
+    });
+    await waitFor(() => expect(dismissToast).toHaveBeenCalledWith('respool-1-0-2'));
+  });
+
+  it('clears a slot on the respool-prompt-dismissed window event (cross-client sync)', () => {
+    renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
+    act(() => dispatchPrompt(makePrompt()));
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent('respool-prompt-dismissed', {
+          detail: { printer_id: 1, ams_id: 0, tray_id: 2 },
+        }),
+      );
+    });
+
+    expect(dismissToast).toHaveBeenCalledWith('respool-1-0-2');
+  });
+
+  it('"Review…" opens the modal, and closeModal clears it', () => {
+    const { result } = renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
+    act(() => dispatchPrompt(makePrompt()));
+
+    act(() => {
+      actionsOfLastToast()[1].onClick();
+    });
+    expect(result.current.activeContext?.printer_id).toBe(1);
+    expect(result.current.activeContext?.tray_id).toBe(2);
+    expect(dismissToast).toHaveBeenCalledWith('respool-1-0-2');
+
+    act(() => result.current.closeModal());
+    expect(result.current.activeContext).toBeNull();
   });
 });

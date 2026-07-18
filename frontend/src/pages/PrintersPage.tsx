@@ -97,6 +97,7 @@ import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
+import { Modal } from '../components/ui/Modal';
 import { BulkPrinterToolbar, type PrinterState } from '../components/BulkPrinterToolbar';
 import { FileManagerModal } from '../components/FileManagerModal';
 import { EmbeddedCameraViewer } from '../components/EmbeddedCameraViewer';
@@ -128,6 +129,7 @@ import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, ge
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
+import { OutOfRotationChip } from '../components/OutOfRotationChip';
 import { Collapsible } from '../components/Collapsible';
 import { ConnectionDiagnosticModal, DiagnosticChecklist } from '../components/ConnectionDiagnostic';
 import { getColorName, parseFilamentColor, isLightColor } from '../utils/colors';
@@ -1801,8 +1803,27 @@ function PrinterCard({
   const [showRecoverConfirm, setShowRecoverConfirm] = useState(false);
   // W2 manual eject: when the bed is above the release threshold the backend
   // 409s with `bed_hot` + live temps; we stash them here to drive the explicit
-  // hot-bed confirm dialog, then re-call the eject with allow_hot=true.
-  const [ejectHotConfirm, setEjectHotConfirm] = useState<{ bed_c: number; threshold_c: number } | null>(null);
+  // hot-bed confirm dialog, then re-call the eject with allow_hot=true. The
+  // profile id (if the operator picked one in the foreign-plate dialog) rides
+  // along so the confirmed hot re-send keeps the chosen sweep profile.
+  const [ejectHotConfirm, setEjectHotConfirm] = useState<{
+    bed_c: number;
+    threshold_c: number;
+    ejectProfileId: number | null;
+  } | null>(null);
+  // W2 foreign-plate eject: the plate-clear gate was raised by a print the farm
+  // did not dispatch (sent manually from Bambu Studio). The backend 409s with
+  // `foreign_plate` + the detected print name/height and a suggested profile;
+  // we stash it here to drive a warn+confirm dialog with an eject-profile picker.
+  const [foreignEjectConfirm, setForeignEjectConfirm] = useState<{
+    message: string;
+    printName: string | null;
+    maxZHeightMm: number;
+    suggestedEjectProfileId: number | null;
+  } | null>(null);
+  // Operator's profile override inside the foreign-plate dialog; null falls back
+  // to the suggested profile, then the first available profile (derived, below).
+  const [foreignEjectProfileId, setForeignEjectProfileId] = useState<number | null>(null);
   const [deleteArchives, setDeleteArchives] = useState(true);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showFileManager, setShowFileManager] = useState(false);
@@ -2343,30 +2364,53 @@ function PrinterCard({
   });
 
   // W2 manual eject: trigger the part-present eject for this printer's
-  // farm-known completed unit. The mutate arg is `allowHot` — the first click
-  // sends false; a `bed_hot` 409 opens the confirm dialog, whose confirm
-  // re-mutates with true. Any other error (or a bed_hot on the confirmed call)
-  // surfaces as a toast and closes the dialog.
+  // farm-known completed unit. The mutate arg is `{allowHot, ejectProfileId?}` —
+  // the first click sends allowHot=false with no profile. A `bed_hot` 409 opens
+  // the hot-bed confirm (which re-mutates with allowHot=true, carrying the same
+  // profile id); a `foreign_plate` 409 opens the profile-picker confirm. Any
+  // other error (or a bed_hot on the confirmed call) surfaces as a toast and
+  // closes both dialogs.
   const ejectMutation = useMutation({
-    mutationFn: (allowHot: boolean) => api.ejectNow(printer.id, allowHot),
+    mutationFn: (vars: { allowHot: boolean; ejectProfileId?: number | null }) =>
+      api.ejectNow(printer.id, vars.allowHot, vars.ejectProfileId ?? null),
     onSuccess: () => {
       setEjectHotConfirm(null);
+      setForeignEjectConfirm(null);
+      setForeignEjectProfileId(null);
       showToast(t('printers.eject.dispatched'));
       queryClient.invalidateQueries({ queryKey: ['printers'] });
       queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
       queryClient.invalidateQueries({ queryKey: ['queue', printer.id] });
     },
-    onError: (error: Error, allowHot) => {
-      if (
-        !allowHot &&
-        error instanceof ApiError &&
-        error.code === 'bed_hot' &&
-        error.detail
-      ) {
-        const bed = Number(error.detail.bed_c);
-        const threshold = Number(error.detail.threshold_c);
-        if (Number.isFinite(bed) && Number.isFinite(threshold)) {
-          setEjectHotConfirm({ bed_c: bed, threshold_c: threshold });
+    onError: (error: Error, vars) => {
+      if (!vars.allowHot && error instanceof ApiError && error.detail) {
+        if (error.code === 'bed_hot') {
+          const bed = Number(error.detail.bed_c);
+          const threshold = Number(error.detail.threshold_c);
+          if (Number.isFinite(bed) && Number.isFinite(threshold)) {
+            // A hot bed on the foreign-confirm call: close that dialog and open
+            // the hot-bed confirm, preserving the operator's chosen profile.
+            setForeignEjectConfirm(null);
+            setEjectHotConfirm({
+              bed_c: bed,
+              threshold_c: threshold,
+              ejectProfileId: vars.ejectProfileId ?? null,
+            });
+            return;
+          }
+        }
+        if (error.code === 'foreign_plate') {
+          const maxZ = Number(error.detail.max_z_height_mm);
+          const suggested = error.detail.suggested_eject_profile_id;
+          setForeignEjectProfileId(null);
+          setForeignEjectConfirm({
+            message:
+              typeof error.detail.message === 'string' ? error.detail.message : error.message,
+            printName:
+              typeof error.detail.print_name === 'string' ? error.detail.print_name : null,
+            maxZHeightMm: Number.isFinite(maxZ) ? maxZ : 0,
+            suggestedEjectProfileId: typeof suggested === 'number' ? suggested : null,
+          });
           return;
         }
       }
@@ -2374,6 +2418,22 @@ function PrinterCard({
       showToast(error.message || t('printers.toast.failedToSendCommand'), 'error');
     },
   });
+
+  // Eject profiles for the foreign-plate picker; only fetched while that dialog
+  // is open. Shared query key so the fleet reuses one cache entry.
+  const { data: ejectProfilesData } = useQuery({
+    queryKey: ['ejectProfiles'],
+    queryFn: api.getEjectProfiles,
+    enabled: foreignEjectConfirm !== null,
+  });
+  const ejectProfiles = ejectProfilesData ?? [];
+  // Effective selection: operator override → backend suggestion → first profile.
+  // Derived (not synced) so no effect is needed when profiles load.
+  const foreignSelectedProfileId =
+    foreignEjectProfileId ??
+    foreignEjectConfirm?.suggestedEjectProfileId ??
+    ejectProfiles[0]?.id ??
+    null;
 
   // Farm one-click recovery: clears the plate hold, lifts quarantine, and resumes
   // any paused production run on this printer in a single action. Replaces the
@@ -3004,17 +3064,28 @@ function PrinterCard({
     loadTrayId,
     isRefreshing,
     includeRfid = true,
+    outOfRotationSpool = null,
   }: {
     amsId: number;
     slotId: number;
     loadTrayId: number;
     isRefreshing?: boolean;
     includeRfid?: boolean;
+    // The inventory spool bound to this slot, when a feed-fault jam took it out
+    // of rotation. Present only at occupied slots; the chip clears the flag.
+    outOfRotationSpool?: InventorySpool | null;
   }) => {
     const printerBusy = status?.state === 'RUNNING';
 
     return (
       <>
+        {outOfRotationSpool?.feed_fault_at && (
+          <OutOfRotationChip
+            spoolId={outOfRotationSpool.id}
+            faultCode={outOfRotationSpool.feed_fault_code}
+            className="px-1 py-1"
+          />
+        )}
         {includeRfid && (
           <button
             className={`w-full px-2 py-1.5 text-left text-xs flex items-center gap-2 rounded transition-colors ${
@@ -3400,7 +3471,7 @@ function PrinterCard({
                       {hasPermission('printers:control') && (
                         <button
                           type="button"
-                          onClick={() => ejectMutation.mutate(false)}
+                          onClick={() => ejectMutation.mutate({ allowHot: false })}
                           disabled={ejectMutation.isPending}
                           aria-label={t('printers.eject.now')}
                           className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors disabled:opacity-50"
@@ -3662,15 +3733,22 @@ function PrinterCard({
 
         {/* Delete Confirmation */}
         {showDeleteConfirm && (
-          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-            <Card className="w-full max-w-md mx-4">
+          <Modal
+            onClose={() => {
+              setShowDeleteConfirm(false);
+              setDeleteArchives(true);
+            }}
+            labelledBy="printers-delete-confirm-title"
+            size="sm"
+            closeOnOverlay={false}
+          >
               <CardContent>
                 <div className="flex items-start gap-3 mb-4">
                   <div className="p-2 rounded-full bg-red-500/20">
                     <AlertTriangle className="w-5 h-5 text-red-400" />
                   </div>
                   <div>
-                    <h3 className="text-lg font-semibold text-white">{t('printers.confirm.deleteTitle')}</h3>
+                    <h3 id="printers-delete-confirm-title" className="text-lg font-semibold text-white">{t('printers.confirm.deleteTitle')}</h3>
                     <p className="text-sm text-bambu-gray mt-1">
                       {t('printers.confirm.deleteMessage', { name: printer.name })}
                     </p>
@@ -3718,8 +3796,7 @@ function PrinterCard({
                   </Button>
                 </div>
               </CardContent>
-            </Card>
-          </div>
+          </Modal>
         )}
 
         {/* Status — see the equivalent defensive `=== false` check on the
@@ -4263,7 +4340,7 @@ function PrinterCard({
                 {hasPermission('printers:control') && (
                   <button
                     type="button"
-                    onClick={() => ejectMutation.mutate(false)}
+                    onClick={() => ejectMutation.mutate({ allowHot: false })}
                     disabled={ejectMutation.isPending}
                     aria-label={t('printers.eject.now')}
                     className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors text-xs font-medium disabled:opacity-50"
@@ -4941,6 +5018,7 @@ function PrinterCard({
                                       isEmpty={isEmpty}
                                       emptyKind={emptyKind}
                                       slotNumber={slotIdx + 1}
+                                      outOfRotation={!!inventoryAssignment?.spool?.feed_fault_at}
                                     />
                                     <div className="text-[9px] text-white font-bold truncate">
                                       {tray?.tray_type || t(emptyKind === 'reset' ? 'ams.slotUnconfigured' : 'ams.slotEmpty')}
@@ -4978,6 +5056,7 @@ function PrinterCard({
                                           slotId: slotIdx,
                                           loadTrayId: ams.id * 4 + slotIdx,
                                           isRefreshing,
+                                          outOfRotationSpool: inventoryAssignment?.spool ?? null,
                                         })}
                                         spoolman={{
                                           enabled: spoolmanEnabled,
@@ -5228,6 +5307,7 @@ function PrinterCard({
                               isEmpty={isEmpty}
                               emptyKind={emptyKind}
                               slotNumber={1}
+                              outOfRotation={!!htInventoryAssignment?.spool?.feed_fault_at}
                             />
                             <div className="text-[9px] text-white font-bold truncate">
                               {tray?.tray_type || t(emptyKind === 'reset' ? 'ams.slotUnconfigured' : 'ams.slotEmpty')}
@@ -5353,6 +5433,7 @@ function PrinterCard({
                                       slotId: htSlotId,
                                       loadTrayId: ams.id * 4 + htSlotId,
                                       isRefreshing: isHtRefreshing,
+                                      outOfRotationSpool: htInventoryAssignment?.spool ?? null,
                                     })}
                                     spoolman={{
                                       enabled: spoolmanEnabled,
@@ -5612,6 +5693,7 @@ function PrinterCard({
                                     isEmpty={isEmpty}
                                     emptyKind={emptyKind}
                                     slotNumber={isDualNozzle ? (extTrayId === 254 ? 'L' : 'R') : slotTrayId + 1}
+                                    outOfRotation={!!extInventoryAssignment?.spool?.feed_fault_at}
                                   />
                                   <div className={`text-[9px] font-bold truncate ${isEmpty ? 'text-white/40' : 'text-white'}`}>
                                     {extTray.tray_type || t('ams.slotEmpty')}
@@ -5640,6 +5722,7 @@ function PrinterCard({
                                         slotId: slotTrayId,
                                         loadTrayId: extTrayId,
                                         includeRfid: false,
+                                        outOfRotationSpool: extInventoryAssignment?.spool ?? null,
                                       })}
                                       spoolman={{
                                         enabled: spoolmanEnabled,
@@ -6046,8 +6129,7 @@ function PrinterCard({
 
       {/* Plate Check Result Modal */}
       {plateCheckResult && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => closePlateCheckModal()}>
-          <div className="bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-w-lg w-full" onClick={e => e.stopPropagation()}>
+        <Modal onClose={() => closePlateCheckModal()} labelledBy="plate-check-modal-title">
             <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
               <div className="flex items-center gap-2">
                 {plateCheckResult.needs_calibration ? (
@@ -6057,7 +6139,7 @@ function PrinterCard({
                 ) : (
                   <XCircle className="w-5 h-5 text-yellow-500" />
                 )}
-                <h2 className="text-lg font-semibold text-white">
+                <h2 id="plate-check-modal-title" className="text-lg font-semibold text-white">
                   Build Plate Check
                 </h2>
                 {plateCheckResult.reference_count !== undefined && plateCheckResult.max_references && (
@@ -6312,8 +6394,7 @@ function PrinterCard({
                 </>
               )}
             </div>
-          </div>
-        </div>
+        </Modal>
       )}
 
       {/* Recover & resume confirmation (farm one-click recovery). Lists the three
@@ -6354,9 +6435,127 @@ function PrinterCard({
           cancelText={t('printers.eject.cancel')}
           variant="danger"
           isLoading={ejectMutation.isPending}
-          onConfirm={() => ejectMutation.mutate(true)}
+          onConfirm={() =>
+            ejectMutation.mutate({
+              allowHot: true,
+              ejectProfileId: ejectHotConfirm.ejectProfileId,
+            })
+          }
           onCancel={() => setEjectHotConfirm(null)}
         />
+      )}
+
+      {/* W2 foreign-plate eject confirmation: the plate-clear gate was raised by
+          a print the farm did not dispatch (sent manually from Bambu Studio).
+          We warn, show the detected print name + part height, and let the
+          operator pick the eject profile the sweep will use before confirming.
+          Confirm re-calls the eject with allow_hot=false + the chosen profile;
+          a subsequent bed_hot 409 hands off to the hot-bed confirm above. */}
+      {foreignEjectConfirm && (
+        <Modal
+          onClose={() => {
+            setForeignEjectConfirm(null);
+            setForeignEjectProfileId(null);
+          }}
+          labelledBy="foreign-eject-title"
+          widthClass="max-w-md"
+          closeOnOverlay={!ejectMutation.isPending}
+          dismissDisabled={ejectMutation.isPending}
+          className="p-5"
+        >
+          <div className="flex items-start gap-3 mb-4">
+            <AlertTriangle className="w-5 h-5 text-yellow-400 flex-shrink-0 mt-0.5" />
+            <div>
+              <h3 id="foreign-eject-title" className="text-sm font-semibold text-white mb-1">
+                {t('printers.eject.foreignTitle')}
+              </h3>
+              <p className="text-xs text-bambu-gray leading-relaxed">
+                {t('printers.eject.foreignBody')}
+              </p>
+            </div>
+          </div>
+          <dl className="mb-4 space-y-1 text-xs">
+            <div className="flex justify-between gap-3">
+              <dt className="text-bambu-gray flex-shrink-0">
+                {t('printers.eject.foreignPrintNameLabel')}
+              </dt>
+              <dd className="text-white text-right break-all">
+                {foreignEjectConfirm.printName || t('printers.eject.foreignUnknownPrint')}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-bambu-gray flex-shrink-0">
+                {t('printers.eject.foreignPartHeightLabel')}
+              </dt>
+              <dd className="text-white text-right">
+                {t('printers.eject.foreignPartHeightValue', {
+                  height: Math.round(foreignEjectConfirm.maxZHeightMm * 10) / 10,
+                })}
+              </dd>
+            </div>
+          </dl>
+          <div className="mb-4">
+            <label
+              htmlFor="foreign-eject-profile"
+              className="block text-xs text-bambu-gray mb-1"
+            >
+              {t('printers.eject.foreignProfileLabel')}
+            </label>
+            <select
+              id="foreign-eject-profile"
+              value={foreignSelectedProfileId ?? ''}
+              onChange={(e) =>
+                setForeignEjectProfileId(e.target.value ? Number(e.target.value) : null)
+              }
+              disabled={ejectMutation.isPending || ejectProfiles.length === 0}
+              className="w-full px-3 py-2 rounded-lg text-sm bg-bambu-dark border border-bambu-dark-tertiary text-white focus:outline-none focus:border-bambu-green disabled:opacity-50"
+            >
+              {ejectProfiles.length === 0 ? (
+                <option value="">{t('printers.eject.foreignNoProfiles')}</option>
+              ) : (
+                ejectProfiles.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                    {p.id === foreignEjectConfirm.suggestedEjectProfileId
+                      ? ` (${t('printers.eject.foreignSuggested')})`
+                      : ''}
+                  </option>
+                ))
+              )}
+            </select>
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setForeignEjectConfirm(null);
+                setForeignEjectProfileId(null);
+              }}
+              disabled={ejectMutation.isPending}
+              className="flex-1 px-3 py-2 rounded-lg text-xs font-medium bg-bambu-dark text-bambu-gray hover:bg-bambu-dark-tertiary transition-colors disabled:opacity-50"
+            >
+              {t('printers.eject.cancel')}
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                ejectMutation.mutate({
+                  allowHot: false,
+                  ejectProfileId: foreignSelectedProfileId,
+                })
+              }
+              disabled={ejectMutation.isPending || foreignSelectedProfileId === null}
+              className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors disabled:opacity-50"
+            >
+              {ejectMutation.isPending ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Wind className="w-3 h-3" />
+              )}
+              {t('printers.eject.foreignConfirm')}
+            </button>
+          </div>
+        </Modal>
       )}
 
       {/* Power On Confirmation */}
@@ -6483,12 +6682,17 @@ function PrinterCard({
 
       {/* Bed Jog — not-homed warning (Studio-style) */}
       {showNotHomedModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg shadow-xl w-full max-w-sm p-5">
+        <Modal
+          onClose={() => setShowNotHomedModal(null)}
+          labelledBy="bed-jog-not-homed-title"
+          widthClass="max-w-sm"
+          closeOnOverlay={false}
+          className="p-5"
+        >
             <div className="flex items-start gap-3 mb-4">
               <AlertTriangle className="w-5 h-5 text-yellow-400 flex-shrink-0 mt-0.5" />
               <div>
-                <h3 className="text-sm font-semibold text-white mb-1">
+                <h3 id="bed-jog-not-homed-title" className="text-sm font-semibold text-white mb-1">
                   {t('printers.bedJog.notHomedTitle')}
                 </h3>
                 <p className="text-xs text-bambu-gray leading-relaxed">
@@ -6524,8 +6728,7 @@ function PrinterCard({
                 {t('common.cancel')}
               </button>
             </div>
-          </div>
-        </div>
+        </Modal>
       )}
 
       {/* Skip Objects Modal */}
@@ -7036,24 +7239,11 @@ export function AddPrinterModal({
     };
   }, []);
 
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
   return (
     <>
-    <div
-      className="fixed inset-0 bg-black/50 flex items-start sm:items-center justify-center z-50 p-4 overflow-y-auto"
-      onClick={onClose}
-    >
-      <Card className="w-full max-w-md my-auto max-h-[calc(100vh-2rem)] overflow-y-auto" onClick={(e: React.MouseEvent) => e.stopPropagation()}>
+    <Modal onClose={onClose} labelledBy="add-printer-modal-title" size="sm" dismissDisabled={showDiagnostic}>
         <CardContent>
-          <h2 className="text-xl font-semibold mb-4">{t('printers.addPrinter')}</h2>
+          <h2 id="add-printer-modal-title" className="text-xl font-semibold mb-4">{t('printers.addPrinter')}</h2>
 
           {/* Discovery Section */}
           <div className="mb-4 pb-4 border-b border-bambu-dark-tertiary">
@@ -7330,8 +7520,7 @@ export function AddPrinterModal({
             )}
           </form>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
     {showDiagnostic && (
       <ConnectionDiagnosticModal
         connection={{
@@ -7420,8 +7609,7 @@ function FirmwareUpdateModal({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <Card className="w-full max-w-md mx-4">
+    <Modal onClose={onClose} labelledBy="firmware-modal-title" size="sm" closeOnOverlay={false}>
         <CardContent>
           <div className="flex items-start gap-3 mb-4">
             <div className={`p-2 rounded-full ${firmwareInfo.update_available ? 'bg-orange-500/20' : 'bg-status-ok/20'}`}>
@@ -7430,7 +7618,7 @@ function FirmwareUpdateModal({
                 : <CheckCircle className="w-5 h-5 text-status-ok" />}
             </div>
             <div className="flex-1">
-              <h3 className="text-lg font-semibold text-white">
+              <h3 id="firmware-modal-title" className="text-lg font-semibold text-white">
                 {firmwareInfo.update_available ? t('printers.firmwareModal.title') : t('printers.firmwareModal.titleUpToDate')}
               </h3>
               <p className="text-sm text-bambu-gray mt-1">
@@ -7622,8 +7810,7 @@ function FirmwareUpdateModal({
             )}
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }
 
@@ -7661,15 +7848,6 @@ function EditPrinterModal({
     },
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToUpdate'), 'error'),
   });
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   const doSave = () => {
     const data: Partial<PrinterCreate> = {
@@ -7709,13 +7887,9 @@ function EditPrinterModal({
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/50 flex items-start sm:items-center justify-center z-50 p-4 overflow-y-auto"
-      onClick={onClose}
-    >
-      <Card className="w-full max-w-md my-auto max-h-[calc(100vh-2rem)] overflow-y-auto" onClick={(e: React.MouseEvent) => e.stopPropagation()}>
+    <Modal onClose={onClose} labelledBy="edit-printer-modal-title" size="sm">
         <CardContent>
-          <h2 className="text-xl font-semibold mb-4">{t('printers.editPrinter')}</h2>
+          <h2 id="edit-printer-modal-title" className="text-xl font-semibold mb-4">{t('printers.editPrinter')}</h2>
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
               <label className="block text-sm text-bambu-gray mb-1">{t('printers.name')}</label>
@@ -7887,8 +8061,7 @@ function EditPrinterModal({
             )}
           </form>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }
 

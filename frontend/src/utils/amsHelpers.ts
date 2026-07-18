@@ -244,15 +244,18 @@ export type SpoolSelectionPolicy = 'slot_order' | 'lowest_remaining' | 'first_lo
 /**
  * Options bundle for the policy-keyed auto-match sort + minimum-start filter.
  * `policy` is the ALREADY backup-gated policy (see `effectiveSelectionPolicy`).
- * The two maps are keyed by `globalTrayId`:
+ * The maps are keyed by `globalTrayId`:
  *  - `inventoryByTrayId`: remaining grams for inventory-bound slots.
  *  - `firstLoadedByTrayId`: first-in-service epoch ms for slots that have one.
+ *  - `outOfRotationByTrayId`: true for slots a spool jam took out of rotation
+ *    (mirrors the backend `Spool.feed_fault_at` skip; #feed-fault).
  * `minStartG` drops KNOWN-low candidates from AUTO selection (0/undefined = off).
  */
 export interface SelectionOptions {
   policy: SpoolSelectionPolicy;
   inventoryByTrayId?: Map<number, number>;
   firstLoadedByTrayId?: Map<number, number>;
+  outOfRotationByTrayId?: Map<number, boolean>;
   minStartG?: number;
 }
 
@@ -336,15 +339,31 @@ export function filterByMinStart<T extends { globalTrayId: number }>(
 }
 
 /**
- * Order a candidate pool for AUTO-matching: drop min-start-blocked spools, then
- * sort by the selection policy. 'slot_order' keeps the incoming order. Returns a
- * new array when it sorts; never mutates the input.
+ * Drop candidates a spool jam took out of rotation (#feed-fault). AUTO-match
+ * only — mirrors the backend `Spool.feed_fault_at` skip so the client-side
+ * preview never picks a jammed spool the dispatcher would refuse. The map only
+ * carries flagged trays (value true); everything else stays eligible. Manual
+ * per-slot overrides bypass this entirely.
+ */
+export function filterByOutOfRotation<T extends { globalTrayId: number }>(
+  filaments: T[],
+  outOfRotationByTrayId: Map<number, boolean> | undefined,
+): T[] {
+  if (!outOfRotationByTrayId || outOfRotationByTrayId.size === 0) return filaments;
+  return filaments.filter((f) => outOfRotationByTrayId.get(f.globalTrayId) !== true);
+}
+
+/**
+ * Order a candidate pool for AUTO-matching: drop min-start-blocked and
+ * out-of-rotation spools, then sort by the selection policy. 'slot_order' keeps
+ * the incoming order. Returns a new array when it sorts; never mutates the input.
  */
 export function orderCandidatesForAutoMatch<
   T extends { globalTrayId: number; amsId?: number; trayId?: number; remain?: number },
 >(filaments: T[], selection: SelectionOptions | undefined): T[] {
   if (!selection) return filaments;
-  const filtered = filterByMinStart(filaments, selection.inventoryByTrayId, selection.minStartG);
+  let filtered = filterByMinStart(filaments, selection.inventoryByTrayId, selection.minStartG);
+  filtered = filterByOutOfRotation(filtered, selection.outOfRotationByTrayId);
   if (selection.policy === 'slot_order') return filtered;
   return [...filtered].sort((a, b) =>
     compareSortKeys(

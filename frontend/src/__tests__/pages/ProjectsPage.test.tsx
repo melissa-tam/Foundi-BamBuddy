@@ -353,7 +353,9 @@ describe('ProjectsPage', () => {
       );
 
       const saveButton = screen.getByRole('button', { name: 'common.save' });
-      const scrollable = document.querySelector('.overflow-y-auto');
+      // The fields wrapper inside the form is the scrollable region; the
+      // shared Modal's Card also carries overflow-y-auto, so scope to the form.
+      const scrollable = document.querySelector('form .overflow-y-auto');
       expect(scrollable).not.toBeNull();
       // The save button must live OUTSIDE the scrollable region — otherwise
       // a long form pushes it below the fold on short viewports (#1642).
@@ -372,10 +374,10 @@ describe('ProjectsPage', () => {
         />,
       );
 
-      // Card has max-h set so it never extends past the viewport — without
-      // this, vertical-center alignment pushes the bottom of the modal
-      // (including the action footer) off-screen.
-      const card = document.querySelector('.max-h-\\[calc\\(100vh-2rem\\)\\]');
+      // The shared Modal's Card has max-h set so it never extends past the
+      // viewport — without this, vertical-center alignment pushes the bottom
+      // of the modal (including the action footer) off-screen.
+      const card = document.querySelector('.max-h-\\[90vh\\]');
       expect(card).not.toBeNull();
     });
   });

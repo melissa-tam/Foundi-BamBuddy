@@ -344,4 +344,38 @@ describe('EjectProfilesPage preview geometry resolution', () => {
       screen.getByText(/not hardware-validated — run the hardware ladder/i),
     ).toBeInTheDocument();
   });
+
+  it('surfaces a preview failure inline (role=alert) and raises no toast', async () => {
+    server.use(
+      http.get('*/api/v1/eject-profiles', () => HttpResponse.json([profile()])),
+      http.get('*/api/v1/library/files', () =>
+        HttpResponse.json([
+          { id: 5, filename: 'unit.gcode.3mf', file_type: 'gcode.3mf', file_size: 1 },
+        ]),
+      ),
+      http.get('*/api/v1/library/files/:id/plates', () =>
+        HttpResponse.json({ plates: [{ index: 1, name: 'Plate 1' }] }),
+      ),
+      http.post('*/api/v1/eject-profiles/:id/preview', () =>
+        HttpResponse.json({ detail: 'generator boom' }, { status: 400 }),
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+
+    // Resolve the model picker, choose a file, and run the preview.
+    const modelSelect = await screen.findByLabelText('Printer model');
+    await waitFor(() => expect(modelSelect).toHaveValue('H2S'));
+    await user.selectOptions(screen.getByLabelText('Library file'), '5');
+    await user.click(screen.getByRole('button', { name: /generate preview/i }));
+
+    // The failure renders as a persistent inline alert carrying the API detail.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('generator boom');
+
+    // ...and ONLY inline: no toast is raised, so the message appears exactly
+    // once (a toast would surface the same text a second time).
+    expect(screen.getAllByText('generator boom')).toHaveLength(1);
+  });
 });

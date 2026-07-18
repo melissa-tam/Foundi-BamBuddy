@@ -533,6 +533,38 @@ describe('QueuePage', () => {
       await waitFor(() => expect(secondCallSkippedCheck).toBe(true));
       expect(attempts).toBe(2);
     });
+
+    it('starts an already-acknowledged item straight through with no Print Anyway confirm (#1698-followup)', async () => {
+      // Deficit was acknowledged at queue creation; the stored flag rides on
+      // the row. Clicking ▶ must dispatch directly — no redundant re-ask.
+      const ackedItem = {
+        ...mockQueueItems[0],
+        manual_start: true,
+        filament_short: true,
+        skip_filament_check: true,
+      };
+      let firstCallSkippedCheck: boolean | null = null;
+      let attempts = 0;
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json([ackedItem])),
+        http.post('/api/v1/queue/:id/start', ({ request }) => {
+          attempts += 1;
+          const url = new URL(request.url);
+          firstCallSkippedCheck = url.searchParams.get('skip_filament_check') === 'true';
+          return HttpResponse.json({ ...ackedItem, manual_start: false, filament_short: false });
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const playButton = await screen.findByTitle(/Start Print|do not have permission to start prints/i);
+      await userEvent.click(playButton);
+
+      // The single start call carries the stored ack; no confirm dialog opens.
+      await waitFor(() => expect(attempts).toBe(1));
+      expect(firstCallSkippedCheck).toBe(true);
+      expect(screen.queryByRole('button', { name: /Print Anyway/i })).not.toBeInTheDocument();
+    });
   });
 });
 
@@ -673,5 +705,76 @@ describe('QueuePage farm surfaces (Phase 4)', () => {
 
     await waitFor(() => expect(releaseCalled).toBe(true));
     expect(await screen.findByText(/released 1 staged item/i)).toBeInTheDocument();
+  });
+
+  // 5b: both farm banners are visible to any queue viewer; only the action
+  // buttons stay behind queue:update_all (disabled + explanatory hint when
+  // lacking). Low-priv = auth enabled with no logged-in user → hasPermission
+  // returns false for everything.
+  it('shows the low-spool banner to a low-privilege viewer with a disabled, hinted release button', async () => {
+    server.use(
+      http.get('*/api/v1/auth/status', () =>
+        HttpResponse.json({ auth_enabled: true, requires_setup: false }),
+      ),
+      http.get('/api/v1/queue/', () =>
+        HttpResponse.json([{ ...farmPending, manual_start: true, filament_short: true }]),
+      ),
+    );
+
+    render(<QueuePage />);
+
+    // Banner renders regardless of permission.
+    expect(
+      await screen.findByText(/low filament — swap the spool, then press re-check/i),
+    ).toBeInTheDocument();
+
+    // The release action is disabled and explains why on hover.
+    const btn = screen.getByRole('button', { name: /re-check and release/i });
+    await waitFor(() => expect(btn).toBeDisabled());
+    expect(btn).toHaveAttribute('title', 'Ask a queue admin to release these items');
+  });
+
+  it('shows the resume-after-failure banner to a low-privilege viewer with a disabled, hinted button', async () => {
+    server.use(
+      http.get('*/api/v1/auth/status', () =>
+        HttpResponse.json({ auth_enabled: true, requires_setup: false }),
+      ),
+      http.get('/api/v1/queue/', () =>
+        HttpResponse.json([
+          {
+            ...mockQueueItems[0],
+            id: 30,
+            status: 'skipped',
+            waiting_reason: 'previous_print_failed',
+            printer_name: 'Test Printer',
+          },
+        ]),
+      ),
+    );
+
+    render(<QueuePage />);
+
+    expect(
+      await screen.findByText(/blocked by a previous-print failure/i),
+    ).toBeInTheDocument();
+
+    const btn = screen.getByRole('button', { name: /resume after failure/i });
+    await waitFor(() => expect(btn).toBeDisabled());
+    expect(btn).toHaveAttribute('title', 'Ask a queue admin to release these items');
+  });
+
+  it('enables the release button for a queue admin (queue:update_all)', async () => {
+    // Default auth (auth_enabled: false) grants all permissions.
+    server.use(
+      http.get('/api/v1/queue/', () =>
+        HttpResponse.json([{ ...farmPending, manual_start: true, filament_short: true }]),
+      ),
+    );
+
+    render(<QueuePage />);
+
+    const btn = await screen.findByRole('button', { name: /re-check and release/i });
+    await waitFor(() => expect(btn).toBeEnabled());
+    expect(btn).not.toHaveAttribute('title', 'Ask a queue admin to release these items');
   });
 });

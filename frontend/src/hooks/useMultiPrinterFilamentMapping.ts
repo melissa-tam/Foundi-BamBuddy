@@ -288,6 +288,7 @@ export function useMultiPrinterFilamentMapping(
   inventoryByTrayIdPerPrinter?: Map<number, Map<number, number>>,
   firstLoadedByTrayIdPerPrinter?: Map<number, Map<number, number>>,
   minStartG?: number,
+  outOfRotationByTrayIdPerPrinter?: Map<number, Map<number, boolean>>,
 ): UseMultiPrinterFilamentMappingResult {
   // Fetch printer status for all selected printers in parallel
   const statusQueries = useQueries({
@@ -311,6 +312,7 @@ export function useMultiPrinterFilamentMapping(
       const config = perPrinterConfigs[printerId] || DEFAULT_PRINTER_CONFIG;
       const inventoryByTrayId = inventoryByTrayIdPerPrinter?.get(printerId);
       const firstLoadedByTrayId = firstLoadedByTrayIdPerPrinter?.get(printerId);
+      const outOfRotationByTrayId = outOfRotationByTrayIdPerPrinter?.get(printerId);
       // Per-printer gate (#1766): two printers in the same dispatch can have
       // different AMS Backup states; the 'lowest_remaining' sort must fall back
       // to slot order on the OFF ones. Resolving inside the loop captures both.
@@ -318,6 +320,7 @@ export function useMultiPrinterFilamentMapping(
         policy: effectiveSelectionPolicy(policy, printerStatus?.ams_filament_backup),
         inventoryByTrayId,
         firstLoadedByTrayId,
+        outOfRotationByTrayId,
         minStartG,
       };
 
@@ -360,7 +363,7 @@ export function useMultiPrinterFilamentMapping(
         firstLoadedByTrayId,
       };
     });
-  }, [selectedPrinterIds, statusQueries, printers, filamentReqs, perPrinterConfigs, defaultMappings, policy, inventoryByTrayIdPerPrinter, firstLoadedByTrayIdPerPrinter, minStartG]);
+  }, [selectedPrinterIds, statusQueries, printers, filamentReqs, perPrinterConfigs, defaultMappings, policy, inventoryByTrayIdPerPrinter, firstLoadedByTrayIdPerPrinter, minStartG, outOfRotationByTrayIdPerPrinter]);
 
   const isLoading = statusQueries.some((q) => q.isLoading);
 
@@ -385,6 +388,7 @@ export function useMultiPrinterFilamentMapping(
       policy: effectiveSelectionPolicy(policy, result.status?.ams_filament_backup),
       inventoryByTrayId: inventoryByTrayIdPerPrinter?.get(printerId),
       firstLoadedByTrayId: firstLoadedByTrayIdPerPrinter?.get(printerId),
+      outOfRotationByTrayId: outOfRotationByTrayIdPerPrinter?.get(printerId),
       minStartG,
     });
     if (!autoMapping) return;

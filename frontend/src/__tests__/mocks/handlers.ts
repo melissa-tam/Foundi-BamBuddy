@@ -477,6 +477,7 @@ export const handlers = [
   http.get('/api/v1/pending-uploads/', () => HttpResponse.json([])),
   http.get('/api/v1/printers/:id/ams-labels', () => HttpResponse.json([])),
   http.get('/api/v1/printers/:id/slot-presets', () => HttpResponse.json([])),
+  http.get('/api/v1/skus', () => HttpResponse.json([])),
   http.get('/api/v1/smart-plugs/by-printer/:id', () => HttpResponse.json([])),
   http.get('/api/v1/smart-plugs/by-printer/:id/scripts', () => HttpResponse.json([])),
   http.get('/api/v1/spoolbuddy/devices', () => HttpResponse.json([])),

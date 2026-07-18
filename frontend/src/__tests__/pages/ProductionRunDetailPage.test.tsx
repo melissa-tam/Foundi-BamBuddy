@@ -7,7 +7,8 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { Route, Routes } from 'react-router-dom';
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { render } from '../utils';
 import { server } from '../mocks/server';
@@ -86,6 +87,11 @@ function detailRun(overrides: Partial<ProductionRun> = {}): ProductionRun {
     created_at: '2026-07-06T09:00:00Z',
     ...overrides,
   };
+}
+
+/** A future ISO string, N hours out — a run scheduled to start later. */
+function futureIso(hours = 3): string {
+  return new Date(Date.now() + hours * 3600_000).toISOString();
 }
 
 function renderDetail(runId = 1) {
@@ -308,5 +314,81 @@ describe('ProductionRunDetailPage', () => {
     expect(screen.getByRole('img', { name: /first article finish photo/i })).toBeInTheDocument();
     // Camera stays collapsed until requested.
     expect(screen.getByRole('button', { name: /view camera/i })).toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Header lifecycle controls (Pause / Abort / Resume / Start-now / Reschedule)
+  // -------------------------------------------------------------------------
+
+  it('shows Pause and Abort on an active run (not Resume)', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs/1', () => HttpResponse.json(detailRun({ status: 'active' }))),
+      printerStatusHandler,
+    );
+
+    renderDetail();
+    await screen.findByText('WID-001 run');
+
+    expect(screen.getByRole('button', { name: /^pause$/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^abort$/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^resume$/i })).not.toBeInTheDocument();
+  });
+
+  it('shows Resume (and Abort) on a paused run, not Pause', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs/1', () => HttpResponse.json(detailRun({ status: 'paused' }))),
+      printerStatusHandler,
+    );
+
+    renderDetail();
+    await screen.findByText('WID-001 run');
+
+    expect(screen.getByRole('button', { name: /^resume$/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^abort$/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^pause$/i })).not.toBeInTheDocument();
+  });
+
+  it('gates abort behind a confirmation dialog, then posts', async () => {
+    let abortCalled = false;
+    server.use(
+      http.get('*/api/v1/production-runs/1', () => HttpResponse.json(detailRun({ status: 'active' }))),
+      printerStatusHandler,
+      http.post('*/api/v1/production-runs/1/abort', () => {
+        abortCalled = true;
+        return HttpResponse.json(detailRun({ status: 'cancelled' }));
+      }),
+    );
+
+    const user = userEvent.setup();
+    renderDetail();
+    await screen.findByText('WID-001 run');
+
+    await user.click(screen.getByRole('button', { name: /^abort$/i }));
+    // Confirmation shown; nothing posted yet.
+    expect(await screen.findByText('Abort this run?')).toBeInTheDocument();
+    expect(abortCalled).toBe(false);
+
+    // Confirm — the modal's confirm button carries the same "Abort" label and
+    // is the last matching button in the DOM (the dialog overlays the header).
+    const abortButtons = screen.getAllByRole('button', { name: /^abort$/i });
+    await user.click(abortButtons[abortButtons.length - 1]);
+    await waitFor(() => expect(abortCalled).toBe(true));
+  });
+
+  it('shows Start-now and Reschedule on a scheduled run, not Pause', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs/1', () =>
+        HttpResponse.json(detailRun({ status: 'active', scheduled_start_at: futureIso(3) })),
+      ),
+      printerStatusHandler,
+    );
+
+    renderDetail();
+    await screen.findByText('WID-001 run');
+
+    expect(screen.getByRole('button', { name: /start now/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /reschedule/i })).toBeInTheDocument();
+    // A scheduled run hasn't started — Pause is not offered.
+    expect(screen.queryByRole('button', { name: /^pause$/i })).not.toBeInTheDocument();
   });
 });

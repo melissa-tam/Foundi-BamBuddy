@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -68,6 +68,7 @@ import { usePageFileDrop } from '../hooks/usePageFileDrop';
 import type { Archive, PrintLogEntry, ProjectListItem } from '../api/client';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
+import { Modal } from '../components/ui/Modal';
 import { PrintModal } from '../components/PrintModal';
 import { UploadModal } from '../components/UploadModal';
 import { PurgeArchivesModal } from '../components/PurgeArchivesModal';
@@ -171,16 +172,12 @@ function ArchiveCard({
   t: TFunction;
   onNavigateToArchive?: (archiveId: number) => void;
 }) {
-  // Debug: log when card is highlighted
-  if (isHighlighted) {
-    console.log('ArchiveCard isHighlighted=true for archive:', archive.id);
-  }
-
   const queryClient = useQueryClient();
   const { showToast } = useToast();
   const { hasPermission, canModify } = useAuth();
   const isMobile = useIsMobile();
   const navigate = useNavigate();
+  const timelapseSelectTitleId = useId();
   const [showReprint, setShowReprint] = useState(false);
   const [showSliceModal, setShowSliceModal] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -1400,58 +1397,64 @@ function ArchiveCard({
 
       {/* Timelapse Selection Modal */}
       {showTimelapseSelect && availableTimelapses.length > 0 && (
-        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-          <div className="bg-card-dark rounded-lg max-w-lg w-full max-h-[80vh] flex flex-col">
-            <div className="flex items-center justify-between p-4 border-b border-gray-700">
-              <div>
-                <h3 className="text-lg font-semibold text-white">{t('archives.modal.selectTimelapse')}</h3>
-                <p className="text-sm text-gray-400 mt-1">
-                  {t('archives.modal.selectTimelapseDesc')}
-                </p>
-              </div>
-              <button
-                onClick={() => {
-                  setShowTimelapseSelect(false);
-                  setAvailableTimelapses([]);
-                }}
-                className="text-gray-400 hover:text-white p-1"
-              >
-                <X className="w-5 h-5" />
-              </button>
+        <Modal
+          onClose={() => {
+            setShowTimelapseSelect(false);
+            setAvailableTimelapses([]);
+          }}
+          labelledBy={timelapseSelectTitleId}
+          closeOnOverlay={false}
+          className="flex flex-col"
+        >
+          <div className="flex items-center justify-between p-4 border-b border-gray-700">
+            <div>
+              <h3 id={timelapseSelectTitleId} className="text-lg font-semibold text-white">{t('archives.modal.selectTimelapse')}</h3>
+              <p className="text-sm text-gray-400 mt-1">
+                {t('archives.modal.selectTimelapseDesc')}
+              </p>
             </div>
-            <div className="overflow-y-auto flex-1 p-2">
-              {availableTimelapses.map((file) => (
-                <button
-                  key={file.name}
-                  onClick={() => timelapseSelectMutation.mutate(file.name)}
-                  disabled={timelapseSelectMutation.isPending}
-                  className="w-full text-left p-3 rounded-lg hover:bg-gray-700 transition-colors flex items-center gap-3 disabled:opacity-50"
-                >
-                  <Film className="w-8 h-8 text-bambu-green flex-shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-white font-medium truncate">{file.name}</p>
-                    <p className="text-sm text-gray-400">
-                      {formatFileSize(file.size)}
-                      {file.mtime && ` • ${formatDateTime(file.mtime, timeFormat)}`}
-                    </p>
-                  </div>
-                </button>
-              ))}
-            </div>
-            <div className="p-4 border-t border-gray-700">
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  setShowTimelapseSelect(false);
-                  setAvailableTimelapses([]);
-                }}
-                className="w-full"
-              >
-                Cancel
-              </Button>
-            </div>
+            <button
+              onClick={() => {
+                setShowTimelapseSelect(false);
+                setAvailableTimelapses([]);
+              }}
+              className="text-gray-400 hover:text-white p-1"
+            >
+              <X className="w-5 h-5" />
+            </button>
           </div>
-        </div>
+          <div className="overflow-y-auto flex-1 p-2">
+            {availableTimelapses.map((file) => (
+              <button
+                key={file.name}
+                onClick={() => timelapseSelectMutation.mutate(file.name)}
+                disabled={timelapseSelectMutation.isPending}
+                className="w-full text-left p-3 rounded-lg hover:bg-gray-700 transition-colors flex items-center gap-3 disabled:opacity-50"
+              >
+                <Film className="w-8 h-8 text-bambu-green flex-shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-white font-medium truncate">{file.name}</p>
+                  <p className="text-sm text-gray-400">
+                    {formatFileSize(file.size)}
+                    {file.mtime && ` • ${formatDateTime(file.mtime, timeFormat)}`}
+                  </p>
+                </div>
+              </button>
+            ))}
+          </div>
+          <div className="p-4 border-t border-gray-700">
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setShowTimelapseSelect(false);
+                setAvailableTimelapses([]);
+              }}
+              className="w-full"
+            >
+              Cancel
+            </Button>
+          </div>
+        </Modal>
       )}
 
       {/* QR Code Modal */}
@@ -1565,6 +1568,7 @@ function ArchiveListRow({
   const queryClient = useQueryClient();
   const { showToast } = useToast();
   const { hasPermission, canModify } = useAuth();
+  const timelapseSelectTitleId = useId();
   const [showEdit, setShowEdit] = useState(false);
   const [showPrintLog, setShowPrintLog] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -2403,45 +2407,51 @@ function ArchiveListRow({
 
       {/* Timelapse Selection Modal */}
       {showTimelapseSelect && availableTimelapses.length > 0 && (
-        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-          <div className="bg-card-dark rounded-lg max-w-lg w-full max-h-[80vh] flex flex-col">
-            <div className="flex items-center justify-between p-4 border-b border-gray-700">
-              <div>
-                <h3 className="text-lg font-semibold text-white">{t('archives.modal.selectTimelapse')}</h3>
-                <p className="text-sm text-gray-400 mt-1">
-                  {t('archives.modal.selectTimelapseDesc')}
-                </p>
-              </div>
-              <button
-                onClick={() => {
-                  setShowTimelapseSelect(false);
-                  setAvailableTimelapses([]);
-                }}
-                className="text-gray-400 hover:text-white p-1"
-              >
-                <X className="w-5 h-5" />
-              </button>
+        <Modal
+          onClose={() => {
+            setShowTimelapseSelect(false);
+            setAvailableTimelapses([]);
+          }}
+          labelledBy={timelapseSelectTitleId}
+          closeOnOverlay={false}
+          className="flex flex-col"
+        >
+          <div className="flex items-center justify-between p-4 border-b border-gray-700">
+            <div>
+              <h3 id={timelapseSelectTitleId} className="text-lg font-semibold text-white">{t('archives.modal.selectTimelapse')}</h3>
+              <p className="text-sm text-gray-400 mt-1">
+                {t('archives.modal.selectTimelapseDesc')}
+              </p>
             </div>
-            <div className="overflow-y-auto flex-1 p-2">
-              {availableTimelapses.map((file) => (
-                <button
-                  key={file.name}
-                  onClick={() => timelapseSelectMutation.mutate(file.name)}
-                  disabled={timelapseSelectMutation.isPending}
-                  className="w-full text-left p-3 rounded-lg hover:bg-gray-700 transition-colors mb-1"
-                >
-                  <div className="font-medium text-white">{file.name}</div>
-                  <div className="text-sm text-gray-400 flex gap-3">
-                    <span>{formatFileSize(file.size)}</span>
-                    {file.mtime && (
-                      <span>{formatDateOnly(file.mtime)}</span>
-                    )}
-                  </div>
-                </button>
-              ))}
-            </div>
+            <button
+              onClick={() => {
+                setShowTimelapseSelect(false);
+                setAvailableTimelapses([]);
+              }}
+              className="text-gray-400 hover:text-white p-1"
+            >
+              <X className="w-5 h-5" />
+            </button>
           </div>
-        </div>
+          <div className="overflow-y-auto flex-1 p-2">
+            {availableTimelapses.map((file) => (
+              <button
+                key={file.name}
+                onClick={() => timelapseSelectMutation.mutate(file.name)}
+                disabled={timelapseSelectMutation.isPending}
+                className="w-full text-left p-3 rounded-lg hover:bg-gray-700 transition-colors mb-1"
+              >
+                <div className="font-medium text-white">{file.name}</div>
+                <div className="text-sm text-gray-400 flex gap-3">
+                  <span>{formatFileSize(file.size)}</span>
+                  {file.mtime && (
+                    <span>{formatDateOnly(file.mtime)}</span>
+                  )}
+                </div>
+              </button>
+            ))}
+          </div>
+        </Modal>
       )}
 
       {/* QR Code Modal */}
@@ -2553,6 +2563,7 @@ export function ArchivesPage() {
   const { showToast } = useToast();
   const { hasPermission, hasAnyPermission } = useAuth();
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const editLogEntryTitleId = useId();
   const [search, setSearch] = useState('');
   const [filterPrinter, setFilterPrinter] = useState<number | null>(() => {
     const saved = localStorage.getItem('archiveFilterPrinter');
@@ -4091,15 +4102,13 @@ export function ArchivesPage() {
           vocabularies so the dropdown stays in lockstep with the
           Archive Edit modal — backend validates against the same list. */}
       {editingLogEntry !== null && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-          onClick={() => setEditingLogEntry(null)}
+        <Modal
+          onClose={() => setEditingLogEntry(null)}
+          labelledBy={editLogEntryTitleId}
+          size="sm"
+          className="p-6"
         >
-          <div
-            className="bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg w-full max-w-md mx-4 p-6"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 className="text-lg font-semibold text-white mb-4">
+            <h3 id={editLogEntryTitleId} className="text-lg font-semibold text-white mb-4">
               {t('archives.log.editEntryTitle')}
             </h3>
             <p className="text-xs text-bambu-gray mb-4">
@@ -4173,8 +4182,7 @@ export function ArchivesPage() {
                 {updateLogEntryMutation.isPending ? t('editArchive.saving') : t('common.save')}
               </Button>
             </div>
-          </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

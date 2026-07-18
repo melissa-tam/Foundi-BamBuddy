@@ -5,8 +5,9 @@ import { useTranslation } from 'react-i18next';
 import type { PrinterStatus, PrintQueueItemCreate, PrintQueueItemUpdate, SpoolAssignment } from '../../api/client';
 import { api } from '../../api/client';
 import { useAuth } from '../../contexts/AuthContext';
-import { Card, CardContent } from '../Card';
+import { CardContent } from '../Card';
 import { Button } from '../Button';
+import { Modal } from '../ui/Modal';
 import { ConfirmModal } from '../ConfirmModal';
 import { useToast } from '../../contexts/ToastContext';
 import { buildLoadedFilaments, useFilamentMapping } from '../../hooks/useFilamentMapping';
@@ -16,12 +17,15 @@ import { getCurrencySymbol } from '../../utils/currency';
 import { getBedTypeInfo } from '../../utils/bedType';
 import { toDateTimeLocalValue, parseUTCDate } from '../../utils/date';
 import { getGlobalTrayId, isPlaceholderDate, effectiveSelectionPolicy, type SelectionOptions } from '../../utils/amsHelpers';
+import { InlineAlert } from '../ui/InlineAlert';
+import { readPrintModalMemory, writePrintModalMemory } from '../../utils/printModalMemory';
 import { FilamentMapping } from './FilamentMapping';
 import { FilamentOverride } from './FilamentOverride';
 import { PlateSelector } from './PlateSelector';
 import { PrinterSelector } from './PrinterSelector';
 import { PrintOptionsPanel } from './PrintOptions';
 import { ScheduleOptionsPanel } from './ScheduleOptions';
+import { useSkuDefaults } from './useSkuDefaults';
 import type {
   AssignmentMode,
   PrintModalProps,
@@ -45,6 +49,7 @@ export function PrintModal({
   libraryFileId,
   archiveName,
   queueItem,
+  prefillFrom,
   initialSelectedPrinterIds,
   onClose,
   onSuccess,
@@ -60,6 +65,21 @@ export function PrintModal({
   const isLibraryFile = !!libraryFileId && !archiveId;
   const isEditing = mode === 'edit-queue-item';
 
+  // Single seed for every field initializer: the edited item in edit mode, or a
+  // requeued item in create mode (plan 2a). Both are full PrintQueueItems, so
+  // each initializer below reads `seed` exactly as edit mode read `queueItem`.
+  const seed = isEditing ? queueItem : prefillFrom;
+
+  // localStorage key for the last-used choices of THIS file (plan 2c).
+  const memoryFileKey = isLibraryFile
+    ? (libraryFileId != null ? String(libraryFileId) : null)
+    : (archiveId != null ? `archive:${archiveId}` : null);
+  // Remembered choices only apply to a fresh create (no seed) — an edit or a
+  // requeue already carries the item's own values, which outrank memory.
+  const [remembered] = useState(() =>
+    !seed && memoryFileKey ? readPrintModalMemory(memoryFileKey) : null,
+  );
+
   type FilamentWarningItem = {
     printerName: string;
     slotLabel: string;
@@ -69,9 +89,9 @@ export function PrintModal({
 
   // Multiple printer selection (used for all modes now)
   const [selectedPrinters, setSelectedPrinters] = useState<number[]>(() => {
-    // Initialize with the queue item's printer if editing
-    if (mode === 'edit-queue-item' && queueItem?.printer_id) {
-      return [queueItem.printer_id];
+    // Initialize with the seed's printer (edit item or requeued item)
+    if (seed?.printer_id) {
+      return [seed.printer_id];
     }
     if (initialSelectedPrinterIds?.length) {
       return initialSelectedPrinterIds;
@@ -81,8 +101,8 @@ export function PrintModal({
 
   // Multi-select plates: create mode users can pick a subset of plates
   const [selectedPlates, setSelectedPlates] = useState<Set<number>>(() => {
-    if (mode === 'edit-queue-item' && queueItem?.plate_id != null) {
-      return new Set([queueItem.plate_id]);
+    if (seed?.plate_id != null) {
+      return new Set([seed.plate_id]);
     }
     return new Set();
   });
@@ -90,64 +110,84 @@ export function PrintModal({
   // Derived single-plate value for filament queries and single-select contexts
   const selectedPlate = selectedPlates.size === 1 ? [...selectedPlates][0] : null;
 
-  // Quantity — number of copies (creates a batch if > 1)
-  const [quantity, setQuantity] = useState(1);
+  // Quantity — number of copies (creates a batch if > 1). A per-copy queue item
+  // carries no quantity, so a requeue leaves this at 1; memory (2c) may restore it.
+  const [quantity, setQuantity] = useState(() => remembered?.quantity ?? 1);
 
   // Eject profile for automatic part removal (farm feature). Optional; "None"
   // (null) by default. Persisted on the queue item so the scheduler can inject
-  // the sweep snippet at dispatch time.
-  const [ejectProfileId, setEjectProfileId] = useState<number | null>(() =>
-    mode === 'edit-queue-item' ? queueItem?.eject_profile_id ?? null : null,
-  );
+  // the sweep snippet at dispatch time. Initial-value precedence: operator's
+  // explicit pick (below) > seed (edit/requeue) > remembered (2c) > SKU default
+  // (applied via effect once the ['skus'] query resolves) > null.
+  const [ejectProfileId, setEjectProfileId] = useState<number | null>(() => {
+    if (seed) return seed.eject_profile_id ?? null;
+    if (remembered) return remembered.ejectProfileId;
+    return null;
+  });
+  // True once the operator changes the eject select — locks out the async SKU
+  // default so a late-arriving suggestion never overwrites an explicit choice.
+  const [ejectUserTouched, setEjectUserTouched] = useState(false);
 
   const [printOptions, setPrintOptions] = useState<PrintOptions>(() => {
-    if (mode === 'edit-queue-item' && queueItem) {
+    if (seed) {
       return {
-        bed_levelling: queueItem.bed_levelling ?? DEFAULT_PRINT_OPTIONS.bed_levelling,
-        flow_cali: queueItem.flow_cali ?? DEFAULT_PRINT_OPTIONS.flow_cali,
-        vibration_cali: queueItem.vibration_cali ?? DEFAULT_PRINT_OPTIONS.vibration_cali,
-        layer_inspect: queueItem.layer_inspect ?? DEFAULT_PRINT_OPTIONS.layer_inspect,
-        timelapse: queueItem.timelapse ?? DEFAULT_PRINT_OPTIONS.timelapse,
-        nozzle_offset_cali: queueItem.nozzle_offset_cali ?? DEFAULT_PRINT_OPTIONS.nozzle_offset_cali,
+        bed_levelling: seed.bed_levelling ?? DEFAULT_PRINT_OPTIONS.bed_levelling,
+        flow_cali: seed.flow_cali ?? DEFAULT_PRINT_OPTIONS.flow_cali,
+        vibration_cali: seed.vibration_cali ?? DEFAULT_PRINT_OPTIONS.vibration_cali,
+        layer_inspect: seed.layer_inspect ?? DEFAULT_PRINT_OPTIONS.layer_inspect,
+        timelapse: seed.timelapse ?? DEFAULT_PRINT_OPTIONS.timelapse,
+        nozzle_offset_cali: seed.nozzle_offset_cali ?? DEFAULT_PRINT_OPTIONS.nozzle_offset_cali,
       };
     }
+    if (remembered) return remembered.printOptions;
     return DEFAULT_PRINT_OPTIONS;
   });
 
   const [scheduleOptions, setScheduleOptions] = useState<ScheduleOptions>(() => {
-    if (mode === 'edit-queue-item' && queueItem) {
+    if (seed) {
       let scheduleType: ScheduleType = 'queue';
-      if (queueItem.scheduled_time && !isPlaceholderDate(queueItem.scheduled_time)) {
-        scheduleType = 'scheduled';
-      }
-
       let scheduledTime = '';
-      if (queueItem.scheduled_time && !isPlaceholderDate(queueItem.scheduled_time)) {
-        const date = parseUTCDate(queueItem.scheduled_time) ?? new Date();
-        // Use toDateTimeLocalValue to convert UTC to local time for datetime-local input
+      // Only edit mode restores the stored schedule time; a requeue (prefill)
+      // drops it (stale — the original already ran) and keeps the queue default.
+      if (isEditing && seed.scheduled_time && !isPlaceholderDate(seed.scheduled_time)) {
+        scheduleType = 'scheduled';
+        const date = parseUTCDate(seed.scheduled_time) ?? new Date();
+        // Convert UTC to local time for the datetime-local input.
         scheduledTime = toDateTimeLocalValue(date);
       }
 
       return {
         scheduleType,
         scheduledTime,
-        requireManualStart: queueItem.manual_start,
-        requirePreviousSuccess: queueItem.require_previous_success,
-        autoOffAfter: queueItem.auto_off_after,
-        gcodeInjection: queueItem.gcode_injection ?? false,
+        requireManualStart: seed.manual_start,
+        requirePreviousSuccess: seed.require_previous_success,
+        autoOffAfter: seed.auto_off_after,
+        gcodeInjection: seed.gcode_injection ?? false,
         staggerEnabled: false,
         staggerGroupSize: DEFAULT_SCHEDULE_OPTIONS.staggerGroupSize,
         staggerIntervalMinutes: DEFAULT_SCHEDULE_OPTIONS.staggerIntervalMinutes,
       };
     }
+    if (remembered) {
+      return {
+        ...DEFAULT_SCHEDULE_OPTIONS,
+        requireManualStart: remembered.requireManualStart,
+        requirePreviousSuccess: remembered.requirePreviousSuccess,
+        autoOffAfter: remembered.autoOffAfter,
+        gcodeInjection: remembered.gcodeInjection,
+      };
+    }
     return DEFAULT_SCHEDULE_OPTIONS;
   });
 
-  // Manual slot overrides: slot_id (1-indexed) -> globalTrayId (default mapping for single printer or all printers)
+  // Manual slot overrides: slot_id (1-indexed) -> globalTrayId. Seeded from the
+  // seed item only (edit or same-file requeue). Deliberately NOT restored from
+  // memory (2c): slot contents drift between sessions, so a remembered mapping
+  // would point at whatever spool now happens to sit in that tray.
   const [manualMappings, setManualMappings] = useState<Record<number, number>>(() => {
-    if (mode === 'edit-queue-item' && queueItem?.ams_mapping && Array.isArray(queueItem.ams_mapping)) {
+    if (seed?.ams_mapping && Array.isArray(seed.ams_mapping)) {
       const mappings: Record<number, number> = {};
-      queueItem.ams_mapping.forEach((globalTrayId, idx) => {
+      seed.ams_mapping.forEach((globalTrayId, idx) => {
         if (globalTrayId !== -1) {
           mappings[idx + 1] = globalTrayId;
         }
@@ -162,34 +202,27 @@ export function PrintModal({
 
   // Assignment mode: 'printer' (specific) or 'model' (any of model)
   const [assignmentMode, setAssignmentMode] = useState<AssignmentMode>(() => {
-    // Initialize from queue item if editing with target_model
-    if (mode === 'edit-queue-item' && queueItem?.target_model) {
-      return 'model';
-    }
+    if (seed) return seed.target_model ? 'model' : 'printer';
+    if (remembered) return remembered.assignmentMode;
     return 'printer';
   });
 
   // Target model for model-based assignment
   const [targetModel, setTargetModel] = useState<string | null>(() => {
-    if (mode === 'edit-queue-item' && queueItem?.target_model) {
-      return queueItem.target_model;
-    }
+    if (seed) return seed.target_model ?? null;
+    if (remembered) return remembered.targetModel;
     return null;
   });
 
-  // Target location for model-based assignment (optional filter)
-  const [targetLocation, setTargetLocation] = useState<string | null>(() => {
-    if (mode === 'edit-queue-item' && queueItem?.target_location) {
-      return queueItem.target_location;
-    }
-    return null;
-  });
+  // Target location for model-based assignment (optional filter). Carried by the
+  // seed only — not remembered across sessions.
+  const [targetLocation, setTargetLocation] = useState<string | null>(() => seed?.target_location ?? null);
 
   // Filament overrides for model-based assignment: slot_id -> {type, color}
   const [filamentOverrides, setFilamentOverrides] = useState<Record<number, { type: string; color: string }>>(() => {
-    if (mode === 'edit-queue-item' && queueItem?.filament_overrides) {
+    if (seed?.filament_overrides) {
       const overrides: Record<number, { type: string; color: string }> = {};
-      for (const o of queueItem.filament_overrides) {
+      for (const o of seed.filament_overrides) {
         overrides[o.slot_id] = { type: o.type, color: o.color };
       }
       return overrides;
@@ -199,9 +232,9 @@ export function PrintModal({
 
   // Per-slot force color match flags. Default is false (opt-in).
   const [forceColorMatch, setForceColorMatch] = useState<Record<number, boolean>>(() => {
-    if (mode === 'edit-queue-item' && queueItem?.filament_overrides) {
+    if (seed?.filament_overrides) {
       const flags: Record<number, boolean> = {};
-      for (const o of queueItem.filament_overrides) {
+      for (const o of seed.filament_overrides) {
         flags[o.slot_id] = o.force_color_match === true;
       }
       return flags;
@@ -209,13 +242,18 @@ export function PrintModal({
     return {};
   });
 
-  // Track initial values for clearing mappings on change (edit mode only)
-  const [initialPrinterIds] = useState(() => (mode === 'edit-queue-item' && queueItem?.printer_id ? [queueItem.printer_id] : []));
-  const [initialPlateId] = useState(() => (mode === 'edit-queue-item' && queueItem ? queueItem.plate_id : null));
+  // Track initial values for clearing mappings on change (whenever a seed set them)
+  const [initialPrinterIds] = useState(() => (seed?.printer_id ? [seed.printer_id] : []));
+  const [initialPlateId] = useState(() => (seed ? seed.plate_id : null));
 
   // Submission state for multi-printer
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitProgress, setSubmitProgress] = useState({ current: 0, total: 0 });
+
+  // Per-dispatch errors from the last create submit (plan 2e). Rendered as an
+  // inline list inside the modal so a partial fan-out failure is fully visible
+  // (a toast would show only a count and vanish).
+  const [submitErrors, setSubmitErrors] = useState<string[]>([]);
 
   const [filamentWarningItems, setFilamentWarningItems] = useState<FilamentWarningItem[] | null>(null);
 
@@ -234,10 +272,12 @@ export function PrintModal({
     queryFn: api.getSettings,
   });
 
-  // Sync print option defaults from settings once available
+  // Sync print option defaults from settings once available. Skipped whenever a
+  // seed (edit/requeue) or remembered choices already supplied print options —
+  // those outrank the server defaults.
   const printDefaultsApplied = useRef(false);
   useEffect(() => {
-    if (!settings || printDefaultsApplied.current || mode === 'edit-queue-item') return;
+    if (!settings || printDefaultsApplied.current || seed || remembered) return;
     printDefaultsApplied.current = true;
     setPrintOptions({
       bed_levelling: settings.default_bed_levelling ?? DEFAULT_PRINT_OPTIONS.bed_levelling,
@@ -247,7 +287,7 @@ export function PrintModal({
       timelapse: settings.default_timelapse ?? DEFAULT_PRINT_OPTIONS.timelapse,
       nozzle_offset_cali: settings.default_nozzle_offset_cali ?? DEFAULT_PRINT_OPTIONS.nozzle_offset_cali,
     });
-  }, [settings, mode]);
+  }, [settings, seed, remembered]);
 
   // Sync stagger defaults from settings once available
   const staggerDefaultsApplied = useRef(false);
@@ -274,6 +314,25 @@ export function PrintModal({
     queryKey: ['eject-profiles'],
     queryFn: api.getEjectProfiles,
   });
+
+  // SKU-derived eject default (plan 2b). Resolves only for library-file prints —
+  // archives carry no library-file link the modal can see, so archive prints get
+  // null. The value is applied to the select via the effect below.
+  const { defaultEjectProfileId, skuCode } = useSkuDefaults(
+    isLibraryFile ? (libraryFileId ?? null) : null,
+  );
+
+  // Apply the SKU-derived eject default once the ['skus'] query resolves (2b).
+  // Guarded so it never outranks a seed, remembered memory, or an explicit pick,
+  // and runs at most once so a late resolution can't clobber a later choice.
+  const ejectSkuDefaultApplied = useRef(false);
+  useEffect(() => {
+    if (ejectSkuDefaultApplied.current) return;
+    if (seed || remembered || ejectUserTouched) return;
+    if (defaultEjectProfileId == null) return;
+    ejectSkuDefaultApplied.current = true;
+    setEjectProfileId(defaultEjectProfileId);
+  }, [seed, remembered, ejectUserTouched, defaultEjectProfileId]);
 
   const { data: spoolAssignments } = useQuery({
     queryKey: ['spool-assignments'],
@@ -325,6 +384,23 @@ export function PrintModal({
         if (!Number.isNaN(ms)) printerMap.set(gtid, ms);
       });
       result.set(printerId, printerMap);
+    });
+    return result;
+  }, [selectedPrinters, inventoryRemainQueries]);
+  // Companion spool-jam map (#feed-fault): globalTrayId -> true for slots a jam
+  // took out of rotation. Only flagged trays appear in the response; the field
+  // is optional (older servers omit it) so a missing map means "nothing flagged".
+  const outOfRotationByTrayIdPerPrinter = useMemo(() => {
+    const result = new Map<number, Map<number, boolean>>();
+    selectedPrinters.forEach((printerId, idx) => {
+      const data = inventoryRemainQueries[idx]?.data?.out_of_rotation;
+      if (!data) return;
+      const printerMap = new Map<number, boolean>();
+      Object.entries(data).forEach(([key, flagged]) => {
+        const gtid = Number(key);
+        if (!Number.isNaN(gtid) && flagged === true) printerMap.set(gtid, true);
+      });
+      if (printerMap.size > 0) result.set(printerId, printerMap);
     });
     return result;
   }, [selectedPrinters, inventoryRemainQueries]);
@@ -407,8 +483,9 @@ export function PrintModal({
     policy: effectiveSelectionPolicy(settings?.spool_selection_policy, printerStatus?.ams_filament_backup),
     inventoryByTrayId: effectivePrinterId ? inventoryByTrayIdPerPrinter.get(effectivePrinterId) : undefined,
     firstLoadedByTrayId: effectivePrinterId ? firstLoadedByTrayIdPerPrinter.get(effectivePrinterId) : undefined,
+    outOfRotationByTrayId: effectivePrinterId ? outOfRotationByTrayIdPerPrinter.get(effectivePrinterId) : undefined,
     minStartG: settings?.min_start_spool_g,
-  }), [settings?.spool_selection_policy, settings?.min_start_spool_g, printerStatus?.ams_filament_backup, effectivePrinterId, inventoryByTrayIdPerPrinter, firstLoadedByTrayIdPerPrinter]);
+  }), [settings?.spool_selection_policy, settings?.min_start_spool_g, printerStatus?.ams_filament_backup, effectivePrinterId, inventoryByTrayIdPerPrinter, firstLoadedByTrayIdPerPrinter, outOfRotationByTrayIdPerPrinter]);
 
   const isPrinterCurrentlyDispatchable = (status: PrinterStatus | undefined): boolean => {
     if (!status?.connected) return false;
@@ -457,6 +534,7 @@ export function PrintModal({
     inventoryByTrayIdPerPrinter,
     firstLoadedByTrayIdPerPrinter,
     settings?.min_start_spool_g,
+    outOfRotationByTrayIdPerPrinter,
   );
 
   // Auto-select first plate when plates load (single or multi-plate)
@@ -468,19 +546,20 @@ export function PrintModal({
 
   // Auto-select first printer when only one available
   useEffect(() => {
-    // Skip auto-select for edit mode (already initialized from queueItem)
-    if (mode === 'edit-queue-item') return;
+    // Skip auto-select when a seed already set the selection (edit or requeue)
+    if (seed) return;
     const activePrinters = printers?.filter(p => p.is_active) || [];
     if (activePrinters.length === 1 && selectedPrinters.length === 0) {
       setSelectedPrinters([activePrinters[0].id]);
     }
-  }, [mode, printers, selectedPrinters.length]);
+  }, [seed, printers, selectedPrinters.length]);
 
   // Clear manual mappings and per-printer configs when printer or plate changes
   useEffect(() => {
-    if (mode === 'edit-queue-item') {
-      // For edit mode, clear mappings if printer selection or plate changed from initial
-      const printersChanged = JSON.stringify(selectedPrinters.sort()) !== JSON.stringify(initialPrinterIds.sort());
+    if (seed) {
+      // Seeded (edit or requeue): keep the seeded mappings until the printer
+      // selection or plate actually changes from the seed's initial values.
+      const printersChanged = JSON.stringify([...selectedPrinters].sort()) !== JSON.stringify([...initialPrinterIds].sort());
       if (printersChanged || selectedPlate !== initialPlateId) {
         setManualMappings({});
         setPerPrinterConfigs({});
@@ -491,7 +570,7 @@ export function PrintModal({
       setPerPrinterConfigs({});
       setInitialExpandApplied(new Set());
     }
-  }, [mode, selectedPrinters, selectedPlate, initialPrinterIds, initialPlateId]);
+  }, [seed, selectedPrinters, selectedPlate, initialPrinterIds, initialPlateId]);
 
   // Clear filament overrides when target model or plate changes (but not on initial mount for edit mode)
   const [prevTargetModel, setPrevTargetModel] = useState(targetModel);
@@ -540,15 +619,6 @@ export function PrintModal({
     }
   }, [settings?.per_printer_mapping_expanded, selectedPrinters, initialExpandApplied, multiPrinterMapping]);
 
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !isSubmitting) onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose, isSubmitting]);
-
   const isMultiPlate = platesData?.is_multi_plate ?? false;
   const plates = platesData?.plates ?? [];
 
@@ -592,17 +662,20 @@ export function PrintModal({
     mutationFn: (data: PrintQueueItemUpdate) => api.updateQueueItem(queueItem!.id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['queue'] });
-      showToast('Queue item updated');
+      showToast(t('printModal.toastQueueItemUpdated'));
       onSuccess?.();
       onClose();
     },
     onError: (error: Error) => {
-      showToast(error.message || 'Failed to update queue item', 'error');
+      showToast(error.message || t('printModal.toastUpdateFailed'), 'error');
     },
   });
 
   const handleSubmit = async (e?: React.FormEvent, options?: { skipFilamentCheck?: boolean }) => {
     e?.preventDefault();
+
+    // Clear any errors from a previous attempt before re-running.
+    setSubmitErrors([]);
 
     if (
       !options?.skipFilamentCheck &&
@@ -633,7 +706,7 @@ export function PrintModal({
           const loadedFilaments = buildLoadedFilaments(printerStatusForWarning);
           const slotLabelByTray = new Map(loadedFilaments.map((f) => [f.globalTrayId, f.label]));
           const assignments = spoolAssignmentsByPrinter.get(printerId);
-          const printerName = printers?.find((p) => p.id === printerId)?.name ?? `Printer ${printerId}`;
+          const printerName = printers?.find((p) => p.id === printerId)?.name ?? t('printModal.printerFallback', { id: printerId });
 
           if (!assignments) continue;
 
@@ -652,7 +725,7 @@ export function PrintModal({
 
             warningItems.push({
               printerName,
-              slotLabel: slotLabelByTray.get(globalTrayId) ?? `Slot ${req.slot_id}`,
+              slotLabel: slotLabelByTray.get(globalTrayId) ?? t('printModal.slotFallback', { id: req.slot_id }),
               requiredGrams: req.used_grams,
               remainingGrams,
             });
@@ -668,11 +741,11 @@ export function PrintModal({
 
     // Validate printer/model selection
     if (assignmentMode === 'printer' && selectedPrinters.length === 0) {
-      showToast('Please select at least one printer', 'error');
+      showToast(t('printModal.toastSelectPrinter'), 'error');
       return;
     }
     if (assignmentMode === 'model' && !targetModel) {
-      showToast('Please select a target printer model', 'error');
+      showToast(t('printModal.toastSelectModel'), 'error');
       return;
     }
 
@@ -846,7 +919,7 @@ export function PrintModal({
           results.success++;
         } catch (error) {
           results.failed++;
-          const plateName = plate ? (plate.name || `Plate ${plate.index}`) : '';
+          const plateName = plate ? (plate.name || t('printModal.plateFallback', { index: plate.index })) : '';
           results.errors.push(plateName ? `${plateName}: ${(error as Error).message}` : (error as Error).message);
         }
       }
@@ -912,8 +985,8 @@ export function PrintModal({
             results.success++;
           } catch (error) {
             results.failed++;
-            const printerName = printers?.find(p => p.id === printerId)?.name || `Printer ${printerId}`;
-            const plateName = plate ? (plate.name || `Plate ${plate.index}`) : '';
+            const printerName = printers?.find(p => p.id === printerId)?.name || t('printModal.printerFallback', { id: printerId });
+            const plateName = plate ? (plate.name || t('printModal.plateFallback', { index: plate.index })) : '';
             const label = plateName ? `${printerName} (${plateName})` : printerName;
             results.errors.push(`${label}: ${(error as Error).message}`);
           }
@@ -927,7 +1000,7 @@ export function PrintModal({
     if (results.failed === 0) {
       if (isEditing) {
         if (mode === 'edit-queue-item') {
-          showToast('Queue item updated');
+          showToast(t('printModal.toastQueueItemUpdated'));
         }
       } else if (results.success === 1) {
         const waitForIdleToast = await asapToastShouldPromiseLaterStart();
@@ -935,7 +1008,7 @@ export function PrintModal({
           waitForIdleToast
             ? t('queue.printQueuedWillStartWhenIdle')
             : assignmentMode === 'model'
-              ? `Queued for any ${targetModel}`
+              ? t('printModal.toastQueuedForModel', { model: targetModel })
               : t('queue.printQueued'),
         );
       } else {
@@ -947,13 +1020,31 @@ export function PrintModal({
         );
       }
       queryClient.invalidateQueries({ queryKey: ['queue'] });
+      // Remember these choices for the next print of this file (create only).
+      if (!isEditing && memoryFileKey) {
+        writePrintModalMemory(memoryFileKey, {
+          ejectProfileId,
+          printOptions,
+          requireManualStart: scheduleOptions.requireManualStart,
+          requirePreviousSuccess: scheduleOptions.requirePreviousSuccess,
+          autoOffAfter: scheduleOptions.autoOffAfter,
+          gcodeInjection: scheduleOptions.gcodeInjection,
+          assignmentMode,
+          targetModel,
+          quantity,
+        });
+      }
       onSuccess?.();
       onClose();
-    } else if (results.success === 0) {
-      showToast(`Failed: ${results.errors[0]}`, 'error');
     } else {
-      showToast(`${results.success} succeeded, ${results.failed} failed`, 'error');
-      queryClient.invalidateQueries({ queryKey: ['queue'] });
+      // Some or all dispatches failed. Keep the modal open and surface every
+      // error inline (each already printer/plate-prefixed at collection time);
+      // the toast stays a bare count summary.
+      setSubmitErrors(results.errors);
+      showToast(t('printModal.toastPartialSuccess', { success: results.success, failed: results.failed }), 'error');
+      if (results.success > 0) {
+        queryClient.invalidateQueries({ queryKey: ['queue'] });
+      }
     }
   };
 
@@ -1018,6 +1109,16 @@ export function PrintModal({
   const TitleIcon = modalConfig.icon;
   const SubmitIcon = modalConfig.submitIcon;
 
+  // Show the "Default from SKU X" hint only while the eject select still holds
+  // the SKU-suggested value and nothing higher-priority displaced it (2b).
+  const ejectFromSku =
+    !ejectUserTouched &&
+    !seed &&
+    !remembered &&
+    defaultEjectProfileId != null &&
+    ejectProfileId === defaultEjectProfileId &&
+    !!skuCode;
+
   // Show filament mapping when:
   // - Single printer selected
   // - For archives: plate is selected (for multi-plate) or not required (single-plate)
@@ -1044,20 +1145,19 @@ export function PrintModal({
   }, [assignmentMode, targetModel, printers, selectedPrinters, DUAL_NOZZLE_MODELS]);
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={isSubmitting ? undefined : onClose}
+    <>
+    <Modal
+      onClose={onClose}
+      labelledBy="print-modal-title"
+      size="lg"
+      dismissDisabled={isSubmitting || !!filamentWarningItems?.length}
     >
-      <Card
-        className="w-full max-w-2xl max-h-[90vh] overflow-y-auto"
-        onClick={(e) => e.stopPropagation()}
-      >
         <CardContent className="p-0">
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
             <div className="flex items-center gap-2">
               <TitleIcon className="w-5 h-5 text-bambu-green" />
-              <h2 className="text-lg font-semibold text-white">{modalConfig.title}</h2>
+              <h2 id="print-modal-title" className="text-lg font-semibold text-white">{modalConfig.title}</h2>
             </div>
             <Button variant="ghost" size="sm" onClick={onClose} disabled={isSubmitting}>
               <X className="w-5 h-5" />
@@ -1067,7 +1167,7 @@ export function PrintModal({
           <form onSubmit={handleSubmit} className="p-4 space-y-4">
             {/* Archive name */}
             <p className="text-sm text-bambu-gray">
-              <span className="block text-bambu-gray mb-1">Print Job</span>
+              <span className="block text-bambu-gray mb-1">{t('printModal.printJob')}</span>
               <span className="text-white font-medium truncate block">{archiveName}</span>
             </p>
 
@@ -1165,7 +1265,7 @@ export function PrintModal({
                   <div className="p-3 mb-2 bg-yellow-500/10 border border-yellow-500/30 rounded-lg flex items-center gap-2">
                     <AlertTriangle className="w-4 h-4 text-yellow-400 flex-shrink-0" />
                     <span className="text-sm text-yellow-400">
-                      File was sliced for {slicedForModel}, but printing on {selectedPrinter.model}
+                      {t('printModal.slicedModelMismatch', { slicedModel: slicedForModel, printerModel: selectedPrinter.model })}
                     </span>
                   </div>
                 );
@@ -1178,7 +1278,7 @@ export function PrintModal({
               <div className="flex items-start gap-2 p-3 mb-2 bg-orange-500/10 border border-orange-500/30 rounded-lg text-sm">
                 <AlertCircle className="w-4 h-4 text-orange-400 mt-0.5 flex-shrink-0" />
                 <p className="text-orange-400">
-                  Archive data unavailable. The source file may have been deleted. Filament mapping is disabled.
+                  {t('printModal.archiveDataUnavailable')}
                 </p>
               </div>
             )}
@@ -1241,7 +1341,10 @@ export function PrintModal({
               <select
                 id="ejectProfile"
                 value={ejectProfileId ?? ''}
-                onChange={(e) => setEjectProfileId(e.target.value ? Number(e.target.value) : null)}
+                onChange={(e) => {
+                  setEjectUserTouched(true);
+                  setEjectProfileId(e.target.value ? Number(e.target.value) : null);
+                }}
                 className="w-full px-3 py-2 text-sm bg-bambu-dark border border-bambu-dark-tertiary rounded text-white focus:outline-none focus:ring-1 focus:ring-bambu-green"
               >
                 <option value="">{t('common.none')}</option>
@@ -1251,6 +1354,11 @@ export function PrintModal({
                   </option>
                 ))}
               </select>
+              {ejectFromSku && (
+                <p className="text-xs text-bambu-green mt-1">
+                  {t('printModal.ejectFromSku', { code: skuCode })}
+                </p>
+              )}
               <p className="text-xs text-bambu-gray mt-1">{t('ejectProfiles.queueHelp')}</p>
             </div>
 
@@ -1269,14 +1377,29 @@ export function PrintModal({
             {/* Error message */}
             {updateQueueMutation.isError && (
               <div className="mb-4 p-3 bg-red-500/20 border border-red-500/50 rounded-lg text-sm text-red-400">
-                {(updateQueueMutation.error as Error)?.message || 'Failed to complete operation'}
+                {(updateQueueMutation.error as Error)?.message || t('printModal.failedToComplete')}
               </div>
+            )}
+
+            {/* Per-dispatch failures from a create fan-out (plan 2e). Every
+                failing printer/plate is listed so nothing is lost to a toast. */}
+            {submitErrors.length > 0 && (
+              <InlineAlert severity="error">
+                <span className="block font-medium mb-1">
+                  {t('printModal.partialFailureTitle', { failed: submitErrors.length, total: submitProgress.total })}
+                </span>
+                <ul className="list-disc pl-4 space-y-0.5">
+                  {submitErrors.map((err, idx) => (
+                    <li key={idx}>{err}</li>
+                  ))}
+                </ul>
+              </InlineAlert>
             )}
 
             {/* Actions */}
             <div className="flex gap-3 pt-2">
               <Button type="button" variant="secondary" onClick={onClose} className="flex-1" disabled={isSubmitting}>
-                Cancel
+                {t('common.cancel')}
               </Button>
               <Button
                 type="submit"
@@ -1298,7 +1421,7 @@ export function PrintModal({
             </div>
           </form>
         </CardContent>
-      </Card>
+    </Modal>
 
       {filamentWarningItems && filamentWarningItems.length > 0 && (
         <ConfirmModal
@@ -1314,7 +1437,7 @@ export function PrintModal({
           onCancel={() => setFilamentWarningItems(null)}
         />
       )}
-    </div>
+    </>
   );
 }
 

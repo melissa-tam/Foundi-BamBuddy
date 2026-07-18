@@ -10,7 +10,7 @@
  * so decimals type cleanly and are coerced/validated once on submit. All copy
  * is i18n; inputs are label-linked (WCAG AA) and keyboard operable.
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -19,9 +19,9 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Copy,
   Download,
   FlaskConical,
-  Info,
   Loader2,
   PackageOpen,
   Pencil,
@@ -36,6 +36,11 @@ import { usePlateIndexSync } from '../hooks/usePlateIndexSync';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
+import { Modal } from '../components/ui/Modal';
+import { InlineAlert } from '../components/ui/InlineAlert';
+import { InfoHint } from '../components/ui/InfoHint';
+import { inputClass } from '../components/ui/Field';
+import { Toggle } from '../components/Toggle';
 import { useToast } from '../contexts/ToastContext';
 import {
   DEFAULT_BED_DROP_CLEARANCE_MM,
@@ -92,37 +97,18 @@ const NUMERIC_FIELDS: NumericFieldMeta[] = [
   { key: 'max_part_height_mm', i18n: 'maxPartHeight', min: 1, max: 300, step: 1 },
 ];
 
-const inputClass =
-  'w-full px-3 py-2 bg-bambu-dark rounded-md text-white border border-bambu-dark-tertiary ' +
-  'focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors';
-
-/**
- * Small plain-English help affordance rendered beside a field label. Follows the
- * fork's established `title=`-on-an-icon convention (e.g. PrinterSelector) — a
- * native tooltip on hover plus an `aria-label` so assistive tech announces it,
- * with no extra dependency. Kept OUTSIDE the `<label>` element so the field's
- * accessible name stays exactly the visible label text.
- */
-function InfoHint({ text }: { text: string }) {
-  return (
-    <span
-      role="img"
-      aria-label={text}
-      title={text}
-      className="inline-flex items-center text-bambu-gray/60 hover:text-bambu-gray transition-colors cursor-help"
-    >
-      <Info className="w-3.5 h-3.5" aria-hidden="true" />
-    </span>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Create / edit dialog
 // ---------------------------------------------------------------------------
 
 interface EjectProfileDialogProps {
-  /** Existing profile when editing; null when creating. */
+  /** Data to prefill the form from: an existing profile (edit), a "(copy)" of
+   *  one (duplicate), or null for a blank create. Any `id` here is ignored —
+   *  whether a save creates or updates is decided by the page via `isEditing`. */
   profile: EjectProfile | null;
+  /** True only when editing an existing row: shows the Edit title and routes
+   *  the save through update. Create and duplicate are both false. */
+  isEditing: boolean;
   saving: boolean;
   /** Backend failure detail from the last save attempt; rendered inline so a
    *  rejected save never dead-ends silently. */
@@ -131,9 +117,9 @@ interface EjectProfileDialogProps {
   onClose: () => void;
 }
 
-function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectProfileDialogProps) {
+function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose }: EjectProfileDialogProps) {
   const { t } = useTranslation();
-  const isEditing = profile !== null;
+  const titleId = useId();
 
   const [name, setName] = useState(profile?.name ?? '');
   // Numeric values are held as strings so decimals type cleanly.
@@ -293,22 +279,12 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={saving ? undefined : onClose}
-      role="dialog"
-      aria-modal="true"
-      aria-label={isEditing ? t('ejectProfiles.editTitle') : t('ejectProfiles.createTitle')}
-    >
-      <Card
-        className="w-full max-w-2xl max-h-[90vh] overflow-y-auto"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} size="lg" dismissDisabled={saving} labelledBy={titleId}>
         <CardContent className="p-0">
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
             <div className="flex items-center gap-2">
               <PackageOpen className="w-5 h-5 text-bambu-green" />
-              <h2 className="text-lg font-semibold text-white">
+              <h2 id={titleId} className="text-lg font-semibold text-white">
                 {isEditing ? t('ejectProfiles.editTitle') : t('ejectProfiles.createTitle')}
               </h2>
             </div>
@@ -419,22 +395,11 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
                   <span className="text-sm text-white">{t('ejectProfiles.fields.sweepBand')}</span>
                   <InfoHint text={t('ejectProfiles.tooltips.sweepBand')} />
                 </span>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={bandEnabled}
+                <Toggle
+                  checked={bandEnabled}
+                  onChange={setBandEnabled}
                   aria-label={t('ejectProfiles.fields.sweepBand')}
-                  onClick={() => setBandEnabled((v) => !v)}
-                  className={`relative w-10 h-5 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-bambu-green/50 ${
-                    bandEnabled ? 'bg-bambu-green' : 'bg-bambu-dark-tertiary'
-                  }`}
-                >
-                  <span
-                    className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                      bandEnabled ? 'translate-x-5' : 'translate-x-0.5'
-                    }`}
-                  />
-                </button>
+                />
               </div>
               <p className="text-xs text-bambu-gray mt-1">{t('ejectProfiles.fields.sweepBandHelp')}</p>
               {bandEnabled && (
@@ -491,22 +456,11 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
                   <span className="text-sm text-white">{t('ejectProfiles.fields.bedDrop')}</span>
                   <InfoHint text={t('ejectProfiles.tooltips.bedDrop')} />
                 </span>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={dropEnabled}
+                <Toggle
+                  checked={dropEnabled}
+                  onChange={setDropEnabled}
                   aria-label={t('ejectProfiles.fields.bedDrop')}
-                  onClick={() => setDropEnabled((v) => !v)}
-                  className={`relative w-10 h-5 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-bambu-green/50 ${
-                    dropEnabled ? 'bg-bambu-green' : 'bg-bambu-dark-tertiary'
-                  }`}
-                >
-                  <span
-                    className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                      dropEnabled ? 'translate-x-5' : 'translate-x-0.5'
-                    }`}
-                  />
-                </button>
+                />
               </div>
               <p className="text-xs text-bambu-gray mt-1">{t('ejectProfiles.fields.bedDropHelp')}</p>
               {dropEnabled && (
@@ -548,22 +502,11 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
                 <span className="text-sm text-white">{t('ejectProfiles.fields.coolingFanAssist')}</span>
                 <InfoHint text={t('ejectProfiles.tooltips.coolingFanAssist')} />
               </span>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={fanAssist}
+              <Toggle
+                checked={fanAssist}
+                onChange={setFanAssist}
                 aria-label={t('ejectProfiles.fields.coolingFanAssist')}
-                onClick={() => setFanAssist((v) => !v)}
-                className={`relative w-10 h-5 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-bambu-green/50 ${
-                  fanAssist ? 'bg-bambu-green' : 'bg-bambu-dark-tertiary'
-                }`}
-              >
-                <span
-                  className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                    fanAssist ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-                />
-              </button>
+              />
             </div>
 
             {/* Final skim pass toggle */}
@@ -573,22 +516,11 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
                   <span className="text-sm text-white">{t('ejectProfiles.fields.finalSkim')}</span>
                   <InfoHint text={t('ejectProfiles.tooltips.finalSkim')} />
                 </span>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={finalSkim}
+                <Toggle
+                  checked={finalSkim}
+                  onChange={setFinalSkim}
                   aria-label={t('ejectProfiles.fields.finalSkim')}
-                  onClick={() => setFinalSkim((v) => !v)}
-                  className={`relative w-10 h-5 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-bambu-green/50 ${
-                    finalSkim ? 'bg-bambu-green' : 'bg-bambu-dark-tertiary'
-                  }`}
-                >
-                  <span
-                    className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                      finalSkim ? 'translate-x-5' : 'translate-x-0.5'
-                    }`}
-                  />
-                </button>
+                />
               </div>
               <p className="text-xs text-bambu-gray mt-1">{t('ejectProfiles.fields.finalSkimHelp')}</p>
             </div>
@@ -626,8 +558,7 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
             </div>
           </form>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }
 
@@ -637,7 +568,6 @@ function EjectProfileDialog({ profile, saving, error, onSave, onClose }: EjectPr
 
 function PreviewPanel({ profiles }: { profiles: EjectProfile[] }) {
   const { t } = useTranslation();
-  const { showToast } = useToast();
 
   const [profileId, setProfileId] = useState<number | null>(profiles[0]?.id ?? null);
   const [fileId, setFileId] = useState<number | null>(null);
@@ -671,6 +601,10 @@ function PreviewPanel({ profiles }: { profiles: EjectProfile[] }) {
   const plates = useMemo(() => platesData?.plates ?? [], [platesData]);
   usePlateIndexSync(plates, plateIndex, setPlateIndex);
 
+  // Failure surfaces as a persistent inline alert under the controls (below),
+  // NOT a toast — the preview result renders in-place, so the operator is
+  // looking at this card when it fails and a toast would vanish before it is
+  // read (matches the DryRunDialog's inline-error convention).
   const previewMutation = useMutation({
     mutationFn: () =>
       api.previewEjectProfile(profileId!, {
@@ -678,9 +612,6 @@ function PreviewPanel({ profiles }: { profiles: EjectProfile[] }) {
         plate_index: plateIndex,
         model: model!,
       }),
-    onError: (err: Error) => {
-      showToast(err.message || t('ejectProfiles.preview.failed'), 'error');
-    },
   });
 
   const result = previewMutation.data;
@@ -804,6 +735,14 @@ function PreviewPanel({ profiles }: { profiles: EjectProfile[] }) {
               </Button>
             </div>
 
+            {/* Preview failure — persistent inline alert (cleared on the next
+                attempt or a file change via previewMutation.reset()). */}
+            {previewMutation.error && (
+              <InlineAlert severity="error" className="mt-4">
+                {previewMutation.error.message || t('ejectProfiles.preview.failed')}
+              </InlineAlert>
+            )}
+
             {/* Result */}
             {result && (
               <div className="mt-4 space-y-3">
@@ -909,6 +848,7 @@ interface DryRunDialogProps {
  */
 function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
   const { t } = useTranslation();
+  const titleId = useId();
 
   const [printerId, setPrinterId] = useState<number | null>(null);
   const [fileId, setFileId] = useState<number | null>(null);
@@ -941,6 +881,22 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
     () => activePrinters.filter((_, i) => statusQueries[i]?.data?.connected === true),
     [activePrinters, statusQueries],
   );
+
+  // Convenience: when the connectivity probes have all settled and resolve to
+  // EXACTLY one connected printer, preselect it so the operator does not have
+  // to pick from a list of one. Statuses load asynchronously, so this is seeded
+  // via an effect keyed on the resolved list rather than a lazy initial state.
+  // Gated on !statusesLoading so a transient one-of-many-loaded window never
+  // auto-selects: with zero or multiple connected printers the selection stays
+  // on the placeholder, unchanged. Only fires while no printer is chosen
+  // (printerId === null). It sets ONLY printerId — allowUnvalidated is left at
+  // its initial false (this is not the select's onChange path, so it neither
+  // ticks nor preserves the override).
+  useEffect(() => {
+    if (!statusesLoading && printerId === null && connectedPrinters.length === 1) {
+      setPrinterId(connectedPrinters[0].id);
+    }
+  }, [statusesLoading, connectedPrinters, printerId]);
 
   // Resolve the selected printer's registry geometry. The unvalidated-override
   // checkbox is offered ONLY when that model is a known registry row whose
@@ -997,20 +953,13 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
   const canDownload = fileId !== null && (downloadModel !== '' || printerId !== null) && !busy;
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={busy ? undefined : onClose}
-      role="dialog"
-      aria-modal="true"
-      aria-label={t('ejectProfiles.dryRun.title')}
-    >
-      <Card className="w-full max-w-lg max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    <Modal onClose={onClose} size="md" dismissDisabled={busy} labelledBy={titleId}>
         <CardContent className="p-0">
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
             <div className="flex items-center gap-2">
               <FlaskConical className="w-5 h-5 text-bambu-green" />
               <div>
-                <h2 className="text-lg font-semibold text-white">{t('ejectProfiles.dryRun.title')}</h2>
+                <h2 id={titleId} className="text-lg font-semibold text-white">{t('ejectProfiles.dryRun.title')}</h2>
                 <p className="text-xs text-bambu-gray">{profile.name}</p>
               </div>
             </div>
@@ -1231,8 +1180,7 @@ function DryRunDialog({ profile, onClose }: DryRunDialogProps) {
             </div>
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }
 
@@ -1274,6 +1222,7 @@ interface GeometryEditDialogProps {
  */
 function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditDialogProps) {
   const { t } = useTranslation();
+  const titleId = useId();
 
   const [values, setValues] = useState<Record<string, string>>(() => {
     const seed: Record<string, string> = {};
@@ -1323,19 +1272,13 @@ function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditD
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={saving ? undefined : onClose}
-      role="dialog"
-      aria-modal="true"
-      aria-label={t('ejectProfiles.geometryManager.editTitle', { model: geometry.model_key })}
-    >
-      <Card className="w-full max-w-xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    <>
+      <Modal onClose={onClose} size="md" dismissDisabled={saving} labelledBy={titleId}>
         <CardContent className="p-0">
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
             <div className="flex items-center gap-2">
               <Ruler className="w-5 h-5 text-bambu-green" />
-              <h2 className="text-lg font-semibold text-white">
+              <h2 id={titleId} className="text-lg font-semibold text-white">
                 {t('ejectProfiles.geometryManager.editTitle', { model: geometry.model_key })}
               </h2>
             </div>
@@ -1406,22 +1349,11 @@ function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditD
               <span className="text-sm text-white">
                 {t('ejectProfiles.geometryManager.fields.validated')}
               </span>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={validated}
+              <Toggle
+                checked={validated}
+                onChange={setValidated}
                 aria-label={t('ejectProfiles.geometryManager.fields.validated')}
-                onClick={() => setValidated((v) => !v)}
-                className={`relative w-10 h-5 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-bambu-green/50 ${
-                  validated ? 'bg-bambu-green' : 'bg-bambu-dark-tertiary'
-                }`}
-              >
-                <span
-                  className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                    validated ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-                />
-              </button>
+              />
             </div>
 
             {/* Actions */}
@@ -1445,7 +1377,7 @@ function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditD
             </div>
           </div>
         </CardContent>
-      </Card>
+      </Modal>
 
       {pendingChanges && (
         <ConfirmModal
@@ -1468,7 +1400,7 @@ function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditD
           onCancel={() => setPendingChanges(null)}
         />
       )}
-    </div>
+    </>
   );
 }
 
@@ -1559,30 +1491,30 @@ function GeometryManagerSection() {
             <table className="w-full text-sm">
               <thead className="text-bambu-gray text-left border-b border-bambu-dark-tertiary">
                 <tr>
-                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.model')}</th>
-                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.bed')}</th>
-                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.envelope')}</th>
-                  <th className="py-3 px-3 font-medium text-right">{t('ejectProfiles.geometryManager.columns.zTravel')}</th>
-                  <th className="py-3 px-3 font-medium text-right">{t('ejectProfiles.geometryManager.columns.maxPartHeight')}</th>
-                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.motion')}</th>
-                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.validated')}</th>
-                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.notes')}</th>
-                  <th className="py-3 px-3 font-medium">{t('ejectProfiles.geometryManager.columns.updated')}</th>
-                  {canEdit && <th className="py-3 px-3 font-medium text-right">{t('common.actions')}</th>}
+                  <th className="py-3 px-2 font-medium">{t('ejectProfiles.geometryManager.columns.model')}</th>
+                  <th className="py-3 px-2 font-medium">{t('ejectProfiles.geometryManager.columns.bed')}</th>
+                  <th className="py-3 px-2 font-medium">{t('ejectProfiles.geometryManager.columns.envelope')}</th>
+                  <th className="py-3 px-2 font-medium text-right">{t('ejectProfiles.geometryManager.columns.zTravel')}</th>
+                  <th className="py-3 px-2 font-medium text-right">{t('ejectProfiles.geometryManager.columns.maxPartHeight')}</th>
+                  <th className="py-3 px-2 font-medium">{t('ejectProfiles.geometryManager.columns.motion')}</th>
+                  <th className="py-3 px-2 font-medium">{t('ejectProfiles.geometryManager.columns.validated')}</th>
+                  <th className="py-3 px-2 font-medium">{t('ejectProfiles.geometryManager.columns.notes')}</th>
+                  <th className="py-3 px-2 font-medium">{t('ejectProfiles.geometryManager.columns.updated')}</th>
+                  {canEdit && <th className="py-3 px-2 font-medium text-right">{t('common.actions')}</th>}
                 </tr>
               </thead>
               <tbody>
                 {geometries.map((g) => (
                   <tr key={g.model_key} className="border-b border-bambu-dark-tertiary last:border-b-0 align-top">
-                    <td className="py-3 px-3 text-white font-medium">{g.model_key}</td>
-                    <td className="py-3 px-3 text-bambu-gray whitespace-nowrap">
+                    <td className="py-3 px-2 text-white font-medium">{g.model_key}</td>
+                    <td className="py-3 px-2 text-bambu-gray whitespace-nowrap">
                       {g.bed_x}×{g.bed_y}
                     </td>
-                    <td className="py-3 px-3 text-bambu-gray whitespace-nowrap text-xs">
+                    <td className="py-3 px-2 text-bambu-gray whitespace-nowrap text-xs">
                       <div>X [{g.env_x_min} – {g.env_x_max}]</div>
                       <div>Y [{g.env_y_min} – {g.env_y_max}]</div>
                     </td>
-                    <td className="py-3 px-3 text-bambu-gray text-right">
+                    <td className="py-3 px-2 text-bambu-gray text-right">
                       {g.z_travel_mm == null ? (
                         <span
                           className="cursor-help"
@@ -1595,8 +1527,8 @@ function GeometryManagerSection() {
                         g.z_travel_mm
                       )}
                     </td>
-                    <td className="py-3 px-3 text-bambu-gray text-right">{g.max_part_height_mm}</td>
-                    <td className="py-3 px-3">
+                    <td className="py-3 px-2 text-bambu-gray text-right">{g.max_part_height_mm}</td>
+                    <td className="py-3 px-2">
                       {g.bedslinger ? (
                         <GeometryBadge tone="violet">
                           {t('ejectProfiles.geometryManager.motion.bedslinger')}
@@ -1607,7 +1539,7 @@ function GeometryManagerSection() {
                         </GeometryBadge>
                       )}
                     </td>
-                    <td className="py-3 px-3">
+                    <td className="py-3 px-2">
                       {g.validated ? (
                         <GeometryBadge tone="green" icon={<Check className="w-3 h-3" aria-hidden="true" />}>
                           {t('ejectProfiles.geometryManager.validatedBadge')}
@@ -1618,16 +1550,16 @@ function GeometryManagerSection() {
                         </GeometryBadge>
                       )}
                     </td>
-                    <td className="py-3 px-3 text-bambu-gray">
-                      <span className="block max-w-[12rem] truncate" title={g.notes ?? ''}>
+                    <td className="py-3 px-2 text-bambu-gray">
+                      <span className="block max-w-[10rem] truncate" title={g.notes ?? ''}>
                         {g.notes || '—'}
                       </span>
                     </td>
-                    <td className="py-3 px-3 text-bambu-gray whitespace-nowrap">
+                    <td className="py-3 px-2 text-bambu-gray whitespace-nowrap">
                       {new Date(g.updated_at).toLocaleDateString()}
                     </td>
                     {canEdit && (
-                      <td className="py-3 px-3">
+                      <td className="py-3 px-2">
                         <div className="flex items-center justify-end">
                           <button
                             type="button"
@@ -1670,10 +1602,15 @@ export function EjectProfilesPage() {
   const { showToast } = useToast();
   const queryClient = useQueryClient();
 
-  const [dialogState, setDialogState] = useState<{ open: boolean; profile: EjectProfile | null }>({
-    open: false,
-    profile: null,
-  });
+  const [dialogState, setDialogState] = useState<{
+    open: boolean;
+    /** Existing row id when editing (drives update + the "updated" toast); null
+     *  for create and duplicate (both create + the "created" toast). */
+    editingId: number | null;
+    /** Form prefill: an existing profile (edit), a "(copy)" of one (duplicate),
+     *  or null for a blank create. */
+    seed: EjectProfile | null;
+  }>({ open: false, editingId: null, seed: null });
   const [pendingDelete, setPendingDelete] = useState<EjectProfile | null>(null);
   const [dryRunProfile, setDryRunProfile] = useState<EjectProfile | null>(null);
 
@@ -1691,27 +1628,46 @@ export function EjectProfilesPage() {
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['eject-profiles'] });
 
   const saveMutation = useMutation({
-    mutationFn: (data: EjectProfileCreate) => {
-      const editingId = dialogState.profile?.id;
-      return editingId != null
-        ? api.updateEjectProfile(editingId, data)
-        : api.createEjectProfile(data);
-    },
+    mutationFn: (data: EjectProfileCreate) =>
+      dialogState.editingId != null
+        ? api.updateEjectProfile(dialogState.editingId, data)
+        : api.createEjectProfile(data),
     onSuccess: () => {
-      const editing = dialogState.profile != null;
+      const editing = dialogState.editingId != null;
       showToast(editing ? t('ejectProfiles.updated') : t('ejectProfiles.created'));
       invalidate();
-      setDialogState({ open: false, profile: null });
+      setDialogState({ open: false, editingId: null, seed: null });
     },
     // No error toast: the failure detail renders inline inside the open
-    // dialog (EjectProfileDialog `error` prop).
+    // dialog (EjectProfileDialog `error` prop). A duplicate that reuses an
+    // existing name surfaces the backend's 409 message here.
   });
 
-  const openDialog = (profile: EjectProfile | null) => {
+  const openCreate = () => {
     // Clear any error left over from a previous failed attempt so the dialog
     // opens clean.
     saveMutation.reset();
-    setDialogState({ open: true, profile });
+    setDialogState({ open: true, editingId: null, seed: null });
+  };
+
+  const openEdit = (profile: EjectProfile) => {
+    saveMutation.reset();
+    setDialogState({ open: true, editingId: profile.id, seed: profile });
+  };
+
+  // Duplicate: open the create dialog prefilled from an existing profile with a
+  // "(copy)" name, so an operator starts a new profile from a hardware-validated
+  // one instead of re-entering every numeric machine field. Every prefilled
+  // value comes from the source DB row — no hardware values are hardcoded. The
+  // seed carries the source id but it is never used: editingId is null, so the
+  // save creates a brand-new row rather than overwriting the source.
+  const openDuplicate = (profile: EjectProfile) => {
+    saveMutation.reset();
+    setDialogState({
+      open: true,
+      editingId: null,
+      seed: { ...profile, name: t('ejectProfiles.copyName', { name: profile.name }) },
+    });
   };
 
   const deleteMutation = useMutation({
@@ -1740,7 +1696,7 @@ export function EjectProfilesPage() {
           <p className="text-sm text-bambu-gray mt-1 max-w-2xl">{t('ejectProfiles.description')}</p>
         </div>
         {list.length > 0 && (
-          <Button onClick={() => openDialog(null)}>
+          <Button onClick={openCreate}>
             <Plus className="w-4 h-4" />
             {t('ejectProfiles.newProfile')}
           </Button>
@@ -1769,7 +1725,7 @@ export function EjectProfilesPage() {
             <PackageOpen className="w-12 h-12 text-bambu-gray mb-4" />
             <h2 className="text-lg font-semibold text-white mb-1">{t('ejectProfiles.empty.title')}</h2>
             <p className="text-sm text-bambu-gray mb-5 max-w-md">{t('ejectProfiles.empty.body')}</p>
-            <Button onClick={() => openDialog(null)}>
+            <Button onClick={openCreate}>
               <Plus className="w-4 h-4" />
               {t('ejectProfiles.newProfile')}
             </Button>
@@ -1810,12 +1766,21 @@ export function EjectProfilesPage() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => openDialog(p)}
+                          onClick={() => openEdit(p)}
                           className="p-2 rounded text-bambu-gray hover:text-white hover:bg-bambu-dark-tertiary transition-colors focus:outline-none focus:ring-2 focus:ring-bambu-green/50"
                           aria-label={`${t('common.edit')} ${p.name}`}
                           title={t('common.edit')}
                         >
                           <Pencil className="w-4 h-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => openDuplicate(p)}
+                          className="p-2 rounded text-bambu-gray hover:text-white hover:bg-bambu-dark-tertiary transition-colors focus:outline-none focus:ring-2 focus:ring-bambu-green/50"
+                          aria-label={`${t('ejectProfiles.duplicateAction')} ${p.name}`}
+                          title={t('ejectProfiles.duplicateAction')}
+                        >
+                          <Copy className="w-4 h-4" />
                         </button>
                         <button
                           type="button"
@@ -1845,7 +1810,8 @@ export function EjectProfilesPage() {
 
       {dialogState.open && (
         <EjectProfileDialog
-          profile={dialogState.profile}
+          profile={dialogState.seed}
+          isEditing={dialogState.editingId != null}
           saving={saveMutation.isPending}
           error={
             saveMutation.error
@@ -1853,7 +1819,7 @@ export function EjectProfilesPage() {
               : null
           }
           onSave={(data) => saveMutation.mutate(data)}
-          onClose={() => setDialogState({ open: false, profile: null })}
+          onClose={() => setDialogState({ open: false, editingId: null, seed: null })}
         />
       )}
 

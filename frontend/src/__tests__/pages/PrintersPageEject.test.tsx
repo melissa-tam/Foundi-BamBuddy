@@ -117,6 +117,61 @@ describe('PrintersPage manual eject (W2) + cooldown tooltip (W3)', () => {
     expect(ejectCalls[1].allow_hot).toBe(true);
   });
 
+  it('opens the foreign-plate confirm on a foreign_plate 409 with the suggested profile preselected, then ejects with that profile', async () => {
+    const ejectCalls: Array<{ allow_hot: boolean; eject_profile_id: number | null }> = [];
+    mount(statusFinish());
+    server.use(
+      http.get('/api/v1/eject-profiles', () =>
+        HttpResponse.json([
+          { id: 7, name: 'Alpha profile' },
+          { id: 9, name: 'Beta profile' },
+        ]),
+      ),
+      http.post('/api/v1/printers/:id/eject', async ({ request }) => {
+        const body = (await request.json()) as { allow_hot: boolean; eject_profile_id: number | null };
+        ejectCalls.push(body);
+        if (body.eject_profile_id === null) {
+          return HttpResponse.json(
+            {
+              detail: {
+                code: 'foreign_plate',
+                message: 'This plate came from a manual Bambu Studio print.',
+                print_name: 'manual_widget.3mf',
+                max_z_height_mm: 24.6,
+                suggested_eject_profile_id: 9,
+              },
+            },
+            { status: 409 },
+          );
+        }
+        return HttpResponse.json({ mode: 'dispatched', queue_item_id: null });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+
+    const ejectBtn = await screen.findByRole('button', { name: /eject now/i });
+    await user.click(ejectBtn);
+
+    // Foreign-plate dialog opens with the print name + detected height.
+    expect(await screen.findByText('Eject a foreign print?')).toBeInTheDocument();
+    expect(screen.getByText('manual_widget.3mf')).toBeInTheDocument();
+    expect(screen.getByText('24.6 mm')).toBeInTheDocument();
+    await waitFor(() => expect(ejectCalls).toHaveLength(1));
+    expect(ejectCalls[0]).toEqual({ allow_hot: false, eject_profile_id: null });
+
+    // The suggested profile (id 9) is preselected in the picker.
+    const select = await screen.findByLabelText('Eject profile');
+    await waitFor(() => expect((select as HTMLSelectElement).value).toBe('9'));
+
+    // Confirm → re-call with allow_hot=false + the chosen profile id.
+    const ejectButtons = screen.getAllByRole('button', { name: /eject now/i });
+    await user.click(ejectButtons[ejectButtons.length - 1]);
+    await waitFor(() => expect(ejectCalls).toHaveLength(2));
+    expect(ejectCalls[1]).toEqual({ allow_hot: false, eject_profile_id: 9 });
+  });
+
   it('shows the cancels-eject hint on the mark-cleared button while a cooldown watch is armed', async () => {
     mount(statusFinish({ eject_watch: { threshold_c: 33 } }));
     render(<PrintersPage />);

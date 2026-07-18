@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useId } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
@@ -28,6 +28,7 @@ import { api } from '../api/client';
 import type { ProjectListItem, ProjectCreate, ProjectUpdate, ProjectImport, Permission } from '../api/client';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
+import { Modal } from '../components/ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
 import { getCurrencySymbol } from '../utils/currency';
@@ -56,6 +57,7 @@ interface ProjectModalProps {
 }
 
 export function ProjectModal({ project, onClose, onSave, isLoading, currencySymbol, t }: ProjectModalProps) {
+  const titleId = useId();
   const [name, setName] = useState(project?.name || '');
   const [description, setDescription] = useState(project?.description || '');
   const [color, setColor] = useState(project?.color || PROJECT_COLORS[0]);
@@ -133,13 +135,12 @@ export function ProjectModal({ project, onClose, onSave, isLoading, currencySymb
   };
 
   return (
-    // max-h + flex column on the card + overflow on the fields wrapper so the
-    // modal stays inside the viewport on short screens (#1642). Outer p-4 is
-    // 1rem each side, hence the 2rem subtraction below.
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg w-full max-w-md border border-bambu-dark-tertiary flex flex-col max-h-[calc(100vh-2rem)]">
+    // Flex column on the card + overflow on the fields wrapper so the modal
+    // stays inside the viewport on short screens (#1642); the Card's
+    // max-h-[90vh] provides the height cap.
+    <Modal onClose={onClose} labelledBy={titleId} size="sm" closeOnOverlay={false} className="flex flex-col">
         <div className="p-4 border-b border-bambu-dark-tertiary flex-shrink-0">
-          <h2 className="text-lg font-semibold text-white">
+          <h2 id={titleId} className="text-lg font-semibold text-white">
             {project ? t('projects.editProject') : t('projects.newProject')}
           </h2>
         </div>
@@ -398,8 +399,7 @@ export function ProjectModal({ project, onClose, onSave, isLoading, currencySymb
             </Button>
           </div>
         </form>
-      </div>
-    </div>
+    </Modal>
   );
 }
 

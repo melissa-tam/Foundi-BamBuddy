@@ -15,10 +15,11 @@
  * The plaintext token is shown EXACTLY ONCE at create time inside a copy-
  * to-clipboard modal. Listings only ever show metadata.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Copy, Plus, Trash2, AlertTriangle } from 'lucide-react';
 import { api, type LongLivedCameraToken } from '../api/client';
+import { Modal } from '../components/ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
 import { parseUTCDate } from '../utils/date';
@@ -133,46 +134,41 @@ interface ConfirmRevokeModalProps {
 
 function ConfirmRevokeModal({ token, onConfirm, onCancel }: ConfirmRevokeModalProps) {
   const { t } = useTranslation();
+  const titleId = useId();
   return (
-    <div
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
-      role="dialog"
-      aria-modal="true"
-    >
-      <div className="bg-bambu-dark-secondary rounded-lg p-6 max-w-md w-full border border-red-500/40">
-        <div className="flex items-start gap-3 mb-4">
-          <AlertTriangle className="w-6 h-6 text-red-400 flex-shrink-0 mt-0.5" />
-          <div>
-            <h2 className="text-lg font-semibold text-white">
-              {t('cameraTokens.confirmRevoke.title', 'Revoke this token?')}
-            </h2>
-            <p className="text-sm text-bambu-gray mt-1">
-              {t(
-                'cameraTokens.confirmRevoke.body',
-                'Any device using "{{name}}" will lose access immediately. This cannot be undone.',
-                { name: token.name },
-              )}
-            </p>
-          </div>
-        </div>
-        <div className="flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="px-4 py-2 bg-bambu-dark-tertiary text-white rounded-md hover:bg-bambu-dark-tertiary/80"
-          >
-            {t('cameraTokens.confirmRevoke.cancel', 'Cancel')}
-          </button>
-          <button
-            type="button"
-            onClick={onConfirm}
-            className="px-4 py-2 bg-red-500 text-white rounded-md hover:bg-red-600"
-          >
-            {t('cameraTokens.confirmRevoke.confirm', 'Revoke')}
-          </button>
+    <Modal onClose={onCancel} labelledBy={titleId} size="sm" closeOnOverlay={false} className="p-6">
+      <div className="flex items-start gap-3 mb-4">
+        <AlertTriangle className="w-6 h-6 text-red-400 flex-shrink-0 mt-0.5" />
+        <div>
+          <h2 id={titleId} className="text-lg font-semibold text-white">
+            {t('cameraTokens.confirmRevoke.title', 'Revoke this token?')}
+          </h2>
+          <p className="text-sm text-bambu-gray mt-1">
+            {t(
+              'cameraTokens.confirmRevoke.body',
+              'Any device using "{{name}}" will lose access immediately. This cannot be undone.',
+              { name: token.name },
+            )}
+          </p>
         </div>
       </div>
-    </div>
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="px-4 py-2 bg-bambu-dark-tertiary text-white rounded-md hover:bg-bambu-dark-tertiary/80"
+        >
+          {t('cameraTokens.confirmRevoke.cancel', 'Cancel')}
+        </button>
+        <button
+          type="button"
+          onClick={onConfirm}
+          className="px-4 py-2 bg-red-500 text-white rounded-md hover:bg-red-600"
+        >
+          {t('cameraTokens.confirmRevoke.confirm', 'Revoke')}
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -184,6 +180,7 @@ interface JustCreatedModalProps {
 function JustCreatedModal({ token, onClose }: JustCreatedModalProps) {
   const { t } = useTranslation();
   const { showToast } = useToast();
+  const titleId = useId();
   const plaintext = token.token ?? '';
 
   const handleCopy = async () => {
@@ -214,46 +211,50 @@ function JustCreatedModal({ token, onClose }: JustCreatedModalProps) {
   };
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg p-6 max-w-2xl w-full border border-bambu-green/40">
-        <div className="flex items-start gap-3 mb-4">
-          <AlertTriangle className="w-6 h-6 text-yellow-400 flex-shrink-0 mt-0.5" />
-          <div>
-            <h2 className="text-lg font-semibold text-white">
-              {t('cameraTokens.created.title', 'Token created — copy it now')}
-            </h2>
-            <p className="text-sm text-bambu-gray mt-1">
-              {t(
-                'cameraTokens.created.warning',
-                'This is the only time this token will be visible. After you close this dialog you can never view it again.',
-              )}
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2 mb-4">
-          <code className="flex-1 px-3 py-2 bg-bambu-dark rounded-md text-bambu-green text-xs break-all font-mono select-all">
-            {plaintext}
-          </code>
-          <button
-            type="button"
-            onClick={handleCopy}
-            className="flex items-center gap-2 px-3 py-2 bg-bambu-green text-white rounded-md hover:bg-bambu-green/90"
-          >
-            <Copy className="w-4 h-4" />
-            {t('cameraTokens.created.copy', 'Copy')}
-          </button>
-        </div>
-        <div className="flex justify-end">
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-4 py-2 bg-bambu-dark-tertiary text-white rounded-md hover:bg-bambu-dark-tertiary/80"
-          >
-            {t('cameraTokens.created.dismiss', "I've saved it")}
-          </button>
+    <Modal
+      onClose={onClose}
+      labelledBy={titleId}
+      size="lg"
+      dismissDisabled
+      className="p-6"
+    >
+      <div className="flex items-start gap-3 mb-4">
+        <AlertTriangle className="w-6 h-6 text-yellow-400 flex-shrink-0 mt-0.5" />
+        <div>
+          <h2 id={titleId} className="text-lg font-semibold text-white">
+            {t('cameraTokens.created.title', 'Token created — copy it now')}
+          </h2>
+          <p className="text-sm text-bambu-gray mt-1">
+            {t(
+              'cameraTokens.created.warning',
+              'This is the only time this token will be visible. After you close this dialog you can never view it again.',
+            )}
+          </p>
         </div>
       </div>
-    </div>
+      <div className="flex items-center gap-2 mb-4">
+        <code className="flex-1 px-3 py-2 bg-bambu-dark rounded-md text-bambu-green text-xs break-all font-mono select-all">
+          {plaintext}
+        </code>
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="flex items-center gap-2 px-3 py-2 bg-bambu-green text-white rounded-md hover:bg-bambu-green/90"
+        >
+          <Copy className="w-4 h-4" />
+          {t('cameraTokens.created.copy', 'Copy')}
+        </button>
+      </div>
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={onClose}
+          className="px-4 py-2 bg-bambu-dark-tertiary text-white rounded-md hover:bg-bambu-dark-tertiary/80"
+        >
+          {t('cameraTokens.created.dismiss', "I've saved it")}
+        </button>
+      </div>
+    </Modal>
   );
 }
 

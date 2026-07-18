@@ -1,17 +1,20 @@
 /**
  * SKU catalog page (farm production, Phase 2).
  *
- * Full CRUD over SKUs (sellable part codes) plus per-SKU file-link management
- * and a "Suggest from file" flow that pre-fills the code/part/name from a
- * library file's parsed metadata. Each row surfaces lifetime production stats
- * (units completed + success rate) fetched per-SKU.
+ * Full CRUD over SKUs (sellable part codes) plus per-SKU file-link management.
+ * In create mode, picking a file in the add-row (or arriving via the
+ * post-upload ?createFromFile deep link) auto-suggests the code/part/name from
+ * that file's parsed metadata, filling only fields the operator hasn't typed.
+ * Each row surfaces lifetime production stats (units completed + success rate)
+ * fetched per-SKU.
  *
  * Server state is TanStack Query; numeric link fields are held as strings so
  * they type cleanly and are coerced/validated once on submit. All copy is
  * i18n; inputs are label-linked (WCAG AA) and keyboard operable.
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertCircle,
@@ -19,7 +22,6 @@ import {
   Package,
   Pencil,
   Plus,
-  Sparkles,
   Trash2,
   X,
 } from 'lucide-react';
@@ -28,12 +30,10 @@ import { usePlateIndexSync } from '../hooks/usePlateIndexSync';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
+import { Modal } from '../components/ui/Modal';
+import { FormField, Input, Select, TextArea, inputClass } from '../components/ui/Field';
 import { useToast } from '../contexts/ToastContext';
 import type { Sku, SkuCreate, SkuFile, SkuFileLinkCreate } from '../types/skus';
-
-const inputClass =
-  'w-full px-3 py-2 bg-bambu-dark rounded-md text-white border border-bambu-dark-tertiary ' +
-  'focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors';
 
 /**
  * Build the POST /skus/{id}/files payload from the raw add-row inputs. Single
@@ -108,6 +108,10 @@ interface SkuLinkAddRowProps {
   setUnitsPerPlate: (v: string) => void;
   /** Clears a stale link error when the file selection changes. */
   onClearLinkError: () => void;
+  /** Fired with the newly-picked file id (or null) when the file changes. The
+   *  create dialog wires this to auto-suggest the SKU fields; edit mode leaves
+   *  it undefined so picking a link file never mutates an existing SKU. */
+  onFilePicked?: (fileId: number | null) => void;
 }
 
 /**
@@ -125,6 +129,7 @@ function SkuLinkAddRow({
   unitsPerPlate,
   setUnitsPerPlate,
   onClearLinkError,
+  onFilePicked,
 }: SkuLinkAddRowProps) {
   const { t } = useTranslation();
 
@@ -159,6 +164,7 @@ function SkuLinkAddRow({
             setFileId(next);
             setPlateIndex(1);
             onClearLinkError();
+            onFilePicked?.(next);
           }}
           className={inputClass}
         >
@@ -388,6 +394,10 @@ function SkuFileLinks({
 
 interface SkuDialogProps {
   sku: Sku | null;
+  /** Create-mode preseed: a library file id to select in the add-row on open
+   *  (from the post-upload "Create SKU from this file" deep link). When set,
+   *  the dialog auto-suggests the SKU fields from that file on mount. */
+  initialFileId?: number | null;
   saving: boolean;
   /** Backend failure detail from the last save attempt (e.g. 409 duplicate
    *  code); rendered inline so a rejected save never dead-ends silently. */
@@ -402,9 +412,10 @@ interface SkuDialogProps {
   onClose: () => void;
 }
 
-function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, onClose }: SkuDialogProps) {
+function SkuDialog({ sku, initialFileId, saving, error, linkError, onClearLinkError, onSave, onClose }: SkuDialogProps) {
   const { t } = useTranslation();
   const { showToast } = useToast();
+  const titleId = useId();
   const isEditing = sku !== null;
 
   const [code, setCode] = useState(sku?.code ?? '');
@@ -416,11 +427,15 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
   );
   const [codeError, setCodeError] = useState(false);
   const [nameError, setNameError] = useState(false);
-  const [suggestFileId, setSuggestFileId] = useState<number | null>(null);
+
+  // Tracks which fields the operator has typed into. Auto-suggest fills ONLY
+  // untouched fields so a manual edit is never clobbered; an empty or a
+  // previously auto-filled (untouched) field is (re)filled on a new pick.
+  const touchedRef = useRef({ code: false, name: false, partNumber: false });
 
   // Add-row (file/plate/units) selection lives here — above both the file
   // panel that renders the controls and the Save button that must commit them.
-  const [linkFileId, setLinkFileId] = useState<number | null>(null);
+  const [linkFileId, setLinkFileId] = useState<number | null>(initialFileId ?? null);
   const [linkPlateIndex, setLinkPlateIndex] = useState<number>(1);
   const [linkUnitsPerPlate, setLinkUnitsPerPlate] = useState<string>('1');
 
@@ -429,31 +444,61 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
     queryFn: api.getEjectProfiles,
   });
 
-  const { data: libraryFiles } = useQuery({
-    queryKey: ['library-files', 'sku'],
-    queryFn: () => api.getLibraryFiles(),
-  });
-  const threeMfFiles = useMemo(
-    () => (libraryFiles ?? []).filter((f) => f.filename.toLowerCase().endsWith('.3mf')),
-    [libraryFiles],
-  );
-
   const suggestMutation = useMutation({
     mutationFn: (fileId: number) => api.suggestSku(fileId),
-    onSuccess: (s) => {
-      if (s.code) setCode(s.code);
-      if (s.part_number) setPartNumber(s.part_number);
-      if (s.name) setName(s.name);
-      if (s.code) setCodeError(false);
-      if (s.name) setNameError(false);
+    onSuccess: ({ code: sCode, name: sName, part_number: sPart, matched_from }) => {
+      // Fill ONLY fields the operator hasn't typed (touchedRef). Empty or
+      // previously auto-filled fields are (re)filled; a manual edit is kept.
+      let filled = false;
+      if (sCode && !touchedRef.current.code) {
+        setCode(sCode);
+        setCodeError(false);
+        filled = true;
+      }
+      if (sName && !touchedRef.current.name) {
+        setName(sName);
+        setNameError(false);
+        filled = true;
+      }
+      if (sPart && !touchedRef.current.partNumber) {
+        setPartNumber(sPart);
+        filled = true;
+      }
+      if (!filled) return;
+      // Map the raw matched_from enum to plain-language copy so no internal
+      // token ("object_name"/"filename") ever reaches the operator.
       showToast(
-        s.matched_from
-          ? t('skus.suggest.applied', { source: s.matched_from })
-          : t('skus.suggest.appliedGeneric'),
+        matched_from === 'object_name'
+          ? t('skus.suggest.appliedFromObjectName')
+          : matched_from === 'filename'
+            ? t('skus.suggest.appliedFromFilename')
+            : t('skus.suggest.appliedGeneric'),
       );
     },
-    // No error toast: the failure renders inline next to the suggest control.
+    onError: () => {
+      // Auto-suggest is best-effort: a failed lookup just leaves the fields for
+      // manual entry (the old inline panel error surface is gone with the panel).
+      showToast(t('skus.suggest.failed'), 'error');
+    },
   });
+
+  // Auto-suggest is CREATE-mode only: picking (or preseeding) a file fills the
+  // untouched SKU fields. Editing an existing SKU must NOT auto-mutate its
+  // fields, so onFilePicked is never wired in edit mode and this guard holds.
+  const handleFilePicked = (fileId: number | null) => {
+    if (isEditing) return;
+    if (fileId !== null) suggestMutation.mutate(fileId);
+  };
+
+  // Preseed path: when the dialog opens via the post-upload deep link
+  // (initialFileId set, create mode), run the suggestion once on mount.
+  useEffect(() => {
+    if (!isEditing && initialFileId != null) {
+      suggestMutation.mutate(initialFileId);
+    }
+    // Mount-only: consume the preseed exactly once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -487,19 +532,12 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={saving ? undefined : onClose}
-      role="dialog"
-      aria-modal="true"
-      aria-label={isEditing ? t('skus.editTitle') : t('skus.createTitle')}
-    >
-      <Card className="w-full max-w-2xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    <Modal onClose={onClose} size="lg" dismissDisabled={saving} labelledBy={titleId}>
         <CardContent className="p-0">
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
             <div className="flex items-center gap-2">
               <Package className="w-5 h-5 text-bambu-green" />
-              <h2 className="text-lg font-semibold text-white">
+              <h2 id={titleId} className="text-lg font-semibold text-white">
                 {isEditing ? t('skus.editTitle') : t('skus.createTitle')}
               </h2>
             </div>
@@ -509,101 +547,50 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
           </div>
 
           <form onSubmit={handleSubmit} className="p-4 space-y-4">
-            {/* Suggest from file */}
-            <div className="p-3 bg-bambu-dark rounded-lg">
-              <div className="flex items-center gap-2 mb-2">
-                <Sparkles className="w-4 h-4 text-bambu-green" />
-                <span className="text-sm font-medium text-white">{t('skus.suggest.title')}</span>
-              </div>
-              <p className="text-xs text-bambu-gray mb-2">{t('skus.suggest.description')}</p>
-              <div className="flex gap-2">
-                <label htmlFor="sku-suggest-file" className="sr-only">
-                  {t('skus.suggest.file')}
-                </label>
-                <select
-                  id="sku-suggest-file"
-                  value={suggestFileId ?? ''}
-                  onChange={(e) => setSuggestFileId(e.target.value ? Number(e.target.value) : null)}
-                  className={inputClass}
-                >
-                  <option value="">{t('skus.suggest.filePlaceholder')}</option>
-                  {threeMfFiles.map((f) => (
-                    <option key={f.id} value={f.id}>
-                      {f.filename}
-                    </option>
-                  ))}
-                </select>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  onClick={() => suggestFileId !== null && suggestMutation.mutate(suggestFileId)}
-                  disabled={suggestFileId === null || suggestMutation.isPending}
-                >
-                  {suggestMutation.isPending ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Sparkles className="w-4 h-4" />
-                  )}
-                  {t('skus.suggest.action')}
-                </Button>
-              </div>
-              {suggestMutation.error && (
-                <p role="alert" className="text-red-400 text-xs mt-2">
-                  {suggestMutation.error.message || t('skus.suggest.failed')}
-                </p>
-              )}
-            </div>
-
             {/* Code */}
-            <div>
-              <label htmlFor="sku-code" className="block text-sm font-medium text-white mb-1">
-                {t('skus.fields.code')}
-              </label>
-              <input
-                id="sku-code"
-                type="text"
-                maxLength={64}
-                value={code}
-                onChange={(e) => {
-                  setCode(e.target.value);
-                  if (codeError) setCodeError(false);
-                }}
-                className={`${inputClass} ${codeError ? 'border-red-500' : ''}`}
-                aria-invalid={codeError}
-                aria-describedby={codeError ? 'sku-code-error' : undefined}
-                autoFocus
-              />
-              {codeError && (
-                <p id="sku-code-error" className="text-red-400 text-xs mt-1">
-                  {t('skus.codeRequired')}
-                </p>
+            <FormField
+              id="sku-code"
+              label={t('skus.fields.code')}
+              error={codeError ? t('skus.codeRequired') : undefined}
+            >
+              {(field) => (
+                <Input
+                  {...field}
+                  type="text"
+                  maxLength={64}
+                  value={code}
+                  onChange={(e) => {
+                    touchedRef.current.code = true;
+                    setCode(e.target.value);
+                    if (codeError) setCodeError(false);
+                  }}
+                  className={codeError ? 'border-red-500' : ''}
+                  autoFocus
+                />
               )}
-            </div>
+            </FormField>
 
             {/* Name */}
-            <div>
-              <label htmlFor="sku-name" className="block text-sm font-medium text-white mb-1">
-                {t('skus.fields.name')}
-              </label>
-              <input
-                id="sku-name"
-                type="text"
-                maxLength={200}
-                value={name}
-                onChange={(e) => {
-                  setName(e.target.value);
-                  if (nameError) setNameError(false);
-                }}
-                className={`${inputClass} ${nameError ? 'border-red-500' : ''}`}
-                aria-invalid={nameError}
-                aria-describedby={nameError ? 'sku-name-error' : undefined}
-              />
-              {nameError && (
-                <p id="sku-name-error" className="text-red-400 text-xs mt-1">
-                  {t('skus.nameRequired')}
-                </p>
+            <FormField
+              id="sku-name"
+              label={t('skus.fields.name')}
+              error={nameError ? t('skus.nameRequired') : undefined}
+            >
+              {(field) => (
+                <Input
+                  {...field}
+                  type="text"
+                  maxLength={200}
+                  value={name}
+                  onChange={(e) => {
+                    touchedRef.current.name = true;
+                    setName(e.target.value);
+                    if (nameError) setNameError(false);
+                  }}
+                  className={nameError ? 'border-red-500' : ''}
+                />
               )}
-            </div>
+            </FormField>
 
             {/* Part number + eject profile */}
             <div className="grid gap-3 sm:grid-cols-2">
@@ -611,24 +598,25 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
                 <label htmlFor="sku-part" className="block text-sm text-bambu-gray mb-1">
                   {t('skus.fields.partNumber')}
                 </label>
-                <input
+                <Input
                   id="sku-part"
                   type="text"
                   maxLength={64}
                   value={partNumber}
-                  onChange={(e) => setPartNumber(e.target.value)}
-                  className={inputClass}
+                  onChange={(e) => {
+                    touchedRef.current.partNumber = true;
+                    setPartNumber(e.target.value);
+                  }}
                 />
               </div>
               <div>
                 <label htmlFor="sku-eject" className="block text-sm text-bambu-gray mb-1">
                   {t('skus.fields.defaultEjectProfile')}
                 </label>
-                <select
+                <Select
                   id="sku-eject"
                   value={ejectProfileId ?? ''}
                   onChange={(e) => setEjectProfileId(e.target.value ? Number(e.target.value) : null)}
-                  className={inputClass}
                 >
                   <option value="">{t('skus.fields.noEjectProfile')}</option>
                   {(ejectProfiles ?? []).map((p) => (
@@ -636,24 +624,26 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
                       {p.name}
                     </option>
                   ))}
-                </select>
+                </Select>
               </div>
             </div>
 
             {/* Notes */}
-            <div>
-              <label htmlFor="sku-notes" className="block text-sm text-bambu-gray mb-1">
-                {t('skus.fields.notes')}
-              </label>
-              <textarea
-                id="sku-notes"
-                rows={2}
-                maxLength={1000}
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                className={inputClass}
-              />
-            </div>
+            <FormField
+              id="sku-notes"
+              label={t('skus.fields.notes')}
+              labelClassName="block text-sm text-bambu-gray mb-1"
+            >
+              {(field) => (
+                <TextArea
+                  {...field}
+                  rows={2}
+                  maxLength={1000}
+                  value={notes}
+                  onChange={(e) => setNotes(e.target.value)}
+                />
+              )}
+            </FormField>
 
             {/* File links: edit mode shows the persisted links plus the add
                 row; create mode shows the add row alone so a file can be linked
@@ -682,6 +672,7 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
                   unitsPerPlate={linkUnitsPerPlate}
                   setUnitsPerPlate={setLinkUnitsPerPlate}
                   onClearLinkError={onClearLinkError}
+                  onFilePicked={handleFilePicked}
                 />
                 <p className="text-xs text-bambu-gray mt-2">{t('skus.files.willLinkOnSave')}</p>
               </div>
@@ -720,8 +711,7 @@ function SkuDialog({ sku, saving, error, linkError, onClearLinkError, onSave, on
             </div>
           </form>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }
 
@@ -733,6 +723,7 @@ export function SkusPage() {
   const { t } = useTranslation();
   const { showToast } = useToast();
   const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const [dialogState, setDialogState] = useState<{ open: boolean; sku: Sku | null }>({
     open: false,
@@ -742,6 +733,10 @@ export function SkusPage() {
   // Set only when a save PERSISTED the SKU but its chained file link failed;
   // rendered inline in the file panel while the dialog stays open in edit mode.
   const [linkError, setLinkError] = useState<string | null>(null);
+  // Create-mode preseed file id, set from the ?createFromFile deep link so the
+  // dialog opens with that file in the add-row + auto-suggest fired. Cleared
+  // whenever a dialog is opened another way, so it never leaks into a fresh one.
+  const [createFromFileId, setCreateFromFileId] = useState<number | null>(null);
 
   const { data: skus, isLoading, isError, refetch, isFetching } = useQuery({
     queryKey: ['skus'],
@@ -802,8 +797,35 @@ export function SkusPage() {
     // opens clean.
     saveMutation.reset();
     setLinkError(null);
+    // A dialog opened via the toolbar/edit buttons has no preseed file.
+    setCreateFromFileId(null);
     setDialogState({ open: true, sku });
   };
+
+  // Deep-link entry: the post-upload "Create SKU from this file" toast navigates
+  // here with ?createFromFile=<id>. Open the create dialog with that file
+  // preseeded (the dialog auto-suggests from it on mount), then strip the param
+  // via replace so a refresh or Back doesn't reopen the dialog.
+  useEffect(() => {
+    const raw = searchParams.get('createFromFile');
+    if (!raw) return;
+    const fileId = Number(raw);
+    if (!Number.isInteger(fileId) || fileId <= 0) return;
+    saveMutation.reset();
+    setLinkError(null);
+    setCreateFromFileId(fileId);
+    setDialogState({ open: true, sku: null });
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete('createFromFile');
+        return next;
+      },
+      { replace: true },
+    );
+    // Mount-only: consume the deep-link param exactly once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const deleteMutation = useMutation({
     mutationFn: (id: number) => api.deleteSku(id),
@@ -922,6 +944,7 @@ export function SkusPage() {
       {dialogState.open && (
         <SkuDialog
           sku={dialogState.sku}
+          initialFileId={createFromFileId}
           saving={saveMutation.isPending}
           error={
             saveMutation.error ? saveMutation.error.message || t('skus.saveFailed') : null
@@ -934,6 +957,7 @@ export function SkusPage() {
           }}
           onClose={() => {
             setLinkError(null);
+            setCreateFromFileId(null);
             setDialogState({ open: false, sku: null });
           }}
         />

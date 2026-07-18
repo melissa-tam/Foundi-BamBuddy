@@ -1194,6 +1194,13 @@ export interface AppSettings {
   spool_selection_policy: 'slot_order' | 'lowest_remaining' | 'first_loaded';
   // Minimum remaining grams for a spool to START a print (0 disables the floor).
   min_start_spool_g: number;
+  // Automatic mid-print spool-jam recovery: when an AMS feed fault (tangle)
+  // pauses a farm print, the server auto-swaps to the next eligible spool and
+  // resumes; the jammed spool is flagged out-of-rotation until re-inserted.
+  spool_recovery_enabled: boolean;            // Master toggle (default true)
+  spool_recovery_max_attempts: number;        // Auto-swap attempts before escalating (1-5, default 2)
+  spool_recovery_step_timeout_s: number;      // Per-step timeout while recovering (15-600s, default 90)
+  spool_recovery_protect_layers: number;      // Skip auto-recovery within the first N layers (0-1000, default 7)
   // Silently auto-create spool records for AMS trays that have no RFID tag.
   auto_add_untagged: boolean;
   // JSON string default filament pushed to BARE tagless trays (mirrors
@@ -1284,6 +1291,10 @@ export interface AppSettings {
   // printer has been offline at least this many minutes (never terminates it —
   // the reconcile resolves the true outcome on reconnect).
   farm_offline_stall_minutes: number;
+  // Pause-stall watch (extrusion-overload fix): flag a farm unit still 'printing'
+  // whose printer has been PAUSED at least this many minutes with no auto-recovery
+  // active (never cancels — just surfaces the stall so an operator checks it).
+  farm_pause_stall_minutes: number;
   // Eject-cooldown stall detection (server-dispatched eject): during the
   // post-print cooldown the bed must keep cooling. Over each stall window
   // (minutes) it must drop at least the epsilon (°C); two consecutive windows
@@ -2864,6 +2875,13 @@ export interface InventorySpool {
   k_profiles?: SpoolKProfile[];
   storage_location?: string | null;
   location_id?: number | null;
+  // Spool-jam recovery (#feed-fault): set when an AMS feed fault took this
+  // spool out of rotation mid-print. Non-null feed_fault_at = flagged until the
+  // spool is physically re-inserted or the flag is manually cleared;
+  // feed_fault_code carries the HMS / fault code that tripped it. Optional for
+  // back-compat with pre-migration snapshots and object-literal test fixtures.
+  feed_fault_at?: string | null;
+  feed_fault_code?: string | null;
 }
 
 export interface SpoolmanBulkCreateResult {
@@ -2905,6 +2923,18 @@ export interface RespoolPromptMessage {
   label_weight_prefill: number | null;
 }
 
+/** WS `spool_auto_assigned` payload — a spool was auto-bound to an AMS slot.
+ *  The optional ``origin`` distinguishes the tagless silent-mint path
+ *  (``"tagless"`` — a genuinely NEW untagged roll) from RFID auto-assign (field
+ *  absent), so the UI toasts only for the tagless case. */
+export interface SpoolAutoAssignedMessage {
+  printer_id: number;
+  ams_id: number;
+  tray_id: number;
+  spool_id: number;
+  origin?: string;
+}
+
 /** WS `spool_respooled` payload — the hardware-certain automatic re-spool that
  *  ran without an operator; drives the observability toast + cache refresh. */
 export interface SpoolRespooledMessage {
@@ -2922,6 +2952,9 @@ export interface SpoolRespooledMessage {
  *  a fresh part-present eject job was dispatched onto the printer. */
 export interface EjectNowResponse {
   mode: 'released_watch' | 'dispatched';
+  /** Farm queue unit the eject was attributed to, or null for a foreign/
+   *  unattributed plate cleared via the confirm dialog. */
+  queue_item_id?: number | null;
 }
 
 // ── CSV import/export (#1576) ──────────────────────────────────────────────
@@ -3826,11 +3859,18 @@ export const api = {
   // farm-known completed unit. Call with allowHot=false first; the backend 409s
   // with `{code:'bed_hot', bed_c, threshold_c}` when the bed is above the
   // release threshold, and the caller re-invokes with allowHot=true after an
-  // explicit operator confirm. 200 → `{mode}` ('released_watch' | 'dispatched').
-  ejectNow: (printerId: number, allowHot: boolean = false) =>
+  // explicit operator confirm. A `{code:'foreign_plate', ...}` 409 means the
+  // plate gate was raised by a print the farm did not dispatch (sent manually
+  // from Bambu Studio); the caller confirms an eject profile and re-invokes
+  // with `ejectProfileId` set. 200 → `{mode}` ('released_watch' | 'dispatched').
+  ejectNow: (
+    printerId: number,
+    allowHot: boolean = false,
+    ejectProfileId?: number | null,
+  ) =>
     request<EjectNowResponse>(`/printers/${printerId}/eject`, {
       method: 'POST',
-      body: JSON.stringify({ allow_hot: allowHot }),
+      body: JSON.stringify({ allow_hot: allowHot, eject_profile_id: ejectProfileId ?? null }),
     }),
   // Farm one-click recovery: lift the plate-clear hold, clear quarantine, and
   // resume any paused production run on this printer in a single operator action
@@ -3939,6 +3979,10 @@ export const api = {
     request<{
       inventory_remain_g: Record<string, number>;
       first_loaded: Record<string, string | null>;
+      // Additive spool-jam map (#feed-fault): stringified global tray id ->
+      // true for slots whose spool is out of rotation. Only flagged trays
+      // appear. Optional — older servers omit it, so consume defensively.
+      out_of_rotation?: Record<string, boolean>;
     }>(`/printers/${printerId}/inventory-remain`),
 
   // Skip Objects
@@ -5479,6 +5523,19 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  // Operator answered "Same spool" to the uncertain-tier re-spool prompt:
+  // persist the dismissal (stamps `respool_dismissed_at` so the prompt stops
+  // firing for this spool across reseats / restarts) and echo the AMS slot
+  // triple so the WS `respool_prompt_dismissed` broadcast can clear the matching
+  // in-flight prompt on every open client.
+  dismissRespoolPrompt: (
+    spoolId: number,
+    slot?: { printer_id: number; ams_id: number; tray_id: number },
+  ) =>
+    request<InventorySpool>(`/inventory/spools/${spoolId}/respool-dismiss`, {
+      method: 'POST',
+      body: JSON.stringify(slot ?? {}),
+    }),
   getSpoolmanSettings: () =>
     request<{ spoolman_enabled: string; spoolman_url: string; spoolman_sync_mode: string; spoolman_disable_weight_sync: string; spoolman_report_partial_usage: string; auto_add_unknown_rfid: string; }>('/settings/spoolman'),
   updateSpoolmanSettings: (data: { spoolman_enabled?: string; spoolman_url?: string; spoolman_sync_mode?: string; spoolman_disable_weight_sync?: string; spoolman_report_partial_usage?: string; auto_add_unknown_rfid?: string; }) =>
@@ -6311,30 +6368,53 @@ export const api = {
       body: JSON.stringify({ file_ids: fileIds, tag_ids: tagIds, action }),
     }),
   getLibraryFile: (id: number) => request<LibraryFile>(`/library/files/${id}`),
-  uploadLibraryFile: async (
+  uploadLibraryFile: (
     file: File,
     folderId?: number | null,
-    generateStlThumbnails: boolean = true
+    generateStlThumbnails: boolean = true,
+    opts?: { onProgress?: (pct: number) => void }
   ): Promise<LibraryFileUploadResponse> => {
     const formData = new FormData();
     formData.append('file', file);
     const params = new URLSearchParams();
     if (folderId) params.set('folder_id', String(folderId));
     params.set('generate_stl_thumbnails', String(generateStlThumbnails));
-    const headers: Record<string, string> = {};
-    if (authToken) {
-      headers['Authorization'] = `Bearer ${authToken}`;
-    }
-    const response = await fetch(`${API_BASE}/library/files?${params}`, {
-      method: 'POST',
-      headers,
-      body: formData,
+    // Uses XMLHttpRequest (not fetch) so the browser exposes real upload
+    // progress via `upload.onprogress`. Auth header and success/error shapes
+    // are preserved EXACTLY from the prior fetch path: resolve with the parsed
+    // JSON body on a 2xx, otherwise reject with a plain `Error` whose message
+    // is the backend `detail` string (or `HTTP <status>` when the body is not
+    // JSON / has no detail) — mirroring `response.json().catch(() => ({}))`.
+    return new Promise<LibraryFileUploadResponse>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${API_BASE}/library/files?${params}`);
+      if (authToken) {
+        xhr.setRequestHeader('Authorization', `Bearer ${authToken}`);
+      }
+      const onProgress = opts?.onProgress;
+      if (onProgress) {
+        xhr.upload.onprogress = (event: ProgressEvent) => {
+          if (event.lengthComputable) {
+            onProgress(Math.round((event.loaded / event.total) * 100));
+          }
+        };
+      }
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(JSON.parse(xhr.responseText) as LibraryFileUploadResponse);
+          return;
+        }
+        let detail: string | undefined;
+        try {
+          detail = (JSON.parse(xhr.responseText) as { detail?: string }).detail;
+        } catch {
+          // Non-JSON error body — mirror fetch's `.json().catch(() => ({}))`.
+        }
+        reject(new Error(detail || `HTTP ${xhr.status}`));
+      };
+      xhr.onerror = () => reject(new Error(`HTTP ${xhr.status}`));
+      xhr.send(formData);
     });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.detail || `HTTP ${response.status}`);
-    }
-    return response.json();
   },
   extractZipFile: async (
     file: File,

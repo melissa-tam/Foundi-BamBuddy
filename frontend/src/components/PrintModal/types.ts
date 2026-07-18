@@ -25,6 +25,11 @@ export interface PrintModalProps {
   archiveName: string;
   /** Existing queue item (only for edit-queue-item mode) */
   queueItem?: PrintQueueItem;
+  /** Seed a fresh create from a prior queue item (History-tab Requeue, plan 2a).
+   *  Carries printers/model/plate, print options, eject profile, AMS mappings,
+   *  filament overrides and schedule flags forward — everything except the stale
+   *  scheduled_time. Ignored in edit-queue-item mode (queueItem is the seed). */
+  prefillFrom?: PrintQueueItem;
   /** Pre-select specific printers when opening the modal */
   initialSelectedPrinterIds?: number[];
   /** Handler for closing the modal */

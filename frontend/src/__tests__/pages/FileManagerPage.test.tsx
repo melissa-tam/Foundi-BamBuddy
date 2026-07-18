@@ -10,6 +10,15 @@ import { FileManagerPage } from '../../pages/FileManagerPage';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
 
+// Mock react-router's navigate so the post-upload "Create SKU from this file"
+// toast action can be asserted as an in-app navigation. Everything else
+// (BrowserRouter, useSearchParams, Link) stays real via importActual.
+const { navigateMock } = vi.hoisted(() => ({ navigateMock: vi.fn() }));
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom');
+  return { ...actual, useNavigate: () => navigateMock };
+});
+
 // Mock data
 const mockFolders = [
   {
@@ -752,6 +761,49 @@ describe('FileManagerPage', () => {
       await waitFor(() => {
         expect(screen.queryByText('Upload Files')).not.toBeInTheDocument();
       });
+    });
+
+    it('offers a Create-SKU toast with a working action after a 3MF upload', async () => {
+      navigateMock.mockClear();
+      server.use(
+        http.post('/api/v1/library/files', () =>
+          HttpResponse.json({
+            id: 10,
+            filename: 'widget.gcode.3mf',
+            file_type: '3mf',
+            file_size: 1024,
+            thumbnail_path: null,
+            duplicate_of: null,
+            metadata: null,
+          }),
+        ),
+      );
+
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Upload'));
+      await waitFor(() => {
+        expect(screen.getByText('Upload Files')).toBeInTheDocument();
+      });
+
+      const file = new File(['content'], 'widget.gcode.3mf', { type: 'application/octet-stream' });
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      await user.upload(fileInput, file);
+
+      await user.click(screen.getByRole('button', { name: /Upload \(1\)/i }));
+
+      // The persistent Create-SKU toast surfaces with its action, linking to the
+      // SKU catalog deep link for this file.
+      const action = await screen.findByRole('link', { name: /create sku from this file/i });
+      expect(action).toHaveAttribute('href', '/skus?createFromFile=10');
+
+      // Clicking it drives an in-app SPA navigation (mocked) — not a new tab.
+      await user.click(action);
+      expect(navigateMock).toHaveBeenCalledWith('/skus?createFromFile=10');
     });
   });
 

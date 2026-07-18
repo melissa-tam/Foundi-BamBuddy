@@ -46,6 +46,7 @@ import { api } from '../api/client';
 import { formatRelativeTime } from '../utils/date';
 import type { SlicerSetting, SlicerSettingsResponse, SlicerSettingDetail, SlicerSettingCreate, Printer, FieldDefinition, Permission } from '../api/client';
 import { Card, CardContent } from '../components/Card';
+import { Modal } from '../components/ui/Modal';
 import { Button } from '../components/Button';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -558,14 +559,19 @@ function PresetDetailModal({
   const metadata = extractMetadata(setting.name, detail?.setting?.inherits as string);
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <Card className="w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden">
-        <CardContent className="p-0 flex flex-col min-h-0 flex-1">
-          {/* Header */}
-          <div className="flex-shrink-0 flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
+    <Modal
+      onClose={onClose}
+      labelledBy="preset-detail-modal-title"
+      widthClass="max-w-3xl"
+      closeOnOverlay={false}
+      className="flex flex-col overflow-hidden"
+    >
+      <CardContent className="p-0 flex flex-col min-h-0 flex-1">
+        {/* Header */}
+        <div className="flex-shrink-0 flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2">
-                <h2 className="text-xl font-semibold text-white truncate">{setting.name}</h2>
+                <h2 id="preset-detail-modal-title" className="text-xl font-semibold text-white truncate">{setting.name}</h2>
                 {isEditable && (
                   <span className="px-2 py-0.5 text-xs font-medium bg-bambu-green/20 text-bambu-green rounded-full">
                     {t('profiles.presets.editable')}
@@ -654,9 +660,8 @@ function PresetDetailModal({
               </div>
             </div>
           )}
-        </CardContent>
-      </Card>
-    </div>
+      </CardContent>
+    </Modal>
   );
 }
 
@@ -777,61 +782,20 @@ function TemplatesModal({
 
   const templateToDelete = deleteConfirmId ? templates.find(tpl => tpl.id === deleteConfirmId) : null;
 
-  // Handle Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (deleteConfirmId) {
-          setDeleteConfirmId(null);
-        } else if (editingId) {
-          handleCancelEdit();
-        } else {
-          onClose();
-        }
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [deleteConfirmId, editingId, onClose]);
-
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      {/* Delete confirmation modal */}
-      {templateToDelete && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-60">
-          <Card className="w-full max-w-md">
-            <CardContent className="p-6">
-              <div className="flex items-center gap-3 mb-4">
-                <div className="p-2 bg-red-500/20 rounded-lg">
-                  <AlertTriangle className="w-6 h-6 text-red-400" />
-                </div>
-                <div>
-                  <h3 className="text-lg font-semibold text-white">{t('profiles.templates.deleteTitle')}</h3>
-                  <p className="text-sm text-bambu-gray">{t('profiles.templates.deleteWarning')}</p>
-                </div>
-              </div>
-              <p className="text-white mb-6">
-                {t('profiles.templates.deleteConfirm', { name: templateToDelete.name })}
-              </p>
-              <div className="flex gap-2">
-                <Button variant="secondary" onClick={() => setDeleteConfirmId(null)} className="flex-1">
-                  {t('common.cancel')}
-                </Button>
-                <Button onClick={() => handleDelete(deleteConfirmId!)} className="flex-1 bg-red-500 hover:bg-red-600">
-                  <Trash2 className="w-4 h-4" />
-                  {t('common.delete')}
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
-
-      <Card className="w-full max-w-2xl max-h-[80vh] flex flex-col">
+    <>
+      <Modal
+        onClose={onClose}
+        labelledBy="templates-modal-title"
+        size="lg"
+        closeOnOverlay={false}
+        dismissDisabled={!!templateToDelete || editingId !== null}
+        className="max-h-[80vh] flex flex-col"
+      >
         <CardContent className="p-0 flex flex-col h-full">
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
-            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+            <h2 id="templates-modal-title" className="text-lg font-semibold text-white flex items-center gap-2">
               <Sparkles className="w-5 h-5 text-amber-400" />
               {t('profiles.templates.title')}
             </h2>
@@ -976,8 +940,42 @@ function TemplatesModal({
             )}
           </div>
         </CardContent>
-      </Card>
-    </div>
+      </Modal>
+      {/* Delete confirmation modal */}
+      {templateToDelete && (
+        <Modal
+          onClose={() => setDeleteConfirmId(null)}
+          labelledBy="template-delete-confirm-title"
+          size="sm"
+          closeOnOverlay={false}
+          overlayZIndex="z-[60]"
+        >
+          <CardContent className="p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="p-2 bg-red-500/20 rounded-lg">
+                <AlertTriangle className="w-6 h-6 text-red-400" />
+              </div>
+              <div>
+                <h3 id="template-delete-confirm-title" className="text-lg font-semibold text-white">{t('profiles.templates.deleteTitle')}</h3>
+                <p className="text-sm text-bambu-gray">{t('profiles.templates.deleteWarning')}</p>
+              </div>
+            </div>
+            <p className="text-white mb-6">
+              {t('profiles.templates.deleteConfirm', { name: templateToDelete.name })}
+            </p>
+            <div className="flex gap-2">
+              <Button variant="secondary" onClick={() => setDeleteConfirmId(null)} className="flex-1">
+                {t('common.cancel')}
+              </Button>
+              <Button onClick={() => handleDelete(deleteConfirmId!)} className="flex-1 bg-red-500 hover:bg-red-600">
+                <Trash2 className="w-4 h-4" />
+                {t('common.delete')}
+              </Button>
+            </div>
+          </CardContent>
+        </Modal>
+      )}
+    </>
   );
 }
 
@@ -1101,25 +1099,21 @@ function DiffModal({
     return str;
   };
 
-  // Handle Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <Card className="w-full max-w-4xl max-h-[85vh] flex flex-col overflow-hidden">
-        <CardContent className="p-0 flex flex-col min-h-0 flex-1">
-          {/* Header */}
-          <div className="flex-shrink-0 flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
-            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-              <GitCompare className="w-5 h-5 text-blue-400" />
-              {t('profiles.diff.title')}
-            </h2>
+    <Modal
+      onClose={onClose}
+      labelledBy="diff-modal-title"
+      size="xl"
+      closeOnOverlay={false}
+      className="max-h-[85vh] flex flex-col overflow-hidden"
+    >
+      <CardContent className="p-0 flex flex-col min-h-0 flex-1">
+        {/* Header */}
+        <div className="flex-shrink-0 flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
+          <h2 id="diff-modal-title" className="text-lg font-semibold text-white flex items-center gap-2">
+            <GitCompare className="w-5 h-5 text-blue-400" />
+            {t('profiles.diff.title')}
+          </h2>
             <button onClick={onClose} className="text-bambu-gray hover:text-white">
               <X className="w-5 h-5" />
             </button>
@@ -1259,8 +1253,7 @@ function DiffModal({
             )}
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }
 

@@ -5,9 +5,12 @@
  * - List renders SKU rows (code, name, part number, file count, stats).
  * - Empty state shows the "no SKUs yet" copy + create CTA.
  * - Error state shows the load-error message + retry button.
- * - Create dialog blocks submission when code/name are blank, and the
- *   "Suggest from file" flow prefills code/part/name from GET /skus/suggest
- *   before a valid submit POSTs and refreshes the list.
+ * - Create dialog blocks submission when code/name are blank, and picking a
+ *   file in the add-row auto-suggests code/part/name from GET /skus/suggest —
+ *   filling only fields the operator hasn't typed, with a plain-language toast
+ *   mapped from matched_from (never the raw enum token).
+ * - A ?createFromFile=<id> deep link opens the create dialog with that file
+ *   preseeded and auto-suggest fired, then strips the param from the URL.
  * - Save commits a pending add-row file selection (links via POST
  *   /skus/{id}/files without a separate "Add file" click), and when that link
  *   fails after the SKU persisted the dialog stays open with the reason inline.
@@ -96,9 +99,19 @@ const platesResponse = {
   is_multi_plate: false,
 };
 
+// A no-op suggest response: create-mode file picks auto-fire GET /skus/suggest,
+// so tests that select a file (but aren't asserting the suggestion) stub it to
+// return nothing rather than let the request fall through to the network.
+const emptySuggest = http.get('*/api/v1/skus/suggest', () =>
+  HttpResponse.json({ code: null, part_number: null, name: null, matched_from: null }),
+);
+
 afterEach(() => {
   server.resetHandlers();
   vi.restoreAllMocks();
+  // The ?createFromFile deep-link test mutates the URL; reset it so a later
+  // test never inherits a stale query string.
+  window.history.pushState({}, '', '/');
 });
 
 describe('SkusPage', () => {
@@ -165,6 +178,28 @@ describe('SkusPage', () => {
     expect(postCalled).toBe(false);
   });
 
+  it('moves focus into the create dialog on open and closes it on Escape (shared Modal)', async () => {
+    server.use(
+      http.get('*/api/v1/skus', () => HttpResponse.json([])),
+      emptyEjectProfiles,
+      emptyLibraryFiles,
+    );
+
+    const user = userEvent.setup();
+    render(<SkusPage />);
+
+    await screen.findByText('No SKUs yet');
+    await user.click(screen.getByRole('button', { name: /new sku/i }));
+
+    // Modal moves focus into the panel on open (WCAG dialog focus management).
+    const dialog = await screen.findByRole('dialog');
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+
+    // Escape dismisses the dialog (not blocked because no save is in flight).
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
   it('surfaces a backend 409 duplicate-code rejection inline in the still-open dialog', async () => {
     server.use(
       http.get('*/api/v1/skus', () => HttpResponse.json([])),
@@ -195,52 +230,22 @@ describe('SkusPage', () => {
     expect(screen.getByRole('button', { name: /^save$/i })).toBeEnabled();
   });
 
-  it('creates a SKU via the suggest-from-file flow and refreshes the list', async () => {
-    let created = false;
+  it('auto-suggests from the picked file, filling untouched fields but never clobbering typed input', async () => {
     server.use(
+      http.get('*/api/v1/skus', () => HttpResponse.json([])),
+      emptyEjectProfiles,
+      http.get('*/api/v1/library/files', () => HttpResponse.json([libraryFile])),
+      http.get('*/api/v1/library/files/:id/plates', () => HttpResponse.json(platesResponse)),
       http.get('*/api/v1/skus/suggest', ({ request }) => {
         const url = new URL(request.url);
+        // The picked file id drives the suggestion (single picker, no separate
+        // "Suggest" button).
         expect(url.searchParams.get('library_file_id')).toBe('5');
         return HttpResponse.json({
           code: 'GEAR-9',
           part_number: 'PN-9',
-          name: 'Gear Nine',
-          matched_from: 'gear9.gcode.3mf',
-        });
-      }),
-      http.get('*/api/v1/skus', () =>
-        HttpResponse.json(created ? [sku({ id: 9, code: 'GEAR-9', name: 'Gear Nine', part_number: 'PN-9' })] : []),
-      ),
-      emptyStats,
-      emptyEjectProfiles,
-      http.get('*/api/v1/library/files', () =>
-        HttpResponse.json([
-          {
-            id: 5,
-            folder_id: null,
-            is_external: false,
-            filename: 'gear9.gcode.3mf',
-            file_type: '3mf',
-            file_size: 1024,
-            thumbnail_path: null,
-            print_count: 0,
-            duplicate_count: 0,
-            created_by_id: null,
-            created_by_username: null,
-            created_at: '2026-07-01T10:00:00Z',
-            print_name: null,
-            print_time_seconds: null,
-            filament_used_grams: null,
-            sliced_for_model: null,
-          },
-        ]),
-      ),
-      http.post('*/api/v1/skus', async ({ request }) => {
-        const body = (await request.json()) as Record<string, unknown>;
-        expect(body).toMatchObject({ code: 'GEAR-9', name: 'Gear Nine', part_number: 'PN-9' });
-        created = true;
-        return HttpResponse.json(sku({ id: 9, code: 'GEAR-9', name: 'Gear Nine', part_number: 'PN-9' }), {
-          status: 201,
+          name: 'Suggested Name',
+          matched_from: 'object_name',
         });
       }),
     );
@@ -250,23 +255,80 @@ describe('SkusPage', () => {
 
     await screen.findByText('No SKUs yet');
     await user.click(screen.getByRole('button', { name: /new sku/i }));
-    await screen.findByRole('dialog');
+    const dialog = await screen.findByRole('dialog');
 
-    // Pick the library file and run the suggestion.
-    await user.selectOptions(await screen.findByLabelText(/library file/i), '5');
-    await user.click(screen.getByRole('button', { name: /suggest/i }));
+    // The operator types their OWN name first — a manual edit must survive the
+    // auto-suggestion that follows.
+    await user.type(within(dialog).getByLabelText(/^name$/i), 'My Custom Name');
 
-    // Suggestion prefilled the code/name fields.
-    await waitFor(() => expect(screen.getByLabelText(/^code$/i)).toHaveValue('GEAR-9'));
-    expect(screen.getByLabelText(/^name$/i)).toHaveValue('Gear Nine');
-    expect(screen.getByLabelText(/part number/i)).toHaveValue('PN-9');
+    // Pick the file in the add-row → auto-suggest fires for that file.
+    await user.selectOptions(await within(dialog).findByLabelText('File'), '5');
 
-    await user.click(screen.getByRole('button', { name: /^save$/i }));
+    // Empty (untouched) fields fill from the suggestion...
+    await waitFor(() => expect(within(dialog).getByLabelText(/^code$/i)).toHaveValue('GEAR-9'));
+    expect(within(dialog).getByLabelText(/part number/i)).toHaveValue('PN-9');
+    // ...but the pre-typed name is NOT clobbered.
+    expect(within(dialog).getByLabelText(/^name$/i)).toHaveValue('My Custom Name');
+  });
 
-    // The row appears after the invalidated list re-fetches. The dialog stays
-    // open on create (so files can be linked immediately) — assert via the
-    // table cell contents instead of dialog dismissal.
-    expect(await screen.findByRole('cell', { name: 'GEAR-9' })).toBeInTheDocument();
+  it('shows a plain-language toast for matched_from=object_name (never the raw token)', async () => {
+    server.use(
+      http.get('*/api/v1/skus', () => HttpResponse.json([])),
+      emptyEjectProfiles,
+      http.get('*/api/v1/library/files', () => HttpResponse.json([libraryFile])),
+      http.get('*/api/v1/library/files/:id/plates', () => HttpResponse.json(platesResponse)),
+      http.get('*/api/v1/skus/suggest', () =>
+        HttpResponse.json({ code: 'GEAR-9', part_number: null, name: null, matched_from: 'object_name' }),
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<SkusPage />);
+
+    await screen.findByText('No SKUs yet');
+    await user.click(screen.getByRole('button', { name: /new sku/i }));
+    const dialog = await screen.findByRole('dialog');
+
+    await user.selectOptions(await within(dialog).findByLabelText('File'), '5');
+
+    // Plain-language copy, mapped from the enum — the raw token never surfaces.
+    expect(
+      await screen.findByText('Details filled from the part names in the file'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/object_name/)).not.toBeInTheDocument();
+  });
+
+  it('opens the create dialog preseeded from ?createFromFile and clears the param', async () => {
+    // Arrive as the post-upload "Create SKU from this file" toast would.
+    window.history.pushState({}, '', '/skus?createFromFile=5');
+
+    server.use(
+      http.get('*/api/v1/skus', () => HttpResponse.json([])),
+      emptyEjectProfiles,
+      http.get('*/api/v1/library/files', () => HttpResponse.json([libraryFile])),
+      http.get('*/api/v1/library/files/:id/plates', () => HttpResponse.json(platesResponse)),
+      http.get('*/api/v1/skus/suggest', ({ request }) => {
+        const url = new URL(request.url);
+        expect(url.searchParams.get('library_file_id')).toBe('5');
+        return HttpResponse.json({
+          code: 'PRESEED-1',
+          part_number: null,
+          name: null,
+          matched_from: 'object_name',
+        });
+      }),
+    );
+
+    render(<SkusPage />);
+
+    // The dialog opens in create mode with the file preseeded in the add-row.
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('Create SKU')).toBeInTheDocument();
+    await waitFor(() => expect(within(dialog).getByLabelText('File')).toHaveValue('5'));
+    // Auto-suggest fired for the preseeded file.
+    await waitFor(() => expect(within(dialog).getByLabelText(/^code$/i)).toHaveValue('PRESEED-1'));
+    // The deep-link param is stripped (replace — no history spam).
+    await waitFor(() => expect(window.location.search).toBe(''));
   });
 
   it('links a pending add-row file selection when Save is pressed (no separate Add-file click)', async () => {
@@ -436,6 +498,7 @@ describe('SkusPage', () => {
       emptyEjectProfiles,
       http.get('*/api/v1/library/files', () => HttpResponse.json([libraryFile])),
       http.get('*/api/v1/library/files/:id/plates', () => HttpResponse.json(platesResponse)),
+      emptySuggest,
       http.post('*/api/v1/skus', async ({ request }) => {
         createBody = (await request.json()) as Record<string, unknown>;
         return HttpResponse.json(created, { status: 201 });
@@ -516,6 +579,7 @@ describe('SkusPage', () => {
       emptyEjectProfiles,
       http.get('*/api/v1/library/files', () => HttpResponse.json([libraryFile])),
       http.get('*/api/v1/library/files/:id/plates', () => HttpResponse.json(platesResponse)),
+      emptySuggest,
       http.get('*/api/v1/skus/:id', () => HttpResponse.json(created)),
       http.post('*/api/v1/skus', () => {
         postCalled = true;

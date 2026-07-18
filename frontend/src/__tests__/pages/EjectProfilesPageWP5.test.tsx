@@ -121,6 +121,20 @@ describe('EjectProfilesPage dry-run allow_unvalidated', () => {
     ).not.toBeInTheDocument();
   });
 
+  it('moves focus into the dry-run dialog on open and closes it on Escape (shared Modal)', async () => {
+    primeDryRun();
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+    const dialog = await openDryRun(user);
+
+    // Modal moves focus into the panel on open (WCAG dialog focus management).
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+
+    // Escape dismisses the dialog (not blocked because no dispatch is in flight).
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
   it('offers the override for an unvalidated model and sends allow_unvalidated only when ticked', async () => {
     primeDryRun();
     let posted: Record<string, unknown> | null = null;
@@ -156,6 +170,74 @@ describe('EjectProfilesPage dry-run allow_unvalidated', () => {
     await user.click(within(dialog).getByRole('button', { name: /dispatch test/i }));
     await waitFor(() => expect(posted).not.toBeNull());
     expect(posted).toMatchObject({ printer_id: 2, library_file_id: 5, allow_unvalidated: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dry-run: sole-connected-printer auto-select
+// ---------------------------------------------------------------------------
+
+describe('EjectProfilesPage dry-run printer auto-select', () => {
+  function primeDryRunWith(printerList: typeof printers) {
+    server.use(
+      http.get('*/api/v1/eject-profiles', () => HttpResponse.json([profile()])),
+      http.get('*/api/v1/model-geometry', () =>
+        geometryList([geoRow(), geoRow({ model_key: 'H2C', validated: false })]),
+      ),
+      http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
+      http.get('*/api/v1/printers/', () => HttpResponse.json(printerList)),
+      http.get('*/api/v1/library/files', () =>
+        HttpResponse.json([{ id: 5, filename: 'unit.gcode.3mf', file_type: 'gcode.3mf', file_size: 1 }]),
+      ),
+      http.get('*/api/v1/library/files/:id/plates', () =>
+        HttpResponse.json({ plates: [{ index: 1, name: 'Plate 1' }] }),
+      ),
+    );
+  }
+
+  async function openDryRun(user: ReturnType<typeof userEvent.setup>) {
+    await screen.findByText('Fast sweep');
+    await user.click(screen.getByRole('button', { name: /dry run fast sweep/i }));
+    return screen.findByRole('dialog');
+  }
+
+  it('preselects the sole connected printer with the override left unticked', async () => {
+    // Only the unvalidated H2C printer is active (default status ⇒ connected),
+    // so exactly one connected printer exists.
+    primeDryRunWith([printers[1]]);
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+    const dialog = await openDryRun(user);
+
+    // Once the connectivity probe settles, the lone printer is auto-selected.
+    const select = within(dialog).getByLabelText('Printer');
+    await waitFor(() => expect(select).toHaveValue('2'));
+
+    // Its model is unvalidated, so the override checkbox is shown — and it must
+    // start UNCHECKED: auto-selecting a printer never ticks the override.
+    const checkbox = within(dialog).getByRole('checkbox', {
+      name: /allow unvalidated geometry/i,
+    });
+    expect(checkbox).not.toBeChecked();
+  });
+
+  it('keeps the placeholder when more than one printer is connected', async () => {
+    primeDryRunWith(printers); // both P-H2S and P-H2C connect
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+    const dialog = await openDryRun(user);
+
+    // Wait until BOTH connected printers are listed (all probes settled) so the
+    // assertion cannot pass on a transient mid-load state.
+    await within(dialog).findByRole('option', { name: /P-H2S/i });
+    await within(dialog).findByRole('option', { name: /P-H2C/i });
+
+    // Multiple connected printers ⇒ nothing is auto-selected.
+    expect(within(dialog).getByLabelText('Printer')).toHaveValue('');
+    // No printer chosen ⇒ the unvalidated override checkbox is not shown.
+    expect(
+      within(dialog).queryByRole('checkbox', { name: /allow unvalidated geometry/i }),
+    ).not.toBeInTheDocument();
   });
 });
 

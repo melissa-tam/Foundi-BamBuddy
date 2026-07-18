@@ -14,6 +14,7 @@ import { api, spoolbuddyApi, ApiError } from '../api/client';
 import type { InventorySpool, SpoolCatalogEntry } from '../api/client';
 import { Button } from '../components/Button';
 import { FilamentSwatch } from '../components/FilamentSwatch';
+import { OutOfRotationChip } from '../components/OutOfRotationChip';
 import { buildFilamentBackground } from '../components/filamentSwatchHelpers';
 import {SpoolFormModal, type SpoolFormMode} from '../components/SpoolFormModal';
 import { ConfirmModal } from '../components/ConfirmModal';
@@ -2471,6 +2472,11 @@ function SpoolCard({
             </span>
           </div>
         </div>
+        {spool.feed_fault_at && (
+          <div onClick={(e) => e.stopPropagation()}>
+            <OutOfRotationChip spoolId={spool.id} faultCode={spool.feed_fault_code} />
+          </div>
+        )}
         <div>
           <div className="flex justify-between text-xs text-bambu-gray mb-1">
             <span>{t('inventory.remaining')}</span>
@@ -2564,6 +2570,9 @@ function SpoolTableRow({
       ))}
       <td className="py-3 px-4">
         <div className="flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
+          {spool.feed_fault_at && (
+            <OutOfRotationChip spoolId={spool.id} faultCode={spool.feed_fault_code} className="mr-1" />
+          )}
           <button onClick={onEdit} className="p-1.5 text-bambu-gray hover:text-white rounded transition-colors" title={t('common.edit')}>
             <Edit2 className="w-4 h-4" />
           </button>

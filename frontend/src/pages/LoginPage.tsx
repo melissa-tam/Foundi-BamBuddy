@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -7,8 +7,9 @@ import { useToast } from '../contexts/ToastContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { X, Mail, Shield, Smartphone, Key } from 'lucide-react';
 import { api, type LoginResponse, type OIDCProvider, type TokenPersistence } from '../api/client';
-import { Card, CardHeader, CardContent } from '../components/Card';
+import { CardHeader, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
+import { Modal } from '../components/ui/Modal';
 
 type LoginStep = 'credentials' | '2fa' | 'reset-password';
 
@@ -136,6 +137,7 @@ export function LoginPage() {
   const [password, setPassword] = useState('');
   const [showForgotPassword, setShowForgotPassword] = useState(false);
   const [forgotEmail, setForgotEmail] = useState('');
+  const forgotPasswordTitleId = useId();
 
   // 2FA step state
   const [step, setStep] = useState<LoginStep>('credentials');
@@ -818,19 +820,16 @@ export function LoginPage() {
 
       {/* Forgot Password Modal */}
       {showForgotPassword && (
-        <div
-          className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-          onClick={() => setShowForgotPassword(false)}
+        <Modal
+          onClose={() => setShowForgotPassword(false)}
+          labelledBy={forgotPasswordTitleId}
+          size="sm"
         >
-          <Card
-            className="w-full max-w-md"
-            onClick={(e: React.MouseEvent) => e.stopPropagation()}
-          >
             <CardHeader>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Mail className="w-5 h-5 text-bambu-green" />
-                  <h2 className="text-lg font-semibold text-white">{t('login.forgotPasswordTitle')}</h2>
+                  <h2 id={forgotPasswordTitleId} className="text-lg font-semibold text-white">{t('login.forgotPasswordTitle')}</h2>
                 </div>
                 <Button
                   variant="ghost"
@@ -915,8 +914,7 @@ export function LoginPage() {
                 </div>
               )}
             </CardContent>
-          </Card>
-        </div>
+        </Modal>
       )}
     </div>
   );

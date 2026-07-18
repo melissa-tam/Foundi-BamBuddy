@@ -10,6 +10,7 @@ import { checkPasswordComplexity } from '../utils/password';
 import { PRESET_CATEGORIES, parsePresetTriple } from '../utils/temperatureFanPresets';
 import type { APIKey, AppSettings, AppSettingsUpdate, SmartPlug, SmartPlugStatus, NotificationProvider, NotificationTemplate, UpdateStatus, GitHubBackupStatus, CloudAuthStatus, UserCreate, UserUpdate, UserResponse, StorageUsageResponse } from '../api/client';
 import { Card, CardContent, CardDensityProvider, CardHeader } from '../components/Card';
+import { Modal } from '../components/ui/Modal';
 import { SlicerBundlesPanel } from '../components/SlicerBundlesPanel';
 import { CameraTokensSection } from './CameraTokensPage';
 import { Collapsible } from '../components/Collapsible';
@@ -39,6 +40,7 @@ import { TwoFactorSettings } from '../components/TwoFactorSettings';
 import { OIDCProviderSettings } from '../components/OIDCProviderSettings';
 import { SecurityStatusCard } from '../components/SecurityStatusCard';
 import { APIBrowser } from '../components/APIBrowser';
+import { InfoHint } from '../components/ui/InfoHint';
 import { virtualPrinterApi, spoolbuddyApi } from '../api/client';
 import { defaultNavItems, getDefaultView, setDefaultView } from '../components/Layout';
 import { availableLanguages } from '../i18n';
@@ -49,7 +51,7 @@ import { Palette } from 'lucide-react';
 import { registerSettingsSearch, getSettingsSearchEntries } from '../lib/settingsSearch';
 import type { UsersSubTab } from '../lib/settingsSearch';
 
-const validTabs = ['general', 'plugs', 'notifications', 'queue', 'filament', 'network', 'apikeys', 'virtual-printer', 'spoolbuddy', 'failure-detection', 'users', 'backup'] as const;
+const validTabs = ['general', 'plugs', 'notifications', 'queue', 'farm', 'filament', 'network', 'apikeys', 'virtual-printer', 'spoolbuddy', 'failure-detection', 'users', 'backup'] as const;
 type TabType = typeof validTabs[number];
 
 // Cross-tab search registrations for cards rendered inline in this file.
@@ -73,8 +75,9 @@ registerSettingsSearch({ labelKey: 'settings.plateClear', labelFallback: 'Plate-
 registerSettingsSearch({ labelKey: 'settings.gcodeInjection', labelFallback: 'G-code Injection', tab: 'queue', keywords: 'gcode injection start end autoprint farmloop swapmod autoclear printflow', anchor: 'card-gcode' });
 registerSettingsSearch({ labelKey: 'settings.slicerCard', labelFallback: 'Slicer', tab: 'queue', keywords: 'slicer orcaslicer bambustudio orca bambu api sidecar url docker preferred', anchor: 'card-slicer' });
 registerSettingsSearch({ labelKey: 'settings.queueDrying', tab: 'queue', keywords: 'drying presets temperature time humidity ams', anchor: 'card-drying' });
-registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'queue', keywords: 'farm retry quarantine consecutive failures cooldown stall window epsilon min cooling max hold release threshold offline stalled usb cleanup warn floor eject', anchor: 'card-farm-production' });
-registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray', anchor: 'card-filamentchecks' });
+registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog', anchor: 'card-farm-production' });
+registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown stall window epsilon plateau min cooling per check give up timer close enough margin release threshold warn floor bed temperature quarantine', anchor: 'card-farm-cooldown' });
+registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool prompt threshold reused tag grams rfid', anchor: 'card-filamentchecks' });
 registerSettingsSearch({ labelKey: 'settings.printModal', tab: 'filament', keywords: 'print modal custom mapping', anchor: 'card-printmodal' });
 registerSettingsSearch({ labelKey: 'settings.amsDisplayThresholds', tab: 'filament', keywords: 'ams humidity temperature threshold history retention', anchor: 'card-amsthresholds' });
 registerSettingsSearch({ labelKey: 'settings.externalUrl', tab: 'network', keywords: 'external url reverse proxy public notification link', anchor: 'card-externalurl' });
@@ -98,7 +101,7 @@ registerSettingsSearch({ labelKey: 'settings.tabs.backup', tab: 'backup', keywor
 // Sidebar (system pages and external links settings is rendered in the General tab)
 registerSettingsSearch({ labelKey: 'externalLinks.sidebarLayout', labelFallback: 'Sidebar', tab: 'general', keywords: 'sidebar layout links pages hide show external custom navigation url add', anchor: 'card-sidebar-links' });
 // Filament tab — integrations
-registerSettingsSearch({ labelKey: 'settings.filamentTracking', tab: 'filament', keywords: 'spoolman filament tracking inventory sync remote integration', anchor: 'card-spoolman' });
+registerSettingsSearch({ labelKey: 'settings.filamentTracking', tab: 'filament', keywords: 'spoolman filament tracking inventory sync remote integration auto add unknown rfid untagged tagless', anchor: 'card-spoolman' });
 registerSettingsSearch({ labelKey: 'settings.catalog.spoolCatalog', labelFallback: 'Spool Catalog', tab: 'filament', keywords: 'spool catalog entries brand material reset import export', anchor: 'card-spool-catalog' });
 registerSettingsSearch({ labelKey: 'settings.colorCatalog.title', labelFallback: 'Color Catalog', tab: 'filament', keywords: 'color catalog hex swatch palette sync reset', anchor: 'card-color-catalog' });
 // Failure detection sub-cards
@@ -947,6 +950,10 @@ export function SettingsPage() {
       settings.disable_filament_warnings !== localSettings.disable_filament_warnings ||
       (settings.spool_selection_policy ?? 'first_loaded') !== (localSettings.spool_selection_policy ?? 'first_loaded') ||
       (settings.min_start_spool_g ?? 120) !== (localSettings.min_start_spool_g ?? 120) ||
+      (settings.spool_recovery_enabled ?? true) !== (localSettings.spool_recovery_enabled ?? true) ||
+      (settings.spool_recovery_max_attempts ?? 2) !== (localSettings.spool_recovery_max_attempts ?? 2) ||
+      (settings.spool_recovery_step_timeout_s ?? 90) !== (localSettings.spool_recovery_step_timeout_s ?? 90) ||
+      (settings.spool_recovery_protect_layers ?? 7) !== (localSettings.spool_recovery_protect_layers ?? 7) ||
       (settings.auto_add_untagged ?? true) !== (localSettings.auto_add_untagged ?? true) ||
       (settings.tagless_default_filament ?? '') !== (localSettings.tagless_default_filament ?? '') ||
       (settings.queue_drying_enabled ?? false) !== (localSettings.queue_drying_enabled ?? false) ||
@@ -998,6 +1005,7 @@ export function SettingsPage() {
       (settings.farm_escalate_consecutive_failures ?? 2) !== (localSettings.farm_escalate_consecutive_failures ?? 2) ||
       (settings.farm_cooldown_warn_floor_c ?? 30) !== (localSettings.farm_cooldown_warn_floor_c ?? 30) ||
       (settings.farm_offline_stall_minutes ?? 30) !== (localSettings.farm_offline_stall_minutes ?? 30) ||
+      (settings.farm_pause_stall_minutes ?? 15) !== (localSettings.farm_pause_stall_minutes ?? 15) ||
       (settings.respool_prompt_threshold_g ?? 30) !== (localSettings.respool_prompt_threshold_g ?? 30) ||
       (settings.farm_cooldown_stall_window_minutes ?? 15) !== (localSettings.farm_cooldown_stall_window_minutes ?? 15) ||
       (settings.farm_cooldown_stall_epsilon_c ?? 1) !== (localSettings.farm_cooldown_stall_epsilon_c ?? 1) ||
@@ -1054,6 +1062,10 @@ export function SettingsPage() {
         disable_filament_warnings: localSettings.disable_filament_warnings,
         spool_selection_policy: localSettings.spool_selection_policy,
         min_start_spool_g: localSettings.min_start_spool_g,
+        spool_recovery_enabled: localSettings.spool_recovery_enabled,
+        spool_recovery_max_attempts: localSettings.spool_recovery_max_attempts,
+        spool_recovery_step_timeout_s: localSettings.spool_recovery_step_timeout_s,
+        spool_recovery_protect_layers: localSettings.spool_recovery_protect_layers,
         auto_add_untagged: localSettings.auto_add_untagged,
         tagless_default_filament: localSettings.tagless_default_filament,
         queue_drying_enabled: localSettings.queue_drying_enabled,
@@ -1105,6 +1117,7 @@ export function SettingsPage() {
         farm_escalate_consecutive_failures: localSettings.farm_escalate_consecutive_failures,
         farm_cooldown_warn_floor_c: localSettings.farm_cooldown_warn_floor_c,
         farm_offline_stall_minutes: localSettings.farm_offline_stall_minutes,
+        farm_pause_stall_minutes: localSettings.farm_pause_stall_minutes,
         respool_prompt_threshold_g: localSettings.respool_prompt_threshold_g,
         farm_cooldown_stall_window_minutes: localSettings.farm_cooldown_stall_window_minutes,
         farm_cooldown_stall_epsilon_c: localSettings.farm_cooldown_stall_epsilon_c,
@@ -1388,6 +1401,17 @@ export function SettingsPage() {
         >
           <ListOrdered className="w-4 h-4" />
           {t('settings.tabs.queue', 'Workflow')}
+        </button>
+        <button
+          onClick={() => handleTabChange('farm')}
+          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
+            activeTab === 'farm'
+              ? 'text-bambu-green border-bambu-green'
+              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
+          }`}
+        >
+          <Factory className="w-4 h-4" />
+          {t('settings.tabs.farm', 'Farm')}
         </button>
         <button
           onClick={() => handleTabChange('filament')}
@@ -3143,33 +3167,37 @@ export function SettingsPage() {
 
       {/* Home Assistant Test Connection Modal */}
       {haTestResult && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-bambu-dark-secondary rounded-lg p-6 max-w-md w-full mx-4">
-            <div className="flex items-center gap-3 mb-4">
-              {haTestResult.success ? (
-                <CheckCircle className="w-8 h-8 text-green-400" />
-              ) : (
-                <XCircle className="w-8 h-8 text-red-400" />
-              )}
-              <h3 className="text-lg font-medium text-white">
-                {haTestResult.success ? t('settings.connectionSuccessful') : t('settings.connectionFailed')}
-              </h3>
-            </div>
-            <p className="text-bambu-gray mb-6">
-              {haTestResult.success
-                ? haTestResult.message || t('settings.haConnectionSuccess')
-                : haTestResult.error || t('settings.haConnectionFailed')}
-            </p>
-            <div className="flex justify-end">
-              <Button
-                variant="primary"
-                onClick={() => setHaTestResult(null)}
-              >
-                {t('settings.ok')}
-              </Button>
-            </div>
+        <Modal
+          onClose={() => setHaTestResult(null)}
+          labelledBy="ha-test-result-title"
+          size="sm"
+          closeOnOverlay={false}
+          className="p-6"
+        >
+          <div className="flex items-center gap-3 mb-4">
+            {haTestResult.success ? (
+              <CheckCircle className="w-8 h-8 text-green-400" />
+            ) : (
+              <XCircle className="w-8 h-8 text-red-400" />
+            )}
+            <h3 id="ha-test-result-title" className="text-lg font-medium text-white">
+              {haTestResult.success ? t('settings.connectionSuccessful') : t('settings.connectionFailed')}
+            </h3>
           </div>
-        </div>
+          <p className="text-bambu-gray mb-6">
+            {haTestResult.success
+              ? haTestResult.message || t('settings.haConnectionSuccess')
+              : haTestResult.error || t('settings.haConnectionFailed')}
+          </p>
+          <div className="flex justify-end">
+            <Button
+              variant="primary"
+              onClick={() => setHaTestResult(null)}
+            >
+              {t('settings.ok')}
+            </Button>
+          </div>
+        </Modal>
       )}
 
       {/* Smart Plugs Tab */}
@@ -4293,195 +4321,6 @@ export function SettingsPage() {
             </CardContent>
           </Card>
 
-          {/* Farm Production defaults (Phase 3) */}
-          <Card id="card-farm-production">
-            <CardHeader>
-              <h3 className="text-base font-semibold text-white flex items-center gap-2">
-                <Factory className="w-4 h-4 text-bambu-green" />
-                {t('settings.farmProduction', 'Farm Production')}
-              </h3>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <p className="text-xs text-bambu-gray">
-                {t('settings.farmProductionDescription', 'Default retry and quarantine policy prefilled into the Start Run dialog. Can be overridden per run.')}
-              </p>
-              <div className="flex gap-4">
-                <div className="flex-1">
-                  <label className="block text-xs text-bambu-gray mb-1">
-                    {t('settings.farmRetryMaxPerUnit', 'Retries per plate')}
-                  </label>
-                  <input
-                    type="number"
-                    min={0}
-                    max={10}
-                    value={localSettings.farm_retry_max_per_unit ?? 1}
-                    onChange={(e) => updateSetting('farm_retry_max_per_unit', Math.max(0, Math.min(10, parseInt(e.target.value) || 0)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmRetryMaxPerUnitHelp', 'Automatic retries before a plate is marked failed (0–10)')}
-                  </p>
-                </div>
-                <div className="flex-1">
-                  <label className="block text-xs text-bambu-gray mb-1">
-                    {t('settings.farmEscalateConsecutiveFailures', 'Quarantine after failures')}
-                  </label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={20}
-                    value={localSettings.farm_escalate_consecutive_failures ?? 2}
-                    onChange={(e) => updateSetting('farm_escalate_consecutive_failures', Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmEscalateConsecutiveFailuresHelp', 'Consecutive failures on a printer that trip a quarantine (1–20)')}
-                  </p>
-                </div>
-                <div className="flex-1">
-                  <label className="block text-xs text-bambu-gray mb-1">
-                    {t('settings.farmCooldownWarnFloor', 'Cooldown warn floor (°C)')}
-                  </label>
-                  <input
-                    type="number"
-                    min={15}
-                    max={50}
-                    value={localSettings.farm_cooldown_warn_floor_c ?? 30}
-                    onChange={(e) => updateSetting('farm_cooldown_warn_floor_c', Math.max(15, Math.min(50, parseInt(e.target.value) || 30)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmCooldownWarnFloorHelp', 'Warn when an eject profile cooldown threshold is below this — a threshold at or below shop ambient never completes (15–50)')}
-                  </p>
-                </div>
-                <div className="flex-1">
-                  <label className="block text-xs text-bambu-gray mb-1">
-                    {t('settings.farmOfflineStallMinutes', 'Offline stall (min)')}
-                  </label>
-                  <input
-                    type="number"
-                    min={5}
-                    max={720}
-                    value={localSettings.farm_offline_stall_minutes ?? 30}
-                    onChange={(e) => updateSetting('farm_offline_stall_minutes', Math.max(5, Math.min(720, parseInt(e.target.value) || 30)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmOfflineStallMinutesHelp', 'Flag a unit still printing whose printer has been offline this long — it never terminates, just shows the stall (5–720)')}
-                  </p>
-                </div>
-              </div>
-              {/* Eject-cooldown stall detection (server-dispatched eject) */}
-              <div className="flex gap-4">
-                <div className="flex-1">
-                  <label className="block text-xs text-bambu-gray mb-1">
-                    {t('settings.farmCooldownStallWindow', 'Cooldown stall window (min)')}
-                  </label>
-                  <input
-                    type="number"
-                    min={0}
-                    max={180}
-                    value={localSettings.farm_cooldown_stall_window_minutes ?? 15}
-                    onChange={(e) => updateSetting('farm_cooldown_stall_window_minutes', Math.max(0, Math.min(180, parseInt(e.target.value) || 0)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmCooldownStallWindowHelp', 'During eject cooldown the bed must keep cooling; two consecutive windows without progress quarantine the printer (0 disables)')}
-                  </p>
-                </div>
-                <div className="flex-1">
-                  <label className="block text-xs text-bambu-gray mb-1">
-                    {t('settings.farmCooldownStallEpsilon', 'Min cooling per window (°C)')}
-                  </label>
-                  <input
-                    type="number"
-                    min={0.1}
-                    max={20}
-                    step={0.1}
-                    value={localSettings.farm_cooldown_stall_epsilon_c ?? 1}
-                    onChange={(e) => updateSetting('farm_cooldown_stall_epsilon_c', Math.max(0.1, Math.min(20, parseFloat(e.target.value) || 1)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmCooldownStallEpsilonHelp', 'Minimum cooling (°C) per window that counts as progress')}
-                  </p>
-                </div>
-                <div className="flex-1">
-                  <label className="block text-xs text-bambu-gray mb-1">
-                    {t('settings.farmCooldownMaxHold', 'Max cooldown hold (min)')}
-                  </label>
-                  <input
-                    type="number"
-                    min={0}
-                    max={720}
-                    value={localSettings.farm_cooldown_max_hold_minutes ?? 180}
-                    onChange={(e) => updateSetting('farm_cooldown_max_hold_minutes', Math.max(0, Math.min(720, parseInt(e.target.value) || 0)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmCooldownMaxHoldHelp', 'After this many minutes above the release threshold the eject runs anyway (0 = wait for threshold indefinitely)')}
-                  </p>
-                </div>
-                <div className="flex-1">
-                  <label className="block text-xs text-bambu-gray mb-1">
-                    {t('settings.farmCooldownPlateauMargin', 'Plateau eject margin (°C)')}
-                  </label>
-                  <input
-                    type="number"
-                    min={0}
-                    max={50}
-                    step={0.5}
-                    value={localSettings.farm_cooldown_plateau_eject_margin_c ?? 3}
-                    onChange={(e) => updateSetting('farm_cooldown_plateau_eject_margin_c', Math.max(0, Math.min(50, parseFloat(e.target.value) || 0)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmCooldownPlateauMarginHelp', 'If cooling plateaus within this many °C of the release threshold, eject (bed has settled at ambient) instead of quarantining. Above threshold + margin the bed is genuinely stuck hot and the printer is quarantined')}
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center justify-between pt-1">
-                <div className="flex-1 mr-4">
-                  <p className="text-sm text-white">
-                    {t('settings.farmUsbAutoCleanup', 'Auto-clean USB when full')}
-                  </p>
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmUsbAutoCleanupHelp', 'On a USB-storage-low fault, automatically delete old camera recordings first, then the oldest unused print files, so dispatch keeps working')}
-                  </p>
-                </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={localSettings.farm_usb_auto_cleanup ?? true}
-                    onChange={(e) => updateSetting('farm_usb_auto_cleanup', e.target.checked)}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
-                </label>
-              </div>
-              {/* Reused-tag re-spool prompt threshold */}
-              <div className="flex gap-4">
-                <div className="flex-1">
-                  <label htmlFor="respool-prompt-threshold" className="block text-xs text-bambu-gray mb-1">
-                    {t('settings.respoolPromptThreshold', 'Re-spool prompt threshold (g)')}
-                  </label>
-                  <input
-                    id="respool-prompt-threshold"
-                    type="number"
-                    min={0}
-                    max={1000}
-                    value={localSettings.respool_prompt_threshold_g ?? 30}
-                    onChange={(e) => updateSetting('respool_prompt_threshold_g', Math.max(0, Math.min(1000, parseInt(e.target.value) || 0)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.respoolPromptThresholdHelp', 'Prompt to re-spool a reused Bambu tag when the donor spool has this many grams or fewer left and no hardware-certain spent marker (0–1000)')}
-                  </p>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-
           {/* G-code Injection (#422) */}
           <Card id="card-gcode">
             <CardHeader>
@@ -5017,6 +4856,232 @@ export function SettingsPage() {
         </div>
       )}
 
+      {activeTab === 'farm' && localSettings && (
+        <div className="flex flex-col lg:flex-row gap-4 lg:gap-6">
+          <div className="lg:w-1/2 space-y-3">
+          {/* Farm Production defaults (Phase 3) */}
+          <Card id="card-farm-production">
+            <CardHeader>
+              <h3 className="text-base font-semibold text-white flex items-center gap-2">
+                <Factory className="w-4 h-4 text-bambu-green" />
+                {t('settings.farmProduction', 'Farm Production')}
+              </h3>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-xs text-bambu-gray">
+                {t('settings.farmProductionDescription', 'Default retry and quarantine policy prefilled into the Start Run dialog. Can be overridden per run.')}
+              </p>
+              <div className="flex gap-4">
+                <div className="flex-1">
+                  <label htmlFor="farm-retry-max-per-unit" className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmRetryMaxPerUnit', 'Retries per plate')}
+                  </label>
+                  <input
+                    id="farm-retry-max-per-unit"
+                    type="number"
+                    min={0}
+                    max={10}
+                    value={localSettings.farm_retry_max_per_unit ?? 1}
+                    onChange={(e) => updateSetting('farm_retry_max_per_unit', Math.max(0, Math.min(10, parseInt(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmRetryMaxPerUnitHelp', 'Automatic retries before a plate is marked failed (0–10)')}
+                  </p>
+                </div>
+                <div className="flex-1">
+                  <label htmlFor="farm-escalate-consecutive-failures" className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmEscalateConsecutiveFailures', 'Quarantine after failures')}
+                  </label>
+                  <input
+                    id="farm-escalate-consecutive-failures"
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={localSettings.farm_escalate_consecutive_failures ?? 2}
+                    onChange={(e) => updateSetting('farm_escalate_consecutive_failures', Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmEscalateConsecutiveFailuresHelp', 'Consecutive failures on a printer that trip a quarantine (1–20)')}
+                  </p>
+                </div>
+                <div className="flex-1">
+                  <label htmlFor="farm-offline-stall-minutes" className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmOfflineStallMinutes', 'Offline stall (min)')}
+                  </label>
+                  <input
+                    id="farm-offline-stall-minutes"
+                    type="number"
+                    min={5}
+                    max={720}
+                    value={localSettings.farm_offline_stall_minutes ?? 30}
+                    onChange={(e) => updateSetting('farm_offline_stall_minutes', Math.max(5, Math.min(720, parseInt(e.target.value) || 30)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmOfflineStallMinutesHelp', 'Flag a unit still printing whose printer has been offline this long — it never terminates, just shows the stall (5–720)')}
+                  </p>
+                </div>
+                <div className="flex-1">
+                  <label htmlFor="farm-pause-stall-minutes" className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmPauseStallMinutes', 'Paused stall (min)')}
+                  </label>
+                  <input
+                    id="farm-pause-stall-minutes"
+                    type="number"
+                    min={5}
+                    max={720}
+                    value={localSettings.farm_pause_stall_minutes ?? 15}
+                    onChange={(e) => updateSetting('farm_pause_stall_minutes', Math.max(5, Math.min(720, parseInt(e.target.value) || 15)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmPauseStallMinutesHelp', 'Flag and notify when a printing unit sits paused this long with no auto-recovery running — it never cancels anything (5–720)')}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center justify-between pt-1">
+                <div className="flex-1 mr-4">
+                  <p className="text-sm text-white">
+                    {t('settings.farmUsbAutoCleanup', 'Auto-clean USB when full')}
+                  </p>
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmUsbAutoCleanupHelp', 'On a USB-storage-low fault, automatically delete old camera recordings first, then the oldest unused print files, so dispatch keeps working')}
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={localSettings.farm_usb_auto_cleanup ?? true}
+                    onChange={(e) => updateSetting('farm_usb_auto_cleanup', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Eject Cooldown — warn floor + server-dispatched eject stall detection (plan 4b) */}
+          <Card id="card-farm-cooldown">
+            <CardHeader>
+              <h3 className="text-base font-semibold text-white flex items-center gap-2">
+                <Thermometer className="w-4 h-4 text-bambu-green" />
+                {t('settings.farmEjectCooldown', 'Eject Cooldown')}
+              </h3>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-xs text-bambu-gray">
+                {t('settings.farmEjectCooldownDescription', 'How the farm waits for the bed to cool before sweeping a finished plate off, and when it gives up or quarantines a printer that will not cool.')}
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div>
+                  <label htmlFor="farm-cooldown-warn-floor" className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.farmCooldownWarnFloor', 'Cooldown warn floor (°C)')}
+                  </label>
+                  <input
+                    id="farm-cooldown-warn-floor"
+                    type="number"
+                    min={15}
+                    max={50}
+                    value={localSettings.farm_cooldown_warn_floor_c ?? 30}
+                    onChange={(e) => updateSetting('farm_cooldown_warn_floor_c', Math.max(15, Math.min(50, parseInt(e.target.value) || 30)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownWarnFloorHelp', 'Warn when an eject profile cooldown threshold is below this — a threshold at or below shop ambient never completes (15–50)')}
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="farm-cooldown-stall-window" className="block text-xs text-bambu-gray">
+                      {t('settings.farmCooldownStallWindow', 'Cooling check interval (min)')}
+                    </label>
+                    <InfoHint text={t('settings.farmCooldownStallWindowHelp')} />
+                  </div>
+                  <input
+                    id="farm-cooldown-stall-window"
+                    type="number"
+                    min={0}
+                    max={180}
+                    value={localSettings.farm_cooldown_stall_window_minutes ?? 15}
+                    onChange={(e) => updateSetting('farm_cooldown_stall_window_minutes', Math.max(0, Math.min(180, parseInt(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownStallWindowHelp', 'How often to confirm the bed is still cooling before an eject. Two failed checks in a row quarantine the printer. 0 turns the check off.')}
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="farm-cooldown-stall-epsilon" className="block text-xs text-bambu-gray">
+                      {t('settings.farmCooldownStallEpsilon', 'Minimum cooling per check (°C)')}
+                    </label>
+                    <InfoHint text={t('settings.farmCooldownStallEpsilonHelp')} />
+                  </div>
+                  <input
+                    id="farm-cooldown-stall-epsilon"
+                    type="number"
+                    min={0.1}
+                    max={20}
+                    step={0.1}
+                    value={localSettings.farm_cooldown_stall_epsilon_c ?? 1}
+                    onChange={(e) => updateSetting('farm_cooldown_stall_epsilon_c', Math.max(0.1, Math.min(20, parseFloat(e.target.value) || 1)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownStallEpsilonHelp', 'The bed must drop at least this much between checks to count as still cooling.')}
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="farm-cooldown-max-hold" className="block text-xs text-bambu-gray">
+                      {t('settings.farmCooldownMaxHold', 'Give-up timer (min)')}
+                    </label>
+                    <InfoHint text={t('settings.farmCooldownMaxHoldHelp')} />
+                  </div>
+                  <input
+                    id="farm-cooldown-max-hold"
+                    type="number"
+                    min={0}
+                    max={720}
+                    value={localSettings.farm_cooldown_max_hold_minutes ?? 180}
+                    onChange={(e) => updateSetting('farm_cooldown_max_hold_minutes', Math.max(0, Math.min(720, parseInt(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownMaxHoldHelp', 'If the bed is still warmer than the eject temperature after this long, eject anyway. 0 = keep waiting.')}
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="farm-cooldown-plateau-margin" className="block text-xs text-bambu-gray">
+                      {t('settings.farmCooldownPlateauMargin', 'Close-enough margin (°C)')}
+                    </label>
+                    <InfoHint text={t('settings.farmCooldownPlateauMarginHelp')} />
+                  </div>
+                  <input
+                    id="farm-cooldown-plateau-margin"
+                    type="number"
+                    min={0}
+                    max={50}
+                    step={0.5}
+                    value={localSettings.farm_cooldown_plateau_eject_margin_c ?? 3}
+                    onChange={(e) => updateSetting('farm_cooldown_plateau_eject_margin_c', Math.max(0, Math.min(50, parseFloat(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownPlateauMarginHelp', 'If cooling stalls but the bed is within this many degrees of the eject temperature, treat it as cooled and eject; stuck hotter than that quarantines the printer.')}
+                  </p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+          </div>
+        </div>
+      )}
+
       {activeTab === 'filament' && localSettings && (
         <>
         <div className="flex flex-col lg:flex-row gap-4 lg:gap-6">
@@ -5091,6 +5156,80 @@ export function SettingsPage() {
                     className="w-32 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
                 </div>
+                {/* Automatic mid-print spool-jam recovery */}
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-white">{t('settings.spoolRecoveryEnabled')}</p>
+                    <p className="text-sm text-bambu-gray">
+                      {t('settings.spoolRecoveryEnabledDesc')}
+                    </p>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      aria-label={t('settings.spoolRecoveryEnabled')}
+                      checked={localSettings.spool_recovery_enabled ?? true}
+                      onChange={(e) => updateSetting('spool_recovery_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                  </label>
+                </div>
+                {(localSettings.spool_recovery_enabled ?? true) && (
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pl-1">
+                    <div>
+                      <label htmlFor="spoolRecoveryMaxAttempts" className="block text-white mb-1">
+                        {t('settings.spoolRecoveryMaxAttempts')}
+                      </label>
+                      <p className="text-sm text-bambu-gray mb-1">
+                        {t('settings.spoolRecoveryMaxAttemptsDesc')}
+                      </p>
+                      <input
+                        id="spoolRecoveryMaxAttempts"
+                        type="number"
+                        min={1}
+                        max={5}
+                        value={localSettings.spool_recovery_max_attempts ?? 2}
+                        onChange={(e) => updateSetting('spool_recovery_max_attempts', Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
+                        className="w-32 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="spoolRecoveryStepTimeout" className="block text-white mb-1">
+                        {t('settings.spoolRecoveryStepTimeout')}
+                      </label>
+                      <p className="text-sm text-bambu-gray mb-1">
+                        {t('settings.spoolRecoveryStepTimeoutDesc')}
+                      </p>
+                      <input
+                        id="spoolRecoveryStepTimeout"
+                        type="number"
+                        min={15}
+                        max={600}
+                        value={localSettings.spool_recovery_step_timeout_s ?? 90}
+                        onChange={(e) => updateSetting('spool_recovery_step_timeout_s', Math.max(15, Math.min(600, parseInt(e.target.value) || 15)))}
+                        className="w-32 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="spoolRecoveryProtectLayers" className="block text-white mb-1">
+                        {t('settings.spoolRecoveryProtectLayers')}
+                      </label>
+                      <p className="text-sm text-bambu-gray mb-1">
+                        {t('settings.spoolRecoveryProtectLayersDesc')}
+                      </p>
+                      <input
+                        id="spoolRecoveryProtectLayers"
+                        type="number"
+                        min={0}
+                        max={1000}
+                        value={localSettings.spool_recovery_protect_layers ?? 7}
+                        onChange={(e) => updateSetting('spool_recovery_protect_layers', Math.max(0, Math.min(1000, parseInt(e.target.value) || 0)))}
+                        className="w-32 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                      />
+                    </div>
+                  </div>
+                )}
                 {/* Auto-add untagged trays */}
                 <div className="flex items-center justify-between">
                   <div>
@@ -5187,7 +5326,10 @@ export function SettingsPage() {
                             />
                           </div>
                           <div>
-                            <label htmlFor="taglessSubtype" className="block text-xs text-bambu-gray mb-1">{t('settings.taglessSubtype')}</label>
+                            <div className="flex items-center gap-1.5 mb-1">
+                              <label htmlFor="taglessSubtype" className="block text-xs text-bambu-gray">{t('settings.taglessSubtype')}</label>
+                              <InfoHint text={t('settings.taglessSubtypeHint')} />
+                            </div>
                             <input
                               id="taglessSubtype"
                               type="text"
@@ -5207,7 +5349,10 @@ export function SettingsPage() {
                             />
                           </div>
                           <div className="col-span-2">
-                            <label htmlFor="taglessSlicerFilament" className="block text-xs text-bambu-gray mb-1">{t('settings.taglessSlicerFilament')}</label>
+                            <div className="flex items-center gap-1.5 mb-1">
+                              <label htmlFor="taglessSlicerFilament" className="block text-xs text-bambu-gray">{t('settings.taglessSlicerFilament')}</label>
+                              <InfoHint text={t('settings.taglessSlicerFilamentHint')} />
+                            </div>
                             <input
                               id="taglessSlicerFilament"
                               type="text"
@@ -5221,6 +5366,24 @@ export function SettingsPage() {
                     </div>
                   );
                 })()}
+                {/* Reused-tag re-spool prompt threshold (relocated from Farm Production, plan 4a) */}
+                <div>
+                  <label htmlFor="respool-prompt-threshold" className="block text-white mb-1">
+                    {t('settings.respoolPromptThreshold', 'Re-spool prompt threshold (g)')}
+                  </label>
+                  <p className="text-sm text-bambu-gray mb-1">
+                    {t('settings.respoolPromptThresholdHelp', 'Prompt to re-spool a reused Bambu tag when the donor spool has this many grams or fewer left and no hardware-certain spent marker (0–1000)')}
+                  </p>
+                  <input
+                    id="respool-prompt-threshold"
+                    type="number"
+                    min={0}
+                    max={1000}
+                    value={localSettings.respool_prompt_threshold_g ?? 30}
+                    onChange={(e) => updateSetting('respool_prompt_threshold_g', Math.max(0, Math.min(1000, parseInt(e.target.value) || 0)))}
+                    className="w-32 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                </div>
               </CardContent>
             </Card>
 
@@ -5501,14 +5664,15 @@ export function SettingsPage() {
 
       {/* Release Notes Modal */}
       {showReleaseNotes && updateCheck?.release_notes && (
-        <div
-          className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
-          onClick={() => setShowReleaseNotes(false)}
+        <Modal
+          onClose={() => setShowReleaseNotes(false)}
+          labelledBy="release-notes-modal-title"
+          size="lg"
+          className="flex flex-col"
         >
-          <Card className="w-full max-w-2xl max-h-[80vh] flex flex-col" onClick={(e: React.MouseEvent) => e.stopPropagation()}>
             <CardHeader className="flex flex-row items-center justify-between shrink-0">
               <div>
-                <h2 className="text-lg font-semibold text-white">
+                <h2 id="release-notes-modal-title" className="text-lg font-semibold text-white">
                   Release Notes - v{updateCheck.latest_version}
                 </h2>
                 {updateCheck.release_name && updateCheck.release_name !== updateCheck.latest_version && (
@@ -5548,8 +5712,7 @@ export function SettingsPage() {
                 Close
               </Button>
             </div>
-          </Card>
-        </div>
+        </Modal>
       )}
 
       {/* Users Tab */}
@@ -6080,22 +6243,19 @@ export function SettingsPage() {
 
       {/* Create User Modal */}
       {showCreateUserModal && !advancedAuthStatus?.advanced_auth_enabled && (
-        <div
-          className="fixed inset-0 bg-black flex items-center justify-center z-50 p-4"
-          onClick={() => {
+        <Modal
+          onClose={() => {
             setShowCreateUserModal(false);
             setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
           }}
+          labelledBy="create-user-modal-title"
+          size="sm"
         >
-          <Card
-            className="w-full max-w-md"
-            onClick={(e: React.MouseEvent) => e.stopPropagation()}
-          >
             <CardHeader>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Users className="w-5 h-5 text-bambu-green" />
-                  <h2 className="text-lg font-semibold text-white">{t('settings.createUser')}</h2>
+                  <h2 id="create-user-modal-title" className="text-lg font-semibold text-white">{t('settings.createUser')}</h2>
                 </div>
                 <Button
                   variant="ghost"
@@ -6270,8 +6430,7 @@ export function SettingsPage() {
               </>
               )}
             </CardContent>
-          </Card>
-        </div>
+        </Modal>
       )}
 
       {/* Create User Modal - Advanced Authentication */}
@@ -6298,23 +6457,20 @@ export function SettingsPage() {
 
       {/* Edit User Modal */}
       {showEditUserModal && editingUserId !== null && (
-        <div
-          className="fixed inset-0 bg-black flex items-center justify-center z-50 p-4"
-          onClick={() => {
+        <Modal
+          onClose={() => {
             setShowEditUserModal(false);
             setEditingUserId(null);
             setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
           }}
+          labelledBy="edit-user-modal-title"
+          size="sm"
         >
-          <Card
-            className="w-full max-w-md"
-            onClick={(e: React.MouseEvent) => e.stopPropagation()}
-          >
             <CardHeader>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Edit2 className="w-5 h-5 text-bambu-green" />
-                  <h2 className="text-lg font-semibold text-white">{t('settings.editUser')}</h2>
+                  <h2 id="edit-user-modal-title" className="text-lg font-semibold text-white">{t('settings.editUser')}</h2>
                 </div>
                 <Button
                   variant="ghost"
@@ -6489,27 +6645,23 @@ export function SettingsPage() {
                 </Button>
               </div>
             </CardContent>
-          </Card>
-        </div>
+        </Modal>
       )}
 
       {/* Delete User Confirmation Modal */}
       {deleteUserId !== null && (
-        <div
-          className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4"
-          onClick={() => {
+        <Modal
+          onClose={() => {
             setDeleteUserId(null);
             setDeleteUserItemCounts(null);
           }}
+          labelledBy="delete-user-modal-title"
+          size="sm"
         >
-          <Card
-            className="w-full max-w-md"
-            onClick={(e: React.MouseEvent) => e.stopPropagation()}
-          >
             <CardHeader>
               <div className="flex items-center gap-2 text-red-400">
                 <Trash2 className="w-5 h-5" />
-                <h3 className="text-lg font-semibold">{t('settings.deleteUserTitle')}</h3>
+                <h3 id="delete-user-modal-title" className="text-lg font-semibold">{t('settings.deleteUserTitle')}</h3>
               </div>
             </CardHeader>
             <CardContent className="space-y-3">
@@ -6588,8 +6740,7 @@ export function SettingsPage() {
                 </>
               )}
             </CardContent>
-          </Card>
-        </div>
+        </Modal>
       )}
 
       {/* Delete Group Confirmation Modal */}
@@ -6650,22 +6801,19 @@ export function SettingsPage() {
 
       {/* Change Password Modal */}
       {showChangePasswordModal && (
-        <div
-          className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-          onClick={() => {
+        <Modal
+          onClose={() => {
             setShowChangePasswordModal(false);
             setChangePasswordData({ currentPassword: '', newPassword: '', confirmPassword: '' });
           }}
+          labelledBy="settings-change-password-title"
+          size="sm"
         >
-          <Card
-            className="w-full max-w-md"
-            onClick={(e: React.MouseEvent) => e.stopPropagation()}
-          >
             <CardHeader>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Key className="w-5 h-5 text-bambu-green" />
-                  <h2 className="text-lg font-semibold text-white">{t('settings.changePassword')}</h2>
+                  <h2 id="settings-change-password-title" className="text-lg font-semibold text-white">{t('settings.changePassword')}</h2>
                 </div>
                 <Button
                   variant="ghost"
@@ -6779,8 +6927,7 @@ export function SettingsPage() {
                 </Button>
               </div>
             </CardContent>
-          </Card>
-        </div>
+        </Modal>
       )}
       </div>
       </div>

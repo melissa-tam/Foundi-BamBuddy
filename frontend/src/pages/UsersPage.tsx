@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useId } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -9,6 +9,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { Button } from '../components/Button';
 import { Card, CardContent, CardHeader } from '../components/Card';
+import { Modal } from '../components/ui/Modal';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { CreateUserAdvancedAuthModal } from '../components/CreateUserAdvancedAuthModal';
 import { LdapUserPicker } from '../components/LdapUserPicker';
@@ -25,6 +26,8 @@ export function UsersPage() {
   const { user: currentUser, hasPermission } = useAuth();
   const { showToast } = useToast();
   const queryClient = useQueryClient();
+  const createUserTitleId = useId();
+  const editUserTitleId = useId();
   const [showCreateModal, setShowCreateModal] = useState(false);
   // Basic-mode (non-advanced-auth) modal: track which tab is active so the
   // LDAP picker can replace the local form when LDAP is enabled.
@@ -420,23 +423,20 @@ export function UsersPage() {
 
       {/* Create User Modal */}
       {showCreateModal && !advancedAuthStatus?.advanced_auth_enabled && (
-        <div
-          className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-          onClick={() => {
+        <Modal
+          onClose={() => {
             setShowCreateModal(false);
             setBasicCreateTab('local');
             setFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
           }}
+          labelledBy={createUserTitleId}
+          size="sm"
         >
-          <Card
-            className="w-full max-w-md"
-            onClick={(e: React.MouseEvent) => e.stopPropagation()}
-          >
             <CardHeader>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <UsersIcon className="w-5 h-5 text-bambu-green" />
-                  <h2 className="text-lg font-semibold text-white">{t('users.modal.createUser')}</h2>
+                  <h2 id={createUserTitleId} className="text-lg font-semibold text-white">{t('users.modal.createUser')}</h2>
                 </div>
                 <Button
                   variant="ghost"
@@ -619,8 +619,7 @@ export function UsersPage() {
               </>
               )}
             </CardContent>
-          </Card>
-        </div>
+        </Modal>
       )}
 
       {/* Create User Modal - Advanced Authentication */}
@@ -647,19 +646,16 @@ export function UsersPage() {
 
       {/* Edit User Modal */}
       {showEditModal && editingUserId !== null && (
-        <div
-          className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-          onClick={closeEditModal}
+        <Modal
+          onClose={closeEditModal}
+          labelledBy={editUserTitleId}
+          size="sm"
         >
-          <Card
-            className="w-full max-w-md"
-            onClick={(e: React.MouseEvent) => e.stopPropagation()}
-          >
             <CardHeader>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Edit2 className="w-5 h-5 text-bambu-green" />
-                  <h2 className="text-lg font-semibold text-white">{t('users.modal.editUser')}</h2>
+                  <h2 id={editUserTitleId} className="text-lg font-semibold text-white">{t('users.modal.editUser')}</h2>
                 </div>
                 <Button
                   variant="ghost"
@@ -787,8 +783,7 @@ export function UsersPage() {
                 </Button>
               </div>
             </CardContent>
-          </Card>
-        </div>
+        </Modal>
       )}
 
       {/* Delete Confirmation Modal */}

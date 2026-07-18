@@ -52,8 +52,10 @@ import type {
   AppSettings,
   Archive,
   Permission,
+  LibraryFileUploadResponse,
 } from '../api/client';
 import { Button } from '../components/Button';
+import { Modal } from '../components/ui/Modal';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { PrintModal } from '../components/PrintModal';
 import { ModelViewerModal } from '../components/ModelViewerModal';
@@ -85,6 +87,7 @@ interface NewFolderModalProps {
 
 function NewFolderModal({ parentId, onClose, onSave, isLoading, t }: NewFolderModalProps) {
   const [name, setName] = useState('');
+  const nameInputRef = useRef<HTMLInputElement>(null);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -92,37 +95,41 @@ function NewFolderModal({ parentId, onClose, onSave, isLoading, t }: NewFolderMo
   };
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg w-full max-w-sm border border-bambu-dark-tertiary">
-        <div className="p-4 border-b border-bambu-dark-tertiary">
-          <h2 className="text-lg font-semibold text-white">{t('fileManager.newFolder')}</h2>
-        </div>
-        <form onSubmit={handleSubmit} className="p-4 space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-white mb-1">
-              {t('fileManager.folderName')}
-            </label>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="w-full bg-bambu-dark border border-bambu-dark-tertiary rounded px-3 py-2 text-white placeholder-bambu-gray focus:outline-none focus:border-bambu-green"
-              placeholder={t('fileManager.folderNamePlaceholder')}
-              autoFocus
-              required
-            />
-          </div>
-          <div className="flex justify-end gap-2 pt-2">
-            <Button type="button" variant="secondary" onClick={onClose}>
-              {t('common.cancel')}
-            </Button>
-            <Button type="submit" disabled={!name.trim() || isLoading}>
-              {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : t('common.create')}
-            </Button>
-          </div>
-        </form>
+    <Modal
+      onClose={onClose}
+      labelledBy="new-folder-modal-title"
+      widthClass="max-w-sm"
+      closeOnOverlay={false}
+      initialFocusRef={nameInputRef}
+    >
+      <div className="p-4 border-b border-bambu-dark-tertiary">
+        <h2 id="new-folder-modal-title" className="text-lg font-semibold text-white">{t('fileManager.newFolder')}</h2>
       </div>
-    </div>
+      <form onSubmit={handleSubmit} className="p-4 space-y-4">
+        <div>
+          <label className="block text-sm font-medium text-white mb-1">
+            {t('fileManager.folderName')}
+          </label>
+          <input
+            ref={nameInputRef}
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className="w-full bg-bambu-dark border border-bambu-dark-tertiary rounded px-3 py-2 text-white placeholder-bambu-gray focus:outline-none focus:border-bambu-green"
+            placeholder={t('fileManager.folderNamePlaceholder')}
+            required
+          />
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <Button type="button" variant="secondary" onClick={onClose}>
+            {t('common.cancel')}
+          </Button>
+          <Button type="submit" disabled={!name.trim() || isLoading}>
+            {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : t('common.create')}
+          </Button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 
@@ -139,6 +146,7 @@ function ExternalFolderModal({ onClose, onSave, isLoading, t }: ExternalFolderMo
   const [path, setPath] = useState('');
   const [readonly, setReadonly] = useState(true);
   const [showHidden, setShowHidden] = useState(false);
+  const nameInputRef = useRef<HTMLInputElement>(null);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -151,29 +159,34 @@ function ExternalFolderModal({ onClose, onSave, isLoading, t }: ExternalFolderMo
   };
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg w-full max-w-md border border-bambu-dark-tertiary">
-        <div className="p-4 border-b border-bambu-dark-tertiary">
-          <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-            <FolderSymlink className="w-5 h-5 text-bambu-green" />
-            {t('fileManager.linkExternalFolder')}
-          </h2>
-          <p className="text-sm text-bambu-gray mt-1">{t('fileManager.linkExternalFolderDescription')}</p>
-        </div>
-        <form onSubmit={handleSubmit} className="p-4 space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-white mb-1">
-              {t('fileManager.folderName')}
-            </label>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="w-full bg-bambu-dark border border-bambu-dark-tertiary rounded px-3 py-2 text-white placeholder-bambu-gray focus:outline-none focus:border-bambu-green"
-              placeholder={t('fileManager.externalFolderNamePlaceholder')}
-              autoFocus
-              required
-            />
+    <Modal
+      onClose={onClose}
+      labelledBy="link-external-folder-modal-title"
+      size="sm"
+      closeOnOverlay={false}
+      initialFocusRef={nameInputRef}
+    >
+      <div className="p-4 border-b border-bambu-dark-tertiary">
+        <h2 id="link-external-folder-modal-title" className="text-lg font-semibold text-white flex items-center gap-2">
+          <FolderSymlink className="w-5 h-5 text-bambu-green" />
+          {t('fileManager.linkExternalFolder')}
+        </h2>
+        <p className="text-sm text-bambu-gray mt-1">{t('fileManager.linkExternalFolderDescription')}</p>
+      </div>
+      <form onSubmit={handleSubmit} className="p-4 space-y-4">
+        <div>
+          <label className="block text-sm font-medium text-white mb-1">
+            {t('fileManager.folderName')}
+          </label>
+          <input
+            ref={nameInputRef}
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className="w-full bg-bambu-dark border border-bambu-dark-tertiary rounded px-3 py-2 text-white placeholder-bambu-gray focus:outline-none focus:border-bambu-green"
+            placeholder={t('fileManager.externalFolderNamePlaceholder')}
+            required
+          />
           </div>
           <div>
             <label className="block text-sm font-medium text-white mb-1">
@@ -219,8 +232,7 @@ function ExternalFolderModal({ onClose, onSave, isLoading, t }: ExternalFolderMo
             </Button>
           </div>
         </form>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -252,6 +264,7 @@ function RenameModal({ type, currentName, onClose, onSave, isLoading, t }: Renam
   const fileExtension = type === 'file' ? (currentName.match(/(\.gcode\.3mf|\.3mf|\.gcode)$/i)?.[1] ?? '') : '';
   const baseName = type === 'file' && fileExtension ? currentName.slice(0, -fileExtension.length) : currentName;
   const [name, setName] = useState(baseName);
+  const nameInputRef = useRef<HTMLInputElement>(null);
 
   const invalidChar = type === 'file' ? findInvalidFilenameChar(name) : null;
   const filenameError = invalidChar
@@ -268,44 +281,48 @@ function RenameModal({ type, currentName, onClose, onSave, isLoading, t }: Renam
   };
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg w-full max-w-sm border border-bambu-dark-tertiary">
-        <div className="p-4 border-b border-bambu-dark-tertiary">
-          <h2 className="text-lg font-semibold text-white">{type === 'file' ? t('fileManager.renameFile') : t('fileManager.renameFolder')}</h2>
-        </div>
-        <form onSubmit={handleSubmit} className="p-4 space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-white mb-1">
-              {t('common.name')}
-            </label>
-            <div className={`flex items-center bg-bambu-dark border rounded focus-within:border-bambu-green ${filenameError ? 'border-red-500' : 'border-bambu-dark-tertiary'}`}>
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                className="flex-1 bg-transparent px-3 py-2 text-white placeholder-bambu-gray focus:outline-none min-w-0"
-                autoFocus
-                required
-              />
-              {fileExtension && (
-                <span className="pr-3 text-bambu-gray text-sm select-none whitespace-nowrap">{fileExtension}</span>
-              )}
-            </div>
-            {filenameError && (
-              <p className="mt-1 text-xs text-red-400">{filenameError}</p>
+    <Modal
+      onClose={onClose}
+      labelledBy="rename-modal-title"
+      widthClass="max-w-sm"
+      closeOnOverlay={false}
+      initialFocusRef={nameInputRef}
+    >
+      <div className="p-4 border-b border-bambu-dark-tertiary">
+        <h2 id="rename-modal-title" className="text-lg font-semibold text-white">{type === 'file' ? t('fileManager.renameFile') : t('fileManager.renameFolder')}</h2>
+      </div>
+      <form onSubmit={handleSubmit} className="p-4 space-y-4">
+        <div>
+          <label className="block text-sm font-medium text-white mb-1">
+            {t('common.name')}
+          </label>
+          <div className={`flex items-center bg-bambu-dark border rounded focus-within:border-bambu-green ${filenameError ? 'border-red-500' : 'border-bambu-dark-tertiary'}`}>
+            <input
+              ref={nameInputRef}
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="flex-1 bg-transparent px-3 py-2 text-white placeholder-bambu-gray focus:outline-none min-w-0"
+              required
+            />
+            {fileExtension && (
+              <span className="pr-3 text-bambu-gray text-sm select-none whitespace-nowrap">{fileExtension}</span>
             )}
           </div>
-          <div className="flex justify-end gap-2 pt-2">
-            <Button type="button" variant="secondary" onClick={onClose}>
-              {t('common.cancel')}
-            </Button>
-            <Button type="submit" disabled={!name.trim() || name.trim() === baseName || !!filenameError || isLoading}>
-              {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : t('common.rename')}
-            </Button>
-          </div>
-        </form>
-      </div>
-    </div>
+          {filenameError && (
+            <p className="mt-1 text-xs text-red-400">{filenameError}</p>
+          )}
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <Button type="button" variant="secondary" onClick={onClose}>
+            {t('common.cancel')}
+          </Button>
+          <Button type="submit" disabled={!name.trim() || name.trim() === baseName || !!filenameError || isLoading}>
+            {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : t('common.rename')}
+          </Button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 
@@ -337,13 +354,17 @@ function MoveFilesModal({ folders, selectedFiles, currentFolderId, onClose, onMo
   const flatFolders = [{ id: null, name: t('fileManager.rootNoFolder'), depth: 0 }, ...flattenFolders(folders)];
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg w-full max-w-sm border border-bambu-dark-tertiary">
-        <div className="p-4 border-b border-bambu-dark-tertiary">
-          <h2 className="text-lg font-semibold text-white">{t('fileManager.moveFiles', { count: selectedFiles.length })}</h2>
-        </div>
-        <div className="p-4 space-y-4">
-          <div className="max-h-64 overflow-y-auto space-y-1">
+    <Modal
+      onClose={onClose}
+      labelledBy="move-files-modal-title"
+      widthClass="max-w-sm"
+      closeOnOverlay={false}
+    >
+      <div className="p-4 border-b border-bambu-dark-tertiary">
+        <h2 id="move-files-modal-title" className="text-lg font-semibold text-white">{t('fileManager.moveFiles', { count: selectedFiles.length })}</h2>
+      </div>
+      <div className="p-4 space-y-4">
+        <div className="max-h-64 overflow-y-auto space-y-1">
             {flatFolders.map((folder) => (
               <button
                 key={folder.id ?? 'root'}
@@ -373,8 +394,7 @@ function MoveFilesModal({ folders, selectedFiles, currentFolderId, onClose, onMo
             </Button>
           </div>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -433,19 +453,23 @@ function LinkFolderModal({ folder, onClose, onLink, isLoading, t }: LinkFolderMo
   const isLinked = folder.project_id || folder.archive_id;
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg w-full max-w-md border border-bambu-dark-tertiary">
-        <div className="p-4 border-b border-bambu-dark-tertiary flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-            <Link2 className="w-5 h-5 text-bambu-green" />
-            {t('fileManager.linkFolder')}
-          </h2>
-          <button onClick={onClose} className="p-1 hover:bg-bambu-dark rounded">
-            <X className="w-5 h-5 text-bambu-gray" />
-          </button>
-        </div>
+    <Modal
+      onClose={onClose}
+      labelledBy="link-folder-modal-title"
+      size="sm"
+      closeOnOverlay={false}
+    >
+      <div className="p-4 border-b border-bambu-dark-tertiary flex items-center justify-between">
+        <h2 id="link-folder-modal-title" className="text-lg font-semibold text-white flex items-center gap-2">
+          <Link2 className="w-5 h-5 text-bambu-green" />
+          {t('fileManager.linkFolder')}
+        </h2>
+        <button onClick={onClose} className="p-1 hover:bg-bambu-dark rounded">
+          <X className="w-5 h-5 text-bambu-gray" />
+        </button>
+      </div>
 
-        <div className="p-4 space-y-4">
+      <div className="p-4 space-y-4">
           <p className="text-sm text-bambu-gray">
             {t('fileManager.linkFolderDescription', { name: folder.name })}
           </p>
@@ -539,8 +563,7 @@ function LinkFolderModal({ folder, onClose, onLink, isLoading, t }: LinkFolderMo
             </Button>
           </div>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -945,7 +968,7 @@ function FileCard({ file, isSelected, isMobile, onSelect, onDelete, onDownload, 
 export function FileManagerPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const { showToast } = useToast();
+  const { showToast, showPersistentToast, dismissToast } = useToast();
   const { hasPermission, hasAnyPermission, canModify, authEnabled } = useAuth();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -1503,6 +1526,31 @@ export function FileManagerPage() {
     queryClient.invalidateQueries({ queryKey: ['library-files'] });
     queryClient.invalidateQueries({ queryKey: ['library-folders'] });
     queryClient.invalidateQueries({ queryKey: ['library-stats'] });
+  };
+
+  // Post-upload SKU carry-forward: when an uploaded file is a (sliced or
+  // unsliced) 3MF, offer a one-click jump to the SKU catalog with that file
+  // preseeded. The toast is persistent + stably keyed per file so re-uploads
+  // don't stack duplicates; non-3mf uploads stay silent (no SKU intent).
+  const handleFileUploaded = (file: LibraryFileUploadResponse) => {
+    if (!file.filename.toLowerCase().endsWith('.3mf')) return;
+    const toastId = `sku-from-upload-${file.id}`;
+    const target = `/skus?createFromFile=${file.id}`;
+    showPersistentToast(
+      toastId,
+      t('fileManager.createSkuFromUploadToast', { filename: file.filename }),
+      'success',
+      {
+        action: {
+          label: t('fileManager.createSkuFromUploadAction'),
+          href: target,
+          onClick: () => {
+            dismissToast(toastId);
+            navigate(target);
+          },
+        },
+      },
+    );
   };
 
   // Page-wide drag-and-drop upload (#1510). Disabled when the user lacks
@@ -2566,6 +2614,7 @@ export function FileManagerPage() {
             setDroppedFiles([]);
           }}
           onUploadComplete={handleUploadComplete}
+          onFileUploaded={handleFileUploaded}
           initialFiles={droppedFiles.length > 0 ? droppedFiles : undefined}
         />
       )}

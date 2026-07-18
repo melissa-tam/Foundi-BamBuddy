@@ -2,7 +2,13 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useToast } from '../contexts/ToastContext';
 import { useTranslation } from 'react-i18next';
-import { api, type Printer, type RespoolPromptMessage, type SpoolRespooledMessage } from '../api/client';
+import {
+  api,
+  type Printer,
+  type RespoolPromptMessage,
+  type SpoolAutoAssignedMessage,
+  type SpoolRespooledMessage,
+} from '../api/client';
 import { inventoryLocationsQueryKey } from '../utils/inventoryQueries';
 
 interface WebSocketMessage {
@@ -335,11 +341,28 @@ export function useWebSocket() {
         debouncedInvalidate('slotPresets');
         break;
 
-      case 'spool_auto_assigned':
-        // RFID tag matched - refresh inventory and assignment data
+      case 'spool_auto_assigned': {
+        // A spool was auto-bound to a slot: either an RFID tag match OR the
+        // tagless silent-mint. Both refresh inventory + assignment caches; only
+        // the tagless path (origin: "tagless" — a genuinely NEW untagged roll)
+        // also surfaces a toast so the operator sees the auto-tracking happen.
+        const m = message as unknown as SpoolAutoAssignedMessage;
         debouncedInvalidate('inventory-spools');
         debouncedInvalidate('spool-assignments');
+        if (m.origin === 'tagless') {
+          const printerName = queryClient
+            .getQueryData<Printer[]>(['printers'])
+            ?.find((p) => p.id === m.printer_id)?.name ?? `Printer ${m.printer_id}`;
+          showToast(
+            t('inventory.taglessMintToast', {
+              printer: printerName,
+              slot: (m.tray_id ?? 0) + 1,
+            }),
+            'success',
+          );
+        }
         break;
+      }
 
       case 'spool_usage_logged':
         // Filament consumption recorded - refresh spool data
@@ -420,9 +443,30 @@ export function useWebSocket() {
           }),
           'success',
         );
+        // The re-spool (auto tier, or a manual one that also broadcasts this)
+        // resolves any pending uncertain-tier prompt for the same slot — clear
+        // its toast + queue entry via the shared window-event bridge.
+        window.dispatchEvent(
+          new CustomEvent('respool-prompt-dismissed', {
+            detail: { printer_id: m.printer_id, ams_id: m.ams_id, tray_id: m.tray_id },
+          }),
+        );
         debouncedInvalidate('inventory-spools');
         debouncedInvalidate('spool-assignments');
         queryClient.invalidateQueries({ queryKey: ['printerStatus', m.printer_id] });
+        break;
+      }
+
+      case 'respool_prompt_dismissed': {
+        // Another client answered "Same spool" to the uncertain-tier prompt
+        // (POST respool-dismiss). Bridge the slot triple so `useRespoolPrompt`
+        // clears the matching toast + queue entry on this client too.
+        const m = message as unknown as { printer_id?: number; ams_id?: number; tray_id?: number };
+        window.dispatchEvent(
+          new CustomEvent('respool-prompt-dismissed', {
+            detail: { printer_id: m.printer_id, ams_id: m.ams_id, tray_id: m.tray_id },
+          }),
+        );
         break;
       }
 

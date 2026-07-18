@@ -75,12 +75,24 @@ export function FilamentMapping({
     });
     return map;
   }, [inventoryRemain]);
+  // Spool-jam skip (#feed-fault): trays flagged out of rotation are dropped from
+  // the auto-suggestion so the dropdown never proposes a jammed spool.
+  const outOfRotationByTrayId = useMemo(() => {
+    if (!inventoryRemain?.out_of_rotation) return undefined;
+    const map = new Map<number, boolean>();
+    Object.entries(inventoryRemain.out_of_rotation).forEach(([key, flagged]) => {
+      const gtid = Number(key);
+      if (!Number.isNaN(gtid) && flagged === true) map.set(gtid, true);
+    });
+    return map.size > 0 ? map : undefined;
+  }, [inventoryRemain]);
   const selection: SelectionOptions = useMemo(() => ({
     policy: effectiveSelectionPolicy(settings?.spool_selection_policy, printerStatus?.ams_filament_backup),
     inventoryByTrayId,
     firstLoadedByTrayId,
+    outOfRotationByTrayId,
     minStartG: settings?.min_start_spool_g,
-  }), [settings?.spool_selection_policy, settings?.min_start_spool_g, printerStatus?.ams_filament_backup, inventoryByTrayId, firstLoadedByTrayId]);
+  }), [settings?.spool_selection_policy, settings?.min_start_spool_g, printerStatus?.ams_filament_backup, inventoryByTrayId, firstLoadedByTrayId, outOfRotationByTrayId]);
 
   const { loadedFilaments, filamentComparison, hasTypeMismatch, hasColorMismatch } =
     useFilamentMapping(filamentReqs, printerStatus, manualMappings, selection);
@@ -207,11 +219,11 @@ export function FilamentMapping({
         <Circle className="w-4 h-4" fill={statusColor} stroke="none" />
         <span>{t('printModal.filamentMapping')}</span>
         {hasTypeMismatch ? (
-          <span className="text-xs text-orange-400">(Type not found)</span>
+          <span className="text-xs text-orange-400">{t('printModal.typeNotFound')}</span>
         ) : hasColorMismatch ? (
-          <span className="text-xs text-yellow-400">(Color mismatch)</span>
+          <span className="text-xs text-yellow-400">{t('printModal.colorMismatch')}</span>
         ) : (
-          <span className="text-xs text-bambu-green">(Ready)</span>
+          <span className="text-xs text-bambu-green">{t('printModal.ready')}</span>
         )}
         {isExpanded ? (
           <ChevronUp className="w-4 h-4 ml-auto" />
@@ -223,7 +235,7 @@ export function FilamentMapping({
       {isExpanded && (
         <div className="mt-2 bg-bambu-dark rounded-lg p-3 space-y-2">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-xs text-bambu-gray">Click to change slot assignment</span>
+            <span className="text-xs text-bambu-gray">{t('printModal.clickToChangeSlot')}</span>
             <button
               type="button"
               onClick={handleRefresh}
@@ -231,7 +243,7 @@ export function FilamentMapping({
               disabled={isRefreshing}
             >
               <RefreshCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin' : ''}`} />
-              <span>Re-read</span>
+              <span>{t('printModal.reread')}</span>
             </button>
           </div>
           {filamentComparison.map((item, idx) => {
@@ -252,7 +264,7 @@ export function FilamentMapping({
                 style={{ gridTemplateColumns: '16px minmax(70px, 1fr) auto 2fr 16px' }}
               >
                 {/* Required color */}
-                <span title={`Required: ${resolvedName} - ${colorLabel}`}>
+                <span title={t('printModal.requiredTooltip', { type: resolvedName, color: colorLabel })}>
                   <Circle className="w-3 h-3" fill={item.color} stroke={item.color} />
                 </span>
                 {/* Required type + grams + nozzle badge */}
@@ -280,10 +292,10 @@ export function FilamentMapping({
                       ? 'border-yellow-400/50 text-yellow-400'
                       : 'border-orange-400/50 text-orange-400'
                   } ${item.isManual ? 'ring-1 ring-blue-400/50' : ''}`}
-                  title={item.isManual ? 'Manually selected' : 'Auto-matched'}
+                  title={item.isManual ? t('printModal.manuallySelected') : t('printModal.autoMatched')}
                 >
                   <option value="" className="bg-bambu-dark text-bambu-gray">
-                    -- Select slot --
+                    {t('printModal.selectSlot')}
                   </option>
                   {/*
                     #1722: every loaded slot is offered for every filament row,
@@ -327,11 +339,11 @@ export function FilamentMapping({
                 {item.status === 'match' ? (
                   <Check className="w-3 h-3 text-bambu-green" />
                 ) : item.status === 'type_only' ? (
-                  <span title="Same type, different color">
+                  <span title={t('printModal.sameTypeDifferentColor')}>
                     <AlertTriangle className="w-3 h-3 text-yellow-400" />
                   </span>
                 ) : (
-                  <span title="Filament type not loaded">
+                  <span title={t('printModal.filamentTypeNotLoaded')}>
                     <AlertTriangle className="w-3 h-3 text-orange-400" />
                   </span>
                 )}
@@ -355,11 +367,11 @@ export function FilamentMapping({
           <div className="text-xs text-bambu-gray">
             {t('printModal.totalCost')}{' '}
             <span className="text-white">
-              {totalCost > 0 || hasAnyCost ? `${currencySymbol}${totalCost.toFixed(2)}` : 'N/A'}
+              {totalCost > 0 || hasAnyCost ? `${currencySymbol}${totalCost.toFixed(2)}` : t('printModal.costNotAvailable')}
             </span>
           </div>
           {hasTypeMismatch && (
-            <p className="text-xs text-orange-400 mt-2">Required filament type not found in printer.</p>
+            <p className="text-xs text-orange-400 mt-2">{t('printModal.requiredTypeNotFound')}</p>
           )}
         </div>
       )}

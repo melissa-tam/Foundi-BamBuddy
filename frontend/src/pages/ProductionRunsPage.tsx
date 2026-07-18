@@ -10,7 +10,7 @@
  * strings and coerced/validated once on submit. All copy is i18n; inputs are
  * label-linked (WCAG AA) and keyboard operable.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -33,15 +33,19 @@ import { api } from '../api/client';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
+import { Modal } from '../components/ui/Modal';
+import { InlineAlert } from '../components/ui/InlineAlert';
+import { inputClass } from '../components/ui/Field';
 import { FirstArticleBanner } from '../components/FirstArticleBanner';
 import {
   BlockedPrintersChip,
-  isScheduled,
   PauseReasonChip,
   RunStagedBanner,
   RunStatusBadge,
   ScheduledChip,
 } from '../components/RunBadges';
+import { isScheduled } from '../utils/productionRuns';
+import { RunRescheduleDialog } from '../components/RunRescheduleDialog';
 import { ScheduledStartField } from '../components/ScheduledStartField';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
@@ -65,10 +69,6 @@ function clampInt(raw: string, min: number, max: number, fallback: number): numb
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
-const inputClass =
-  'w-full px-3 py-2 bg-bambu-dark rounded-md text-white border border-bambu-dark-tertiary ' +
-  'focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors';
-
 // ---------------------------------------------------------------------------
 // Start-run dialog
 // ---------------------------------------------------------------------------
@@ -87,6 +87,7 @@ interface StartRunDialogProps {
 
 function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDialogProps) {
   const { t } = useTranslation();
+  const titleId = useId();
 
   // All SKUs (including those with zero linked files), fetched here rather than
   // passed pre-filtered: a SKU the operator just created must still appear in
@@ -114,7 +115,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
   const [printerIds, setPrinterIds] = useState<number[]>([]);
   const [ejectProfileId, setEjectProfileId] = useState<number | null>(null);
   const [cooldownOverride, setCooldownOverride] = useState<string>('');
-  const [requireFirstArticle, setRequireFirstArticle] = useState(true);
+  const [requireFirstArticle, setRequireFirstArticle] = useState(false);
   const [retriesPerPlate, setRetriesPerPlate] = useState<string>(String(RETRY_FALLBACK));
   const [escalateFailures, setEscalateFailures] = useState<string>(String(ESCALATE_FALLBACK));
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -350,19 +351,12 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={saving ? undefined : onClose}
-      role="dialog"
-      aria-modal="true"
-      aria-label={t('productionRuns.startTitle')}
-    >
-      <Card className="w-full max-w-2xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    <Modal onClose={onClose} size="lg" dismissDisabled={saving} labelledBy={titleId}>
         <CardContent className="p-0">
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
             <div className="flex items-center gap-2">
               <Factory className="w-5 h-5 text-bambu-green" />
-              <h2 className="text-lg font-semibold text-white">{t('productionRuns.startTitle')}</h2>
+              <h2 id={titleId} className="text-lg font-semibold text-white">{t('productionRuns.startTitle')}</h2>
             </div>
             <Button variant="ghost" size="sm" onClick={onClose} disabled={saving} aria-label={t('common.close')}>
               <X className="w-5 h-5" />
@@ -736,15 +730,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
 
             {/* Backend rejection (persistent, unlike a toast — the dialog is
                 the surface the user is looking at when the POST fails). */}
-            {error && (
-              <div
-                role="alert"
-                className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/40 rounded-lg text-sm text-red-300"
-              >
-                <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-400" />
-                <span>{error}</span>
-              </div>
-            )}
+            {error && <InlineAlert severity="error">{error}</InlineAlert>}
 
             {/* Actions */}
             <div className="flex gap-3 pt-2">
@@ -767,84 +753,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
             </div>
           </form>
         </CardContent>
-      </Card>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Reschedule dialog — change (or clear) a scheduled run's start time (Phase 5)
-// ---------------------------------------------------------------------------
-
-function RescheduleDialog({
-  run,
-  saving,
-  error,
-  onSubmit,
-  onClose,
-}: {
-  run: ProductionRun;
-  saving: boolean;
-  error: string | null;
-  onSubmit: (at: string | null) => void;
-  onClose: () => void;
-}) {
-  const { t } = useTranslation();
-  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
-  const [value, setValue] = useState<string | null>(run.scheduled_start_at);
-  const [valid, setValid] = useState(true);
-
-  return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={saving ? undefined : onClose}
-      role="dialog"
-      aria-modal="true"
-      aria-label={t('productionRuns.reschedule')}
-    >
-      <Card className="w-full max-w-md" onClick={(e) => e.stopPropagation()}>
-        <CardContent className="p-0">
-          <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
-            <div className="flex items-center gap-2">
-              <CalendarClock className="w-5 h-5 text-bambu-green" />
-              <h2 className="text-lg font-semibold text-white">{t('productionRuns.rescheduleTitle')}</h2>
-            </div>
-            <Button variant="ghost" size="sm" onClick={onClose} disabled={saving} aria-label={t('common.close')}>
-              <X className="w-5 h-5" />
-            </Button>
-          </div>
-          <div className="p-4 space-y-4">
-            <p className="text-sm text-bambu-gray">{run.name}</p>
-            <ScheduledStartField
-              value={value}
-              onChange={setValue}
-              onValidityChange={setValid}
-              dateFormat={settings?.date_format || 'system'}
-              timeFormat={settings?.time_format || 'system'}
-              idPrefix="run-reschedule-schedule"
-            />
-            {error && (
-              <div
-                role="alert"
-                className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/40 rounded-lg text-sm text-red-300"
-              >
-                <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-400" />
-                <span>{error}</span>
-              </div>
-            )}
-            <div className="flex justify-end gap-2">
-              <Button variant="secondary" onClick={onClose} disabled={saving}>
-                {t('common.cancel')}
-              </Button>
-              <Button onClick={() => onSubmit(value)} disabled={saving || !valid}>
-                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                {t('common.save')}
-              </Button>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }
 
@@ -1324,7 +1233,7 @@ export function ProductionRunsPage() {
       )}
 
       {pendingReschedule && (
-        <RescheduleDialog
+        <RunRescheduleDialog
           run={pendingReschedule}
           saving={rescheduleMutation.isPending}
           error={
@@ -1368,13 +1277,9 @@ export function ProductionRunsPage() {
               dialog above) — the confirm dialog is the surface in focus when
               the DELETE fails, so the detail must not vanish as a toast. */}
           {deleteMutation.error && (
-            <div
-              role="alert"
-              className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/40 rounded-lg text-sm text-red-300"
-            >
-              <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-400" />
-              <span>{deleteMutation.error.message || t('productionRuns.deleteFailed')}</span>
-            </div>
+            <InlineAlert severity="error">
+              {deleteMutation.error.message || t('productionRuns.deleteFailed')}
+            </InlineAlert>
           )}
         </ConfirmModal>
       )}

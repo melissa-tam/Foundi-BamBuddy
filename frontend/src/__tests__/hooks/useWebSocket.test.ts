@@ -469,6 +469,147 @@ describe('useWebSocket hook', () => {
       vi.unstubAllGlobals();
     });
 
+    it('bridges respool_prompt_dismissed to a respool-prompt-dismissed window event', async () => {
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      const received: Array<{ printer_id?: number; ams_id?: number; tray_id?: number }> = [];
+      const handler = (e: Event) => received.push((e as CustomEvent).detail);
+      window.addEventListener('respool-prompt-dismissed', handler);
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'respool_prompt_dismissed',
+          spool_id: 9,
+          printer_id: 3,
+          ams_id: 1,
+          tray_id: 2,
+        });
+      });
+
+      window.removeEventListener('respool-prompt-dismissed', handler);
+      expect(received).toContainEqual({ printer_id: 3, ams_id: 1, tray_id: 2 });
+
+      vi.unstubAllGlobals();
+    });
+
+    it('bridges spool_respooled to a respool-prompt-dismissed window event', async () => {
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      const received: Array<{ printer_id?: number; ams_id?: number; tray_id?: number }> = [];
+      const handler = (e: Event) => received.push((e as CustomEvent).detail);
+      window.addEventListener('respool-prompt-dismissed', handler);
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'spool_respooled',
+          printer_id: 5,
+          ams_id: 0,
+          tray_id: 3,
+          donor_spool_id: 8,
+          new_spool_id: 9,
+          brand: 'Overture',
+          label_weight: 1000,
+        });
+      });
+
+      window.removeEventListener('respool-prompt-dismissed', handler);
+      expect(received).toContainEqual({ printer_id: 5, ams_id: 0, tray_id: 3 });
+
+      vi.unstubAllGlobals();
+    });
+
+    it('toasts on a tagless spool_auto_assigned (origin: tagless)', async () => {
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'spool_auto_assigned',
+          printer_id: 1,
+          ams_id: 0,
+          tray_id: 2,
+          spool_id: 9,
+          origin: 'tagless',
+        });
+      });
+
+      // The mocked t() returns the key verbatim, so the rendered toast carries
+      // the i18n key — proof the tagless branch fired showToast.
+      await waitFor(() => {
+        expect(document.body.textContent).toContain('inventory.taglessMintToast');
+      });
+
+      vi.unstubAllGlobals();
+    });
+
+    it('does NOT toast for an RFID spool_auto_assigned (no origin) but still invalidates', async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      await vi.advanceTimersByTimeAsync(0);
+      const ws = wsInstances[wsInstances.length - 1]!;
+      act(() => {
+        ws.open();
+      });
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'spool_auto_assigned',
+          printer_id: 1,
+          ams_id: 0,
+          tray_id: 2,
+          spool_id: 9,
+        });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(5000);
+      });
+
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['inventory-spools'] });
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['spool-assignments'] });
+      expect(document.body.textContent).not.toContain('inventory.taglessMintToast');
+
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    });
+
     it('handles missing_spool_assignment message without error', async () => {
       vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
         cb(0);

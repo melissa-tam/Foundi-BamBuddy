@@ -9,7 +9,7 @@
  * invalidation) for the run; the printers' live phase (eject_watch + bed) reads
  * the shared ['printerStatus', id] caches the WebSocket keeps warm.
  */
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -21,12 +21,17 @@ import {
   Factory,
   Hand,
   Loader2,
+  Pause,
   Play,
   RotateCcw,
+  Square,
+  Zap,
 } from 'lucide-react';
 import { api, type PrinterStatus } from '../api/client';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
+import { ConfirmModal } from '../components/ConfirmModal';
+import { RunRescheduleDialog } from '../components/RunRescheduleDialog';
 import { FirstArticleBanner } from '../components/FirstArticleBanner';
 import {
   BlockedPrintersChip,
@@ -37,6 +42,7 @@ import {
 } from '../components/RunBadges';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
+import { isScheduled } from '../utils/productionRuns';
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { formatDateTime, formatRelativeTime, parseUTCDate } from '../utils/date';
 import { waitingReasonText } from '../utils/waitingReason';
@@ -321,6 +327,11 @@ export function ProductionRunDetailPage() {
   const { hasPermission } = useAuth();
   const queryClient = useQueryClient();
 
+  const canUpdate = hasPermission('production_runs:update');
+  // Abort behind a confirm; reschedule opens the shared dialog.
+  const [abortConfirmOpen, setAbortConfirmOpen] = useState(false);
+  const [rescheduleOpen, setRescheduleOpen] = useState(false);
+
   const {
     data: run,
     isLoading,
@@ -346,14 +357,61 @@ export function ProductionRunDetailPage() {
     })),
   });
 
+  // Lifecycle mutations all invalidate the ['production-runs'] tree, which by
+  // TanStack's prefix match also refreshes this run's ['production-runs', id]
+  // detail query (the 5 s poll + `production_run_changed` WS invalidation keep
+  // it live regardless).
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ['production-runs'] });
+
   const resumeMutation = useMutation({
     mutationFn: () => api.resumeProductionRun(runId),
     onSuccess: () => {
       showToast(t('productionRuns.resumed'));
-      queryClient.invalidateQueries({ queryKey: ['production-runs'] });
+      invalidate();
     },
     onError: (err: Error) => showToast(err.message || t('productionRuns.actionFailed'), 'error'),
   });
+
+  const pauseMutation = useMutation({
+    mutationFn: () => api.pauseProductionRun(runId),
+    onSuccess: () => {
+      showToast(t('productionRuns.paused'));
+      invalidate();
+    },
+    onError: (err: Error) => showToast(err.message || t('productionRuns.actionFailed'), 'error'),
+  });
+
+  const abortMutation = useMutation({
+    mutationFn: () => api.abortProductionRun(runId),
+    onSuccess: () => {
+      showToast(t('productionRuns.aborted'));
+      invalidate();
+      setAbortConfirmOpen(false);
+    },
+    onError: (err: Error) => {
+      showToast(err.message || t('productionRuns.actionFailed'), 'error');
+      setAbortConfirmOpen(false);
+    },
+  });
+
+  // Reschedule / Start-now share one endpoint (Phase 5): a future ISO
+  // reschedules, null starts the run now (Start-now toasts differently).
+  const rescheduleMutation = useMutation({
+    mutationFn: (at: string | null) => api.rescheduleProductionRun(runId, at),
+    onSuccess: (_run, at) => {
+      showToast(at ? t('productionRuns.rescheduled') : t('productionRuns.startedNow'));
+      invalidate();
+      setRescheduleOpen(false);
+    },
+    onError: (err: Error) => showToast(err.message || t('productionRuns.actionFailed'), 'error'),
+  });
+
+  // Any lifecycle mutation in flight disables the whole header action cluster.
+  const mutating =
+    resumeMutation.isPending ||
+    pauseMutation.isPending ||
+    abortMutation.isPending ||
+    rescheduleMutation.isPending;
 
   const notFound = isError && /not found/i.test(error?.message ?? '');
   const units = run?.units ?? [];
@@ -407,12 +465,63 @@ export function ProductionRunDetailPage() {
                   </div>
                   {run.sku_code && <p className="mt-2 text-sm text-gray-400">{run.sku_code}</p>}
                 </div>
-                {(run.status === 'paused' || run.pause_reason === 'operator_stop') &&
-                  hasPermission('production_runs:update') && (
+                {/* Lifecycle controls — mirror the list card so the detail page
+                    is no longer a dead end. A scheduled (not-yet-started) run
+                    offers Start-now + Reschedule; a running run Pause; a paused
+                    or operator-stopped run Resume; any non-terminal run Abort. */}
+                <div className="flex items-center gap-1 shrink-0">
+                  {isScheduled(run) && canUpdate && (
+                    <>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => rescheduleMutation.mutate(null)}
+                        disabled={mutating}
+                        aria-label={t('productionRuns.startNow')}
+                      >
+                        {mutating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
+                        {t('productionRuns.startNow')}
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => {
+                          rescheduleMutation.reset();
+                          setRescheduleOpen(true);
+                        }}
+                        disabled={mutating}
+                        aria-label={t('productionRuns.reschedule')}
+                      >
+                        <CalendarClock className="h-4 w-4" />
+                        {t('productionRuns.reschedule')}
+                      </Button>
+                    </>
+                  )}
+                  {run.status === 'active' &&
+                    !isScheduled(run) &&
+                    run.pause_reason !== 'operator_stop' &&
+                    canUpdate && (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => pauseMutation.mutate()}
+                      disabled={mutating}
+                      aria-label={t('productionRuns.pause')}
+                    >
+                      {pauseMutation.isPending ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Pause className="h-4 w-4" />
+                      )}
+                      {t('productionRuns.pause')}
+                    </Button>
+                  )}
+                  {(run.status === 'paused' || run.pause_reason === 'operator_stop') && canUpdate && (
                     <Button
                       size="sm"
                       onClick={() => resumeMutation.mutate()}
-                      disabled={resumeMutation.isPending}
+                      disabled={mutating}
+                      aria-label={t('productionRuns.resume')}
                     >
                       {resumeMutation.isPending ? (
                         <Loader2 className="h-4 w-4 animate-spin" />
@@ -422,6 +531,19 @@ export function ProductionRunDetailPage() {
                       {t('productionRuns.resume')}
                     </Button>
                   )}
+                  {run.status !== 'completed' && run.status !== 'cancelled' && canUpdate && (
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={() => setAbortConfirmOpen(true)}
+                      disabled={mutating}
+                      aria-label={t('productionRuns.abort')}
+                    >
+                      <Square className="h-4 w-4" />
+                      {t('productionRuns.abort')}
+                    </Button>
+                  )}
+                </div>
               </div>
 
               {/* Progress */}
@@ -524,6 +646,36 @@ export function ProductionRunDetailPage() {
               )}
             </CardContent>
           </Card>
+
+          {abortConfirmOpen && (
+            <ConfirmModal
+              title={t('productionRuns.abortTitle')}
+              message={t('productionRuns.abortBody', { name: run.name })}
+              confirmText={t('productionRuns.abort')}
+              cancelText={t('common.cancel')}
+              variant="danger"
+              isLoading={abortMutation.isPending}
+              onConfirm={() => abortMutation.mutate()}
+              onCancel={() => setAbortConfirmOpen(false)}
+            />
+          )}
+
+          {rescheduleOpen && (
+            <RunRescheduleDialog
+              run={run}
+              saving={rescheduleMutation.isPending}
+              error={
+                rescheduleMutation.error
+                  ? rescheduleMutation.error.message || t('productionRuns.actionFailed')
+                  : null
+              }
+              onSubmit={(at) => rescheduleMutation.mutate(at)}
+              onClose={() => {
+                rescheduleMutation.reset();
+                setRescheduleOpen(false);
+              }}
+            />
+          )}
         </div>
       )}
     </div>
