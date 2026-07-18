@@ -171,6 +171,10 @@ class SpoolUpdate(BaseModel):
     tag_type: str | None = None
     cost_per_kg: float | None = Field(default=None, ge=0)
     weight_locked: bool | None = None
+    # Manual clear of the out-of-rotation (feed-fault) marker: PATCH with an
+    # explicit null returns a jammed spool to service (route uses
+    # model_dump(exclude_unset=True), so an omitted field is left untouched).
+    feed_fault_at: datetime | None = None
     # User-defined category + per-spool low-stock threshold override (#729).
     category: str | None = Field(default=None, max_length=50)
     low_stock_threshold_pct: int | None = Field(default=None, ge=1, le=99)
@@ -216,6 +220,17 @@ class SpoolResponse(SpoolBase):
     # Hardware-observed spent marker (reused-tag re-spool). NULL = never observed
     # spent; set only by a runout/backup-swap signal, never by gram estimates.
     spent_at: datetime | None = None
+    # Tier-3 re-spool prompt suppression: operator answered "Same spool" to the
+    # uncertain prompt. NULL = not dismissed. Read-only here; stamped only via
+    # POST /inventory/spools/{id}/respool-dismiss (absent from SpoolUpdate). Does
+    # NOT gate hardware-certain (tier 1/2) re-spool.
+    respool_dismissed_at: datetime | None = None
+    # Out-of-rotation marker (mid-print feed-fault / jam recovery). NULL = in
+    # rotation; set when a stuck/tangled-spool HMS pulls the tray out of service.
+    # Distinct from spent_at (hardware exhaustion) and archived_at (soft-hide).
+    feed_fault_at: datetime | None = None
+    # HMS short code that flagged the feed fault (e.g. "0700_8010").
+    feed_fault_code: str | None = None
     # FIFO substrate: when this spool FIRST entered service. Read-only; stamped
     # server-side on first assignment. NULL = never loaded.
     first_loaded_at: datetime | None = None

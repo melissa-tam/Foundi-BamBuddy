@@ -19,6 +19,7 @@ from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import spool_respool
+from backend.app.services.bambu_mqtt import HMSError
 from backend.app.services.spool_respool import (
     RESPOOL_TAG_TYPE,
     RespoolError,
@@ -379,7 +380,7 @@ async def test_mark_spent_via_ams_mapping(db_session, printer_factory):
     db_session.add(item)
     await db_session.commit()
 
-    state = _make_state(0, 0, _tray(), tray_now=99)  # tray_now ignored — ams_mapping wins
+    state = _make_state(0, 0, _tray(), tray_now=255)  # tray_now unloaded → single-feeder ams_mapping fallback wins
     marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state)
 
     assert marked is not None and marked.id == spool.id
@@ -474,11 +475,7 @@ async def test_respool_double_submit_is_noop(db_session, printer_factory, monkey
     assert second.id == first.id
     assert second.brand == "Polymaker"  # unchanged — brand edits go through spool edit
     active_rows = (
-        (
-            await db_session.execute(
-                select(Spool).where(Spool.tag_uid == DONOR_TAG_UID, Spool.archived_at.is_(None))
-            )
-        )
+        (await db_session.execute(select(Spool).where(Spool.tag_uid == DONOR_TAG_UID, Spool.archived_at.is_(None))))
         .scalars()
         .all()
     )
@@ -639,6 +636,107 @@ async def test_gate_auto_sibling_conflict_falls_back_to_prompt(db_session, print
     assert any(b["type"] == "respool_prompt" for b in broadcasts)
 
 
+# -- Tier 3 dismissal persistence (respool_dismissed_at) ---------------------
+
+
+@pytest.mark.asyncio
+async def test_gate_tier3_suppressed_when_dismissed(db_session, printer_factory, monkeypatch):
+    """A tier-3-eligible spool (spent_at NULL, near-empty) the operator already
+    answered 'Same spool' on (respool_dismissed_at stamped) does NOT re-prompt."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=990.0)  # remaining 10 <= 30
+    donor.respool_dismissed_at = datetime.utcnow()
+    await db_session.commit()
+
+    broadcasts = _spy_broadcast(monkeypatch)
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    assert result is None
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+
+
+@pytest.mark.asyncio
+async def test_gate_tier3_fires_when_not_dismissed(db_session, printer_factory, monkeypatch):
+    """Baseline: the SAME near-empty spool DOES prompt while not dismissed."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=990.0)
+    await db_session.commit()
+
+    broadcasts = _spy_broadcast(monkeypatch)
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] != []
+
+
+@pytest.mark.asyncio
+async def test_gate_tier3_dismissal_survives_dedup_clear(db_session, printer_factory, monkeypatch):
+    """The persisted dismissal outlives the in-memory dedup: clearing the slot
+    dedup (as main.on_ams_change does when a slot reports empty) does NOT re-open
+    the prompt for a dismissed spool — the whole point of the new column."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=990.0)
+    donor.respool_dismissed_at = datetime.utcnow()
+    await db_session.commit()
+
+    broadcasts = _spy_broadcast(monkeypatch)
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+    # Simulate the empty-slot dedup clear that used to re-arm the prompt.
+    spool_respool.clear_respool_prompt_dedup(printer.id, 0, 0)
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+
+
+# -- Tier 2 auto-brand fallback to the tagless default (3b-5) ----------------
+
+
+@pytest.mark.asyncio
+async def test_gate_tier2_empty_last_brand_uses_tagless_default(db_session, printer_factory, monkeypatch):
+    """Before the first-ever manual re-spool (respool_last_brand empty), a
+    spent+loaded spool auto-respools using the configured tagless-default brand
+    instead of prompting (3b-5)."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=True)
+    from backend.app.api.routes.settings import set_setting
+
+    # respool_last_brand intentionally NOT set (empty) → the fallback engages.
+    await set_setting(
+        db_session,
+        "tagless_default_filament",
+        '{"brand": "eSun", "material": "PETG", "subtype": "HF", "rgba": "00FF00FF"}',
+    )
+    await db_session.commit()
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
+    broadcasts = _spy_broadcast(monkeypatch)
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
+
+    assert result is not None
+    assert result.tag_type == RESPOOL_TAG_TYPE
+    assert result.brand == "eSun"  # sourced from the tagless default, not last-brand
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+
+
+@pytest.mark.asyncio
+async def test_gate_tier2_both_empty_falls_back_to_prompt(db_session, printer_factory, monkeypatch):
+    """respool_last_brand empty AND the tagless default explicitly OFF (empty
+    string) → no brand to auto with, so surface the one-click prompt (today's
+    behaviour is preserved when the parser yields nothing)."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=True)
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db_session, "tagless_default_filament", "")  # explicit off
+    await db_session.commit()
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
+    broadcasts = _spy_broadcast(monkeypatch)
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
+
+    assert result is None  # did not auto-respool
+    assert any(b["type"] == "respool_prompt" for b in broadcasts)
+
+
 # -- Spoolman mode no-ops ----------------------------------------------------
 
 
@@ -661,6 +759,135 @@ async def test_hooks_noop_in_spoolman_mode(db_session, printer_factory, monkeypa
     assert broadcasts == []
 
 
+# -- Bug C: live-tray-now resolution + per-incident spent dedup --------------
+
+
+async def _single_feeder_item(db, printer_id, *, mapping="[0, -1, -1, -1]"):
+    batch = PrintBatch(name="run", sku_file_id=1, status="active")
+    db.add(batch)
+    await db.flush()
+    item = PrintQueueItem(printer_id=printer_id, batch_id=batch.id, status="printing", ams_mapping=mapping)
+    db.add(item)
+    await db.flush()
+    return item
+
+
+async def _new_spool(db, **kwargs):
+    spool = Spool(
+        material="PETG", label_weight=1000, core_weight=250, weight_used=kwargs.pop("weight_used", 100), **kwargs
+    )
+    spool.k_profiles = []
+    spool.assignments = []
+    db.add(spool)
+    await db.flush()
+    return spool
+
+
+@pytest.mark.asyncio
+async def test_resolve_prefers_live_tray_now_over_mapping(db_session, printer_factory):
+    """Single-feeder job: the live feeding tray_now (a real 0-254 tray) wins over
+    the dispatched ams_mapping — the mapping can be stale after a reload/swap."""
+    printer = await printer_factory()
+    spool0 = await _new_spool(db_session)  # mapping target (global 0)
+    spool1 = await _new_spool(db_session)  # live tray_now (global 1)
+    await _assign(db_session, printer.id, 0, 0, spool0.id)
+    await _assign(db_session, printer.id, 0, 1, spool1.id)
+    await _single_feeder_item(db_session, printer.id, mapping="[0, -1, -1, -1]")
+    await db_session.commit()
+
+    state = _make_state(0, 1, _tray(), tray_now=1)  # feeding tray 1, mapping says 0
+    state.subtask_id = "job-1"
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state)
+
+    assert marked is not None and marked.id == spool1.id  # live tray_now won
+    assert (await db_session.get(Spool, spool0.id)).spent_at is None  # mapping target untouched
+
+
+@pytest.mark.asyncio
+async def test_resolve_tray_now_255_falls_back_to_mapping(db_session, printer_factory):
+    """tray_now unloaded (255) → the single-feeder ams_mapping is the fallback."""
+    printer = await printer_factory()
+    spool0 = await _new_spool(db_session)
+    await _assign(db_session, printer.id, 0, 0, spool0.id)
+    await _single_feeder_item(db_session, printer.id, mapping="[0, -1, -1, -1]")
+    await db_session.commit()
+
+    state = _make_state(0, 0, _tray(), tray_now=255)
+    state.subtask_id = "job-1"
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state)
+
+    assert marked is not None and marked.id == spool0.id
+
+
+@pytest.mark.asyncio
+async def test_incident_dedup_no_second_stamp_same_job(db_session, printer_factory):
+    """A re-raised runout on the SAME (printer, job, tray) must not stamp the
+    operator's freshly-inserted replacement spool (the 18:56 misattribution)."""
+    printer = await printer_factory()
+    spool_a = await _new_spool(db_session)
+    await _assign(db_session, printer.id, 0, 0, spool_a.id)
+    await _single_feeder_item(db_session, printer.id, mapping="[0, -1, -1, -1]")
+    await db_session.commit()
+
+    state = _make_state(0, 0, _tray(), tray_now=255)
+    state.subtask_id = "job-1"
+    first = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state)
+    assert first is not None and first.id == spool_a.id
+
+    # Operator inserts a fresh spool → auto re-assigned to the same slot.
+    assignment = (
+        await db_session.execute(
+            select(SpoolAssignment).where(
+                SpoolAssignment.printer_id == printer.id,
+                SpoolAssignment.ams_id == 0,
+                SpoolAssignment.tray_id == 0,
+            )
+        )
+    ).scalar_one()
+    spool_b = await _new_spool(db_session, weight_used=0)
+    assignment.spool_id = spool_b.id
+    await db_session.commit()
+
+    # Re-raised runout on the same job/tray → dedup → the fresh spool is untouched.
+    second = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state)
+    assert second is None
+    assert (await db_session.get(Spool, spool_b.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_incident_dedup_different_subtask_stamps(db_session, printer_factory):
+    """A DIFFERENT job (new subtask_id) on the same tray naturally misses the
+    dedup and stamps — a genuine later exhaustion is still recorded."""
+    printer = await printer_factory()
+    spool_a = await _new_spool(db_session)
+    await _assign(db_session, printer.id, 0, 0, spool_a.id)
+    await _single_feeder_item(db_session, printer.id, mapping="[0, -1, -1, -1]")
+    await db_session.commit()
+
+    state1 = _make_state(0, 0, _tray(), tray_now=255)
+    state1.subtask_id = "job-1"
+    assert (await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state1)) is not None
+
+    assignment = (
+        await db_session.execute(
+            select(SpoolAssignment).where(
+                SpoolAssignment.printer_id == printer.id,
+                SpoolAssignment.ams_id == 0,
+                SpoolAssignment.tray_id == 0,
+            )
+        )
+    ).scalar_one()
+    spool_b = await _new_spool(db_session, weight_used=0)
+    assignment.spool_id = spool_b.id
+    await db_session.commit()
+
+    state2 = _make_state(0, 0, _tray(), tray_now=255)
+    state2.subtask_id = "job-2"  # a new print → new dedup key
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state2)
+    assert marked is not None and marked.id == spool_b.id
+    assert (await db_session.get(Spool, spool_b.id)).spent_at is not None
+
+
 def _spy_broadcast(monkeypatch):
     from backend.app.core.websocket import ws_manager
 
@@ -671,3 +898,149 @@ def _spy_broadcast(monkeypatch):
 
     monkeypatch.setattr(ws_manager, "broadcast", _spy)
     return collected
+
+
+# -- S1: restart-replay runout suppression (note_status_push seed) -----------
+
+
+def _runout_err(code="8011", attr=0x07000000):
+    """A live runout HMSError → hms_short_code(attr, code) == "0700_8011"."""
+    return HMSError(code=code, attr=attr, module=7, severity=2)
+
+
+@pytest.mark.asyncio
+async def test_note_status_push_seeds_first_push_then_mark_spent_noops(db_session, printer_factory):
+    """First push carries a live runout code → seeded; mark_spent_on_runout no-ops
+    for that code so a swapped-in fresh spool bound to the slot is not mis-stamped."""
+    printer = await printer_factory()
+    fresh = await _new_spool(db_session, weight_used=0)  # the fresh roll now on the slot
+    await _assign(db_session, printer.id, 0, 0, fresh.id)
+    await _single_feeder_item(db_session, printer.id, mapping="[0, -1, -1, -1]")
+    await db_session.commit()
+
+    state = _make_state(0, 0, _tray(), tray_now=255)
+    state.subtask_id = "job-1"
+    state.hms_errors = [_runout_err()]  # runout live at the first status push
+
+    spool_respool.note_status_push(printer.id, state)  # seed the replayed code
+    assert await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state) is None
+    assert (await db_session.get(Spool, fresh.id)).spent_at is None  # NOT stamped
+
+
+@pytest.mark.asyncio
+async def test_note_status_push_unknown_state_does_not_consume_seed(db_session, printer_factory):
+    """A connect-time broadcast (fresh PrinterState, state="unknown", no HMS yet)
+    must NOT consume the one-shot seed — otherwise a still-live runout arriving on
+    the next real report would replay as "new" and mis-stamp the fresh spool."""
+    printer = await printer_factory()
+    fresh = await _new_spool(db_session, weight_used=0)
+    await _assign(db_session, printer.id, 0, 0, fresh.id)
+    await _single_feeder_item(db_session, printer.id, mapping="[0, -1, -1, -1]")
+    await db_session.commit()
+
+    connect_state = _make_state(0, 0, _tray(), gcode_state="unknown", tray_now=255)
+    connect_state.hms_errors = []  # no report yet
+    spool_respool.note_status_push(printer.id, connect_state)  # must stay unseeded
+
+    report_state = _make_state(0, 0, _tray(), gcode_state="PAUSE", tray_now=255)
+    report_state.subtask_id = "job-1"
+    report_state.hms_errors = [_runout_err()]  # the still-live replayed code
+    spool_respool.note_status_push(printer.id, report_state)  # NOW seeds, with the code
+
+    assert await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, report_state) is None
+    assert (await db_session.get(Spool, fresh.id)).spent_at is None  # NOT stamped
+
+
+@pytest.mark.asyncio
+async def test_note_status_push_later_new_runout_stamps(db_session, printer_factory):
+    """A runout NOT live at seed time (first push had zero HMS) is genuinely new and
+    stamps normally."""
+    printer = await printer_factory()
+    spool = await _new_spool(db_session, weight_used=400)
+    await _assign(db_session, printer.id, 0, 0, spool.id)
+    await _single_feeder_item(db_session, printer.id, mapping="[0, -1, -1, -1]")
+    await db_session.commit()
+
+    seed_state = _make_state(0, 0, _tray(), tray_now=255)
+    seed_state.hms_errors = []  # zero HMS at the first push → seeds {}
+    spool_respool.note_status_push(printer.id, seed_state)
+
+    fire_state = _make_state(0, 0, _tray(), tray_now=255)
+    fire_state.subtask_id = "job-1"
+    fire_state.hms_errors = [_runout_err()]
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, fire_state)
+    assert marked is not None and marked.id == spool.id
+    assert marked.spent_at is not None
+
+
+@pytest.mark.asyncio
+async def test_note_status_push_seeded_code_clears_then_refires_stamps(db_session, printer_factory):
+    """A seeded code that later clears from HMS is dropped from the seed; a
+    subsequent re-fire is treated as new and stamps."""
+    printer = await printer_factory()
+    spool = await _new_spool(db_session, weight_used=400)
+    await _assign(db_session, printer.id, 0, 0, spool.id)
+    await _single_feeder_item(db_session, printer.id, mapping="[0, -1, -1, -1]")
+    await db_session.commit()
+
+    s1 = _make_state(0, 0, _tray(), tray_now=255)
+    s1.hms_errors = [_runout_err()]
+    spool_respool.note_status_push(printer.id, s1)  # seeds {0700_8011}
+
+    s2 = _make_state(0, 0, _tray(), tray_now=255)
+    s2.hms_errors = []  # code cleared on a later push
+    spool_respool.note_status_push(printer.id, s2)  # drops it from the seed
+
+    s3 = _make_state(0, 0, _tray(), tray_now=255)
+    s3.subtask_id = "job-1"
+    s3.hms_errors = [_runout_err()]
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, s3)
+    assert marked is not None and marked.spent_at is not None
+
+
+@pytest.mark.asyncio
+async def test_restart_replay_fresh_spool_not_stamped_end_to_end(db_session, printer_factory):
+    """End-to-end restart scenario: the donor is stamped spent pre-restart; a restart
+    (_reset_state) drops the in-memory dedup; a fresh spool is re-assigned to the slot;
+    the same runout code is still live at the first post-restart push — the fresh
+    spool must NOT be stamped (the 18:56 misattribution)."""
+    printer = await printer_factory()
+    donor = await _new_spool(db_session, weight_used=400)
+    await _assign(db_session, printer.id, 0, 0, donor.id)
+    await _single_feeder_item(db_session, printer.id, mapping="[0, -1, -1, -1]")
+    await db_session.commit()
+
+    pre = _make_state(0, 0, _tray(), tray_now=255)
+    pre.subtask_id = "job-1"
+    pre.hms_errors = [_runout_err()]
+    # Pre-restart there is no seed yet → the donor stamps spent as normal.
+    stamped = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, pre)
+    assert stamped is not None and stamped.id == donor.id
+    assert stamped.spent_at is not None
+
+    # Simulate a server restart: the in-memory dedup AND the seed state are lost.
+    spool_respool._reset_state()
+
+    # Operator swapped a fresh roll into the slot during the pause.
+    assignment = (
+        await db_session.execute(
+            select(SpoolAssignment).where(
+                SpoolAssignment.printer_id == printer.id,
+                SpoolAssignment.ams_id == 0,
+                SpoolAssignment.tray_id == 0,
+            )
+        )
+    ).scalar_one()
+    fresh = await _new_spool(db_session, weight_used=0)
+    assignment.spool_id = fresh.id
+    await db_session.commit()
+
+    # First post-restart push still carries the runout code → seed it.
+    post = _make_state(0, 0, _tray(), tray_now=255)
+    post.subtask_id = "job-1"
+    post.hms_errors = [_runout_err()]
+    spool_respool.note_status_push(printer.id, post)
+
+    # The replayed runout must NOT stamp the fresh spool.
+    assert await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, post) is None
+    assert (await db_session.get(Spool, fresh.id)).spent_at is None

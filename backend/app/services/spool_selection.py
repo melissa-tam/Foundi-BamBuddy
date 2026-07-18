@@ -24,6 +24,14 @@ remaining grams fall below the floor can never be the STARTING spool of a print
 below the floor the requirement's slot is reported in
 :attr:`MatchOutcome.start_blocked_slots` so the caller can stage the job with a
 distinct reason instead of silently dispatching or falling back to a mismatch.
+
+Above every policy sits a hard exclude of unusable spools: a spool flagged with a
+mid-print feed fault (``Spool.feed_fault_at`` → :attr:`SlotInventory.out_of_rotation`)
+OR a spent spool (``Spool.spent_at`` → :attr:`SlotInventory.spent`) is removed from
+the candidate set before any eligibility split, so it can never start a print, be
+staged, or surface in ``start_blocked_slots`` — it is simply invisible to selection
+until the condition clears. This exclusion is unconditional: a jammed or spent spool
+never starts a print regardless of the selection policy or the minimum-start floor.
 """
 
 from __future__ import annotations
@@ -67,10 +75,20 @@ class SlotInventory:
     ``remain`` percentage). ``first_loaded_ord`` is epoch seconds of
     ``COALESCE(first_loaded_at, created_at)`` (Spoolman: ``first_used``) — the
     FIFO ordinal; ``None`` when unknown/unbound.
+
+    ``out_of_rotation`` is the feed-fault hard-exclude flag: a spool flagged with a
+    mid-print feed fault (jam / tangle) is out of service and must never be selected.
+    ``spent`` is the run-dry hard-exclude flag: a spool marked spent has no filament
+    left to start with. Both are kept SEPARATE (their log/operator semantics differ)
+    and both hard-exclude the slot. Only the internal inventory mode can set them
+    (``Spool.feed_fault_at`` / ``Spool.spent_at``); Spoolman has no such concept, so
+    they stay ``False`` there.
     """
 
     remaining_g: float | None
     first_loaded_ord: float | None
+    out_of_rotation: bool = False
+    spent: bool = False
 
 
 @dataclass
@@ -267,6 +285,11 @@ def match_filaments_to_slots(
     type-only) and the nozzle filter are UNCHANGED from the legacy matcher. On
     top, per requirement over the not-yet-used candidates:
 
+    0. Unusable candidates are hard-excluded up front, so a jammed or spent spool
+       never starts a print regardless of the policy or the floor: out-of-rotation
+       (``SlotInventory.out_of_rotation`` — a jammed / feed-fault spool) and spent
+       (``SlotInventory.spent`` — a run-dry spool). They enter neither ``eligible``
+       nor ``dropped``, so they can never match nor appear in ``start_blocked_slots``.
     1. ``min_start_g > 0`` drops candidates whose *known* remaining is below the
        floor into a ``dropped`` reserve (unknown/unbound stay eligible).
     2. Eligible candidates are sorted by the policy key (``slot_order`` = none).
@@ -287,6 +310,26 @@ def match_filaments_to_slots(
     for req in required:
         slot_id = req.get("slot_id", 0)
         available = [f for f in loaded if f["global_tray_id"] not in used_tray_ids]
+
+        # (0) Unusable-spool hard exclude: a jammed / feed-fault spool
+        # (out_of_rotation) OR a spent spool leaves the candidate set entirely
+        # BEFORE any eligibility split, so neither can ever start a print, be
+        # staged, or surface in start_blocked_slots — regardless of the policy or
+        # the minimum-start floor. The two reasons are kept SEPARATE so the trace
+        # names why a slot vanished (jam vs run-dry differ operationally).
+        excluded_oor: list[int] = []
+        excluded_spent: list[int] = []
+        if inv:
+            kept: list[dict] = []
+            for f in available:
+                si = inv.get(f["global_tray_id"])
+                if si is not None and si.out_of_rotation:
+                    excluded_oor.append(f["global_tray_id"])
+                elif si is not None and si.spent:
+                    excluded_spent.append(f["global_tray_id"])
+                else:
+                    kept.append(f)
+            available = kept
 
         # Nozzle-aware hard filter (cross-nozzle assignment fails the print).
         req_nozzle_id = req.get("nozzle_id")
@@ -320,7 +363,7 @@ def match_filaments_to_slots(
         if trace:
             logger.info(
                 "[spool-select] slot=%s type=%r color=%r tii=%r nozzle=%s policy=%s min_start=%s; "
-                "eligible=%s dropped=%s",
+                "eligible=%s dropped=%s excluded_oor=%s excluded_spent=%s",
                 slot_id,
                 req_type_repr(req),
                 req.get("color", ""),
@@ -330,6 +373,8 @@ def match_filaments_to_slots(
                 min_start_g,
                 _trace_rows(eligible, inv),
                 _trace_rows(dropped, inv),
+                excluded_oor,
+                excluded_spent,
             )
 
         # (4) bucket scan on eligible; dropped-only match ⇒ start-blocked.
@@ -484,7 +529,12 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
         used = float(spool.weight_used or 0)
         remaining_g = max(0.0, label - used)
         first_ord = _dt_to_epoch(spool.first_loaded_at or spool.created_at)
-        out[gtid] = SlotInventory(remaining_g=remaining_g, first_loaded_ord=first_ord)
+        out[gtid] = SlotInventory(
+            remaining_g=remaining_g,
+            first_loaded_ord=first_ord,
+            out_of_rotation=spool.feed_fault_at is not None,
+            spent=spool.spent_at is not None,
+        )
     return out
 
 

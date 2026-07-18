@@ -50,6 +50,7 @@ from sqlalchemy.orm import selectinload
 from backend.app.core.websocket import ws_manager
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
+from backend.app.services import ams_presence
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_tag_matcher import (
     auto_assign_spool,
@@ -222,6 +223,20 @@ async def _tagless_default(db: AsyncSession) -> dict | None:
     return parsed
 
 
+async def tagless_default_brand(db: AsyncSession) -> str:
+    """The configured tagless-default filament brand, or "" when unset/off.
+
+    Public accessor over :func:`_tagless_default` (the single JSON parser) so
+    other services — e.g. the re-spool tier-2 auto-brand fallback — share ONE
+    source of truth for the ``tagless_default_filament`` setting without copying
+    the parse or reaching into a module-private helper. Returns "" when the
+    feature is off (parser returns None) or the configured JSON carries no brand,
+    so callers never invent a brand.
+    """
+    default = await _tagless_default(db)
+    return ((default or {}).get("brand") or "").strip()
+
+
 async def effective_threshold(db: AsyncSession) -> int:
     """The 'effectively empty' grams threshold (reuses ``respool_prompt_threshold_g``)."""
     from backend.app.api.routes.settings import get_setting
@@ -374,7 +389,14 @@ async def _push_config(db: AsyncSession, spool: Spool, printer_id: int, ams_id: 
             current_tray_info_idx=tray.get("tray_info_idx", "") or "",
             current_tray_type=tray.get("tray_type", "") or "",
         )
-    except Exception:  # noqa: BLE001 — a config-push failure self-heals on the next retry
+    except Exception:  # noqa: BLE001 — log a TRANSIENT push failure; a later AMS push retries it
+        # NOT self-healing for a deterministic error: the callee's lazy-load crash
+        # (walking spool.k_profiles on a pre-existing DB spool) used to fail EVERY
+        # push here and was fixed at apply_spool_to_slot_via_mqtt. What remains is a
+        # genuinely transient MQTT/config failure — while the slot stays bare the
+        # bare-tray trigger re-fires on subsequent AMS pushes (gated by
+        # _AUTOCONFIG_RETRY_S), so a transient miss is retried; a stuck-bare slot
+        # eventually escalates via spool_recovery's forced sweep.
         logger.exception(
             "Bare-tray config push failed for spool %d on printer %d AMS%d-T%d",
             spool.id,
@@ -385,19 +407,112 @@ async def _push_config(db: AsyncSession, spool: Spool, printer_id: int, ams_id: 
         return False
 
 
-async def _broadcast_auto_assigned(printer_id: int, ams_id: int, tray_id: int, spool_id: int) -> None:
-    await ws_manager.broadcast(
-        {
-            "type": "spool_auto_assigned",
-            "printer_id": printer_id,
-            "ams_id": ams_id,
-            "tray_id": tray_id,
-            "spool_id": spool_id,
-        }
-    )
+async def _broadcast_auto_assigned(
+    printer_id: int, ams_id: int, tray_id: int, spool_id: int, origin: str | None = None
+) -> None:
+    """Broadcast a ``spool_auto_assigned`` slot event.
+
+    ``origin`` distinguishes this module's tagless silent-mint (``"tagless"`` —
+    a genuinely NEW untagged roll the frontend toasts about) from the RFID
+    auto-assign broadcasts elsewhere (``main.on_ams_change`` / ``routes.inventory``),
+    which omit the field. The key is only added when ``origin`` is given so RFID
+    payloads stay byte-for-byte unchanged (absent field).
+    """
+    payload: dict = {
+        "type": "spool_auto_assigned",
+        "printer_id": printer_id,
+        "ams_id": ams_id,
+        "tray_id": tray_id,
+        "spool_id": spool_id,
+    }
+    if origin is not None:
+        payload["origin"] = origin
+    await ws_manager.broadcast(payload)
 
 
 # --- Hook B: tagless-slot policy -------------------------------------------
+
+
+async def _maybe_move_tagless_assignment(
+    db: AsyncSession,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    tray: dict,
+    ams_data: list,
+) -> bool:
+    """Re-bind a MOVED tagless roll to its existing ledger row instead of minting.
+
+    A tagless spool physically relocated to another slot on the SAME printer
+    leaves its old :class:`SpoolAssignment` sticky-kept over the now-empty source
+    slot (phase 1's :func:`should_keep_on_empty`). Without this, branch (1) of
+    :func:`handle_tagless_slot` would mint a SECOND spool for the same physical
+    roll — the ledger duplicate this closes.
+
+    A candidate is one of THIS printer's OTHER assignments whose spool is tagless,
+    not spent, and fingerprint-matches ``tray``, AND whose own slot is verifiably
+    EMPTY in the live ``ams_data`` (its tray dict is present with a blank
+    ``tray_type``). A slot ABSENT from the payload is unknowable, so it is NOT a
+    candidate. Cross-printer moves are never considered — we only query THIS
+    printer.
+
+    Returns True (caller should ``continue``) ONLY when exactly one candidate is
+    found and its assignment was moved to this slot. Zero candidates → False
+    (mint as usual). Two or more → False plus a WARNING naming the ambiguous
+    spool ids (mint rather than guess which roll moved).
+    """
+    from backend.app.api.routes.inventory import _find_tray_in_ams_data
+
+    res = await db.execute(
+        select(SpoolAssignment)
+        .options(selectinload(SpoolAssignment.spool))
+        .where(SpoolAssignment.printer_id == printer_id)
+    )
+    candidates: list[SpoolAssignment] = []
+    for asg in res.scalars().all():
+        if asg.ams_id == ams_id and asg.tray_id == tray_id:
+            continue  # the target slot itself (defensive — branch (1) has no row here)
+        spool = asg.spool
+        if spool is None or not is_tagless_spool(spool) or spool.spent_at is not None:
+            continue
+        if not fingerprint_matches(spool, tray):
+            continue
+        src_tray = _find_tray_in_ams_data(ams_data, asg.ams_id, asg.tray_id)
+        if src_tray is None:
+            continue  # source slot/unit absent from the payload → unknowable, not a candidate
+        if (src_tray.get("tray_type") or "").strip():
+            continue  # source slot still holds filament → not an empty source
+        candidates.append(asg)
+
+    if len(candidates) != 1:
+        if len(candidates) >= 2:
+            logger.warning(
+                "Tagless slot-move ambiguous on printer %d AMS%d-T%d: %d empty-source candidates "
+                "(spool ids %s) fingerprint-match — minting a fresh row instead of moving",
+                printer_id,
+                ams_id,
+                tray_id,
+                len(candidates),
+                [c.spool_id for c in candidates],
+            )
+        return False
+
+    asg = candidates[0]
+    old_ams_id, old_tray_id = asg.ams_id, asg.tray_id
+    asg.ams_id = ams_id
+    asg.tray_id = tray_id
+    _refresh_assignment_fingerprint(asg, tray)
+    await db.commit()
+    await _broadcast_auto_assigned(printer_id, ams_id, tray_id, asg.spool_id, origin="tagless")
+    logger.info(
+        "Tagless moved assignment (slot-move) spool %d from AMS%d-T%d to AMS%d-T%d",
+        asg.spool_id,
+        old_ams_id,
+        old_tray_id,
+        ams_id,
+        tray_id,
+    )
+    return True
 
 
 async def handle_tagless_slot(
@@ -407,6 +522,7 @@ async def handle_tagless_slot(
     tray_id: int,
     tray: dict,
     existing_assignment: SpoolAssignment | None,
+    ams_data: list,
 ) -> bool:
     """Policy for a NON-empty tray with no valid RFID tag (native-loop Hook B).
 
@@ -414,8 +530,28 @@ async def handle_tagless_slot(
     ``continue``), or False to let the existing tagged-spool paths run
     (weight-sync, respool gate, K-profile re-apply). ``tray`` is guaranteed to
     have a non-empty ``tray_type`` here — the empty-tray branch handles bare/empty.
+
+    ``ams_data`` is the full live AMS payload the caller is iterating; the
+    no-assignment branch uses it to detect a roll that physically MOVED from
+    another (now-empty) slot on THIS printer and re-bind its existing ledger row
+    instead of minting a duplicate (see :func:`_maybe_move_tagless_assignment`).
     """
     key = (printer_id, ams_id, tray_id)
+
+    # Defer while an RFID identify is in flight on this slot: minting/pushing now
+    # collides with the firmware's read and fails it (HMS 0700_2x00_0001_0081).
+    # Return True (NOT False): a falsy return falls through main.on_ams_change to
+    # the MUTATING spent→respool gate + AMS weight-sync (main.py ~:2077-2132);
+    # True makes the caller ``continue`` — do nothing else with this tray this pass.
+    # A later AMS push (after the identify settles) handles the slot normally.
+    if ams_presence.identify_in_flight(printer_id, ams_id, tray_id):
+        logger.debug(
+            "Deferring tagless handling for printer %d AMS%d-T%d: identify in flight",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return True
 
     # An assignment whose spool row was deleted is an orphan — drop it and treat
     # the slot as unassigned.
@@ -453,7 +589,7 @@ async def handle_tagless_slot(
                 tray_info_idx=tray.get("tray_info_idx", "") or "",
             )
             await db.commit()
-            await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id)
+            await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
             return True
 
         # (4) Same filament → rebind: refresh a drifted fingerprint, write NOTHING
@@ -478,12 +614,19 @@ async def handle_tagless_slot(
             tray_info_idx=tray.get("tray_info_idx", "") or "",
         )
         await db.commit()
-        await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id)
+        await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
         return True
 
     # (1) No assignment. Honour the feature switch.
     if not await _auto_add_untagged(db):
         return True  # feature off — leave the slot alone (handled = do nothing)
+
+    # Slot-move: a tagless roll physically relocated to this slot from another
+    # (now-empty) slot on THIS printer must re-bind its EXISTING ledger row, not
+    # mint a duplicate. Phase 1's sticky-keep leaves the source assignment intact
+    # over its empty slot, which is exactly the row we move here.
+    if await _maybe_move_tagless_assignment(db, printer_id, ams_id, tray_id, tray, ams_data):
+        return True
 
     # Stale-config override: a spent spool's leftover config re-reported by the
     # firmware on this now-refilled slot → apply the default instead of minting
@@ -497,7 +640,7 @@ async def handle_tagless_slot(
             await _assign_from_setting(db, new_spool, printer_id, ams_id, tray_id, default)
             await db.commit()
             await _push_config(db, new_spool, printer_id, ams_id, tray_id, tray)
-            await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id)
+            await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
             logger.info(
                 "Stale-config override on printer %d AMS%d-T%d: applied tagless default over firmware leftover",
                 printer_id,
@@ -518,7 +661,7 @@ async def handle_tagless_slot(
         tray_info_idx=tray.get("tray_info_idx", "") or "",
     )
     await db.commit()
-    await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id)
+    await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
     return True
 
 
@@ -526,7 +669,7 @@ async def handle_tagless_slot(
 
 
 async def maybe_autoconfigure_bare_tray(
-    db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, tray: dict
+    db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, tray: dict, *, force: bool = False
 ) -> bool:
     """Push a default filament to a BARE tray (spool present, nothing configured).
 
@@ -539,6 +682,12 @@ async def maybe_autoconfigure_bare_tray(
     The config push self-heals: while the slot stays bare, the trigger persists
     across AMS pushes (gated by :data:`_AUTOCONFIG_RETRY_S`) until the firmware
     reports a non-empty tray_type and the slot leaves this branch.
+
+    ``force=True`` bypasses ONLY the :data:`_AUTOCONFIG_RETRY_S` window (every
+    other guard — presence, tray_type-empty, RFID, settings, operator/RFID-bound
+    slot — still applies). ``spool_recovery`` uses it for a one-shot bare-tray
+    sweep when a mid-print jam has no configured replacement, so a present-but-bare
+    backup spool can be enrolled without waiting out the retry cadence.
     """
     if not tray_present(tray):
         return False
@@ -555,7 +704,7 @@ async def maybe_autoconfigure_bare_tray(
     key = (printer_id, ams_id, tray_id)
     now = monotonic()
     last = _autoconfig_attempts.get(key)
-    if last is not None and (now - last) < _AUTOCONFIG_RETRY_S:
+    if not force and last is not None and (now - last) < _AUTOCONFIG_RETRY_S:
         return False  # config attempt still inside its retry window
 
     res = await db.execute(

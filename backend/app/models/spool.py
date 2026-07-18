@@ -76,6 +76,22 @@ class Spool(Base):
     # certainty key that gates the automatic re-spool tier; NULL = never observed
     # spent (falls back to the one-click prompt tier).
     spent_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # Operator answered "Same spool" to the tier-3 (uncertain) re-spool prompt:
+    # suppresses further tier-3 prompts for this spool across reseats / AMS
+    # power-cycles / server restarts (the in-memory prompt dedup cannot survive
+    # those). Hardware-certain spent (tier 1/2 auto re-spool) is NOT gated by
+    # this — only the uncertain prompt tier reads it, so a genuine exhaustion
+    # still surfaces. Stamped ONLY via POST /inventory/spools/{id}/respool-dismiss
+    # (the single mutator — deliberately absent from SpoolUpdate).
+    respool_dismissed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # Out-of-rotation marker: set when a feed-fault HMS (stuck/tangled spool)
+    # triggers mid-print recovery on this spool's tray; NULL = in rotation.
+    # Cleared on physical remove+re-insert (ams_presence edge) or manual PATCH.
+    # Distinct from spent_at (hardware exhaustion) and archived_at (soft-hide):
+    # a jammed spool is neither.
+    feed_fault_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # The HMS short code (e.g. "0700_8010") that flagged the feed fault.
+    feed_fault_code: Mapped[str | None] = mapped_column(String(16))
     # FIFO substrate: when this spool FIRST entered service (first time it got a
     # SpoolAssignment). Stamped by later work items — the column exists so the
     # spool-selection policy can order candidates oldest-first. NULL = never

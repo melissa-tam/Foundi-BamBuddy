@@ -7,6 +7,7 @@ override, and provisional disposal on RFID takeover.
 """
 
 import json
+import logging
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -100,6 +101,48 @@ async def _assignment(db, printer_id, ams_id=0, tray_id=0):
     return res.scalar_one_or_none()
 
 
+async def _seed_assignment(
+    db, printer_id, ams_id, tray_id, *, material="PETG", rgba="112233FF", tag_uid=None, spent=False
+):
+    """Create a spool + SpoolAssignment at (ams_id, tray_id) and return the spool id.
+
+    Tagless by default (no tag_uid/tray_uuid). The fingerprint is seeded from the
+    material/colour so a same-filament tray re-binds on fingerprint match.
+    """
+    spool = Spool(
+        material=material,
+        rgba=rgba,
+        data_origin="rfid_auto" if tag_uid else "ams_auto",
+        tag_uid=tag_uid,
+        spent_at=datetime.utcnow() if spent else None,
+    )
+    spool.k_profiles = []
+    spool.assignments = []
+    db.add(spool)
+    await db.flush()
+    db.add(
+        SpoolAssignment(
+            spool_id=spool.id,
+            printer_id=printer_id,
+            ams_id=ams_id,
+            tray_id=tray_id,
+            fingerprint_color=rgba,
+            fingerprint_type=material,
+        )
+    )
+    await db.commit()
+    return spool.id
+
+
+def _empty_tray(tray_id):
+    """A slot that is present in the AMS payload but reports no filament (empty)."""
+    return {"id": tray_id, "state": 9, "tray_type": "", "tag_uid": "0" * 16, "tray_uuid": "0" * 32}
+
+
+def _ams(ams_id, trays):
+    return [{"id": ams_id, "tray": trays}]
+
+
 # --- mint_tagless_spool ----------------------------------------------------
 
 
@@ -146,6 +189,30 @@ class TestMint:
             await spool_tagless.mint_tagless_spool(db_session)
         with pytest.raises(ValueError):
             await spool_tagless.mint_tagless_spool(db_session, tray={}, default_filament={})
+
+
+# --- broadcast origin ------------------------------------------------------
+
+
+class TestBroadcastOrigin:
+    """The ``spool_auto_assigned`` broadcast helper carries ``origin: "tagless"``
+    ONLY for this module's silent mints; the RFID auto-assign broadcasts
+    elsewhere call it with no origin and must stay field-absent so the frontend
+    toasts only for a genuinely new untagged spool."""
+
+    async def test_tagless_origin_present(self, env):
+        await spool_tagless._broadcast_auto_assigned(1, 0, 2, 5, origin="tagless")
+        payload = env.ws.call_args.args[0]
+        assert payload["type"] == "spool_auto_assigned"
+        assert payload["origin"] == "tagless"
+
+    async def test_rfid_path_omits_origin(self, env):
+        # Default (no origin) mirrors the RFID broadcast dicts in main.py /
+        # routes.inventory — the key must be ABSENT, not None.
+        await spool_tagless._broadcast_auto_assigned(1, 0, 2, 5)
+        payload = env.ws.call_args.args[0]
+        assert payload["type"] == "spool_auto_assigned"
+        assert "origin" not in payload
 
 
 # --- predicates ------------------------------------------------------------
@@ -202,7 +269,7 @@ class TestPredicates:
 class TestHandleTaglessSlot:
     async def test_no_assignment_mints_and_assigns(self, db_session, printer_factory, env):
         printer = await printer_factory()
-        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None)
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None, [])
         assert handled is True
         sa = await _assignment(db_session, printer.id)
         assert sa is not None
@@ -210,17 +277,21 @@ class TestHandleTaglessSlot:
         assert spool.data_origin == "ams_auto"
         assert spool.first_loaded_at is not None
         env.ws.assert_awaited()  # spool_auto_assigned broadcast
+        # A genuinely NEW tagless mint tags the broadcast so the frontend toasts.
+        payload = env.ws.call_args.args[0]
+        assert payload["type"] == "spool_auto_assigned"
+        assert payload["origin"] == "tagless"
 
     async def test_auto_add_off_leaves_slot_alone(self, db_session, printer_factory, env):
         env.settings["auto_add_untagged"] = "false"
         printer = await printer_factory()
-        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None)
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None, [])
         assert handled is True  # handled = deliberately do nothing
         assert await _assignment(db_session, printer.id) is None  # nothing minted
 
     async def test_rebind_preserves_spool_and_operator_edits(self, db_session, printer_factory, env):
         printer = await printer_factory()
-        await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None)
+        await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None, [])
         sa = await _assignment(db_session, printer.id)
         spool_id = sa.spool_id
         spool = await db_session.get(Spool, spool_id)
@@ -230,7 +301,7 @@ class TestHandleTaglessSlot:
 
         # Second push, same filament → rebind, no new spool, no overwrite.
         sa2 = await _assignment(db_session, printer.id)
-        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), sa2)
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), sa2, [])
         assert handled is True
         sa3 = await _assignment(db_session, printer.id)
         assert sa3.spool_id == spool_id  # same ledger row rebound
@@ -242,13 +313,13 @@ class TestHandleTaglessSlot:
 
     async def test_different_filament_unlinks_and_mints(self, db_session, printer_factory, env):
         printer = await printer_factory()
-        await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG", color="112233FF"), None)
+        await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG", color="112233FF"), None, [])
         sa = await _assignment(db_session, printer.id)
         old_id = sa.spool_id
 
         sa2 = await _assignment(db_session, printer.id)
         handled = await spool_tagless.handle_tagless_slot(
-            db_session, printer.id, 0, 0, _tray("PLA", color="FF0000FF"), sa2
+            db_session, printer.id, 0, 0, _tray("PLA", color="FF0000FF"), sa2, []
         )
         assert handled is True
         sa3 = await _assignment(db_session, printer.id)
@@ -269,7 +340,7 @@ class TestHandleTaglessSlot:
         await db_session.commit()
 
         sa = await _assignment(db_session, printer.id)
-        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), sa)
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), sa, [])
         assert handled is True
         await db_session.refresh(spent)
         assert spent.archived_at is not None  # archived (grams preserved)
@@ -290,7 +361,7 @@ class TestHandleTaglessSlot:
 
         sa = await _assignment(db_session, printer.id)
         # state 10 = present but filament not fed → not loaded → no churn.
-        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG", state=10), sa)
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG", state=10), sa, [])
         assert handled is True
         sa2 = await _assignment(db_session, printer.id)
         assert sa2.spool_id == spent.id  # unchanged
@@ -310,7 +381,7 @@ class TestHandleTaglessSlot:
         await db_session.commit()
 
         sa = await _assignment(db_session, printer.id)
-        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), sa)
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), sa, [])
         assert handled is False  # RFID/respool flows own it
         sa2 = await _assignment(db_session, printer.id)
         assert sa2.spool_id == tagged.id  # untouched
@@ -322,11 +393,31 @@ class TestHandleTaglessSlot:
         db_session.add(SpoolAssignment(spool_id=999999, printer_id=printer.id, ams_id=0, tray_id=0))
         await db_session.commit()
         orphan = await _assignment(db_session, printer.id)  # .spool is None (dangling FK)
-        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), orphan)
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), orphan, [])
         assert handled is True
         sa = await _assignment(db_session, printer.id)
         spool = await db_session.get(Spool, sa.spool_id)
         assert spool is not None and spool.data_origin == "ams_auto"
+
+    async def test_defers_while_identify_in_flight(self, db_session, printer_factory, env, monkeypatch):
+        # Guard 4: while an RFID identify is in flight on this slot, handle_tagless_slot
+        # mints/pushes NOTHING and returns True — a falsy return would fall through
+        # main.on_ams_change to the MUTATING spent→respool gate + weight-sync.
+        monkeypatch.setattr("backend.app.services.ams_presence.identify_in_flight", lambda *a: True)
+        printer = await printer_factory()
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None, [])
+        assert handled is True  # deferred → caller `continue`s
+        assert await _assignment(db_session, printer.id) is None  # nothing minted
+        env.ws.assert_not_awaited()  # no spool_auto_assigned broadcast
+        env.apply.assert_not_awaited()  # no config push (no filament-setting write)
+
+    async def test_processes_normally_when_not_in_flight(self, db_session, printer_factory, env, monkeypatch):
+        # The complement: with no identify in flight the slot is handled as usual.
+        monkeypatch.setattr("backend.app.services.ams_presence.identify_in_flight", lambda *a: False)
+        printer = await printer_factory()
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None, [])
+        assert handled is True
+        assert await _assignment(db_session, printer.id) is not None  # minted normally
 
     async def test_mid_print_no_idle_requirement(self, db_session, printer_factory, env, monkeypatch):
         # Hook B has no idle gate — a tagless spool inserted mid-print is minted
@@ -337,9 +428,144 @@ class TestHandleTaglessSlot:
             lambda pid: SimpleNamespace(state="RUNNING", nozzles=[], ams_extruder_map=None, raw_data={}, kprofiles=[]),
         )
         printer = await printer_factory()
-        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None)
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None, [])
         assert handled is True
         assert await _assignment(db_session, printer.id) is not None
+
+
+# --- Hook B branch (1): slot-move dedup ------------------------------------
+
+
+class TestSlotMove:
+    """A tagless roll physically MOVED to another slot on the SAME printer must
+    re-bind its EXISTING ledger row (no duplicate mint). Phase 1's sticky-keep
+    leaves the source assignment over the now-empty slot; branch (1) moves it."""
+
+    async def test_unique_candidate_moves_ledger_row(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        # Roll originally at AMS0-T0; sticky-kept there over the now-empty slot.
+        spool_id = await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+        before = await db_session.scalar(select(func.count(Spool.id)))
+
+        # Live payload: T0 now empty, T1 holds the same roll. Handle the NEW slot.
+        ams_data = _ams(0, [_empty_tray(0), {**_tray("PETG", color="112233FF"), "id": 1}])
+        handled = await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 1, _tray("PETG", color="112233FF"), None, ams_data
+        )
+        assert handled is True
+
+        moved = await _assignment(db_session, printer.id, ams_id=0, tray_id=1)
+        assert moved is not None and moved.spool_id == spool_id  # SAME ledger row re-bound
+        assert await _assignment(db_session, printer.id, ams_id=0, tray_id=0) is None  # source released
+        assert moved.fingerprint_type == "PETG"  # fingerprint refreshed for the new slot
+        after = await db_session.scalar(select(func.count(Spool.id)))
+        assert after == before  # NO new spool minted
+        payload = env.ws.call_args.args[0]
+        assert payload["type"] == "spool_auto_assigned" and payload["origin"] == "tagless"
+
+    async def test_cross_ams_move_same_printer(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        spool_id = await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+
+        # Moved from AMS0-T0 to AMS1-T0; AMS0-T0 reports empty in the payload.
+        ams_data = _ams(0, [_empty_tray(0)]) + _ams(1, [{**_tray("PETG", color="112233FF"), "id": 0}])
+        handled = await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 1, 0, _tray("PETG", color="112233FF"), None, ams_data
+        )
+        assert handled is True
+        moved = await _assignment(db_session, printer.id, ams_id=1, tray_id=0)
+        assert moved is not None and moved.spool_id == spool_id
+        assert await _assignment(db_session, printer.id, ams_id=0, tray_id=0) is None
+
+    async def test_two_candidates_mint_and_warn(self, db_session, printer_factory, env, caplog):
+        printer = await printer_factory()
+        # Two same-fingerprint tagless rolls, both sticky-kept over empty slots.
+        id_a = await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+        id_b = await _seed_assignment(db_session, printer.id, 0, 2, material="PETG", rgba="112233FF")
+        before = await db_session.scalar(select(func.count(Spool.id)))
+
+        ams_data = _ams(0, [_empty_tray(0), {**_tray("PETG", color="112233FF"), "id": 1}, _empty_tray(2)])
+        with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
+            handled = await spool_tagless.handle_tagless_slot(
+                db_session, printer.id, 0, 1, _tray("PETG", color="112233FF"), None, ams_data
+            )
+        assert handled is True
+        # Ambiguous → NO move: both source rows untouched, a fresh row minted at T1.
+        assert await _assignment(db_session, printer.id, ams_id=0, tray_id=0) is not None
+        assert await _assignment(db_session, printer.id, ams_id=0, tray_id=2) is not None
+        new_sa = await _assignment(db_session, printer.id, ams_id=0, tray_id=1)
+        assert new_sa is not None and new_sa.spool_id not in (id_a, id_b)
+        after = await db_session.scalar(select(func.count(Spool.id)))
+        assert after == before + 1  # a duplicate WAS minted (ambiguity = can't safely move)
+        warned = "\n".join(r.message for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "ambiguous" in warned.lower()
+        assert str(id_a) in warned and str(id_b) in warned
+
+    async def test_source_absent_from_payload_not_a_candidate(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        id_a = await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+        before = await db_session.scalar(select(func.count(Spool.id)))
+
+        # AMS0-T0 is ABSENT from the payload (unknowable) → not a candidate → mint.
+        ams_data = _ams(0, [{**_tray("PETG", color="112233FF"), "id": 1}])
+        handled = await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 1, _tray("PETG", color="112233FF"), None, ams_data
+        )
+        assert handled is True
+        assert await _assignment(db_session, printer.id, ams_id=0, tray_id=0) is not None  # source untouched
+        new_sa = await _assignment(db_session, printer.id, ams_id=0, tray_id=1)
+        assert new_sa is not None and new_sa.spool_id != id_a
+        after = await db_session.scalar(select(func.count(Spool.id)))
+        assert after == before + 1  # minted (no confident move)
+
+    async def test_spent_tagged_and_different_fingerprint_not_candidates(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        # None of these three empty-source rows may be moved into the new slot:
+        await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF", spent=True)  # spent
+        await _seed_assignment(
+            db_session, printer.id, 0, 2, material="PETG", rgba="112233FF", tag_uid=_VALID_TAG
+        )  # tagged
+        await _seed_assignment(db_session, printer.id, 0, 3, material="PLA", rgba="FF0000FF")  # different filament
+        before = await db_session.scalar(select(func.count(Spool.id)))
+
+        ams_data = _ams(
+            0, [_empty_tray(0), {**_tray("PETG", color="112233FF"), "id": 1}, _empty_tray(2), _empty_tray(3)]
+        )
+        handled = await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 1, _tray("PETG", color="112233FF"), None, ams_data
+        )
+        assert handled is True
+        # No candidate qualified → fresh mint, all three source rows intact.
+        assert await _assignment(db_session, printer.id, ams_id=0, tray_id=0) is not None
+        assert await _assignment(db_session, printer.id, ams_id=0, tray_id=2) is not None
+        assert await _assignment(db_session, printer.id, ams_id=0, tray_id=3) is not None
+        assert await _assignment(db_session, printer.id, ams_id=0, tray_id=1) is not None
+        after = await db_session.scalar(select(func.count(Spool.id)))
+        assert after == before + 1
+
+    async def test_nonempty_source_not_a_candidate(self, db_session, printer_factory, env):
+        # The source slot STILL holds filament in the payload (not empty) → the roll
+        # didn't leave it, so this is a genuinely new roll here → mint, don't move.
+        printer = await printer_factory()
+        id_a = await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+        before = await db_session.scalar(select(func.count(Spool.id)))
+
+        ams_data = _ams(
+            0,
+            [
+                {**_tray("PETG", color="112233FF"), "id": 0},  # source STILL loaded
+                {**_tray("PETG", color="112233FF"), "id": 1},
+            ],
+        )
+        handled = await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 1, _tray("PETG", color="112233FF"), None, ams_data
+        )
+        assert handled is True
+        assert await _assignment(db_session, printer.id, ams_id=0, tray_id=0) is not None
+        new_sa = await _assignment(db_session, printer.id, ams_id=0, tray_id=1)
+        assert new_sa is not None and new_sa.spool_id != id_a
+        after = await db_session.scalar(select(func.count(Spool.id)))
+        assert after == before + 1
 
 
 # --- D3b: maybe_autoconfigure_bare_tray ------------------------------------
@@ -441,7 +667,7 @@ class TestStaleConfigOverride:
 
         # Firmware re-reports the SAME leftover config (PLA red) → stale → apply DEFAULT.
         handled = await spool_tagless.handle_tagless_slot(
-            db_session, printer.id, 0, 0, _tray("PLA", color="FF0000FF"), None
+            db_session, printer.id, 0, 0, _tray("PLA", color="FF0000FF"), None, []
         )
         assert handled is True
         sa = await _assignment(db_session, printer.id)
@@ -462,7 +688,7 @@ class TestStaleConfigOverride:
         # A genuinely different filament (PLA blue) → not the leftover → normal
         # tray-derived mint, marker cleared.
         handled = await spool_tagless.handle_tagless_slot(
-            db_session, printer.id, 0, 0, _tray("PLA", color="0000FFFF"), None
+            db_session, printer.id, 0, 0, _tray("PLA", color="0000FFFF"), None, []
         )
         assert handled is True
         sa = await _assignment(db_session, printer.id)
@@ -523,3 +749,119 @@ class TestProvisionalDisposal:
         assert disp == "kept"
         await db_session.refresh(spool)
         assert spool.archived_at is None
+
+
+# --- force=True bare-tray sweep (spool_recovery's mid-print enrollment) ------
+
+
+class TestForceBareTray:
+    async def test_force_bypasses_only_the_retry_window(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        # First (unforced) call mints + pushes and stamps the retry window.
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is True
+        assert env.apply.await_count == 1
+        # Second call INSIDE the window without force → skipped.
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is False
+        assert env.apply.await_count == 1
+        # Same window but force=True → re-pushes (window bypassed), no re-mint.
+        assert (
+            await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True) is True
+        )
+        assert env.apply.await_count == 2
+        count = await db_session.scalar(select(func.count(Spool.id)).where(Spool.data_origin == "ams_auto"))
+        assert count == 1  # forced re-push did not mint a duplicate
+
+    async def test_force_still_respects_the_other_guards(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        # auto_add off → force does NOT override.
+        env.settings["auto_add_untagged"] = "false"
+        assert (
+            await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True)
+            is False
+        )
+        env.settings["auto_add_untagged"] = "true"
+        # Already-configured (non-bare) tray → force does NOT override.
+        assert (
+            await spool_tagless.maybe_autoconfigure_bare_tray(
+                db_session, printer.id, 0, 0, _bare(tray_type="PETG"), force=True
+            )
+            is False
+        )
+        # RFID tray → force does NOT override.
+        assert (
+            await spool_tagless.maybe_autoconfigure_bare_tray(
+                db_session, printer.id, 0, 0, _bare(tag=_VALID_TAG), force=True
+            )
+            is False
+        )
+        # Operator-bound slot → force does NOT override.
+        operator_spool = Spool(material="PLA", data_origin="manual")
+        operator_spool.k_profiles = []
+        operator_spool.assignments = []
+        db_session.add(operator_spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=operator_spool.id, printer_id=printer.id, ams_id=0, tray_id=0))
+        await db_session.commit()
+        assert (
+            await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True)
+            is False
+        )
+        env.apply.assert_not_awaited()
+
+
+# --- apply_spool_to_slot_via_mqtt lazy-load regression (prod 2026-07-17) -----
+
+
+class TestApplySpoolLazyLoadRegression:
+    async def test_db_loaded_spool_does_not_lazyload_and_publishes(self, db_session, printer_factory, monkeypatch):
+        """The REAL callee behind the bare-tray push. A DB-loaded spool whose
+        k_profiles relationship is NOT eager-loaded must publish the MQTT config
+        without a greenlet/lazy-load crash (the deterministic bare-tray failure)."""
+        from backend.app.api.routes.inventory import apply_spool_to_slot_via_mqtt
+        from backend.app.models.spool_k_profile import SpoolKProfile
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory()
+        spool = Spool(material="PETG", rgba="00FF00FF", data_origin="ams_auto")
+        spool.k_profiles = []
+        spool.assignments = []
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(
+            SpoolKProfile(spool_id=spool.id, printer_id=printer.id, nozzle_diameter="0.4", k_value=0.02, cali_idx=5)
+        )
+        await db_session.commit()
+        spool_id = spool.id
+
+        # Expire ONLY the k_profiles relationship so it is unloaded (columns stay
+        # loaded): the old `for kp in spool.k_profiles` walk would greenlet-crash
+        # on this object; the explicit-query fix must not.
+        loaded = await db_session.get(Spool, spool_id)
+        db_session.expire(loaded, ["k_profiles"])
+
+        calls: list[tuple] = []
+
+        class _FakeClient:
+            def ams_set_filament_setting(self, **kw):
+                calls.append(("set", kw))
+
+            def extrusion_cali_sel(self, **kw):
+                calls.append(("cali", kw))
+
+        monkeypatch.setattr(printer_manager, "get_client", lambda pid: _FakeClient())
+        monkeypatch.setattr(printer_manager, "get_status", lambda pid: None)
+
+        ok = await apply_spool_to_slot_via_mqtt(
+            db=db_session,
+            current_user=None,
+            spool=loaded,
+            printer_id=printer.id,
+            ams_id=0,
+            tray_id=0,
+        )
+
+        assert ok is True  # reached the end without raising
+        assert any(c[0] == "set" for c in calls)  # filament setting published
+        # The stored K-profile is found via the explicit query (cali_idx 5, not -1).
+        cali = [c for c in calls if c[0] == "cali"]
+        assert cali and cali[0][1]["cali_idx"] == 5

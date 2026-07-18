@@ -28,6 +28,7 @@ existing integration suite already covers.
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -107,6 +108,47 @@ class TestLockSerialisesConcurrentCallbacks:
         await asyncio.gather(task_a, task_b)
 
         assert order == ["first-enter", "first-exit", "second-enter"]
+
+    @pytest.mark.asyncio
+    async def test_phase1_cleanup_and_phase2_assign_run_under_one_held_lock(self, monkeypatch):
+        """F3: BOTH DB phases of ``on_ams_change`` (phase 1 stale-cleanup AND
+        phase 2 mint/assign) must run under a single held per-printer lock, while
+        the phase-3 Spoolman sync stays lock-free.
+
+        We record ``lock.locked()`` at the moment each phase opens its
+        ``async_session`` — a fake session that raises immediately so we never need
+        a real DB (each phase's own try/except swallows it and moves on). Expect
+        the lock HELD for phases 1 and 2 and RELEASED for phase 3.
+        """
+        import backend.app.main as main_mod
+
+        printer_id = 99
+        lock = _get_ams_assignment_lock(printer_id)
+        observed: list[bool] = []
+
+        class _FakeSession:
+            async def __aenter__(self):
+                observed.append(lock.locked())
+                raise RuntimeError("bail-out-of-phase-body")
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(main_mod, "async_session", lambda: _FakeSession())
+        # Neutralise the pre-phase side effects and the trailing farm-staging hook so
+        # nothing touches the real DB or MQTT.
+        monkeypatch.setattr(main_mod.printer_manager, "get_printer", lambda pid: None)
+        monkeypatch.setattr(main_mod.printer_manager, "get_status", lambda pid: None)
+        monkeypatch.setattr(
+            "backend.app.services.farm_staging.maybe_release_on_ams_change",
+            AsyncMock(return_value=None),
+        )
+
+        await main_mod.on_ams_change(printer_id, [])
+
+        # Phase 1 (cleanup) and phase 2 (assign) opened their sessions while the
+        # lock was held; phase 3 (Spoolman sync) opened it lock-free.
+        assert observed[:3] == [True, True, False]
 
     @pytest.mark.asyncio
     async def test_different_printers_run_in_parallel(self):

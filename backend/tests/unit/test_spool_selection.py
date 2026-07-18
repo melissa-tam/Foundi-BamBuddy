@@ -5,6 +5,8 @@ Covers the pure matcher (:func:`match_filaments_to_slots`), the AMS-Backup gate
 guard tying the module constants to ``AppSettings``.
 """
 
+import logging
+
 from backend.app.schemas.settings import AppSettings
 from backend.app.services.spool_selection import (
     DEFAULT_MIN_START_SPOOL_G,
@@ -246,5 +248,108 @@ class TestStartBlockedSlots:
         loaded = [_loaded(0, tray_id=0)]
         inv = {0: SlotInventory(remaining_g=50.0, first_loaded_ord=None)}
         out = _match([_req()], loaded, policy="slot_order", inv=inv, min_start_g=0)
+        assert out.mapping == [0]
+        assert out.start_blocked_slots == []
+
+
+class TestOutOfRotation:
+    def test_oor_never_matches_even_as_only_candidate(self):
+        """A jammed spool is invisible to selection: the only same-type spool
+        being out-of-rotation yields a no-match, not a pick."""
+        loaded = [_loaded(0, tray_id=0, color="#FF0000")]
+        inv = {0: SlotInventory(remaining_g=500.0, first_loaded_ord=100.0, out_of_rotation=True)}
+        out = _match([_req(color="#FF0000")], loaded, policy="first_loaded", inv=inv)
+        assert out.mapping == [-1]
+        assert out.start_blocked_slots == []
+
+    def test_oor_never_start_blocked_distinct_from_floor_drop(self):
+        """An out-of-rotation spool ABOVE the floor is fully excluded — it must
+        NOT land in start_blocked_slots (that path is only for floor-dropped
+        candidates that would otherwise have matched)."""
+        loaded = [_loaded(0, tray_id=0, color="#FF0000")]
+        # remaining_g well above the floor, so the ONLY reason it is gone is OOR.
+        inv = {0: SlotInventory(remaining_g=500.0, first_loaded_ord=None, out_of_rotation=True)}
+        out = _match([_req(color="#FF0000")], loaded, policy="slot_order", inv=inv, min_start_g=120)
+        assert out.mapping == [-1]
+        assert out.start_blocked_slots == []
+
+    def test_default_false_preserves_behavior(self):
+        """out_of_rotation defaults to False — an existing-style FIFO happy case
+        (constructed without the flag) still picks the oldest spool unchanged."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1)]
+        inv = {
+            0: SlotInventory(remaining_g=500.0, first_loaded_ord=100.0),
+            1: SlotInventory(remaining_g=500.0, first_loaded_ord=200.0),
+        }
+        out = _match([_req()], loaded, policy="first_loaded", inv=inv)
+        assert out.mapping == [0]
+        assert out.start_blocked_slots == []
+
+    def test_oor_excluded_then_fifo_picks_older_eligible(self):
+        """Two eligible spools plus an OLDER out-of-rotation spool: the jammed
+        oldest is skipped and FIFO picks the older of the two ELIGIBLE ones."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1), _loaded(2, tray_id=2)]
+        inv = {
+            0: SlotInventory(remaining_g=500.0, first_loaded_ord=50.0, out_of_rotation=True),  # oldest, jammed
+            1: SlotInventory(remaining_g=500.0, first_loaded_ord=100.0),  # older eligible
+            2: SlotInventory(remaining_g=500.0, first_loaded_ord=200.0),  # newer eligible
+        }
+        out = _match([_req()], loaded, policy="first_loaded", inv=inv)
+        assert out.mapping == [1]
+        assert out.start_blocked_slots == []
+
+
+class TestSpentExclusion:
+    """A spent spool (``SlotInventory.spent``) is hard-excluded exactly like an
+    out-of-rotation one — regardless of policy or floor — so a run-dry roll can
+    never start a print. Kept SEPARATE from out_of_rotation (log semantics differ)."""
+
+    def test_spent_excluded_under_slot_order_floor_zero(self):
+        """The exact gap S2 closes: slot_order + min_start_g=0 (the skip_filament_check
+        path) still hard-excludes a spent spool — the ONLY matching candidate being
+        spent yields a no-match, not a start."""
+        loaded = [_loaded(0, tray_id=0, color="#FF0000")]
+        inv = {0: SlotInventory(remaining_g=500.0, first_loaded_ord=None, spent=True)}
+        out = _match([_req(color="#FF0000")], loaded, policy="slot_order", inv=inv, min_start_g=0)
+        assert out.mapping == [-1]
+        assert out.start_blocked_slots == []
+
+    def test_spent_never_start_blocked(self):
+        """A spent spool is fully excluded — it must NOT surface in
+        start_blocked_slots (that path is only for floor-dropped candidates)."""
+        loaded = [_loaded(0, tray_id=0, color="#FF0000")]
+        inv = {0: SlotInventory(remaining_g=500.0, first_loaded_ord=None, spent=True)}
+        out = _match([_req(color="#FF0000")], loaded, policy="slot_order", inv=inv, min_start_g=120)
+        assert out.mapping == [-1]
+        assert out.start_blocked_slots == []
+
+    def test_oor_and_spent_both_excluded_trace_names_reason(self, caplog):
+        """OOR and spent slots are both excluded and the decision trace names WHICH
+        reason each slot vanished for (excluded_oor vs excluded_spent), leaving the
+        live slot to be picked."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1), _loaded(2, tray_id=2)]
+        inv = {
+            0: SlotInventory(remaining_g=500.0, first_loaded_ord=50.0, out_of_rotation=True),  # jammed
+            1: SlotInventory(remaining_g=500.0, first_loaded_ord=100.0, spent=True),  # run-dry
+            2: SlotInventory(remaining_g=500.0, first_loaded_ord=200.0),  # live
+        }
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_selection"):
+            out = _match([_req()], loaded, policy="first_loaded", inv=inv)
+        assert out.mapping == [2]  # only the live slot is selectable
+        assert out.start_blocked_slots == []
+        trace = "\n".join(r.message for r in caplog.records)
+        assert "excluded_oor=[0]" in trace
+        assert "excluded_spent=[1]" in trace
+
+    def test_spent_false_default_preserves_behavior(self):
+        """spent defaults to False — a plain FIFO happy case (no flag set) still
+        picks the oldest spool unchanged."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1)]
+        inv = {
+            0: SlotInventory(remaining_g=500.0, first_loaded_ord=100.0),
+            1: SlotInventory(remaining_g=500.0, first_loaded_ord=200.0),
+        }
+        assert inv[0].spent is False  # default
+        out = _match([_req()], loaded, policy="first_loaded", inv=inv)
         assert out.mapping == [0]
         assert out.start_blocked_slots == []

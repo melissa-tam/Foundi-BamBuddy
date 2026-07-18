@@ -40,6 +40,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.models.spool_usage_history import SpoolUsageHistory
+from backend.app.services.hms_errors import hms_short_code
 from backend.app.services.spool_tag_matcher import (
     ZERO_TAG_UID,
     ZERO_TRAY_UUID,
@@ -90,11 +91,36 @@ _last_tray_now: dict[int, int] = {}
 # slot goes empty so remove + reinsert re-prompts.
 _respool_prompt_dedup: dict[int, dict[tuple[int, int], tuple[str, str]]] = {}
 
+# Per-incident spent-stamp dedup, keyed (printer_id, subtask_id, global_tray): one
+# spent stamp per tray per job. A re-raised runout HMS on the SAME job/tray must
+# not stamp again — otherwise a fresh spool the operator just inserted (auto-minted
+# and re-assigned to the same slot) gets stamped SPENT with a fabricated
+# label-floored weight (production 2026-07-17 18:56: new spool 73 stamped 1000 g
+# spent 7 s after insertion). Key-scoped by subtask_id so a genuinely new job
+# naturally misses; process-lifetime like the other edge dicts above, cleared by
+# :func:`_reset_state`.
+_spent_dedup: set[tuple[int, object, int]] = set()
+
+# S1 restart-replay suppression. ``main._notified_hms_errors`` is in-memory, so a
+# server restart makes EVERY still-live HMS code replay as "new" on the next push —
+# and ``mark_spent_on_runout`` would re-stamp spent on whatever spool is bound to the
+# tray NOW, which after an operator swap during the pause is a FRESH roll (production
+# 2026-07-17 18:56: a fresh spool stamped spent+1000 g 7 s after insertion). These
+# two structures record the runout codes ALREADY LIVE at the first status push per
+# printer (via :func:`note_status_push`) so a replayed pre-restart runout is skipped,
+# while a genuinely-new runout appearing later is absent from the seed and stamps
+# normally. Process-lifetime like the edge dicts above; cleared by :func:`_reset_state`.
+_runout_seeded: set[int] = set()
+_seeded_runout_codes: dict[int, set[str]] = {}
+
 
 def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
     _last_tray_now.clear()
     _respool_prompt_dedup.clear()
+    _spent_dedup.clear()
+    _runout_seeded.clear()
+    _seeded_runout_codes.clear()
 
 
 class RespoolError(Exception):
@@ -284,7 +310,12 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
 
 
 async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> int | None:
-    """Which tray ran out: dispatched farm ams_mapping first, else live tray_now."""
+    """Which tray ran out: prefer the live feeding ``tray_now`` over the dispatched
+    farm ams_mapping for a single-feeder job (the mapping can be stale after a
+    firmware backup-switch / operator reload), falling back to the mapping when
+    ``tray_now`` is unloaded/unknown (255/None). ``last_loaded_tray`` is
+    deliberately NOT consulted — it is never cleared at print start and would leak
+    a stale tray across jobs. The multi-feeder fail-safe is unchanged."""
     result = await db.execute(
         select(PrintQueueItem)
         .join(PrintBatch, PrintQueueItem.batch_id == PrintBatch.id)
@@ -299,6 +330,7 @@ async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> i
     )
     item = result.scalar_one_or_none()
     tray_now = getattr(state, "tray_now", None)
+    live_ok = tray_now is not None and 0 <= tray_now <= 254
     if item and item.ams_mapping:
         try:
             mapping = json.loads(item.ams_mapping)
@@ -306,7 +338,9 @@ async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> i
         except (ValueError, TypeError):
             feeders = []
         if len(feeders) == 1:
-            return feeders[0]  # single-feeder farm job — deterministic
+            # Single-feeder farm job: the live feeding tray is authoritative; the
+            # mapping is only a fallback for an unloaded/unknown tray_now.
+            return tray_now if live_ok else feeders[0]
         if feeders:
             # Multi-filament job: the mapping alone can't say WHICH feeder ran
             # out. Trust the live tray_now only when it is one of the job's
@@ -320,21 +354,94 @@ async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> i
     return None
 
 
+def _live_runout_codes(state) -> set[str]:
+    """Runout HMS short codes currently live on ``state`` — the same short-code
+    derivation the runout hook / spool_recovery use (``hms_short_code(attr, code)``),
+    intersected with :data:`RUNOUT_HMS_CODES`."""
+    out: set[str] = set()
+    for e in getattr(state, "hms_errors", None) or []:
+        try:
+            out.add(hms_short_code(e.attr, e.code))
+        except Exception:  # noqa: BLE001 — a malformed HMS entry must not crash seeding
+            continue
+    return out & RUNOUT_HMS_CODES
+
+
+def note_status_push(printer_id: int, state) -> None:
+    """Seed / maintain the per-printer restart-replay runout-suppression set (S1).
+
+    Called (guarded) from ``main.on_printer_status_change`` on every status push,
+    BEFORE the runout hook — hence outside the "HMS present" branch, so the FIRST
+    push per printer seeds even with zero HMS. That first push records the runout
+    codes live at that instant into ``_seeded_runout_codes[printer_id]``: after a
+    restart main lost its HMS dedup, so any code still live now would otherwise
+    replay as "new" and mis-stamp a swapped-in fresh spool. Every LATER push drops
+    seeded codes no longer live, so a genuine recurrence stamps normally; a code that
+    first appears only AFTER seeding is never added here → correctly treated as new.
+
+    Accepted residual: a runout that fired entirely DURING server downtime (never
+    observed live at the first push) never stamps spent — the tray's true state is
+    unknowable across the gap, so we fail safe. That case is bounded by the pause-
+    stall watchdog (the print sits PAUSEd and escalates) and the Tier-3 respool prompt
+    when the reused tag next arrives. Pure set bookkeeping; the caller owns guarding."""
+    live = _live_runout_codes(state)
+    if printer_id not in _runout_seeded:
+        # The one-shot seed must capture a REAL printer report. A fresh
+        # PrinterState defaults to state="unknown" and the connect-time
+        # on_state_change broadcast fires before any report arrives — consuming
+        # the seed there would record an empty set and let a still-live runout
+        # replay as "new" on the next push (the exact mis-stamp this guards).
+        # Stay unseeded until the push carries a known gcode_state.
+        if (getattr(state, "state", None) or "unknown").lower() == "unknown":
+            return
+        _runout_seeded.add(printer_id)
+        _seeded_runout_codes[printer_id] = set(live)
+        return
+    seeded = _seeded_runout_codes.get(printer_id)
+    if seeded:
+        # Drop any seeded code no longer live so a genuine recurrence later stamps.
+        seeded.intersection_update(live)
+
+
 async def mark_spent_on_runout(db: AsyncSession, printer_id: int, new_short_codes, state) -> Spool | None:
     """Tier 1: a NEW runout HMS code stamps spent_at on the exhausted tray's spool.
 
     Resolves the exhausted tray via the dispatched farm ``ams_mapping`` (the
     deterministic feeding tray) falling back to the live ``tray_now``. Idempotent:
     re-observing the code is a no-op once spent_at is set. No-op in Spoolman mode.
+    Skips a restart-replayed runout (a code seeded live at the first push — see
+    :func:`note_status_push`) so a swapped-in fresh spool is never mis-stamped.
     """
     if await _spoolman_enabled(db):
         return None
-    if not (set(new_short_codes) & RUNOUT_HMS_CODES):
+    triggering = set(new_short_codes) & RUNOUT_HMS_CODES
+    if not triggering:
+        return None
+    # S1: a code already live at the first status push after a restart is a replay of
+    # a PRE-restart runout (main lost its in-memory HMS dedup), NOT a fresh exhaustion.
+    # Stamping now would mis-mark whatever spool is bound to the slot NOW — after an
+    # operator swap during the pause that is a FRESH roll (the 18:56 misattribution).
+    seeded = _seeded_runout_codes.get(printer_id)
+    if seeded and triggering & seeded:
+        logger.info(
+            "Restart-replayed runout on printer %d (%s already live at first status push) — not stamping spent",
+            printer_id,
+            sorted(triggering & seeded),
+        )
         return None
     global_tray = await _resolve_exhausted_tray(db, printer_id, state)
     if global_tray is None:
         return None
-    return await _mark_tray_spent(db, printer_id, global_tray)
+    # Incident dedup: one spent stamp per (printer, job, tray). A re-raised runout
+    # on the same job/tray must not stamp the operator's freshly-inserted spool.
+    subtask_id = getattr(state, "subtask_id", None)
+    key = (printer_id, subtask_id, global_tray)
+    if key in _spent_dedup:
+        return None
+    spool = await _mark_tray_spent(db, printer_id, global_tray)
+    if spool is not None:
+        _spent_dedup.add(key)
+    return spool
 
 
 async def capture_backup_swap(db: AsyncSession, printer_id: int, state) -> Spool | None:
@@ -473,7 +580,19 @@ async def maybe_auto_or_prompt_respool(
             return None  # spent but not loaded → dead spool re-inserted, no trigger
         brand = (await _respool_last_brand(db)).strip()
         if not brand:
-            # No prefill brand → can't auto safely; surface the one-click prompt.
+            # 3b-5: before the first-ever manual re-spool the server-held last
+            # brand is empty. Fall back to the configured tagless-default brand
+            # (ONE source of truth — the spool_tagless parser; local import per
+            # this module's cycle-avoidance convention) so a hardware-certain
+            # spent+loaded spool still auto-respools instead of prompting. Never
+            # invents a brand: the accessor returns "" when the setting is off,
+            # keeping today's prompt fallback below.
+            from backend.app.services.spool_tagless import tagless_default_brand
+
+            brand = await tagless_default_brand(db)
+        if not brand:
+            # No prefill brand and no configured default → can't auto safely;
+            # surface the one-click prompt.
             await _broadcast_respool_prompt(db, printer_id, ams_id, tray_id, tray, spool)
             return None
         try:
@@ -514,6 +633,14 @@ async def maybe_auto_or_prompt_respool(
             return None
 
     # Tier 3: uncertain — spent_at NULL, remaining near-empty → one-click prompt.
+    # Suppress permanently once the operator answered "Same spool"
+    # (respool_dismissed_at stamped): a deliberately-run-down near-empty spool
+    # must not re-prompt on every reseat / AMS power-cycle / server restart (the
+    # in-memory dedup cannot survive those). This gate is TIER-3 ONLY — a
+    # hardware-certain spent event (the spent_at branch above) is never gated by
+    # the dismissal, so a genuine exhaustion still auto-respools/prompts.
+    if spool.respool_dismissed_at is not None:
+        return None
     remaining = (spool.label_weight or 0) - (spool.weight_used or 0)
     threshold = await _respool_prompt_threshold_g(db)
     if remaining <= threshold:
