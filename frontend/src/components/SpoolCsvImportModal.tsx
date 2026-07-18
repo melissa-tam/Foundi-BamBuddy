@@ -4,6 +4,7 @@ import { Upload, X, FileText, Loader2, CheckCircle, XCircle, MinusCircle, Wand2,
 import { api, type CsvImportPreview, type CsvImportRow } from '../api/client';
 import { getSwatchStyle } from '../utils/colors';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 
 interface SpoolCsvImportModalProps {
   onClose: () => void;
@@ -75,16 +76,21 @@ export function SpoolCsvImportModal({ onClose, onImported }: SpoolCsvImportModal
   const validCount = preview?.valid_count ?? 0;
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg w-full max-w-3xl border border-bambu-dark-tertiary flex flex-col max-h-[90vh]">
-        <div className="p-4 border-b border-bambu-dark-tertiary flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-white">{t('inventory.csv.modalTitle', 'Import spools from CSV')}</h2>
-          <button onClick={onClose} className="p-1 hover:bg-bambu-dark rounded">
-            <X className="w-5 h-5 text-bambu-gray" />
-          </button>
-        </div>
+    <Modal
+      onClose={onClose}
+      labelledBy="spool-csv-import-modal-title"
+      closeOnOverlay={false}
+      widthClass="max-w-3xl"
+      className="flex flex-col"
+    >
+      <div className="p-4 border-b border-bambu-dark-tertiary flex items-center justify-between">
+        <h2 id="spool-csv-import-modal-title" className="text-lg font-semibold text-white">{t('inventory.csv.modalTitle', 'Import spools from CSV')}</h2>
+        <button onClick={onClose} className="p-1 hover:bg-bambu-dark rounded">
+          <X className="w-5 h-5 text-bambu-gray" />
+        </button>
+      </div>
 
-        <div className="p-4 space-y-4 overflow-y-auto flex-1">
+      <div className="p-4 space-y-4 overflow-y-auto flex-1 min-h-0">
           {/* Drop zone / file picker */}
           <div
             onDragOver={(e) => {
@@ -236,7 +242,6 @@ export function SpoolCsvImportModal({ onClose, onImported }: SpoolCsvImportModal
             )}
           </Button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

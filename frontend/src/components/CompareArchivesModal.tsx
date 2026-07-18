@@ -1,9 +1,10 @@
-import { useEffect } from 'react';
+import { useId } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { X, Check, AlertTriangle, Loader2 } from 'lucide-react';
 import { api } from '../api/client';
 import type { ArchiveComparison } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 
 interface CompareArchivesModalProps {
   archiveIds: number[];
@@ -11,14 +12,7 @@ interface CompareArchivesModalProps {
 }
 
 export function CompareArchivesModal({ archiveIds, onClose }: CompareArchivesModalProps) {
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
+  const titleId = useId();
 
   const { data: comparison, isLoading, error } = useQuery({
     queryKey: ['archive-comparison', archiveIds],
@@ -26,11 +20,10 @@ export function CompareArchivesModal({ archiveIds, onClose }: CompareArchivesMod
   });
 
   return (
-    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4" onClick={onClose}>
-      <div className="bg-bambu-dark-secondary rounded-lg max-w-4xl w-full max-h-[90vh] flex flex-col border border-bambu-dark-tertiary" onClick={(e) => e.stopPropagation()}>
+    <Modal onClose={onClose} size="xl" className="flex flex-col" labelledBy={titleId}>
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
-          <h3 className="text-lg font-semibold text-white">
+          <h3 id={titleId} className="text-lg font-semibold text-white">
             Compare Archives ({archiveIds.length})
           </h3>
           <button
@@ -66,8 +59,7 @@ export function CompareArchivesModal({ archiveIds, onClose }: CompareArchivesMod
             Close
           </Button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 

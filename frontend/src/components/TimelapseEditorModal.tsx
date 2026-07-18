@@ -16,6 +16,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { api } from '../api/client';
 import { useToast } from '../contexts/ToastContext';
 import { formatMediaTime } from '../utils/date';
@@ -95,17 +96,6 @@ export function TimelapseEditorModal({
       setTrimEnd(videoInfo.duration);
     }
   }, [videoInfo?.duration, trimEnd]);
-
-  // Close on Escape
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   // Video event handlers
   useEffect(() => {
@@ -244,11 +234,16 @@ export function TimelapseEditorModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80">
-      <div className="relative bg-bambu-dark-secondary rounded-xl max-w-5xl w-full mx-4 max-h-[90vh] overflow-hidden flex flex-col">
+    <Modal
+      onClose={onClose}
+      labelledBy="timelapse-editor-modal-title"
+      closeOnOverlay={false}
+      widthClass="max-w-5xl"
+      className="relative flex flex-col"
+    >
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary shrink-0">
-          <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+          <h3 id="timelapse-editor-modal-title" className="text-lg font-semibold text-white flex items-center gap-2">
             <Film className="w-5 h-5 text-bambu-green" />
             Edit Timelapse
           </h3>
@@ -281,7 +276,7 @@ export function TimelapseEditorModal({
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div className="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
           {/* Video Preview */}
           <div className="relative">
             <video
@@ -535,7 +530,6 @@ export function TimelapseEditorModal({
             <p className="text-bambu-gray text-sm">This may take a few moments</p>
           </div>
         )}
-      </div>
-    </div>
+    </Modal>
   );
 }

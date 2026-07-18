@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useId } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
@@ -16,6 +16,7 @@ import {
   type DiagnosticStatus,
   type PrinterDiagnosticResult,
 } from '../api/client';
+import { Modal } from './ui/Modal';
 
 function StatusIcon({ status }: { status: DiagnosticStatus }) {
   if (status === 'pass') return <CheckCircle2 className="w-5 h-5 text-bambu-green flex-shrink-0" />;
@@ -103,6 +104,7 @@ type ConnectionDiagnosticModalProps = {
 export function ConnectionDiagnosticModal(props: ConnectionDiagnosticModalProps) {
   const { onClose, printerName } = props;
   const { t } = useTranslation();
+  const titleId = useId();
   const printerId = 'printerId' in props ? props.printerId : undefined;
   const connection = 'connection' in props ? props.connection : undefined;
 
@@ -118,14 +120,6 @@ export function ConnectionDiagnosticModal(props: ConnectionDiagnosticModalProps)
     // Run once on mount — re-running is the explicit "Retry" button.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   // Tick an elapsed-seconds counter while the diagnostic is running so the
   // existing-printer flow (which waits up to PUBLISH_WAIT_DEFAULT_SECONDS for
@@ -148,15 +142,11 @@ export function ConnectionDiagnosticModal(props: ConnectionDiagnosticModalProps)
   const result = diagnose.data as PrinterDiagnosticResult | undefined;
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={onClose}>
-      <div
-        className="bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary w-full max-w-lg flex flex-col max-h-[85vh]"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy={titleId} className="flex flex-col">
         <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-2 min-w-0">
             <Stethoscope className="w-5 h-5 text-bambu-green flex-shrink-0" />
-            <h2 className="text-lg font-semibold text-white truncate">
+            <h2 id={titleId} className="text-lg font-semibold text-white truncate">
               {t('diagnostic.modalTitle', { name: printerName || '' })}
             </h2>
           </div>
@@ -212,7 +202,6 @@ export function ConnectionDiagnosticModal(props: ConnectionDiagnosticModalProps)
             {t('common.close')}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

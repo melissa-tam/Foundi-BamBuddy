@@ -1,8 +1,9 @@
-import { useEffect } from 'react';
+import { useEffect, useId } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { X, Stethoscope, CheckCircle2, XCircle, MinusCircle, Loader2 } from 'lucide-react';
 import { api, type CameraDiagnoseResult, type CameraDiagnoseStage } from '../api/client';
+import { Modal } from './ui/Modal';
 
 interface CameraDiagnoseModalProps {
   printerId: number;
@@ -18,6 +19,7 @@ function StageIcon({ status }: { status: CameraDiagnoseStage['status'] }) {
 
 export function CameraDiagnoseModal({ printerId, printerName, onClose }: CameraDiagnoseModalProps) {
   const { t } = useTranslation();
+  const titleId = useId();
 
   // Kick the diagnostic off as soon as the modal mounts. There's no
   // "Start" button — opening the modal IS the test. The mutation
@@ -33,29 +35,14 @@ export function CameraDiagnoseModal({ printerId, printerName, onClose }: CameraD
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
   const result = diagnose.data as CameraDiagnoseResult | undefined;
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary w-full max-w-lg flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy={titleId} className="flex flex-col">
         <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-2 min-w-0">
             <Stethoscope className="w-5 h-5 text-bambu-green flex-shrink-0" />
-            <h2 className="text-lg font-semibold text-white truncate">
+            <h2 id={titleId} className="text-lg font-semibold text-white truncate">
               {t('camera.diagnose.modalTitle', { name: printerName || '' })}
             </h2>
           </div>
@@ -152,7 +139,6 @@ export function CameraDiagnoseModal({ printerId, printerName, onClose }: CameraD
             {t('common.close')}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

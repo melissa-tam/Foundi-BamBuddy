@@ -5,7 +5,6 @@
 // no longer holds a code→description table and no longer hides codes it doesn't
 // recognise: an unknown/novel fault renders with an explicit fallback message so
 // a lights-out farm never shows a faulting printer as "OK" (H1).
-import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { X, AlertTriangle, AlertCircle, Info, ExternalLink, Loader2, Trash2 } from 'lucide-react';
@@ -13,6 +12,8 @@ import type { HMSError, Permission } from '../api/client';
 import { api } from '../api/client';
 import { useToast } from '../contexts/ToastContext';
 import { formatHmsCode } from '../utils/hmsCode';
+import { Modal } from './ui/Modal';
+import { CardContent } from './Card';
 
 interface HMSErrorModalProps {
   printerName: string;
@@ -60,15 +61,6 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
     },
   });
 
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
   // printerStatusMutation with optimistic update
   const activateActionMutation = useMutation({
     mutationFn: (data: {
@@ -97,13 +89,13 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
   });
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg shadow-xl max-w-lg w-full max-h-[80vh] flex flex-col">
+    <Modal onClose={onClose} closeOnOverlay={false} labelledBy="hms-error-modal-title">
+      <CardContent className="p-0">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-5 h-5 text-orange-400" />
-            <h2 className="text-lg font-semibold text-white">{t('hmsErrors.title', { name: printerName })}</h2>
+            <h2 id="hms-error-modal-title" className="text-lg font-semibold text-white">{t('hmsErrors.title', { name: printerName })}</h2>
           </div>
           <button
             onClick={onClose}
@@ -114,7 +106,7 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-4">
+        <div className="p-4">
           {errors.length === 0 ? (
             <div className="text-center py-8 text-bambu-gray">
               <AlertCircle className="w-12 h-12 mx-auto mb-3 opacity-30" />
@@ -210,7 +202,7 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
             </button>
           )}
         </div>
-      </div>
-    </div>
+      </CardContent>
+    </Modal>
   );
 }

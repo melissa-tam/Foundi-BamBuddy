@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useState, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, Plus, Loader2, Users as UsersIcon } from 'lucide-react';
-import { Card, CardContent, CardHeader } from './Card';
+import { CardContent, CardHeader } from './Card';
 import { Button } from './Button';
 import { LdapUserPicker } from './LdapUserPicker';
+import { Modal } from './ui/Modal';
 import type { Group, UserCreate, UserResponse } from '../api/client';
 
 interface AdvancedAuthFormData extends UserCreate {
@@ -41,18 +42,8 @@ export function CreateUserAdvancedAuthModal({
   onLdapProvisioned,
 }: CreateUserAdvancedAuthModalProps) {
   const { t } = useTranslation();
+  const titleId = useId();
   const [tab, setTab] = useState<Tab>('local');
-
-  // Close modal on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   const toggleGroup = (groupId: number) => {
     setFormData({
@@ -64,20 +55,13 @@ export function CreateUserAdvancedAuthModal({
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={onClose}
-    >
-      <Card
-        className="w-full max-w-md"
-        onClick={(e: React.MouseEvent) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} size="sm" labelledBy={titleId}>
         <CardHeader>
           <div className="flex items-center justify-between">
             <div className="flex flex-col gap-1">
               <div className="flex items-center gap-2">
                 <UsersIcon className="w-5 h-5 text-bambu-green" />
-                <h2 className="text-lg font-semibold text-white">{t('users.modal.createUser')}</h2>
+                <h2 id={titleId} className="text-lg font-semibold text-white">{t('users.modal.createUser')}</h2>
               </div>
               <p className="text-sm text-bambu-gray ml-7">{t('users.modal.advancedAuthSubtitle') || 'with Advanced Authentication'}</p>
             </div>
@@ -232,7 +216,6 @@ export function CreateUserAdvancedAuthModal({
             )}
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }

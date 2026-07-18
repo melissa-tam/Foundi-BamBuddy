@@ -17,7 +17,15 @@
  *                a string for non-numeric labels (e.g. "L" / "R" for the
  *                dual-nozzle external trays, where carrying a separate
  *                Ext-L/Ext-R caption underneath made the row taller).
+ *   outOfRotation - True when a spool jam took this spool out of rotation
+ *                (Spool.feed_fault_at != null; #feed-fault). Renders a small
+ *                warning badge — NOT colour-only: an icon glyph plus an
+ *                aria-label + title carry the meaning for screen readers and
+ *                on hover/focus.
  */
+
+import { useTranslation } from 'react-i18next';
+import { AlertTriangle } from 'lucide-react';
 
 interface FilamentSlotCircleProps {
   trayColor?: string | null;
@@ -25,6 +33,7 @@ interface FilamentSlotCircleProps {
   isEmpty: boolean;
   emptyKind?: 'physical' | 'reset' | null;
   slotNumber: number | string;
+  outOfRotation?: boolean;
 }
 
 function isLightFilamentColor(hex: string): boolean {
@@ -35,14 +44,16 @@ function isLightFilamentColor(hex: string): boolean {
   return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6;
 }
 
-export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, slotNumber }: FilamentSlotCircleProps) {
+export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, slotNumber, outOfRotation }: FilamentSlotCircleProps) {
+  const { t } = useTranslation();
   // Reset slots get a quieter border than physical-empty so they read as
   // "cleared but possibly still has a spool the firmware hasn't confirmed
   // gone" rather than "definitely no spool".
   const emptyBorderColor = emptyKind === 'reset' ? '#3d3d3d' : '#666';
+  const outOfRotationLabel = t('ams.outOfRotation');
   return (
     <div
-      className="w-3.5 h-3.5 rounded-full mx-auto mb-0.5 border-2 flex items-center justify-center"
+      className="relative w-3.5 h-3.5 rounded-full mx-auto mb-0.5 border-2 flex items-center justify-center"
       style={{
         backgroundColor: trayColor ? `#${trayColor}` : (trayType ? '#333' : 'transparent'),
         borderColor: isEmpty ? emptyBorderColor : 'rgba(255,255,255,0.1)',
@@ -55,6 +66,19 @@ export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, sl
       >
         {slotNumber}
       </span>
+      {outOfRotation && (
+        // Corner warning badge. Not colour-only: an AlertTriangle glyph carries
+        // the meaning; aria-label + title expose the tooltip text to screen
+        // readers and on hover/focus (the title attr is keyboard-discoverable).
+        <span
+          role="img"
+          aria-label={outOfRotationLabel}
+          title={outOfRotationLabel}
+          className="absolute -top-1 -right-1 flex items-center justify-center w-2.5 h-2.5 rounded-full bg-amber-400 ring-1 ring-bambu-dark"
+        >
+          <AlertTriangle className="w-[7px] h-[7px] text-black" aria-hidden="true" strokeWidth={3} />
+        </span>
+      )}
     </div>
   );
 }

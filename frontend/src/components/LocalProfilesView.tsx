@@ -17,6 +17,7 @@ import {
 import { api } from '../api/client';
 import type { LocalPreset, LocalPresetsResponse } from '../api/client';
 import { Card, CardContent } from './Card';
+import { Modal } from './ui/Modal';
 import { Button } from './Button';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -491,11 +492,11 @@ export function LocalProfilesView() {
 
       {/* Delete Confirmation Modal */}
       {deleteConfirm !== null && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg p-6 max-w-sm mx-4">
+        <Modal onClose={() => setDeleteConfirm(null)} closeOnOverlay={false} widthClass="max-w-sm" labelledBy="local-profile-delete-title">
+          <CardContent className="p-6">
             <div className="flex items-center gap-2 mb-3">
               <AlertCircle className="w-5 h-5 text-red-400" />
-              <h3 className="text-white font-medium">{t('profiles.localProfiles.deleteConfirmTitle')}</h3>
+              <h3 id="local-profile-delete-title" className="text-white font-medium">{t('profiles.localProfiles.deleteConfirmTitle')}</h3>
             </div>
             <p className="text-sm text-bambu-gray mb-4">{t('profiles.localProfiles.deleteConfirm')}</p>
             <div className="flex justify-end gap-2">
@@ -512,8 +513,8 @@ export function LocalProfilesView() {
                 {t('profiles.localProfiles.delete')}
               </Button>
             </div>
-          </div>
-        </div>
+          </CardContent>
+        </Modal>
       )}
     </div>
   );

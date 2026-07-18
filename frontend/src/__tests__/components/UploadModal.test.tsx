@@ -58,6 +58,21 @@ describe('UploadModal', () => {
       const uploadButton = screen.getByRole('button', { name: /Upload/i });
       expect(uploadButton).toBeDisabled();
     });
+
+    it('shows the File Manager hint steering SKU/production uploads elsewhere', () => {
+      render(<UploadModal onClose={mockOnClose} />);
+
+      expect(
+        screen.getByText(/For SKUs and production runs/i)
+      ).toBeInTheDocument();
+    });
+
+    it('links the File Manager hint to /files', () => {
+      render(<UploadModal onClose={mockOnClose} />);
+
+      const link = screen.getByRole('link', { name: /File Manager/i });
+      expect(link).toHaveAttribute('href', '/files');
+    });
   });
 
   describe('file handling with initialFiles', () => {

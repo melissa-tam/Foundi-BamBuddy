@@ -6,6 +6,7 @@ import { api } from '../api/client';
 import { parseUTCDate, formatTimeOnly, formatDateTime, type TimeFormat } from '../utils/date';
 import type { NotificationLogEntry } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 
 const EVENT_COLORS: Record<string, string> = {
@@ -80,13 +81,12 @@ export function NotificationLogViewer({ onClose }: NotificationLogViewerProps) {
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg w-full max-w-3xl max-h-[85vh] flex flex-col">
+    <Modal onClose={onClose} labelledBy="notification-log-modal-title" widthClass="max-w-3xl" closeOnOverlay={false} className="flex flex-col">
         {/* Header */}
         <div className="p-4 border-b border-bambu-dark-tertiary flex items-center justify-between">
           <div className="flex items-center gap-3">
             <History className="w-5 h-5 text-bambu-green" />
-            <h2 className="text-lg font-semibold text-white">{t('notifications.notificationLog')}</h2>
+            <h2 id="notification-log-modal-title" className="text-lg font-semibold text-white">{t('notifications.notificationLog')}</h2>
           </div>
           <button
             onClick={onClose}
@@ -200,8 +200,7 @@ export function NotificationLogViewer({ onClose }: NotificationLogViewerProps) {
             </div>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 

@@ -1,11 +1,13 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Upload, X, File, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
 import { api } from '../api/client';
 import type { BulkUploadResult } from '../api/client';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 
 interface FileWithStatus {
@@ -30,15 +32,6 @@ export function UploadModal({ onClose, initialFiles }: UploadModalProps) {
   );
   const [isDragging, setIsDragging] = useState(false);
   const [uploadResult, setUploadResult] = useState<BulkUploadResult | null>(null);
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   const uploadMutation = useMutation({
     mutationFn: (filesToUpload: File[]) =>
@@ -147,12 +140,11 @@ export function UploadModal({ onClose, initialFiles }: UploadModalProps) {
   const isUploading = uploadMutation.isPending;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <Card className="w-full max-w-2xl max-h-[90vh] flex flex-col">
+    <Modal onClose={onClose} labelledBy="upload-modal-title" size="lg" closeOnOverlay={false} className="flex flex-col">
         <CardContent className="p-0 flex flex-col h-full">
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
-            <h2 className="text-xl font-semibold text-white">{t('uploadModal.title')}</h2>
+            <h2 id="upload-modal-title" className="text-xl font-semibold text-white">{t('uploadModal.title')}</h2>
             <button
               onClick={onClose}
               className="text-bambu-gray hover:text-white transition-colors"
@@ -200,6 +192,21 @@ export function UploadModal({ onClose, initialFiles }: UploadModalProps) {
           <div className="px-4 pb-4">
             <p className="text-xs text-bambu-gray">
               {t('uploadModal.extractionInfo')}
+            </p>
+          </div>
+
+          {/* Archives is NOT the SKU/production-run library — steer operators who
+              want a printable file into the File Manager so they don't "lose" it. */}
+          <div className="px-4 pb-4">
+            <p className="text-xs text-bambu-gray">
+              {t('uploadModal.libraryHint')}{' '}
+              <Link
+                to="/files"
+                onClick={onClose}
+                className="text-bambu-green hover:underline"
+              >
+                {t('uploadModal.libraryHintLink')}
+              </Link>
             </p>
           </div>
 
@@ -286,7 +293,6 @@ export function UploadModal({ onClose, initialFiles }: UploadModalProps) {
             )}
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }

@@ -58,9 +58,9 @@ function deriveStatusLine(
 }
 
 const TONE_CLASS: Record<FarmStatusLine['tone'], string> = {
-  normal: 'text-gray-300',
-  muted: 'text-gray-400',
-  danger: 'text-red-400',
+  normal: 'text-gray-700 dark:text-gray-300',
+  muted: 'text-gray-600 dark:text-gray-400',
+  danger: 'text-red-700 dark:text-red-400',
 };
 
 export function FarmUnitChip({ ctx }: { ctx?: FarmPrinterContext | null }) {

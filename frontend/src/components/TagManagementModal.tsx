@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { X, Tag, Pencil, Trash2, Loader2, Search, Check, AlertTriangle } from 'lucide-react';
 import { api } from '../api/client';
 import type { TagInfo } from '../api/client';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 
 interface TagManagementModalProps {
@@ -20,22 +21,17 @@ export function TagManagementModal({ onClose }: TagManagementModalProps) {
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<'count' | 'name'>('count');
 
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (editingTag) {
-          setEditingTag(null);
-        } else if (deleteConfirm) {
-          setDeleteConfirm(null);
-        } else {
-          onClose();
-        }
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose, editingTag, deleteConfirm]);
+  // Layered dismissal (Escape via <Modal>): an inline edit or a pending delete
+  // confirmation is unwound first; only an otherwise-idle modal actually closes.
+  const handleModalClose = () => {
+    if (editingTag) {
+      setEditingTag(null);
+    } else if (deleteConfirm) {
+      setDeleteConfirm(null);
+    } else {
+      onClose();
+    }
+  };
 
   const { data: tags, isLoading } = useQuery({
     queryKey: ['tags'],
@@ -124,14 +120,18 @@ export function TagManagementModal({ onClose }: TagManagementModalProps) {
   const totalUsage = tags?.reduce((sum, t) => sum + t.count, 0) || 0;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <Card className="w-full max-w-lg max-h-[80vh] flex flex-col">
-        <CardContent className="p-0 flex flex-col min-h-0">
+    <Modal
+      onClose={handleModalClose}
+      labelledBy="tag-management-modal-title"
+      closeOnOverlay={false}
+      className="flex flex-col"
+    >
+      <CardContent className="p-0 flex flex-col min-h-0">
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary flex-shrink-0">
             <div className="flex items-center gap-2">
               <Tag className="w-5 h-5 text-bambu-green" />
-              <h2 className="text-xl font-semibold text-white">Manage Tags</h2>
+              <h2 id="tag-management-modal-title" className="text-xl font-semibold text-white">Manage Tags</h2>
             </div>
             <button
               onClick={onClose}
@@ -287,8 +287,7 @@ export function TagManagementModal({ onClose }: TagManagementModalProps) {
               Close
             </Button>
           </div>
-        </CardContent>
-      </Card>
-    </div>
+      </CardContent>
+    </Modal>
   );
 }

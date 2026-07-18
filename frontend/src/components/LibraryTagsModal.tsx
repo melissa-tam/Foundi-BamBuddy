@@ -1,10 +1,12 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Tag, Plus, Loader2, Pencil, Trash2, X } from 'lucide-react';
 
 import { api, type LibraryTag } from '../api/client';
 import { Button } from './Button';
+import { CardContent } from './Card';
+import { Modal } from './ui/Modal';
 import { ConfirmModal } from './ConfirmModal';
 import { useToast } from '../contexts/ToastContext';
 import { libraryTagsQueryKey } from '../utils/libraryTagsQuery';
@@ -32,6 +34,7 @@ export function LibraryTagsModal({ open, onClose, onPickTag }: LibraryTagsModalP
   const [editing, setEditing] = useState<LibraryTag | null>(null);
   const [name, setName] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<LibraryTag | null>(null);
+  const nameInputRef = useRef<HTMLInputElement>(null);
 
   const { data: tags = [], isLoading } = useQuery({
     queryKey: libraryTagsQueryKey,
@@ -98,21 +101,6 @@ export function LibraryTagsModal({ open, onClose, onPickTag }: LibraryTagsModalP
     setName('');
   }, [saveMutation.isPending]);
 
-  useEffect(() => {
-    if (!open) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      if (saveMutation.isPending || deleteMutation.isPending) return;
-      if (editorOpen) {
-        closeEditor();
-      } else if (!deleteTarget) {
-        onClose();
-      }
-    };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [open, editorOpen, deleteTarget, saveMutation.isPending, deleteMutation.isPending, closeEditor, onClose]);
-
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
     saveMutation.mutate();
@@ -124,20 +112,16 @@ export function LibraryTagsModal({ open, onClose, onPickTag }: LibraryTagsModalP
   const editorTitleId = 'library-tag-editor-title';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div
-        className="absolute inset-0 bg-black/60"
-        onClick={() => {
-          if (saveMutation.isPending || deleteMutation.isPending) return;
-          onClose();
-        }}
-      />
-      <div
-        className="relative w-full max-w-4xl mx-4 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-h-[90vh] flex flex-col"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={modalTitleId}
+    <>
+      <Modal
+        onClose={onClose}
+        size="xl"
+        labelledBy={modalTitleId}
+        dismissDisabled={
+          saveMutation.isPending || deleteMutation.isPending || editorOpen || deleteTarget !== null
+        }
       >
+        <CardContent className="p-0">
         <div className="flex items-center justify-between gap-4 px-6 py-4 border-b border-bambu-dark-tertiary">
           <div className="min-w-0 flex-1">
             <h2 id={modalTitleId} className="text-lg font-semibold text-white flex items-center gap-2">
@@ -221,17 +205,19 @@ export function LibraryTagsModal({ open, onClose, onPickTag }: LibraryTagsModalP
             </table>
           )}
         </div>
-      </div>
+        </CardContent>
+      </Modal>
 
       {editorOpen && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/60" onClick={closeEditor} />
-          <div
-            className="relative w-full max-w-md mx-4 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl p-6 shadow-2xl"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby={editorTitleId}
-          >
+        <Modal
+          onClose={closeEditor}
+          size="sm"
+          overlayZIndex="z-[60]"
+          labelledBy={editorTitleId}
+          dismissDisabled={saveMutation.isPending}
+          initialFocusRef={nameInputRef}
+        >
+          <CardContent className="p-6">
             <h3 id={editorTitleId} className="text-lg font-semibold text-white mb-4">
               {editing ? t('fileManager.tags.edit') : t('fileManager.tags.add')}
             </h3>
@@ -241,13 +227,13 @@ export function LibraryTagsModal({ open, onClose, onPickTag }: LibraryTagsModalP
               </label>
               <input
                 id="library-tag-name"
+                ref={nameInputRef}
                 type="text"
                 maxLength={64}
                 className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green mb-4"
                 placeholder={t('fileManager.tags.createPlaceholder')}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                autoFocus
               />
               <div className="flex justify-end gap-2">
                 <Button type="button" variant="secondary" onClick={closeEditor}>
@@ -259,8 +245,8 @@ export function LibraryTagsModal({ open, onClose, onPickTag }: LibraryTagsModalP
                 </Button>
               </div>
             </form>
-          </div>
-        </div>
+          </CardContent>
+        </Modal>
       )}
 
       {deleteTarget && (
@@ -278,6 +264,6 @@ export function LibraryTagsModal({ open, onClose, onPickTag }: LibraryTagsModalP
           onCancel={() => setDeleteTarget(null)}
         />
       )}
-    </div>
+    </>
   );
 }

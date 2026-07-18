@@ -6,6 +6,7 @@ import { Search, Filter, RefreshCw, Droplet, Settings2, Printer as PrinterIcon, 
 import { api } from '../api/client';
 import type { OrcaProfileListResponse, OrcaProfileMeta, Printer } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { FilterDropdown } from '../pages/ProfilesPage';
 import { formatRelativeTime } from '../utils/date';
 
@@ -364,14 +365,10 @@ function OrcaPresetDetailModal({ setting, onClose, t }: OrcaPresetDetailModalPro
   });
 
   return (
-    <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={onClose}>
-      <div
-        className="bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg shadow-2xl max-w-4xl w-full max-h-[90vh] flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy="orca-preset-detail-title" size="xl" className="flex flex-col">
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
           <div>
-            <h2 className="text-lg font-bold text-white">{setting.name}</h2>
+            <h2 id="orca-preset-detail-title" className="text-lg font-bold text-white">{setting.name}</h2>
             <p className="text-xs text-bambu-gray mt-0.5">{setting.type}</p>
           </div>
           <button onClick={onClose} className="text-bambu-gray hover:text-white p-1">
@@ -393,7 +390,6 @@ function OrcaPresetDetailModal({ setting, onClose, t }: OrcaPresetDetailModalPro
             <p className="text-center text-bambu-gray py-16">{t('profiles.cloudView.noPresetsFound')}</p>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

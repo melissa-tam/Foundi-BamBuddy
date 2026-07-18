@@ -3,9 +3,33 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, ty
 
 type ToastType = 'success' | 'error' | 'warning' | 'info' | 'loading';
 
+/**
+ * Auto-dismiss delay (ms) per severity. Errors linger longest so an operator
+ * glancing away does not miss them; warnings sit in between; success/info keep
+ * the original 3s. `loading` is auto-dismissed on the same 3s cadence as before
+ * (long-running work should use showPersistentToast instead).
+ *
+ * Failure-surfacing convention (choose the SURFACE first, then the mechanism):
+ *  - Dialog-internal mutation failure → inline alert INSIDE the dialog
+ *    (`<InlineAlert>`), never a toast: the dialog is the surface in focus and a
+ *    toast would vanish before the user reads it.
+ *  - Page-level failure               → `showToast(message, 'error')`.
+ *  - Long-running / actionable        → `showPersistentToast(id, message, ...)`.
+ */
+const TOAST_DURATION_MS: Record<ToastType, number> = {
+  error: 8000,
+  warning: 5000,
+  success: 3000,
+  info: 3000,
+  loading: 3000,
+};
+
 interface ToastAction {
   label: string;
-  href: string;
+  /** External-link actions carry an href (opened in a new tab). Pure in-app
+   *  actions (the `actions[]` array path) supply only `onClick` and render as a
+   *  <button>, so href is optional. */
+  href?: string;
   onClick?: () => void;
 }
 
@@ -13,7 +37,10 @@ type ShowPersistentToast = (
   id: string,
   message: string,
   type?: ToastType,
-  options?: { action?: ToastAction },
+  /** `action` = a single legacy link-style action (unchanged, auto-dismisses on
+   *  activation). `actions` = one or more in-app button actions that own their
+   *  own dismissal (each `onClick` decides whether/when to clear the toast). */
+  options?: { action?: ToastAction; actions?: ToastAction[] },
 ) => void;
 
 interface Toast {
@@ -22,6 +49,7 @@ interface Toast {
   type: ToastType;
   persistent?: boolean;
   action?: ToastAction;
+  actions?: ToastAction[];
 }
 
 interface ToastContextType {
@@ -91,27 +119,37 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     const id = Math.random().toString(36).substr(2, 9);
     setToasts((prev) => [...prev, { id, message, type }]);
 
-    // Auto-dismiss after 3 seconds
+    // Auto-dismiss after a severity-dependent delay (errors linger longest).
     const timeout = setTimeout(() => {
       if (!isMountedRef.current) return;
       setToasts((prev) => prev.filter((t) => t.id !== id));
       timeoutRefs.current.delete(id);
-    }, 3000);
+    }, TOAST_DURATION_MS[type]);
     timeoutRefs.current.set(id, timeout);
   }, []);
 
   const showPersistentToast = useCallback(
-    (id: string, message: string, type: ToastType = 'info', options?: { action?: ToastAction }) => {
+    (
+      id: string,
+      message: string,
+      type: ToastType = 'info',
+      options?: { action?: ToastAction; actions?: ToastAction[] },
+    ) => {
       if (!isMountedRef.current) return;
       setToasts((prev) => {
         // Update existing toast if same id, otherwise add new one
         const exists = prev.find((t) => t.id === id);
         if (exists) {
           return prev.map((t) =>
-            t.id === id ? { ...t, message, type, persistent: true, action: options?.action } : t,
+            t.id === id
+              ? { ...t, message, type, persistent: true, action: options?.action, actions: options?.actions }
+              : t,
           );
         }
-        return [...prev, { id, message, type, persistent: true, action: options?.action }];
+        return [
+          ...prev,
+          { id, message, type, persistent: true, action: options?.action, actions: options?.actions },
+        ];
       });
     },
     [],
@@ -143,13 +181,34 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           >
             {icons[toast.type]}
             <span className="text-white text-sm">{toast.message}</span>
+            {toast.actions && toast.actions.length > 0 &&
+              // In-app button actions: each onClick owns its own dismissal
+              // (e.g. dismiss only on success), so we do NOT auto-clear here.
+              toast.actions.map((action, i) => (
+                <button
+                  key={`${toast.id}-action-${i}`}
+                  type="button"
+                  onClick={action.onClick}
+                  className="ml-2 px-2 py-1 rounded text-xs font-medium bg-bambu-green/20 text-bambu-green hover:bg-bambu-green/30 whitespace-nowrap"
+                >
+                  {action.label}
+                </button>
+              ))}
             {toast.action && (
               <a
                 href={toast.action.href}
                 target="_blank"
                 rel="noopener noreferrer"
-                onClick={() => {
-                  toast.action?.onClick?.();
+                onClick={(e) => {
+                  // An action carrying its own onClick handles activation
+                  // programmatically (e.g. in-app SPA navigation via
+                  // react-router). Prevent the default new-tab open so we don't
+                  // ALSO follow href. Actions with only an href (external links,
+                  // e.g. the sponsor prompt) keep the default new-tab behavior.
+                  if (toast.action?.onClick) {
+                    e.preventDefault();
+                    toast.action.onClick();
+                  }
                   dismissToast(toast.id);
                 }}
                 className="ml-2 px-2 py-1 rounded text-xs font-medium bg-bambu-green/20 text-bambu-green hover:bg-bambu-green/30 whitespace-nowrap"

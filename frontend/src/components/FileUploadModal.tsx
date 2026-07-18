@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, type DragEvent } from 'react';
+import { useState, useRef, useEffect, useId, type DragEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Upload,
@@ -14,6 +14,7 @@ import {
 import { api } from '../api/client';
 import type { LibraryFileUploadResponse } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 
 interface UploadFile {
   file: File;
@@ -22,6 +23,10 @@ interface UploadFile {
   isZip?: boolean;
   is3mf?: boolean;
   extractedCount?: number;
+  /** Live upload percentage (0-100) from XHR upload progress. Undefined until
+   *  the first computable progress event (ZIP extraction and no-content-length
+   *  uploads never set it, so those rows keep showing the spinner). */
+  progress?: number;
 }
 
 interface FileUploadModalProps {
@@ -42,6 +47,7 @@ interface FileUploadModalProps {
 
 export function FileUploadModal({ folderId, onClose, onUploadComplete, onFileUploaded, autoUpload, validateFile, accept, initialFiles }: FileUploadModalProps) {
   const { t } = useTranslation();
+  const titleId = useId();
   const [files, setFiles] = useState<UploadFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -94,7 +100,9 @@ export function FileUploadModal({ folderId, onClose, onUploadComplete, onFileUpl
             error: result.errors.length > 0 ? t('fileManager.zipFilesFailed', '{{count}} files failed', { count: result.errors.length }) : undefined,
           });
         } else {
-          const result = await api.uploadLibraryFile(uf.file, folderId, generateStlThumbnails);
+          const result = await api.uploadLibraryFile(uf.file, folderId, generateStlThumbnails, {
+            onProgress: (pct) => updateFileStatus(uf.file, { progress: pct }),
+          });
           updateFileStatus(uf.file, { status: 'success' });
           const error = onFileUploaded?.(result);
           if (error) {
@@ -174,10 +182,9 @@ export function FileUploadModal({ folderId, onClose, onUploadComplete, onFileUpl
   const allDone = files.length > 0 && pendingCount === 0 && !isUploading;
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg w-full max-w-lg border border-bambu-dark-tertiary">
+    <Modal onClose={onClose} closeOnOverlay={false} labelledBy={titleId}>
         <div className="p-4 border-b border-bambu-dark-tertiary flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-white">{t('fileManager.uploadFiles')}</h2>
+          <h2 id={titleId} className="text-lg font-semibold text-white">{t('fileManager.uploadFiles')}</h2>
           <button onClick={onClose} className="p-1 hover:bg-bambu-dark rounded">
             <X className="w-5 h-5 text-bambu-gray" />
           </button>
@@ -328,7 +335,19 @@ export function FileUploadModal({ folderId, onClose, onUploadComplete, onFileUpl
                     </button>
                   )}
                   {uploadFile.status === 'uploading' && (
-                    <Loader2 className="w-4 h-4 text-bambu-green animate-spin" />
+                    uploadFile.progress !== undefined ? (
+                      <span
+                        role="progressbar"
+                        aria-valuenow={uploadFile.progress}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        className="text-xs font-medium text-bambu-green tabular-nums flex-shrink-0"
+                      >
+                        {uploadFile.progress}%
+                      </span>
+                    ) : (
+                      <Loader2 className="w-4 h-4 text-bambu-green animate-spin" />
+                    )
                   )}
                   {uploadFile.status === 'success' && (
                     <CheckCircle className="w-4 h-4 text-green-500" />
@@ -377,7 +396,6 @@ export function FileUploadModal({ folderId, onClose, onUploadComplete, onFileUpl
             </Button>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

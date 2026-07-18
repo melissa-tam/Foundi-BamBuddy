@@ -5,6 +5,7 @@ import { X, Loader2, ChevronDown } from 'lucide-react';
 import { api } from '../api/client';
 import type { InventorySpool } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { MATERIALS, DEFAULT_BRANDS, KNOWN_VARIANTS } from './spool-form/constants';
 import { buildFilamentOptions } from './spool-form/utils';
 
@@ -438,17 +439,15 @@ export function BulkEditSpoolsModal({
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50"
-      onClick={isPending ? undefined : onClose}
+    <Modal
+      onClose={onClose}
+      labelledBy="bulk-edit-spools-modal-title"
+      widthClass="max-w-3xl"
+      dismissDisabled={isPending}
     >
-      <div
-        className="w-full max-w-3xl bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg max-h-[90vh] flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
         <div className="flex items-center justify-between p-5 border-b border-bambu-dark-tertiary">
           <div>
-            <h2 className="text-lg font-semibold text-white">
+            <h2 id="bulk-edit-spools-modal-title" className="text-lg font-semibold text-white">
               {t('inventory.bulk.editTitle')}
             </h2>
             <p className="text-sm text-bambu-gray mt-0.5">
@@ -519,7 +518,6 @@ export function BulkEditSpoolsModal({
             </Button>
           </div>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

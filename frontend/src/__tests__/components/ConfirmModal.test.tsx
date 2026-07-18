@@ -75,16 +75,15 @@ describe('ConfirmModal', () => {
     it('calls onCancel when clicking backdrop', async () => {
       const user = userEvent.setup();
       const onCancel = vi.fn();
-      const { container } = render(
-        <ConfirmModal {...defaultProps} onCancel={onCancel} />
-      );
+      render(<ConfirmModal {...defaultProps} onCancel={onCancel} />);
 
-      // Click on the backdrop (first div with fixed class)
-      const backdrop = container.querySelector('.fixed');
-      if (backdrop) {
-        await user.click(backdrop);
-        expect(onCancel).toHaveBeenCalledTimes(1);
-      }
+      // Overlay now portals to document.body (via ui/Modal); it is the
+      // dialog panel's parent. (Cannot use ``.fixed`` — the ToastProvider
+      // region also carries that class.)
+      const backdrop = screen.getByRole('dialog').parentElement;
+      expect(backdrop).not.toBeNull();
+      await user.click(backdrop as HTMLElement);
+      expect(onCancel).toHaveBeenCalledTimes(1);
     });
 
     it('does not call onCancel when clicking modal content', async () => {
@@ -145,15 +144,12 @@ describe('ConfirmModal', () => {
     it('does not call onCancel when clicking backdrop while loading', async () => {
       const user = userEvent.setup();
       const onCancel = vi.fn();
-      const { container } = render(
-        <ConfirmModal {...defaultProps} onCancel={onCancel} isLoading={true} />
-      );
+      render(<ConfirmModal {...defaultProps} onCancel={onCancel} isLoading={true} />);
 
-      const backdrop = container.querySelector('.fixed');
-      if (backdrop) {
-        await user.click(backdrop);
-        expect(onCancel).not.toHaveBeenCalled();
-      }
+      const backdrop = screen.getByRole('dialog').parentElement;
+      expect(backdrop).not.toBeNull();
+      await user.click(backdrop as HTMLElement);
+      expect(onCancel).not.toHaveBeenCalled();
     });
 
     it('does not call onCancel on Escape key while loading', () => {

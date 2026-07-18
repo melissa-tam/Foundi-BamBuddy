@@ -5,6 +5,7 @@ import { Tag, Loader2, Plus, X } from 'lucide-react';
 
 import { api, type LibraryTag } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 import { libraryTagsQueryKey } from '../utils/libraryTagsQuery';
 
@@ -106,17 +107,6 @@ export function BulkTagsPickerModal({ open, fileIds, onClose }: BulkTagsPickerMo
     },
   });
 
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !applyMutation.isPending && !createTagMutation.isPending) {
-        onClose();
-      }
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [open, onClose, applyMutation.isPending, createTagMutation.isPending]);
-
   if (!open) return null;
 
   const createDisabled =
@@ -127,14 +117,13 @@ export function BulkTagsPickerModal({ open, fileIds, onClose }: BulkTagsPickerMo
   const titleId = 'bulk-tags-picker-title';
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/60" onClick={() => !applyMutation.isPending && onClose()} />
-      <div
-        className="relative w-full max-w-md mx-4 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-h-[90vh] flex flex-col"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-      >
+    <Modal
+      onClose={onClose}
+      labelledBy={titleId}
+      size="sm"
+      overlayZIndex="z-[60]"
+      dismissDisabled={applyMutation.isPending || createTagMutation.isPending}
+    >
         <div className="flex items-center justify-between gap-4 px-5 py-4 border-b border-bambu-dark-tertiary">
           <h3 id={titleId} className="text-base font-semibold text-white flex items-center gap-2">
             <Tag className="w-4 h-4 text-bambu-green" />
@@ -254,7 +243,6 @@ export function BulkTagsPickerModal({ open, fileIds, onClose }: BulkTagsPickerMo
             {action === 'add' ? t('fileManager.tags.applyAdd') : t('fileManager.tags.applyRemove')}
           </Button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

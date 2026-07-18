@@ -13,12 +13,12 @@ import { useIsSidebarCompact } from '../hooks/useIsSidebarCompact';
 import { useColorCatalogVersion } from '../hooks/useColorCatalogVersion';
 import { useSponsorPrompt } from '../hooks/useSponsorPrompt';
 import { useUnknownTagPrompt } from '../hooks/useUnknownTagPrompt';
-import { UnknownSpoolModal } from './UnknownSpoolModal';
 import { useRespoolPrompt } from '../hooks/useRespoolPrompt';
 import { RespoolTagModal } from './RespoolTagModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
-import { Card, CardHeader, CardContent } from './Card';
+import { CardHeader, CardContent } from './Card';
+import { Modal } from './ui/Modal';
 import { parseUTCDate } from '../utils/date';
 import { Button } from './Button';
 import { BugReportBubble } from './BugReportBubble';
@@ -123,9 +123,10 @@ export function Layout() {
   // Sponsor-prompt toast — fires once per session post-auth if a milestone is eligible.
   useSponsorPrompt(settings?.currency ?? 'EUR');
 
-  // Unknown-spool prompt — surfaces a confirmation modal when the AMS reports a
-  // tag with no inventory match (only when `auto_add_unknown_rfid` is off).
-  const unknownSpool = useUnknownTagPrompt();
+  // Unknown-spool prompt — raises a per-slot persistent toast when the AMS
+  // reports a tag with no inventory match (only when `auto_add_unknown_rfid` is
+  // off). Side-effect only; the hook owns its toasts.
+  useUnknownTagPrompt();
   const respoolPrompt = useRespoolPrompt();
 
   // Fetch default sidebar order via a public endpoint (no settings:read needed)
@@ -915,16 +916,9 @@ export function Layout() {
         <Outlet />
       </main>
 
-      <UnknownSpoolModal
-        prompt={unknownSpool.prompt}
-        isPending={unknownSpool.isPending}
-        onConfirm={unknownSpool.confirm}
-        onCancel={unknownSpool.cancel}
-      />
-
       <RespoolTagModal
-        context={respoolPrompt.prompt}
-        onClose={respoolPrompt.dismiss}
+        context={respoolPrompt.activeContext}
+        onClose={respoolPrompt.closeModal}
       />
 
       {/* Keyboard Shortcuts Modal */}
@@ -945,15 +939,21 @@ export function Layout() {
 
       {/* Plate Detection Alert Modal */}
       {plateDetectionAlert && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[100] p-4">
-          <div className="bg-bambu-dark-secondary border-2 border-yellow-500 rounded-xl shadow-2xl max-w-md w-full animate-in fade-in zoom-in duration-200">
+        <Modal
+          onClose={() => setPlateDetectionAlert(null)}
+          labelledBy="plate-detection-alert-title"
+          size="sm"
+          closeOnOverlay={false}
+          overlayZIndex="z-[100]"
+          className="animate-in fade-in zoom-in duration-200"
+        >
             <div className="p-6 text-center">
               <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-yellow-500/20 flex items-center justify-center">
                 <svg className="w-10 h-10 text-yellow-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
                 </svg>
               </div>
-              <h2 className="text-xl font-bold text-yellow-400 mb-2">
+              <h2 id="plate-detection-alert-title" className="text-xl font-bold text-yellow-400 mb-2">
                 {t('plateAlert.title')}
               </h2>
               <p className="text-lg text-white mb-2">
@@ -969,28 +969,24 @@ export function Layout() {
                 {t('plateAlert.understand')}
               </button>
             </div>
-          </div>
-        </div>
+        </Modal>
       )}
 
       {/* Change Password Modal */}
       {showChangePasswordModal && (
-        <div
-          className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-          onClick={() => {
+        <Modal
+          onClose={() => {
             setShowChangePasswordModal(false);
             setChangePasswordData({ currentPassword: '', newPassword: '', confirmPassword: '' });
           }}
+          labelledBy="layout-change-password-title"
+          size="sm"
         >
-          <Card
-            className="w-full max-w-md"
-            onClick={(e: React.MouseEvent) => e.stopPropagation()}
-          >
             <CardHeader>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Key className="w-5 h-5 text-bambu-green" />
-                  <h2 className="text-lg font-semibold text-white">{t('changePassword.title')}</h2>
+                  <h2 id="layout-change-password-title" className="text-lg font-semibold text-white">{t('changePassword.title')}</h2>
                 </div>
                 <Button
                   variant="ghost"
@@ -1114,8 +1110,7 @@ export function Layout() {
                 </Button>
               </div>
             </CardContent>
-          </Card>
-        </div>
+        </Modal>
       )}
       <BugReportBubble />
     </div>

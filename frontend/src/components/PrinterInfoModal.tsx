@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, Copy, Check, Signal, Cable } from 'lucide-react';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
+import { Modal } from './ui/Modal';
 import { formatDateOnly } from '../utils/date';
 import { getPrinterImage, getWifiStrength } from '../utils/printer';
 import type { Printer, PrinterStatus } from '../api/client';
@@ -62,14 +63,6 @@ function CopyButton({ value }: { value: string }) {
 
 export function PrinterInfoModal({ printer, status, totalPrintHours, onClose }: PrinterInfoModalProps) {
   const { t } = useTranslation();
-
-  useEffect(() => {
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKey);
-    return () => window.removeEventListener('keydown', handleKey);
-  }, [onClose]);
 
   const rows: { label: string; value: React.ReactNode }[] = [];
 
@@ -221,16 +214,10 @@ export function PrinterInfoModal({ printer, status, totalPrintHours, onClose }: 
   });
 
   return (
-    <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
-      role="dialog"
-      aria-modal="true"
-      onClick={onClose}
-    >
-      <Card className="w-full max-w-md" onClick={(e: React.MouseEvent) => e.stopPropagation()}>
+    <Modal onClose={onClose} labelledBy="printer-info-modal-title" size="sm">
         <CardContent>
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg font-semibold text-white">
+            <h2 id="printer-info-modal-title" className="text-lg font-semibold text-white">
               {printer.name}
             </h2>
             <button onClick={onClose} className="p-1 hover:bg-bambu-dark rounded flex-shrink-0">
@@ -256,7 +243,6 @@ export function PrinterInfoModal({ printer, status, totalPrintHours, onClose }: 
             ))}
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }

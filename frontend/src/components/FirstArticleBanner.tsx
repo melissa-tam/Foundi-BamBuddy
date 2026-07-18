@@ -18,21 +18,19 @@
  *                       "Resume restarts a new first article" hint
  *  - approved / null:   a small check (approved) or nothing
  */
-import { useState, type FormEvent } from 'react';
+import { useId, useState, type FormEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertCircle, AlertTriangle, CheckCircle2, Camera, CameraOff, Loader2, X, XCircle } from 'lucide-react';
 import { api, withStreamToken } from '../api/client';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
 import { Button } from './Button';
 import { ConfirmModal } from './ConfirmModal';
+import { Modal } from './ui/Modal';
+import { FormField, TextArea } from './ui/Field';
 import { CameraTile } from './CameraTile';
 import { useToast } from '../contexts/ToastContext';
 import type { ProductionRun } from '../types/productionRuns';
-
-const inputClass =
-  'w-full px-3 py-2 bg-bambu-dark rounded-md text-white border border-bambu-dark-tertiary ' +
-  'focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors';
 
 /**
  * First-article inspection aids (Phase 4, F1): the finished part's finish photo
@@ -125,6 +123,7 @@ export function FirstArticleBanner({ run }: { run: ProductionRun }) {
   const { t } = useTranslation();
   const { showToast } = useToast();
   const queryClient = useQueryClient();
+  const titleId = useId();
   const state = run.first_article_state;
 
   const [confirm, setConfirm] = useState<'physical' | 'eject' | null>(null);
@@ -197,12 +196,12 @@ export function FirstArticleBanner({ run }: { run: ProductionRun }) {
   if (state === 'rejected') {
     return (
       <div className="mt-3 rounded-lg border border-red-500/40 bg-red-500/10 p-3">
-        <span className="inline-flex items-center gap-1.5 text-sm font-medium text-red-300">
+        <span className="inline-flex items-center gap-1.5 text-sm font-medium text-red-700 dark:text-red-300">
           <XCircle className="w-4 h-4" />
           {t('productionRuns.firstArticle.rejectedBadge')}
         </span>
         {run.first_article_reject_reason ? (
-          <p className="mt-1 text-sm text-red-200/90">
+          <p className="mt-1 text-sm text-red-700 dark:text-red-200/90">
             {t('productionRuns.firstArticle.rejectedReason', {
               reason: run.first_article_reject_reason,
             })}
@@ -221,12 +220,12 @@ export function FirstArticleBanner({ run }: { run: ProductionRun }) {
     <>
       <div className="mt-3 rounded-lg border border-yellow-500/40 bg-yellow-500/10 p-3">
         <div className="flex items-start gap-2">
-          <AlertTriangle className="w-5 h-5 flex-shrink-0 text-yellow-300" />
+          <AlertTriangle className="w-5 h-5 flex-shrink-0 text-yellow-700 dark:text-yellow-300" />
           <div className="min-w-0">
-            <p className="text-sm font-semibold text-yellow-200">
+            <p className="text-sm font-semibold text-yellow-700 dark:text-yellow-200">
               {t('productionRuns.firstArticle.awaitingTitle')}
             </p>
-            <p className="mt-0.5 text-xs text-yellow-200/80">
+            <p className="mt-0.5 text-xs text-yellow-700 dark:text-yellow-200/80">
               {t('productionRuns.firstArticle.awaitingBody')}
             </p>
           </div>
@@ -269,9 +268,9 @@ export function FirstArticleBanner({ run }: { run: ProductionRun }) {
         {approveMutation.error && (
           <div
             role="alert"
-            className="mt-3 flex items-start gap-2 rounded-lg border border-red-500/40 bg-red-500/10 p-2.5 text-sm text-red-300"
+            className="mt-3 flex items-start gap-2 rounded-lg border border-red-500/40 bg-red-500/10 p-2.5 text-sm text-red-700 dark:text-red-300"
           >
-            <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-400" />
+            <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-600 dark:text-red-400" />
             <span>
               {approveMutation.error.message || t('productionRuns.firstArticle.approveFailed')}
             </span>
@@ -301,19 +300,17 @@ export function FirstArticleBanner({ run }: { run: ProductionRun }) {
       )}
 
       {rejectOpen && (
-        <div
-          className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-          onClick={rejectMutation.isPending ? undefined : () => setRejectOpen(false)}
-          role="dialog"
-          aria-modal="true"
-          aria-label={t('productionRuns.firstArticle.rejectTitle')}
+        <Modal
+          onClose={() => setRejectOpen(false)}
+          size="sm"
+          dismissDisabled={rejectMutation.isPending}
+          labelledBy={titleId}
         >
-          <Card className="w-full max-w-md" onClick={(e) => e.stopPropagation()}>
             <CardContent className="p-0">
               <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
                 <div className="flex items-center gap-2">
-                  <XCircle className="w-5 h-5 text-red-400" />
-                  <h2 className="text-lg font-semibold text-white">
+                  <XCircle className="w-5 h-5 text-red-600 dark:text-red-400" />
+                  <h2 id={titleId} className="text-lg font-semibold text-white">
                     {t('productionRuns.firstArticle.rejectTitle')}
                   </h2>
                 </div>
@@ -332,37 +329,33 @@ export function FirstArticleBanner({ run }: { run: ProductionRun }) {
                 <p className="text-sm text-bambu-gray">
                   {t('productionRuns.firstArticle.rejectBody')}
                 </p>
-                <div>
-                  <label htmlFor="reject-reason" className="block text-sm font-medium text-white mb-1">
-                    {t('productionRuns.firstArticle.rejectReasonLabel')}
-                  </label>
-                  <textarea
-                    id="reject-reason"
-                    rows={3}
-                    maxLength={500}
-                    value={reason}
-                    onChange={(e) => {
-                      setReason(e.target.value);
-                      if (reasonError) setReasonError(false);
-                    }}
-                    placeholder={t('productionRuns.firstArticle.rejectReasonPlaceholder')}
-                    className={`${inputClass} resize-y ${reasonError ? 'border-red-500' : ''}`}
-                    aria-invalid={reasonError}
-                    aria-describedby={reasonError ? 'reject-reason-error' : undefined}
-                  />
-                  {reasonError && (
-                    <p id="reject-reason-error" className="text-red-400 text-xs mt-1">
-                      {t('productionRuns.firstArticle.rejectReasonRequired')}
-                    </p>
+                <FormField
+                  id="reject-reason"
+                  label={t('productionRuns.firstArticle.rejectReasonLabel')}
+                  error={reasonError ? t('productionRuns.firstArticle.rejectReasonRequired') : undefined}
+                >
+                  {(field) => (
+                    <TextArea
+                      {...field}
+                      rows={3}
+                      maxLength={500}
+                      value={reason}
+                      onChange={(e) => {
+                        setReason(e.target.value);
+                        if (reasonError) setReasonError(false);
+                      }}
+                      placeholder={t('productionRuns.firstArticle.rejectReasonPlaceholder')}
+                      className={`resize-y ${reasonError ? 'border-red-500' : ''}`}
+                    />
                   )}
-                </div>
+                </FormField>
 
                 {rejectMutation.error && (
                   <div
                     role="alert"
-                    className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/40 rounded-lg text-sm text-red-300"
+                    className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/40 rounded-lg text-sm text-red-700 dark:text-red-300"
                   >
-                    <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-400" />
+                    <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-600 dark:text-red-400" />
                     <span>
                       {rejectMutation.error.message || t('productionRuns.firstArticle.rejectFailed')}
                     </span>
@@ -390,8 +383,7 @@ export function FirstArticleBanner({ run }: { run: ProductionRun }) {
                 </div>
               </form>
             </CardContent>
-          </Card>
-        </div>
+        </Modal>
       )}
     </>
   );

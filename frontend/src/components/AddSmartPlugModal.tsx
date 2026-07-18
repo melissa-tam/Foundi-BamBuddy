@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { api } from '../api/client';
 import type { SmartPlug, SmartPlugCreate, SmartPlugUpdate, DiscoveredTasmotaDevice } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 
 interface AddSmartPlugModalProps {
   plug?: SmartPlug | null;
@@ -172,19 +173,14 @@ export function AddSmartPlugModal({ plug, onClose }: AddSmartPlugModalProps) {
     staleTime: 0,
   });
 
-  // Close on Escape key and cleanup scan polling
+  // Cleanup scan polling on unmount
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
       if (scanPollRef.current) {
         clearInterval(scanPollRef.current);
       }
     };
-  }, [onClose]);
+  }, []);
 
   // Start scanning for Tasmota devices (auto-detects network)
   const startScan = async () => {
@@ -407,17 +403,10 @@ export function AddSmartPlugModal({ plug, onClose }: AddSmartPlugModalProps) {
   const isPending = createMutation.isPending || updateMutation.isPending;
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary w-full max-w-md max-h-[90vh] flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy="add-smart-plug-modal-title" size="sm">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary flex-shrink-0">
-          <h2 className="text-lg font-semibold text-white">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary">
+          <h2 id="add-smart-plug-modal-title" className="text-lg font-semibold text-white">
             {isEditing ? t('smartPlugs.editTitle') : t('smartPlugs.addTitle')}
           </h2>
           <button
@@ -429,7 +418,7 @@ export function AddSmartPlugModal({ plug, onClose }: AddSmartPlugModalProps) {
         </div>
 
         {/* Form */}
-        <form onSubmit={handleSubmit} className="p-6 space-y-4 overflow-y-auto">
+        <form onSubmit={handleSubmit} className="p-6 space-y-4">
           {error && (
             <div className="p-3 bg-red-500/20 border border-red-500/50 rounded-lg text-sm text-red-400">
               {error}
@@ -1648,7 +1637,6 @@ export function AddSmartPlugModal({ plug, onClose }: AddSmartPlugModalProps) {
             </Button>
           </div>
         </form>
-      </div>
-    </div>
+    </Modal>
   );
 }

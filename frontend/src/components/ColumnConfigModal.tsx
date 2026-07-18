@@ -1,8 +1,9 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { GripVertical, Eye, EyeOff, ChevronUp, ChevronDown, RotateCcw } from 'lucide-react';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 
 export interface ColumnConfig {
   id: string;
@@ -20,6 +21,7 @@ interface ColumnConfigModalProps {
 
 export function ColumnConfigModal({ isOpen, onClose, columns, defaultColumns, onSave }: ColumnConfigModalProps) {
   const { t } = useTranslation();
+  const titleId = useId();
   const [localColumns, setLocalColumns] = useState<ColumnConfig[]>(columns);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
   const draggedIndexRef = useRef<number | null>(null);
@@ -29,15 +31,6 @@ export function ColumnConfigModal({ isOpen, onClose, columns, defaultColumns, on
       setLocalColumns(columns.map((c) => ({ ...c })));
     }
   }, [isOpen, columns]);
-
-  useEffect(() => {
-    if (!isOpen) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onClose]);
 
   if (!isOpen) return null;
 
@@ -95,11 +88,10 @@ export function ColumnConfigModal({ isOpen, onClose, columns, defaultColumns, on
   const visibleCount = localColumns.filter((c) => c.visible).length;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
-      <Card className="w-full max-w-md max-h-[80vh] flex flex-col" onClick={(e: React.MouseEvent) => e.stopPropagation()}>
+    <Modal onClose={onClose} size="sm" className="flex flex-col" labelledBy={titleId}>
         <CardContent className="p-6 flex flex-col min-h-0">
           {/* Header */}
-          <h3 className="text-lg font-semibold text-white mb-2">{t('inventory.configureColumns')}</h3>
+          <h3 id={titleId} className="text-lg font-semibold text-white mb-2">{t('inventory.configureColumns')}</h3>
           <p className="text-sm text-bambu-gray mb-4">
             {t('inventory.configureColumnsDesc')}
             <span className="ml-2 text-bambu-gray/60">
@@ -181,7 +173,6 @@ export function ColumnConfigModal({ isOpen, onClose, columns, defaultColumns, on
             </Button>
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }

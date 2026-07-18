@@ -62,9 +62,9 @@ describe('PlatePickerModal', () => {
     const onClose = vi.fn();
     render(<PlatePickerModal plates={[makePlate({})]} onSelect={() => {}} onClose={onClose} />);
 
-    // The outermost div is the backdrop; clicking it fires onClose.
+    // The dialog's parent is the portaled backdrop; clicking it fires onClose.
     // Plate rows stop propagation so they can't accidentally close the modal.
-    const backdrop = document.querySelector('[class*="fixed"]') as HTMLElement;
+    const backdrop = screen.getByRole('dialog').parentElement as HTMLElement;
     expect(backdrop).toBeTruthy();
     await user.click(backdrop);
 

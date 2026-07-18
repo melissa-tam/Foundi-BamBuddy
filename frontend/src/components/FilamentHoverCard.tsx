@@ -1,9 +1,10 @@
-import { useState, useRef, useEffect, useLayoutEffect, type ReactNode } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect, useId, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { Droplets, Copy, Check, Settings2, Package, Unlink, RefreshCw } from 'lucide-react';
 import { isLightColor } from '../utils/colors';
+import { Modal } from './ui/Modal';
 
 interface FilamentData {
   vendor: 'Bambu Lab' | 'Generic';
@@ -69,6 +70,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
   const [coords, setCoords] = useState<{ top: number; left: number } | null>(null);
   const [copied, setCopied] = useState(false);
   const [showUnlinkConfirm, setShowUnlinkConfirm] = useState(false);
+  const unlinkTitleId = useId();
   const triggerRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -479,41 +481,40 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
 
       {/* Unlink Confirmation Dialog */}
       {showUnlinkConfirm && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center" onClick={() => setShowUnlinkConfirm(false)}>
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
-          <div
-            className="relative bg-bambu-dark-secondary rounded-lg shadow-xl w-full max-w-sm mx-4 border border-bambu-dark-tertiary"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="p-4 space-y-4">
-              <div className="space-y-2">
-                <h3 className="text-base font-semibold text-white">
-                  {t('spoolman.unlinkConfirmTitle')}
-                </h3>
-                <p className="text-sm text-bambu-gray">
-                  {t('spoolman.unlinkConfirmMessage')}
-                </p>
-              </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setShowUnlinkConfirm(false)}
-                  className="flex-1 px-3 py-2 text-sm font-medium rounded transition-colors bg-bambu-dark hover:bg-bambu-dark-tertiary text-white"
-                >
-                  {t('common.cancel')}
-                </button>
-                <button
-                  onClick={() => {
-                    spoolman?.onUnlinkSpool?.();
-                    setShowUnlinkConfirm(false);
-                  }}
-                  className="flex-1 px-3 py-2 text-sm font-medium rounded transition-colors bg-red-500/20 hover:bg-red-500/30 text-red-400"
-                >
-                  {t('inventory.unassignSpool')}
-                </button>
-              </div>
+        <Modal
+          onClose={() => setShowUnlinkConfirm(false)}
+          overlayZIndex="z-[100]"
+          widthClass="max-w-sm"
+          labelledBy={unlinkTitleId}
+        >
+          <div className="p-4 space-y-4">
+            <div className="space-y-2">
+              <h3 id={unlinkTitleId} className="text-base font-semibold text-white">
+                {t('spoolman.unlinkConfirmTitle')}
+              </h3>
+              <p className="text-sm text-bambu-gray">
+                {t('spoolman.unlinkConfirmMessage')}
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowUnlinkConfirm(false)}
+                className="flex-1 px-3 py-2 text-sm font-medium rounded transition-colors bg-bambu-dark hover:bg-bambu-dark-tertiary text-white"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={() => {
+                  spoolman?.onUnlinkSpool?.();
+                  setShowUnlinkConfirm(false);
+                }}
+                className="flex-1 px-3 py-2 text-sm font-medium rounded transition-colors bg-red-500/20 hover:bg-red-500/30 text-red-400"
+              >
+                {t('inventory.unassignSpool')}
+              </button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

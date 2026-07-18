@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { X, FolderKanban, Loader2, XCircle, Search } from 'lucide-react';
 import { api } from '../api/client';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
 import { Button } from './Button';
 import { useToast } from '../contexts/ToastContext';
+import { Modal } from './ui/Modal';
 
 interface BatchProjectModalProps {
   selectedIds: number[];
@@ -33,15 +34,6 @@ export function BatchProjectModal({ selectedIds, onClose }: BatchProjectModalPro
     ? sortedProjects?.filter((p) => p.name.toLowerCase().includes(trimmed))
     : sortedProjects;
   const showSearch = (sortedProjects?.length ?? 0) > 5;
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   // Helper to invalidate all project-related queries
   const invalidateProjectQueries = () => {
@@ -90,14 +82,13 @@ export function BatchProjectModal({ selectedIds, onClose }: BatchProjectModalPro
   const isPending = assignMutation.isPending || removeMutation.isPending;
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <Card className="w-full max-w-md max-h-[80vh] flex flex-col">
+    <Modal onClose={onClose} labelledBy="batch-project-modal-title" size="sm" closeOnOverlay={false}>
         <CardContent className="p-0 flex flex-col min-h-0">
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary shrink-0">
             <div className="flex items-center gap-2">
               <FolderKanban className="w-5 h-5 text-bambu-green" />
-              <h2 className="text-xl font-semibold text-white">
+              <h2 id="batch-project-modal-title" className="text-xl font-semibold text-white">
                 Assign to Project
               </h2>
             </div>
@@ -213,7 +204,6 @@ export function BatchProjectModal({ selectedIds, onClose }: BatchProjectModalPro
             </Button>
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }

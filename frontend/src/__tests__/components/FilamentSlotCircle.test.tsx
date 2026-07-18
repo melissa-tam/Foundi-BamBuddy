@@ -85,4 +85,38 @@ describe('FilamentSlotCircle', () => {
     const text = screen.getByText('1');
     expectColor(text.style.color, '#fff', 'rgb(255, 255, 255)');
   });
+
+  describe('out-of-rotation badge', () => {
+    it('renders the warning badge when outOfRotation is true', () => {
+      render(
+        <FilamentSlotCircle trayColor="FF0000" isEmpty={false} slotNumber={1} outOfRotation />
+      );
+      // Badge is an accessible image with an aria-label (not colour-only).
+      const badge = screen.getByRole('img');
+      expect(badge).toBeInTheDocument();
+    });
+
+    it('gives the badge a non-empty aria-label and a matching title', () => {
+      render(
+        <FilamentSlotCircle trayColor="FF0000" isEmpty={false} slotNumber={1} outOfRotation />
+      );
+      const badge = screen.getByRole('img');
+      const label = badge.getAttribute('aria-label');
+      expect(label).toBeTruthy();
+      // title carries the same tooltip text for hover/keyboard discovery.
+      expect(badge.getAttribute('title')).toBe(label);
+    });
+
+    it('does not render the badge when outOfRotation is false', () => {
+      render(
+        <FilamentSlotCircle trayColor="FF0000" isEmpty={false} slotNumber={1} outOfRotation={false} />
+      );
+      expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    });
+
+    it('does not render the badge when outOfRotation is omitted', () => {
+      render(<FilamentSlotCircle trayColor="FF0000" isEmpty={false} slotNumber={1} />);
+      expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    });
+  });
 });

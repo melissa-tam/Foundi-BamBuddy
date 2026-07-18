@@ -1,10 +1,11 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Loader2, ChevronDown, ArrowRightLeft } from 'lucide-react';
 import { api, multiVirtualPrinterApi } from '../api/client';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 
 type Mode = 'archive' | 'review' | 'queue' | 'proxy';
@@ -28,6 +29,7 @@ export function VirtualPrinterAddDialog({ onClose }: VirtualPrinterAddDialogProp
   const [name, setName] = useState('');
   const [mode, setMode] = useState<Mode>('archive');
   const [targetPrinterId, setTargetPrinterId] = useState<number | null>(null);
+  const nameInputRef = useRef<HTMLInputElement>(null);
 
   const { data: printers } = useQuery({
     queryKey: ['printers'],
@@ -52,27 +54,20 @@ export function VirtualPrinterAddDialog({ onClose }: VirtualPrinterAddDialogProp
   });
 
   return (
-    <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
-      onClick={onClose}
-    >
-      <Card
-        className="w-full max-w-md"
-        onClick={(e: React.MouseEvent) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy="virtual-printer-add-dialog-title" size="sm" initialFocusRef={nameInputRef}>
         <CardContent className="p-6 space-y-4">
-          <h3 className="text-lg font-semibold text-white">{t('virtualPrinter.addDialog.title')}</h3>
+          <h3 id="virtual-printer-add-dialog-title" className="text-lg font-semibold text-white">{t('virtualPrinter.addDialog.title')}</h3>
 
           {/* Name */}
           <div>
             <label className="text-sm text-white font-medium block mb-1">{t('virtualPrinter.addDialog.name')}</label>
             <input
+              ref={nameInputRef}
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Bambuddy"
               className="w-full bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-md px-3 py-2 text-white text-sm placeholder-bambu-gray"
-              autoFocus
             />
           </div>
 
@@ -150,7 +145,6 @@ export function VirtualPrinterAddDialog({ onClose }: VirtualPrinterAddDialogProp
             </Button>
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }

@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { X, Play, Square, Trash2, RefreshCw, ArrowDown, ArrowUp, Search } from 'lucide-react';
 import { api, type MQTTLogEntry } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { useState, useEffect, useRef, useMemo } from 'react';
 
 interface MQTTDebugModalProps {
@@ -46,15 +47,6 @@ export function MQTTDebugModal({ printerId, printerName, onClose }: MQTTDebugMod
       queryClient.invalidateQueries({ queryKey: ['mqtt-logs', printerId] });
     },
   });
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   // Auto-scroll to bottom when new logs arrive
   useEffect(() => {
@@ -116,12 +108,11 @@ export function MQTTDebugModal({ printerId, printerName, onClose }: MQTTDebugMod
   }, [logs, searchQuery, directionFilter]);
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg max-w-4xl w-full max-h-[85vh] flex flex-col">
+    <Modal onClose={onClose} labelledBy="mqtt-debug-modal-title" size="xl" closeOnOverlay={false} className="flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
           <div>
-            <h2 className="text-lg font-semibold text-white">{t('mqttDebug.title')}</h2>
+            <h2 id="mqtt-debug-modal-title" className="text-lg font-semibold text-white">{t('mqttDebug.title')}</h2>
             <p className="text-sm text-bambu-gray">{printerName}</p>
           </div>
           <button
@@ -325,7 +316,6 @@ export function MQTTDebugModal({ printerId, printerName, onClose }: MQTTDebugMod
             {t('common.close')}
           </Button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

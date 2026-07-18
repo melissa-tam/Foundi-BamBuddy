@@ -1,7 +1,7 @@
-import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, History } from 'lucide-react';
 import { PrintLogTable } from './PrintLogTable';
+import { Modal } from './ui/Modal';
 
 interface PrintLogModalProps {
   archiveId: number;
@@ -12,27 +12,12 @@ interface PrintLogModalProps {
 export function PrintLogModal({ archiveId, archiveName, onClose }: PrintLogModalProps) {
   const { t } = useTranslation();
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary w-full max-w-2xl max-h-[85vh] flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy="print-log-modal-title" size="lg" className="flex flex-col">
         <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-2 min-w-0">
             <History className="w-5 h-5 text-bambu-green flex-shrink-0" />
-            <h2 className="text-lg font-semibold text-white truncate" title={archiveName || ''}>
+            <h2 id="print-log-modal-title" className="text-lg font-semibold text-white truncate" title={archiveName || ''}>
               {t('archives.runLog.modalTitle', { name: archiveName || t('archives.runLog.modalTitleFallback') })}
             </h2>
           </div>
@@ -47,7 +32,6 @@ export function PrintLogModal({ archiveId, archiveName, onClose }: PrintLogModal
         <div className="p-6 overflow-y-auto flex-1">
           <PrintLogTable archiveId={archiveId} />
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

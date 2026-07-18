@@ -5,6 +5,8 @@ import { X, Loader2, Search, Link } from 'lucide-react';
 import { api } from '../api/client';
 import type { UnlinkedSpool } from '../api/client';
 import { Button } from './Button';
+import { CardContent } from './Card';
+import { Modal } from './ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 
 interface LinkSpoolModalProps {
@@ -68,13 +70,12 @@ export function LinkSpoolModal({ isOpen, onClose, tagUid, trayUuid, printerId, a
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-bambu-dark-secondary rounded-xl shadow-xl w-full max-w-md mx-4 max-h-[80vh] flex flex-col border border-bambu-dark-tertiary">
+    <Modal onClose={onClose} size="sm" labelledBy="link-spool-modal-title">
+      <CardContent className="p-0">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-white/10">
           <div>
-            <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+            <h3 id="link-spool-modal-title" className="text-lg font-semibold text-white flex items-center gap-2">
               <Link className="w-5 h-5 text-bambu-green" />
               {t('spoolman.selectSpool')}
             </h3>
@@ -107,7 +108,7 @@ export function LinkSpoolModal({ isOpen, onClose, tagUid, trayUuid, printerId, a
         </div>
 
         {/* Spool List */}
-        <div className="flex-1 overflow-y-auto p-2 min-h-0">
+        <div className="p-2">
           {isLoading ? (
             <div className="flex justify-center py-8">
               <Loader2 className="w-6 h-6 animate-spin text-bambu-green" />
@@ -151,7 +152,7 @@ export function LinkSpoolModal({ isOpen, onClose, tagUid, trayUuid, printerId, a
             {t('inventory.cancel') || 'Cancel'}
           </Button>
         </div>
-      </div>
-    </div>
+      </CardContent>
+    </Modal>
   );
 }

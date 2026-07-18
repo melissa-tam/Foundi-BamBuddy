@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useRef, useId } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
@@ -16,6 +16,7 @@ import type { InventorySpool, SpoolUsageRecord, FilamentSkuSettings, ShoppingLis
 import { getSwatchStyle } from '../utils/colors';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
+import { Modal } from './ui/Modal';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1789,6 +1790,8 @@ function AddToCartModal({
   onAdd: (item: { material: string; subtype: string | null; brand: string | null; color_name: string | null; quantity_spools: number; note: string | null }) => void;
 }) {
   const { t } = useTranslation();
+  const titleId = useId();
+  const qtyInputRef = useRef<HTMLInputElement>(null);
   const label = [f.group.brand, f.group.material, f.group.subtype, f.group.colorName].filter(Boolean).join(' ');
   const [mode, setMode] = useState<'qty' | 'duration'>('qty');
   const [qty, setQty] = useState('1');
@@ -1812,12 +1815,11 @@ function AddToCartModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-      <div className="bg-bambu-dark-secondary rounded-2xl border border-bambu-dark-tertiary w-full max-w-sm shadow-2xl">
+    <Modal onClose={onClose} closeOnOverlay={false} widthClass="max-w-sm" labelledBy={titleId} initialFocusRef={qtyInputRef}>
         <div className="flex items-center justify-between px-5 pt-5 pb-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-2">
             <ShoppingCart className="w-5 h-5 text-bambu-green" />
-            <h2 className="text-base font-semibold text-white">{t('forecast.addToCartTitle')}</h2>
+            <h2 id={titleId} className="text-base font-semibold text-white">{t('forecast.addToCartTitle')}</h2>
           </div>
           <button onClick={onClose} className="p-1 text-bambu-gray hover:text-white transition-colors"><X className="w-5 h-5" /></button>
         </div>
@@ -1846,10 +1848,10 @@ function AddToCartModal({
             <div className="space-y-1.5">
               <label className="text-xs text-bambu-gray">{t('forecast.numberOfSpools')}</label>
               <input
+                ref={qtyInputRef}
                 type="number" min={1} max={99}
                 value={qty} onChange={(e) => setQty(e.target.value)}
                 className="w-full px-3 py-2 bg-bambu-dark-tertiary border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                autoFocus
               />
             </div>
           ) : (
@@ -1897,8 +1899,7 @@ function AddToCartModal({
             </button>
           </div>
         </form>
-      </div>
-    </div>
+    </Modal>
   );
 }
 

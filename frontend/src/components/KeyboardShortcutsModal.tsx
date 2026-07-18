@@ -1,7 +1,7 @@
-import { useEffect } from 'react';
 import { X, Keyboard, ExternalLink } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
+import { Modal } from './ui/Modal';
 
 interface NavItem {
   id: string;
@@ -81,24 +81,14 @@ export function KeyboardShortcutsModal({ onClose, navItems, sidebarItems }: Keyb
   const { t } = useTranslation();
   const shortcuts = getShortcuts(sidebarItems, navItems, t);
 
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
-      <Card className="w-full max-w-md" onClick={(e) => e.stopPropagation()}>
-        <CardContent className="p-0">
+    <Modal onClose={onClose} size="sm" labelledBy="keyboard-shortcuts-modal-title">
+      <CardContent className="p-0">
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
             <div className="flex items-center gap-2">
               <Keyboard className="w-5 h-5 text-bambu-green" />
-              <h2 className="text-xl font-semibold text-white">Keyboard Shortcuts</h2>
+              <h2 id="keyboard-shortcuts-modal-title" className="text-xl font-semibold text-white">Keyboard Shortcuts</h2>
             </div>
             <button
               onClick={onClose}
@@ -141,7 +131,6 @@ export function KeyboardShortcutsModal({ onClose, navItems, sidebarItems }: Keyb
             </p>
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }

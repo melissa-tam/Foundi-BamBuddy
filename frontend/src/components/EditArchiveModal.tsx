@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useRef, useId } from 'react';
 import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { X, Save, Tag, Camera, Trash2, Loader2, Plus, FolderKanban, Hash, Link } from 'lucide-react';
@@ -6,6 +6,7 @@ import { api } from '../api/client';
 import type { Archive } from '../api/client';
 import { Button } from './Button';
 import { PrintLogTable } from './PrintLogTable';
+import { Modal } from './ui/Modal';
 
 // Keys for failure reasons - translated at render time.
 // Exported so the Print Log per-row classification editor (#1687 part 4)
@@ -36,15 +37,7 @@ interface EditArchiveModalProps {
 
 export function EditArchiveModal({ archive, onClose, existingTags = [] }: EditArchiveModalProps) {
   const { t } = useTranslation();
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
+  const titleId = useId();
   const queryClient = useQueryClient();
   const [printName, setPrintName] = useState(archive.print_name || '');
   const [printerId, setPrinterId] = useState<number | null>(archive.printer_id);
@@ -212,17 +205,10 @@ export function EditArchiveModal({ archive, onClose, existingTags = [] }: EditAr
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary w-full max-w-md max-h-[90vh] flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} size="sm" className="flex flex-col" labelledBy={titleId}>
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary">
-          <h2 className="text-lg font-semibold text-white">{t('editArchive.title')}</h2>
+          <h2 id={titleId} className="text-lg font-semibold text-white">{t('editArchive.title')}</h2>
           <button
             onClick={onClose}
             className="text-bambu-gray hover:text-white transition-colors"
@@ -510,7 +496,6 @@ export function EditArchiveModal({ archive, onClose, existingTags = [] }: EditAr
             </Button>
           </div>
         </form>
-      </div>
-    </div>
+    </Modal>
   );
 }

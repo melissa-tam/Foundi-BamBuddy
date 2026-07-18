@@ -22,6 +22,7 @@ import {
 import { api } from '../api/client';
 import type { KProfile, KProfileCreate, KProfileDelete, Permission } from '../api/client';
 import { Card, CardContent } from './Card';
+import { Modal } from './ui/Modal';
 import { Button } from './Button';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -378,8 +379,15 @@ function KProfileModal({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <Card className="w-full max-w-md relative">
+    <>
+    <Modal
+      onClose={onClose}
+      size="sm"
+      closeOnOverlay={false}
+      className="relative"
+      labelledBy="kprofile-modal-title"
+      dismissDisabled={showDeleteConfirm || isSyncing}
+    >
         {/* Syncing overlay */}
         {isSyncing && (
           <div className="absolute inset-0 bg-bambu-dark-secondary/90 flex flex-col items-center justify-center z-10 rounded-lg">
@@ -394,7 +402,7 @@ function KProfileModal({
         )}
         <CardContent className="p-0">
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
-            <h2 className="text-xl font-semibold text-white">
+            <h2 id="kprofile-modal-title" className="text-xl font-semibold text-white">
               {profile ? t('kProfiles.modal.editTitle') : t('kProfiles.modal.addTitle')}
             </h2>
             <button
@@ -642,19 +650,24 @@ function KProfileModal({
             </div>
           </form>
         </CardContent>
-      </Card>
+      </Modal>
 
       {/* Delete Confirmation Modal */}
       {showDeleteConfirm && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[60]">
-          <Card className="w-full max-w-sm">
-            <CardContent className="p-6">
+        <Modal
+          onClose={() => setShowDeleteConfirm(false)}
+          widthClass="max-w-sm"
+          closeOnOverlay={false}
+          overlayZIndex="z-[60]"
+          labelledBy="kprofile-delete-title"
+        >
+          <CardContent className="p-6">
               <div className="flex items-center gap-3 mb-4">
                 <div className="w-10 h-10 rounded-full bg-red-500/20 flex items-center justify-center">
                   <Trash2 className="w-5 h-5 text-red-500" />
                 </div>
                 <div>
-                  <h3 className="text-lg font-semibold text-white">{t('kProfiles.deleteConfirm.title')}</h3>
+                  <h3 id="kprofile-delete-title" className="text-lg font-semibold text-white">{t('kProfiles.deleteConfirm.title')}</h3>
                   <p className="text-sm text-bambu-gray">{t('kProfiles.deleteConfirm.cannotUndo')}</p>
                 </div>
               </div>
@@ -685,11 +698,10 @@ function KProfileModal({
                   {t('common.delete')}
                 </Button>
               </div>
-            </CardContent>
-          </Card>
-        </div>
+          </CardContent>
+        </Modal>
       )}
-    </div>
+    </>
   );
 }
 
@@ -1521,15 +1533,20 @@ export function KProfilesView() {
 
       {/* Bulk Delete Confirmation Modal */}
       {showBulkDeleteConfirm && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <Card className="w-full max-w-sm">
-            <CardContent className="p-6">
+        <Modal
+          onClose={() => setShowBulkDeleteConfirm(false)}
+          widthClass="max-w-sm"
+          closeOnOverlay={false}
+          dismissDisabled={bulkDeleteInProgress}
+          labelledBy="kprofile-bulk-delete-title"
+        >
+          <CardContent className="p-6">
               <div className="flex items-center gap-3 mb-4">
                 <div className="w-10 h-10 rounded-full bg-red-500/20 flex items-center justify-center">
                   <Trash2 className="w-5 h-5 text-red-500" />
                 </div>
                 <div>
-                  <h3 className="text-lg font-semibold text-white">{t('kProfiles.bulkDelete.title')}</h3>
+                  <h3 id="kprofile-bulk-delete-title" className="text-lg font-semibold text-white">{t('kProfiles.bulkDelete.title')}</h3>
                   <p className="text-sm text-bambu-gray">{t('kProfiles.bulkDelete.cannotUndo')}</p>
                 </div>
               </div>
@@ -1558,9 +1575,8 @@ export function KProfilesView() {
                   {t('common.delete')}
                 </Button>
               </div>
-            </CardContent>
-          </Card>
-        </div>
+          </CardContent>
+        </Modal>
       )}
     </>
   );

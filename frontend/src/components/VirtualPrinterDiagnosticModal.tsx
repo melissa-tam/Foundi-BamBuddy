@@ -16,6 +16,7 @@ import {
   type VPDiagnosticStatus,
   type VPDiagnosticResult,
 } from '../api/client';
+import { Modal } from './ui/Modal';
 
 function StatusIcon({ status }: { status: VPDiagnosticStatus }) {
   if (status === 'pass') return <CheckCircle2 className="w-5 h-5 text-bambu-green flex-shrink-0" />;
@@ -49,14 +50,6 @@ export function VirtualPrinterDiagnosticModal({
     // Run once on mount — re-running is the explicit "Run again" button.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   const result = diagnose.data;
 
@@ -93,15 +86,11 @@ export function VirtualPrinterDiagnosticModal({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={onClose}>
-      <div
-        className="bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary w-full max-w-lg flex flex-col max-h-[85vh]"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy="vp-diagnostic-modal-title" className="flex flex-col">
         <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-2 min-w-0">
             <Stethoscope className="w-5 h-5 text-bambu-green flex-shrink-0" />
-            <h2 className="text-lg font-semibold text-white truncate">
+            <h2 id="vp-diagnostic-modal-title" className="text-lg font-semibold text-white truncate">
               {t('vpDiagnostic.title', { name: vpName })}
             </h2>
           </div>
@@ -153,7 +142,6 @@ export function VirtualPrinterDiagnosticModal({
             {t('common.close')}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { X, Loader2, Printer, CheckSquare, Square, Search } from 'lucide-react';
 import { api, type SpoolLabelTemplate, type InventorySpool } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 import { getSwatchStyle } from '../utils/colors';
 
@@ -289,18 +290,12 @@ export function LabelTemplatePickerModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start sm:items-center justify-center p-4 overflow-y-auto">
-      <div
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-        onClick={onClose}
-      />
-
-      <div className="relative w-full max-w-3xl bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-h-[90vh] overflow-hidden flex flex-col my-auto">
+    <Modal onClose={onClose} widthClass="max-w-3xl" className="flex flex-col" labelledBy="label-template-picker-title">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-2">
             <Printer className="w-5 h-5 text-bambu-green" />
-            <h2 className="text-lg font-semibold text-white">
+            <h2 id="label-template-picker-title" className="text-lg font-semibold text-white">
               {t('inventory.labels.title', 'Print spool labels')}
             </h2>
             {selectedCount > 0 && (
@@ -495,7 +490,6 @@ export function LabelTemplatePickerModal({
             {t('common.cancel', 'Cancel')}
           </Button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

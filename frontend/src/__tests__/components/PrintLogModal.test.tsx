@@ -131,10 +131,10 @@ describe('PrintLogModal', () => {
 
   it('calls onClose when backdrop is clicked', async () => {
     const onClose = vi.fn();
-    const { container } = render(
+    render(
       <PrintLogModal archiveId={42} archiveName="Benchy" onClose={onClose} />
     );
-    const backdrop = container.querySelector('.fixed.inset-0');
+    const backdrop = screen.getByRole('dialog').parentElement;
     if (!backdrop) throw new Error('Backdrop not found');
     fireEvent.click(backdrop);
     expect(onClose).toHaveBeenCalledTimes(1);

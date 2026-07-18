@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { X, Save, Loader2, Send, CheckCircle, XCircle } from 'lucide-react';
@@ -6,6 +6,7 @@ import { api } from '../api/client';
 import type { NotificationProvider, NotificationProviderCreate, NotificationProviderUpdate, ProviderType } from '../api/client';
 import { Button } from './Button';
 import { Toggle } from './Toggle';
+import { Modal } from './ui/Modal';
 
 interface AddNotificationModalProps {
   provider?: NotificationProvider | null;
@@ -95,15 +96,6 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
     queryKey: ['printers'],
     queryFn: api.getPrinters,
   });
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   // Test configuration mutation
   const testMutation = useMutation({
@@ -290,17 +282,10 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
   const configFields = getConfigFields(providerType);
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 overflow-y-auto"
-      onClick={onClose}
-    >
-      <div
-        className="bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary w-full max-w-lg my-8 max-h-[90vh] overflow-y-auto"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy="add-notification-modal-title">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary">
-          <h2 className="text-lg font-semibold text-white">
+          <h2 id="add-notification-modal-title" className="text-lg font-semibold text-white">
             {isEditing ? t('notifications.editTitle') : t('notifications.addTitle')}
           </h2>
           <button
@@ -754,7 +739,6 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
             </Button>
           </div>
         </form>
-      </div>
-    </div>
+    </Modal>
   );
 }

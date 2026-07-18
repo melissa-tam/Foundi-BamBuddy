@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { PlateMetadata } from '../types/plates';
 import { withStreamToken } from '../api/client';
 import { formatDuration } from '../utils/date';
+import { Modal } from './ui/Modal';
 
 interface PlatePickerModalProps {
   plates: PlateMetadata[];
@@ -13,18 +14,11 @@ interface PlatePickerModalProps {
 export function PlatePickerModal({ plates, onSelect, onClose }: PlatePickerModalProps) {
   const { t } = useTranslation();
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-3xl max-h-[85vh] flex flex-col rounded-lg bg-bambu-dark-secondary border border-bambu-dark-tertiary/60"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy="plate-picker-modal-title" widthClass="max-w-3xl" className="flex flex-col">
         {/* Header */}
         <div className="flex-shrink-0 flex items-start justify-between gap-3 px-4 pt-4 pb-3 border-b border-bambu-dark-tertiary/40">
           <div className="min-w-0">
-            <h3 className="text-white font-medium">{t('archives.platePicker.title')}</h3>
+            <h3 id="plate-picker-modal-title" className="text-white font-medium">{t('archives.platePicker.title')}</h3>
             <p className="text-xs text-bambu-gray mt-1">{t('archives.platePicker.hint')}</p>
           </div>
           <button
@@ -76,7 +70,6 @@ export function PlatePickerModal({ plates, onSelect, onClose }: PlatePickerModal
             ))}
           </div>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

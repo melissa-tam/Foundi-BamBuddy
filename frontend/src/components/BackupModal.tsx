@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Download, X, Settings, Bell, FileText, Plug, Printer, Palette, Wrench, Archive, Loader2, Key, AlertTriangle, Link, FolderKanban, Upload, Camera } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
 import { Button } from './Button';
 import { Toggle } from './Toggle';
+import { Modal } from './ui/Modal';
 
 interface BackupCategory {
   id: string;
@@ -140,15 +141,6 @@ export function BackupModal({ onClose, onExport }: BackupModalProps) {
   const [includeAccessCodes, setIncludeAccessCodes] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
 
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
   const toggleCategory = (id: string) => {
     setSelected((prev) => ({ ...prev, [id]: !prev[id] }));
   };
@@ -181,11 +173,7 @@ export function BackupModal({ onClose, onExport }: BackupModalProps) {
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
-      onClick={isExporting ? undefined : onClose}
-    >
-      <Card className="w-full max-w-lg" onClick={(e: React.MouseEvent) => e.stopPropagation()}>
+    <Modal onClose={onClose} labelledBy="backup-export-modal-title" dismissDisabled={isExporting}>
         <CardContent className="p-0">
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
@@ -194,7 +182,7 @@ export function BackupModal({ onClose, onExport }: BackupModalProps) {
                 <Download className="w-5 h-5" />
               </div>
               <div>
-                <h3 className="text-lg font-semibold text-white">
+                <h3 id="backup-export-modal-title" className="text-lg font-semibold text-white">
                   {t('backup.exportTitle', { defaultValue: 'Export Backup' })}
                 </h3>
                 <p className="text-sm text-bambu-gray">
@@ -340,7 +328,6 @@ export function BackupModal({ onClose, onExport }: BackupModalProps) {
             </div>
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }

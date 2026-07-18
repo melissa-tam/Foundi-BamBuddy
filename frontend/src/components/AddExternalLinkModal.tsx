@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useRef } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { X, Save, Loader2, Upload, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -6,6 +6,7 @@ import { api } from '../api/client';
 import type { ExternalLink, ExternalLinkCreate, ExternalLinkUpdate } from '../api/client';
 import { Button } from './Button';
 import { IconPicker, getIconByName } from './IconPicker';
+import { Modal } from './ui/Modal';
 interface AddExternalLinkModalProps {
   link?: ExternalLink | null;
   onClose: () => void;
@@ -27,15 +28,6 @@ export function AddExternalLinkModal({ link, onClose }: AddExternalLinkModalProp
   );
   const [pendingIconFile, setPendingIconFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   // Create mutation
   const createMutation = useMutation({
@@ -154,14 +146,7 @@ export function AddExternalLinkModal({ link, onClose }: AddExternalLinkModalProp
   const PresetIcon = getIconByName(icon);
 
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary w-full max-w-md"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy="add-external-link-modal-title" size="sm">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-3">
@@ -172,7 +157,7 @@ export function AddExternalLinkModal({ link, onClose }: AddExternalLinkModalProp
                 <PresetIcon className="w-5 h-5" />
               )}
             </div>
-            <h2 className="text-lg font-semibold text-white">
+            <h2 id="add-external-link-modal-title" className="text-lg font-semibold text-white">
               {isEditing ? 'Edit Link' : 'Add External Link'}
             </h2>
           </div>
@@ -312,7 +297,6 @@ export function AddExternalLinkModal({ link, onClose }: AddExternalLinkModalProp
             </Button>
           </div>
         </form>
-      </div>
-    </div>
+    </Modal>
   );
 }

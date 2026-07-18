@@ -1,10 +1,11 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useRef } from 'react';
 import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { X, Save, Loader2, RotateCcw, Plus, Eye } from 'lucide-react';
 import { api } from '../api/client';
 import type { NotificationTemplate, NotificationTemplateUpdate } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 
 interface NotificationTemplateEditorProps {
   template: NotificationTemplate;
@@ -40,15 +41,6 @@ export function NotificationTemplateEditor({ template, onClose }: NotificationTe
     }),
     enabled: showPreview && titleTemplate.length > 0 && bodyTemplate.length > 0,
   });
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   // Update mutation
   const updateMutation = useMutation({
@@ -118,11 +110,10 @@ export function NotificationTemplateEditor({ template, onClose }: NotificationTe
   const hasChanges = titleTemplate !== template.title_template || bodyTemplate !== template.body_template;
 
   return (
-    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-      <div className="bg-bambu-dark-secondary rounded-lg w-full max-w-2xl max-h-[90vh] flex flex-col">
+    <Modal onClose={onClose} labelledBy="notification-template-editor-title" size="lg" closeOnOverlay={false} className="flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary shrink-0">
-          <h2 className="text-lg font-semibold text-white">
+          <h2 id="notification-template-editor-title" className="text-lg font-semibold text-white">
             {t('notifications.editTemplate', { name: template.name })}
           </h2>
           <button
@@ -272,7 +263,6 @@ export function NotificationTemplateEditor({ template, onClose }: NotificationTe
             </Button>
           </div>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

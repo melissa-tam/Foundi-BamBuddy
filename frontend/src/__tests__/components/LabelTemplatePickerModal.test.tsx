@@ -294,7 +294,7 @@ describe('LabelTemplatePickerModal', () => {
     // templates render as a 2-column grid, trimming ~150px of vertical and
     // leaving room for the footer. The earlier min-h-0 on the spool list is
     // kept so it still yields any remaining slack.
-    const { container } = render(
+    render(
       <LabelTemplatePickerModal
         isOpen={true}
         onClose={vi.fn()}
@@ -317,13 +317,13 @@ describe('LabelTemplatePickerModal', () => {
     // Templates section must be a responsive grid (single column on mobile,
     // two columns from sm: up) — a future refactor that drops the grid and
     // reintroduces stacked rows fails CI.
-    const templatesSection = container.querySelector('div.grid.sm\\:grid-cols-2');
+    const templatesSection = document.body.querySelector('div.grid.sm\\:grid-cols-2');
     expect(templatesSection).not.toBeNull();
     expect(templatesSection!.className).toContain('grid-cols-1');
     expect(templatesSection!.querySelectorAll('button').length).toBe(6);
 
     // Spool list still uses min-h-0 so it can yield further on very tight viewports.
-    const spoolListScroller = container.querySelector('div.flex-1.overflow-y-auto');
+    const spoolListScroller = document.body.querySelector('div.flex-1.overflow-y-auto');
     expect(spoolListScroller).not.toBeNull();
     expect(spoolListScroller!.className).toContain('min-h-0');
     expect(spoolListScroller!.className).not.toMatch(/min-h-\[\d/);

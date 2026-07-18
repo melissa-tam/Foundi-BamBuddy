@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { api } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { RichTextEditor } from './RichTextEditor';
 
 interface ProjectPageModalProps {
@@ -50,22 +51,19 @@ export function ProjectPageModal({ archiveId, archiveName, onClose }: ProjectPag
     },
   });
 
-  // Handle escape key to close modal
+  // The image lightbox is a non-modal overlay layered above the dialog. While
+  // it is open the parent <Modal> is dismiss-disabled, so this handler owns
+  // Escape for the lightbox itself (close the image, keep the dialog open).
+  // The dialog's own Escape/overlay dismissal (with the edit-cancel layer)
+  // lives in handleModalClose, wired to <Modal onClose>.
   useEffect(() => {
+    if (selectedImageIndex === null) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (selectedImageIndex !== null) {
-          setSelectedImageIndex(null);
-        } else if (isEditing) {
-          handleCancelEdit();
-        } else {
-          onClose();
-        }
-      }
+      if (e.key === 'Escape') setSelectedImageIndex(null);
     };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [selectedImageIndex, isEditing, onClose]);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedImageIndex]);
 
   // Combine all images for gallery
   const allImages = [
@@ -94,6 +92,18 @@ export function ProjectPageModal({ archiveId, archiveName, onClose }: ProjectPag
     setEditData({});
   };
 
+  // Dialog dismissal (Escape via <Modal>, or overlay click): an in-progress
+  // inline edit is cancelled first — preserving the previous layered Escape
+  // behaviour — otherwise the dialog closes. The lightbox layer is handled
+  // separately (dismissDisabled + the Escape effect above).
+  const handleModalClose = () => {
+    if (isEditing) {
+      handleCancelEdit();
+    } else {
+      onClose();
+    }
+  };
+
   // Sanitize HTML content using DOMPurify
   const sanitizeHtml = (html: string) => {
     return DOMPurify.sanitize(html, {
@@ -111,24 +121,19 @@ export function ProjectPageModal({ archiveId, archiveName, onClose }: ProjectPag
     allImages.length > 0
   );
 
-  // Handle backdrop click to close modal
-  const handleBackdropClick = (e: React.MouseEvent) => {
-    if (e.target === e.currentTarget) {
-      onClose();
-    }
-  };
-
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={handleBackdropClick}
+    <Modal
+      onClose={handleModalClose}
+      labelledBy="project-page-modal-title"
+      size="xl"
+      className="flex flex-col"
+      dismissDisabled={selectedImageIndex !== null}
     >
-      <div className="bg-bambu-dark-secondary rounded-xl max-w-4xl w-full max-h-[90vh] overflow-hidden flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-3">
             <FileText className="w-5 h-5 text-bambu-green" />
-            <h2 className="text-lg font-semibold text-white">
+            <h2 id="project-page-modal-title" className="text-lg font-semibold text-white">
               Project Page
               {archiveName && <span className="text-bambu-gray ml-2">- {archiveName}</span>}
             </h2>
@@ -166,7 +171,7 @@ export function ProjectPageModal({ archiveId, archiveName, onClose }: ProjectPag
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="flex-1 overflow-y-auto p-6 min-h-0">
           {isLoading && (
             <div className="flex items-center justify-center py-12">
               <div className="animate-spin rounded-full h-8 w-8 border-2 border-bambu-green border-t-transparent" />
@@ -382,12 +387,12 @@ export function ProjectPageModal({ archiveId, archiveName, onClose }: ProjectPag
             </div>
           )}
         </div>
-      </div>
 
-      {/* Image Lightbox */}
+      {/* Image Lightbox — non-modal overlay layered above the dialog (z-[60]).
+          While open, the parent Modal is dismissDisabled so this owns dismissal. */}
       {selectedImageIndex !== null && allImages[selectedImageIndex] && (
         <div
-          className="fixed inset-0 bg-black/90 flex items-center justify-center z-60"
+          className="fixed inset-0 bg-black/90 flex items-center justify-center z-[60]"
           onClick={() => setSelectedImageIndex(null)}
         >
           <button
@@ -431,6 +436,6 @@ export function ProjectPageModal({ archiveId, archiveName, onClose }: ProjectPag
           </div>
         </div>
       )}
-    </div>
+    </Modal>
   );
 }

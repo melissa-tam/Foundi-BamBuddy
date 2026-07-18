@@ -1,8 +1,8 @@
-import { useEffect } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { X, AlertTriangle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { buildApiKeyQrPayload } from '../utils/apiKeyQr';
 
 interface ApiKeyQRCodeModalProps {
@@ -18,27 +18,11 @@ export function ApiKeyQRCodeModal({ apiKey, baseUrl, onClose }: ApiKeyQRCodeModa
   const origin = baseUrl ?? window.location.origin;
   const payload = buildApiKeyQrPayload(origin, apiKey);
 
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
   return (
-    <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary w-full max-w-sm"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy="api-key-qr-modal-title" widthClass="max-w-sm">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary">
-          <h2 className="text-lg font-semibold text-white">{t('settings.apiKeyQrTitle')}</h2>
+          <h2 id="api-key-qr-modal-title" className="text-lg font-semibold text-white">{t('settings.apiKeyQrTitle')}</h2>
           <button
             onClick={onClose}
             className="text-bambu-gray hover:text-white transition-colors"
@@ -64,7 +48,6 @@ export function ApiKeyQRCodeModal({ apiKey, baseUrl, onClose }: ApiKeyQRCodeModa
             {t('common.close')}
           </Button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

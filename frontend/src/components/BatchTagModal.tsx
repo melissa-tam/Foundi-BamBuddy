@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { X, Tag, Plus, Loader2 } from 'lucide-react';
 import { api } from '../api/client';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
 import { Button } from './Button';
 import { useToast } from '../contexts/ToastContext';
+import { Modal } from './ui/Modal';
 
 interface BatchTagModalProps {
   selectedIds: number[];
@@ -18,15 +19,6 @@ export function BatchTagModal({ selectedIds, existingTags, onClose }: BatchTagMo
   const [newTag, setNewTag] = useState('');
   const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
   const [mode, setMode] = useState<'add' | 'remove'>('add');
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   const batchTagMutation = useMutation({
     mutationFn: async () => {
@@ -94,14 +86,13 @@ export function BatchTagModal({ selectedIds, existingTags, onClose }: BatchTagMo
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <Card className="w-full max-w-md">
+    <Modal onClose={onClose} labelledBy="batch-tag-modal-title" size="sm" closeOnOverlay={false}>
         <CardContent className="p-0">
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
             <div className="flex items-center gap-2">
               <Tag className="w-5 h-5 text-bambu-green" />
-              <h2 className="text-xl font-semibold text-white">
+              <h2 id="batch-tag-modal-title" className="text-xl font-semibold text-white">
                 {mode === 'add' ? 'Add Tags' : 'Remove Tags'}
               </h2>
             </div>
@@ -225,7 +216,6 @@ export function BatchTagModal({ selectedIds, existingTags, onClose }: BatchTagMo
             </Button>
           </div>
         </CardContent>
-      </Card>
-    </div>
+    </Modal>
   );
 }

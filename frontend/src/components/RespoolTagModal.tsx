@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useCallback, useEffect, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle } from 'lucide-react';
 import { ConfirmModal } from './ConfirmModal';
 import { api } from '../api/client';
-import type { Printer, RespoolPromptMessage, RespoolRequest } from '../api/client';
+import type { InventorySpool, Printer, RespoolPromptMessage, RespoolRequest } from '../api/client';
 import { useToast } from '../contexts/ToastContext';
 import { getAmsLabel } from '../utils/amsHelpers';
 import { getSwatchStyle } from '../utils/colors';
@@ -33,6 +33,22 @@ function writeLastBrand(brand: string): void {
   }
 }
 
+// The `tagless_default_filament` setting is a JSON string ({brand, material, …}).
+// Parse defensively — malformed / absent → no brand.
+function parseTaglessBrand(raw: string | null | undefined): string {
+  if (!raw) return '';
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const brand = (parsed as { brand?: unknown }).brand;
+      if (typeof brand === 'string') return brand;
+    }
+  } catch {
+    /* malformed JSON — treat as no default */
+  }
+  return '';
+}
+
 interface RespoolTagModalProps {
   /** Slot + prefill context; ``null`` keeps the modal closed. Supplied by the
    *  global prompt queue (`useRespoolPrompt`) or the manual tray-menu action. */
@@ -52,18 +68,83 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
   const [brand, setBrand] = useState('');
   const [labelWeight, setLabelWeight] = useState('');
   const [costPerKg, setCostPerKg] = useState('');
+  const [costTouched, setCostTouched] = useState(false);
   const [note, setNote] = useState('');
+
+  // Known inventory — feeds the brand datalist and the cost-per-kg prefill.
+  // Only fetched while the modal is actually open; the app keeps this cache warm
+  // elsewhere (Inventory page + WS invalidations), so it is usually instant.
+  const { data: allSpools } = useQuery({
+    queryKey: ['inventory-spools'],
+    queryFn: () => api.getSpools(true),
+    enabled: context != null,
+    staleTime: 30_000,
+  });
+
+  // Distinct, non-archived brands, alphabetically — the zero-typing datalist.
+  const brandOptions = Array.from(
+    new Set(
+      (allSpools ?? [])
+        .filter(s => !s.archived_at)
+        .map(s => s.brand?.trim())
+        .filter((b): b is string => !!b),
+    ),
+  ).sort((a, b) => a.localeCompare(b));
+
+  const material = context?.tray_type ?? '';
+
+  // Most recent non-archived spool cost/kg for a brand: prefer the same material
+  // as this tag, else any spool of that brand; blank when there is no prior.
+  const suggestCostForBrand = useCallback(
+    (brandValue: string): string => {
+      const wantBrand = brandValue.trim().toLowerCase();
+      if (!wantBrand || !allSpools) return '';
+      const wantMaterial = material.trim().toLowerCase();
+      const candidates = allSpools.filter(
+        (s): s is InventorySpool & { cost_per_kg: number } =>
+          !s.archived_at &&
+          s.cost_per_kg != null &&
+          (s.brand?.trim().toLowerCase() ?? '') === wantBrand,
+      );
+      if (candidates.length === 0) return '';
+      const byRecency = (a: InventorySpool, b: InventorySpool) =>
+        (b.created_at ?? '').localeCompare(a.created_at ?? '');
+      const sameMaterial = candidates.filter(
+        s => (s.material ?? '').trim().toLowerCase() === wantMaterial,
+      );
+      const pool = sameMaterial.length > 0 ? sameMaterial : candidates;
+      pool.sort(byRecency);
+      return String(pool[0].cost_per_kg);
+    },
+    [allSpools, material],
+  );
 
   // Reset the form whenever a different slot's context arrives (queue advances
   // or a new manual open). `context` is a stable object per queue entry, so
   // this doesn't fire on unrelated parent re-renders.
   useEffect(() => {
     if (!context) return;
-    setBrand(context.brand_prefill ?? readLastBrand());
+    const settings = queryClient.getQueryData<{ tagless_default_filament?: string | null }>([
+      'settings',
+    ]);
+    const initialBrand =
+      context.brand_prefill ||
+      parseTaglessBrand(settings?.tagless_default_filament) ||
+      readLastBrand();
+    setBrand(initialBrand);
     setLabelWeight(context.label_weight_prefill != null ? String(context.label_weight_prefill) : '');
     setCostPerKg('');
+    setCostTouched(false);
     setNote('');
-  }, [context]);
+  }, [context, queryClient]);
+
+  // Seed / recompute cost from the chosen brand until the operator edits it
+  // manually. Covers the initial open, a brand change (typed or picked), and the
+  // spools query resolving after the modal opened.
+  useEffect(() => {
+    if (!context || costTouched) return;
+    setCostPerKg(suggestCostForBrand(brand));
+  }, [context, brand, costTouched, suggestCostForBrand]);
 
   const respoolMutation = useMutation({
     mutationFn: (payload: RespoolRequest) => api.respoolTag(payload),
@@ -93,7 +174,7 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
   const slotLabel = `${t('inventory.unknownSpoolSlot', 'Slot')} ${context.tray_id + 1}`;
   const location = `${printerName} • ${amsLabel} • ${slotLabel}`;
 
-  const material = context.tray_sub_brands || context.tray_type || '—';
+  const materialLabel = context.tray_sub_brands || context.tray_type || '—';
   const swatchStyle = context.tray_color ? getSwatchStyle(context.tray_color) : undefined;
   const tagIdentity = context.tag_uid || context.tray_uuid || null;
 
@@ -128,7 +209,7 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
       onCancel={onClose}
     >
       <div className="space-y-3">
-        {/* Material + colour swatch + tag identity */}
+        {/* Material + colour swatch — the plain-language headline (no raw hex) */}
         <div className="flex items-center gap-3 p-3 rounded-lg bg-bambu-dark-secondary border border-bambu-dark-tertiary">
           {swatchStyle && (
             <div
@@ -138,18 +219,18 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
             />
           )}
           <div className="min-w-0 flex-1">
-            <p className="text-white text-sm font-medium truncate">{material}</p>
-            {tagIdentity && (
-              <p className="text-xs text-bambu-gray font-mono truncate">{tagIdentity}</p>
-            )}
+            <p className="text-white text-sm font-medium truncate">{materialLabel}</p>
           </div>
         </div>
 
-        {/* Donor spool line — only when a Bambuddy row backs this tag */}
+        {/* Donor spool line — only when a Bambuddy row backs this tag. The
+            internal record id lives in the title attribute, not the visible copy. */}
         {context.donor_spool_id != null && (
-          <p className="text-xs text-bambu-gray">
+          <p
+            className="text-xs text-bambu-gray"
+            title={t('inventory.respool.donorRecordTitle', { id: context.donor_spool_id })}
+          >
             {t('inventory.respool.donorLine', {
-              id: context.donor_spool_id,
               grams: Math.max(0, Math.round(context.donor_remaining_g ?? 0)),
             })}
           </p>
@@ -158,13 +239,13 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
         {/* Persistent one-tag-per-roll warning */}
         <div
           role="note"
-          className="flex items-start gap-2 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/40 text-yellow-200 text-xs"
+          className="flex items-start gap-2 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/40 text-yellow-700 dark:text-yellow-200 text-xs"
         >
           <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" aria-hidden="true" />
           <span>{t('inventory.respool.warning')}</span>
         </div>
 
-        {/* Brand (required) */}
+        {/* Brand (required) — native datalist for zero-typing, free text allowed */}
         <div>
           <label htmlFor="respool-brand" className="block text-xs text-bambu-gray mb-1">
             {t('inventory.respool.brandLabel')}
@@ -172,12 +253,18 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
           <input
             id="respool-brand"
             type="text"
+            list="respool-brand-options"
             value={brand}
             onChange={e => setBrand(e.target.value)}
             aria-required="true"
             placeholder={t('inventory.respool.brandPlaceholder')}
             className={inputClass}
           />
+          <datalist id="respool-brand-options">
+            {brandOptions.map(b => (
+              <option key={b} value={b} />
+            ))}
+          </datalist>
         </div>
 
         {/* Label weight + cost/kg */}
@@ -206,7 +293,10 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
               min={0}
               step={0.01}
               value={costPerKg}
-              onChange={e => setCostPerKg(e.target.value)}
+              onChange={e => {
+                setCostPerKg(e.target.value);
+                setCostTouched(true);
+              }}
               placeholder={t('inventory.respool.costPlaceholder')}
               className={inputClass}
             />
@@ -227,6 +317,19 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
             className={inputClass}
           />
         </div>
+
+        {/* Raw tag identity — de-jargoned out of the headline into a disclosure */}
+        {tagIdentity && (
+          <details className="text-xs text-bambu-gray">
+            <summary className="cursor-pointer select-none hover:text-white">
+              {t('inventory.respool.detailsLabel')}
+            </summary>
+            <div className="mt-2 flex items-center gap-2">
+              <span>{t('inventory.respool.tagIdLabel')}</span>
+              <span className="font-mono break-all text-bambu-gray">{tagIdentity}</span>
+            </div>
+          </details>
+        )}
       </div>
     </ConfirmModal>
   );

@@ -5,6 +5,7 @@ import { X, Loader2, Save, Beaker, Palette, Zap, Tag, Unlink } from 'lucide-reac
 import { api, ApiError } from '../api/client';
 import type { InventorySpool, SlicerSetting, SpoolCatalogEntry, LocalPreset, BuiltinFilament, SpoolmanBulkCreateResult, SpoolKProfileInput, SpoolmanFilamentEntry } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 import type { SpoolFormData, PrinterWithCalibrations, ColorPreset } from './spool-form/types';
 import { defaultFormData, validateForm, SPOOLMAN_LINKED_FIELDS } from './spool-form/types';
@@ -716,16 +717,6 @@ export function SpoolFormModal({
     return true;
   };
 
-  // Close on Escape key
-  useEffect(() => {
-    if (!isOpen) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onClose]);
-
   if (!isOpen) return null;
 
   const handleSubmit = () => {
@@ -786,16 +777,15 @@ export function SpoolFormModal({
   const isPending = createMutation.isPending || bulkCreateMutation.isPending || updateMutation.isPending || deleteTagMutation.isPending || unassignMutation.isPending;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-        onClick={onClose}
-      />
-
-      <div className="relative w-full max-w-xl mx-4 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-h-[90vh] flex flex-col">
+    <Modal
+      onClose={onClose}
+      labelledBy="spool-form-modal-title"
+      widthClass="max-w-xl"
+      className="relative flex flex-col"
+    >
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary flex-shrink-0">
-          <h2 className="text-lg font-semibold text-white flex items-baseline gap-2">
+          <h2 id="spool-form-modal-title" className="text-lg font-semibold text-white flex items-baseline gap-2">
             {isEditing ? t('inventory.editSpool') : isCopying ? t('inventory.copySpool') : t('inventory.addSpool')}
             {isEditing && spool && (
               <span className="text-sm font-mono text-bambu-gray">#{spool.id}</span>
@@ -873,7 +863,7 @@ export function SpoolFormModal({
         </div>
 
         {/* Content */}
-        <div className="p-4 overflow-y-auto flex-1" style={{ scrollbarGutter: 'stable' }}>
+        <div className="p-4 overflow-y-auto flex-1 min-h-0" style={{ scrollbarGutter: 'stable' }}>
           {activeTab === 'filament' ? (
             <div className="space-y-6">
               {/* Spoolman Filament Catalog Picker — only when creating a spool in Spoolman mode */}
@@ -1026,7 +1016,6 @@ export function SpoolFormModal({
           </Button>
           </div>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

@@ -5,6 +5,7 @@ import { X, Loader2, Package, Search } from 'lucide-react';
 import { api } from '../api/client';
 import type { InventorySpool, SpoolAssignment } from '../api/client';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { ConfirmModal } from './ConfirmModal';
 import { useToast } from '../contexts/ToastContext';
 import { filterSpoolsByQuery } from '../utils/inventorySearch';
@@ -350,18 +351,18 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
 
   return (
     <>
-      <div className="fixed inset-0 z-[100] flex items-start sm:items-center justify-center p-4 overflow-y-auto">
-        <div
-          className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-          onClick={onClose}
-        />
-
-      <div className="relative w-full max-w-2xl bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-h-[90vh] overflow-hidden flex flex-col my-auto">
+      <Modal
+        onClose={onClose}
+        labelledBy="assign-spool-modal-title"
+        size="lg"
+        overlayZIndex="z-[100]"
+        dismissDisabled={showMismatchConfirm}
+      >
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-2">
             <Package className="w-5 h-5 text-bambu-green" />
-            <h2 className="text-lg font-semibold text-white">{t('inventory.assignSpool')}</h2>
+            <h2 id="assign-spool-modal-title" className="text-lg font-semibold text-white">{t('inventory.assignSpool')}</h2>
           </div>
           <button
             onClick={onClose}
@@ -372,7 +373,7 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
         </div>
 
         {/* Content */}
-        <div className="p-4 space-y-4 overflow-y-auto">
+        <div className="p-4 space-y-4">
           {/* Tray info */}
           {trayInfo && (
             <div className="p-3 bg-bambu-dark rounded-lg border border-bambu-dark-tertiary">
@@ -577,8 +578,7 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
           </div>
         )}
 
-      </div>
-      </div>
+      </Modal>
 
       {showMismatchConfirm && trayInfo && selectedSpoolId && mismatchDetails && (() => {
         let message = '';

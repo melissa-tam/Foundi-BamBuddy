@@ -2,9 +2,10 @@ interface ToggleProps {
   checked: boolean;
   onChange: (checked: boolean) => void;
   disabled?: boolean;
+  'aria-label'?: string;
 }
 
-export function Toggle({ checked, onChange, disabled }: ToggleProps) {
+export function Toggle({ checked, onChange, disabled, 'aria-label': ariaLabel }: ToggleProps) {
   const handleClick = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -18,6 +19,7 @@ export function Toggle({ checked, onChange, disabled }: ToggleProps) {
       type="button"
       role="switch"
       aria-checked={checked}
+      aria-label={ariaLabel}
       disabled={disabled}
       onClick={handleClick}
       className={`relative inline-flex w-11 h-7 md:w-9 md:h-5 rounded-full transition-colors flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-bambu-green focus:ring-offset-2 focus:ring-offset-bambu-dark ${
@@ -30,7 +32,7 @@ export function Toggle({ checked, onChange, disabled }: ToggleProps) {
     >
       <span
         className={`pointer-events-none absolute top-[3px] md:top-[2px] left-[3px] md:left-[2px] w-5 h-5 md:w-4 md:h-4 bg-white rounded-full shadow transition-transform duration-200 ease-in-out ${
-          checked ? 'translate-x-4' : 'translate-x-0'
+          checked ? 'translate-x-[calc(1.5rem_-_6px)] md:translate-x-4' : 'translate-x-0'
         }`}
       />
     </button>

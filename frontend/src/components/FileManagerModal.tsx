@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useId } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
@@ -26,6 +26,7 @@ import { api } from '../api/client';
 import { parseUTCDate } from '../utils/date';
 import { Button } from './Button';
 import { ConfirmModal } from './ConfirmModal';
+import { Modal } from './ui/Modal';
 import { ModelViewer } from './ModelViewer';
 import { GcodeViewer } from './GcodeViewer';
 import type { PlateMetadata } from '../types/plates';
@@ -48,6 +49,7 @@ interface PrinterFileViewerModalProps {
 }
 
 function PrinterFileViewerModal({ printerId, filePath, filename, onClose }: PrinterFileViewerModalProps) {
+  const viewerTitleId = useId();
   const [activeTab, setActiveTab] = useState<PrinterViewerTab | null>(null);
   const [plates, setPlates] = useState<PlateMetadata[]>([]);
   const [platesLoading, setPlatesLoading] = useState(false);
@@ -80,13 +82,9 @@ function PrinterFileViewerModal({ printerId, filePath, filename, onClose }: Prin
     : plates.find((plate) => plate.index === selectedPlateId) ?? null;
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-6" onClick={onClose}>
-      <div
-        className="bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary w-full max-w-4xl h-[80vh] flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} size="xl" className="flex flex-col h-[80vh]" labelledBy={viewerTitleId}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-bambu-dark-tertiary">
-          <h2 className="text-lg font-semibold text-white truncate flex-1 mr-4">{filename}</h2>
+          <h2 id={viewerTitleId} className="text-lg font-semibold text-white truncate flex-1 mr-4">{filename}</h2>
           <Button variant="ghost" size="sm" onClick={onClose}>
             <X className="w-5 h-5" />
           </Button>
@@ -232,8 +230,7 @@ function PrinterFileViewerModal({ printerId, filePath, filename, onClose }: Prin
             </div>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -281,6 +278,7 @@ const SORT_OPTIONS: { value: SortOption; label: string }[] = [
 
 export function FileManagerModal({ printerId, printerName, onClose }: FileManagerModalProps) {
   const { t } = useTranslation();
+  const titleId = useId();
   const { showToast } = useToast();
   const queryClient = useQueryClient();
   const [currentPath, setCurrentPath] = useState('/');
@@ -290,15 +288,6 @@ export function FileManagerModal({ printerId, printerName, onClose }: FileManage
   const [sortBy, setSortBy] = useState<SortOption>('name-asc');
   const [downloadProgress, setDownloadProgress] = useState<{ current: number; total: number } | null>(null);
   const [viewerFile, setViewerFile] = useState<{ path: string; name: string } | null>(null);
-
-  // Close on Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
 
   // No auto-poll: every refetch opens a fresh FTPS connection (TLS handshake
   // and all) to the printer, and a 30s interval saturated fragile printer
@@ -422,20 +411,20 @@ export function FileManagerModal({ printerId, printerName, onClose }: FileManage
   ];
 
   return (
-    <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-3xl max-h-[85vh] flex flex-col bg-bambu-dark-secondary rounded-xl border border-bambu-dark-tertiary overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
+    <>
+      <Modal
+        onClose={onClose}
+        widthClass="max-w-3xl"
+        className="flex flex-col"
+        dismissDisabled={filesToDelete.length > 0 || viewerFile !== null}
+        labelledBy={titleId}
       >
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary flex-shrink-0">
             <div className="flex items-center gap-3">
               <HardDrive className="w-5 h-5 text-bambu-green" />
               <div>
-                <h2 className="text-lg font-semibold text-white">{t('printerFiles.title')}</h2>
+                <h2 id={titleId} className="text-lg font-semibold text-white">{t('printerFiles.title')}</h2>
                 <p className="text-sm text-bambu-gray">{printerName}</p>
               </div>
             </div>
@@ -713,7 +702,7 @@ export function FileManagerModal({ printerId, printerName, onClose }: FileManage
             </Button>
           </div>
         </div>
-      </div>
+      </Modal>
 
       {/* Delete Confirmation Modal */}
       {filesToDelete.length > 0 && (
@@ -741,6 +730,6 @@ export function FileManagerModal({ printerId, printerName, onClose }: FileManage
           onClose={() => setViewerFile(null)}
         />
       )}
-    </div>
+    </>
   );
 }

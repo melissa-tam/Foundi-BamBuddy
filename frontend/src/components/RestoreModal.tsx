@@ -1,8 +1,9 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Upload, X, AlertTriangle, CheckCircle, SkipForward, RefreshCw, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
-import { Card, CardContent } from './Card';
+import { CardContent } from './Card';
 import { Button } from './Button';
+import { Modal } from './ui/Modal';
 import { Toggle } from './Toggle';
 
 interface RestoreResult {
@@ -32,20 +33,6 @@ export function RestoreModal({ onClose, onRestore, onSuccess }: RestoreModalProp
   const [result, setResult] = useState<RestoreResult | null>(null);
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && state !== 'restoring') {
-        // Use handleClose for result state to trigger onSuccess
-        if (state === 'result' && result?.success) {
-          onSuccess();
-        }
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose, onSuccess, state, result]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -99,17 +86,12 @@ export function RestoreModal({ onClose, onRestore, onSuccess }: RestoreModalProp
   const totalSkipped = result?.total_skipped || 0;
 
   return (
-    <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
-      onMouseDown={(e) => {
-        // Only close if clicking directly on the backdrop, not on children
-        if (e.target === e.currentTarget && state !== 'restoring') {
-          onClose();
-        }
-      }}
+    <Modal
+      onClose={handleClose}
+      labelledBy="restore-modal-title"
+      dismissDisabled={state === 'restoring'}
     >
-      <Card className="w-full max-w-lg">
-        <CardContent className="p-0">
+      <CardContent className="p-0">
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
             <div className="flex items-center gap-3">
@@ -129,7 +111,7 @@ export function RestoreModal({ onClose, onRestore, onSuccess }: RestoreModalProp
                 )}
               </div>
               <div>
-                <h3 className="text-lg font-semibold text-white">
+                <h3 id="restore-modal-title" className="text-lg font-semibold text-white">
                   {state === 'options' && t('backup.restoreBackup')}
                   {state === 'restoring' && t('backup.restoring')}
                   {state === 'result' && (result?.success ? t('backup.restoreComplete') : t('backup.restoreFailed2'))}
@@ -402,8 +384,7 @@ export function RestoreModal({ onClose, onRestore, onSuccess }: RestoreModalProp
               </div>
             </>
           )}
-        </CardContent>
-      </Card>
-    </div>
+      </CardContent>
+    </Modal>
   );
 }
