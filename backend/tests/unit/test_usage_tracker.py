@@ -17,10 +17,34 @@ from backend.app.services.usage_tracker import (
     _decode_mqtt_mapping,
     _find_3mf_by_filename,
     _match_slots_by_color,
+    _parse_ams_mapping,
+    _resolve_run_context,
     _track_from_3mf,
     on_print_complete,
     on_print_start,
 )
+from backend.app.utils.threemf_tools import count_plates_in_slice_info
+
+
+def _write_3mf_with_plates(path, plates: dict[int, list[tuple]]):
+    """Write a minimal .gcode.3mf whose Metadata/slice_info.config carries the
+    given plates. ``plates`` maps plate index -> list of
+    ``(filament_id, used_g, type, color)`` tuples.
+    """
+    import zipfile as _zip
+
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>', "<config>"]
+    for idx in sorted(plates):
+        parts.append("  <plate>")
+        parts.append(f'    <metadata key="index" value="{idx}"/>')
+        for fid, used_g, ftype, color in plates[idx]:
+            parts.append(f'    <filament id="{fid}" used_g="{used_g}" type="{ftype}" color="{color}"/>')
+        parts.append("  </plate>")
+    parts.append("</config>")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _zip.ZipFile(path, "w") as zf:
+        zf.writestr("Metadata/slice_info.config", "\n".join(parts))
+    return path
 
 
 def _make_spool(spool_id=1, label_weight=1000, weight_used=0, tag_uid=None, tray_uuid=None):
@@ -206,8 +230,9 @@ class TestOnPrintComplete:
             tray_now=0,
         )
 
-        # db returns: archive, queue_item(None), assignment, spool
-        db = _mock_db_sequential([archive, None, assignment, spool])
+        # db returns: guard(archive.started_at, usage-count), then archive,
+        # queue_item(None), assignment, spool for the 3MF path.
+        db = _mock_db_sequential([archive, None, archive, None, assignment, spool])
 
         filament_usage = [{"slot_id": 1, "used_g": 15.0, "type": "PLA", "color": "#FF0000"}]
 
@@ -297,8 +322,9 @@ class TestOnPrintComplete:
             tray_now=0,
         )
 
-        # db returns: archive, queue_item(None), assignment, spool
-        db = _mock_db_sequential([archive, None, assignment, spool])
+        # db returns: guard(archive.started_at, usage-count), then archive,
+        # queue_item(None), assignment, spool for the 3MF path.
+        db = _mock_db_sequential([archive, None, archive, None, assignment, spool])
 
         filament_usage = [{"slot_id": 1, "used_g": 15.0, "type": "PLA", "color": "#FF0000"}]
 
@@ -2154,12 +2180,14 @@ class TestOnPrintStartAmsMapping:
         )
 
         queue_item = _make_queue_item(plate_id=2)
-        # on_print_start now executes: SpoolAssignment lookup, then PrintQueueItem lookup.
+        # on_print_start executes a SpoolAssignment lookup, then plate_id is
+        # resolved via farm_correlation.resolve_active_plate_id, which selects the
+        # printing PrintQueueItem candidates (.all()) — the sole one wins here.
         db = AsyncMock()
         assignment_result = MagicMock()
         assignment_result.scalars.return_value.all.return_value = []
         queue_result = MagicMock()
-        queue_result.scalars.return_value.first.return_value = queue_item
+        queue_result.scalars.return_value.all.return_value = [queue_item]
         db.execute = AsyncMock(side_effect=[assignment_result, queue_result])
 
         await on_print_start(1, {"subtask_name": "Test"}, printer_manager, db=db)
@@ -2179,7 +2207,7 @@ class TestOnPrintStartAmsMapping:
         assignment_result = MagicMock()
         assignment_result.scalars.return_value.all.return_value = []
         queue_result = MagicMock()
-        queue_result.scalars.return_value.first.return_value = None
+        queue_result.scalars.return_value.all.return_value = []
         db.execute = AsyncMock(side_effect=[assignment_result, queue_result])
 
         await on_print_start(1, {"subtask_name": "Test"}, printer_manager, db=db)
@@ -2471,3 +2499,459 @@ class TestTrackFrom3mfPlateId:
             )
 
         assert extract_mock.call_args.args[1] is None
+
+
+# ---------------------------------------------------------------------------
+# Usage-accounting integrity (Phase 1): durable plate/mapping resolution,
+# idempotency guard, multi-plate skip, and the AMS weight-sync gate.
+# ---------------------------------------------------------------------------
+
+
+class TestParseAmsMapping:
+    """Unit tests for _parse_ams_mapping()."""
+
+    def test_valid_json_list(self):
+        assert _parse_ams_mapping("[0, 6, -1]") == [0, 6, -1]
+
+    def test_none_and_empty(self):
+        assert _parse_ams_mapping(None) is None
+        assert _parse_ams_mapping("") is None
+
+    def test_invalid_json(self):
+        assert _parse_ams_mapping("not json") is None
+
+    def test_non_list_json(self):
+        assert _parse_ams_mapping('{"a": 1}') is None
+
+
+class TestCountPlatesInSliceInfo:
+    """Unit tests for threemf_tools.count_plates_in_slice_info()."""
+
+    def test_counts_multiple_plates(self, tmp_path):
+        p = _write_3mf_with_plates(
+            tmp_path / "multi.3mf",
+            {1: [(1, 10.0, "PLA", "#FFFFFF")], 2: [(1, 20.0, "PLA", "#000000")], 3: [(1, 5.0, "PLA", "#FF0000")]},
+        )
+        assert count_plates_in_slice_info(p) == 3
+
+    def test_single_plate(self, tmp_path):
+        p = _write_3mf_with_plates(tmp_path / "single.3mf", {1: [(1, 10.0, "PLA", "#FFFFFF")]})
+        assert count_plates_in_slice_info(p) == 1
+
+    def test_missing_config_returns_zero(self, tmp_path):
+        import zipfile as _zip
+
+        p = tmp_path / "no_config.3mf"
+        with _zip.ZipFile(p, "w") as zf:
+            zf.writestr("other.txt", "x")
+        assert count_plates_in_slice_info(p) == 0
+
+    def test_missing_file_returns_zero(self, tmp_path):
+        assert count_plates_in_slice_info(tmp_path / "does_not_exist.3mf") == 0
+
+
+class TestResolveRunContext:
+    """_resolve_run_context() session fast-path (no query) and precedence."""
+
+    @pytest.mark.asyncio
+    async def test_session_fast_path_no_query(self):
+        """A live session returns its own values without touching the DB."""
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=AssertionError("resolver must not query when a session exists"))
+        session = PrintSession(
+            printer_id=1,
+            print_name="X",
+            started_at=datetime.now(timezone.utc),
+            ams_mapping=[3, -1],
+            plate_id=7,
+        )
+        plate_id, ams_mapping = await _resolve_run_context(db, 1, {"subtask_id": "ignored"}, 99, session)
+        assert plate_id == 7
+        assert ams_mapping == [3, -1]
+
+
+async def _seed_completion(
+    db,
+    printer_id: int,
+    tmp_path,
+    *,
+    plates: dict,
+    rel_path: str = "archives/x/file.gcode.3mf",
+    queue_plate_id=None,
+    subtask: str = "ST-SUB",
+    ams_mapping: str = "[0]",
+    assign_ams_id: int = 0,
+    assign_tray_id: int = 0,
+    archive_started_at=None,
+    spool_weight_used: float = 0.0,
+    with_queue_item: bool = True,
+):
+    """Seed a printer's completed print: real multi/single-plate 3MF on disk, a
+    PrintArchive (status='printing'), a Spool + SpoolAssignment, and optionally
+    the dispatched PrintQueueItem carrying the durable plate_id/ams_mapping.
+    """
+    from backend.app.models.archive import PrintArchive
+    from backend.app.models.print_queue import PrintQueueItem
+    from backend.app.models.spool import Spool
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    _write_3mf_with_plates(tmp_path / rel_path, plates)
+
+    archive = PrintArchive(
+        printer_id=printer_id,
+        filename=rel_path.split("/")[-1],
+        file_path=rel_path,
+        file_size=1000,
+        status="printing",
+        print_name="SeededPrint",
+        started_at=archive_started_at or (datetime.now(timezone.utc) - timedelta(minutes=5)),
+        filament_used_grams=50.0,
+    )
+    db.add(archive)
+    await db.commit()
+    await db.refresh(archive)
+
+    spool = Spool(material="PLA", label_weight=1000, weight_used=spool_weight_used)
+    db.add(spool)
+    await db.commit()
+    await db.refresh(spool)
+
+    db.add(SpoolAssignment(spool_id=spool.id, printer_id=printer_id, ams_id=assign_ams_id, tray_id=assign_tray_id))
+    item = None
+    if with_queue_item:
+        item = PrintQueueItem(
+            printer_id=printer_id,
+            archive_id=archive.id,
+            status="completed",
+            plate_id=queue_plate_id,
+            ams_mapping=ams_mapping,
+            dispatch_subtask_id=subtask,
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(item)
+    await db.commit()
+    return archive, spool, item
+
+
+def _completion_pm():
+    """Mock printer_manager for a settled completed print (no live mapping)."""
+    pm = MagicMock()
+    pm.get_status.return_value = SimpleNamespace(
+        raw_data={},
+        progress=100,
+        layer_num=1,
+        tray_now=0,
+        last_loaded_tray=0,
+        tray_change_log=[],
+        total_layers=1,
+    )
+    return pm
+
+
+async def _count_history(db) -> int:
+    from sqlalchemy import func, select
+
+    from backend.app.models.spool_usage_history import SpoolUsageHistory
+
+    result = await db.execute(select(func.count()).select_from(SpoolUsageHistory))
+    return result.scalar() or 0
+
+
+class TestUsageIntegrityIntegration:
+    """Real-DB integration for the durable resolver + idempotency guard."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_sessions(self):
+        _active_sessions.clear()
+        yield
+        _active_sessions.clear()
+
+    @pytest.mark.asyncio
+    async def test_no_session_matched_by_subtask_is_plate_scoped(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """No session, but the terminal subtask_id matches a queue item → only
+        the printed plate's grams are charged, NOT the whole multi-plate file."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        # Plate 1 = 50 g, plate 2 = 999 g → whole-file sum 1049 g.
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 50.0, "PLA", "#FF0000")], 2: [(1, 999.0, "PLA", "#00FF00")]},
+            queue_plate_id=1,
+            subtask="ST-SUB-1",
+        )
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed", "subtask_id": "ST-SUB-1"},
+            printer_manager=_completion_pm(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert sum(r["weight_used"] for r in results) == pytest.approx(50.0, abs=0.1)
+        assert spool.weight_used == pytest.approx(50.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_shaped_payload_derives_plate_and_mapping(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """Reconcile-shaped payload (subtask_id present, no session, no
+        ams_mapping arg) derives BOTH the plate and the AMS mapping from the
+        durable queue item: plate 2's 30 g lands on the mapped tray AMS1-T2."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        # Mapping "[6]" → slicer slot 1 -> global tray 6 -> AMS1-T2.
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 111.0, "PLA", "#FF0000")], 2: [(1, 30.0, "PLA", "#00FF00")]},
+            queue_plate_id=2,
+            subtask="ST-REC-9",
+            ams_mapping="[6]",
+            assign_ams_id=1,
+            assign_tray_id=2,
+        )
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={
+                "status": "completed",
+                "subtask_id": "ST-REC-9",
+                "last_progress": 100.0,
+                "last_layer_num": 1,
+                "raw_data": {},
+                "_reconciled": True,
+            },
+            printer_manager=_completion_pm(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert len(results) == 1
+        assert results[0]["ams_id"] == 1
+        assert results[0]["tray_id"] == 2
+        assert results[0]["weight_used"] == pytest.approx(30.0, abs=0.1)
+        assert spool.weight_used == pytest.approx(30.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_second_completion_is_noop(self, db_session, printer_factory, tmp_path, monkeypatch):
+        """A duplicate completion for the same run inserts no new history rows
+        and does not change weight_used (idempotency guard)."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 50.0, "PLA", "#FF0000")]},
+            queue_plate_id=1,
+            subtask="ST-DUP",
+        )
+
+        first = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed", "subtask_id": "ST-DUP"},
+            printer_manager=_completion_pm(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+        assert len(first) == 1
+        await db_session.refresh(spool)
+        weight_after_first = spool.weight_used
+        rows_after_first = await _count_history(db_session)
+
+        second = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed", "subtask_id": "ST-DUP"},
+            printer_manager=_completion_pm(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert second == []
+        assert await _count_history(db_session) == rows_after_first
+        assert spool.weight_used == weight_after_first
+
+    @pytest.mark.asyncio
+    async def test_reprint_finalizes_again(self, db_session, printer_factory, tmp_path, monkeypatch):
+        """A reprint resets archive.started_at to now, so a prior run's older
+        usage row no longer blocks finalizing the fresh run."""
+        from backend.app.core.config import settings as app_settings
+        from backend.app.models.spool_usage_history import SpoolUsageHistory
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 50.0, "PLA", "#FF0000")]},
+            queue_plate_id=1,
+            subtask="ST-RE",
+            spool_weight_used=50.0,
+        )
+        # A prior run's usage row, finalized 2h ago.
+        db_session.add(
+            SpoolUsageHistory(
+                spool_id=spool.id,
+                printer_id=printer.id,
+                print_name="prev",
+                weight_used=50.0,
+                percent_used=5,
+                status="completed",
+                archive_id=archive.id,
+                created_at=datetime.utcnow() - timedelta(hours=2),
+            )
+        )
+        # Reprint resets started_at to now (main.py:3011-3012 behavior).
+        archive.started_at = datetime.now(timezone.utc)
+        await db_session.commit()
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed", "subtask_id": "ST-RE"},
+            printer_manager=_completion_pm(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert len(results) == 1
+        assert await _count_history(db_session) == 2
+        assert spool.weight_used == pytest.approx(100.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_multi_plate_unknowable_skips_and_warns(
+        self, db_session, printer_factory, tmp_path, monkeypatch, caplog
+    ):
+        """Multi-plate file with no session AND no queue item → 3MF path skipped
+        (no over-charge), a WARNING is logged, and no usage rows are written."""
+        import logging
+
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 50.0, "PLA", "#FF0000")], 2: [(1, 999.0, "PLA", "#00FF00")]},
+            with_queue_item=False,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="backend.app.services.usage_tracker"):
+            results = await on_print_complete(
+                printer_id=printer.id,
+                data={"status": "completed"},  # no subtask_id → unresolvable
+                printer_manager=_completion_pm(),
+                db=db_session,
+                archive_id=archive.id,
+            )
+
+        await db_session.refresh(spool)
+        assert results == []
+        assert await _count_history(db_session) == 0
+        assert spool.weight_used == 0.0
+        assert any("plates but the printed plate is unknown" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_single_plate_no_session_tracks_full(self, db_session, printer_factory, tmp_path, monkeypatch):
+        """A single-plate file with no session still tracks the full usage — the
+        multi-plate skip must NOT fire for a one-plate file."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 42.0, "PLA", "#FF0000")]},
+            queue_plate_id=None,  # unknown plate index, but only one plate exists
+            subtask="ST-ONE",
+        )
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed", "subtask_id": "ST-ONE"},
+            printer_manager=_completion_pm(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert len(results) == 1
+        assert spool.weight_used == pytest.approx(42.0, abs=0.1)
+
+
+class TestAmsWeightSyncAllowed:
+    """Truth table for main._ams_weight_sync_allowed()."""
+
+    @pytest.mark.asyncio
+    async def test_active_state_blocks(self, db_session, printer_factory):
+        from backend.app.main import _ams_weight_sync_allowed
+
+        printer = await printer_factory()
+        for active in ("RUNNING", "PAUSE", "PREPARE", "SLICING"):
+            assert await _ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state=active)) is False
+
+    @pytest.mark.asyncio
+    async def test_none_and_unknown_state_block(self, db_session, printer_factory):
+        from backend.app.main import _ams_weight_sync_allowed
+
+        printer = await printer_factory()
+        assert await _ams_weight_sync_allowed(db_session, printer.id, None) is False
+        assert await _ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state=None)) is False
+        assert await _ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state="unknown")) is False
+
+    @pytest.mark.asyncio
+    async def test_idle_with_printing_archive_blocks(self, db_session, printer_factory):
+        from backend.app.main import _ams_weight_sync_allowed
+        from backend.app.models.archive import PrintArchive
+
+        printer = await printer_factory()
+        db_session.add(
+            PrintArchive(
+                printer_id=printer.id,
+                filename="p.gcode.3mf",
+                file_path="a/p.gcode.3mf",
+                file_size=1,
+                status="printing",
+            )
+        )
+        await db_session.commit()
+        assert await _ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state="IDLE")) is False
+
+    @pytest.mark.asyncio
+    async def test_idle_no_printing_archive_allows(self, db_session, printer_factory):
+        from backend.app.main import _ams_weight_sync_allowed
+        from backend.app.models.archive import PrintArchive
+
+        printer = await printer_factory()
+        # A settled archive for the same printer must not block the sync.
+        db_session.add(
+            PrintArchive(
+                printer_id=printer.id,
+                filename="p.gcode.3mf",
+                file_path="a/p.gcode.3mf",
+                file_size=1,
+                status="completed",
+            )
+        )
+        await db_session.commit()
+        assert await _ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state="IDLE")) is True

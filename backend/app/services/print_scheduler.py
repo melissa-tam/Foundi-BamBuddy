@@ -47,6 +47,7 @@ from backend.app.services.spool_selection import (
     match_filaments_to_slots,
     normalize_color_for_compare,
 )
+from backend.app.services.usb_storage import upload_in_flight
 from backend.app.utils.filament_types import canonical_filament_type as _canonical_filament_type
 from backend.app.utils.filename import derive_remote_filename
 from backend.app.utils.printer_models import normalize_printer_model
@@ -159,6 +160,17 @@ class PrintScheduler:
                 await check_stalled_prints(db)
             except Exception:
                 logger.exception("Offline-stall watch failed (non-fatal)")
+
+            # Pause-stall watch: flag farm units still 'printing' whose CONNECTED
+            # printer has sat unattended-PAUSEd past the grace window (an HMS
+            # outside the recovery sets, door-open, forgotten manual pause). Its
+            # OWN guarded try/except so one watch can't starve the other.
+            try:
+                from backend.app.services.farm_stall import check_paused_prints
+
+                await check_paused_prints(db)
+            except Exception:
+                logger.exception("Pause-stall watch failed (non-fatal)")
 
             # Check if shortest-job-first scheduling is enabled
             sjf_enabled = await self._get_bool_setting(db, "queue_shortest_first")
@@ -1106,11 +1118,14 @@ class PrintScheduler:
             logger.debug("No filaments loaded on printer %s", printer_id)
             return MatchOutcome(mapping=None)
 
-        # Inventory facts (remaining grams + first-loaded ordinal) are only needed
-        # when the policy sorts or the floor is active — skip the lookup otherwise.
-        inv: dict[int, SlotInventory] = {}
-        if eff_policy != "slot_order" or min_start_g > 0:
-            inv = await build_slot_inventory(db, printer_id, loaded_filaments)
+        # Inventory facts (remaining grams + first-loaded ordinal + the
+        # out-of-rotation / spent hard-exclude flags) are ALWAYS built: even under
+        # slot_order with the floor disabled, the matcher needs the inventory to
+        # keep a jammed or spent spool from starting a print (skip_filament_check
+        # forces the floor to 0, so the old conditional let an unusable spool through
+        # on that path). ``spool_recovery._match_candidates`` builds it unconditionally
+        # too — same precedent.
+        inv: dict[int, SlotInventory] = await build_slot_inventory(db, printer_id, loaded_filaments)
 
         return match_filaments_to_slots(
             filament_reqs,
@@ -1154,9 +1169,9 @@ class PrintScheduler:
             }
             for o in force_overrides
         ]
-        inv: dict[int, SlotInventory] = {}
-        if policy != "slot_order" or min_start_g > 0:
-            inv = await build_slot_inventory(db, printer_id, loaded)
+        # Always build inventory (see _compute_ams_mapping_for_printer): the matcher
+        # must hard-exclude jammed / spent spools even under slot_order + floor 0.
+        inv: dict[int, SlotInventory] = await build_slot_inventory(db, printer_id, loaded)
         return match_filaments_to_slots(
             reqs,
             loaded,
@@ -2331,6 +2346,14 @@ class PrintScheduler:
                     original_filename=filename,
                     created_by_id=item.created_by_id,
                     project_id=item.project_id,
+                    # Scope the parse to the plate this farm unit prints (#1697).
+                    # Farm production units carry library_file_id + plate_id
+                    # (production_run.py sets plate_id=sku_file.plate_index), so
+                    # without this the dispatch-time archive stores the summed-
+                    # across-plates totals for a single-plate print. source_file
+                    # here is the ORIGINAL library file — any G-code injection
+                    # happens later (~:2415), after this parse.
+                    plate_id=item.plate_id,
                 )
                 if archive:
                     item.archive_id = archive.id
@@ -2451,29 +2474,33 @@ class PrintScheduler:
         except Exception as e:
             logger.debug("Queue item %s: Delete failed (may not exist): %s", item.id, e)
 
+        # An FTPS upload makes the H2S firmware transiently report sdcard=false;
+        # mark the printer upload-in-flight so the USB-drop verifier treats that edge
+        # as a dispatch blip, not a genuine drop.
         try:
-            if ftp_retry_enabled:
-                uploaded = await with_ftp_retry(
-                    upload_file_async,
-                    printer.ip_address,
-                    printer.access_code,
-                    file_path,
-                    remote_path,
-                    socket_timeout=ftp_timeout,
-                    printer_model=printer.model,
-                    max_retries=ftp_retry_count,
-                    retry_delay=ftp_retry_delay,
-                    operation_name=f"Upload print to {printer.name}",
-                )
-            else:
-                uploaded = await upload_file_async(
-                    printer.ip_address,
-                    printer.access_code,
-                    file_path,
-                    remote_path,
-                    socket_timeout=ftp_timeout,
-                    printer_model=printer.model,
-                )
+            async with upload_in_flight(printer.id):
+                if ftp_retry_enabled:
+                    uploaded = await with_ftp_retry(
+                        upload_file_async,
+                        printer.ip_address,
+                        printer.access_code,
+                        file_path,
+                        remote_path,
+                        socket_timeout=ftp_timeout,
+                        printer_model=printer.model,
+                        max_retries=ftp_retry_count,
+                        retry_delay=ftp_retry_delay,
+                        operation_name=f"Upload print to {printer.name}",
+                    )
+                else:
+                    uploaded = await upload_file_async(
+                        printer.ip_address,
+                        printer.access_code,
+                        file_path,
+                        remote_path,
+                        socket_timeout=ftp_timeout,
+                        printer_model=printer.model,
+                    )
         except Exception as e:
             uploaded = False
             logger.error("Queue item %s: FTP error: %s (type: %s)", item.id, e, type(e).__name__)

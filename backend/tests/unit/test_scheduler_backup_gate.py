@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backend.app.services.print_scheduler import PrintScheduler
-from backend.app.services.spool_selection import MatchOutcome, effective_policy
+from backend.app.services.spool_selection import MatchOutcome, SlotInventory, effective_policy
 
 
 @pytest.fixture
@@ -112,3 +112,74 @@ class TestBackupGateThroughScheduler:
         # The farm default passes through unchanged even with backup OFF.
         out = await _effective_policy_handed_to_matcher(scheduler, backup_state=False, policy_setting="first_loaded")
         assert out == "first_loaded"
+
+
+async def _mapping_with_real_matcher(scheduler, *, policy_setting, min_start_g, inv):
+    """Drive ``_compute_ams_mapping_for_printer`` with the REAL matcher, returning
+    ``(mapping, build_slot_inventory_await_count)``.
+
+    ``build_slot_inventory`` is mocked to return ``inv`` so the await count proves
+    whether the scheduler consulted inventory at all — under the OLD conditional
+    (``slot_order`` + floor 0) it was skipped, letting a jammed / spent spool start.
+    """
+    db = MagicMock()
+    item = SimpleNamespace(filament_overrides=None, skip_filament_check=False, id=1)
+    reqs = [{"slot_id": 1, "type": "PLA", "color": "#000000", "tray_info_idx": "", "used_grams": 10.0}]
+    loaded = [
+        {
+            "ams_id": 0,
+            "tray_id": 0,
+            "global_tray_id": 0,
+            "is_external": False,
+            "type": "PLA",
+            "color": "#000000",
+            "tray_info_idx": "",
+            "remain": -1,
+        }
+    ]
+    build_mock = AsyncMock(return_value=inv)
+    with (
+        _patch_status(True),  # backup ON — irrelevant under slot_order, isolates the inv behaviour
+        patch.object(scheduler, "_get_filament_requirements", new=AsyncMock(return_value=reqs)),
+        patch.object(scheduler, "_build_loaded_filaments", return_value=loaded),
+        patch.object(scheduler, "_get_setting", new=AsyncMock(return_value=policy_setting)),
+        patch.object(scheduler, "_get_int_setting", new=AsyncMock(return_value=min_start_g)),
+        patch("backend.app.services.print_scheduler.build_slot_inventory", new=build_mock),
+    ):
+        outcome = await scheduler._compute_ams_mapping_for_printer(db, printer_id=1, item=item)
+    return outcome.mapping, build_mock.await_count
+
+
+class TestInventoryAlwaysBuiltExcludesUnusable:
+    """S2: inventory is ALWAYS built (even slot_order + floor 0, i.e. the
+    skip_filament_check path), so a jammed / spent spool can never start a print
+    regardless of policy or floor."""
+
+    @pytest.mark.asyncio
+    async def test_inventory_built_under_slot_order_floor_zero(self, scheduler):
+        # A healthy slot: the mapping still resolves, and build_slot_inventory WAS
+        # consulted (await_count == 1) — the old conditional would have skipped it.
+        inv = {0: SlotInventory(remaining_g=500.0, first_loaded_ord=None)}
+        mapping, built = await _mapping_with_real_matcher(
+            scheduler, policy_setting="slot_order", min_start_g=0, inv=inv
+        )
+        assert built == 1
+        assert mapping == [0]
+
+    @pytest.mark.asyncio
+    async def test_spent_spool_excluded_under_slot_order_floor_zero(self, scheduler):
+        inv = {0: SlotInventory(remaining_g=500.0, first_loaded_ord=None, spent=True)}
+        mapping, built = await _mapping_with_real_matcher(
+            scheduler, policy_setting="slot_order", min_start_g=0, inv=inv
+        )
+        assert built == 1  # inventory consulted despite slot_order + floor 0
+        assert mapping == [-1]  # spent spool hard-excluded — no start
+
+    @pytest.mark.asyncio
+    async def test_out_of_rotation_spool_excluded_under_slot_order_floor_zero(self, scheduler):
+        inv = {0: SlotInventory(remaining_g=500.0, first_loaded_ord=None, out_of_rotation=True)}
+        mapping, built = await _mapping_with_real_matcher(
+            scheduler, policy_setting="slot_order", min_start_g=0, inv=inv
+        )
+        assert built == 1
+        assert mapping == [-1]  # jammed spool hard-excluded — no start

@@ -1394,7 +1394,9 @@ async def start_queue_item(
     # Live deficit check — re-evaluated against current spool state, so a
     # spool swap between scheduler flagging and the user clicking ▶ clears
     # the block automatically.
-    if not skip_filament_check:
+    # A creation-time ack (#1698-followup) counts; the ▶ confirm is only for
+    # un-acked items, so an already-acknowledged deficit never re-asks.
+    if not (skip_filament_check or item.skip_filament_check):
         deficit = await compute_deficit_for_queue_item(db, item)
         if deficit:
             raise HTTPException(

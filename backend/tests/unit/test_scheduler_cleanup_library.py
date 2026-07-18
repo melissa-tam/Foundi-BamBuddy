@@ -110,7 +110,12 @@ async def queue_factory(tmp_path):
 async def _dispatch_library_item(ctx, *, archive_failure=False, unlink_side_effect=None):
     scheduler = PrintScheduler()
 
-    async def archive_print(self, *, printer_id, source_file, original_filename, created_by_id=None, project_id=None):
+    async def archive_print(
+        self, *, printer_id, source_file, original_filename, created_by_id=None, project_id=None, plate_id=None
+    ):
+        # Capture the plate_id the scheduler forwards so tests can pin plate
+        # scoping (#1697); production farm units carry a real plate_id.
+        ctx.captured_plate_id = plate_id
         if archive_failure:
             raise RuntimeError("archive copy failed")
 
@@ -207,6 +212,29 @@ async def test_dispatch_stamps_dispatch_subtask_id(queue_factory):
     item, _library_file, _archive = await _queue_snapshot(ctx)
     assert item.status == "printing"
     assert item.dispatch_subtask_id == "STAMP-1"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_forwards_item_plate_id_to_archive_print(queue_factory):
+    """#1697: a farm production unit dispatched from a library file carries
+    ``plate_id`` (production_run.py sets plate_id=sku_file.plate_index). The
+    scheduler must forward it to ``archive_print`` so the dispatch-time archive
+    — the row on_print_start later finds via the expected-print branch and
+    surfaces to the user — is scoped to the printed plate, not the summed-across-
+    plates project totals. The grams outcome of that plate_id is pinned at the
+    archive_print level by test_archives_api.TestArchivePrintPlateScoping."""
+    ctx = await queue_factory(cleanup=False)
+
+    async with ctx.session_maker() as db:
+        item = await db.get(PrintQueueItem, ctx.queue_item_id)
+        item.plate_id = 2
+        await db.commit()
+
+    await _dispatch_library_item(ctx)
+
+    item, _library_file, _archive = await _queue_snapshot(ctx)
+    assert item.status == "printing"
+    assert ctx.captured_plate_id == 2
 
 
 @pytest.mark.asyncio

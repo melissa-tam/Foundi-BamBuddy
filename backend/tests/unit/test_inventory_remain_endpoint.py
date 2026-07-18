@@ -93,7 +93,7 @@ class TestGetInventoryRemain:
         ):
             result = await _call_endpoint(db)
 
-        assert result == {"inventory_remain_g": {}, "first_loaded": {}}
+        assert result == {"inventory_remain_g": {}, "first_loaded": {}, "out_of_rotation": {}}
 
     @pytest.mark.asyncio
     async def test_spoolman_first_used_maps_to_first_loaded(self, db):

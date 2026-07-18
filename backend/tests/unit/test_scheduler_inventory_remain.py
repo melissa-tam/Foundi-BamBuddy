@@ -42,13 +42,15 @@ def _make_async_session_returning(rows: list):
     return db
 
 
-def _spool(*, label_weight, weight_used, first_loaded_at=None, created_at=None):
+def _spool(*, label_weight, weight_used, first_loaded_at=None, created_at=None, spent_at=None):
     """Internal-mode spool stub with the attributes build_slot_inventory reads."""
     return SimpleNamespace(
         label_weight=label_weight,
         weight_used=weight_used,
         first_loaded_at=first_loaded_at,
         created_at=created_at or datetime(2026, 1, 1, tzinfo=timezone.utc),
+        feed_fault_at=None,
+        spent_at=spent_at,
     )
 
 
@@ -71,6 +73,27 @@ class TestInternalInventoryOverrides:
             out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
         assert out[0].remaining_g == 950.0
         assert out[3].remaining_g == 50.0
+
+    @pytest.mark.asyncio
+    async def test_spent_and_feed_fault_flags_propagate(self):
+        """``SlotInventory.spent`` mirrors ``spool.spent_at`` (and out_of_rotation
+        mirrors ``feed_fault_at``) so the matcher can hard-exclude either — a
+        spent or jammed spool must never start a print."""
+        spent_spool = _spool(label_weight=1000, weight_used=0, spent_at=datetime(2026, 5, 1, tzinfo=timezone.utc))
+        live_spool = _spool(label_weight=1000, weight_used=0)
+        rows = [
+            SimpleNamespace(ams_id=0, tray_id=0, spool=spent_spool),
+            SimpleNamespace(ams_id=0, tray_id=1, spool=live_spool),
+        ]
+        loaded = [
+            {"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False},
+            {"ams_id": 0, "tray_id": 1, "global_tray_id": 1, "is_external": False},
+        ]
+        db = _make_async_session_returning(rows)
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        assert out[0].spent is True and out[0].out_of_rotation is False
+        assert out[1].spent is False and out[1].out_of_rotation is False
 
     @pytest.mark.asyncio
     async def test_first_loaded_ordinal_prefers_first_loaded_at(self):

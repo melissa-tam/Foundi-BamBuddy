@@ -185,14 +185,27 @@ async def apply_spool_to_slot_via_mqtt(
         extruder_for_ams(state.ams_extruder_map, ams_id, tray_id) if (state and state.ams_extruder_map) else None
     )
 
-    # Prefer exact extruder match, fall back to extruder-agnostic kp for the
-    # same nozzle. Hard-skipping on mismatch silently drops valid stored
-    # profiles when the AMS-extruder mapping has shifted.
+    # Fetch this spool's K-profiles with an explicit query instead of walking the
+    # `spool.k_profiles` relationship. Callers pass spools loaded WITHOUT eager-
+    # loading that relationship (the tagless bare-tray re-push hands us
+    # `assignment.spool` from a selectinload of the assignment alone), and touching
+    # a lazy relationship inside an async session raises a greenlet/lazy-load error
+    # — deterministically, not intermittently (production 2026-07-17: bare-tray
+    # auto-config crashed on every pre-existing spool). The printer + nozzle filter
+    # that the old loop applied via `continue` is pushed into SQL.
+    kp_result = await db.execute(
+        select(SpoolKProfile).where(
+            SpoolKProfile.spool_id == spool.id,
+            SpoolKProfile.printer_id == printer_id,
+            SpoolKProfile.nozzle_diameter == nozzle_diameter,
+        )
+    )
+    # Prefer exact extruder match, fall back to an extruder-agnostic kp for the
+    # same nozzle. Hard-skipping on mismatch silently drops valid stored profiles
+    # when the AMS-extruder mapping has shifted.
     exact_kp = None
     fallback_kp = None
-    for kp in spool.k_profiles:
-        if kp.printer_id != printer_id or kp.nozzle_diameter != nozzle_diameter:
-            continue
+    for kp in kp_result.scalars().all():
         if slot_extruder is not None and kp.extruder is not None and kp.extruder == slot_extruder:
             exact_kp = kp
             break
@@ -1394,6 +1407,59 @@ async def reset_spool_consumed_counter(
     await db.commit()
     result = await db.execute(select(Spool).options(selectinload(Spool.k_profiles)).where(Spool.id == spool_id))
     await ws_manager.broadcast({"type": "inventory_changed"})
+    return result.scalar_one()
+
+
+class RespoolDismissRequest(BaseModel):
+    """Optional AMS slot triple echoed back on the dismissal WS broadcast so the
+    frontend can clear the matching in-flight ``respool_prompt``. All absent →
+    nulls in the broadcast (the timestamp stamp does not need the slot)."""
+
+    printer_id: int | None = None
+    ams_id: int | None = None
+    tray_id: int | None = None
+
+
+@router.post("/spools/{spool_id}/respool-dismiss", response_model=SpoolResponse)
+async def dismiss_respool_prompt(
+    spool_id: int,
+    req: RespoolDismissRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+):
+    """Persist the operator's "Same spool" answer to the tier-3 re-spool prompt.
+
+    Stamps ``respool_dismissed_at`` so the uncertain-tier prompt stops firing for
+    this spool on every reseat / AMS power-cycle / server restart — the in-memory
+    prompt dedup (`spool_respool._respool_prompt_dedup`) is process-memory and is
+    deliberately cleared when the slot reports empty, so a deliberately-run-down
+    near-empty spool would otherwise re-prompt forever. Idempotent: re-stamping an
+    already-dismissed spool is fine (200). Hardware-certain spent (tier 1/2 auto
+    re-spool) is NOT gated by this flag, so a genuine exhaustion still surfaces.
+
+    Broadcasts ``respool_prompt_dismissed`` with the optional slot triple so open
+    clients drop the matching prompt. 404 for an unknown spool.
+    """
+    from datetime import datetime
+
+    result = await db.execute(select(Spool).where(Spool.id == spool_id))
+    spool = result.scalar_one_or_none()
+    if not spool:
+        raise HTTPException(404, "Spool not found")
+
+    spool.respool_dismissed_at = datetime.utcnow()
+    await db.commit()
+
+    await ws_manager.broadcast(
+        {
+            "type": "respool_prompt_dismissed",
+            "spool_id": spool_id,
+            "printer_id": req.printer_id if req else None,
+            "ams_id": req.ams_id if req else None,
+            "tray_id": req.tray_id if req else None,
+        }
+    )
+    result = await db.execute(select(Spool).options(selectinload(Spool.k_profiles)).where(Spool.id == spool_id))
     return result.scalar_one()
 
 

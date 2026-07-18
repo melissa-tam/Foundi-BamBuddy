@@ -140,8 +140,10 @@ def _mock_db_sequential(responses):
         result = MagicMock()
         if idx < len(responses):
             result.scalar_one_or_none.return_value = responses[idx]
+            result.scalars.return_value.first.return_value = responses[idx]
         else:
             result.scalar_one_or_none.return_value = None
+            result.scalars.return_value.first.return_value = None
         return result
 
     db.execute = mock_execute
@@ -182,7 +184,7 @@ class TestCostCalculation:
         )
 
         # db returns: archive, queue_item(None), assignment, spool
-        db = _mock_db_sequential([archive, None, assignment, spool])
+        db = _mock_db_sequential([None, archive, None, assignment, spool])
 
         # 20g used from 3MF
         filament_usage = [{"slot_id": 1, "used_g": 20.0, "type": "PLA", "color": "#FF0000"}]
@@ -239,7 +241,7 @@ class TestCostCalculation:
         )
 
         # db returns: archive, queue_item(None), assignment, spool
-        db = _mock_db_sequential([archive, None, assignment, spool])
+        db = _mock_db_sequential([None, archive, None, assignment, spool])
 
         # 30g used from 3MF
         filament_usage = [{"slot_id": 1, "used_g": 30.0, "type": "PLA", "color": "#FF0000"}]
@@ -296,7 +298,7 @@ class TestCostCalculation:
         )
 
         # db returns: archive, queue_item(None), assignment, spool
-        db = _mock_db_sequential([archive, None, assignment, spool])
+        db = _mock_db_sequential([None, archive, None, assignment, spool])
 
         filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": "#FF0000"}]
 
@@ -349,7 +351,7 @@ class TestCostCalculation:
         )
 
         # db returns: archive, queue_item(None), assignment, spool
-        db = _mock_db_sequential([archive, None, assignment, spool])
+        db = _mock_db_sequential([None, archive, None, assignment, spool])
 
         # 40g total, but only 50% used
         filament_usage = [{"slot_id": 1, "used_g": 40.0, "type": "PLA", "color": "#FF0000"}]
@@ -455,7 +457,7 @@ class TestCostCalculation:
 
         # db returns: archive, assignment1, spool1, assignment2, spool2
         # ams_mapping is provided, so no queue item lookup is performed
-        db = _mock_db_sequential([archive, assignment1, spool1, assignment2, spool2])
+        db = _mock_db_sequential([None, archive, assignment1, spool1, assignment2, spool2])
 
         # Two filaments used
         filament_usage = [
@@ -553,6 +555,8 @@ class TestCostAggregation:
 
         # Build mock db that returns proper scalars for the aggregation queries
         responses = []
+        # Idempotency guard: started_at -> None (guard skips, one execute consumed).
+        responses.append(("scalar_one_or_none", None))
         # 1. select(PrintArchive) → archive
         responses.append(("scalar_one_or_none", archive))
         # 2. select(PrintQueueItem) → None
@@ -643,6 +647,8 @@ class TestCostAggregation:
         expected_cost = 0.50
 
         responses = []
+        # Idempotency guard: started_at -> None (guard skips, one execute consumed).
+        responses.append(("scalar_one_or_none", None))
         responses.append(("scalar_one_or_none", archive))
         responses.append(("scalar_one_or_none", None))  # queue item
         responses.append(("scalar_one_or_none", assignment))
@@ -723,6 +729,7 @@ class TestCostAggregation:
         )
 
         responses = [
+            ("scalar_one_or_none", None),  # idempotency guard: started_at -> None (skip)
             ("scalar_one_or_none", archive),
             ("scalar_one_or_none", None),  # queue item
             ("scalar_one_or_none", assignment),
@@ -809,6 +816,7 @@ class TestCostAggregation:
         )
 
         responses = [
+            ("scalar_one_or_none", None),  # idempotency guard: started_at -> None (skip)
             ("scalar_one_or_none", archive),
             ("scalar_one_or_none", None),
             ("scalar_one_or_none", assignment),
@@ -875,7 +883,7 @@ class TestCostAggregation:
             tray_now=0,
         )
 
-        db = _mock_db_sequential([archive_new, None, assignment_new, spool_new])
+        db = _mock_db_sequential([None, None, archive_new, None, assignment_new, spool_new])
 
         with (
             patch("backend.app.core.config.settings") as mock_settings,

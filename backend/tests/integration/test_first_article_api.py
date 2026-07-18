@@ -94,8 +94,9 @@ async def _drive_fa_to_awaiting(db_session, run_id):
 @pytest.mark.asyncio
 @pytest.mark.integration
 class TestRunCreateNewFields:
-    async def test_create_defaults_gate_on_first_article(self, async_client, db_session, tmp_path):
-        body = await _create_run(async_client, db_session, tmp_path, "SKU200.01")
+    async def test_create_gate_on_first_article_when_requested(self, async_client, db_session, tmp_path):
+        # Explicit opt-in gates the run on a first article (the default is now False).
+        body = await _create_run(async_client, db_session, tmp_path, "SKU200.01", require_first_article=True)
         assert body["require_first_article"] is True
         assert body["first_article_state"] == "pending_print"
         assert body["retry_max_per_unit"] == 1
@@ -107,8 +108,10 @@ class TestRunCreateNewFields:
         assert body["plates_total"] == 3
         assert body["plates_pending"] == 3
 
-    async def test_create_without_gate_creates_all_plates(self, async_client, db_session, tmp_path):
-        body = await _create_run(async_client, db_session, tmp_path, "SKU201.01", require_first_article=False)
+    async def test_create_defaults_no_gate_creates_all_plates(self, async_client, db_session, tmp_path):
+        # Omitting require_first_article defaults to False (2026-07 flip) — no FA gate,
+        # every plate is materialised immediately.
+        body = await _create_run(async_client, db_session, tmp_path, "SKU201.01")
         assert body["require_first_article"] is False
         assert body["first_article_state"] is None
         items = await _run_items(db_session, body["id"])
@@ -141,7 +144,7 @@ class TestFirstArticleEndpoints:
         assert r.status_code == 409
 
     async def test_approve_local_happy(self, async_client, db_session, tmp_path):
-        body = await _create_run(async_client, db_session, tmp_path, "SKU212.01")
+        body = await _create_run(async_client, db_session, tmp_path, "SKU212.01", require_first_article=True)
         await _drive_fa_to_awaiting(db_session, body["id"])
 
         # State is visible to the API session (committed to the shared engine).
@@ -157,7 +160,7 @@ class TestFirstArticleEndpoints:
         assert len(items) == 3  # FA + 2 materialised remaining plates
 
     async def test_reject_pauses_and_reason_exposed(self, async_client, db_session, tmp_path):
-        body = await _create_run(async_client, db_session, tmp_path, "SKU213.01")
+        body = await _create_run(async_client, db_session, tmp_path, "SKU213.01", require_first_article=True)
         await _drive_fa_to_awaiting(db_session, body["id"])
 
         r = await async_client.post(
@@ -171,7 +174,7 @@ class TestFirstArticleEndpoints:
         assert payload["first_article_reject_reason"] == "warping on the edge"
 
     async def test_reject_then_resume_new_first_article(self, async_client, db_session, tmp_path):
-        body = await _create_run(async_client, db_session, tmp_path, "SKU214.01")
+        body = await _create_run(async_client, db_session, tmp_path, "SKU214.01", require_first_article=True)
         await _drive_fa_to_awaiting(db_session, body["id"])
         await async_client.post(f"/api/v1/production-runs/{body['id']}/first-article/reject", json={"reason": "bad"})
         r = await async_client.post(f"/api/v1/production-runs/{body['id']}/resume")
@@ -182,7 +185,7 @@ class TestFirstArticleEndpoints:
         assert payload["first_article_reject_reason"] is None
 
     async def test_reject_reason_length_validation(self, async_client, db_session, tmp_path):
-        body = await _create_run(async_client, db_session, tmp_path, "SKU215.01")
+        body = await _create_run(async_client, db_session, tmp_path, "SKU215.01", require_first_article=True)
         await _drive_fa_to_awaiting(db_session, body["id"])
         r = await async_client.post(f"/api/v1/production-runs/{body['id']}/first-article/reject", json={"reason": ""})
         assert r.status_code == 422  # min_length=1

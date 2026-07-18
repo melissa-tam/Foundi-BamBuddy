@@ -94,7 +94,7 @@ class RunCreate(BaseModel):
     eject_profile_id: int | None = None
     cooldown_temp_c_override: float | None = Field(default=None, gt=0, le=100)
     # Farm first-article + failure policy (Phase 3). All optional; numbers fall
-    # back to the global farm settings, require_first_article defaults True.
+    # back to the global farm settings, require_first_article defaults False.
     require_first_article: bool | None = Field(default=None, description="Gate the run on first-article approval")
     retry_max_per_unit: int | None = Field(default=None, ge=0, le=10)
     escalate_consecutive_failures: int | None = Field(default=None, ge=1, le=20)

@@ -223,6 +223,85 @@ class PrintSession:
 # Module-level storage, keyed by printer_id
 _active_sessions: dict[int, PrintSession] = {}
 
+# Queue-item statuses a completion-time run-context lookup accepts. The scheduler
+# flips the queue item to a terminal status (main.py) BEFORE usage tracking runs,
+# so a completion-time lookup must accept the already-stamped terminal states, not
+# just "printing" — the single canonical tuple used by both _resolve_run_context
+# and the archive-keyed fallback inside _track_from_3mf.
+_RUN_CONTEXT_STATUSES = ("printing", "completed", "failed", "cancelled", "aborted")
+
+
+def _parse_ams_mapping(raw: str | None) -> list[int] | None:
+    """Parse a PrintQueueItem.ams_mapping JSON string to a list, or None."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+async def _resolve_run_context(
+    db: AsyncSession,
+    printer_id: int,
+    data: dict,
+    archive_id: int | None,
+    session: "PrintSession | None",
+) -> tuple[int | None, list[int] | None]:
+    """Resolve ``(plate_id, ams_mapping)`` for a completing print from the most
+    durable source available.
+
+    ``plate_id`` used to flow only from the in-memory :class:`PrintSession`, so a
+    completion whose session did not survive (server restart mid-print, or a
+    ``reconcile_stale_active_prints`` synthesis) resolved ``plate_id=None`` and
+    then summed EVERY plate of a multi-plate 3MF into the run — over-charging the
+    unit (#usage-integrity). Both durable copies live on the dispatched queue
+    item, so the resolution order is:
+
+    1. the live session's captured values (the print-start truth — one path);
+    2. the queue item whose ``dispatch_subtask_id`` equals the terminal payload's
+       ``subtask_id`` (the id Bambuddy minted for this exact dispatch), any status;
+    3. the queue item linked to this ``archive_id`` (accepting any terminal status
+       the scheduler may already have stamped — see ``_RUN_CONTEXT_STATUSES``).
+
+    ``resolve_active_plate_id`` in farm_correlation is deliberately NOT reused: it
+    filters ``status == "printing"``, which is wrong at completion (the row is
+    already terminal by the time usage runs).
+    """
+    from backend.app.models.print_queue import PrintQueueItem
+
+    # 1. Session fast path — print-start captured both values, no query needed.
+    if session is not None:
+        return session.plate_id, session.ams_mapping
+
+    # 2. dispatch_subtask_id match (id-bound, any status).
+    subtask = (data.get("subtask_id") or "").strip()
+    if subtask:
+        result = await db.execute(
+            select(PrintQueueItem)
+            .where(PrintQueueItem.dispatch_subtask_id == subtask)
+            .order_by(PrintQueueItem.started_at.desc())
+        )
+        item = result.scalars().first()
+        if item is not None:
+            return item.plate_id, _parse_ams_mapping(item.ams_mapping)
+
+    # 3. archive_id-linked queue item (session lost; reprints reuse the archive so
+    #    take the most recently started matching row).
+    if archive_id:
+        result = await db.execute(
+            select(PrintQueueItem)
+            .where(PrintQueueItem.archive_id == archive_id)
+            .where(PrintQueueItem.status.in_(_RUN_CONTEXT_STATUSES))
+            .order_by(PrintQueueItem.started_at.desc())
+        )
+        item = result.scalars().first()
+        if item is not None:
+            return item.plate_id, _parse_ams_mapping(item.ams_mapping)
+
+    return None, None
+
 
 def _to_epoch_seconds(value: datetime | None) -> float | None:
     """Convert datetime to epoch seconds, assuming UTC for naive values."""
@@ -385,19 +464,14 @@ async def on_print_start(printer_id: int, data: dict, printer_manager, db: Async
             )
 
     # Capture the queue item's plate_id so 3MF parsing at completion is scoped to
-    # the plate that actually ran, not the whole multi-plate file (#1697).
+    # the plate that actually ran, not the whole multi-plate file (#1697). Shared
+    # with the archive-creation path via the single farm_correlation resolver so
+    # id-matching stays consistent (prefers the dispatch_subtask_id-matched item).
     plate_id: int | None = None
     if db:
-        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.farm_correlation import resolve_active_plate_id
 
-        queue_result = await db.execute(
-            select(PrintQueueItem)
-            .where(PrintQueueItem.printer_id == printer_id)
-            .where(PrintQueueItem.status == "printing")
-        )
-        queue_item = queue_result.scalars().first()
-        if queue_item is not None:
-            plate_id = queue_item.plate_id
+        plate_id = await resolve_active_plate_id(db, printer_id, data.get("subtask_id"))
 
     # Always create session (even without valid remain data) so print_name
     # is available at completion for 3MF-based tracking
@@ -450,14 +524,49 @@ async def on_print_complete(
     results = []
     handled_trays: set[tuple[int, int]] = set()
 
+    # Idempotency guard: a completion can be delivered more than once for the same
+    # run — the reconcile synthesis racing the real MQTT terminal, or a manual
+    # re-finalize — and finalizing twice double-charges the spool. Anchor on the
+    # archive's started_at (reset to now on every reprint, main.py): a usage-history
+    # row created at/after started_at means THIS run already finalized. Reprints
+    # reset started_at, so their older rows fall before it and never block a fresh
+    # finalize. The pop above must still happen so the (now-stale) session is cleared.
+    if archive_id:
+        from sqlalchemy import func
+
+        from backend.app.models.archive import PrintArchive
+
+        started_result = await db.execute(select(PrintArchive.started_at).where(PrintArchive.id == archive_id))
+        started_at = started_result.scalar_one_or_none()
+        if started_at is not None:
+            # started_at is app-written tz-aware UTC; SpoolUsageHistory.created_at is
+            # naive UTC (SQLite server_default). Strip tzinfo — compare on naive UTC.
+            started_naive = started_at.replace(tzinfo=None) if started_at.tzinfo else started_at
+            existing_result = await db.execute(
+                select(func.count())
+                .select_from(SpoolUsageHistory)
+                .where(SpoolUsageHistory.archive_id == archive_id)
+                .where(SpoolUsageHistory.created_at >= started_naive)
+            )
+            existing_count = existing_result.scalar()
+            if isinstance(existing_count, int) and existing_count > 0:
+                logger.info("[UsageTracker] usage already finalized for archive %s — skipping", archive_id)
+                return []
+
     # Fetch default filament cost from settings for fallback
     default_cost_str = await get_setting(db, "default_filament_cost")
     default_filament_cost = float(default_cost_str) if default_cost_str else 0.0
 
-    # Fall back to ams_mapping captured at print start (needed when auto-archive is off
-    # and the caller can't retrieve the mapping from _print_ams_mappings without archive_id)
-    if not ams_mapping and session and session.ams_mapping:
-        ams_mapping = session.ams_mapping
+    # Resolve the printed plate + AMS mapping from the most durable source (live
+    # session → dispatch_subtask_id-matched queue item → archive-linked queue item)
+    # so multi-plate 3MF usage stays plate-scoped even when the session did not
+    # survive to completion (restart mid-print / reconcile synthesis).
+    resolved_plate_id, resolved_ams_mapping = await _resolve_run_context(db, printer_id, data, archive_id, session)
+
+    # Prefer the caller-supplied mapping (MQTT request topic / register); fall back
+    # to the durably-resolved one (which is the session's when a session exists).
+    if not ams_mapping:
+        ams_mapping = resolved_ams_mapping
 
     logger.info(
         "[UsageTracker] on_print_complete: printer=%d, archive=%s, session=%s, ams_mapping=%s",
@@ -510,7 +619,7 @@ async def on_print_complete(
             spool_assignments=session.spool_assignments if session else None,
             print_started_at=session.started_at if session else None,
             threemf_path=threemf_path,
-            plate_id=session.plate_id if session else None,
+            plate_id=resolved_plate_id,
         )
         results.extend(threemf_results)
 
@@ -695,7 +804,7 @@ async def on_print_complete(
     # so the overwrite must reconstruct the whole-print cost.
 
     if archive_id and results:
-        from sqlalchemy import func, select
+        from sqlalchemy import func
 
         from backend.app.models.archive import PrintArchive
         from backend.app.models.print_log import PrintLogEntry
@@ -905,7 +1014,7 @@ async def _track_from_3mf(
     from backend.app.core.config import settings as app_settings
     from backend.app.models.archive import PrintArchive
     from backend.app.models.print_queue import PrintQueueItem
-    from backend.app.utils.threemf_tools import extract_filament_usage_from_3mf
+    from backend.app.utils.threemf_tools import count_plates_in_slice_info, extract_filament_usage_from_3mf
 
     file_path: Path | None = threemf_path
     archive: PrintArchive | None = None
@@ -930,6 +1039,24 @@ async def _track_from_3mf(
     if file_path is None:
         logger.info("[UsageTracker] 3MF: no file available for archive %s, skipping", archive_id)
         return []
+
+    # Unknown printed plate on a multi-plate 3MF: with no plate_id the extractor
+    # sums EVERY plate, charging the whole file to this one run. Skip 3MF tracking
+    # (the remain%-delta fallback in on_print_complete still applies) rather than
+    # over-charge. A single-plate file — or an unreadable one (count 0) — proceeds:
+    # the extractor returns the sole plate.
+    if plate_id is None:
+        plate_count = count_plates_in_slice_info(file_path)
+        if plate_count > 1:
+            logger.warning(
+                "[UsageTracker] 3MF: %s has %d plates but the printed plate is unknown "
+                "(no session, no queue item) on printer %d — skipping 3MF usage to avoid "
+                "charging the whole file",
+                file_path,
+                plate_count,
+                printer_id,
+            )
+            return []
 
     filament_usage = extract_filament_usage_from_3mf(file_path, plate_id)
     if not filament_usage:
@@ -962,7 +1089,7 @@ async def _track_from_3mf(
         queue_result = await db.execute(
             select(PrintQueueItem)
             .where(PrintQueueItem.archive_id == archive_id)
-            .where(PrintQueueItem.status.in_(["printing", "completed", "failed"]))
+            .where(PrintQueueItem.status.in_(_RUN_CONTEXT_STATUSES))
         )
         queue_item = queue_result.scalar_one_or_none()
         if queue_item and queue_item.ams_mapping:

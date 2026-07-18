@@ -14,10 +14,18 @@ import pytest
 
 from backend.app.services.print_scheduler import PrintScheduler
 
-# The direct-mapping helper is now policy-aware. These tests exercise the
-# simple slot_order / no-floor path, which never touches the DB for inventory.
+# The direct-mapping helper is policy-aware AND always builds the slot inventory
+# (so a jammed / spent spool is hard-excluded even under slot_order + floor 0).
+# These tests exercise the override→slot MAPPING, not inventory, so they stub
+# build_slot_inventory to an empty map.
 _SLOT_ORDER = "slot_order"
 _NO_FLOOR = 0
+
+
+def _stub_inventory():
+    """Patch the (now always invoked) inventory lookup to an empty map — these
+    tests assert on mapping output, not inventory facts."""
+    return patch("backend.app.services.print_scheduler.build_slot_inventory", new=AsyncMock(return_value={}))
 
 
 class TestBuildOverrideDirectMapping:
@@ -34,7 +42,10 @@ class TestBuildOverrideDirectMapping:
         return MagicMock(raw_data=raw, ams_filament_backup=None)
 
     async def _direct(self, scheduler, overrides, status):
-        return await scheduler._build_override_direct_mapping(MagicMock(), 5, overrides, status, _SLOT_ORDER, _NO_FLOOR)
+        with _stub_inventory():
+            return await scheduler._build_override_direct_mapping(
+                MagicMock(), 5, overrides, status, _SLOT_ORDER, _NO_FLOOR
+            )
 
     @pytest.mark.asyncio
     async def test_single_force_override_matches_ams_slot(self, scheduler):
@@ -134,10 +145,12 @@ class TestComputeAmsMappingFallback:
         )
 
     def _policy_patches(self, scheduler):
-        """Pin the settings reads to slot_order / no floor (no inventory DB access)."""
+        """Pin the settings reads to slot_order / no floor and stub the (now always
+        built) inventory lookup — these tests assert mapping, not inventory."""
         return (
             patch.object(scheduler, "_get_setting", new=AsyncMock(return_value=_SLOT_ORDER)),
             patch.object(scheduler, "_get_int_setting", new=AsyncMock(return_value=_NO_FLOOR)),
+            _stub_inventory(),
         )
 
     @pytest.mark.asyncio
@@ -150,8 +163,8 @@ class TestComputeAmsMappingFallback:
             filament_overrides_json='[{"slot_id": 1, "type": "PLA", "color": "#CBC6B8", "force_color_match": true}]'
         )
         db = AsyncMock()
-        p1, p2 = self._policy_patches(scheduler)
-        with p1, p2, patch.object(scheduler, "_get_filament_requirements", return_value=None):
+        p1, p2, p3 = self._policy_patches(scheduler)
+        with p1, p2, p3, patch.object(scheduler, "_get_filament_requirements", return_value=None):
             result = await scheduler._compute_ams_mapping_for_printer(db, 5, item)
         assert result.mapping == [0]  # global_tray_id 0 (AMS 0, tray 0)
 
@@ -162,8 +175,8 @@ class TestComputeAmsMappingFallback:
         mock_pm.get_status.return_value = self._make_status()
         item = self._make_item(filament_overrides_json='[{"slot_id": 1, "type": "PLA", "color": "#CBC6B8"}]')
         db = AsyncMock()
-        p1, p2 = self._policy_patches(scheduler)
-        with p1, p2, patch.object(scheduler, "_get_filament_requirements", return_value=None):
+        p1, p2, p3 = self._policy_patches(scheduler)
+        with p1, p2, p3, patch.object(scheduler, "_get_filament_requirements", return_value=None):
             result = await scheduler._compute_ams_mapping_for_printer(db, 5, item)
         assert result.mapping is None
 
@@ -174,8 +187,8 @@ class TestComputeAmsMappingFallback:
         mock_pm.get_status.return_value = self._make_status()
         item = self._make_item(filament_overrides_json=None)
         db = AsyncMock()
-        p1, p2 = self._policy_patches(scheduler)
-        with p1, p2, patch.object(scheduler, "_get_filament_requirements", return_value=None):
+        p1, p2, p3 = self._policy_patches(scheduler)
+        with p1, p2, p3, patch.object(scheduler, "_get_filament_requirements", return_value=None):
             result = await scheduler._compute_ams_mapping_for_printer(db, 5, item)
         assert result.mapping is None
 
@@ -190,8 +203,8 @@ class TestComputeAmsMappingFallback:
         )
         db = AsyncMock()
         filament_reqs = [{"slot_id": 1, "type": "PLA", "color": "#000000", "tray_info_idx": "GFA00"}]
-        p1, p2 = self._policy_patches(scheduler)
-        with p1, p2, patch.object(scheduler, "_get_filament_requirements", return_value=filament_reqs):
+        p1, p2, p3 = self._policy_patches(scheduler)
+        with p1, p2, p3, patch.object(scheduler, "_get_filament_requirements", return_value=filament_reqs):
             result = await scheduler._compute_ams_mapping_for_printer(db, 5, item)
         # After override, slot 1 becomes PLA #CBC6B8 → matches tray 0.
         assert result.mapping == [0]

@@ -841,12 +841,15 @@ class TestSpoolAssignmentSnapshot:
 
         filament_usage = [{"slot_id": 1, "used_g": 14.2, "type": "PLA", "color": "#FF0000"}]
 
-        # db: archive, queue_item(None), live assignment(None), spool,
-        # then cost aggregation queries
+        # db: guard(archive.started_at, usage-count), then archive, queue_item(None),
+        # live assignment(None), spool, then cost aggregation queries.
         # NOTE: No assignment in db — it was deleted by on_ams_change mid-print!
         db = AsyncMock()
         db.execute = AsyncMock(
             side_effect=[
+                # Idempotency guard: started_at load + usage-count (non-int -> no rows).
+                MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),
+                MagicMock(),
                 MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),
                 MagicMock(scalar_one_or_none=MagicMock(return_value=None)),
                 MagicMock(scalar_one_or_none=MagicMock(return_value=None)),

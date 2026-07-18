@@ -35,6 +35,7 @@ from backend.app.services.capability_gate import (
     read_live_nozzles,
 )
 from backend.app.services.eject.geometry import list_geometries
+from backend.app.services.farm_correlation import WAITING_REASON_PLATE_VISION
 from backend.app.services.farm_policy import (
     _sku_code,
     build_first_article_plan,
@@ -216,7 +217,7 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
     escalate = (
         data.escalate_consecutive_failures if data.escalate_consecutive_failures is not None else default_escalate
     )
-    require_fa = data.require_first_article if data.require_first_article is not None else True
+    require_fa = data.require_first_article if data.require_first_article is not None else False
 
     batch = PrintBatch(
         name=run_name,
@@ -303,9 +304,9 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
 # Farm waiting-reason machine codes surfaced as per-printer flags. This is the
 # ONE place the vocabulary is mapped — both the run-detail printer states and the
 # fleet-scoped printer contexts derive from ``_derive_printer_unit_context`` so no
-# parallel mapping (and no new reason codes) can drift in.
+# parallel mapping (and no new reason codes) can drift in. The vision token is
+# imported from its single origin in farm_correlation (no local duplicate).
 _WAIT_STALLED = "printer_offline_stalled"
-_WAIT_VISION = "plate_not_empty_printer_detected"
 
 
 def _derive_printer_unit_context(printer_id: int, items: list[PrintQueueItem]) -> dict:
@@ -402,7 +403,7 @@ def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueIte
             "model_mismatch": printer_manager.is_model_mismatch(p.id),
             "model_mismatch_reason": printer_manager.model_mismatch_reason(p.id),
             "stalled": waiting_reason == _WAIT_STALLED,
-            "vision_hold": waiting_reason == _WAIT_VISION,
+            "vision_hold": waiting_reason == WAITING_REASON_PLATE_VISION,
         }
         disconnected = printer_manager.get_status(p.id) is not None and not connected
         if (

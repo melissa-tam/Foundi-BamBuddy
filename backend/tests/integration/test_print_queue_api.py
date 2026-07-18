@@ -730,6 +730,87 @@ class TestQueueStartEndpoint:
         await db_session.refresh(item)
         assert item.skip_filament_check is False
 
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_start_stored_ack_bypasses_deficit_check(
+        self,
+        async_client: AsyncClient,
+        queue_item_factory,
+        db_session,
+        monkeypatch,
+    ):
+        """An item whose deficit was acknowledged at creation (stored
+        skip_filament_check=True) starts straight through with NO query param —
+        the manual-start ▶ must honor the persisted ack instead of re-asking
+        the same "Print Anyway" question (#1698-followup)."""
+        from backend.app.services import filament_deficit as fd_module
+
+        item = await queue_item_factory(manual_start=True, skip_filament_check=True)
+        called = {}
+
+        async def _fake_deficit(_db, _item):
+            called["deficit"] = True
+            return [
+                fd_module.FilamentDeficit(
+                    slot_id=1,
+                    ams_id=0,
+                    tray_id=0,
+                    filament_type="PLA",
+                    required_grams=270.0,
+                    remaining_grams=200.0,
+                ),
+            ]
+
+        monkeypatch.setattr(
+            "backend.app.api.routes.print_queue.compute_deficit_for_queue_item",
+            _fake_deficit,
+        )
+
+        # No skip_filament_check query param — the stored ack alone must carry it.
+        response = await async_client.post(f"/api/v1/queue/{item.id}/start")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["manual_start"] is False
+        assert body["filament_short"] is False
+        # The live deficit helper is never consulted for an already-acked item.
+        assert called == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_start_stored_ack_bypasses_start_spool_floor(
+        self,
+        async_client: AsyncClient,
+        queue_item_factory,
+        db_session,
+        monkeypatch,
+    ):
+        """Stored ack also skips the below-minimum start-spool floor with no
+        query param — the ▶ confirm is only for un-acked items."""
+        item = await queue_item_factory(manual_start=True, skip_filament_check=True)
+        called = {}
+
+        async def _no_deficit(_db, _item):
+            called["deficit"] = True
+            return []
+
+        async def _blocked(_db, _item):
+            called["start_rule"] = True
+            return [1]
+
+        monkeypatch.setattr(
+            "backend.app.api.routes.print_queue.compute_deficit_for_queue_item",
+            _no_deficit,
+        )
+        monkeypatch.setattr(
+            "backend.app.services.spool_selection.start_rule_blocked_slots",
+            _blocked,
+        )
+
+        response = await async_client.post(f"/api/v1/queue/{item.id}/start")
+        assert response.status_code == 200
+        # Neither filament gate is consulted on the stored-ack path.
+        assert called == {}
+
 
 class TestQueueCancelEndpoint:
     """Tests for the /queue/{item_id}/cancel endpoint."""
