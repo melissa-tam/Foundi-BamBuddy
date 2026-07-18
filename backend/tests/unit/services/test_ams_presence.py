@@ -122,6 +122,49 @@ class TestPresenceTracking:
         assert res.scalar_one_or_none() is not None  # assignment survived the removal
 
 
+class TestOutOfRotationClear:
+    """on_ams_change fires spool_recovery.clear_on_reinsert on a presence GAIN
+    edge (physical re-insert), NOT on the first-push seed, and NOT idle-gated."""
+
+    async def test_gain_edge_invokes_clear(self, db_session, monkeypatch):
+        spy = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", spy)
+        client = MagicMock()
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        # Prime absent (state 9), then physical insert 9→11 → clear fires once.
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
+        spy.assert_not_awaited()
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+        spy.assert_awaited_once()
+        args = spy.await_args.args
+        assert args[0] is db_session and args[1] == 1 and args[2] == 0 and args[3] == 0
+        assert args[4]["state"] == 11  # the live tray payload
+
+    async def test_first_push_seed_does_not_clear(self, db_session, monkeypatch):
+        spy = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", spy)
+        client = MagicMock()
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)]), client=client)
+
+        # A spool present on the very first push is a seed, not a re-insert.
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+        spy.assert_not_awaited()
+
+    async def test_gain_during_print_still_clears(self, db_session, monkeypatch):
+        # NOT idle-gated: a spool untangled and re-seated mid-print clears too,
+        # even though the idle-only RFID re-read stays suppressed during a print.
+        spy = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", spy)
+        client = MagicMock()
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="RUNNING"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain
+        spy.assert_awaited_once()
+        client.ams_refresh_tray.assert_not_called()  # idle re-read still suppressed mid-print
+
+
 class TestTerminalSweep:
     """on_printer_terminal re-reads eligible unidentified slots (incl. auto-minted
     tagless), skips operator-bound + already-identified, once per transition."""
@@ -201,6 +244,10 @@ class TestTerminalSweep:
         await ams_presence.on_printer_terminal(1)  # duplicate terminal callback, same subtask
         assert client.ams_refresh_tray.call_count == 1
 
+        # A whole print cycle (minutes) elapses before the next terminal, so the
+        # prior sweep's identify has long completed and its in-flight echo flag aged
+        # out — Guard 3d skips only a STILL-in-flight identify, not a new sweep.
+        ams_presence._echo_pending.clear()
         status.subtask_id = "t2"  # a NEW print reached terminal
         await ams_presence.on_printer_terminal(1)
         assert client.ams_refresh_tray.call_count == 2
@@ -240,3 +287,258 @@ class TestSpacingWait:
         monkeypatch.setattr(ams_presence.asyncio, "sleep", sleep)
         await ams_presence._spacing_wait(1)
         assert sleep.await_count == 2  # never early-exits; burns the full window
+
+
+class TestEchoConsume:
+    """The one-shot echo-consume flag. A commanded re-read on a PRESENT slot makes
+    the firmware flap the tray state present→9→present (~20 s); that settle-back
+    arrives as a fresh gain — the command's own echo — which on_ams_change would
+    otherwise answer with ANOTHER re-read (a self-sustaining ~22 s loop). The flag
+    lets the NEXT gain be recognized and swallowed exactly once, with NO time gate
+    on genuine physical insertions (empty slots never arm)."""
+
+    async def test_echo_swallowed_exactly_once(self, db_session, monkeypatch):
+        # A present untagged slot's re-read arms the flag; the identify flap's
+        # settle-back gain is swallowed once (no 2nd re-read, no feed-fault clear);
+        # a later genuine flap re-reads again — proving no lingering suppression.
+        clear = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
+
+        # Prime absent, then a genuine insert 9→11 → re-read fires + flag armed.
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+        assert client.ams_refresh_tray.call_count == 1
+        assert clear.await_count == 1
+        assert (1, 0, 0) in ams_presence._echo_pending  # armed on success
+
+        # Identify flap: loss 11→9 then settle-back 9→11 — THIS gain is our echo.
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+        assert client.ams_refresh_tray.call_count == 1  # echo swallowed — no 2nd re-read
+        assert clear.await_count == 1  # feed-fault clear NOT re-run for the echo
+        assert (1, 0, 0) not in ams_presence._echo_pending  # flag consumed
+
+        # A SECOND genuine flap afterwards is acted on normally (no lingering gate).
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+        assert client.ams_refresh_tray.call_count == 2
+        assert clear.await_count == 2
+
+    async def test_empty_slot_never_arms(self, db_session, monkeypatch):
+        # A re-read commanded on an EMPTY (state 9) slot produces no identify flap,
+        # so record_reread must NOT arm — a real insertion made right after a print
+        # ends is then recognized instantly, with no swallow.
+        clear = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        # Directly: an empty slot never arms the flag.
+        ams_presence.record_reread(1, 0, 0)
+        assert ams_presence._echo_pending == {}
+
+        # A real insertion gain moments later fires the re-read immediately.
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # insert
+        client.ams_refresh_tray.assert_called_once_with(0, 0)
+
+    async def test_terminal_sweep_ignition_killed(self, db_session, sessions, monkeypatch):
+        # The loop's ignition: the terminal sweep re-reads a present untagged slot
+        # and arms the flag; the identify flap's echo gain is then swallowed, so the
+        # sweep issues exactly ONE command instead of looping every ~22 s.
+        clear = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
+        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = _pstate([_tray(0, state=11)], gcode_state="FINISH", subtask_id="t1")
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+
+        # Terminal sweep on the present untagged slot → one re-read + flag armed.
+        await ams_presence.on_printer_terminal(1)
+        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        assert (1, 0, 0) in ams_presence._echo_pending
+
+        # The identify flap's settle-back gain is the sweep command's echo.
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # echo gain
+        client.ams_refresh_tray.assert_called_once_with(0, 0)  # still ONE — echo swallowed, loop dead
+        assert (1, 0, 0) not in ams_presence._echo_pending
+
+    async def test_valid_tag_gain_skips_reread_but_clears(self, db_session, monkeypatch):
+        # A genuine gain on a tray that already carries a valid tag needs no re-read
+        # (re-reading would only re-flap it), but the feed-fault clear still runs.
+        clear = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
+        await ams_presence.on_ams_change(
+            1, [{"id": 0, "tray": [_tray(0, state=11, tag=_VALID_TAG)]}], db_session
+        )  # genuine gain, already identified
+        client.ams_refresh_tray.assert_not_called()  # no re-read for an identified tray
+        clear.assert_awaited_once()  # feed-fault clear still runs
+        assert ams_presence._echo_pending == {}  # nothing to arm (no command issued)
+
+    async def test_refused_command_arms_nothing(self, db_session, monkeypatch):
+        # A refused re-read (client returns (False, ...) when filament is loaded)
+        # starts no identify cycle → no echo → the flag must NOT arm, and a following
+        # gain still fires a fresh re-read attempt.
+        clear = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (False, "Please unload filament first")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain (refused)
+        assert client.ams_refresh_tray.call_count == 1
+        assert ams_presence._echo_pending == {}  # refused → nothing armed
+
+        # A following gain still attempts a re-read (no phantom suppression).
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain
+        assert client.ams_refresh_tray.call_count == 2
+
+    async def test_stale_flag_treated_genuine(self, db_session, monkeypatch):
+        # A flag whose identify cycle never ran (command lost to a race) is GC'd:
+        # once older than _ECHO_PENDING_STALE_S it reads as no-flag, so the gain is
+        # treated genuine — re-read fires and the feed-fault clear runs. The flag is
+        # arm-aged directly (real monotonic, minus the bound) rather than freezing
+        # the process-wide time.monotonic, which is the async event loop's clock.
+        clear = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
+
+        # Arm the flag with a timestamp already older than the staleness bound.
+        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic() - ams_presence._ECHO_PENDING_STALE_S - 1
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # stale gain
+
+        client.ams_refresh_tray.assert_called_once_with(0, 0)  # stale flag → genuine → re-read fires
+        clear.assert_awaited_once()  # and the feed-fault clear runs
+
+
+class TestIdentifyInFlight:
+    """identify_in_flight: read-only 'is a commanded identify (or an active unit
+    identify) still running on this slot?' — the single signal Guards 3d and 4
+    share to keep at most one identify per slot in flight."""
+
+    def test_unit_busy_any_tray_is_true(self, monkeypatch):
+        # ams_status_main == 2 (the unit is actively identifying) → True for the slot.
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=2))
+        assert ams_presence.identify_in_flight(1, 0, 0) is True
+
+    def test_fresh_flag_is_true(self, monkeypatch):
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
+        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic()
+        assert ams_presence.identify_in_flight(1, 0, 0) is True
+
+    def test_stale_flag_is_false(self, monkeypatch):
+        # A flag older than _IDENTIFY_ACTIVE_S no longer implies an in-flight identify.
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
+        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic() - ams_presence._IDENTIFY_ACTIVE_S - 1
+        assert ams_presence.identify_in_flight(1, 0, 0) is False
+
+    def test_neither_is_false(self, monkeypatch):
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
+        assert ams_presence.identify_in_flight(1, 0, 0) is False
+
+    def test_no_status_is_false(self, monkeypatch):
+        # get_status None (printer gone) → getattr default 0 → not busy, no flag → False.
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: None)
+        assert ams_presence.identify_in_flight(1, 0, 0) is False
+
+
+class TestTerminalSweepIdentifySkip:
+    """Guard 3d: the terminal sweep skips a slot whose identify is already in
+    flight (fresh _echo_pending) so a concurrent idle-gain re-read is never
+    doubled, but still sweeps a slot whose flag has gone stale."""
+
+    async def test_skips_fresh_flag_sweeps_stale(self, db_session, sessions, monkeypatch):
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
+        status = SimpleNamespace(
+            state="FINISH",
+            subtask_id="t1",
+            ams_status_main=0,
+            raw_data={"ams": [{"id": 0, "tray": [_tray(0, state=11), _tray(1, state=11)]}]},
+        )
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+
+        now = ams_presence.time.monotonic()
+        ams_presence._echo_pending[(1, 0, 0)] = now  # fresh → T0 skipped
+        ams_presence._echo_pending[(1, 0, 1)] = now - ams_presence._IDENTIFY_ACTIVE_S - 1  # stale → T1 swept
+
+        await ams_presence.on_printer_terminal(1)
+        assert [c.args for c in client.ams_refresh_tray.call_args_list] == [(0, 1)]  # only the stale slot
+
+
+class TestIdentifyCollisionRegression:
+    """Incident regression: an idle-gain re-read, the terminal sweep, and the
+    tagless config used to hit one slot within seconds; the second identify / the
+    filament-setting write failed the firmware's in-flight read (HMS
+    0700_2x00_0001_0081). Now exactly one identify is issued and the tagless path
+    defers while it is in flight — no filament-setting write in the window."""
+
+    async def test_gain_reread_then_sweep_and_config_do_not_collide(self, db_session, sessions, monkeypatch):
+        from sqlalchemy import func, select
+
+        from backend.app.models.spool import Spool
+        from backend.app.services import spool_tagless
+
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
+        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
+
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        present = _pstate([_tray(0, state=11)], gcode_state="IDLE", ams_status_main=0)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: present)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+
+        # (1) Idle gain 9→11 → exactly ONE identify command; the in-flight flag arms.
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain → re-read
+        assert client.ams_refresh_tray.call_count == 1  # identify #1
+        assert (1, 0, 0) in ams_presence._echo_pending
+
+        # (2) Terminal sweep on the SAME slot must SKIP it — no second identify.
+        finish = SimpleNamespace(
+            state="FINISH",
+            subtask_id="task-9",
+            ams_status_main=0,
+            raw_data={"ams": [{"id": 0, "tray": [_tray(0, state=11)]}]},
+        )
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: finish)
+        await ams_presence.on_printer_terminal(1)
+        assert client.ams_refresh_tray.call_count == 1  # sweep skipped — still ONE identify total
+
+        # (3) Tagless config on the SAME slot must DEFER — nothing minted, no write.
+        tray = {
+            "id": 0,
+            "state": 11,
+            "tray_type": "PETG",
+            "tray_sub_brands": "PETG HF",
+            "tray_color": "112233FF",
+            "tray_info_idx": "",
+            "tray_weight": "0",
+            "tag_uid": "0" * 16,
+            "tray_uuid": "0" * 32,
+            "remain": 40,
+        }
+        handled = await spool_tagless.handle_tagless_slot(db_session, 1, 0, 0, tray, None, [])
+        assert handled is True  # deferred → caller `continue`s (no respool-gate fall-through)
+        minted = await db_session.scalar(select(func.count(Spool.id)))
+        assert minted == 0  # zero mints / filament-setting writes during the in-flight window

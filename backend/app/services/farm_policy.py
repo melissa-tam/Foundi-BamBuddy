@@ -290,6 +290,25 @@ async def on_terminal(
                             failure_count=1,
                         )
                     return
+                if pending.purpose == "manual":
+                    # Foreign-plate manual eject (operator "Eject now" on a plate the
+                    # farm did not dispatch). It owns no queue item / run, so there is
+                    # nothing to retry, quarantine, or pause — completed clears the
+                    # gate exactly like production; any other terminal keeps the gate
+                    # raised (fail-closed) and only WARNs.
+                    if final_status == "completed":
+                        printer_manager.set_awaiting_plate_clear(printer_id, False)
+                        logger.info(
+                            "farm_policy: manual eject on printer %s completed — plate-clear gate released", printer_id
+                        )
+                    else:
+                        logger.warning(
+                            "farm_policy: manual eject on printer %s ended '%s' — sweep unverified, "
+                            "plate kept gated (no quarantine)",
+                            printer_id,
+                            final_status,
+                        )
+                    return
                 # production eject
                 if final_status == "completed":
                     printer_manager.set_awaiting_plate_clear(printer_id, False)

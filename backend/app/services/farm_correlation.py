@@ -70,6 +70,11 @@ logger = logging.getLogger(__name__)
 
 Verdict = Literal["matched", "matched_by_name", "fallback", "foreign", "none"]
 
+# waiting_reason token for the native vision plate-occupancy hold. Single origin:
+# imported by farm_stall (skip set) and production_run (printer-state flag) so the
+# machine code has exactly one home and cannot drift.
+WAITING_REASON_PLATE_VISION = "plate_not_empty_printer_detected"
+
 # Verdicts where the finish IS the dispatched unit — the caller updates that item's
 # terminal status and runs farm_policy attribution for it. ``fallback`` is included
 # (best-effort attribution of the sole printing item) but is deliberately NOT in
@@ -215,6 +220,45 @@ async def resolve_terminal_item(db: AsyncSession, printer_id: int, payload: dict
     return TerminalResolution(None, "none")
 
 
+async def resolve_active_plate_id(db: AsyncSession, printer_id: int, subtask_id: str | None) -> int | None:
+    """Return the ``plate_id`` of the queue item currently printing on ``printer_id``.
+
+    Used at print-start / archive-creation to scope the 3MF parse to the plate that
+    actually ran (#1697): a multi-plate ``.gcode.3mf`` carries every plate's
+    prediction + weight, so without the printed plate's index the archive would
+    store the summed-across-plates totals for a single-plate print.
+
+    Resolution mirrors :func:`resolve_terminal_item`'s identity discipline: when the
+    printer echoes a ``subtask_id`` equal to a printing item's stamped
+    ``dispatch_subtask_id`` that item wins (the id Bambuddy minted for this exact
+    dispatch). Otherwise the sole ``printing`` item on the printer is the best
+    attribution. Returns that item's ``plate_id`` — which may itself be ``None`` for
+    a non-plate-scoped (single-plate / non-farm) print — or ``None`` when nothing is
+    printing or the printer runs more than one un-id-matched job.
+    """
+    result = await db.execute(
+        select(PrintQueueItem)
+        .where(PrintQueueItem.printer_id == printer_id)
+        .where(PrintQueueItem.status == "printing")
+        .order_by(PrintQueueItem.started_at.desc())
+    )
+    candidates = list(result.scalars().all())
+    if not candidates:
+        return None
+
+    subtask = (subtask_id or "").strip() or None
+    if subtask:
+        for item in candidates:
+            if item.dispatch_subtask_id and item.dispatch_subtask_id == subtask:
+                return item.plate_id
+
+    # No id match: the sole printing unit is the best attribution. More than one
+    # un-id-matched printing item is genuinely ambiguous — attribute nothing.
+    if len(candidates) == 1:
+        return candidates[0].plate_id
+    return None
+
+
 def classify_stop(payload: dict, printer_id: int, user_stopped_printer_ids: set[int]) -> str | None:
     """Classify a terminal payload as an OPERATOR stop, or ``None`` (Phase 3.1).
 
@@ -295,7 +339,7 @@ async def on_native_plate_detection(db: AsyncSession, printer_id: int, short_cod
 
     # (a) human-clear-only gate, (b) flag the unit.
     printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=None)
-    item.waiting_reason = "plate_not_empty_printer_detected"
+    item.waiting_reason = WAITING_REASON_PLATE_VISION
     await db.commit()
 
     # (c) source-disambiguated notification.

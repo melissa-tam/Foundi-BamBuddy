@@ -1153,6 +1153,71 @@ class TestOnTerminalEjectHandling:
         finally:
             remote.pop_pending_eject(printer.id)
 
+    async def test_manual_completed_clears_gate(self, db_session):
+        # A foreign-plate manual eject owns no run/queue item: completed clears the
+        # gate exactly like production, matched by the printer-keyed stem.
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "MANok")
+        remote.register_pending_eject(printer.id, remote.PendingEject("manual", None, None))
+        cleared = []
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client(None)),
+                patch.object(
+                    farm_policy.printer_manager,
+                    "set_awaiting_plate_clear",
+                    side_effect=lambda pid, v, **kw: cleared.append((pid, v)),
+                ),
+            ):
+                await farm_policy.on_terminal(
+                    db_session,
+                    printer.id,
+                    None,
+                    "completed",
+                    completed_subtask_id=None,
+                    completed_subtask_name=f"eject_manual_p{printer.id}",
+                )
+            assert remote.peek_pending_eject(printer.id) is None  # popped
+            assert cleared == [(printer.id, False)]  # gate released
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+    async def test_manual_failed_keeps_gate_no_quarantine(self, db_session):
+        # A manual eject that ends non-completed keeps the gate raised (fail-closed)
+        # and — unlike production/FA — NEVER quarantines (it owns no run to protect).
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "MANfail")
+        remote.register_pending_eject(printer.id, remote.PendingEject("manual", None, None))
+        cleared = []
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client(None)),
+                patch.object(
+                    farm_policy.printer_manager,
+                    "set_awaiting_plate_clear",
+                    side_effect=lambda pid, v, **kw: cleared.append((pid, v)),
+                ),
+                patch.object(farm_policy.printer_manager, "set_quarantined") as set_q,
+                patch.object(farm_policy.notification_service, "on_printer_quarantined", new_callable=AsyncMock),
+            ):
+                await farm_policy.on_terminal(
+                    db_session,
+                    printer.id,
+                    None,
+                    "failed",
+                    completed_subtask_id=None,
+                    completed_subtask_name=f"eject_manual_p{printer.id}",
+                )
+            assert remote.peek_pending_eject(printer.id) is None  # job ended → popped
+            assert cleared == []  # gate KEPT — sweep unverified
+            set_q.assert_not_called()  # NO quarantine
+            await db_session.refresh(printer)
+            assert printer.quarantined is False
+        finally:
+            remote.pop_pending_eject(printer.id)
+
     async def test_echo_mismatch_keeps_pending(self, db_session):
         from backend.app.services.eject import remote
 

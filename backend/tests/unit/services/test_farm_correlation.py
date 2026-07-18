@@ -16,6 +16,7 @@ from backend.app.services.farm_correlation import (
     classify_stop,
     farm_work_targets_printer,
     on_native_plate_detection,
+    resolve_active_plate_id,
     resolve_terminal_item,
 )
 from backend.app.services.printer_manager import printer_manager
@@ -29,6 +30,7 @@ async def _add_item(
     dispatch_subtask_id=None,
     library_file_id=None,
     batch_id=None,
+    plate_id=None,
 ):
     item = PrintQueueItem(
         printer_id=printer_id,
@@ -37,6 +39,7 @@ async def _add_item(
         dispatch_subtask_id=dispatch_subtask_id,
         library_file_id=library_file_id,
         batch_id=batch_id,
+        plate_id=plate_id,
         started_at=datetime.now(timezone.utc),
     )
     db.add(item)
@@ -165,6 +168,46 @@ class TestFarmWorkTargetsPrinter:
         batch = await _add_farm_batch(db_session)
         await _add_item(db_session, printer_id=5, status="completed", batch_id=batch.id)
         assert await farm_work_targets_printer(db_session, 5) is False
+
+
+class TestResolveActivePlateId:
+    """The print-start / archive-creation plate-id resolver (#1697)."""
+
+    async def test_subtask_match_returns_its_plate_id(self, db_session):
+        # Two printing items; the one whose dispatch_subtask_id matches wins,
+        # even though the other started more recently.
+        await _add_item(db_session, printer_id=1, dispatch_subtask_id="OTHER", plate_id=7)
+        await _add_item(db_session, printer_id=1, dispatch_subtask_id="SUB-1", plate_id=2)
+        assert await resolve_active_plate_id(db_session, 1, "SUB-1") == 2
+
+    async def test_sole_printing_item_when_no_subtask(self, db_session):
+        await _add_item(db_session, printer_id=1, dispatch_subtask_id=None, plate_id=3)
+        assert await resolve_active_plate_id(db_session, 1, None) == 3
+
+    async def test_sole_printing_item_when_subtask_matches_nothing(self, db_session):
+        # An echoed id that matches no item still resolves to the sole printing
+        # unit — plate scoping is best-effort, not identity-gated like terminals.
+        await _add_item(db_session, printer_id=1, dispatch_subtask_id="SUB-1", plate_id=4)
+        assert await resolve_active_plate_id(db_session, 1, "NOPE") == 4
+
+    async def test_no_match_multiple_candidates_returns_none(self, db_session):
+        # Two un-id-matched printing items → genuinely ambiguous → None.
+        await _add_item(db_session, printer_id=1, dispatch_subtask_id="A", plate_id=1)
+        await _add_item(db_session, printer_id=1, dispatch_subtask_id="B", plate_id=2)
+        assert await resolve_active_plate_id(db_session, 1, "ZZZ") is None
+
+    async def test_nothing_printing_returns_none(self, db_session):
+        await _add_item(db_session, printer_id=1, status="completed", plate_id=5)
+        assert await resolve_active_plate_id(db_session, 1, None) is None
+
+    async def test_null_plate_id_passes_through(self, db_session):
+        # A matched item whose plate_id is None (single-plate / non-farm) returns None.
+        await _add_item(db_session, printer_id=1, dispatch_subtask_id="SUB-1", plate_id=None)
+        assert await resolve_active_plate_id(db_session, 1, "SUB-1") is None
+
+    async def test_only_considers_target_printer(self, db_session):
+        await _add_item(db_session, printer_id=2, dispatch_subtask_id="SUB-1", plate_id=9)
+        assert await resolve_active_plate_id(db_session, 1, "SUB-1") is None
 
 
 class TestClassifyStop:

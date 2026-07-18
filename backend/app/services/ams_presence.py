@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from backend.app.services.bambu_mqtt import AMS_STATUS_IDENTIFYING
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_tag_matcher import is_valid_tag
 
@@ -50,9 +52,13 @@ logger = logging.getLogger(__name__)
 # read takes a few seconds and the AMS can only identify one slot at a time.
 _RFID_REREAD_SPACING_S = 5
 
-# ``ams_status_main == 2`` means the AMS is actively identifying a tag (used to
-# early-skip the inter-read spacing wait once a read has completed).
-_AMS_STATUS_IDENTIFYING = 2
+# An identify cycle runs ≤~25 s, so an ``_echo_pending`` flag fresher than this
+# means the commanded identify is (or may still be) in flight — used by
+# :func:`identify_in_flight` and the terminal sweep's command-time skip to keep at
+# most one identify per slot running. This is DELIBERATELY tighter than
+# ``_ECHO_PENDING_STALE_S`` (120): that value is only a GC bound for a command lost
+# to a race, not a statement that an identify is still active.
+_IDENTIFY_ACTIVE_S = 30
 
 # --- Module-level edge state (matches the fork's other event-edge bookkeeping,
 #     e.g. farm_staging._tray_signatures). Lost on restart; startup priming and
@@ -69,12 +75,31 @@ _primed: set[int] = set()
 # on_print_complete callbacks for the same print (one-shot per RUNNING→terminal).
 _swept_subtasks: dict[int, str] = {}
 
+# (printer_id, ams_id, tray_id) -> time.monotonic() at which a re-read command was
+# issued on a PRESENT slot. A commanded re-read (ams_get_rfid) on an occupied slot
+# makes the firmware run a ~20 s identify cycle during which the tray state flaps
+# present→9→present; the settle-back is a fresh absent→present GAIN edge that
+# on_ams_change would answer with ANOTHER re-read — a self-sustaining ~22 s loop.
+# This one-shot flag lets the NEXT gain on the slot be recognized as our own
+# command's echo and swallowed exactly once. It is NOT a time-suppression window:
+# empty slots never arm (see record_reread), so a real insertion made right after
+# a print ends is never eaten; only the identify echo is.
+_echo_pending: dict[tuple[int, int, int], float] = {}
+
+# GC bound only: a flag whose identify cycle never ran (command lost to a race,
+# e.g. a print started right after publish) is discarded after this many seconds
+# and its gain treated as genuine. Suppresses nothing by itself — an expired flag
+# reads as no flag. A code constant, not operator-tunable (it is a GC bound, not
+# behavior an operator would ever set), like _RFID_REREAD_SPACING_S above.
+_ECHO_PENDING_STALE_S = 120
+
 
 def _reset_state() -> None:
     """Test hook: clear all module-level edge state between cases."""
     _last_presence.clear()
     _primed.clear()
     _swept_subtasks.clear()
+    _echo_pending.clear()
 
 
 # --- Tray / state predicates ----------------------------------------------
@@ -106,6 +131,58 @@ def _iter_ams_units(state) -> list:
     if isinstance(ams, dict):
         ams = ams.get("ams", [])
     return ams if isinstance(ams, list) else []
+
+
+# --- Echo-consume flag -----------------------------------------------------
+
+
+def record_reread(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Arm the one-shot echo-consume flag for a commanded RFID re-read.
+
+    Call this immediately after a re-read command (``ams_get_rfid``) is accepted
+    by the client. It arms ``_echo_pending`` for the slot ONLY when the slot is
+    present (state 10/11) at command time, so the next presence GAIN on that slot
+    — the settle-back of the firmware's ~20 s identify flap — is recognized as our
+    own command's echo and swallowed exactly once (see :func:`on_ams_change`).
+
+    An identify on an EMPTY (state 9/absent) slot produces NO edge at all, so an
+    empty slot is deliberately NOT armed: arming it would eat a real insertion
+    made right after a print ends — the exact operator flow this design protects.
+    All three commanders (idle gain re-read, terminal sweep, manual refresh) route
+    through here so the present-at-command-time guard lives in one place.
+    """
+    state = printer_manager.get_status(printer_id)
+    for ams_unit in _iter_ams_units(state):
+        if not isinstance(ams_unit, dict):
+            continue
+        try:
+            unit_id = int(ams_unit.get("id", 0))
+        except (TypeError, ValueError):
+            continue
+        if unit_id != ams_id:
+            continue
+        for tray in ams_unit.get("tray", []) or []:
+            if not isinstance(tray, dict):
+                continue
+            try:
+                tid = int(tray.get("id", 0))
+            except (TypeError, ValueError):
+                continue
+            if tid != tray_id:
+                continue
+            if _tray_present(tray):
+                _echo_pending[(printer_id, ams_id, tray_id)] = time.monotonic()
+            return  # matched the slot (armed or not) — nothing further to scan
+
+
+def identify_in_flight(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """True while a commanded identify may still be running on this slot, or the
+    AMS unit is actively identifying any tray. Read-only (never pops the flag)."""
+    state = printer_manager.get_status(printer_id)
+    if getattr(state, "ams_status_main", 0) == AMS_STATUS_IDENTIFYING:
+        return True
+    ts = _echo_pending.get((printer_id, ams_id, tray_id))
+    return ts is not None and time.monotonic() - ts < _IDENTIFY_ACTIVE_S
 
 
 # --- Assignment context ----------------------------------------------------
@@ -208,15 +285,60 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                     # a refill done while down doesn't read as a fresh gain.
                     continue
 
-                # Steady state: act only on a presence GAIN, and only while the
-                # printer is idle. Firing ams_get_rfid during a print is unsafe;
+                if present and not prev:
+                    # Echo-consume FIRST: a re-read we commanded on this present
+                    # slot flaps the firmware's tray state present→9→present
+                    # (~20 s); the settle-back arrives here as a fresh gain. If a
+                    # flag is armed for the slot, THIS gain is our command's own
+                    # echo — pop it and swallow the whole edge (no re-read AND no
+                    # feed-fault clear; the spool never physically moved). Popped
+                    # regardless of ``running`` — an echo can land as a print
+                    # starts. A stale flag (identify never ran) reads as no flag →
+                    # the gain acts normally.
+                    ts = _echo_pending.pop(key, None)
+                    if ts is not None and time.monotonic() - ts < _ECHO_PENDING_STALE_S:
+                        logger.debug(
+                            "AMS presence: swallowed re-read echo for printer %d AMS%d-T%d",
+                            printer_id,
+                            ams_id,
+                            tray_id,
+                        )
+                        continue
+
+                    # Genuine physical re-insert: clear any feed-fault out-of-
+                    # rotation flag. NOT idle-gated (a spool untangled and re-
+                    # seated mid-print clears too) and NOT on the first-push seed.
+                    # Best-effort — a failure must never break the AMS callback.
+                    try:
+                        from backend.app.services.spool_recovery import clear_on_reinsert
+
+                        await clear_on_reinsert(db, printer_id, ams_id, tray_id, tray)
+                    except Exception:  # noqa: BLE001 — best-effort clear
+                        logger.exception(
+                            "AMS presence: feed-fault clear failed for printer %d AMS%d-T%d",
+                            printer_id,
+                            ams_id,
+                            tray_id,
+                        )
+
+                # Steady state: act only on a genuine presence GAIN, and only while
+                # the printer is idle. Firing ams_get_rfid during a print is unsafe;
                 # the terminal sweep handles mid-print refills. A LOSS only updates
                 # the map above (NO auto-unassign).
                 if present and not prev and not running:
+                    # An already-identified tray needs no re-read (re-reading would
+                    # only re-flap it); the feed-fault clear above still ran.
+                    if is_valid_tag(tray.get("tag_uid", "") or "", tray.get("tray_uuid", "") or ""):
+                        continue
                     client = printer_manager.get_client(printer_id)
                     if client is not None:
                         try:
-                            client.ams_refresh_tray(ams_id, tray_id)
+                            ok, _msg = client.ams_refresh_tray(ams_id, tray_id)
+                            # Arm the echo flag ONLY on success: a refused command
+                            # (filament loaded) runs no identify cycle → no echo →
+                            # must not arm.
+                            if ok:
+                                record_reread(printer_id, ams_id, tray_id)
                         except Exception:  # noqa: BLE001 — best-effort re-read
                             logger.exception(
                                 "AMS presence: immediate re-read failed for printer %d AMS%d-T%d",
@@ -296,8 +418,29 @@ async def on_printer_terminal(printer_id: int) -> None:
 
         logger.info("[Printer %s] terminal RFID re-read sweep: %d unidentified slot(s)", printer_id, len(eligible))
         for idx, (ams_id, tray_id) in enumerate(eligible):
+            # Skip a slot whose identify is already in flight — a concurrent idle
+            # gain re-read on THIS slot armed the echo flag, and commanding a second
+            # ams_get_rfid now is the witnessed gain-vs-sweep double command that
+            # fails the read. Checked at COMMAND time, not during eligibility
+            # collection, so a gain that arms the flag mid-sweep is still caught.
+            ts = _echo_pending.get((printer_id, ams_id, tray_id))
+            if ts is not None and time.monotonic() - ts < _IDENTIFY_ACTIVE_S:
+                logger.debug(
+                    "[Printer %s] terminal RFID re-read: skipping AMS%d slot%d — identify already in flight",
+                    printer_id,
+                    ams_id,
+                    tray_id,
+                )
+                continue
             try:
-                client.ams_refresh_tray(ams_id, tray_id)
+                ok, _msg = client.ams_refresh_tray(ams_id, tray_id)
+                # Arm the echo flag ONLY on success: the identify cycle this
+                # command starts flaps the tray present→9→present, and that
+                # settle-back gain must be swallowed, not answered with another
+                # re-read (the loop this fix kills). A refused command (filament
+                # loaded) starts no identify → no echo → nothing to arm.
+                if ok:
+                    record_reread(printer_id, ams_id, tray_id)
                 logger.info("[Printer %s] terminal RFID re-read: AMS%d slot%d", printer_id, ams_id, tray_id)
             except Exception:  # noqa: BLE001 — one failed read must not stop the sweep
                 logger.exception("[Printer %s] terminal RFID re-read failed: AMS%d slot%d", printer_id, ams_id, tray_id)
@@ -322,7 +465,7 @@ async def _spacing_wait(printer_id: int) -> None:
         elapsed += step
         state = printer_manager.get_status(printer_id)
         main = getattr(state, "ams_status_main", 0) if state is not None else 0
-        if main == _AMS_STATUS_IDENTIFYING:
+        if main == AMS_STATUS_IDENTIFYING:
             saw_identifying = True
         elif saw_identifying:
             break
