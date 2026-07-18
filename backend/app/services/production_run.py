@@ -14,6 +14,7 @@ import json
 import logging
 import math
 from collections import Counter
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -582,6 +583,20 @@ async def build_farm_printer_contexts(db: AsyncSession) -> list[dict]:
     return contexts
 
 
+def planned_plate_count(quantity: int | None, items: Iterable[PrintQueueItem]) -> int:
+    """Planned plate count for a run — the ``plates_total`` figure the run-detail
+    API reports.
+
+    SINGLE SOURCE OF TRUTH for "planned" (reused by ``build_run_response`` and by
+    ``farm_policy._maybe_complete_run``). ``quantity`` is the plan the run was
+    created with; a run whose primary plates (``retry_count`` 0, retries don't
+    consume a plan slot) outran the plan — e.g. plates added after creation —
+    counts those instead. Never counts retries toward the plan.
+    """
+    non_retry_created = sum(1 for it in items if (it.retry_count or 0) == 0)
+    return max(quantity or 0, non_retry_created)
+
+
 async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool = False) -> dict:
     """Derive the RunResponse payload for a loaded run (queue_items eager-loaded).
 
@@ -603,7 +618,7 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
     # planned plate count; ``non_retry_created`` is the primary plates already
     # materialised (retries don't consume a plan slot).
     non_retry_created = sum(1 for it in items if (it.retry_count or 0) == 0)
-    planned_plates = max(run.quantity or 0, non_retry_created)
+    planned_plates = planned_plate_count(run.quantity, items)
     uncreated = max(0, planned_plates - non_retry_created)
     plates_total = planned_plates
     plates_completed = counts.get("completed", 0)

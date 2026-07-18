@@ -61,7 +61,9 @@ class _ActiveWatch:
     dispatch race)."""
 
     threshold_c: float | None
-    queue_item_id: int
+    # None for the auto FOREIGN-plate eject watch (purpose="foreign"): it releases
+    # against a directly-passed threshold + eject profile, not a queue item.
+    queue_item_id: int | None
     purpose: str
     release_now: asyncio.Event
 
@@ -418,8 +420,12 @@ async def watch_gate_escalation_only(
     held by an unknown job and only a human clearing it (which NULLs the gate) may
     resume dispatch. Same poll cadence and escalation constant as the cooldown
     watch; fires ONE plate-not-empty notification at ``escalate_s`` then keeps
-    polling. Exits ``"cleared"`` when the gate is cleared externally (operator) or
-    ``"stale"`` when the printer disconnects/goes stale. ``manager``, ``sleep`` and
+    polling. Exits ``"cleared"`` when the gate is cleared externally (operator).
+
+    A disconnected/stale tick does NOT end the watch — its lifetime is the gated
+    PHASE, not connectivity (mirroring ``watch_bed_and_clear``'s unreadable-bed
+    tolerance). A printer that drops off mid-hold and comes back must still find its
+    stranded plate escalating, not silently un-watched. ``manager``, ``sleep`` and
     ``notify`` are injectable for testing.
     """
     if notify is None:
@@ -437,11 +443,6 @@ async def watch_gate_escalation_only(
                 "Eject monitor: printer %s foreign-gate cleared externally — escalation watch exiting", printer_id
             )
             return "cleared"
-
-        state = manager.get_status(printer_id)
-        if not state or not getattr(state, "connected", False):
-            logger.info("Eject monitor: printer %s stale/offline during foreign-gate watch — aborting", printer_id)
-            return "stale"
 
         if not escalated and elapsed >= escalate_s:
             escalated = True
@@ -625,12 +626,14 @@ async def _dispatch_fa_eject(*, printer_id: int, queue_item_id: int, run_id: int
         )
 
 
-async def _act_on_cooldown_stall(reason: str, *, printer_id: int, queue_item_id: int) -> None:
+async def _act_on_cooldown_stall(reason: str, *, printer_id: int, queue_item_id: int | None) -> None:
     """``on_stall`` action: quarantine the printer + pause the unit's run.
 
     Mirrors the farm_policy failure pairing (quarantine + ``_maybe_pause_run_no_printers``).
     Opens its own session; NEVER mutates the queue item and NEVER touches the plate
-    gate — a plateaued bed's part is still on the plate for a human to clear."""
+    gate — a plateaued bed's part is still on the plate for a human to clear.
+    ``queue_item_id`` is None for the auto foreign-plate watch (no queue unit) — the
+    printer is still quarantined, there is simply no run to pause."""
     from backend.app.core.database import async_session
     from backend.app.models.print_batch import PrintBatch
     from backend.app.models.print_queue import PrintQueueItem
@@ -638,7 +641,7 @@ async def _act_on_cooldown_stall(reason: str, *, printer_id: int, queue_item_id:
 
     async with async_session() as db:
         await farm_policy.quarantine_printer(db, printer_id, reason=f"Cooldown stalled: {reason}", failure_count=1)
-        item = await db.get(PrintQueueItem, queue_item_id)
+        item = await db.get(PrintQueueItem, queue_item_id) if queue_item_id is not None else None
         if item is not None and item.batch_id is not None:
             batch = await db.get(PrintBatch, item.batch_id)
             if batch is not None:
@@ -865,12 +868,16 @@ class EjectCooldownMonitor:
         """Re-arm cooldown watches lost to a restart. Returns the count re-armed.
 
         For every printer whose persisted ``awaiting_plate_clear`` gate is set,
-        re-spawn the watch iff the most-recently-started job was a successful eject
-        job (see :func:`should_rearm`) AND that item's ``dispatch_subtask_id``
+        re-spawn the COOLDOWN watch iff the most-recently-started job was a successful
+        eject job (see :func:`should_rearm`) AND that item's ``dispatch_subtask_id``
         matches the printer's persisted ``plate_gate_subtask_id`` (both non-null).
         A gate whose source we cannot positively tie to the eject job — a foreign
-        deposit, or a pre-migration NULL-source gate — never auto-clears on restart;
-        it is left set for a human."""
+        deposit, or a pre-migration NULL-source gate — never auto-clears on restart.
+        But it must NOT be left watch-less: a stranded gate with no watch escalates
+        NOTHING and silently stalls the farm (the exact failure this closes). So every
+        such gate instead arms the ESCALATION-ONLY hold — it never auto-clears, but it
+        escalates + notifies until a human clears the plate. The return count is the
+        number of COOLDOWN watches re-armed (escalation-only holds are not counted)."""
         from backend.app.core.database import async_session
         from backend.app.models.printer import Printer
         from backend.app.services.eject import remote as eject_remote
@@ -893,21 +900,30 @@ class EjectCooldownMonitor:
                     )
                     continue
                 item = await _latest_started_item(db, printer_id)
-                if item is None or not should_rearm(
-                    True, item.status, item.eject_profile_id, getattr(item, "first_article", False)
-                ):
+                cooldown_rearmable = (
+                    item is not None
+                    and should_rearm(True, item.status, item.eject_profile_id, getattr(item, "first_article", False))
+                    and bool(gate_subtask_id)
+                    and item.dispatch_subtask_id == gate_subtask_id
+                )
+                if cooldown_rearmable:
+                    if self._start_watch(printer_id, item.id):
+                        rearmed += 1
                     continue
-                if not gate_subtask_id or item.dispatch_subtask_id != gate_subtask_id:
-                    logger.info(
-                        "Eject monitor: printer %s gate NOT re-armed — source subtask %r != last dispatch %r "
-                        "(left gated for manual clear)",
-                        printer_id,
-                        gate_subtask_id,
-                        item.dispatch_subtask_id,
-                    )
-                    continue
-                if self._start_watch(printer_id, item.id):
-                    rearmed += 1
+                # Not positively tie-able to the eject job (item None / not a completed
+                # eject / gate-subtask mismatch): NEVER auto-clear — but the gate must
+                # not sit watch-less and silently stall the farm. Arm the escalation-
+                # only hold (deduped against any watch already in flight) so a stranded
+                # plate still escalates + notifies until a human clears it.
+                logger.info(
+                    "Eject monitor: printer %s gate NOT cooldown-re-armed (item=%s, gate=%r, last dispatch=%r) "
+                    "— arming escalation-only hold (no auto-clear)",
+                    printer_id,
+                    item.id if item is not None else None,
+                    gate_subtask_id,
+                    item.dispatch_subtask_id if item is not None else None,
+                )
+                self.start_escalation_only_watch(printer_id)
         if rearmed:
             logger.info("Eject monitor: re-armed %d cooldown watch(es) after restart", rearmed)
         return rearmed
@@ -938,19 +954,47 @@ class EjectCooldownMonitor:
         )
         return True
 
+    def start_foreign_eject_watch(self, printer_id: int, profile_id: int, threshold_c: float) -> bool:
+        """Arm an AUTO eject watch for a FOREIGN plate positively identified as the
+        farm's OWN file (2026-07-18 decision).
+
+        Like the production cooldown watch it holds the plate gate and dispatches an
+        eject once the live bed reaches ``threshold_c`` — but it carries NO queue item.
+        The release dispatches a foreign-plate sweep (``dispatch_identified_foreign_eject``,
+        the same primitive the manual foreign "Eject now" uses) against the chosen
+        ``profile_id``; the gate-clear stays owned by the eject job's own terminal.
+        Deduped against any in-flight watch. Deliberately NOT restart-durable (mirrors
+        the manual foreign eject): after a restart ``rearm_on_startup`` degrades this to
+        an escalation-only hold rather than re-deriving the foreign identity."""
+        if printer_id in self._watching:
+            return False
+        self._watching[printer_id] = None
+        spawn_background_task(
+            self._watch(printer_id, None, purpose="foreign", threshold_override=threshold_c, profile_id=profile_id),
+            name=f"eject-foreign-watch-{printer_id}",
+        )
+        return True
+
     async def _watch(
         self,
         printer_id: int,
-        queue_item_id: int,
+        queue_item_id: int | None,
         *,
         purpose: str = "production",
         run_id: int | None = None,
+        threshold_override: float | None = None,
+        profile_id: int | None = None,
     ) -> None:
         try:
-            threshold = await _resolve_eject_threshold(queue_item_id, for_first_article=purpose == "fa")
-            if threshold is None:
-                # Not an eject job — leave the manual plate-clear behaviour intact.
-                return
+            if threshold_override is not None:
+                # Foreign auto-eject: the release threshold is the chosen profile's
+                # cooldown target, passed directly (there is no queue item to resolve).
+                threshold: float | None = threshold_override
+            else:
+                threshold = await _resolve_eject_threshold(queue_item_id, for_first_article=purpose == "fa")
+                if threshold is None:
+                    # Not an eject job — leave the manual plate-clear behaviour intact.
+                    return
             # Record the full watch identity so active_watch() still exposes the
             # threshold AND a manual "Eject now" can drive this watch's release_now.
             release_now = asyncio.Event()
@@ -963,6 +1007,14 @@ class EjectCooldownMonitor:
             if purpose == "fa":
                 on_release = functools.partial(
                     _dispatch_fa_eject, printer_id=printer_id, queue_item_id=queue_item_id, run_id=run_id
+                )
+            elif purpose == "foreign":
+                # Lazy import: manual.py imports monitor at module load, so importing it
+                # at module top here would be a circular import.
+                from backend.app.services.eject.manual import dispatch_identified_foreign_eject
+
+                on_release = functools.partial(
+                    dispatch_identified_foreign_eject, printer_id=printer_id, profile_id=profile_id
                 )
             else:
                 on_release = functools.partial(

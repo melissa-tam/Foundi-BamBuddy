@@ -630,8 +630,9 @@ class _FakeGateManager:
 
 
 class TestWatchGateEscalationOnly:
-    """The foreign-deposit gate watch: holds the gate, escalates once, exits on
-    external clear or stale — and NEVER releases the gate itself."""
+    """The foreign-deposit gate watch: holds the gate, escalates once, exits ONLY on
+    external clear (a disconnected tick no longer aborts) — and NEVER releases the
+    gate itself."""
 
     async def test_exits_when_gate_cleared_externally(self):
         mgr = _FakeGateManager([(True, _status(60)), (False, None)])
@@ -664,15 +665,26 @@ class TestWatchGateEscalationOnly:
         assert outcome == "cleared"
         assert mgr.clear_calls == []
 
-    async def test_stale_when_disconnected(self):
-        mgr = _FakeGateManager([(True, _status(60, connected=False))])
+    async def test_disconnected_tick_keeps_polling_then_escalates_and_clears(self):
+        # F3: a disconnected/stale tick no longer ABORTS the foreign-gate watch (the
+        # old "stale" exit is gone — it stranded printers that briefly dropped off).
+        # The gate is held for the whole PHASE: the watch keeps polling across the
+        # disconnect, escalates ONCE, and exits only when the gate is cleared.
+        mgr = _FakeGateManager(
+            [
+                (True, _status(60)),  # tick 0 — elapsed 0
+                (True, _status(60, connected=False)),  # tick 1 — DISCONNECTED, must NOT abort
+                (True, _status(60)),  # tick 2 — elapsed 40 → escalation window
+                (False, None),  # tick 3 — operator clears the gate
+            ]
+        )
         notify = _NotifyRecorder()
         outcome = await watch_gate_escalation_only(
-            3, manager=mgr, escalate_s=100, check_interval_s=20, sleep=_noop_sleep, notify=notify
+            4, manager=mgr, escalate_s=40, check_interval_s=20, sleep=_noop_sleep, notify=notify
         )
-        assert outcome == "stale"
-        assert notify.calls == []
-        assert mgr.clear_calls == []
+        assert outcome == "cleared"
+        assert notify.calls == [4]  # escalated exactly once despite the mid-hold disconnect
+        assert mgr.clear_calls == []  # the watch itself never releases
 
     async def test_escalation_notify_failure_does_not_kill_watch(self):
         mgr = _FakeGateManager([(True, _status(60)), (True, _status(60)), (True, _status(60)), (False, None)])
@@ -723,9 +735,12 @@ async def _seed_completed_eject_item(db_session, *, printer_id, dispatch_subtask
 
 
 class TestRearmRequiresSubtaskMatch:
-    """rearm_on_startup only re-arms a gate it can positively tie to the eject job:
-    the last-started item's dispatch_subtask_id must equal the printer's persisted
-    plate_gate_subtask_id (both non-null). Foreign / pre-migration NULL never re-arm."""
+    """rearm_on_startup only re-arms a COOLDOWN watch on a gate it can positively tie
+    to the eject job: the last-started item's dispatch_subtask_id must equal the
+    printer's persisted plate_gate_subtask_id (both non-null). A gate it CANNOT tie
+    (foreign / pre-migration NULL / mismatch) never auto-clears — but instead of being
+    left watch-less (a silent stall) it arms the escalation-only hold (F3). A
+    quarantined printer is excluded entirely."""
 
     @staticmethod
     def _patch(monkeypatch, db_session):
@@ -740,45 +755,65 @@ class TestRearmRequiresSubtaskMatch:
         monkeypatch.setattr("backend.app.core.database.async_session", _fake_session, raising=False)
         mon = EjectCooldownMonitor()
         started: list[tuple[int, int]] = []
+        escalated: list[int] = []
         monkeypatch.setattr(mon, "_start_watch", lambda pid, qid: started.append((pid, qid)) or True)
-        return mon, started
+        monkeypatch.setattr(mon, "start_escalation_only_watch", lambda pid: escalated.append(pid) or True)
+        return mon, started, escalated
 
     async def test_rearms_when_subtask_matches(self, db_session, monkeypatch):
         printer = await _seed_printer(db_session, awaiting=True, gate_subtask_id="SUB-1", serial="RE-1")
         item = await _seed_completed_eject_item(db_session, printer_id=printer.id, dispatch_subtask_id="SUB-1")
-        mon, started = self._patch(monkeypatch, db_session)
+        mon, started, escalated = self._patch(monkeypatch, db_session)
         rearmed = await mon.rearm_on_startup()
         assert rearmed == 1
         assert started == [(printer.id, item.id)]
+        assert escalated == []  # a cooldown re-arm never also arms escalation-only
 
-    async def test_no_rearm_on_subtask_mismatch(self, db_session, monkeypatch):
+    async def test_escalation_only_on_subtask_mismatch(self, db_session, monkeypatch):
+        # Gate-subtask mismatch → NOT cooldown-re-armed, but NOT left watch-less: the
+        # stranded plate arms the escalation-only hold instead (rearmed count stays 0).
         printer = await _seed_printer(db_session, awaiting=True, gate_subtask_id="SUB-1", serial="RE-2")
         await _seed_completed_eject_item(db_session, printer_id=printer.id, dispatch_subtask_id="SUB-2")
-        mon, started = self._patch(monkeypatch, db_session)
+        mon, started, escalated = self._patch(monkeypatch, db_session)
         rearmed = await mon.rearm_on_startup()
         assert rearmed == 0
         assert started == []
+        assert escalated == [printer.id]
 
-    async def test_no_rearm_on_null_gate_source(self, db_session, monkeypatch):
-        # A pre-migration / foreign gate has no source id — never auto-clears.
+    async def test_escalation_only_on_null_gate_source(self, db_session, monkeypatch):
+        # A pre-migration / foreign gate has no source id — never auto-clears, but the
+        # gate must still escalate rather than sit silently → escalation-only armed.
         printer = await _seed_printer(db_session, awaiting=True, gate_subtask_id=None, serial="RE-3")
         await _seed_completed_eject_item(db_session, printer_id=printer.id, dispatch_subtask_id="SUB-9")
-        mon, started = self._patch(monkeypatch, db_session)
+        mon, started, escalated = self._patch(monkeypatch, db_session)
         rearmed = await mon.rearm_on_startup()
         assert rearmed == 0
         assert started == []
+        assert escalated == [printer.id]
+
+    async def test_escalation_only_when_no_prior_item(self, db_session, monkeypatch):
+        # A gate raised with NO last-started item at all (e.g. a native-vision plate
+        # gate) still escalates rather than sitting watch-less.
+        printer = await _seed_printer(db_session, awaiting=True, gate_subtask_id="SUB-1", serial="RE-N")
+        mon, started, escalated = self._patch(monkeypatch, db_session)
+        rearmed = await mon.rearm_on_startup()
+        assert rearmed == 0
+        assert started == []
+        assert escalated == [printer.id]
 
     async def test_no_rearm_when_printer_quarantined(self, db_session, monkeypatch):
-        # A quarantined printer is excluded from re-arm even with a matching gate:
-        # its plate stays gated for a human, no cooldown/eject watch is spawned.
+        # A quarantined printer is excluded from the query entirely — with a matching
+        # gate it re-arms NOTHING (not even escalation-only): its plate stays gated for
+        # a human and quarantine handling owns it.
         printer = await _seed_printer(
             db_session, awaiting=True, gate_subtask_id="SUB-1", serial="RE-Q", quarantined=True
         )
         await _seed_completed_eject_item(db_session, printer_id=printer.id, dispatch_subtask_id="SUB-1")
-        mon, started = self._patch(monkeypatch, db_session)
+        mon, started, escalated = self._patch(monkeypatch, db_session)
         rearmed = await mon.rearm_on_startup()
         assert rearmed == 0
         assert started == []
+        assert escalated == []
 
 
 class TestActiveWatch:
@@ -897,6 +932,62 @@ class TestActiveWatch:
         mon = EjectCooldownMonitor()
         assert mon.start_fa_eject_watch(7, 42, 9) is True
         assert mon.start_fa_eject_watch(7, 42, 9) is False  # deduped
+        mon._watching.pop(7, None)
+
+    @pytest.mark.asyncio
+    async def test_foreign_watch_uses_direct_threshold_and_releases_into_foreign_dispatch(self, monkeypatch):
+        """start_foreign_eject_watch → _watch(purpose='foreign'): the threshold is
+        passed DIRECTLY (no queue item, so _resolve_eject_threshold is NEVER called),
+        the watch exposes it, and the release action is the foreign-plate dispatcher
+        bound to the chosen profile (F5)."""
+        import backend.app.services.eject.manual as manual_mod
+        import backend.app.services.eject.monitor as monitor_mod
+
+        mon = EjectCooldownMonitor()
+        seen: dict[str, object] = {}
+
+        async def fake_resolve(qid, *, for_first_article=False):
+            seen["resolve_called"] = True  # must NOT run for the direct-threshold path
+            return 99.0
+
+        async def fake_settings():
+            return (0, 1.0, 0, 3.0)  # isolate from the settings DB
+
+        async def fake_watch(pid, threshold, **kwargs):
+            seen["threshold"] = threshold
+            seen["mid"] = mon.active_watch(pid)  # visible to status consumers mid-watch
+            await kwargs["on_release"]()  # release fires the bound foreign dispatch
+            return "released"
+
+        async def fake_foreign_dispatch(*, printer_id, profile_id):
+            seen["dispatch"] = (printer_id, profile_id)
+
+        monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", fake_resolve)
+        monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", fake_settings)
+        monkeypatch.setattr(monitor_mod, "watch_bed_and_clear", fake_watch)
+        # The foreign on_release lazy-imports this name from the manual module.
+        monkeypatch.setattr(manual_mod, "dispatch_identified_foreign_eject", fake_foreign_dispatch)
+        mon._watching[7] = None  # what start_foreign_eject_watch records before spawning
+        await mon._watch(7, None, purpose="foreign", threshold_override=33.0, profile_id=5)
+        assert seen["threshold"] == 33.0
+        assert seen["mid"] == 33.0  # foreign watch exposes its release threshold to the UI
+        assert seen["dispatch"] == (7, 5)
+        assert "resolve_called" not in seen  # direct threshold skips _resolve_eject_threshold
+        assert mon.active_watch(7) is None  # popped on exit
+
+    def test_start_foreign_eject_watch_dedupes_against_inflight_watch(self, monkeypatch):
+        import backend.app.services.eject.monitor as monitor_mod
+
+        def fake_spawn(coro, name=None):
+            coro.close()  # never run — avoid "never awaited" warnings
+            return None
+
+        monkeypatch.setattr(monitor_mod, "spawn_background_task", fake_spawn)
+        mon = EjectCooldownMonitor()
+        assert mon.start_foreign_eject_watch(7, 5, 33.0) is True
+        assert mon.active_watch(7) is None  # sentinel until the watch resolves (mirrors prod/FA)
+        assert mon.start_foreign_eject_watch(7, 5, 33.0) is False  # deduped
+        assert mon.start_escalation_only_watch(7) is False  # any other watch also deduped
         mon._watching.pop(7, None)
 
     def test_escalation_only_watch_has_no_threshold_and_dedupes(self, monkeypatch):

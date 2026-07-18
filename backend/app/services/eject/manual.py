@@ -44,8 +44,10 @@ from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.eject import remote as eject_remote
+from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
 from backend.app.services.eject.monitor import _latest_started_item, _resolve_eject_threshold, eject_cooldown_monitor
 from backend.app.services.printer_manager import printer_manager
+from backend.app.utils.filename import derive_remote_filename
 from backend.app.utils.threemf_tools import list_gcode_plate_ids, read_plate_gcode_header
 
 if TYPE_CHECKING:
@@ -455,3 +457,172 @@ async def _manual_eject_foreign(
         eject_profile_id,
     )
     return {"mode": "dispatched", "queue_item_id": None}
+
+
+# --------------------------------------------------------------------------- #
+# Auto foreign-eject: a foreign completion that is positively the farm's OWN file
+# (2026-07-18 decision) is auto-ejected after cooldown, no operator confirm.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ForeignFarmFile:
+    """A foreign plate positively identified as the farm's OWN file — safe to
+    auto-eject after cooldown. Carries the chosen eject ``profile_id``, the release
+    ``threshold_c`` (the profile's ``cooldown_temp_c``) and the print name for logs."""
+
+    profile_id: int
+    threshold_c: float
+    print_name: str | None
+
+
+def _canonical_names(*names: str | None) -> set[str]:
+    """The set of canonical (``derive_remote_filename``) forms of ``names``, blanks
+    skipped. Folds spaces→underscores and normalises the 3MF/gcode suffix so a
+    screen-started print's UNDERSCORED USB echo and the farm's SPACED library/archive
+    filename compare equal — the extension/underscore canonicalisation
+    ``farm_correlation._normalize_name`` deliberately does NOT do."""
+    out: set[str] = set()
+    for name in names:
+        if not name:
+            continue
+        base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        try:
+            out.add(derive_remote_filename(base))
+        except TypeError:  # non-str duck type — skip rather than crash the identity check
+            continue
+    return out
+
+
+async def _farm_dispatched_names(db: AsyncSession, printer_id: int) -> set[str]:
+    """Canonical names of every FARM file dispatched to ``printer_id``: the library
+    filenames and archive filenames of the printer's farm queue items (a batch with a
+    ``sku_file_id``, or an item carrying an ``eject_profile_id``). The identity corpus
+    a foreign completion's echoed name is checked against before auto-ejecting it."""
+    from backend.app.models.library import LibraryFile
+    from backend.app.models.print_batch import PrintBatch
+
+    result = await db.execute(
+        select(PrintQueueItem)
+        .outerjoin(PrintBatch, PrintQueueItem.batch_id == PrintBatch.id)
+        .where(PrintQueueItem.printer_id == printer_id)
+        .where((PrintQueueItem.eject_profile_id.is_not(None)) | (PrintBatch.sku_file_id.is_not(None)))
+    )
+    names: set[str] = set()
+    for item in result.scalars().all():
+        if item.archive_id is not None:
+            archive = await db.get(PrintArchive, item.archive_id)
+            if archive is not None:
+                names |= _canonical_names(archive.filename)
+        if item.library_file_id is not None:
+            library_file = await db.get(LibraryFile, item.library_file_id)
+            if library_file is not None:
+                names |= _canonical_names(library_file.filename)
+    return names
+
+
+async def identify_farm_file_foreign(
+    db: AsyncSession, printer_id: int, *, subtask_name: str | None, filename: str | None
+) -> ForeignFarmFile | None:
+    """Decide whether a FOREIGN completion is positively the farm's OWN file, so the
+    farm may auto-eject it after cooldown instead of only escalating (2026-07-18).
+
+    Returns a :class:`ForeignFarmFile` (profile + release threshold) ONLY when ALL of:
+
+      (a) the echoed ``subtask_name``/``filename`` matches a file the farm has
+          dispatched to THIS printer, both sides canonicalised through
+          ``derive_remote_filename`` (a screen-started print echoes the UNDERSCORED
+          USB name; the farm library stores the SPACED display name — only this
+          canonicalisation makes them compare equal);
+      (b) the printer model's geometry row is hardware-``validated`` (production eject
+          never runs on an unvalidated model);
+      (c) a suggested eject profile exists for this printer;
+      (d) the foreign donor resolves and its parsed max Z height is within that
+          profile's ``max_part_height_mm`` guard.
+
+    Any miss → None (the caller falls back to the escalation-only hold). The cheap
+    checks run BEFORE the donor resolution (which may FTPS re-fetch) so the common
+    negative — a genuinely foreign print — exits fast without touching the wire. The
+    helper opens no session of its own (the caller owns ``db``, per convention) and
+    cleans up any temp re-fetch it makes."""
+    # (a) name match against farm-dispatched files on this printer — the strongest,
+    # cheapest signal, so it gates everything else.
+    echoed = _canonical_names(subtask_name, filename)
+    if not echoed:
+        return None
+    if echoed.isdisjoint(await _farm_dispatched_names(db, printer_id)):
+        return None
+
+    printer = await db.get(Printer, printer_id)
+    if printer is None:
+        return None
+
+    # (b) model geometry must be hardware-validated (fail-closed, never auto-eject an
+    # unvalidated model's envelope).
+    try:
+        await get_geometry_required(db, printer.model, require_validated=True)
+    except GeometryUnavailable:
+        return None
+
+    # (c) a profile to sweep with — the printer's usual eject profile.
+    profile_id = await _suggest_eject_profile_id(db, printer_id)
+    if profile_id is None:
+        return None
+    profile = await db.get(EjectProfile, profile_id)
+    if profile is None:
+        return None
+
+    # (d) donor resolves + part height within the profile's guard. _resolve_foreign_source
+    # raises ManualEjectError when the donor/plate/height cannot be resolved → not
+    # identified. Clean up any temp re-fetch either way (the auto-eject dispatch
+    # re-resolves the donor fresh at release time, exactly like the manual confirm).
+    try:
+        source = await _resolve_foreign_source(db, printer)
+    except ManualEjectError:
+        return None
+    try:
+        if source.max_z > profile.max_part_height_mm:
+            return None
+    finally:
+        _safe_unlink(source.tmp_path)
+
+    logger.info(
+        "identify_farm_file_foreign: printer %s foreign plate IS the farm's own file "
+        "(profile %s, cooldown %.1f°C, max_z %.1fmm) — auto-eject eligible",
+        printer_id,
+        profile_id,
+        profile.cooldown_temp_c,
+        source.max_z,
+    )
+    return ForeignFarmFile(profile_id=profile_id, threshold_c=profile.cooldown_temp_c, print_name=source.print_name)
+
+
+async def dispatch_identified_foreign_eject(*, printer_id: int, profile_id: int) -> None:
+    """``on_release`` for the auto foreign-eject watch: resolve the foreign donor FRESH
+    and dispatch the sweep exactly as ``_manual_eject_foreign``'s confirm call does
+    (minus the thermal gate — the cooldown watch already waited for the bed to reach
+    the threshold). Opens its own session (module convention); RAISES on any failure so
+    :func:`watch_bed_and_clear` counts a dispatch failure (retry, then stall after
+    three) rather than silently dropping the sweep."""
+    from backend.app.core.database import async_session
+
+    async with async_session() as db:
+        printer = await db.get(Printer, printer_id)
+        if printer is None:
+            raise ManualEjectError("not_found", "Printer not found", status_code=404)
+        source = await _resolve_foreign_source(db, printer)
+        try:
+            await eject_remote.dispatch_foreign_eject(
+                db,
+                printer_id=printer_id,
+                profile_id=profile_id,
+                source_path=source.donor_path,
+                plate_id=source.plate_id,
+            )
+            logger.info(
+                "dispatch_identified_foreign_eject: printer %s auto foreign-plate eject dispatched "
+                "(plate %s, profile %s)",
+                printer_id,
+                source.plate_id,
+                profile_id,
+            )
+        finally:
+            _safe_unlink(source.tmp_path)

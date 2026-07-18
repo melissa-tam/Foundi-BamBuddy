@@ -744,7 +744,47 @@ async def _maybe_complete_run(db: AsyncSession, batch: PrintBatch) -> None:
     if completed == 0:
         return
 
+    # Planned plate count — the SAME figure the run-detail API reports as
+    # ``plates_total`` (single source of truth; lazy import breaks the
+    # production_run <-> farm_policy import cycle, as elsewhere in this module).
+    from backend.app.services.production_run import planned_plate_count
+
+    planned = planned_plate_count(batch.quantity, items)
+
+    # F2: an operator-stopped unit holds the run SHORT of its plan. Completing the
+    # run here (as the plain last-plate path would) strands the documented
+    # "Resume tops the deficit back up" affordance — resume of a *completed* run
+    # 409s via ``can_transition``. Pause instead, KEEPING ``operator_stop`` so the
+    # run card still explains the hold; RESUME's ``top_up_run`` mints the
+    # replacement plate(s). Mirrors ``_maybe_pause_run_exhausted``. The
+    # retries-exhausted path owns its own (no ``operator_stop``) case.
+    if batch.pause_reason == "operator_stop" and completed < planned:
+        batch.status = "paused"
+        await db.commit()
+        broadcast_production_run_changed(batch.id)
+        run = await _load_run(db, batch.id)
+        deficit = planned - completed
+        plate_word = "plate" if deficit == 1 else "plates"
+        await notification_service.on_run_paused(
+            run.name,
+            _sku_code(run),
+            f"a stopped unit left this run {deficit} {plate_word} short — Resume creates the replacement {plate_word}",
+            db,
+        )
+        logger.warning(
+            "farm_policy: paused run %s — operator stop left it %d plate(s) short (%d/%d completed)",
+            batch.id,
+            deficit,
+            completed,
+            planned,
+        )
+        return
+
     batch.status = "completed"
+    # A completed run must not carry a stale hold reason (e.g. an ``operator_stop``
+    # hold whose deficit was later topped up to the full plan). The prod incident
+    # left ``pause_reason='operator_stop'`` stamped on a completed run — clear it.
+    batch.pause_reason = None
     await db.commit()
     broadcast_production_run_changed(batch.id)
     run = await _load_run(db, batch.id)

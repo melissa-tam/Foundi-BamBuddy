@@ -104,6 +104,7 @@ class TestPlateClearGate:
         mock_monitor = stack.enter_context(patch("backend.app.main.eject_cooldown_monitor"))
         mock_monitor.on_terminal_status = MagicMock()
         mock_monitor.start_escalation_only_watch = MagicMock()
+        mock_monitor.start_foreign_eject_watch = MagicMock()
         return SimpleNamespace(pm=mock_pm, monitor=mock_monitor, notif=mock_notif, maker=maker)
 
     @staticmethod
@@ -137,6 +138,24 @@ class TestPlateClearGate:
 
     @staticmethod
     async def _drain(tasks_before):
+        for task in asyncio.all_tasks() - tasks_before:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    @staticmethod
+    async def _settle_foreign(tasks_before):
+        """Await the foreign auto-eject decision task to COMPLETION (deterministic —
+        it decides auto-eject vs escalation-only + fires the notification), then drain
+        any other unrelated background tasks the callback spawned."""
+        for task in asyncio.all_tasks() - tasks_before:
+            if (task.get_name() or "").startswith("foreign-auto-eject"):
+                try:
+                    await task
+                except Exception:  # noqa: BLE001
+                    pass
         for task in asyncio.all_tasks() - tasks_before:
             task.cancel()
             try:
@@ -285,8 +304,9 @@ class TestPlateClearGate:
     async def test_foreign_terminal_leaves_item_and_raises_gate(self, test_engine):
         """Phase 1 P1-A: a terminal whose subtask_id matches NO printing item (a
         LOCAL print started from the touchscreen) is FOREIGN — the farm item stays
-        'printing', the gate is raised keyed to the foreign subtask, the escalation-
-        only watch is started (NOT the auto-clear), and the foreign notification
+        'printing', the gate is raised keyed to the foreign subtask. The plate is not
+        the farm's own file (a plain non-farm item) so identification fails and the
+        ESCALATION-ONLY watch is started (NOT the auto-clear); the foreign notification
         fires. The farm queue is left untouched."""
         from contextlib import ExitStack
 
@@ -313,7 +333,7 @@ class TestPlateClearGate:
                 },
             )
 
-            await self._drain(tasks_before)
+            await self._settle_foreign(tasks_before)
 
         # 1. Farm unit untouched — still printing (a foreign print never marks it done).
         async with env.maker() as s:
@@ -321,11 +341,113 @@ class TestPlateClearGate:
             assert refetched.status == "printing"
         # 2. Gate raised, keyed to the FOREIGN subtask.
         env.pm.set_awaiting_plate_clear.assert_any_call(pid, True, source_subtask_id="FOREIGN-9")
-        # 3. Auto-clear NOT armed; escalation-only watch started instead.
+        # 3. Not the farm's own file → auto-clear NOT armed, auto-eject NOT armed;
+        #    escalation-only watch started instead.
         env.monitor.on_terminal_status.assert_not_called()
+        env.monitor.start_foreign_eject_watch.assert_not_called()
         env.monitor.start_escalation_only_watch.assert_called_once_with(pid)
-        # 4. Foreign notification fired.
+        # 4. Foreign notification fired WITHOUT an auto-eject temperature (not the farm's file).
         env.notif.on_foreign_job_detected.assert_awaited()
+        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject_temp_c") is None
+
+    @pytest.mark.asyncio
+    async def test_foreign_terminal_not_gated_when_toggle_off_and_no_farm(self, test_engine):
+        """F1b: a FOREIGN terminal on a printer with NO farm involvement and
+        require_plate_clear OFF must NOT gate — the foreign path obeys the SAME guard
+        as the generic branch (upstream toggle-off behaviour preserved). Zero printing
+        candidates + an echoed id → foreign verdict; guard false → no gate, no watch,
+        no notification."""
+        from contextlib import ExitStack
+
+        from backend.app.api.routes.settings import set_setting
+
+        tasks_before = set(asyncio.all_tasks())
+
+        with ExitStack() as stack:
+            env = self._setup_mocks(stack, test_engine)
+            async with env.maker() as s:
+                await set_setting(s, "require_plate_clear", "false")
+                await s.commit()
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                1,
+                {
+                    "status": "completed",
+                    "filename": "local.gcode",
+                    "subtask_name": "OperatorLocalPrint",
+                    "subtask_id": "FOREIGN-Z",  # zero candidates + id → foreign
+                    "timelapse_was_active": False,
+                    "last_layer_num": 20,
+                    "last_progress": 88.0,
+                },
+            )
+
+            await self._settle_foreign(tasks_before)
+
+        true_calls = [c for c in env.pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
+        assert true_calls == [], "Toggle-off foreign with no farm involvement must NOT gate."
+        env.monitor.start_escalation_only_watch.assert_not_called()
+        env.monitor.start_foreign_eject_watch.assert_not_called()
+        env.notif.on_foreign_job_detected.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_foreign_terminal_farm_file_arms_auto_eject(self, test_engine):
+        """F5: a FOREIGN completion positively identified as the farm's OWN file arms
+        the AUTO foreign-eject watch (NOT escalation-only) and the notification names
+        the cooldown target. The farm queue stays untouched; the gate is still raised.
+        Identification itself is unit-tested in test_manual; here the main.py wiring is
+        exercised with identify_farm_file_foreign patched to a positive result."""
+        from contextlib import ExitStack
+        from unittest.mock import AsyncMock
+
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.eject.manual import ForeignFarmFile
+
+        tasks_before = set(asyncio.all_tasks())
+
+        with ExitStack() as stack:
+            env = self._setup_mocks(stack, test_engine)
+            pid, iid = await self._seed_printing_item(env.maker, serial="FAE-1", dispatch_subtask_id="DISPATCHED-1")
+            stack.enter_context(
+                patch(
+                    "backend.app.services.eject.manual.identify_farm_file_foreign",
+                    AsyncMock(return_value=ForeignFarmFile(profile_id=7, threshold_c=33.0, print_name="Farm Widget")),
+                )
+            )
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "Farm_Widget.gcode.3mf",
+                    "subtask_name": "Farm_Widget",
+                    "subtask_id": "FOREIGN-9",  # != DISPATCHED-1 → foreign
+                    "timelapse_was_active": False,
+                    "last_layer_num": 20,
+                    "last_progress": 88.0,
+                },
+            )
+
+            await self._settle_foreign(tasks_before)
+
+        # Farm unit untouched.
+        async with env.maker() as s:
+            refetched = await s.get(PrintQueueItem, iid)
+            assert refetched.status == "printing"
+        # Gate raised keyed to the foreign subtask.
+        env.pm.set_awaiting_plate_clear.assert_any_call(pid, True, source_subtask_id="FOREIGN-9")
+        # AUTO foreign-eject watch armed with the identified profile + threshold; NOT
+        # escalation-only, NOT the queue-bound auto-clear.
+        env.monitor.start_foreign_eject_watch.assert_called_once_with(pid, 7, 33.0)
+        env.monitor.start_escalation_only_watch.assert_not_called()
+        env.monitor.on_terminal_status.assert_not_called()
+        # Notification fired naming the cooldown target °C.
+        env.notif.on_foreign_job_detected.assert_awaited()
+        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject_temp_c") == 33.0
 
 
 class TestEjectJobCallbacks:

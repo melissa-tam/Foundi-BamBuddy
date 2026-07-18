@@ -36,13 +36,21 @@ any) the finish belongs to, returning one of five verdicts:
                          the best attribution; logged at WARNING because it was not
                          id-confirmed.
 - ``foreign``          — the terminal carried a ``subtask_id`` that matches NO
-                         printing item. The printer ran something Bambuddy did not
-                         dispatch. Farm state MUST NOT be mutated: no unit is marked
-                         done, no retry/quarantine is attributed, and no auto-clear
-                         is armed. The caller still raises the plate-clear gate
-                         (the deposit is real) but keys it human-clear-only.
-- ``none``             — nothing is printing on this printer (non-farm/plain print,
-                         or already reconciled). No queue item to touch.
+                         printing item — EITHER a printing candidate exists whose id
+                         differs, OR there are ZERO printing candidates at all (the
+                         production S4 case: the farm units were cancelled, then the
+                         operator re-started the farm's own USB file from the
+                         touchscreen — a fresh firmware-minted id, no printing row).
+                         The printer ran something Bambuddy did not dispatch. Farm
+                         state MUST NOT be mutated: no unit is marked done, no
+                         retry/quarantine is attributed, and no auto-clear is armed.
+                         The caller still raises the plate-clear gate (the deposit is
+                         real) but keys it human-clear-only.
+- ``none``             — nothing to attribute AND nothing to gate on identity: zero
+                         printing candidates with NO echoed ``subtask_id`` (a bare
+                         state blip we must never guess a deposit from), or the
+                         pathological multi-candidate no-id no-name-match case. No
+                         queue item to touch.
 
 Why ``foreign`` must never mutate farm state: attribution drives retry counting,
 quarantine escalation, run completion, and the cooldown auto-clear threshold. A
@@ -151,8 +159,8 @@ async def resolve_terminal_item(db: AsyncSession, printer_id: int, payload: dict
     Candidates are the queue items on ``printer_id`` currently in ``printing``
     status (most-recently-started first). Matching order: subtask_id equality →
     dispatched-name match → single no-id candidate (fallback) → id-present-but-no-
-    match (foreign) → nothing printing (none). See the module docstring for the
-    full verdict semantics.
+    match / zero-candidate-with-id (foreign) → nothing printing, no id (none). See
+    the module docstring for the full verdict semantics.
     """
     result = await db.execute(
         select(PrintQueueItem)
@@ -161,10 +169,27 @@ async def resolve_terminal_item(db: AsyncSession, printer_id: int, payload: dict
         .order_by(PrintQueueItem.started_at.desc())
     )
     candidates = list(result.scalars().all())
-    if not candidates:
-        return TerminalResolution(None, "none")
-
     payload_subtask = (payload.get("subtask_id") or "").strip() or None
+
+    if not candidates:
+        # Zero printing candidates. A terminal that STILL echoes a subtask_id is a
+        # deposit Bambuddy did not dispatch onto this printer (the production S4 case:
+        # every farm unit was cancelled, then the operator re-started the farm's own
+        # USB file from the touchscreen — a fresh firmware-minted id, no printing row
+        # left). That is FOREIGN, not silent "none": the caller must gate + watch +
+        # alert, never raise the gate silently and strand the printer out of rotation.
+        # With NO id echoed we cannot distinguish a real deposit from a bare state
+        # blip, so keep "none" and never guess a foreign deposit into existence.
+        if payload_subtask is not None:
+            logger.warning(
+                "farm_correlation: printer %s terminal subtask_id %r with ZERO printing queue items "
+                "(name=%r) — FOREIGN; farm queue left untouched",
+                printer_id,
+                payload_subtask,
+                payload.get("subtask_name") or payload.get("filename"),
+            )
+            return TerminalResolution(None, "foreign")
+        return TerminalResolution(None, "none")
 
     # (1) subtask_id equality — the id Bambuddy minted for this exact dispatch.
     if payload_subtask:
