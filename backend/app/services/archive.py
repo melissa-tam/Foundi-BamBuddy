@@ -215,6 +215,17 @@ class ThreeMFParser:
                 any_time_seen = False
                 any_grams_seen = False
 
+                # Plate-scoped file-level values (#1697): when a specific plate was
+                # printed (``self.plate_number`` set from the queue item's plate_id
+                # or a single-plate export's index), the archive's headline time /
+                # weight must reflect THAT plate, not the sum of every plate. We
+                # remember the matched plate element + its prediction/weight while
+                # summing, then choose scoped-vs-summed after the loop. Missing
+                # target → falls back to the sums so we never regress #1593.
+                target_plate_elem = None
+                target_time: int | None = None
+                target_grams: float | None = None
+
                 for plate_position, plate in enumerate(plates, start=1):
                     # Plate-level fields that only make sense at the file
                     # level when there's exactly one plate. ``plate_number``
@@ -224,6 +235,8 @@ class ThreeMFParser:
                     # is also single-valued; we take the first plate's value
                     # as a best-effort default for the archive metadata.
                     plate_index_value: int | None = None
+                    plate_time: int | None = None
+                    plate_grams: float | None = None
                     for meta in plate.findall("metadata"):
                         key = meta.get("key")
                         value = meta.get("value")
@@ -234,14 +247,18 @@ class ThreeMFParser:
                                 pass  # Skip non-numeric plate index
                         elif key == "prediction" and value:
                             try:
-                                summed_time += int(value)
+                                parsed_time = int(value)
+                                summed_time += parsed_time
                                 any_time_seen = True
+                                plate_time = parsed_time
                             except ValueError:
                                 pass
                         elif key == "weight" and value:
                             try:
-                                summed_grams += float(value)
+                                parsed_grams = float(value)
+                                summed_grams += parsed_grams
                                 any_grams_seen = True
+                                plate_grams = parsed_grams
                             except ValueError:
                                 pass
                         elif key == "curr_bed_type" and value and "bed_type" not in self.metadata:
@@ -270,6 +287,20 @@ class ThreeMFParser:
                         if printable_objects:
                             self.metadata["printable_objects"] = printable_objects
 
+                    # Remember this plate if it is the one that was printed. For a
+                    # single-plate export ``self.plate_number`` was just set above;
+                    # for a farm dispatch it came from the constructor (the queue
+                    # item's plate_id). Either way, file-level time/weight and the
+                    # filament breakdown scope to this element after the loop.
+                    if (
+                        self.plate_number is not None
+                        and plate_index_value is not None
+                        and plate_index_value == self.plate_number
+                    ):
+                        target_plate_elem = plate
+                        target_time = plate_time
+                        target_grams = plate_grams
+
                     # Per-plate nozzle-requirement capabilities (farm capability
                     # gate input). Wrapped independently so one malformed plate
                     # can neither disturb the #1593 summation above nor drop
@@ -285,15 +316,33 @@ class ThreeMFParser:
                             self.file_path,
                         )
 
-                if any_time_seen:
+                # Choose plate-scoped vs summed file-level totals (#1697). Scope
+                # only when a target plate was actually matched; otherwise fall
+                # back per-field to the #1593 summed totals so a missing/valueless
+                # plate never emits nothing where the old code emitted a sum.
+                use_plate_scope = self.plate_number is not None and target_plate_elem is not None
+                if self.plate_number is not None:
+                    # Observability: record which plate this parse targeted (lands
+                    # in extra_data). Set whenever a plate was requested, even when
+                    # the plate was missing and we fell back to summed totals.
+                    self.metadata["plate_number"] = self.plate_number
+
+                if use_plate_scope and target_time is not None:
+                    self.metadata["print_time_seconds"] = target_time
+                elif any_time_seen:
                     self.metadata["print_time_seconds"] = summed_time
-                if any_grams_seen:
+
+                if use_plate_scope and target_grams is not None:
+                    self.metadata["filament_used_grams"] = round(target_grams, 2)
+                elif any_grams_seen:
                     self.metadata["filament_used_grams"] = round(summed_grams, 2)
 
                 # Get filament info from filaments ACTUALLY USED in the print
                 # slice_info has <filament id="1" type="PLA" color="#FFFFFF" used_g="100" />
-                # Only include filaments where used_g > 0
-                filaments = root.findall(".//filament")
+                # Only include filaments where used_g > 0. When plate-scoped, read
+                # only the printed plate's <filament> children so type/color/slots
+                # reflect that plate, not every plate in the file.
+                filaments = target_plate_elem.findall("filament") if use_plate_scope else root.findall(".//filament")
                 if filaments:
                     # Collect unique filament types and colors for filaments that are actually used
                     types = []
@@ -1292,6 +1341,7 @@ class ArchiveService:
         project_id: int | None = None,
         subtask_id: str | None = None,
         prefer_filename_for_name: bool = False,
+        plate_id: int | None = None,
     ) -> PrintArchive | None:
         """Archive a 3MF file with metadata.
 
@@ -1376,12 +1426,18 @@ class ArchiveService:
         content_hash = self.compute_file_hash(dest_file)
 
         # Extract plate number from filename (e.g., "plate_5" from "/data/Metadata/plate_5.gcode")
+        # Resolution order: filename regex → explicit plate_id arg → None. The
+        # filename regex only fires for slicer-uploaded `plate_N.gcode` paths; for
+        # LAN/farm dispatch the MQTT gcode_file is the whole .gcode.3mf name, so
+        # the caller passes the queue item's plate_id to scope the parse (#1697).
         plate_number = None
         if print_data:
             filename = print_data.get("filename", "")
             match = re.search(r"plate_(\d+)", filename)
             if match:
                 plate_number = int(match.group(1))
+        if plate_number is None and plate_id is not None:
+            plate_number = plate_id
 
         # Parse 3MF metadata
         parser = ThreeMFParser(dest_file, plate_number=plate_number)

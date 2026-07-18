@@ -45,8 +45,10 @@ running pass per printer. Injectable ``manager`` / ``now`` for tests.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -75,8 +77,21 @@ MIN_FILE_AGE_S: float = 3600.0
 
 # After an attempt (success OR failure) on a printer, suppress re-runs for this long
 # so a flapping / re-arriving HMS code doesn't thrash the USB or the notification
-# channel.
+# channel. Also reused as the per-printer USB-DROP alert cooldown (single source of
+# truth) so a physically flapping USB stick can't spam the drop notification.
 CLEANUP_COOLDOWN_S: float = 6 * 3600.0
+
+# Verify-then-alert delay for a reported ``sdcard`` True→False edge: on the first
+# FTPS probe seeing an empty/unreachable root, wait this long and re-probe before
+# treating the drop as genuine. H2S firmware transiently reports ``sdcard=false``
+# for ~1 s during job dispatch / FTPS upload — a single confirming re-probe filters
+# those dispatch blips out without a fixed idle debounce.
+USB_DROP_PROBE_RETRY_S: float = 15.0
+
+# Human reason carried on the confirmed-drop notification (attempted=False → no
+# "Auto-cleanup could not free space:" prefix). Lives here so main.py stays a thin
+# edge-detect + spawn.
+USB_DROP_REASON: str = "USB drive dropped/unmounted — power-cycle the printer to remount it"
 
 # Stage-2 stop target AND the stage-2 entry guard: don't touch print files at all
 # once at least this much space is free; in stage 2, stop deleting as soon as the
@@ -84,7 +99,10 @@ CLEANUP_COOLDOWN_S: float = 6 * 3600.0
 TARGET_FREE_BYTES: int = 2 * 1024**3
 
 # Recording directories cleaned in stage 1 (camera stills, thumbnails, timelapses).
-RECORDING_DIRS: tuple[str, ...] = ("/ipcam", "/ipcam/thumbnail", "/timelapse")
+# ``/timelapse/thumbnail`` holds orphan timelapse preview stills that accumulate
+# alongside the timelapses themselves. ``_delete_old_recordings`` degrades to an
+# empty listing when a dir is absent, so listing a dir a given model lacks is safe.
+RECORDING_DIRS: tuple[str, ...] = ("/ipcam", "/ipcam/thumbnail", "/timelapse", "/timelapse/thumbnail")
 
 # Root print-file extensions considered for stage-2 deletion (longest first).
 _PRINT_FILE_SUFFIXES: tuple[str, ...] = (".gcode.3mf", ".3mf")
@@ -128,6 +146,20 @@ _inflight: set[int] = set()
 # ``record_sdcard_and_detect_drop``.
 _last_sdcard: dict[int, bool] = {}
 
+# Printers with an in-flight FTPS UPLOAD (dispatch / remote-eject / firmware). H2S
+# firmware transiently reports ``sdcard=false`` for ~1 s while an upload is in
+# progress, which is NOT a genuine drop — the verify-then-alert path suppresses the
+# edge outright while the id is present. Maintained by the ``upload_in_flight``
+# context manager wrapped around each FTPS upload call site. A genuinely missing USB
+# instead makes the upload FAIL, and that path already fails the queue item + sends
+# its own failure notification, so suppressing the drop alert here loses nothing.
+_uploads_in_flight: set[int] = set()
+
+# printer_id -> timestamp of the last CONFIRMED USB-drop alert. Per-printer cooldown
+# (reusing ``CLEANUP_COOLDOWN_S``) so a physically flapping USB stick can't spam the
+# drop notification. Re-arms naturally after the cooldown / a remount.
+_last_drop_alert_at: dict[int, float] = {}
+
 
 def _reset_state() -> None:
     """Test hook: clear the module-level cooldown + deferral + in-flight + USB state."""
@@ -135,6 +167,8 @@ def _reset_state() -> None:
     _deferred_printers.clear()
     _inflight.clear()
     _last_sdcard.clear()
+    _uploads_in_flight.clear()
+    _last_drop_alert_at.clear()
 
 
 def record_sdcard_and_detect_drop(printer_id: int, cur_sdcard: bool) -> bool:
@@ -178,6 +212,154 @@ def should_retry_deferred(printer_id: int, live_state: str | None) -> bool:
     if printer_id not in _deferred_printers:
         return False
     return str(live_state or "").upper() not in _ACTIVE_PRINT_STATES
+
+
+@contextlib.asynccontextmanager
+async def upload_in_flight(printer_id: int) -> AsyncIterator[None]:
+    """Mark ``printer_id`` as having an FTPS upload in progress for its duration.
+
+    Wrapped around each FTPS upload call site (dispatch / remote-eject / firmware).
+    While the id is present, a reported ``sdcard`` True→False edge is treated as a
+    dispatch blip and suppressed by ``verify_and_alert_usb_drop`` — the H2S firmware
+    transiently drops ``sdcard`` for ~1 s during an upload. Always removes the id on
+    exit, including when the wrapped block raises (a genuinely missing USB fails the
+    upload, whose own failure path notifies).
+    """
+    _uploads_in_flight.add(printer_id)
+    try:
+        yield
+    finally:
+        _uploads_in_flight.discard(printer_id)
+
+
+def _live_sdcard_present(manager, printer_id: int) -> bool:
+    """Whether the printer's live state currently reports the USB (`sdcard`) present."""
+    try:
+        client = manager.get_client(printer_id)
+    except Exception:  # noqa: BLE001 — manager access must never crash the verifier
+        return False
+    if client is None or getattr(client, "state", None) is None:
+        return False
+    return bool(getattr(client.state, "sdcard", False))
+
+
+async def _usb_probe_entry_count(ip: str, code: str, model: str | None) -> int | None:
+    """Number of root FTPS entries, or None when the probe itself errors.
+
+    A present USB drive lists a non-empty root; a missing/unmounted drive (or a down
+    port / rejected login) collapses to an empty listing or an exception. Both the
+    empty and exception cases are treated by the caller as "not present".
+    """
+    try:
+        entries = await list_files_async(ip, code, path="/", printer_model=model)
+    except Exception:  # noqa: BLE001 — a failed probe reads as "not present"
+        return None
+    return len(entries or [])
+
+
+async def verify_and_alert_usb_drop(
+    printer_id: int,
+    *,
+    manager=None,
+    now: float | None = None,
+    sleep=None,
+) -> None:
+    """Verify a reported ``sdcard`` True→False edge before alerting on a USB drop.
+
+    Thin service-owned entry point for the ``main`` status hook (which owns only the
+    edge detection via ``record_sdcard_and_detect_drop``). A reported drop is NOT
+    trusted blindly — the H2S firmware transiently reports ``sdcard=false`` during
+    job dispatch / FTPS upload:
+
+      * If an FTPS upload is in flight for this printer → suppress (dispatch blip).
+      * Else actively probe FTPS: a non-empty root means the USB is present →
+        suppress. Empty/unreachable → wait ``USB_DROP_PROBE_RETRY_S`` and re-probe;
+        still empty/unreachable → confirmed drop.
+      * If the printer reports the USB back (live ``sdcard`` True) before the alert
+        fires → no alert.
+      * A per-printer 6h cooldown (``CLEANUP_COOLDOWN_S``) keeps a flapping stick
+        from spamming the notification.
+
+    Fires the ``on_storage_low`` notification with ``attempted=False`` (raw reason,
+    no "Auto-cleanup could not free space:" prefix) only on a confirmed drop. Never
+    raises — the whole body is guarded so it can't crash the status flow.
+    """
+    if manager is None:
+        manager = printer_manager
+    now = time.time() if now is None else now
+    sleep = asyncio.sleep if sleep is None else sleep
+
+    try:
+        # (a) Upload-in-flight suppression — a dispatch/upload blip, not a drop.
+        if printer_id in _uploads_in_flight:
+            logger.info(
+                "[USB-STORAGE] printer %s sdcard=false during active upload; ignoring (dispatch blip)",
+                printer_id,
+            )
+            return
+
+        from backend.app.core.database import async_session
+        from backend.app.models.printer import Printer
+
+        async with async_session() as db:
+            printer = await db.get(Printer, printer_id)
+            if printer is None:
+                logger.warning("[USB-STORAGE] printer %s not found; cannot verify USB drop", printer_id)
+                return
+            printer_name = printer.name or f"printer {printer_id}"
+            ip = printer.ip_address
+            code = printer.access_code
+            model = printer.model
+
+        # (b) Active FTPS probe — a present USB lists a non-empty root.
+        count = await _usb_probe_entry_count(ip, code, model)
+        if count:
+            logger.info(
+                "[USB-STORAGE] printer %s transient sdcard=false ignored (FTPS probe saw %d entries)",
+                printer_id,
+                count,
+            )
+            return
+
+        # Empty/unreachable → confirm with one delayed re-probe (filters dispatch blips).
+        await sleep(USB_DROP_PROBE_RETRY_S)
+        count = await _usb_probe_entry_count(ip, code, model)
+        if count:
+            logger.info(
+                "[USB-STORAGE] printer %s transient sdcard=false ignored (FTPS probe saw %d entries)",
+                printer_id,
+                count,
+            )
+            return
+
+        # (a′) Re-check upload-in-flight AFTER the re-probe. An edge can fire just
+        # BEFORE a dispatch upload begins (blips also occur at the project_file /
+        # print-start moment); once that upload is running, the printer caps
+        # concurrent FTPS sessions, so BOTH probes can fail on session contention and
+        # fabricate a confirmed drop. If an upload is now in flight, it's that blip.
+        if printer_id in _uploads_in_flight:
+            logger.info(
+                "[USB-STORAGE] printer %s sdcard=false during active upload; ignoring (dispatch blip)",
+                printer_id,
+            )
+            return
+
+        # (c) Cancellation — the printer reported the USB back before we alerted.
+        if _live_sdcard_present(manager, printer_id):
+            logger.info("[USB-STORAGE] printer %s sdcard restored during verification; no alert", printer_id)
+            return
+
+        # (d) Repeat suppression — one alert per printer per cooldown window.
+        last = _last_drop_alert_at.get(printer_id)
+        if last is not None and now - last < CLEANUP_COOLDOWN_S:
+            logger.info("[USB-STORAGE] printer %s USB drop within alert cooldown; suppressing", printer_id)
+            return
+
+        _last_drop_alert_at[printer_id] = now
+        logger.warning("[USB-STORAGE] printer %s USB drop confirmed by FTPS probe; alerting", printer_id)
+        await _fire_usb_drop_notification(printer_id, printer_name)
+    except Exception:  # noqa: BLE001 — verifier must NEVER crash the status flow
+        logger.exception("[USB-STORAGE] USB-drop verification failed unexpectedly for printer %s", printer_id)
 
 
 @dataclass
@@ -520,15 +702,20 @@ async def on_storage_low(
         # Consume any pending deferral for this attempt: only the printing outcome
         # below re-arms it. Guards that intentionally swallow the attempt (disabled
         # setting, cooldown) leave it cleared, or the main.py retry hook would
-        # re-fire a DB-opening task on every status tick forever.
+        # re-fire a DB-opening task on every status tick forever. Remember whether it
+        # was already deferred so we can log only the NEW deferral (see below).
+        was_deferred = printer_id in _deferred_printers
         _deferred_printers.discard(printer_id)
 
         status = await _perform_gated_cleanup(printer_id, manager, now, include_print_files=True, notify=True)
         if status == "printing":
             # Never clean mid-print — record the deferral so the main.py hook can
-            # retry once the print ends.
+            # retry once the print ends. Log ONLY when newly deferred: a mid-print
+            # storage-low HMS re-triggers this every status tick, and logging each
+            # time floods the log (776 lines/day in prod from one flapping printer).
             _deferred_printers.add(printer_id)
-            logger.info("[USB-STORAGE] printer %s is printing; deferring cleanup", printer_id)
+            if not was_deferred:
+                logger.info("[USB-STORAGE] printer %s is printing; deferring cleanup", printer_id)
     except Exception:  # noqa: BLE001 — the storage hook must NEVER crash the status flow
         logger.exception("[USB-STORAGE] cleanup failed unexpectedly for printer %s", printer_id)
         try:
@@ -589,5 +776,28 @@ async def _fire_notification(printer_id: int, printer_name: str, outcome: _Clean
             files_deleted=outcome.files_deleted,
             free_bytes=outcome.free_bytes,
             reason=outcome.reason,
+            db=db,
+        )
+
+
+async def _fire_usb_drop_notification(printer_id: int, printer_name: str) -> None:
+    """Send the ``on_storage_low`` notification for a CONFIRMED USB drop.
+
+    Passes ``attempted=False`` so the body carries the raw drop reason with no
+    "Auto-cleanup could not free space:" prefix (no cleanup was attempted).
+    """
+    from backend.app.core.database import async_session
+    from backend.app.services.notification_service import notification_service
+
+    async with async_session() as db:
+        await notification_service.on_storage_low(
+            printer_id,
+            printer_name,
+            success=False,
+            freed_bytes=0,
+            files_deleted=0,
+            free_bytes=None,
+            reason=USB_DROP_REASON,
+            attempted=False,
             db=db,
         )

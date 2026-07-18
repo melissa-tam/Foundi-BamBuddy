@@ -940,6 +940,128 @@ class TestMultiPlateSliceInfoSum:
         assert meta["filament_used_grams"] == 5.0
 
 
+class TestPlateScopedSliceInfo:
+    """When a specific plate ran (``plate_number`` set from the queue item's
+    plate_id, or a single-plate export's own index), the archive's file-level
+    ``print_time_seconds`` / ``filament_used_grams`` and the filament
+    type/color/slots must reflect THAT plate — not the sum across every plate of
+    a multi-plate ``.gcode.3mf`` (#1697). Missing/valueless target falls back to
+    the #1593 summed totals so a single-plate print never headlines the whole
+    project's numbers.
+    """
+
+    # A 3-plate file with distinct time/weight and per-plate filament rows.
+    _THREE_PLATE_XML = """<?xml version="1.0" encoding="UTF-8"?>
+    <config>
+        <plate>
+            <metadata key="index" value="1" />
+            <metadata key="prediction" value="1000" />
+            <metadata key="weight" value="10.0" />
+            <filament id="1" type="PLA" color="#FF0000" used_g="10.0" />
+        </plate>
+        <plate>
+            <metadata key="index" value="2" />
+            <metadata key="prediction" value="2000" />
+            <metadata key="weight" value="25.5" />
+            <filament id="1" type="PETG" color="#00FF00" used_g="20.5" />
+            <filament id="2" type="PETG" color="#0000FF" used_g="5.0" />
+        </plate>
+        <plate>
+            <metadata key="index" value="3" />
+            <metadata key="prediction" value="3000" />
+            <metadata key="weight" value="30.0" />
+            <filament id="1" type="ABS" color="#FFFFFF" used_g="30.0" />
+        </plate>
+    </config>
+    """
+
+    @staticmethod
+    def _make_3mf_with_slice_info(slice_info_xml: str) -> str:
+        import os
+        import tempfile
+        import zipfile
+
+        fd, path = tempfile.mkstemp(suffix=".3mf")
+        os.close(fd)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("3D/3dmodel.model", "<model/>")
+            zf.writestr("Metadata/slice_info.config", slice_info_xml)
+        return path
+
+    def test_plate_number_scopes_totals_and_filaments(self):
+        """plate_number=2 → plate-2 time (2000), weight (25.5), filament
+        type/color/slots — never the summed 6000s / 65.5g. plate_number recorded."""
+        from backend.app.services.archive import ThreeMFParser
+
+        path = self._make_3mf_with_slice_info(self._THREE_PLATE_XML)
+        meta = ThreeMFParser(path, plate_number=2).parse()
+
+        assert meta["print_time_seconds"] == 2000
+        assert meta["filament_used_grams"] == 25.5
+        # Filament type/color scoped to plate 2's PETG rows (not plate 1 PLA / 3 ABS).
+        assert meta["filament_type"] == "PETG"
+        assert meta["filament_color"] == "#00FF00,#0000FF"
+        assert meta["filament_slots"] == [
+            {"slot_id": 1, "used_g": 20.5, "type": "PETG", "color": "#00FF00"},
+            {"slot_id": 2, "used_g": 5.0, "type": "PETG", "color": "#0000FF"},
+        ]
+        # Observability: the parse records which plate it targeted.
+        assert meta["plate_number"] == 2
+
+    def test_plate_number_none_sums_all_plates(self):
+        """#1593 regression pin: plate_number=None → summed totals across all
+        plates, and NO plate_number key (byte-identical to pre-#1697)."""
+        from backend.app.services.archive import ThreeMFParser
+
+        path = self._make_3mf_with_slice_info(self._THREE_PLATE_XML)
+        meta = ThreeMFParser(path).parse()  # no plate_number
+
+        assert meta["print_time_seconds"] == 6000  # 1000+2000+3000
+        assert meta["filament_used_grams"] == 65.5  # 10.0+25.5+30.0
+        assert "plate_number" not in meta
+        # All plates' filaments contribute type/color when unscoped.
+        assert meta["filament_type"] == "PLA, PETG, ABS"
+
+    def test_missing_target_plate_falls_back_to_sum(self):
+        """plate_number=99 matches no plate → summed fallback (never emits
+        nothing), but plate_number is still recorded for observability."""
+        from backend.app.services.archive import ThreeMFParser
+
+        path = self._make_3mf_with_slice_info(self._THREE_PLATE_XML)
+        meta = ThreeMFParser(path, plate_number=99).parse()
+
+        assert meta["print_time_seconds"] == 6000
+        assert meta["filament_used_grams"] == 65.5
+        assert meta["filament_type"] == "PLA, PETG, ABS"
+        assert meta["plate_number"] == 99
+
+    def test_target_plate_missing_weight_falls_back_per_field(self):
+        """Per-field fallback: the target plate has a prediction but no weight →
+        time scopes to the plate, grams fall back to the summed total."""
+        from backend.app.services.archive import ThreeMFParser
+
+        slice_info_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <config>
+            <plate>
+                <metadata key="index" value="1" />
+                <metadata key="prediction" value="1000" />
+                <metadata key="weight" value="10.0" />
+            </plate>
+            <plate>
+                <metadata key="index" value="2" />
+                <metadata key="prediction" value="2000" />
+            </plate>
+        </config>
+        """
+        path = self._make_3mf_with_slice_info(slice_info_xml)
+        meta = ThreeMFParser(path, plate_number=2).parse()
+
+        # Time scopes to plate 2; grams fall back to the sum (only plate 1 had a weight).
+        assert meta["print_time_seconds"] == 2000
+        assert meta["filament_used_grams"] == 10.0
+        assert meta["plate_number"] == 2
+
+
 class TestPlateCapabilities:
     """Per-plate nozzle-requirement capabilities feed the farm capability gate.
 

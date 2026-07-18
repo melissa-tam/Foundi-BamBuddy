@@ -1720,3 +1720,93 @@ class TestUploadSourceThreeMF:
         assert "outside the data directory" in response.json()["detail"]
         # Did not write anything under the bogus /tmp/source/ either.
         assert not (Path("/tmp") / "source").exists() or not (Path("/tmp") / "source" / "totally_outside.3mf").exists()  # nosec B108
+
+
+class TestArchivePrintPlateScoping:
+    """#1697 end-to-end: a farm queue print of a single plate out of a
+    multi-plate ``.gcode.3mf`` must archive THAT plate's grams/time, resolved
+    from the queue item's plate_id via the shared farm_correlation helper — not
+    the summed-across-plates project totals the parser produces without a plate.
+    """
+
+    _MULTI_PLATE_SLICE_INFO = """<?xml version="1.0" encoding="UTF-8"?>
+    <config>
+        <plate>
+            <metadata key="index" value="1" />
+            <metadata key="prediction" value="1000" />
+            <metadata key="weight" value="10.0" />
+            <filament id="1" type="PLA" color="#FF0000" used_g="10.0" />
+        </plate>
+        <plate>
+            <metadata key="index" value="2" />
+            <metadata key="prediction" value="2000" />
+            <metadata key="weight" value="25.5" />
+            <filament id="1" type="PETG" color="#00FF00" used_g="25.5" />
+        </plate>
+        <plate>
+            <metadata key="index" value="3" />
+            <metadata key="prediction" value="3000" />
+            <metadata key="weight" value="30.0" />
+            <filament id="1" type="ABS" color="#FFFFFF" used_g="30.0" />
+        </plate>
+    </config>
+    """
+
+    def _write_multi_plate_3mf(self, path: Path) -> None:
+        import zipfile
+
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("3D/3dmodel.model", "<model/>")
+            zf.writestr("Metadata/slice_info.config", self._MULTI_PLATE_SLICE_INFO)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_queue_print_archives_plate_2_grams(self, printer_factory, db_session, tmp_path, monkeypatch):
+        from datetime import datetime, timezone
+
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services import archive as archive_module
+        from backend.app.services.archive import ArchiveService
+        from backend.app.services.farm_correlation import resolve_active_plate_id
+
+        # Redirect archive output under tmp so the test writes nowhere real.
+        monkeypatch.setattr(archive_module.settings, "base_dir", tmp_path)
+        monkeypatch.setattr(archive_module.settings, "archive_dir", tmp_path / "archive")
+
+        printer = await printer_factory()
+
+        # A farm queue unit printing plate 2, stamped with its dispatch id.
+        item = PrintQueueItem(
+            printer_id=printer.id,
+            status="printing",
+            first_article=False,
+            dispatch_subtask_id="SUB-2",
+            plate_id=2,
+            started_at=datetime.now(timezone.utc),
+        )
+        db_session.add(item)
+        await db_session.commit()
+
+        source = tmp_path / "multi.gcode.3mf"
+        self._write_multi_plate_3mf(source)
+
+        # Resolve exactly as main.on_print_start does, then archive.
+        resolved = await resolve_active_plate_id(db_session, printer.id, "SUB-2")
+        assert resolved == 2
+
+        service = ArchiveService(db_session)
+        archive = await service.archive_print(
+            printer_id=printer.id,
+            source_file=source,
+            print_data={"filename": "multi.gcode.3mf", "status": "printing", "subtask_id": "SUB-2"},
+            subtask_id="SUB-2",
+            plate_id=resolved,
+        )
+
+        assert archive is not None
+        # Plate 2's values — NOT the summed 6000s / 65.5g project totals.
+        assert archive.filament_used_grams == 25.5
+        assert archive.print_time_seconds == 2000
+        assert archive.filament_type == "PETG"
+        # Observability marker persisted into extra_data.
+        assert (archive.extra_data or {}).get("plate_number") == 2

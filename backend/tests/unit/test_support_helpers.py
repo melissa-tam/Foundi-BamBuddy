@@ -5,7 +5,9 @@ _format_bytes, and _collect_support_info diagnostic sections.
 """
 
 import asyncio
+import os
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1236,3 +1238,230 @@ class TestRedactRawPushStatus:
         assert _redact_raw_push_status(None) == {}  # type: ignore[arg-type]
         assert _redact_raw_push_status([]) == {}  # type: ignore[arg-type]
         assert _redact_raw_push_status("") == {}  # type: ignore[arg-type]
+
+
+class TestReadLogEntriesMultiFile:
+    """read_log_entries() walking rotated ``bambuddy.log.*`` siblings newest-first.
+
+    Covers the multi-file walk added for time-based rotation: ordering across
+    files, search/level filters spanning files, the ``days`` walk bound, the
+    ``limit`` short-circuit, per-file continuation folding, and missing/empty
+    file tolerance.
+    """
+
+    @staticmethod
+    def _line(sec: int, level: str, name: str, msg: str) -> str:
+        # ``sec`` drives the seconds field so timestamps are distinct/orderable.
+        return f"2026-07-17 10:00:{sec:02d},000 {level} [{name}] {msg}"
+
+    @staticmethod
+    def _write(path: Path, lines: list[str], mtime: float | None = None) -> None:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+
+    def _read(self, log_dir: Path, **kwargs):
+        from backend.app.services import log_reader
+
+        with patch.object(log_reader, "settings") as mock_settings:
+            mock_settings.log_dir = log_dir
+            return log_reader.read_log_entries(**kwargs)
+
+    def test_newest_first_ordering_across_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            self._write(d / "bambuddy.log", [self._line(3, "INFO", "app", "CURRENT")], mtime=now)
+            self._write(d / "bambuddy.log.2026-07-16", [self._line(2, "INFO", "app", "YESTERDAY")], mtime=now - 86400)
+            self._write(
+                d / "bambuddy.log.2026-07-15", [self._line(1, "INFO", "app", "TWODAYSAGO")], mtime=now - 2 * 86400
+            )
+            entries, total = self._read(d, days=7)
+        assert [e.message for e in entries] == ["CURRENT", "YESTERDAY", "TWODAYSAGO"]
+        assert total == 3
+
+    def test_search_spans_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            self._write(d / "bambuddy.log", [self._line(3, "INFO", "app", "needle here")], mtime=now)
+            self._write(d / "bambuddy.log.2026-07-16", [self._line(2, "INFO", "app", "unrelated")], mtime=now - 86400)
+            self._write(
+                d / "bambuddy.log.2026-07-15", [self._line(1, "ERROR", "app", "another needle")], mtime=now - 2 * 86400
+            )
+            entries, _ = self._read(d, search="needle", days=7)
+        assert [e.message for e in entries] == ["needle here", "another needle"]
+
+    def test_level_filter_across_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            self._write(
+                d / "bambuddy.log",
+                [self._line(4, "INFO", "app", "info-cur"), self._line(3, "ERROR", "app", "err-cur")],
+                mtime=now,
+            )
+            self._write(
+                d / "bambuddy.log.2026-07-16",
+                [self._line(2, "ERROR", "app", "err-old"), self._line(1, "WARNING", "app", "warn-old")],
+                mtime=now - 86400,
+            )
+            entries, _ = self._read(d, level_filter="ERROR", days=7)
+        assert [e.message for e in entries] == ["err-cur", "err-old"]
+
+    def test_days_bound_excludes_old_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            self._write(d / "bambuddy.log", [self._line(3, "INFO", "app", "CURRENT")], mtime=now)
+            self._write(d / "bambuddy.log.2026-07-16", [self._line(2, "INFO", "app", "RECENT")], mtime=now - 2 * 86400)
+            self._write(
+                d / "bambuddy.log.2026-07-01", [self._line(1, "INFO", "app", "ANCIENT")], mtime=now - 10 * 86400
+            )
+            entries, total = self._read(d, days=7)
+        msgs = [e.message for e in entries]
+        assert msgs == ["CURRENT", "RECENT"]
+        assert "ANCIENT" not in msgs
+        # The out-of-window file is never opened, so its lines are not counted.
+        assert total == 2
+
+    def test_limit_short_circuits_before_older_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            # The LAST written line is the newest (logs append at the bottom).
+            self._write(
+                d / "bambuddy.log",
+                [self._line(1, "INFO", "app", "older-cur"), self._line(2, "INFO", "app", "newest-cur")],
+                mtime=now,
+            )
+            self._write(d / "bambuddy.log.2026-07-16", [self._line(3, "INFO", "app", "OLD")], mtime=now - 86400)
+            entries, total = self._read(d, limit=1, days=7)
+        assert [e.message for e in entries] == ["newest-cur"]
+        # Older sibling never opened because limit was reached in the current file.
+        assert total == 2
+
+    def test_continuation_lines_folded_per_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            lines = [
+                self._line(2, "ERROR", "app", "boom"),
+                "Traceback (most recent call last):",
+                '  File "x.py", line 1, in <module>',
+                "ValueError: nope",
+            ]
+            self._write(d / "bambuddy.log", lines, mtime=now)
+            entries, total = self._read(d, days=7)
+        assert len(entries) == 1
+        assert entries[0].message.startswith("boom")
+        assert "Traceback" in entries[0].message
+        assert "ValueError: nope" in entries[0].message
+        assert total == 4
+
+    def test_missing_current_file_reads_siblings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            # No bambuddy.log at all — only a rotated sibling exists.
+            self._write(d / "bambuddy.log.2026-07-16", [self._line(1, "INFO", "app", "ONLY_OLD")], mtime=now - 86400)
+            entries, total = self._read(d, days=7)
+        assert [e.message for e in entries] == ["ONLY_OLD"]
+        assert total == 1
+
+    def test_empty_current_file_tolerated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            (d / "bambuddy.log").write_text("", encoding="utf-8")
+            os.utime(d / "bambuddy.log", (now, now))
+            self._write(
+                d / "bambuddy.log.2026-07-16", [self._line(1, "INFO", "app", "FROM_SIBLING")], mtime=now - 86400
+            )
+            entries, total = self._read(d, days=7)
+        assert [e.message for e in entries] == ["FROM_SIBLING"]
+        assert total == 1  # empty current contributes 0 lines
+
+    def test_no_log_files_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            entries, total = self._read(Path(tmpdir), days=7)
+        assert entries == []
+        assert total == 0
+
+
+class TestLogMaintenanceSweeper:
+    """NSSM rotated-service-log age-purge sweeper (services/log_maintenance.py)."""
+
+    @staticmethod
+    def _touch(path: Path, mtime: float) -> None:
+        path.write_text("x", encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+
+    def _purge(self, log_dir: Path, retention_days: int) -> int:
+        from backend.app.services import log_maintenance
+
+        with patch.object(log_maintenance, "settings") as mock_settings:
+            mock_settings.log_dir = log_dir
+            mock_settings.log_retention_days = retention_days
+            return log_maintenance.log_maintenance_service.purge_rotated_service_logs()
+
+    def test_old_rotated_deleted_young_and_active_kept(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            old = now - 30 * 86400
+
+            active_out = d / "service-stdout.log"
+            active_err = d / "service-stderr.log"
+            old_out = d / "service-stdout-2026-06-01_00-00-00.log"
+            old_err = d / "service-stderr-2026-06-01_00-00-00.log"
+            young_out = d / "service-stdout-2026-07-17_00-00-00.log"
+            bd_current = d / "bambuddy.log"
+            bd_rotated = d / "bambuddy.log.2026-06-01"
+
+            # Active files intentionally OLD to prove name-exclusion beats age.
+            self._touch(active_out, old)
+            self._touch(active_err, old)
+            self._touch(old_out, old)
+            self._touch(old_err, old)
+            self._touch(young_out, now)
+            self._touch(bd_current, old)
+            self._touch(bd_rotated, old)
+
+            deleted = self._purge(d, retention_days=7)
+
+            # Assert inside the with-block so the temp dir still exists.
+            assert deleted == 2
+            assert not old_out.exists()
+            assert not old_err.exists()
+            assert active_out.exists()
+            assert active_err.exists()
+            assert young_out.exists()
+            # bambuddy.log* is owned by the handler's backupCount — never touched.
+            assert bd_current.exists()
+            assert bd_rotated.exists()
+
+    def test_explicit_retention_days_kwarg_overrides_setting(self):
+        from backend.app.services import log_maintenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            rotated = d / "service-stdout-old.log"
+            self._touch(rotated, now - 5 * 86400)  # 5 days old
+            with patch.object(log_maintenance, "settings") as mock_settings:
+                mock_settings.log_dir = d
+                mock_settings.log_retention_days = 30  # would keep it
+                # Explicit 1-day window deletes the 5-day-old rotated file.
+                deleted = log_maintenance.log_maintenance_service.purge_rotated_service_logs(retention_days=1)
+            assert deleted == 1
+            assert not rotated.exists()
+
+    def test_no_rotated_files_returns_zero(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            now = time.time()
+            self._touch(d / "service-stdout.log", now - 100 * 86400)  # active, old
+            self._touch(d / "bambuddy.log", now - 100 * 86400)
+            deleted = self._purge(d, retention_days=7)
+        assert deleted == 0

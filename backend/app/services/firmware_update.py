@@ -27,6 +27,7 @@ from backend.app.services.bambu_ftp import (
 )
 from backend.app.services.firmware_check import get_firmware_service
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.usb_storage import upload_in_flight
 
 logger = logging.getLogger(__name__)
 
@@ -334,30 +335,33 @@ class FirmwareUpdateService:
             # Get FTP retry settings
             ftp_retry_enabled, ftp_retry_count, ftp_retry_delay, ftp_timeout = await get_ftp_retry_settings()
 
-            if ftp_retry_enabled:
-                success = await with_ftp_retry(
-                    upload_file_async,
-                    ip_address,
-                    access_code,
-                    firmware_path,
-                    remote_path,
-                    progress_callback=on_upload_progress,
-                    socket_timeout=ftp_timeout,
-                    printer_model=model,
-                    max_retries=ftp_retry_count,
-                    retry_delay=ftp_retry_delay,
-                    operation_name=f"Upload firmware to printer {printer_id}",
-                )
-            else:
-                success = await upload_file_async(
-                    ip_address,
-                    access_code,
-                    firmware_path,
-                    remote_path,
-                    progress_callback=on_upload_progress,
-                    socket_timeout=ftp_timeout,
-                    printer_model=model,
-                )
+            # The firmware FTPS upload transiently drops the H2S sdcard flag; mark the
+            # printer upload-in-flight so the USB-drop verifier ignores that blip.
+            async with upload_in_flight(printer_id):
+                if ftp_retry_enabled:
+                    success = await with_ftp_retry(
+                        upload_file_async,
+                        ip_address,
+                        access_code,
+                        firmware_path,
+                        remote_path,
+                        progress_callback=on_upload_progress,
+                        socket_timeout=ftp_timeout,
+                        printer_model=model,
+                        max_retries=ftp_retry_count,
+                        retry_delay=ftp_retry_delay,
+                        operation_name=f"Upload firmware to printer {printer_id}",
+                    )
+                else:
+                    success = await upload_file_async(
+                        ip_address,
+                        access_code,
+                        firmware_path,
+                        remote_path,
+                        progress_callback=on_upload_progress,
+                        socket_timeout=ftp_timeout,
+                        printer_model=model,
+                    )
 
             if not success:
                 raise Exception("Failed to upload firmware to printer")

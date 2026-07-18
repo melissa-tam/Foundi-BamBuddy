@@ -8,6 +8,8 @@ its own route handlers.
 
 import logging
 import re
+import time
+from pathlib import Path
 
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -48,90 +50,131 @@ def parse_log_line(line: str) -> LogEntry | None:
     return None
 
 
+def _entry_matches(entry: LogEntry, level_filter: str | None, search: str | None) -> bool:
+    """Return True if ``entry`` passes the level and case-insensitive search filters."""
+    if level_filter and entry.level.upper() != level_filter.upper():
+        return False
+    if search:
+        search_lower = search.lower()
+        if not (search_lower in entry.message.lower() or search_lower in entry.logger_name.lower()):
+            return False
+    return True
+
+
+def _scan_lines_reverse(
+    lines: list[str],
+    entries: list[LogEntry],
+    limit: int,
+    level_filter: str | None,
+    search: str | None,
+) -> None:
+    """Parse ``lines`` newest-first, folding continuation lines, appending matches
+    to ``entries`` in place until it reaches ``limit``.
+
+    Continuation lines (tracebacks etc.) are folded into the message of the entry
+    they belong to. Folding is per-file: a rotation boundary never splits an
+    entry because the handler rotates on whole-line writes at midnight.
+    """
+    current_entry: LogEntry | None = None
+    multi_line_buffer: list[str] = []
+
+    for line in reversed(lines):
+        parsed = parse_log_line(line)
+        if parsed:
+            if current_entry:
+                if _entry_matches(current_entry, level_filter, search):
+                    entries.append(current_entry)
+                    if len(entries) >= limit:
+                        return
+            # Attach any accumulated multi-line content to the new (earlier) entry
+            # — in reverse order, continuation lines come before their parent.
+            current_entry = parsed
+            if multi_line_buffer:
+                current_entry.message += "\n" + "\n".join(reversed(multi_line_buffer))
+            multi_line_buffer = []
+        elif line.strip():
+            # Continuation of a multi-line entry (attached to the next parsed entry).
+            multi_line_buffer.append(line.rstrip())
+
+    # Don't forget the last (oldest) entry in this file. Any leftover
+    # multi_line_buffer would be orphaned lines before the first entry.
+    if current_entry and len(entries) < limit and _entry_matches(current_entry, level_filter, search):
+        entries.append(current_entry)
+
+
+def _enumerate_log_files(log_file: Path, days: int) -> list[Path]:
+    """Return ``log_file`` plus rotated ``bambuddy.log.*`` siblings to scan, newest first.
+
+    The current ``log_file`` is always first (and always scanned, even if it is
+    missing on disk — the caller tolerates that). Rotated siblings written by the
+    ``TimedRotatingFileHandler`` (e.g. ``bambuddy.log.2026-07-17``) follow in
+    descending mtime order. ``days`` bounds the walk: a sibling whose mtime is
+    older than ``days`` days is dropped (the current file is exempt).
+    """
+    files: list[Path] = [log_file]
+    cutoff = time.time() - days * 86400
+    try:
+        siblings = [p for p in log_file.parent.glob(f"{log_file.name}.*") if p.is_file()]
+    except OSError as e:
+        logger.error("Error enumerating rotated log files: %s", e)
+        return files
+
+    dated: list[tuple[float, Path]] = []
+    for p in siblings:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < cutoff:
+            continue
+        dated.append((mtime, p))
+    dated.sort(key=lambda t: t[0], reverse=True)
+    files.extend(p for _, p in dated)
+    return files
+
+
 def read_log_entries(
     limit: int = 200,
     level_filter: str | None = None,
     search: str | None = None,
+    days: int = 7,
 ) -> tuple[list[LogEntry], int]:
-    """Read and parse log entries from ``bambuddy.log``, newest first.
+    """Read and parse log entries from ``bambuddy.log`` and its rotations, newest first.
 
-    Continuation lines (tracebacks etc.) are folded into the message of the
-    entry they belong to. Returns ``(entries, total_lines_in_file)``.
+    The current ``bambuddy.log`` plus any rotated siblings (``bambuddy.log.*``,
+    e.g. ``bambuddy.log.2026-07-17`` written by the ``TimedRotatingFileHandler``)
+    are walked newest-first — the current file, then rotated siblings by
+    descending mtime. ``days`` bounds how far back the file walk goes: a rotated
+    sibling whose mtime is older than ``days`` days is skipped (the current file
+    is always scanned). Scanning stops once ``limit`` matching entries are
+    collected, both within and across files.
+
+    Continuation lines (tracebacks etc.) are folded into the message of the entry
+    they belong to. Returns ``(entries, total_lines_scanned)`` — the second value
+    is the number of raw lines read across every file actually walked (not just
+    the current file).
     """
     log_file = settings.log_dir / "bambuddy.log"
-    if not log_file.exists():
-        return [], 0
-
     entries: list[LogEntry] = []
     total_lines = 0
 
-    try:
-        with open(log_file, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-            total_lines = len(lines)
+    for path in _enumerate_log_files(log_file, days):
+        if len(entries) >= limit:
+            break
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            # Current file may not exist yet; rotated siblings may be pruned
+            # between enumeration and open. Both are tolerated.
+            continue
+        except Exception as e:
+            logger.error("Error reading log file %s: %s", path, e)
+            continue
+        total_lines += len(lines)
+        _scan_lines_reverse(lines, entries, limit, level_filter, search)
 
-            # Parse lines in reverse order (newest first)
-            current_entry: LogEntry | None = None
-            multi_line_buffer: list[str] = []
-
-            for line in reversed(lines):
-                parsed = parse_log_line(line)
-                if parsed:
-                    # Found a new log entry start
-                    if current_entry:
-                        # Apply filters and add previous entry (without multi_line_buffer - it belongs to new entry)
-                        should_include = True
-
-                        # Level filter
-                        if level_filter and current_entry.level.upper() != level_filter.upper():
-                            should_include = False
-
-                        # Search filter (case-insensitive)
-                        if search and should_include:
-                            search_lower = search.lower()
-                            if not (
-                                search_lower in current_entry.message.lower()
-                                or search_lower in current_entry.logger_name.lower()
-                            ):
-                                should_include = False
-
-                        if should_include:
-                            entries.append(current_entry)
-
-                            if len(entries) >= limit:
-                                break
-
-                    # Set new entry and attach any accumulated multi-line content to it
-                    # (in reverse order, continuation lines come before their parent entry)
-                    current_entry = parsed
-                    if multi_line_buffer:
-                        current_entry.message += "\n" + "\n".join(reversed(multi_line_buffer))
-                    multi_line_buffer = []
-                elif line.strip():
-                    # Continuation of multi-line log entry (will be attached to next parsed entry)
-                    multi_line_buffer.append(line.rstrip())
-
-            # Don't forget the last (oldest) entry
-            # Note: any remaining multi_line_buffer would be orphaned lines before the first entry
-            if current_entry and len(entries) < limit:
-                should_include = True
-                if level_filter and current_entry.level.upper() != level_filter.upper():
-                    should_include = False
-                if search and should_include:
-                    search_lower = search.lower()
-                    if not (
-                        search_lower in current_entry.message.lower()
-                        or search_lower in current_entry.logger_name.lower()
-                    ):
-                        should_include = False
-                if should_include:
-                    entries.append(current_entry)
-
-    except Exception as e:
-        logger.error("Error reading log file: %s", e)
-        return [], 0
-
-    # Entries are already in newest-first order
+    # Entries are already in newest-first order (within and across files).
     return entries, total_lines
 
 

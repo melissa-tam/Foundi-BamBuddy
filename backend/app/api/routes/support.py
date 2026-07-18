@@ -175,10 +175,11 @@ async def get_logs(
     limit: int = Query(200, ge=1, le=1000, description="Maximum number of entries to return"),
     level: str | None = Query(None, description="Filter by log level (DEBUG, INFO, WARNING, ERROR)"),
     search: str | None = Query(None, description="Search in message or logger name"),
+    days: int = Query(default=7, ge=1, le=90, description="How many days of rotated log files to search back through"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_READ),
 ):
     """Get recent application log entries with optional filtering."""
-    entries, total_lines = read_log_entries(limit=limit, level_filter=level, search=search)
+    entries, total_lines = read_log_entries(limit=limit, level_filter=level, search=search, days=days)
 
     return LogsResponse(
         entries=entries,
@@ -1118,6 +1119,13 @@ async def _collect_support_info() -> dict:
     return info
 
 
+# Total on-disk log budget for a support bundle: the current bambuddy.log tail
+# plus as many rotated siblings (newest-first) as fit under this cap. Generous
+# because time-based rotation now keeps daily siblings that are individually
+# large but collectively the diagnostic trail worth shipping.
+LOG_BUNDLE_MAX_BYTES = 50 * 1024 * 1024
+
+
 def _get_log_content(max_bytes: int = 10 * 1024 * 1024, sensitive_strings: dict[str, str] | None = None) -> bytes:
     """Get log file content, limited to max_bytes from the end."""
     log_file = settings.log_dir / "bambuddy.log"
@@ -1277,9 +1285,44 @@ async def generate_support_bundle(
             snapshot_json = sanitize_log_content(snapshot_json, sensitive_strings)
             zf.writestr(f"push-status/printer-{i + 1}.json", snapshot_json)
 
-        # Add log file
+        # Add log file(s): the current bambuddy.log (tail-capped) plus rotated
+        # daily siblings newest-first until the running total would exceed
+        # LOG_BUNDLE_MAX_BYTES. Time-based rotation means the recent history a
+        # maintainer needs frequently lives in yesterday's sibling, not just the
+        # current file.
         log_content = _get_log_content(sensitive_strings=sensitive_strings)
         zf.writestr("bambuddy.log", log_content)
+        added_log_bytes = len(log_content)
+
+        log_file = settings.log_dir / "bambuddy.log"
+        try:
+            rotated_siblings = sorted(
+                (p for p in log_file.parent.glob(f"{log_file.name}.*") if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError as e:
+            logger.warning("Could not enumerate rotated logs for bundle: %s", e)
+            rotated_siblings = []
+
+        for sibling in rotated_siblings:
+            try:
+                sibling_size = sibling.stat().st_size
+            except OSError as e:
+                logger.warning("Skipping rotated log %s in bundle: %s", sibling.name, e)
+                continue
+            # Stop once the next sibling would push us past the budget (raw size
+            # is a close upper bound on the sanitized bytes we actually add).
+            if added_log_bytes + sibling_size > LOG_BUNDLE_MAX_BYTES:
+                break
+            try:
+                raw = sibling.read_bytes()
+            except OSError as e:
+                logger.warning("Skipping rotated log %s in bundle: %s", sibling.name, e)
+                continue
+            sanitized = sanitize_log_content(raw.decode("utf-8", errors="replace"), sensitive_strings).encode("utf-8")
+            zf.writestr(sibling.name, sanitized)
+            added_log_bytes += len(sanitized)
 
     zip_buffer.seek(0)
 

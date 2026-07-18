@@ -7,7 +7,11 @@ and cumulative layer usage lookup.
 import io
 import json
 import math
+import os
+import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
+from pathlib import Path
 
 from backend.app.utils.threemf_tools import (
     extract_bed_type_from_3mf,
@@ -17,9 +21,11 @@ from backend.app.utils.threemf_tools import (
     extract_print_time_from_3mf,
     extract_project_filaments_from_3mf,
     get_cumulative_usage_at_layer,
+    list_gcode_plate_ids,
     mm_to_grams,
     parse_gcode_layer_filament_usage,
     read_plate_gcode_machine_end,
+    zero_slice_usage_metadata,
 )
 
 
@@ -30,6 +36,44 @@ def create_mock_3mf(slice_info_content: str) -> io.BytesIO:
         zf.writestr("Metadata/slice_info.config", slice_info_content)
     buffer.seek(0)
     return buffer
+
+
+def _write_3mf(members: list[str]) -> Path:
+    """Write a temp .3mf containing exactly ``members`` (each a zero-byte entry)."""
+    fd, name = tempfile.mkstemp(suffix=".3mf")
+    os.close(fd)
+    path = Path(name)
+    with zipfile.ZipFile(path, "w") as zf:
+        for m in members:
+            zf.writestr(m, b"")
+    return path
+
+
+class TestListGcodePlateIds:
+    def test_multiple_plates_sorted(self):
+        path = _write_3mf(["Metadata/plate_2.gcode", "Metadata/plate_1.gcode", "3D/3dmodel.model"])
+        try:
+            assert list_gcode_plate_ids(path) == [1, 2]
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_ignores_non_gcode_and_unsliced_plates(self):
+        # A plate can exist without a .gcode member (unsliced) — only G-code plates count.
+        path = _write_3mf(["Metadata/plate_1.gcode", "Metadata/plate_1.gcode.md5", "Metadata/plate_3.json"])
+        try:
+            assert list_gcode_plate_ids(path) == [1]
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_no_gcode_returns_empty(self):
+        path = _write_3mf(["3D/3dmodel.model"])
+        try:
+            assert list_gcode_plate_ids(path) == []
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_unreadable_returns_empty(self):
+        assert list_gcode_plate_ids(Path("does-not-exist.3mf")) == []
 
 
 class TestParseGcodeLayerFilamentUsage:
@@ -994,3 +1038,124 @@ class TestReadPlateGcodeMachineEnd:
         path = self._write_plate(tmp_path, gcode)
         tail = read_plate_gcode_machine_end(path, 1)
         assert tail == "; MACHINE_END_GCODE_START\nM18\n; EXECUTABLE_BLOCK_END\n"
+
+
+class TestZeroSliceUsageMetadata:
+    """zero_slice_usage_metadata strips a motion-only eject file's inherited donor
+    slice usage so no consumer books phantom grams / print time. It rewrites only
+    Metadata/slice_info.config (weight + prediction values -> 0; every filament's
+    used_g / used_m -> 0, across ALL plates) and copies every other ZIP member
+    verbatim; slice_info.config has no .md5 sidecar so nothing else recomputes."""
+
+    _SLICE_INFO = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<config>\n"
+        "  <plate>\n"
+        '    <metadata key="index" value="1"/>\n'
+        '    <metadata key="prediction" value="16735"/>\n'
+        '    <metadata key="weight" value="406.85"/>\n'
+        '    <metadata key="curr_bed_type" value="Textured PEI Plate"/>\n'
+        '    <filament id="1" type="PETG" color="#FF8000" used_g="406.9" used_m="132.15"/>\n'
+        "  </plate>\n"
+        "  <plate>\n"
+        '    <metadata key="index" value="2"/>\n'
+        '    <metadata key="prediction" value="8000"/>\n'
+        '    <metadata key="weight" value="200.0"/>\n'
+        '    <filament id="1" type="PETG" color="#FF8000" used_g="200.0" used_m="65.0"/>\n'
+        '    <filament id="2" type="PLA" color="#00FF00" used_g="12.5" used_m="4.1"/>\n'
+        "  </plate>\n"
+        "</config>\n"
+    )
+
+    _GCODE = b"; HEADER_BLOCK_START\n; max_z_height: 18.00\n; HEADER_BLOCK_END\nG28 X Y\n"
+    _MD5 = b"ABCDEF0123456789ABCDEF0123456789"
+    _MODEL = b"<model/>"
+
+    @classmethod
+    def _write_3mf(cls, tmp_path, *, with_slice_info=True, name="art.gcode.3mf"):
+        path = tmp_path / name
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            if with_slice_info:
+                zf.writestr("Metadata/slice_info.config", cls._SLICE_INFO)
+            zf.writestr("Metadata/plate_1.gcode", cls._GCODE)
+            zf.writestr("Metadata/plate_1.gcode.md5", cls._MD5)
+            zf.writestr("3D/3dmodel.model", cls._MODEL)
+        return path
+
+    @staticmethod
+    def _members(path):
+        with zipfile.ZipFile(path, "r") as zf:
+            return {name: zf.read(name) for name in zf.namelist()}
+
+    def test_all_plate_weights_predictions_and_filaments_zeroed(self, tmp_path):
+        path = self._write_3mf(tmp_path)
+        zero_slice_usage_metadata(path)
+
+        with zipfile.ZipFile(path, "r") as zf:
+            root = ET.fromstring(zf.read("Metadata/slice_info.config").decode())
+
+        weights = [m.get("value") for m in root.iter("metadata") if m.get("key") == "weight"]
+        predictions = [m.get("value") for m in root.iter("metadata") if m.get("key") == "prediction"]
+        used_g = [f.get("used_g") for f in root.iter("filament")]
+        used_m = [f.get("used_m") for f in root.iter("filament")]
+
+        # Both plates present, all usage figures zeroed.
+        assert weights == ["0", "0"]
+        assert predictions == ["0", "0"]
+        assert used_g == ["0", "0", "0"]
+        assert used_m == ["0", "0", "0"]
+
+    def test_other_slice_info_attributes_preserved(self, tmp_path):
+        path = self._write_3mf(tmp_path)
+        zero_slice_usage_metadata(path)
+
+        with zipfile.ZipFile(path, "r") as zf:
+            root = ET.fromstring(zf.read("Metadata/slice_info.config").decode())
+
+        # Non-usage metadata (index, bed type) and filament identity survive.
+        assert [m.get("value") for m in root.iter("metadata") if m.get("key") == "index"] == ["1", "2"]
+        assert [m.get("value") for m in root.iter("metadata") if m.get("key") == "curr_bed_type"] == [
+            "Textured PEI Plate"
+        ]
+        assert [(f.get("id"), f.get("type"), f.get("color")) for f in root.iter("filament")] == [
+            ("1", "PETG", "#FF8000"),
+            ("1", "PETG", "#FF8000"),
+            ("2", "PLA", "#00FF00"),
+        ]
+
+    def test_gcode_md5_and_other_members_byte_identical(self, tmp_path):
+        path = self._write_3mf(tmp_path)
+        before = self._members(path)
+        zero_slice_usage_metadata(path)
+        after = self._members(path)
+
+        # No members added or dropped.
+        assert set(after) == set(before)
+        # Every member EXCEPT slice_info.config is byte-for-byte identical — the
+        # plate gcode + its .md5 sidecar in particular are untouched (red line #1).
+        assert after["Metadata/plate_1.gcode"] == before["Metadata/plate_1.gcode"] == self._GCODE
+        assert after["Metadata/plate_1.gcode.md5"] == before["Metadata/plate_1.gcode.md5"] == self._MD5
+        assert after["3D/3dmodel.model"] == before["3D/3dmodel.model"] == self._MODEL
+        # slice_info.config is the only member that changed.
+        assert after["Metadata/slice_info.config"] != before["Metadata/slice_info.config"]
+
+    def test_extract_helpers_report_zero_after_zeroing(self, tmp_path):
+        path = self._write_3mf(tmp_path)
+        zero_slice_usage_metadata(path)
+
+        # The public extract helpers (used by archive / usage tracker) now see zero.
+        slots = extract_filament_usage_from_3mf(path, plate_id=1)
+        assert all(s["used_g"] == 0 for s in slots)
+        assert extract_print_time_from_3mf(path, plate_id=1) == 0
+        # Plate 2 as well — all donor plates zeroed.
+        assert all(s["used_g"] == 0 for s in extract_filament_usage_from_3mf(path, plate_id=2))
+        assert extract_print_time_from_3mf(path, plate_id=2) == 0
+
+    def test_missing_slice_info_is_noop(self, tmp_path):
+        path = self._write_3mf(tmp_path, with_slice_info=False)
+        before = self._members(path)
+        # Must not raise, and must leave the archive completely untouched.
+        zero_slice_usage_metadata(path)
+        after = self._members(path)
+        assert after == before
+        assert "Metadata/slice_info.config" not in after

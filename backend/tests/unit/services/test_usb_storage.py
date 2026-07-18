@@ -35,10 +35,11 @@ _GB = 1024**3
 # Fakes / helpers
 # --------------------------------------------------------------------------- #
 class _FakeState:
-    def __init__(self, state="IDLE", gcode_file=None, subtask_name=None):
+    def __init__(self, state="IDLE", gcode_file=None, subtask_name=None, sdcard=False):
         self.state = state
         self.gcode_file = gcode_file
         self.subtask_name = subtask_name
+        self.sdcard = sdcard
 
 
 class _FakeClient:
@@ -364,6 +365,146 @@ class TestSdcardDrop:
         # Remount, then a second drop fires again.
         assert usb_storage.record_sdcard_and_detect_drop(3, True) is False
         assert usb_storage.record_sdcard_and_detect_drop(3, False) is True
+
+
+class TestVerifyAndAlertUsbDrop:
+    """The verify-then-alert flow behind main.py's ``sdcard`` True→False edge.
+
+    ``record_sdcard_and_detect_drop`` (above) still owns the pure edge; main.py now
+    spawns ``verify_and_alert_usb_drop`` which does NOT trust the edge blindly:
+    upload-in-flight suppression, an FTPS re-probe that filters ~1 s dispatch blips,
+    live-state cancellation, and a per-printer 6 h alert cooldown. Only a
+    probe-confirmed drop fires the ``attempted=False`` notification. FTPS/list is
+    mocked at the module boundary; the alert sleep is injected so the suite stays
+    fast (no real 15 s wait)."""
+
+    async def test_edge_during_upload_is_suppressed(self, db_session, session_maker, printer_factory):
+        printer = await printer_factory(model="H2S")
+        usb_storage._uploads_in_flight.add(printer.id)
+        list_mock = _list_from({"/": []})
+        sleep = AsyncMock()
+        with (
+            _patch_session(session_maker),
+            patch.object(usb_storage, "list_files_async", new=list_mock),
+            patch.object(notification_service, "on_storage_low", new_callable=AsyncMock) as notify,
+        ):
+            await usb_storage.verify_and_alert_usb_drop(printer.id, manager=_FakeManager(), now=NOW, sleep=sleep)
+        # Suppressed before any probe / wait / notification.
+        notify.assert_not_awaited()
+        list_mock.assert_not_awaited()
+        sleep.assert_not_awaited()
+
+    async def test_probe_sees_usb_present_suppressed(self, db_session, session_maker, printer_factory):
+        printer = await printer_factory(model="H2S")
+        # A non-empty root on the FIRST probe → USB present → suppress, no re-probe.
+        list_mock = _list_from({"/": [_rec("a.3mf", path="/a.3mf", size=_GB)]})
+        sleep = AsyncMock()
+        with (
+            _patch_session(session_maker),
+            patch.object(usb_storage, "list_files_async", new=list_mock),
+            patch.object(notification_service, "on_storage_low", new_callable=AsyncMock) as notify,
+        ):
+            await usb_storage.verify_and_alert_usb_drop(printer.id, manager=_FakeManager(), now=NOW, sleep=sleep)
+        notify.assert_not_awaited()
+        sleep.assert_not_awaited()  # present on first probe → never waits
+        assert printer.id not in usb_storage._last_drop_alert_at
+
+    async def test_confirmed_drop_alerts_once(self, db_session, session_maker, printer_factory):
+        printer = await printer_factory(model="H2S")
+        # Empty root on BOTH probes + no live sdcard → confirmed drop.
+        list_mock = _list_from({"/": []})
+        sleep = AsyncMock()
+        with (
+            _patch_session(session_maker),
+            patch.object(usb_storage, "list_files_async", new=list_mock),
+            patch.object(notification_service, "on_storage_low", new_callable=AsyncMock) as notify,
+        ):
+            await usb_storage.verify_and_alert_usb_drop(printer.id, manager=_FakeManager(), now=NOW, sleep=sleep)
+        sleep.assert_awaited_once()  # one confirming re-probe delay
+        notify.assert_awaited_once()
+        kwargs = notify.await_args.kwargs
+        assert kwargs["attempted"] is False
+        assert kwargs["success"] is False
+        assert kwargs["reason"] == usb_storage.USB_DROP_REASON
+        assert usb_storage._last_drop_alert_at[printer.id] == NOW
+
+    async def test_upload_starting_after_first_probe_is_suppressed(self, db_session, session_maker, printer_factory):
+        """Race: the edge fires just BEFORE a dispatch upload begins, then both FTPS
+        probes fail on session contention against that now-running upload. The
+        post-re-probe upload-in-flight re-check suppresses the false confirmed drop."""
+        printer = await printer_factory(model="H2S")
+        list_mock = _list_from({"/": []})  # both probes see an empty/contended root
+
+        async def _sleep(_seconds):
+            # The dispatch upload begins during the confirmation wait.
+            usb_storage._uploads_in_flight.add(printer.id)
+
+        with (
+            _patch_session(session_maker),
+            patch.object(usb_storage, "list_files_async", new=list_mock),
+            patch.object(notification_service, "on_storage_low", new_callable=AsyncMock) as notify,
+        ):
+            await usb_storage.verify_and_alert_usb_drop(printer.id, manager=_FakeManager(), now=NOW, sleep=_sleep)
+        notify.assert_not_awaited()  # re-check caught the now-in-flight upload
+        assert printer.id not in usb_storage._last_drop_alert_at
+
+    async def test_probe_exception_treated_as_absent_and_alerts(self, db_session, session_maker, printer_factory):
+        printer = await printer_factory(model="H2S")
+        # list_files_async raising (port 990 down / login rejected) reads as "absent".
+        raising = AsyncMock(side_effect=OSError("port 990 down"))
+        sleep = AsyncMock()
+        with (
+            _patch_session(session_maker),
+            patch.object(usb_storage, "list_files_async", new=raising),
+            patch.object(notification_service, "on_storage_low", new_callable=AsyncMock) as notify,
+        ):
+            await usb_storage.verify_and_alert_usb_drop(printer.id, manager=_FakeManager(), now=NOW, sleep=sleep)
+        notify.assert_awaited_once()
+        assert notify.await_args.kwargs["attempted"] is False
+
+    async def test_sdcard_restored_during_verification_cancels(self, db_session, session_maker, printer_factory):
+        printer = await printer_factory(model="H2S")
+        # Both probes empty, but the printer reports the USB back (live sdcard=True)
+        # before the alert → cancelled, no notification.
+        list_mock = _list_from({"/": []})
+        mgr = _FakeManager(_FakeClient(_FakeState(state="IDLE", sdcard=True)))
+        sleep = AsyncMock()
+        with (
+            _patch_session(session_maker),
+            patch.object(usb_storage, "list_files_async", new=list_mock),
+            patch.object(notification_service, "on_storage_low", new_callable=AsyncMock) as notify,
+        ):
+            await usb_storage.verify_and_alert_usb_drop(printer.id, manager=mgr, now=NOW, sleep=sleep)
+        notify.assert_not_awaited()
+        assert printer.id not in usb_storage._last_drop_alert_at
+
+    async def test_cooldown_suppresses_second_drop_then_fires_after(self, db_session, session_maker, printer_factory):
+        printer = await printer_factory(model="H2S")
+        list_mock = _list_from({"/": []})
+        sleep = AsyncMock()
+        with (
+            _patch_session(session_maker),
+            patch.object(usb_storage, "list_files_async", new=list_mock),
+            patch.object(notification_service, "on_storage_low", new_callable=AsyncMock) as notify,
+        ):
+            # 1st confirmed drop → alert.
+            await usb_storage.verify_and_alert_usb_drop(printer.id, manager=_FakeManager(), now=NOW, sleep=sleep)
+            # 2nd within the 6 h cooldown → suppressed (a flapping stick can't spam).
+            await usb_storage.verify_and_alert_usb_drop(printer.id, manager=_FakeManager(), now=NOW + 60, sleep=sleep)
+            # After the cooldown → fires again.
+            after = NOW + usb_storage.CLEANUP_COOLDOWN_S + 1
+            await usb_storage.verify_and_alert_usb_drop(printer.id, manager=_FakeManager(), now=after, sleep=sleep)
+        assert notify.await_count == 2
+        assert usb_storage._last_drop_alert_at[printer.id] == after
+
+    async def test_upload_in_flight_removes_id_on_exception(self):
+        pid = 99
+        with pytest.raises(ValueError):
+            async with usb_storage.upload_in_flight(pid):
+                assert pid in usb_storage._uploads_in_flight
+                raise ValueError("boom")
+        # Always removed on exit, even when the wrapped block raised.
+        assert pid not in usb_storage._uploads_in_flight
 
 
 class TestPostPrintDrain:
