@@ -1988,6 +1988,10 @@ async def get_inventory_remain(
     return {
         "inventory_remain_g": {str(gtid): si.remaining_g for gtid, si in inv.items() if si.remaining_g is not None},
         "first_loaded": {str(gtid): epoch_to_iso(si.first_loaded_ord) for gtid, si in inv.items()},
+        # Out-of-rotation (jammed / feed-fault) trays — only flagged slots appear.
+        # Keys are stringified global tray ids, matching the maps above, so the
+        # PrintModal mirror can drop these trays from auto-match (spool_recovery).
+        "out_of_rotation": {str(gtid): True for gtid, si in inv.items() if si.out_of_rotation},
     }
 
 
@@ -3538,6 +3542,16 @@ async def refresh_ams_slot(
     success, message = client.ams_refresh_tray(ams_id, slot_id)
     if not success:
         raise HTTPException(400, message)
+
+    # Arm the echo-consume flag so the firmware's identify flap (present→9→present
+    # over ~20 s) doesn't ignite the ams_presence re-read loop from its settle-back
+    # gain. Manual refresh itself stays unconditionally allowed (deliberate
+    # operator act); the flag only swallows THIS command's own echo, once. Local
+    # import — printers.py doesn't import ams_presence at module level (matches
+    # main.py's local-import pattern at :1912/:4644).
+    from backend.app.services import ams_presence
+
+    ams_presence.record_reread(printer_id, ams_id, slot_id)
 
     # Apply PA profile after delay (RFID re-read takes a few seconds)
     spawn_background_task(

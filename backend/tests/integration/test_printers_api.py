@@ -1051,7 +1051,10 @@ class TestAMSRefreshAPI:
         mock_client = MagicMock()
         mock_client.ams_refresh_tray.return_value = (True, "Refreshing AMS 0 tray 1")
 
-        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.services.ams_presence.record_reread") as mock_record,
+        ):
             mock_pm.get_client.return_value = mock_client
 
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/0/slot/1/refresh")
@@ -1060,6 +1063,9 @@ class TestAMSRefreshAPI:
             result = response.json()
             assert result["success"] is True
             mock_client.ams_refresh_tray.assert_called_once_with(0, 1)
+            # A successful refresh arms the echo-consume flag so the firmware's
+            # identify flap doesn't ignite the ams_presence re-read loop.
+            mock_record.assert_called_once_with(printer.id, 0, 1)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1070,13 +1076,18 @@ class TestAMSRefreshAPI:
         mock_client = MagicMock()
         mock_client.ams_refresh_tray.return_value = (False, "Please unload filament first")
 
-        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.services.ams_presence.record_reread") as mock_record,
+        ):
             mock_pm.get_client.return_value = mock_client
 
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/0/slot/0/refresh")
 
             assert response.status_code == 400
             assert "unload" in response.json()["detail"].lower()
+            # A refused refresh runs no identify cycle → the flag must NOT be armed.
+            mock_record.assert_not_called()
 
 
 class TestAMSLoadUnloadAPI:

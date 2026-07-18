@@ -122,6 +122,11 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"  # Override with LOG_LEVEL env var or DEBUG=true
     log_to_file: bool = True  # Set to false to disable file logging
+    # How many daily-rotated bambuddy.log siblings the TimedRotatingFileHandler
+    # keeps (backupCount) AND the age window the NSSM service-log sweeper purges
+    # past. Override with the LOG_RETENTION_DAYS env var — applied at restart
+    # (deliberately NOT a DB setting).
+    log_retention_days: int = 30
 
     # API
     api_prefix: str = "/api/v1"

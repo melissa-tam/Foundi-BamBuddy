@@ -2,7 +2,7 @@
 
 Bambu printers report HMS errors with a fixed catalog of remediation actions
 (resume / stop / check assistant / etc.). The catalog is bundled as JSON, keyed
-by the 3-letter SN prefix (printer model code: 03W = A1, 31B = X1C, etc.) and
+by the 3-letter SN prefix (printer model code: 093 = H2S, 31B = H2C, 094 = H2D, etc.) and
 the short error code with no separator.
 
 The action IDs and their string names are derived from BambuStudio's source via

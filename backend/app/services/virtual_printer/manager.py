@@ -92,9 +92,9 @@ MODEL_SERIAL_PREFIXES = {
     "O1D": "09400A",  # H2D
     "O1E": "09400A",  # H2D Pro (same prefix family as H2D)
     "O2D": "09400A",  # H2D Pro
-    "O1C": "09400A",  # H2C
-    "O1C2": "09400A",  # H2C (dual nozzle variant)
-    "O1S": "09400A",  # H2S
+    "O1C": "31B80A",  # H2C (first 4 chars "31B8" match real fleet serials: 31B8AP5A2600711)
+    "O1C2": "31B80A",  # H2C (dual nozzle variant; first 4 chars "31B8" match real fleet serials)
+    "O1S": "09380A",  # H2S (first 4 chars "0938" match real fleet serials)
 }
 
 # Reverse mapping: display name → SSDP model code (for auto-inheriting from printer model)

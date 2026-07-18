@@ -3415,6 +3415,9 @@ async def run_migrations(conn):
         ("on_run_unit_stopped", "1", "TRUE"),
         # Phase 3.2: a printing unit's printer has been offline past the stall grace.
         ("on_print_stalled", "1", "TRUE"),
+        # Pause-stall: a printing unit's CONNECTED printer sat unattended-PAUSEd
+        # past the pause-stall grace (an HMS outside the recovery sets, door-open).
+        ("on_print_paused_stalled", "1", "TRUE"),
         # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
         ("on_storage_low", "1", "TRUE"),
         # Cooldown escalation: post-print eject cooldown is running long (bed still
@@ -3426,6 +3429,12 @@ async def run_migrations(conn):
         ("on_run_aborted", "1", "TRUE"),
         ("on_run_resumed", "0", "FALSE"),
         ("on_first_article_approved", "1", "TRUE"),
+        # Mid-print spool-jam recovery (automatic feed-fault recovery): the
+        # swap-and-resume succeeded / failed, and a jammed spool was taken out
+        # of rotation.
+        ("on_spool_recovery_succeeded", "1", "TRUE"),
+        ("on_spool_recovery_failed", "1", "TRUE"),
+        ("on_spool_out_of_rotation", "1", "TRUE"),
     ):
         _default = _sqlite_default if is_sqlite() else _pg_default
         await _safe_execute(conn, f"ALTER TABLE notification_providers ADD COLUMN {_col} BOOLEAN DEFAULT {_default}")
@@ -3620,6 +3629,22 @@ async def run_migrations(conn):
             "OR COALESCE(weight_used, 0) > 0)"
         )
     )
+
+    # Out-of-rotation marker for mid-print feed-fault recovery: set by
+    # spool_recovery on a feed-fault HMS; cleared on physical remove+re-insert
+    # or manual PATCH. Idempotent ADD COLUMN — TIMESTAMP NULL is the dialect-safe
+    # form used by the adjacent spent_at / first_loaded_at columns (SQLAlchemy
+    # DateTime round-trips ISO strings on SQLite regardless of affinity).
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN feed_fault_at TIMESTAMP NULL")
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN feed_fault_code VARCHAR(16)")
+
+    # Tier-3 re-spool prompt suppression: stamped when the operator answers
+    # "Same spool" to the uncertain re-spool prompt so a deliberately-run-down
+    # near-empty spool stops re-prompting on every reseat / AMS power-cycle /
+    # server restart (the in-memory dedup cannot survive those). Idempotent ADD
+    # COLUMN — TIMESTAMP NULL is the dialect-safe form (SQLite + Postgres) shared
+    # by the adjacent spent_at / feed_fault_at columns.
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN respool_dismissed_at TIMESTAMP NULL")
 
     # Migration (WI-5): the boolean ``prefer_lowest_filament`` setting is replaced
     # by the tri-state ``spool_selection_policy``. Remap an enabled legacy flag to

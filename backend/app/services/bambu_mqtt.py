@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 #   "n3s/<id>"  – AMS HT (H2D Pro and similar; IDs typically start at 128)
 _AMS_MODULE_PREFIXES = ("ams/", "n3f/", "n3s/")
 
+# AMS main status 2 = actively identifying an RFID tag (the per-status meanings
+# are documented inline at the ams_status_main dataclass field and the push-status
+# decode below). Exported so ams_presence shares one origin for this magic value.
+AMS_STATUS_IDENTIFYING = 2
+
 
 def parse_ams_filament_backup_from_cfg(cfg_raw: object) -> bool | None:
     """Extract AMS Filament Backup state from a Bambu push_status ``print.cfg`` value.
@@ -5181,6 +5186,13 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot refresh AMS tray: not connected", self.serial_number)
             return False, "Printer not connected"
 
+        # Refuse while the AMS is mid-identify: commanding a SECOND ams_get_rfid now
+        # collides with the in-flight read and makes the firmware fail it (HMS
+        # 0700_2x00_0001_0081). One identify per slot in flight — the caller retries.
+        if self.state.ams_status_main == AMS_STATUS_IDENTIFYING:
+            logger.warning("[%s] Cannot refresh AMS tray: AMS is busy identifying a tray", self.serial_number)
+            return False, "AMS is busy identifying a tray"
+
         # Check if filament is currently loaded (tray_now != 255)
         # RFID refresh requires the AMS to move filament, which can't happen if one is loaded
         tray_now = self.state.tray_now
@@ -5237,6 +5249,18 @@ class BambuMQTTClient:
         """
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot set AMS filament setting: not connected", self.serial_number)
+            return False
+
+        # Refuse while the AMS is mid-identify: writing filament settings to a slot
+        # the firmware is actively reading clobbers the RFID read (HMS
+        # 0700_2x00_0001_0081). Never write during an identify — the caller retries.
+        if self.state.ams_status_main == AMS_STATUS_IDENTIFYING:
+            logger.warning(
+                "[%s] Refusing ams_filament_setting for AMS %s tray %s: AMS is identifying a tray",
+                self.serial_number,
+                ams_id,
+                tray_id,
+            )
             return False
 
         # Calculate mqtt IDs based on AMS type.

@@ -97,6 +97,32 @@ class AppSettings(BaseModel):
         le=10000,
         description="Minimum remaining grams for a spool to START a print; 0 disables the guard",
     )
+    # Automatic mid-print spool-jam recovery (AMS feed-fault auto-recovery):
+    # when a feed fault interrupts a running print, swap to the next eligible
+    # spool and resume instead of failing the unit. Default ON (user decision at
+    # approval). The step knobs bound the unload/load/resume retry loop.
+    spool_recovery_enabled: bool = Field(
+        default=True,
+        description="Automatically recover mid-print AMS feed faults by swapping to the next eligible spool",
+    )
+    spool_recovery_max_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Resends per recovery step (unload/load/resume) before giving up on that step",
+    )
+    spool_recovery_step_timeout_s: int = Field(
+        default=90,
+        ge=15,
+        le=600,
+        description="Seconds to wait for each recovery step to confirm",
+    )
+    spool_recovery_protect_layers: int = Field(
+        default=7,
+        ge=0,
+        le=1000,
+        description="Below this layer, spools under min_start_spool_g stay ineligible as mid-print replacements",
+    )
     # Structured default filament pushed to BARE (unconfigured) tagless trays,
     # stored as a JSON string (mirrors gcode_snippets). Empty string = feature
     # off (nothing pushed). Shape validated on write against TaglessDefaultFilament.
@@ -518,6 +544,12 @@ class AppSettings(BaseModel):
         le=720,
         description="Flag a farm unit still 'printing' whose printer has been offline this many minutes (5–720)",
     )
+    farm_pause_stall_minutes: int = Field(
+        default=15,
+        ge=5,
+        le=720,
+        description="Flag a farm unit still 'printing' whose CONNECTED printer has sat unattended-PAUSEd this many minutes (5–720)",
+    )
     farm_cooldown_stall_window_minutes: int = Field(
         default=15,
         ge=0,
@@ -589,6 +621,10 @@ class AppSettingsUpdate(BaseModel):
     auto_add_untagged: bool | None = None
     spool_selection_policy: str | None = None
     min_start_spool_g: int | None = Field(default=None, ge=0, le=10000)
+    spool_recovery_enabled: bool | None = None
+    spool_recovery_max_attempts: int | None = Field(default=None, ge=1, le=5)
+    spool_recovery_step_timeout_s: int | None = Field(default=None, ge=15, le=600)
+    spool_recovery_protect_layers: int | None = Field(default=None, ge=0, le=1000)
     tagless_default_filament: str | None = None
     check_updates: bool | None = None
     check_printer_firmware: bool | None = None
@@ -701,6 +737,7 @@ class AppSettingsUpdate(BaseModel):
     farm_escalate_consecutive_failures: int | None = Field(default=None, ge=1, le=20)
     farm_cooldown_warn_floor_c: int | None = Field(default=None, ge=15, le=50)
     farm_offline_stall_minutes: int | None = Field(default=None, ge=5, le=720)
+    farm_pause_stall_minutes: int | None = Field(default=None, ge=5, le=720)
     farm_cooldown_stall_window_minutes: int | None = Field(default=None, ge=0, le=180)
     farm_cooldown_stall_epsilon_c: float | None = Field(default=None, ge=0.1, le=20.0)
     farm_cooldown_max_hold_minutes: int | None = Field(default=None, ge=0, le=720)

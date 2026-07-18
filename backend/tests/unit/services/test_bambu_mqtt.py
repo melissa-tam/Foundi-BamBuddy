@@ -4298,7 +4298,7 @@ class TestDeleteKProfileDualNozzleDetection:
         assert "setting_id" not in cmd
 
     def test_h2s_uses_single_nozzle_format(self):
-        """H2S shares serial prefix "094" with H2D but is single-nozzle (#1386).
+        """A client whose serial carries the H2D prefix "094" but whose model says H2S must still take the single-nozzle branch (#1386) — model, not serial prefix, decides (real H2S serials are "093...").
         Must take the single-nozzle branch with setting_id included.
         """
         client = self._make_client(serial="09400S000000001", model="H2S")
@@ -6233,7 +6233,14 @@ class TestAmsChangeHashPresence:
     @staticmethod
     def _feed(client, state, *, tray_type="", tag="0000000000000000", remain=0):
         client._handle_ams_data(
-            {"ams": [{"id": 0, "tray": [{"id": 0, "state": state, "tray_type": tray_type, "tag_uid": tag, "remain": remain}]}]}
+            {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [{"id": 0, "state": state, "tray_type": tray_type, "tag_uid": tag, "remain": remain}],
+                    }
+                ]
+            }
         )
 
     def test_presence_gain_9_to_11_fires(self, client):
@@ -6273,9 +6280,67 @@ class TestAmsChangeHashPresence:
         # the hash iterated the raw partial, the missing state → 'a' would fire.
         client.on_ams_change = Mock()
         client._handle_ams_data(
-            {"ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PETG", "tag_uid": "1234567890ABCDEF", "remain": 80}]}]}
+            {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [
+                            {"id": 0, "state": 11, "tray_type": "PETG", "tag_uid": "1234567890ABCDEF", "remain": 80}
+                        ],
+                    }
+                ]
+            }
         )
         client.on_ams_change.reset_mock()
         # Partial: only remain re-stated (unchanged), no `state`, no tray_type, no tag.
         client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "remain": 80}]}]})
         assert client.on_ams_change.call_count == 0
+
+
+class TestAmsIdentifyGuards:
+    """The server must never clobber its own AMS RFID reads: while the AMS is
+    actively identifying a tag (``ams_status_main == 2``) both the re-read command
+    and the filament-setting write are refused, so a second identify / a
+    concurrent write can't fail the in-flight read (HMS 0700_2x00_0001_0081)."""
+
+    @pytest.fixture
+    def client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        c = BambuMQTTClient(ip_address="192.168.1.100", serial_number="TEST123", access_code="12345678")
+        c._client = MagicMock()  # publish target — presence means "connected"
+        c.state.connected = True
+        c.state.tray_now = 255  # nothing loaded → ams_refresh_tray passes the load check
+        return c
+
+    def test_refresh_tray_refused_while_identifying(self, client):
+        client.state.ams_status_main = 2
+        ok, msg = client.ams_refresh_tray(0, 0)
+        assert ok is False
+        assert "identifying" in msg.lower()
+        client._client.publish.assert_not_called()  # no ams_get_rfid emitted
+
+    def test_refresh_tray_proceeds_when_idle(self, client):
+        client.state.ams_status_main = 0
+        ok, _msg = client.ams_refresh_tray(0, 0)
+        assert ok is True
+        client._client.publish.assert_called_once()
+
+    def test_set_filament_setting_refused_while_identifying(self, client, caplog):
+        import logging
+
+        client.state.ams_status_main = 2
+        with caplog.at_level(logging.WARNING, logger="backend.app.services.bambu_mqtt"):
+            ok = client.ams_set_filament_setting(0, 0, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230)
+        assert ok is False
+        client._client.publish.assert_not_called()  # no ams_filament_setting emitted
+        warned = "\n".join(r.message for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "identifying" in warned.lower()
+
+    def test_set_filament_setting_proceeds_when_idle(self, client):
+        client.state.ams_status_main = 0
+        ok = client.ams_set_filament_setting(0, 0, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230)
+        assert ok is True
+        client._client.publish.assert_called_once()
