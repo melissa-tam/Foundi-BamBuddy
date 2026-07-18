@@ -1,12 +1,18 @@
 """Manual "Eject now" service (W2) — ordered preconditions + execution paths."""
 
 import asyncio
+import os
+import tempfile
+import zipfile
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from backend.app.models.archive import PrintArchive
+from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.eject import manual, remote as eject_remote
@@ -255,3 +261,171 @@ class TestManualEjectExecution:
         dispatch.assert_awaited_once()
         assert dispatch.await_args.kwargs["queue_item_id"] == item.id
         assert dispatch.await_args.kwargs["purpose"] == "production"
+
+
+_FOREIGN_PLATE_GCODE = (
+    "; HEADER_BLOCK_START\n"
+    "; max_z_height: 18.00\n"
+    "; HEADER_BLOCK_END\n"
+    "; EXECUTABLE_BLOCK_START\n"
+    "G1 X10 Y10\n"
+    "; EXECUTABLE_BLOCK_END\n"
+)
+
+
+def _make_source_3mf() -> Path:
+    fd, name = tempfile.mkstemp(suffix=".gcode.3mf")
+    os.close(fd)
+    path = Path(name)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("Metadata/plate_1.gcode", _FOREIGN_PLATE_GCODE)
+        zf.writestr("3D/3dmodel.model", "<model/>")
+    return path
+
+
+async def _mk_archive(db, *, printer_id, subtask, file_path, filename="foreign.gcode.3mf", print_name="Foreign Widget"):
+    arch = PrintArchive(
+        printer_id=printer_id,
+        filename=filename,
+        file_path=file_path,
+        file_size=123,
+        subtask_id=subtask,
+        print_name=print_name,
+        status="completed",
+    )
+    db.add(arch)
+    await db.flush()
+    return arch
+
+
+class TestManualEjectForeignPlate:
+    """The two-step foreign-plate flow: a gate raised by a non-farm print resolves the
+    donor from the archive → confirm prompt → dispatch on the second call. A farm-known-
+    but-ineligible gate is never treated as foreign."""
+
+    async def test_foreign_plate_raises_confirm_payload(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "FGN", gate="SUB-F")
+            # A prior eject-profiled unit (NOT gate-matching → stays foreign) seeds the
+            # profile suggestion.
+            await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="OTHER", eject_profile_id=77)
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                pytest.raises(manual.ForeignPlateEject) as exc,
+            ):
+                await manual.manual_eject(db_session, printer.id)
+            assert exc.value.code == "foreign_plate"
+            assert exc.value.status_code == 409
+            assert exc.value.print_name == "Foreign Widget"
+            assert exc.value.max_z_height_mm == 18.0
+            assert exc.value.suggested_eject_profile_id == 77
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_confirm_with_profile_dispatches_foreign(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "FGC", gate="SUB-F")
+            prof = EjectProfile(name="fgc-ep")
+            db_session.add(prof)
+            await db_session.flush()
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            dispatch = AsyncMock()
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
+            ):
+                result = await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
+            assert result == {"mode": "dispatched", "queue_item_id": None}
+            dispatch.assert_awaited_once()
+            assert dispatch.await_args.kwargs["printer_id"] == printer.id
+            assert dispatch.await_args.kwargs["profile_id"] == prof.id
+            assert dispatch.await_args.kwargs["plate_id"] == 1
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_confirm_hot_bed_uses_profile_cooldown(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "FGH", gate="SUB-F")
+            prof = EjectProfile(name="fgh-ep", cooldown_temp_c=30.0)
+            db_session.add(prof)
+            await db_session.flush()
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=45.0))
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                pytest.raises(manual.BedTooHot) as exc,
+            ):
+                await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
+            assert exc.value.threshold_c == 30.0
+            assert exc.value.bed_c == 45.0
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_null_gate_refuses_not_foreign(self, db_session):
+        printer = await _mk_printer(db_session, "FGN0", gate=None)
+        await db_session.commit()
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            pytest.raises(manual.ManualEjectError) as exc,
+        ):
+            await manual.manual_eject(db_session, printer.id)
+        assert exc.value.code == "no_eligible_unit"
+        assert not isinstance(exc.value, manual.ForeignPlateEject)
+
+    async def test_no_archive_refuses(self, db_session):
+        printer = await _mk_printer(db_session, "FGNA", gate="SUB-F")
+        await db_session.commit()
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            pytest.raises(manual.ManualEjectError) as exc,
+        ):
+            await manual.manual_eject(db_session, printer.id)
+        assert exc.value.code == "no_eligible_unit"
+
+    async def test_archive_file_missing_and_fetch_fails_refuses(self, db_session):
+        # Fallback archive row (file_path="") → FTPS re-fetch attempted; unfetchable →
+        # the actionable by-hand-clear 409.
+        printer = await _mk_printer(db_session, "FGFF", gate="SUB-F")
+        await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path="", filename="gone.gcode.3mf")
+        await db_session.commit()
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            patch(
+                "backend.app.services.bambu_ftp.download_file_try_paths_async",
+                AsyncMock(return_value=False),
+            ),
+            pytest.raises(manual.ManualEjectError) as exc,
+        ):
+            await manual.manual_eject(db_session, printer.id)
+        assert exc.value.code == "no_eligible_unit"
+        assert "by hand" in str(exc.value)

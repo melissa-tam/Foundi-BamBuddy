@@ -12,6 +12,10 @@ from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.dispatch import build_part_present_eject_file
 from backend.app.services.eject.generator import EjectGenerationError
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
+from backend.app.utils.threemf_tools import (
+    extract_filament_usage_from_3mf,
+    extract_print_time_from_3mf,
+)
 from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
 
 _PLATE_GCODE = (
@@ -24,14 +28,30 @@ _PLATE_GCODE = (
     "; EXECUTABLE_BLOCK_END\n"
 )
 
+# A donor slice_info carrying real usage (~407 g / 16735 s) that repack copies
+# verbatim — the motion-only eject build must zero it so no consumer books it.
+_SLICE_INFO_NONZERO = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    "<config>\n"
+    "  <plate>\n"
+    '    <metadata key="index" value="1"/>\n'
+    '    <metadata key="prediction" value="16735"/>\n'
+    '    <metadata key="weight" value="406.85"/>\n'
+    '    <filament id="1" type="PETG" color="#FF8000" used_g="406.9" used_m="132.15"/>\n'
+    "  </plate>\n"
+    "</config>\n"
+)
 
-def _make_3mf(gcode=_PLATE_GCODE, plate_id=1):
+
+def _make_3mf(gcode=_PLATE_GCODE, plate_id=1, slice_info=None):
     fd, name = tempfile.mkstemp(suffix=".3mf")
     os.close(fd)
     path = Path(name)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"Metadata/plate_{plate_id}.gcode", gcode)
         zf.writestr(f"Metadata/plate_{plate_id}.gcode.md5", "STALE")
+        if slice_info is not None:
+            zf.writestr("Metadata/slice_info.config", slice_info)
         zf.writestr("3D/3dmodel.model", "<model/>")
     return path
 
@@ -116,6 +136,31 @@ class TestBuildPartPresentEjectFile:
                 build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
         finally:
             src.unlink(missing_ok=True)
+
+    def test_built_artifact_reports_zero_slice_usage(self):
+        # The motion-only eject file extrudes nothing. repack_3mf_with_gcode copies
+        # the donor's slice_info.config verbatim, so the builder must additionally
+        # zero it — otherwise the archive parser / usage tracker / queue card book
+        # the donor's ~407 g and 16735 s against a sweep that used none.
+        src = _make_3mf(slice_info=_SLICE_INFO_NONZERO)
+        out = None
+        try:
+            # Sanity: the donor really does advertise the usage that would ride along.
+            donor_slots = extract_filament_usage_from_3mf(src, plate_id=1)
+            assert any(s["used_g"] > 0 for s in donor_slots)
+            assert extract_print_time_from_3mf(src, plate_id=1) == 16735
+
+            out = build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            slots = extract_filament_usage_from_3mf(out, plate_id=1)
+            prediction = extract_print_time_from_3mf(out, plate_id=1)
+        finally:
+            src.unlink(missing_ok=True)
+            if out:
+                out.unlink(missing_ok=True)
+
+        # filament_used_grams == 0 and print_time_seconds == 0 in the built artifact.
+        assert all(s["used_g"] == 0 for s in slots)
+        assert prediction == 0
 
     def test_h2c_dual_nozzle_home_flows_through_shared_path(self):
         # The part-present builder flows through the SAME generator + validator as

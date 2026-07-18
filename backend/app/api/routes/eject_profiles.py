@@ -50,7 +50,11 @@ from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
 from backend.app.utils.printer_models import canon_model, full_home_lines
-from backend.app.utils.threemf_tools import read_plate_gcode_header, repack_3mf_with_gcode
+from backend.app.utils.threemf_tools import (
+    read_plate_gcode_header,
+    repack_3mf_with_gcode,
+    zero_slice_usage_metadata,
+)
 
 router = APIRouter(prefix="/eject-profiles", tags=["eject-profiles"])
 
@@ -293,6 +297,11 @@ def _build_dryrun_3mf(
     The eject block is motion-only (no thermal gate at all now — the cooldown wait
     lives in the eject monitor), so nothing here could hang an ambient empty bed;
     the block self-completes via its FINISH epilogue.
+
+    The artifact's ``slice_info.config`` is zeroed (``zero_slice_usage_metadata``)
+    so this motion-only file reports ZERO filament / print-time usage — it extrudes
+    nothing, so no consumer (archive / usage tracker / queue card) should book the
+    donor's plate weight or prediction against it.
     """
     try:
         eject_block = generate_eject_gcode(profile, max_z, geometry)
@@ -309,6 +318,9 @@ def _build_dryrun_3mf(
     out_path = repack_3mf_with_gcode(source_path, plate_index, dryrun_gcode)
     if out_path is None:
         raise HTTPException(status_code=422, detail=f"Plate {plate_index} has no G-code to replace")
+    # Motion-only file: strip the donor's slice usage so no consumer books phantom
+    # grams / print time against a sweep that extrudes nothing.
+    zero_slice_usage_metadata(out_path)
     return out_path
 
 

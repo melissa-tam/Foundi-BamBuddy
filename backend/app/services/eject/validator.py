@@ -69,10 +69,12 @@ def validate_eject_gcode(
     Returns a :class:`ValidationResult`; ``ok`` is True only when there are no
     errors. Checks: part not taller than the guard; no move below the z_offset
     floor; no move above the eject Z ceiling (the lift height, or the bed-drop
-    target when the release assist is on — floored at ``PARK_Z_MM``); all X/Y
-    inside the model's machine travel envelope (``geometry.envelope``); prologue
-    present with no bare ``G28`` and no ``G28 Z`` (dual-nozzle models require both
-    parameterized home forms); no standalone tool-change. ``geometry`` is the
+    target when the release assist is on — floored at ``PARK_Z_MM``); the block's
+    LAST Z-bearing move ends the bed at least the park Z (``max(lift_z,
+    PARK_Z_MM)``) clear of the nozzle, so a surviving part is not dragged into;
+    all X/Y inside the model's machine travel envelope (``geometry.envelope``);
+    prologue present with no bare ``G28`` and no ``G28 Z`` (dual-nozzle models
+    require both parameterized home forms); no standalone tool-change. ``geometry`` is the
     resolved :class:`~backend.app.services.eject.geometry.ModelGeometry` — the
     caller resolves it from the registry, so the validator does no model lookup.
 
@@ -166,6 +168,11 @@ def validate_eject_gcode(
     has_m17 = False
     has_g90 = False
     has_g28_xy = False
+    # The Z of the most recent Z-bearing G0/G1 move — the block's END STATE. The
+    # generator now parks the bed proportional to part height so a surviving part
+    # clears the nozzle; the guard after the loop rejects any block whose last Z
+    # move ends bed-high (e.g. a legacy/hand-edited fixed ``Z10`` park).
+    last_z: float | None = None
 
     for raw in gcode.splitlines():
         tokens = _tokens(raw)
@@ -201,6 +208,8 @@ def validate_eject_gcode(
                 has_g28_xy = True
         elif cmd in ("G0", "G1"):
             params = _params(tokens)
+            if "Z" in params:
+                last_z = params["Z"]
             if "Z" in params and params["Z"] < z_floor:
                 errors.append(f"Move Z{params['Z']:g} is below the z_offset floor {profile.z_offset_mm:g}")
             if "Z" in params and params["Z"] > z_hi:
@@ -229,5 +238,17 @@ def validate_eject_gcode(
                 errors.append(f"Prologue missing dual-nozzle home {line!r}")
     elif not has_g28_xy:
         errors.append("Prologue missing 'G28 X Y' home")
+
+    # Guard 6: end-state clearance. Independent of the ceiling check: the block's
+    # LAST Z-bearing move must leave the bed at least the park Z (part top +
+    # clearance, floored at PARK_Z_MM) below the nozzle, so a part that survived
+    # the sweep clears the toolhead. A block ending bed-high (e.g. a legacy fixed
+    # ``Z10`` park under a taller part) is rejected here even though every
+    # individual move sits under the ceiling.
+    if last_z is not None and last_z < max(lift_z, PARK_Z_MM) - _EPS:
+        errors.append(
+            f"block ends with the bed at Z{last_z:g} while the part top is {max_z_height:g} mm "
+            "— end state must clear the part"
+        )
 
     return ValidationResult(ok=not errors, errors=errors, warnings=warnings)

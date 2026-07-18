@@ -311,13 +311,27 @@ class TestUpperZCeilingGuard:
         assert any("z_travel_mm" in e for e in result.errors), result.errors
 
     def test_zero_clearance_tiny_part_park_z10_still_passes(self):
-        # clearance_mm 0 + a 5mm part -> lift 5, but the park move is Z10. The
-        # PARK_Z_MM floor keeps the ceiling at 10 so the legal park is not rejected.
+        # clearance_mm 0 + a 5mm part -> lift 5, but the park Z floors at PARK_Z_MM
+        # (10). Both the ceiling and the new end-state guard use max(lift_z,
+        # PARK_Z_MM), so the legal park is not rejected on either side.
         profile = _profile(clearance_mm=0.0)
         gcode = generate_eject_gcode(profile, 5.0, H2S_GEOMETRY)
-        assert "Z10 F9000" in gcode  # the centre park at PARK_Z_MM
+        assert "G1 Z10 F900" in gcode  # the park drop at PARK_Z_MM
         result = validate_eject_gcode(gcode, profile, 5.0, H2S_GEOMETRY)
         assert result.ok, result.errors
+
+    def test_end_state_bed_high_park_rejected(self):
+        # The user's failure mode: a block whose LAST Z-bearing move ends bed-high
+        # (a legacy fixed Z10 combined park) under a 30mm part must FAIL — a part
+        # surviving the sweep would be dragged into the nozzle. Appending makes the
+        # old-style park the last Z move.
+        profile = _profile()
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        assert validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).ok
+        bad = gcode + "G1 X170 Y160 Z10 F9000\n"
+        result = validate_eject_gcode(bad, profile, 30.0, H2S_GEOMETRY)
+        assert not result.ok
+        assert any("end state must clear the part" in e for e in result.errors), result.errors
 
 
 class TestBedslingerGuard:

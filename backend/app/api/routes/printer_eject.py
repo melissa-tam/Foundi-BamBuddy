@@ -17,7 +17,7 @@ from backend.app.core.auth import RequirePermissionIfAuthEnabled
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
 from backend.app.services.eject import remote as eject_remote
-from backend.app.services.eject.manual import BedTooHot, ManualEjectError, manual_eject
+from backend.app.services.eject.manual import BedTooHot, ForeignPlateEject, ManualEjectError, manual_eject
 
 router = APIRouter(prefix="/printers", tags=["printers"])
 
@@ -25,9 +25,12 @@ router = APIRouter(prefix="/printers", tags=["printers"])
 class EjectNowBody(BaseModel):
     """Body for ``POST /printers/{id}/eject``. ``allow_hot`` is the explicit hot-bed
     confirm — the UI re-calls with it True after the operator acknowledges the
-    live-bed-vs-threshold dialog raised by a 409 ``bed_hot``."""
+    live-bed-vs-threshold dialog raised by a 409 ``bed_hot``. ``eject_profile_id`` is
+    the operator's chosen profile for the foreign-plate confirm — the UI re-calls with
+    it after a 409 ``foreign_plate`` prompt to dispatch the sweep."""
 
     allow_hot: bool = False
+    eject_profile_id: int | None = None
 
 
 @router.post("/{printer_id}/eject")
@@ -40,13 +43,28 @@ async def eject_now(
     """Manually trigger the part-present eject sweep for a farm-known finished unit.
 
     404 unknown printer; 409 ``bed_hot`` (with ``bed_c``/``threshold_c``) when the
-    bed is above the release threshold and ``allow_hot`` is false; other 409s carry a
+    bed is above the release threshold and ``allow_hot`` is false; 409 ``foreign_plate``
+    (with ``print_name``/``max_z_height_mm``/``suggested_eject_profile_id``) when the
+    gate came from a print the farm did not dispatch and no ``eject_profile_id`` was
+    supplied — the UI re-calls with a chosen profile to sweep it; other 409s carry a
     stable ``code`` + actionable ``message``. On success returns the eject mode
     (``released_watch`` when an armed watch was signalled, ``dispatched`` otherwise).
     """
     allow_hot = bool(body.allow_hot) if body is not None else False
+    eject_profile_id = body.eject_profile_id if body is not None else None
     try:
-        return await manual_eject(db, printer_id, allow_hot=allow_hot)
+        return await manual_eject(db, printer_id, allow_hot=allow_hot, eject_profile_id=eject_profile_id)
+    except ForeignPlateEject as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "foreign_plate",
+                "message": str(exc),
+                "print_name": exc.print_name,
+                "max_z_height_mm": exc.max_z_height_mm,
+                "suggested_eject_profile_id": exc.suggested_eject_profile_id,
+            },
+        ) from exc
     except BedTooHot as exc:
         raise HTTPException(
             status_code=409,

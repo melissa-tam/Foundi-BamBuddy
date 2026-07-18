@@ -39,13 +39,14 @@ from backend.app.models.printer import Printer
 from backend.app.services.eject.dispatch import build_part_present_eject_file
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.usb_storage import upload_in_flight
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-EjectPurpose = Literal["fa", "production"]
+EjectPurpose = Literal["fa", "production", "manual"]
 
 
 @dataclass(frozen=True)
@@ -72,10 +73,12 @@ _pending_eject: dict[int, PendingEject] = {}
 # rehydrated — no eject stays "in flight" across a day-long outage.
 _PENDING_EJECT_STALE_TTL_H = 24
 
-# The one canonical eject-job-name convention, minted at dispatch as
-# ``eject_{purpose}_item{queue_item_id}`` (see the ``derive_remote_filename`` call
-# below). Case-insensitive; the printer echoes the stem verbatim as ``subtask_name``.
-_EJECT_NAME_RE = re.compile(r"^eject_(fa|production)_item(\d+)$", re.IGNORECASE)
+# The canonical eject-job-name convention, minted at dispatch. Two shapes:
+#   * queue-item-bound (production / first-article): ``eject_{purpose}_item{queue_item_id}``
+#   * foreign-plate manual eject (no queue item): ``eject_manual_p{printer_id}``
+# Case-insensitive; the printer echoes the stem verbatim as ``subtask_name``. For the
+# manual form the trailing integer is the PRINTER id (there is no queue item).
+_EJECT_NAME_RE = re.compile(r"^eject_(?:(fa|production)_item|manual_p)(\d+)$", re.IGNORECASE)
 
 
 def _eject_name_stem(name: str) -> str:
@@ -96,14 +99,20 @@ def _eject_name_stem(name: str) -> str:
 
 
 def parse_eject_job_name(name: str | None) -> tuple[EjectPurpose, int] | None:
-    """``(purpose, queue_item_id)`` parsed from an eject job's echoed name/filename,
-    or None when ``name`` is not one of our eject jobs."""
+    """``(purpose, id)`` parsed from an eject job's echoed name/filename, or None
+    when ``name`` is not one of our eject jobs.
+
+    The trailing int is the QUEUE-ITEM id for ``fa``/``production`` jobs and the
+    PRINTER id for a ``manual`` (foreign-plate) job. Every consumer uses only the
+    truthiness of this result (``is_eject_job_name``), so the id's meaning per
+    purpose does not leak."""
     if not name:
         return None
     m = _EJECT_NAME_RE.match(_eject_name_stem(name))
     if not m:
         return None
-    return (m.group(1).lower(), int(m.group(2)))  # type: ignore[return-value]
+    purpose = m.group(1).lower() if m.group(1) else "manual"
+    return (purpose, int(m.group(2)))  # type: ignore[return-value]
 
 
 def is_eject_job_name(name: str | None) -> bool:
@@ -164,8 +173,17 @@ def matches_pending_eject(
     expected_subtask = getattr(client, "last_dispatch_subtask_id", None) if client else None
     id_mismatch = bool(completed_subtask_id and expected_subtask and completed_subtask_id != expected_subtask)
     name_mismatch = False
-    if subtask_name and pending.queue_item_id is not None:
-        name_mismatch = _eject_name_stem(subtask_name).lower() != expected_eject_stem(pending).lower()
+    if subtask_name:
+        # A manual (foreign-plate) eject carries no queue item, so its stem is keyed
+        # by PRINTER id — close the queue_item_id-None leniency for that purpose by
+        # name-checking the printer-keyed stem instead.
+        expected_stem: str | None = None
+        if pending.purpose == "manual":
+            expected_stem = f"eject_manual_p{printer_id}"
+        elif pending.queue_item_id is not None:
+            expected_stem = expected_eject_stem(pending)
+        if expected_stem is not None:
+            name_mismatch = _eject_name_stem(subtask_name).lower() != expected_stem.lower()
     return not (id_mismatch or name_mismatch)
 
 
@@ -334,13 +352,6 @@ async def dispatch_part_present_eject(
     failure, leaving no half state (nothing is registered unless ``start_print``
     was accepted).
     """
-    from backend.app.services.bambu_ftp import (
-        get_ftp_retry_settings,
-        upload_file_async,
-        with_ftp_retry,
-    )
-    from backend.app.utils.filename import derive_remote_filename
-
     item = await db.get(PrintQueueItem, queue_item_id)
     if item is None:
         raise EjectDispatchError(f"Queue item {queue_item_id} not found; cannot eject", status_code=409)
@@ -371,7 +382,113 @@ async def dispatch_part_present_eject(
     except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
         raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc
 
-    remote_filename = derive_remote_filename(f"eject_{purpose}_item{queue_item_id}.gcode.3mf")
+    pending = PendingEject(purpose=purpose, run_id=run_id, queue_item_id=queue_item_id)
+    # The eject file's FTPS upload transiently drops the H2S sdcard flag; mark the
+    # printer upload-in-flight so the USB-drop verifier ignores that dispatch blip.
+    async with upload_in_flight(printer.id):
+        await _upload_start_register_eject(
+            db,
+            printer=printer,
+            eject_path=eject_path,
+            job_stem=f"eject_{purpose}_item{queue_item_id}",
+            plate_id=plate_id,
+            pending=pending,
+        )
+    logger.info(
+        "eject.remote: dispatched %s eject for item %s (run %s) on printer %s",
+        purpose,
+        queue_item_id,
+        run_id,
+        printer.id,
+    )
+
+
+async def dispatch_foreign_eject(
+    db: AsyncSession,
+    *,
+    printer_id: int,
+    profile_id: int,
+    source_path: Path,
+    plate_id: int,
+) -> None:
+    """Build + FTPS-upload + dispatch a part-present eject for a FOREIGN plate.
+
+    The two-step "Eject now" confirm for a plate the farm did not dispatch (started
+    from Bambu Studio): the manual-eject service resolved the donor ``source_path`` +
+    ``plate_id`` from the foreign print's archive and picked an ``eject_profile_id``,
+    and this shares ``dispatch_part_present_eject``'s upload→start→register tail. It is
+    NOT queue-item-bound — it registers a ``purpose="manual"`` :class:`PendingEject`
+    with ``queue_item_id=None``. That no-op mirror is DELIBERATE: a manual eject is not
+    restart-durable, so a mid-eject restart leaves the plate gate raised (fail-closed).
+
+    Geometry is fail-closed (``require_validated=True``); the caller owns cleanup of
+    ``source_path`` (it may be a temp FTPS re-fetch). Raises :class:`EjectDispatchError`
+    on any precondition (409) or transport (502) failure, leaving nothing registered
+    unless ``start_print`` was accepted.
+    """
+    printer = await db.get(Printer, printer_id)
+    if printer is None:
+        raise EjectDispatchError("Eject printer not found", status_code=409)
+    if not printer_manager.is_connected(printer.id):
+        raise EjectDispatchError("Printer is not connected; cannot eject remotely", status_code=409)
+
+    try:
+        geometry = await get_geometry_required(db, printer.model, require_validated=True)
+    except GeometryUnavailable as exc:
+        raise EjectDispatchError(exc.reason, status_code=409) from exc
+
+    profile = await db.get(EjectProfile, profile_id)
+    if profile is None:
+        raise EjectDispatchError("Eject profile not found", status_code=409)
+
+    try:
+        eject_path = build_part_present_eject_file(Path(source_path), plate_id, profile, geometry)
+    except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
+        raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc
+
+    pending = PendingEject(purpose="manual", run_id=None, queue_item_id=None)
+    # Same as the production path: the FTPS upload transiently drops the H2S sdcard
+    # flag; mark the printer upload-in-flight so the USB-drop verifier ignores the blip.
+    async with upload_in_flight(printer.id):
+        await _upload_start_register_eject(
+            db,
+            printer=printer,
+            eject_path=eject_path,
+            job_stem=f"eject_manual_p{printer_id}",
+            plate_id=plate_id,
+            pending=pending,
+        )
+    logger.info(
+        "eject.remote: dispatched manual (foreign-plate) eject on printer %s (plate %s, profile %s)",
+        printer_id,
+        plate_id,
+        profile_id,
+    )
+
+
+async def _upload_start_register_eject(
+    db: AsyncSession,
+    *,
+    printer: Printer,
+    eject_path: Path,
+    job_stem: str,
+    plate_id: int,
+    pending: PendingEject,
+) -> None:
+    """Shared eject tail: FTPS-upload the built eject file (honouring the FTP retry
+    settings), start it with EVERY pre-print calibration OFF, then register + durably
+    mirror the pending eject. The built ``eject_path`` is always cleaned up; nothing is
+    registered unless ``start_print`` was accepted. Raises :class:`EjectDispatchError`
+    (502) on upload / start failure.
+    """
+    from backend.app.services.bambu_ftp import (
+        get_ftp_retry_settings,
+        upload_file_async,
+        with_ftp_retry,
+    )
+    from backend.app.utils.filename import derive_remote_filename
+
+    remote_filename = derive_remote_filename(f"{job_stem}.gcode.3mf")
     remote_path = f"/{remote_filename}"
     ftp_retry_enabled, ftp_retry_count, ftp_retry_delay, ftp_timeout = await get_ftp_retry_settings()
     try:
@@ -386,7 +503,7 @@ async def dispatch_part_present_eject(
                 printer_model=printer.model,
                 max_retries=ftp_retry_count,
                 retry_delay=ftp_retry_delay,
-                operation_name=f"Upload {purpose} eject to {printer.name}",
+                operation_name=f"Upload {pending.purpose} eject to {printer.name}",
             )
         else:
             uploaded = await upload_file_async(
@@ -399,7 +516,7 @@ async def dispatch_part_present_eject(
             )
     except Exception as exc:  # noqa: BLE001
         uploaded = False
-        logger.error("eject.remote: %s eject upload error: %s", purpose, exc)
+        logger.error("eject.remote: %s eject upload error: %s", pending.purpose, exc)
     finally:
         try:
             eject_path.unlink(missing_ok=True)
@@ -426,15 +543,8 @@ async def dispatch_part_present_eject(
     if not started:
         raise EjectDispatchError("Failed to send the eject command to the printer", status_code=502)
 
-    pending = PendingEject(purpose=purpose, run_id=run_id, queue_item_id=queue_item_id)
     register_pending_eject(printer.id, pending)
     # Durable mirror: stamp the owning unit so the eject survives a restart between
-    # here and its terminal (W1). Same-session write, committed inside.
+    # here and its terminal (W1). A manual/foreign eject has no queue item, so this is
+    # a deliberate no-op — the gate stays raised across a restart (fail-closed).
     await persist_pending_eject(db, printer.id, pending)
-    logger.info(
-        "eject.remote: dispatched %s eject for item %s (run %s) on printer %s",
-        purpose,
-        queue_item_id,
-        run_id,
-        printer.id,
-    )

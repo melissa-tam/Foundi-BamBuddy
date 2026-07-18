@@ -5,6 +5,11 @@ height and printer model. The block runs *after* the printer's stock shutdown
 (bed dropped ~Z123, motors M18-disabled), so it re-engages the motors and homes
 only X/Y before cooling the bed and sweeping the part off the front (door side).
 
+The block ENDS with the bed parked proportional to part height — the toolhead
+sits at ``max(max_z_height + clearance_mm, PARK_Z_MM)`` above the plate (bed
+dropped clear FIRST, then a straight traverse to centre), so a part that
+survived the sweep stays clear of the nozzle instead of being dragged into.
+
 Every coordinate is derived from the profile plus the model's bed dimensions,
 then clamped into the model's proven-safe machine travel envelope so no
 generated move can trip the firmware soft limits — nothing is hardcoded. The bed
@@ -46,9 +51,12 @@ if TYPE_CHECKING:
 # safety error (schema-validated and re-checked here + in the validator).
 SWEEP_BAND_MIN_WIDTH_MM = 10.0
 
-# Safe Z (mm) the toolhead parks at after the sweep, above the plate — a module
-# constant (not an inline literal) so the same value is the validator's park-Z
-# floor for the upper-Z ceiling guard (``_fmt(10.0)`` == "10", byte-identical).
+# Minimum safe park Z (mm) — the FLOOR the toolhead parks at after the sweep. The
+# block now parks the bed proportional to part height (``max(lift_z, PARK_Z_MM)``,
+# so a tall part ends farther from the nozzle), and this constant is the lower
+# bound so a tiny part with ``clearance_mm=0`` still parks at least this clear. A
+# module constant (not an inline literal) so the same value is the validator's
+# park-Z floor for the upper-Z ceiling guard (``_fmt(10.0)`` == "10", byte-identical).
 PARK_Z_MM = 10.0
 
 # The dual-nozzle homing forms (``DUAL_NOZZLE_HOME`` / ``DUAL_NOZZLE_FULL_HOME``)
@@ -164,6 +172,10 @@ def generate_eject_gcode(
     (re-engage + home X/Y), bed-heater off, the descending sweep + park, then the
     :data:`COMPLETION_EPILOGUE` (stock machine-end finish tail) so the standalone
     file ends FINISH rather than FAILED-at-EOF.
+
+    The block's END STATE parks the bed at ``max(max_z_height + clearance_mm,
+    PARK_Z_MM)`` (part height + clearance, floored at :data:`PARK_Z_MM`), Z
+    before XY, so a part that survived the sweep sits clear of the nozzle.
 
     There is NO in-file cooldown wait: the bed-cooldown gate moved OUT of the
     G-code into the eject monitor, which holds the plate-clear gate until the live
@@ -333,12 +345,18 @@ def generate_eject_gcode(
         lines.append("; --- final skim ---")
         sweep_level(profile.z_offset_mm, profile.skim_speed_mm_min)
 
-    # --- park centre at a safe Z ------------------------------------------
-    # Bed centre, clamped into the travel envelope (the centre is well inside it
-    # for every real bed, but clamp for the same single-source guarantee).
+    # --- park centre at a part-clear Z ------------------------------------
+    # The block's END STATE. Park the bed proportional to part height so a part
+    # that survived the sweep stays clear of the nozzle: reuse the prologue lift
+    # height (``max_z_height + clearance_mm``), floored at PARK_Z_MM for a tiny
+    # part with clearance 0. Drop the bed clear FIRST (toolhead still at the rear,
+    # off the bed), THEN traverse to centre — never a low-Z diagonal across the
+    # bed interior that would drag the nozzle through a surviving part.
+    park_z = max(lift_z, PARK_Z_MM)
     park_x = _clamp(bed_x / 2, x_min, x_max)
     park_y = _clamp(bed_y / 2, y_min, y_max)
-    lines.append(f"G1 X{_fmt(park_x)} Y{_fmt(park_y)} Z{_fmt(PARK_Z_MM)} F9000")
+    lines.append(f"G1 Z{_fmt(park_z)} F900")
+    lines.append(f"G1 X{_fmt(park_x)} Y{_fmt(park_y)} F9000")
 
     # --- completion epilogue ----------------------------------------------
     # Stock machine-end finish tail so this standalone motion-only file ends

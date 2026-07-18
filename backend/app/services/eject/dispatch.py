@@ -23,7 +23,11 @@ from backend.app.services.eject.generator import (
     generate_eject_gcode,
 )
 from backend.app.services.eject.validator import validate_eject_gcode
-from backend.app.utils.threemf_tools import read_plate_gcode_header, repack_3mf_with_gcode
+from backend.app.utils.threemf_tools import (
+    read_plate_gcode_header,
+    repack_3mf_with_gcode,
+    zero_slice_usage_metadata,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -85,6 +89,10 @@ def build_part_present_eject_file(
     HARDWARE LADDER: the retained-Z assumption MUST be validated on an empty-bed
     dry run before this is used unattended in production.
 
+    The artifact's ``slice_info.config`` is zeroed (``zero_slice_usage_metadata``)
+    so this motion-only file reports ZERO filament / print-time usage — it extrudes
+    nothing, and must not inherit the donor's plate weight / prediction.
+
     Returns the temp ``.gcode.3mf`` :class:`Path` (caller cleans it up). Raises
     :class:`EjectGenerationError` on any failure.
     """
@@ -100,4 +108,7 @@ def build_part_present_eject_file(
     out = repack_3mf_with_gcode(Path(source_path), plate_id, block)
     if out is None:
         raise EjectGenerationError("Failed to repack the part-present eject 3mf")
+    # Motion-only file: strip the donor's slice usage so no consumer books phantom
+    # grams / print time against a sweep that extrudes nothing.
+    zero_slice_usage_metadata(out)
     return out

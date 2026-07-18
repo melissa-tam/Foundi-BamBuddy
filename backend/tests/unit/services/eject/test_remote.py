@@ -255,7 +255,15 @@ class TestEjectNameHelpers:
 
     @pytest.mark.parametrize(
         "name",
-        [None, "", "OperatorLocalPrint", "widget_v3.gcode.3mf", "eject_item32", "eject_production_item", "reject_production_item1"],
+        [
+            None,
+            "",
+            "OperatorLocalPrint",
+            "widget_v3.gcode.3mf",
+            "eject_item32",
+            "eject_production_item",
+            "reject_production_item1",
+        ],
     )
     def test_parse_negative(self, name):
         assert remote.parse_eject_job_name(name) is None
@@ -285,9 +293,7 @@ class TestMatchesPendingEjectNameTightening:
         remote.register_pending_eject(9101, remote.PendingEject("production", 1, 32))
         try:
             with patch.object(printer_manager, "get_client", return_value=None):
-                assert (
-                    remote.matches_pending_eject(9101, "ANY", subtask_name="OperatorLocalPrint") is False
-                )
+                assert remote.matches_pending_eject(9101, "ANY", subtask_name="OperatorLocalPrint") is False
                 assert remote.peek_pending_eject(9101) is not None  # foreign — pending kept
         finally:
             remote.pop_pending_eject(9101)
@@ -323,6 +329,128 @@ class TestMatchesPendingEjectNameTightening:
                 assert remote.matches_pending_eject(9105, None, subtask_name="eject_production_item99") is False
         finally:
             remote.pop_pending_eject(9105)
+
+
+class TestManualEjectName:
+    """The foreign-plate manual eject job stem ``eject_manual_p{printer_id}`` — parse
+    round-trip + the printer-keyed name check in matches_pending_eject."""
+
+    @staticmethod
+    def _client(subtask):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(last_dispatch_subtask_id=subtask)
+
+    @pytest.mark.parametrize(
+        "name,expected",
+        [
+            ("eject_manual_p7", ("manual", 7)),
+            ("eject_manual_p7.3mf", ("manual", 7)),
+            ("eject_manual_p7.gcode.3mf", ("manual", 7)),
+            ("/eject_manual_p42.3mf", ("manual", 42)),
+            ("EJECT_MANUAL_P5", ("manual", 5)),
+        ],
+    )
+    def test_parse_manual_positive(self, name, expected):
+        assert remote.parse_eject_job_name(name) == expected
+        assert remote.is_eject_job_name(name) is True
+
+    @pytest.mark.parametrize("name", ["eject_manual_item7", "eject_manual_p", "eject_fa_p7", "eject_manual"])
+    def test_parse_manual_negative(self, name):
+        assert remote.parse_eject_job_name(name) is None
+        assert remote.is_eject_job_name(name) is False
+
+    async def test_manual_pending_name_match_by_printer_id(self):
+        # A manual pending has queue_item_id=None; the name check keys off the PRINTER
+        # id, closing the old queue_item_id-None leniency for this purpose.
+        remote.register_pending_eject(9201, remote.PendingEject("manual", None, None))
+        try:
+            with patch.object(printer_manager, "get_client", return_value=None):
+                assert remote.matches_pending_eject(9201, None, subtask_name="eject_manual_p9201") is True
+                assert remote.matches_pending_eject(9201, None, subtask_name="eject_manual_p9999") is False
+                assert remote.matches_pending_eject(9201, None, subtask_name="OperatorLocalPrint") is False
+        finally:
+            remote.pop_pending_eject(9201)
+
+
+class TestDispatchForeignEject:
+    async def test_registers_manual_pending_and_starts_all_off(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer = Printer(name="FE", serial_number="FE1", ip_address="1.2.3.4", access_code="x", model="H2S")
+            db_session.add(printer)
+            await db_session.flush()
+            prof = EjectProfile(name="fe-ep")
+            db_session.add(prof)
+            await db_session.commit()
+            await db_session.refresh(printer)
+            await db_session.refresh(prof)
+            start = MagicMock(return_value=True)
+            c1, c2, c3 = _ftp_patches()
+            with c1, c2, c3, patch.object(printer_manager, "start_print", start):
+                await remote.dispatch_foreign_eject(
+                    db_session, printer_id=printer.id, profile_id=prof.id, source_path=source, plate_id=1
+                )
+            pending = remote.peek_pending_eject(printer.id)
+            assert pending == remote.PendingEject("manual", None, None)
+            assert pending.queue_item_id is None
+            # The uploaded/started filename derives from the printer-keyed manual stem.
+            started_name = start.call_args.args[1]
+            assert started_name == f"eject_manual_p{printer.id}.3mf"
+            kwargs = start.call_args.kwargs
+            assert kwargs["bed_levelling"] is False
+            assert kwargs["vibration_cali"] is False
+            assert kwargs["use_ams"] is False
+        finally:
+            remote.pop_pending_eject(printer.id)
+            source.unlink(missing_ok=True)
+
+    async def test_upload_failure_raises_502_no_pending(self, db_session):
+        source = _make_source_3mf()
+        printer_id = None
+        try:
+            printer = Printer(name="FEu", serial_number="FEu1", ip_address="1.2.3.4", access_code="x", model="H2S")
+            db_session.add(printer)
+            await db_session.flush()
+            prof = EjectProfile(name="feu-ep")
+            db_session.add(prof)
+            await db_session.commit()
+            await db_session.refresh(printer)
+            await db_session.refresh(prof)
+            printer_id = printer.id
+            c1, c2, c3 = _ftp_patches(upload=False)
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+                pytest.raises(remote.EjectDispatchError) as exc,
+            ):
+                await remote.dispatch_foreign_eject(
+                    db_session, printer_id=printer.id, profile_id=prof.id, source_path=source, plate_id=1
+                )
+            assert exc.value.status_code == 502
+            assert remote.peek_pending_eject(printer.id) is None
+        finally:
+            if printer_id is not None:
+                remote.pop_pending_eject(printer_id)
+            source.unlink(missing_ok=True)
+
+    async def test_unknown_profile_raises_409(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer = Printer(name="FEp", serial_number="FEp1", ip_address="1.2.3.4", access_code="x", model="H2S")
+            db_session.add(printer)
+            await db_session.commit()
+            await db_session.refresh(printer)
+            c1, c2, c3 = _ftp_patches()
+            with c1, c2, c3, pytest.raises(remote.EjectDispatchError) as exc:
+                await remote.dispatch_foreign_eject(
+                    db_session, printer_id=printer.id, profile_id=987654, source_path=source, plate_id=1
+                )
+            assert exc.value.status_code == 409
+        finally:
+            source.unlink(missing_ok=True)
 
 
 class TestDispatchPartPresentEjectProfileGuard:

@@ -137,8 +137,39 @@ class TestDefaultsProfile:
 
     def test_parks_centre_at_safe_z(self):
         gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
-        # H2S bed 340x320 -> centre 170,160
-        assert "G1 X170 Y160 Z10 F9000" in gcode
+        # H2S bed 340x320 -> centre 170,160. End state parks proportional to part
+        # height: bed drops clear FIRST (30 + clearance 10 = 40), THEN a straight
+        # traverse to centre — no low-Z diagonal through a surviving part.
+        lines = gcode.splitlines()
+        assert "G1 Z40 F900" in lines
+        assert "G1 X170 Y160 F9000" in lines
+        park_idx = lines.index("G1 X170 Y160 F9000")
+        assert lines[park_idx - 1] == "G1 Z40 F900"
+        # The old fixed bed-high combined park must be gone.
+        assert "G1 X170 Y160 Z10 F9000" not in gcode
+
+    def test_park_z_scales_with_part_height(self):
+        # The park (end-state) Z tracks part height + clearance, not a fixed value.
+        short = generate_eject_gcode(_profile(clearance_mm=10.0), 20.0, H2S_GEOMETRY)
+        tall = generate_eject_gcode(_profile(clearance_mm=10.0, max_part_height_mm=60.0), 40.0, H2S_GEOMETRY)
+
+        def _park_z(gcode: str) -> float:
+            lines = gcode.splitlines()
+            idx = lines.index("G1 X170 Y160 F9000")
+            z_line = lines[idx - 1]
+            return float(z_line.split("Z", 1)[1].split()[0])
+
+        assert _park_z(short) == pytest.approx(30.0)  # 20 + 10
+        assert _park_z(tall) == pytest.approx(50.0)  # 40 + 10
+        assert _park_z(tall) > _park_z(short)
+
+    def test_park_z_floored_at_park_z_mm(self):
+        # Tiny part + clearance 0 -> lift 5, but the park floors at PARK_Z_MM (10).
+        gcode = generate_eject_gcode(_profile(clearance_mm=0.0), 5.0, H2S_GEOMETRY)
+        lines = gcode.splitlines()
+        assert "G1 Z10 F900" in lines
+        park_idx = lines.index("G1 X170 Y160 F9000")
+        assert lines[park_idx - 1] == "G1 Z10 F900"
 
     def test_no_move_below_z_offset(self):
         gcode = generate_eject_gcode(_profile(z_offset_mm=0.4), 30.0, H2S_GEOMETRY)
@@ -163,7 +194,12 @@ class TestRejections:
         # (bed 330x320) parks at the H2C centre (165,160), not the H2S centre.
         # Unknown-model rejection now lives in the geometry accessor (test_geometry).
         gcode = generate_eject_gcode(_profile(), 20.0, H2C_GEOMETRY)
-        assert "G1 X165 Y160 Z10 F9000" in gcode
+        lines = gcode.splitlines()
+        # Part-clear park: Z (20 + clearance 10 = 30) first, then the H2C centre.
+        assert "G1 Z30 F900" in lines
+        assert "G1 X165 Y160 F9000" in lines
+        park_idx = lines.index("G1 X165 Y160 F9000")
+        assert lines[park_idx - 1] == "G1 Z30 F900"
 
     def test_h2s_geometry_present(self):
         assert H2S_GEOMETRY.bed == (340.0, 320.0)

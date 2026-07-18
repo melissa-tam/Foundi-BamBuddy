@@ -180,7 +180,8 @@ G1 Y320 F9000
 G1 X325 F9000
 G1 Y0 F1500
 G1 Y320 F9000
-G1 X165 Y160 Z10 F9000
+G1 Z40 F900
+G1 X165 Y160 F9000
 ; --- completion epilogue: stock machine-end finish tail (job ends FINISH) ---
 M220 S100  ; Reset feedrate magnitude
 M201.2 K1.0 ; Reset acc magnitude
