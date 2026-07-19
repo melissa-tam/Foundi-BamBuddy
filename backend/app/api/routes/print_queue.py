@@ -1121,7 +1121,11 @@ async def release_staged_items(
 async def reorder_queue(
     data: PrintQueueReorder,
     db: AsyncSession = Depends(get_db),
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_UPDATE_ALL),
+    # Reorder is gated by the dedicated queue:reorder permission (matches what
+    # the frontend gates the drag-reorder control on — QueuePage `canReorder`).
+    # Previously required queue:update_all, which locked reorder-capable
+    # operators out of the control the UI showed them (D13 contract fix).
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_REORDER),
 ):
     """Bulk update positions for queue items."""
     for reorder_item in data.items:

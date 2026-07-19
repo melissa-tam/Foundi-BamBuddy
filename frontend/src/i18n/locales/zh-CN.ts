@@ -1540,6 +1540,7 @@ export default {
       stagedBannerTitle: '耗材不足 — 更换料卷后按重新检查',
       stagedBannerBody: '{{count}} 个项目被耗材检查搁置。重新检查仅释放料卷现已足够的项目。',
       recheckButton: '重新检查并释放',
+      stagedBlockingHeading: '等待中：',
       releasedToast: '已释放 {{count}} 个搁置项目',
       releasedNone: '未释放任何项目 — 耗材仍然不足',
       recheckFailed: '重新检查失败',

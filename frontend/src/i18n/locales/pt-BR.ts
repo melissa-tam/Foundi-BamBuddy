@@ -1540,6 +1540,7 @@ export default {
       stagedBannerTitle: 'Filamento insuficiente — troque a bobina e pressione Verificar novamente',
       stagedBannerBody: '{{count}} item(ns) foram retidos pela verificação de filamento. Verificar novamente libera apenas os itens cuja bobina agora tem material suficiente.',
       recheckButton: 'Verificar novamente e liberar',
+      stagedBlockingHeading: 'Aguardando:',
       releasedToast: '{{count}} item(ns) retido(s) liberado(s)',
       releasedNone: 'Nenhum item liberado — filamento ainda insuficiente',
       recheckFailed: 'Falha ao verificar novamente',

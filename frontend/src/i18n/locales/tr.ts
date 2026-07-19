@@ -1542,6 +1542,7 @@ export default {
       stagedBannerTitle: 'Filament az — bobini değiştirin, sonra Yeniden denetle\'ye basın',
       stagedBannerBody: '{{count}} öğe filament denetimi tarafından bekletildi. Yeniden denetle yalnızca bobini artık yeterli olan öğeleri serbest bırakır.',
       recheckButton: 'Yeniden denetle ve serbest bırak',
+      stagedBlockingHeading: 'Bekleniyor:',
       releasedToast: 'Bekletilen {{count}} öğe serbest bırakıldı',
       releasedNone: 'Hiçbir öğe serbest bırakılmadı — filament hâlâ az',
       recheckFailed: 'Yeniden denetleme başarısız',

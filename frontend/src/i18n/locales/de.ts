@@ -1540,6 +1540,7 @@ export default {
       stagedBannerTitle: 'Filament knapp — Spule wechseln, dann Neu prüfen drücken',
       stagedBannerBody: '{{count}} Element(e) wurden von der Filamentprüfung zurückgestellt. Neu prüfen gibt nur Elemente frei, deren Spule jetzt genug Material hat.',
       recheckButton: 'Neu prüfen und freigeben',
+      stagedBlockingHeading: 'Wartet auf:',
       releasedToast: '{{count}} zurückgestellte(s) Element(e) freigegeben',
       releasedNone: 'Keine Elemente freigegeben — Filament weiterhin knapp',
       recheckFailed: 'Neuprüfung fehlgeschlagen',

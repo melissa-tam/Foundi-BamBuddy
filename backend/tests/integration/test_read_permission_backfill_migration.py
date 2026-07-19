@@ -60,6 +60,29 @@ async def _get_perms(group_name: str) -> set[str]:
         return set(grp.permissions or [])
 
 
+async def _get_perms_list(group_name: str) -> list[str]:
+    """Ordered permission list (order-sensitive assertions for the seed-sync)."""
+    async with _database_module.async_session() as session:
+        grp = (await session.execute(select(Group).where(Group.name == group_name))).scalar_one_or_none()
+        assert grp is not None
+        return list(grp.permissions or [])
+
+
+async def _set_perms(group_name: str, perms: list[str], *, is_system: bool | None = None) -> None:
+    """Overwrite a group's stored permission list (and optionally is_system).
+
+    Simulates a pre-existing group row whose permission set predates newer
+    DEFAULT_GROUPS grants (the shape the additive seed-sync must reconcile).
+    """
+    async with _database_module.async_session() as session:
+        grp = (await session.execute(select(Group).where(Group.name == group_name))).scalar_one_or_none()
+        assert grp is not None, f"group {group_name} not pre-seeded"
+        grp.permissions = list(perms)
+        if is_system is not None:
+            grp.is_system = is_system
+        await session.commit()
+
+
 # Note: ``async_client`` is depended upon (even though unused) so pytest-asyncio
 # uses the same event loop the conftest fixture uses for async_session(). Without
 # it, calling ``async_session()`` twice in one test trips an asyncpg
@@ -110,8 +133,13 @@ class TestReadPermissionMigration:
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_operators_backfill_adds_own_read_flags(self, async_client: AsyncClient):
-        """Operators with no read flags get the _OWN variants backfilled
-        (fail-closed — no _ALL)."""
+        """Operators with no read flags get the _OWN variants backfilled, AND
+        the shared-surface _ALL grants the farm remediation added to the seed
+        (queue:read_all + library:read_all — the shared farm queue/library).
+
+        archives stay own-scoped for Operators: archives:read_all is NOT a
+        shared-surface grant and must remain absent (the IDOR closure there is
+        unchanged)."""
         await seed_default_groups()
         await _strip_and_set("Operators")
 
@@ -121,9 +149,12 @@ class TestReadPermissionMigration:
         assert "archives:read_own" in perms
         assert "library:read_own" in perms
         assert "queue:read_own" in perms
+        # Archives are still own-scoped for Operators (not a shared surface).
         assert "archives:read_all" not in perms
-        assert "library:read_all" not in perms
-        assert "queue:read_all" not in perms
+        # Queue + library reads ARE shared-surface for Operators now (farm
+        # remediation: operators see the whole admin-created queue/library).
+        assert "library:read_all" in perms
+        assert "queue:read_all" in perms
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -234,3 +265,125 @@ class TestReadPermissionMigration:
 
         perms = await _get_perms("Viewers")
         assert "orca_cloud:auth" not in perms
+
+
+class TestSeedGroupSync:
+    """Generic additive seed-sync (D10): pre-existing SYSTEM groups get newly
+    seeded DEFAULT_GROUPS permissions back-filled at startup, without ever
+    removing a stored (possibly admin-customized) permission.
+
+    This closes the gap behind incident-3: the production Operators group
+    predated the farm SKU / production-run / eject and shared-queue grants, and
+    seed_default_groups only ever *created* missing groups — it never topped up
+    an existing system group with permissions added to the seed later.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_missing_seed_perms_backfilled_in_order(self, async_client: AsyncClient):
+        """A system Operators row that is a strict subset of the seed gains
+        exactly the missing seed perms — current order preserved at the front,
+        missing perms appended in seed order."""
+        from backend.app.core.permissions import DEFAULT_GROUPS
+
+        await seed_default_groups()
+        base = ["printers:read", "websocket:connect"]  # both valid seed perms
+        await _set_perms("Operators", base)
+
+        await seed_default_groups()
+
+        perms = await _get_perms_list("Operators")
+        seed_perms = DEFAULT_GROUPS["Operators"]["permissions"]
+        # Current order preserved at the front.
+        assert perms[: len(base)] == base
+        # Missing seed perms appended in seed order.
+        appended = perms[len(base) :]
+        expected_missing = [p for p in seed_perms if p not in set(base)]
+        assert appended == expected_missing
+        # Net set is exactly the seed (base was a strict subset), no dupes.
+        assert set(perms) == set(seed_perms)
+        assert len(perms) == len(set(perms))
+        # The three shared-surface grants specifically landed.
+        assert {
+            "queue:read_all",
+            "queue:update_all",
+            "library:read_all",
+            "skus:read",
+            "production_runs:read",
+            "eject_profiles:read",
+        } <= set(perms)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_custom_extra_perms_preserved(self, async_client: AsyncClient):
+        """A permission an admin added that is NOT in the seed survives the
+        sync (the pass only ADDS; it never prunes)."""
+        await seed_default_groups()
+        # settings:update is admin-level and NOT part of the Operators seed.
+        base = ["printers:read", "websocket:connect", "settings:update"]
+        await _set_perms("Operators", base)
+
+        await seed_default_groups()
+
+        perms = await _get_perms("Operators")
+        assert "settings:update" in perms  # custom extra preserved
+        assert "skus:read" in perms  # seed perm still backfilled alongside
+        assert "queue:read_all" in perms
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_non_system_group_with_default_name_untouched(self, async_client: AsyncClient):
+        """A group carrying a DEFAULT_GROUPS name but is_system=False (a custom
+        role) is skipped by the sync — those are curated by hand."""
+        await seed_default_groups()
+        base = ["printers:read", "websocket:connect"]
+        await _set_perms("Operators", base, is_system=False)
+
+        await seed_default_groups()
+
+        perms = await _get_perms("Operators")
+        # The additive seed-sync is is_system-gated: NONE of the farm/shared
+        # grants that only it would inject appear on a non-system row. (The
+        # pre-existing one-off, name-targeted backfills — read_own, orca_cloud
+        # — are is_system-agnostic and out of this sync's scope, so we assert
+        # on the perms the sync uniquely owns rather than full equality.)
+        for farm_perm in (
+            "skus:read",
+            "queue:read_all",
+            "queue:update_all",
+            "library:read_all",
+            "production_runs:read",
+            "eject_profiles:read",
+        ):
+            assert farm_perm not in perms, f"{farm_perm} leaked into a non-system group"
+        # Base perms preserved (the sync never removes anything).
+        assert {"printers:read", "websocket:connect"} <= perms
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_second_run_is_noop(self, async_client: AsyncClient):
+        """Running the sync twice yields an identical list — no re-append, no
+        duplicates."""
+        await seed_default_groups()
+        await _set_perms("Operators", ["printers:read", "websocket:connect"])
+
+        await seed_default_groups()
+        after_first = await _get_perms_list("Operators")
+
+        await seed_default_groups()
+        after_second = await _get_perms_list("Operators")
+
+        assert after_second == after_first
+        assert len(after_second) == len(set(after_second))
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_fresh_create_path_still_seeds_full_set(self, async_client: AsyncClient):
+        """The create-missing path is unaffected: a fresh install (the
+        async_client fixture already seeded onto an empty DB) has the FULL
+        Operators seed, including the three new shared-surface grants."""
+        from backend.app.core.permissions import DEFAULT_GROUPS
+
+        perms = await _get_perms("Operators")
+        assert perms == set(DEFAULT_GROUPS["Operators"]["permissions"])
+        assert {"queue:read_all", "queue:update_all", "library:read_all"} <= perms

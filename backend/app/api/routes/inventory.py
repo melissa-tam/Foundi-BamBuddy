@@ -245,7 +245,7 @@ async def apply_spool_to_slot_via_mqtt(
             "printer" if printer_kp else "stored",
         )
 
-    client.ams_set_filament_setting(
+    setting_ok = client.ams_set_filament_setting(
         ams_id=ams_id,
         tray_id=tray_id,
         tray_info_idx=effective_tray_info_idx,
@@ -256,6 +256,20 @@ async def apply_spool_to_slot_via_mqtt(
         nozzle_temp_max=temp_max,
         setting_id=effective_setting_id,
     )
+    if not setting_ok:
+        # The filament-setting write was refused (AMS identifying/drying, or offline).
+        # Do NOT proceed to extrusion_cali_sel or persist a slot-preset row for a
+        # write that never reached the printer — the preset row must not record a
+        # config that did not land. A later AMS push re-applies once the AMS settles.
+        logger.warning(
+            "Spool assign: ams_filament_setting refused for spool %d AMS%d-T%d on printer %d "
+            "(AMS busy identifying/drying, or offline) — skipping calibration + preset persist",
+            spool.id,
+            ams_id,
+            tray_id,
+            printer_id,
+        )
+        return False
 
     if matching_kp and matching_kp.cali_idx is not None:
         # filament_id for cali_sel must match the preset under which the kp

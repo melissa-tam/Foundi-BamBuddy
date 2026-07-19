@@ -147,7 +147,9 @@ def cq_scheduler(monkeypatch, test_engine):
     s = PrintScheduler()
     monkeypatch.setattr(s, "_check_auto_drying", AsyncMock())
     monkeypatch.setattr(s, "_get_job_name", AsyncMock(return_value="job"))
-    monkeypatch.setattr(s, "_compute_ams_mapping_for_printer", AsyncMock(return_value=sched_mod.MatchOutcome(mapping=[0])))
+    monkeypatch.setattr(
+        s, "_compute_ams_mapping_for_printer", AsyncMock(return_value=sched_mod.MatchOutcome(mapping=[0]))
+    )
     monkeypatch.setattr(sched_mod.notification_service, "on_queue_job_assigned", AsyncMock())
     monkeypatch.setattr(sched_mod.notification_service, "on_queue_job_waiting", AsyncMock())
     return s
@@ -270,5 +272,5 @@ async def test_deficit_staging_happens_even_while_budget_exhausted(
     # Staged for filament — NOT parked on the stagger gate.
     assert row.filament_short is True
     assert row.manual_start is True
-    assert row.waiting_reason == "filament_short"
+    assert row.waiting_reason.startswith("Low filament")  # D9: rich reason names the short machines
     start_mock.assert_not_awaited()

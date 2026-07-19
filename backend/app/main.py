@@ -406,13 +406,10 @@ _last_progress_milestone: dict[int, int] = {}
 # Track whether first layer complete notification has been sent for current print
 _first_layer_notified: dict[int, bool] = {}
 
-# Track HMS errors that have been notified: {printer_id: set of error codes}
-# This prevents sending duplicate notifications for the same error
-_notified_hms_errors: dict[int, set[str]] = {}
-# Track when HMS errors were last seen: {printer_id: timestamp}
-# Used to debounce clearing — prevents flapping errors from re-triggering notifications
-_hms_last_seen: dict[int, float] = {}
-_HMS_CLEAR_GRACE_SECONDS = 30.0
+# HMS re-notify dedup moved to services/hms_notify_dedup (per-code last-seen ledger
+# that collapses a flapping code to one notification). The old per-printer
+# set-replace + empty-list grace clear re-notified on every reappearance of a code
+# that flapped while another stayed present (the 0700_0002 storm).
 
 # Track timelapse file baselines at print start: {printer_id: set of video filenames}
 # Used for snapshot-diff detection at print completion
@@ -1333,8 +1330,8 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     # Restart-replay runout suppression (S1). Seed / maintain the per-printer set of
     # runout HMS codes already live at the FIRST status push, BEFORE the runout hook
     # below and OUTSIDE the "HMS present" branch so the first push seeds even with
-    # zero HMS. After a restart main lost `_notified_hms_errors`, so a still-live
-    # runout would replay as "new" and mis-stamp a swapped-in fresh spool;
+    # zero HMS. After a restart the in-memory HMS notify dedup is empty, so a still-
+    # live runout would replay as "new" and mis-stamp a swapped-in fresh spool;
     # note_status_push records those codes so mark_spent_on_runout skips them.
     try:
         from backend.app.services.spool_respool import note_status_push as _note_runout_push
@@ -1348,14 +1345,18 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     if current_hms_errors:
         # Build set of current error codes (using attr for uniqueness)
         current_error_codes = {f"{e.attr:08x}" for e in current_hms_errors}
-        previously_notified = _notified_hms_errors.get(printer_id, set())
 
-        # Find new errors that haven't been notified yet
-        new_error_codes = current_error_codes - previously_notified
+        # Per-code re-notify dedup (services/hms_notify_dedup): a code counts as
+        # "new" only on first appearance or after it has been ABSENT past the
+        # re-notify window. A code flapping out-then-back within the window is one
+        # continuing incident, not a fresh alert — this collapses the observed
+        # 0700_0002 storm (~80 sends in 2.5 h) to a single notification, while a
+        # genuine clear-and-recur hours later still notifies. Replaces the old
+        # per-printer set-replace + empty-list grace clear (both removed). The
+        # ledger self-bounds (prunes absent-too-long codes) and is per-printer.
+        from backend.app.services import hms_notify_dedup
 
-        # Update tracking immediately to prevent duplicate notifications from concurrent callbacks
-        _notified_hms_errors[printer_id] = current_error_codes
-        _hms_last_seen[printer_id] = time.time()
+        new_error_codes = hms_notify_dedup.new_codes(printer_id, current_error_codes, time.time())
 
         if new_error_codes:
             # Get the actual new errors for the notification.
@@ -1550,16 +1551,10 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         "[SPOOL-RECOVERY] feed-fault hook failed for printer %s: %s", printer_id, _fe
                     )
 
-    else:
-        # No HMS errors — only clear tracking after a grace period to prevent
-        # flapping errors (brief hms:[] gaps) from re-triggering notifications.
-        # Some HMS codes (e.g. chamber temp regulation during PETG prints) toggle
-        # on/off every few seconds as conditions fluctuate around thresholds.
-        if printer_id in _notified_hms_errors:
-            last_seen = _hms_last_seen.get(printer_id, 0)
-            if time.time() - last_seen >= _HMS_CLEAR_GRACE_SECONDS:
-                _notified_hms_errors.pop(printer_id, None)
-                _hms_last_seen.pop(printer_id, None)
+    # An empty hms list needs no bookkeeping: hms_notify_dedup ages each code out by
+    # its own last-seen timestamp, so a flapping code that briefly clears is still
+    # recognized as the same continuing incident on its next appearance (no grace
+    # window to reset). The old else-branch grace clear is intentionally gone.
 
     # Mid-print USB-drop alert (runs every tick, independent of HMS). The firmware
     # unmounts a full/failed USB drive and reports sdcard=False (with hms[] often
@@ -1951,6 +1946,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                     capture_backup_swap,
                     clear_respool_prompt_dedup,
                     maybe_auto_or_prompt_respool,
+                    should_evaluate_respool,
                 )
                 from backend.app.services.spool_tag_matcher import (
                     auto_assign_spool,
@@ -2076,14 +2072,16 @@ async def on_ams_change(printer_id: int, ams_data: list):
 
                             if existing_assignment:
                                 # Reused-tag Tier 2/3 (same-slot swap where the
-                                # assignment survived): if this slot's spool was marked
-                                # spent (hardware runout) and a fresh spool is now
-                                # loaded, auto-respool (or prompt). A completed
-                                # re-spool re-assigns the slot itself, so skip the
-                                # normal weight-sync path below.
-                                if (
-                                    existing_assignment.spool is not None
-                                    and existing_assignment.spool.spent_at is not None
+                                # assignment survived): run the respool gate when this
+                                # slot's spool was marked spent (hardware runout →
+                                # auto-respool/prompt) OR the tray reports far more
+                                # filament than the ledger holds (a reused core carried
+                                # the tag onto a fresh roll — remain-jump → prompt).
+                                # should_evaluate_respool is the single origin for that
+                                # jump test. A completed re-spool re-assigns the slot
+                                # itself, so skip the normal weight-sync path below.
+                                if existing_assignment.spool is not None and should_evaluate_respool(
+                                    existing_assignment.spool, tray
                                 ):
                                     try:
                                         _respooled = await maybe_auto_or_prompt_respool(
@@ -2193,6 +2191,9 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                                 client = printer_manager.get_client(printer_id)
                                                 if client:
                                                     cali_filament_id = spool.slicer_filament or tray_info_idx or ""
+                                                    # Fire-and-forget by design: the unchecked return is
+                                                    # intentional — a refused push (AMS identifying/drying)
+                                                    # self-heals on the next drift-detect tick.
                                                     client.extrusion_cali_sel(
                                                         ams_id=ams_id,
                                                         tray_id=tray_id,

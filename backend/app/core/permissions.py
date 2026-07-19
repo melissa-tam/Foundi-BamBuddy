@@ -411,14 +411,22 @@ DEFAULT_GROUPS = {
             Permission.ARCHIVES_UPDATE_OWN.value,
             Permission.ARCHIVES_DELETE_OWN.value,
             Permission.ARCHIVES_REPRINT_OWN.value,
-            # Queue - own items only
+            # Queue - own items, plus read/update ALL for the shared farm queue.
+            # The farm queue is a shared operational surface: operators must see
+            # AND manage admin-created queue items, not just their own. These
+            # *_all grants explicitly reverse the own-scoped migration default
+            # (fail-closed per CWE-636) for THIS group only.
             Permission.QUEUE_READ_OWN.value,
+            Permission.QUEUE_READ_ALL.value,
             Permission.QUEUE_CREATE.value,
             Permission.QUEUE_UPDATE_OWN.value,
+            Permission.QUEUE_UPDATE_ALL.value,
             Permission.QUEUE_DELETE_OWN.value,
             Permission.QUEUE_REORDER.value,
-            # Library - own items only
+            # Library - own items, plus read ALL for the shared farm library
+            # (same shared-surface rationale as the queue *_all grants above).
             Permission.LIBRARY_READ_OWN.value,
+            Permission.LIBRARY_READ_ALL.value,
             Permission.LIBRARY_UPLOAD.value,
             Permission.LIBRARY_UPDATE_OWN.value,
             Permission.LIBRARY_DELETE_OWN.value,

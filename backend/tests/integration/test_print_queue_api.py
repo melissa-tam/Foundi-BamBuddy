@@ -3037,3 +3037,84 @@ class TestReorderEndpoint:
         await db_session.refresh(item2)
         assert item1.position == 2
         assert item2.position == 1
+
+
+class TestReorderRoutePermission:
+    """D13 contract fix: POST /queue/reorder is gated by the dedicated
+    ``queue:reorder`` permission (what the frontend gates the drag-reorder
+    control on) rather than ``queue:update_all``. An operator granted reorder
+    but not update_all must be able to use the control the UI shows them."""
+
+    async def _setup_admin(self, async_client: AsyncClient) -> str:
+        """Enable auth + create the first admin; return the admin bearer token."""
+        await async_client.post(
+            "/api/v1/auth/setup",
+            json={
+                "auth_enabled": True,
+                "admin_username": "reorderadmin",
+                "admin_password": "AdminPass1!",
+            },
+        )
+        login = await async_client.post(
+            "/api/v1/auth/login",
+            json={"username": "reorderadmin", "password": "AdminPass1!"},
+        )
+        assert login.status_code == 200, login.text
+        return login.json()["access_token"]
+
+    async def _make_group(self, async_client: AsyncClient, admin_token: str, name: str, perms: list[str]) -> int:
+        resp = await async_client.post(
+            "/api/v1/groups",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={"name": name, "permissions": perms},
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["id"]
+
+    async def _make_user_token(self, async_client: AsyncClient, admin_token: str, username: str, group_id: int) -> str:
+        resp = await async_client.post(
+            "/api/v1/users/",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={"username": username, "password": "Reorderpass1!", "group_ids": [group_id]},
+        )
+        assert resp.status_code in (200, 201), resp.text
+        login = await async_client.post(
+            "/api/v1/auth/login",
+            json={"username": username, "password": "Reorderpass1!"},
+        )
+        assert login.status_code == 200, login.text
+        return login.json()["access_token"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_reorder_allowed_with_queue_reorder_only(self, async_client: AsyncClient):
+        """A user holding queue:reorder but NOT queue:update_all can reorder —
+        the exact operator the old queue:update_all gate wrongly blocked."""
+        admin_token = await self._setup_admin(async_client)
+        gid = await self._make_group(async_client, admin_token, "ReorderOnly", ["queue:reorder", "websocket:connect"])
+        token = await self._make_user_token(async_client, admin_token, "reorderuser", gid)
+
+        # A valid payload (no duplicate positions); the id need not exist —
+        # the route no-ops unknown ids and returns 200. The permission
+        # dependency is what decides allow vs 403.
+        resp = await async_client.post(
+            "/api/v1/queue/reorder",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"items": [{"id": 999999, "position": 1}]},
+        )
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_reorder_forbidden_without_queue_reorder(self, async_client: AsyncClient):
+        """A user lacking queue:reorder (and queue:update_all) is 403."""
+        admin_token = await self._setup_admin(async_client)
+        gid = await self._make_group(async_client, admin_token, "NoReorder", ["queue:read_own", "websocket:connect"])
+        token = await self._make_user_token(async_client, admin_token, "noreorderuser", gid)
+
+        resp = await async_client.post(
+            "/api/v1/queue/reorder",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"items": [{"id": 999999, "position": 1}]},
+        )
+        assert resp.status_code == 403, resp.text

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -51,10 +52,47 @@ logger = logging.getLogger(__name__)
 # restart — worst case is one extra release pass on the first AMS push.
 _tray_signatures: dict[int, str] = {}
 
+# D8 periodic-completeness safety net. The enumerated release triggers (AMS
+# change / run resume / banner button) can ALL miss — the production incident:
+# two staged items sat for hours while a fully-loaded printer went idle and no
+# event fired. The scheduler tick calls :func:`maybe_release_periodic` to
+# re-check fleet-wide, time-debounced by this monotonic stamp so the per-item
+# 3MF deficit re-parse stays bounded even though the tick is faster. The
+# tray-signature debounce above CANNOT serve here: it suppresses "nothing
+# changed", which is exactly the case we must catch. Lost on restart — worst
+# case one extra pass on the first post-restart tick.
+_last_periodic_release: float | None = None
+_PERIODIC_DEBOUNCE_S = 60.0
+
+# Human-readable low-spool staging reason. The (manual_start + filament_short)
+# FLAGS are the machine signal for staging identity — the queue banner and the
+# release query below both key on them; ``waiting_reason`` is DISPLAY text. The
+# un-staged waiting path already stores rich English sentences here ("Waiting
+# for filament: 011-H2S (needs PETG) | Busy: ..."); staged items now do too,
+# NAMING the blocked machine(s) so the operator walks to the RIGHT printer
+# instead of a bare "filament_short" token (the D9 incident). Not token-shaped,
+# so the frontend humanizer (waitingReason.ts) passes it through verbatim, and
+# :func:`release_filament_staged` clears any reason carrying this prefix.
+STAGING_REASON_PREFIX = "Low filament"
+
+
+def build_staged_reason(who: str, *, start_min: bool = False) -> str:
+    """Build the rich low-spool staging ``waiting_reason`` (see STAGING_REASON_PREFIX).
+
+    ``who`` names the blocked machine(s): a pinned printer name, the short
+    candidates of a model run, or a ``"<model> printers"`` fallback. ``start_min``
+    selects the below-minimum-start-weight wording over the generic-deficit one.
+    """
+    who = (who or "").strip() or "assigned printer"
+    what = "starting spool below minimum" if start_min else "needs more filament"
+    return f"{STAGING_REASON_PREFIX}: {who} ({what})"
+
 
 def _reset_state() -> None:
     """Test hook: clear the module-level debounce state between cases."""
+    global _last_periodic_release
     _tray_signatures.clear()
+    _last_periodic_release = None
 
 
 def compute_tray_signature(ams_data: list) -> str:
@@ -107,9 +145,10 @@ async def release_filament_staged(db: AsyncSession, printer_id: int | None = Non
     Scans pending items with ``manual_start`` AND ``filament_short`` (optionally
     scoped to one printer), re-runs :func:`compute_deficit_for_queue_item`
     against live spool state, and for each item whose deficit is now EMPTY:
-    clears ``manual_start`` + ``filament_short`` (and a stale
-    ``waiting_reason == "filament_short"``), so the next scheduler tick
-    dispatches it. Items still short are left staged. Commits once; returns the
+    clears ``manual_start`` + ``filament_short`` (and the staging
+    ``waiting_reason`` — any ``STAGING_REASON_PREFIX`` string or legacy token),
+    so the next scheduler tick dispatches it. Items still short are left staged.
+    Commits once; returns the
     number of items released. A per-item deficit-compute failure leaves that
     item staged (fail-safe) rather than releasing on unknown data.
     """
@@ -152,7 +191,14 @@ async def release_filament_staged(db: AsyncSession, printer_id: int | None = Non
             continue
         item.manual_start = False
         item.filament_short = False
-        if item.waiting_reason in ("filament_short", spool_selection.WAITING_REASON_START_MIN):
+        # Clear the staging reason we authored — a rich "Low filament: ..." string
+        # (STAGING_REASON_PREFIX) or a legacy bare token from a pre-D9 build — so a
+        # released item never keeps a stale hold reason. An UNRELATED reason (never
+        # set on a staged item today, but defensive) is left intact.
+        wr = item.waiting_reason
+        if wr and (
+            wr.startswith(STAGING_REASON_PREFIX) or wr in ("filament_short", spool_selection.WAITING_REASON_START_MIN)
+        ):
             item.waiting_reason = None
         released += 1
         logger.info(
@@ -191,4 +237,30 @@ async def maybe_release_on_ams_change(printer_id: int, ams_data: list) -> int:
             return await release_filament_staged(db, printer_id)
     except Exception:  # noqa: BLE001 — must never crash the AMS callback chain
         logger.exception("farm_staging: AMS-change release pass failed for printer %s", printer_id)
+        return 0
+
+
+async def maybe_release_periodic(db: AsyncSession) -> int:
+    """Scheduler-tick safety net (D8): fleet-wide staged-item release, debounced.
+
+    Invoked from :meth:`PrintScheduler.check_queue` each tick. Runs the SAME
+    single release path (:func:`release_filament_staged` fleet-wide) that the AMS
+    hook, run-resume and banner button use, so staged work can't stall forever
+    when none of those enumerated events fire (the incident: a fully-loaded
+    printer went idle and nothing re-checked). Time-debounced by
+    ``_PERIODIC_DEBOUNCE_S`` so the per-item 3MF deficit re-parse is bounded below
+    the tick rate; steady state is free — :func:`release_filament_staged`
+    short-circuits on an empty staged set before any 3MF is touched. Reuses the
+    caller's session (the scheduler owns one). Never raises: a release failure
+    must not kill the dispatch tick.
+    """
+    global _last_periodic_release
+    try:
+        now = time.monotonic()
+        if _last_periodic_release is not None and (now - _last_periodic_release) < _PERIODIC_DEBOUNCE_S:
+            return 0
+        _last_periodic_release = now
+        return await release_filament_staged(db, printer_id=None)
+    except Exception:  # noqa: BLE001 — must never crash the scheduler tick
+        logger.exception("farm_staging: periodic release pass failed")
         return 0

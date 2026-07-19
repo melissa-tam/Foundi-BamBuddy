@@ -107,6 +107,20 @@ async def websocket_endpoint(websocket: WebSocket, token: str | None = Query(def
 
         logger.info("Sent initial status for %s printers", len(statuses))
 
+        # Replay any unresolved reused-tag re-spool prompts to this client. The
+        # respool_prompt WS event is otherwise fire-once (ws_manager keeps no
+        # backlog), so a client disconnected when a prompt fired never learns of it
+        # — leaving a stale spool ledger if the operator never answers (F2). The
+        # service re-validates each slot against live + durable state before
+        # re-sending. Fully guarded: a reconnect must never fail on a farm-side hook.
+        try:
+            from backend.app.services.spool_respool import rebroadcast_unresolved_respool_prompts
+
+            async with async_session() as respool_db:
+                await rebroadcast_unresolved_respool_prompts(respool_db, websocket.send_json)
+        except Exception:  # noqa: BLE001 — reconnect must never break on the replay hook
+            logger.warning("respool_prompt reconnect re-broadcast failed", exc_info=True)
+
         # Keep connection alive and handle incoming messages.
         while True:
             data = await websocket.receive_json()

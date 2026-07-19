@@ -1540,6 +1540,7 @@ export default {
       stagedBannerTitle: '線材不足 — 更換線材卷後按重新檢查',
       stagedBannerBody: '{{count}} 個項目被線材檢查擱置。重新檢查僅釋放線材現已足夠的項目。',
       recheckButton: '重新檢查並釋放',
+      stagedBlockingHeading: '等待中：',
       releasedToast: '已釋放 {{count}} 個擱置項目',
       releasedNone: '未釋放任何項目 — 線材仍然不足',
       recheckFailed: '重新檢查失敗',

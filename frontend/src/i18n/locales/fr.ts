@@ -1540,6 +1540,7 @@ export default {
       stagedBannerTitle: 'Filament insuffisant — changez la bobine, puis appuyez sur Revérifier',
       stagedBannerBody: '{{count}} élément(s) retenus par le contrôle de filament. Revérifier ne libère que les éléments dont la bobine a désormais assez de matière.',
       recheckButton: 'Revérifier et libérer',
+      stagedBlockingHeading: 'En attente de :',
       releasedToast: '{{count}} élément(s) retenu(s) libéré(s)',
       releasedNone: 'Aucun élément libéré — filament toujours insuffisant',
       recheckFailed: 'Échec de la revérification',

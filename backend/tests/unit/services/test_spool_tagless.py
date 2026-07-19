@@ -844,9 +844,11 @@ class TestApplySpoolLazyLoadRegression:
         class _FakeClient:
             def ams_set_filament_setting(self, **kw):
                 calls.append(("set", kw))
+                return True  # real client returns True on a successful publish
 
             def extrusion_cali_sel(self, **kw):
                 calls.append(("cali", kw))
+                return True
 
         monkeypatch.setattr(printer_manager, "get_client", lambda pid: _FakeClient())
         monkeypatch.setattr(printer_manager, "get_status", lambda pid: None)
@@ -865,3 +867,95 @@ class TestApplySpoolLazyLoadRegression:
         # The stored K-profile is found via the explicit query (cali_idx 5, not -1).
         cali = [c for c in calls if c[0] == "cali"]
         assert cali and cali[0][1]["cali_idx"] == 5
+
+    async def test_refused_setting_skips_cali_and_preset(self, db_session, printer_factory, monkeypatch):
+        # ams_set_filament_setting refused (AMS busy identifying/drying) → apply returns
+        # False and NEITHER extrusion_cali_sel NOR the slot-preset persist runs: the DB
+        # preset row must not record a write that never reached the printer.
+        from backend.app.api.routes import inventory as inv
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory()
+        spool = Spool(material="PETG", rgba="00FF00FF", data_origin="ams_auto")
+        spool.k_profiles = []
+        spool.assignments = []
+        db_session.add(spool)
+        await db_session.commit()
+
+        calls: list[tuple] = []
+
+        class _RefusingClient:
+            def ams_set_filament_setting(self, **kw):
+                calls.append(("set", kw))
+                return False  # refused — identifying/drying/offline
+
+            def extrusion_cali_sel(self, **kw):
+                calls.append(("cali", kw))
+                return True
+
+        monkeypatch.setattr(printer_manager, "get_client", lambda pid: _RefusingClient())
+        monkeypatch.setattr(printer_manager, "get_status", lambda pid: None)
+        preset = AsyncMock()
+        monkeypatch.setattr("backend.app.services.slot_preset_writer.upsert_slot_preset_for_spool", preset)
+
+        ok = await inv.apply_spool_to_slot_via_mqtt(
+            db=db_session, current_user=None, spool=spool, printer_id=printer.id, ams_id=0, tray_id=0
+        )
+        assert ok is False
+        assert [c[0] for c in calls] == ["set"]  # only the setting attempt — no cali
+        preset.assert_not_awaited()  # no preset row for a write that never landed
+
+
+class TestDryingDefers:
+    """AMS drying disengages trays (presence flaps to state 10) and fails any config
+    write / identify (HMS 0700_C069). handle_tagless_slot and maybe_autoconfigure_
+    bare_tray defer while drying; the bare-tray retry window is not burned on the
+    defer, and force= does not bypass the drying/identify guards."""
+
+    async def test_handle_tagless_slot_defers_while_drying(self, db_session, printer_factory, env, monkeypatch):
+        monkeypatch.setattr("backend.app.services.ams_presence.unit_drying", lambda *a: True)
+        printer = await printer_factory()
+        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None, [])
+        assert handled is True  # deferred → caller `continue`s (no respool-gate fall-through)
+        assert await _assignment(db_session, printer.id) is None  # nothing minted
+        env.apply.assert_not_awaited()  # no config push
+
+    async def test_bare_tray_defers_while_drying(self, db_session, printer_factory, env, monkeypatch):
+        monkeypatch.setattr("backend.app.services.ams_presence.unit_drying", lambda *a: True)
+        printer = await printer_factory()
+        handled = await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare())
+        assert handled is False
+        assert await _assignment(db_session, printer.id) is None  # nothing minted
+        env.apply.assert_not_awaited()
+        # Retry window NOT burned: the doomed push never stamped _autoconfig_attempts.
+        assert (printer.id, 0, 0) not in spool_tagless._autoconfig_attempts
+
+    async def test_bare_tray_defers_while_identify_in_flight(self, db_session, printer_factory, env, monkeypatch):
+        monkeypatch.setattr("backend.app.services.ams_presence.identify_in_flight", lambda *a: True)
+        printer = await printer_factory()
+        handled = await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare())
+        assert handled is False
+        assert (printer.id, 0, 0) not in spool_tagless._autoconfig_attempts  # window not burned
+        env.apply.assert_not_awaited()
+
+    async def test_bare_tray_force_still_respects_drying(self, db_session, printer_factory, env, monkeypatch):
+        # force= bypasses ONLY the retry window — never the drying guard.
+        monkeypatch.setattr("backend.app.services.ams_presence.unit_drying", lambda *a: True)
+        printer = await printer_factory()
+        handled = await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True)
+        assert handled is False
+        env.apply.assert_not_awaited()
+
+    async def test_retry_window_not_burned_processes_after_drying_ends(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
+        # Because the drying defer never stamped the retry window, the first call after
+        # drying ends proceeds immediately (no wait for _AUTOCONFIG_RETRY_S).
+        drying = {"v": True}
+        monkeypatch.setattr("backend.app.services.ams_presence.unit_drying", lambda *a: drying["v"])
+        printer = await printer_factory()
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is False
+        assert env.apply.await_count == 0
+        drying["v"] = False  # drying ended
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is True
+        assert env.apply.await_count == 1  # processed immediately — window was never armed

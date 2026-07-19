@@ -1540,6 +1540,7 @@ export default {
       stagedBannerTitle: 'Filamento insufficiente — sostituisci la bobina, poi premi Ricontrolla',
       stagedBannerBody: '{{count}} elemento/i trattenuti dal controllo filamento. Ricontrolla rilascia solo gli elementi la cui bobina ora ha materiale sufficiente.',
       recheckButton: 'Ricontrolla e rilascia',
+      stagedBlockingHeading: 'In attesa di:',
       releasedToast: '{{count}} elemento/i trattenuti rilasciati',
       releasedNone: 'Nessun elemento rilasciato — filamento ancora insufficiente',
       recheckFailed: 'Ricontrollo non riuscito',

@@ -38,6 +38,29 @@ _AMS_MODULE_PREFIXES = ("ams/", "n3f/", "n3s/")
 # decode below). Exported so ams_presence shares one origin for this magic value.
 AMS_STATUS_IDENTIFYING = 2
 
+# Tray `state` codes that mean a spool is physically PRESENT: 11 = loaded, 10 =
+# "spool present, filament not in feeder" (see the merge comment in
+# _handle_ams_data). Wiping tray identity for a present spool is the bug behind the
+# AMS-drying incident (drying disengages trays to state 10, and the identity wipe
+# then storms the RFID pipeline into HMS 0700_C069) and behind routine load/unload
+# transit wipes (~50×/week fleet-wide). Exported so ams_presence keys presence off
+# one origin.
+TRAY_PRESENT_STATES = (10, 11)
+
+# AMS drying latch. `dry_time` (minutes remaining) is the primary "unit is drying"
+# signal, but the firmware only reports it once a cycle is under way. A monotonic
+# latch (deadline = start + cycle duration + slack) covers the gap before the first
+# dry_time push and a touchscreen-started cycle seeded from the drying echo.
+_DRYING_LATCH_SLACK_S = 1800  # 30 min past the nominal cycle end
+_DRYING_LATCH_DEFAULT_S = 24 * 3600  # latch cap when no duration was supplied
+
+# Per-printer identify gate: after we publish an ams_get_rfid identify, hold off any
+# further identify on this printer for this long. The AMS identifies one slot at a
+# time; a second overlapping ams_get_rfid fails the in-flight read (HMS
+# 0700_2x00_0001_0081). Cleared early when the AMS is observed leaving the
+# identifying state (see the ams_status decode).
+_IDENTIFY_GATE_S = 30
+
 
 def parse_ams_filament_backup_from_cfg(cfg_raw: object) -> bool | None:
     """Extract AMS Filament Backup state from a Bambu push_status ``print.cfg`` value.
@@ -555,7 +578,14 @@ class BambuMQTTClient:
         # last start. Bambu does not echo these back in the per-tick AMS push
         # — only the dry_time countdown — so we cache what we sent to drive
         # the UI badge. Cleared on stop or on the dry_time falling edge to 0.
+        # Each entry also carries a monotonic "latched_until" deadline so the
+        # unit reads as drying before the first dry_time push (see ams_unit_drying).
         self._drying_targets: dict[int, dict[str, object]] = {}
+        # monotonic() deadline until which a fresh ams_get_rfid identify we
+        # published is treated as still in flight on THIS printer — no second
+        # identify may go out until then (0.0 = gate open). Cleared early when the
+        # AMS is seen leaving the identifying state.
+        self._identify_gate_until: float = 0.0
 
         self.state = PrinterState()
         self._client: mqtt.Client | None = None
@@ -1187,8 +1217,19 @@ class BambuMQTTClient:
                     self.state.ams_status = raw_ams_status if raw_ams_status is not None else 0
 
                 # Compute main and sub status
+                prev_ams_status_main = self.state.ams_status_main
                 self.state.ams_status_sub = self.state.ams_status & 0xFF
                 self.state.ams_status_main = (self.state.ams_status >> 8) & 0xFF
+
+                # Clear the per-printer identify gate the instant the AMS leaves the
+                # identifying state: the in-flight read is done, so the next slot's
+                # identify (e.g. the terminal sweep's ~5 s-spaced re-reads) is not
+                # held off waiting out _IDENTIFY_GATE_S.
+                if (
+                    prev_ams_status_main == AMS_STATUS_IDENTIFYING
+                    and self.state.ams_status_main != AMS_STATUS_IDENTIFYING
+                ):
+                    self._identify_gate_until = 0.0
 
                 # Log when ams_status changes (for filament change tracking debug)
                 logger.debug(
@@ -1208,6 +1249,7 @@ class BambuMQTTClient:
                 # INFO level so the body lands in support bundles by default.
                 elif cmd == "ams_filament_drying":
                     logger.info("[%s] ams_filament_drying response: %s", self.serial_number, print_data)
+                    self._handle_drying_echo(print_data)
                 # Check for developer mode probe response
                 if (
                     cmd == "ams_filament_setting"
@@ -1679,8 +1721,17 @@ class BambuMQTTClient:
                 else:
                     self.state.ams_status = raw_ams_status if raw_ams_status is not None else 0
                 # Compute main and sub status
+                prev_ams_status_main = self.state.ams_status_main
                 self.state.ams_status_sub = self.state.ams_status & 0xFF
                 self.state.ams_status_main = (self.state.ams_status >> 8) & 0xFF
+                # Sibling of the print-message decode's gate-clear: releasing the
+                # identify gate early on the AMS-payload path too, so whichever push
+                # first reports the identify→idle transition frees the next slot.
+                if (
+                    prev_ams_status_main == AMS_STATUS_IDENTIFYING
+                    and self.state.ams_status_main != AMS_STATUS_IDENTIFYING
+                ):
+                    self._identify_gate_until = 0.0
                 logger.debug(
                     f"[{self.serial_number}] ams_status: {self.state.ams_status} "
                     f"(main={self.state.ams_status_main}, sub={self.state.ams_status_sub})"
@@ -1946,14 +1997,23 @@ class BambuMQTTClient:
                             slot_clearing = new_tray.get("tray_type") == ""
                             # Some printers (e.g. H2D) only send {id, state} in
                             # incremental updates when a tray is not fully loaded.
-                            # state=11 means loaded; other values (9=empty,
-                            # 10=spool present but filament not in feeder) indicate
-                            # the slot should be cleared.  Without this, old
-                            # tray_type/tray_color persist indefinitely (#784).
+                            # state 10/11 both mean a spool is physically PRESENT
+                            # (11 = loaded, 10 = spool present, filament not in
+                            # feeder) — DON'T clear: wiping identity for a present
+                            # spool blanked tray_type mid-transit (~50×/week fleet-
+                            # wide during normal load/unload), and during AMS drying
+                            # (trays disengage to state 10) it drove the identity-
+                            # wipe → RFID re-read storm behind HMS 0700_C069. Any
+                            # other value (9=empty, 8, 0, unknown / unparseable)
+                            # clears the stale tray_type/tray_color (#784).
                             tray_state = new_tray.get("state")
+                            try:
+                                norm_tray_state = int(tray_state) if tray_state is not None else None
+                            except (TypeError, ValueError):
+                                norm_tray_state = None
                             if (
                                 tray_state is not None
-                                and tray_state != 11
+                                and norm_tray_state not in TRAY_PRESENT_STATES
                                 and "tray_type" not in new_tray
                                 and merged_tray.get("tray_type")
                             ):
@@ -4262,15 +4322,103 @@ class BambuMQTTClient:
             wire_json,
         )
         # Track the active-cycle target so the badge can show "PETG @ 65°C"
-        # while drying. Bambu only echoes dry_time on subsequent pushes.
+        # while drying. Bambu only echoes dry_time on subsequent pushes. The
+        # latched_until deadline lets ams_unit_drying report "drying" in the window
+        # before the first dry_time push arrives (duration is in HOURS).
         if mode == 1:
+            duration_s = (int(duration) * 3600) if duration else _DRYING_LATCH_DEFAULT_S
             self._drying_targets[ams_id] = {
                 "filament": filament or "",
                 "temp": int(temp),
+                "latched_until": time.monotonic() + duration_s + _DRYING_LATCH_SLACK_S,
             }
         else:
             self._drying_targets.pop(ams_id, None)
         return True
+
+    def ams_unit_drying(self, ams_id: int) -> bool:
+        """True while AMS unit ``ams_id`` is running a drying cycle.
+
+        Drying is signalled by the per-unit ``dry_time`` (minutes remaining) > 0 —
+        ``ams_status_main`` has no drying value (enum 0..4). The merged unit's
+        ``dry_time`` is the primary signal; a monotonic ``latched_until`` backstop
+        (seeded by ``send_drying_command`` or the drying echo) covers the window
+        before the first ``dry_time`` push and a unit row that momentarily omits the
+        field. Every AMS write path consults this: a config write / re-read into a
+        drying unit disengages the tray and raises HMS 0700_C069. External/virtual
+        trays (254/255) have no unit row and no latch → naturally False. Never
+        raises — a malformed ``raw_data`` must not crash a write path.
+        """
+        try:
+            raw = self.state.raw_data or {}
+            ams = raw.get("ams", [])
+            if isinstance(ams, dict):
+                ams = ams.get("ams", [])
+            if isinstance(ams, list):
+                for unit in ams:
+                    if not isinstance(unit, dict):
+                        continue
+                    try:
+                        if int(unit.get("id", -1)) != ams_id:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    try:
+                        if int(unit.get("dry_time") or 0) > 0:
+                            return True
+                    except (TypeError, ValueError):
+                        pass
+                    break
+        except Exception:  # noqa: BLE001 — malformed raw_data must never crash a write path
+            pass
+        target = self._drying_targets.get(ams_id)
+        if target:
+            deadline = target.get("latched_until")
+            if isinstance(deadline, (int, float)) and time.monotonic() < deadline:
+                return True
+            # Expired latch: drop it so a stale entry can't keep refusing writes.
+            self._drying_targets.pop(ams_id, None)
+        return False
+
+    def _handle_drying_echo(self, print_data: dict) -> None:
+        """Seed / clear the drying latch from an ``ams_filament_drying`` echo.
+
+        A touchscreen-started drying cycle echoes here with no prior
+        ``send_drying_command`` to seed the badge cache, so mode 1 seeds
+        ``_drying_targets`` (filament/temp for the UI badge + a monotonic latch) and
+        mode 0 clears it. An echo with no ``ams_id`` is ignored — the per-unit
+        ``dry_time`` covers that case within seconds. ``duration`` is in HOURS.
+        """
+        if print_data.get("result") != "success":
+            return
+        if "ams_id" not in print_data:
+            return
+        try:
+            ams_id = int(print_data["ams_id"])
+        except (TypeError, ValueError):
+            return
+        try:
+            mode = int(print_data.get("mode"))
+        except (TypeError, ValueError):
+            mode = None
+        if mode == 0:
+            self._drying_targets.pop(ams_id, None)
+            return
+        if mode == 1:
+            try:
+                duration_s = int(print_data.get("duration") or 0) * 3600
+            except (TypeError, ValueError):
+                duration_s = 0
+            duration_s = duration_s or _DRYING_LATCH_DEFAULT_S
+            try:
+                temp = int(print_data.get("temp") or 0)
+            except (TypeError, ValueError):
+                temp = 0
+            self._drying_targets[ams_id] = {
+                "filament": print_data.get("filament") or "",
+                "temp": temp,
+                "latched_until": time.monotonic() + duration_s + _DRYING_LATCH_SLACK_S,
+            }
 
     def _handle_kprofile_response(self, data: dict):
         """Handle K-profile response from printer."""
@@ -5186,12 +5334,29 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot refresh AMS tray: not connected", self.serial_number)
             return False, "Printer not connected"
 
+        # Refuse while this AMS unit is drying: a re-read disengages the tray and
+        # fails the drying cycle (HMS 0700_C069). The caller retries after drying.
+        if self.ams_unit_drying(ams_id):
+            logger.warning("[%s] Cannot refresh AMS tray: AMS unit %s is drying", self.serial_number, ams_id)
+            return False, "AMS unit is drying — retry after the drying cycle"
+
         # Refuse while the AMS is mid-identify: commanding a SECOND ams_get_rfid now
         # collides with the in-flight read and makes the firmware fail it (HMS
         # 0700_2x00_0001_0081). One identify per slot in flight — the caller retries.
         if self.state.ams_status_main == AMS_STATUS_IDENTIFYING:
             logger.warning("[%s] Cannot refresh AMS tray: AMS is busy identifying a tray", self.serial_number)
             return False, "AMS is busy identifying a tray"
+
+        # Per-printer identify gate: an ams_get_rfid we published within the last
+        # _IDENTIFY_GATE_S is still running (the AMS identifies one slot at a time),
+        # so a second overlapping identify would fail the in-flight read even before
+        # ams_status_main flips to 2. Cleared early on the identify→idle transition.
+        if time.monotonic() < self._identify_gate_until:
+            logger.warning(
+                "[%s] Cannot refresh AMS tray: an identify is already in flight on this printer",
+                self.serial_number,
+            )
+            return False, "AMS is identifying another tray"
 
         # Check if filament is currently loaded (tray_now != 255)
         # RFID refresh requires the AMS to move filament, which can't happen if one is loaded
@@ -5213,6 +5378,9 @@ class BambuMQTTClient:
         # This command is used by Bambu Studio to re-read the RFID tag
         command = {"print": {"command": "ams_get_rfid", "ams_id": ams_id, "slot_id": tray_id, "sequence_id": "0"}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        # Arm the per-printer identify gate: the read runs one slot at a time, so no
+        # further identify may go out until it settles (or ams_status leaves 2).
+        self._identify_gate_until = time.monotonic() + _IDENTIFY_GATE_S
         logger.info("[%s] Triggering RFID re-read: AMS %s, slot %s", self.serial_number, ams_id, tray_id)
 
         return True, f"Refreshing AMS {ams_id} tray {tray_id}"
@@ -5249,6 +5417,17 @@ class BambuMQTTClient:
         """
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot set AMS filament setting: not connected", self.serial_number)
+            return False
+
+        # Refuse while this AMS unit is drying: a filament-setting write disengages
+        # the drying tray and fails the cycle (HMS 0700_C069). Caller retries after.
+        if self.ams_unit_drying(ams_id):
+            logger.warning(
+                "[%s] Refusing ams_filament_setting for AMS %s tray %s: AMS unit is drying",
+                self.serial_number,
+                ams_id,
+                tray_id,
+            )
             return False
 
         # Refuse while the AMS is mid-identify: writing filament settings to a slot
@@ -5338,6 +5517,29 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot reset AMS slot: not connected", self.serial_number)
             return False
 
+        # Refuse while this AMS unit is drying: a reset write disengages the drying
+        # tray and fails the cycle (HMS 0700_C069). Caller retries after drying.
+        if self.ams_unit_drying(ams_id):
+            logger.warning(
+                "[%s] Refusing reset_ams_slot for AMS %s tray %s: AMS unit is drying",
+                self.serial_number,
+                ams_id,
+                tray_id,
+            )
+            return False
+
+        # Refuse while the AMS is mid-identify: this write is an ams_filament_setting
+        # to a slot the firmware is actively reading, clobbering the RFID read (HMS
+        # 0700_2x00_0001_0081). Never write during an identify — the caller retries.
+        if self.state.ams_status_main == AMS_STATUS_IDENTIFYING:
+            logger.warning(
+                "[%s] Refusing reset_ams_slot for AMS %s tray %s: AMS is identifying a tray",
+                self.serial_number,
+                ams_id,
+                tray_id,
+            )
+            return False
+
         # Calculate mqtt IDs based on AMS type — same convention as
         # ams_set_filament_setting above. See its comment for the #1279 capture rationale.
         if ams_id == 255:
@@ -5412,6 +5614,29 @@ class BambuMQTTClient:
         """
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot set calibration: not connected", self.serial_number)
+            return False
+
+        # Refuse while this AMS unit is drying: selecting a calibration profile pokes
+        # the drying tray and fails the cycle (HMS 0700_C069). Caller retries after.
+        if self.ams_unit_drying(ams_id):
+            logger.warning(
+                "[%s] Refusing extrusion_cali_sel for AMS %s tray %s: AMS unit is drying",
+                self.serial_number,
+                ams_id,
+                tray_id,
+            )
+            return False
+
+        # Refuse while the AMS is mid-identify: touching the slot the firmware is
+        # actively reading clobbers the RFID read (HMS 0700_2x00_0001_0081). Never
+        # command during an identify — the caller retries once it settles.
+        if self.state.ams_status_main == AMS_STATUS_IDENTIFYING:
+            logger.warning(
+                "[%s] Refusing extrusion_cali_sel for AMS %s tray %s: AMS is identifying a tray",
+                self.serial_number,
+                ams_id,
+                tray_id,
+            )
             return False
 
         # Calculate mqtt IDs based on AMS type.

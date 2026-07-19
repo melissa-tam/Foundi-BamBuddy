@@ -26,6 +26,7 @@ from backend.app.services.bambu_ftp import (
     upload_file_async,
     with_ftp_retry,
 )
+from backend.app.services.farm_staging import build_staged_reason, maybe_release_periodic
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import (
@@ -38,7 +39,6 @@ from backend.app.services.spool_selection import (
     DEFAULT_MIN_START_SPOOL_G,
     DEFAULT_SELECTION_POLICY,
     SELECTION_POLICIES,
-    WAITING_REASON_START_MIN,
     MatchOutcome,
     SlotInventory,
     build_slot_inventory,
@@ -171,6 +171,19 @@ class PrintScheduler:
                 await check_paused_prints(db)
             except Exception:
                 logger.exception("Pause-stall watch failed (non-fatal)")
+
+            # Staged-completeness safety net (D8): the low-spool release triggers
+            # (AMS change / run resume / banner button) can all MISS — a
+            # fully-loaded printer going idle fires no event, stranding staged
+            # units (the incident: two sat for hours). Re-check fleet-wide each
+            # tick behind a time debounce; free in steady state (empty staged set
+            # short-circuits before any 3MF parse). Own guard so it can't kill
+            # dispatch. Runs BEFORE the pending-item query so a freed unit
+            # dispatches this same tick.
+            try:
+                await maybe_release_periodic(db)
+            except Exception:
+                logger.exception("Periodic staged-release pass failed (non-fatal)")
 
             # Check if shortest-job-first scheduling is enabled
             sjf_enabled = await self._get_bool_setting(db, "queue_shortest_first")
@@ -374,8 +387,14 @@ class PrintScheduler:
                             # loaded as firmware backup donors). Do NOT persist a
                             # mapping. Notify once per transition, mirroring the
                             # filament-deficit path.
-                            was_blocked = item.waiting_reason == WAITING_REASON_START_MIN
-                            await self._stage_filament_short(db, item, unpin=False, reason=WAITING_REASON_START_MIN)
+                            # Already low-spool staged? The durable FLAG is the
+                            # transition signal (token-independent now the reason
+                            # is a rich string) — dedup the once-per-transition
+                            # notification off it.
+                            was_blocked = bool(item.filament_short)
+                            printer = await self._get_printer(db, item.printer_id)
+                            stage_reason = build_staged_reason(printer.name if printer else "", start_min=True)
+                            await self._stage_filament_short(db, item, unpin=False, reason=stage_reason)
                             logger.info(
                                 "Queue item %s: start spool below minimum on printer %s (slots %s) — staged",
                                 item.id,
@@ -384,12 +403,11 @@ class PrintScheduler:
                             )
                             if not was_blocked:
                                 job_name = await self._get_job_name(db, item)
-                                printer = await self._get_printer(db, item.printer_id)
                                 try:
                                     await notification_service.on_queue_job_waiting(
                                         job_name=job_name,
                                         target_model=(printer.model if printer else "") or "",
-                                        waiting_reason=WAITING_REASON_START_MIN,
+                                        waiting_reason=stage_reason,
                                         db=db,
                                     )
                                 except Exception as e:
@@ -497,6 +515,10 @@ class PrintScheduler:
                     last_waiting_reason: str | None = None
                     candidates_deficit_blocked = 0
                     candidates_start_blocked = 0
+                    # Short candidates found THIS item's pass — named in the
+                    # staged reason (D9) so the banner tells the operator which
+                    # machines to top up.
+                    blocked_candidate_ids: list[int] = []
                     while True:
                         candidate_id, last_waiting_reason = await self._find_idle_printer_for_model(
                             db,
@@ -532,6 +554,7 @@ class PrintScheduler:
                             )
                         if deficit:
                             deficit_blocked.add(candidate_id)
+                            blocked_candidate_ids.append(candidate_id)
                             candidates_deficit_blocked += 1
                             logger.info(
                                 "Queue item %s: candidate printer %s short on filament (%d slot(s)) — trying next",
@@ -546,6 +569,7 @@ class PrintScheduler:
                         # (it can still finish other prints / serve as a backup donor).
                         if candidate_start_blocked and not item.skip_filament_check:
                             deficit_blocked.add(candidate_id)
+                            blocked_candidate_ids.append(candidate_id)
                             candidates_start_blocked += 1
                             logger.info(
                                 "Queue item %s: candidate printer %s start spool below minimum (slots %s) — trying next",
@@ -673,14 +697,15 @@ class PrintScheduler:
                         # stage the item UNPINNED so a later tick re-runs the full
                         # candidate search once any printer's spool is topped up. One
                         # notification per (batch, model) group per tick — the incident
-                        # sent one per unit (10 for a 10-plate run). When the blocks
-                        # were PURELY the start-spool floor (no true deficit), surface
-                        # the distinct reason; a mix stays generic.
-                        stage_reason = (
-                            WAITING_REASON_START_MIN
-                            if candidates_deficit_blocked == 0 and candidates_start_blocked > 0
-                            else "filament_short"
-                        )
+                        # sent one per unit (10 for a 10-plate run). D9: NAME the short
+                        # machines in the persisted reason (the model log named nothing
+                        # persistent) so the queue banner tells the operator which
+                        # printer to top up. Purely start-floor blocks read "below
+                        # minimum"; a mix stays generic ("needs more filament").
+                        start_min_only = candidates_deficit_blocked == 0 and candidates_start_blocked > 0
+                        blocked_names = await self._resolve_printer_names(db, blocked_candidate_ids)
+                        who = ", ".join(blocked_names) if blocked_names else f"{item.target_model} printers"
+                        stage_reason = build_staged_reason(who, start_min=start_min_only)
                         await self._stage_model_item_filament_short(
                             db, item, notified_short_groups, reason=stage_reason
                         )
@@ -904,6 +929,26 @@ class PrintScheduler:
             reasons.append(f"Offline: {', '.join(printers_offline)}")
 
         return None, " | ".join(reasons) if reasons else f"No available {model} printers{location_suffix}"
+
+    async def _resolve_printer_names(self, db: AsyncSession, printer_ids: list[int]) -> list[str]:
+        """Resolve printer ids to names, de-duplicated and input-order preserving.
+
+        Names the short candidates in a model-based low-spool staging reason so
+        the operator knows WHICH machines to top up (the D9 incident: the model
+        staging log named nothing persistent). Missing rows are skipped; an empty
+        input returns ``[]``.
+        """
+        if not printer_ids:
+            return []
+        result = await db.execute(select(Printer.id, Printer.name).where(Printer.id.in_(printer_ids)))
+        names_by_id = dict(result.all())
+        seen: set[int] = set()
+        out: list[str] = []
+        for pid in printer_ids:
+            if pid in names_by_id and pid not in seen:
+                seen.add(pid)
+                out.append(names_by_id[pid])
+        return out
 
     @staticmethod
     def _is_busy_only(waiting_reason: str) -> bool:
@@ -2027,9 +2072,10 @@ class PrintScheduler:
         ``unpin=True`` clears the pin and its stale mapping — used by the
         model-based path when EVERY eligible printer is short, so ``farm_staging``
         releases it and the next tick re-runs the full candidate search across the
-        fleet. ``reason`` is the machine ``waiting_reason`` token (``filament_short``
-        or ``start_spool_below_minimum``), now set on BOTH shapes so QueuePage can
-        tell the operator why a pinned item is held.
+        fleet. ``reason`` is the persisted ``waiting_reason`` — callers build a
+        human-readable :func:`farm_staging.build_staged_reason` string that NAMES
+        the blocked machine(s) (D9); the ``"filament_short"`` default is a legacy
+        fallback for a caller that passes none.
         """
         item.filament_short = True
         item.manual_start = True
@@ -2051,7 +2097,9 @@ class PrintScheduler:
 
         The incident sent one waiting notification per unit (10 for a 10-plate
         run); dedup by group keeps a large run to a single notification. ``reason``
-        distinguishes a true filament deficit from the start-spool floor.
+        is the persisted + notified waiting reason — a rich
+        :func:`farm_staging.build_staged_reason` string from the caller naming the
+        short machines (D9).
         """
         await self._stage_filament_short(db, item, unpin=True, reason=reason)
         logger.info(
@@ -2107,9 +2155,10 @@ class PrintScheduler:
         deficit = await self._compute_deficit_safe(db, item)
 
         if deficit:
-            await self._stage_filament_short(db, item, unpin=False)
-            job_name = await self._get_job_name(db, item)
             printer = await self._get_printer(db, item.printer_id) if item.printer_id else None
+            stage_reason = build_staged_reason(printer.name if printer else "", start_min=False)
+            await self._stage_filament_short(db, item, unpin=False, reason=stage_reason)
+            job_name = await self._get_job_name(db, item)
             logger.info(
                 "Queue item %s blocked on filament deficit (%d slot(s)) — promoted to manual_start",
                 item.id,
@@ -2119,7 +2168,7 @@ class PrintScheduler:
                 await notification_service.on_queue_job_waiting(
                     job_name=job_name,
                     target_model=(printer.model if printer else "") or "",
-                    waiting_reason="filament_short",
+                    waiting_reason=stage_reason,
                     db=db,
                 )
             except Exception as e:

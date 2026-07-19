@@ -707,6 +707,44 @@ describe('QueuePage farm surfaces (Phase 4)', () => {
     expect(await screen.findByText(/released 1 staged item/i)).toBeInTheDocument();
   });
 
+  it('lists distinct per-machine blocking reasons in the low-spool banner (D9)', async () => {
+    // The scheduler persists a rich "Low filament: <printer> (...)" reason into
+    // each staged row so the banner NAMES which machine to top up — the incident
+    // was a bare "swap the spool" banner that sent the operator to the wrong one.
+    server.use(
+      http.get('/api/v1/queue/', () =>
+        HttpResponse.json([
+          {
+            ...farmPending,
+            id: 10,
+            manual_start: true,
+            filament_short: true,
+            waiting_reason: 'Low filament: 004-H2S (needs more filament)',
+          },
+          {
+            ...farmPending,
+            id: 12,
+            manual_start: true,
+            filament_short: true,
+            waiting_reason: 'Low filament: 011-H2S (starting spool below minimum)',
+          },
+        ]),
+      ),
+    );
+
+    render(<QueuePage />);
+
+    // Banner-only heading proves the details block rendered; the reasons name
+    // the specific short machines (they also appear on their rows → getAllByText).
+    expect(await screen.findByText(/waiting on:/i)).toBeInTheDocument();
+    expect(
+      screen.getAllByText('Low filament: 004-H2S (needs more filament)').length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText('Low filament: 011-H2S (starting spool below minimum)').length,
+    ).toBeGreaterThan(0);
+  });
+
   // 5b: both farm banners are visible to any queue viewer; only the action
   // buttons stay behind queue:update_all (disabled + explanatory hint when
   // lacking). Low-priv = auth enabled with no logged-in user → hasPermission

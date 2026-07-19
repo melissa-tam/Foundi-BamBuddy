@@ -19,12 +19,26 @@ from backend.app.services import ams_presence
 
 _VALID_TAG = "1234567890ABCDEF"
 
+# Captured before any fixture can patch it, so the delegation tests can exercise the
+# REAL unit_drying (the autouse fixture below replaces ams_presence.unit_drying).
+_REAL_UNIT_DRYING = ams_presence.unit_drying
+
 
 @pytest.fixture(autouse=True)
 def _clean_state():
     ams_presence._reset_state()
     yield
     ams_presence._reset_state()
+
+
+@pytest.fixture(autouse=True)
+def _default_not_drying(monkeypatch):
+    """These tests model a NON-drying printer. A bare ``MagicMock`` client returns a
+    truthy Mock from ``ams_unit_drying``, which would make the new drying gate read
+    every presence/sweep test as drying; default the gate OFF. Drying-specific tests
+    re-patch ``ams_presence.unit_drying`` to True, and the delegation tests call
+    ``_REAL_UNIT_DRYING`` directly."""
+    monkeypatch.setattr(ams_presence, "unit_drying", lambda printer_id, ams_id: False)
 
 
 @pytest.fixture
@@ -542,3 +556,131 @@ class TestIdentifyCollisionRegression:
         assert handled is True  # deferred → caller `continue`s (no respool-gate fall-through)
         minted = await db_session.scalar(select(func.count(Spool.id)))
         assert minted == 0  # zero mints / filament-setting writes during the in-flight window
+
+
+class TestUnitDryingDelegation:
+    """unit_drying delegates to the client's ams_unit_drying (single origin) and is
+    crash-safe when the printer is gone or the client raises."""
+
+    def test_delegates_to_client(self, monkeypatch):
+        client = MagicMock()
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+        client.ams_unit_drying.return_value = True
+        assert _REAL_UNIT_DRYING(1, 0) is True
+        client.ams_unit_drying.return_value = False
+        assert _REAL_UNIT_DRYING(1, 0) is False
+
+    def test_no_client_is_false(self, monkeypatch):
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: None)
+        assert _REAL_UNIT_DRYING(1, 0) is False
+
+    def test_client_raises_is_false(self, monkeypatch):
+        client = MagicMock()
+        client.ams_unit_drying.side_effect = RuntimeError("boom")
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+        assert _REAL_UNIT_DRYING(1, 0) is False
+
+
+class TestDryingGates:
+    """A drying cycle flaps tray presence (state → 10) with no physical event. While
+    drying, on_ams_change must NOT clear a feed-fault flag and NOT fire an idle
+    re-read, and the terminal sweep must skip the drying unit — a re-read would
+    disengage the tray and fail the cycle (HMS 0700_C069)."""
+
+    async def test_clear_on_reinsert_skipped_while_drying(self, db_session, monkeypatch):
+        monkeypatch.setattr(ams_presence, "unit_drying", lambda pid, aid: True)
+        spy = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", spy)
+        client = MagicMock()
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # drying flap gain
+        spy.assert_not_awaited()  # feed-fault clear NOT run for a drying flap
+        assert ams_presence._last_presence[(1, 0, 0)] is True  # presence map still updated
+
+    async def test_idle_reread_skipped_while_drying(self, db_session, monkeypatch):
+        monkeypatch.setattr(ams_presence, "unit_drying", lambda pid, aid: True)
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
+        client = MagicMock()
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # drying flap
+        client.ams_refresh_tray.assert_not_called()  # no re-read during drying
+
+    async def test_terminal_sweep_skips_drying_unit(self, db_session, sessions, monkeypatch):
+        monkeypatch.setattr(ams_presence, "unit_drying", lambda pid, aid: True)
+        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = SimpleNamespace(
+            state="FINISH",
+            subtask_id="t1",
+            ams_status_main=0,
+            raw_data={"ams": [{"id": 0, "tray": [_tray(0, state=11)]}]},
+        )
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+
+        await ams_presence.on_printer_terminal(1)
+        client.ams_refresh_tray.assert_not_called()  # drying unit skipped
+
+    async def test_non_drying_control_still_reads(self, db_session, monkeypatch):
+        # Control (autouse unit_drying=False): the same gain re-reads normally.
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+        client.ams_refresh_tray.assert_called_once_with(0, 0)
+
+
+class TestTrayPresentSingleOrigin:
+    """_tray_present is keyed off bambu_mqtt.TRAY_PRESENT_STATES (one origin)."""
+
+    def test_single_origin_and_membership(self):
+        from backend.app.services.bambu_mqtt import TRAY_PRESENT_STATES
+
+        assert ams_presence.TRAY_PRESENT_STATES is TRAY_PRESENT_STATES
+        assert ams_presence._tray_present({"state": 10}) is True
+        assert ams_presence._tray_present({"state": 11}) is True
+        assert ams_presence._tray_present({"state": 9}) is False
+        assert ams_presence._tray_present({"state": 0}) is False
+        assert ams_presence._tray_present({"state": None}) is False
+
+
+class TestEchoWindowBoundary:
+    """F3: the echo-consume window equals the identify-cycle bound (30 s). A gain
+    within it is the identify flap's echo (swallowed); beyond it a gain is a real
+    reseat and runs clear_on_reinsert."""
+
+    async def test_echo_swallowed_under_30s(self, db_session, monkeypatch):
+        clear = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
+
+        # Arm the flag 10 s ago (< 30 s) → the next gain is the identify echo, swallowed.
+        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic() - 10
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # echo gain
+        clear.assert_not_awaited()  # swallowed — feed-fault clear NOT run
+        assert client.ams_refresh_tray.call_count == 0
+
+    async def test_genuine_reinsert_over_30s_runs_clear(self, db_session, monkeypatch):
+        clear = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
+
+        # Arm the flag 31 s ago (> 30 s) → GC'd; the gain is a genuine reseat and clears.
+        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic() - 31
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # genuine gain
+        clear.assert_awaited_once()
+        client.ams_refresh_tray.assert_called_once_with(0, 0)

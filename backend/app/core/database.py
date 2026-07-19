@@ -3894,6 +3894,38 @@ async def seed_default_groups():
 
         await session.commit()
 
+        # Additive seed-sync (D10): back-fill newly-seeded permissions into
+        # pre-existing SYSTEM groups. The create-missing loop above seeds a
+        # BRAND-NEW group with the full DEFAULT_GROUPS permission set, but a
+        # system group that already existed before a permission was added to
+        # DEFAULT_GROUPS never received the new grant (e.g. the production
+        # Operators group predates the farm SKU / production-run / eject and
+        # shared-queue grants). This idempotent pass adds ONLY the permissions
+        # present in the seed but missing from the stored row — preserving the
+        # group's current order and appending the missing ones in seed order.
+        # It NEVER removes anything, so administrator customizations survive.
+        # A second run is a no-op. Custom (non-system) groups that happen to
+        # share a default name are left untouched — those are curated by hand.
+        result = await session.execute(select(Group))
+        for group in result.scalars().all():
+            seed_config = DEFAULT_GROUPS.get(group.name)
+            if seed_config is None or not group.is_system:
+                continue
+            current = list(group.permissions or [])
+            current_set = set(current)
+            missing = [p for p in seed_config["permissions"] if p not in current_set]
+            if missing:
+                # Reassign (don't mutate in place) so SQLAlchemy flags the JSON
+                # column dirty — same pattern as the backfills below.
+                group.permissions = [*current, *missing]
+                logger.info(
+                    "Backfilled %d permission(s) into system group '%s': %s",
+                    len(missing),
+                    group.name,
+                    missing,
+                )
+        await session.commit()
+
         # Migrate new permissions: grant printers:clear_plate to all groups with printers:control
         result = await session.execute(select(Group))
         all_groups = result.scalars().all()
