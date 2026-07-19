@@ -553,6 +553,18 @@ async def handle_tagless_slot(
         )
         return True
 
+    # Defer while the AMS unit is drying: minting/pushing config now disengages the
+    # drying tray and fails the cycle (HMS 0700_C069). Same True-return rationale as
+    # the identify defer above — a later push (after drying) handles the slot.
+    if ams_presence.unit_drying(printer_id, ams_id):
+        logger.debug(
+            "Deferring tagless handling for printer %d AMS%d-T%d: AMS unit is drying",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return True
+
     # An assignment whose spool row was deleted is an orphan — drop it and treat
     # the slot as unassigned.
     if existing_assignment is not None and existing_assignment.spool is None:
@@ -700,6 +712,20 @@ async def maybe_autoconfigure_bare_tray(
     default = await _tagless_default(db)
     if default is None:
         return False  # setting cleared → feature off
+
+    # Defer a doomed config push while the AMS is mid-identify or drying: the write
+    # would collide with the RFID read (HMS 0700_2x00_0001_0081) or disengage the
+    # drying tray (HMS 0700_C069). Return BEFORE stamping _autoconfig_attempts so the
+    # retry window is not burned on a push that never went out. force= bypasses only
+    # the retry window — never these hardware-state guards.
+    if ams_presence.identify_in_flight(printer_id, ams_id, tray_id) or ams_presence.unit_drying(printer_id, ams_id):
+        logger.debug(
+            "Deferring bare-tray auto-config for printer %d AMS%d-T%d: AMS identify/drying in progress",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return False
 
     key = (printer_id, ams_id, tray_id)
     now = monotonic()

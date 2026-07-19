@@ -24,7 +24,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services.filament_deficit import FilamentDeficit, compute_deficit_for_queue_item
 from backend.app.services.print_scheduler import PrintScheduler
-from backend.app.services.spool_selection import WAITING_REASON_START_MIN, MatchOutcome
+from backend.app.services.spool_selection import MatchOutcome
 
 
 def _deficit(printer_id_override=None, ams_mapping_override=None, slots=1):
@@ -349,7 +349,7 @@ async def test_all_candidates_short_stages_unpinned_with_one_notification(
     assert row.ams_mapping is None
     assert row.manual_start is True
     assert row.filament_short is True
-    assert row.waiting_reason == "filament_short"
+    assert row.waiting_reason.startswith("Low filament")  # D9: rich reason names the short machines
     # Exactly one waiting notification for the group.
     assert sched_mod.notification_service.on_queue_job_waiting.await_count == 1
 
@@ -428,7 +428,8 @@ async def test_pinned_start_block_stages_with_reason(cq_scheduler, db_session, p
     assert row.ams_mapping is None  # no mapping persisted
     assert row.manual_start is True
     assert row.filament_short is True
-    assert row.waiting_reason == WAITING_REASON_START_MIN
+    assert row.waiting_reason.startswith("Low filament")  # D9 rich reason
+    assert "below minimum" in row.waiting_reason
     assert sched_mod.notification_service.on_queue_job_waiting.await_count == 1
 
 
@@ -514,7 +515,8 @@ async def test_all_candidates_start_blocked_stages_with_start_min_reason(
     ).one()
     assert row.printer_id is None  # UNPINNED
     assert row.manual_start is True
-    assert row.waiting_reason == WAITING_REASON_START_MIN
+    assert row.waiting_reason.startswith("Low filament")  # D9 rich reason
+    assert "below minimum" in row.waiting_reason
 
 
 @pytest.mark.asyncio
@@ -559,7 +561,8 @@ async def test_mixed_block_stages_generic_filament_short(cq_scheduler, db_sessio
         )
     ).one()
     assert row.printer_id is None
-    assert row.waiting_reason == "filament_short"  # mixed → generic
+    assert row.waiting_reason.startswith("Low filament")  # mixed → generic
+    assert "needs more filament" in row.waiting_reason
 
 
 def _mk_start():

@@ -1548,6 +1548,7 @@ export default {
       stagedBannerTitle: 'Low filament — swap the spool, then press Re-check',
       stagedBannerBody: '{{count}} item(s) were staged by the low-spool check. Re-check releases only the items whose spool now has enough material.',
       recheckButton: 'Re-check and release',
+      stagedBlockingHeading: 'Waiting on:',
       releasedToast: 'Released {{count}} staged item(s)',
       releasedNone: 'No items released — filament still short',
       recheckFailed: 'Re-check failed',

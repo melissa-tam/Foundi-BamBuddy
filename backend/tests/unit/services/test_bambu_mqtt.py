@@ -1000,9 +1000,12 @@ class TestAMSTrayStateClearning:
     """Tests for AMS tray state-based clearing (#784).
 
     Some printers (e.g. H2D) only send {id, state} in incremental MQTT
-    updates when a tray is not fully loaded.  state=11 means loaded;
-    other values (9=empty, 10=spool present but filament not in feeder)
-    should clear stale tray data that was set from an earlier pushall.
+    updates when a tray is not fully loaded. state 10/11 mean a spool is
+    physically PRESENT (11=loaded, 10=present but not fed) and PRESERVE tray
+    identity; other values (9=empty, 8, 0, unknown) clear stale tray data set
+    from an earlier pushall. Wiping a present spool (state 10) drove the
+    AMS-drying incident (drying disengages trays to state 10 → HMS 0700_C069),
+    so state 10 must NOT clear (D4 root fix).
     """
 
     @pytest.fixture
@@ -1054,8 +1057,10 @@ class TestAMSTrayStateClearning:
         assert ams[0]["tray"][0]["tray_type"] == "PETG"
         assert ams[0]["tray"][1]["tray_type"] == "PLA"
 
-    def test_state_10_clears_stale_tray_data(self, mqtt_client):
-        """Incremental update with state=10 (spool present, not loaded) clears tray."""
+    def test_state_10_preserves_present_spool(self, mqtt_client):
+        """state=10 (spool present, filament not in feeder) is PRESENT — tray identity
+        MUST be preserved (D4). Wiping it drove the AMS-drying incident (drying
+        disengages trays to state 10) and routine load/unload transit wipes."""
         self._seed_loaded_tray(mqtt_client)
 
         # H2D sends only {id, state} when filament is retracted
@@ -1077,18 +1082,16 @@ class TestAMSTrayStateClearning:
         tray0 = ams[0]["tray"][0]
         tray1 = ams[0]["tray"][1]
 
-        # Tray 0 should be cleared
-        assert tray0["tray_type"] == "", "tray_type must be cleared on state=10"
-        assert tray0["tray_color"] == "", "tray_color must be cleared"
-        assert tray0["tray_sub_brands"] == "", "tray_sub_brands must be cleared"
-        assert tray0["tray_id_name"] == "", "tray_id_name must be cleared"
-        assert tray0["tray_info_idx"] == "", "tray_info_idx must be cleared"
-        assert tray0["tag_uid"] == "0000000000000000", "tag_uid must be cleared"
-        assert tray0["tray_uuid"] == "00000000000000000000000000000000", "tray_uuid must be cleared"
-        assert tray0["remain"] == 0, "remain must be 0"
-        assert tray0["k"] is None, "k must be cleared"
-        assert tray0["cali_idx"] is None, "cali_idx must be cleared"
-        assert tray0["state"] == 10, "state should be preserved"
+        # Tray 0 present (state 10) → identity PRESERVED, not cleared.
+        assert tray0["tray_type"] == "PETG", "present spool (state=10) must keep tray_type"
+        assert tray0["tray_color"] == "00FF00FF"
+        assert tray0["tray_sub_brands"] == "PETG HF"
+        assert tray0["tray_id_name"] == "A00-G1"
+        assert tray0["tray_info_idx"] == "GFG99"
+        assert tray0["tag_uid"] == "AABBCCDD11223344"
+        assert tray0["tray_uuid"] == "AABBCCDD11223344AABBCCDD11223344"
+        assert tray0["remain"] == 75
+        assert tray0["state"] == 10, "state should be updated"
 
         # Tray 1 should be untouched
         assert tray1["tray_type"] == "PLA", "Loaded slot must be preserved"
@@ -1143,9 +1146,9 @@ class TestAMSTrayStateClearning:
         """Don't re-clear a tray that's already empty (avoids log spam)."""
         self._seed_loaded_tray(mqtt_client)
 
-        # First unload clears
+        # First unload to EMPTY (state=9) clears — state 10 is "present" and preserves.
         update = {
-            "ams": [{"id": 0, "tray": [{"id": 0, "state": 10}, {"id": 1, "state": 11}]}],
+            "ams": [{"id": 0, "tray": [{"id": 0, "state": 9}, {"id": 1, "state": 11}]}],
             "power_on_flag": False,
         }
         mqtt_client._handle_ams_data(update)
@@ -1157,13 +1160,13 @@ class TestAMSTrayStateClearning:
         assert mqtt_client.state.raw_data["ams"][0]["tray"][0]["tray_type"] == ""
 
     def test_reload_after_unload_restores_data(self, mqtt_client):
-        """After clearing via state=10, a full update with state=11 restores data."""
+        """After clearing via an empty state (9), a full update with state=11 restores data."""
         self._seed_loaded_tray(mqtt_client)
 
-        # Unload
+        # Unload to EMPTY (state=9 genuinely clears; state 10 would preserve).
         mqtt_client._handle_ams_data(
             {
-                "ams": [{"id": 0, "tray": [{"id": 0, "state": 10}, {"id": 1, "state": 11}]}],
+                "ams": [{"id": 0, "tray": [{"id": 0, "state": 9}, {"id": 1, "state": 11}]}],
                 "power_on_flag": False,
             }
         )
@@ -3730,15 +3733,25 @@ class TestSendDryingCommand:
         assert qos == 1
 
     def test_start_caches_target_for_badge(self, mqtt_client):
-        """mode=1 send populates _drying_targets so the badge can render it."""
+        """mode=1 send populates _drying_targets so the badge can render it.
+
+        The entry now also carries a monotonic ``latched_until`` deadline (drives
+        ams_unit_drying before the first dry_time push), so assert the badge-facing
+        fields plus the latch's presence rather than exact dict equality.
+        """
         mqtt_client.send_drying_command(ams_id=2, temp=65, duration=12, mode=1, filament="PETG")
-        assert mqtt_client._drying_targets[2] == {"filament": "PETG", "temp": 65}
+        entry = mqtt_client._drying_targets[2]
+        assert entry["filament"] == "PETG"
+        assert entry["temp"] == 65
+        assert isinstance(entry["latched_until"], float)
 
     def test_start_overwrites_prior_target_for_same_ams(self, mqtt_client):
         """A second start on the same AMS replaces the cached target."""
         mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4, mode=1, filament="PLA")
         mqtt_client.send_drying_command(ams_id=0, temp=70, duration=6, mode=1, filament="ABS")
-        assert mqtt_client._drying_targets[0] == {"filament": "ABS", "temp": 70}
+        entry = mqtt_client._drying_targets[0]
+        assert entry["filament"] == "ABS"
+        assert entry["temp"] == 70
 
     def test_stop_clears_target(self, mqtt_client):
         """mode=0 send drops the cache so the badge stops showing the target."""
@@ -3753,7 +3766,8 @@ class TestSendDryingCommand:
         mqtt_client.send_drying_command(ams_id=128, temp=80, duration=6, mode=1, filament="PA-CF")
         mqtt_client.send_drying_command(ams_id=0, temp=0, duration=0, mode=0)
         assert 0 not in mqtt_client._drying_targets
-        assert mqtt_client._drying_targets[128] == {"filament": "PA-CF", "temp": 80}
+        assert mqtt_client._drying_targets[128]["filament"] == "PA-CF"
+        assert mqtt_client._drying_targets[128]["temp"] == 80
 
 
 class TestStartPrintAmsMapping:
@@ -6344,3 +6358,286 @@ class TestAmsIdentifyGuards:
         ok = client.ams_set_filament_setting(0, 0, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230)
         assert ok is True
         client._client.publish.assert_called_once()
+
+
+class TestAmsDryingGuards:
+    """AMS drying is a lockout. While a unit dries (per-unit ``dry_time`` > 0, or a
+    still-latched drying target) no re-read / filament-setting / reset / calibration
+    write may touch it — poking a drying tray raises HMS 0700_C069. Drying is
+    detected by ``dry_time`` because ``ams_status_main`` has no drying value."""
+
+    @pytest.fixture
+    def client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        c = BambuMQTTClient(ip_address="192.168.1.100", serial_number="DRY1", access_code="12345678")
+        c._client = MagicMock()
+        c.state.connected = True
+        c.state.tray_now = 255  # nothing loaded → ams_refresh_tray passes the load check
+        return c
+
+    @staticmethod
+    def _set_dry_time(client, ams_id, minutes):
+        client.state.raw_data["ams"] = [{"id": ams_id, "dry_time": minutes, "tray": [{"id": 0, "state": 10}]}]
+
+    def test_unit_drying_true_from_merged_dry_time(self, client):
+        self._set_dry_time(client, 0, 45)
+        assert client.ams_unit_drying(0) is True
+        assert client.ams_unit_drying(1) is False  # different unit, no dry_time
+
+    def test_unit_drying_false_when_dry_time_zero(self, client):
+        self._set_dry_time(client, 0, 0)
+        assert client.ams_unit_drying(0) is False
+
+    def test_unit_drying_handles_missing_or_malformed_raw_data(self, client):
+        client.state.raw_data = {}
+        assert client.ams_unit_drying(0) is False
+        client.state.raw_data = {"ams": "garbage"}
+        assert client.ams_unit_drying(0) is False
+
+    def test_mode1_echo_latches_and_seeds_badge(self, client):
+        # Touchscreen-started cycle: no dry_time yet, latch via the echo; also seeds
+        # the badge fields (filament/temp) the UI consumes.
+        client._handle_drying_echo(
+            {
+                "command": "ams_filament_drying",
+                "result": "success",
+                "ams_id": 0,
+                "mode": 1,
+                "filament": "PETG",
+                "temp": 65,
+                "duration": 8,
+            }
+        )
+        assert client.ams_unit_drying(0) is True
+        entry = client._drying_targets[0]
+        assert entry["filament"] == "PETG"
+        assert entry["temp"] == 65
+        assert isinstance(entry["latched_until"], float)
+
+    def test_mode0_echo_clears_latch(self, client):
+        client._handle_drying_echo(
+            {"result": "success", "ams_id": 0, "mode": 1, "filament": "PLA", "temp": 55, "duration": 4}
+        )
+        assert 0 in client._drying_targets
+        client._handle_drying_echo({"result": "success", "ams_id": 0, "mode": 0})
+        assert 0 not in client._drying_targets
+        assert client.ams_unit_drying(0) is False
+
+    def test_echo_without_ams_id_does_not_latch(self, client):
+        client._handle_drying_echo({"result": "success", "mode": 1, "filament": "PLA", "temp": 55})
+        assert client._drying_targets == {}
+        assert client.ams_unit_drying(0) is False
+
+    def test_echo_ignored_when_result_not_success(self, client):
+        client._handle_drying_echo({"result": "fail", "ams_id": 0, "mode": 1, "temp": 55, "duration": 4})
+        assert 0 not in client._drying_targets
+
+    def test_falling_edge_pops_latched_target(self, client):
+        client._handle_drying_echo(
+            {"result": "success", "ams_id": 0, "mode": 1, "filament": "PLA", "temp": 55, "duration": 4}
+        )
+        # dry_time observed > 0 (seeds previous), then the falling edge to 0 clears it.
+        client._handle_ams_data({"ams": [{"id": 0, "dry_time": 5, "tray": [{"id": 0, "state": 10}]}]})
+        client._handle_ams_data({"ams": [{"id": 0, "dry_time": 0, "tray": [{"id": 0, "state": 10}]}]})
+        assert 0 not in client._drying_targets
+
+    def test_latch_expiry_via_monotonic(self, client, monkeypatch):
+        import backend.app.services.bambu_mqtt as bm
+
+        now = [1000.0]
+        monkeypatch.setattr(bm.time, "monotonic", lambda: now[0])
+        # duration 1h + 30 min slack → latched_until = 1000 + 3600 + 1800 = 6400.
+        client._handle_drying_echo(
+            {"result": "success", "ams_id": 0, "mode": 1, "filament": "PLA", "temp": 55, "duration": 1}
+        )
+        assert client.ams_unit_drying(0) is True
+        now[0] = 6399.0
+        assert client.ams_unit_drying(0) is True
+        now[0] = 6401.0  # past latched_until → expired, popped, not drying
+        assert client.ams_unit_drying(0) is False
+        assert 0 not in client._drying_targets
+
+    def test_refresh_tray_refused_while_drying(self, client):
+        self._set_dry_time(client, 0, 30)
+        ok, msg = client.ams_refresh_tray(0, 0)
+        assert ok is False
+        assert "drying" in msg.lower()
+        client._client.publish.assert_not_called()
+
+    def test_set_filament_setting_refused_while_drying(self, client):
+        self._set_dry_time(client, 0, 30)
+        ok = client.ams_set_filament_setting(0, 0, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230)
+        assert ok is False
+        client._client.publish.assert_not_called()
+
+    def test_reset_ams_slot_refused_while_drying(self, client):
+        self._set_dry_time(client, 0, 30)
+        ok = client.reset_ams_slot(0, 0)
+        assert ok is False
+        client._client.publish.assert_not_called()
+
+    def test_extrusion_cali_sel_refused_while_drying(self, client):
+        self._set_dry_time(client, 0, 30)
+        ok = client.extrusion_cali_sel(0, 0, cali_idx=-1, filament_id="GFL05")
+        assert ok is False
+        client._client.publish.assert_not_called()
+
+    def test_other_unit_unaffected_by_drying(self, client):
+        # Unit 0 drying; writes to unit 1 still proceed.
+        self._set_dry_time(client, 0, 30)
+        assert client.ams_refresh_tray(1, 0)[0] is True
+        assert client.ams_set_filament_setting(1, 0, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230) is True
+
+    def test_reset_ams_slot_refused_while_identifying(self, client):
+        client.state.ams_status_main = 2
+        ok = client.reset_ams_slot(0, 0)
+        assert ok is False
+        client._client.publish.assert_not_called()
+
+    def test_extrusion_cali_sel_refused_while_identifying(self, client):
+        client.state.ams_status_main = 2
+        ok = client.extrusion_cali_sel(0, 0, cali_idx=-1, filament_id="GFL05")
+        assert ok is False
+        client._client.publish.assert_not_called()
+
+    def test_drying_echo_wired_through_process_message(self, client):
+        # The ams_filament_drying command response routes to _handle_drying_echo.
+        client._process_message(
+            {
+                "print": {
+                    "command": "ams_filament_drying",
+                    "result": "success",
+                    "ams_id": 2,
+                    "mode": 1,
+                    "filament": "PETG",
+                    "temp": 65,
+                    "duration": 6,
+                }
+            }
+        )
+        assert client.ams_unit_drying(2) is True
+
+
+class TestIdentifyGate:
+    """After an ams_get_rfid identify is published, a per-printer gate holds off any
+    further identify until the read settles (or the AMS leaves the identifying
+    state) — a second overlapping identify fails the in-flight read."""
+
+    @pytest.fixture
+    def client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        c = BambuMQTTClient(ip_address="192.168.1.100", serial_number="GATE1", access_code="12345678")
+        c._client = MagicMock()
+        c.state.connected = True
+        c.state.tray_now = 255
+        return c
+
+    def test_second_refresh_inside_gate_refused(self, client):
+        ok1, _ = client.ams_refresh_tray(0, 0)
+        assert ok1 is True
+        assert client._identify_gate_until > 0
+        ok2, msg2 = client.ams_refresh_tray(0, 1)  # different slot, gate still armed
+        assert ok2 is False
+        assert "identifying another tray" in msg2.lower()
+        assert client._client.publish.call_count == 1  # only the first identify went out
+
+    def test_gate_cleared_by_identify_to_idle_transition(self, client):
+        ok1, _ = client.ams_refresh_tray(0, 0)
+        assert ok1 is True
+        client.state.ams_status_main = 2  # AMS entered identifying
+        client._handle_ams_data({"ams_status": 0})  # 2 → 0 transition clears the gate
+        assert client._identify_gate_until == 0.0
+        assert client.ams_refresh_tray(0, 1)[0] is True
+
+    def test_gate_expires(self, client, monkeypatch):
+        import backend.app.services.bambu_mqtt as bm
+
+        now = [1000.0]
+        monkeypatch.setattr(bm.time, "monotonic", lambda: now[0])
+        assert client.ams_refresh_tray(0, 0)[0] is True  # arms gate to 1000 + 30 = 1030
+        now[0] = 1029.0
+        assert client.ams_refresh_tray(0, 1)[0] is False
+        now[0] = 1031.0
+        assert client.ams_refresh_tray(0, 1)[0] is True
+
+
+class TestTrayClearPresenceConsistency:
+    """The stale-clear in _handle_ams_data keys off TRAY_PRESENT_STATES: a partial
+    {id,state} update wipes stale tray identity ONLY when the spool is genuinely
+    absent/unknown. State 10/11 (spool present) PRESERVES identity — wiping it drove
+    the AMS-drying incident (HMS 0700_C069) and routine load/unload transit wipes."""
+
+    @pytest.fixture
+    def client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        c = BambuMQTTClient(ip_address="192.168.1.100", serial_number="TRAY1", access_code="12345678")
+        c._client = MagicMock()
+        c.state.connected = True
+        return c
+
+    @staticmethod
+    def _seed_loaded(client):
+        client._handle_ams_data(
+            {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [{"id": 0, "state": 11, "tray_type": "PETG", "tray_color": "008000FF", "remain": 80}],
+                    }
+                ]
+            }
+        )
+
+    @staticmethod
+    def _tray_type(client):
+        return client.state.raw_data["ams"][0]["tray"][0].get("tray_type")
+
+    def _partial_state(self, client, state):
+        client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": state}]}]})
+
+    def test_state_10_partial_preserves_identity(self, client):
+        self._seed_loaded(client)
+        self._partial_state(client, 10)  # spool present, filament not in feeder
+        assert self._tray_type(client) == "PETG"
+
+    def test_state_11_partial_preserves_identity(self, client):
+        self._seed_loaded(client)
+        self._partial_state(client, 11)
+        assert self._tray_type(client) == "PETG"
+
+    def test_state_9_partial_clears_identity(self, client):
+        self._seed_loaded(client)
+        self._partial_state(client, 9)  # #784: empty slot clears stale tray_type
+        assert self._tray_type(client) == ""
+
+    def test_state_0_partial_clears_identity(self, client):
+        self._seed_loaded(client)
+        self._partial_state(client, 0)  # H2C idle-empty dialect
+        assert self._tray_type(client) == ""
+
+    def test_state_8_partial_clears_identity(self, client):
+        self._seed_loaded(client)
+        self._partial_state(client, 8)
+        assert self._tray_type(client) == ""
+
+    def test_full_push_empty_tray_type_still_clears(self, client):
+        self._seed_loaded(client)
+        # Explicit empty tray_type (spool removal) always clears, regardless of state.
+        client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": ""}]}]})
+        assert self._tray_type(client) == ""
+
+    def test_state_10_partial_preserves_identity_during_drying(self, client):
+        # The incident: AMS drying disengages trays to state 10 — identity must persist.
+        self._seed_loaded(client)
+        client.state.raw_data["ams"][0]["dry_time"] = 60
+        self._partial_state(client, 10)
+        assert self._tray_type(client) == "PETG"

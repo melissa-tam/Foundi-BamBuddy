@@ -101,8 +101,9 @@ _respool_prompt_dedup: dict[int, dict[tuple[int, int], tuple[str, str]]] = {}
 # :func:`_reset_state`.
 _spent_dedup: set[tuple[int, object, int]] = set()
 
-# S1 restart-replay suppression. ``main._notified_hms_errors`` is in-memory, so a
-# server restart makes EVERY still-live HMS code replay as "new" on the next push —
+# S1 restart-replay suppression. The HMS notify dedup (``services.hms_notify_dedup``)
+# is in-memory, so a server restart makes EVERY still-live HMS code replay as "new"
+# on the next push —
 # and ``mark_spent_on_runout`` would re-stamp spent on whatever spool is bound to the
 # tray NOW, which after an operator swap during the pause is a FRESH roll (production
 # 2026-07-17 18:56: a fresh spool stamped spent+1000 g 7 s after insertion). These
@@ -489,24 +490,20 @@ def _count_trays_in_ams(state, ams_id: int) -> int:
     return 0
 
 
-async def _broadcast_respool_prompt(
+async def _build_respool_prompt_payload(
     db: AsyncSession,
     printer_id: int,
     ams_id: int,
     tray_id: int,
     tray: dict,
     donor: Spool,
-) -> None:
-    """Broadcast a deduped ``respool_prompt`` WS event (frozen contract)."""
-    from backend.app.services.printer_manager import printer_manager
+) -> dict:
+    """Construct the frozen ``respool_prompt`` WS payload.
 
-    slot_key = (ams_id, tray_id)
-    tag_uid = tray.get("tag_uid") or ""
-    tray_uuid = tray.get("tray_uuid") or ""
-    tag_key = (tag_uid, tray_uuid)
-    per_printer = _respool_prompt_dedup.setdefault(printer_id, {})
-    if per_printer.get(slot_key) == tag_key:
-        return
+    Single origin shared by the live gate broadcast and the reconnect
+    re-broadcast so the wire contract has exactly one definition.
+    """
+    from backend.app.services.printer_manager import printer_manager
 
     state = printer_manager.get_status(printer_id)
     tray_count = _count_trays_in_ams(state, ams_id) if ams_id != 255 else 0
@@ -520,26 +517,46 @@ async def _broadcast_respool_prompt(
     brand_prefill = (await _respool_last_brand(db)) or None
     donor_remaining = float((donor.label_weight or 0) - (donor.weight_used or 0))
 
+    return {
+        "type": "respool_prompt",
+        "printer_id": printer_id,
+        "ams_id": ams_id,
+        "tray_id": tray_id,
+        "tag_uid": (tray.get("tag_uid") or "") or None,
+        "tray_uuid": (tray.get("tray_uuid") or "") or None,
+        "tray_type": tray.get("tray_type") or None,
+        "tray_color": tray.get("tray_color") or None,
+        "tray_sub_brands": tray.get("tray_sub_brands") or None,
+        "tray_count": tray_count,
+        "donor_spool_id": donor.id,
+        "donor_remaining_g": donor_remaining,
+        "brand_prefill": brand_prefill,
+        "label_weight_prefill": label_weight_prefill,
+    }
+
+
+async def _broadcast_respool_prompt(
+    db: AsyncSession,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    tray: dict,
+    donor: Spool,
+) -> None:
+    """Broadcast a deduped ``respool_prompt`` WS event (frozen contract)."""
+    slot_key = (ams_id, tray_id)
+    tag_uid = tray.get("tag_uid") or ""
+    tray_uuid = tray.get("tray_uuid") or ""
+    tag_key = (tag_uid, tray_uuid)
+    per_printer = _respool_prompt_dedup.setdefault(printer_id, {})
+    if per_printer.get(slot_key) == tag_key:
+        return
+
+    payload = await _build_respool_prompt_payload(db, printer_id, ams_id, tray_id, tray, donor)
+
     # Broadcast first; only commit the dedup if the WS write succeeds (mirrors
     # main._broadcast_unknown_tag so a failed push retries on the next tick).
-    await ws_manager.broadcast(
-        {
-            "type": "respool_prompt",
-            "printer_id": printer_id,
-            "ams_id": ams_id,
-            "tray_id": tray_id,
-            "tag_uid": tag_uid or None,
-            "tray_uuid": tray_uuid or None,
-            "tray_type": tray.get("tray_type") or None,
-            "tray_color": tray.get("tray_color") or None,
-            "tray_sub_brands": tray.get("tray_sub_brands") or None,
-            "tray_count": tray_count,
-            "donor_spool_id": donor.id,
-            "donor_remaining_g": donor_remaining,
-            "brand_prefill": brand_prefill,
-            "label_weight_prefill": label_weight_prefill,
-        }
-    )
+    await ws_manager.broadcast(payload)
     per_printer[slot_key] = tag_key
     logger.info(
         "respool_prompt broadcast: printer=%d AMS=%d slot=%d donor=%d remaining=%.1fg",
@@ -547,8 +564,114 @@ async def _broadcast_respool_prompt(
         ams_id,
         tray_id,
         donor.id,
-        donor_remaining,
+        payload["donor_remaining_g"],
     )
+
+
+async def rebroadcast_unresolved_respool_prompts(db: AsyncSession, send) -> int:
+    """Replay every still-unresolved ``respool_prompt`` to a (re)connecting client.
+
+    The ``respool_prompt`` WS event is fire-once — ``ws_manager.broadcast`` reaches
+    only sockets connected at emit time and keeps no backlog — so a client that was
+    disconnected when a prompt fired never learns of it (F2). This replays the
+    prompts tracked in the in-memory per-slot dedup (:data:`_respool_prompt_dedup`,
+    the very records the live gate populates) to the single ``send`` coroutine (the
+    reconnecting socket's ``send_json``). It bypasses the dedup *guard* (which would
+    suppress a re-send) but never mutates the dedup state.
+
+    A dedup entry alone is NOT proof the prompt is still open: the durable answer
+    lives in the DB, and the dismissal route stamps ``respool_dismissed_at`` WITHOUT
+    clearing this in-memory dedup. So each slot is re-validated before re-sending —
+    the slot must still physically hold the same tag, and the tag's donor row must
+    still resolve, be un-dismissed, and un-archived. Returns the number re-sent.
+    Never raises (a reconnect must never break on a farm-side hook); no-op in
+    Spoolman mode.
+    """
+    if await _spoolman_enabled(db):
+        return 0
+
+    from backend.app.services.printer_manager import printer_manager
+
+    # Snapshot the dedup so a concurrent AMS push mutating it cannot break iteration.
+    snapshot = [
+        (pid, ams_id, tray_id, tag_uid, tray_uuid)
+        for pid, slots in _respool_prompt_dedup.items()
+        for (ams_id, tray_id), (tag_uid, tray_uuid) in slots.items()
+    ]
+
+    sent = 0
+    for pid, ams_id, tray_id, tag_uid, tray_uuid in snapshot:
+        try:
+            state = printer_manager.get_status(pid)
+            tray = _resolve_live_tray(state, ams_id, tray_id)
+            # Replay only while the SAME tag still physically occupies the slot; a
+            # gone / re-tagged slot is stale (the dedup clears on the empty edge).
+            if not tray or not tray.get("tray_type"):
+                continue
+            if (tray.get("tag_uid") or "") != tag_uid or (tray.get("tray_uuid") or "") != tray_uuid:
+                continue
+            donor = await get_spool_by_tag(db, tag_uid, tray_uuid)
+            # Durable resolution signals: a re-spool archives/hard-deletes the donor
+            # (and clears the dedup); a dismissal stamps respool_dismissed_at without
+            # touching the dedup — both must suppress the replay.
+            if donor is None or donor.archived_at is not None or donor.respool_dismissed_at is not None:
+                continue
+            payload = await _build_respool_prompt_payload(db, pid, ams_id, tray_id, tray, donor)
+            await send(payload)
+            sent += 1
+        except Exception:  # noqa: BLE001 — one slot's failure must not abort the replay
+            logger.exception("respool_prompt re-broadcast failed for printer %s AMS%d-T%d", pid, ams_id, tray_id)
+
+    if sent:
+        logger.info("Re-broadcast %d unresolved respool_prompt(s) to a (re)connecting client", sent)
+    return sent
+
+
+# Minimum gap between the AMS-reported tray remain% and the gram-ledger's implied
+# remaining% before a slot is treated as a reused-core refill the ledger missed.
+# 30 points is far above ordinary AMS %-quantization noise (integer %, ~10 g steps
+# on a 1 kg spool) yet well below the full jump a fresh roll on a spent donor shows
+# (production: 958.99/1000 g used → ledger ~4% while the tray read remain=100%).
+_RESPOOL_REMAIN_JUMP_PCT = 30.0
+
+
+def _remain_jump(spool: Spool, tray: dict) -> bool:
+    """Detect a reused-core refill the gram ledger cannot see.
+
+    A reused Bambu core carries its RFID tag onto a FRESH roll, so the firmware
+    re-reads the tray as ~full (``remain`` ≈ 100%) while our ledger still holds the
+    donor's near-spent ``weight_used``. The tag identity is CORRECT, so RFID
+    re-reads never fix it — only a re-spool resets the ledger. True iff the tray
+    carries a valid tag, the spool has a positive label weight, the tray ``remain``
+    parses to an int in 1..100, and it exceeds the ledger's implied remaining % by
+    at least :data:`_RESPOOL_REMAIN_JUMP_PCT`. A weight-locked fresh row (ledger
+    ≈100%) cannot jump — ``remain`` cannot exceed 100 by 30 — so no special-case is
+    needed for it.
+    """
+    if not is_valid_tag(tray.get("tag_uid", "") or "", tray.get("tray_uuid", "") or ""):
+        return False
+    label_weight = spool.label_weight or 0
+    if label_weight <= 0:
+        return False
+    try:
+        remain = int(tray.get("remain"))
+    except (TypeError, ValueError):
+        return False
+    if not (1 <= remain <= 100):
+        return False
+    ledger_pct = max(0, label_weight - (spool.weight_used or 0)) / label_weight * 100
+    return (remain - ledger_pct) >= _RESPOOL_REMAIN_JUMP_PCT
+
+
+def should_evaluate_respool(spool: Spool, tray: dict) -> bool:
+    """Single-origin gate for the existing-assignment respool call site.
+
+    True when :func:`maybe_auto_or_prompt_respool` should run for a slot whose
+    ``SpoolAssignment`` survived: either the spool is hardware-spent (Tier 1/2) or
+    the tray shows a remain-jump refill the gram ledger missed (Tier 3 trigger).
+    Keeps the jump logic out of ``main.on_ams_change`` so there is one definition.
+    """
+    return spool.spent_at is not None or _remain_jump(spool, tray)
 
 
 async def maybe_auto_or_prompt_respool(
@@ -566,8 +689,9 @@ async def maybe_auto_or_prompt_respool(
       and return the NEW spool (the caller must skip its own auto-assign — the
       re-spool already re-assigned the slot). Empty brand or a sibling conflict
       falls through to the prompt instead.
-    * Tier 3 (prompt): ``spent_at`` NULL and remaining ≤ threshold → broadcast a
-      deduped ``respool_prompt`` and return None (existing auto-assign proceeds).
+    * Tier 3 (prompt): ``spent_at`` NULL and (remaining ≤ threshold OR a remain-jump
+      refill the ledger missed, :func:`_remain_jump`) → broadcast a deduped
+      ``respool_prompt`` and return None (existing auto-assign proceeds).
     * Otherwise: None (no-op).
 
     No-op in Spoolman mode.
@@ -643,7 +767,12 @@ async def maybe_auto_or_prompt_respool(
         return None
     remaining = (spool.label_weight or 0) - (spool.weight_used or 0)
     threshold = await _respool_prompt_threshold_g(db)
-    if remaining <= threshold:
+    # Prompt when the spool ledger reads near-empty (the original trigger) OR the
+    # tray reports far more filament than the ledger says it should hold — a reused
+    # core carried the tag onto a fresh roll and the gram ledger never noticed
+    # (_remain_jump). Both routes share the dismissal suppression above and the
+    # per-slot dedup inside _broadcast_respool_prompt.
+    if remaining <= threshold or _remain_jump(spool, tray):
         await _broadcast_respool_prompt(db, printer_id, ams_id, tray_id, tray, spool)
     return None
 

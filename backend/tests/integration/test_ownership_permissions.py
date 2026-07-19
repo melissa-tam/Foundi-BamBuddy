@@ -80,8 +80,11 @@ class TestOwnershipPermissionsSetup:
         )
         operator2_token = operator2_login.json()["access_token"]
 
-        # Create viewer user (has no update/delete permissions)
-        await async_client.post(
+        # Create viewer user (has no update/delete permissions). Viewers hold
+        # queue:read_own + library:read_own (NO _all), so they are the remaining
+        # OWN-scoped read principal after the farm remediation made Operators a
+        # shared-surface group — the read IDOR-closure tests below use them.
+        viewer_response = await async_client.post(
             "/api/v1/users/",
             headers={"Authorization": f"Bearer {admin_token}"},
             json={
@@ -90,6 +93,7 @@ class TestOwnershipPermissionsSetup:
                 "group_ids": [viewers_group["id"]],
             },
         )
+        viewer_user = viewer_response.json()
 
         viewer_login = await async_client.post(
             "/api/v1/auth/login",
@@ -105,6 +109,7 @@ class TestOwnershipPermissionsSetup:
             "operator2_token": operator2_token,
             "operator2_user": operator2_user,
             "viewer_token": viewer_token,
+            "viewer_user": viewer_user,
         }
 
 
@@ -512,10 +517,14 @@ class TestQueueOwnershipPermissions(TestOwnershipPermissionsSetup):
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_operator_cannot_update_others_queue_item(
+    async def test_operator_can_update_others_queue_item(
         self, async_client: AsyncClient, auth_setup, queue_item_factory
     ):
-        """Operator cannot update another user's queue item."""
+        """Operator CAN update another user's queue item. The farm remediation
+        grants Operators queue:update_all (shared farm queue — operators manage
+        the whole board, not just their own rows). The own-scoped WRITE gate is
+        still pinned by test_operator_cannot_delete_others_queue_item (Operators
+        lack queue:delete_all) and the archive update/delete ownership tests."""
         item = await queue_item_factory(created_by_id=auth_setup["operator2_user"]["id"])
 
         response = await async_client.patch(
@@ -524,14 +533,15 @@ class TestQueueOwnershipPermissions(TestOwnershipPermissionsSetup):
             json={"position": 10},
         )
 
-        assert response.status_code == 403
+        assert response.status_code == 200
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_operator_cannot_cancel_others_queue_item(
+    async def test_operator_can_cancel_others_queue_item(
         self, async_client: AsyncClient, auth_setup, queue_item_factory
     ):
-        """Operator cannot cancel another user's queue item."""
+        """Operator CAN cancel another user's queue item (queue:update_all —
+        shared farm queue management)."""
         item = await queue_item_factory(created_by_id=auth_setup["operator2_user"]["id"])
 
         response = await async_client.post(
@@ -539,7 +549,7 @@ class TestQueueOwnershipPermissions(TestOwnershipPermissionsSetup):
             headers={"Authorization": f"Bearer {auth_setup['operator_token']}"},
         )
 
-        assert response.status_code == 403
+        assert response.status_code == 200
 
     # ========================================================================
     # Start / Stop ownership gates (#1625-followup)
@@ -567,10 +577,11 @@ class TestQueueOwnershipPermissions(TestOwnershipPermissionsSetup):
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_operator_cannot_start_others_queue_item(
+    async def test_operator_can_start_others_queue_item(
         self, async_client: AsyncClient, auth_setup, queue_item_factory
     ):
-        """Operator cannot start another user's queue item."""
+        """Operator CAN start another user's queue item (queue:update_all —
+        shared farm queue management)."""
         item = await queue_item_factory(
             created_by_id=auth_setup["operator2_user"]["id"],
             manual_start=True,
@@ -581,7 +592,7 @@ class TestQueueOwnershipPermissions(TestOwnershipPermissionsSetup):
             headers={"Authorization": f"Bearer {auth_setup['operator_token']}"},
         )
 
-        assert response.status_code == 403
+        assert response.status_code == 200
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -628,10 +639,9 @@ class TestQueueOwnershipPermissions(TestOwnershipPermissionsSetup):
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_operator_cannot_stop_others_queue_item(
-        self, async_client: AsyncClient, auth_setup, queue_item_factory
-    ):
-        """Operator cannot stop another user's printing queue item."""
+    async def test_operator_can_stop_others_queue_item(self, async_client: AsyncClient, auth_setup, queue_item_factory):
+        """Operator CAN stop another user's printing queue item (queue:update_all
+        — shared farm queue management)."""
         item = await queue_item_factory(
             created_by_id=auth_setup["operator2_user"]["id"],
             status="printing",
@@ -642,16 +652,18 @@ class TestQueueOwnershipPermissions(TestOwnershipPermissionsSetup):
             headers={"Authorization": f"Bearer {auth_setup['operator_token']}"},
         )
 
-        assert response.status_code == 403
+        assert response.status_code == 200
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_operator_cannot_stop_unowned_queue_item(
+    async def test_operator_can_stop_unowned_queue_item(
         self, async_client: AsyncClient, auth_setup, queue_item_factory
     ):
-        """Operator cannot stop a NULL-owner printing queue item — stop mirrors
-        cancel (destructive, no claim semantics). Admins with _ALL can still stop it.
-        """
+        """Operator CAN stop a NULL-owner printing queue item now that Operators
+        hold queue:update_all: the _ALL branch was always allowed to stop
+        unowned items, and Operators are now in it (shared farm queue). An
+        own-only holder is still rejected — pinned via a viewer/own-scoped path
+        elsewhere and the archive ownership tests."""
         item = await queue_item_factory(created_by_id=None, status="printing")
 
         response = await async_client.post(
@@ -659,7 +671,7 @@ class TestQueueOwnershipPermissions(TestOwnershipPermissionsSetup):
             headers={"Authorization": f"Bearer {auth_setup['operator_token']}"},
         )
 
-        assert response.status_code == 403
+        assert response.status_code == 200
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -676,8 +688,13 @@ class TestQueueOwnershipPermissions(TestOwnershipPermissionsSetup):
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_bulk_update_skips_non_owned_items(self, async_client: AsyncClient, auth_setup, queue_item_factory):
-        """Bulk update only updates items the user owns."""
+    async def test_bulk_update_updates_all_items_for_shared_queue(
+        self, async_client: AsyncClient, auth_setup, queue_item_factory
+    ):
+        """Bulk update touches non-owned items too now that Operators hold
+        queue:update_all (shared farm queue): both the owned and the other-user
+        item update, none skipped. (An own-only holder still skips non-owned
+        items — that branch stays covered by the archive ownership tests.)"""
         # Create items owned by different users
         own_item = await queue_item_factory(
             created_by_id=auth_setup["operator_user"]["id"],
@@ -697,9 +714,9 @@ class TestQueueOwnershipPermissions(TestOwnershipPermissionsSetup):
 
         assert response.status_code == 200
         result = response.json()
-        # Should only update the owned item
-        assert result["updated_count"] == 1
-        assert result["skipped_count"] == 1
+        # Shared-surface update_all → both updated, none skipped.
+        assert result["updated_count"] == 2
+        assert result["skipped_count"] == 0
 
 
 class TestLibraryOwnershipPermissions(TestOwnershipPermissionsSetup):
@@ -1132,11 +1149,14 @@ class TestReadIDORClosure(TestOwnershipPermissionsSetup):
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_operator_get_others_library_file_returns_404(
+    async def test_own_scoped_user_get_others_library_file_returns_404(
         self, async_client: AsyncClient, auth_setup, db_session
     ):
         """Library IDOR closure (same shape as archives — closed in the same PR
-        per maziggy/bambuddy-security #2)."""
+        per maziggy/bambuddy-security #2). The own-scoped read principal is now
+        the Viewer (library:read_own): Operators became a shared-surface group
+        (library:read_all) in the farm remediation, so the IDOR invariant is
+        pinned against the Viewer, which must NOT reach another user's file."""
         from backend.app.models.library import LibraryFile
 
         admin_file = LibraryFile(
@@ -1152,13 +1172,17 @@ class TestReadIDORClosure(TestOwnershipPermissionsSetup):
 
         response = await async_client.get(
             f"/api/v1/library/files/{admin_file.id}",
-            headers={"Authorization": f"Bearer {auth_setup['operator_token']}"},
+            headers={"Authorization": f"Bearer {auth_setup['viewer_token']}"},
         )
         assert response.status_code == 404
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_operator_list_library_files_excludes_others(self, async_client: AsyncClient, auth_setup, db_session):
+    async def test_own_scoped_user_list_library_files_excludes_others(
+        self, async_client: AsyncClient, auth_setup, db_session
+    ):
+        """Own-scoped list filtering pinned against the Viewer (library:read_own);
+        Operators are now shared-surface (library:read_all)."""
         from backend.app.models.library import LibraryFile
 
         own = LibraryFile(
@@ -1166,7 +1190,7 @@ class TestReadIDORClosure(TestOwnershipPermissionsSetup):
             file_path="library/my_file.3mf",
             file_type="3mf",
             file_size=1024,
-            created_by_id=auth_setup["operator_user"]["id"],
+            created_by_id=auth_setup["viewer_user"]["id"],
         )
         others = LibraryFile(
             filename="admin_file.3mf",
@@ -1182,7 +1206,7 @@ class TestReadIDORClosure(TestOwnershipPermissionsSetup):
 
         response = await async_client.get(
             "/api/v1/library/files",
-            headers={"Authorization": f"Bearer {auth_setup['operator_token']}"},
+            headers={"Authorization": f"Bearer {auth_setup['viewer_token']}"},
         )
         assert response.status_code == 200
         returned_ids = {f["id"] for f in response.json()}
@@ -1191,21 +1215,22 @@ class TestReadIDORClosure(TestOwnershipPermissionsSetup):
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_operator_queue_list_excludes_others_items(
+    async def test_own_scoped_user_queue_list_excludes_others_items(
         self, async_client: AsyncClient, auth_setup, archive_factory, printer_factory, db_session
     ):
-        """GET /queue/ must filter to own queue items only for OWN callers —
-        same shape as the archive list."""
+        """GET /queue/ filters to own items for an OWN-scoped caller — pinned
+        against the Viewer (queue:read_own). Operators are now shared-surface
+        (queue:read_all) and intentionally see the whole farm queue."""
         from backend.app.models.print_queue import PrintQueueItem
 
         printer = await printer_factory()
-        archive = await archive_factory(printer.id, print_name="A", created_by_id=auth_setup["operator_user"]["id"])
+        archive = await archive_factory(printer.id, print_name="A", created_by_id=auth_setup["viewer_user"]["id"])
         own_item = PrintQueueItem(
             archive_id=archive.id,
             printer_id=printer.id,
             status="pending",
             position=1,
-            created_by_id=auth_setup["operator_user"]["id"],
+            created_by_id=auth_setup["viewer_user"]["id"],
         )
         admin_item = PrintQueueItem(
             archive_id=archive.id,
@@ -1221,7 +1246,7 @@ class TestReadIDORClosure(TestOwnershipPermissionsSetup):
 
         response = await async_client.get(
             "/api/v1/queue/",
-            headers={"Authorization": f"Bearer {auth_setup['operator_token']}"},
+            headers={"Authorization": f"Bearer {auth_setup['viewer_token']}"},
         )
         assert response.status_code == 200
         returned_ids = {q["id"] for q in response.json()}
@@ -1230,10 +1255,12 @@ class TestReadIDORClosure(TestOwnershipPermissionsSetup):
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_operator_get_others_queue_item_returns_404(
+    async def test_own_scoped_user_get_others_queue_item_returns_404(
         self, async_client: AsyncClient, auth_setup, archive_factory, printer_factory, db_session
     ):
-        """Direct-id queue item access — same enumeration risk as archive get."""
+        """Direct-id queue item access — same enumeration risk as archive get.
+        Pinned against the Viewer (queue:read_own); Operators are now
+        shared-surface (queue:read_all)."""
         from backend.app.models.print_queue import PrintQueueItem
 
         printer = await printer_factory()
@@ -1251,7 +1278,7 @@ class TestReadIDORClosure(TestOwnershipPermissionsSetup):
 
         response = await async_client.get(
             f"/api/v1/queue/{admin_item.id}",
-            headers={"Authorization": f"Bearer {auth_setup['operator_token']}"},
+            headers={"Authorization": f"Bearer {auth_setup['viewer_token']}"},
         )
         assert response.status_code == 404
 

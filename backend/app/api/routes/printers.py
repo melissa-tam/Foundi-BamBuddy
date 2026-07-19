@@ -2395,7 +2395,7 @@ async def configure_ams_slot(
     # Method 1: Select existing calibration profile by cali_idx
     # Do NOT include setting_id — BambuStudio never sends it in extrusion_cali_sel,
     # and including it causes the firmware to mislink the profile on X1C/P1S.
-    client.extrusion_cali_sel(
+    cali_ok = client.extrusion_cali_sel(
         ams_id=ams_id,
         tray_id=tray_id,
         cali_idx=cali_idx,
@@ -2572,10 +2572,25 @@ async def configure_ams_slot(
     update_result = client.request_status_update()
     logger.info("[configure_ams_slot] Status update request result: %s", update_result)
 
-    return {
+    result: dict = {
         "success": True,
         "message": f"Configured AMS {ams_id} tray {tray_id} with {tray_sub_brands}",
     }
+    if not cali_ok:
+        # The filament setting landed (checked above) but the K/calibration select was
+        # refused (AMS identifying or drying). Surface it without failing the route —
+        # a later RFID re-read / K-drift tick re-asserts the profile.
+        warning = "Calibration profile not applied: AMS busy identifying or drying — retry after it settles."
+        logger.warning(
+            "[configure_ams_slot] extrusion_cali_sel refused (printer=%d ams=%d tray=%d): %s",
+            printer_id,
+            ams_id,
+            tray_id,
+            warning,
+        )
+        result["warning"] = warning
+        result["calibration_applied"] = False
+    return result
 
 
 @router.post("/{printer_id}/ams/{ams_id}/tray/{tray_id}/reset")
@@ -3748,13 +3763,26 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
         # NOTE: Do NOT send ams_set_filament_setting here — it tells the firmware
         # "this is a manual config" which destroys the RFID-detected spool state
         # (changes eye icon to pen icon in slicer).
-        client.extrusion_cali_sel(
+        cali_ok = client.extrusion_cali_sel(
             ams_id=ams_id,
             tray_id=slot_id,
             cali_idx=matching_cali_idx,
             filament_id=matching_filament_id,
             nozzle_diameter=nozzle_diameter,
         )
+        if not cali_ok:
+            # Refused (AMS identifying/drying). This is a fire-and-forget background
+            # re-apply spawned from refresh_ams_slot — like the main.py K-drift path
+            # it self-heals on a later re-read, so log and stop rather than falsely
+            # claim "Applied".
+            logger.warning(
+                "PA re-apply AMS%d-T%d: extrusion_cali_sel refused (AMS busy identifying/drying) — "
+                "cali_idx=%d not applied; a later re-read re-asserts it",
+                ams_id,
+                slot_id,
+                matching_cali_idx,
+            )
+            return
 
         # NOTE: Do NOT send extrusion_cali_set here. extrusion_cali_sel already
         # selected the correct profile by cali_idx. Sending extrusion_cali_set with

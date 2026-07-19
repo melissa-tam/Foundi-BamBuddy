@@ -94,6 +94,20 @@ async def apply_group_mapping(
         result = await db.execute(select(Group).where(Group.name.in_(mapped_group_names)))
         new_groups = list(result.scalars().all())
 
+    # Silent-deprovision observability (D12): the identity source named one or
+    # more roles/groups, but NONE resolved to a local Bambuddy group. The
+    # fail-closed replace below then clears the user's memberships entirely —
+    # a legitimate but easy-to-miss lockout usually caused by a group-mapping
+    # typo or a group renamed/deleted on our side. Surface it loudly (no
+    # semantic change — the replace still happens).
+    if mapped_group_names and not new_groups:
+        logger.warning(
+            "[group-sync:%s] ERP/OIDC roles %s matched no local group — user %s memberships will be cleared",
+            source,
+            sorted(mapped_group_names),
+            user.username,
+        )
+
     old_ids = {g.id for g in user.groups}
     new_ids = {g.id for g in new_groups}
     if old_ids == new_ids:

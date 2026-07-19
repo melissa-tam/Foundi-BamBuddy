@@ -118,6 +118,19 @@ class TestReleaseFilamentStaged:
         assert await farm_staging.release_filament_staged(db_session) == 0
         spy.assert_not_awaited()
 
+    async def test_releases_and_clears_rich_prefix_reason(self, db_session, monkeypatch):
+        # D9: staged rows now carry a rich "Low filament: <printer> (...)" reason.
+        # Release must clear it (STAGING_REASON_PREFIX match), not just the legacy
+        # bare token, so a released item keeps no stale hold reason.
+        reason = farm_staging.build_staged_reason("011-H2S, 002-H2S", start_min=True)
+        item = await _add_staged(db_session, printer_id=1, waiting_reason=reason)
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        assert await farm_staging.release_filament_staged(db_session) == 1
+        await db_session.refresh(item)
+        assert item.manual_start is False
+        assert item.filament_short is False
+        assert item.waiting_reason is None
+
 
 def _patch_start_rule(monkeypatch, blocks: bool):
     """Force the start-spool floor re-check to a fixed verdict."""
@@ -273,3 +286,71 @@ class TestAmsChangeHook:
 
         monkeypatch.setattr(farm_staging, "compute_tray_signature", boom)
         assert await farm_staging.maybe_release_on_ams_change(1, [{"id": 0}]) == 0
+
+
+class TestBuildStagedReason:
+    """The rich low-spool staging reason (D9): names the blocked machine(s), is
+    prefix-recognisable for the release-clear, and is NOT token-shaped so the
+    frontend humanizer passes it through verbatim."""
+
+    def test_names_printer_and_default_action(self):
+        r = farm_staging.build_staged_reason("004-H2S")
+        assert r.startswith(farm_staging.STAGING_REASON_PREFIX)
+        assert "004-H2S" in r
+        assert "needs more filament" in r
+        # Not a bare machine token (has spaces/punctuation) → humanizer passthrough.
+        assert " " in r and ":" in r
+
+    def test_start_min_variant(self):
+        r = farm_staging.build_staged_reason("004-H2S", start_min=True)
+        assert r.startswith(farm_staging.STAGING_REASON_PREFIX)
+        assert "starting spool below minimum" in r
+
+    def test_empty_who_falls_back(self):
+        r = farm_staging.build_staged_reason("")
+        assert r.startswith(farm_staging.STAGING_REASON_PREFIX)
+        assert "assigned printer" in r
+
+
+class TestPeriodicRelease:
+    """D8 scheduler-tick safety net: fleet-wide release the enumerated triggers
+    can miss (a fully-loaded printer going idle fires no event), time-debounced
+    so the per-item 3MF re-parse can't run every tick."""
+
+    async def test_releases_when_deficit_cleared(self, db_session, monkeypatch):
+        item = await _add_staged(db_session, printer_id=1, waiting_reason="filament_short")
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        released = await farm_staging.maybe_release_periodic(db_session)
+        assert released == 1
+        await db_session.refresh(item)
+        assert item.manual_start is False
+        assert item.filament_short is False
+        assert item.waiting_reason is None  # no stale reason left behind
+
+    async def test_leaves_still_short_item_staged(self, db_session, monkeypatch):
+        item = await _add_staged(db_session, printer_id=1)
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[{"slot_id": 1}]))
+        assert await farm_staging.maybe_release_periodic(db_session) == 0
+        await db_session.refresh(item)
+        assert item.manual_start is True
+
+    async def test_debounce_prevents_per_tick_hammering(self, db_session, monkeypatch):
+        # The underlying (3MF-parsing) release must NOT run on every tick: the
+        # second rapid call is throttled by the module-level time debounce.
+        spy = AsyncMock(return_value=0)
+        monkeypatch.setattr(farm_staging, "release_filament_staged", spy)
+        await farm_staging.maybe_release_periodic(db_session)  # state reset by fixture → runs
+        await farm_staging.maybe_release_periodic(db_session)  # within window → skipped
+        assert spy.await_count == 1
+
+    async def test_debounce_window_reopens_after_interval(self, db_session, monkeypatch):
+        spy = AsyncMock(return_value=0)
+        monkeypatch.setattr(farm_staging, "release_filament_staged", spy)
+        monkeypatch.setattr(farm_staging, "_PERIODIC_DEBOUNCE_S", 0.0)  # window elapsed every call
+        await farm_staging.maybe_release_periodic(db_session)
+        await farm_staging.maybe_release_periodic(db_session)
+        assert spy.await_count == 2
+
+    async def test_never_raises(self, db_session, monkeypatch):
+        monkeypatch.setattr(farm_staging, "release_filament_staged", AsyncMock(side_effect=RuntimeError("boom")))
+        assert await farm_staging.maybe_release_periodic(db_session) == 0

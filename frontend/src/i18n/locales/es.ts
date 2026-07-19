@@ -1540,6 +1540,7 @@ export default {
       stagedBannerTitle: 'Filamento insuficiente — cambie la bobina y pulse Volver a comprobar',
       stagedBannerBody: '{{count}} elemento(s) quedaron retenidos por la comprobación de filamento. Volver a comprobar libera solo los elementos cuya bobina ya tiene material suficiente.',
       recheckButton: 'Volver a comprobar y liberar',
+      stagedBlockingHeading: 'Esperando:',
       releasedToast: '{{count}} elemento(s) retenido(s) liberado(s)',
       releasedNone: 'Ningún elemento liberado — el filamento sigue siendo insuficiente',
       recheckFailed: 'Error al volver a comprobar',

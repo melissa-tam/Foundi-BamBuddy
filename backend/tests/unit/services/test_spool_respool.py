@@ -24,10 +24,13 @@ from backend.app.services.spool_respool import (
     RESPOOL_TAG_TYPE,
     RespoolError,
     RespoolSiblingConflict,
+    _remain_jump,
     capture_backup_swap,
     mark_spent_on_runout,
     maybe_auto_or_prompt_respool,
+    rebroadcast_unresolved_respool_prompts,
     respool_tag,
+    should_evaluate_respool,
 )
 
 DONOR_TAG_UID = "AABBCCDD11223344"
@@ -1044,3 +1047,229 @@ async def test_restart_replay_fresh_spool_not_stamped_end_to_end(db_session, pri
     # The replayed runout must NOT stamp the fresh spool.
     assert await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, post) is None
     assert (await db_session.get(Spool, fresh.id)).spent_at is None
+
+
+# -- Part 2: remain-jump refill detection (reused core carries tag onto a fresh
+#    roll; the gram ledger never notices) --------------------------------------
+
+
+def _pure_spool(label_weight=1000, weight_used=0, spent=False):
+    """A detached Spool object for the pure-helper truth-table tests (no session)."""
+    return Spool(
+        material="PETG",
+        label_weight=label_weight,
+        core_weight=250,
+        weight_used=weight_used,
+        spent_at=datetime.utcnow() if spent else None,
+    )
+
+
+def test_remain_jump_true_for_reused_core_stale_ledger():
+    """Production case: 958.99/1000 g used (ledger ~4%) while the tray reads
+    remain=100% (a fresh roll on a reused core) → jump detected."""
+    assert _remain_jump(_pure_spool(1000, 958.99), _tray()) is True
+
+
+def test_remain_jump_true_when_over_used_ledger_clamped_to_zero():
+    """weight_used > label (1850.99 on a 1000 g label) clamps ledger_pct to 0 → jump."""
+    assert _remain_jump(_pure_spool(1000, 1850.99), _tray()) is True
+
+
+def test_remain_jump_false_for_weight_locked_fresh_row():
+    """A fresh row (weight_used 0 → ledger ~100%) cannot jump: remain ≤ 100, so
+    remain − 100 is never ≥ 30. No weight_locked special-case needed."""
+    assert _remain_jump(_pure_spool(1000, 0), _tray()) is False
+
+
+def test_remain_jump_boundary_at_30_fires_just_under_does_not():
+    """remain − ledger_pct == 30 fires (inclusive); 29.9 does not."""
+    # used 300 → ledger_pct 70; remain 100 → jump exactly 30.
+    assert _remain_jump(_pure_spool(1000, 300), {**_tray(), "remain": 100}) is True
+    # used 299 → ledger_pct 70.1 → jump 29.9 < 30.
+    assert _remain_jump(_pure_spool(1000, 299), {**_tray(), "remain": 100}) is False
+
+
+def test_remain_jump_false_for_out_of_range_or_missing_remain():
+    for bad in (-1, 0, 101, 255, None, "x"):
+        assert _remain_jump(_pure_spool(1000, 990), {**_tray(), "remain": bad}) is False
+
+
+def test_remain_jump_false_for_zero_or_none_label_weight():
+    for lw in (0, None):
+        assert _remain_jump(_pure_spool(lw, 990), _tray()) is False
+
+
+def test_remain_jump_false_for_invalid_tag():
+    tray = _tray(tag_uid="0000000000000000", tray_uuid="00000000000000000000000000000000")
+    assert _remain_jump(_pure_spool(1000, 990), tray) is False
+
+
+def test_should_evaluate_respool_truth_table():
+    """spent OR jump opens the gate; a fresh/invalid-tag non-spent slot does not."""
+    jump_tray = _tray()  # remain 100, valid tag
+    # spent → True regardless of the tray (short-circuits before the jump test).
+    assert should_evaluate_respool(_pure_spool(1000, 0, spent=True), {**_tray(), "remain": 0}) is True
+    # spent_at None + remain-jump → True.
+    assert should_evaluate_respool(_pure_spool(1000, 958.99), jump_tray) is True
+    # spent_at None + no jump (fresh row) → False.
+    assert should_evaluate_respool(_pure_spool(1000, 0), jump_tray) is False
+    # spent_at None + invalid tag → False.
+    assert (
+        should_evaluate_respool(
+            _pure_spool(1000, 958.99),
+            _tray(tag_uid="0000000000000000", tray_uuid="00000000000000000000000000000000"),
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_remain_jump_prompts_even_above_threshold(db_session, printer_factory, monkeypatch):
+    """spent_at NULL and remaining ABOVE the near-empty threshold, but the tray
+    reports a remain-jump → the Tier-3 prompt still fires. Both the bound and the
+    arrival call sites funnel through maybe_auto_or_prompt_respool, so this proves
+    the prompt for both contexts."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=958.99)  # remaining 41 > 30
+    await db_session.commit()
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
+    broadcasts = _spy_broadcast(monkeypatch)
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    assert result is None  # a prompt, not an auto-respool
+    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
+    assert len(prompts) == 1
+    assert prompts[0]["donor_spool_id"] == donor.id
+
+
+@pytest.mark.asyncio
+async def test_gate_remain_jump_suppressed_when_dismissed(db_session, printer_factory, monkeypatch):
+    """The durable dismissal still suppresses a remain-jump prompt (both routes
+    share the respool_dismissed_at gate)."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=958.99)
+    donor.respool_dismissed_at = datetime.utcnow()
+    await db_session.commit()
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
+    broadcasts = _spy_broadcast(monkeypatch)
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    assert result is None
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+
+
+# -- F2: fire-once respool_prompt re-broadcast on (re)connect -----------------
+
+
+async def _fire_tier3_prompt(db, printer, monkeypatch, *, weight_used=990.0):
+    """Fire a real Tier-3 prompt so _respool_prompt_dedup is populated exactly as
+    the live gate populates it. Returns (donor, broadcasts_spy)."""
+    donor = await _make_donor(db, spent=False, weight_used=weight_used)  # remaining 10 <= 30
+    await db.commit()
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
+    broadcasts = _spy_broadcast(monkeypatch)
+    await maybe_auto_or_prompt_respool(db, printer.id, 0, 0, _tray(), donor)
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"]  # dedup now armed
+    return donor, broadcasts
+
+
+def _capture_send():
+    sent: list[dict] = []
+
+    async def _send(payload):
+        sent.append(payload)
+
+    return sent, _send
+
+
+@pytest.mark.asyncio
+async def test_rebroadcast_replays_unresolved_prompt(db_session, printer_factory, monkeypatch):
+    """A client that missed the fire-once prompt gets it replayed on (re)connect."""
+    printer = await printer_factory()
+    donor, _ = await _fire_tier3_prompt(db_session, printer, monkeypatch)
+
+    sent, send = _capture_send()
+    n = await rebroadcast_unresolved_respool_prompts(db_session, send)
+
+    assert n == 1
+    assert len(sent) == 1
+    assert sent[0]["type"] == "respool_prompt"
+    assert sent[0]["donor_spool_id"] == donor.id
+    assert sent[0]["donor_remaining_g"] == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_rebroadcast_payload_matches_live_prompt(db_session, printer_factory, monkeypatch):
+    """The replayed payload is identical to the live gate's payload (one contract)."""
+    printer = await printer_factory()
+    _donor, broadcasts = await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    live = next(b for b in broadcasts if b["type"] == "respool_prompt")
+
+    sent, send = _capture_send()
+    await rebroadcast_unresolved_respool_prompts(db_session, send)
+    assert sent[0] == live
+
+
+@pytest.mark.asyncio
+async def test_rebroadcast_skips_dismissed_donor(db_session, printer_factory, monkeypatch):
+    """The dismissal route stamps respool_dismissed_at WITHOUT clearing the in-memory
+    dedup — the replay must still suppress a dismissed prompt (F2 correctness)."""
+    printer = await printer_factory()
+    donor, _ = await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    donor.respool_dismissed_at = datetime.utcnow()
+    await db_session.commit()
+
+    sent, send = _capture_send()
+    n = await rebroadcast_unresolved_respool_prompts(db_session, send)
+    assert n == 0 and sent == []
+
+
+@pytest.mark.asyncio
+async def test_rebroadcast_skips_archived_donor(db_session, printer_factory, monkeypatch):
+    """A re-spooled / archived donor is not replayed."""
+    printer = await printer_factory()
+    donor, _ = await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    donor.archived_at = datetime.utcnow()
+    await db_session.commit()
+
+    sent, send = _capture_send()
+    assert await rebroadcast_unresolved_respool_prompts(db_session, send) == 0
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_rebroadcast_skips_when_slot_no_longer_holds_tag(db_session, printer_factory, monkeypatch):
+    """A slot now empty (or holding a different tag) is stale → no replay."""
+    printer = await printer_factory()
+    await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(tray_type="")))  # slot went empty
+
+    sent, send = _capture_send()
+    assert await rebroadcast_unresolved_respool_prompts(db_session, send) == 0
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_rebroadcast_no_entries_sends_nothing(db_session, printer_factory):
+    """No unresolved prompts tracked → nothing replayed."""
+    await printer_factory()
+    sent, send = _capture_send()
+    assert await rebroadcast_unresolved_respool_prompts(db_session, send) == 0
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_rebroadcast_noop_in_spoolman_mode(db_session, printer_factory, monkeypatch):
+    """Spoolman owns the lifecycle → the replay hook is a no-op even with a dedup entry."""
+    printer = await printer_factory()
+    await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db_session, "spoolman_enabled", "true")
+    await db_session.commit()
+
+    sent, send = _capture_send()
+    assert await rebroadcast_unresolved_respool_prompts(db_session, send) == 0
+    assert sent == []

@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from backend.app.services.bambu_mqtt import AMS_STATUS_IDENTIFYING
+from backend.app.services.bambu_mqtt import AMS_STATUS_IDENTIFYING, TRAY_PRESENT_STATES
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_tag_matcher import is_valid_tag
 
@@ -86,12 +86,15 @@ _swept_subtasks: dict[int, str] = {}
 # a print ends is never eaten; only the identify echo is.
 _echo_pending: dict[tuple[int, int, int], float] = {}
 
-# GC bound only: a flag whose identify cycle never ran (command lost to a race,
-# e.g. a print started right after publish) is discarded after this many seconds
-# and its gain treated as genuine. Suppresses nothing by itself — an expired flag
-# reads as no flag. A code constant, not operator-tunable (it is a GC bound, not
-# behavior an operator would ever set), like _RFID_REREAD_SPACING_S above.
-_ECHO_PENDING_STALE_S = 120
+# Echo-consume window == the identify-cycle bound (_IDENTIFY_ACTIVE_S). Within this
+# window a presence GAIN on a slot we just re-read is the firmware's identify flap
+# settling back and is swallowed; BEYOND it a gain is a REAL physical event (a
+# genuine pull+reseat), so the flag is GC'd and the gain acts normally — including
+# its feed-fault clear. The old 120 s value swallowed a real reseat made 30–120 s
+# after a re-read together with its feed-fault clear; that was a defect (F3).
+# Suppresses nothing by itself — an expired flag reads as no flag. A code constant,
+# not operator-tunable, like _RFID_REREAD_SPACING_S above.
+_ECHO_PENDING_STALE_S = 30.0
 
 
 def _reset_state() -> None:
@@ -114,8 +117,12 @@ def _norm_state(raw: object) -> int | None:
 
 
 def _tray_present(tray: dict) -> bool:
-    """Positive-evidence-only presence: seated/loaded (state 10/11) only."""
-    return _norm_state(tray.get("state")) in (10, 11)
+    """Positive-evidence-only presence: seated/loaded (state 10/11) only.
+
+    Keyed off ``bambu_mqtt.TRAY_PRESENT_STATES`` so presence and the client's
+    stale-clear guard share one origin for the present-state set.
+    """
+    return _norm_state(tray.get("state")) in TRAY_PRESENT_STATES
 
 
 def _printer_running(state) -> bool:
@@ -183,6 +190,21 @@ def identify_in_flight(printer_id: int, ams_id: int, tray_id: int) -> bool:
         return True
     ts = _echo_pending.get((printer_id, ams_id, tray_id))
     return ts is not None and time.monotonic() - ts < _IDENTIFY_ACTIVE_S
+
+
+def unit_drying(printer_id: int, ams_id: int) -> bool:
+    """True while AMS unit ``ams_id`` on ``printer_id`` is running a drying cycle.
+
+    Delegates to the client's :meth:`ams_unit_drying` (per-unit ``dry_time`` plus a
+    monotonic latch). Drying disengages trays — the presence bit flaps to state 10
+    with no physical event — and any concurrent identify / config write fails the
+    cycle (HMS 0700_C069). Presence and tagless flows gate on this. Never raises: an
+    unreachable client reads as not-drying."""
+    try:
+        client = printer_manager.get_client(printer_id)
+        return bool(client and client.ams_unit_drying(ams_id))
+    except Exception:  # noqa: BLE001 — must never break the AMS callback chain
+        return False
 
 
 # --- Assignment context ----------------------------------------------------
@@ -308,24 +330,29 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                     # Genuine physical re-insert: clear any feed-fault out-of-
                     # rotation flag. NOT idle-gated (a spool untangled and re-
                     # seated mid-print clears too) and NOT on the first-push seed.
+                    # Gated on NOT drying: a drying cycle flaps tray presence
+                    # (state → 10) with no physical event, and a jammed spool must
+                    # not silently re-enter rotation from a drying flap.
                     # Best-effort — a failure must never break the AMS callback.
-                    try:
-                        from backend.app.services.spool_recovery import clear_on_reinsert
+                    if not unit_drying(printer_id, ams_id):
+                        try:
+                            from backend.app.services.spool_recovery import clear_on_reinsert
 
-                        await clear_on_reinsert(db, printer_id, ams_id, tray_id, tray)
-                    except Exception:  # noqa: BLE001 — best-effort clear
-                        logger.exception(
-                            "AMS presence: feed-fault clear failed for printer %d AMS%d-T%d",
-                            printer_id,
-                            ams_id,
-                            tray_id,
-                        )
+                            await clear_on_reinsert(db, printer_id, ams_id, tray_id, tray)
+                        except Exception:  # noqa: BLE001 — best-effort clear
+                            logger.exception(
+                                "AMS presence: feed-fault clear failed for printer %d AMS%d-T%d",
+                                printer_id,
+                                ams_id,
+                                tray_id,
+                            )
 
                 # Steady state: act only on a genuine presence GAIN, and only while
                 # the printer is idle. Firing ams_get_rfid during a print is unsafe;
                 # the terminal sweep handles mid-print refills. A LOSS only updates
-                # the map above (NO auto-unassign).
-                if present and not prev and not running:
+                # the map above (NO auto-unassign). Skip while drying — a drying flap
+                # is not a real insert and a re-read would fail the cycle.
+                if present and not prev and not running and not unit_drying(printer_id, ams_id):
                     # An already-identified tray needs no re-read (re-reading would
                     # only re-flap it); the feed-fault clear above still ran.
                     if is_valid_tag(tray.get("tag_uid", "") or "", tray.get("tray_uuid", "") or ""):
@@ -387,6 +414,16 @@ async def on_printer_terminal(printer_id: int) -> None:
                 try:
                     ams_id = int(ams_unit.get("id", 0))
                 except (TypeError, ValueError):
+                    continue
+                # Skip a drying unit: re-reading its slots disengages the trays and
+                # fails the drying cycle (HMS 0700_C069). A later terminal or idle
+                # gain re-reads once drying ends.
+                if unit_drying(printer_id, ams_id):
+                    logger.debug(
+                        "[Printer %s] terminal RFID re-read: skipping AMS%d — unit is drying",
+                        printer_id,
+                        ams_id,
+                    )
                     continue
                 for tray in ams_unit.get("tray", []) or []:
                     if not isinstance(tray, dict):

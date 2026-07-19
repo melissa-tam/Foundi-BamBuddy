@@ -76,6 +76,7 @@ import { QueueStatsBar } from '../components/QueueStatsBar';
 import { CompactHistoryRow } from '../components/CompactHistoryRow';
 import { QueueTimelineView } from '../components/QueueTimelineView';
 import { WaitingReason } from '../components/ui/WaitingReason';
+import { waitingReasonText } from '../utils/waitingReason';
 import { Modal } from '../components/ui/Modal';
 
 function formatWeight(g: number, useKg = false): string {
@@ -1957,6 +1958,29 @@ export function QueuePage() {
     [queue],
   );
 
+  // D9: distinct per-machine blocking reasons across the staged rows, so the
+  // banner NAMES which printer to top up (the incident: a bare "swap the spool"
+  // banner sent the operator to the wrong machine). The scheduler persists a
+  // rich "Low filament: <printer> (…)" string into waiting_reason; dedup by the
+  // raw string here and humanize at render (a legacy bare token still maps).
+  const stagedBlockingReasons = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const item of queue ?? []) {
+      if (
+        item.status === 'pending' &&
+        item.manual_start &&
+        item.filament_short &&
+        item.waiting_reason &&
+        !seen.has(item.waiting_reason)
+      ) {
+        seen.add(item.waiting_reason);
+        out.push(item.waiting_reason);
+      }
+    }
+    return out;
+  }, [queue]);
+
   const aggregateForRows = (rows: QueueRow[]) => {
     let count = 0;
     let time = 0;
@@ -2077,6 +2101,18 @@ export function QueuePage() {
             <div className="text-xs text-yellow-700 dark:text-yellow-200/70 mt-0.5">
               {t('queue.farm.stagedBannerBody', { count: systemStagedCount })}
             </div>
+            {stagedBlockingReasons.length > 0 && (
+              <div className="mt-1.5">
+                <div className="text-xs font-medium text-yellow-700 dark:text-yellow-200/80">
+                  {t('queue.farm.stagedBlockingHeading')}
+                </div>
+                <ul className="mt-0.5 text-xs text-yellow-700 dark:text-yellow-200/70 list-disc list-inside space-y-0.5">
+                  {stagedBlockingReasons.map((reason) => (
+                    <li key={reason}>{waitingReasonText(reason, t) ?? reason}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
           <button
             onClick={() => {

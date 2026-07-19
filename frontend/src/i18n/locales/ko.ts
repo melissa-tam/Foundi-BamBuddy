@@ -1746,6 +1746,7 @@ export default {
       stagedBannerTitle: '필라멘트 부족 — 스풀을 교체한 뒤 재확인을 누르세요',
       stagedBannerBody: '{{count}}개 항목이 필라멘트 검사로 보류되었습니다. 재확인은 스풀에 재료가 충분해진 항목만 해제합니다.',
       recheckButton: '재확인 후 해제',
+      stagedBlockingHeading: '대기 중:',
       releasedToast: '보류된 {{count}}개 항목을 해제했습니다',
       releasedNone: '해제된 항목 없음 — 필라멘트가 여전히 부족합니다',
       recheckFailed: '재확인 실패',

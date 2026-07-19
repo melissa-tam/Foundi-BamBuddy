@@ -1539,6 +1539,7 @@ export default {
       stagedBannerTitle: 'フィラメント不足 — スプールを交換してから再チェックを押してください',
       stagedBannerBody: '{{count}} 件がフィラメントチェックにより保留されました。再チェックは、スプールに十分な材料がある項目のみ解放します。',
       recheckButton: '再チェックして解放',
+      stagedBlockingHeading: '待機中:',
       releasedToast: '保留中の {{count}} 件を解放しました',
       releasedNone: '解放された項目はありません — フィラメントが依然不足しています',
       recheckFailed: '再チェックに失敗しました',

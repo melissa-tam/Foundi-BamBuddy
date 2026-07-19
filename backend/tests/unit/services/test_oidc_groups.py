@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -99,3 +100,40 @@ class TestApplyGroupMapping:
 
         assert changed is True
         assert user.groups == []
+
+    async def test_unresolved_names_warns_and_still_clears(self, db_session: AsyncSession, caplog):
+        """Non-empty mapped names that resolve to NO local group (D12): the
+        fail-closed replace still clears memberships, AND a WARNING naming the
+        user + the unmatched names is emitted so a silent deprovision is
+        observable."""
+        admins = await _make_group(db_session, "Administrators")
+        user = await _make_user(db_session, "dave", [admins])
+
+        with caplog.at_level(logging.WARNING, logger="backend.app.services.oidc_groups"):
+            changed = await apply_group_mapping(db_session, user, ["NoSuchGroup", "AlsoMissing"], source="erp")
+        await db_session.commit()
+        await db_session.refresh(user, attribute_names=["groups"])
+
+        # Semantic behavior unchanged: memberships cleared (fail-closed).
+        assert changed is True
+        assert user.groups == []
+        # Observability: a WARNING naming the user and the unmatched names.
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "matched no local group" in r.getMessage() and "dave" in r.getMessage() and "NoSuchGroup" in r.getMessage()
+            for r in warnings
+        ), f"expected silent-deprovision WARNING, got: {[r.getMessage() for r in warnings]}"
+
+    async def test_empty_names_does_not_warn(self, db_session: AsyncSession, caplog):
+        """The legitimate empty-mapping clear (no roles supplied at all) must
+        NOT fire the silent-deprovision warning — only the unmatched-names case
+        does."""
+        admins = await _make_group(db_session, "Administrators")
+        user = await _make_user(db_session, "erin", [admins])
+
+        with caplog.at_level(logging.WARNING, logger="backend.app.services.oidc_groups"):
+            await apply_group_mapping(db_session, user, [], source="erp")
+
+        assert not [
+            r for r in caplog.records if r.levelno == logging.WARNING and "matched no local group" in r.getMessage()
+        ]
