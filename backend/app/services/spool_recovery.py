@@ -130,9 +130,10 @@ RECOVERABLE_HMS_CODES: frozenset[str] = FEED_FAULT_HMS_CODES | RUNOUT_HMS_CODES
 WAITING_REASON_RECOVERING = "spool_jam_recovering"
 WAITING_REASON_FAILED = "spool_jam_recovery_failed"
 
-# --- Safety bounds (code constants, NOT operator knobs — precedent
-#     ams_presence._RFID_REREAD_SPACING_S). The unload/load/resume confirm
-#     timeout and per-step resend count ARE operator settings. -----------------
+# --- Safety bounds (code constants, NOT operator knobs — precedent the client-
+#     owned settle-wait, bambu_mqtt._IDENTIFY_GATE_S / wait_ams_settle). The
+#     unload/load/resume confirm timeout and per-step resend count ARE operator
+#     settings. -----------------------------------------------------------------
 _POLL_INTERVAL_S = 1.0  # live-state poll spacing during every confirm wait
 _POST_RESUME_STABLE_S = 60  # RUNNING must hold this long after a resume = success
 _REPAUSE_WATCH_S = 120  # ceiling on how long we wait for RUNNING after a resume

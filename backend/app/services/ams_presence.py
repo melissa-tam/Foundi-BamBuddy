@@ -31,7 +31,6 @@ absent, so an H2C never reads as phantom spools.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -47,10 +46,6 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
-
-# Spacing between sequential per-slot RFID re-reads in the terminal sweep — a
-# read takes a few seconds and the AMS can only identify one slot at a time.
-_RFID_REREAD_SPACING_S = 5
 
 # An identify cycle runs ≤~25 s, so an ``_echo_pending`` flag fresher than this
 # means the commanded identify is (or may still be) in flight — used by
@@ -93,7 +88,7 @@ _echo_pending: dict[tuple[int, int, int], float] = {}
 # its feed-fault clear. The old 120 s value swallowed a real reseat made 30–120 s
 # after a re-read together with its feed-fault clear; that was a defect (F3).
 # Suppresses nothing by itself — an expired flag reads as no flag. A code constant,
-# not operator-tunable, like _RFID_REREAD_SPACING_S above.
+# not operator-tunable, like _IDENTIFY_ACTIVE_S above.
 _ECHO_PENDING_STALE_S = 30.0
 
 
@@ -385,8 +380,9 @@ async def on_printer_terminal(printer_id: int) -> None:
 
     Called from ``main.on_print_complete`` (skipped for eject-job terminals so
     each unit cycle sweeps once at the PRINT terminal, not again at the eject
-    terminal). One-shot per RUNNING/PAUSE→terminal transition; sequential with
-    spacing. Never raises. Results flow the normal RFID pipeline.
+    terminal). One-shot per RUNNING/PAUSE→terminal transition; sequential, each
+    read gated on the client's ``wait_ams_settle`` so identifies never overlap.
+    Never raises. Results flow the normal RFID pipeline.
     """
     try:
         # Dedup duplicate terminal callbacks: on_print_complete can fire several
@@ -454,7 +450,13 @@ async def on_printer_terminal(printer_id: int) -> None:
             return
 
         logger.info("[Printer %s] terminal RFID re-read sweep: %d unidentified slot(s)", printer_id, len(eligible))
-        for idx, (ams_id, tray_id) in enumerate(eligible):
+        for ams_id, tray_id in eligible:
+            # Settle-wait FIRST (including before the first read): the client blocks
+            # until its AMS is not identifying AND our per-printer identify gate has
+            # cleared, so sequential re-reads never overlap. This event-informed pace
+            # (poll of the client's own state; the gate-clear runs on the paho thread)
+            # replaces the old fixed inter-read spacing loop.
+            await client.wait_ams_settle()
             # Skip a slot whose identify is already in flight — a concurrent idle
             # gain re-read on THIS slot armed the echo flag, and commanding a second
             # ams_get_rfid now is the witnessed gain-vs-sweep double command that
@@ -481,28 +483,5 @@ async def on_printer_terminal(printer_id: int) -> None:
                 logger.info("[Printer %s] terminal RFID re-read: AMS%d slot%d", printer_id, ams_id, tray_id)
             except Exception:  # noqa: BLE001 — one failed read must not stop the sweep
                 logger.exception("[Printer %s] terminal RFID re-read failed: AMS%d slot%d", printer_id, ams_id, tray_id)
-            if idx < len(eligible) - 1:
-                await _spacing_wait(printer_id)
     except Exception:  # noqa: BLE001 — the sweep must never crash the completion callback
         logger.exception("AMS terminal RFID re-read sweep failed for printer %s", printer_id)
-
-
-async def _spacing_wait(printer_id: int) -> None:
-    """Wait up to ``_RFID_REREAD_SPACING_S`` between reads.
-
-    Best-effort early exit: once we have observed the AMS actively identifying
-    (``ams_status_main == 2``) and then return to idle, the previous read has
-    completed, so move to the next slot without burning the full window.
-    """
-    elapsed = 0.0
-    step = 0.5
-    saw_identifying = False
-    while elapsed < _RFID_REREAD_SPACING_S:
-        await asyncio.sleep(step)
-        elapsed += step
-        state = printer_manager.get_status(printer_id)
-        main = getattr(state, "ams_status_main", 0) if state is not None else 0
-        if main == AMS_STATUS_IDENTIFYING:
-            saw_identifying = True
-        elif saw_identifying:
-            break

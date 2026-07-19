@@ -6486,10 +6486,13 @@ class TestAmsDryingGuards:
         client._client.publish.assert_not_called()
 
     def test_other_unit_unaffected_by_drying(self, client):
-        # Unit 0 drying; writes to unit 1 still proceed.
+        # Unit 0 drying; writes to unit 1 still proceed. Check the mutating write
+        # FIRST: ams_refresh_tray arms the per-printer identify gate (a separate
+        # refusal path the mutating writes now also honor), which would otherwise
+        # mask this drying-isolation assertion.
         self._set_dry_time(client, 0, 30)
-        assert client.ams_refresh_tray(1, 0)[0] is True
         assert client.ams_set_filament_setting(1, 0, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230) is True
+        assert client.ams_refresh_tray(1, 0)[0] is True
 
     def test_reset_ams_slot_refused_while_identifying(self, client):
         client.state.ams_status_main = 2
@@ -6565,6 +6568,140 @@ class TestIdentifyGate:
         assert client.ams_refresh_tray(0, 1)[0] is False
         now[0] = 1031.0
         assert client.ams_refresh_tray(0, 1)[0] is True
+
+    # The three MUTATING AMS writes now consult the same per-printer identify gate
+    # (via _ams_write_refusal): while an ams_get_rfid we published is still in
+    # flight, a config write to any slot would clobber the read. Mirrors
+    # test_second_refresh_inside_gate_refused for each mutating method.
+
+    def test_set_filament_setting_refused_inside_gate(self, client):
+        assert client.ams_refresh_tray(0, 0)[0] is True  # arms the identify gate
+        ok = client.ams_set_filament_setting(0, 1, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230)
+        assert ok is False
+        assert client._client.publish.call_count == 1  # only the identify went out
+
+    def test_set_filament_setting_allowed_after_gate_cleared(self, client):
+        client.ams_refresh_tray(0, 0)  # arms the gate
+        client.state.ams_status_main = 2  # AMS entered identifying
+        client._handle_ams_data({"ams_status": 0})  # 2 → 0 transition clears the gate
+        assert client._identify_gate_until == 0.0
+        assert client.ams_set_filament_setting(0, 1, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230) is True
+
+    def test_set_filament_setting_allowed_after_gate_expiry(self, client, monkeypatch):
+        import backend.app.services.bambu_mqtt as bm
+
+        now = [1000.0]
+        monkeypatch.setattr(bm.time, "monotonic", lambda: now[0])
+        assert client.ams_refresh_tray(0, 0)[0] is True  # arms gate to 1030
+        now[0] = 1029.0
+        assert client.ams_set_filament_setting(0, 1, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230) is False
+        now[0] = 1031.0
+        assert client.ams_set_filament_setting(0, 1, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230) is True
+
+    def test_reset_ams_slot_refused_inside_gate(self, client):
+        assert client.ams_refresh_tray(0, 0)[0] is True
+        assert client.reset_ams_slot(0, 1) is False
+        assert client._client.publish.call_count == 1
+
+    def test_reset_ams_slot_allowed_after_gate_cleared(self, client):
+        client.ams_refresh_tray(0, 0)
+        client.state.ams_status_main = 2
+        client._handle_ams_data({"ams_status": 0})
+        assert client._identify_gate_until == 0.0
+        assert client.reset_ams_slot(0, 1) is True
+
+    def test_reset_ams_slot_allowed_after_gate_expiry(self, client, monkeypatch):
+        import backend.app.services.bambu_mqtt as bm
+
+        now = [1000.0]
+        monkeypatch.setattr(bm.time, "monotonic", lambda: now[0])
+        assert client.ams_refresh_tray(0, 0)[0] is True
+        now[0] = 1029.0
+        assert client.reset_ams_slot(0, 1) is False
+        now[0] = 1031.0
+        assert client.reset_ams_slot(0, 1) is True
+
+    def test_extrusion_cali_sel_refused_inside_gate(self, client):
+        assert client.ams_refresh_tray(0, 0)[0] is True
+        assert client.extrusion_cali_sel(0, 1, cali_idx=-1, filament_id="GFL05") is False
+        assert client._client.publish.call_count == 1
+
+    def test_extrusion_cali_sel_allowed_after_gate_cleared(self, client):
+        client.ams_refresh_tray(0, 0)
+        client.state.ams_status_main = 2
+        client._handle_ams_data({"ams_status": 0})
+        assert client._identify_gate_until == 0.0
+        assert client.extrusion_cali_sel(0, 1, cali_idx=-1, filament_id="GFL05") is True
+
+    def test_extrusion_cali_sel_allowed_after_gate_expiry(self, client, monkeypatch):
+        import backend.app.services.bambu_mqtt as bm
+
+        now = [1000.0]
+        monkeypatch.setattr(bm.time, "monotonic", lambda: now[0])
+        assert client.ams_refresh_tray(0, 0)[0] is True
+        now[0] = 1029.0
+        assert client.extrusion_cali_sel(0, 1, cali_idx=-1, filament_id="GFL05") is False
+        now[0] = 1031.0
+        assert client.extrusion_cali_sel(0, 1, cali_idx=-1, filament_id="GFL05") is True
+
+
+class TestWaitAmsSettle:
+    """wait_ams_settle blocks until the AMS is not identifying AND the per-printer
+    identify gate has cleared, capped at _IDENTIFY_GATE_S. The terminal RFID re-read
+    sweep awaits it before each slot so identifies never overlap."""
+
+    @pytest.fixture
+    def client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        c = BambuMQTTClient(ip_address="192.168.1.100", serial_number="SETTLE1", access_code="12345678")
+        c._client = MagicMock()
+        c.state.connected = True
+        return c
+
+    async def test_immediate_true_when_idle_and_gate_clear(self, client, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        import backend.app.services.bambu_mqtt as bm
+
+        sleep = AsyncMock()
+        monkeypatch.setattr(bm.asyncio, "sleep", sleep)
+        client.state.ams_status_main = 0
+        client._identify_gate_until = 0.0
+        assert await client.wait_ams_settle() is True
+        sleep.assert_not_awaited()  # returned on entry, never polled
+
+    async def test_waits_while_identifying_then_true_on_settle(self, client, monkeypatch):
+        import backend.app.services.bambu_mqtt as bm
+
+        client.state.ams_status_main = 2  # identifying
+        client._identify_gate_until = 0.0
+        polls = [0]
+
+        async def fake_sleep(_):
+            polls[0] += 1
+            if polls[0] >= 2:
+                client.state.ams_status_main = 0  # AMS settles after two polls
+
+        monkeypatch.setattr(bm.asyncio, "sleep", fake_sleep)
+        assert await client.wait_ams_settle() is True
+        assert polls[0] == 2
+
+    async def test_false_at_identify_gate_cap(self, client, monkeypatch):
+        import backend.app.services.bambu_mqtt as bm
+
+        now = [1000.0]
+        monkeypatch.setattr(bm.time, "monotonic", lambda: now[0])
+        client.state.ams_status_main = 2  # never settles
+
+        async def fake_sleep(_):
+            now[0] += 10.0  # advance the monotonic clock each poll
+
+        monkeypatch.setattr(bm.asyncio, "sleep", fake_sleep)
+        # deadline = 1000 + _IDENTIFY_GATE_S(30) = 1030; three 10 s polls reach it.
+        assert await client.wait_ams_settle() is False
 
 
 class TestTrayClearPresenceConsistency:

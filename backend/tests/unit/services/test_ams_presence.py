@@ -194,10 +194,10 @@ class TestTerminalSweep:
         db_session.add(SpoolAssignment(spool_id=manual_spool.id, printer_id=1, ams_id=0, tray_id=2))
         await db_session.commit()
 
+        order: list[str] = []
         client = MagicMock()
-        client.ams_refresh_tray.return_value = (True, "ok")
-        spacing = AsyncMock()
-        monkeypatch.setattr(ams_presence, "_spacing_wait", spacing)
+        client.ams_refresh_tray.side_effect = lambda a, t: order.append(f"read {a},{t}") or (True, "ok")
+        client.wait_ams_settle = AsyncMock(side_effect=lambda: order.append("settle"))
         status = SimpleNamespace(
             state="FINISH",
             subtask_id="t1",
@@ -223,12 +223,15 @@ class TestTerminalSweep:
         await ams_presence.on_printer_terminal(1)
 
         assert [c.args for c in client.ams_refresh_tray.call_args_list] == [(0, 0), (0, 1)]
-        assert spacing.await_count == 1  # one wait between the two reads
+        # Settle-wait is awaited once per swept slot, before each read (including the
+        # FIRST) — the pace is per-slot now, not a single between-reads spacing.
+        assert client.wait_ams_settle.await_count == 2
+        assert order == ["settle", "read 0,0", "settle", "read 0,1"]
 
     async def test_state9_included_no_assignment(self, db_session, sessions, monkeypatch):
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
-        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
+        client.wait_ams_settle = AsyncMock(return_value=True)
         status = SimpleNamespace(
             state="FINISH",
             subtask_id="t1",
@@ -244,7 +247,7 @@ class TestTerminalSweep:
     async def test_once_per_transition_dedup(self, db_session, sessions, monkeypatch):
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
-        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
+        client.wait_ams_settle = AsyncMock(return_value=True)
         status = SimpleNamespace(
             state="FINISH",
             subtask_id="t1",
@@ -268,7 +271,7 @@ class TestTerminalSweep:
 
     async def test_no_eligible_slots_no_reads(self, db_session, sessions, monkeypatch):
         client = MagicMock()
-        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
+        client.wait_ams_settle = AsyncMock(return_value=True)
         status = SimpleNamespace(
             state="FINISH",
             subtask_id="t1",
@@ -280,27 +283,6 @@ class TestTerminalSweep:
 
         await ams_presence.on_printer_terminal(1)
         client.ams_refresh_tray.assert_not_called()
-
-
-class TestSpacingWait:
-    async def test_early_exit_after_identifying_then_idle(self, monkeypatch):
-        # ams_status_main 2 (identifying) then 0 (idle) → break after 2 polls.
-        seq = iter([SimpleNamespace(ams_status_main=2), SimpleNamespace(ams_status_main=0)])
-        monkeypatch.setattr(
-            ams_presence.printer_manager, "get_status", lambda pid: next(seq, SimpleNamespace(ams_status_main=0))
-        )
-        sleep = AsyncMock()
-        monkeypatch.setattr(ams_presence.asyncio, "sleep", sleep)
-        await ams_presence._spacing_wait(1)
-        assert sleep.await_count == 2
-
-    async def test_full_window_when_never_identifying(self, monkeypatch):
-        monkeypatch.setattr(ams_presence, "_RFID_REREAD_SPACING_S", 1.0)  # 2 polls of 0.5s
-        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
-        sleep = AsyncMock()
-        monkeypatch.setattr(ams_presence.asyncio, "sleep", sleep)
-        await ams_presence._spacing_wait(1)
-        assert sleep.await_count == 2  # never early-exits; burns the full window
 
 
 class TestEchoConsume:
@@ -366,9 +348,9 @@ class TestEchoConsume:
         # sweep issues exactly ONE command instead of looping every ~22 s.
         clear = AsyncMock()
         monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
-        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
+        client.wait_ams_settle = AsyncMock(return_value=True)
         status = _pstate([_tray(0, state=11)], gcode_state="FINISH", subtask_id="t1")
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
         monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
@@ -482,7 +464,7 @@ class TestTerminalSweepIdentifySkip:
     async def test_skips_fresh_flag_sweeps_stale(self, db_session, sessions, monkeypatch):
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
-        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
+        client.wait_ams_settle = AsyncMock(return_value=True)
         status = SimpleNamespace(
             state="FINISH",
             subtask_id="t1",
@@ -514,10 +496,10 @@ class TestIdentifyCollisionRegression:
         from backend.app.services import spool_tagless
 
         monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
-        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
 
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
+        client.wait_ams_settle = AsyncMock(return_value=True)
         present = _pstate([_tray(0, state=11)], gcode_state="IDLE", ams_status_main=0)
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: present)
         monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
@@ -611,9 +593,9 @@ class TestDryingGates:
 
     async def test_terminal_sweep_skips_drying_unit(self, db_session, sessions, monkeypatch):
         monkeypatch.setattr(ams_presence, "unit_drying", lambda pid, aid: True)
-        monkeypatch.setattr(ams_presence, "_spacing_wait", AsyncMock())
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
+        client.wait_ams_settle = AsyncMock(return_value=True)
         status = SimpleNamespace(
             state="FINISH",
             subtask_id="t1",
