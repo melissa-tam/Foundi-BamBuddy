@@ -265,12 +265,17 @@ _HMS_USER_ACTION_CODES: frozenset[str] = frozenset(
 # their ARRIVAL to raise a plate-clear gate; it does NOT filter them.
 #   0300_8017 — foreign objects detected on the heatbed
 #   0300_8006 — build-plate marker check
+#   0500_806E — foreign objects detected on the heatbed (H2S live-observed 2026-07-20,
+#               printer 8 / fw 01.01.02.00, text "Foreign objects detected on heatbed";
+#               the sibling 808C was already seeded, but the H2S actually emits 806E —
+#               it PAUSEd at layer 0, same human-clear-then-Resume reaction)
 #   0500_808C — build-plate offset / debris detected (H2-series; PAUSEs at layer 0,
 #               human must clear + realign the plate before Resume — same reaction)
 _HMS_PLATE_OCCUPANCY_CODES: frozenset[str] = frozenset(
     {
         "0300_8017",
         "0300_8006",
+        "0500_806E",
         "0500_808C",
     }
 )

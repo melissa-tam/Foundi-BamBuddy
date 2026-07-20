@@ -13,6 +13,7 @@ information" (0700_2X00_0001_0081 / 07XX_4025) errors a commanded read on a tagl
 slot can only produce. The old ``data_origin == "ams_auto"`` eligibility rule is gone.
 """
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -70,11 +71,15 @@ def _tray(tray_id, *, state, tray_type="", tag="0000000000000000", tray_uuid="0"
     }
 
 
-def _pstate(trays, *, ams_id=0, gcode_state="IDLE", subtask_id="task-1", ams_status_main=0):
+def _pstate(trays, *, ams_id=0, gcode_state="IDLE", subtask_id="task-1", ams_status_main=0, tray_now=255):
+    # tray_now defaults to 255 (no filament engaged) so every existing caller reads as
+    # NOT engaged — the same behaviour a missing attr gave via _filament_engaged's
+    # getattr default. Engaged-filament cases pass tray_now=<loaded global tray id>.
     return SimpleNamespace(
         state=gcode_state,
         subtask_id=subtask_id,
         ams_status_main=ams_status_main,
+        tray_now=tray_now,
         raw_data={"ams": [{"id": ams_id, "tray": trays}]},
     )
 
@@ -1094,3 +1099,147 @@ class TestPhysicalCycleNote:
         ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - 10
         await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain while drying
         _spy_note.assert_not_awaited()
+
+
+class TestEngagedFilamentDefer:
+    """A commanded ams_get_rfid is refused by the client while any filament is loaded
+    (``tray_now != 255``); the client's WARNING names the ENGAGED slot, so two eligible
+    tagged slots swept while one is engaged log two IDENTICAL warnings in the same
+    instant (the live 07-20 double log). The need-driven paths pre-check the same
+    predicate and defer QUIETLY (one DEBUG, no WARNING), stamping nothing so the slot's
+    eligibility is untouched and the NEXT terminal retries once filament is unloaded."""
+
+    def _client(self):
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        client.wait_ams_settle = AsyncMock(return_value=True)
+        return client
+
+    async def _bind_tagged(self, db_session, tray_id, tag):
+        spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=tag)
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=tray_id))
+        await db_session.commit()
+
+    async def test_engaged_terminal_defers_then_retries_when_unloaded(self, db_session, sessions, monkeypatch):
+        # rfid_refresh slot: engaged filament ⇒ the sweep commands NOTHING; once the
+        # filament is unloaded (tray_now=255) the next terminal sends exactly one.
+        await self._bind_tagged(db_session, 0, _VALID_TAG)
+        client = self._client()
+        status = _pstate([_tray(0, state=11)], gcode_state="FINISH", subtask_id="t1", tray_now=1)  # slot 1 engaged
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+
+        await ams_presence.on_printer_terminal(1)
+        client.ams_refresh_tray.assert_not_called()  # engaged → deferred, no ams_get_rfid
+
+        status.tray_now = 255  # filament unloaded
+        status.subtask_id = "t2"  # a NEW print reached terminal
+        await ams_presence.on_printer_terminal(1)
+        client.ams_refresh_tray.assert_called_once_with(0, 0)  # deferred refresh now runs
+
+    async def test_engaged_preserves_discovery_eligibility(self, db_session, sessions, monkeypatch):
+        # A DISCOVERY read deferred for engaged filament must NOT consume the unanswered
+        # cycle — the next (unloaded) terminal still sees it and reads once.
+        _arm_cycle(1, 0, 0)
+        client = self._client()
+        status = _pstate([_tray(0, state=11)], gcode_state="FINISH", subtask_id="t1", tray_now=2)  # engaged
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+
+        await ams_presence.on_printer_terminal(1)
+        client.ams_refresh_tray.assert_not_called()
+        assert ams_presence._unanswered_cycle(1, 0, 0) is True  # discovery evidence preserved
+
+        status.tray_now = 255
+        status.subtask_id = "t2"
+        await ams_presence.on_printer_terminal(1)
+        client.ams_refresh_tray.assert_called_once_with(0, 0)
+
+    async def test_two_engaged_tagged_slots_emit_no_warning(self, db_session, sessions, monkeypatch, caplog):
+        # THE double-log pin: two tagged slots eligible while slot 1 is engaged. The old
+        # path logged the SAME "filament loaded from AMS 1 slot 2" WARNING once per slot
+        # (the message names the engaged slot, not the target). The pre-check now emits
+        # zero client commands and zero WARNINGs — one quiet DEBUG per deferred slot.
+        await self._bind_tagged(db_session, 0, _VALID_TAG)
+        await self._bind_tagged(db_session, 2, "FEDCBA0987654321")
+        client = self._client()
+        status = _pstate(
+            [_tray(0, state=11), _tray(1, state=11), _tray(2, state=11)],
+            gcode_state="FINISH",
+            subtask_id="t1",
+            tray_now=1,  # slot 1 engaged — blocks the whole AMS
+        )
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+
+        with caplog.at_level(logging.DEBUG, logger="backend.app.services.ams_presence"):
+            await ams_presence.on_printer_terminal(1)
+
+        client.ams_refresh_tray.assert_not_called()  # both eligible slots deferred
+        ap = [r for r in caplog.records if r.name == "backend.app.services.ams_presence"]
+        assert not [r for r in ap if r.levelno >= logging.WARNING]  # no (doubled) WARNING
+        deferred = [r for r in ap if "filament engaged" in r.getMessage()]
+        assert len(deferred) == 2 and all(r.levelno == logging.DEBUG for r in deferred)  # one DEBUG per slot
+
+    async def test_disengaged_sends_exactly_once_per_slot(self, db_session, sessions, monkeypatch):
+        # Control: unloaded (tray_now=255) ⇒ each eligible tagged slot is read exactly
+        # once — no double-invocation.
+        await self._bind_tagged(db_session, 0, _VALID_TAG)
+        client = self._client()
+        status = _pstate([_tray(0, state=11)], gcode_state="FINISH", subtask_id="t1", tray_now=255)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+
+        await ams_presence.on_printer_terminal(1)
+        client.ams_refresh_tray.assert_called_once_with(0, 0)
+
+    async def test_command_identify_defer_logs_debug_and_stamps_nothing(self, monkeypatch, caplog):
+        # The defer path directly: DEBUG (not WARNING), no client command, and NONE of
+        # the read bookkeeping (echo arm / identity-learned / discovery stamp) mutated —
+        # so eligibility is genuinely preserved.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], tray_now=1), client=client)
+
+        with caplog.at_level(logging.DEBUG, logger="backend.app.services.ams_presence"):
+            ok, msg = await ams_presence.command_identify(1, 0, 0, source="terminal_sweep", reason="rfid_refresh")
+
+        assert ok is False and msg == "filament engaged"
+        client.ams_refresh_tray.assert_not_called()
+        ap = [r for r in caplog.records if r.name == "backend.app.services.ams_presence"]
+        assert any(r.levelno == logging.DEBUG and "deferred" in r.getMessage() for r in ap)
+        assert not [r for r in ap if r.levelno >= logging.WARNING]
+        assert ams_presence._echo_pending == {}
+        assert ams_presence._slot_read_at == {}
+        assert ams_presence._discovery_read_at == {}
+
+    async def test_manual_refresh_not_preempted_by_engaged(self, monkeypatch):
+        # Operator bypass (enforce_need=False) is wire-safety-only: the engaged pre-check
+        # does NOT apply, so the command still reaches the client, which returns its own
+        # verbatim refusal. Explicit intent, explicit answer — never a silent skip.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (
+            False,
+            "Please unload filament first. Currently loaded: AMS 1 slot 2",
+        )
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], tray_now=1), client=client)
+
+        ok, msg = await ams_presence.command_identify(1, 0, 0, source="manual_refresh", enforce_need=False)
+        assert ok is False and "unload filament" in msg
+        client.ams_refresh_tray.assert_called_once_with(0, 0)  # reached the client, not pre-empted
+
+    def test_engaged_helper_mirrors_the_client_sentinel(self, monkeypatch):
+        # _filament_engaged reads the live PrinterState.tray_now (get_status) against the
+        # single-origin 255 sentinel; None / missing / 255 all read as not-engaged.
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(tray_now=255))
+        assert ams_presence._filament_engaged(1) is False
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(tray_now=1))
+        assert ams_presence._filament_engaged(1) is True
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(tray_now=254))
+        assert ams_presence._filament_engaged(1) is True  # external spool engaged
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace())
+        assert ams_presence._filament_engaged(1) is False  # missing attr → unloaded default
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: None)
+        assert ams_presence._filament_engaged(1) is False  # printer gone → not engaged

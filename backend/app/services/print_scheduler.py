@@ -172,6 +172,18 @@ class PrintScheduler:
             except Exception:
                 logger.exception("Pause-stall watch failed (non-fatal)")
 
+            # Attention-reminder nag (W3): the offline / pause-stall / recovery /
+            # runout escalations each alert only ONCE per incident, so a printer left
+            # PAUSEd needing a human went silent for hours (2026-07-20). Re-fire the
+            # ORIGINAL escalation notification once per hour while the hold persists.
+            # Own guard, same as the sibling watches — it must not kill the tick.
+            try:
+                from backend.app.services.farm_stall import check_attention_reminders
+
+                await check_attention_reminders(db)
+            except Exception:
+                logger.exception("Attention-reminder watch failed (non-fatal)")
+
             # Staged-completeness safety net (D8): the low-spool release triggers
             # (AMS change / run resume / banner button) can all MISS — a
             # fully-loaded printer going idle fires no event, stranding staged
@@ -2247,6 +2259,10 @@ class PrintScheduler:
         item.status = "failed"
         item.error_message = error_message
         item.completed_at = datetime.now(timezone.utc)
+        # Terminal-transition hygiene (W4b): NULL any stale hold token in the SAME
+        # update that sets the terminal status, so a dispatch-time failure can't
+        # leave e.g. a capability-block waiting_reason on a now-failed row.
+        item.waiting_reason = None
         await db.commit()
         try:
             from backend.app.services.farm_policy import on_terminal

@@ -199,6 +199,7 @@ async def init_db():
         printer_sensor_history,
         project,
         project_bom,
+        recovery_escalation,
         settings,
         shopping_list,
         sku,
@@ -691,6 +692,8 @@ async def run_migrations(conn):
     inside begin_nested() so any failure is always fatal and never silently
     swallowed.
     """
+    from datetime import datetime as _dt, timedelta as _td
+
     from sqlalchemy import text
 
     # Migration: Add is_favorite column to print_archives
@@ -3720,6 +3723,57 @@ async def run_migrations(conn):
         )
         """,
     )
+
+    # Migration (W2): durable per-escalation ledger for the repeat-jam printer
+    # quarantine (services/spool_recovery._escalate writes one row per give-up).
+    # Two escalations for a printer within _JAM_QUARANTINE_WINDOW_H hours →
+    # farm_policy.quarantine_printer, surviving the restarts the in-memory latch
+    # cannot. On a fresh DB Base.metadata.create_all already made this table
+    # (dialect-correct); this IF NOT EXISTS is the fallback for pre-existing DBs,
+    # dialect-branched on the autoincrement PK spelling exactly like
+    # spool_usage_history / smart_plug_energy_snapshots above.
+    await _safe_execute(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS recovery_escalation (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            printer_id INTEGER NOT NULL REFERENCES printers(id),
+            created_at TIMESTAMP NOT NULL,
+            reason VARCHAR(64) NOT NULL,
+            code VARCHAR(32)
+        )
+        """
+        if is_sqlite()
+        else """
+        CREATE TABLE IF NOT EXISTS recovery_escalation (
+            id SERIAL PRIMARY KEY,
+            printer_id INTEGER NOT NULL REFERENCES printers(id),
+            created_at TIMESTAMP NOT NULL,
+            reason VARCHAR(64) NOT NULL,
+            code VARCHAR(32)
+        )
+        """,
+    )
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_recovery_escalation_printer_created "
+        "ON recovery_escalation(printer_id, created_at)",
+    )
+
+    # W2 retention: a recovery_escalation row older than the quarantine window can
+    # never influence a decision, so drop it at startup — behaviour-preserving and
+    # it bounds the table. This is the recovery-escalation twin of the
+    # notification_ledger startup prune (notify_dedup.prune_ledger, run from main's
+    # lifespan hygiene); it lives HERE because run_migrations is the every-startup
+    # hook inside this change's file scope. 30 days mirrors
+    # notify_dedup.LEDGER_PRUNE_DAYS. DML → conn.execute inside begin_nested (never
+    # swallowed), per this module's migration convention.
+    _esc_cutoff = _dt.utcnow() - _td(days=30)
+    async with conn.begin_nested():
+        await conn.execute(
+            text("DELETE FROM recovery_escalation WHERE created_at < :cutoff"),
+            {"cutoff": _esc_cutoff},
+        )
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (

@@ -10,13 +10,27 @@ This module is the single owner of the recovery state machine. On a recoverable
 HMS (feed fault, or a runout the firmware backup failed to rescue) during a FARM
 print it reproduces the operator's proven manual recovery sequence:
 
-    (printer already PAUSEd) → unload → confirm the AMS finished the unload cycle
-    (see :func:`_confirm_unloaded`) → mark the jammed spool out of rotation →
-    select the next eligible loaded spool → load it → confirm ``tray_now ==
-    target`` (the first load may not take — resend) → resume → confirm RUNNING and
-    hold stable (a lingering fault may need one extra pause/resume cycle) →
-    SUCCESS. If nothing works: escalate — notify and leave the printer PAUSED for
-    a human, never resume blind.
+    (printer already PAUSEd) → [reset a wedged filament-change] → unload → confirm
+    the AMS finished the unload cycle (see :func:`_confirm_unloaded`) → mark the
+    jammed spool out of rotation → select the next eligible loaded spool → load it
+    → confirm ``tray_now == target`` (the first load may not take — resend) →
+    resume → confirm RUNNING and hold stable (a lingering fault may need one extra
+    pause/resume cycle) → SUCCESS. If nothing works: escalate — notify and leave
+    the printer PAUSED for a human, never resume blind.
+
+    W1 (009-H2S 2026-07-20): after a feed fault the AMS can sit WEDGED mid
+    filament-change (gcode_state PAUSE, ``ams_status_main`` non-idle) where it
+    silently ignores every unload — recovery's two AND the operator's two were all
+    no-ops for hours. The ONLY verb that freed it was a ``resume`` (the touchscreen
+    CONTINUE for the standing 07008010). So every candidate round now runs
+    :func:`_reset_stuck_change` FIRST: on an idle AMS it is a no-op; on a wedged one
+    it re-issues the firmware CONTINUE and reads the outcome — the firmware may
+    self-heal outright (no swap), re-fault and re-pause on its own, or hang RUNNING
+    in an incomplete change (the live case) which we re-pause before the swap round.
+
+    W2: a printer whose recovery escalates repeatedly within a rolling window is
+    quarantined off the durable ``recovery_escalation`` ledger — a recurring AMS jam
+    is hardware (buffer / feeder), not a spool the swap machine can fix.
 
 The unload is UNCONDITIONAL after a feed fault, even when ``tray_now`` already
 reads 255. Production incident 009-H2S 2026-07-20: an earlier ``tray_now == 255``
@@ -96,6 +110,19 @@ logger = logging.getLogger(__name__)
 # on a healthy print (acting requires a PAUSE anyway). The pull-out/pull-back
 # siblings (07xx_8003/8004/8006) stay OUT — those can need physical extruder work
 # an auto-load could grind.
+#
+# F9 — two deliberate EXCLUSIONS, recorded so a future widening does not regress:
+#   * ``0700_0025`` is NOT a trigger. It was observed live 2026-07-20 07:48 on
+#     009-H2S, ~5 min BEFORE the 8010 that actually wedged the change, but its
+#     semantics are unknown / uncatalogued. The 8010 always follows and is the
+#     real trigger, so adding 0025 would only widen the surface with no signal.
+#   * ``0700_0001`` must NEVER be added as a short code. The same low-16 code word
+#     (``0001``) also appears under the SLOT-ATTRIBUTED runout attr family
+#     ``0700_2X00_0002_0001`` (see hms_errors._RUNOUT_SLOT_CODE32, which carries
+#     0x00020001). A short-code match here would route those runouts into the
+#     jam-swap machine, regressing the 2026-07-19 runout-honest design (runouts
+#     must escalate for a SAME-slot refill, never swap). Distinguishing the two
+#     would require attr-aware FULL-code matching first — short codes alone cannot.
 AMS_FEED_FAULT_HMS_CODES: frozenset[str] = frozenset(
     {
         "0700_8010",
@@ -163,6 +190,13 @@ _UNLOAD_GRACE_S = 15.0
 # Absolute floor a replacement spool must clear even past the protected layers —
 # never load a known-empty spool. A ledger ≤ 5 g is empty for replacement purposes.
 _RECOVERY_HARD_MIN_G = 5
+# Stuck-change firmware resets allowed per incident. The resume that unwedges a
+# stuck filament-change is the touchscreen CONTINUE action (the vendored
+# hms_actions.json 093-family action for 07008010 is ["CHECK_ASSISTANT","CONTINUE"])
+# and it worked ONCE on 009-H2S 2026-07-20 after four unloads were silently
+# ignored. Bounded-by-evidence at 1: a reset that did not free the AMS means it is
+# genuinely wedged and needs hands, so a second resume would only loop, not heal.
+_MAX_STUCK_RESETS = 1
 
 # tray_now sentinel: no filament fed (unloaded). 255 on H2-series.
 _NO_FILAMENT = 255
@@ -210,7 +244,14 @@ _ESCALATE_DETAIL: dict[str, str] = {
         "insert filament and resume on the printer."
     ),
     "candidates_exhausted": "Tried every eligible replacement spool without a stable resume. Left PAUSED for a human.",
-    "unload_failed": "The jammed spool would not unload. Left PAUSED for a human.",
+    "unload_failed": (
+        "The AMS ignored the unload while stuck mid filament-change and the firmware reset (resume) did not "
+        "free it — physical intervention at the printer is likely required (check the filament buffer/feeder)."
+    ),
+    "stuck_reset_failed": (
+        "The AMS is stuck mid filament-change and did not respond to the firmware reset (resume) — physical "
+        "intervention at the printer is likely required (check the filament buffer/feeder)."
+    ),
     "repeated_jams": (
         "Auto-recovered several times this job but the fault keeps returning — likely an "
         "extruder-side problem, not the spool. Left PAUSED for a human."
@@ -304,6 +345,23 @@ _success_counts: dict[tuple[int, str], int] = {}
 # escalates instead of swapping again (code constant, precedent _MAX_CANDIDATES).
 _MAX_SUCCESSES_PER_JOB = 3
 
+# Per-job stuck-change reset budget: (printer_id, job_id) -> firmware resets
+# (resumes) already published this incident. Bounds the wedged-change reset to
+# _MAX_STUCK_RESETS; a frozen RecoveryIncident cannot carry a mutable counter, so
+# this follows the module's per-(printer, job) dict idiom (_success_counts).
+# Process-lifetime like the rest of this block — a post-restart re-fire gets its
+# one bounded reset again, which is safe.
+_stuck_resets: dict[tuple[int, str], int] = {}
+
+# --- W2 durable repeat-jam quarantine (code constants, NOT operator knobs) ----
+# A printer whose recovery escalates _JAM_QUARANTINE_THRESHOLD times within
+# _JAM_QUARANTINE_WINDOW_H hours is quarantined: a recurring AMS jam is hardware
+# (buffer / feeder), not a spool the swap machine can fix. Counted from the durable
+# recovery_escalation ledger so it survives the restarts this in-memory state does
+# not (009-H2S 2026-07-20: three same-fault escalations across the day).
+_JAM_QUARANTINE_WINDOW_H = 24
+_JAM_QUARANTINE_THRESHOLD = 2
+
 
 def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
@@ -311,6 +369,7 @@ def _reset_state() -> None:
     _handled.clear()
     _escalated.clear()
     _success_counts.clear()
+    _stuck_resets.clear()
 
 
 def has_live_recovery(printer_id: int) -> bool:
@@ -639,12 +698,37 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
         if incident.jammed_global_tray is not None:
             await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
 
-        # (3) Try up to _MAX_CANDIDATES replacement trays. Every round runs its own
-        #     unload cycle first — the whole point of the 009-H2S fix: a round that
-        #     follows a failed load must reset the AMS before loading again.
+        # (3) Try up to _MAX_CANDIDATES replacement trays. Every round runs a
+        #     stuck-change reset first (W1) and then its own unload cycle — the
+        #     009-H2S fix: after a feed fault the AMS can sit wedged mid-change,
+        #     silently ignoring unloads; only a firmware CONTINUE (resume) frees it,
+        #     and a round that follows a failed load must reset the AMS before
+        #     loading again.
         tried: set[int] = set()
         evidence = _RecoveryEvidence()
         for _round in range(_MAX_CANDIDATES):
+            # W1: reset an AMS wedged mid filament-change before touching the unload.
+            reset = await _reset_stuck_change(incident, client)
+            if reset == "abort":
+                await _abort(incident)
+                return
+            if reset == "fail":
+                await _escalate(incident, "stuck_reset_failed")
+                return
+            if reset == "recovered":
+                # Same-feeder self-heal: the firmware reset cleared the jam with no
+                # swap. Clear the jammed spool's out-of-rotation flag exactly the way
+                # _abort does when an operator resumes on the jammed feeder, count the
+                # self-heal toward the per-job flap cap, and close as a no-swap
+                # success — never resume/swap on top of a running print.
+                from backend.app.core.database import async_session
+
+                async with async_session() as db:
+                    await _clear_oor_if_resumed_on_jammed_feeder(db, incident)
+                await _succeed(incident, incident.jammed_global_tray, swapped=False)
+                return
+            # reset in ("skipped", "ok") → fall through to the unload step. On "ok"
+            # the AMS now answers; on "skipped" (idle AMS) nothing changed.
             unload = await _unload_and_confirm(incident, client)
             if unload not in ("ok", "skipped"):
                 _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict=f"unload_{unload}")
@@ -768,6 +852,156 @@ async def _await_state(printer_id: int, targets: set[str], timeout_s: float) -> 
 def _feed_fault_live(state) -> bool:
     """True while a FEED-FAULT HMS code is standing on the live printer state."""
     return bool(_active_recoverable_codes(state) & FEED_FAULT_HMS_CODES)
+
+
+def _change_completed(state) -> bool:
+    """True when the pending filament-change resolved to a real feeding tray —
+    ``tray_now`` is a concrete slot (0..253), not the 255 "nothing fed" sentinel."""
+    tray = getattr(state, "tray_now", None)
+    return tray is not None and 0 <= tray <= 253
+
+
+async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
+    """Reset an AMS wedged mid filament-change by re-issuing the firmware's own
+    CONTINUE (a ``resume``), then read the outcome. Runs at the TOP of every
+    candidate round, BEFORE the unload.
+
+    Returns one of:
+
+    ``skipped`` — not applicable this round: the AMS is idle (a normal round, no
+        wedge) OR the per-incident reset budget (:data:`_MAX_STUCK_RESETS`) is
+        spent. The caller falls through to the unload UNCHANGED — zero behaviour
+        change on a healthy AMS.
+    ``ok`` — the state machine moved and is back at PAUSE: proceed to the swap
+        round. Covers the firmware re-faulting and auto-pausing on its own (a) and
+        the hung case (c) where the change never completed so we re-paused it.
+    ``recovered`` — the firmware fully self-healed: fault gone, RUNNING stable, and
+        the pending change completed (a real tray feeds) or the AMS returned to
+        idle. No swap needed — the caller clears the jammed spool's out-of-rotation
+        flag and closes the incident as a success.
+    ``fail`` — the reset did NOT free the AMS (still wedged at the deadline, or the
+        resume send failed): the caller escalates ``stuck_reset_failed``.
+    ``abort`` — live state was lost mid-reset (disconnect / external actor).
+
+    Entry gate (else ``skipped``): the wedge must be LIVE — gcode_state PAUSE AND
+    ``ams_status_main`` non-idle (``!= AMS_STATUS_IDLE``). Wire evidence (009-H2S
+    2026-07-20): a resume is the ONLY verb that unwedged the stuck change after
+    FOUR unloads (recovery's two + the operator's two) were silently ignored — it
+    is literally the touchscreen CONTINUE for the standing 07008010.
+    """
+    pid = incident.printer_id
+    key = (pid, incident.job_id)
+
+    if _stuck_resets.get(key, 0) >= _MAX_STUCK_RESETS:
+        return "skipped"  # budget spent — one bounded reset per incident
+
+    st = _get_state(pid)
+    if st is None:
+        return "skipped"
+    if getattr(st, "state", None) != "PAUSE":
+        return "skipped"
+    initial_ams = getattr(st, "ams_status_main", None)
+    if initial_ams == AMS_STATUS_IDLE:
+        return "skipped"  # AMS idle → not a wedged change; the unload owns this round
+
+    # The AMS is wedged mid-change. Spend a reset and re-issue the firmware CONTINUE.
+    _stuck_resets[key] = _stuck_resets.get(key, 0) + 1
+    logger.info(
+        "spool_recovery: printer %s AMS wedged mid filament-change (state=PAUSE ams_status_main=%s tray_now=%s) "
+        "— publishing resume to reset the stuck state machine (reset %d/%d)",
+        pid,
+        initial_ams,
+        getattr(st, "tray_now", None),
+        _stuck_resets[key],
+        _MAX_STUCK_RESETS,
+    )
+    if not client.resume_print():
+        logger.warning(
+            "spool_recovery: printer %s reset resume_print send returned False (offline?) — reset failed", pid
+        )
+        return "fail"
+
+    deadline = _now() + incident.settings.step_timeout_s
+    saw_leave = False  # observed the machine leave PAUSE or change ams_status — the (a)/(d) discriminator
+    healthy_since: float | None = None
+    while _now() < deadline:
+        st = _get_state(pid)
+        if st is None:
+            return "abort"
+        state = getattr(st, "state", None)
+        ams = getattr(st, "ams_status_main", None)
+        if state != "PAUSE" or ams != initial_ams:
+            saw_leave = True
+        # (b) healthy self-heal — RUNNING, fault clear, change done or AMS idle,
+        #     held stable for _POST_RESUME_STABLE_S (mirrors _resume_and_confirm).
+        if state == "RUNNING" and not _feed_fault_live(st) and (_change_completed(st) or ams == AMS_STATUS_IDLE):
+            if healthy_since is None:
+                healthy_since = _now()
+            elif _now() - healthy_since >= _POST_RESUME_STABLE_S:
+                logger.info(
+                    "spool_recovery: printer %s firmware reset self-healed the change — RUNNING stable, fault clear, "
+                    "tray_now=%s ams_status_main=%s; no swap needed",
+                    pid,
+                    getattr(st, "tray_now", None),
+                    ams,
+                )
+                return "recovered"
+        else:
+            healthy_since = None
+            # (a) the firmware re-faulted and auto-paused on its own AFTER moving.
+            if state == "PAUSE" and saw_leave:
+                logger.info(
+                    "spool_recovery: printer %s state machine moved then re-PAUSEd after the reset "
+                    "(ams_status_main=%s) — proceeding to the swap round",
+                    pid,
+                    ams,
+                )
+                return "ok"
+        await asyncio.sleep(_POLL_INTERVAL_S)
+
+    # Deadline reached.
+    st = _get_state(pid)
+    if st is None:
+        return "abort"
+    state = getattr(st, "state", None)
+    ams = getattr(st, "ams_status_main", None)
+    if state == "RUNNING":
+        if not _feed_fault_live(st) and (_change_completed(st) or ams == AMS_STATUS_IDLE):
+            logger.info(
+                "spool_recovery: printer %s firmware reset left the print RUNNING and healthy at the deadline "
+                "(tray_now=%s ams_status_main=%s); no swap needed",
+                pid,
+                getattr(st, "tray_now", None),
+                ams,
+            )
+            return "recovered"
+        # (c) THE LIVE 009 HUNG CASE: RUNNING but the change never completed and the
+        #     fault stands (it sat like this ~2.5 min). Re-pause it ourselves so the
+        #     proven unload→swap→resume round can run.
+        logger.info(
+            "spool_recovery: printer %s hung RUNNING in an incomplete filament-change after the reset "
+            "(tray_now=%s ams_status_main=%s fault_live=%s) — self-pausing to run the swap round",
+            pid,
+            getattr(st, "tray_now", None),
+            ams,
+            _feed_fault_live(st),
+        )
+        if client.pause_print() and await _await_state(pid, {"PAUSE"}, incident.settings.step_timeout_s):
+            return "ok"
+        logger.warning("spool_recovery: printer %s could not re-pause after the reset — escalating", pid)
+        return "fail"
+    if state == "PAUSE" and saw_leave:
+        return "ok"  # re-faulted and re-paused right at the deadline
+    # (d) the state machine never moved — still wedged (PAUSE + non-idle) at the
+    #     deadline without ever leaving. A resume cannot free it; hands are needed.
+    logger.warning(
+        "spool_recovery: printer %s AMS never left the wedged change after the reset (state=%s ams_status_main=%s) "
+        "— escalating stuck_reset_failed",
+        pid,
+        state,
+        ams,
+    )
+    return "fail"
 
 
 def _unload_skippable(state) -> bool:
@@ -1474,12 +1708,20 @@ async def _describe_slot(db: AsyncSession, printer_id: int, global_tray: int | N
     return f"AMS{ams_id} slot {tray_id}"
 
 
-async def _succeed(incident: RecoveryIncident, target: int) -> None:
-    """Recovery landed: clear waiting_reason, rewrite the item's ams_mapping
-    (jammed → replacement), and fire the success notification.
+async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = True) -> None:
+    """Recovery landed: clear waiting_reason and close the incident as a success.
 
     Re-arms dedup (a genuine second tangle in the same job must be handled) and
-    counts the success toward the per-job flap cap.
+    counts the recovery toward the per-job flap cap — the bookkeeping is identical
+    whether or not a swap happened.
+
+    ``swapped`` (default True) is the ordinary jammed → replacement swap: rewrite
+    the item's ams_mapping and fire the ``spool_recovery_succeeded`` notification
+    (its copy is swap-and-out-of-rotation framed). ``swapped=False`` is the W1
+    no-swap self-heal (a firmware reset freed the wedged change on the SAME feeder,
+    ``target == jammed``): the mapping is unchanged and the swap-framed template —
+    which would claim a swap AND that the donor is out of rotation, both false here
+    — is deliberately NOT sent; the cleared pause + INFO log are the signal.
     """
     from backend.app.core.database import async_session
     from backend.app.models.printer import Printer
@@ -1492,34 +1734,45 @@ async def _succeed(incident: RecoveryIncident, target: int) -> None:
 
     try:
         async with async_session() as db:
-            from_desc = await _describe_slot(db, incident.printer_id, incident.jammed_global_tray)
-            to_desc = await _describe_slot(db, incident.printer_id, target)
             item = await db.get(PrintQueueItem, incident.item_id)
             if item is not None:
                 item.waiting_reason = None
-                item.ams_mapping = _rewrite_mapping(item.ams_mapping, incident.jammed_global_tray, target)
+                if swapped:
+                    item.ams_mapping = _rewrite_mapping(item.ams_mapping, incident.jammed_global_tray, target)
                 await db.commit()
-            printer = await db.get(Printer, incident.printer_id)
-            printer_name = (printer.name if printer else None) or f"printer {incident.printer_id}"
-            try:
-                await notification_service.on_spool_recovery_succeeded(
-                    printer_id=incident.printer_id,
-                    printer_name=printer_name,
-                    job_name=incident.job_name,
-                    layer=incident.layer_at_fault,
-                    from_spool=from_desc,
-                    to_spool=to_desc,
-                    db=db,
-                )
-            except Exception:  # noqa: BLE001 — notification failure is non-fatal
-                logger.exception("spool_recovery: success notification failed for printer %s", incident.printer_id)
-        logger.info(
-            "spool_recovery: printer %s RECOVERED at layer %s — swapped %s → %s and resumed",
-            incident.printer_id,
-            incident.layer_at_fault,
-            incident.jammed_global_tray,
-            target,
-        )
+            if swapped:
+                from_desc = await _describe_slot(db, incident.printer_id, incident.jammed_global_tray)
+                to_desc = await _describe_slot(db, incident.printer_id, target)
+                printer = await db.get(Printer, incident.printer_id)
+                printer_name = (printer.name if printer else None) or f"printer {incident.printer_id}"
+                try:
+                    await notification_service.on_spool_recovery_succeeded(
+                        printer_id=incident.printer_id,
+                        printer_name=printer_name,
+                        job_name=incident.job_name,
+                        layer=incident.layer_at_fault,
+                        from_spool=from_desc,
+                        to_spool=to_desc,
+                        db=db,
+                    )
+                except Exception:  # noqa: BLE001 — notification failure is non-fatal
+                    logger.exception("spool_recovery: success notification failed for printer %s", incident.printer_id)
+        if swapped:
+            logger.info(
+                "spool_recovery: printer %s RECOVERED at layer %s — swapped %s → %s and resumed",
+                incident.printer_id,
+                incident.layer_at_fault,
+                incident.jammed_global_tray,
+                target,
+            )
+        else:
+            logger.info(
+                "spool_recovery: printer %s RECOVERED at layer %s — firmware reset self-healed the wedged change "
+                "on feeder %s (no swap)",
+                incident.printer_id,
+                incident.layer_at_fault,
+                incident.jammed_global_tray,
+            )
     except Exception:  # noqa: BLE001 — never crash the driver
         logger.exception("spool_recovery: succeed handler failed for printer %s", incident.printer_id)
 
@@ -1563,9 +1816,65 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
                 )
             except Exception:  # noqa: BLE001 — notification failure is non-fatal
                 logger.exception("spool_recovery: failed notification error for printer %s", incident.printer_id)
+
+            # W2: durably record this escalation and quarantine the printer if its
+            # AMS keeps escalating within the window (reuse the SAME session).
+            await _record_escalation_and_maybe_quarantine(db, incident, reason)
         logger.warning("spool_recovery: printer %s ESCALATED (%s) — left PAUSED", incident.printer_id, reason)
     except Exception:  # noqa: BLE001 — never crash the driver
         logger.exception("spool_recovery: escalate handler failed for printer %s", incident.printer_id)
+
+
+async def _record_escalation_and_maybe_quarantine(db: AsyncSession, incident: RecoveryIncident, reason: str) -> None:
+    """Record one durable ``recovery_escalation`` row, then quarantine the printer
+    when it has crossed :data:`_JAM_QUARANTINE_THRESHOLD` escalations within
+    :data:`_JAM_QUARANTINE_WINDOW_H` hours — a recurring AMS jam is hardware (buffer
+    / feeder), not a spool the swap machine can fix. Counting from the durable
+    ledger survives the restarts the in-memory latch cannot.
+
+    Called from :func:`_escalate` only — an operator takeover (:func:`_abort`)
+    deliberately records nothing. Best-effort: any failure here must NOT break the
+    escalation that called it (the printer is already left PAUSED regardless).
+    ``farm_policy`` is lazy-imported (function-level service import, the module's
+    idiom, and it keeps the quarantine path off the import graph).
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import func as sa_func
+
+    from backend.app.models.recovery_escalation import RecoveryEscalation
+    from backend.app.services import farm_policy
+
+    try:
+        now = datetime.utcnow()
+        db.add(
+            RecoveryEscalation(
+                printer_id=incident.printer_id,
+                created_at=now,
+                reason=reason,
+                code=incident.code or None,
+            )
+        )
+        await db.commit()
+
+        window_start = now - timedelta(hours=_JAM_QUARANTINE_WINDOW_H)
+        count = int(
+            await db.scalar(
+                select(sa_func.count())
+                .select_from(RecoveryEscalation)
+                .where(RecoveryEscalation.printer_id == incident.printer_id)
+                .where(RecoveryEscalation.created_at >= window_start)
+            )
+            or 0
+        )
+        if count >= _JAM_QUARANTINE_THRESHOLD:
+            q_reason = (
+                f"Repeated AMS jam escalations ({count} in {_JAM_QUARANTINE_WINDOW_H}h) — AMS hardware "
+                "suspected (buffer/feeder). Inspect the filament path, then Recover & resume."
+            )
+            await farm_policy.quarantine_printer(db, incident.printer_id, q_reason, failure_count=count)
+    except Exception:  # noqa: BLE001 — quarantine bookkeeping must never break the escalation
+        logger.exception("spool_recovery: repeat-jam quarantine bookkeeping failed for printer %s", incident.printer_id)
 
 
 async def _abort(incident: RecoveryIncident) -> None:

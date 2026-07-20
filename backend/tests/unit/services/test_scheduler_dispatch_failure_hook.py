@@ -107,6 +107,20 @@ class TestFailQueueItemHook:
         assert retries[0].retry_count == 1
         assert retries[0].printer_id == printer.id  # printer-pinned run keeps the pin
 
+    async def test_clears_stale_waiting_reason_on_failure(self, db_session):
+        """W4b: a dispatch-time failure NULLs a stale hold token in the SAME update
+        that sets the terminal status (on_terminal mocked to isolate this clear)."""
+        item = PrintQueueItem(printer_id=5, status="printing", plate_id=1, position=1, waiting_reason="no_usb_drive")
+        db_session.add(item)
+        await db_session.commit()
+
+        with patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock):
+            await scheduler._fail_queue_item(db_session, item, "boom")
+
+        await db_session.refresh(item)
+        assert item.status == "failed"
+        assert item.waiting_reason is None
+
     async def test_dispatch_failure_on_non_farm_item_is_noop(self, db_session):
         item = PrintQueueItem(batch_id=None, printer_id=5, status="printing", plate_id=1, position=1)
         db_session.add(item)

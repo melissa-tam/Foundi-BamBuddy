@@ -834,6 +834,11 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
             item.manual_start = False
         elif action == "abort":
             item.status = "cancelled"
+            # Terminal-transition hygiene (W4b): a run-abort cancels PENDING items
+            # directly (they never flow through farm_policy.on_terminal), so any
+            # scheduler hold token (filament_short, capability block, stagger_hold…)
+            # must be cleared here or it survives on a cancelled row forever.
+            item.waiting_reason = None
 
     run.status = {"pause": "paused", "resume": "active", "abort": "cancelled"}[action]
     if action == "resume":

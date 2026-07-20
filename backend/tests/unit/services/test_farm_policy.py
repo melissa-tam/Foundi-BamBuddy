@@ -1502,3 +1502,84 @@ class TestFaEjectCooldownGate:
             await farm_policy._dispatch_remote_eject(db_session, batch, fa)
         assert exc.value.status_code == 409
         assert "not connected" in exc.value.detail
+
+
+class TestTerminalWaitingReasonHygiene:
+    """W4b: a farm unit reaching a terminal status through ``on_terminal`` must not
+    keep a stale hold token (the 2026-07-20 completed/cancelled rows still flagged
+    spool_jam_recovery_failed / printer_offline_stalled / print_paused_stalled)."""
+
+    async def _held_item(self, db, batch, prof, *, status, reason, printer_id=3, pos=1):
+        item = PrintQueueItem(
+            batch_id=batch.id,
+            status=status,
+            first_article=False,
+            printer_id=printer_id,
+            eject_profile_id=prof.id,
+            plate_id=1,
+            position=pos,
+            waiting_reason=reason,
+            completed_at=datetime.now(timezone.utc),
+        )
+        db.add(item)
+        await db.commit()
+        return item
+
+    async def test_completed_clears_stale_waiting_reason(self, db_session):
+        batch, prof = await _mk_run(db_session, quantity=1, printer_ids=[3], require_fa=False)
+        item = await self._held_item(db_session, batch, prof, status="completed", reason="spool_jam_recovery_failed")
+        await farm_policy.on_terminal(db_session, 3, item.id, "completed")
+        await db_session.refresh(item)
+        assert item.waiting_reason is None
+
+    async def test_failed_clears_stale_waiting_reason(self, db_session):
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False)
+        item = await self._held_item(db_session, batch, prof, status="failed", reason="printer_offline_stalled")
+        await farm_policy.on_terminal(db_session, 3, item.id, "failed")
+        await db_session.refresh(item)
+        assert item.waiting_reason is None
+
+    async def test_cancelled_clears_stale_waiting_reason(self, db_session):
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False)
+        item = await self._held_item(db_session, batch, prof, status="cancelled", reason="print_paused_stalled", pos=2)
+        await farm_policy.on_terminal(db_session, 3, item.id, "cancelled")
+        await db_session.refresh(item)
+        assert item.waiting_reason is None
+
+    async def test_only_the_transitioning_unit_is_cleared(self, db_session):
+        """The clear targets the exact unit that went terminal — a still-printing
+        (non-terminal) sibling keeps its own waiting_reason."""
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False)
+        done = await self._held_item(
+            db_session, batch, prof, status="completed", reason="print_paused_stalled", printer_id=3, pos=1
+        )
+        sibling = await self._held_item(
+            db_session, batch, prof, status="printing", reason="spool_jam_recovery_failed", printer_id=4, pos=2
+        )
+        await farm_policy.on_terminal(db_session, 3, done.id, "completed")
+        await db_session.refresh(done)
+        await db_session.refresh(sibling)
+        assert done.waiting_reason is None
+        assert sibling.status == "printing"
+        assert sibling.waiting_reason == "spool_jam_recovery_failed"  # untouched — not terminal
+
+    async def test_non_farm_terminal_leaves_waiting_reason(self, db_session):
+        """A non-farm batch (sku_file_id NULL) early-returns before the clear — the
+        hygiene is scoped to farm terminal transitions only."""
+        batch = PrintBatch(name="plain", quantity=1, status="active", target_units=1)
+        db_session.add(batch)
+        await db_session.flush()
+        item = PrintQueueItem(
+            batch_id=batch.id,
+            status="cancelled",
+            printer_id=3,
+            plate_id=1,
+            position=1,
+            waiting_reason="print_paused_stalled",
+            completed_at=datetime.now(timezone.utc),
+        )
+        db_session.add(item)
+        await db_session.commit()
+        await farm_policy.on_terminal(db_session, 3, item.id, "cancelled")
+        await db_session.refresh(item)
+        assert item.waiting_reason == "print_paused_stalled"  # untouched (non-farm)

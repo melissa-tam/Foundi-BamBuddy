@@ -79,6 +79,16 @@ logger = logging.getLogger(__name__)
 # to a race, not a statement that an identify is still active.
 _IDENTIFY_ACTIVE_S = 30
 
+# The ``tray_now`` sentinel bambu_mqtt.PrinterState uses for "no filament engaged"
+# (``tray_now: int = 255``; the client's ``ams_refresh_tray`` guard is literally
+# ``tray_now != 255``). bambu_mqtt exposes no named constant or predicate for it, so —
+# per the fork's mirror-don't-duplicate rule — the value lives ONCE here, consumed only
+# by :func:`_filament_engaged`, whose docstring names the client guard it mirrors. If
+# bambu_mqtt later grows a ``TRAY_UNLOADED`` constant / ``filament_engaged`` predicate,
+# import it and delete this (the single-origin treatment ``TRAY_PRESENT_STATES`` and
+# ``AMS_STATUS_IDENTIFYING`` already get above).
+_TRAY_UNLOADED = 255
+
 # --- Module-level edge state (matches the fork's other event-edge bookkeeping,
 #     e.g. farm_staging._tray_signatures). Lost on restart; startup priming and
 #     the first-push seeding tolerate that. -----------------------------------
@@ -360,6 +370,30 @@ def unit_drying(printer_id: int, ams_id: int) -> bool:
         return False
 
 
+def _filament_engaged(printer_id: int) -> bool:
+    """True while filament is loaded in the extruder path — a MIRROR of the client's own
+    ``BambuMQTTClient.ams_refresh_tray`` guard ``self.state.tray_now != 255``.
+
+    A commanded ``ams_get_rfid`` has to move filament, so the client REFUSES one (with a
+    WARNING) whenever any tray is engaged — regardless of which slot the read targets.
+    Its refusal message even names the ENGAGED slot (decoded from ``tray_now``), not the
+    slot asked for, so two eligible tagged slots swept while one is engaged produce two
+    IDENTICAL warnings in the same instant (the live 07-20 double log). Pre-checking the
+    same predicate here lets the need-driven sweep / idle-gain re-read defer QUIETLY
+    instead of provoking that (doubled) WARNING after the fact.
+
+    Reads the live ``PrinterState.tray_now`` via ``printer_manager.get_status`` — the
+    exact field the client guards on (``get_status`` returns ``client.state``), so this
+    stays single-origin with the guard. A missing/None value reads as unloaded so a
+    partial state never false-blocks a read; the client's own guard remains the backstop.
+    Never raises — an unreadable state is treated as not-engaged."""
+    try:
+        tray_now = getattr(printer_manager.get_status(printer_id), "tray_now", _TRAY_UNLOADED)
+    except Exception:  # noqa: BLE001 — must never break the identify path
+        return False
+    return tray_now is not None and tray_now != _TRAY_UNLOADED
+
+
 # --- Assignment context ----------------------------------------------------
 
 
@@ -524,6 +558,29 @@ async def command_identify(
     client = printer_manager.get_client(printer_id)
     if client is None:
         return False, "Printer not connected"
+
+    # Engaged-filament pre-check — NEED-driven paths only (terminal sweep, idle gain).
+    # The client refuses an ams_get_rfid while any filament is loaded (tray_now != 255)
+    # and logs a WARNING that names the engaged slot — twice when two tagged slots are
+    # eligible (see :func:`_filament_engaged`). Defer QUIETLY here and stamp NOTHING (no
+    # identity-learned, no echo arm, no discovery stamp): the slot's eligibility is left
+    # untouched so the NEXT terminal retries it once filament is no longer engaged —
+    # ``rfid_refresh`` re-derives from the live tag, ``discovery`` keeps its unanswered
+    # cycle. Operator bypass (``enforce_need=False``) is deliberately NOT pre-checked:
+    # explicit intent still reaches the client and gets its verbatim "Please unload
+    # filament first" refusal, never a silent skip — engaged-filament is a wire-safety
+    # refusal like drying/identifying, which the doctrine keeps with the client there.
+    if enforce_need and _filament_engaged(printer_id):
+        logger.debug(
+            "[Printer %s] identify deferred: AMS%d slot%d (source=%s, reason=%s) — "
+            "filament engaged; eligibility preserved for the next terminal",
+            printer_id,
+            ams_id,
+            tray_id,
+            source,
+            reason or "operator",
+        )
+        return False, "filament engaged"
 
     ok, msg = client.ams_refresh_tray(ams_id, tray_id)
     if ok:
