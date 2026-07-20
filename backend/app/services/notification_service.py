@@ -2295,6 +2295,7 @@ class NotificationService:
         db: AsyncSession,
         *,
         is_feed_fault: bool = True,
+        runout_slot: str | None = None,
     ):
         """Fire when a mid-print feed fault / runout could NOT be auto-recovered.
 
@@ -2307,7 +2308,8 @@ class NotificationService:
         seeded jam template; a filament RUNOUT (``is_feed_fault=False``) gets
         runout-framed copy built in backend English here — there is no runout
         template seeded and the jam wording ("Spool jam NOT recovered") is wrong
-        for an empty spool."""
+        for an empty spool. ``runout_slot`` (e.g. "AMS A slot 3") names the slot to
+        refill when the firmware attributed it."""
         providers = await self._get_providers_for_event(db, "on_spool_recovery_failed", printer_id)
         if not providers:
             return
@@ -2321,10 +2323,11 @@ class NotificationService:
         if is_feed_fault:
             title, message = await self._build_message_from_template(db, "spool_recovery_failed", variables)
         else:
+            slot_txt = f" into {runout_slot}" if runout_slot else ""
             title = f"Filament runout NOT recovered — {printer_name}"
             message = (
-                f"{printer_name}: '{job_name}' is left PAUSED. Filament ran out and no usable "
-                "replacement spool was found — load filament and resume on the printer."
+                f"{printer_name}: '{job_name}' is left PAUSED. Filament ran out and the printer only "
+                f"accepts new filament in the SAME slot — insert filament{slot_txt} and resume on the printer."
             )
         await self._send_to_providers(
             providers,

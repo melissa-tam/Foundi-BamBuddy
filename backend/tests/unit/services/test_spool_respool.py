@@ -28,6 +28,7 @@ from backend.app.services.spool_respool import (
     capture_backup_swap,
     mark_spent_on_runout,
     maybe_auto_or_prompt_respool,
+    note_commanded_load,
     rebroadcast_unresolved_respool_prompts,
     respool_tag,
     should_evaluate_respool,
@@ -388,7 +389,7 @@ async def test_mark_spent_via_ams_mapping(db_session, printer_factory):
 
     assert marked is not None and marked.id == spool.id
     assert marked.spent_at is not None
-    assert marked.weight_used == 1000  # floored to label
+    assert marked.weight_used == 400  # true ledger PRESERVED — the label floor is gone
 
 
 @pytest.mark.asyncio
@@ -510,26 +511,184 @@ async def test_mark_spent_ignores_non_runout_codes(db_session, printer_factory):
     assert await mark_spent_on_runout(db_session, printer.id, {"0300_4057"}, state) is None
 
 
-@pytest.mark.asyncio
-async def test_backup_swap_capture(db_session, printer_factory):
-    """tray_now leaving a still-present tray during RUNNING marks that spool spent."""
-    printer = await printer_factory()
-    spool = Spool(material="PETG", label_weight=1000, core_weight=250, weight_used=500)
+# -- Tier 1: backup-swap detector (stable-feeder + pending-confirm rebuild) ----
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Drive spool_respool._monotonic so the 60 s swap-confirm windows advance
+    without wall-clock waits."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(spool_respool, "_monotonic", lambda: clock["t"])
+    return clock
+
+
+def _running(tray_now, *, present=(0, 1, 2)):
+    """A RUNNING printer state with every ``present`` AMS tray seated (non-empty
+    tray_type), feeding ``tray_now``."""
+    state = MagicMock()
+    state.state = "RUNNING"
+    state.tray_now = tray_now
+    state.raw_data = {"ams": [{"id": 0, "tray": [{"id": t, **_tray()} for t in present]}]}
+    return state
+
+
+async def _bind_at(db, printer_id, ams_id, tray_id, *, weight_used=500.0):
+    spool = Spool(material="PETG", label_weight=1000, core_weight=250, weight_used=weight_used)
     spool.k_profiles = []
     spool.assignments = []
-    db_session.add(spool)
-    await db_session.flush()
-    await _assign(db_session, printer.id, 0, 0, spool.id)
-    await db_session.commit()
+    db.add(spool)
+    await db.flush()
+    await _assign(db, printer_id, ams_id, tray_id, spool.id)
+    await db.commit()
+    return spool
 
-    # AMS still shows tray 0 present (exist-bit proxy) after the swap to tray 1.
-    state1 = _make_state(0, 0, _tray(), gcode_state="RUNNING", tray_now=0)
-    assert await capture_backup_swap(db_session, printer.id, state1) is None  # seeds the edge
 
-    state2 = _make_state(0, 0, _tray(), gcode_state="RUNNING", tray_now=1)
-    marked = await capture_backup_swap(db_session, printer.id, state2)
+async def _establish_stable_feeder(db, printer_id, tray, clock, *, present=(0, 1, 2)):
+    """Two RUNNING pushes ≥ _SWAP_CONFIRM_S apart make ``tray`` the stable feeder."""
+    await capture_backup_swap(db, printer_id, _running(tray, present=present))
+    clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    await capture_backup_swap(db, printer_id, _running(tray, present=present))
+    assert spool_respool._stable_feeder.get(printer_id) == tray
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_genuine_switch_stamps_after_confirm(db_session, printer_factory, fake_clock):
+    """A genuine firmware backup switch (the stable feeder ran dry, a sibling feeds
+    on for ≥ 60 s, the departed still present) STILL marks the departed spool spent —
+    and preserves its true grams (the label floor is gone)."""
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=500.0)
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+
+    # Edge off the stable feeder (0 → 1) opens a pending swap; not yet confirmed.
+    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None
+
+    # The new tray feeds stably past the confirm window with tray 0 still present.
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    marked = await capture_backup_swap(db_session, printer.id, _running(1))
     assert marked is not None and marked.id == spool.id
     assert marked.spent_at is not None
+    assert marked.weight_used == 500.0  # true ledger preserved
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_no_stamp_before_confirm_window(db_session, printer_factory, fake_clock):
+    """Within the confirm window the pending swap has NOT stamped yet."""
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0)
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+
+    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None  # opens pending
+    fake_clock["t"] += 10  # still < 60 s
+    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None
+    assert (await db_session.get(Spool, spool.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_drops_on_flap_back_to_departed(db_session, printer_factory, fake_clock):
+    """tray_now returning to the departed feeder = it's feeding again → drop, no stamp."""
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0)
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+
+    await capture_backup_swap(db_session, printer.id, _running(1))  # pending 0→1
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    marked = await capture_backup_swap(db_session, printer.id, _running(0))  # flapped back to 0
+    assert marked is None
+    assert (await db_session.get(Spool, spool.id)).spent_at is None
+    assert printer.id not in spool_respool._pending_swaps  # dropped
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_drops_when_departed_no_longer_present(db_session, printer_factory, fake_clock):
+    """The departed spool physically gone (tray reads empty) = ordinary unload → drop."""
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0)
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+
+    await capture_backup_swap(db_session, printer.id, _running(1))  # pending 0→1
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    # tray 0 no longer present in the AMS payload → departed spool removed.
+    marked = await capture_backup_swap(db_session, printer.id, _running(1, present=(1, 2)))
+    assert marked is None
+    assert (await db_session.get(Spool, spool.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_drops_on_state_change(db_session, printer_factory, fake_clock):
+    """Leaving RUNNING before the window elapses drops the pending swap."""
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0)
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+
+    await capture_backup_swap(db_session, printer.id, _running(1))  # pending 0→1
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    paused = _running(1)
+    paused.state = "PAUSE"
+    assert await capture_backup_swap(db_session, printer.id, paused) is None
+    assert (await db_session.get(Spool, spool.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_transient_walk_no_false_stamp(db_session, printer_factory, fake_clock):
+    """The 011 pattern: stable feeder 2, then tray_now WALKS 2→1→0 during the
+    firmware's runout handling. The 1→0 edge departs a NON-stable value (1) so it
+    never opens a pending, and the 2→1 pending drops when tray_now moves on — so
+    tray 1's still-full spool is NOT falsely stamped."""
+    printer = await printer_factory()
+    tray1_spool = await _bind_at(db_session, printer.id, 0, 1, weight_used=200.0)  # must NOT be stamped
+    await _establish_stable_feeder(db_session, printer.id, 2, fake_clock)
+
+    # Walk 2→1 (opens pending 2→1) then 1→0 (prev 1 is not the stable feeder → nothing).
+    await capture_backup_swap(db_session, printer.id, _running(1))
+    marked = await capture_backup_swap(db_session, printer.id, _running(0))
+    assert marked is None
+    assert (await db_session.get(Spool, tray1_spool.id)).spent_at is None  # tray 1 untouched
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_commanded_load_suppressed(db_session, printer_factory, fake_clock):
+    """Our own commanded load to the new tray consumes the marker and never opens a
+    pending swap — the departed spool is never stamped (the 006 false-stamp mode)."""
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0)
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+
+    note_commanded_load(printer.id, 1)  # WE issued the load to tray 1
+    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None  # edge 0→1 suppressed
+    assert printer.id not in spool_respool._pending_swaps  # no pending opened
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None
+    assert (await db_session.get(Spool, spool.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_commanded_load_ttl_expiry_rearms(db_session, printer_factory, fake_clock):
+    """A commanded-load marker older than _COMMANDED_LOAD_TTL_S no longer suppresses:
+    a later genuine switch to that same tray stamps normally."""
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0)
+
+    note_commanded_load(printer.id, 1)  # stale marker at t0
+    fake_clock["t"] += spool_respool._COMMANDED_LOAD_TTL_S + 1  # let it expire
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+
+    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None  # opens pending (marker expired)
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    marked = await capture_backup_swap(db_session, printer.id, _running(1))
+    assert marked is not None and marked.id == spool.id  # stamped — TTL expiry re-armed detection
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_noop_when_not_running(db_session, printer_factory):
+    """Not mid-print: the edge tracker updates but nothing stamps (baseline)."""
+    printer = await printer_factory()
+    idle = MagicMock()
+    idle.state = "IDLE"
+    idle.tray_now = 1
+    idle.raw_data = {"ams": [{"id": 0, "tray": [{"id": 0, **_tray()}]}]}
+    assert await capture_backup_swap(db_session, printer.id, idle) is None
 
 
 # -- Tier 2 / 3 gate ---------------------------------------------------------
@@ -544,6 +703,7 @@ async def test_gate_spent_and_loaded_auto_respools(db_session, printer_factory, 
     from backend.app.api.routes.settings import set_setting
 
     await set_setting(db_session, "respool_last_brand", "Polymaker")
+    await set_setting(db_session, "respool_auto_enabled", "true")  # Tier-2 auto path under test
     await db_session.commit()
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
@@ -626,6 +786,7 @@ async def test_gate_auto_sibling_conflict_falls_back_to_prompt(db_session, print
     from backend.app.api.routes.settings import set_setting
 
     await set_setting(db_session, "respool_last_brand", "Polymaker")
+    await set_setting(db_session, "respool_auto_enabled", "true")  # exercise the auto→sibling-conflict path
     await db_session.commit()
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(tag_uid=DONOR_TAG_UID, state=11)))
@@ -708,6 +869,7 @@ async def test_gate_tier2_empty_last_brand_uses_tagless_default(db_session, prin
         "tagless_default_filament",
         '{"brand": "eSun", "material": "PETG", "subtype": "HF", "rgba": "00FF00FF"}',
     )
+    await set_setting(db_session, "respool_auto_enabled", "true")  # Tier-2 auto brand-fallback under test
     await db_session.commit()
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
@@ -730,6 +892,7 @@ async def test_gate_tier2_both_empty_falls_back_to_prompt(db_session, printer_fa
     from backend.app.api.routes.settings import set_setting
 
     await set_setting(db_session, "tagless_default_filament", "")  # explicit off
+    await set_setting(db_session, "respool_auto_enabled", "true")  # auto ON, but no brand to auto with
     await db_session.commit()
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
@@ -1273,3 +1436,72 @@ async def test_rebroadcast_noop_in_spoolman_mode(db_session, printer_factory, mo
     sent, send = _capture_send()
     assert await rebroadcast_unresolved_respool_prompts(db_session, send) == 0
     assert sent == []
+
+
+# -- W3: respool_auto_enabled quarantine (Tier-2 auto OFF by default) ----------
+
+
+@pytest.mark.asyncio
+async def test_gate_spent_loaded_prompts_when_auto_disabled(db_session, printer_factory, monkeypatch):
+    """respool_auto_enabled defaults OFF: a spent+loaded tag arrival broadcasts the
+    one-click PROMPT instead of silently auto-minting a fresh row. A last brand IS
+    set, proving the gate is the toggle — not a missing brand."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=True)
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db_session, "respool_last_brand", "Polymaker")  # auto WOULD work if enabled
+    await db_session.commit()
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
+    broadcasts = _spy_broadcast(monkeypatch)
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
+
+    assert result is None  # NOT auto-respooled
+    assert any(b["type"] == "respool_prompt" for b in broadcasts)  # prompted instead
+    assert (await db_session.get(Spool, donor.id)).archived_at is None  # donor untouched
+
+
+# -- W3: firmware slot attribution outranks tray_now/mapping inference ----------
+
+
+@pytest.mark.asyncio
+async def test_resolve_prefers_decoded_hms_slot_over_tray_now(db_session, printer_factory):
+    """A live 0700_2X00 runout HMS naming AMS0 slot3 (global tray 2) stamps THAT
+    spool even while tray_now and the mapping both point at tray 0."""
+    printer = await printer_factory()
+    at_tray0 = await _new_spool(db_session, weight_used=100)
+    at_tray2 = await _new_spool(db_session, weight_used=400)
+    await _assign(db_session, printer.id, 0, 0, at_tray0.id)
+    await _assign(db_session, printer.id, 0, 2, at_tray2.id)
+    await _single_feeder_item(db_session, printer.id, mapping="[0, -1, -1, -1]")
+    await db_session.commit()
+
+    state = _make_state(0, 0, _tray(), tray_now=0)  # tray_now/mapping both say tray 0
+    state.subtask_id = "job-hms"
+    # 0700_8011 trigger + the slot-naming fault (attr 0x07002200, code 0x20001 → AMS0 slot2).
+    state.hms_errors = [
+        HMSError(code="8011", attr=0x07000000, module=7, severity=2),
+        HMSError(code="0x20001", attr=0x07002200, module=7, severity=2),
+    ]
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state)
+
+    assert marked is not None and marked.id == at_tray2.id  # firmware-named slot won
+    assert (await db_session.get(Spool, at_tray0.id)).spent_at is None  # tray_now target untouched
+
+
+@pytest.mark.asyncio
+async def test_resolve_falls_back_to_tray_now_on_8011_only(db_session, printer_factory):
+    """The slot-agnostic 0700_8011 runout (no slot-naming HMS) falls back to the
+    live tray_now inference."""
+    printer = await printer_factory()
+    at_tray1 = await _new_spool(db_session, weight_used=400)
+    await _assign(db_session, printer.id, 0, 1, at_tray1.id)
+    await db_session.commit()
+
+    state = _make_state(0, 1, _tray(), tray_now=1)
+    state.subtask_id = "job-8011"
+    state.hms_errors = [HMSError(code="8011", attr=0x07000000, module=7, severity=2)]  # no slot attribution
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state)
+
+    assert marked is not None and marked.id == at_tray1.id  # tray_now fallback used

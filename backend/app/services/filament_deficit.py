@@ -436,11 +436,17 @@ async def compute_deficit_for_queue_item(
             if assignment is None or assignment.spool is None:
                 continue
             spool = assignment.spool
-            label_weight = float(spool.label_weight or 0)
-            weight_used = float(spool.weight_used or 0)
-            if label_weight <= 0:
-                continue
-            remaining = max(0.0, label_weight - weight_used)
+            if spool.spent_at is not None:
+                # A spent spool is KNOWN empty (remaining 0.0, not undetermined) — the
+                # spent stamp no longer floors weight_used, so an under-counted ledger
+                # must not read positive and let dispatch start a print on an empty roll.
+                remaining = 0.0
+            else:
+                label_weight = float(spool.label_weight or 0)
+                weight_used = float(spool.weight_used or 0)
+                if label_weight <= 0:
+                    continue
+                remaining = max(0.0, label_weight - weight_used)
 
         if remaining is None:
             # Unable to determine remaining grams — preserve pre-#1762 behaviour
@@ -534,6 +540,12 @@ async def compute_deficit_for_queue_item(
             spool = assignment.spool
             if spool is None:
                 grams_by_slot[slot_key] = None
+                continue
+            if spool.spent_at is not None:
+                # Spent → KNOWN empty: contributes 0.0 to the pool (NOT undetermined,
+                # which would make the identity open-ended and never block). The spent
+                # stamp no longer floors weight_used, so the ledger can't read positive.
+                grams_by_slot[slot_key] = 0.0
                 continue
             label_weight = float(spool.label_weight or 0)
             weight_used = float(spool.weight_used or 0)

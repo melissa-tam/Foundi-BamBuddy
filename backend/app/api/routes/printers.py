@@ -1992,6 +1992,9 @@ async def get_inventory_remain(
         # Keys are stringified global tray ids, matching the maps above, so the
         # PrintModal mirror can drop these trays from auto-match (spool_recovery).
         "out_of_rotation": {str(gtid): True for gtid, si in inv.items() if si.out_of_rotation},
+        # Spent (run-dry) trays — mirror of SlotInventory.spent so the PrintModal
+        # client mirror stops suggesting a spool the dispatcher already hard-excludes.
+        "spent": {str(gtid): True for gtid, si in inv.items() if si.spent},
     }
 
 
@@ -3825,6 +3828,13 @@ async def ams_load(
     client = printer_manager.get_client(printer_id)
     if not client:
         raise HTTPException(400, "Printer not connected")
+
+    # Mark this as an operator-commanded load so the backup-swap detector does not
+    # mistake the resulting tray_now edge for a firmware runout and spend the
+    # departed spool (spool_respool commanded-swap suppression).
+    from backend.app.services import spool_respool
+
+    spool_respool.note_commanded_load(printer_id, tray_id)
 
     success = client.ams_load_filament(tray_id)
     if not success:

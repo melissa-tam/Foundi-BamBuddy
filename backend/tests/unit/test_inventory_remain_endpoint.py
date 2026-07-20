@@ -93,7 +93,34 @@ class TestGetInventoryRemain:
         ):
             result = await _call_endpoint(db)
 
-        assert result == {"inventory_remain_g": {}, "first_loaded": {}, "out_of_rotation": {}}
+        assert result == {"inventory_remain_g": {}, "first_loaded": {}, "out_of_rotation": {}, "spent": {}}
+
+    @pytest.mark.asyncio
+    async def test_exposes_spent_flag_per_slot(self, db):
+        # D2: a spent (run-dry) slot is surfaced so the PrintModal client mirror stops
+        # suggesting a spool the dispatcher already hard-excludes. Only spent slots appear.
+        state = SimpleNamespace(raw_data={})
+        inv = {
+            0: SlotInventory(remaining_g=800.0, first_loaded_ord=None, spent=False),
+            3: SlotInventory(remaining_g=0.0, first_loaded_ord=None, spent=True),
+        }
+        with (
+            patch(
+                "backend.app.services.printer_manager.printer_manager.get_status",
+                return_value=state,
+            ),
+            patch(
+                "backend.app.services.print_scheduler.PrintScheduler._build_loaded_filaments",
+                return_value=[
+                    {"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False},
+                    {"ams_id": 0, "tray_id": 3, "global_tray_id": 3, "is_external": False},
+                ],
+            ),
+            _patch_inventory(inv),
+        ):
+            result = await _call_endpoint(db)
+
+        assert result["spent"] == {"3": True}  # only the spent slot appears
 
     @pytest.mark.asyncio
     async def test_spoolman_first_used_maps_to_first_loaded(self, db):

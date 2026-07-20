@@ -1119,6 +1119,7 @@ export function SettingsPage() {
         farm_offline_stall_minutes: localSettings.farm_offline_stall_minutes,
         farm_pause_stall_minutes: localSettings.farm_pause_stall_minutes,
         respool_prompt_threshold_g: localSettings.respool_prompt_threshold_g,
+        respool_auto_enabled: localSettings.respool_auto_enabled,
         farm_cooldown_stall_window_minutes: localSettings.farm_cooldown_stall_window_minutes,
         farm_cooldown_stall_epsilon_c: localSettings.farm_cooldown_stall_epsilon_c,
         farm_cooldown_max_hold_minutes: localSettings.farm_cooldown_max_hold_minutes,
@@ -5383,6 +5384,23 @@ export function SettingsPage() {
                     onChange={(e) => updateSetting('respool_prompt_threshold_g', Math.max(0, Math.min(1000, parseInt(e.target.value) || 0)))}
                     className="w-32 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
+                </div>
+                {/* Automatic re-spool on reused tags (W3.1) — default off: prompt
+                    instead of silently minting when a spent tag reappears. */}
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-white">{t('settings.respoolAutoEnabled')}</p>
+                    <p className="text-sm text-bambu-gray">{t('settings.respoolAutoEnabledDesc')}</p>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={localSettings.respool_auto_enabled ?? false}
+                      onChange={(e) => updateSetting('respool_auto_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                  </label>
                 </div>
               </CardContent>
             </Card>

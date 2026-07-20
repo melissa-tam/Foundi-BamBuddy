@@ -129,6 +129,7 @@ import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, ge
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
+import { wasFeedingTrayId, slotRanOut } from '../utils/slotStatus';
 import { OutOfRotationChip } from '../components/OutOfRotationChip';
 import { Collapsible } from '../components/Collapsible';
 import { ConnectionDiagnosticModal, DiagnosticChecklist } from '../components/ConnectionDiagnostic';
@@ -2086,6 +2087,10 @@ function PrinterCard({
   const effectiveTrayNow = (currentTrayNow !== undefined && currentTrayNow !== 255)
     ? currentTrayNow
     : cachedTrayNow.current;
+  // Tray that WAS feeding this job while the active green ring has cleared (a
+  // runout PAUSE flips tray_now to 255) — drives the dimmed "was feeding" ring so
+  // the operator can still see which slot to refill (W6). Undefined when no hint.
+  const wasFeedingTray = wasFeedingTrayId(status?.state, effectiveTrayNow, status?.last_loaded_tray);
 
   // Fetch smart plug for this printer
   const { data: smartPlug } = useQuery({
@@ -4997,11 +5002,17 @@ function PrinterCard({
                                 const activePrintSlotLabel = activePrintSlotIdx >= 0
                                   ? `P${activePrintSlotIdx + 1}`
                                   : null;
+                                // W6 status badges/ring for this slot.
+                                const wasFeeding = !isActive && wasFeedingTray === globalTrayId;
+                                const slotRanOutFlag = slotRanOut(status.hms_errors, ams.id, slotIdx);
+                                const spentCoreFlag = !!inventoryAssignment?.spool?.spent_at;
                                 // Slot visual content (goes inside hover card)
                                 const slotVisual = (
                                   <div
-                                    className={`relative w-full bg-bambu-dark-secondary rounded-lg p-1 text-center ${isEmpty ? 'opacity-50' : ''} ${isActive ? 'ring-2 ring-bambu-green ring-offset-1 ring-offset-bambu-dark' : ''}`}
+                                    className={`relative w-full bg-bambu-dark-secondary rounded-lg p-1 text-center ${isEmpty ? 'opacity-50' : ''} ${isActive ? 'ring-2 ring-bambu-green ring-offset-1 ring-offset-bambu-dark' : wasFeeding ? 'ring-2 ring-bambu-green/40 ring-offset-1 ring-offset-bambu-dark' : ''}`}
+                                    title={wasFeeding ? t('printers.slot.wasFeeding') : undefined}
                                   >
+                                    {wasFeeding && <span className="sr-only">{t('printers.slot.wasFeeding')}</span>}
                                     {activePrintSlotLabel && (
                                       <span
                                         aria-label={t('printers.activeJobSlot.ariaLabel', { n: activePrintSlotIdx + 1 })}
@@ -5019,6 +5030,8 @@ function PrinterCard({
                                       emptyKind={emptyKind}
                                       slotNumber={slotIdx + 1}
                                       outOfRotation={!!inventoryAssignment?.spool?.feed_fault_at}
+                                      ranOut={slotRanOutFlag}
+                                      spentCore={spentCoreFlag}
                                     />
                                     <div className="text-[9px] text-white font-bold truncate">
                                       {tray?.tray_type || t(emptyKind === 'reset' ? 'ams.slotUnconfigured' : 'ams.slotEmpty')}
@@ -5286,11 +5299,17 @@ function PrinterCard({
                         const htActivePrintSlotLabel = htActivePrintSlotIdx >= 0
                           ? `P${htActivePrintSlotIdx + 1}`
                           : null;
+                        // W6 status badges/ring for this HT slot.
+                        const htWasFeeding = !isActive && wasFeedingTray === globalTrayId;
+                        const htSlotRanOut = slotRanOut(status.hms_errors, ams.id, htSlotId);
+                        const htSpentCore = !!htInventoryAssignment?.spool?.spent_at;
                         // Slot visual content (goes inside hover card)
                         const slotVisual = (
                           <div
-                            className={`relative w-full bg-bambu-dark-secondary rounded-lg p-1 text-center ${isEmpty ? 'opacity-50' : ''} ${isActive ? 'ring-2 ring-bambu-green ring-offset-1 ring-offset-bambu-dark' : ''}`}
+                            className={`relative w-full bg-bambu-dark-secondary rounded-lg p-1 text-center ${isEmpty ? 'opacity-50' : ''} ${isActive ? 'ring-2 ring-bambu-green ring-offset-1 ring-offset-bambu-dark' : htWasFeeding ? 'ring-2 ring-bambu-green/40 ring-offset-1 ring-offset-bambu-dark' : ''}`}
+                            title={htWasFeeding ? t('printers.slot.wasFeeding') : undefined}
                           >
+                            {htWasFeeding && <span className="sr-only">{t('printers.slot.wasFeeding')}</span>}
                             {htActivePrintSlotLabel && (
                               <span
                                 aria-label={t('printers.activeJobSlot.ariaLabel', { n: htActivePrintSlotIdx + 1 })}
@@ -5308,6 +5327,8 @@ function PrinterCard({
                               emptyKind={emptyKind}
                               slotNumber={1}
                               outOfRotation={!!htInventoryAssignment?.spool?.feed_fault_at}
+                              ranOut={htSlotRanOut}
+                              spentCore={htSpentCore}
                             />
                             <div className="text-[9px] text-white font-bold truncate">
                               {tray?.tray_type || t(emptyKind === 'reset' ? 'ams.slotUnconfigured' : 'ams.slotEmpty')}
@@ -5694,6 +5715,7 @@ function PrinterCard({
                                     emptyKind={emptyKind}
                                     slotNumber={isDualNozzle ? (extTrayId === 254 ? 'L' : 'R') : slotTrayId + 1}
                                     outOfRotation={!!extInventoryAssignment?.spool?.feed_fault_at}
+                                    spentCore={!!extInventoryAssignment?.spool?.spent_at}
                                   />
                                   <div className={`text-[9px] font-bold truncate ${isEmpty ? 'text-white/40' : 'text-white'}`}>
                                     {extTray.tray_type || t('ams.slotEmpty')}

@@ -37,7 +37,11 @@ from backend.app.core.websocket import broadcast_production_run_changed
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.farm_correlation import WAITING_REASON_PLATE_VISION
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.spool_recovery import WAITING_REASON_FAILED, WAITING_REASON_RECOVERING
+from backend.app.services.spool_recovery import (
+    WAITING_REASON_FAILED,
+    WAITING_REASON_RECOVERING,
+    WAITING_REASON_RUNOUT,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,10 +75,14 @@ WAITING_REASON_PAUSED = "print_paused_stalled"
 # as ownership would leave the printer PAUSEd forever with the watchdog silenced.
 # The orphan is instead reclaimed below.
 #
-# WAITING_REASON_FAILED STAYS: escalation already fired its one-shot operator
-# notification and deliberately left the printer PAUSED for a human. Re-notifying it
-# through the pause-stall watch would just double up on a hold a human already owns.
-_ATTENDED_PAUSE_REASONS: frozenset[str] = frozenset({WAITING_REASON_PLATE_VISION, WAITING_REASON_FAILED})
+# WAITING_REASON_FAILED / WAITING_REASON_RUNOUT STAY: escalation already fired its
+# one-shot operator notification and deliberately left the printer PAUSED for a human
+# (a jam that couldn't be recovered, or a filament runout that needs a same-slot
+# refill). Re-notifying either through the pause-stall watch would just double up on a
+# hold a human already owns.
+_ATTENDED_PAUSE_REASONS: frozenset[str] = frozenset(
+    {WAITING_REASON_PLATE_VISION, WAITING_REASON_FAILED, WAITING_REASON_RUNOUT}
+)
 
 _DEFAULT_GRACE_MINUTES = 30
 _DEFAULT_PAUSE_GRACE_MINUTES = 15

@@ -8,6 +8,7 @@ import {
   type RespoolPromptMessage,
   type SpoolAutoAssignedMessage,
   type SpoolRespooledMessage,
+  type TaglessFreshPromptMessage,
 } from '../api/client';
 import { inventoryLocationsQueryKey } from '../utils/inventoryQueries';
 
@@ -464,6 +465,42 @@ export function useWebSocket() {
         const m = message as unknown as { printer_id?: number; ams_id?: number; tray_id?: number };
         window.dispatchEvent(
           new CustomEvent('respool-prompt-dismissed', {
+            detail: { printer_id: m.printer_id, ams_id: m.ams_id, tray_id: m.tray_id },
+          }),
+        );
+        break;
+      }
+
+      case 'tagless_fresh_prompt': {
+        // A tagless roll has been consumed past half its label weight after a
+        // qualified physical cycle — ask whether a FRESH roll is now on the slot
+        // (W5). Mirrors the `respool_prompt` window-event bridge; the backend
+        // ships the slot + spool + material data so `useTaglessFreshPrompt` needs
+        // no cache lookup.
+        const m = message as unknown as TaglessFreshPromptMessage;
+        window.dispatchEvent(
+          new CustomEvent<TaglessFreshPromptMessage>('tagless-fresh-prompt', {
+            detail: {
+              printer_id: m.printer_id,
+              ams_id: m.ams_id,
+              tray_id: m.tray_id,
+              spool_id: m.spool_id,
+              remaining_g: m.remaining_g,
+              material: m.material,
+              rgba: m.rgba,
+            },
+          }),
+        );
+        break;
+      }
+
+      case 'tagless_fresh_prompt_dismissed': {
+        // Another client answered the tagless fresh-roll prompt ("Same roll" or
+        // "Fresh roll"). Bridge the slot triple so `useTaglessFreshPrompt` clears
+        // the matching toast + queue entry on this client too.
+        const m = message as unknown as { printer_id?: number; ams_id?: number; tray_id?: number };
+        window.dispatchEvent(
+          new CustomEvent('tagless-fresh-prompt-dismissed', {
             detail: { printer_id: m.printer_id, ams_id: m.ams_id, tray_id: m.tray_id },
           }),
         );

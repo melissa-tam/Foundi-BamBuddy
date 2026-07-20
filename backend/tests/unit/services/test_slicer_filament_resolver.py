@@ -35,7 +35,7 @@ async def test_pfus_cloud_unavailable_preserves_setting_id():
         "backend.app.api.routes.cloud.build_authenticated_cloud",
         AsyncMock(return_value=None),
     ):
-        tray_info_idx, setting_id, sub_brand = await resolve_slicer_filament(
+        tray_info_idx, setting_id, sub_brand, temp_min, temp_max = await resolve_slicer_filament(
             db=db,
             current_user=None,
             slicer_filament="PFUS990b6e19965353",
@@ -56,7 +56,7 @@ async def test_pfcn_cloud_unavailable_preserves_setting_id():
         "backend.app.api.routes.cloud.build_authenticated_cloud",
         AsyncMock(return_value=None),
     ):
-        tray_info_idx, setting_id, sub_brand = await resolve_slicer_filament(
+        tray_info_idx, setting_id, sub_brand, temp_min, temp_max = await resolve_slicer_filament(
             db=db,
             current_user=None,
             slicer_filament="PFCN1234567890",
@@ -82,7 +82,7 @@ async def test_pfus_cloud_resolves_filament_id_regression_guard():
         "backend.app.api.routes.cloud.build_authenticated_cloud",
         AsyncMock(return_value=cloud_mock),
     ):
-        tray_info_idx, setting_id, sub_brand = await resolve_slicer_filament(
+        tray_info_idx, setting_id, sub_brand, temp_min, temp_max = await resolve_slicer_filament(
             db=db,
             current_user=MagicMock(),
             slicer_filament="PFUS990b6e19965353",
@@ -106,7 +106,7 @@ async def test_gfs_cloud_unavailable_resolves_via_normalize():
         "backend.app.api.routes.cloud.build_authenticated_cloud",
         AsyncMock(return_value=None),
     ):
-        tray_info_idx, setting_id, sub_brand = await resolve_slicer_filament(
+        tray_info_idx, setting_id, sub_brand, temp_min, temp_max = await resolve_slicer_filament(
             db=db,
             current_user=None,
             slicer_filament="GFSG02",
@@ -130,7 +130,7 @@ async def test_literal_material_name_clears_both():
         "backend.app.api.routes.cloud.build_authenticated_cloud",
         AsyncMock(return_value=None),
     ):
-        tray_info_idx, setting_id, sub_brand = await resolve_slicer_filament(
+        tray_info_idx, setting_id, sub_brand, temp_min, temp_max = await resolve_slicer_filament(
             db=db,
             current_user=None,
             slicer_filament="PETG",
@@ -140,3 +140,74 @@ async def test_literal_material_name_clears_both():
     assert tray_info_idx == ""
     assert setting_id == ""
     assert sub_brand is None
+
+
+class TestNozzleTempResolution:
+    """W4: the resolver returns the full wire-identity tuple and resolves temps in
+    tier order - spool-row temps -> tagless-default fingerprint -> MATERIAL_TEMPS."""
+
+    @pytest.mark.asyncio
+    async def test_returns_five_tuple(self):
+        db = MagicMock()
+        result = await resolve_slicer_filament(
+            db=db, current_user=None, slicer_filament="", slicer_filament_name=None, material="PETG"
+        )
+        assert len(result) == 5
+        _, _, _, tmin, tmax = result
+        assert isinstance(tmin, int) and isinstance(tmax, int)
+
+    @pytest.mark.asyncio
+    async def test_row_temps_win(self):
+        db = MagicMock()
+        _, _, _, tmin, tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament="",
+            slicer_filament_name=None,
+            material="PETG",
+            rgba="112233FF",
+            nozzle_temp_min=245,
+            nozzle_temp_max=265,
+        )
+        assert (tmin, tmax) == (245, 265)  # the spool row overrides every lower tier
+
+    @pytest.mark.asyncio
+    async def test_default_fingerprint_tier(self, monkeypatch):
+        # No row temps, fingerprint matches the default -> the default's pair.
+        from backend.app.services import spool_tagless
+
+        monkeypatch.setattr(spool_tagless, "default_temps_for_fingerprint", AsyncMock(return_value=(230, 270)))
+        db = MagicMock()
+        _, _, _, tmin, tmax = await resolve_slicer_filament(
+            db=db, current_user=None, slicer_filament="", slicer_filament_name=None, material="PETG", rgba="000000FF"
+        )
+        assert (tmin, tmax) == (230, 270)
+
+    @pytest.mark.asyncio
+    async def test_material_temps_fallback(self, monkeypatch):
+        # No row temps, no fingerprint match -> MATERIAL_TEMPS.
+        from backend.app.services import spool_tagless
+
+        monkeypatch.setattr(spool_tagless, "default_temps_for_fingerprint", AsyncMock(return_value=None))
+        db = MagicMock()
+        _, _, _, tmin, tmax = await resolve_slicer_filament(
+            db=db, current_user=None, slicer_filament="", slicer_filament_name=None, material="PETG", rgba="FF0000FF"
+        )
+        assert (tmin, tmax) == (220, 260)  # MATERIAL_TEMPS["PETG"]
+
+    @pytest.mark.asyncio
+    async def test_partial_row_temp_fills_from_material(self, monkeypatch):
+        # Only min set on the row -> max fills from MATERIAL_TEMPS (independent tiers).
+        from backend.app.services import spool_tagless
+
+        monkeypatch.setattr(spool_tagless, "default_temps_for_fingerprint", AsyncMock(return_value=None))
+        db = MagicMock()
+        _, _, _, tmin, tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament="",
+            slicer_filament_name=None,
+            material="PETG",
+            nozzle_temp_min=235,
+        )
+        assert (tmin, tmax) == (235, 260)

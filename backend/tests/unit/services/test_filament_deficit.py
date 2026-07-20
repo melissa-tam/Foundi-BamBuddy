@@ -576,9 +576,7 @@ class TestFilamentDeficitBackupAware:
 
     # ---- (j) preset-less BOUND spools now pool by tray identity --------------
     @pytest.mark.asyncio
-    async def test_backup_on_presetless_bound_spools_pool_by_tray_identity(
-        self, db_session, printer_factory, tmp_path
-    ):
+    async def test_backup_on_presetless_bound_spools_pool_by_tray_identity(self, db_session, printer_factory, tmp_path):
         """The old unique-key rule is gone: two BOUND spools with no
         ``slicer_filament`` preset, sitting in live trays of the same identity,
         now pool (510 g ≥ 200 g) → no deficit."""
@@ -598,3 +596,68 @@ class TestFilamentDeficitBackupAware:
         ]
         deficit = await self._run(db_session, item, printer_id=printer.id, backup_on=True, model="X1C", trays=trays)
         assert deficit == []
+
+
+class TestFilamentDeficitSpentGuard:
+    """A spent spool is KNOWN empty (remaining 0.0), not undetermined. Now that the
+    spent stamp no longer floors weight_used, an under-counted ledger on a spent row
+    must not read positive and let dispatch start a print on an empty roll."""
+
+    @pytest.mark.asyncio
+    async def test_spent_spool_reads_zero_despite_positive_ledger(self, db_session, printer_factory, tmp_path):
+        from datetime import datetime
+
+        printer = await printer_factory()
+        archive = await _setup_archive_3mf(
+            db_session, tmp_path, [{"id": "1", "type": "PLA", "color": "#FFFFFF", "used_g": "100.0"}]
+        )
+        spool = await _spool(db_session, label_weight=1000, weight_used=50.0)  # ledger claims 950 g left
+        spool.spent_at = datetime.utcnow()  # ...but it ran dry
+        await db_session.commit()
+        await _assign(db_session, printer_id=printer.id, spool_id=spool.id, ams_id=0, tray_id=0)
+        item = await _queue_item(db_session, printer_id=printer.id, archive=archive, ams_mapping=[0])
+
+        with patch("backend.app.services.filament_deficit.app_settings.base_dir", Path("/")):
+            deficit = await compute_deficit_for_queue_item(db_session, item)
+
+        assert len(deficit) == 1
+        assert deficit[0].remaining_grams == 0.0  # spent -> KNOWN empty
+
+    @pytest.mark.asyncio
+    async def test_non_spent_spool_unaffected(self, db_session, printer_factory, tmp_path):
+        printer = await printer_factory()
+        archive = await _setup_archive_3mf(
+            db_session, tmp_path, [{"id": "1", "type": "PLA", "color": "#FFFFFF", "used_g": "100.0"}]
+        )
+        spool = await _spool(db_session, label_weight=1000, weight_used=50.0)  # 950 g left, NOT spent
+        await _assign(db_session, printer_id=printer.id, spool_id=spool.id, ams_id=0, tray_id=0)
+        item = await _queue_item(db_session, printer_id=printer.id, archive=archive, ams_mapping=[0])
+
+        with patch("backend.app.services.filament_deficit.app_settings.base_dir", Path("/")):
+            deficit = await compute_deficit_for_queue_item(db_session, item)
+
+        assert deficit == []  # plenty remaining, not spent -> no deficit
+
+    @pytest.mark.asyncio
+    async def test_backup_on_spent_spool_contributes_zero_to_pool(self, db_session, printer_factory, tmp_path):
+        # Backup ON: the only same-identity tray is bound to a SPENT spool with an
+        # under-counted ledger -> it contributes 0.0 (not undetermined) -> the pool is
+        # empty for the need -> deficit.
+        from datetime import datetime
+
+        printer = await printer_factory(model="X1C")
+        archive = await _setup_archive_3mf(
+            db_session, tmp_path, [{"id": "1", "type": "PETG", "color": "#000000", "used_g": "100.0"}]
+        )
+        spent = await _spool(db_session, label_weight=1000, weight_used=50.0, color="#000000")  # ledger 950 g left
+        spent.spent_at = datetime.utcnow()
+        await db_session.commit()
+        await _assign(db_session, printer_id=printer.id, spool_id=spent.id, ams_id=0, tray_id=0)
+        item = await _queue_item(db_session, printer_id=printer.id, archive=archive, ams_mapping=[0])
+
+        trays = [(0, 0, "PETG", "GFG02", "#000000")]
+        deficit = await TestFilamentDeficitBackupAware._run(
+            db_session, item, printer_id=printer.id, backup_on=True, model="X1C", trays=trays
+        )
+        assert len(deficit) == 1  # spent contributes 0 -> pool < required
+        assert deficit[0].remaining_grams == 0.0

@@ -78,6 +78,23 @@ class TestSettingsAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_update_respool_auto_enabled(self, async_client: AsyncClient):
+        """respool_auto_enabled round-trips (default False → True → back) through the
+        boolean-parse whitelist."""
+        # Defaults OFF when never written (operator directive — no tag reuse yet).
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["respool_auto_enabled"] is False
+
+        response = await async_client.put("/api/v1/settings/", json={"respool_auto_enabled": True})
+        assert response.status_code == 200
+        assert response.json()["respool_auto_enabled"] is True
+
+        # Persisted read-back through the boolean-parse whitelist.
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["respool_auto_enabled"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_update_currency(self, async_client: AsyncClient):
         """Verify currency can be updated."""
         response = await async_client.put("/api/v1/settings/", json={"currency": "EUR"})

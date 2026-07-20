@@ -116,6 +116,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "disable_filament_warnings",
             "auto_add_untagged",
             "spool_recovery_enabled",
+            "respool_auto_enabled",
             "check_updates",
             "check_printer_firmware",
             "include_beta_updates",

@@ -1240,6 +1240,10 @@ def printer_state_to_dict(
         "ams_status_main": state.ams_status_main,
         "ams_status_sub": state.ams_status_sub,
         "tray_now": state.tray_now,
+        # Last tray fed THIS job (reset to -1 at print start; survives the
+        # end-of-print retract → 255). Drives the "was feeding" dimmed AMS ring
+        # during a runout PAUSE, when tray_now reads 255 and clears the live ring.
+        "last_loaded_tray": state.last_loaded_tray,
         # Per-AMS extruder map: {ams_id: extruder_id} where 0=right, 1=left
         "ams_extruder_map": ams_extruder_map,
         # WiFi signal strength

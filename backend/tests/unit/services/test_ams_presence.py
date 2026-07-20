@@ -666,3 +666,84 @@ class TestEchoWindowBoundary:
         await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # genuine gain
         clear.assert_awaited_once()
         client.ams_refresh_tray.assert_called_once_with(0, 0)
+
+
+class TestPhysicalCycleNote:
+    """A genuine presence GAIN whose preceding absence lasted >= _MIN_PHYSICAL_ABSENT_S
+    records a physical roll swap via spool_tagless.note_physical_cycle (the W1 latch
+    release / W5 prompt). A sub-second flap, an echo, a drying flap, and the first-push
+    seed all suppress it."""
+
+    @pytest.fixture(autouse=True)
+    def _spy_note(self, monkeypatch):
+        from backend.app.services import spool_tagless
+
+        note = AsyncMock()
+        monkeypatch.setattr(spool_tagless, "note_physical_cycle", note)
+        return note
+
+    async def test_qualified_absence_fires_once(self, db_session, monkeypatch, _spy_note):
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(
+            1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session
+        )  # first push seeds present
+        await ams_presence.on_ams_change(
+            1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session
+        )  # loss -> stamps absence
+        # Backdate the absence past the physical-swap threshold.
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - (
+            ams_presence._MIN_PHYSICAL_ABSENT_S + 1
+        )
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain
+        _spy_note.assert_awaited_once_with(1, 0, 0)
+
+    async def test_short_flap_does_not_fire(self, db_session, monkeypatch, _spy_note):
+        # 16 ms flap (a runout-instant state flap) -> absence < 5 s -> no cycle.
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss (stamp now)
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain, ~0 s later
+        _spy_note.assert_not_awaited()
+
+    async def test_first_push_seed_never_fires(self, db_session, monkeypatch, _spy_note):
+        client = MagicMock()
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)]), client=client)
+        await ams_presence.on_ams_change(
+            1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session
+        )  # first push, present
+        _spy_note.assert_not_awaited()
+
+    async def test_echo_gain_does_not_fire(self, db_session, monkeypatch, _spy_note):
+        # An identify-flap echo gain is swallowed before the cycle note (an echo is not
+        # a physical event) even though the backdated absence would otherwise qualify.
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - 10
+        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic()  # arm the echo flag
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # echo gain
+        _spy_note.assert_not_awaited()
+
+    async def test_drying_gain_does_not_fire(self, db_session, monkeypatch, _spy_note):
+        monkeypatch.setattr(ams_presence, "unit_drying", lambda pid, aid: True)
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
+        client = MagicMock()
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - 10
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain while drying
+        _spy_note.assert_not_awaited()

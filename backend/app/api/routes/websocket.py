@@ -121,6 +121,17 @@ async def websocket_endpoint(websocket: WebSocket, token: str | None = Query(def
         except Exception:  # noqa: BLE001 — reconnect must never break on the replay hook
             logger.warning("respool_prompt reconnect re-broadcast failed", exc_info=True)
 
+        # Replay any unresolved tagless fresh-roll prompts too (W5). Same fire-once
+        # gap as the respool prompt above; the service re-validates each unanswered
+        # slot against live + durable state before re-sending. Fully guarded.
+        try:
+            from backend.app.services.spool_tagless import rebroadcast_unresolved_tagless_prompts
+
+            async with async_session() as tagless_db:
+                await rebroadcast_unresolved_tagless_prompts(tagless_db, websocket.send_json)
+        except Exception:  # noqa: BLE001 — reconnect must never break on the replay hook
+            logger.warning("tagless_fresh_prompt reconnect re-broadcast failed", exc_info=True)
+
         # Keep connection alive and handle incoming messages.
         while True:
             data = await websocket.receive_json()

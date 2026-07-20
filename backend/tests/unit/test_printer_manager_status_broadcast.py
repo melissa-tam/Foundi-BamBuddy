@@ -97,6 +97,9 @@ def _fake_state(**overrides):
         "subtask_name": None,
         "total_layers": None,
         "tray_now": None,
+        # printer_state_to_dict reads state.last_loaded_tray unconditionally beside
+        # tray_now (W6.1 was-feeding ring); the real PrinterState always has it.
+        "last_loaded_tray": -1,
         "wifi_signal": None,
         "wired_network": None,
         "ams_filament_backup": None,

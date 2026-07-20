@@ -216,6 +216,21 @@ class TestPauseStallWatch:
         await db_session.refresh(item)
         assert item.waiting_reason == "spool_jam_recovery_failed"  # untouched
 
+    async def test_runout_reason_still_muted(self, db_session):
+        """A ``filament_runout_recovery_failed`` pause stays muted — the runout
+        escalation already fired its one-shot notification and left the printer
+        PAUSED for a same-slot refill; re-notifying would double up."""
+        item = await _add_printing(db_session, 9)
+        item.waiting_reason = "filament_runout_recovery_failed"
+        await db_session.commit()
+        mgr = _FakeManager({9: True}, {9: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_print_paused_stalled", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_paused_prints(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_paused_prints(db_session, manager=mgr, now=_PAUSE_GRACE_S + 100)
+            mock_n.assert_not_awaited()
+        await db_session.refresh(item)
+        assert item.waiting_reason == "filament_runout_recovery_failed"  # untouched
+
     async def test_recovering_with_live_task_owned(self, db_session, monkeypatch):
         """A ``spool_jam_recovering`` pause backed by a LIVE recovery task is owned —
         no flag, and the token is left for the recovery driver."""

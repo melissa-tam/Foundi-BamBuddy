@@ -27,18 +27,40 @@ class TestDefaults:
         assert s.auto_add_untagged is True
 
     def test_tagless_default_filament_default_shape(self):
+        # W4: the shipped default carries the SPECIFIC Bambu PETG HF wire identity
+        # (GFG02 + 230/270 nozzle range) so a bare-tray push is a byte-identical
+        # firmware backup-group peer instead of the generic GFG99 that split the group.
         s = AppSettings()
         parsed = json.loads(s.tagless_default_filament)
         assert parsed["brand"] == "Bambu Lab"
         assert parsed["material"] == "PETG"
         assert parsed["subtype"] == "HF"
         assert parsed["rgba"] == "000000FF"
+        assert parsed["slicer_filament"] == "GFG02"
+        assert parsed["nozzle_temp_min"] == 230
+        assert parsed["nozzle_temp_max"] == 270
         # Round-trips through the typed sub-model.
-        assert TaglessDefaultFilament(**parsed).slicer_filament is None
+        model = TaglessDefaultFilament(**parsed)
+        assert model.slicer_filament == "GFG02"
+        assert (model.nozzle_temp_min, model.nozzle_temp_max) == (230, 270)
 
     def test_prefer_lowest_filament_is_removed(self):
         assert "prefer_lowest_filament" not in AppSettings.model_fields
         assert "prefer_lowest_filament" not in AppSettingsUpdate.model_fields
+
+
+class TestRespoolAutoEnabled:
+    """The W3 Tier-2 auto-respool toggle (default OFF)."""
+
+    def test_default_is_false(self):
+        assert AppSettings().respool_auto_enabled is False
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_update_twin_accepts_bool(self, value):
+        assert AppSettingsUpdate(respool_auto_enabled=value).respool_auto_enabled is value
+
+    def test_update_twin_accepts_none(self):
+        assert AppSettingsUpdate(respool_auto_enabled=None).respool_auto_enabled is None
 
 
 class TestSpoolSelectionPolicyValidator:

@@ -1300,6 +1300,11 @@ class PrintScheduler:
                             "global_tray_id": global_tray_id,
                             "extruder_id": ams_extruder_map.get(str(ams_id)),
                             "remain": tray.get("remain", -1),
+                            # Raw firmware tray state (10/11 present, 9 empty, ...) —
+                            # consumed by spool_recovery's presence filter to drop a
+                            # seated-but-unsensed candidate. Additive key; no existing
+                            # consumer reads it.
+                            "state": tray.get("state"),
                         }
                     )
 
@@ -1320,6 +1325,7 @@ class PrintScheduler:
                         "global_tray_id": tray_id,
                         "extruder_id": (255 - tray_id) if ams_extruder_map else None,
                         "remain": vt.get("remain", -1),
+                        "state": vt.get("state"),
                     }
                 )
 

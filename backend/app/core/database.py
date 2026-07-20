@@ -3664,6 +3664,40 @@ async def run_migrations(conn):
     )
     await conn.execute(text("DELETE FROM settings WHERE key = 'prefer_lowest_filament'"))
 
+    # Migration (W4): normalize the shipped tagless-default filament to a full
+    # 4-dimension wire identity (GFG02 Bambu PETG HF + nozzle range 230/270) so every
+    # bare-tray config push emits a byte-identical firmware backup-group peer. ONLY
+    # rewrites a row still holding the UNEDITED old default (Bambu Lab / PETG / HF /
+    # 000000FF / no slicer_filament); an operator-customised row is untouched.
+    # Semantic JSON compare (the frontend's JSON.stringify key order differs from
+    # pydantic's model_dump_json). Idempotent by construction — the rewritten row no
+    # longer matches the old-default predicate. Absent row is a no-op (the schema
+    # default materialises at read time).
+    import json as _json
+
+    async with conn.begin_nested():
+        _tdf_row = (
+            await conn.execute(text("SELECT value FROM settings WHERE key = 'tagless_default_filament'"))
+        ).scalar()
+        if _tdf_row:
+            try:
+                _tdf = _json.loads(_tdf_row)
+            except (ValueError, TypeError):
+                _tdf = None
+            if isinstance(_tdf, dict) and (
+                _tdf.get("brand") == "Bambu Lab"
+                and _tdf.get("material") == "PETG"
+                and _tdf.get("subtype") == "HF"
+                and (_tdf.get("rgba") or "").upper() == "000000FF"
+                and not (_tdf.get("slicer_filament") or "")
+            ):
+                from backend.app.schemas.settings import _DEFAULT_TAGLESS_FILAMENT_JSON
+
+                await conn.execute(
+                    text("UPDATE settings SET value = :new WHERE key = 'tagless_default_filament'"),
+                    {"new": _DEFAULT_TAGLESS_FILAMENT_JSON},
+                )
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),

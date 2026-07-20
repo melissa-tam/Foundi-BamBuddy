@@ -932,6 +932,51 @@ def lookup_description_any(attr: int | str, code: int | str) -> str | None:
     return lookup_full_code(full_code) or get_error_description(hms_short_code(attr, code))
 
 
+# Firmware runout ``code`` words (low 32 bits) that carry a per-slot attribution
+# in their ``attr`` — the ``0700_2X00`` family that names the exhausted slot on the
+# printer screen ("AMS A Slot 3 filament has run out …"). Probe-verified against the
+# vendored catalog (128 real ecodes) and the two live 2026-07-19 incident attrs.
+# The slot-agnostic "insert into the SAME slot" runout (07xx_8011) is deliberately
+# absent — it names no slot, so the resolver falls back to tray_now/mapping there.
+_RUNOUT_SLOT_CODE32: frozenset[int] = frozenset({0x00020001, 0x00020005, 0x00030001, 0x00030002})
+
+
+def runout_slot_from_hms(attr: int, code: int) -> tuple[int, int] | None:
+    """Decode the AMS unit + slot a per-slot runout HMS names, or ``None``.
+
+    Pure layout decode of the firmware's ``0700_2X00`` slot-attributed runout
+    family: the ``attr`` high byte is the AMS module class (``0x07``), the next
+    byte is the AMS unit id, and the third byte encodes the slot as ``0x20 + tray``
+    (``0x20``..``0x23`` → tray 0..3). ``code`` (the full 32-bit code word) must be a
+    runout code that carries slot attribution (:data:`_RUNOUT_SLOT_CODE32`). Returns
+    ``(ams_id, tray_id)`` on a match, else ``None`` — so a non-runout code, the
+    slot-agnostic 8011 "insert same slot" runout, and any malformed value all fail
+    closed and let the caller fall back to tray_now/mapping inference.
+
+    Verified: attr ``117448704`` / code ``0x00020001`` → ``(0, 0)`` ("AMS A Slot 1");
+    attr ``117449216`` → ``(0, 2)`` ("AMS A Slot 3") — the two live incident faults.
+    """
+    if code not in _RUNOUT_SLOT_CODE32:
+        return None
+    if (attr >> 24) & 0xFF != 0x07:  # not an AMS-module fault
+        return None
+    slot_byte = (attr >> 8) & 0xFF
+    if not (0x20 <= slot_byte <= 0x23):  # not a slot-attributed attr
+        return None
+    ams_id = (attr >> 16) & 0xFF
+    if not (0 <= ams_id <= 7):
+        return None
+    return (ams_id, slot_byte - 0x20)
+
+
+def _code_word(code: int | str) -> int:
+    """Parse an HMSError ``code`` (int or hex string like ``"0x20001"``) to its full
+    32-bit int — the form :func:`runout_slot_from_hms` expects."""
+    if isinstance(code, str):
+        return int(code.replace("0x", ""), 16) if code else 0
+    return int(code or 0)
+
+
 def hms_error_payload(e) -> dict:
     """Serialize an HMSError to the API/WS wire dict.
 
@@ -944,12 +989,17 @@ def hms_error_payload(e) -> dict:
     URL is the vendored per-code deep link when available, else the HMS landing
     page. Used by BOTH the REST route and the WebSocket ``printer_state_to_dict``
     so the two payloads never drift.
+
+    A per-slot runout fault additionally carries ``runout_slot`` (``{"ams_id",
+    "tray_id"}``) decoded from the firmware attr — the single enrichment site that
+    feeds the WS/REST per-slot "ran out" badge. Absent on every non-runout code, so
+    the base payload shape is unchanged for those.
     """
     short_code = hms_short_code(e.attr, e.code)
     description = lookup_full_code(e.full_code) or get_error_description(short_code)
     wiki_path = lookup_wiki_path(e.full_code)
     wiki_url = (HMS_WIKI_URL_ORIGIN + wiki_path) if wiki_path else HMS_WIKI_URL
-    return {
+    payload = {
         "code": e.code,
         "attr": e.attr,
         "module": e.module,
@@ -961,3 +1011,7 @@ def hms_error_payload(e) -> dict:
         "description": description,
         "wiki_url": wiki_url,
     }
+    runout_slot = runout_slot_from_hms(int(e.attr or 0), _code_word(e.code))
+    if runout_slot is not None:
+        payload["runout_slot"] = {"ams_id": runout_slot[0], "tray_id": runout_slot[1]}
+    return payload

@@ -61,7 +61,6 @@ from backend.app.services.spoolman import (
 from backend.app.services.spoolman_tracking import get_fallback_spool_tag_for_slot
 from backend.app.utils.filament_ids import (
     GENERIC_FILAMENT_IDS,
-    MATERIAL_TEMPS,
     filament_id_to_setting_id,
     normalize_slicer_filament,
 )
@@ -1500,12 +1499,19 @@ async def assign_spoolman_slot(
             # configured profile never reached the printer. Shared with the
             # internal-mode route via the same helper so the two flows can't
             # drift again.
-            tray_info_idx, setting_id, sub_brand_override = await resolve_slicer_filament(
+            # W4: consume the resolver's COMPLETE wire identity (id/setting/sub-brand
+            # AND the resolved nozzle-temp range) so this Spoolman write site emits an
+            # identical 4-dimension identity to the internal-inventory route for a
+            # same-identity spool.
+            tray_info_idx, setting_id, sub_brand_override, temp_min, temp_max = await resolve_slicer_filament(
                 db=db,
                 current_user=current_user,
                 slicer_filament=mapped.get("slicer_filament"),
                 slicer_filament_name=mapped.get("slicer_filament_name"),
                 material=tray_type,
+                rgba=mapped.get("rgba"),
+                nozzle_temp_min=mapped.get("nozzle_temp_min"),
+                nozzle_temp_max=mapped.get("nozzle_temp_max"),
             )
             if sub_brand_override:
                 tray_sub_brands = sub_brand_override
@@ -1530,9 +1536,7 @@ async def assign_spoolman_slot(
             if tray_info_idx and not setting_id:
                 setting_id = filament_id_to_setting_id(tray_info_idx)
 
-            temp_defaults = MATERIAL_TEMPS.get(material_upper, (200, 240))
-            temp_min = mapped.get("nozzle_temp_min") or temp_defaults[0]
-            temp_max = temp_defaults[1]
+            # temp_min/temp_max already resolved by resolve_slicer_filament above (W4).
 
             # Pull printer state from printer_manager. The previous
             # `mqtt_client.printer_state` access via hasattr always returned

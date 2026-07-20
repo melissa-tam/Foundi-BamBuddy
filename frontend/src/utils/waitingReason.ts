@@ -55,6 +55,8 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
       return t('productionRuns.detail.waiting.spoolJamRecovering');
     case 'spool_jam_recovery_failed':
       return t('productionRuns.detail.waiting.spoolJamRecoveryFailed');
+    case 'filament_runout_recovery_failed':
+      return t('productionRuns.detail.waiting.filamentRunoutRecoveryFailed');
     default:
       // An unmapped token gets humanized (never shown raw to an operator); a
       // backend-authored sentence is already readable and passes through.

@@ -134,12 +134,19 @@ async def apply_spool_to_slot_via_mqtt(
     # the builtin-name realignment, AND the defensive PFUS/PFCN/material-name
     # sanitization. When it returns an empty tray_info_idx the local
     # current-tray-state + generic-material fallback below rescues the slot.
-    tray_info_idx, setting_id, sub_brand_override = await resolve_slicer_filament(
+    # W4: the resolver returns the COMPLETE wire identity — id/setting/sub-brand AND
+    # the resolved nozzle-temp range (spool-row temps → tagless-default fingerprint →
+    # MATERIAL_TEMPS) — so this write site and the Spoolman route can't diverge on
+    # any of the four firmware backup-group dimensions.
+    tray_info_idx, setting_id, sub_brand_override, temp_min, temp_max = await resolve_slicer_filament(
         db=db,
         current_user=current_user,
         slicer_filament=spool.slicer_filament,
         slicer_filament_name=spool.slicer_filament_name,
         material=spool.material,
+        rgba=spool.rgba,
+        nozzle_temp_min=spool.nozzle_temp_min,
+        nozzle_temp_max=spool.nozzle_temp_max,
     )
     if sub_brand_override:
         tray_sub_brands = sub_brand_override
@@ -173,11 +180,7 @@ async def apply_spool_to_slot_via_mqtt(
     if tray_info_idx and not setting_id:
         setting_id = filament_id_to_setting_id(tray_info_idx)
 
-    temp_min, temp_max = MATERIAL_TEMPS.get((spool.material or "").upper(), (200, 240))
-    if spool.nozzle_temp_min is not None:
-        temp_min = spool.nozzle_temp_min
-    if spool.nozzle_temp_max is not None:
-        temp_max = spool.nozzle_temp_max
+    # temp_min/temp_max already resolved by resolve_slicer_filament above (W4).
 
     nozzle_diameter = nozzle_for_ams_unit(state, ams_id, tray_id)
 
@@ -1462,6 +1465,27 @@ async def dismiss_respool_prompt(
         raise HTTPException(404, "Spool not found")
 
     spool.respool_dismissed_at = datetime.utcnow()
+
+    # Evidence-gated un-spend: a dismissed roll whose live AMS tray reports far MORE
+    # filament than a spent row could hold (_remain_jump) was a FALSE spent stamp —
+    # NULL spent_at so it re-enters rotation with its (now un-floored) true grams. A
+    # genuinely-empty dismissed roll shows no jump and stays spent.
+    if spool.spent_at is not None and req is not None and None not in (req.printer_id, req.ams_id, req.tray_id):
+        from backend.app.services import spool_respool
+        from backend.app.services.printer_manager import printer_manager
+
+        state = printer_manager.get_status(req.printer_id)
+        tray = spool_respool._resolve_live_tray(state, req.ams_id, req.tray_id) if state is not None else None
+        if tray is not None and spool_respool._remain_jump(spool, tray):
+            spool.spent_at = None
+            logger.info(
+                "Un-spent spool %d on dismiss (printer %s AMS%s-T%s) — AMS remain contradicts the spent stamp",
+                spool_id,
+                req.printer_id,
+                req.ams_id,
+                req.tray_id,
+            )
+
     await db.commit()
 
     await ws_manager.broadcast(
@@ -1474,6 +1498,81 @@ async def dismiss_respool_prompt(
         }
     )
     result = await db.execute(select(Spool).options(selectinload(Spool.k_profiles)).where(Spool.id == spool_id))
+    return result.scalar_one()
+
+
+class TaglessFreshRequest(BaseModel):
+    """Body for ``POST /inventory/spools/{id}/tagless-fresh`` (W5).
+
+    ``answer="same"`` clears the fresh-roll prompt for THIS physical cycle only (no
+    permanent stamp — the next qualified cycle re-asks). ``answer="fresh"`` archives
+    the current tagless row and mints a replacement, applying the optional
+    brand/label_weight/cost_per_kg/note to the new row.
+    """
+
+    printer_id: int
+    ams_id: int
+    tray_id: int
+    answer: str  # "fresh" | "same"
+    brand: str | None = None
+    label_weight: int | None = None
+    cost_per_kg: float | None = None
+    note: str | None = None
+
+
+@router.post("/spools/{spool_id}/tagless-fresh", response_model=SpoolResponse)
+async def answer_tagless_fresh(
+    spool_id: int,
+    req: TaglessFreshRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+):
+    """Answer the W5 tagless fresh-roll prompt for a slot.
+
+    * ``answer="same"`` — the operator confirms it is the SAME roll: clear the prompt's
+      per-cycle unanswered entry and broadcast ``tagless_fresh_prompt_dismissed`` so open
+      clients drop the toast. NO permanent stamp (deliberate divergence from the respool
+      prompt) — the next qualified physical cycle re-asks.
+    * ``answer="fresh"`` — a fresh roll is on the slot: archive the current tagless row
+      (grams preserved), mint + bind + push a replacement (default-vs-tray via the shared
+      W1 transition) with the optional brand/label_weight/cost_per_kg/note; broadcast the
+      fresh assign + ``inventory_changed`` + the dismissed event. Returns the NEW spool.
+
+    404 unknown spool; 409 when a fresh answer can't resolve the slot's live tray.
+    """
+    from backend.app.services import spool_tagless
+
+    result = await db.execute(select(Spool).options(selectinload(Spool.k_profiles)).where(Spool.id == spool_id))
+    spool = result.scalar_one_or_none()
+    if not spool:
+        raise HTTPException(404, "Spool not found")
+
+    if req.answer == "same":
+        spool_tagless.clear_fresh_prompt(req.printer_id, req.ams_id, req.tray_id)
+        await spool_tagless.broadcast_tagless_fresh_dismissed(req.printer_id, req.ams_id, req.tray_id)
+        return spool
+
+    if req.answer != "fresh":
+        raise HTTPException(422, "answer must be 'fresh' or 'same'")
+
+    try:
+        new_spool = await spool_tagless.apply_fresh_roll(
+            db,
+            spool,
+            req.printer_id,
+            req.ams_id,
+            req.tray_id,
+            brand=req.brand,
+            label_weight=req.label_weight,
+            cost_per_kg=req.cost_per_kg,
+            note=req.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+
+    await spool_tagless.broadcast_tagless_fresh_dismissed(req.printer_id, req.ams_id, req.tray_id)
+    await ws_manager.broadcast({"type": "inventory_changed"})
+    result = await db.execute(select(Spool).options(selectinload(Spool.k_profiles)).where(Spool.id == new_spool.id))
     return result.scalar_one()
 
 

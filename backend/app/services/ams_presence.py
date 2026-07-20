@@ -62,6 +62,18 @@ _IDENTIFY_ACTIVE_S = 30
 # (printer_id, ams_id, tray_id) -> last observed physical presence (bool).
 _last_presence: dict[tuple[int, int, int], bool] = {}
 
+# (printer_id, ams_id, tray_id) -> time.monotonic() at which the slot last went
+# PRESENT→ABSENT. On a later genuine GAIN the elapsed absence tells a real physical
+# roll swap (≥ _MIN_PHYSICAL_ABSENT_S) apart from the runout-instant state flap that
+# a firmware backup switch produces (sub-second). Drives the W1 spent-binding latch
+# release / W5 fresh-roll prompt via spool_tagless.note_physical_cycle.
+_absent_since: dict[tuple[int, int, int], float] = {}
+
+# A physical roll swap keeps the slot empty for at least this long (pull the old
+# roll, seat a new one); a firmware runout state flap is sub-second. A code
+# constant, not operator-tunable.
+_MIN_PHYSICAL_ABSENT_S = 5.0
+
 # Printers whose first on_ams_change (post-restart) has been processed. The first
 # push only seeds the presence map (no re-read); later pushes act on gains.
 _primed: set[int] = set()
@@ -95,6 +107,7 @@ _ECHO_PENDING_STALE_S = 30.0
 def _reset_state() -> None:
     """Test hook: clear all module-level edge state between cases."""
     _last_presence.clear()
+    _absent_since.clear()
     _primed.clear()
     _swept_subtasks.clear()
     _echo_pending.clear()
@@ -302,6 +315,12 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                     # a refill done while down doesn't read as a fresh gain.
                     continue
 
+                if not present and prev:
+                    # PRESENT→ABSENT: stamp the absence start so a later genuine GAIN
+                    # can tell a real physical roll swap (≥ _MIN_PHYSICAL_ABSENT_S)
+                    # from a runout-instant state flap (sub-second).
+                    _absent_since[key] = time.monotonic()
+
                 if present and not prev:
                     # Echo-consume FIRST: a re-read we commanded on this present
                     # slot flaps the firmware's tray state present→9→present
@@ -322,6 +341,12 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                         )
                         continue
 
+                    # Consume the absence stamp for this genuine gain (an echo above
+                    # never reaches here). ≥ _MIN_PHYSICAL_ABSENT_S ⇒ a real physical
+                    # roll swap; a firmware runout state flap is sub-second → no cycle.
+                    absent_at = _absent_since.pop(key, None)
+                    physical_cycle = absent_at is not None and (time.monotonic() - absent_at) >= _MIN_PHYSICAL_ABSENT_S
+
                     # Genuine physical re-insert: clear any feed-fault out-of-
                     # rotation flag. NOT idle-gated (a spool untangled and re-
                     # seated mid-print clears too) and NOT on the first-push seed.
@@ -341,6 +366,23 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                                 ams_id,
                                 tray_id,
                             )
+
+                        # W1/W5: a genuine gain after a QUALIFIED physical absence is a
+                        # real roll swap. Record the cycle so the spent-binding latch
+                        # releases (branch 3 / bare-tray) + the fresh-roll prompt fires.
+                        # Guarded like the clear above; never break the AMS callback.
+                        if physical_cycle:
+                            try:
+                                from backend.app.services import spool_tagless
+
+                                await spool_tagless.note_physical_cycle(printer_id, ams_id, tray_id)
+                            except Exception:  # noqa: BLE001 — best-effort physical-cycle note
+                                logger.exception(
+                                    "AMS presence: physical-cycle note failed for printer %d AMS%d-T%d",
+                                    printer_id,
+                                    ams_id,
+                                    tray_id,
+                                )
 
                 # Steady state: act only on a genuine presence GAIN, and only while
                 # the printer is idle. Firing ams_get_rfid during a print is unsafe;

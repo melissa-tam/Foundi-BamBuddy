@@ -1,7 +1,7 @@
 import { AlertCircle, CheckCircle, Info, Loader2, X, XCircle } from 'lucide-react';
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 
-type ToastType = 'success' | 'error' | 'warning' | 'info' | 'loading';
+export type ToastType = 'success' | 'error' | 'warning' | 'info' | 'loading';
 
 /**
  * Auto-dismiss delay (ms) per severity. Errors linger longest so an operator
@@ -24,7 +24,7 @@ const TOAST_DURATION_MS: Record<ToastType, number> = {
   loading: 3000,
 };
 
-interface ToastAction {
+export interface ToastAction {
   label: string;
   /** External-link actions carry an href (opened in a new tab). Pure in-app
    *  actions (the `actions[]` array path) supply only `onClick` and render as a

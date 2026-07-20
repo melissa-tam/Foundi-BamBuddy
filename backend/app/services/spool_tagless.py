@@ -19,17 +19,23 @@ Continuity rules:
   the SAME ledger row: :func:`should_keep_on_empty` keeps the assignment while
   the slot is empty; :func:`fingerprint_matches` re-binds on return. Operator
   edits to a minted spool are NEVER overwritten.
-* **Ran-dry always mints new** — a spool marked ``spent_at`` re-loaded is
-  archived (grams preserved) and a fresh row is minted (physically a new roll).
+* **Spent-binding latch (W1)** — a spool marked ``spent_at`` keeps its binding
+  while the tray remains continuously present (:func:`should_keep_on_empty` keeps
+  spent rows too); the spent binding IS the durable "this tray ran dry" latch.
+  "Ran-dry mints new" fires ONLY after a qualified physical absence
+  (:func:`note_physical_cycle` records the cycle; branch (3) /
+  :func:`maybe_autoconfigure_bare_tray` consume it) — a runout-instant state flap
+  can no longer phantom-mint a fresh row over a still-present spool.
 * **Provisional disposal** — an auto-minted tagless row is provisional; when a
   real RFID tag later claims the slot, :func:`dispose_provisional_on_tag`
   hard-deletes it (no usage ledger) or archives it (has one).
 
-Module edge state (``_autoconfig_attempts``, ``_stale_config_markers``) mirrors
-the fork's other event-edge bookkeeping (``spool_respool._last_tray_now``). It is
-lost on restart — worst case a bare-tray config re-push waits one AMS push, and a
-lost stale-config marker degrades to a tray-derived mint (benign; an operator can
-correct the row).
+Module edge state (``_autoconfig_attempts``, ``_pending_physical_cycles``,
+``_fresh_prompt_unanswered``) mirrors the fork's other event-edge bookkeeping
+(``spool_respool._last_tray_now``). It is lost on restart — worst case a bare-tray
+config re-push waits one AMS push, a spent slot stays latched+excluded until a
+pull/reseat (honest, not silent), and an unanswered fresh-roll prompt re-asks on
+the next physical cycle.
 
 ``stamp_first_loaded`` lives in ``spool_tag_matcher`` (the lowest module every
 assignment-creating caller already imports); this module re-exports it via import
@@ -59,6 +65,7 @@ from backend.app.services.spool_tag_matcher import (
     stamp_first_loaded,
 )
 from backend.app.utils.color_utils import colors_similar
+from backend.app.utils.filament_ids import GENERIC_FILAMENT_IDS
 from backend.app.utils.filament_types import canonical_filament_type
 
 if TYPE_CHECKING:
@@ -70,6 +77,11 @@ logger = logging.getLogger(__name__)
 # attract-exclusion, provisional-disposal, and terminal-sweep relax all key on.
 DATA_ORIGIN = "ams_auto"
 
+# Generic (GFx99) slicer ids — the fallback a bare-tray auto-config writes when no
+# specific id is configured. A tray re-reporting one of these is untrustworthy for
+# minting a fresh identity (W4 generic-id override).
+_GENERIC_ID_VALUES = frozenset(GENERIC_FILAMENT_IDS.values())
+
 # Re-push cadence for a BARE tray whose default-filament config has not yet
 # landed on the printer (failed / slow MQTT). The trigger persists across AMS
 # pushes until the firmware reports a non-empty tray_type; this gate stops it
@@ -80,18 +92,31 @@ _AUTOCONFIG_RETRY_S = 30.0
 # config attempt. Cleared when the slot empties.
 _autoconfig_attempts: dict[tuple[int, int, int], float] = {}
 
-# (printer_id, ams_id, tray_id) -> (canonical_material, upper_rgba) fingerprint of
-# a SPENT spool that just departed a now-empty slot. If the firmware then
-# re-reports that same leftover config on the slot, it is stale firmware state
-# (not a real new spool), so we apply the bare-tray default instead of minting
-# from the leftover fingerprint.
-_stale_config_markers: dict[tuple[int, int, int], tuple[str, str]] = {}
+# (printer_id, ams_id, tray_id) of slots that saw a QUALIFIED physical roll swap
+# (≥ _MIN_PHYSICAL_ABSENT_S absent → present, recorded by note_physical_cycle).
+# This is the spent-binding latch's RELEASE signal: handle_tagless_slot branch (3)
+# and maybe_autoconfigure_bare_tray consume it to mint the replacement over a spent
+# row. A spent row with NO pending cycle stays latched (no phantom mint). Popped
+# once processed on every branch; process-lifetime (a swap during downtime degrades
+# to a latched+excluded slot, released by pull/reseat — honest, not silent).
+_pending_physical_cycles: set[tuple[int, int, int]] = set()
+
+# Fraction of a tagless row's label weight consumed past which a physical cycle
+# raises the over-consumption / fresh-roll prompt (W5). 0.5 = half the roll.
+_FRESH_ROLL_PROMPT_USED_FRAC = 0.5
+
+# (printer_id, ams_id, tray_id) of tagless fresh-roll prompts awaiting an operator
+# answer (W5). PER-CYCLE dedup (deliberately NOT the permanent respool_dismissed_at):
+# cleared by either tagless-fresh answer and re-armed on the next qualified physical
+# cycle, so each new roll swap asks again. Lost on restart (re-asks next cycle).
+_fresh_prompt_unanswered: set[tuple[int, int, int]] = set()
 
 
 def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
     _autoconfig_attempts.clear()
-    _stale_config_markers.clear()
+    _pending_physical_cycles.clear()
+    _fresh_prompt_unanswered.clear()
 
 
 # --- state / predicate helpers ---------------------------------------------
@@ -148,6 +173,40 @@ def fingerprint_matches(spool: Spool, tray: dict) -> bool:
     return canonical_filament_type(_tray_material(tray)) == canonical_filament_type(spool.material or "")
 
 
+def _fingerprint_matches_default(material: str | None, rgba: str | None, default: dict) -> bool:
+    """True when a (material, rgba) pair fingerprint-matches the tagless default —
+    same canonical material AND color within tolerance. The material+rgba twin of
+    :func:`fingerprint_matches` (a dict default has no tray shape), shared by the
+    generic-id mint override (W4.4) and :func:`default_temps_for_fingerprint`."""
+    if canonical_filament_type(material or "") != canonical_filament_type(default.get("material") or ""):
+        return False
+    return colors_similar(rgba or "", default.get("rgba") or "")
+
+
+async def default_temps_for_fingerprint(
+    db: AsyncSession, material: str | None, rgba: str | None
+) -> tuple[int, int] | None:
+    """The tagless default's ``(nozzle_temp_min, nozzle_temp_max)`` IFF a
+    (material, rgba) pair fingerprint-matches the configured default AND the default
+    carries both temps; else ``None``.
+
+    Public accessor over the single tagless-default JSON parser (:func:`_tagless_default`)
+    — the slicer resolver's middle nozzle-temp tier (row temps → THIS →
+    ``MATERIAL_TEMPS``) so a fingerprint-matched tagless slot inherits the default's
+    canonical range and stays a byte-identical firmware backup-group peer (W4)."""
+    default = await _tagless_default(db)
+    if default is None or not _fingerprint_matches_default(material, rgba, default):
+        return None
+    tmin = default.get("nozzle_temp_min")
+    tmax = default.get("nozzle_temp_max")
+    if tmin is None or tmax is None:
+        return None
+    try:
+        return (int(tmin), int(tmax))
+    except (TypeError, ValueError):
+        return None
+
+
 def effectively_empty(spool: Spool, threshold_g: int) -> bool:
     """Remaining grams at or below the 'effectively empty' threshold."""
     remaining = (spool.label_weight or 0) - (spool.weight_used or 0)
@@ -157,24 +216,19 @@ def effectively_empty(spool: Spool, threshold_g: int) -> bool:
 def should_keep_on_empty(assignment: SpoolAssignment, threshold_g: int) -> bool:
     """Sticky-rebind decision for a slot that just went empty.
 
-    Keep the assignment (do NOT unlink) only when the bound spool is a tagless
-    roll that is neither spent nor effectively empty — i.e. pulled for drying and
-    expected back. A spent or near-empty spool departing is a genuine removal;
-    the caller should unlink it.
+    Keep the assignment (do NOT unlink) when the bound spool is a tagless roll that
+    is either SPENT (W1: the spent binding is the durable "this tray ran dry" latch
+    — kept until a physical roll swap releases it via :func:`note_physical_cycle`,
+    so a runout-instant flap can't phantom-mint a fresh row) OR live-but-not-
+    effectively-empty (pulled for drying and expected back). A non-spent near-empty
+    spool departing is a genuine removal; the caller should unlink it.
     """
     spool = assignment.spool
     if spool is None or not is_tagless_spool(spool):
         return False
     if spool.spent_at is not None:
-        return False
+        return True  # W1: keep the spent binding as the latch until a physical swap
     return not effectively_empty(spool, threshold_g)
-
-
-def _marker_matches(marker: tuple[str, str], tray: dict) -> bool:
-    mat, color = marker
-    if canonical_filament_type(_tray_material(tray)) != canonical_filament_type(mat):
-        return False
-    return colors_similar(tray.get("tray_color") or "", color or "")
 
 
 def _refresh_assignment_fingerprint(assignment: SpoolAssignment, tray: dict) -> None:
@@ -283,6 +337,23 @@ async def mint_tagless_spool(
         slicer_filament_name = parsed.slicer_filament_name
         nozzle_temp_min = parsed.nozzle_temp_min
         nozzle_temp_max = parsed.nozzle_temp_max
+        # Generic-id self-perpetuation guard (W4.4): if the tray reports a GENERIC
+        # slicer id (GFG99 …) — the id a bare-tray auto-config wrote earlier — but
+        # the configured tagless default carries a SPECIFIC id and this tray
+        # fingerprint-matches the default, mint the default's specific id/name/temps
+        # instead. Re-reading the leftover generic id would perpetuate the GFG99 that
+        # split the firmware backup group (2026-07-19 incident).
+        if slicer_filament and slicer_filament in _GENERIC_ID_VALUES:
+            _default = await _tagless_default(db)
+            if (
+                _default is not None
+                and (_default.get("slicer_filament") or "")
+                and _fingerprint_matches_default(material, rgba, _default)
+            ):
+                slicer_filament = _default["slicer_filament"]
+                slicer_filament_name = None
+                nozzle_temp_min = _default.get("nozzle_temp_min")
+                nozzle_temp_max = _default.get("nozzle_temp_max")
         # Only a POSITIVE reported net weight overrides the model default.
         label_weight = parsed.label_weight if parsed.label_weight > 0 else None
         source = "tray"
@@ -295,8 +366,10 @@ async def mint_tagless_spool(
         core_weight = 250
         slicer_filament = default_filament.get("slicer_filament") or None
         slicer_filament_name = None
-        nozzle_temp_min = None
-        nozzle_temp_max = None
+        # W4: stamp the configured default's canonical nozzle range onto the row so
+        # the resolver emits it verbatim (a byte-identical backup-group peer).
+        nozzle_temp_min = default_filament.get("nozzle_temp_min")
+        nozzle_temp_max = default_filament.get("nozzle_temp_max")
         label_weight = None  # use the Spool model default (1000 g)
         source = "default"
 
@@ -428,6 +501,318 @@ async def _broadcast_auto_assigned(
     if origin is not None:
         payload["origin"] = origin
     await ws_manager.broadcast(payload)
+
+
+# --- W1 spent-binding release / fresh-roll transition ----------------------
+
+
+def _apply_new_fields(spool: Spool, fields: dict | None) -> None:
+    """Apply the tagless-fresh route's optional manual fields onto a fresh row.
+
+    Only non-empty values write (a blank field leaves the mint default). Used when
+    the operator records a Fresh roll with brand / label weight / cost / note.
+    """
+    if not fields:
+        return
+    brand = (fields.get("brand") or "").strip()
+    if brand:
+        spool.brand = brand
+    lw = fields.get("label_weight")
+    if lw:
+        try:
+            spool.label_weight = int(lw)
+        except (TypeError, ValueError):
+            pass
+    cost = fields.get("cost_per_kg")
+    if cost is not None:
+        spool.cost_per_kg = cost
+    note = (fields.get("note") or "").strip()
+    if note:
+        spool.note = note
+
+
+async def _replace_row_after_cycle(
+    db: AsyncSession,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    tray: dict | None,
+    departed: Spool,
+    *,
+    new_fields: dict | None = None,
+) -> Spool:
+    """Archive a departed tagless row and mint+bind+push its replacement (W1/W5).
+
+    The SINGLE spent-binding / fresh-roll transition, shared by
+    :func:`handle_tagless_slot` branch (3), :func:`maybe_autoconfigure_bare_tray`,
+    and the W5 tagless-fresh route. Default-mints from the configured tagless default
+    when the tray is bare/absent OR still carries the departed row's config (firmware
+    leftover — :func:`fingerprint_matches`), so a physically-fresh roll gets a clean
+    4-dimension identity; else mints from the tray's own (genuinely different) config.
+    Optional ``new_fields`` (brand/label_weight/cost_per_kg/note) ride the new row.
+    Commits; broadcasts ``spool_auto_assigned(origin="tagless")``. Returns the new spool.
+    """
+    departed.archived_at = datetime.utcnow()  # keep the ledger row + its grams
+    res = await db.execute(
+        select(SpoolAssignment).where(
+            SpoolAssignment.printer_id == printer_id,
+            SpoolAssignment.ams_id == ams_id,
+            SpoolAssignment.tray_id == tray_id,
+        )
+    )
+    old = res.scalar_one_or_none()
+    if old is not None:
+        await db.delete(old)
+        await db.flush()
+
+    default = await _tagless_default(db)
+    tray_configured = bool(tray and (tray.get("tray_type") or "").strip())
+    use_default = default is not None and (not tray_configured or fingerprint_matches(departed, tray))
+
+    if use_default:
+        new_spool = await mint_tagless_spool(db, default_filament=default)
+        _apply_new_fields(new_spool, new_fields)
+        await _assign_from_setting(db, new_spool, printer_id, ams_id, tray_id, default)
+        await db.commit()
+        await _push_config(db, new_spool, printer_id, ams_id, tray_id, tray or {})
+    else:
+        if not tray_configured:
+            # No configured tray to mint from and no default → cannot build an identity.
+            raise ValueError("cannot replace tagless row: no tagless default and tray is not configured")
+        new_spool = await mint_tagless_spool(db, tray=tray)
+        _apply_new_fields(new_spool, new_fields)
+        await auto_assign_spool(
+            printer_id,
+            ams_id,
+            tray_id,
+            new_spool,
+            printer_manager,
+            db,
+            tray_info_idx=tray.get("tray_info_idx", "") or "",
+        )
+        await db.commit()
+    await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
+    return new_spool
+
+
+# --- W5 tagless fresh-roll prompt ------------------------------------------
+
+
+def _live_tray(printer_id: int, ams_id: int, tray_id: int) -> dict | None:
+    """The live tray dict for a slot from the printer's merged AMS state, or None.
+
+    Regular AMS units only (tagless fresh-roll prompts key on AMS trays). Never
+    raises — an unreachable printer reads as no tray.
+    """
+    try:
+        state = printer_manager.get_status(printer_id)
+    except Exception:  # noqa: BLE001 — resolution must never raise into the callback/route
+        return None
+    if state is None or not getattr(state, "raw_data", None):
+        return None
+    ams = state.raw_data.get("ams")
+    if isinstance(ams, dict):
+        ams = ams.get("ams", [])
+    for unit in ams or []:
+        if not isinstance(unit, dict):
+            continue
+        try:
+            if int(unit.get("id", -1)) != ams_id:
+                continue
+        except (TypeError, ValueError):
+            continue
+        for tray in unit.get("tray", []) or []:
+            if not isinstance(tray, dict):
+                continue
+            try:
+                if int(tray.get("id", -1)) == tray_id:
+                    return tray
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _tagless_fresh_payload(printer_id: int, ams_id: int, tray_id: int, spool: Spool) -> dict:
+    """Frozen ``tagless_fresh_prompt`` WS payload (W5) — one origin for the live
+    broadcast and the reconnect replay. Matches the frontend useWebSocket bridge +
+    TaglessFreshPromptMessage: {printer_id, ams_id, tray_id, spool_id, remaining_g,
+    material, rgba}."""
+    return {
+        "type": "tagless_fresh_prompt",
+        "printer_id": printer_id,
+        "ams_id": ams_id,
+        "tray_id": tray_id,
+        "spool_id": spool.id,
+        "remaining_g": float((spool.label_weight or 0) - (spool.weight_used or 0)),
+        "material": spool.material or "",
+        "rgba": spool.rgba,
+    }
+
+
+async def _broadcast_tagless_fresh_prompt(printer_id: int, ams_id: int, tray_id: int, spool: Spool) -> None:
+    await ws_manager.broadcast(_tagless_fresh_payload(printer_id, ams_id, tray_id, spool))
+
+
+async def broadcast_tagless_fresh_dismissed(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Cross-client clear of a tagless fresh-roll prompt (either answer, W5)."""
+    await ws_manager.broadcast(
+        {
+            "type": "tagless_fresh_prompt_dismissed",
+            "printer_id": printer_id,
+            "ams_id": ams_id,
+            "tray_id": tray_id,
+        }
+    )
+
+
+def clear_fresh_prompt(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Clear a slot's fresh-roll prompt unanswered entry (route answer / release)."""
+    _fresh_prompt_unanswered.discard((printer_id, ams_id, tray_id))
+
+
+async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> None:
+    """W5 over-consumption / fresh-roll prompt for a physical cycle on a tagless slot.
+
+    Reads the slot's kept assignment. A SPENT bound row leaves the pending cycle for
+    the W1 spent→mint transition (certain fresh roll — silent, no prompt). A NON-spent
+    row consumed past :data:`_FRESH_ROLL_PROMPT_USED_FRAC` of its label, still
+    unanswered for this cycle, broadcasts ``tagless_fresh_prompt`` and records the
+    unanswered entry. Every non-spent outcome (prompt or sub-threshold) POPs the
+    pending cycle — no latch is involved for non-spent rows.
+    """
+    key = (printer_id, ams_id, tray_id)
+    res = await db.execute(
+        select(SpoolAssignment)
+        .options(selectinload(SpoolAssignment.spool))
+        .where(
+            SpoolAssignment.printer_id == printer_id,
+            SpoolAssignment.ams_id == ams_id,
+            SpoolAssignment.tray_id == tray_id,
+        )
+    )
+    assignment = res.scalar_one_or_none()
+    spool = assignment.spool if assignment is not None else None
+    if spool is None or not is_tagless_spool(spool):
+        _pending_physical_cycles.discard(key)  # nothing tagless bound to latch/prompt
+        return
+    if spool.spent_at is not None:
+        return  # leave the pending cycle for the W1 spent→mint transition (silent)
+    label = spool.label_weight or 0
+    used = spool.weight_used or 0
+    if label > 0 and used >= _FRESH_ROLL_PROMPT_USED_FRAC * label and key not in _fresh_prompt_unanswered:
+        await _broadcast_tagless_fresh_prompt(printer_id, ams_id, tray_id, spool)
+        _fresh_prompt_unanswered.add(key)
+        logger.info(
+            "tagless_fresh_prompt broadcast: printer=%d AMS%d-T%d spool=%d used=%.0f/%d g",
+            printer_id,
+            ams_id,
+            tray_id,
+            spool.id,
+            float(used),
+            int(label),
+        )
+    _pending_physical_cycles.discard(key)  # non-spent processed (prompt or sub-threshold)
+
+
+async def note_physical_cycle(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Record a QUALIFIED physical roll swap on a slot — the W1 latch release + W5 prompt.
+
+    Called (guarded, awaited) from ``ams_presence.on_ams_change`` on a genuine presence
+    GAIN whose preceding absence lasted ≥ ``ams_presence._MIN_PHYSICAL_ABSENT_S``. Arms
+    :data:`_pending_physical_cycles` (the spent-binding latch's release signal that
+    branch (3) / :func:`maybe_autoconfigure_bare_tray` consume on the next push) then
+    runs the W5 over-consumption prompt in its OWN session (mirrors
+    ``ams_presence.on_printer_terminal``). Never raises — a farm-side failure must never
+    break the AMS callback chain.
+    """
+    key = (printer_id, ams_id, tray_id)
+    _pending_physical_cycles.add(key)
+    try:
+        from backend.app.core.database import async_session
+
+        async with async_session() as db:
+            await _maybe_prompt_fresh_roll(db, printer_id, ams_id, tray_id)
+    except Exception:  # noqa: BLE001 — must never break the AMS callback chain
+        logger.exception("note_physical_cycle W5 prompt failed for printer %d AMS%d-T%d", printer_id, ams_id, tray_id)
+
+
+async def apply_fresh_roll(
+    db: AsyncSession,
+    spool: Spool,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    *,
+    brand: str | None = None,
+    label_weight: int | None = None,
+    cost_per_kg: float | None = None,
+    note: str | None = None,
+) -> Spool:
+    """Answer a W5 fresh-roll prompt with "Fresh roll" — archive the current tagless
+    row and mint+bind+push a replacement (default-vs-tray via the shared transition),
+    applying the operator's optional brand/label_weight/cost_per_kg/note to the new row.
+    Clears the prompt's unanswered entry. Returns the new spool. Raises ``ValueError``
+    when the slot's live tray can't be resolved (the route maps it to HTTP 409)."""
+    tray = _live_tray(printer_id, ams_id, tray_id)
+    if tray is None:
+        raise ValueError("slot is no longer readable")
+    new_spool = await _replace_row_after_cycle(
+        db,
+        printer_id,
+        ams_id,
+        tray_id,
+        tray,
+        spool,
+        new_fields={"brand": brand, "label_weight": label_weight, "cost_per_kg": cost_per_kg, "note": note},
+    )
+    clear_fresh_prompt(printer_id, ams_id, tray_id)
+    _pending_physical_cycles.discard((printer_id, ams_id, tray_id))
+    return new_spool
+
+
+async def rebroadcast_unresolved_tagless_prompts(db: AsyncSession, send) -> int:
+    """Replay unresolved ``tagless_fresh_prompt`` events to a (re)connecting client (W5).
+
+    Sibling of ``spool_respool.rebroadcast_unresolved_respool_prompts``. The prompt WS
+    event is fire-once (``ws_manager.broadcast`` keeps no backlog), so a client that was
+    disconnected when a prompt fired never learns of it. Re-validate each unanswered
+    entry against durable + live state before re-sending — the assignment must still
+    exist, the spool must still be tagless + non-spent + non-archived, and the slot must
+    still be physically present. A stale entry is skipped (never mutates the set — the
+    per-cycle set is cleared only by an answer or a new cycle). Returns the count
+    re-sent. Never raises (a reconnect must not break on a farm-side hook).
+    """
+    snapshot = list(_fresh_prompt_unanswered)
+    sent = 0
+    for printer_id, ams_id, tray_id in snapshot:
+        try:
+            res = await db.execute(
+                select(SpoolAssignment)
+                .options(selectinload(SpoolAssignment.spool))
+                .where(
+                    SpoolAssignment.printer_id == printer_id,
+                    SpoolAssignment.ams_id == ams_id,
+                    SpoolAssignment.tray_id == tray_id,
+                )
+            )
+            assignment = res.scalar_one_or_none()
+            spool = assignment.spool if assignment is not None else None
+            if spool is None or not is_tagless_spool(spool):
+                continue
+            if spool.spent_at is not None or spool.archived_at is not None:
+                continue
+            tray = _live_tray(printer_id, ams_id, tray_id)
+            if tray is None or not tray_present(tray):
+                continue
+            await send(_tagless_fresh_payload(printer_id, ams_id, tray_id, spool))
+            sent += 1
+        except Exception:  # noqa: BLE001 — one slot's failure must not abort the replay
+            logger.exception(
+                "tagless_fresh_prompt re-broadcast failed for printer %s AMS%d-T%d", printer_id, ams_id, tray_id
+            )
+    if sent:
+        logger.info("Re-broadcast %d unresolved tagless_fresh_prompt(s) to a (re)connecting client", sent)
+    return sent
 
 
 # --- Hook B: tagless-slot policy -------------------------------------------
@@ -573,9 +958,6 @@ async def handle_tagless_slot(
         existing_assignment = None
 
     if existing_assignment is not None:
-        # A live assignment means the slot is tracked — the stale-config marker
-        # is moot now (pre-assignment clear).
-        _stale_config_markers.pop(key, None)
         spool = existing_assignment.spool
 
         # (2) Bound to a TAGGED spool → RFID/respool flows own it (this also lets
@@ -583,25 +965,27 @@ async def handle_tagless_slot(
         if not is_tagless_spool(spool):
             return False
 
-        # (3) Bound spool is spent → a fresh roll physically cannot be it.
+        # (3) Bound spool is spent → the spent binding IS the durable "ran dry" latch
+        # (W1). Only a QUALIFIED physical roll swap — a pending cycle recorded by
+        # note_physical_cycle after a ≥ _MIN_PHYSICAL_ABSENT_S absence — releases it
+        # into a fresh mint; with no pending cycle the runout-instant state flap keeps
+        # the binding, so a phantom fresh row can no longer be minted over a
+        # still-present spool. _replace_row_after_cycle default-mints when the tray
+        # still carries the departed config (firmware leftover), else tray-mints.
         if spool.spent_at is not None:
             if not _tray_loaded(tray):
                 return True  # dead roll re-seated, filament not fed — no churn
-            spool.archived_at = datetime.utcnow()  # keep the ledger row + its grams
-            await db.delete(existing_assignment)
-            await db.flush()
-            new_spool = await mint_tagless_spool(db, tray=tray)
-            await auto_assign_spool(
-                printer_id,
-                ams_id,
-                tray_id,
-                new_spool,
-                printer_manager,
-                db,
-                tray_info_idx=tray.get("tray_info_idx", "") or "",
-            )
-            await db.commit()
-            await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
+            if key not in _pending_physical_cycles:
+                logger.info(
+                    "Spent binding latched — awaiting physical roll swap (printer %d AMS%d-T%d spool %d)",
+                    printer_id,
+                    ams_id,
+                    tray_id,
+                    spool.id,
+                )
+                return True  # keep the binding: no archive, no unlink, no mint
+            _pending_physical_cycles.discard(key)  # consume the cycle
+            await _replace_row_after_cycle(db, printer_id, ams_id, tray_id, tray, spool)
             return True
 
         # (4) Same filament → rebind: refresh a drifted fingerprint, write NOTHING
@@ -639,28 +1023,6 @@ async def handle_tagless_slot(
     # over its empty slot, which is exactly the row we move here.
     if await _maybe_move_tagless_assignment(db, printer_id, ams_id, tray_id, tray, ams_data):
         return True
-
-    # Stale-config override: a spent spool's leftover config re-reported by the
-    # firmware on this now-refilled slot → apply the default instead of minting
-    # from the leftover fingerprint. A DIFFERING config clears the marker and
-    # falls through to the normal tray-derived mint.
-    marker = _stale_config_markers.pop(key, None)
-    if marker is not None and _marker_matches(marker, tray):
-        default = await _tagless_default(db)
-        if default is not None:
-            new_spool = await mint_tagless_spool(db, default_filament=default)
-            await _assign_from_setting(db, new_spool, printer_id, ams_id, tray_id, default)
-            await db.commit()
-            await _push_config(db, new_spool, printer_id, ams_id, tray_id, tray)
-            await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
-            logger.info(
-                "Stale-config override on printer %d AMS%d-T%d: applied tagless default over firmware leftover",
-                printer_id,
-                ams_id,
-                tray_id,
-            )
-            return True
-        # setting cleared → fall through to a normal tray-derived mint.
 
     new_spool = await mint_tagless_spool(db, tray=tray)
     await auto_assign_spool(
@@ -748,6 +1110,18 @@ async def maybe_autoconfigure_bare_tray(
         # OWN auto-minted default is eligible for a self-healing re-push.
         return False
 
+    # W1: a spent ams_auto binding is the "ran dry" latch — never re-push a spent
+    # row's config. Only a QUALIFIED physical roll swap (a pending cycle recorded by
+    # note_physical_cycle) releases it into the same archive→unlink→default-mint→push
+    # transition as branch (3). Checked BEFORE stamping the retry window so a latched
+    # slot never burns it.
+    if assignment is not None and assignment.spool is not None and assignment.spool.spent_at is not None:
+        if key not in _pending_physical_cycles:
+            return False  # latched — no re-push of a spent slot's config
+        _pending_physical_cycles.discard(key)  # consume the cycle
+        await _replace_row_after_cycle(db, printer_id, ams_id, tray_id, tray, assignment.spool)
+        return True
+
     _autoconfig_attempts[key] = now
 
     if assignment is None:
@@ -763,48 +1137,12 @@ async def maybe_autoconfigure_bare_tray(
     return True
 
 
-# --- stale-config markers + dedup lifecycle --------------------------------
+# --- dedup lifecycle -------------------------------------------------------
 
 
 def clear_autoconfig_dedup(printer_id: int, ams_id: int, tray_id: int) -> None:
     """Drop the bare-tray retry timestamp for a slot (called when it empties)."""
     _autoconfig_attempts.pop((printer_id, ams_id, tray_id), None)
-
-
-def clear_stale_marker(printer_id: int, ams_id: int, tray_id: int) -> None:
-    _stale_config_markers.pop((printer_id, ams_id, tray_id), None)
-
-
-def record_stale_marker_for_spool(printer_id: int, ams_id: int, tray_id: int, spool: Spool | None) -> None:
-    """Record a departing SPENT spool's fingerprint so its firmware-leftover
-    config on the next insertion is recognized as stale (not a new spool).
-
-    No-op unless the spool exists and is spent — a live spool departing is a
-    normal removal, not a firmware-leftover source.
-    """
-    if spool is None or spool.spent_at is None:
-        return
-    _stale_config_markers[(printer_id, ams_id, tray_id)] = (
-        canonical_filament_type(spool.material or ""),
-        (spool.rgba or "").upper(),
-    )
-
-
-async def record_stale_marker(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> None:
-    """Fetch the slot's bound spool and record a stale-config marker iff it is
-    spent. Called from the native-loop 'truly empty' branch."""
-    res = await db.execute(
-        select(SpoolAssignment)
-        .options(selectinload(SpoolAssignment.spool))
-        .where(
-            SpoolAssignment.printer_id == printer_id,
-            SpoolAssignment.ams_id == ams_id,
-            SpoolAssignment.tray_id == tray_id,
-        )
-    )
-    assignment = res.scalar_one_or_none()
-    if assignment is not None:
-        record_stale_marker_for_spool(printer_id, ams_id, tray_id, assignment.spool)
 
 
 # --- provisional disposal on RFID takeover ---------------------------------

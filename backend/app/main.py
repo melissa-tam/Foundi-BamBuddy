@@ -1725,11 +1725,6 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                 assignment.tray_id,
                             )
                             continue
-                        # Departing while spent → record the leftover-config marker so a
-                        # firmware re-read of its stale config isn't mistaken for a new spool.
-                        spool_tagless.record_stale_marker_for_spool(
-                            printer_id, assignment.ams_id, assignment.tray_id, assignment.spool
-                        )
                         logger.info(
                             "Auto-unlink: spool %d AMS%d-T%d — tray not found in AMS data (slot empty?)",
                             assignment.spool_id,
@@ -1879,9 +1874,6 @@ async def on_ams_change(printer_id: int, ams_data: list):
                             # the spent leftover-config marker and unlink.
                             if spool_tagless.should_keep_on_empty(assignment, _tagless_threshold):
                                 continue
-                            spool_tagless.record_stale_marker_for_spool(
-                                printer_id, assignment.ams_id, assignment.tray_id, assignment.spool
-                            )
                             stale.append(assignment)
                             continue
 
@@ -2024,21 +2016,10 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                     continue
                                 # Truly empty (state 9 / cleared) — drop any cached
                                 # unknown-tag / re-spool-prompt / bare-config dedup so
-                                # reinserting the same spool re-prompts, and record a
-                                # stale-config marker if the departing spool was spent.
+                                # reinserting the same spool re-prompts.
                                 _clear_unknown_tag_dedup(printer_id, ams_id, tray_id)
                                 clear_respool_prompt_dedup(printer_id, ams_id, tray_id)
                                 spool_tagless.clear_autoconfig_dedup(printer_id, ams_id, tray_id)
-                                try:
-                                    await spool_tagless.record_stale_marker(db, printer_id, ams_id, tray_id)
-                                except Exception as _sme:  # noqa: BLE001 — never crash the AMS callback
-                                    logger.warning(
-                                        "Stale-config marker record failed for printer %s AMS%d-T%d: %s",
-                                        printer_id,
-                                        ams_id,
-                                        tray_id,
-                                        _sme,
-                                    )
                                 continue  # Empty slot
                             # Check if assignment already exists for this slot
                             existing = await db.execute(
@@ -2287,11 +2268,8 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                         continue
                                 # Slot matched (existing tag, untagged inventory
                                 # match, or freshly auto-created spool) — drop any
-                                # stale dedup so a future tag swap re-prompts, and
-                                # clear any tagless stale-config marker (an RFID tag
-                                # now owns the slot).
+                                # stale dedup so a future tag swap re-prompts.
                                 _clear_unknown_tag_dedup(printer_id, ams_id, tray_id)
-                                spool_tagless.clear_stale_marker(printer_id, ams_id, tray_id)
                                 await auto_assign_spool(
                                     printer_id,
                                     ams_id,
@@ -2319,9 +2297,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                     tray_id,
                                 )
                             elif is_valid_tag(tag_uid, tray_uuid):
-                                # Non-BL spool with some tag — let user choose. A valid
-                                # tag now owns the slot, so drop any tagless marker.
-                                spool_tagless.clear_stale_marker(printer_id, ams_id, tray_id)
+                                # Non-BL spool with some tag — let user choose.
                                 await _broadcast_unknown_tag(
                                     printer_id=printer_id,
                                     ams_id=ams_id,

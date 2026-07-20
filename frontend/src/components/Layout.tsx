@@ -14,7 +14,9 @@ import { useColorCatalogVersion } from '../hooks/useColorCatalogVersion';
 import { useSponsorPrompt } from '../hooks/useSponsorPrompt';
 import { useUnknownTagPrompt } from '../hooks/useUnknownTagPrompt';
 import { useRespoolPrompt } from '../hooks/useRespoolPrompt';
+import { useTaglessFreshPrompt } from '../hooks/useTaglessFreshPrompt';
 import { RespoolTagModal } from './RespoolTagModal';
+import { TaglessFreshModal } from './TaglessFreshModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { CardHeader, CardContent } from './Card';
@@ -128,6 +130,10 @@ export function Layout() {
   // off). Side-effect only; the hook owns its toasts.
   useUnknownTagPrompt();
   const respoolPrompt = useRespoolPrompt();
+  // Tagless fresh-roll prompt — raises a per-slot persistent toast when a
+  // non-RFID roll is consumed past half its label weight (W5). Side-effect only;
+  // the hook owns its toasts, and its review modal is rendered below.
+  const taglessFreshPrompt = useTaglessFreshPrompt();
 
   // Fetch default sidebar order via a public endpoint (no settings:read needed)
   const { data: defaultSidebarData } = useQuery({
@@ -919,6 +925,11 @@ export function Layout() {
       <RespoolTagModal
         context={respoolPrompt.activeContext}
         onClose={respoolPrompt.closeModal}
+      />
+
+      <TaglessFreshModal
+        context={taglessFreshPrompt.activeContext}
+        onClose={taglessFreshPrompt.closeModal}
       />
 
       {/* Keyboard Shortcuts Modal */}

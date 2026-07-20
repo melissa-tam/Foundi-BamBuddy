@@ -382,6 +382,11 @@ export interface HMSError {
   short_code?: string;
   description?: string | null;
   wiki_url?: string;
+  // Per-slot runout attribution (W6): present on filament-runout HMS codes whose
+  // wire attr names the exhausted AMS slot (the `0700_2X00` family). Drives the
+  // per-slot "ran out" badge on PrintersPage. Absent for the slot-agnostic
+  // `_8011`-only case and for every non-runout code.
+  runout_slot?: { ams_id: number; tray_id: number } | null;
 }
 
 export interface HMSActionBody {
@@ -542,6 +547,10 @@ export interface PrinterStatus {
   fila_switch: FilaSwitchState | null;
   // Currently loaded tray (global tray ID, 255 = no filament loaded, 254 = external spool)
   tray_now: number;
+  // Last tray the printer loaded for THIS job (global tray ID; -1 = none). Reset
+  // per-job on the backend, so during a runout PAUSE (tray_now flips to 255) the
+  // UI can still show which slot WAS feeding via a dimmed "was feeding" ring (W6).
+  last_loaded_tray: number;
   // AMS status for filament change tracking (0=idle, 1=filament_change, 2=rfid_identifying, 3=assist, 4=calibration)
   ams_status_main: number;
   // AMS sub-status for filament change step (when main=1): 4=retraction, 6=load verification, 7=purge
@@ -1357,6 +1366,10 @@ export interface AppSettings {
   // spent marker, prompt the operator to re-spool once the donor's remaining
   // grams drop at or below this threshold (default 30).
   respool_prompt_threshold_g: number;
+  // Automatic re-spool on reused tags: when false (default), a reappearing spent
+  // tag raises the re-spool PROMPT instead of silently minting a fresh spool.
+  // Enable only when running Bambu refills on reused cores.
+  respool_auto_enabled: boolean;
 }
 
 export type AppSettingsUpdate = Partial<AppSettings>;
@@ -2882,6 +2895,11 @@ export interface InventorySpool {
   // back-compat with pre-migration snapshots and object-literal test fixtures.
   feed_fault_at?: string | null;
   feed_fault_code?: string | null;
+  // Hardware-certain spent marker (W6/W3): set when the roll is genuinely spent
+  // (RFID runout, confirmed exhaustion). Drives the "spent — replace roll" slot
+  // badge; a spent spool is hard-excluded from selection. Optional for
+  // back-compat with pre-migration snapshots and object-literal test fixtures.
+  spent_at?: string | null;
 }
 
 export interface SpoolmanBulkCreateResult {
@@ -2945,6 +2963,36 @@ export interface SpoolRespooledMessage {
   new_spool_id: number;
   brand: string;
   label_weight: number;
+}
+
+/** WS `tagless_fresh_prompt` payload (W5) — a tagless (non-RFID) roll has been
+ *  consumed past half its label weight and a qualified physical cycle occurred,
+ *  so the operator is asked whether a FRESH roll is now on the slot (over-
+ *  consumption + swap visibility). Dismissal is PER physical cycle, not
+ *  permanent (a later roll swap re-asks). */
+export interface TaglessFreshPromptMessage {
+  printer_id: number;
+  ams_id: number;
+  tray_id: number;
+  spool_id: number;
+  remaining_g: number;
+  material: string;
+  rgba: string | null;
+}
+
+/** POST body for `POST /inventory/spools/{spool_id}/tagless-fresh`. `answer`
+ *  "fresh" archives the current tagless row and mints a replacement (the
+ *  optional brand/label_weight/cost/note ride the new row); "same" clears the
+ *  prompt for THIS physical cycle only. */
+export interface TaglessFreshRequest {
+  printer_id: number;
+  ams_id: number;
+  tray_id: number;
+  answer: 'fresh' | 'same';
+  brand?: string | null;
+  label_weight?: number | null;
+  cost_per_kg?: number | null;
+  note?: string | null;
 }
 
 /** Response from `POST /printers/{id}/eject` (W2 manual eject). `released_watch`
@@ -5535,6 +5583,15 @@ export const api = {
     request<InventorySpool>(`/inventory/spools/${spoolId}/respool-dismiss`, {
       method: 'POST',
       body: JSON.stringify(slot ?? {}),
+    }),
+  // Answer the tagless fresh-roll prompt (W5): "fresh" archives the current
+  // tagless row and mints a replacement (optional brand/weight/cost on the new
+  // row); "same" clears the prompt for this physical cycle only. The response
+  // body is the fresh spool on "fresh" and ignored on "same".
+  taglessFresh: (spoolId: number, data: TaglessFreshRequest) =>
+    request<InventorySpool>(`/inventory/spools/${spoolId}/tagless-fresh`, {
+      method: 'POST',
+      body: JSON.stringify(data),
     }),
   getSpoolmanSettings: () =>
     request<{ spoolman_enabled: string; spoolman_url: string; spoolman_sync_mode: string; spoolman_disable_weight_sync: string; spoolman_report_partial_usage: string; auto_add_unknown_rfid: string; }>('/settings/spoolman'),

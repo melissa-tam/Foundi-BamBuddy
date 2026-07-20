@@ -129,6 +129,10 @@ RECOVERABLE_HMS_CODES: frozenset[str] = FEED_FAULT_HMS_CODES | RUNOUT_HMS_CODES
 # --- waiting_reason tokens (rendered by the queue UI, mapped in waitingReason.ts)
 WAITING_REASON_RECOVERING = "spool_jam_recovering"
 WAITING_REASON_FAILED = "spool_jam_recovery_failed"
+# A filament RUNOUT that escalated (distinct copy from a jam: the fix is to insert
+# filament into the SAME slot, not swap). farm_stall treats it as attended so the
+# pause-stall watchdog doesn't double-escalate.
+WAITING_REASON_RUNOUT = "filament_runout_recovery_failed"
 
 # --- Safety bounds (code constants, NOT operator knobs — precedent the client-
 #     owned settle-wait, bambu_mqtt._IDENTIFY_GATE_S / wait_ams_settle). The
@@ -138,6 +142,9 @@ _POLL_INTERVAL_S = 1.0  # live-state poll spacing during every confirm wait
 _POST_RESUME_STABLE_S = 60  # RUNNING must hold this long after a resume = success
 _REPAUSE_WATCH_S = 120  # ceiling on how long we wait for RUNNING after a resume
 _MAX_CANDIDATES = 3  # distinct replacement trays tried before escalating
+# Absolute floor a replacement spool must clear even past the protected layers —
+# never load a known-empty spool. A ledger ≤ 5 g is empty for replacement purposes.
+_RECOVERY_HARD_MIN_G = 5
 
 # tray_now sentinel: no filament fed (unloaded). 255 on H2-series.
 _NO_FILAMENT = 255
@@ -158,6 +165,11 @@ _ESCALATE_DETAIL: dict[str, str] = {
     "no_eligible_spool": "No other loaded spool matched the jammed filament. Left PAUSED for a human.",
     "only_low_spools_in_protected_layers": (
         "The only matching spool is below the minimum-start weight this early in the print. Left PAUSED for a human."
+    ),
+    "only_near_empty_spools": "Every matching spool is effectively empty. Left PAUSED for a human.",
+    "runout_needs_refill": (
+        "Filament ran out and the printer only accepts new filament in the SAME slot — "
+        "insert filament and resume on the printer."
     ),
     "candidates_exhausted": "Tried every eligible replacement spool without a stable resume. Left PAUSED for a human.",
     "unload_failed": "The jammed spool would not unload. Left PAUSED for a human.",
@@ -262,6 +274,25 @@ def _log_gate_out(reason: str, printer_id: int, recoverable: frozenset[str]) -> 
     )
 
 
+def _log_candidate_outcome(incident: RecoveryIncident, *, gtid: int | None, verdict: str) -> None:
+    """One parseable INFO line after a non-ok unload/load confirm and at candidate-
+    loop end, carrying the live telemetry that explains WHY a step didn't take —
+    candidate global tray, verdict, live tray_now, ams_status_main/sub, and the
+    pending tray target the firmware is honoring."""
+    st = _get_state(incident.printer_id)
+    logger.info(
+        "[spool_recovery] candidate outcome printer=%s gtid=%s verdict=%s tray_now=%s "
+        "ams_status=%s/%s pending_target=%s",
+        incident.printer_id,
+        gtid,
+        verdict,
+        getattr(st, "tray_now", None) if st is not None else None,
+        getattr(st, "ams_status_main", None) if st is not None else None,
+        getattr(st, "ams_status_sub", None) if st is not None else None,
+        getattr(st, "pending_tray_target", None) if st is not None else None,
+    )
+
+
 # --- small helpers ----------------------------------------------------------
 
 
@@ -315,6 +346,15 @@ def _rewrite_mapping(raw: str | None, jammed: int | None, target: int) -> str | 
         return raw
     rewritten = [target if (isinstance(v, (int, float)) and int(v) == jammed) else v for v in mapping]
     return json.dumps(rewritten)
+
+
+def _runout_slot_desc(global_tray: int | None) -> str | None:
+    """Human slot name for the runout notification ("AMS A slot 1") from a regular
+    AMS global tray (letter = A + g//4, slot = g%4 + 1). ``None`` for AMS-HT /
+    external / unresolved trays (no clean letter+slot mapping)."""
+    if global_tray is None or not (0 <= global_tray <= 127):
+        return None
+    return f"AMS {chr(ord('A') + global_tray // 4)} slot {global_tray % 4 + 1}"
 
 
 # --- settings ---------------------------------------------------------------
@@ -520,13 +560,27 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
         # (2) Show the operator a live status; take the jammed spool out of
         #     rotation (feed-fault incidents only — a runout spool is SPENT).
         await _stamp_recovering(incident)
-        if incident.is_feed_fault and incident.jammed_global_tray is not None:
+
+        # A filament RUNOUT escalates IMMEDIATELY — no unload/select/load. Firmware
+        # refuses cross-slot ams_change_filament in the 8011 "insert into the SAME
+        # slot" state (2026-07-19 incident: 10 cross-slot loads across two printers
+        # executed ZERO times while the operator confirmed the target slots held
+        # filament), so the whole swap machine is futile here — the fix is a
+        # same-slot refill by a human. The feed-fault branch below keeps the proven
+        # unload→swap→resume machine (006 recovery #1).
+        if not incident.is_feed_fault:
+            await _escalate(incident, "runout_needs_refill")
+            return
+
+        if incident.jammed_global_tray is not None:
             await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
 
         # (3) Try up to _MAX_CANDIDATES replacement trays.
         tried: set[int] = set()
         for _round in range(_MAX_CANDIDATES):
             unload = await _unload_and_confirm(incident, client)
+            if unload != "ok":
+                _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict=f"unload_{unload}")
             if unload == "abort":
                 await _abort(incident)
                 return
@@ -543,11 +597,24 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                 if st is not None and getattr(st, "state", None) == "RUNNING":
                     await _abort(incident)
                     return
-                await _escalate(incident, "only_low_spools_in_protected_layers" if only_low else "no_eligible_spool")
+                if only_low:
+                    # At/after the protected layers the floor is the hard minimum, so
+                    # "only low" there means every match is effectively empty; below
+                    # them it means below the ordinary minimum-start weight.
+                    reason = (
+                        "only_near_empty_spools"
+                        if incident.layer_at_fault >= incident.settings.protect_layers
+                        else "only_low_spools_in_protected_layers"
+                    )
+                else:
+                    reason = "no_eligible_spool"
+                await _escalate(incident, reason)
                 return
             tried.add(target)
 
             load = await _load_and_confirm(incident, client, target)
+            if load != "ok":
+                _log_candidate_outcome(incident, gtid=target, verdict=f"load_{load}")
             if load == "abort":
                 await _abort(incident)
                 return
@@ -598,6 +665,7 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                 )
 
         # (4) Every candidate exhausted.
+        _log_candidate_outcome(incident, gtid=None, verdict="candidates_exhausted")
         await _escalate(incident, "candidates_exhausted")
     except Exception:  # noqa: BLE001 — the driver must never crash the event loop
         logger.exception("spool_recovery: recovery driver crashed for printer %s", pid)
@@ -807,6 +875,7 @@ async def _match_candidates(
     given requirement. Returns ``(global_tray_id | None, only_low)``."""
     from backend.app.api.routes.settings import get_setting
     from backend.app.core.database import async_session
+    from backend.app.services.bambu_mqtt import TRAY_PRESENT_STATES
     from backend.app.services.print_scheduler import scheduler
     from backend.app.services.spool_selection import (
         _read_min_start_g,
@@ -815,6 +884,18 @@ async def _match_candidates(
         match_filaments_to_slots,
     )
 
+    def _present(f: dict) -> bool:
+        # Drop a candidate whose tray reports an explicit non-present state (e.g.
+        # 9 = seated-but-unsensed): a load there is doomed. FAIL OPEN when the state
+        # is None/unparseable — dialect variance must never exclude a real candidate.
+        st = f.get("state")
+        if st is None:
+            return True
+        try:
+            return int(st) in TRAY_PRESENT_STATES
+        except (TypeError, ValueError):
+            return True
+
     loaded_all = scheduler._build_loaded_filaments(status)
     candidates = [
         f
@@ -822,6 +903,7 @@ async def _match_candidates(
         if not f.get("is_external")
         and f.get("global_tray_id") != incident.jammed_global_tray
         and f.get("global_tray_id") not in tried
+        and _present(f)
     ]
     if not candidates:
         return None, False
@@ -833,9 +915,10 @@ async def _match_candidates(
         policy_setting = await get_setting(db, "spool_selection_policy")
 
     # The layer rule is a floor PARAMETER, not new floor logic: below the
-    # protected-layer threshold a low spool stays a backup donor; at/after it a
-    # low spool is a valid mid-print replacement.
-    min_start_g = 0 if incident.layer_at_fault >= incident.settings.protect_layers else base_min
+    # protected-layer threshold a low spool stays a backup donor; at/after it the
+    # floor drops to the hard minimum — a low-but-not-empty spool is a valid
+    # mid-print replacement, but a known-empty one (≤ _RECOVERY_HARD_MIN_G) never is.
+    min_start_g = _RECOVERY_HARD_MIN_G if incident.layer_at_fault >= incident.settings.protect_layers else base_min
     policy = effective_policy(policy_setting, backup_on)
 
     outcome = match_filaments_to_slots(
@@ -1011,7 +1094,13 @@ async def _load_and_confirm(incident: RecoveryIncident, client, target: int) -> 
     loop. A ``pending_tray_target`` that becomes something other than our target
     means another actor issued a load → abort.
     """
+    from backend.app.services import spool_respool
+
     for _ in range(max(1, incident.settings.max_attempts)):
+        # Mark every load send as ours BEFORE it goes out, so the backup-swap
+        # detector suppresses the resulting tray_now edge instead of spending the
+        # departed spool (the 006 self-inflicted false-stamp mode).
+        spool_respool.note_commanded_load(incident.printer_id, target)
         if not client.ams_load_filament(target):
             # Offline / rejected send: a no-op that never confirms — consume the
             # attempt and advance immediately instead of burning a full confirm wait.
@@ -1263,11 +1352,15 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
     await _log_tray_snapshot(incident)
 
     detail = _ESCALATE_DETAIL.get(reason, reason)
+    # A jam that couldn't be recovered keeps WAITING_REASON_FAILED; a RUNOUT gets its
+    # own token (distinct UI copy: refill the SAME slot, don't swap).
+    token = WAITING_REASON_FAILED if incident.is_feed_fault else WAITING_REASON_RUNOUT
+    slot_hint = None if incident.is_feed_fault else _runout_slot_desc(incident.jammed_global_tray)
     try:
         async with async_session() as db:
             item = await db.get(PrintQueueItem, incident.item_id)
             if item is not None:
-                item.waiting_reason = WAITING_REASON_FAILED
+                item.waiting_reason = token
                 await db.commit()
             printer = await db.get(Printer, incident.printer_id)
             printer_name = (printer.name if printer else None) or f"printer {incident.printer_id}"
@@ -1279,6 +1372,7 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
                     detail=detail,
                     db=db,
                     is_feed_fault=incident.is_feed_fault,
+                    runout_slot=slot_hint,
                 )
             except Exception:  # noqa: BLE001 — notification failure is non-fatal
                 logger.exception("spool_recovery: failed notification error for printer %s", incident.printer_id)

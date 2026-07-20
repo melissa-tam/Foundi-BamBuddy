@@ -52,6 +52,48 @@ logger = logging.getLogger(__name__)
 _KNOWN_MATERIALS = set(MATERIAL_TEMPS.keys()) | set(GENERIC_FILAMENT_IDS.keys())
 
 
+async def _resolve_nozzle_temps(
+    db: AsyncSession,
+    material: str | None,
+    rgba: str | None,
+    row_min: int | None,
+    row_max: int | None,
+) -> tuple[int, int]:
+    """The slot's nozzle temperature range, resolved in ONE place (W4).
+
+    Tier order, each temp independently: the spool ROW's temp when set → the
+    configured tagless default's pair when the spool's material+rgba fingerprint
+    matches the default → ``MATERIAL_TEMPS`` (final always-valid fallback). The
+    default tier is a best-effort enrichment behind a guard: it has an always-valid
+    fallback below it, so a settings-read failure degrades to MATERIAL_TEMPS rather
+    than raising into a slot write.
+    """
+    temp_min, temp_max = row_min, row_max
+    if temp_min is None or temp_max is None:
+        default_pair: tuple[int, int] | None = None
+        try:
+            # Lazy import: the single owner of the tagless-default JSON parse, kept
+            # function-local so the resolver and spool_tagless have no import cycle.
+            from backend.app.services.spool_tagless import default_temps_for_fingerprint
+
+            default_pair = await default_temps_for_fingerprint(db, material, rgba)
+        except Exception as e:  # noqa: BLE001 — best-effort; MATERIAL_TEMPS is the guaranteed fallback
+            logger.debug("Tagless-default temp lookup failed for %r/%r: %s", material, rgba, e)
+        if default_pair is not None:
+            d_min, d_max = default_pair
+            if temp_min is None:
+                temp_min = d_min
+            if temp_max is None:
+                temp_max = d_max
+    if temp_min is None or temp_max is None:
+        m_min, m_max = MATERIAL_TEMPS.get((material or "").upper(), (200, 240))
+        if temp_min is None:
+            temp_min = m_min
+        if temp_max is None:
+            temp_max = m_max
+    return (temp_min, temp_max)
+
+
 async def resolve_slicer_filament(
     *,
     db: AsyncSession,
@@ -59,12 +101,16 @@ async def resolve_slicer_filament(
     slicer_filament: str | None,
     slicer_filament_name: str | None,
     material: str | None,
-) -> tuple[str, str, str | None]:
-    """Resolve a spool's slicer-preset reference to printer-side ids.
+    rgba: str | None = None,
+    nozzle_temp_min: int | None = None,
+    nozzle_temp_max: int | None = None,
+) -> tuple[str, str, str | None, int, int]:
+    """Resolve a spool's stored identity to the COMPLETE printer-side wire tuple.
 
     ``slicer_filament``: the spool's stored reference (e.g. ``"GFA01"``,
     ``"PFUS990b6e19965353"``, ``"38"`` for a numeric LocalPreset id, or
-    free-text). May be empty or None — returns the empty tuple in that case.
+    free-text). May be empty or None — the id/setting pair is empty in that case
+    but the temps are still resolved (the caller consumes them unconditionally).
 
     ``slicer_filament_name``: optional builtin-name realignment hint. When
     set and the resolved tray_info_idx maps to a different builtin name,
@@ -72,16 +118,25 @@ async def resolve_slicer_filament(
     "Bambu PLA Matte" but the cloud lookup landed on "Bambu PLA Basic").
 
     ``material``: spool material string for the local-preset fallback
-    branch when the LocalPreset's setting JSON doesn't carry a filament_id.
+    branch when the LocalPreset's setting JSON doesn't carry a filament_id, AND
+    for the nozzle-temp resolution (fingerprint / MATERIAL_TEMPS).
 
-    Returns ``(tray_info_idx, setting_id, sub_brand_override)`` — all empty
-    when nothing resolved. ``sub_brand_override`` is non-None when a more
-    specific brand label is available (cloud detail name or local preset
-    name); ``None`` means the caller should use its own default.
+    ``rgba`` / ``nozzle_temp_min`` / ``nozzle_temp_max``: the spool row's colour
+    and its stored temps — feed the temp resolution (:func:`_resolve_nozzle_temps`)
+    so the WHOLE wire identity is composed here and the two write-site consumers
+    can't diverge (W4). Optional so pre-W4 callers still type-check.
+
+    Returns ``(tray_info_idx, setting_id, sub_brand_override, nozzle_temp_min,
+    nozzle_temp_max)``. id/setting are empty when nothing resolved;
+    ``sub_brand_override`` is non-None when a more specific brand label is
+    available (cloud detail name or local preset name). The two temps are ALWAYS
+    concrete ints (MATERIAL_TEMPS is the final fallback).
     """
+    temp_min, temp_max = await _resolve_nozzle_temps(db, material, rgba, nozzle_temp_min, nozzle_temp_max)
+
     sf = (slicer_filament or "").strip()
     if not sf:
-        return ("", "", None)
+        return ("", "", None, temp_min, temp_max)
 
     tray_info_idx = ""
     setting_id = ""
@@ -215,4 +270,4 @@ async def resolve_slicer_filament(
         ):
             setting_id = ""
 
-    return (tray_info_idx, setting_id, sub_brand_override)
+    return (tray_info_idx, setting_id, sub_brand_override, temp_min, temp_max)

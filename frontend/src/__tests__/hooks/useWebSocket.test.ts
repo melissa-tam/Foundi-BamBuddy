@@ -538,6 +538,82 @@ describe('useWebSocket hook', () => {
       vi.unstubAllGlobals();
     });
 
+    it('bridges tagless_fresh_prompt to a tagless-fresh-prompt window event', async () => {
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      const received: Array<Record<string, unknown>> = [];
+      const handler = (e: Event) => received.push((e as CustomEvent).detail);
+      window.addEventListener('tagless-fresh-prompt', handler);
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'tagless_fresh_prompt',
+          printer_id: 2,
+          ams_id: 1,
+          tray_id: 3,
+          spool_id: 77,
+          remaining_g: 410,
+          material: 'PETG',
+          rgba: 'FF8800FF',
+        });
+      });
+
+      window.removeEventListener('tagless-fresh-prompt', handler);
+      expect(received).toContainEqual({
+        printer_id: 2,
+        ams_id: 1,
+        tray_id: 3,
+        spool_id: 77,
+        remaining_g: 410,
+        material: 'PETG',
+        rgba: 'FF8800FF',
+      });
+
+      vi.unstubAllGlobals();
+    });
+
+    it('bridges tagless_fresh_prompt_dismissed to a tagless-fresh-prompt-dismissed window event', async () => {
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      const received: Array<{ printer_id?: number; ams_id?: number; tray_id?: number }> = [];
+      const handler = (e: Event) => received.push((e as CustomEvent).detail);
+      window.addEventListener('tagless-fresh-prompt-dismissed', handler);
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'tagless_fresh_prompt_dismissed',
+          printer_id: 2,
+          ams_id: 1,
+          tray_id: 3,
+        });
+      });
+
+      window.removeEventListener('tagless-fresh-prompt-dismissed', handler);
+      expect(received).toContainEqual({ printer_id: 2, ams_id: 1, tray_id: 3 });
+
+      vi.unstubAllGlobals();
+    });
+
     it('toasts on a tagless spool_auto_assigned (origin: tagless)', async () => {
       vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
         cb(0);

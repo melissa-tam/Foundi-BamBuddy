@@ -10,6 +10,7 @@ from backend.app.services.hms_errors import (
     hms_severity,
     hms_short_code,
     lookup_description_any,
+    runout_slot_from_hms,
 )
 
 
@@ -237,9 +238,7 @@ class TestHmsErrorPayloadCatalog:
     def test_full_code_description_wins_over_two_group(self):
         # short_code 0500_0004 is NOT in the legacy table, but the full ecode
         # 0500010000030004 IS in the vendored catalog — full-code must win.
-        err = _fake_hms_error(
-            code="0x30004", attr=0x05000100, module=5, severity=3, full_code="0500010000030004"
-        )
+        err = _fake_hms_error(code="0x30004", attr=0x05000100, module=5, severity=3, full_code="0500010000030004")
         payload = hms_error_payload(err)
         assert payload["short_code"] == "0500_0004"
         assert get_error_description("0500_0004") is None
@@ -256,9 +255,7 @@ class TestHmsErrorPayloadCatalog:
         assert payload["description"] is None
 
     def test_wiki_deep_link_for_known_code(self):
-        err = _fake_hms_error(
-            code="0x30004", attr=0x05000100, module=5, severity=3, full_code="0500010000030004"
-        )
+        err = _fake_hms_error(code="0x30004", attr=0x05000100, module=5, severity=3, full_code="0500010000030004")
         payload = hms_error_payload(err)
         assert payload["wiki_url"].startswith("https://wiki.bambulab.com/en/")
         assert "/hmscode/" in payload["wiki_url"]
@@ -267,3 +264,67 @@ class TestHmsErrorPayloadCatalog:
         err = _fake_hms_error(code="0xFFFF", attr=0xFFFF0000, full_code="FFFF00000000FFFF")
         payload = hms_error_payload(err)
         assert payload["wiki_url"] == HMS_WIKI_URL
+
+
+class TestRunoutSlotFromHms:
+    """Pure decode of the 0700_2X00 per-slot runout family (attr → AMS+slot).
+
+    Probe-verified against the two live 2026-07-19 incident faults and real
+    catalog ecodes; the slot-agnostic 8011 runout and every non-runout code
+    fail closed so the caller falls back to tray_now/mapping inference."""
+
+    def test_live_incident_vector_slot1(self):
+        # 117448704 = 0x07002000, code 0x00020001 → AMS0 slot0 ("AMS A Slot 1").
+        assert runout_slot_from_hms(117448704, 0x00020001) == (0, 0)
+
+    def test_live_incident_vector_slot3(self):
+        # 117449216 = 0x07002200, code 0x00020001 → AMS0 slot2 ("AMS A Slot 3").
+        assert runout_slot_from_hms(117449216, 0x00020001) == (0, 2)
+
+    def test_catalog_ecode_ams_a_slot2_purge_variant(self):
+        # 0700210000020005 "AMS A Slot 2 filament has run out, and purging …".
+        assert runout_slot_from_hms(0x07002100, 0x00020005) == (0, 1)
+
+    def test_catalog_ecode_ams_b_slot1_wait_variant(self):
+        # 0701200000030001 "AMS B Slot 1 filament has run out. Please wait …".
+        assert runout_slot_from_hms(0x07012000, 0x00030001) == (1, 0)
+
+    def test_catalog_ecode_ams_b_slot4_autoswitch_variant(self):
+        # 0701230000030002 "AMS B Slot 4 filament has run out and automatically switched".
+        assert runout_slot_from_hms(0x07012300, 0x00030002) == (1, 3)
+
+    def test_catalog_ecode_ams_c_slot3(self):
+        # 0702220000020001 "AMS C Slot 3 …".
+        assert runout_slot_from_hms(0x07022200, 0x00020001) == (2, 2)
+
+    def test_wrong_module_byte_rejected(self):
+        # Same slot layout but module byte 0x03 (motion), not 0x07 (AMS).
+        assert runout_slot_from_hms(0x03002000, 0x00020001) is None
+
+    def test_slot_byte_out_of_range_rejected(self):
+        # slot byte 0x24 is one past the last valid slot (0x20..0x23).
+        assert runout_slot_from_hms(0x07002400, 0x00020001) is None
+
+    def test_non_runout_code32_rejected(self):
+        # 0x8011 is the slot-AGNOSTIC "insert into the same slot" runout — no slot.
+        assert runout_slot_from_hms(0x07002000, 0x00008011) is None
+
+    def test_arbitrary_non_runout_code_rejected(self):
+        assert runout_slot_from_hms(0x07002000, 0x0000400C) is None
+
+
+class TestHmsErrorPayloadRunoutSlot:
+    """hms_error_payload adds `runout_slot` ONLY for a per-slot runout fault."""
+
+    def test_runout_fault_carries_slot(self):
+        err = _fake_hms_error(code="0x20001", attr=0x07002200, module=7, severity=2, full_code="0700220000020001")
+        payload = hms_error_payload(err)
+        assert payload["runout_slot"] == {"ams_id": 0, "tray_id": 2}
+
+    def test_non_runout_fault_omits_slot(self):
+        # The default fake (0300_400C) is not a runout → no extra key.
+        assert "runout_slot" not in hms_error_payload(_fake_hms_error())
+
+    def test_slot_agnostic_8011_omits_slot(self):
+        err = _fake_hms_error(code="0x8011", attr=0x07000000, module=7, severity=2, full_code="0700000000008011")
+        assert "runout_slot" not in hms_error_payload(err)

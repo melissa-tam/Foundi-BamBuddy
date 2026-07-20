@@ -19,13 +19,29 @@ class TaglessDefaultFilament(BaseModel):
     subtype: str = ""
     rgba: str
     slicer_filament: str | None = None
+    # Nozzle temperature range (W4). Optional so an operator-edited blob without
+    # them still validates; the shipped default carries the live RFID-read Bambu
+    # PETG HF range so a tagless slot's wire identity is a byte-identical firmware
+    # backup-group peer on all four dimensions (brand-class / type / colour /
+    # nozzle-temp-range) of same-filament Bambu slots.
+    nozzle_temp_min: int | None = None
+    nozzle_temp_max: int | None = None
 
 
 # Default filament for bare tagless trays (Bambu Lab PETG HF), serialized to a
 # JSON string because settings are persisted as strings. Empty string clears the
-# setting (feature off — no default is pushed to bare trays).
+# setting (feature off — no default is pushed to bare trays). Ships the SPECIFIC
+# Bambu PETG HF slicer id (GFG02) + its 230/270 nozzle range so bare-tray pushes
+# resolve a full 4-dimension identity instead of falling to the generic GFG99 —
+# a mismatch that split the firmware auto-refill backup group (2026-07-19 incident).
 _DEFAULT_TAGLESS_FILAMENT_JSON = TaglessDefaultFilament(
-    brand="Bambu Lab", material="PETG", subtype="HF", rgba="000000FF"
+    brand="Bambu Lab",
+    material="PETG",
+    subtype="HF",
+    rgba="000000FF",
+    slicer_filament="GFG02",
+    nozzle_temp_min=230,
+    nozzle_temp_max=270,
 ).model_dump_json()
 
 
@@ -104,6 +120,14 @@ class AppSettings(BaseModel):
     spool_recovery_enabled: bool = Field(
         default=True,
         description="Automatically recover mid-print AMS feed faults by swapping to the next eligible spool",
+    )
+    # Tier-2 auto re-spool of a reused Bambu tag onto a fresh third-party spool.
+    # Default OFF (operator directive — the farm does NOT reuse tags yet): a
+    # spent+loaded tag arrival surfaces the one-click prompt instead of silently
+    # minting a fresh row, so a false spent stamp can never auto-corrupt the ledger.
+    respool_auto_enabled: bool = Field(
+        default=False,
+        description="Automatically re-spool a reused Bambu RFID tag onto a fresh spool (off = prompt instead)",
     )
     spool_recovery_max_attempts: int = Field(
         default=2,
@@ -622,6 +646,7 @@ class AppSettingsUpdate(BaseModel):
     spool_selection_policy: str | None = None
     min_start_spool_g: int | None = Field(default=None, ge=0, le=10000)
     spool_recovery_enabled: bool | None = None
+    respool_auto_enabled: bool | None = None
     spool_recovery_max_attempts: int | None = Field(default=None, ge=1, le=5)
     spool_recovery_step_timeout_s: int | None = Field(default=None, ge=15, le=600)
     spool_recovery_protect_layers: int | None = Field(default=None, ge=0, le=1000)

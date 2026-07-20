@@ -27,6 +27,7 @@ from backend.app.services.bambu_mqtt import HMSError, PrinterState
 from backend.app.services.spool_recovery import (
     WAITING_REASON_FAILED,
     WAITING_REASON_RECOVERING,
+    WAITING_REASON_RUNOUT,
     clear_on_reinsert,
     on_feed_fault_hms,
 )
@@ -788,25 +789,53 @@ async def test_runout_rescued_by_firmware_transient_close(db_session, printer_fa
     assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
 
 
-async def test_runout_stuck_recovers_without_oor_marking(db_session, printer_factory, install_settings, monkeypatch):
+async def test_runout_escalates_immediately_zero_loads(db_session, printer_factory, install_settings, monkeypatch):
+    """W2: a stuck runout PAUSE escalates IMMEDIATELY with the runout token and
+    ZERO ams_change_filament (load) sends — firmware refuses cross-slot loads in the
+    8011 insert-same-slot state, so the swap machine never runs. Even with an
+    eligible replacement present, recovery does not try to load it."""
     install_settings()
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
     jammed = await _bind_spool(db_session, printer.id, 0, 0)  # the "ran out" tray
+    await _bind_spool(db_session, printer.id, 0, 1)  # a same-material replacement IS loaded
     oor = _spy(monkeypatch, "on_spool_out_of_rotation")
-    state = _make_state(hms=[_runout_hms()])  # PAUSE, but a runout code
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(hms=[_runout_hms()], trays=[_ams_tray(0), _ams_tray(1)])  # PAUSE, runout code
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
     task = await on_feed_fault_hms(printer.id, {"0300_8004"}, state)
     await task
 
-    assert state.state == "RUNNING"  # recovery still swapped + resumed
+    assert state.state == "PAUSE"  # never resumed — left for a same-slot refill
+    assert not any(c[0] == "load" for c in client.calls)  # ZERO cross-slot load commands
+    assert ("unload",) not in client.calls  # the whole swap machine was skipped
+    failed.assert_awaited_once()
+    assert failed.call_args.kwargs["is_feed_fault"] is False  # runout copy branch
     oor.assert_not_awaited()  # runout spool is SPENT — never marked out-of-rotation
     db_session.expunge_all()
     jammed_after = await db_session.get(Spool, jammed.id)
     assert jammed_after.feed_fault_at is None  # no feed-fault marking on a runout
-    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_RUNOUT
+
+
+async def test_runout_escalation_detail_names_slot_refill(db_session, printer_factory, install_settings, monkeypatch):
+    """The runout escalation carries the runout_needs_refill detail (same-slot refill
+    guidance), not a jam reason."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(hms=[_runout_hms()])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0300_8004"}, state)
+    await task
+
+    failed.assert_awaited_once()
+    assert "same" in failed.call_args.kwargs["detail"].lower()  # "insert into the SAME slot"
 
 
 # ===========================================================================
@@ -849,6 +878,127 @@ async def test_low_spool_after_protected_layers_selected(db_session, printer_fac
     assert state.state == "RUNNING"
     db_session.expunge_all()
     assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+
+async def test_near_empty_spool_after_protected_layers_escalates_near_empty(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """W2 hard floor: past the protected layers a low-but-not-empty spool loads, but
+    a KNOWN-EMPTY one (≤ _RECOVERY_HARD_MIN_G) never does — it escalates the new
+    only_near_empty_spools reason, not the protected-layer one."""
+    install_settings(protect_layers=7)
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    await _bind_spool(db_session, printer.id, 0, 1, weight_used=997.0)  # remaining 3g < 5g floor
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(layer=8)  # at/after the threshold
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    await task
+
+    assert not any(c[0] == "load" for c in client.calls)  # never loaded the empty spool
+    failed.assert_awaited_once()
+    assert "effectively empty" in failed.call_args.kwargs["detail"]  # only_near_empty_spools
+    assert state.state == "PAUSE"
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_FAILED
+
+
+async def test_below_protected_layers_uses_protected_layer_reason(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """Below the protected layers a low spool escalates the protected-layer reason
+    (NOT only_near_empty_spools) — the ordinary minimum-start floor still applies."""
+    install_settings(protect_layers=7)
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    await _bind_spool(db_session, printer.id, 0, 1, weight_used=950.0)  # remaining 50g < 120g min-start
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(layer=3)  # below the threshold
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    await task
+
+    failed.assert_awaited_once()
+    assert "this early in the print" in failed.call_args.kwargs["detail"]  # only_low_spools_in_protected_layers
+
+
+# ===========================================================================
+# W2 presence filter: a seated-but-unsensed candidate (state 9) is excluded;
+# a None/unparseable state fails OPEN (kept).
+# ===========================================================================
+
+
+async def test_state9_candidate_excluded(db_session, printer_factory, install_settings, monkeypatch):
+    """A candidate tray reporting state 9 (seated but unsensed) is dropped from the
+    replacement scan — a load there is doomed — so recovery escalates."""
+    install_settings()
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    # tray0 jammed (state 11), tray1 the only other loaded tray but state 9.
+    state = _make_state(trays=[_ams_tray(0), _ams_tray(1, state=9)])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    await task
+
+    assert not any(c == ("load", 1) for c in client.calls)  # state-9 tray never loaded
+    failed.assert_awaited_once()
+    assert state.state == "PAUSE"
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_FAILED
+
+
+async def test_state_none_candidate_kept(db_session, printer_factory, install_settings, monkeypatch):
+    """A candidate whose state is None/unparseable fails OPEN (kept) — dialect
+    variance must never exclude a real replacement."""
+    install_settings()
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    state = _make_state(trays=[_ams_tray(0), _ams_tray(1, state=None)])  # tray1 state unknown
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    await task
+
+    assert ("load", 1) in client.calls  # kept and loaded despite unknown state
+    assert state.state == "RUNNING"
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+
+# ===========================================================================
+# W3: every recovery load send is marked as ours (note_commanded_load) so the
+# backup-swap detector can't spend the departed spool.
+# ===========================================================================
+
+
+async def test_load_step_notes_commanded_load(db_session, printer_factory, install_settings, monkeypatch):
+    """The load step stamps note_commanded_load(printer_id, target) before each send."""
+    from backend.app.services import spool_respool
+
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    await _bind_spool(db_session, printer.id, 0, 0)  # jammed tray0
+    noted: list[tuple[int, int]] = []
+    monkeypatch.setattr(spool_respool, "note_commanded_load", lambda pid, tray: noted.append((pid, tray)))
+    state = _make_state(trays=[_ams_tray(0), _ams_tray(1)])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    await task
+
+    assert (printer.id, 1) in noted  # the replacement load was marked as ours
+    assert state.state == "RUNNING"
 
 
 # ===========================================================================

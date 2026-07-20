@@ -233,12 +233,13 @@ class TestPredicates:
             spool_tagless.should_keep_on_empty(self._asg(material="PETG", label_weight=1000, weight_used=990), 30)
             is False
         )
-        # spent → not kept.
+        # spent → KEPT (W1: the spent binding is the durable "ran dry" latch until a
+        # physical roll swap releases it — a runout-instant flap can't phantom-mint).
         assert (
             spool_tagless.should_keep_on_empty(
                 self._asg(material="PETG", label_weight=1000, weight_used=0, spent_at=datetime.utcnow()), 30
             )
-            is False
+            is True
         )
         # tagged (has RFID identity) → not kept.
         assert (
@@ -329,7 +330,9 @@ class TestHandleTaglessSlot:
         new_spool = await db_session.get(Spool, sa3.spool_id)
         assert new_spool.material == "PLA"
 
-    async def test_spent_loaded_archives_and_mints(self, db_session, printer_factory, env):
+    async def test_spent_loaded_no_cycle_latches(self, db_session, printer_factory, env, caplog):
+        # W1: spent + loaded but NO qualified physical cycle → keep the binding
+        # (latched). No archive, no unlink, no mint — the phantom-mint the incident hit.
         printer = await printer_factory()
         spent = Spool(material="PETG", rgba="112233FF", data_origin="ams_auto", spent_at=datetime.utcnow())
         spent.k_profiles = []
@@ -340,7 +343,35 @@ class TestHandleTaglessSlot:
         await db_session.commit()
 
         sa = await _assignment(db_session, printer.id)
-        handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), sa, [])
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+            handled = await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), sa, [])
+        assert handled is True
+        await db_session.refresh(spent)
+        assert spent.archived_at is None  # latched — NOT archived
+        sa2 = await _assignment(db_session, printer.id)
+        assert sa2.spool_id == spent.id  # same spent row still bound
+        count = await db_session.scalar(select(func.count(Spool.id)))
+        assert count == 1  # nothing minted
+        env.ws.assert_not_awaited()
+        assert "latched" in "\n".join(r.message for r in caplog.records).lower()
+
+    async def test_spent_loaded_with_cycle_tray_mints(self, db_session, printer_factory, env):
+        # A qualified physical cycle + a DIFFERENT tray filament → archive spent,
+        # mint from the tray, pending cycle consumed (popped).
+        printer = await printer_factory()
+        spent = Spool(material="PETG", rgba="112233FF", data_origin="ams_auto", spent_at=datetime.utcnow())
+        spent.k_profiles = []
+        spent.assignments = []
+        db_session.add(spent)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spent.id, printer_id=printer.id, ams_id=0, tray_id=0))
+        await db_session.commit()
+
+        spool_tagless._pending_physical_cycles.add((printer.id, 0, 0))
+        sa = await _assignment(db_session, printer.id)
+        handled = await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 0, _tray("PLA", color="FF0000FF"), sa, []
+        )
         assert handled is True
         await db_session.refresh(spent)
         assert spent.archived_at is not None  # archived (grams preserved)
@@ -348,6 +379,37 @@ class TestHandleTaglessSlot:
         assert sa2.spool_id != spent.id
         fresh = await db_session.get(Spool, sa2.spool_id)
         assert fresh.spent_at is None and fresh.data_origin == "ams_auto"
+        assert fresh.material == "PLA" and fresh.brand is None  # tray-derived
+        assert (printer.id, 0, 0) not in spool_tagless._pending_physical_cycles  # consumed
+
+    async def test_spent_loaded_with_cycle_fingerprint_match_default_mints(self, db_session, printer_factory, env):
+        # A qualified cycle where the tray still carries the DEPARTED config (firmware
+        # leftover — fingerprint matches) → default-mint (clean identity), config pushed.
+        env.settings["tagless_default_filament"] = json.dumps(
+            {"brand": "Bambu Lab", "material": "PETG", "subtype": "HF", "rgba": "000000FF", "slicer_filament": "GFG02"}
+        )
+        printer = await printer_factory()
+        spent = Spool(material="PETG", rgba="112233FF", data_origin="ams_auto", spent_at=datetime.utcnow())
+        spent.k_profiles = []
+        spent.assignments = []
+        db_session.add(spent)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spent.id, printer_id=printer.id, ams_id=0, tray_id=0))
+        await db_session.commit()
+
+        spool_tagless._pending_physical_cycles.add((printer.id, 0, 0))
+        sa = await _assignment(db_session, printer.id)
+        # Tray still reports the departed's PETG/112233 config → fingerprint matches.
+        handled = await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 0, _tray("PETG", color="112233FF"), sa, []
+        )
+        assert handled is True
+        sa2 = await _assignment(db_session, printer.id)
+        fresh = await db_session.get(Spool, sa2.spool_id)
+        assert fresh.brand == "Bambu Lab" and fresh.rgba == "000000FF"  # default identity, not the leftover
+        assert fresh.slicer_filament == "GFG02"
+        env.apply.assert_awaited_once()  # default-mint pushes config
+        assert (printer.id, 0, 0) not in spool_tagless._pending_physical_cycles
 
     async def test_spent_not_loaded_no_churn(self, db_session, printer_factory, env):
         printer = await printer_factory()
@@ -653,62 +715,6 @@ class TestBareTray:
         env.apply.assert_not_awaited()
 
 
-# --- stale-config firmware-leftover override -------------------------------
-
-
-class TestStaleConfigOverride:
-    async def test_leftover_equal_applies_default(self, db_session, printer_factory, env):
-        env.settings["tagless_default_filament"] = json.dumps(
-            {"brand": "Bambu Lab", "material": "PETG", "subtype": "HF", "rgba": "000000FF"}
-        )
-        printer = await printer_factory()
-        spent = Spool(material="PLA", rgba="FF0000FF", spent_at=datetime.utcnow(), data_origin="ams_auto")
-        spool_tagless.record_stale_marker_for_spool(printer.id, 0, 0, spent)
-
-        # Firmware re-reports the SAME leftover config (PLA red) → stale → apply DEFAULT.
-        handled = await spool_tagless.handle_tagless_slot(
-            db_session, printer.id, 0, 0, _tray("PLA", color="FF0000FF"), None, []
-        )
-        assert handled is True
-        sa = await _assignment(db_session, printer.id)
-        spool = await db_session.get(Spool, sa.spool_id)
-        assert spool.material == "PETG"  # default applied, NOT the PLA leftover
-        assert sa.fingerprint_type == "PETG"  # seeded from the setting
-        env.apply.assert_awaited_once()
-        assert (printer.id, 0, 0) not in spool_tagless._stale_config_markers  # consumed
-
-    async def test_differing_config_respected(self, db_session, printer_factory, env):
-        env.settings["tagless_default_filament"] = json.dumps(
-            {"brand": "Bambu Lab", "material": "PETG", "subtype": "HF", "rgba": "000000FF"}
-        )
-        printer = await printer_factory()
-        spent = Spool(material="PLA", rgba="FF0000FF", spent_at=datetime.utcnow(), data_origin="ams_auto")
-        spool_tagless.record_stale_marker_for_spool(printer.id, 0, 0, spent)
-
-        # A genuinely different filament (PLA blue) → not the leftover → normal
-        # tray-derived mint, marker cleared.
-        handled = await spool_tagless.handle_tagless_slot(
-            db_session, printer.id, 0, 0, _tray("PLA", color="0000FFFF"), None, []
-        )
-        assert handled is True
-        sa = await _assignment(db_session, printer.id)
-        spool = await db_session.get(Spool, sa.spool_id)
-        assert spool.material == "PLA"  # minted from the REAL tray, not the default
-        assert spool.brand is None  # tray-derived (the default would have set a brand)
-        assert (printer.id, 0, 0) not in spool_tagless._stale_config_markers  # cleared
-        env.apply.assert_not_awaited()  # tray-derived path doesn't push config
-
-    def test_marker_record_and_clear(self):
-        spent = Spool(material="PLA", rgba="FF0000FF", spent_at=datetime.utcnow())
-        spool_tagless.record_stale_marker_for_spool(1, 0, 0, spent)
-        assert (1, 0, 0) in spool_tagless._stale_config_markers
-        spool_tagless.clear_stale_marker(1, 0, 0)
-        assert (1, 0, 0) not in spool_tagless._stale_config_markers
-        # A non-spent spool records nothing.
-        spool_tagless.record_stale_marker_for_spool(1, 0, 1, Spool(material="PLA", rgba="00FF00FF", spent_at=None))
-        assert (1, 0, 1) not in spool_tagless._stale_config_markers
-
-
 # --- provisional disposal on RFID takeover ---------------------------------
 
 
@@ -959,3 +965,279 @@ class TestDryingDefers:
         drying["v"] = False  # drying ended
         assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is True
         assert env.apply.await_count == 1  # processed immediately — window was never armed
+
+
+# --- W4: mint temp stamping + generic-id override --------------------------
+
+
+class TestMintIdentityW4:
+    async def test_default_branch_stamps_temps(self, db_session):
+        default = {
+            "brand": "Bambu Lab",
+            "material": "PETG",
+            "subtype": "HF",
+            "rgba": "000000FF",
+            "slicer_filament": "GFG02",
+            "nozzle_temp_min": 230,
+            "nozzle_temp_max": 270,
+        }
+        spool = await spool_tagless.mint_tagless_spool(db_session, default_filament=default)
+        assert spool.slicer_filament == "GFG02"
+        assert spool.nozzle_temp_min == 230
+        assert spool.nozzle_temp_max == 270
+
+    async def test_tray_generic_id_overridden_by_default(self, db_session, env, monkeypatch):
+        # Tray reports a GENERIC id (GFG99) but fingerprint-matches the specific default
+        # -> mint the default's id + temps (stops GFG99 self-perpetuation).
+        env.settings["tagless_default_filament"] = json.dumps(
+            {
+                "brand": "Bambu Lab",
+                "material": "PETG",
+                "subtype": "HF",
+                "rgba": "000000FF",
+                "slicer_filament": "GFG02",
+                "nozzle_temp_min": 230,
+                "nozzle_temp_max": 270,
+            }
+        )
+        parsed = SimpleNamespace(
+            material="PETG",
+            subtype="HF",
+            color_name=None,
+            rgba="000000FF",
+            core_weight=250,
+            slicer_filament="GFG99",
+            slicer_filament_name="Generic PETG",
+            nozzle_temp_min=220,
+            nozzle_temp_max=260,
+            label_weight=0,
+        )
+        monkeypatch.setattr(spool_tagless, "parse_tray_fields", AsyncMock(return_value=parsed))
+        spool = await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PETG", color="000000FF"))
+        assert spool.slicer_filament == "GFG02"  # overridden to the default's specific id
+        assert spool.slicer_filament_name is None
+        assert spool.nozzle_temp_min == 230 and spool.nozzle_temp_max == 270
+
+    async def test_tray_generic_id_no_fingerprint_match_keeps_generic(self, db_session, env, monkeypatch):
+        # Different material -> does NOT fingerprint-match the PETG default -> no override.
+        env.settings["tagless_default_filament"] = json.dumps(
+            {"brand": "Bambu Lab", "material": "PETG", "subtype": "HF", "rgba": "000000FF", "slicer_filament": "GFG02"}
+        )
+        parsed = SimpleNamespace(
+            material="PLA",
+            subtype=None,
+            color_name=None,
+            rgba="00FF00FF",
+            core_weight=250,
+            slicer_filament="GFL99",
+            slicer_filament_name=None,
+            nozzle_temp_min=190,
+            nozzle_temp_max=230,
+            label_weight=0,
+        )
+        monkeypatch.setattr(spool_tagless, "parse_tray_fields", AsyncMock(return_value=parsed))
+        spool = await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PLA", color="00FF00FF"))
+        assert spool.slicer_filament == "GFL99"  # kept - no fingerprint match, no override
+
+    async def test_default_temps_for_fingerprint(self, db_session, env):
+        env.settings["tagless_default_filament"] = json.dumps(
+            {
+                "brand": "Bambu Lab",
+                "material": "PETG",
+                "subtype": "HF",
+                "rgba": "000000FF",
+                "nozzle_temp_min": 230,
+                "nozzle_temp_max": 270,
+            }
+        )
+        # Fingerprint match (PETG / near-black) -> the default's pair.
+        assert await spool_tagless.default_temps_for_fingerprint(db_session, "PETG", "000000FF") == (230, 270)
+        # Different material -> None.
+        assert await spool_tagless.default_temps_for_fingerprint(db_session, "PLA", "000000FF") is None
+        # Far colour -> None.
+        assert await spool_tagless.default_temps_for_fingerprint(db_session, "PETG", "FF0000FF") is None
+
+
+# --- W1: bare-tray spent-binding guard -------------------------------------
+
+
+class TestBareTraySpentGuard:
+    async def _seed_spent_ams_auto(self, db_session, printer_id):
+        spent = Spool(material="PETG", rgba="000000FF", data_origin="ams_auto", spent_at=datetime.utcnow())
+        spent.k_profiles = []
+        spent.assignments = []
+        db_session.add(spent)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spent.id, printer_id=printer_id, ams_id=0, tray_id=0))
+        await db_session.commit()
+        return spent
+
+    async def test_spent_bound_no_cycle_returns_false(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        spent = await self._seed_spent_ams_auto(db_session, printer.id)
+        handled = await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare())
+        assert handled is False  # latched - never re-push a spent slot's config
+        await db_session.refresh(spent)
+        assert spent.archived_at is None
+        env.apply.assert_not_awaited()
+        assert (printer.id, 0, 0) not in spool_tagless._autoconfig_attempts  # window not burned
+
+    async def test_spent_bound_with_cycle_default_mints(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        spent = await self._seed_spent_ams_auto(db_session, printer.id)
+        spool_tagless._pending_physical_cycles.add((printer.id, 0, 0))
+        handled = await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare())
+        assert handled is True
+        await db_session.refresh(spent)
+        assert spent.archived_at is not None  # archived
+        sa = await _assignment(db_session, printer.id)
+        fresh = await db_session.get(Spool, sa.spool_id)
+        assert fresh.spent_at is None and fresh.data_origin == "ams_auto" and fresh.material == "PETG"
+        env.apply.assert_awaited_once()  # default-mint pushes config
+        assert (printer.id, 0, 0) not in spool_tagless._pending_physical_cycles  # consumed
+
+
+# --- W5: fresh-roll prompt --------------------------------------------------
+
+
+async def _seed_fresh_prompt_spool(db_session, printer_id, *, used, spent=False):
+    sid = await _seed_assignment(db_session, printer_id, 0, 0, material="PETG", rgba="112233FF", spent=spent)
+    spool = await db_session.get(Spool, sid)
+    spool.label_weight = 1000
+    spool.weight_used = float(used)
+    await db_session.commit()
+    return sid
+
+
+class TestFreshRollPrompt:
+    async def test_non_spent_past_threshold_prompts_and_pops(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=600)  # 60% >= 50%
+        key = (printer.id, 0, 0)
+        spool_tagless._pending_physical_cycles.add(key)
+        await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
+        payload = env.ws.call_args.args[0]
+        assert payload["type"] == "tagless_fresh_prompt"
+        assert payload["spool_id"] == sid and payload["material"] == "PETG"
+        assert payload["remaining_g"] == 400.0 and payload["rgba"] == "112233FF"
+        assert key in spool_tagless._fresh_prompt_unanswered
+        assert key not in spool_tagless._pending_physical_cycles  # popped (processed)
+
+    async def test_spent_silent_keeps_pending(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        await _seed_fresh_prompt_spool(db_session, printer.id, used=600, spent=True)
+        key = (printer.id, 0, 0)
+        spool_tagless._pending_physical_cycles.add(key)
+        await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
+        env.ws.assert_not_awaited()  # spent -> silent (the W1 spent->mint transition owns it)
+        assert key in spool_tagless._pending_physical_cycles  # left for W1
+
+    async def test_sub_threshold_pops_no_prompt(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        await _seed_fresh_prompt_spool(db_session, printer.id, used=100)  # 10% < 50%
+        key = (printer.id, 0, 0)
+        spool_tagless._pending_physical_cycles.add(key)
+        await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
+        env.ws.assert_not_awaited()
+        assert key not in spool_tagless._pending_physical_cycles  # popped, no-op
+
+    async def test_dedup_no_second_prompt_same_cycle(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        await _seed_fresh_prompt_spool(db_session, printer.id, used=600)
+        key = (printer.id, 0, 0)
+        spool_tagless._pending_physical_cycles.add(key)
+        await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
+        assert env.ws.await_count == 1
+        spool_tagless._pending_physical_cycles.add(key)  # another cycle, still unanswered
+        await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
+        assert env.ws.await_count == 1  # suppressed while unanswered
+
+    async def test_reasks_after_answer_clears(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        await _seed_fresh_prompt_spool(db_session, printer.id, used=600)
+        key = (printer.id, 0, 0)
+        spool_tagless._pending_physical_cycles.add(key)
+        await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
+        assert env.ws.await_count == 1
+        spool_tagless.clear_fresh_prompt(printer.id, 0, 0)  # operator answered
+        spool_tagless._pending_physical_cycles.add(key)  # a NEW qualified cycle
+        await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
+        assert env.ws.await_count == 2  # re-asks
+
+
+@pytest.fixture
+def sessions(test_engine, monkeypatch):
+    """Point spool_tagless's own-session opener (note_physical_cycle) at the test
+    engine - mirrors the ams_presence AMS-hook fixture."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    import backend.app.core.database as core_db
+
+    maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(core_db, "async_session", maker)
+    return maker
+
+
+class TestNotePhysicalCycle:
+    async def test_records_pending_and_prompts_non_spent(self, db_session, printer_factory, env, sessions):
+        printer = await printer_factory()
+        sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=700)
+        await spool_tagless.note_physical_cycle(printer.id, 0, 0)
+        payload = env.ws.call_args.args[0]
+        assert payload["type"] == "tagless_fresh_prompt" and payload["spool_id"] == sid
+        assert (printer.id, 0, 0) not in spool_tagless._pending_physical_cycles  # non-spent -> popped
+
+    async def test_records_pending_spent_leaves_it(self, db_session, printer_factory, env, sessions):
+        printer = await printer_factory()
+        await _seed_fresh_prompt_spool(db_session, printer.id, used=700, spent=True)
+        await spool_tagless.note_physical_cycle(printer.id, 0, 0)
+        env.ws.assert_not_awaited()  # spent -> silent
+        assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles  # left for the W1 transition
+
+
+class TestTaglessReplay:
+    def _present_state(self):
+        return SimpleNamespace(raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PETG"}]}]})
+
+    async def test_resends_valid_unanswered(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=700)
+        spool_tagless._fresh_prompt_unanswered.add((printer.id, 0, 0))
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: self._present_state())
+        send = AsyncMock()
+        n = await spool_tagless.rebroadcast_unresolved_tagless_prompts(db_session, send)
+        assert n == 1
+        payload = send.await_args.args[0]
+        assert payload["type"] == "tagless_fresh_prompt" and payload["spool_id"] == sid
+
+    async def test_drops_stale_spent(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        await _seed_fresh_prompt_spool(db_session, printer.id, used=700, spent=True)
+        spool_tagless._fresh_prompt_unanswered.add((printer.id, 0, 0))
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: self._present_state())
+        send = AsyncMock()
+        n = await spool_tagless.rebroadcast_unresolved_tagless_prompts(db_session, send)
+        assert n == 0  # spent row -> dropped
+        send.assert_not_awaited()
+
+    async def test_drops_when_slot_absent(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        await _seed_fresh_prompt_spool(db_session, printer.id, used=700)
+        spool_tagless._fresh_prompt_unanswered.add((printer.id, 0, 0))
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: None)  # printer gone
+        send = AsyncMock()
+        n = await spool_tagless.rebroadcast_unresolved_tagless_prompts(db_session, send)
+        assert n == 0
+        send.assert_not_awaited()
+
+
+def test_marker_machinery_removed():
+    """W1: the stale-config marker machinery is deleted outright - every symbol gone."""
+    for name in (
+        "record_stale_marker",
+        "record_stale_marker_for_spool",
+        "clear_stale_marker",
+        "_stale_config_markers",
+        "_marker_matches",
+    ):
+        assert not hasattr(spool_tagless, name), f"{name} should be removed"

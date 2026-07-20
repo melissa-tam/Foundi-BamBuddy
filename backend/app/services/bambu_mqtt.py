@@ -3363,6 +3363,10 @@ class BambuMQTTClient:
             # Reset completion tracking for new print
             self._was_running = True
             self._completion_triggered = False
+            # W6.1: last_loaded_tray means "last tray fed THIS job" — reset it so a
+            # runout PAUSE renders the was-feeding ring for the CURRENT job's slot,
+            # not a stale tray leaked from the previous print.
+            self.state.last_loaded_tray = -1
             # #1721: rearm the end-of-print finish-photo trigger for the new print
             self._finish_photo_captured = False
             # Reset last valid progress/layer for usage tracking

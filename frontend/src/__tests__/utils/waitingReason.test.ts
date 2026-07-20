@@ -36,6 +36,9 @@ describe('waitingReasonText', () => {
     expect(waitingReasonText('spool_jam_recovery_failed', t)).toBe(
       'productionRuns.detail.waiting.spoolJamRecoveryFailed',
     );
+    expect(waitingReasonText('filament_runout_recovery_failed', t)).toBe(
+      'productionRuns.detail.waiting.filamentRunoutRecoveryFailed',
+    );
   });
 
   it('humanizes an unmapped bare token instead of returning it raw', () => {
