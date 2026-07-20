@@ -84,6 +84,7 @@ from backend.app.core.database import async_session, engine, init_db
 from backend.app.core.tasks import spawn_background_task
 from backend.app.core.websocket import ws_manager
 from backend.app.models.smart_plug import SmartPlug
+from backend.app.services import notify_dedup
 from backend.app.services.archive import ArchiveService, peek_plate_index_in_3mf, swap_plate_suffix
 from backend.app.services.archive_purge import archive_purge_service
 from backend.app.services.bambu_ftp import (
@@ -406,10 +407,11 @@ _last_progress_milestone: dict[int, int] = {}
 # Track whether first layer complete notification has been sent for current print
 _first_layer_notified: dict[int, bool] = {}
 
-# HMS re-notify dedup moved to services/hms_notify_dedup (per-code last-seen ledger
-# that collapses a flapping code to one notification). The old per-printer
-# set-replace + empty-list grace clear re-notified on every reappearance of a code
-# that flapped while another stayed present (the 0700_0002 storm).
+# HMS re-notify dedup lives in services/notify_dedup (per-code last-seen ledger
+# that collapses a flapping code to one notification, plus the durable
+# notification_ledger that keeps a STANDING code from re-blasting at every deploy).
+# The old per-printer set-replace + empty-list grace clear re-notified on every
+# reappearance of a code that flapped while another stayed present (0700_0002 storm).
 
 # Track timelapse file baselines at print start: {printer_id: set of video filenames}
 # Used for snapshot-diff detection at print completion
@@ -1342,11 +1344,36 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             "[RESPOOL] runout replay-seed hook failed for printer %s: %s", printer_id, _ne
         )
 
-    if current_hms_errors:
-        # Build set of current error codes (using attr for uniqueness)
-        current_error_codes = {f"{e.attr:08x}" for e in current_hms_errors}
+    # Restart-replay HMS suppression (Phase D). Same one-shot shape as the runout
+    # seed above and gated on the same "real report" rule: on the FIRST status push
+    # per printer per process, every live code we have PROVABLY alerted on before
+    # (durable notification_ledger row) is pre-marked seen, so a standing
+    # pre-restart incident is not re-blasted at every deploy (2026-07-20 00:45: six
+    # printers re-announced within 7 s). A live code with no durable row stays new
+    # — a fault raised during the downtime must still notify. Exactly one DB read
+    # per printer per process, hence the cheap needs_standing_seed() pre-check.
+    if state_known and notify_dedup.needs_standing_seed(printer_id):
+        try:
+            async with async_session() as _seed_db:
+                await notify_dedup.seed_standing(
+                    _seed_db,
+                    printer_id,
+                    {e.full_code for e in current_hms_errors},
+                    time.time(),
+                )
+        except Exception as _se:  # noqa: BLE001 — seeding must never crash the status flow
+            logging.getLogger(__name__).warning(
+                "[NOTIFY-DEDUP] HMS standing seed failed for printer %s: %s", printer_id, _se
+            )
 
-        # Per-code re-notify dedup (services/hms_notify_dedup): a code counts as
+    if current_hms_errors:
+        # Build the set of current error codes, keyed by the LOSSLESS full_code.
+        # The old key (`f"{e.attr:08x}"`) collided for distinct codes sharing one
+        # attr — they deduped as a single incident, and it could not address a
+        # durable ledger row unambiguously.
+        current_error_codes = {e.full_code for e in current_hms_errors}
+
+        # Per-code re-notify dedup (services/notify_dedup): a code counts as
         # "new" only on first appearance or after it has been ABSENT past the
         # re-notify window. A code flapping out-then-back within the window is one
         # continuing incident, not a fresh alert — this collapses the observed
@@ -1354,9 +1381,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # genuine clear-and-recur hours later still notifies. Replaces the old
         # per-printer set-replace + empty-list grace clear (both removed). The
         # ledger self-bounds (prunes absent-too-long codes) and is per-printer.
-        from backend.app.services import hms_notify_dedup
-
-        new_error_codes = hms_notify_dedup.new_codes(printer_id, current_error_codes, time.time())
+        new_error_codes = notify_dedup.new_codes(printer_id, current_error_codes, time.time())
 
         if new_error_codes:
             # Get the actual new errors for the notification.
@@ -1365,7 +1390,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             new_errors = [
                 e
                 for e in current_hms_errors
-                if f"{e.attr:08x}" in new_error_codes and _hms_should_notify_severity(e.severity)
+                if e.full_code in new_error_codes and _hms_should_notify_severity(e.severity)
             ]
 
             try:
@@ -1386,6 +1411,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         0x12: "Chamber",
                     }
 
+                    from backend.app.services import ams_presence
                     from backend.app.services.hms_catalog import lookup_full_code
                     from backend.app.services.hms_errors import get_error_description
 
@@ -1413,6 +1439,19 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         description = lookup_full_code(error.full_code) or get_error_description(short_code)
                         if not description or short_code in _HMS_NOTIFICATION_SUPPRESS:
                             continue
+                        # A "failed to read the filament information" fault that
+                        # answers a discovery read WE commanded on a possibly-tagless
+                        # slot is expected: it means "no tag ⇒ tagless ⇒ the default
+                        # filament assumption stands", not a broken AMS reader. An
+                        # UNMATCHED one still notifies — that is how a genuinely
+                        # failing reader surfaces.
+                        if ams_presence.is_expected_read_failure(printer_id, error.attr, error_code_int):
+                            logging.getLogger(__name__).debug(
+                                "[HMS] printer %s %s: discovery read: no tag → tagless confirmed (not notified)",
+                                printer_id,
+                                short_code,
+                            )
+                            continue
                         # USB-storage-low codes are owned by the dedicated on_storage_low
                         # event (auto-cleanup + outcome notification) fired below — skip
                         # them here so the user doesn't also get a generic printer-error
@@ -1429,6 +1468,17 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         )
                         sent_count += 1
                         notified_short_codes.append(short_code)
+                        # Durable "we alerted on this" stamp (Phase D). Only an
+                        # ACTUAL send is recorded, so the next process's
+                        # seed_standing suppresses exactly the standing incidents
+                        # the operator already knows about and nothing else. Never
+                        # raises (the service swallows + logs its own failures).
+                        await notify_dedup.record_sent(
+                            db,
+                            notify_dedup.HMS_SCOPE,
+                            notify_dedup.hms_ledger_key(printer_id, error.full_code),
+                            time.time(),
+                        )
 
                     # Full forensic trail: every NEW short code this cycle, INCLUDING
                     # the description-less ones dropped above (they otherwise leave no
@@ -1477,7 +1527,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             from backend.app.services.hms_errors import hms_short_code
 
             _new_occupancy = {
-                hms_short_code(e.attr, e.code) for e in current_hms_errors if f"{e.attr:08x}" in new_error_codes
+                hms_short_code(e.attr, e.code) for e in current_hms_errors if e.full_code in new_error_codes
             } & _HMS_PLATE_OCCUPANCY_CODES
             if _new_occupancy:
                 try:
@@ -1497,7 +1547,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             # flow; the service is fully self-guarded (unreachable FTPS → failure
             # notification, never an exception).
             _new_storage = {
-                e.full_code for e in current_hms_errors if f"{e.attr:08x}" in new_error_codes
+                e.full_code for e in current_hms_errors if e.full_code in new_error_codes
             } & HMS_STORAGE_LOW_FULL_CODES
             if _new_storage:
                 try:
@@ -1517,7 +1567,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             )
 
             _new_runout = {
-                hms_short_code(e.attr, e.code) for e in current_hms_errors if f"{e.attr:08x}" in new_error_codes
+                hms_short_code(e.attr, e.code) for e in current_hms_errors if e.full_code in new_error_codes
             } & _RUNOUT_HMS_CODES
             if _new_runout:
                 try:
@@ -1539,7 +1589,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             from backend.app.services.spool_recovery import RECOVERABLE_HMS_CODES
 
             _new_recoverable = {
-                hms_short_code(e.attr, e.code) for e in current_hms_errors if f"{e.attr:08x}" in new_error_codes
+                hms_short_code(e.attr, e.code) for e in current_hms_errors if e.full_code in new_error_codes
             } & RECOVERABLE_HMS_CODES
             if _new_recoverable:
                 try:
@@ -1551,7 +1601,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         "[SPOOL-RECOVERY] feed-fault hook failed for printer %s: %s", printer_id, _fe
                     )
 
-    # An empty hms list needs no bookkeeping: hms_notify_dedup ages each code out by
+    # An empty hms list needs no bookkeeping: notify_dedup ages each code out by
     # its own last-seen timestamp, so a flapping code that briefly clears is still
     # recognized as the same continuing incident on its next appearance (no grace
     # window to reset). The old else-branch grace clear is intentionally gone.
@@ -1948,6 +1998,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                     is_bambu_tag,
                     is_valid_tag,
                     link_tag_to_inventory_spool,
+                    reapply_k_profile_if_drifted,
                 )
                 from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid
 
@@ -2062,7 +2113,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                 # jump test. A completed re-spool re-assigns the slot
                                 # itself, so skip the normal weight-sync path below.
                                 if existing_assignment.spool is not None and should_evaluate_respool(
-                                    existing_assignment.spool, tray
+                                    existing_assignment.spool, tray, printer_id, ams_id, tray_id
                                 ):
                                     try:
                                         _respooled = await maybe_auto_or_prompt_respool(
@@ -2110,88 +2161,19 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                             existing_assignment.spool.weight_used = new_used
                                             await db.commit()
 
-                                # Re-apply stored K-profile when the live tray's
-                                # cali_idx drifted from the spool's stored profile.
-                                # This catches "reset slot → re-read" and any other
-                                # path where the firmware loses the user's K-profile
-                                # selection while the SpoolAssignment row persists.
-                                # Per the maintainer's rule: any time a spool tag is
-                                # identified and matches inventory, the slot must be
-                                # configured with the spool's stored settings. Without
-                                # this block the existing-assignment branch only ran
-                                # weight-sync and let the firmware-default cali_idx win.
+                                # Re-apply the spool's stored K-profile when the live
+                                # tray's cali_idx drifted (owned by spool_tag_matcher,
+                                # rate-limited per slot).
                                 try:
-                                    spool = existing_assignment.spool
-                                    if (
-                                        spool is not None
-                                        and is_bambu_tag(tag_uid, tray_uuid, tray_info_idx)
-                                        and spool.k_profiles
-                                    ):
-                                        state = printer_manager.get_status(printer_id)
-                                        from backend.app.utils.printer_models import (
-                                            extruder_for_ams,
-                                            nozzle_for_ams_unit,
-                                        )
-
-                                        nozzle_diameter = nozzle_for_ams_unit(state, ams_id, tray_id)
-                                        slot_extruder: int | None = (
-                                            extruder_for_ams(state.ams_extruder_map, ams_id, tray_id)
-                                            if (state and state.ams_extruder_map)
-                                            else None
-                                        )
-                                        # Prefer exact extruder match, fall back to
-                                        # extruder-agnostic kp for the same printer +
-                                        # nozzle. Avoids hard-skipping when the AMS is
-                                        # mapped differently than at calibration time.
-                                        matching_kp = None
-                                        fallback_kp = None
-                                        for kp in spool.k_profiles:
-                                            if (
-                                                kp.printer_id != printer_id
-                                                or kp.nozzle_diameter != nozzle_diameter
-                                                or kp.cali_idx is None
-                                            ):
-                                                continue
-                                            if (
-                                                slot_extruder is not None
-                                                and kp.extruder is not None
-                                                and kp.extruder == slot_extruder
-                                            ):
-                                                matching_kp = kp
-                                                break
-                                            if fallback_kp is None:
-                                                fallback_kp = kp
-                                        chosen_kp = matching_kp or fallback_kp
-                                        if chosen_kp is not None:
-                                            live_cali_idx = tray.get("cali_idx")
-                                            # Only fire MQTT when the printer's live
-                                            # cali_idx differs from the stored value.
-                                            # Avoids spamming the broker on every
-                                            # MQTT push during steady-state operation.
-                                            if live_cali_idx != chosen_kp.cali_idx:
-                                                client = printer_manager.get_client(printer_id)
-                                                if client:
-                                                    cali_filament_id = spool.slicer_filament or tray_info_idx or ""
-                                                    # Fire-and-forget by design: the unchecked return is
-                                                    # intentional — a refused push (AMS identifying/drying)
-                                                    # self-heals on the next drift-detect tick.
-                                                    client.extrusion_cali_sel(
-                                                        ams_id=ams_id,
-                                                        tray_id=tray_id,
-                                                        cali_idx=chosen_kp.cali_idx,
-                                                        filament_id=cali_filament_id,
-                                                        nozzle_diameter=nozzle_diameter,
-                                                    )
-                                                    logger.info(
-                                                        "Re-applied K-profile cali_idx=%d for spool %d "
-                                                        "on printer %d AMS%d-T%d (live=%s drift detected)",
-                                                        chosen_kp.cali_idx,
-                                                        spool.id,
-                                                        printer_id,
-                                                        ams_id,
-                                                        tray_id,
-                                                        live_cali_idx,
-                                                    )
+                                    await reapply_k_profile_if_drifted(
+                                        db,
+                                        printer_id,
+                                        ams_id,
+                                        tray_id,
+                                        tray,
+                                        existing_assignment.spool,
+                                        printer_manager.get_status(printer_id),
+                                    )
                                 except Exception:
                                     logger.exception(
                                         "K-profile re-apply failed for printer %d AMS%d-T%d",
@@ -6949,6 +6931,22 @@ async def lifespan(app: FastAPI):
                         )
     except Exception as _he:  # noqa: BLE001 — hygiene must never block startup
         logging.getLogger(__name__).warning("Plate-gate startup hygiene failed: %s", _he)
+
+    # Notification-ledger hygiene: drop durable dedup rows nobody can still be
+    # deduping against (older than notify_dedup.LEDGER_PRUNE_DAYS). Behaviour-
+    # preserving — a key that stale re-notifies as new either way — and it bounds
+    # the table without a dedicated scheduler.
+    try:
+        async with async_session() as _nl_db:
+            _pruned = await notify_dedup.prune_ledger(_nl_db)
+            if _pruned:
+                logging.getLogger(__name__).info(
+                    "Startup hygiene: pruned %d notification-ledger row(s) older than %d days",
+                    _pruned,
+                    notify_dedup.LEDGER_PRUNE_DAYS,
+                )
+    except Exception as _ple:  # noqa: BLE001 — hygiene must never block startup
+        logging.getLogger(__name__).warning("Notification-ledger prune failed: %s", _ple)
 
     # Restart-safe eject terminal handling (W1): hydrate the in-memory pending-eject
     # registry from durable per-unit stamps BEFORE re-arming cooldown watches, so

@@ -186,6 +186,7 @@ async def init_db():
         long_lived_token,
         maintenance,
         notification,
+        notification_ledger,
         notification_template,
         oidc_provider,
         orca_base_cache,
@@ -3697,6 +3698,28 @@ async def run_migrations(conn):
                     text("UPDATE settings SET value = :new WHERE key = 'tagless_default_filament'"),
                     {"new": _DEFAULT_TAGLESS_FILAMENT_JSON},
                 )
+
+    # Migration (Phase D): durable notification dedup ledger. The in-memory HMS
+    # re-notify ledger re-blasted every standing code fleet-wide at each deploy
+    # (2026-07-20: six printers re-announced within 7 s). ``notification_ledger``
+    # records when an alert was last ACTUALLY sent, so a standing pre-restart
+    # incident is recognised across restarts while a fault raised DURING the
+    # downtime (no row) still notifies. Natural composite PK (scope, dedup_key) —
+    # no surrogate id. Identical DDL on both dialects: VARCHAR/TIMESTAMP and the
+    # inline PRIMARY KEY clause are valid on SQLite and PostgreSQL alike (no
+    # AUTOINCREMENT/SERIAL to branch on), and TIMESTAMP is the dialect-safe
+    # datetime spelling already used by the spool.*_at columns above.
+    await _safe_execute(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS notification_ledger (
+            scope VARCHAR(32) NOT NULL,
+            dedup_key VARCHAR(255) NOT NULL,
+            last_sent_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (scope, dedup_key)
+        )
+        """,
+    )
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (

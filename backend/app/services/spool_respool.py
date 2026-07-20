@@ -14,8 +14,10 @@ certainty tiers:
   resolving to a spent, LOADED tray physically cannot be the old (empty) spool,
   so it re-spools with no operator involvement.
 * **Tier 3 — one-click prompt** (`maybe_auto_or_prompt_respool`): uncertain cases
-  (spent_at NULL, remaining below threshold) broadcast a ``respool_prompt`` WS
-  event mirroring the ``unknown_tag`` flow.
+  (spent_at NULL) broadcast a ``respool_prompt`` WS event mirroring the
+  ``unknown_tag`` flow — but ONLY with physical evidence that the roll could have
+  changed (a recent presence cycle on the slot, :func:`_swap_evidence`). A merely
+  run-down seated spool, and an impossible ledger row, prompt nothing.
 
 The core operation `respool_tag` disposes the donor, mints a fresh full
 third-party spool (weight_locked, spent_at NULL), copies K-profiles, re-assigns
@@ -121,6 +123,16 @@ _COMMANDED_LOAD_TTL_S = 600
 # slot goes empty so remove + reinsert re-prompts.
 _respool_prompt_dedup: dict[int, dict[tuple[int, int], tuple[str, str]]] = {}
 
+# Remain-jump corroboration ledger, keyed (printer_id, ams_id, tray_id) ->
+# (first_seen_monotonic, observation_count). A single AMS push showing a remain
+# jump is not evidence — the reading can be mid-identify garbage or a one-off
+# firmware artefact — so a jump counts only once it has held across
+# ``_JUMP_MIN_PUSHES`` observations spanning ``_JUMP_STABLE_S``. The entry is
+# dropped the moment the jump stops reading (the condition must hold, not merely
+# have occurred) and on the slot-empty edge (:func:`clear_respool_prompt_dedup`).
+# Process-lifetime like the edge dicts above: a restart simply re-corroborates.
+_jump_seen: dict[tuple[int, int, int], tuple[float, int]] = {}
+
 # Per-incident spent-stamp dedup, keyed (printer_id, subtask_id, global_tray): one
 # spent stamp per tray per job. A re-raised runout HMS on the SAME job/tray must
 # not stamp again — otherwise a fresh spool the operator just inserted (auto-minted
@@ -131,10 +143,10 @@ _respool_prompt_dedup: dict[int, dict[tuple[int, int], tuple[str, str]]] = {}
 # :func:`_reset_state`.
 _spent_dedup: set[tuple[int, object, int]] = set()
 
-# S1 restart-replay suppression. The HMS notify dedup (``services.hms_notify_dedup``)
-# is in-memory, so a server restart makes EVERY still-live HMS code replay as "new"
-# on the next push —
-# and ``mark_spent_on_runout`` would re-stamp spent on whatever spool is bound to the
+# S1 restart-replay suppression. The HMS dedup (``services.notify_dedup``) recognises
+# a standing code across a restart only when it was ALERTED on before (durable ledger
+# row); a never-notified code (no description / info severity) still replays as "new"
+# on the next push — and ``mark_spent_on_runout`` would re-stamp spent on whatever spool is bound to the
 # tray NOW, which after an operator swap during the pause is a FRESH roll (production
 # 2026-07-17 18:56: a fresh spool stamped spent+1000 g 7 s after insertion). These
 # two structures record the runout codes ALREADY LIVE at the first status push per
@@ -153,6 +165,7 @@ def _reset_state() -> None:
     _pending_swaps.clear()
     _commanded_loads.clear()
     _respool_prompt_dedup.clear()
+    _jump_seen.clear()
     _spent_dedup.clear()
     _runout_seeded.clear()
     _seeded_runout_codes.clear()
@@ -653,11 +666,19 @@ async def capture_backup_swap(db: AsyncSession, printer_id: int, state) -> Spool
 
 
 def clear_respool_prompt_dedup(printer_id: int, ams_id: int, tray_id: int) -> None:
-    """Drop the cached prompt tag for a slot (called when the slot reports empty)."""
+    """Drop the cached per-slot prompt state (called when the slot reports empty).
+
+    Clears BOTH per-slot memories in one place — the broadcast dedup tag and the
+    remain-jump corroboration ledger (:data:`_jump_seen`). They share one lifetime:
+    an emptied slot invalidates everything learned about the roll that was in it, so
+    the next roll re-prompts and re-corroborates from scratch. Keeping the pair here
+    means every caller of the empty edge (``main.on_ams_change``) and of a completed
+    re-spool (:func:`respool_tag`) gets both without repeating itself.
+    """
     per_printer = _respool_prompt_dedup.get(printer_id)
-    if per_printer is None:
-        return
-    per_printer.pop((ams_id, tray_id), None)
+    if per_printer is not None:
+        per_printer.pop((ams_id, tray_id), None)
+    _jump_seen.pop((printer_id, ams_id, tray_id), None)
 
 
 def _count_trays_in_ams(state, ams_id: int) -> int:
@@ -665,6 +686,26 @@ def _count_trays_in_ams(state, ams_id: int) -> int:
         if isinstance(unit, dict) and int(unit.get("id", -1)) == ams_id:
             return len(unit.get("tray", []) or [])
     return 0
+
+
+async def _classify_trigger(db: AsyncSession, donor: Spool) -> str:
+    """Why this prompt fired: ``"spent"`` | ``"near_empty"`` | ``"remain_jump"``.
+
+    Derived purely from DURABLE state (the spent stamp and the gram ledger vs the
+    prompt threshold), never from the in-memory corroboration ledger, so a prompt
+    replayed to a reconnecting client is labelled exactly as the live one was. The
+    frontend picks its copy from this: ``near_empty`` gets "almost empty — replacing
+    this roll?", the other two keep the reused-tag framing, which is what the
+    operator's two false popups actually got wrong.
+
+    Precedence mirrors the gate itself: a hardware-certain spent stamp outranks
+    everything; otherwise a ledger reading at/below the threshold is the plain
+    "almost empty" case and only a jump ABOVE it is reported as a reused core.
+    """
+    if donor.spent_at is not None:
+        return "spent"
+    remaining = (donor.label_weight or 0) - (donor.weight_used or 0)
+    return "near_empty" if remaining <= await _respool_prompt_threshold_g(db) else "remain_jump"
 
 
 async def _build_respool_prompt_payload(
@@ -678,7 +719,8 @@ async def _build_respool_prompt_payload(
     """Construct the frozen ``respool_prompt`` WS payload.
 
     Single origin shared by the live gate broadcast and the reconnect
-    re-broadcast so the wire contract has exactly one definition.
+    re-broadcast so the wire contract has exactly one definition — including the
+    ``trigger`` label, which is therefore recomputed identically on replay.
     """
     from backend.app.services.printer_manager import printer_manager
 
@@ -709,6 +751,7 @@ async def _build_respool_prompt_payload(
         "donor_remaining_g": donor_remaining,
         "brand_prefill": brand_prefill,
         "label_weight_prefill": label_weight_prefill,
+        "trigger": await _classify_trigger(db, donor),
     }
 
 
@@ -736,12 +779,13 @@ async def _broadcast_respool_prompt(
     await ws_manager.broadcast(payload)
     per_printer[slot_key] = tag_key
     logger.info(
-        "respool_prompt broadcast: printer=%d AMS=%d slot=%d donor=%d remaining=%.1fg",
+        "respool_prompt broadcast: printer=%d AMS=%d slot=%d donor=%d remaining=%.1fg trigger=%s",
         printer_id,
         ams_id,
         tray_id,
         donor.id,
         payload["donor_remaining_g"],
+        payload["trigger"],
     )
 
 
@@ -811,8 +855,106 @@ async def rebroadcast_unresolved_respool_prompts(db: AsyncSession, send) -> int:
 # (production: 958.99/1000 g used → ledger ~4% while the tray read remain=100%).
 _RESPOOL_REMAIN_JUMP_PCT = 30.0
 
+# --- Tier-3 evidence gating (2026-07-20 false-popup remediation) -------------
+#
+# Two false "A reused Bambu tag was detected…" popups reached an operator whose
+# farm reuses NO tags. The trigger had fired on the gram ledger alone: donor 45
+# read −243 g remaining and donor 34 −813 g (weight_used ABOVE label_weight — an
+# impossible state, residue of the over-charge era), and any merely run-down
+# seated spool was one AMS push away from the same modal (13 live rows sat ≤50 g).
+# Nothing in the gate asked the only question that matters for "did the roll on
+# this tag change?": has anybody touched the slot?
+#
+# * ``_RESPOOL_SWAP_EVIDENCE_S`` — how recently the slot must have seen a QUALIFIED
+#   physical presence cycle (``ams_presence.last_physical_cycle_age``) for a swap to
+#   be possible at all. That accessor is deliberately non-consuming, so the identify
+#   lane and this lane never steal each other's evidence. 10 minutes covers an
+#   unhurried roll change and the AMS push that follows it.
+# * ``_LEDGER_CORRUPT_TOL_G`` — grams by which weight_used may exceed label_weight
+#   before the row is treated as impossible rather than empty. It is a RUNTIME
+#   prompt-suppression tolerance only; the DB target is zero negative rows and the
+#   repair is the offline tool (``tools/repair/repair_spool_ledger.py``).
+# * ``_JUMP_MIN_PUSHES`` / ``_JUMP_STABLE_S`` — a remain jump must hold across at
+#   least this many observations spanning this long before it counts, so a single
+#   in-flux reading can never prompt.
+_RESPOOL_SWAP_EVIDENCE_S = 600.0
+_LEDGER_CORRUPT_TOL_G = 50.0
+_JUMP_STABLE_S = 10.0
+_JUMP_MIN_PUSHES = 2
 
-def _remain_jump(spool: Spool, tray: dict) -> bool:
+
+def _swap_evidence(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Could the roll on this slot physically have been swapped recently?
+
+    True only when ``ams_presence`` recorded a QUALIFIED physical cycle (an
+    ABSENT→PRESENT transition past its ≥5 s flap filter) on the slot within
+    :data:`_RESPOOL_SWAP_EVIDENCE_S`. This is the whole Tier-3 fix: a near-empty
+    spool nobody has touched cannot have become a fresh roll, so it must not raise
+    a prompt claiming it might have.
+
+    The accessor is non-consuming, so asking here never robs the identify/discovery
+    lane of the same evidence. Fails CLOSED (no evidence → no prompt) and never
+    raises — this runs inside the AMS callback chain, per the module's convention
+    of local, defensive imports.
+    """
+    try:
+        from backend.app.services import ams_presence
+
+        age = ams_presence.last_physical_cycle_age(printer_id, ams_id, tray_id)
+    except Exception:  # noqa: BLE001 — must never break the AMS callback chain
+        logger.debug(
+            "Swap-evidence lookup failed for printer %s AMS%s-T%s — treating as no evidence",
+            printer_id,
+            ams_id,
+            tray_id,
+            exc_info=True,
+        )
+        return False
+    return age is not None and age <= _RESPOOL_SWAP_EVIDENCE_S
+
+
+def _ledger_corrupt(spool: Spool) -> bool:
+    """Is this row's gram ledger physically impossible?
+
+    ``weight_used`` above ``label_weight`` (beyond :data:`_LEDGER_CORRUPT_TOL_G`)
+    computes a NEGATIVE remaining, which the old near-empty test happily read as
+    "almost empty" — the direct cause of the false reused-tag popups. A NULL/0
+    label with grams charged against it is the same defect (remaining computes
+    negative), so it classifies the same way.
+    """
+    label = spool.label_weight or 0
+    used = spool.weight_used or 0
+    if label <= 0:
+        return used > 0
+    return (used - label) > _LEDGER_CORRUPT_TOL_G
+
+
+def _remain_reading_untrustworthy(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """True while the tray's ``remain`` reading cannot be trusted for corroboration.
+
+    A commanded identify in flight (the value is mid-re-read) or a drying unit (trays
+    disengage and re-report) both produce transient tray payloads. Fails CLOSED
+    (unknown → untrustworthy → no jump) and never raises, same contract as
+    :func:`_swap_evidence`.
+    """
+    try:
+        from backend.app.services import ams_presence
+
+        return ams_presence.identify_in_flight(printer_id, ams_id, tray_id) or ams_presence.unit_drying(
+            printer_id, ams_id
+        )
+    except Exception:  # noqa: BLE001 — must never break the AMS callback chain
+        logger.debug(
+            "Remain-reading trust check failed for printer %s AMS%s-T%s — treating as untrustworthy",
+            printer_id,
+            ams_id,
+            tray_id,
+            exc_info=True,
+        )
+        return True
+
+
+def _remain_jump_reading(spool: Spool, tray: dict) -> bool:
     """Detect a reused-core refill the gram ledger cannot see.
 
     A reused Bambu core carries its RFID tag onto a FRESH roll, so the firmware
@@ -824,6 +966,12 @@ def _remain_jump(spool: Spool, tray: dict) -> bool:
     at least :data:`_RESPOOL_REMAIN_JUMP_PCT`. A weight-locked fresh row (ledger
     ≈100%) cannot jump — ``remain`` cannot exceed 100 by 30 — so no special-case is
     needed for it.
+
+    This is the INSTANTANEOUS reading only: pure arithmetic over one tray payload,
+    no state, no trust check. The push-driven trigger consumes the corroborated
+    :func:`_remain_jump` instead; the operator-initiated dismissal route (a single
+    deliberate question about the live tray, with no push history to corroborate
+    against) consumes this one.
     """
     if not is_valid_tag(tray.get("tag_uid", "") or "", tray.get("tray_uuid", "") or ""):
         return False
@@ -840,15 +988,44 @@ def _remain_jump(spool: Spool, tray: dict) -> bool:
     return (remain - ledger_pct) >= _RESPOOL_REMAIN_JUMP_PCT
 
 
-def should_evaluate_respool(spool: Spool, tray: dict) -> bool:
+def _remain_jump(spool: Spool, tray: dict, printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """A remain jump CORROBORATED across pushes — the push-driven trigger's test.
+
+    One push is not evidence: the AMS re-reports a tray on every state change, and a
+    reading taken mid-identify or mid-drying is in flux. So the instantaneous
+    :func:`_remain_jump_reading` only starts a corroboration window here, and the
+    jump counts only once it has been observed on ≥ :data:`_JUMP_MIN_PUSHES`
+    pushes spanning ≥ :data:`_JUMP_STABLE_S` — a genuine refilled core keeps reading
+    the same way, an artefact does not. A push that stops reading as a jump drops the
+    window entirely (the condition must HOLD, not merely have happened once), and an
+    untrustworthy push neither fires nor counts.
+
+    Stateful by necessity (:data:`_jump_seen`), so it is the trigger path's helper;
+    anything wanting the pure arithmetic calls :func:`_remain_jump_reading`.
+    """
+    key = (printer_id, ams_id, tray_id)
+    if not _remain_jump_reading(spool, tray):
+        _jump_seen.pop(key, None)
+        return False
+    if _remain_reading_untrustworthy(printer_id, ams_id, tray_id):
+        return False
+    now = _monotonic()
+    first_seen, count = _jump_seen.get(key, (now, 0))
+    count += 1
+    _jump_seen[key] = (first_seen, count)
+    return count >= _JUMP_MIN_PUSHES and (now - first_seen) >= _JUMP_STABLE_S
+
+
+def should_evaluate_respool(spool: Spool, tray: dict, printer_id: int, ams_id: int, tray_id: int) -> bool:
     """Single-origin gate for the existing-assignment respool call site.
 
     True when :func:`maybe_auto_or_prompt_respool` should run for a slot whose
     ``SpoolAssignment`` survived: either the spool is hardware-spent (Tier 1/2) or
-    the tray shows a remain-jump refill the gram ledger missed (Tier 3 trigger).
-    Keeps the jump logic out of ``main.on_ams_change`` so there is one definition.
+    the tray shows a CORROBORATED remain-jump refill the gram ledger missed (a Tier 3
+    trigger). Keeps the jump logic out of ``main.on_ams_change`` so there is one
+    definition; the slot coordinates are what let the jump corroborate per slot.
     """
-    return spool.spent_at is not None or _remain_jump(spool, tray)
+    return spool.spent_at is not None or _remain_jump(spool, tray, printer_id, ams_id, tray_id)
 
 
 async def maybe_auto_or_prompt_respool(
@@ -866,9 +1043,12 @@ async def maybe_auto_or_prompt_respool(
       and return the NEW spool (the caller must skip its own auto-assign — the
       re-spool already re-assigned the slot). Empty brand or a sibling conflict
       falls through to the prompt instead.
-    * Tier 3 (prompt): ``spent_at`` NULL and (remaining ≤ threshold OR a remain-jump
-      refill the ledger missed, :func:`_remain_jump`) → broadcast a deduped
-      ``respool_prompt`` and return None (existing auto-assign proceeds).
+    * Tier 3 (prompt): ``spent_at`` NULL, the ledger is plausible, and (remaining ≤
+      threshold OR a corroborated remain-jump refill the ledger missed) AND the slot
+      shows recent physical evidence a roll could have changed
+      (:func:`_swap_evidence`) → broadcast a deduped ``respool_prompt`` and return
+      None (existing auto-assign proceeds). An impossible ledger row logs a WARNING
+      and prompts nothing.
     * Otherwise: None (no-op).
 
     No-op in Spoolman mode.
@@ -940,7 +1120,29 @@ async def maybe_auto_or_prompt_respool(
             )
             return None
 
-    # Tier 3: uncertain — spent_at NULL, remaining near-empty → one-click prompt.
+    # Tier 3: uncertain — spent_at NULL. Two gates, in order.
+    #
+    # (1) An IMPOSSIBLE ledger row is reported, never prompted. weight_used above
+    # label_weight computes a negative remaining, which the pre-2026-07-20 trigger
+    # read as "almost empty" and turned into a modal announcing a reused tag on a
+    # farm that reuses none (production donors 45 at −243 g and 34 at −813 g). The
+    # data is repaired by the offline tool, not at runtime: no auto-correction, no
+    # health flag, no new event — deliberately one WARNING and out (operator
+    # decision 2026-07-20), so the row stays visible until it is actually fixed.
+    if _ledger_corrupt(spool):
+        logger.warning(
+            "Impossible spool ledger — re-spool prompt suppressed: spool %d on printer %d AMS%d-T%d "
+            "(label %.1f g, used %.1f g → remaining %.1f g). weight_used exceeds the label, so "
+            "'near-empty' is meaningless here. Repair the row with tools/repair/repair_spool_ledger.py.",
+            spool.id,
+            printer_id,
+            ams_id,
+            tray_id,
+            float(spool.label_weight or 0),
+            float(spool.weight_used or 0),
+            float((spool.label_weight or 0) - (spool.weight_used or 0)),
+        )
+        return None
     # Suppress permanently once the operator answered "Same spool"
     # (respool_dismissed_at stamped): a deliberately-run-down near-empty spool
     # must not re-prompt on every reseat / AMS power-cycle / server restart (the
@@ -949,15 +1151,29 @@ async def maybe_auto_or_prompt_respool(
     # the dismissal, so a genuine exhaustion still auto-respools/prompts.
     if spool.respool_dismissed_at is not None:
         return None
+    # (2) A prompt needs a REASON and EVIDENCE. The reason is the ledger reading
+    # near-empty or a corroborated remain-jump (a reused core carried the tag onto a
+    # fresh roll and the gram ledger never noticed). The evidence is physical: unless
+    # somebody actually cycled a roll through this slot recently, the spool in it is
+    # the same one the ledger already describes and there is nothing to ask about.
+    # This is what silences the standing near-empty rows — they are near-empty
+    # because they were printed down, not because a roll was swapped.
     remaining = (spool.label_weight or 0) - (spool.weight_used or 0)
     threshold = await _respool_prompt_threshold_g(db)
-    # Prompt when the spool ledger reads near-empty (the original trigger) OR the
-    # tray reports far more filament than the ledger says it should hold — a reused
-    # core carried the tag onto a fresh roll and the gram ledger never noticed
-    # (_remain_jump). Both routes share the dismissal suppression above and the
-    # per-slot dedup inside _broadcast_respool_prompt.
-    if remaining <= threshold or _remain_jump(spool, tray):
-        await _broadcast_respool_prompt(db, printer_id, ams_id, tray_id, tray, spool)
+    if not (remaining <= threshold or _remain_jump(spool, tray, printer_id, ams_id, tray_id)):
+        return None
+    if not _swap_evidence(printer_id, ams_id, tray_id):
+        logger.debug(
+            "Re-spool prompt withheld for spool %d (printer %d AMS%d-T%d): no physical roll cycle "
+            "on the slot within %.0fs — an untouched spool cannot have become a fresh roll",
+            spool.id,
+            printer_id,
+            ams_id,
+            tray_id,
+            _RESPOOL_SWAP_EVIDENCE_S,
+        )
+        return None
+    await _broadcast_respool_prompt(db, printer_id, ams_id, tray_id, tray, spool)
     return None
 
 

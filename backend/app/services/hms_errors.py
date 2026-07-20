@@ -941,23 +941,19 @@ def lookup_description_any(attr: int | str, code: int | str) -> str | None:
 _RUNOUT_SLOT_CODE32: frozenset[int] = frozenset({0x00020001, 0x00020005, 0x00030001, 0x00030002})
 
 
-def runout_slot_from_hms(attr: int, code: int) -> tuple[int, int] | None:
-    """Decode the AMS unit + slot a per-slot runout HMS names, or ``None``.
+def ams_slot_from_attr(attr: int) -> tuple[int, int] | None:
+    """Decode the AMS unit + slot a slot-attributed HMS ``attr`` names, or ``None``.
 
-    Pure layout decode of the firmware's ``0700_2X00`` slot-attributed runout
-    family: the ``attr`` high byte is the AMS module class (``0x07``), the next
-    byte is the AMS unit id, and the third byte encodes the slot as ``0x20 + tray``
-    (``0x20``..``0x23`` → tray 0..3). ``code`` (the full 32-bit code word) must be a
-    runout code that carries slot attribution (:data:`_RUNOUT_SLOT_CODE32`). Returns
-    ``(ams_id, tray_id)`` on a match, else ``None`` — so a non-runout code, the
-    slot-agnostic 8011 "insert same slot" runout, and any malformed value all fail
-    closed and let the caller fall back to tray_now/mapping inference.
+    Pure layout decode, shared by every slot-attributed AMS fault family: the high
+    byte is the module class (``0x07`` = AMS), the next byte is the AMS unit id, and
+    the third byte encodes the slot as ``0x20 + tray`` (``0x20``..``0x23`` → tray
+    0..3). Fails closed (``None``) for a non-AMS module, an attr that carries no slot
+    byte, or an out-of-range unit — so callers fall back to their own attribution.
 
-    Verified: attr ``117448704`` / code ``0x00020001`` → ``(0, 0)`` ("AMS A Slot 1");
-    attr ``117449216`` → ``(0, 2)`` ("AMS A Slot 3") — the two live incident faults.
+    The CODE word decides whether a given fault family actually uses this layout;
+    that judgement stays with the per-family predicates (:func:`runout_slot_from_hms`,
+    :func:`filament_read_failure_slot`), never here.
     """
-    if code not in _RUNOUT_SLOT_CODE32:
-        return None
     if (attr >> 24) & 0xFF != 0x07:  # not an AMS-module fault
         return None
     slot_byte = (attr >> 8) & 0xFF
@@ -967,6 +963,77 @@ def runout_slot_from_hms(attr: int, code: int) -> tuple[int, int] | None:
     if not (0 <= ams_id <= 7):
         return None
     return (ams_id, slot_byte - 0x20)
+
+
+def ams_unit_from_attr(attr: int) -> int | None:
+    """Decode the AMS unit id an AMS-module HMS ``attr`` names, or ``None``.
+
+    The unit byte is present on EVERY ``0x07`` fault (``0700_*`` = unit 0,
+    ``0701_*`` = unit 1 …), including the ones that name no slot — so a unit-scoped
+    fault such as ``0700_4025`` ("Failed to read the filament information") can still
+    be attributed to its AMS. Fails closed for a non-AMS module.
+    """
+    if (attr >> 24) & 0xFF != 0x07:
+        return None
+    ams_id = (attr >> 16) & 0xFF
+    return ams_id if 0 <= ams_id <= 7 else None
+
+
+# Firmware ``code`` words for "the AMS could not read the filament tag". Two shapes,
+# both live-observed on the fleet:
+#   * ``0x00010081`` — the slot-attributed ``0700_2X00_0001_0081`` family ("Failed to
+#     read the filament information from AMS A slot 1. The AMS main board may be
+#     malfunctioning."); its attr carries the slot byte, so it decodes to an exact slot.
+#   * low-16 ``0x4025`` — ``07XX_4025`` ("Failed to read the filament information."),
+#     which names the AMS unit but NO slot.
+# A commanded RFID read on a slot that holds no tag can only fail this way, and the
+# resulting code can never self-clear on a tagless slot — which is why the farm
+# suppresses its OWN discovery reads' failures (services/ams_presence).
+_READ_FAILURE_CODE32: frozenset[int] = frozenset({0x00010081})
+_READ_FAILURE_CODE16: frozenset[int] = frozenset({0x4025})
+
+
+def is_filament_read_failure(attr: int, code: int) -> bool:
+    """True when (attr, code) is an AMS "failed to read the filament information" fault.
+
+    Restricted to the AMS module (``0x07``) so an unrelated module reusing the same
+    low-16 code word can never be classified as a tag-read failure.
+    """
+    if (attr >> 24) & 0xFF != 0x07:
+        return False
+    return code in _READ_FAILURE_CODE32 or (code & 0xFFFF) in _READ_FAILURE_CODE16
+
+
+def filament_read_failure_slot(attr: int, code: int) -> tuple[int, int] | None:
+    """The exact ``(ams_id, tray_id)`` a read-failure HMS names, or ``None``.
+
+    ``None`` means either "not a read failure" or "this read failure names no slot"
+    (the ``07XX_4025`` shape) — callers that need to tell those apart pair this with
+    :func:`is_filament_read_failure` / :func:`ams_unit_from_attr`.
+    """
+    if not is_filament_read_failure(attr, code):
+        return None
+    return ams_slot_from_attr(attr)
+
+
+def runout_slot_from_hms(attr: int, code: int) -> tuple[int, int] | None:
+    """Decode the AMS unit + slot a per-slot runout HMS names, or ``None``.
+
+    The firmware's ``0700_2X00`` slot-attributed runout family, decoded through the
+    shared :func:`ams_slot_from_attr` layout reader. ``code`` (the full 32-bit code
+    word) must be a runout code that carries slot attribution
+    (:data:`_RUNOUT_SLOT_CODE32`) — this predicate is what keeps the decode
+    runout-specific, since other families share the attr layout. Returns
+    ``(ams_id, tray_id)`` on a match, else ``None`` — so a non-runout code, the
+    slot-agnostic 8011 "insert same slot" runout, and any malformed value all fail
+    closed and let the caller fall back to tray_now/mapping inference.
+
+    Verified: attr ``117448704`` / code ``0x00020001`` → ``(0, 0)`` ("AMS A Slot 1");
+    attr ``117449216`` → ``(0, 2)`` ("AMS A Slot 3") — the two live incident faults.
+    """
+    if code not in _RUNOUT_SLOT_CODE32:
+        return None
+    return ams_slot_from_attr(attr)
 
 
 def _code_word(code: int | str) -> int:

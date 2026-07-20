@@ -1467,16 +1467,22 @@ async def dismiss_respool_prompt(
     spool.respool_dismissed_at = datetime.utcnow()
 
     # Evidence-gated un-spend: a dismissed roll whose live AMS tray reports far MORE
-    # filament than a spent row could hold (_remain_jump) was a FALSE spent stamp —
-    # NULL spent_at so it re-enters rotation with its (now un-floored) true grams. A
-    # genuinely-empty dismissed roll shows no jump and stays spent.
+    # filament than a spent row could hold was a FALSE spent stamp — NULL spent_at so
+    # it re-enters rotation with its (now un-floored) true grams. A genuinely-empty
+    # dismissed roll shows no jump and stays spent.
+    #
+    # This consumes the INSTANTANEOUS reading (`_remain_jump_reading`), not the
+    # push-corroborated `_remain_jump`: the operator asking one deliberate question
+    # about the tray in front of them has no stream of pushes to corroborate against
+    # (a spent spool short-circuits the push-driven gate, so its jump ledger is empty
+    # by construction), and the corroboration exists to filter passive push noise.
     if spool.spent_at is not None and req is not None and None not in (req.printer_id, req.ams_id, req.tray_id):
         from backend.app.services import spool_respool
         from backend.app.services.printer_manager import printer_manager
 
         state = printer_manager.get_status(req.printer_id)
         tray = spool_respool._resolve_live_tray(state, req.ams_id, req.tray_id) if state is not None else None
-        if tray is not None and spool_respool._remain_jump(spool, tray):
+        if tray is not None and spool_respool._remain_jump_reading(spool, tray):
             spool.spent_at = None
             logger.info(
                 "Un-spent spool %d on dismiss (printer %s AMS%s-T%s) — AMS remain contradicts the spent stamp",

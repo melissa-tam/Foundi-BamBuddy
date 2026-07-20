@@ -10,7 +10,9 @@ from sqlalchemy.orm import selectinload
 
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.utils.printer_models import nozzle_for_ams_unit
+from backend.app.models.spool_k_profile import SpoolKProfile
+from backend.app.utils.printer_models import extruder_for_ams, nozzle_for_ams_unit
+from backend.app.utils.retry_window import RetryWindow
 from backend.app.utils.tag_normalization import (
     normalize_tag_uid as _normalize_tag_uid,
     normalize_tray_uuid as _normalize_tray_uuid,
@@ -21,6 +23,15 @@ logger = logging.getLogger(__name__)
 # Zero-value constants for tag validation
 ZERO_TAG_UID = "0000000000000000"
 ZERO_TRAY_UUID = "00000000000000000000000000000000"
+
+# Minimum spacing between K-profile drift re-applies on ONE slot. The drift check
+# runs on every AMS push, and an identify's tray-state flap republishes cali_idx
+# repeatedly — un-gated that is one extrusion_cali_sel per push into an AMS that is
+# already mid-read. One attempt per window per slot; a refused push waits out the
+# window instead of re-firing immediately.
+_KDRIFT_RETRY_S = 30.0
+
+_kdrift_window = RetryWindow(_KDRIFT_RETRY_S)
 
 
 def stamp_first_loaded(spool: Spool) -> None:
@@ -750,3 +761,100 @@ async def auto_assign_spool(
     )
 
     return assignment
+
+
+async def reapply_k_profile_if_drifted(
+    db: AsyncSession,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    tray: dict,
+    spool: Spool | None,
+    state,
+) -> bool:
+    """Re-select a spool's stored K-profile when the slot's live ``cali_idx`` drifted.
+
+    "Reset slot → re-read" and any other path where the firmware loses the user's
+    K-profile selection leaves the :class:`SpoolAssignment` intact but the slot
+    calibrated to the firmware default. The maintainer's rule is that an identified
+    spool matching inventory must be configured with the spool's stored settings, so
+    the drift is corrected here — the assignment-ops owner every AMS caller already
+    imports — instead of inline in the AMS callback.
+
+    Only fires for a Bambu-tagged tray bound to a spool with a stored profile for
+    THIS printer + serving nozzle (exact extruder match preferred, extruder-agnostic
+    fallback so a shifted AMS-extruder mapping doesn't hard-skip a valid profile) and
+    only when the live ``cali_idx`` differs from the stored one.
+
+    Rate-limited per slot by :data:`_KDRIFT_RETRY_S`. The publish stays
+    FIRE-AND-FORGET by design: a refused push (AMS identifying / drying) is not
+    inspected and not retried inside the window — it self-heals on a later drift tick
+    once the window elapses, which is the whole point of the gate (the un-gated
+    version re-fired on every push, storming the AMS during exactly the identify flap
+    that caused the drift). Returns True when a re-apply was published.
+    """
+    if spool is None:
+        return False
+    if not is_bambu_tag(tray.get("tag_uid", "") or "", tray.get("tray_uuid", "") or "", tray.get("tray_info_idx", "")):
+        return False
+
+    nozzle_diameter = nozzle_for_ams_unit(state, ams_id, tray_id)
+    slot_extruder: int | None = (
+        extruder_for_ams(state.ams_extruder_map, ams_id, tray_id) if (state and state.ams_extruder_map) else None
+    )
+
+    # Explicit query rather than walking ``spool.k_profiles``: callers hand us spools
+    # loaded without that relationship eager-loaded, and touching it inside an async
+    # session raises a greenlet error (the 2026-07-17 bare-tray production crash).
+    # Same selection as the relationship walk — this printer + serving nozzle, a
+    # usable cali_idx, exact extruder match preferred.
+    kp_result = await db.execute(
+        select(SpoolKProfile).where(
+            SpoolKProfile.spool_id == spool.id,
+            SpoolKProfile.printer_id == printer_id,
+            SpoolKProfile.nozzle_diameter == nozzle_diameter,
+            SpoolKProfile.cali_idx.isnot(None),
+        )
+    )
+    matching_kp = None
+    fallback_kp = None
+    for kp in kp_result.scalars().all():
+        if slot_extruder is not None and kp.extruder is not None and kp.extruder == slot_extruder:
+            matching_kp = kp
+            break
+        if fallback_kp is None:
+            fallback_kp = kp
+    chosen_kp = matching_kp or fallback_kp
+    if chosen_kp is None:
+        return False
+
+    live_cali_idx = tray.get("cali_idx")
+    if live_cali_idx == chosen_kp.cali_idx:
+        return False  # no drift — the slot already holds the stored selection
+
+    from backend.app.services.printer_manager import printer_manager
+
+    client = printer_manager.get_client(printer_id)
+    if client is None:
+        return False
+    if not _kdrift_window.allow((printer_id, ams_id, tray_id)):
+        return False  # a re-apply for this slot is still inside its retry window
+
+    cali_filament_id = spool.slicer_filament or tray.get("tray_info_idx", "") or ""
+    client.extrusion_cali_sel(
+        ams_id=ams_id,
+        tray_id=tray_id,
+        cali_idx=chosen_kp.cali_idx,
+        filament_id=cali_filament_id,
+        nozzle_diameter=nozzle_diameter,
+    )
+    logger.info(
+        "Re-applied K-profile cali_idx=%d for spool %d on printer %d AMS%d-T%d (live=%s drift detected)",
+        chosen_kp.cali_idx,
+        spool.id,
+        printer_id,
+        ams_id,
+        tray_id,
+        live_cali_idx,
+    )
+    return True

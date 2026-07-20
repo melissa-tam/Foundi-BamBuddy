@@ -392,6 +392,7 @@ class PrintScheduler:
                             # is a rich string) — dedup the once-per-transition
                             # notification off it.
                             was_blocked = bool(item.filament_short)
+                            prior_reason = item.waiting_reason
                             printer = await self._get_printer(db, item.printer_id)
                             stage_reason = build_staged_reason(printer.name if printer else "", start_min=True)
                             await self._stage_filament_short(db, item, unpin=False, reason=stage_reason)
@@ -401,17 +402,10 @@ class PrintScheduler:
                                 item.printer_id,
                                 outcome.start_blocked_slots,
                             )
-                            if not was_blocked:
-                                job_name = await self._get_job_name(db, item)
-                                try:
-                                    await notification_service.on_queue_job_waiting(
-                                        job_name=job_name,
-                                        target_model=(printer.model if printer else "") or "",
-                                        waiting_reason=stage_reason,
-                                        db=db,
-                                    )
-                                except Exception as e:
-                                    logger.debug("start-min notification failed for item %s: %s", item.id, e)
+                            if self._hold_is_new(was_held=was_blocked, prior_reason=prior_reason, reason=stage_reason):
+                                await self._notify_queue_waiting(
+                                    db, item, stage_reason, (printer.model if printer else "") or ""
+                                )
                             continue
                         if outcome.mapping:
                             item.ams_mapping = json.dumps(outcome.mapping)
@@ -722,13 +716,7 @@ class PrintScheduler:
                             # Send waiting notification only when transitioning to
                             # waiting and the reason requires user action.
                             if last_waiting_reason and not was_waiting and not self._is_busy_only(last_waiting_reason):
-                                job_name = await self._get_job_name(db, item)
-                                await notification_service.on_queue_job_waiting(
-                                    job_name=job_name,
-                                    target_model=item.target_model,
-                                    waiting_reason=last_waiting_reason,
-                                    db=db,
-                                )
+                                await self._notify_queue_waiting(db, item, last_waiting_reason, item.target_model)
 
             # Log summary of skip reasons (helps diagnose why queue items aren't starting)
             if skip_reasons:
@@ -2023,6 +2011,45 @@ class PrintScheduler:
                             "Auto-off: Failed to power off plug %s for printer %s: %s", plug_id, item.printer_id, e
                         )
 
+    @staticmethod
+    def _hold_is_new(*, was_held: bool, prior_reason: str | None, reason: str) -> bool:
+        """Whether a hold just STARTED (or changed shape) and so deserves an alert.
+
+        The scheduler re-evaluates every held item on every 30 s tick, so "the item
+        is held" is true on every tick and is NOT an event. The event is the
+        not-held → held transition, plus a change of the persisted reason (which
+        NAMES the blocking printers — when that set changes the operator is looking
+        at a different problem). Both inputs are durable columns
+        (``filament_short`` / ``waiting_reason``) read BEFORE staging overwrites
+        them; no parallel in-memory flag exists to drift.
+        """
+        return not was_held or reason != prior_reason
+
+    async def _notify_queue_waiting(
+        self,
+        db: AsyncSession,
+        item: PrintQueueItem,
+        reason: str,
+        target_model: str,
+    ) -> None:
+        """Single emit path for the queue_job_waiting event (all scheduler holds).
+
+        Composes the per-item ``dedup_key`` (the chokepoint's re-notify floor) and
+        swallows notification failures — a hold is already persisted on the item,
+        so a provider outage must never break the dispatch tick.
+        """
+        job_name = await self._get_job_name(db, item)
+        try:
+            await notification_service.on_queue_job_waiting(
+                job_name=job_name,
+                target_model=target_model or "",
+                waiting_reason=reason,
+                db=db,
+                dedup_key=str(item.id),
+            )
+        except Exception as e:
+            logger.debug("queue-waiting notification failed for item %s: %s", item.id, e)
+
     async def _get_job_name(self, db: AsyncSession, item: PrintQueueItem) -> str:
         """Get a human-readable name for a queue item."""
         if item.archive_id:
@@ -2106,7 +2133,16 @@ class PrintScheduler:
         is the persisted + notified waiting reason — a rich
         :func:`farm_staging.build_staged_reason` string from the caller naming the
         short machines (D9).
+
+        ``notified_groups`` is a PER-TICK set, so on its own it collapsed a run to
+        one alert *per tick* and a hold lasting an hour still sent ~120 of them
+        (the 2026-07-20 spam). The durable transition guard below is what makes the
+        alert fire once per hold; the group set keeps its own (still needed)
+        one-per-run-per-tick job. Transition first, so a group slot is never
+        consumed by an already-held unit while a genuinely new one stays silent.
         """
+        was_blocked = bool(item.filament_short)
+        prior_reason = item.waiting_reason
         await self._stage_filament_short(db, item, unpin=True, reason=reason)
         logger.info(
             "Queue item %s: every eligible %s printer blocked (%s) — staged UNPINNED",
@@ -2114,20 +2150,13 @@ class PrintScheduler:
             item.target_model,
             reason,
         )
+        if not self._hold_is_new(was_held=was_blocked, prior_reason=prior_reason, reason=reason):
+            return
         group_key = (item.batch_id, item.target_model)
         if group_key in notified_groups:
             return
         notified_groups.add(group_key)
-        job_name = await self._get_job_name(db, item)
-        try:
-            await notification_service.on_queue_job_waiting(
-                job_name=job_name,
-                target_model=item.target_model or "",
-                waiting_reason=reason,
-                db=db,
-            )
-        except Exception as e:
-            logger.debug("filament_short notification failed for item %s: %s", item.id, e)
+        await self._notify_queue_waiting(db, item, reason, item.target_model or "")
 
     async def _block_on_filament_deficit(
         self,
@@ -2161,24 +2190,23 @@ class PrintScheduler:
         deficit = await self._compute_deficit_safe(db, item)
 
         if deficit:
+            # The deficit re-evaluates on EVERY tick, so notifying unconditionally
+            # here re-sent the identical "Low filament" alert every 30 s (the
+            # 2026-07-20 incident: 16+ sends in 8 min). Capture the durable hold
+            # state BEFORE staging overwrites it and alert only on the transition —
+            # the same rule the start-minimum sibling above already applied.
+            was_blocked = bool(item.filament_short)
+            prior_reason = item.waiting_reason
             printer = await self._get_printer(db, item.printer_id) if item.printer_id else None
             stage_reason = build_staged_reason(printer.name if printer else "", start_min=False)
             await self._stage_filament_short(db, item, unpin=False, reason=stage_reason)
-            job_name = await self._get_job_name(db, item)
             logger.info(
                 "Queue item %s blocked on filament deficit (%d slot(s)) — promoted to manual_start",
                 item.id,
                 len(deficit),
             )
-            try:
-                await notification_service.on_queue_job_waiting(
-                    job_name=job_name,
-                    target_model=(printer.model if printer else "") or "",
-                    waiting_reason=stage_reason,
-                    db=db,
-                )
-            except Exception as e:
-                logger.debug("filament_short notification failed for item %s: %s", item.id, e)
+            if self._hold_is_new(was_held=was_blocked, prior_reason=prior_reason, reason=stage_reason):
+                await self._notify_queue_waiting(db, item, stage_reason, (printer.model if printer else "") or "")
             return True
 
         # No deficit — clear any stale flag from a previous tick.
@@ -2307,16 +2335,7 @@ class PrintScheduler:
                 held_printer_id,
             )
             if not already_waiting:
-                job_name = await self._get_job_name(db, item)
-                try:
-                    await notification_service.on_queue_job_waiting(
-                        job_name=job_name,
-                        target_model=(printer.model if printer else "") or "",
-                        waiting_reason="no_usb_drive",
-                        db=db,
-                    )
-                except Exception as e:
-                    logger.debug("no_usb_drive notification failed for item %s: %s", item.id, e)
+                await self._notify_queue_waiting(db, item, "no_usb_drive", (printer.model if printer else "") or "")
             return
 
         # Farm capability-matching gate (#Phase4). Non-farm items bypass it. A

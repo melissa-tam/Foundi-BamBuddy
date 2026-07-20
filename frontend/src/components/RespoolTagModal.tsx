@@ -180,6 +180,20 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
 
   const brandValid = brand.trim().length > 0;
 
+  // Header framing follows the prompt's trigger (see `RespoolTrigger`). A
+  // `near_empty` prompt only means "this roll is nearly used up and the slot was
+  // handled" — claiming a reused tag had been detected there was the misleading
+  // copy behind the 2026-07-20 false popups. `spent` / `remain_jump` (and the
+  // manual tray-menu path, which carries no trigger) keep the reused-tag framing
+  // and add the specific evidence line underneath.
+  const nearEmpty = context.trigger === 'near_empty';
+  const triggerLineKey =
+    context.trigger === 'spent'
+      ? 'inventory.respool.triggerSpent'
+      : context.trigger === 'remain_jump'
+        ? 'inventory.respool.triggerRemainJump'
+        : null;
+
   const handleConfirm = () => {
     if (!brandValid || respoolMutation.isPending) return;
     const weightNum = labelWeight.trim() === '' ? null : Number(labelWeight);
@@ -197,8 +211,12 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
 
   return (
     <ConfirmModal
-      title={t('inventory.respool.title')}
-      message={t('inventory.respool.message', { location })}
+      title={nearEmpty ? t('inventory.respool.nearEmptyTitle') : t('inventory.respool.title')}
+      message={
+        nearEmpty
+          ? t('inventory.respool.nearEmptyMessage', { location })
+          : t('inventory.respool.message', { location })
+      }
       confirmText={t('inventory.respool.confirm')}
       cancelText={t('inventory.respool.dismiss')}
       variant="default"
@@ -209,6 +227,9 @@ export function RespoolTagModal({ context, onClose }: RespoolTagModalProps) {
       onCancel={onClose}
     >
       <div className="space-y-3">
+        {/* Why this was raised — the specific evidence behind the reused-tag framing */}
+        {triggerLineKey && <p className="text-xs text-bambu-gray">{t(triggerLineKey)}</p>}
+
         {/* Material + colour swatch — the plain-language headline (no raw hex) */}
         <div className="flex items-center gap-3 p-3 rounded-lg bg-bambu-dark-secondary border border-bambu-dark-tertiary">
           {swatchStyle && (

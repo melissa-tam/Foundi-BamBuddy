@@ -89,6 +89,38 @@ describe('RespoolTagModal', () => {
     expect(screen.getByText(/ONE tag per donor roll/i)).toBeInTheDocument();
   });
 
+  // -- trigger-driven framing (2026-07-20: the copy claimed a reused tag had been
+  //    detected no matter WHY the prompt fired, which is how two false "reused
+  //    RFID spool" popups reached an operator whose farm reuses no tags) --------
+
+  it('frames a near_empty prompt as a roll replacement, with no reused-tag language', () => {
+    render(<RespoolTagModal context={makeContext({ trigger: 'near_empty' })} onClose={vi.fn()} />);
+    expect(screen.getByText(/Replacing this roll\?/i)).toBeInTheDocument();
+    expect(screen.getByText(/almost empty/i)).toBeInTheDocument();
+    expect(screen.queryByText(/reused Bambu tag was detected/i)).not.toBeInTheDocument();
+    // The re-spool form itself is unchanged — same actions, same fields.
+    expect(screen.getByRole('button', { name: CONFIRM })).toBeInTheDocument();
+    expect(screen.getByLabelText('Brand')).toBeInTheDocument();
+  });
+
+  it('keeps the reused-tag framing for a remain_jump prompt and names the evidence', () => {
+    render(<RespoolTagModal context={makeContext({ trigger: 'remain_jump' })} onClose={vi.fn()} />);
+    expect(screen.getByText(/reused Bambu tag was detected/i)).toBeInTheDocument();
+    expect(screen.getByText(/far more filament than this record holds/i)).toBeInTheDocument();
+  });
+
+  it('keeps the reused-tag framing for a spent prompt and names the evidence', () => {
+    render(<RespoolTagModal context={makeContext({ trigger: 'spent' })} onClose={vi.fn()} />);
+    expect(screen.getByText(/reused Bambu tag was detected/i)).toBeInTheDocument();
+    expect(screen.getByText(/reported running out/i)).toBeInTheDocument();
+  });
+
+  it('falls back to the reused-tag framing when no trigger is supplied (manual tray-menu path)', () => {
+    render(<RespoolTagModal context={makeContext()} onClose={vi.fn()} />);
+    expect(screen.getByText(/reused Bambu tag was detected/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Replacing this roll\?/i)).not.toBeInTheDocument();
+  });
+
   it('keeps the raw tag UID inside the collapsed Details disclosure, not the headline', () => {
     render(<RespoolTagModal context={makeContext()} onClose={vi.fn()} />);
     const uid = screen.getByText('DEADBEEF');

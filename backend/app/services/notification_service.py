@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import smtplib
+import time
 from datetime import datetime, timedelta, timezone
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -19,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models.notification import NotificationDigestQueue, NotificationLog, NotificationProvider
 from backend.app.models.notification_template import NotificationTemplate
+from backend.app.services import notify_dedup
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,15 @@ logger = logging.getLogger(__name__)
 # was both inconsistent with the rest of the project and a more obvious
 # bot signature for upstream WAFs.
 _USER_AGENT = "Bambuddy/1.0 (+https://github.com/maziggy/bambuddy)"
+
+# Belt-and-braces re-notify floor for the queue-waiting event (Phase D). The
+# emitters (print_scheduler's staging paths) already notify only on the
+# not-blocked → blocked transition; this is the chokepoint guarantee that a future
+# caller which loses its transition guard cannot reproduce the 2026-07-20 incident
+# (the same "Low filament: 005-H2S" alert on every 30 s tick — 16+ sends in
+# 8 minutes). One hour is far above a scheduler tick and far below the timescale on
+# which an operator would want a genuine reminder.
+_QUEUE_WAITING_RENOTIFY_S = 3600.0
 
 
 def _looks_like_cloudflare_challenge(response: httpx.Response) -> bool:
@@ -1762,8 +1773,28 @@ class NotificationService:
         target_model: str,
         waiting_reason: str,
         db: AsyncSession,
+        dedup_key: str | None = None,
     ):
-        """Handle job waiting for filament event."""
+        """Handle job waiting for filament event.
+
+        ``dedup_key`` (the queue item id at every farm call site) engages the
+        chokepoint re-notify floor: the same (item, waiting_reason) pair alerts at
+        most once per :data:`_QUEUE_WAITING_RENOTIFY_S`. A CHANGED reason is a
+        different key and alerts immediately — the operator needs to know when the
+        hold changes shape. Omitting the key preserves the un-gated behaviour for
+        callers that have no stable identity to dedup on.
+        """
+        if dedup_key is not None and not notify_dedup.allow(
+            "queue_waiting", f"{dedup_key}:{waiting_reason}", time.time(), _QUEUE_WAITING_RENOTIFY_S
+        ):
+            logger.debug(
+                "queue_job_waiting suppressed for %s (%s): within the %.0fs re-notify floor",
+                dedup_key,
+                waiting_reason,
+                _QUEUE_WAITING_RENOTIFY_S,
+            )
+            return
+
         providers = await self._get_providers_for_event(db, "on_queue_job_waiting", None)
         if not providers:
             return

@@ -38,6 +38,13 @@ _AMS_MODULE_PREFIXES = ("ams/", "n3f/", "n3s/")
 # decode below). Exported so ams_presence shares one origin for this magic value.
 AMS_STATUS_IDENTIFYING = 2
 
+# AMS main status 0 = idle: no filament change, RFID read, assist or calibration
+# in progress. Exported so spool_recovery shares one origin for this magic value —
+# an unload is only CONFIRMED once the state machine has returned here (a stuck
+# ``ams_status_main == 1`` filament_change is exactly what defeated the 009-H2S
+# self-heal on 2026-07-20).
+AMS_STATUS_IDLE = 0
+
 # Tray `state` codes that mean a spool is physically PRESENT: 11 = loaded, 10 =
 # "spool present, filament not in feeder" (see the merge comment in
 # _handle_ams_data). Wiping tray identity for a present spool is the bug behind the
@@ -60,6 +67,26 @@ _DRYING_LATCH_DEFAULT_S = 24 * 3600  # latch cap when no duration was supplied
 # 0700_2x00_0001_0081). Cleared early when the AMS is observed leaving the
 # identifying state (see the ams_status decode).
 _IDENTIFY_GATE_S = 30
+
+# Refusal-reason → log text, used by the ONE standardized WARNING the AMS write
+# choke points emit (see BambuMQTTClient._refuse_ams_write). Unit-scoped on purpose:
+# every hazard _ams_write_refusal evaluates is a property of the AMS UNIT, not of the
+# individual slot, which is why the evaluator (and the log) key on ams_id alone.
+_AMS_REFUSAL_LOG_TEXT = {
+    "drying": "AMS unit is drying",
+    "identifying": "AMS is identifying a tray",
+    "identify_in_flight": "an identify is already in flight on this printer",
+}
+
+# Refusal-reason → operator-facing message for the identify path. ams_refresh_tray
+# returns (ok, message) and that message reaches the operator through the manual
+# refresh route's 400, so its wording is part of the API surface (unlike the three
+# mutating writes, which return a bare bool).
+_AMS_REFRESH_REFUSAL_MESSAGE = {
+    "drying": "AMS unit is drying — retry after the drying cycle",
+    "identifying": "AMS is busy identifying a tray",
+    "identify_in_flight": "AMS is identifying another tray",
+}
 
 
 def parse_ams_filament_backup_from_cfg(cfg_raw: object) -> bool | None:
@@ -5203,7 +5230,6 @@ class BambuMQTTClient:
         #   - Ext-R on dual-nozzle H2D (tray_id=255): captured shape from
         #     BambuStudio uses slot_id=0 (extruder index, 0=right), and
         #     curr_temp/tar_temp = the actual right-nozzle temp.  See #891.
-        self._sequence_id += 1
         if tray_id == 255:
             ams_id = 255
             slot_id = 0  # extruder index for the right nozzle
@@ -5223,6 +5249,17 @@ class BambuMQTTClient:
             curr_temp = -1
             tar_temp = -1
 
+        # Wire-safety refusal via the shared _refuse_ams_write helper (drying →
+        # identifying → per-printer identify gate; it owns the WARNING log). A load
+        # into a drying unit disengages the tray and fails the cycle; a load while an
+        # RFID read is in flight clobbers that read. Deliberately NOT gated on a
+        # standing HMS: a feed-fault code is live for the whole jam-recovery window,
+        # and refusing there would deadlock the very swap this command exists for.
+        # A load is motion, not an identify — it never arms the identify gate.
+        if self._refuse_ams_write("ams_change_filament (load)", ams_id) is not None:
+            return False
+
+        self._sequence_id += 1
         command = {
             "print": {
                 "command": "ams_change_filament",
@@ -5267,6 +5304,17 @@ class BambuMQTTClient:
             ams_id = 255  # No filament or external spool
         else:
             ams_id = tray_now // 4  # Source AMS
+
+        # Wire-safety refusal via the shared _refuse_ams_write helper (drying →
+        # identifying → per-printer identify gate; it owns the WARNING log). The
+        # drying dimension is evaluated against the SOURCE unit derived above, so the
+        # "nothing loaded / external" case (ams_id 255) has no unit to be drying and
+        # naturally skips it — the identify dimensions still apply. Deliberately NOT
+        # gated on a standing HMS: the post-feed-fault unload IS the recovery action
+        # (009-H2S 2026-07-20), so refusing under a live jam code would deadlock it.
+        # An unload is motion, not an identify — it never arms the identify gate.
+        if self._refuse_ams_write("ams_change_filament (unload)", ams_id) is not None:
+            return False
 
         # Command format from BambuStudio traffic capture:
         # - No extruder_id field
@@ -5355,6 +5403,41 @@ class BambuMQTTClient:
             return "identify_in_flight"
         return None
 
+    def _refuse_ams_write(self, op: str, ams_id: int) -> str | None:
+        """Evaluate the AMS wire-safety refusal for ``op`` and log a refusal once.
+
+        The ONE "evaluate + WARNING" pair shared by all four AMS write choke points
+        (``ams_get_rfid`` / ``ams_filament_setting`` / ``reset_ams_slot`` /
+        ``extrusion_cali_sel``). Returns the reason string from
+        :meth:`_ams_write_refusal` (None when the wire is safe) so each caller keeps
+        its own return shape — a bare bool for the mutating writes, ``(False,
+        message)`` for the identify. The log line is deliberately unit-scoped
+        (``op`` + ``ams_id`` + reason): every hazard the evaluator weighs is a
+        property of the AMS unit, never of one slot.
+        """
+        refusal = self._ams_write_refusal(ams_id)
+        if refusal is not None:
+            logger.warning(
+                "[%s] Refusing %s on AMS %s: %s",
+                self.serial_number,
+                op,
+                ams_id,
+                _AMS_REFUSAL_LOG_TEXT.get(refusal, refusal),
+            )
+        return refusal
+
+    def ams_write_refusal(self, ams_id: int) -> str | None:
+        """Public read-only pre-flight check: why an AMS write to ``ams_id`` would be
+        refused right now, or None when the wire is safe.
+
+        Thin, side-effect-free wrapper over the shared evaluator (no logging, no
+        state change) for callers that must decide BEFORE building a command whether
+        it is worth attempting. Commanding paths must NOT use this to pre-approve a
+        write — the write methods re-evaluate at publish time, which is the only
+        check that closes the race.
+        """
+        return self._ams_write_refusal(ams_id)
+
     async def wait_ams_settle(self) -> bool:
         """Block until this printer's AMS is quiescent for a fresh identify.
 
@@ -5393,24 +5476,14 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot refresh AMS tray: not connected", self.serial_number)
             return False, "Printer not connected"
 
-        # Wire-safety refusal, evaluated by the shared _ams_write_refusal helper
-        # (drying → identifying → per-printer identify gate). Each reason maps to
-        # this method's own message + (False, msg) return; a re-read / config write
-        # into any of these states fails the firmware read (HMS 0700_C069 while
-        # drying, HMS 0700_2x00_0001_0081 while an identify is in flight).
-        refusal = self._ams_write_refusal(ams_id)
-        if refusal == "drying":
-            logger.warning("[%s] Cannot refresh AMS tray: AMS unit %s is drying", self.serial_number, ams_id)
-            return False, "AMS unit is drying — retry after the drying cycle"
-        if refusal == "identifying":
-            logger.warning("[%s] Cannot refresh AMS tray: AMS is busy identifying a tray", self.serial_number)
-            return False, "AMS is busy identifying a tray"
-        if refusal == "identify_in_flight":
-            logger.warning(
-                "[%s] Cannot refresh AMS tray: an identify is already in flight on this printer",
-                self.serial_number,
-            )
-            return False, "AMS is identifying another tray"
+        # Wire-safety refusal via the shared _refuse_ams_write helper (drying →
+        # identifying → per-printer identify gate; it owns the WARNING log). Each
+        # reason maps to this method's own operator-facing message; a re-read into
+        # any of these states fails the firmware read (HMS 0700_C069 while drying,
+        # HMS 0700_2x00_0001_0081 while an identify is in flight).
+        refusal = self._refuse_ams_write("ams_get_rfid", ams_id)
+        if refusal is not None:
+            return False, _AMS_REFRESH_REFUSAL_MESSAGE[refusal]
 
         # Check if filament is currently loaded (tray_now != 255)
         # RFID refresh requires the AMS to move filament, which can't happen if one is loaded
@@ -5473,35 +5546,12 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot set AMS filament setting: not connected", self.serial_number)
             return False
 
-        # Wire-safety refusal via the shared _ams_write_refusal helper (drying →
-        # identifying → per-printer identify gate). A filament-setting write into a
-        # drying unit fails the cycle (HMS 0700_C069); into a slot mid-identify (or
-        # with our identify still in flight) it clobbers the RFID read (HMS
-        # 0700_2x00_0001_0081). Each reason keeps this method's own message + False.
-        refusal = self._ams_write_refusal(ams_id)
-        if refusal == "drying":
-            logger.warning(
-                "[%s] Refusing ams_filament_setting for AMS %s tray %s: AMS unit is drying",
-                self.serial_number,
-                ams_id,
-                tray_id,
-            )
-            return False
-        if refusal == "identifying":
-            logger.warning(
-                "[%s] Refusing ams_filament_setting for AMS %s tray %s: AMS is identifying a tray",
-                self.serial_number,
-                ams_id,
-                tray_id,
-            )
-            return False
-        if refusal == "identify_in_flight":
-            logger.warning(
-                "[%s] Refusing ams_filament_setting for AMS %s tray %s: an identify is already in flight on this printer",
-                self.serial_number,
-                ams_id,
-                tray_id,
-            )
+        # Wire-safety refusal via the shared _refuse_ams_write helper (drying →
+        # identifying → per-printer identify gate; it owns the WARNING log). A
+        # filament-setting write into a drying unit fails the cycle (HMS 0700_C069);
+        # into a slot mid-identify (or with our identify still in flight) it clobbers
+        # the RFID read (HMS 0700_2x00_0001_0081).
+        if self._refuse_ams_write("ams_filament_setting", ams_id) is not None:
             return False
 
         # Calculate mqtt IDs based on AMS type.
@@ -5579,36 +5629,12 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot reset AMS slot: not connected", self.serial_number)
             return False
 
-        # Wire-safety refusal via the shared _ams_write_refusal helper (drying →
-        # identifying → per-printer identify gate). A reset write is an
-        # ams_filament_setting under the hood: into a drying unit it fails the cycle
-        # (HMS 0700_C069); into a slot mid-identify (or with our identify still in
-        # flight) it clobbers the RFID read (HMS 0700_2x00_0001_0081). Each reason
-        # keeps this method's own message + False.
-        refusal = self._ams_write_refusal(ams_id)
-        if refusal == "drying":
-            logger.warning(
-                "[%s] Refusing reset_ams_slot for AMS %s tray %s: AMS unit is drying",
-                self.serial_number,
-                ams_id,
-                tray_id,
-            )
-            return False
-        if refusal == "identifying":
-            logger.warning(
-                "[%s] Refusing reset_ams_slot for AMS %s tray %s: AMS is identifying a tray",
-                self.serial_number,
-                ams_id,
-                tray_id,
-            )
-            return False
-        if refusal == "identify_in_flight":
-            logger.warning(
-                "[%s] Refusing reset_ams_slot for AMS %s tray %s: an identify is already in flight on this printer",
-                self.serial_number,
-                ams_id,
-                tray_id,
-            )
+        # Wire-safety refusal via the shared _refuse_ams_write helper (drying →
+        # identifying → per-printer identify gate; it owns the WARNING log). A reset
+        # write is an ams_filament_setting under the hood: into a drying unit it fails
+        # the cycle (HMS 0700_C069); into a slot mid-identify (or with our identify
+        # still in flight) it clobbers the RFID read (HMS 0700_2x00_0001_0081).
+        if self._refuse_ams_write("reset_ams_slot", ams_id) is not None:
             return False
 
         # Calculate mqtt IDs based on AMS type — same convention as
@@ -5687,36 +5713,12 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot set calibration: not connected", self.serial_number)
             return False
 
-        # Wire-safety refusal via the shared _ams_write_refusal helper (drying →
-        # identifying → per-printer identify gate). Selecting a calibration profile
-        # pokes the slot: into a drying unit it fails the cycle (HMS 0700_C069);
-        # into a slot mid-identify (or with our identify still in flight) it clobbers
-        # the RFID read (HMS 0700_2x00_0001_0081). Each reason keeps this method's
-        # own message + False.
-        refusal = self._ams_write_refusal(ams_id)
-        if refusal == "drying":
-            logger.warning(
-                "[%s] Refusing extrusion_cali_sel for AMS %s tray %s: AMS unit is drying",
-                self.serial_number,
-                ams_id,
-                tray_id,
-            )
-            return False
-        if refusal == "identifying":
-            logger.warning(
-                "[%s] Refusing extrusion_cali_sel for AMS %s tray %s: AMS is identifying a tray",
-                self.serial_number,
-                ams_id,
-                tray_id,
-            )
-            return False
-        if refusal == "identify_in_flight":
-            logger.warning(
-                "[%s] Refusing extrusion_cali_sel for AMS %s tray %s: an identify is already in flight on this printer",
-                self.serial_number,
-                ams_id,
-                tray_id,
-            )
+        # Wire-safety refusal via the shared _refuse_ams_write helper (drying →
+        # identifying → per-printer identify gate; it owns the WARNING log).
+        # Selecting a calibration profile pokes the slot: into a drying unit it fails
+        # the cycle (HMS 0700_C069); into a slot mid-identify (or with our identify
+        # still in flight) it clobbers the RFID read (HMS 0700_2x00_0001_0081).
+        if self._refuse_ams_write("extrusion_cali_sel", ams_id) is not None:
             return False
 
         # Calculate mqtt IDs based on AMS type.

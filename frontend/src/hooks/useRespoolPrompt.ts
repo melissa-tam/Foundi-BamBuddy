@@ -18,7 +18,9 @@ import {
  *
  * The uncertain-tier `respool_prompt` no longer auto-opens the modal (a blocking
  * dialog for a maybe-spent spool was too noisy). Instead each queued slot raises
- * a persistent, non-blocking toast with two explicit answers:
+ * a persistent, non-blocking toast — worded from the prompt's `trigger`, so an
+ * "almost empty" spool is never announced as a detected reused tag — with two
+ * explicit answers:
  *   - "Same spool"  → POST `respool-dismiss` (persists the answer so the prompt
  *                     never fires again for this spool) and clear the slot.
  *   - "Review…"     → open `RespoolTagModal` for the full re-spool form.
@@ -90,8 +92,17 @@ export function useRespoolPrompt() {
       const printers = queryClient.getQueryData<Printer[]>(['printers']);
       const printerName =
         printers?.find(p => p.id === prompt.printer_id)?.name ?? `Printer ${prompt.printer_id}`;
+      // Say the true thing. A `near_empty` prompt means the record is nearly used
+      // up and somebody handled the slot — it is NOT evidence of a reused tag, and
+      // announcing one was how two false "reused RFID spool" popups reached the
+      // operator (2026-07-20). `spent` / `remain_jump` (and the manual tray-menu
+      // path, which carries no trigger) keep the reused-tag framing.
+      const nearEmpty = prompt.trigger === 'near_empty';
       return {
-        message: t('inventory.respool.promptToast', { printer: printerName, slot: prompt.tray_id + 1 }),
+        message: t(
+          nearEmpty ? 'inventory.respool.nearEmptyToast' : 'inventory.respool.reusedTagToast',
+          { printer: printerName, slot: prompt.tray_id + 1 },
+        ),
         type: 'warning',
         actions: [
           {

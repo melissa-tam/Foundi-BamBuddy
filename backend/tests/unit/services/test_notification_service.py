@@ -4,10 +4,12 @@ Tests event-based notifications and toggle behavior.
 """
 
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.app.services import notification_service as notification_service_module, notify_dedup
 from backend.app.services.notification_service import NotificationService
 
 
@@ -3215,3 +3217,78 @@ class TestOnStorageLowWording:
         detail = self._detail_for(mock_build)
         assert detail.startswith("Auto-cleanup freed 3 MB across 2 file(s)")
         assert "5.0 GB free now" in detail
+
+
+class TestQueueJobWaitingDedup:
+    """Chokepoint re-notify floor for the queue-waiting event (Phase D).
+
+    Production 2026-07-20: the identical "Low filament: 005-H2S (starting spool
+    below minimum)" alert fired on EVERY 30 s scheduler tick — 16+ sends in
+    8 minutes — because the emitter staged and notified with no transition guard.
+    The emitters are fixed; this gate is the guarantee that no future caller can
+    reproduce it. In-memory by design (see notify_dedup.allow).
+    """
+
+    @pytest.fixture
+    def service(self):
+        return NotificationService()
+
+    @pytest.fixture(autouse=True)
+    def _reset_dedup(self):
+        notify_dedup._reset_state()
+        yield
+        notify_dedup._reset_state()
+
+    @staticmethod
+    async def _fire(service, db, *, reason="Low filament: 005-H2S", dedup_key="12"):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "m")
+            await service.on_queue_job_waiting(
+                job_name="job",
+                target_model="H2S",
+                waiting_reason=reason,
+                db=db,
+                dedup_key=dedup_key,
+            )
+            return mock_send.await_count
+
+    @pytest.mark.asyncio
+    async def test_repeat_within_the_window_is_suppressed(self, service):
+        db = AsyncMock()
+        assert await self._fire(service, db) == 1
+        assert await self._fire(service, db) == 0
+        assert await self._fire(service, db) == 0
+
+    @pytest.mark.asyncio
+    async def test_changed_reason_sends_again(self, service):
+        """The reason NAMES the blocking printers — a different hold is news."""
+        db = AsyncMock()
+        assert await self._fire(service, db, reason="Low filament: 005-H2S") == 1
+        assert await self._fire(service, db, reason="Low filament: 011-H2S") == 1
+
+    @pytest.mark.asyncio
+    async def test_other_items_are_independent(self, service):
+        db = AsyncMock()
+        assert await self._fire(service, db, dedup_key="12") == 1
+        assert await self._fire(service, db, dedup_key="13") == 1
+
+    @pytest.mark.asyncio
+    async def test_no_dedup_key_keeps_the_ungated_behaviour(self, service):
+        db = AsyncMock()
+        assert await self._fire(service, db, dedup_key=None) == 1
+        assert await self._fire(service, db, dedup_key=None) == 1
+
+    @pytest.mark.asyncio
+    async def test_sends_again_after_the_window_elapses(self, service):
+        db = AsyncMock()
+        assert await self._fire(service, db) == 1
+        with patch(
+            "backend.app.services.notification_service.time.time",
+            return_value=time.time() + notification_service_module._QUEUE_WAITING_RENOTIFY_S + 1,
+        ):
+            assert await self._fire(service, db) == 1

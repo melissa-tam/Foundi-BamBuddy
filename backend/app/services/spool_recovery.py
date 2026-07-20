@@ -10,12 +10,24 @@ This module is the single owner of the recovery state machine. On a recoverable
 HMS (feed fault, or a runout the firmware backup failed to rescue) during a FARM
 print it reproduces the operator's proven manual recovery sequence:
 
-    (printer already PAUSEd) → unload → confirm ``tray_now == 255`` → mark the
-    jammed spool out of rotation → select the next eligible loaded spool → load
-    it → confirm ``tray_now == target`` (the first load may not take — resend) →
-    resume → confirm RUNNING and hold stable (a lingering fault may need one
-    extra pause/resume cycle) → SUCCESS. If nothing works: escalate — notify and
-    leave the printer PAUSED for a human, never resume blind.
+    (printer already PAUSEd) → unload → confirm the AMS finished the unload cycle
+    (see :func:`_confirm_unloaded`) → mark the jammed spool out of rotation →
+    select the next eligible loaded spool → load it → confirm ``tray_now ==
+    target`` (the first load may not take — resend) → resume → confirm RUNNING and
+    hold stable (a lingering fault may need one extra pause/resume cycle) →
+    SUCCESS. If nothing works: escalate — notify and leave the printer PAUSED for
+    a human, never resume blind.
+
+The unload is UNCONDITIONAL after a feed fault, even when ``tray_now`` already
+reads 255. Production incident 009-H2S 2026-07-20: an earlier ``tray_now == 255``
+short-circuit made the machine send ZERO unloads across four candidate loads while
+the AMS sat stuck mid-filament-change (``ams_status_main == 1``); every load was
+doomed and it escalated to a human. The operator then recovered the identical
+state in 90 s with the commands the machine already had — an explicit unload (sent
+at ``tray_now == 255``), a load, a resume. After a feed fault 255 means "nothing is
+feeding", NOT "the path is clear": only an explicit unload resets the stuck change
+state machine. The short-circuit now survives ONLY for the genuinely-clean restart
+case it was written for (see :func:`_unload_skippable`).
 
 Trigger scope is ``RECOVERABLE_HMS_CODES`` (:data:`FEED_FAULT_HMS_CODES` —
 AMS-side + extruder-side feed faults — plus the reused-tag
@@ -59,6 +71,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
+from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE
 from backend.app.services.hms_errors import hms_short_code
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_respool import RUNOUT_HMS_CODES, _decode_global_tray
@@ -142,12 +155,23 @@ _POLL_INTERVAL_S = 1.0  # live-state poll spacing during every confirm wait
 _POST_RESUME_STABLE_S = 60  # RUNNING must hold this long after a resume = success
 _REPAUSE_WATCH_S = 120  # ceiling on how long we wait for RUNNING after a resume
 _MAX_CANDIDATES = 3  # distinct replacement trays tried before escalating
+# Minimum time the AMS must hold idle + empty before an unload counts as complete
+# when NO filament-change cycle was observed at all (command latency, or an unload
+# the firmware treats as a no-op). The operator's proven manual recovery left 16 s
+# between the unload and the load that worked; 15 s is that gap, floored.
+_UNLOAD_GRACE_S = 15.0
 # Absolute floor a replacement spool must clear even past the protected layers —
 # never load a known-empty spool. A ledger ≤ 5 g is empty for replacement purposes.
 _RECOVERY_HARD_MIN_G = 5
 
 # tray_now sentinel: no filament fed (unloaded). 255 on H2-series.
 _NO_FILAMENT = 255
+
+# The client's AMS write-refusal reason (a ``bambu_mqtt._AMS_REFUSAL_LOG_TEXT`` key)
+# that recovery must NOT try to wait out: a drying cycle holds the lockout for hours,
+# so the swap lane is doomed until a human stops it. Every other reason is identify
+# contention, which settles in seconds.
+_REFUSAL_DRYING = "drying"
 
 # --- Settings defaults (mirror schemas/settings.py) -------------------------
 _DEFAULT_ENABLED = True
@@ -162,7 +186,21 @@ _ESCALATE_DETAIL: dict[str, str] = {
         "originally mapped slot at the next filament change). Left PAUSED for a human."
     ),
     "jammed_tray_unresolved": "Could not identify which spool jammed. Left PAUSED for a human.",
+    # Narrow by design: this reason is only honest when the candidate set was
+    # genuinely EMPTY and no load was ever attempted. The 009-H2S incident reported
+    # it after four failed loads — the two reasons below now carry those cases.
     "no_eligible_spool": "No other loaded spool matched the jammed filament. Left PAUSED for a human.",
+    "candidate_loads_failed": (
+        "Eligible replacement spools were found but none would load — check the filament path. Left PAUSED for a human."
+    ),
+    "feed_path_blocked": (
+        "Replacement spools failed to load repeatedly — the filament path (buffer / PTFE) is likely "
+        "blocked. Clear the buffer and PTFE path, then resume on the printer. Left PAUSED for a human."
+    ),
+    "ams_drying": (
+        "The AMS is running a drying cycle, so no filament change can be commanded without failing it. "
+        "Left PAUSED for a human."
+    ),
     "only_low_spools_in_protected_layers": (
         "The only matching spool is below the minimum-start weight this early in the print. Left PAUSED for a human."
     ),
@@ -188,6 +226,32 @@ class RecoverySettings:
     max_attempts: int
     step_timeout_s: float
     protect_layers: int
+
+
+@dataclass
+class _RecoveryEvidence:
+    """What the candidate loop actually achieved, so the escalation reason is chosen
+    by evidence instead of by position in the code.
+
+    The 009-H2S incident reported ``no_eligible_spool`` after four failed loads —
+    a lie that sent the operator looking for spools instead of at the feed path.
+    """
+
+    confirmed_unloads: int = 0  # unload cycles the AMS confirmed complete
+    loads_attempted: int = 0  # candidates we sent an ams_change_filament for
+    loads_confirmed: int = 0  # loads the printer confirmed on tray_now
+
+    def exhaustion_reason(self) -> str:
+        """The honest escalation reason for running out of candidates/rounds."""
+        if self.loads_attempted == 0:
+            return "no_eligible_spool"  # genuinely nothing to try
+        if self.loads_confirmed:
+            return "candidates_exhausted"  # loads worked; the print wouldn't hold
+        if self.confirmed_unloads:
+            # The AMS unloaded cleanly every round and STILL nothing would feed —
+            # the blockage is downstream of the spool.
+            return "feed_path_blocked"
+        return "candidate_loads_failed"
 
 
 @dataclass(frozen=True)
@@ -575,18 +639,26 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
         if incident.jammed_global_tray is not None:
             await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
 
-        # (3) Try up to _MAX_CANDIDATES replacement trays.
+        # (3) Try up to _MAX_CANDIDATES replacement trays. Every round runs its own
+        #     unload cycle first — the whole point of the 009-H2S fix: a round that
+        #     follows a failed load must reset the AMS before loading again.
         tried: set[int] = set()
+        evidence = _RecoveryEvidence()
         for _round in range(_MAX_CANDIDATES):
             unload = await _unload_and_confirm(incident, client)
-            if unload != "ok":
+            if unload not in ("ok", "skipped"):
                 _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict=f"unload_{unload}")
             if unload == "abort":
                 await _abort(incident)
                 return
+            if unload == "drying":
+                await _escalate(incident, "ams_drying")
+                return
             if unload == "fail":
                 await _escalate(incident, "unload_failed")
                 return
+            if unload == "ok":
+                evidence.confirmed_unloads += 1
 
             target, only_low = await _select_replacement(incident, tried)
             if target is None:
@@ -607,19 +679,24 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                         else "only_low_spools_in_protected_layers"
                     )
                 else:
-                    reason = "no_eligible_spool"
+                    reason = evidence.exhaustion_reason()
                 await _escalate(incident, reason)
                 return
             tried.add(target)
 
+            evidence.loads_attempted += 1
             load = await _load_and_confirm(incident, client, target)
             if load != "ok":
                 _log_candidate_outcome(incident, gtid=target, verdict=f"load_{load}")
             if load == "abort":
                 await _abort(incident)
                 return
+            if load == "drying":
+                await _escalate(incident, "ams_drying")
+                return
             if load == "fail":
                 continue  # load never confirmed — try the next candidate
+            evidence.loads_confirmed += 1
 
             resume = await _resume_and_confirm(incident, client, target)
             if resume == "abort":
@@ -666,7 +743,7 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
 
         # (4) Every candidate exhausted.
         _log_candidate_outcome(incident, gtid=None, verdict="candidates_exhausted")
-        await _escalate(incident, "candidates_exhausted")
+        await _escalate(incident, evidence.exhaustion_reason())
     except Exception:  # noqa: BLE001 — the driver must never crash the event loop
         logger.exception("spool_recovery: recovery driver crashed for printer %s", pid)
     finally:
@@ -688,19 +765,89 @@ async def _await_state(printer_id: int, targets: set[str], timeout_s: float) -> 
 # --- step helpers -----------------------------------------------------------
 
 
-async def _unload_and_confirm(incident: RecoveryIncident, client) -> str:
-    """Unload until ``tray_now == 255``. ``ok`` / ``fail`` / ``abort``.
+def _feed_fault_live(state) -> bool:
+    """True while a FEED-FAULT HMS code is standing on the live printer state."""
+    return bool(_active_recoverable_codes(state) & FEED_FAULT_HMS_CODES)
 
-    Already-255 short-circuits (the restart path, or a firmware that unloaded on
-    the fault) with no command sent. An external RESUME mid-unload aborts.
+
+def _unload_skippable(state) -> bool:
+    """True only for the genuinely-clean "nothing to unload" state.
+
+    ALL THREE must hold: nothing is feeding (``tray_now == 255``), the AMS state
+    machine is idle (``ams_status_main == 0``), and no feed-fault code is standing.
+    That is the restart / firmware-already-unloaded path the original short-circuit
+    was written for.
+
+    Anything else — above all a live feed fault, or an ``ams_status_main`` stuck at
+    ``1`` (filament_change) — means an explicit unload is exactly what the AMS needs,
+    because after a feed fault ``tray_now == 255`` says only "nothing is feeding".
+    """
+    if state is None:
+        return False
+    if getattr(state, "tray_now", None) != _NO_FILAMENT:
+        return False
+    if getattr(state, "ams_status_main", None) != AMS_STATUS_IDLE:
+        return False
+    return not _feed_fault_live(state)
+
+
+def _ams_unit_for_tray(global_tray: int | None) -> int:
+    """The AMS unit a global tray belongs to, for the pre-flight refusal check.
+
+    Reuses the module's existing decoder; external / unloaded / unresolvable trays
+    have no unit and map to the client's own 255 sentinel, for which the unit-scoped
+    drying hazard is vacuously false.
+    """
+    ams_id, _tray_id = _decode_global_tray(global_tray)
+    return 255 if ams_id is None else ams_id
+
+
+async def _wait_ams_write_window(client, ams_id: int) -> str | None:
+    """Pre-flight the AMS wire for a recovery load/unload on unit ``ams_id``.
+
+    Returns the refusal reason that STILL stands after giving the wire a chance to
+    settle, or None when it is clear. Drying is a doomed lane — it is reported
+    immediately so the caller can escalate instead of burning attempts on writes the
+    client will refuse for the whole cycle. An identify-contention refusal is
+    transient by construction, so the client's own settle wait absorbs it (the same
+    idiom the terminal sweep uses) rather than ending the recovery.
+
+    This is advisory only: the client re-evaluates at publish time, which is the
+    check that actually closes the race.
+    """
+    refusal = client.ams_write_refusal(ams_id)
+    if refusal is None or refusal == _REFUSAL_DRYING:
+        return refusal
+    await client.wait_ams_settle()
+    return client.ams_write_refusal(ams_id)
+
+
+async def _unload_and_confirm(incident: RecoveryIncident, client) -> str:
+    """Unload the feeder and confirm the AMS finished the cycle.
+
+    ``ok`` (a confirmed unload cycle ran) / ``skipped`` (nothing to unload — see
+    :func:`_unload_skippable`) / ``drying`` (the AMS is drying: a doomed lane) /
+    ``fail`` / ``abort`` (an external RESUME mid-unload).
+
+    The unload is sent even when ``tray_now`` already reads 255 — the client encodes
+    that as ``ams_id/slot_id/target = 255``, which is byte-for-byte the operator's
+    proven manual recovery command and the only thing that resets a stuck
+    filament-change state machine.
     """
     st = _get_state(incident.printer_id)
-    if st is not None and getattr(st, "tray_now", None) == _NO_FILAMENT:
-        return "ok"
+    if _unload_skippable(st):
+        return "skipped"
+
+    unit = _ams_unit_for_tray(getattr(st, "tray_now", None) if st is not None else None)
+    refusal = await _wait_ams_write_window(client, unit)
+    if refusal == _REFUSAL_DRYING:
+        return "drying"
+
     for _ in range(max(1, incident.settings.max_attempts)):
         if not client.ams_unload_filament():
-            # Offline / rejected send: a no-op that never confirms — consume the
-            # attempt and advance immediately instead of burning a full confirm wait.
+            # Offline / refused / rejected send: a no-op that never confirms —
+            # consume the attempt and advance immediately instead of burning a full
+            # confirm wait.
             logger.warning(
                 "spool_recovery: printer %s ams_unload_filament send returned False (offline?) — attempt consumed",
                 incident.printer_id,
@@ -713,17 +860,50 @@ async def _unload_and_confirm(incident: RecoveryIncident, client) -> str:
 
 
 async def _confirm_unloaded(incident: RecoveryIncident) -> str:
+    """Wait for the commanded unload to COMPLETE. ``ok`` / ``timeout`` / ``abort``.
+
+    ``tray_now == 255`` alone is not completion: after a feed fault it already reads
+    255 before the unload, so the old criterion returned instantly and the load then
+    raced an AMS that was still mid-cycle (009-H2S 2026-07-20). Two evidence paths,
+    both bounded by ``step_timeout_s``:
+
+    (a) The AMS is observed going NON-idle — the change cycle started. Completion is
+        its return to idle with nothing feeding.
+    (b) No non-idle transition is ever observed (command latency, or an unload the
+        firmware no-ops). Then idle + empty must hold across consecutive polls for
+        :data:`_UNLOAD_GRACE_S` before it counts; any contrary poll restarts the dwell.
+
+    A state machine still stuck non-idle at the deadline returns ``timeout`` — the
+    caller resends, and ultimately escalates ``unload_failed`` rather than loading
+    into a busy AMS.
+    """
     deadline = _now() + incident.settings.step_timeout_s
-    while _now() < deadline:
+    saw_cycle = False
+    settled_since: float | None = None
+    while True:
         st = _get_state(incident.printer_id)
         if st is None:
             return "abort"
         if getattr(st, "state", None) == "RUNNING":
             return "abort"  # someone else resumed the print
-        if getattr(st, "tray_now", None) == _NO_FILAMENT:
-            return "ok"
+        idle = getattr(st, "ams_status_main", None) == AMS_STATUS_IDLE
+        empty = getattr(st, "tray_now", None) == _NO_FILAMENT
+        if not idle:
+            saw_cycle = True  # the change cycle is running
+            settled_since = None
+        elif not empty:
+            settled_since = None  # idle but still feeding — not unloaded
+        elif saw_cycle:
+            return "ok"  # cycle ran and returned to idle with nothing feeding
+        else:
+            # No cycle observed yet: idle + empty must HOLD for the grace dwell.
+            if settled_since is None:
+                settled_since = _now()
+            if _now() - settled_since >= _UNLOAD_GRACE_S:
+                return "ok"
+        if _now() >= deadline:
+            return "timeout"
         await asyncio.sleep(_POLL_INTERVAL_S)
-    return "timeout"
 
 
 async def _select_replacement(incident: RecoveryIncident, tried: set[int]) -> tuple[int | None, bool]:
@@ -1088,13 +1268,20 @@ async def _log_tray_snapshot(incident: RecoveryIncident) -> None:
 
 
 async def _load_and_confirm(incident: RecoveryIncident, client, target: int) -> str:
-    """Load ``target`` until ``tray_now == target``. ``ok`` / ``fail`` / ``abort``.
+    """Load ``target`` until ``tray_now == target``. ``ok`` / ``drying`` / ``fail`` /
+    ``abort``.
 
     The live incident needed two sends before the load took, hence the resend
     loop. A ``pending_tray_target`` that becomes something other than our target
-    means another actor issued a load → abort.
+    means another actor issued a load → abort. A drying target unit is a doomed lane
+    (the client refuses every write to it) — reported so the caller escalates instead
+    of burning attempts.
     """
     from backend.app.services import spool_respool
+
+    refusal = await _wait_ams_write_window(client, _ams_unit_for_tray(target))
+    if refusal == _REFUSAL_DRYING:
+        return "drying"
 
     for _ in range(max(1, incident.settings.max_attempts)):
         # Mark every load send as ours BEFORE it goes out, so the backup-swap
