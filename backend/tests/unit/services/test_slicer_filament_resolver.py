@@ -211,3 +211,114 @@ class TestNozzleTempResolution:
             nozzle_temp_min=235,
         )
         assert (tmin, tmax) == (235, 260)
+
+
+class TestGenericIdOverride:
+    """E3 (2026-07-20): a stale spool row carrying a GENERIC id must not be able to
+    re-publish it — the firmware's auto-refill backup group pairs slots only on an
+    exact brand-class/type/colour/TEMPS match, and 011-H2S's trays 1-2 sat on GFG99
+    beside GFG02 peers, splitting the group. Every write site routes through this
+    resolver, so the substitution belongs here (one chokepoint, all consumers)."""
+
+    _DEFAULT = {"slicer_filament": "GFG02", "nozzle_temp_min": 230, "nozzle_temp_max": 270}
+
+    def _override(self, monkeypatch, value):
+        from backend.app.services import spool_tagless
+
+        monkeypatch.setattr(spool_tagless, "override_generic_identity", AsyncMock(return_value=value))
+
+    @pytest.mark.asyncio
+    async def test_generic_id_is_replaced_with_the_defaults_id_and_temps(self, monkeypatch):
+        self._override(monkeypatch, self._DEFAULT)
+        db = MagicMock()
+        tray_info_idx, setting_id, _sub, tmin, tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament="GFG99",
+            slicer_filament_name=None,
+            material="PETG",
+            rgba="000000FF",
+            # Stale row temps: substituting the id alone would still split the backup
+            # group on the temperature dimension, so these must be replaced too.
+            nozzle_temp_min=220,
+            nozzle_temp_max=260,
+        )
+        assert tray_info_idx == "GFG02"
+        assert setting_id == "GFSG02"  # re-derived via the shared filament_id_to_setting_id
+        assert (tmin, tmax) == (230, 270)
+
+    @pytest.mark.asyncio
+    async def test_no_default_or_no_fingerprint_match_passes_through(self, monkeypatch):
+        self._override(monkeypatch, None)  # helper vetoed (feature off / different filament)
+        db = MagicMock()
+        tray_info_idx, setting_id, _sub, tmin, tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament="GFG99",
+            slicer_filament_name=None,
+            material="PETG",
+            rgba="FF0000FF",
+            nozzle_temp_min=220,
+            nozzle_temp_max=260,
+        )
+        assert tray_info_idx == "GFG99"  # unchanged
+        assert setting_id == "GFSG99"
+        assert (tmin, tmax) == (220, 260)
+
+    @pytest.mark.asyncio
+    async def test_lookup_failure_degrades_to_the_resolved_identity(self, monkeypatch):
+        from backend.app.services import spool_tagless
+
+        monkeypatch.setattr(
+            spool_tagless, "override_generic_identity", AsyncMock(side_effect=RuntimeError("settings down"))
+        )
+        db = MagicMock()
+        tray_info_idx, setting_id, _sub, tmin, tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament="GFG99",
+            slicer_filament_name=None,
+            material="PETG",
+            rgba="000000FF",
+            nozzle_temp_min=220,
+            nozzle_temp_max=260,
+        )
+        assert tray_info_idx == "GFG99"  # never raises into a slot write
+        assert (tmin, tmax) == (220, 260)
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_through_the_real_helper(self, monkeypatch):
+        # No stubbing of the override: the configured tagless default drives it.
+        import json
+
+        from backend.app.services import spool_tagless
+
+        default = json.dumps(
+            {
+                "brand": "Bambu Lab",
+                "material": "PETG",
+                "subtype": "HF",
+                "rgba": "000000FF",
+                "slicer_filament": "GFG02",
+                "nozzle_temp_min": 230,
+                "nozzle_temp_max": 270,
+            }
+        )
+
+        async def fake_get_setting(db, key):
+            return default if key == "tagless_default_filament" else None
+
+        monkeypatch.setattr("backend.app.api.routes.settings.get_setting", fake_get_setting)
+        assert spool_tagless.override_generic_identity  # the resolver's real collaborator
+        db = MagicMock()
+        tray_info_idx, setting_id, _sub, tmin, tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament="GFG99",
+            slicer_filament_name=None,
+            material="PETG",
+            rgba="000000FF",
+            nozzle_temp_min=220,
+            nozzle_temp_max=260,
+        )
+        assert (tray_info_idx, setting_id, tmin, tmax) == ("GFG02", "GFSG02", 230, 270)

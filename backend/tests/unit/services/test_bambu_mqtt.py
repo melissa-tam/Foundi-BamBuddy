@@ -6645,6 +6645,205 @@ class TestIdentifyGate:
         assert client.extrusion_cali_sel(0, 1, cali_idx=-1, filament_id="GFL05") is True
 
 
+class TestAmsWriteRefusalHelper:
+    """The four AMS write choke points share ONE evaluate-and-log helper
+    (_refuse_ams_write) over the single evaluator (_ams_write_refusal). Parity pins:
+    every method refuses for every reason, in the canonical order drying →
+    identifying → identify gate, keeping its own return shape and publishing nothing.
+    """
+
+    @staticmethod
+    def _fresh():
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        c = BambuMQTTClient(ip_address="192.168.1.100", serial_number="REFUSE1", access_code="12345678")
+        c._client = MagicMock()
+        c.state.connected = True
+        c.state.tray_now = 255
+        return c
+
+    @pytest.fixture
+    def client(self):
+        return self._fresh()
+
+    @staticmethod
+    def _arm(client, reason):
+        if reason == "drying":
+            client.state.raw_data["ams"] = [{"id": 0, "dry_time": 30, "tray": [{"id": 0, "state": 10}]}]
+        elif reason == "identifying":
+            client.state.ams_status_main = 2
+        else:
+            import time as _time
+
+            client._identify_gate_until = _time.monotonic() + 30
+
+    @staticmethod
+    def _call_all(client):
+        """Every choke point, as (label, callable) with its own return shape."""
+        return [
+            ("ams_get_rfid", lambda: client.ams_refresh_tray(0, 0)[0]),
+            (
+                "ams_filament_setting",
+                lambda: client.ams_set_filament_setting(0, 0, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230),
+            ),
+            ("reset_ams_slot", lambda: client.reset_ams_slot(0, 0)),
+            ("extrusion_cali_sel", lambda: client.extrusion_cali_sel(0, 0, cali_idx=-1, filament_id="GFL05")),
+        ]
+
+    @pytest.mark.parametrize("reason", ["drying", "identifying", "identify_in_flight"])
+    def test_every_choke_point_refuses_every_reason(self, client, reason, caplog):
+        import logging
+
+        self._arm(client, reason)
+        with caplog.at_level(logging.WARNING):
+            for op, call in self._call_all(client):
+                assert call() is False, f"{op} did not refuse while {reason}"
+        client._client.publish.assert_not_called()
+        # One standardized WARNING per refusal, naming the op and the reason.
+        from backend.app.services.bambu_mqtt import _AMS_REFUSAL_LOG_TEXT
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 4
+        for op, _call in self._call_all(client):
+            assert any(f"Refusing {op} on AMS 0" in w and _AMS_REFUSAL_LOG_TEXT[reason] in w for w in warnings)
+
+    def test_all_proceed_when_the_wire_is_safe(self):
+        # A fresh client per op: the identify itself arms the per-printer gate, which
+        # would (correctly) refuse the writes that follow it on the same client.
+        for op, _ in self._call_all(self._fresh()):
+            c = self._fresh()
+            call = dict(self._call_all(c))[op]
+            assert call() is True, f"{op} refused on a safe wire"
+            c._client.publish.assert_called_once()
+
+    def test_refusal_order_is_drying_then_identifying_then_gate(self, client):
+        # All three hazards at once → the drying reason wins, exactly as before the
+        # extraction (the evaluator's order is the contract the callers rely on).
+        for reason in ("drying", "identifying", "identify_in_flight"):
+            self._arm(client, reason)
+        assert client.ams_write_refusal(0) == "drying"
+        assert client._refuse_ams_write("ams_get_rfid", 0) == "drying"
+
+    def test_refresh_tray_messages_are_reason_specific(self):
+        # Each reason maps to the operator-facing message the manual-refresh route 400s
+        # with; one reason per fresh client so the order rule doesn't mask them.
+        from backend.app.services.bambu_mqtt import _AMS_REFRESH_REFUSAL_MESSAGE
+
+        for reason, expected in _AMS_REFRESH_REFUSAL_MESSAGE.items():
+            c = self._fresh()
+            self._arm(c, reason)
+            ok, msg = c.ams_refresh_tray(0, 0)
+            assert ok is False and msg == expected
+
+    def test_public_accessor_is_read_only(self, client, caplog):
+        import logging
+
+        assert client.ams_write_refusal(0) is None
+        self._arm(client, "identifying")
+        with caplog.at_level(logging.WARNING):
+            assert client.ams_write_refusal(0) == "identifying"
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []  # no logging
+        client._client.publish.assert_not_called()
+
+
+class TestAmsChangeFilamentGuards:
+    """`ams_change_filament` (load + unload) rides the same wire-safety authority as
+    the other AMS writes — a load/unload into a drying unit or across an in-flight
+    RFID read is refused. Two things it must NEVER do: refuse while a feed-fault HMS
+    is standing (that is precisely when jam recovery has to unload — 009-H2S
+    2026-07-20), and arm the identify gate (motion is not an identify)."""
+
+    @pytest.fixture
+    def client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        c = BambuMQTTClient(ip_address="192.168.1.100", serial_number="SWAP1", access_code="12345678")
+        c._client = MagicMock()
+        c.state.connected = True
+        c.state.tray_now = 0  # feeding AMS 0 slot 0
+        return c
+
+    @staticmethod
+    def _dry(client, ams_id):
+        client.state.raw_data["ams"] = [{"id": ams_id, "dry_time": 30, "tray": [{"id": 0, "state": 10}]}]
+
+    def test_load_refused_while_drying(self, client):
+        self._dry(client, 0)
+        assert client.ams_load_filament(0) is False
+        client._client.publish.assert_not_called()
+
+    def test_load_refused_while_identifying(self, client, caplog):
+        import logging
+
+        client.state.ams_status_main = 2
+        with caplog.at_level(logging.WARNING, logger="backend.app.services.bambu_mqtt"):
+            assert client.ams_load_filament(0) is False
+        client._client.publish.assert_not_called()
+        warned = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "ams_change_filament (load)" in warned
+
+    def test_load_refused_inside_the_identify_gate(self, client):
+        client.state.tray_now = 255  # ams_refresh_tray's own "filament loaded" check
+        assert client.ams_refresh_tray(0, 0)[0] is True  # arms the gate
+        assert client.ams_load_filament(0) is False
+        assert client._client.publish.call_count == 1  # only the identify went out
+
+    def test_unload_refused_while_the_source_unit_dries(self, client, caplog):
+        import logging
+
+        client.state.tray_now = 4  # AMS 1 slot 0
+        self._dry(client, 1)
+        with caplog.at_level(logging.WARNING, logger="backend.app.services.bambu_mqtt"):
+            assert client.ams_unload_filament() is False
+        client._client.publish.assert_not_called()
+        warned = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "ams_change_filament (unload)" in warned
+
+    def test_unload_refused_while_identifying(self, client):
+        client.state.ams_status_main = 2
+        assert client.ams_unload_filament() is False
+        client._client.publish.assert_not_called()
+
+    def test_unload_with_nothing_feeding_has_no_unit_to_be_drying(self, client):
+        # tray_now 255 encodes ams_id 255 — no unit row, so the unit-scoped drying
+        # hazard is vacuous and the recovery unload still goes out.
+        client.state.tray_now = 255
+        self._dry(client, 0)
+        assert client.ams_unload_filament() is True
+        client._client.publish.assert_called_once()
+
+    def test_load_and_unload_still_sent_under_a_standing_feed_fault(self, client):
+        """THE NO-DEADLOCK PIN: a live jam HMS must never gate the swap commands —
+        that is the exact state jam recovery has to unload and reload in."""
+        from backend.app.services.bambu_mqtt import HMSError
+
+        client.state.hms_errors = [
+            HMSError(code="8010", attr=0x07008210, module=7, severity=2),  # 0700_8010 tangle
+            HMSError(code="8011", attr=0x07000000, module=7, severity=2),  # 0700_8011 runout
+        ]
+        client.state.tray_now = 255  # nothing feeding — the live incident's telemetry
+        assert client.ams_unload_filament() is True
+        assert client.ams_load_filament(2) is True
+        assert client._client.publish.call_count == 2
+
+    def test_neither_arms_the_identify_gate(self, client):
+        assert client.ams_unload_filament() is True
+        assert client.ams_load_filament(1) is True
+        assert client._identify_gate_until == 0.0  # motion is not an identify
+        client.state.tray_now = 255  # ams_refresh_tray's own "filament loaded" check
+        assert client.ams_refresh_tray(0, 0)[0] is True  # so a later identify is free
+
+    def test_load_does_not_burn_a_sequence_id_when_refused(self, client):
+        client.state.ams_status_main = 2
+        before = client._sequence_id
+        assert client.ams_load_filament(0) is False
+        assert client._sequence_id == before
+
+
 class TestWaitAmsSettle:
     """wait_ams_settle blocks until the AMS is not identifying AND the per-printer
     identify gate has cleared, capped at _IDENTIFY_GATE_S. The terminal RFID re-read

@@ -30,12 +30,13 @@ Continuity rules:
   real RFID tag later claims the slot, :func:`dispose_provisional_on_tag`
   hard-deletes it (no usage ledger) or archives it (has one).
 
-Module edge state (``_autoconfig_attempts``, ``_pending_physical_cycles``,
-``_fresh_prompt_unanswered``) mirrors the fork's other event-edge bookkeeping
-(``spool_respool._last_tray_now``). It is lost on restart — worst case a bare-tray
-config re-push waits one AMS push, a spent slot stays latched+excluded until a
-pull/reseat (honest, not silent), and an unanswered fresh-roll prompt re-asks on
-the next physical cycle.
+Module edge state (``_autoconfig_window``, ``_pending_physical_cycles``,
+``_fresh_prompt_unanswered``, ``_identity_reconciled``) mirrors the fork's other
+event-edge bookkeeping (``spool_respool._last_tray_now``). It is lost on restart —
+worst case a bare-tray config re-push waits one AMS push, a spent slot stays
+latched+excluded until a pull/reseat (honest, not silent), an unanswered fresh-roll
+prompt re-asks on the next physical cycle, and the one-shot identity reconcile is
+re-armed (it re-checks live divergence first, so a converged slot stays silent).
 
 ``stamp_first_loaded`` lives in ``spool_tag_matcher`` (the lowest module every
 assignment-creating caller already imports); this module re-exports it via import
@@ -47,7 +48,6 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from time import monotonic
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
@@ -67,6 +67,7 @@ from backend.app.services.spool_tag_matcher import (
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_ids import GENERIC_FILAMENT_IDS
 from backend.app.utils.filament_types import canonical_filament_type
+from backend.app.utils.retry_window import RetryWindow
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -88,9 +89,18 @@ _GENERIC_ID_VALUES = frozenset(GENERIC_FILAMENT_IDS.values())
 # hammering the broker every push in the meantime.
 _AUTOCONFIG_RETRY_S = 30.0
 
-# (printer_id, ams_id, tray_id) -> monotonic timestamp of the last bare-tray
-# config attempt. Cleared when the slot empties.
-_autoconfig_attempts: dict[tuple[int, int, int], float] = {}
+# Per-slot gate for that cadence. Cleared when the slot empties
+# (:func:`clear_autoconfig_dedup`).
+_autoconfig_window = RetryWindow(_AUTOCONFIG_RETRY_S)
+
+# Settle delay before a FRESH tagless row may be minted for a just-inserted spool.
+# Inserting a roll makes the firmware publish the slot's config ~1 s BEFORE its own
+# RFID read lands; minting on that first push auto-mints a tagless row that the tag
+# read then destroys ("Provisional tagless spool N hard-deleted on RFID takeover" —
+# three cases in one evening, 2026-07-19). Holding a fresh mint until the gain has
+# settled lets the firmware's read win. Only FRESH mints wait: an existing binding
+# (rebind / slot-move / spent-replace) is already the ledger's answer for the slot.
+_MINT_SETTLE_S = 5.0
 
 # (printer_id, ams_id, tray_id) of slots that saw a QUALIFIED physical roll swap
 # (≥ _MIN_PHYSICAL_ABSENT_S absent → present, recorded by note_physical_cycle).
@@ -102,8 +112,11 @@ _autoconfig_attempts: dict[tuple[int, int, int], float] = {}
 _pending_physical_cycles: set[tuple[int, int, int]] = set()
 
 # Fraction of a tagless row's label weight consumed past which a physical cycle
-# raises the over-consumption / fresh-roll prompt (W5). 0.5 = half the roll.
-_FRESH_ROLL_PROMPT_USED_FRAC = 0.5
+# raises the over-consumption / fresh-roll prompt (W5). 0.7 = the roll is ≥70 %
+# consumed (≤300 g left on a 1000 g label) — operator setting 2026-07-20: a swap
+# earlier in a roll's life is routine (drying, slot juggling) and asking then is
+# noise.
+_FRESH_ROLL_PROMPT_USED_FRAC = 0.7
 
 # (printer_id, ams_id, tray_id) of tagless fresh-roll prompts awaiting an operator
 # answer (W5). PER-CYCLE dedup (deliberately NOT the permanent respool_dismissed_at):
@@ -111,12 +124,20 @@ _FRESH_ROLL_PROMPT_USED_FRAC = 0.5
 # cycle, so each new roll swap asks again. Lost on restart (re-asks next cycle).
 _fresh_prompt_unanswered: set[tuple[int, int, int]] = set()
 
+# (printer_id, ams_id, tray_id) of slots whose live identity has been EVALUATED
+# against the resolver this process (E3) — either found converged or re-pushed once.
+# A stale spool row can keep re-publishing a GENERIC id that splits the firmware's
+# auto-refill backup group; the reconcile corrects it ONCE per slot per process, so a
+# divergence can never loop and a converged slot costs nothing on later pushes.
+_identity_reconciled: set[tuple[int, int, int]] = set()
+
 
 def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
-    _autoconfig_attempts.clear()
+    _autoconfig_window.reset()
     _pending_physical_cycles.clear()
     _fresh_prompt_unanswered.clear()
+    _identity_reconciled.clear()
 
 
 # --- state / predicate helpers ---------------------------------------------
@@ -205,6 +226,43 @@ async def default_temps_for_fingerprint(
         return (int(tmin), int(tmax))
     except (TypeError, ValueError):
         return None
+
+
+async def override_generic_identity(
+    db: AsyncSession, slicer_filament: str | None, material: str | None, rgba: str | None
+) -> dict | None:
+    """The tagless default's SPECIFIC identity to write instead of a GENERIC one.
+
+    Returns ``{"slicer_filament", "nozzle_temp_min", "nozzle_temp_max"}`` when
+    ``slicer_filament`` is a generic id (``GFG99`` …) AND the configured tagless
+    default carries a specific id AND ``(material, rgba)`` fingerprint-matches that
+    default; ``None`` otherwise (nothing to override).
+
+    Generic-id self-perpetuation is the 011-H2S no-auto-refill cause (2026-07-19):
+    the firmware's auto-refill backup group only pairs slots whose brand-class /
+    type / colour / nozzle temps match EXACTLY, so one slot configured ``GFG99``
+    beside a ``GFG02`` peer splits the group. A generic id enters the ledger from a
+    bare-tray auto-config or a legacy row and is then re-read and re-published
+    forever. This is the single override, consumed at BOTH ends of that loop: the
+    tagless mint (:func:`mint_tagless_spool`, so a re-read row stops carrying it)
+    and the wire resolver (``slicer_filament_resolver.resolve_slicer_filament``, so
+    a stale row already in the DB can no longer re-publish it). The temps ride along
+    deliberately — substituting the id while keeping a stale row's temps would still
+    split the group on the temperature dimension.
+    """
+    if not slicer_filament or slicer_filament not in _GENERIC_ID_VALUES:
+        return None
+    default = await _tagless_default(db)
+    if default is None:
+        return None
+    specific = default.get("slicer_filament") or ""
+    if not specific or not _fingerprint_matches_default(material, rgba, default):
+        return None
+    return {
+        "slicer_filament": specific,
+        "nozzle_temp_min": default.get("nozzle_temp_min"),
+        "nozzle_temp_max": default.get("nozzle_temp_max"),
+    }
 
 
 def effectively_empty(spool: Spool, threshold_g: int) -> bool:
@@ -337,23 +395,15 @@ async def mint_tagless_spool(
         slicer_filament_name = parsed.slicer_filament_name
         nozzle_temp_min = parsed.nozzle_temp_min
         nozzle_temp_max = parsed.nozzle_temp_max
-        # Generic-id self-perpetuation guard (W4.4): if the tray reports a GENERIC
-        # slicer id (GFG99 …) — the id a bare-tray auto-config wrote earlier — but
-        # the configured tagless default carries a SPECIFIC id and this tray
-        # fingerprint-matches the default, mint the default's specific id/name/temps
-        # instead. Re-reading the leftover generic id would perpetuate the GFG99 that
-        # split the firmware backup group (2026-07-19 incident).
-        if slicer_filament and slicer_filament in _GENERIC_ID_VALUES:
-            _default = await _tagless_default(db)
-            if (
-                _default is not None
-                and (_default.get("slicer_filament") or "")
-                and _fingerprint_matches_default(material, rgba, _default)
-            ):
-                slicer_filament = _default["slicer_filament"]
-                slicer_filament_name = None
-                nozzle_temp_min = _default.get("nozzle_temp_min")
-                nozzle_temp_max = _default.get("nozzle_temp_max")
+        # Generic-id self-perpetuation guard (W4.4): a tray re-reporting the GENERIC
+        # id an earlier bare-tray auto-config wrote mints the tagless default's
+        # SPECIFIC id/name/temps instead — see :func:`override_generic_identity`.
+        _override = await override_generic_identity(db, slicer_filament, material, rgba)
+        if _override is not None:
+            slicer_filament = _override["slicer_filament"]
+            slicer_filament_name = None
+            nozzle_temp_min = _override["nozzle_temp_min"]
+            nozzle_temp_max = _override["nozzle_temp_max"]
         # Only a POSITIVE reported net weight overrides the model default.
         label_weight = parsed.label_weight if parsed.label_weight > 0 else None
         source = "tray"
@@ -900,6 +950,111 @@ async def _maybe_move_tagless_assignment(
     return True
 
 
+def _mint_settling(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """True while a just-inserted spool's gain is still settling (F1).
+
+    The insert's first MQTT push carries the slot's CONFIG but not yet its tag —
+    the firmware's own RFID read lands ~1 s later. Minting on that push creates a
+    provisional tagless row the tag read immediately hard-deletes. A gain younger
+    than :data:`_MINT_SETTLE_S` therefore defers a FRESH mint by one push; a slot
+    with no recorded gain (restart, never observed) reads as settled, so the defer
+    can never wedge a slot.
+    """
+    age = ams_presence.recent_gain_age(printer_id, ams_id, tray_id)
+    return age is not None and age < _MINT_SETTLE_S
+
+
+def _printer_busy(printer_id: int) -> bool:
+    """True while the printer is mid-job (RUNNING/PAUSE).
+
+    Delegates to ``ams_presence._printer_running`` rather than re-deriving the
+    predicate: that module already owns the running-state reading every AMS-side
+    guard shares, and a second copy is exactly the drift this fork avoids. Never
+    raises — an unreachable printer reads as busy (the conservative answer for the
+    idle-only reconcile below).
+    """
+    try:
+        return ams_presence._printer_running(printer_manager.get_status(printer_id))
+    except Exception:  # noqa: BLE001 — must never break the AMS callback chain
+        return True
+
+
+async def _maybe_reconcile_slot_identity(
+    db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, tray: dict, spool: Spool
+) -> bool:
+    """One-shot re-push when a bound slot's LIVE identity diverges from the resolver (E3).
+
+    The rebind branch is the natural observation point: the slot is bound,
+    configured, and the firmware has just told us what it currently holds. When the
+    live ``tray_info_idx`` differs from what the resolver now composes for the bound
+    spool — the 011-H2S state where trays 1-2 sat on ``GFG99`` while 3-4 were
+    ``GFG02``, splitting the auto-refill backup group — re-push the slot config once
+    so the fleet converges without a migration or a repair tool.
+
+    Gated three ways: the printer must be IDLE (a config write mid-print is exactly
+    what the AMS-write doctrine forbids), the client must not be refusing AMS writes
+    (drying / identifying / identify gate), and a per-slot once-per-process set caps
+    it at a single evaluation so a resolver that keeps disagreeing with the firmware
+    can never loop and a converged slot never re-resolves. Only DEFERRALS (busy /
+    disconnected / refused write) leave the shot unconsumed — a later push retries.
+    Returns True when a re-push was dispatched. Never raises.
+    """
+    key = (printer_id, ams_id, tray_id)
+    if key in _identity_reconciled:
+        return False
+    try:
+        from backend.app.services.slicer_filament_resolver import resolve_slicer_filament
+
+        resolved, _setting_id, _sub_brand, _tmin, _tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament=spool.slicer_filament,
+            slicer_filament_name=spool.slicer_filament_name,
+            material=spool.material,
+            rgba=spool.rgba,
+            nozzle_temp_min=spool.nozzle_temp_min,
+            nozzle_temp_max=spool.nozzle_temp_max,
+        )
+        live = (tray.get("tray_info_idx") or "").strip()
+        if not resolved or resolved == live:
+            # Nothing resolvable, or the slot already carries it: the reconcile is
+            # DONE for this slot. Consuming the shot here is what keeps a converged
+            # fleet (the steady state) at one resolver call per slot per process
+            # rather than one per AMS push.
+            _identity_reconciled.add(key)
+            return False
+        if _printer_busy(printer_id):
+            return False  # idle-only — retried on a later push
+        client = printer_manager.get_client(printer_id)
+        if client is None:
+            return False
+        refusal = client.ams_write_refusal(ams_id)
+        if refusal is not None:
+            logger.debug(
+                "Deferring slot-identity reconcile for printer %d AMS%d-T%d: %s",
+                printer_id,
+                ams_id,
+                tray_id,
+                refusal,
+            )
+            return False
+        _identity_reconciled.add(key)  # one shot, armed BEFORE the push so it cannot loop
+        logger.info(
+            "Reconciling slot identity on printer %d AMS%d-T%d: live=%r -> %r (spool %d)",
+            printer_id,
+            ams_id,
+            tray_id,
+            live,
+            resolved,
+            spool.id,
+        )
+        await _push_config(db, spool, printer_id, ams_id, tray_id, tray)
+        return True
+    except Exception:  # noqa: BLE001 — a reconcile failure must not change the rebind outcome
+        logger.exception("Slot-identity reconcile failed for printer %d AMS%d-T%d", printer_id, ams_id, tray_id)
+        return False
+
+
 async def handle_tagless_slot(
     db: AsyncSession,
     printer_id: int,
@@ -989,14 +1144,29 @@ async def handle_tagless_slot(
             return True
 
         # (4) Same filament → rebind: refresh a drifted fingerprint, write NOTHING
-        # to the spool (operator edits are sacred).
+        # to the spool (operator edits are sacred). This is also the one place the
+        # farm sees an already-bound, already-configured slot's LIVE identity, so
+        # the one-shot identity reconcile (E3) rides here.
         if fingerprint_matches(spool, tray):
             _refresh_assignment_fingerprint(existing_assignment, tray)
             await db.commit()
+            await _maybe_reconcile_slot_identity(db, printer_id, ams_id, tray_id, tray, spool)
             return True
 
-        # (5) Different filament → unlink (old spool stays active, just unbound),
-        # then mint the new one from the tray.
+        # (5) Different filament → mint a fresh row. Settle first: an insertion's
+        # first push (config seen, tag not yet read) must not mint a row the
+        # firmware's own RFID read then destroys. Checked BEFORE the unlink so a
+        # defer leaves the slot's state untouched for the next push.
+        if _mint_settling(printer_id, ams_id, tray_id):
+            logger.debug(
+                "Deferring tagless mint for printer %d AMS%d-T%d: insertion still settling",
+                printer_id,
+                ams_id,
+                tray_id,
+            )
+            return True
+
+        # Unlink (old spool stays active, just unbound), then mint from the tray.
         await db.delete(existing_assignment)
         await db.flush()
         new_spool = await mint_tagless_spool(db, tray=tray)
@@ -1022,6 +1192,17 @@ async def handle_tagless_slot(
     # mint a duplicate. Phase 1's sticky-keep leaves the source assignment intact
     # over its empty slot, which is exactly the row we move here.
     if await _maybe_move_tagless_assignment(db, printer_id, ams_id, tray_id, tray, ams_data):
+        return True
+
+    # Settle before minting a FRESH row (F1) — the slot-move above re-binds an
+    # EXISTING ledger row and is deliberately not deferred.
+    if _mint_settling(printer_id, ams_id, tray_id):
+        logger.debug(
+            "Deferring tagless mint for printer %d AMS%d-T%d: insertion still settling",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
         return True
 
     new_spool = await mint_tagless_spool(db, tray=tray)
@@ -1077,9 +1258,9 @@ async def maybe_autoconfigure_bare_tray(
 
     # Defer a doomed config push while the AMS is mid-identify or drying: the write
     # would collide with the RFID read (HMS 0700_2x00_0001_0081) or disengage the
-    # drying tray (HMS 0700_C069). Return BEFORE stamping _autoconfig_attempts so the
-    # retry window is not burned on a push that never went out. force= bypasses only
-    # the retry window — never these hardware-state guards.
+    # drying tray (HMS 0700_C069). Return BEFORE the retry window is stamped so it is
+    # not burned on a push that never went out. force= bypasses only the retry
+    # window — never these hardware-state guards.
     if ams_presence.identify_in_flight(printer_id, ams_id, tray_id) or ams_presence.unit_drying(printer_id, ams_id):
         logger.debug(
             "Deferring bare-tray auto-config for printer %d AMS%d-T%d: AMS identify/drying in progress",
@@ -1090,10 +1271,6 @@ async def maybe_autoconfigure_bare_tray(
         return False
 
     key = (printer_id, ams_id, tray_id)
-    now = monotonic()
-    last = _autoconfig_attempts.get(key)
-    if not force and last is not None and (now - last) < _AUTOCONFIG_RETRY_S:
-        return False  # config attempt still inside its retry window
 
     res = await db.execute(
         select(SpoolAssignment)
@@ -1122,7 +1299,28 @@ async def maybe_autoconfigure_bare_tray(
         await _replace_row_after_cycle(db, printer_id, ams_id, tray_id, tray, assignment.spool)
         return True
 
-    _autoconfig_attempts[key] = now
+    # Settle before the FIRST mint on this slot (F1): a bare tray whose spool was
+    # just inserted may still have the firmware's RFID read in flight, and a row
+    # minted now is the one the tag read hard-deletes. A slot we ALREADY track only
+    # re-pushes config, so it is not deferred. Before the retry window, so the defer
+    # does not burn it.
+    if assignment is None and _mint_settling(printer_id, ams_id, tray_id):
+        logger.debug(
+            "Deferring bare-tray mint for printer %d AMS%d-T%d: insertion still settling",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return False
+
+    # The retry-cadence gate is the LAST guard: every ineligible/deferred path above
+    # returns without stamping, so the window is armed only by an attempt that is
+    # actually about to publish. force= clears the previous stamp instead of skipping
+    # the gate, so a forced push still re-arms the cadence for the pushes after it.
+    if force:
+        _autoconfig_window.clear(key)
+    if not _autoconfig_window.allow(key):
+        return False  # config attempt still inside its retry window
 
     if assignment is None:
         spool = await mint_tagless_spool(db, default_filament=default)
@@ -1142,7 +1340,7 @@ async def maybe_autoconfigure_bare_tray(
 
 def clear_autoconfig_dedup(printer_id: int, ams_id: int, tray_id: int) -> None:
     """Drop the bare-tray retry timestamp for a slot (called when it empties)."""
-    _autoconfig_attempts.pop((printer_id, ams_id, tray_id), None)
+    _autoconfig_window.clear((printer_id, ams_id, tray_id))
 
 
 # --- provisional disposal on RFID takeover ---------------------------------

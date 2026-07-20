@@ -2921,10 +2921,20 @@ export interface RespoolRequest {
   note?: string | null;
 }
 
+/** Why a `respool_prompt` fired, so the UI can say the true thing:
+ *  - `spent`       — a hardware runout marked the roll empty,
+ *  - `remain_jump` — the AMS reports far more filament than the record holds
+ *                    (a tag that moved onto a refilled roll),
+ *  - `near_empty`  — the record is simply almost used up, and the slot was
+ *                    physically handled; NOT evidence of a reused tag.
+ *  Absent on the manual tray-menu path (a deliberate operator action, which
+ *  keeps the reused-tag framing). */
+export type RespoolTrigger = 'spent' | 'near_empty' | 'remain_jump';
+
 /** WS `respool_prompt` payload — the uncertain-tier prompt asking the operator
- *  to confirm a reused Bambu tag now sits on a fresh spool. Nullables mirror
- *  the tray data the backend broadcasts (same style as `UnknownTagDetail`);
- *  the `*_prefill` and donor fields are absent on the manual tray-menu path. */
+ *  to confirm what is now on a slot. Nullables mirror the tray data the backend
+ *  broadcasts (same style as `UnknownTagDetail`); the `*_prefill`, donor and
+ *  `trigger` fields are absent on the manual tray-menu path. */
 export interface RespoolPromptMessage {
   printer_id: number;
   ams_id: number;
@@ -2939,6 +2949,7 @@ export interface RespoolPromptMessage {
   donor_remaining_g: number | null;
   brand_prefill: string | null;
   label_weight_prefill: number | null;
+  trigger?: RespoolTrigger | null;
 }
 
 /** WS `spool_auto_assigned` payload — a spool was auto-bound to an AMS slot.

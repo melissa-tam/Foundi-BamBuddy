@@ -1782,3 +1782,183 @@ async def test_auto_assign_stamps_first_loaded_once(db_session, printer_factory)
     await auto_assign_spool(printer.id, 1, 0, spool, mock_pm, db_session)
     await db_session.commit()
     assert spool.first_loaded_at == stamped
+
+
+# -- K-profile drift re-apply (F3: extracted from main.on_ams_change) --------
+
+
+class _CaliClient:
+    """Client stub recording extrusion_cali_sel publishes."""
+
+    def __init__(self, accept: bool = True):
+        self.accept = accept
+        self.calls: list[dict] = []
+
+    def extrusion_cali_sel(self, **kw):
+        self.calls.append(kw)
+        return self.accept
+
+
+_TAGGED_TRAY = {
+    "tag_uid": "AABBCCDD11223344",
+    "tray_uuid": "AABBCCDD11223344AABBCCDD11223344",
+    "tray_info_idx": "GFL99",
+    "cali_idx": -1,  # firmware default — drifted from the stored profile
+}
+
+
+async def _seed_spool_with_kp(db_session, printer_id, *, cali_idx=7, nozzle="0.4", extruder=None):
+    from backend.app.models.spool_k_profile import SpoolKProfile
+
+    spool = Spool(material="PLA", slicer_filament="GFL99", label_weight=1000, core_weight=250)
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.flush()
+    db_session.add(
+        SpoolKProfile(
+            spool_id=spool.id,
+            printer_id=printer_id,
+            nozzle_diameter=nozzle,
+            k_value=0.02,
+            cali_idx=cali_idx,
+            extruder=extruder,
+        )
+    )
+    await db_session.commit()
+    return spool
+
+
+@pytest.fixture
+def kdrift_client(monkeypatch):
+    """Fresh drift window + a capturing client for the lazily-imported singleton."""
+    from backend.app.services import spool_tag_matcher
+    from backend.app.services.printer_manager import printer_manager
+
+    spool_tag_matcher._kdrift_window.reset()
+    client = _CaliClient()
+    monkeypatch.setattr(printer_manager, "get_client", lambda pid: client)
+    yield client
+    spool_tag_matcher._kdrift_window.reset()
+
+
+@pytest.mark.asyncio
+async def test_kdrift_sends_once_inside_the_window_and_again_after(db_session, printer_factory, kdrift_client):
+    """The un-gated version fired one extrusion_cali_sel per AMS push — during an
+    identify's tray-state flap that is a write storm into an AMS mid-read. One
+    publish per slot per _KDRIFT_RETRY_S; the window elapsing re-arms it."""
+    import backend.app.utils.retry_window as rw
+    from backend.app.services import spool_tag_matcher
+    from backend.app.services.spool_tag_matcher import reapply_k_profile_if_drifted
+
+    printer = await printer_factory()
+    spool = await _seed_spool_with_kp(db_session, printer.id)
+
+    assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, _TAGGED_TRAY, spool, None) is True
+    assert len(kdrift_client.calls) == 1
+    assert kdrift_client.calls[0]["cali_idx"] == 7
+    assert kdrift_client.calls[0]["filament_id"] == "GFL99"
+    assert kdrift_client.calls[0]["nozzle_diameter"] == "0.4"
+
+    # Same slot, still drifted, next push → suppressed by the window.
+    assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, _TAGGED_TRAY, spool, None) is False
+    assert len(kdrift_client.calls) == 1
+
+    # Window elapses → re-armed.
+    original = rw.monotonic
+    rw.monotonic = lambda: original() + spool_tag_matcher._KDRIFT_RETRY_S + 1
+    try:
+        assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, _TAGGED_TRAY, spool, None) is True
+    finally:
+        rw.monotonic = original
+    assert len(kdrift_client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_kdrift_refused_push_is_not_retried_inside_the_window(db_session, printer_factory, monkeypatch):
+    """The publish is fire-and-forget BY DESIGN: a refused write (AMS identifying /
+    drying) is not inspected and must not re-fire on the very next push — it
+    self-heals on a later drift tick once the window elapses."""
+    from backend.app.services import spool_tag_matcher
+    from backend.app.services.printer_manager import printer_manager
+    from backend.app.services.spool_tag_matcher import reapply_k_profile_if_drifted
+
+    spool_tag_matcher._kdrift_window.reset()
+    client = _CaliClient(accept=False)  # refused
+    monkeypatch.setattr(printer_manager, "get_client", lambda pid: client)
+    printer = await printer_factory()
+    spool = await _seed_spool_with_kp(db_session, printer.id)
+
+    assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, _TAGGED_TRAY, spool, None) is True
+    for _ in range(3):  # three more AMS pushes, still drifted, still refusing
+        assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, _TAGGED_TRAY, spool, None) is False
+    assert len(client.calls) == 1
+    spool_tag_matcher._kdrift_window.reset()
+
+
+@pytest.mark.asyncio
+async def test_kdrift_no_publish_without_drift_or_profile_or_tag(db_session, printer_factory, kdrift_client):
+    from backend.app.services.spool_tag_matcher import reapply_k_profile_if_drifted
+
+    printer = await printer_factory()
+    spool = await _seed_spool_with_kp(db_session, printer.id)
+
+    # Live cali_idx already equals the stored profile → no publish.
+    converged = dict(_TAGGED_TRAY, cali_idx=7)
+    assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, converged, spool, None) is False
+
+    # Untagged (tagless) tray → the RFID-identity rule doesn't apply here.
+    untagged = dict(_TAGGED_TRAY, tag_uid="0" * 16, tray_uuid="0" * 32, tray_info_idx="")
+    assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, untagged, spool, None) is False
+
+    # No spool bound.
+    assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, _TAGGED_TRAY, None, None) is False
+
+    # Spool without a stored profile for this printer/nozzle.
+    bare = Spool(material="PLA", label_weight=1000, core_weight=250)
+    bare.k_profiles = []
+    bare.assignments = []
+    db_session.add(bare)
+    await db_session.commit()
+    assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, _TAGGED_TRAY, bare, None) is False
+
+    assert kdrift_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_kdrift_does_not_lazyload_k_profiles(db_session, printer_factory, kdrift_client):
+    """The moved block walked ``spool.k_profiles``; callers hand us spools without
+    that relationship loaded, and touching it inside an async session greenlet-crashes
+    (the 2026-07-17 bare-tray production failure). The explicit query must be used."""
+    from backend.app.services.spool_tag_matcher import reapply_k_profile_if_drifted
+
+    printer = await printer_factory()
+    spool = await _seed_spool_with_kp(db_session, printer.id)
+    loaded = await db_session.get(Spool, spool.id)
+    db_session.expire(loaded, ["k_profiles"])
+    assert not _relationship_is_loaded(loaded, "k_profiles")
+
+    assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, _TAGGED_TRAY, loaded, None) is True
+    assert len(kdrift_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_kdrift_prefers_the_exact_extruder_profile(db_session, printer_factory, kdrift_client):
+    from types import SimpleNamespace
+
+    from backend.app.models.spool_k_profile import SpoolKProfile
+    from backend.app.services.spool_tag_matcher import reapply_k_profile_if_drifted
+
+    printer = await printer_factory()
+    spool = await _seed_spool_with_kp(db_session, printer.id, cali_idx=3, extruder=0)
+    db_session.add(
+        SpoolKProfile(
+            spool_id=spool.id, printer_id=printer.id, nozzle_diameter="0.4", k_value=0.03, cali_idx=9, extruder=1
+        )
+    )
+    await db_session.commit()
+
+    # ams_extruder_map (string-keyed) puts AMS 0 on extruder 1 → that profile wins.
+    state = SimpleNamespace(ams_extruder_map={"0": 1}, nozzles=None)
+    assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, _TAGGED_TRAY, spool, state) is True
+    assert kdrift_client.calls[0]["cali_idx"] == 9

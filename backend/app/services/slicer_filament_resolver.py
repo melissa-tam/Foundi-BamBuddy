@@ -126,6 +126,12 @@ async def resolve_slicer_filament(
     so the WHOLE wire identity is composed here and the two write-site consumers
     can't diverge (W4). Optional so pre-W4 callers still type-check.
 
+    A resolved GENERIC id (``GFG99`` …) is finally re-composed as the configured
+    tagless default's SPECIFIC identity — id, setting_id and temps — when the
+    spool fingerprint-matches that default (``spool_tagless.override_generic_identity``),
+    so no write site can re-publish a generic id that splits the firmware's
+    auto-refill backup group.
+
     Returns ``(tray_info_idx, setting_id, sub_brand_override, nozzle_temp_min,
     nozzle_temp_max)``. id/setting are empty when nothing resolved;
     ``sub_brand_override`` is non-None when a more specific brand label is
@@ -269,5 +275,29 @@ async def resolve_slicer_filament(
             and (setting_id.startswith("PFUS") or setting_id.startswith("PFCN") or setting_id.startswith("GFS"))
         ):
             setting_id = ""
+
+    # Generic-id override (E3, 2026-07-20): a GENERIC resolved id (GFG99 …) that
+    # fingerprint-matches the configured tagless default is re-composed as the
+    # default's SPECIFIC identity — id, setting_id AND nozzle temps. The firmware's
+    # auto-refill backup group pairs slots only on an exact brand-class/type/colour/
+    # temps match, so a stale spool row carrying a leftover generic id re-published
+    # a GFG99 that split the group (011-H2S, live). Every write site routes through
+    # this resolver, so the substitution happens once here instead of at each caller.
+    # Best-effort: the tagless-default lookup is a settings read, and a failure must
+    # degrade to the resolved identity rather than raise into a slot write.
+    try:
+        from backend.app.services.spool_tagless import override_generic_identity
+
+        override = await override_generic_identity(db, tray_info_idx, material, rgba)
+    except Exception as e:  # noqa: BLE001 — the un-overridden identity is a valid answer
+        logger.debug("Generic-id override lookup failed for %r: %s", tray_info_idx, e)
+        override = None
+    if override is not None:
+        tray_info_idx = override["slicer_filament"]
+        setting_id = filament_id_to_setting_id(tray_info_idx)
+        if override["nozzle_temp_min"] is not None:
+            temp_min = int(override["nozzle_temp_min"])
+        if override["nozzle_temp_max"] is not None:
+            temp_max = int(override["nozzle_temp_max"])
 
     return (tray_info_idx, setting_id, sub_brand_override, temp_min, temp_max)

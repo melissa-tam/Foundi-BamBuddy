@@ -639,3 +639,149 @@ async def test_override_params_check_candidate_printer(db_session, printer_facto
     await db_session.refresh(item)
     assert item.printer_id is None
     assert item.ams_mapping is None
+
+
+# ---------------------------------------------------------------------------
+# Hold-transition notification guards (Phase D, 2026-07-20 spam incident)
+#
+# The scheduler re-evaluates every held item on EVERY 30 s tick, so "the item is
+# held" is a state, not an event. Notifying unconditionally re-sent the identical
+# "Low filament: 005-H2S" alert 16+ times in 8 minutes. Both staging paths now
+# alert only on the not-held → held transition (or a CHANGED reason, which names
+# a different set of blocking printers).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_notify_dedup():
+    """The chokepoint floor is process-wide in-memory state; isolate each case."""
+    from backend.app.services import notify_dedup
+
+    notify_dedup._reset_state()
+    yield
+    notify_dedup._reset_state()
+
+
+@pytest.fixture
+def waiting_notifier(monkeypatch):
+    """Capture queue_job_waiting sends from any scheduler path."""
+    notif = AsyncMock()
+    monkeypatch.setattr(sched_mod.notification_service, "on_queue_job_waiting", notif)
+    return notif
+
+
+@pytest.mark.asyncio
+async def test_deficit_across_three_ticks_notifies_once(scheduler, db_session, queue_item, waiting_notifier):
+    """THE incident: a standing deficit alerted on every tick."""
+    item = await queue_item()
+    with patch(
+        "backend.app.services.print_scheduler.compute_deficit_for_queue_item",
+        AsyncMock(return_value=_deficit()),
+    ):
+        for _ in range(3):
+            assert await scheduler._block_on_filament_deficit(db_session, item) is True
+
+    assert waiting_notifier.await_count == 1
+    await db_session.refresh(item)
+    assert item.filament_short is True  # still held on every tick — only the ALERT is deduped
+
+
+@pytest.mark.asyncio
+async def test_changed_reason_while_held_notifies_again(
+    scheduler, db_session, queue_item, waiting_notifier, monkeypatch
+):
+    """The reason names the blocking machine(s); a different hold is news."""
+    item = await queue_item()
+    reasons = iter(["Low filament: 005-H2S", "Low filament: 005-H2S", "Low filament: 011-H2S"])
+    monkeypatch.setattr(sched_mod, "build_staged_reason", lambda *a, **k: next(reasons))
+    with patch(
+        "backend.app.services.print_scheduler.compute_deficit_for_queue_item",
+        AsyncMock(return_value=_deficit()),
+    ):
+        for _ in range(3):
+            await scheduler._block_on_filament_deficit(db_session, item)
+
+    assert waiting_notifier.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_release_then_reblock_notifies_again(scheduler, db_session, queue_item, waiting_notifier):
+    """A topped-up spool clears the flag; running dry again is a NEW hold."""
+    deficit_mock = AsyncMock(side_effect=[_deficit(), [], _deficit()])
+    with patch("backend.app.services.print_scheduler.compute_deficit_for_queue_item", deficit_mock):
+        item = await queue_item()
+        assert await scheduler._block_on_filament_deficit(db_session, item) is True
+        assert await scheduler._block_on_filament_deficit(db_session, item) is False
+        assert await scheduler._block_on_filament_deficit(db_session, item) is True
+
+    assert waiting_notifier.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_already_held_item_does_not_notify_on_first_evaluation(
+    scheduler, db_session, queue_item, waiting_notifier
+):
+    """A restart / re-queue that re-evaluates an ALREADY-staged item with the same
+    reason is not a transition — the operator already has that alert."""
+    item = await queue_item(filament_short=True, manual_start=True, waiting_reason="Low filament: 005-H2S")
+    with (
+        patch("backend.app.services.print_scheduler.build_staged_reason", lambda *a, **k: "Low filament: 005-H2S"),
+        patch(
+            "backend.app.services.print_scheduler.compute_deficit_for_queue_item",
+            AsyncMock(return_value=_deficit()),
+        ),
+    ):
+        await scheduler._block_on_filament_deficit(db_session, item)
+
+    waiting_notifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_staging_across_three_ticks_notifies_once(cq_scheduler, db_session, waiting_notifier):
+    """Same rule on the model path: its notified-groups set is PER TICK, so on its
+    own it still sent one alert per tick for the whole life of the hold."""
+    item = await _model_item(db_session, batch_id=7, target_model="H2S")
+    for _ in range(3):
+        await cq_scheduler._stage_model_item_filament_short(db_session, item, set(), reason="Low filament: 005-H2S")
+
+    assert waiting_notifier.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_model_staging_reason_change_notifies_again(cq_scheduler, db_session, waiting_notifier):
+    item = await _model_item(db_session, batch_id=7, target_model="H2S")
+    await cq_scheduler._stage_model_item_filament_short(db_session, item, set(), reason="Low filament: 005-H2S")
+    await cq_scheduler._stage_model_item_filament_short(db_session, item, set(), reason="Low filament: 011-H2S")
+
+    assert waiting_notifier.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_model_staging_group_slot_is_not_consumed_by_a_held_unit(cq_scheduler, db_session, waiting_notifier):
+    """Transition first, group-dedup second: an already-held unit must not eat the
+    group's one notification and leave a genuinely new unit silent."""
+    held = await _model_item(db_session, batch_id=7, target_model="H2S", pos=1)
+    held.filament_short = True
+    held.waiting_reason = "Low filament: 005-H2S"
+    await db_session.commit()
+    fresh = await _model_item(db_session, batch_id=7, target_model="H2S", pos=2)
+
+    groups: set = set()
+    await cq_scheduler._stage_model_item_filament_short(db_session, held, groups, reason="Low filament: 005-H2S")
+    await cq_scheduler._stage_model_item_filament_short(db_session, fresh, groups, reason="Low filament: 005-H2S")
+
+    assert waiting_notifier.await_count == 1
+    assert waiting_notifier.await_args.kwargs["dedup_key"] == str(fresh.id)
+
+
+@pytest.mark.asyncio
+async def test_every_send_carries_the_item_dedup_key(scheduler, db_session, queue_item, waiting_notifier):
+    """The chokepoint floor needs a stable per-item key at every call site."""
+    item = await queue_item()
+    with patch(
+        "backend.app.services.print_scheduler.compute_deficit_for_queue_item",
+        AsyncMock(return_value=_deficit()),
+    ):
+        await scheduler._block_on_filament_deficit(db_session, item)
+
+    assert waiting_notifier.await_args.kwargs["dedup_key"] == str(item.id)

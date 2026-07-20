@@ -312,6 +312,74 @@ class TestRunoutSlotFromHms:
     def test_arbitrary_non_runout_code_rejected(self):
         assert runout_slot_from_hms(0x07002000, 0x0000400C) is None
 
+    def test_read_failure_on_a_slot_attr_is_not_a_runout(self):
+        # Same slot-carrying attr, but 0x00010081 is "failed to read the filament
+        # information" — a tag-read failure, NOT an empty spool. Fails closed so no
+        # caller can mistake a dead RFID read for a runout.
+        assert runout_slot_from_hms(0x07002000, 0x00010081) is None
+
+    def test_feed_fault_8010_family_is_not_slot_decoded(self):
+        # The live 009-H2S 2026-07-20 tangle: attr 0x07008210 / code 0x8010. The
+        # 8010 family carries no slot attribution, so jam attribution falls back to
+        # tray_now / the item's ams_mapping (see spool_recovery._resolve_jammed_tray).
+        assert runout_slot_from_hms(0x07008210, 0x00008010) is None
+
+
+class TestLiveCapturedAttrDecodes:
+    """Pins for the shared attr-layout decoders against LIVE-captured 2026-07-19/20
+    fleet values, in the shape the current API exposes them (``ams_slot_from_attr``
+    + the per-family predicates).
+
+    Note the off-by-one that makes these easy to misread: the firmware's own text is
+    1-indexed ("AMS A Slot 1") while the attr's slot nibble is 0-indexed
+    (``0x20 + tray``). Every decoder here returns the 0-indexed ``tray_id``.
+    """
+
+    def test_slot_nibble_is_zero_indexed_across_the_family(self):
+        from backend.app.services.hms_errors import ams_slot_from_attr
+
+        # 0x07002000 / 2100 / 2200 = firmware "AMS A Slot 1 / 2 / 3".
+        assert ams_slot_from_attr(0x07002000) == (0, 0)
+        assert ams_slot_from_attr(0x07002100) == (0, 1)
+        assert ams_slot_from_attr(0x07002200) == (0, 2)
+
+    def test_runout_code_word_decodes_the_same_three_slots(self):
+        assert runout_slot_from_hms(0x07002000, 0x00020001) == (0, 0)
+        assert runout_slot_from_hms(0x07002100, 0x00020001) == (0, 1)
+        assert runout_slot_from_hms(0x07002200, 0x00020001) == (0, 2)
+
+    def test_decimal_forms_from_the_incident_log(self):
+        # The two attrs as they appear in the raw MQTT payloads.
+        assert runout_slot_from_hms(117448704, 0x00020001) == (0, 0)  # 0x07002000
+        assert runout_slot_from_hms(117449216, 0x00020001) == (0, 2)  # 0x07002200
+
+    def test_read_failure_is_classified_and_slot_decoded(self):
+        from backend.app.services.hms_errors import filament_read_failure_slot, is_filament_read_failure
+
+        # 0700_2X00_0001_0081 — "Failed to read the filament information from AMS A
+        # slot 1. The AMS main board may be malfunctioning."
+        assert is_filament_read_failure(0x07002000, 0x00010081) is True
+        assert filament_read_failure_slot(0x07002000, 0x00010081) == (0, 0)
+
+    def test_unit_scoped_read_failure_names_no_slot(self):
+        from backend.app.services.hms_errors import (
+            ams_unit_from_attr,
+            filament_read_failure_slot,
+            is_filament_read_failure,
+        )
+
+        # 07XX_4025 names the AMS unit but no slot.
+        assert is_filament_read_failure(0x07010000, 0x00004025) is True
+        assert filament_read_failure_slot(0x07010000, 0x00004025) is None
+        assert ams_unit_from_attr(0x07010000) == 1
+
+    def test_feed_fault_is_neither_a_runout_nor_a_read_failure(self):
+        from backend.app.services.hms_errors import ams_unit_from_attr, is_filament_read_failure
+
+        assert runout_slot_from_hms(0x07008210, 0x00008010) is None
+        assert is_filament_read_failure(0x07008210, 0x00008010) is False
+        assert ams_unit_from_attr(0x07008210) == 0  # the unit is still attributable
+
 
 class TestHmsErrorPayloadRunoutSlot:
     """hms_error_payload adds `runout_slot` ONLY for a per-slot runout fault."""

@@ -3557,19 +3557,21 @@ async def refresh_ams_slot(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success, message = client.ams_refresh_tray(ams_id, slot_id)
-    if not success:
-        raise HTTPException(400, message)
-
-    # Arm the echo-consume flag so the firmware's identify flap (present→9→present
-    # over ~20 s) doesn't ignite the ams_presence re-read loop from its settle-back
-    # gain. Manual refresh itself stays unconditionally allowed (deliberate
-    # operator act); the flag only swallows THIS command's own echo, once. Local
-    # import — printers.py doesn't import ams_presence at module level (matches
-    # main.py's local-import pattern at :1912/:4644).
+    # Route through the single identify commander so this read gets the same
+    # bookkeeping as every other one — notably the echo-consume flag, so the
+    # firmware's identify flap (present→9→present over ~20 s) doesn't ignite the
+    # ams_presence re-read loop from its settle-back gain. ``enforce_need=False``:
+    # a deliberate operator act bypasses the NEED check, never wire safety (the
+    # client still refuses while drying / identifying). Local import — printers.py
+    # doesn't import ams_presence at module level (matches main.py's local-import
+    # pattern at :1912/:4644).
     from backend.app.services import ams_presence
 
-    ams_presence.record_reread(printer_id, ams_id, slot_id)
+    success, message = await ams_presence.command_identify(
+        printer_id, ams_id, slot_id, source="manual_refresh", enforce_need=False
+    )
+    if not success:
+        raise HTTPException(400, message)
 
     # Apply PA profile after delay (RFID re-read takes a few seconds)
     spawn_background_task(

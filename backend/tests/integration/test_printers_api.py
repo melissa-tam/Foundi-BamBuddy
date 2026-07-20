@@ -1051,11 +1051,16 @@ class TestAMSRefreshAPI:
         mock_client = MagicMock()
         mock_client.ams_refresh_tray.return_value = (True, "Refreshing AMS 0 tray 1")
 
+        # The route delegates to ams_presence.command_identify (the single identify
+        # commander), which resolves the client through the SERVICE's printer_manager
+        # reference — both have to see the mock.
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.services.ams_presence.printer_manager") as mock_pm_svc,
             patch("backend.app.services.ams_presence.record_reread") as mock_record,
         ):
             mock_pm.get_client.return_value = mock_client
+            mock_pm_svc.get_client.return_value = mock_client
 
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/0/slot/1/refresh")
 
@@ -1078,9 +1083,11 @@ class TestAMSRefreshAPI:
 
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.services.ams_presence.printer_manager") as mock_pm_svc,
             patch("backend.app.services.ams_presence.record_reread") as mock_record,
         ):
             mock_pm.get_client.return_value = mock_client
+            mock_pm_svc.get_client.return_value = mock_client
 
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/0/slot/0/refresh")
 

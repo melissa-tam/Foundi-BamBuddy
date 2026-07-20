@@ -15,6 +15,7 @@ from backend.app.models.location import Location
 from backend.app.models.long_lived_token import LongLivedToken
 from backend.app.models.maintenance import MaintenanceHistory, MaintenanceType, PrinterMaintenance
 from backend.app.models.notification import NotificationLog
+from backend.app.models.notification_ledger import NotificationLedger
 from backend.app.models.notification_template import NotificationTemplate
 from backend.app.models.oidc_provider import OIDCProvider, UserOIDCLink
 from backend.app.models.orca_base_cache import OrcaBaseProfile
@@ -53,6 +54,7 @@ __all__ = [
     "KProfileNote",
     "NotificationTemplate",
     "NotificationLog",
+    "NotificationLedger",
     "Project",
     "APIKey",
     "AMSSensorHistory",

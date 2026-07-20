@@ -3,9 +3,11 @@
 Covers the core operation (donor disposal, fresh-full mint, tag move, assignment
 rewire, K-profile copy, last-brand persistence, staged release), the sibling-tag
 guard both directions, and the three certainty tiers (spent-marking on runout /
-backup-swap, auto re-spool, one-click prompt).
+backup-swap, auto re-spool, one-click prompt) including the Tier-3 evidence gates
+(physical swap evidence, impossible-ledger suppression, remain-jump corroboration).
 """
 
+import time
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -25,6 +27,7 @@ from backend.app.services.spool_respool import (
     RespoolError,
     RespoolSiblingConflict,
     _remain_jump,
+    _remain_jump_reading,
     capture_backup_swap,
     mark_spent_on_runout,
     maybe_auto_or_prompt_respool,
@@ -97,9 +100,36 @@ async def _make_donor(db, *, data_origin="rfid_auto", tag_type="bambulab", spent
 
 @pytest.fixture(autouse=True)
 def _reset_module_state():
+    from backend.app.services import ams_presence
+
     spool_respool._reset_state()
+    ams_presence._reset_state()  # the Tier-3 swap-evidence ledger lives there
     yield
     spool_respool._reset_state()
+    ams_presence._reset_state()
+
+
+def _record_physical_cycle(printer_id, ams_id=0, tray_id=0, *, age_s=0.0):
+    """Stamp a QUALIFIED physical presence cycle on a slot in ams_presence's real
+    ledger — the swap evidence Tier 3 requires before it may prompt.
+
+    Writes the same map the presence tracker writes (and that
+    ``last_physical_cycle_age`` reads), so the tests exercise the real accessor
+    rather than a stub of it. ``age_s`` backdates the stamp.
+    """
+    from backend.app.services import ams_presence
+
+    ams_presence._physical_cycle_at[(printer_id, ams_id, tray_id)] = time.monotonic() - age_s
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Drive spool_respool._monotonic so its monotonic windows — the 60 s
+    swap-confirm and the 10 s remain-jump corroboration — advance without
+    wall-clock waits."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(spool_respool, "_monotonic", lambda: clock["t"])
+    return clock
 
 
 # -- core happy path ---------------------------------------------------------
@@ -514,15 +544,6 @@ async def test_mark_spent_ignores_non_runout_codes(db_session, printer_factory):
 # -- Tier 1: backup-swap detector (stable-feeder + pending-confirm rebuild) ----
 
 
-@pytest.fixture
-def fake_clock(monkeypatch):
-    """Drive spool_respool._monotonic so the 60 s swap-confirm windows advance
-    without wall-clock waits."""
-    clock = {"t": 1000.0}
-    monkeypatch.setattr(spool_respool, "_monotonic", lambda: clock["t"])
-    return clock
-
-
 def _running(tray_now, *, present=(0, 1, 2)):
     """A RUNNING printer state with every ``present`` AMS tray seated (non-empty
     tray_type), feeding ``tray_now``."""
@@ -735,6 +756,7 @@ async def test_gate_null_spent_under_threshold_prompts_with_dedup(db_session, pr
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=False, weight_used=990.0)  # remaining 10 <= 30
     await db_session.commit()
+    _record_physical_cycle(printer.id)  # somebody cycled a roll through the slot
 
     broadcasts = _spy_broadcast(monkeypatch)
     tray = _tray()
@@ -752,6 +774,7 @@ async def test_gate_null_spent_over_threshold_does_nothing(db_session, printer_f
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=False, weight_used=100.0)  # remaining 900 > 30
     await db_session.commit()
+    _record_physical_cycle(printer.id)  # evidence present — the THRESHOLD is what blocks
 
     broadcasts = _spy_broadcast(monkeypatch)
     result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
@@ -811,6 +834,7 @@ async def test_gate_tier3_suppressed_when_dismissed(db_session, printer_factory,
     donor = await _make_donor(db_session, spent=False, weight_used=990.0)  # remaining 10 <= 30
     donor.respool_dismissed_at = datetime.utcnow()
     await db_session.commit()
+    _record_physical_cycle(printer.id)  # evidence present — the DISMISSAL is what blocks
 
     broadcasts = _spy_broadcast(monkeypatch)
     result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
@@ -825,6 +849,7 @@ async def test_gate_tier3_fires_when_not_dismissed(db_session, printer_factory, 
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=False, weight_used=990.0)
     await db_session.commit()
+    _record_physical_cycle(printer.id)
 
     broadcasts = _spy_broadcast(monkeypatch)
     await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
@@ -841,6 +866,7 @@ async def test_gate_tier3_dismissal_survives_dedup_clear(db_session, printer_fac
     donor = await _make_donor(db_session, spent=False, weight_used=990.0)
     donor.respool_dismissed_at = datetime.utcnow()
     await db_session.commit()
+    _record_physical_cycle(printer.id)  # evidence present on both passes
 
     broadcasts = _spy_broadcast(monkeypatch)
     await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
@@ -1227,93 +1253,228 @@ def _pure_spool(label_weight=1000, weight_used=0, spent=False):
     )
 
 
-def test_remain_jump_true_for_reused_core_stale_ledger():
+def test_remain_jump_reading_true_for_reused_core_stale_ledger():
     """Production case: 958.99/1000 g used (ledger ~4%) while the tray reads
     remain=100% (a fresh roll on a reused core) → jump detected."""
-    assert _remain_jump(_pure_spool(1000, 958.99), _tray()) is True
+    assert _remain_jump_reading(_pure_spool(1000, 958.99), _tray()) is True
 
 
-def test_remain_jump_true_when_over_used_ledger_clamped_to_zero():
+def test_remain_jump_reading_true_when_over_used_ledger_clamped_to_zero():
     """weight_used > label (1850.99 on a 1000 g label) clamps ledger_pct to 0 → jump."""
-    assert _remain_jump(_pure_spool(1000, 1850.99), _tray()) is True
+    assert _remain_jump_reading(_pure_spool(1000, 1850.99), _tray()) is True
 
 
-def test_remain_jump_false_for_weight_locked_fresh_row():
+def test_remain_jump_reading_false_for_weight_locked_fresh_row():
     """A fresh row (weight_used 0 → ledger ~100%) cannot jump: remain ≤ 100, so
     remain − 100 is never ≥ 30. No weight_locked special-case needed."""
-    assert _remain_jump(_pure_spool(1000, 0), _tray()) is False
+    assert _remain_jump_reading(_pure_spool(1000, 0), _tray()) is False
 
 
-def test_remain_jump_boundary_at_30_fires_just_under_does_not():
+def test_remain_jump_reading_boundary_at_30_fires_just_under_does_not():
     """remain − ledger_pct == 30 fires (inclusive); 29.9 does not."""
     # used 300 → ledger_pct 70; remain 100 → jump exactly 30.
-    assert _remain_jump(_pure_spool(1000, 300), {**_tray(), "remain": 100}) is True
+    assert _remain_jump_reading(_pure_spool(1000, 300), {**_tray(), "remain": 100}) is True
     # used 299 → ledger_pct 70.1 → jump 29.9 < 30.
-    assert _remain_jump(_pure_spool(1000, 299), {**_tray(), "remain": 100}) is False
+    assert _remain_jump_reading(_pure_spool(1000, 299), {**_tray(), "remain": 100}) is False
 
 
-def test_remain_jump_false_for_out_of_range_or_missing_remain():
+def test_remain_jump_reading_false_for_out_of_range_or_missing_remain():
     for bad in (-1, 0, 101, 255, None, "x"):
-        assert _remain_jump(_pure_spool(1000, 990), {**_tray(), "remain": bad}) is False
+        assert _remain_jump_reading(_pure_spool(1000, 990), {**_tray(), "remain": bad}) is False
 
 
-def test_remain_jump_false_for_zero_or_none_label_weight():
+def test_remain_jump_reading_false_for_zero_or_none_label_weight():
     for lw in (0, None):
-        assert _remain_jump(_pure_spool(lw, 990), _tray()) is False
+        assert _remain_jump_reading(_pure_spool(lw, 990), _tray()) is False
 
 
-def test_remain_jump_false_for_invalid_tag():
+def test_remain_jump_reading_false_for_invalid_tag():
     tray = _tray(tag_uid="0000000000000000", tray_uuid="00000000000000000000000000000000")
-    assert _remain_jump(_pure_spool(1000, 990), tray) is False
+    assert _remain_jump_reading(_pure_spool(1000, 990), tray) is False
 
 
-def test_should_evaluate_respool_truth_table():
-    """spent OR jump opens the gate; a fresh/invalid-tag non-spent slot does not."""
+# -- Phase C: remain-jump corroboration (a single push is never evidence) ------
+
+
+def test_remain_jump_single_push_does_not_qualify(fake_clock):
+    """One observation of a jump proves nothing — the AMS re-reports a tray on every
+    state change. The corroborated gate stays False until the window is satisfied."""
+    spool = _pure_spool(1000, 958.99)
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+
+
+def test_remain_jump_two_pushes_spanning_window_qualifies(fake_clock):
+    """Two pushes ≥ _JUMP_STABLE_S apart with the jump still reading → corroborated."""
+    spool = _pure_spool(1000, 958.99)
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+    fake_clock["t"] += spool_respool._JUMP_STABLE_S
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is True
+
+
+def test_remain_jump_pushes_inside_window_do_not_qualify(fake_clock):
+    """Push count alone is not enough — the observations must SPAN the window, so a
+    burst of pushes 1 s apart never corroborates."""
+    spool = _pure_spool(1000, 958.99)
+    for _ in range(5):
+        assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+        fake_clock["t"] += 1.0
+
+
+def test_remain_jump_window_restarts_when_jump_stops_reading(fake_clock):
+    """The condition must HOLD: a push where the jump no longer reads drops the
+    window, so the next jump starts corroborating from scratch."""
+    spool = _pure_spool(1000, 958.99)
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+    fake_clock["t"] += 5.0
+    # A push whose tray reports no jump (remain matches the ledger) clears the window.
+    assert _remain_jump(spool, {**_tray(), "remain": 4}, 1, 0, 0) is False
+    fake_clock["t"] += 6.0
+    # 11 s after the FIRST observation, but this is the restarted window's first push.
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+    fake_clock["t"] += spool_respool._JUMP_STABLE_S
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is True
+
+
+def test_remain_jump_rejected_while_identify_in_flight(fake_clock, monkeypatch):
+    """A reading taken while a commanded identify is running is in flux — it neither
+    fires nor counts toward corroboration."""
+    from backend.app.services import ams_presence
+
+    spool = _pure_spool(1000, 958.99)
+    monkeypatch.setattr(ams_presence, "identify_in_flight", lambda *_a: True)
+    for _ in range(3):
+        assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+        fake_clock["t"] += 30.0
+    # Once the identify is done, corroboration starts from zero rather than
+    # inheriting the untrusted observations.
+    monkeypatch.setattr(ams_presence, "identify_in_flight", lambda *_a: False)
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+    fake_clock["t"] += spool_respool._JUMP_STABLE_S
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is True
+
+
+def test_remain_jump_rejected_while_unit_drying(fake_clock, monkeypatch):
+    """Drying disengages trays and re-reports them — same untrusted-reading rule."""
+    from backend.app.services import ams_presence
+
+    spool = _pure_spool(1000, 958.99)
+    monkeypatch.setattr(ams_presence, "unit_drying", lambda *_a: True)
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+    fake_clock["t"] += 60.0
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+
+
+def test_remain_jump_ledger_clears_on_slot_empty_edge(fake_clock):
+    """The slot-empty edge (main.on_ams_change) drops the corroboration window with
+    the prompt dedup — a new roll must re-earn its evidence."""
+    spool = _pure_spool(1000, 958.99)
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+    fake_clock["t"] += 30.0
+    spool_respool.clear_respool_prompt_dedup(1, 0, 0)  # slot reported empty
+    assert (1, 0, 0) not in spool_respool._jump_seen
+    # First push after the clear starts a fresh window instead of firing.
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+
+
+def test_remain_jump_corroborates_per_slot(fake_clock):
+    """The ledger is keyed per slot — one slot's history never corroborates another."""
+    spool = _pure_spool(1000, 958.99)
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is False
+    fake_clock["t"] += 30.0
+    assert _remain_jump(spool, _tray(), 1, 0, 1) is False  # different tray, own window
+    assert _remain_jump(spool, _tray(), 1, 0, 0) is True
+
+
+def test_should_evaluate_respool_truth_table(fake_clock):
+    """spent OR a CORROBORATED jump opens the gate; a fresh/invalid-tag non-spent
+    slot does not."""
     jump_tray = _tray()  # remain 100, valid tag
     # spent → True regardless of the tray (short-circuits before the jump test).
-    assert should_evaluate_respool(_pure_spool(1000, 0, spent=True), {**_tray(), "remain": 0}) is True
-    # spent_at None + remain-jump → True.
-    assert should_evaluate_respool(_pure_spool(1000, 958.99), jump_tray) is True
+    assert should_evaluate_respool(_pure_spool(1000, 0, spent=True), {**_tray(), "remain": 0}, 1, 0, 0) is True
+    # spent_at None + remain-jump → True only once corroborated across the window.
+    jumping = _pure_spool(1000, 958.99)
+    assert should_evaluate_respool(jumping, jump_tray, 1, 0, 0) is False
+    fake_clock["t"] += spool_respool._JUMP_STABLE_S
+    assert should_evaluate_respool(jumping, jump_tray, 1, 0, 0) is True
     # spent_at None + no jump (fresh row) → False.
-    assert should_evaluate_respool(_pure_spool(1000, 0), jump_tray) is False
+    assert should_evaluate_respool(_pure_spool(1000, 0), jump_tray, 1, 0, 1) is False
     # spent_at None + invalid tag → False.
     assert (
         should_evaluate_respool(
             _pure_spool(1000, 958.99),
             _tray(tag_uid="0000000000000000", tray_uuid="00000000000000000000000000000000"),
+            1,
+            0,
+            2,
         )
         is False
     )
 
 
 @pytest.mark.asyncio
-async def test_gate_remain_jump_prompts_even_above_threshold(db_session, printer_factory, monkeypatch):
+async def test_gate_remain_jump_prompts_even_above_threshold(db_session, printer_factory, monkeypatch, fake_clock):
     """spent_at NULL and remaining ABOVE the near-empty threshold, but the tray
-    reports a remain-jump → the Tier-3 prompt still fires. Both the bound and the
-    arrival call sites funnel through maybe_auto_or_prompt_respool, so this proves
-    the prompt for both contexts."""
+    reports a CORROBORATED remain-jump on a physically-cycled slot → the Tier-3
+    prompt still fires, labelled ``remain_jump``. Both the bound and the arrival
+    call sites funnel through maybe_auto_or_prompt_respool, so this proves the
+    prompt for both contexts."""
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=False, weight_used=958.99)  # remaining 41 > 30
     await db_session.commit()
+    _record_physical_cycle(printer.id)
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
     broadcasts = _spy_broadcast(monkeypatch)
+    # First push only opens the corroboration window.
+    assert await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor) is None
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+
+    fake_clock["t"] += spool_respool._JUMP_STABLE_S
     result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
 
     assert result is None  # a prompt, not an auto-respool
     prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
     assert len(prompts) == 1
     assert prompts[0]["donor_spool_id"] == donor.id
+    assert prompts[0]["trigger"] == "remain_jump"
 
 
 @pytest.mark.asyncio
-async def test_gate_remain_jump_suppressed_when_dismissed(db_session, printer_factory, monkeypatch):
+async def test_gate_remain_jump_suppressed_when_dismissed(db_session, printer_factory, monkeypatch, fake_clock):
     """The durable dismissal still suppresses a remain-jump prompt (both routes
     share the respool_dismissed_at gate)."""
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=False, weight_used=958.99)
     donor.respool_dismissed_at = datetime.utcnow()
     await db_session.commit()
+    _record_physical_cycle(printer.id)
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
+    broadcasts = _spy_broadcast(monkeypatch)
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+    fake_clock["t"] += spool_respool._JUMP_STABLE_S
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    assert result is None
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+
+
+# -- Phase C: Tier-3 evidence gates (the two false "reused tag" popups) --------
+
+
+@pytest.mark.asyncio
+async def test_near_empty_without_swap_evidence_never_prompts(db_session, printer_factory, monkeypatch):
+    """THE regression pin. A near-empty spool nobody has touched raises NOTHING.
+
+    Production 2026-07-20: 13 rows sat at ≤50 g remaining, every one of them a
+    standing "A reused Bambu tag was detected…" modal waiting for the next AMS push,
+    on a farm that reuses no tags. Being printed down is not evidence that the roll
+    changed — only a physical cycle on the slot is.
+    """
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=990.0)  # remaining 10 <= 30
+    await db_session.commit()
+    # No _record_physical_cycle: the slot has not been touched.
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
     broadcasts = _spy_broadcast(monkeypatch)
@@ -1321,6 +1482,130 @@ async def test_gate_remain_jump_suppressed_when_dismissed(db_session, printer_fa
 
     assert result is None
     assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+
+
+@pytest.mark.asyncio
+async def test_near_empty_with_recent_cycle_prompts_as_near_empty(db_session, printer_factory, monkeypatch):
+    """The same spool DOES prompt once a roll was physically cycled through the
+    slot — and is labelled ``near_empty`` so the UI says "almost empty — replacing
+    this roll?" instead of claiming a reused tag was detected."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=990.0)
+    await db_session.commit()
+    _record_physical_cycle(printer.id)
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
+    broadcasts = _spy_broadcast(monkeypatch)
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
+    assert len(prompts) == 1
+    assert prompts[0]["trigger"] == "near_empty"
+
+
+@pytest.mark.asyncio
+async def test_stale_physical_cycle_is_not_swap_evidence(db_session, printer_factory, monkeypatch):
+    """Evidence expires: a cycle older than _RESPOOL_SWAP_EVIDENCE_S no longer
+    explains a prompt now (otherwise one desiccant check would arm the slot for good)."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=990.0)
+    await db_session.commit()
+    _record_physical_cycle(printer.id, age_s=spool_respool._RESPOOL_SWAP_EVIDENCE_S + 1)
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
+    broadcasts = _spy_broadcast(monkeypatch)
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+
+
+@pytest.mark.asyncio
+async def test_swap_evidence_is_per_slot(db_session, printer_factory, monkeypatch):
+    """A cycle on a NEIGHBOURING slot is not evidence about this one."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=990.0)
+    await db_session.commit()
+    _record_physical_cycle(printer.id, tray_id=1)  # the other slot was touched
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
+    broadcasts = _spy_broadcast(monkeypatch)
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+
+
+@pytest.mark.asyncio
+async def test_corrupt_ledger_warns_and_never_prompts(db_session, printer_factory, monkeypatch, caplog):
+    """The live donor shape: label 1000 g, weight_used 1243 g ⇒ −243 g remaining.
+
+    An impossible row is REPORTED, never prompted — and nothing is auto-corrected
+    (operator decision 2026-07-20: the offline repair tool owns the data).
+    """
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=1243.0)
+    await db_session.commit()
+    _record_physical_cycle(printer.id)  # evidence present — the CORRUPTION is what blocks
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
+    broadcasts = _spy_broadcast(monkeypatch)
+    with caplog.at_level("WARNING", logger="backend.app.services.spool_respool"):
+        result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    assert result is None
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+    warnings = [
+        r for r in caplog.records if r.levelname == "WARNING" and r.name == "backend.app.services.spool_respool"
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert str(donor.id) in message and "1243" in message and "-243" in message
+    assert "AMS0-T0" in message  # the slot is named
+
+    # No auto-correction of any column.
+    refreshed = await db_session.get(Spool, donor.id)
+    assert refreshed.weight_used == pytest.approx(1243.0)
+    assert refreshed.label_weight == 1000
+    assert refreshed.spent_at is None
+    assert refreshed.respool_dismissed_at is None
+
+
+@pytest.mark.asyncio
+async def test_zero_label_with_charged_grams_is_corrupt(db_session, printer_factory, monkeypatch):
+    """A 0 label carrying charged grams computes negative remaining too — same class
+    of impossible row, same suppression, no auto-correction.
+
+    (A NULL label cannot reach this path from the DB — ``spool.label_weight`` is NOT
+    NULL — but an in-memory row can, so :func:`_ledger_corrupt` handles both; the
+    NULL arm is pinned in :func:`test_ledger_corrupt_treats_absent_label_as_corrupt`.)
+    """
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=120.0)
+    donor.label_weight = 0
+    await db_session.commit()
+    _record_physical_cycle(printer.id)
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
+    broadcasts = _spy_broadcast(monkeypatch)
+    assert await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor) is None
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+    refreshed = await db_session.get(Spool, donor.id)
+    assert refreshed.weight_used == pytest.approx(120.0) and refreshed.label_weight == 0  # untouched
+
+
+def test_ledger_corrupt_treats_absent_label_as_corrupt():
+    """No label but grams charged against it → remaining computes negative → corrupt.
+    An unused row with no label is merely unknown, not corrupt."""
+    assert spool_respool._ledger_corrupt(_pure_spool(None, 120)) is True
+    assert spool_respool._ledger_corrupt(_pure_spool(0, 120)) is True
+    assert spool_respool._ledger_corrupt(_pure_spool(None, 0)) is False
+
+
+def test_ledger_corrupt_tolerance_boundary():
+    """Ordinary over-charge rounding inside the tolerance is NOT corruption (it stays
+    an ordinary near-empty row); beyond it, the row is impossible."""
+    assert spool_respool._ledger_corrupt(_pure_spool(1000, 1000 + spool_respool._LEDGER_CORRUPT_TOL_G)) is False
+    assert spool_respool._ledger_corrupt(_pure_spool(1000, 1000 + spool_respool._LEDGER_CORRUPT_TOL_G + 0.1)) is True
+    assert spool_respool._ledger_corrupt(_pure_spool(1000, 990)) is False
 
 
 # -- F2: fire-once respool_prompt re-broadcast on (re)connect -----------------
@@ -1331,6 +1616,7 @@ async def _fire_tier3_prompt(db, printer, monkeypatch, *, weight_used=990.0):
     the live gate populates it. Returns (donor, broadcasts_spy)."""
     donor = await _make_donor(db, spent=False, weight_used=weight_used)  # remaining 10 <= 30
     await db.commit()
+    _record_physical_cycle(printer.id)  # the swap evidence Tier 3 requires
     _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
     broadcasts = _spy_broadcast(monkeypatch)
     await maybe_auto_or_prompt_respool(db, printer.id, 0, 0, _tray(), donor)
@@ -1373,6 +1659,27 @@ async def test_rebroadcast_payload_matches_live_prompt(db_session, printer_facto
     sent, send = _capture_send()
     await rebroadcast_unresolved_respool_prompts(db_session, send)
     assert sent[0] == live
+
+
+@pytest.mark.asyncio
+async def test_rebroadcast_recomputes_trigger_from_durable_state(db_session, printer_factory, monkeypatch):
+    """The replayed prompt is labelled from DURABLE state, so a reconnecting client
+    gets the same copy the live one did — and follows the row if it changed while the
+    client was away (here: the donor was stamped spent in the meantime)."""
+    printer = await printer_factory()
+    donor, broadcasts = await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    assert next(b for b in broadcasts if b["type"] == "respool_prompt")["trigger"] == "near_empty"
+
+    sent, send = _capture_send()
+    await rebroadcast_unresolved_respool_prompts(db_session, send)
+    assert sent[0]["trigger"] == "near_empty"
+
+    donor.spent_at = datetime.utcnow()  # hardware runout landed while the client was away
+    await db_session.commit()
+
+    sent2, send2 = _capture_send()
+    await rebroadcast_unresolved_respool_prompts(db_session, send2)
+    assert sent2[0]["trigger"] == "spent"
 
 
 @pytest.mark.asyncio
@@ -1445,7 +1752,12 @@ async def test_rebroadcast_noop_in_spoolman_mode(db_session, printer_factory, mo
 async def test_gate_spent_loaded_prompts_when_auto_disabled(db_session, printer_factory, monkeypatch):
     """respool_auto_enabled defaults OFF: a spent+loaded tag arrival broadcasts the
     one-click PROMPT instead of silently auto-minting a fresh row. A last brand IS
-    set, proving the gate is the toggle — not a missing brand."""
+    set, proving the gate is the toggle — not a missing brand.
+
+    Also pins that the hardware-certain path is untouched by the Phase-C evidence
+    gates: no physical cycle is recorded here and it still prompts (the runout IS
+    the hardware event), carrying ``trigger="spent"`` so the UI keeps the
+    reused-tag framing for it."""
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=True)
     from backend.app.api.routes.settings import set_setting
@@ -1458,7 +1770,9 @@ async def test_gate_spent_loaded_prompts_when_auto_disabled(db_session, printer_
     result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
 
     assert result is None  # NOT auto-respooled
-    assert any(b["type"] == "respool_prompt" for b in broadcasts)  # prompted instead
+    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
+    assert len(prompts) == 1  # prompted instead
+    assert prompts[0]["trigger"] == "spent"
     assert (await db_session.get(Spool, donor.id)).archived_at is None  # donor untouched
 
 

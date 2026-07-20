@@ -93,11 +93,33 @@ describe('useRespoolPrompt', () => {
     expect(showPersistentToast).toHaveBeenCalledTimes(1);
     const [id, message, type, options] = showPersistentToast.mock.calls[0];
     expect(id).toBe('respool-1-0-2');
-    expect(message).toBe('inventory.respool.promptToast');
+    expect(message).toBe('inventory.respool.reusedTagToast');
     expect(type).toBe('warning');
     expect(options.actions).toHaveLength(2);
     // The modal stays closed — the toast is the surface now.
     expect(result.current.activeContext).toBeNull();
+  });
+
+  it('words a near_empty prompt as a roll replacement, not a detected reused tag', () => {
+    renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
+    act(() => dispatchPrompt(makePrompt({ trigger: 'near_empty' })));
+
+    const [, message] = showPersistentToast.mock.calls[0];
+    expect(message).toBe('inventory.respool.nearEmptyToast');
+  });
+
+  it('keeps the reused-tag wording for spent and remain_jump prompts', () => {
+    renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
+    act(() => {
+      dispatchPrompt(makePrompt({ trigger: 'spent' }));
+      dispatchPrompt(makePrompt({ tray_id: 3, trigger: 'remain_jump' }));
+    });
+
+    const messages = showPersistentToast.mock.calls.map(call => call[1]);
+    expect(messages).toEqual([
+      'inventory.respool.reusedTagToast',
+      'inventory.respool.reusedTagToast',
+    ]);
   });
 
   it('dedupes a repeat event for the same slot to a single toast', () => {
