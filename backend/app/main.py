@@ -4576,6 +4576,32 @@ async def on_print_complete(printer_id: int, data: dict):
         data = {**data, "status": "cancelled"}
     _user_stopped_printers.discard(printer_id)
 
+    # Server-dispatched eject jobs (part-present sweep / FA remote eject) are
+    # motion-only prints with NO queue item and NO archive. Detect this terminal as
+    # our OWN sweep UP FRONT — before terminal correlation — because both of the
+    # reads below are guaranteed to fail (and log noise) for a sweep: correlation
+    # would find zero printing units and log a false-FOREIGN warning for the farm's
+    # own job (11× per production run, live 2026-07-20), and the archive lookup can
+    # never resolve a sweep ("Could not find archive for print complete"). Registry
+    # match (id / name) OR name evidence (W1: an eject-named terminal is ours even
+    # when a restart lost the registry). Everything downstream that must treat an
+    # eject specially — the no-deposit-rewrite exemption, the never-gate branch, the
+    # notification suppression, farm_policy.on_terminal finalisation — keys on THIS
+    # flag, never on the verdict.
+    from backend.app.services.eject.remote import is_eject_job_name, matches_pending_eject
+
+    _eject_job_name = data.get("subtask_name") or data.get("filename")
+    _is_eject_job = matches_pending_eject(
+        printer_id, data.get("subtask_id"), subtask_name=data.get("subtask_name")
+    ) or is_eject_job_name(_eject_job_name)
+    if _is_eject_job:
+        logger.info(
+            "[CALLBACK] printer %s: terminal is a server-dispatched eject job (status=%s) — "
+            "exempt from no-deposit rewrite + print notification",
+            printer_id,
+            _raw_status,
+        )
+
     # Terminal-status correlation (Phase 1, P1-A). Resolve WHICH queue item this
     # finish belongs to ONCE, up front, and thread the verdict to BOTH the plate-
     # clear gate below and the queue-status update later. The old printer_id-only
@@ -4592,8 +4618,6 @@ async def on_print_complete(printer_id: int, data: dict):
     _farm_targets_printer = False
     _global_require_plate_clear = True
     try:
-        from backend.app.api.routes.settings import get_setting
-        from backend.app.core.database import run_with_retry
         from backend.app.services.farm_correlation import (
             ATTRIBUTED_VERDICTS,
             AUTO_CLEAR_VERDICTS,
@@ -4601,28 +4625,43 @@ async def on_print_complete(printer_id: int, data: dict):
             resolve_terminal_item,
         )
 
-        async def _do_resolve(db):
-            resolution = await resolve_terminal_item(db, printer_id, data)
-            item = resolution.item
-            raw_rpc = await get_setting(db, "require_plate_clear")
-            return {
-                "verdict": resolution.verdict,
-                "item_id": item.id if item is not None else None,
-                "is_dry_run": bool(item is not None and item.is_dry_run),
-                "first_article": bool(item is not None and item.first_article),
-                "is_farm": bool(item is not None and item.eject_profile_id is not None),
-                "targets": await farm_work_targets_printer(db, printer_id),
-                "raw_rpc": raw_rpc,
-            }
+        if _is_eject_job:
+            # W5: skip the correlation read entirely for our own sweep — it has no
+            # queue item to bind and resolve_terminal_item would log a false FOREIGN
+            # warning. Short-circuit to the 'eject' sentinel: deliberately NOT in
+            # ATTRIBUTED_VERDICTS / AUTO_CLEAR_VERDICTS and NOT 'foreign', so
+            # _attributed and _auto_clear_ok both stay False and no gate branch fires
+            # — byte-for-byte the same downstream state the old false-FOREIGN verdict
+            # produced (queue untouched, gate not raised), minus the warning. The
+            # resolved_* defaults set just above already describe an eject terminal
+            # (no item → no dry-run / first-article / farm flags).
+            _verdict = "eject"
+        else:
+            from backend.app.api.routes.settings import get_setting
+            from backend.app.core.database import run_with_retry
 
-        _c = await run_with_retry(_do_resolve, label="terminal correlation")
-        _verdict = _c["verdict"]
-        _resolved_item_id = _c["item_id"]
-        _resolved_is_dry_run = _c["is_dry_run"]
-        _resolved_first_article = _c["first_article"]
-        _resolved_is_farm = _c["is_farm"]
-        _farm_targets_printer = _c["targets"]
-        _global_require_plate_clear = True if _c["raw_rpc"] is None else _c["raw_rpc"].strip().lower() == "true"
+            async def _do_resolve(db):
+                resolution = await resolve_terminal_item(db, printer_id, data)
+                item = resolution.item
+                raw_rpc = await get_setting(db, "require_plate_clear")
+                return {
+                    "verdict": resolution.verdict,
+                    "item_id": item.id if item is not None else None,
+                    "is_dry_run": bool(item is not None and item.is_dry_run),
+                    "first_article": bool(item is not None and item.first_article),
+                    "is_farm": bool(item is not None and item.eject_profile_id is not None),
+                    "targets": await farm_work_targets_printer(db, printer_id),
+                    "raw_rpc": raw_rpc,
+                }
+
+            _c = await run_with_retry(_do_resolve, label="terminal correlation")
+            _verdict = _c["verdict"]
+            _resolved_item_id = _c["item_id"]
+            _resolved_is_dry_run = _c["is_dry_run"]
+            _resolved_first_article = _c["first_article"]
+            _resolved_is_farm = _c["is_farm"]
+            _farm_targets_printer = _c["targets"]
+            _global_require_plate_clear = True if _c["raw_rpc"] is None else _c["raw_rpc"].strip().lower() == "true"
     except Exception as e:  # noqa: BLE001 — a correlation failure must not crash the callback
         logger.warning("[CALLBACK] terminal correlation failed for printer %s: %s", printer_id, e)
         ATTRIBUTED_VERDICTS = frozenset()  # type: ignore[assignment]
@@ -4636,34 +4675,6 @@ async def on_print_complete(printer_id: int, data: dict):
     # (deposits nothing by construction) and any print that reached terminal having
     # produced zero layers AND zero progress (stopped in PREPARE/heating).
     from backend.app.services.eject.monitor import deposited_nothing
-
-    # Server-dispatched eject jobs (part-present sweep / FA remote eject) are
-    # motion-only prints with NO queue item and NO archive that deposit nothing by
-    # construction (layer=0, progress=0). Resolve THIS terminal against the pending
-    # eject registry ONCE, up front — BEFORE farm_policy.on_terminal (which runs
-    # later in the notification flow) pops it. A clean eject FINISH reports wire
-    # status "completed"; without this guard the no-deposit rewrite below would
-    # corrupt it to "cancelled", and farm_policy would then false-quarantine a
-    # printer whose sweep actually succeeded. The captured flag also suppresses the
-    # "Print Complete/Stopped" notification for the sweep (it is farm plumbing, not
-    # a user print). farm_policy still pops the registry and finalises the sweep.
-    from backend.app.services.eject.remote import is_eject_job_name, matches_pending_eject
-
-    # Name evidence (W1): an eject-named terminal is our sweep even if the registry
-    # was lost to a restart — exempt it from the no-deposit rewrite, gate raise, and
-    # print notifications. OR'd with the registry/id match (which additionally gates
-    # the gate-CLEAR / FA-finalise / quarantine actions in farm_policy).
-    _eject_job_name = data.get("subtask_name") or data.get("filename")
-    _is_eject_job = matches_pending_eject(
-        printer_id, data.get("subtask_id"), subtask_name=data.get("subtask_name")
-    ) or is_eject_job_name(_eject_job_name)
-    if _is_eject_job:
-        logger.info(
-            "[CALLBACK] printer %s: terminal is a server-dispatched eject job (status=%s) — "
-            "exempt from no-deposit rewrite + print notification",
-            printer_id,
-            _raw_status,
-        )
 
     # W6.4: auto RFID re-read sweep at the PRINT terminal so a mid-print AMS
     # refill (the firmware does not auto-read spools inserted during a print) is
@@ -4679,6 +4690,28 @@ async def on_print_complete(printer_id: int, data: dict):
             asyncio.create_task(ams_presence.on_printer_terminal(printer_id))
         except Exception as _swe:  # noqa: BLE001 — sweep must never crash the callback
             logger.warning("AMS terminal re-read sweep failed to schedule for printer %s: %s", printer_id, _swe)
+
+        # W6 slot-identity reconcile: the printer is IDLE at a terminal by
+        # construction, which is exactly when spool_tagless's idle-gated reconcile can
+        # act. On a busy farm the AMS-change pushes that also reach the reconcile
+        # overwhelmingly arrive mid-print (deferred), so a slot whose live identity
+        # diverges from the resolver (011-H2S: tray_info_idx / stale nozzle temps
+        # splitting the firmware auto-refill backup group) never got an idle
+        # evaluation. Own session, fire-and-forget; the reconcile never raises and
+        # never blocks the callback.
+        try:
+            from backend.app.services import spool_tagless as _spool_tagless_reconcile
+
+            async def _reconcile_slot_identities():
+                try:
+                    async with async_session() as _rdb:
+                        await _spool_tagless_reconcile.reconcile_bound_slot_identities(_rdb, printer_id)
+                except Exception as _re:  # noqa: BLE001 — reconcile must never crash the callback
+                    logger.warning("Slot-identity reconcile failed for printer %s: %s", printer_id, _re)
+
+            asyncio.create_task(_reconcile_slot_identities())
+        except Exception as _re:  # noqa: BLE001 — reconcile must never crash the callback
+            logger.warning("Slot-identity reconcile failed to schedule for printer %s: %s", printer_id, _re)
 
     no_deposit = deposited_nothing(
         is_dry_run=_resolved_is_dry_run,
@@ -4905,58 +4938,65 @@ async def on_print_complete(printer_id: int, data: dict):
             possible_keys.append((printer_id, f"{filename}.3mf"))
             possible_keys.append((printer_id, filename))
 
-    # Find the archive for this print
-    logger.info("Looking for archive in _active_prints, keys to try: %s...", possible_keys[:5])
-    logger.info("Current _active_prints: %s", list(_active_prints.keys()))
+    # Find the archive for this print. A server-dispatched eject sweep creates NO
+    # archive by construction (on_print_start early-returns for it), so the whole
+    # lookup — the _active_prints scan and the DB fallback — is guaranteed to miss
+    # for a sweep and only logs noise (culminating in the "Could not find archive for
+    # print complete" WARNING below). Skip it entirely for eject terminals; archive_id
+    # stays None and the no-archive path below still finalises the sweep via
+    # farm_policy.on_terminal.
     archive_id = None
-    for key in possible_keys:
-        archive_id = _active_prints.pop(key, None)
-        if archive_id:
-            logger.info("Found archive %s with key %s", archive_id, key)
-            # Also clean up any other keys pointing to this archive
-            keys_to_remove = [k for k, v in _active_prints.items() if v == archive_id]
-            for k in keys_to_remove:
-                _active_prints.pop(k, None)
-            break
+    if not _is_eject_job:
+        logger.info("Looking for archive in _active_prints, keys to try: %s...", possible_keys[:5])
+        logger.info("Current _active_prints: %s", list(_active_prints.keys()))
+        for key in possible_keys:
+            archive_id = _active_prints.pop(key, None)
+            if archive_id:
+                logger.info("Found archive %s with key %s", archive_id, key)
+                # Also clean up any other keys pointing to this archive
+                keys_to_remove = [k for k, v in _active_prints.items() if v == archive_id]
+                for k in keys_to_remove:
+                    _active_prints.pop(k, None)
+                break
 
-    if not archive_id:
-        # Try to find by filename or subtask_name if not tracked (for prints started before app)
-        async with async_session() as db:
-            from backend.app.models.archive import PrintArchive
+        if not archive_id:
+            # Try to find by filename or subtask_name if not tracked (for prints started before app)
+            async with async_session() as db:
+                from backend.app.models.archive import PrintArchive
 
-            # Try matching by subtask_name (stored as print_name) first
-            if subtask_name:
-                result = await db.execute(
-                    select(PrintArchive)
-                    .where(PrintArchive.printer_id == printer_id)
-                    .where(PrintArchive.status == "printing")
-                    .where(
-                        or_(
-                            PrintArchive.print_name.ilike(f"%{subtask_name}%"),
-                            PrintArchive.filename.ilike(f"%{subtask_name}%"),
+                # Try matching by subtask_name (stored as print_name) first
+                if subtask_name:
+                    result = await db.execute(
+                        select(PrintArchive)
+                        .where(PrintArchive.printer_id == printer_id)
+                        .where(PrintArchive.status == "printing")
+                        .where(
+                            or_(
+                                PrintArchive.print_name.ilike(f"%{subtask_name}%"),
+                                PrintArchive.filename.ilike(f"%{subtask_name}%"),
+                            )
                         )
+                        .order_by(PrintArchive.created_at.desc())
+                        .limit(1)
                     )
-                    .order_by(PrintArchive.created_at.desc())
-                    .limit(1)
-                )
-                archive = result.scalar_one_or_none()
-                if archive:
-                    archive_id = archive.id
-                    logger.info("Found archive %s by subtask_name match: %s", archive_id, subtask_name)
+                    archive = result.scalar_one_or_none()
+                    if archive:
+                        archive_id = archive.id
+                        logger.info("Found archive %s by subtask_name match: %s", archive_id, subtask_name)
 
-            # Also try by filename
-            if not archive_id and filename:
-                result = await db.execute(
-                    select(PrintArchive)
-                    .where(PrintArchive.printer_id == printer_id)
-                    .where(PrintArchive.filename == filename)
-                    .where(PrintArchive.status == "printing")
-                    .order_by(PrintArchive.created_at.desc())
-                    .limit(1)
-                )
-                archive = result.scalar_one_or_none()
-                if archive:
-                    archive_id = archive.id
+                # Also try by filename
+                if not archive_id and filename:
+                    result = await db.execute(
+                        select(PrintArchive)
+                        .where(PrintArchive.printer_id == printer_id)
+                        .where(PrintArchive.filename == filename)
+                        .where(PrintArchive.status == "printing")
+                        .order_by(PrintArchive.created_at.desc())
+                        .limit(1)
+                    )
+                    archive = result.scalar_one_or_none()
+                    if archive:
+                        archive_id = archive.id
 
     # Cleanup: delete uploaded file from printer SD card to prevent phantom prints (Issue #374, #1542)
     # The print scheduler uploads files to the SD card root (/). Some printers (e.g. P1S, A1)
@@ -5295,7 +5335,12 @@ async def on_print_complete(printer_id: int, data: dict):
     log_timing("Filament usage tracking")
 
     if not archive_id:
-        logger.warning("Could not find archive for print complete: filename=%s, subtask=%s", filename, subtask_name)
+        # An eject sweep never has an archive by construction — the WARNING is only
+        # meaningful for an ordinary print whose archive we genuinely lost. The
+        # no-archive path below (notification suppression + farm_policy.on_terminal
+        # finalisation) still runs for the sweep.
+        if not _is_eject_job:
+            logger.warning("Could not find archive for print complete: filename=%s, subtask=%s", filename, subtask_name)
 
         # Still send print-complete/failed/stopped notifications even without an archive.
         # Try to enrich with queue/library-file data so user-specific emails work too.
@@ -6884,6 +6929,10 @@ async def lifespan(app: FastAPI):
             if aborted_items:
                 for item in aborted_items:
                     item.status = "cancelled"
+                    # Terminal-transition hygiene (W4b): this repair path terminalises
+                    # rows outside farm_policy.on_terminal, so stale hold tokens must
+                    # be cleared here too.
+                    item.waiting_reason = None
                 await db.commit()
                 logging.info("Fixed %d queue item(s) with invalid 'aborted' status → 'cancelled'", len(aborted_items))
     except Exception as e:

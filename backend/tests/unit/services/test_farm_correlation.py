@@ -337,3 +337,13 @@ class TestNativePlateDetection:
 
         assert "0500_808C" in _HMS_PLATE_OCCUPANCY_CODES
         assert {"0300_8017", "0300_8006"} <= _HMS_PLATE_OCCUPANCY_CODES
+
+    def test_806e_is_in_plate_occupancy_set(self):
+        """0500_806E — the native-vision code the H2S actually emits ("Foreign objects
+        detected on heatbed", live 2026-07-20, printer 8) — joined the single-origin
+        frozenset so the same capture hook + reason attribution pick it up (W4a)."""
+        from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
+
+        # All four native-vision codes are pinned members.
+        assert {"0300_8017", "0300_8006", "0500_806E", "0500_808C"} <= _HMS_PLATE_OCCUPANCY_CODES
+        assert "0500_806E" in _HMS_PLATE_OCCUPANCY_CODES

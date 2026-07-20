@@ -181,6 +181,22 @@ class TestTransitionResumeWiring:
         await transition_run(db_session, batch.id, "resume")
         assert await _pending_count(db_session, batch.id) == 1  # only the original pending
 
+    async def test_abort_cancels_pending_and_clears_waiting_reason(self, db_session):
+        """W4b terminal hygiene: a run-abort cancels PENDING items outside
+        farm_policy.on_terminal, so its own transition must clear any scheduler
+        hold token — a cancelled row must never keep e.g. filament_short."""
+        batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=3)
+        await _add(db_session, batch, printer_id=3, status="completed", pos=1)
+        held = await _add(db_session, batch, printer_id=3, status="pending", pos=2)
+        held.waiting_reason = "filament_short"
+        await db_session.commit()
+
+        run = await transition_run(db_session, batch.id, "abort")
+        assert run.status == "cancelled"
+        await db_session.refresh(held)
+        assert held.status == "cancelled"
+        assert held.waiting_reason is None
+
     async def test_resume_after_retries_exhausted_tops_up_deficit(self, db_session):
         """Phase 1 R3: a run paused with retries_exhausted resumes and tops up
         exactly the dead-chain deficit."""

@@ -1400,6 +1400,138 @@ class TestSlotIdentityReconcile:
         )
         env.apply.assert_awaited_once()
 
+    async def test_temps_diverge_repushes_even_when_id_matches(self, db_session, printer_factory, env, monkeypatch):
+        """W6 defect (a): the 011 tray-2 pin — the right GFG02 id but STALE 220/260
+        temps beside a 230/270 peer. A tray_info_idx-only check declared it converged
+        and burned the shot without healing the split backup group; the full-identity
+        check sees the temp divergence and re-pushes. The shot is consumed once the
+        push lands (armed before the push so it cannot loop)."""
+        printer = await printer_factory()
+        await self._seed_bound_slot(db_session, printer.id)
+        self._resolves_to(monkeypatch, "GFG02")  # resolver: GFG02 @ 230/270
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_client", lambda pid: _FakeClient())
+        tray = _tray("PETG")
+        tray["tray_info_idx"] = "GFG02"  # id AGREES with the resolver
+        tray["nozzle_temp_min"] = 220  # but the temps are stale
+        tray["nozzle_temp_max"] = 260
+        assert (printer.id, 0, 0) not in spool_tagless._identity_reconciled  # not consumed before the push
+        assert await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 0, tray, await _assignment(db_session, printer.id), []
+        )
+        env.apply.assert_awaited_once()  # the temp split was re-pushed
+        assert (printer.id, 0, 0) in spool_tagless._identity_reconciled  # consumed after convergence
+
+    async def test_full_identity_converged_one_resolver_call_no_push(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
+        """Fully converged across id AND temps ⇒ no push, shot consumed, and the
+        resolver is consulted EXACTLY once total (a second pass short-circuits on the
+        consumed key before it re-resolves)."""
+        printer = await printer_factory()
+        await self._seed_bound_slot(db_session, printer.id)
+        resolver = AsyncMock(return_value=("GFG02", "GFSG02", None, 230, 270))
+        monkeypatch.setattr("backend.app.services.slicer_filament_resolver.resolve_slicer_filament", resolver)
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_client", lambda pid: _FakeClient())
+        tray = _tray("PETG")
+        tray["tray_info_idx"] = "GFG02"
+        tray["nozzle_temp_min"] = 230
+        tray["nozzle_temp_max"] = 270
+        assert await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 0, tray, await _assignment(db_session, printer.id), []
+        )
+        env.apply.assert_not_awaited()
+        assert (printer.id, 0, 0) in spool_tagless._identity_reconciled
+        # Second pass: key already consumed → returns before re-resolving, no push.
+        assert await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 0, tray, await _assignment(db_session, printer.id), []
+        )
+        assert resolver.await_count == 1
+        env.apply.assert_not_awaited()
+
+
+class TestReconcileBoundSlotIdentities:
+    """W6 defect (b): on a busy farm the AMS-change pushes that reach the reconcile
+    arrive mid-print (idle-deferred), so a divergent slot never gets an idle
+    evaluation. reconcile_bound_slot_identities is the terminal-callback second call
+    site — the printer is idle by construction there — sweeping every bound+configured
+    slot through the SAME one-shot reconcile."""
+
+    async def _seed_bound_slot(self, db_session, printer_id):
+        return await _seed_assignment(db_session, printer_id, 0, 0, material="PETG", rgba="112233FF")
+
+    def _resolves_to(self, monkeypatch, value="GFG02"):
+        monkeypatch.setattr(
+            "backend.app.services.slicer_filament_resolver.resolve_slicer_filament",
+            AsyncMock(return_value=(value, "GFSG02", None, 230, 270)),
+        )
+
+    @staticmethod
+    def _idle_state_with(tray, *, ams_id=0):
+        return SimpleNamespace(state="IDLE", raw_data={"ams": {"ams": [{"id": ams_id, "tray": [tray]}]}})
+
+    async def test_busy_push_deferred_then_terminal_reconciles(self, db_session, printer_factory, env, monkeypatch):
+        """The 011 trays-0/1 pin: a GFG99 slot seen only through mid-print AMS pushes
+        defers every time (busy → shot unconsumed), then the idle terminal sweep
+        re-pushes it to the resolver's GFG02 identity."""
+        printer = await printer_factory()
+        await self._seed_bound_slot(db_session, printer.id)
+        self._resolves_to(monkeypatch, "GFG02")  # the slot should converge to GFG02
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_client", lambda pid: _FakeClient())
+        tray = _tray("PETG")
+        tray["id"] = 0
+        tray["tray_info_idx"] = "GFG99"  # split id — must be re-pushed
+
+        # During-print AMS push → busy → deferred, shot NOT consumed.
+        monkeypatch.setattr(
+            spool_tagless.printer_manager,
+            "get_status",
+            lambda pid: SimpleNamespace(state="RUNNING", raw_data={}),
+        )
+        assert await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 0, tray, await _assignment(db_session, printer.id), []
+        )
+        env.apply.assert_not_awaited()
+        assert (printer.id, 0, 0) not in spool_tagless._identity_reconciled
+
+        # Idle terminal sweep → the live AMS carries the configured slot → re-push.
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: self._idle_state_with(tray))
+        pushed = await spool_tagless.reconcile_bound_slot_identities(db_session, printer.id)
+        assert pushed == 1
+        env.apply.assert_awaited_once()
+        assert (printer.id, 0, 0) in spool_tagless._identity_reconciled
+
+    async def test_unconfigured_slot_skipped(self, db_session, printer_factory, env, monkeypatch):
+        """A bound slot with no tray_info_idx (not configured) is skipped — nothing to
+        reconcile — and the resolver is never consulted."""
+        printer = await printer_factory()
+        await self._seed_bound_slot(db_session, printer.id)
+        resolver = AsyncMock(return_value=("GFG02", "GFSG02", None, 230, 270))
+        monkeypatch.setattr("backend.app.services.slicer_filament_resolver.resolve_slicer_filament", resolver)
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_client", lambda pid: _FakeClient())
+        tray = _tray("PETG")
+        tray["id"] = 0
+        tray["tray_info_idx"] = ""  # configured tray_type but no idx → not configured
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: self._idle_state_with(tray))
+        assert await spool_tagless.reconcile_bound_slot_identities(db_session, printer.id) == 0
+        resolver.assert_not_awaited()
+        env.apply.assert_not_awaited()
+
+    async def test_unreachable_printer_returns_zero_no_raise(self, db_session, printer_factory, env, monkeypatch):
+        """An unreachable printer (get_status raises) or a stateless one (None) yields
+        0 and never raises into the terminal callback."""
+        printer = await printer_factory()
+
+        def _boom(pid):
+            raise RuntimeError("offline")
+
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", _boom)
+        assert await spool_tagless.reconcile_bound_slot_identities(db_session, printer.id) == 0
+        env.apply.assert_not_awaited()
+
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: None)
+        assert await spool_tagless.reconcile_bound_slot_identities(db_session, printer.id) == 0
+        env.apply.assert_not_awaited()
+
 
 # --- F1: fresh-mint settle defer -------------------------------------------
 

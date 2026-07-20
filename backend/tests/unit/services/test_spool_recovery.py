@@ -20,6 +20,10 @@ from sqlalchemy import select
 
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
+
+# Imported at module level so the test-engine's create_all registers this new table
+# (conftest builds the schema from Base.metadata, not the models/__init__ list).
+from backend.app.models.recovery_escalation import RecoveryEscalation
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services import spool_recovery
@@ -1598,11 +1602,16 @@ async def test_unload_confirms_only_after_the_ams_returns_to_idle(
     db_session, printer_factory, install_settings, monkeypatch
 ):
     """A filament-change cycle observed going non-idle confirms only on its return
-    to idle — and NO load is published while the AMS is still busy."""
+    to idle — and NO load is published while the AMS is still busy.
+
+    The round BEGINS with the AMS idle (``ams_status_main=0``) so the W1 stuck-change
+    reset is a no-op (a wedged AMS at round-top is now the reset's domain, covered by
+    its own tests); it is the UNLOAD itself (``unload_stuck``) that drives the AMS
+    non-idle here, which is exactly what ``_confirm_unloaded`` must wait out."""
     install_settings(step_timeout_s=5.0)
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
-    state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
+    state = _make_state(tray_now=255, ams_status_main=0, trays=[_ams_tray(0), _ams_tray(1)])
     client = FakeClient(state, unload_stuck=True)  # the unload leaves the AMS busy
     busy_polls = {"n": 0}
 
@@ -1855,9 +1864,14 @@ async def test_identify_refusal_is_absorbed_by_the_settle_wait(
 
 def test_every_escalation_reason_has_operator_facing_copy():
     """No reason token may reach a notification without human-facing detail."""
-    for reason in ("no_eligible_spool", "candidate_loads_failed", "feed_path_blocked", "ams_drying", "unload_failed"):
+    for reason in ("no_eligible_spool", "candidate_loads_failed", "feed_path_blocked", "ams_drying"):
         assert reason in spool_recovery._ESCALATE_DETAIL
         assert spool_recovery._ESCALATE_DETAIL[reason].endswith("Left PAUSED for a human.")
+    # W1: the wedged-change reasons point the operator at the physical fix instead
+    # (the AMS is left paused regardless, but the copy names the part to inspect).
+    for reason in ("unload_failed", "stuck_reset_failed"):
+        assert reason in spool_recovery._ESCALATE_DETAIL
+        assert spool_recovery._ESCALATE_DETAIL[reason].endswith("(check the filament buffer/feeder).")
 
 
 # ===========================================================================
@@ -1888,3 +1902,280 @@ async def test_jam_attributed_to_live_tray_when_attr_carries_no_slot(
     db_session.expunge_all()
     assert (await db_session.get(Spool, on_tray1.id)).feed_fault_at is not None  # global tray 1 blamed
     assert (await db_session.get(Spool, on_tray0.id)).feed_fault_at is None
+
+
+# ===========================================================================
+# W1: stuck-change firmware reset (009-H2S 2026-07-20).
+#
+# After a feed fault the AMS can sit WEDGED mid filament-change (PAUSE +
+# ams_status_main non-idle) where it silently ignores unloads. The ONLY verb that
+# freed it live was a resume (the touchscreen CONTINUE). Every candidate round now
+# runs _reset_stuck_change FIRST.
+# ===========================================================================
+
+
+class _SelfHealClient(FakeClient):
+    """The reset resume fully self-heals: RUNNING, fault cleared, AMS idle, and the
+    pending change completed onto the jammed feeder (tray_now == 0). No swap needed."""
+
+    def resume_print(self):
+        self.calls.append(("resume",))
+        self._resume += 1
+        self.state.state = "RUNNING"
+        self.state.hms_errors = []  # fault cleared by the firmware
+        self.state.ams_status_main = 0  # change machine returned to idle
+        self.state.tray_now = 0  # the firmware finished loading the jammed slot
+        return True
+
+
+class _WedgedClient(FakeClient):
+    """The AMS ignores even the reset resume: the send is accepted but the state
+    machine never moves (still PAUSE, still non-idle) — a genuinely dead AMS."""
+
+    def resume_print(self):
+        self.calls.append(("resume",))
+        self._resume += 1
+        return True  # no state change
+
+
+async def test_incident_pin_resume_first_then_hung_self_pause_then_swap(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """THE W1 LIVE-INCIDENT PIN (009-H2S 2026-07-20): PAUSE + tray_now 255 +
+    ams_status_main 1 + a standing 0700_8010. The FIRST published command is the
+    reset RESUME (before any unload). The change stays hung RUNNING, so recovery
+    self-PAUSEs at the reset deadline, then the normal unload → select → load →
+    resume round runs and _succeed fires when the swap confirms. Zero human touch.
+
+    The base FakeClient IS the hung case: resume takes the printer RUNNING but
+    leaves ams_status_main / the fault / tray_now unchanged until we re-pause it."""
+    install_settings()
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    jammed = await _bind_spool(db_session, printer.id, 0, 0)  # jammed tray0
+    state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    assert task is not None
+    await task
+
+    published = [c for c in client.calls if c[0] in ("resume", "pause", "unload", "load")]
+    assert published[0] == ("resume",), f"the first published command must be the reset resume, got {published}"
+    r_idx = published.index(("resume",))
+    u_idx = published.index(("unload",))
+    assert r_idx < u_idx  # the reset resume precedes the first unload
+    assert ("pause",) in client.calls  # self-paused the hung change at the reset deadline
+    assert ("load", 1) in client.calls  # the swap round ran after the self-pause
+    assert state.state == "RUNNING"  # self-healed via the swap, no human
+
+    db_session.expunge_all()
+    refreshed = await db_session.get(PrintQueueItem, item.id)
+    assert refreshed.waiting_reason is None
+    assert json.loads(refreshed.ams_mapping) == [1, -1, -1, -1]  # swapped 0 → 1
+    assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None  # jammed left OOR (a real swap)
+
+
+async def test_reset_outcome_auto_refault_returns_ok_no_self_pause(monkeypatch):
+    """Reset (a): the firmware moves (RUNNING) then re-faults and auto-PAUSEs on its
+    own → 'ok', and recovery does NOT publish a self-pause."""
+    state = _make_state(tray_now=255, ams_status_main=1)
+
+    def _on_poll(n, st):
+        # After the loop has OBSERVED the resume take the printer RUNNING (poll 2),
+        # the firmware re-faults back to PAUSE on its own.
+        if n >= 3:
+            st.state = "PAUSE"
+
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client, on_poll=_on_poll)
+
+    verdict = await spool_recovery._reset_stuck_change(_incident(7, step_timeout_s=1.0), client)
+
+    assert verdict == "ok"
+    assert ("resume",) in client.calls  # the reset resume was published
+    assert ("pause",) not in client.calls  # (a) never self-pauses
+
+
+async def test_reset_recovered_self_heals_without_swap(db_session, printer_factory, install_settings, monkeypatch):
+    """Reset (b): the firmware reset fully self-heals (fault clears, RUNNING stable,
+    the change completed on the jammed feeder). Recovery ends success with NO swap:
+    the jammed spool's out-of-rotation flag (stamped at step 2) is cleared, the
+    per-job flap counter is incremented, and no unload/load is ever sent."""
+    install_settings(step_timeout_s=1.0)
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    jammed = await _bind_spool(db_session, printer.id, 0, 0)  # jammed tray0, OOR-marked at step 2
+    succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+    state = _make_state(tray_now=0, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
+    client = _SelfHealClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    assert task is not None
+    await task
+
+    assert not any(c[0] in ("unload", "load") for c in client.calls)  # NO swap performed
+    assert client.calls.count(("resume",)) == 1  # only the reset resume
+    assert state.state == "RUNNING"
+    assert spool_recovery._success_counts[(printer.id, "task-1")] == 1  # counted toward the flap cap
+    succeeded.assert_not_awaited()  # a no-swap self-heal never sends the swap-framed alert
+
+    db_session.expunge_all()
+    cleared = await db_session.get(Spool, jammed.id)
+    assert cleared.feed_fault_at is None  # OOR flag cleared (self-heal on the jammed feeder)
+    assert cleared.feed_fault_code is None
+    refreshed = await db_session.get(PrintQueueItem, item.id)
+    assert refreshed.waiting_reason is None
+    assert json.loads(refreshed.ams_mapping) == [0, -1, -1, -1]  # mapping unchanged (no swap)
+
+
+async def test_reset_never_moves_escalates_stuck_reset_failed(
+    db_session, printer_factory, install_settings, monkeypatch, caplog
+):
+    """Reset (d): the AMS ignores even the reset resume (state never leaves PAUSE +
+    non-idle) → recovery escalates the new stuck_reset_failed reason, never touching
+    the unload."""
+    install_settings(step_timeout_s=0.05)
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    _spy(monkeypatch, "on_spool_out_of_rotation")
+    state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
+    client = _WedgedClient(state)
+    _wire(monkeypatch, state, client)
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
+        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+        await task
+
+    assert ("resume",) in client.calls  # the reset was attempted
+    assert ("unload",) not in client.calls  # escalated before the unload
+    assert _escalated_reasons(caplog) == ["stuck_reset_failed"]
+    assert "buffer/feeder" in failed.call_args.kwargs["detail"]  # points at the physical fix
+    assert state.state == "PAUSE"  # never resumed blind
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_FAILED
+
+
+async def test_reset_skipped_when_ams_idle(monkeypatch):
+    """An idle AMS at round-top: the reset is a no-op ('skipped') that publishes
+    nothing — the pre-W1 flow is byte-identical."""
+    state = _make_state(ams_status_main=0)  # idle
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    verdict = await spool_recovery._reset_stuck_change(_incident(7, step_timeout_s=1.0), client)
+
+    assert verdict == "skipped"
+    assert client.calls == []  # nothing published on an idle AMS
+
+
+async def test_stuck_reset_budget_spent_no_second_resume(monkeypatch):
+    """The reset budget is one per incident: a second wedged round publishes NO
+    second resume — it returns 'skipped' (the round then falls through to the unload
+    exactly as an idle-AMS round would)."""
+    state = _make_state(tray_now=255, ams_status_main=1)
+    client = _WedgedClient(state)  # resume never moves the state machine
+    _wire(monkeypatch, state, client)
+    incident = _incident(7, step_timeout_s=0.02)
+
+    v1 = await spool_recovery._reset_stuck_change(incident, client)
+    assert v1 == "fail"  # wedged: the reset did not free it
+    assert client.calls.count(("resume",)) == 1  # the first round published the reset
+
+    v2 = await spool_recovery._reset_stuck_change(incident, client)
+    assert v2 == "skipped"  # budget spent
+    assert client.calls.count(("resume",)) == 1  # NO second resume
+
+
+# ===========================================================================
+# W2: durable repeat-jam quarantine off the recovery_escalation ledger.
+# ===========================================================================
+
+
+async def test_two_escalations_within_window_quarantines(db_session, printer_factory, install_settings, monkeypatch):
+    """Two recovery escalations for one printer within _JAM_QUARANTINE_WINDOW_H
+    hours quarantine it, with failure_count == the in-window escalation count. The
+    first escalation (count 1) is under the threshold and does not."""
+    from backend.app.services import farm_policy
+
+    install_settings()
+    printer = await printer_factory()
+    _spy(monkeypatch, "on_spool_recovery_failed")
+    q = AsyncMock(return_value=True)
+    monkeypatch.setattr(farm_policy, "quarantine_printer", q)
+
+    incident = _incident(printer.id, step_timeout_s=0.05)
+    await spool_recovery._escalate(incident, "unload_failed")
+    q.assert_not_called()  # one escalation is under the threshold
+
+    await spool_recovery._escalate(incident, "stuck_reset_failed")
+    q.assert_awaited_once()
+    assert q.await_args.kwargs["failure_count"] == 2
+    assert "Repeated AMS jam" in q.await_args.args[2]  # positional reason text
+
+    db_session.expunge_all()
+    rows = (
+        (await db_session.execute(select(RecoveryEscalation).where(RecoveryEscalation.printer_id == printer.id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2  # both escalations durably recorded
+
+
+async def test_two_escalations_outside_window_no_quarantine(db_session, printer_factory, install_settings, monkeypatch):
+    """Escalations spread beyond the window do not accumulate: an old (25 h) row
+    plus a fresh one leaves only ONE in-window → no quarantine."""
+    from datetime import timedelta
+
+    from backend.app.services import farm_policy
+
+    install_settings()
+    printer = await printer_factory()
+    _spy(monkeypatch, "on_spool_recovery_failed")
+    q = AsyncMock(return_value=True)
+    monkeypatch.setattr(farm_policy, "quarantine_printer", q)
+
+    db_session.add(
+        RecoveryEscalation(
+            printer_id=printer.id,
+            created_at=datetime.utcnow() - timedelta(hours=25),  # outside the 24 h window
+            reason="unload_failed",
+            code="0700_8010",
+        )
+    )
+    await db_session.commit()
+
+    await spool_recovery._escalate(_incident(printer.id, step_timeout_s=0.05), "stuck_reset_failed")
+
+    q.assert_not_called()  # only one escalation is inside the window
+    db_session.expunge_all()
+    rows = (
+        (await db_session.execute(select(RecoveryEscalation).where(RecoveryEscalation.printer_id == printer.id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2  # both persisted, but only one is in-window
+
+
+async def test_abort_records_no_escalation_row(db_session, printer_factory, install_settings, monkeypatch):
+    """_abort (operator takeover) must NOT write a recovery_escalation row — a
+    takeover is not a give-up and must never count toward quarantine."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    state = _make_state(gcode_state="RUNNING")  # an external actor already resumed
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    await spool_recovery._abort(_incident(printer.id, step_timeout_s=0.05))
+
+    db_session.expunge_all()
+    rows = (
+        (await db_session.execute(select(RecoveryEscalation).where(RecoveryEscalation.printer_id == printer.id)))
+        .scalars()
+        .all()
+    )
+    assert rows == []  # abort never records an escalation

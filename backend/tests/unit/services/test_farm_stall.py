@@ -13,13 +13,14 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from backend.app.models.print_queue import PrintQueueItem
-from backend.app.services import farm_stall
+from backend.app.services import farm_stall, notify_dedup
 from backend.app.services.notification_service import notification_service
 
 pytestmark = pytest.mark.asyncio
 
 _GRACE_S = 30 * 60  # default farm_offline_stall_minutes = 30
 _PAUSE_GRACE_S = 15 * 60  # default farm_pause_stall_minutes = 15
+_W = farm_stall._ATTENTION_REMINDER_S  # attention-reminder window (3600 s)
 
 
 class _FakeState:
@@ -44,8 +45,10 @@ class _FakeManager:
 @pytest.fixture(autouse=True)
 def _clean_state():
     farm_stall._reset_state()
+    notify_dedup._reset_state()  # the attention reminders ride notify_dedup.allow()
     yield
     farm_stall._reset_state()
+    notify_dedup._reset_state()
 
 
 async def _add_printing(db, printer_id, pos=1):
@@ -355,6 +358,147 @@ class TestPauseStallWatch:
         assert AppSettings().farm_pause_stall_minutes == 15
 
 
+async def _add_paused_held(db, printer_id, reason, pos=1):
+    """A printing farm unit already carrying an ESCALATED hold token."""
+    it = await _add_printing(db, printer_id, pos=pos)
+    it.waiting_reason = reason
+    await db.commit()
+    await db.refresh(it)
+    return it
+
+
+class TestAttentionReminders:
+    """W3: an unresolved escalated hold on a still-PAUSEd printer re-fires its OWN
+    notification once per window until a human clears it (the 2026-07-20 5-hour
+    single-alert incident). First reminder lands ONE window after first-seen."""
+
+    async def test_first_tick_seeds_no_immediate_reminder(self, db_session):
+        await _add_paused_held(db_session, 7, "print_paused_stalled")
+        mgr = _FakeManager({7: True}, {7: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_print_paused_stalled", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W - 1)  # still inside window
+            mock_n.assert_not_awaited()
+
+    async def test_three_windows_three_reminders(self, db_session):
+        await _add_paused_held(db_session, 7, "print_paused_stalled")
+        mgr = _FakeManager({7: True}, {7: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_print_paused_stalled", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)  # seed only
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)  # reminder 1
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=2 * _W)  # reminder 2
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=3 * _W)  # reminder 3
+            assert mock_n.await_count == 3  # exactly one per elapsed window, none at seed
+
+    async def test_pause_ends_resets_then_new_incident_reminds(self, db_session):
+        item = await _add_paused_held(db_session, 7, "print_paused_stalled")
+        paused = _FakeManager({7: True}, {7: _FakeState("PAUSE")})
+        running = _FakeManager({7: True}, {7: _FakeState("RUNNING")})
+        with patch.object(notification_service, "on_print_paused_stalled", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=paused, now=0.0)  # seed
+            await farm_stall.check_attention_reminders(db_session, manager=paused, now=_W)  # reminder 1
+            assert mock_n.await_count == 1
+            # Pause ends → tracking resets (the key leaves the remindable condition).
+            await farm_stall.check_attention_reminders(db_session, manager=running, now=_W + 1)
+            assert (7, "print_paused_stalled") not in farm_stall._attention_first_seen
+            # A NEW pause incident re-seeds and reminds again a window later.
+            await farm_stall.check_attention_reminders(db_session, manager=paused, now=_W + 2)  # re-seed
+            await farm_stall.check_attention_reminders(db_session, manager=paused, now=2 * _W + 2)  # reminder 2
+            assert mock_n.await_count == 2
+        await db_session.refresh(item)
+        assert item.status == "printing"  # never terminal
+
+    async def test_non_escalated_pause_no_reminder(self, db_session):
+        # A benign hold token (not one of the escalated four) is never reminded.
+        await _add_paused_held(db_session, 7, "stagger_hold")
+        mgr = _FakeManager({7: True}, {7: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_print_paused_stalled", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=2 * _W)
+            mock_n.assert_not_awaited()
+        assert (7, "stagger_hold") not in farm_stall._attention_first_seen
+
+    async def test_none_waiting_reason_no_reminder(self, db_session):
+        await _add_printing(db_session, 7)  # waiting_reason is None
+        mgr = _FakeManager({7: True}, {7: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_print_paused_stalled", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_not_awaited()
+
+    async def test_running_printer_never_reminds(self, db_session):
+        await _add_paused_held(db_session, 7, "print_paused_stalled")
+        mgr = _FakeManager({7: True}, {7: _FakeState("RUNNING")})  # connected but not paused
+        with patch.object(notification_service, "on_print_paused_stalled", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=2 * _W)
+            mock_n.assert_not_awaited()
+
+    async def test_offline_printer_never_reminds(self, db_session):
+        await _add_paused_held(db_session, 7, "spool_jam_recovery_failed")
+        mgr = _FakeManager({7: False}, {7: _FakeState("PAUSE")})  # PAUSE but OFFLINE
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_not_awaited()
+
+    async def test_jam_reason_refires_spool_recovery_failed(self, db_session):
+        await _add_paused_held(db_session, 7, "spool_jam_recovery_failed")
+        mgr = _FakeManager({7: True}, {7: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_awaited_once()
+            assert mock_n.await_args.kwargs["is_feed_fault"] is True
+
+    async def test_runout_reason_refires_with_is_feed_fault_false(self, db_session):
+        await _add_paused_held(db_session, 8, "filament_runout_recovery_failed")
+        mgr = _FakeManager({8: True}, {8: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_awaited_once()
+            assert mock_n.await_args.kwargs["is_feed_fault"] is False
+
+    async def test_plate_vision_reason_refires_plate_not_empty(self, db_session):
+        await _add_paused_held(db_session, 9, "plate_not_empty_printer_detected")
+        mgr = _FakeManager({9: True}, {9: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_awaited_once()
+
+    async def test_notify_failure_does_not_abort_tick(self, db_session):
+        # One bad printer's notify blowing up must not stop the other's reminder.
+        await _add_paused_held(db_session, 7, "print_paused_stalled")
+        await _add_paused_held(db_session, 8, "print_paused_stalled", pos=2)
+        mgr = _FakeManager({7: True, 8: True}, {7: _FakeState("PAUSE"), 8: _FakeState("PAUSE")})
+
+        async def _boom(printer_id, *a, **k):
+            if printer_id == 7:
+                raise RuntimeError("boom")
+
+        with patch.object(notification_service, "on_print_paused_stalled", new=AsyncMock(side_effect=_boom)) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            # Both printers attempted (7 raised, 8 succeeded) — the tick survived.
+            assert mock_n.await_count == 2
+
+    async def test_reason_set_membership_pinned(self):
+        # async only to satisfy the module-level asyncio mark; no awaits needed.
+        expected = {
+            "spool_jam_recovery_failed",
+            "print_paused_stalled",
+            "filament_runout_recovery_failed",
+            "plate_not_empty_printer_detected",
+        }
+        assert set(farm_stall._ATTENTION_REASONS) == expected
+        # The dispatch dict IS the reason set — they cannot drift.
+        assert set(farm_stall._ATTENTION_DISPATCH) == farm_stall._ATTENTION_REASONS
+
+
 class TestSchedulerHookGuard:
     async def test_check_queue_survives_stall_watch_exception(self):
         """The scheduler-tick hook is guarded: a stall-watch exception must NOT
@@ -401,4 +545,30 @@ class TestSchedulerHookGuard:
             mock_session.return_value.__aenter__ = AsyncMock(return_value=mock_db)
             mock_session.return_value.__aexit__ = AsyncMock(return_value=False)
             # Must not raise despite the pause watch blowing up.
+            await scheduler.check_queue()
+
+    async def test_check_queue_survives_attention_watch_exception(self):
+        """The attention-reminder watch has its OWN guard: an exception in it must
+        not propagate out of check_queue."""
+        from unittest.mock import MagicMock
+
+        from backend.app.services.print_scheduler import PrintScheduler
+
+        scheduler = PrintScheduler()
+        empty = MagicMock()
+        empty.scalars.return_value.all.return_value = []
+        with (
+            patch("backend.app.services.print_scheduler.async_session") as mock_session,
+            patch("backend.app.services.farm_stall.check_stalled_prints", new=AsyncMock()),
+            patch("backend.app.services.farm_stall.check_paused_prints", new=AsyncMock()),
+            patch(
+                "backend.app.services.farm_stall.check_attention_reminders",
+                new=AsyncMock(side_effect=RuntimeError("boom")),
+            ),
+        ):
+            mock_db = AsyncMock()
+            mock_db.execute = AsyncMock(return_value=empty)
+            mock_session.return_value.__aenter__ = AsyncMock(return_value=mock_db)
+            mock_session.return_value.__aexit__ = AsyncMock(return_value=False)
+            # Must not raise despite the attention watch blowing up.
             await scheduler.check_queue()

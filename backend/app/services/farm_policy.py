@@ -340,6 +340,18 @@ async def on_terminal(
         if batch is None or batch.sku_file_id is None:
             return  # non-farm batch — leave it alone
 
+        # Terminal-transition hygiene (W4b): a farm unit reaching a terminal status
+        # must not keep a stale hold token. The 2026-07-20 incident left completed/
+        # cancelled rows flagged spool_jam_recovery_failed / printer_offline_stalled /
+        # print_paused_stalled forever. This hook is the single reaction point for
+        # EVERY farm terminal that flows through main.on_print_complete (archive +
+        # no-archive paths) and the scheduler dispatch-failure path
+        # (print_scheduler._fail_queue_item), so clearing here covers them all. Only
+        # touches this exact unit — a still-printing sibling keeps its own reason.
+        if item.waiting_reason is not None:
+            item.waiting_reason = None
+            await db.commit()
+
         if final_status == "completed":
             await _on_item_completed(db, batch, item, archive_data)
         elif final_status == "failed":

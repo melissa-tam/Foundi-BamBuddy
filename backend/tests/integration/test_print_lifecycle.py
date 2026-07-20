@@ -449,6 +449,44 @@ class TestPlateClearGate:
         env.notif.on_foreign_job_detected.assert_awaited()
         assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject_temp_c") == 33.0
 
+    @pytest.mark.asyncio
+    async def test_genuine_foreign_terminal_still_calls_resolver(self, test_engine):
+        """W5 scope guard: the eject short-circuit skips resolve_terminal_item ONLY for
+        eject jobs. A genuinely foreign terminal (NOT an eject) must still run the
+        resolver so the foreign branch is reached exactly as before — proving the
+        short-circuit did not swallow ordinary correlation."""
+        from contextlib import ExitStack
+
+        from backend.app.services import farm_correlation
+
+        resolver_spy = AsyncMock(wraps=farm_correlation.resolve_terminal_item)
+        tasks_before = set(asyncio.all_tasks())
+
+        with ExitStack() as stack:
+            env = self._setup_mocks(stack, test_engine)
+            stack.enter_context(patch("backend.app.services.farm_correlation.resolve_terminal_item", resolver_spy))
+            pid, _iid = await self._seed_printing_item(env.maker, serial="RSV-1", dispatch_subtask_id="DISPATCHED-1")
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "local.gcode",
+                    "subtask_name": "OperatorLocalPrint",
+                    "subtask_id": "FOREIGN-9",  # != DISPATCHED-1 → foreign, and NOT an eject
+                    "timelapse_was_active": False,
+                    "last_layer_num": 20,
+                    "last_progress": 88.0,
+                },
+            )
+
+            await self._settle_foreign(tasks_before)
+
+        # The resolver WAS consulted for a non-eject terminal (foreign branch intact).
+        resolver_spy.assert_awaited()
+
 
 class TestEjectJobCallbacks:
     """C2: a server-dispatched eject sweep (a PendingEject, NO queue item, NO
@@ -814,6 +852,141 @@ class TestEjectJobCallbacks:
             await self._settle(tasks_before)
 
         sweep.assert_awaited_once_with(pid)
+
+    @pytest.mark.asyncio
+    async def test_registry_eject_skips_correlation_no_false_foreign_or_archive_warning(
+        self, test_engine, capture_logs
+    ):
+        """W5: a registry-matched eject terminal never calls resolve_terminal_item (so
+        it cannot log the false-FOREIGN warning for the farm's own sweep) and skips the
+        archive lookup (which always misses for a sweep, so no "Could not find archive"
+        warning). farm_policy.on_terminal still finalises the sweep as 'completed'."""
+        from contextlib import ExitStack
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from backend.app.services import farm_correlation
+        from backend.app.services.bambu_ftp import DeleteResult
+        from backend.app.services.eject import remote
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await self._seed_printer(maker, "EJ-NOCORR")
+        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 2))
+        resolver_spy = AsyncMock(wraps=farm_correlation.resolve_terminal_item)
+        tasks_before = set(asyncio.all_tasks())
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch("backend.app.main.async_session", maker))
+                stack.enter_context(patch("backend.app.core.database.async_session", maker))
+                stack.enter_context(patch("backend.app.services.farm_correlation.resolve_terminal_item", resolver_spy))
+                mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+                mock_notif.on_print_complete = AsyncMock()
+                mock_notif.on_queue_completed = AsyncMock()
+                mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+                stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+                mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+                mock_ws.send_print_complete = AsyncMock()
+                mock_ws.broadcast = AsyncMock()
+                stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+                mock_del = stack.enter_context(
+                    patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
+                )
+                mock_del.return_value = DeleteResult.DELETED
+                farm_hook = stack.enter_context(
+                    patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
+                )
+
+                from backend.app.main import on_print_complete
+
+                await on_print_complete(
+                    pid,
+                    {
+                        "status": "completed",
+                        "filename": "eject_production_item2.gcode.3mf",
+                        "subtask_name": "eject_production_item2",
+                        "subtask_id": "SUB-E",
+                        "timelapse_was_active": False,
+                        "last_layer_num": 0,
+                        "last_progress": 0,
+                    },
+                )
+                await self._settle(tasks_before)
+
+            # The resolver was never consulted for our own sweep → no false FOREIGN.
+            resolver_spy.assert_not_awaited()
+            warnings = " ".join(r.getMessage() for r in capture_logs.get_warnings())
+            assert "FOREIGN" not in warnings, warnings
+            assert "Could not find archive" not in warnings, warnings
+            # The sweep was still finalised (un-rewritten 'completed').
+            farm_hook.assert_awaited_once()
+            assert farm_hook.await_args.args[3] == "completed"
+        finally:
+            remote.pop_pending_eject(pid)
+
+    @pytest.mark.asyncio
+    async def test_named_eject_empty_registry_skips_correlation_and_archive_warning(self, test_engine, capture_logs):
+        """W5 + W1 name evidence: an eject-NAMED terminal with an EMPTY registry
+        (is_eject_job_name path — a restart lost the registry) is still recognised as
+        our sweep before correlation. resolve_terminal_item is not called and no
+        FOREIGN / no "Could not find archive" warning fires; the farm hook still runs."""
+        from contextlib import ExitStack
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from backend.app.services import farm_correlation
+        from backend.app.services.bambu_ftp import DeleteResult
+        from backend.app.services.eject import remote
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await self._seed_printer(maker, "EJ-NAME-NOCORR")
+        assert remote.peek_pending_eject(pid) is None  # empty registry — only the NAME identifies it
+        resolver_spy = AsyncMock(wraps=farm_correlation.resolve_terminal_item)
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            stack.enter_context(patch("backend.app.main.async_session", maker))
+            stack.enter_context(patch("backend.app.core.database.async_session", maker))
+            stack.enter_context(patch("backend.app.services.farm_correlation.resolve_terminal_item", resolver_spy))
+            mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+            mock_notif.on_print_complete = AsyncMock()
+            mock_notif.on_queue_completed = AsyncMock()
+            mock_notif.on_foreign_job_detected = AsyncMock()
+            mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+            stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+            mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+            mock_ws.send_print_complete = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+            stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+            mock_del = stack.enter_context(
+                patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
+            )
+            mock_del.return_value = DeleteResult.DELETED
+            farm_hook = stack.enter_context(
+                patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
+            )
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "eject_production_item2.gcode.3mf",
+                    "subtask_name": "eject_production_item2",
+                    "subtask_id": "FOREIGN-SUB",  # not a registry id — name carries the identification
+                    "timelapse_was_active": False,
+                    "last_layer_num": 0,
+                    "last_progress": 0,
+                },
+            )
+            await self._settle(tasks_before)
+
+        resolver_spy.assert_not_awaited()
+        warnings = " ".join(r.getMessage() for r in capture_logs.get_warnings())
+        assert "FOREIGN" not in warnings, warnings
+        assert "Could not find archive" not in warnings, warnings
+        mock_notif.on_foreign_job_detected.assert_not_awaited()
+        farm_hook.assert_awaited_once()
+        assert farm_hook.await_args.args[3] == "completed"
 
 
 class TestPrintCompleteLogic:

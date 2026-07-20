@@ -125,10 +125,12 @@ _FRESH_ROLL_PROMPT_USED_FRAC = 0.7
 _fresh_prompt_unanswered: set[tuple[int, int, int]] = set()
 
 # (printer_id, ams_id, tray_id) of slots whose live identity has been EVALUATED
-# against the resolver this process (E3) — either found converged or re-pushed once.
-# A stale spool row can keep re-publishing a GENERIC id that splits the firmware's
-# auto-refill backup group; the reconcile corrects it ONCE per slot per process, so a
-# divergence can never loop and a converged slot costs nothing on later pushes.
+# against the resolver this process (E3/W6) — either found converged or re-pushed once.
+# A stale spool row can keep re-publishing an identity (a GENERIC id, or divergent
+# nozzle temps) that splits the firmware's auto-refill backup group; the reconcile
+# corrects it ONCE per slot per process, so a divergence can never loop and a fully
+# converged slot costs nothing on later pushes. Convergence is the WHOLE wire identity
+# the firmware groups on — tray_info_idx AND both nozzle temps — not tray_info_idx alone.
 _identity_reconciled: set[tuple[int, int, int]] = set()
 
 
@@ -979,17 +981,44 @@ def _printer_busy(printer_id: int) -> bool:
         return True
 
 
+def _live_nozzle_temp(tray: dict, key: str) -> int | None:
+    """A live tray's reported nozzle temperature as an int, or None when unset.
+
+    Mirrors ``spool_tag_matcher.parse_tray_fields``'s convention: a missing,
+    unparseable, or ZERO value is "unset" (the firmware reports 0 for an
+    unconfigured temp). An unset temp is no evidence of divergence for the identity
+    reconcile — only a temp the firmware POSITIVELY reports can diverge.
+    """
+    try:
+        v = int(tray.get(key))
+    except (TypeError, ValueError):
+        return None
+    return v or None
+
+
+def _temp_diverges(resolved_temp: int | None, live_temp: int | None) -> bool:
+    """True only when the firmware POSITIVELY reports a nozzle temp differing from the
+    resolver's. A resolver that produced no temp, or a slot that reported none this
+    push, is not divergence on that dimension (the id / other temp still can be)."""
+    return resolved_temp is not None and live_temp is not None and int(resolved_temp) != live_temp
+
+
 async def _maybe_reconcile_slot_identity(
     db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, tray: dict, spool: Spool
 ) -> bool:
-    """One-shot re-push when a bound slot's LIVE identity diverges from the resolver (E3).
+    """One-shot re-push when a bound slot's LIVE identity diverges from the resolver (E3/W6).
 
-    The rebind branch is the natural observation point: the slot is bound,
-    configured, and the firmware has just told us what it currently holds. When the
-    live ``tray_info_idx`` differs from what the resolver now composes for the bound
-    spool — the 011-H2S state where trays 1-2 sat on ``GFG99`` while 3-4 were
-    ``GFG02``, splitting the auto-refill backup group — re-push the slot config once
-    so the fleet converges without a migration or a repair tool.
+    The rebind branch is one natural observation point (the slot is bound,
+    configured, and the firmware has just told us what it holds); the idle
+    terminal-callback sweep (:func:`reconcile_bound_slot_identities`) is the other.
+    Convergence is compared across the WHOLE wire identity the firmware's auto-refill
+    backup group keys on — ``tray_info_idx`` AND both nozzle temps — not
+    ``tray_info_idx`` alone: the 011-H2S state had trays on the right ``GFG02`` id but
+    STALE 220/260 temps beside a 230/270 peer, which a tray_info_idx-only check
+    declared converged (burning the one shot without ever healing the split group). A
+    temp the firmware did not report this push (missing/0 == unset) is no evidence of
+    divergence and never forces a push. When ANY dimension diverges, re-push the slot
+    config once so the fleet converges without a migration or a repair tool.
 
     Gated three ways: the printer must be IDLE (a config write mid-print is exactly
     what the AMS-write doctrine forbids), the client must not be refusing AMS writes
@@ -1005,7 +1034,7 @@ async def _maybe_reconcile_slot_identity(
     try:
         from backend.app.services.slicer_filament_resolver import resolve_slicer_filament
 
-        resolved, _setting_id, _sub_brand, _tmin, _tmax = await resolve_slicer_filament(
+        resolved, _setting_id, _sub_brand, r_tmin, r_tmax = await resolve_slicer_filament(
             db=db,
             current_user=None,
             slicer_filament=spool.slicer_filament,
@@ -1015,12 +1044,19 @@ async def _maybe_reconcile_slot_identity(
             nozzle_temp_min=spool.nozzle_temp_min,
             nozzle_temp_max=spool.nozzle_temp_max,
         )
-        live = (tray.get("tray_info_idx") or "").strip()
-        if not resolved or resolved == live:
-            # Nothing resolvable, or the slot already carries it: the reconcile is
-            # DONE for this slot. Consuming the shot here is what keeps a converged
-            # fleet (the steady state) at one resolver call per slot per process
-            # rather than one per AMS push.
+        live_idx = (tray.get("tray_info_idx") or "").strip()
+        live_tmin = _live_nozzle_temp(tray, "nozzle_temp_min")
+        live_tmax = _live_nozzle_temp(tray, "nozzle_temp_max")
+        converged = (
+            resolved == live_idx
+            and not _temp_diverges(r_tmin, live_tmin)
+            and not _temp_diverges(r_tmax, live_tmax)
+        )
+        if not resolved or converged:
+            # Nothing resolvable, or the slot already carries the whole identity: the
+            # reconcile is DONE for this slot. Consuming the shot here is what keeps a
+            # converged fleet (the steady state) at one resolver call per slot per
+            # process rather than one per AMS push.
             _identity_reconciled.add(key)
             return False
         if _printer_busy(printer_id):
@@ -1040,12 +1076,17 @@ async def _maybe_reconcile_slot_identity(
             return False
         _identity_reconciled.add(key)  # one shot, armed BEFORE the push so it cannot loop
         logger.info(
-            "Reconciling slot identity on printer %d AMS%d-T%d: live=%r -> %r (spool %d)",
+            "Reconciling slot identity on printer %d AMS%d-T%d: live idx=%r temps=%s/%s -> "
+            "idx=%r temps=%s/%s (spool %d)",
             printer_id,
             ams_id,
             tray_id,
-            live,
+            live_idx,
+            live_tmin,
+            live_tmax,
             resolved,
+            r_tmin,
+            r_tmax,
             spool.id,
         )
         await _push_config(db, spool, printer_id, ams_id, tray_id, tray)
@@ -1053,6 +1094,71 @@ async def _maybe_reconcile_slot_identity(
     except Exception:  # noqa: BLE001 — a reconcile failure must not change the rebind outcome
         logger.exception("Slot-identity reconcile failed for printer %d AMS%d-T%d", printer_id, ams_id, tray_id)
         return False
+
+
+async def reconcile_bound_slot_identities(db: AsyncSession, printer_id: int) -> int:
+    """Idle sweep: re-push every bound+configured slot whose live identity diverges (E3/W6).
+
+    The SECOND call site for :func:`_maybe_reconcile_slot_identity` (one
+    implementation). ``handle_tagless_slot``'s rebind branch only reaches the
+    reconcile from an AMS-change push, and on a busy farm those pushes overwhelmingly
+    arrive WHILE printing — so the idle gate defers every one and a divergent slot
+    (011-H2S: tray_info_idx / stale-temps split) never gets its idle evaluation.
+    Called from the printer-terminal callback, where the printer is idle by
+    construction, this iterates the printer's live AMS trays and runs the same
+    once-per-process reconcile on every slot that is bound (a :class:`SpoolAssignment`)
+    and configured (non-empty ``tray_type`` AND ``tray_info_idx``).
+
+    Never raises (module never-crash-guard style); returns 0 on any unavailability
+    (unreachable printer, no merged state). Returns the number of slots re-pushed.
+    """
+    pushed = 0
+    try:
+        state = printer_manager.get_status(printer_id)
+    except Exception:  # noqa: BLE001 — an unreachable printer reconciles nothing
+        return 0
+    if state is None or not getattr(state, "raw_data", None):
+        return 0
+    ams = state.raw_data.get("ams")
+    if isinstance(ams, dict):
+        ams = ams.get("ams", [])
+    try:
+        for unit in ams or []:
+            if not isinstance(unit, dict):
+                continue
+            try:
+                ams_id = int(unit.get("id", -1))
+            except (TypeError, ValueError):
+                continue
+            for tray in unit.get("tray", []) or []:
+                if not isinstance(tray, dict):
+                    continue
+                if not (tray.get("tray_type") or "").strip():
+                    continue  # not configured — nothing to reconcile
+                if not (tray.get("tray_info_idx") or "").strip():
+                    continue  # not configured
+                try:
+                    tray_id = int(tray.get("id", -1))
+                except (TypeError, ValueError):
+                    continue
+                res = await db.execute(
+                    select(SpoolAssignment)
+                    .options(selectinload(SpoolAssignment.spool))
+                    .where(
+                        SpoolAssignment.printer_id == printer_id,
+                        SpoolAssignment.ams_id == ams_id,
+                        SpoolAssignment.tray_id == tray_id,
+                    )
+                )
+                assignment = res.scalar_one_or_none()
+                spool = assignment.spool if assignment is not None else None
+                if spool is None:
+                    continue  # not bound
+                if await _maybe_reconcile_slot_identity(db, printer_id, ams_id, tray_id, tray, spool):
+                    pushed += 1
+    except Exception:  # noqa: BLE001 — a farm-side sweep must never break the terminal callback
+        logger.exception("reconcile_bound_slot_identities failed for printer %d", printer_id)
+    return pushed
 
 
 async def handle_tagless_slot(
