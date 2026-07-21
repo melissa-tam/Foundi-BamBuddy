@@ -849,6 +849,14 @@ export default {
       cooling: '正在冷卻至 {{threshold}}°C',
       awaitingPlateClear: '等待清理列印板',
     },
+    ejectPhase: {
+      building: '彈出：正在產生…',
+      uploading: '彈出：上傳中 {{pct}} %',
+      uploadingNoPct: '彈出：上傳中…',
+      sent: '彈出：已傳送',
+      sweeping: '彈出：清掃中…',
+      failed: '彈出失敗',
+    },
     // Farm production context surfaced on the printer card (Phase 3, F2).
     farm: {
       run: '執行：{{name}}',
@@ -1641,6 +1649,15 @@ export default {
       history: '歷史',
     },
     // Status
+    phase: {
+      assigned: '已指派',
+      uploading: '上傳中 {{pct}} %',
+      uploadingNoPct: '上傳中…',
+      sent: '已傳送',
+      preparing: '準備中…',
+      printing: '列印中',
+      failed: '失敗',
+    },
     status: {
       pending: '等待中',
       waiting: '等待中',

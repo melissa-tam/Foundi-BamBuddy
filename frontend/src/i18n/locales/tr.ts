@@ -849,6 +849,14 @@ export default {
       cooling: '{{threshold}}°C\'ye soğutuluyor',
       awaitingPlateClear: 'Plakanın temizlenmesi bekleniyor',
     },
+    ejectPhase: {
+      building: 'Çıkarma: hazırlanıyor…',
+      uploading: 'Çıkarma: yükleniyor {{pct}} %',
+      uploadingNoPct: 'Çıkarma: yükleniyor…',
+      sent: 'Çıkarma: gönderildi',
+      sweeping: 'Çıkarma: süpürülüyor…',
+      failed: 'Çıkarma başarısız',
+    },
     // Farm production context surfaced on the printer card (Phase 3, F2).
     farm: {
       run: 'Çalışma: {{name}}',
@@ -1641,6 +1649,15 @@ export default {
       history: 'Geçmiş',
     },
     // Durum
+    phase: {
+      assigned: 'Atandı',
+      uploading: 'Yükleniyor {{pct}} %',
+      uploadingNoPct: 'Yükleniyor…',
+      sent: 'Gönderildi',
+      preparing: 'Hazırlanıyor…',
+      printing: 'Yazdırılıyor',
+      failed: 'Başarısız',
+    },
     status: {
       pending: 'Beklemede',
       waiting: 'Bekliyor',

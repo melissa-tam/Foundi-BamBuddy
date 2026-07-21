@@ -849,6 +849,14 @@ export default {
       cooling: 'Resfriando até {{threshold}}°C',
       awaitingPlateClear: 'Aguardando liberação da placa',
     },
+    ejectPhase: {
+      building: 'Ejeção: preparando…',
+      uploading: 'Ejeção: enviando {{pct}} %',
+      uploadingNoPct: 'Ejeção: enviando…',
+      sent: 'Ejeção: enviada',
+      sweeping: 'Ejeção: varrendo…',
+      failed: 'Falha na ejeção',
+    },
     // Farm production context surfaced on the printer card (Phase 3, F2).
     farm: {
       run: 'Série: {{name}}',
@@ -1641,6 +1649,15 @@ export default {
       history: 'Histórico',
     },
     // Status
+    phase: {
+      assigned: 'Atribuído',
+      uploading: 'Enviando {{pct}} %',
+      uploadingNoPct: 'Enviando…',
+      sent: 'Enviado',
+      preparing: 'Preparando…',
+      printing: 'Imprimindo',
+      failed: 'Falhou',
+    },
     status: {
       pending: 'Pendente',
       waiting: 'Aguardando',

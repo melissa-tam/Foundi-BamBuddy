@@ -27,6 +27,7 @@ from backend.app.services.bambu_ftp import (
     with_ftp_retry,
 )
 from backend.app.services.dispatch_kick import DispatchKick, dispatch_kick
+from backend.app.services.eject import progress as dispatch_progress
 from backend.app.services.farm_staging import build_staged_reason, maybe_release_periodic
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
@@ -2355,6 +2356,16 @@ class PrintScheduler:
         # leave e.g. a capability-block waiting_reason on a now-failed row.
         item.waiting_reason = None
         await db.commit()
+        # Dispatch-progress telemetry: EVERY dispatch-time failure funnels through
+        # here, so a single emit covers all failure paths (C4-backend).
+        dispatch_progress.emit_queue_item_status(
+            item_id=item.id,
+            batch_id=item.batch_id,
+            printer_id=item.printer_id,
+            status="failed",
+            phase="failed",
+            detail=error_message,
+        )
         try:
             from backend.app.services.farm_policy import on_terminal
 
@@ -2449,6 +2460,16 @@ class PrintScheduler:
         - library_file_id: Print from a library file (file manager)
         """
         logger.info("Starting queue item %s", item.id)
+
+        # Dispatch-progress telemetry (C3): the unit is picked and dispatch is
+        # starting. `uploading`/`sent` follow below; failures emit via _fail_queue_item.
+        dispatch_progress.emit_queue_item_status(
+            item_id=item.id,
+            batch_id=item.batch_id,
+            printer_id=item.printer_id,
+            status="pending",
+            phase="assigned",
+        )
 
         # Get printer first (needed for both paths)
         result = await db.execute(select(Printer).where(Printer.id == item.printer_id))
@@ -2759,6 +2780,25 @@ class PrintScheduler:
         # An FTPS upload makes the H2S firmware transiently report sdcard=false;
         # mark the printer upload-in-flight so the USB-drop verifier treats that edge
         # as a dispatch blip, not a genuine drop.
+        # Dispatch-progress telemetry (C3): the FTP callback fires on the executor
+        # thread, so marshal each tick back onto the loop before emitting. The
+        # callback must never raise (a raise aborts the upload).
+        _loop = asyncio.get_running_loop()
+        _prog_item_id, _prog_batch_id, _prog_printer_id = item.id, item.batch_id, item.printer_id
+
+        def _on_upload_progress(uploaded_bytes: int, total_bytes: int) -> None:
+            pct = round(uploaded_bytes / total_bytes * 100.0, 1) if total_bytes else None
+            _loop.call_soon_threadsafe(
+                lambda: dispatch_progress.emit_queue_item_status(
+                    item_id=_prog_item_id,
+                    batch_id=_prog_batch_id,
+                    printer_id=_prog_printer_id,
+                    status="pending",
+                    phase="uploading",
+                    progress_pct=pct,
+                )
+            )
+
         try:
             async with upload_in_flight(printer.id):
                 if ftp_retry_enabled:
@@ -2770,6 +2810,7 @@ class PrintScheduler:
                         remote_path,
                         socket_timeout=ftp_timeout,
                         printer_model=printer.model,
+                        progress_callback=_on_upload_progress,
                         max_retries=ftp_retry_count,
                         retry_delay=ftp_retry_delay,
                         operation_name=f"Upload print to {printer.name}",
@@ -2782,6 +2823,7 @@ class PrintScheduler:
                         remote_path,
                         socket_timeout=ftp_timeout,
                         printer_model=printer.model,
+                        progress_callback=_on_upload_progress,
                     )
         except Exception as e:
             uploaded = False
@@ -2912,6 +2954,16 @@ class PrintScheduler:
         if started:
             logger.info("Queue item %s: Print started successfully - %s", item.id, filename)
 
+            # Dispatch-progress telemetry (C3): the start command was accepted. The
+            # watchdog emits `preparing`/`printing` as the printer transitions.
+            dispatch_progress.emit_queue_item_status(
+                item_id=item.id,
+                batch_id=item.batch_id,
+                printer_id=item.printer_id,
+                status="printing",
+                phase="sent",
+            )
+
             # Correlation (Phase 1, P1-A): stamp the subtask_id minted for THIS
             # dispatch so a terminal MQTT status can be bound back to this exact
             # queue item (not a printer_id-only lookup). start_print set it on the
@@ -2949,6 +3001,7 @@ class PrintScheduler:
                         pre_state,
                         pre_subtask_id,
                         pre_gcode_file,
+                        item.batch_id,
                     ),
                     name=f"watchdog-print-start-{item.id}",
                 )
@@ -3021,6 +3074,7 @@ class PrintScheduler:
         pre_state: str,
         pre_subtask_id: str | None = None,
         pre_gcode_file: str | None = None,
+        batch_id: int | None = None,
         timeout: float = 90.0,
         phase_b_timeout: float = 180.0,
         poll_interval: float = 3.0,
@@ -3054,6 +3108,22 @@ class PrintScheduler:
         """
         last_status = None
         landed_on_subtask = False
+        # Dispatch-progress telemetry (C3): emit `preparing`/`printing` the FIRST time
+        # each is observed (deduped here so a phase is broadcast once, not per poll).
+        _emitted_phases: set[str] = set()
+
+        def _emit_observed_phase(state: str | None) -> None:
+            ph = dispatch_progress.phase_for_observed_state(state)
+            if ph and ph not in _emitted_phases:
+                _emitted_phases.add(ph)
+                dispatch_progress.emit_queue_item_status(
+                    item_id=queue_item_id,
+                    batch_id=batch_id,
+                    printer_id=printer_id,
+                    status="printing",
+                    phase=ph,
+                )
+
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_interval)
@@ -3066,6 +3136,7 @@ class PrintScheduler:
                 scheduler._release_dispatch_hold(printer_id)
                 return
             last_status = status
+            _emit_observed_phase(status.state)
             if status.state in _ACTIVE_PRINT_STATES:
                 # Printer is actively processing the job — release the
                 # post-dispatch hold so the next pending item for this printer
@@ -3094,6 +3165,7 @@ class PrintScheduler:
                     scheduler._release_dispatch_hold(printer_id)
                     return
                 last_status = status
+                _emit_observed_phase(status.state)
                 if status.state in _ACTIVE_PRINT_STATES:
                     scheduler._release_dispatch_hold(printer_id)
                     return

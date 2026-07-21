@@ -854,6 +854,14 @@ export default {
       cooling: 'Cooling to {{threshold}}°C',
       awaitingPlateClear: 'Awaiting plate clear',
     },
+    ejectPhase: {
+      building: 'Ejecting: building…',
+      uploading: 'Ejecting: uploading {{pct}} %',
+      uploadingNoPct: 'Ejecting: uploading…',
+      sent: 'Ejecting: sent',
+      sweeping: 'Ejecting: sweeping…',
+      failed: 'Eject failed',
+    },
     // Farm production context surfaced on the printer card (Phase 3, F2).
     farm: {
       run: 'Run: {{name}}',
@@ -1653,6 +1661,15 @@ export default {
       history: 'History',
     },
     // Status
+    phase: {
+      assigned: 'Assigned',
+      uploading: 'Uploading {{pct}} %',
+      uploadingNoPct: 'Uploading…',
+      sent: 'Sent',
+      preparing: 'Preparing…',
+      printing: 'Printing',
+      failed: 'Failed',
+    },
     status: {
       pending: 'Pending',
       waiting: 'Waiting',

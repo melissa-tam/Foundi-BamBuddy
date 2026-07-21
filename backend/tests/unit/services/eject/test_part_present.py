@@ -82,11 +82,12 @@ def _read_plate_gcode(path, plate_id=1):
 
 
 class TestBuildPartPresentEjectFile:
-    def test_content_is_part_present_motion_only(self):
+    @pytest.mark.asyncio
+    async def test_content_is_part_present_motion_only(self):
         src = _make_3mf()
         out = None
         try:
-            out = build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            out = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
             gcode = _read_plate_gcode(out)
         finally:
             src.unlink(missing_ok=True)
@@ -112,11 +113,12 @@ class TestBuildPartPresentEjectFile:
         # The original print body is gone (fully replaced).
         assert "E1" not in gcode
 
-    def test_md5_sidecar_recomputed(self):
+    @pytest.mark.asyncio
+    async def test_md5_sidecar_recomputed(self):
         src = _make_3mf()
         out = None
         try:
-            out = build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            out = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
             with zipfile.ZipFile(out, "r") as zf:
                 gcode_bytes = zf.read("Metadata/plate_1.gcode")
                 md5 = zf.read("Metadata/plate_1.gcode.md5").decode("ascii")
@@ -129,18 +131,20 @@ class TestBuildPartPresentEjectFile:
         assert md5 == hashlib.md5(gcode_bytes, usedforsecurity=False).hexdigest().upper()
         assert md5 != "STALE"
 
-    def test_missing_header_raises(self):
+    @pytest.mark.asyncio
+    async def test_missing_header_raises(self):
         src = _make_3mf("; EXECUTABLE_BLOCK_START\nG1 X1\n; EXECUTABLE_BLOCK_END\n")
         try:
             with pytest.raises(EjectGenerationError):
-                build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+                await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
         finally:
             src.unlink(missing_ok=True)
 
-    def test_built_artifact_reports_zero_slice_usage(self):
-        # The motion-only eject file extrudes nothing. repack_3mf_with_gcode copies
-        # the donor's slice_info.config verbatim, so the builder must additionally
-        # zero it — otherwise the archive parser / usage tracker / queue card book
+    @pytest.mark.asyncio
+    async def test_built_artifact_reports_zero_slice_usage(self):
+        # The motion-only eject file extrudes nothing. The one-pass build copies the
+        # donor's slice_info.config verbatim EXCEPT for its usage figures, which it
+        # zeroes — otherwise the archive parser / usage tracker / queue card book
         # the donor's ~407 g and 16735 s against a sweep that used none.
         src = _make_3mf(slice_info=_SLICE_INFO_NONZERO)
         out = None
@@ -150,7 +154,7 @@ class TestBuildPartPresentEjectFile:
             assert any(s["used_g"] > 0 for s in donor_slots)
             assert extract_print_time_from_3mf(src, plate_id=1) == 16735
 
-            out = build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            out = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
             slots = extract_filament_usage_from_3mf(out, plate_id=1)
             prediction = extract_print_time_from_3mf(out, plate_id=1)
         finally:
@@ -162,7 +166,8 @@ class TestBuildPartPresentEjectFile:
         assert all(s["used_g"] == 0 for s in slots)
         assert prediction == 0
 
-    def test_h2c_dual_nozzle_home_flows_through_shared_path(self):
+    @pytest.mark.asyncio
+    async def test_h2c_dual_nozzle_home_flows_through_shared_path(self):
         # The part-present builder flows through the SAME generator + validator as
         # production injection: an H2C build must carry the dual-nozzle
         # parameterized homes (007-H2C stall-loop incident, 2026-07-12) and pass
@@ -171,7 +176,7 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf()
         out = None
         try:
-            out = build_part_present_eject_file(src, 1, _profile(), H2C_GEOMETRY)
+            out = await build_part_present_eject_file(src, 1, _profile(), H2C_GEOMETRY)
             gcode = _read_plate_gcode(out)
         finally:
             src.unlink(missing_ok=True)

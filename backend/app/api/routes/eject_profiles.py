@@ -41,6 +41,7 @@ from backend.app.schemas.eject_profile import (
     EjectProfileUpdate,
     EjectValidationResponse,
 )
+from backend.app.services.eject.build_cache import EjectBuildError, get_or_build_eject_file
 from backend.app.services.eject.generator import (
     BLOCK_END_MARKER,
     EjectGenerationError,
@@ -51,11 +52,7 @@ from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
 from backend.app.utils.printer_models import canon_model, full_home_lines
-from backend.app.utils.threemf_tools import (
-    read_plate_gcode_header,
-    repack_3mf_with_gcode,
-    zero_slice_usage_metadata,
-)
+from backend.app.utils.threemf_tools import read_plate_gcode_header
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +282,7 @@ async def preview_eject_profile(
     )
 
 
-def _build_dryrun_3mf(
+async def _build_dryrun_3mf(
     source_path: Path, plate_index: int, profile: EjectProfile, max_z: float, geometry: ModelGeometry
 ) -> Path:
     """Generate + validate the motion-only eject block and repack into a temp
@@ -301,10 +298,11 @@ def _build_dryrun_3mf(
     lives in the eject monitor), so nothing here could hang an ambient empty bed;
     the block self-completes via its FINISH epilogue.
 
-    The artifact's ``slice_info.config`` is zeroed (``zero_slice_usage_metadata``)
-    so this motion-only file reports ZERO filament / print-time usage — it extrudes
-    nothing, so no consumer (archive / usage tracker / queue card) should book the
-    donor's plate weight or prediction against it.
+    The one-pass build (``repack_3mf_eject`` via :func:`get_or_build_eject_file`)
+    replaces the plate G-code AND zeroes the donor's ``slice_info.config`` usage in a
+    single ZIP rewrite, OFF the event loop + cached, so this motion-only file reports
+    ZERO filament / print-time usage — no consumer books the donor's plate weight or
+    prediction against a sweep that extrudes nothing.
     """
     try:
         eject_block = generate_eject_gcode(profile, max_z, geometry)
@@ -318,13 +316,10 @@ def _build_dryrun_3mf(
         raise HTTPException(status_code=422, detail="Generated eject block is malformed")
 
     dryrun_gcode = _build_dryrun_gcode(source_path, plate_index, eject_block, geometry)
-    out_path = repack_3mf_with_gcode(source_path, plate_index, dryrun_gcode)
-    if out_path is None:
-        raise HTTPException(status_code=422, detail=f"Plate {plate_index} has no G-code to replace")
-    # Motion-only file: strip the donor's slice usage so no consumer books phantom
-    # grams / print time against a sweep that extrudes nothing.
-    zero_slice_usage_metadata(out_path)
-    return out_path
+    try:
+        return await get_or_build_eject_file(source_path, plate_index, dryrun_gcode)
+    except EjectBuildError as exc:
+        raise HTTPException(status_code=422, detail=f"Plate {plate_index} has no G-code to replace") from exc
 
 
 @router.post("/{profile_id}/dry-run")
@@ -339,7 +334,7 @@ async def dry_run_eject_profile(
     source_path = await _resolve_source_3mf(db, body.library_file_id)
     max_z = _read_max_z_or_422(source_path, body.plate_index)
 
-    out_path = _build_dryrun_3mf(source_path, body.plate_index, profile, max_z, geometry)
+    out_path = await _build_dryrun_3mf(source_path, body.plate_index, profile, max_z, geometry)
 
     safe_profile = re.sub(r"[^A-Za-z0-9_.-]+", "_", profile.name).strip("_") or "profile"
     safe_file = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(source_path).stem).strip("_") or "file"
@@ -420,7 +415,7 @@ async def dispatch_dry_run_eject_profile(
         )
 
     max_z = _read_max_z_or_422(source_path, body.plate_index)
-    out_path = _build_dryrun_3mf(source_path, body.plate_index, profile, max_z, geometry)
+    out_path = await _build_dryrun_3mf(source_path, body.plate_index, profile, max_z, geometry)
 
     try:
         file_bytes = out_path.read_bytes()

@@ -817,17 +817,33 @@ def list_gcode_plate_ids(source_path: Path) -> list[int]:
     return sorted(ids)
 
 
-def _write_repacked_3mf(source_path: Path, target_gcode: str, gcode_bytes: bytes) -> Path:
+_SLICE_INFO_NAME = "Metadata/slice_info.config"
+
+
+def _write_repacked_3mf(
+    source_path: Path,
+    target_gcode: str,
+    gcode_bytes: bytes,
+    *,
+    extra_replacements: dict[str, bytes] | None = None,
+) -> Path:
     """Copy `source_path` to a new temp 3MF with `target_gcode` replaced by
-    `gcode_bytes`.
+    `gcode_bytes` (and, optionally, each member in `extra_replacements` replaced
+    by its bytes) in a SINGLE zip pass.
 
     The printer validates the plate gcode against an embedded `<plate>.gcode.md5`
     sidecar (uppercase hex, no trailing newline); rewriting the gcode without
     refreshing this hash makes firmware reject the file at load (P1S: HMS
     0500-4003 "unable to parse"). The sidecar is recomputed from the exact bytes
     written — but only when the source already carries one (a file without the
-    sidecar shouldn't gain one). Every other member is copied verbatim, keeping
-    its original compression. Caller owns the returned temp file.
+    sidecar shouldn't gain one).
+
+    `extra_replacements` (member name → replacement bytes) lets an eject build
+    swap other members — e.g. the zeroed ``slice_info.config`` — in the SAME pass
+    instead of a second full ZIP rewrite (latency Phase C1). The plate-gcode +
+    ``.md5`` replacement always wins over an ``extra_replacements`` entry for the
+    same names. Every non-replaced member is copied verbatim, keeping its original
+    compression. Caller owns the returned temp file.
     """
     import tempfile
 
@@ -835,6 +851,7 @@ def _write_repacked_3mf(source_path: Path, target_gcode: str, gcode_bytes: bytes
     # Not a security hash — this reproduces Bambu's `.gcode.md5` sidecar format,
     # so flag it as non-security for the linters (ruff S324 / bandit B324).
     md5_value = hashlib.md5(gcode_bytes, usedforsecurity=False).hexdigest().upper().encode("ascii")
+    extra = extra_replacements or {}
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".3mf") as tmp:
         tmp_path = Path(tmp.name)
@@ -850,6 +867,8 @@ def _write_repacked_3mf(source_path: Path, target_gcode: str, gcode_bytes: bytes
                     zf_write.writestr(info, gcode_bytes)
                 elif item == md5_name:
                     zf_write.writestr(info, md5_value)
+                elif item in extra:
+                    zf_write.writestr(info, extra[item])
                 else:
                     zf_write.writestr(info, zf.read(item))
     except Exception:
@@ -862,7 +881,9 @@ def _write_repacked_3mf(source_path: Path, target_gcode: str, gcode_bytes: bytes
 def repack_3mf_with_gcode(source_path: Path, plate_id: int, new_gcode_content: str):
     """Write a temp copy of `source_path` whose plate `plate_id` G-code is
     REPLACED ENTIRELY by `new_gcode_content`, recomputing the `.gcode.md5`
-    sidecar. Used by the eject dry-run to ship an eject-only executable file.
+    sidecar. General-purpose plate-gcode swap (the hardware-ladder test-plate
+    tool ``tools/ladder/make_test_plate.py`` consumes this); the eject/dry-run
+    build uses :func:`repack_3mf_eject`, which additionally zeroes slice usage.
 
     Returns the temp file :class:`Path`, or None if the plate has no gcode member
     or repacking fails. Caller is responsible for cleaning up the temp file.
@@ -877,55 +898,33 @@ def repack_3mf_with_gcode(source_path: Path, plate_id: int, new_gcode_content: s
         return None
 
 
-def zero_slice_usage_metadata(threemf_path: Path) -> None:
-    """Zero every filament / print-time usage figure in a 3MF's ``slice_info.config``.
+def zero_slice_usage_bytes(original: bytes) -> bytes | None:
+    """Return `original` ``slice_info.config`` bytes with every usage figure zeroed,
+    or ``None`` when nothing needs changing.
 
-    The farm's two eject utility files — the empty-bed *dry-run* file and the
-    *part-present* remote-eject file — are MOTION-ONLY toolhead sweeps that
-    extrude nothing. Both are built by repacking a real sliced donor 3MF
-    (:func:`repack_3mf_with_gcode` swaps only the plate G-code, NOT the metadata),
-    so the donor's ``Metadata/slice_info.config`` rides along unchanged, still
-    advertising the donor plate's ``weight``, its print-time ``prediction`` and
-    each filament's ``used_g`` / ``used_m``. Every downstream consumer that trusts
-    that metadata — the archive parser (``services/archive.py``), the usage
-    tracker, ``LibraryFile.file_metadata`` and the queue card — would then book
-    hundreds of phantom grams (~400 g per dispatch) and a phantom print time
-    against a job that consumed none. Zeroing the metadata once, at BUILD time,
-    makes every consumer truthful with no per-consumer guards.
+    The farm's eject utility files — the empty-bed *dry-run* file and the
+    *part-present* remote-eject file — are MOTION-ONLY toolhead sweeps that extrude
+    nothing, built by repacking a real sliced donor 3MF whose
+    ``Metadata/slice_info.config`` would otherwise ride along advertising the donor
+    plate's ``weight`` / print-time ``prediction`` / per-filament ``used_g`` /
+    ``used_m``. Every downstream consumer that trusts that metadata (archive parser,
+    usage tracker, ``LibraryFile.file_metadata``, the queue card) would then book
+    hundreds of phantom grams (~400 g per dispatch) against a job that consumed none.
 
-    The rewrite touches ``Metadata/slice_info.config`` only: every ``weight`` and
-    ``prediction`` ``<metadata>`` value becomes ``"0"`` and every ``<filament>``
-    gets ``used_g="0"`` / ``used_m="0"`` — across ALL plates, not just the eject
-    plate, because the donor plates in these artifacts are unprintable leftovers
-    and zeroing every one makes even a summed-across-plates fallback read zero.
-    Every other ZIP member is copied byte-for-byte; ``slice_info.config`` carries
-    NO ``.md5`` sidecar (the plate-G-code red line does not apply here), so nothing
-    else needs recomputing.
-
-    No-ops silently when the archive has no ``slice_info.config`` (a donor that
-    never carried one); it never raises for that case. A ``slice_info.config`` that
-    will not parse as XML is left untouched (logged) so a corrupt donor can never
-    wedge an eject dispatch.
+    This is the pure transform (``bytes -> bytes | None``) applied inside the single
+    eject repack pass (:func:`repack_3mf_eject`): every ``weight`` / ``prediction``
+    ``<metadata>`` value becomes ``"0"`` and every ``<filament>`` gets ``used_g="0"``
+    / ``used_m="0"`` — across ALL plates. Returns ``None`` when the config will not
+    parse as XML (logged), so a corrupt donor leaves the member untouched rather than
+    wedging an eject dispatch. The donor's verbatim XML declaration is re-attached
+    (ElementTree's unicode serialization drops it) so the result differs from the
+    donor ONLY in the zeroed values.
     """
-    import os
-    import tempfile
-
-    threemf_path = Path(threemf_path)
-    slice_info_name = "Metadata/slice_info.config"
-
-    with zipfile.ZipFile(threemf_path, "r") as zf:
-        if slice_info_name not in zf.namelist():
-            return
-        original = zf.read(slice_info_name)
-
     try:
         root = ET.fromstring(original)
     except ET.ParseError:
-        logger.warning(
-            "zero_slice_usage_metadata: %s carries an unparseable slice_info.config; leaving usage metadata untouched",
-            threemf_path,
-        )
-        return
+        logger.warning("zero_slice_usage_bytes: unparseable slice_info.config; leaving usage metadata untouched")
+        return None
 
     for meta in root.iter("metadata"):
         if meta.get("key") in ("weight", "prediction"):
@@ -934,8 +933,6 @@ def zero_slice_usage_metadata(threemf_path: Path) -> None:
         filament.set("used_g", "0")
         filament.set("used_m", "0")
 
-    # ElementTree's unicode serialization drops the XML declaration; re-attach the
-    # donor's verbatim so slice_info.config differs only in the zeroed values.
     body = ET.tostring(root, encoding="unicode")
     if original.lstrip()[:5].lower() == b"<?xml":
         decl_end = original.find(b"?>")
@@ -947,27 +944,39 @@ def zero_slice_usage_metadata(threemf_path: Path) -> None:
         new_bytes = (decl + "\n" + body).encode("utf-8")
     else:
         new_bytes = body.encode("utf-8")
+    return new_bytes
 
-    # In-place archive rewrite: slice_info.config replaced, every other member
-    # copied verbatim (same zip-rewrite shape as _write_repacked_3mf). Write a
-    # sibling temp then os.replace so a mid-write failure can't corrupt the file.
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".3mf", dir=str(threemf_path.parent)) as tmp:
-        tmp_path = Path(tmp.name)
+
+def repack_3mf_eject(source_path: Path, plate_id: int, gcode_text: str, *, zero_usage: bool = True) -> Path | None:
+    """ONE-PASS eject-file build: the single public entry the farm's motion-only
+    eject / dry-run builders use.
+
+    In a SINGLE zip rewrite it (a) REPLACES plate `plate_id`'s G-code with
+    `gcode_text` and recomputes the ``.gcode.md5`` sidecar, and (b) — when
+    `zero_usage` — replaces ``Metadata/slice_info.config`` with its usage-zeroed
+    form (:func:`zero_slice_usage_bytes`). This collapses the former two-pass
+    composition (``repack_3mf_with_gcode`` then a whole-file ``slice_info`` rewrite)
+    into one read/re-deflate pass (latency Phase C1); the produced container is
+    byte-equivalent to that two-pass output — same members, same replacements, same
+    MD5 sidecar semantics (uppercase hex, no trailing newline).
+
+    Returns the temp ``.gcode.3mf`` :class:`Path`, or ``None`` if the plate has no
+    gcode member or repacking fails. Caller owns the returned temp file.
+    """
     try:
-        with (
-            zipfile.ZipFile(threemf_path, "r") as zf,
-            zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf_write,
-        ):
-            for item in zf.namelist():
-                info = zf.getinfo(item)
-                if item == slice_info_name:
-                    zf_write.writestr(info, new_bytes)
-                else:
-                    zf_write.writestr(info, zf.read(item))
-        os.replace(tmp_path, threemf_path)
+        with zipfile.ZipFile(source_path, "r") as zf:
+            names = zf.namelist()
+            target_gcode = _find_target_gcode_name(names, plate_id)
+            if target_gcode is None:
+                return None
+            extra: dict[str, bytes] | None = None
+            if zero_usage and _SLICE_INFO_NAME in names:
+                zeroed = zero_slice_usage_bytes(zf.read(_SLICE_INFO_NAME))
+                if zeroed is not None:
+                    extra = {_SLICE_INFO_NAME: zeroed}
+        return _write_repacked_3mf(source_path, target_gcode, gcode_text.encode("utf-8"), extra_replacements=extra)
     except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+        return None
 
 
 def read_plate_gcode_header(source_path: Path, plate_id: int, max_bytes: int = 65536) -> dict[str, str]:

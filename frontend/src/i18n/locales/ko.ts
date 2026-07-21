@@ -823,6 +823,14 @@ export default {
       cooling: '{{threshold}}°C까지 냉각 중',
       awaitingPlateClear: '플레이트 비움 대기 중',
     },
+    ejectPhase: {
+      building: '배출: 준비 중…',
+      uploading: '배출: 업로드 중 {{pct}} %',
+      uploadingNoPct: '배출: 업로드 중…',
+      sent: '배출: 전송됨',
+      sweeping: '배출: 쓸어내는 중…',
+      failed: '배출 실패',
+    },
     // Farm production context surfaced on the printer card (Phase 3, F2).
     farm: {
       run: '런: {{name}}',
@@ -1563,6 +1571,15 @@ export default {
       currentlyPrinting: '현재 인쇄 중',
       queued: '대기 중',
       history: '기록'
+    },
+    phase: {
+      assigned: '할당됨',
+      uploading: '업로드 중 {{pct}} %',
+      uploadingNoPct: '업로드 중…',
+      sent: '전송됨',
+      preparing: '준비 중…',
+      printing: '인쇄 중',
+      failed: '실패',
     },
     status: {
       pending: '대기 중',

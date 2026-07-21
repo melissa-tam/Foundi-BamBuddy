@@ -848,6 +848,14 @@ export default {
       cooling: '{{threshold}}°C まで冷却中',
       awaitingPlateClear: 'プレートのクリア待ち',
     },
+    ejectPhase: {
+      building: '排出: 作成中…',
+      uploading: '排出: アップロード中 {{pct}} %',
+      uploadingNoPct: '排出: アップロード中…',
+      sent: '排出: 送信済み',
+      sweeping: '排出: 除去中…',
+      failed: '排出に失敗しました',
+    },
     // Farm production context surfaced on the printer card (Phase 3, F2).
     farm: {
       run: 'ラン: {{name}}',
@@ -1640,6 +1648,15 @@ export default {
       history: '履歴',
     },
     // Status
+    phase: {
+      assigned: '割り当て済み',
+      uploading: 'アップロード中 {{pct}} %',
+      uploadingNoPct: 'アップロード中…',
+      sent: '送信済み',
+      preparing: '準備中…',
+      printing: '印刷中',
+      failed: '失敗',
+    },
     status: {
       pending: '待機中',
       waiting: '待機中',

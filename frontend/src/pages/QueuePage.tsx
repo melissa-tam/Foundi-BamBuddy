@@ -76,6 +76,7 @@ import { QueueStatsBar } from '../components/QueueStatsBar';
 import { CompactHistoryRow } from '../components/CompactHistoryRow';
 import { QueueTimelineView } from '../components/QueueTimelineView';
 import { WaitingReason } from '../components/ui/WaitingReason';
+import { QueuePhaseChip } from '../components/QueuePhaseChip';
 import { waitingReasonText } from '../utils/waitingReason';
 import { Modal } from '../components/ui/Modal';
 
@@ -683,6 +684,10 @@ function SortableQueueItem({
 
         {/* Status badge + Actions */}
         <div className="flex flex-col sm:flex-row items-end sm:items-center gap-2 sm:gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+          {/* Live dispatch-phase chip (Phase C): concrete feedback during the
+              otherwise-dead upload + firmware-prep window. Mounted only for
+              pending/printing rows; the chip self-hides once actually printing. */}
+          {(isPending || isPrinting) && <QueuePhaseChip itemId={item.id} />}
           <StatusBadge status={item.status} waitingReason={item.waiting_reason} printerState={printerState} t={t} />
 
           <div className="flex items-center gap-0.5 sm:gap-1">
@@ -1340,7 +1345,9 @@ export function QueuePage() {
   const { data: queue, isLoading } = useQuery({
     queryKey: ['queue', filterPrinter, filterStatus],
     queryFn: () => api.getQueue(filterPrinter || undefined, filterStatus || undefined),
-    refetchInterval: 5000,
+    // WS `queue_item_status` is now the primary liveness signal (Phase C); the
+    // poll is a slower fallback for missed messages / reconnect gaps.
+    refetchInterval: 15000,
   });
 
   const { data: printers } = useQuery({

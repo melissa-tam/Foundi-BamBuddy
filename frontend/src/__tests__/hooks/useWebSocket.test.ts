@@ -1032,4 +1032,174 @@ describe('useWebSocket hook', () => {
       vi.unstubAllGlobals();
     });
   });
+
+  describe('live dispatch/eject phase (Phase C)', () => {
+    it('queue_item_status patches the ["queue"] status in place and writes the phase cache', async () => {
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      // Seed a filtered ['queue', ...] variant — the handler uses setQueriesData
+      // with the ['queue'] prefix, so it must patch this despite the filter tail.
+      queryClient.setQueryData(['queue', '', ''], [
+        { id: 5, status: 'pending' },
+        { id: 6, status: 'pending' },
+      ]);
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'queue_item_status',
+          item_id: 5,
+          batch_id: null,
+          printer_id: 7,
+          status: 'printing',
+          phase: 'uploading',
+          progress_pct: 62,
+          detail: null,
+          ts: '2026-07-21T00:00:00Z',
+        });
+      });
+
+      const list = queryClient.getQueryData(['queue', '', '']) as Array<{
+        id: number;
+        status: string;
+      }>;
+      expect(list.find((i) => i.id === 5)!.status).toBe('printing');
+      // The unrelated item is untouched.
+      expect(list.find((i) => i.id === 6)!.status).toBe('pending');
+      // The finer-grained live phase lands in the per-item client-only cache.
+      expect(queryClient.getQueryData(['queueItemPhase', 5])).toEqual({
+        phase: 'uploading',
+        progress_pct: 62,
+        status: 'printing',
+        ts: '2026-07-21T00:00:00Z',
+      });
+
+      vi.unstubAllGlobals();
+    });
+
+    it('queue_item_status on a terminal status invalidates the ["queue"] list', async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      await vi.advanceTimersByTimeAsync(0);
+      const ws = wsInstances[wsInstances.length - 1]!;
+      act(() => {
+        ws.open();
+      });
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'queue_item_status',
+          item_id: 5,
+          batch_id: 1,
+          printer_id: 7,
+          status: 'completed',
+          phase: 'printing',
+          progress_pct: null,
+          detail: null,
+          ts: '2026-07-21T00:00:00Z',
+        });
+      });
+
+      // debouncedInvalidate: 3000 ms window + per-key rAF flush.
+      await act(async () => {
+        vi.advanceTimersByTime(4000);
+      });
+
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['queue'] });
+
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    });
+
+    it('eject_progress writes a per-printer phase map entry', async () => {
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'eject_progress',
+          printer_id: 7,
+          queue_item_id: 12,
+          phase: 'uploading',
+          progress_pct: 62,
+          detail: null,
+          ts: '2026-07-21T00:00:00Z',
+        });
+      });
+
+      expect(queryClient.getQueryData(['ejectProgress', 7])).toEqual({
+        phase: 'uploading',
+        progress_pct: 62,
+        queue_item_id: 12,
+        ts: '2026-07-21T00:00:00Z',
+      });
+
+      vi.unstubAllGlobals();
+    });
+
+    it("print_complete clears the printer's live eject phase entry", async () => {
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'eject_progress',
+          printer_id: 7,
+          queue_item_id: null,
+          phase: 'sweeping',
+          progress_pct: null,
+          detail: null,
+          ts: '2026-07-21T00:00:00Z',
+        });
+      });
+      expect(queryClient.getQueryData(['ejectProgress', 7])).not.toBeNull();
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'print_complete',
+          printer_id: 7,
+          data: { status: 'completed' },
+        });
+      });
+      // The sweep's done — the chip's cache entry is cleared to null.
+      expect(queryClient.getQueryData(['ejectProgress', 7])).toBeNull();
+
+      vi.unstubAllGlobals();
+    });
+  });
 });

@@ -2826,6 +2826,16 @@ async def on_print_start(printer_id: int, data: dict):
             "skipping archive/plate-detection/usage/notification",
             printer_id,
         )
+        # Eject-progress telemetry (C4): the sweep has started printing on the printer.
+        from backend.app.services.eject import progress as _eject_progress
+        from backend.app.services.eject.remote import peek_pending_eject as _peek_pending_eject
+
+        _pending = _peek_pending_eject(printer_id)
+        _eject_progress.emit_eject_progress(
+            printer_id=printer_id,
+            queue_item_id=_pending.queue_item_id if _pending is not None else None,
+            phase="sweeping",
+        )
         return
 
     await ws_manager.send_print_start(printer_id, data)

@@ -2991,6 +2991,78 @@ export interface TaglessFreshPromptMessage {
   rgba: string | null;
 }
 
+// ── Live dispatch/eject phase feedback (Phase C latency-reduction) ──────────
+// Two WS message types give the operator live feedback during the ~6 s upload
+// + ~45 s firmware-prep window that otherwise looks dead between the queue
+// poll's 15 s ticks. Both are discriminated on `type`; their `phase` fields are
+// string-literal unions so the UI can exhaustively map each to copy + styling.
+
+/** Dispatch-lifecycle phase of a queue item, carried on `queue_item_status`.
+ *  `uploading` = the FTPS push (the only phase with a non-null `progress_pct`);
+ *  `preparing` = the printer's firmware prep before extrusion begins. */
+export type QueueItemPhase =
+  | 'assigned'
+  | 'uploading'
+  | 'sent'
+  | 'preparing'
+  | 'printing'
+  | 'failed';
+
+/** WS `queue_item_status` payload — a live queue-item transition. `status` is
+ *  the durable queue status (same union as `PrintQueueItem['status']`); `phase`
+ *  is the finer-grained live dispatch sub-state. `progress_pct` (0–100) is
+ *  non-null ONLY for the `uploading` phase. */
+export interface QueueItemStatusMessage {
+  type: 'queue_item_status';
+  item_id: number;
+  batch_id: number | null;
+  printer_id: number | null;
+  status: PrintQueueItem['status'];
+  phase: QueueItemPhase;
+  progress_pct: number | null;
+  detail: string | null;
+  ts: string;
+}
+
+/** Dispatch-lifecycle phase of an eject, carried on `eject_progress`.
+ *  `building` = repacking the eject 3MF; `uploading` = FTPS push (the only
+ *  phase with a non-null `progress_pct`); `sweeping` = the toolhead clearing
+ *  the plate. */
+export type EjectPhase = 'building' | 'uploading' | 'sent' | 'sweeping' | 'failed';
+
+/** WS `eject_progress` payload — a live eject dispatch phase for a printer. */
+export interface EjectProgressMessage {
+  type: 'eject_progress';
+  printer_id: number;
+  queue_item_id: number | null;
+  phase: EjectPhase;
+  progress_pct: number | null;
+  detail: string | null;
+  ts: string;
+}
+
+/** Client-only live phase state the WS handler stashes in the
+ *  `['queueItemPhase', item_id]` query cache; the queue row subscribes to it to
+ *  render the dispatch phase chip between polls. Distinct from the durable
+ *  `PrintQueueItem` so the API response type stays pure. */
+export interface QueueItemPhaseState {
+  phase: QueueItemPhase;
+  progress_pct: number | null;
+  status: PrintQueueItem['status'];
+  ts: string;
+}
+
+/** Client-only live eject phase state the WS handler stashes in the
+ *  `['ejectProgress', printer_id]` query cache; the printer card subscribes to
+ *  it to render a compact eject-phase chip. `null` in the cache = no live
+ *  eject (cleared after the display window / on print completion). */
+export interface EjectPhaseState {
+  phase: EjectPhase;
+  progress_pct: number | null;
+  queue_item_id: number | null;
+  ts: string;
+}
+
 /** POST body for `POST /inventory/spools/{spool_id}/tagless-fresh`. `answer`
  *  "fresh" archives the current tagless row and mints a replacement (the
  *  optional brand/label_weight/cost/note ride the new row); "same" clears the

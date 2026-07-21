@@ -5,6 +5,11 @@ import { useTranslation } from 'react-i18next';
 import {
   api,
   type Printer,
+  type PrintQueueItem,
+  type QueueItemStatusMessage,
+  type QueueItemPhaseState,
+  type EjectProgressMessage,
+  type EjectPhaseState,
   type RespoolPromptMessage,
   type SpoolAutoAssignedMessage,
   type SpoolRespooledMessage,
@@ -25,6 +30,24 @@ interface WebSocketMessage {
  *  the list never refetches on its own, so quarantine / plate-gate /
  *  model-mismatch badges rendered from it go stale without this. */
 const FARM_BADGE_FLAGS = ['quarantined', 'awaiting_plate_clear', 'model_mismatch'] as const;
+
+/** Queue-item statuses that end the dispatch lifecycle — a `queue_item_status`
+ *  landing on one of these additionally refreshes the whole ['queue'] list so
+ *  counts/summaries reflect the terminal transition (the in-place patch only
+ *  keeps the visible row live between polls). */
+const QUEUE_TERMINAL_STATUSES: ReadonlySet<PrintQueueItem['status']> = new Set([
+  'completed',
+  'failed',
+  'cancelled',
+  'skipped',
+]);
+
+/** How long a live eject phase entry survives with no follow-up message before
+ *  it self-clears from the ['ejectProgress', printerId] cache. `sweeping` and
+ *  the mid-dispatch phases hold for the full TTL (they also clear early on the
+ *  printer's next print_complete); a terminal `failed` shows only briefly. */
+const EJECT_PHASE_TTL_MS = 120_000;
+const EJECT_FAILED_TTL_MS = 8_000;
 
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
@@ -49,6 +72,19 @@ export function useWebSocket() {
 
   // Use ref for handleMessage to avoid stale closure in connect
   const handleMessageRef = useRef<(message: WebSocketMessage) => void>(() => {});
+
+  // Per-printer self-clear timers for live eject-phase cache entries (Phase C).
+  const ejectClearTimersRef = useRef<Map<number, number>>(new Map());
+
+  // Clear a printer's live eject-phase entry now and drop its pending timer.
+  const clearEjectProgress = useCallback((printerId: number) => {
+    const timer = ejectClearTimersRef.current.get(printerId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      ejectClearTimersRef.current.delete(printerId);
+    }
+    queryClient.setQueryData<EjectPhaseState | null>(['ejectProgress', printerId], null);
+  }, [queryClient]);
 
   // Process message queue with throttling to prevent UI freeze
   const processMessageQueue = useCallback(() => {
@@ -268,6 +304,63 @@ export function useWebSocket() {
         }
         break;
 
+      case 'queue_item_status': {
+        // Live queue-item transition (Phase C): patch the visible row's status
+        // in place so it reflects the change between the 15 s polls, and stash
+        // the finer-grained live phase/progress in a per-item client-only cache
+        // entry (mirrors the ['printerStatus', id] pattern) that the row
+        // subscribes to for its dispatch phase chip.
+        const m = message as unknown as QueueItemStatusMessage;
+        if (typeof m.item_id !== 'number') break;
+
+        // The queue query key carries the page's (printer, status) filter, so
+        // patch EVERY cached ['queue', ...] variant, not one fixed key.
+        queryClient.setQueriesData<PrintQueueItem[]>(
+          { queryKey: ['queue'] },
+          (old) =>
+            old?.map((it) => (it.id === m.item_id ? { ...it, status: m.status } : it)),
+        );
+
+        queryClient.setQueryData<QueueItemPhaseState>(['queueItemPhase', m.item_id], {
+          phase: m.phase,
+          progress_pct: m.progress_pct,
+          status: m.status,
+          ts: m.ts,
+        });
+
+        // A terminal transition changes counts/list membership — refresh the
+        // whole list (debounced) so summaries and filtered views stay correct.
+        if (QUEUE_TERMINAL_STATUSES.has(m.status)) {
+          debouncedInvalidate('queue');
+        }
+        break;
+      }
+
+      case 'eject_progress': {
+        // Live eject dispatch phase (Phase C): stash per-printer state the card
+        // subscribes to. Re-arm a self-clear timer on every message so a stalled
+        // phase eventually disappears; `failed` shows only briefly.
+        const m = message as unknown as EjectProgressMessage;
+        if (typeof m.printer_id !== 'number') break;
+
+        queryClient.setQueryData<EjectPhaseState>(['ejectProgress', m.printer_id], {
+          phase: m.phase,
+          progress_pct: m.progress_pct,
+          queue_item_id: m.queue_item_id,
+          ts: m.ts,
+        });
+
+        const existing = ejectClearTimersRef.current.get(m.printer_id);
+        if (existing !== undefined) clearTimeout(existing);
+        const ttl = m.phase === 'failed' ? EJECT_FAILED_TTL_MS : EJECT_PHASE_TTL_MS;
+        const printerId = m.printer_id;
+        ejectClearTimersRef.current.set(
+          printerId,
+          window.setTimeout(() => clearEjectProgress(printerId), ttl),
+        );
+        break;
+      }
+
       case 'missing_spool_assignment': {
         if (message.printer_id === undefined || !Array.isArray(message.missing_slots)) {
           break;
@@ -302,6 +395,11 @@ export function useWebSocket() {
         // The printer_status websocket messages will naturally update the status
         debouncedInvalidate('archives');
         debouncedInvalidate('archiveStats');
+        // A completed print means any in-flight eject sweep on that printer is
+        // done — clear its live phase chip immediately (Phase C).
+        if (message.printer_id !== undefined) {
+          clearEjectProgress(message.printer_id);
+        }
         break;
 
       case 'archive_created':
@@ -549,7 +647,7 @@ export function useWebSocket() {
         debouncedInvalidate('spoolbuddy-update-check');
         break;
     }
-  }, [queryClient, debouncedInvalidate, throttledPrinterStatusUpdate, showToast, t]);
+  }, [queryClient, debouncedInvalidate, throttledPrinterStatusUpdate, clearEjectProgress, showToast, t]);
 
   // Keep the ref updated with latest handleMessage
   useEffect(() => {
@@ -562,6 +660,10 @@ export function useWebSocket() {
     // connect() in the ws.onclose handler.
     void connect();
 
+    // Capture the (stable) timers Map so the cleanup uses the same reference
+    // the effect saw, not whatever `.current` holds at teardown.
+    const ejectClearTimers = ejectClearTimersRef.current;
+
     return () => {
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
@@ -572,6 +674,8 @@ export function useWebSocket() {
       if (printerStatusTimeoutRef.current) {
         clearTimeout(printerStatusTimeoutRef.current);
       }
+      ejectClearTimers.forEach((timer) => clearTimeout(timer));
+      ejectClearTimers.clear();
       if (wsRef.current) {
         wsRef.current.close();
       }

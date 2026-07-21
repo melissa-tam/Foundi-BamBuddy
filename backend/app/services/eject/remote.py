@@ -36,6 +36,7 @@ from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.services.eject import progress as eject_progress
 from backend.app.services.eject.dispatch import build_part_present_eject_file
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
 from backend.app.services.printer_manager import printer_manager
@@ -377,9 +378,11 @@ async def dispatch_part_present_eject(
 
     source_path = await _resolve_source_path(db, item)
     plate_id = item.plate_id or 1
+    eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=queue_item_id, phase="building")
     try:
-        eject_path = build_part_present_eject_file(source_path, plate_id, profile, geometry)
+        eject_path = await build_part_present_eject_file(source_path, plate_id, profile, geometry)
     except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
+        eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=queue_item_id, phase="failed")
         raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc
 
     pending = PendingEject(purpose=purpose, run_id=run_id, queue_item_id=queue_item_id)
@@ -441,9 +444,11 @@ async def dispatch_foreign_eject(
     if profile is None:
         raise EjectDispatchError("Eject profile not found", status_code=409)
 
+    eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=None, phase="building")
     try:
-        eject_path = build_part_present_eject_file(Path(source_path), plate_id, profile, geometry)
+        eject_path = await build_part_present_eject_file(Path(source_path), plate_id, profile, geometry)
     except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
+        eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=None, phase="failed")
         raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc
 
     pending = PendingEject(purpose="manual", run_id=None, queue_item_id=None)
@@ -481,6 +486,8 @@ async def _upload_start_register_eject(
     registered unless ``start_print`` was accepted. Raises :class:`EjectDispatchError`
     (502) on upload / start failure.
     """
+    import asyncio
+
     from backend.app.services.bambu_ftp import (
         get_ftp_retry_settings,
         upload_file_async,
@@ -491,6 +498,20 @@ async def _upload_start_register_eject(
     remote_filename = derive_remote_filename(f"{job_stem}.gcode.3mf")
     remote_path = f"/{remote_filename}"
     ftp_retry_enabled, ftp_retry_count, ftp_retry_delay, ftp_timeout = await get_ftp_retry_settings()
+
+    # Upload progress rides the FTP callback, which fires on the executor thread —
+    # marshal each tick back onto the loop before emitting (never touch the socket
+    # from another thread). The callback must never raise (it would abort the upload).
+    loop = asyncio.get_running_loop()
+
+    def _on_upload_progress(uploaded_bytes: int, total_bytes: int) -> None:
+        pct = round(uploaded_bytes / total_bytes * 100.0, 1) if total_bytes else None
+        loop.call_soon_threadsafe(
+            lambda: eject_progress.emit_eject_progress(
+                printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="uploading", progress_pct=pct
+            )
+        )
+
     try:
         if ftp_retry_enabled:
             uploaded = await with_ftp_retry(
@@ -501,6 +522,7 @@ async def _upload_start_register_eject(
                 remote_path,
                 socket_timeout=ftp_timeout,
                 printer_model=printer.model,
+                progress_callback=_on_upload_progress,
                 max_retries=ftp_retry_count,
                 retry_delay=ftp_retry_delay,
                 operation_name=f"Upload {pending.purpose} eject to {printer.name}",
@@ -513,6 +535,7 @@ async def _upload_start_register_eject(
                 remote_path,
                 socket_timeout=ftp_timeout,
                 printer_model=printer.model,
+                progress_callback=_on_upload_progress,
             )
     except Exception as exc:  # noqa: BLE001
         uploaded = False
@@ -524,6 +547,7 @@ async def _upload_start_register_eject(
             pass
 
     if not uploaded:
+        eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="failed")
         raise EjectDispatchError("Failed to upload the eject file to the printer", status_code=502)
 
     # EVERY pre-print calibration OFF — never bed-probe / shake / re-level with a
@@ -541,7 +565,10 @@ async def _upload_start_register_eject(
         use_ams=False,
     )
     if not started:
+        eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="failed")
         raise EjectDispatchError("Failed to send the eject command to the printer", status_code=502)
+
+    eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="sent")
 
     register_pending_eject(printer.id, pending)
     # Durable mirror: stamp the owning unit so the eject survives a restart between

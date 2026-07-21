@@ -849,6 +849,14 @@ export default {
       cooling: 'Raffreddamento fino a {{threshold}}°C',
       awaitingPlateClear: 'In attesa che il piatto venga liberato',
     },
+    ejectPhase: {
+      building: 'Espulsione: preparazione…',
+      uploading: 'Espulsione: caricamento {{pct}} %',
+      uploadingNoPct: 'Espulsione: caricamento…',
+      sent: 'Espulsione: inviata',
+      sweeping: 'Espulsione: rimozione…',
+      failed: 'Espulsione non riuscita',
+    },
     // Farm production context surfaced on the printer card (Phase 3, F2).
     farm: {
       run: 'Serie: {{name}}',
@@ -1641,6 +1649,15 @@ export default {
       history: 'Cronologia',
     },
     // Status
+    phase: {
+      assigned: 'Assegnato',
+      uploading: 'Caricamento {{pct}} %',
+      uploadingNoPct: 'Caricamento…',
+      sent: 'Inviato',
+      preparing: 'Preparazione…',
+      printing: 'Stampa',
+      failed: 'Non riuscito',
+    },
     status: {
       pending: 'In attesa',
       waiting: 'In attesa',

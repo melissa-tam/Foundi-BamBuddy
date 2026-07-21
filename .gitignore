@@ -35,6 +35,9 @@ npm-debug.log*
 # Archive files (user data)
 archive/
 
+# Built eject/dry-run file cache (runtime artifact under the data dir)
+eject_cache/
+
 # Firmware cache (downloaded firmware files)
 firmware/
 

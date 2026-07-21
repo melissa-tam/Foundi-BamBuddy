@@ -131,6 +131,7 @@ import { deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
 import { wasFeedingTrayId, slotRanOut } from '../utils/slotStatus';
 import { OutOfRotationChip } from '../components/OutOfRotationChip';
+import { EjectPhaseChip } from '../components/EjectPhaseChip';
 import { Collapsible } from '../components/Collapsible';
 import { ConnectionDiagnosticModal, DiagnosticChecklist } from '../components/ConnectionDiagnostic';
 import { getColorName, parseFilamentColor, isLightColor } from '../utils/colors';
@@ -3940,6 +3941,9 @@ function PrinterCard({
                           <div className="flex min-h-[18px] items-center gap-2 pr-8">
                             <p className="min-w-0 truncate text-sm text-bambu-gray">{getStatusDisplay(status.state, status.stg_cur_name)}</p>
                             {plateStatusPill}
+                            {/* Live eject-phase chip (Phase C): shows the sweep
+                                dispatch progressing while the plate looks idle. */}
+                            <EjectPhaseChip printerId={printer.id} />
                           </div>
                           <p className={`min-h-[18px] truncate pr-8 text-sm ${printName ? 'text-white' : 'text-bambu-gray/70'}`}>
                             {printName || t('printers.noActiveJob', 'No active job')}
