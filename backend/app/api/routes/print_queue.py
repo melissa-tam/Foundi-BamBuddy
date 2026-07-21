@@ -655,6 +655,14 @@ async def add_to_queue(
     except Exception:
         pass  # Don't fail queue add if notification fails
 
+    # Wake the scheduler so newly enqueued work dispatches immediately (latency Phase A).
+    try:
+        from backend.app.services.dispatch_kick import dispatch_kick
+
+        dispatch_kick.kick("enqueue", item.printer_id)
+    except Exception:
+        logger.debug("dispatch kick failed after enqueue (non-fatal)", exc_info=True)
+
     return _enrich_response(item)
 
 
@@ -1463,4 +1471,13 @@ async def start_queue_item(
         item_id,
         skip_filament_check,
     )
+
+    # Wake the scheduler so the manually started item dispatches immediately (latency Phase A).
+    try:
+        from backend.app.services.dispatch_kick import dispatch_kick
+
+        dispatch_kick.kick("manual_start", item.printer_id)
+    except Exception:
+        logger.debug("dispatch kick failed after manual start (non-fatal)", exc_info=True)
+
     return _enrich_response(item)

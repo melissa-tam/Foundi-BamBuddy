@@ -4950,6 +4950,17 @@ async def on_print_complete(printer_id: int, data: dict):
                 _final_status,
             )
 
+    # Wake the scheduler on every terminal (completed AND failed): a freed printer
+    # or a newly cleared gate should be re-used without waiting out the poll interval
+    # (latency Phase A). Reached on all terminal paths here — a gated printer stays
+    # gated (the kick just lets the scheduler re-scan), so this is always safe. Guarded.
+    try:
+        from backend.app.services.dispatch_kick import dispatch_kick
+
+        dispatch_kick.kick("printer_terminal", printer_id)
+    except Exception:
+        logger.debug("[CALLBACK] dispatch kick failed on terminal (non-fatal)", exc_info=True)
+
     # MQTT relay - publish print complete
     try:
         printer_info = printer_manager.get_printer(printer_id)

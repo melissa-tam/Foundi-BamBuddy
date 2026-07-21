@@ -416,6 +416,21 @@ class AppSettings(BaseModel):
         default=3, ge=1, le=60, description="Minutes between staggered printer groups"
     )
 
+    # Event-driven dispatch tunables (latency Phase A). The scheduler wakes on a
+    # kick when work arrives; the interval is only the fallback safety-net poll.
+    queue_check_interval_seconds: int = Field(
+        default=30, ge=5, le=300, description="Fallback poll interval for the scheduler loop between kicks"
+    )
+    dispatch_kick_debounce_seconds: float = Field(
+        default=1.0, ge=0.2, le=10, description="Debounce after a kick to coalesce a burst into one scheduler pass"
+    )
+    usb_preflight_fresh_window_seconds: int = Field(
+        default=10, ge=0, le=120, description="Trust a cached USB-presence flag if a full report landed this recently"
+    )
+    usb_preflight_max_wait_seconds: float = Field(
+        default=2.5, ge=0, le=10, description="Max wait for a fresh full report during USB pre-flight before proceeding"
+    )
+
     # Plate-clear confirmation for queue scheduling
     require_plate_clear: bool = Field(
         default=False,
@@ -722,6 +737,10 @@ class AppSettingsUpdate(BaseModel):
     default_nozzle_offset_cali: bool | None = None
     stagger_group_size: int | None = Field(default=None, ge=1, le=50)
     stagger_interval_minutes: int | None = Field(default=None, ge=1, le=60)
+    queue_check_interval_seconds: int | None = Field(default=None, ge=5, le=300)
+    dispatch_kick_debounce_seconds: float | None = Field(default=None, ge=0.2, le=10)
+    usb_preflight_fresh_window_seconds: int | None = Field(default=None, ge=0, le=120)
+    usb_preflight_max_wait_seconds: float | None = Field(default=None, ge=0, le=10)
     require_plate_clear: bool | None = None
     farm_usb_auto_cleanup: bool | None = None
     queue_shortest_first: bool | None = None

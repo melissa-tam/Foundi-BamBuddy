@@ -26,6 +26,7 @@ from backend.app.services.bambu_ftp import (
     upload_file_async,
     with_ftp_retry,
 )
+from backend.app.services.dispatch_kick import DispatchKick, dispatch_kick
 from backend.app.services.farm_staging import build_staged_reason, maybe_release_periodic
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
@@ -63,12 +64,13 @@ logger = logging.getLogger(__name__)
 # briefly in SLICING between PREPARE and RUNNING while parsing the g-code.
 _ACTIVE_PRINT_STATES: frozenset[str] = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
 
-# USB pre-flight settle window. The H2 fleet reports USB presence (state.sdcard)
-# ONLY inside a full status report, which we must explicitly request
-# (request_status_update → MQTT pushall) — so after asking we wait briefly for
-# the fresh report to land before reading the flag. 2.5 s comfortably covers the
-# observed pushall round-trip on H2S/H2C without materially delaying dispatch.
-_USB_PREFLIGHT_WAIT_S = 2.5
+# USB pre-flight: the H2 fleet reports USB presence (state.sdcard) ONLY inside a
+# full status report, which we must explicitly request (request_status_update →
+# MQTT pushall). The old fixed 2.5 s settle sleep is gone (latency Phase A): if a
+# full report already landed within ``usb_preflight_fresh_window_seconds`` we read
+# the cached flag with no request and no wait; otherwise we request and wait on the
+# client's full-report Event up to ``usb_preflight_max_wait_seconds`` (event, not a
+# fixed sleep — it proceeds the instant the fresh report merges).
 
 # Filament-type equivalence + canonicalisation is shared with the farm capability
 # gate — single source of truth in ``utils.filament_types`` (imported above as
@@ -93,7 +95,6 @@ class PrintScheduler:
 
     def __init__(self):
         self._running = False
-        self._check_interval = 30  # seconds
         self._power_on_wait_time = 180  # seconds to wait for printer after power on (3 min)
         self._power_on_check_interval = 10  # seconds between connection checks
         self._min_drying_seconds = 1800  # 30 minutes minimum before humidity re-check can stop drying
@@ -129,7 +130,15 @@ class PrintScheduler:
         self._hold_unpinned_items: set[int] = set()
 
     async def run(self):
-        """Main loop - check queue every interval."""
+        """Main loop — event-driven with a periodic timeout as the fallback poll.
+
+        Instead of an unconditional ``sleep(interval)`` between passes, the loop
+        waits on ``dispatch_kick`` up to ``queue_check_interval_seconds``: a kick
+        (enqueue / manual start / plate-gate release / freed printer …) wakes it
+        immediately; the interval timeout is only the safety-net poll that
+        behaves exactly as the old fixed tick. The interval is re-read every
+        iteration so an operator can retune it live.
+        """
         self._running = True
         logger.info("Print scheduler started")
 
@@ -139,7 +148,18 @@ class PrintScheduler:
             except Exception as e:
                 logger.error("Scheduler error: %s", e)
 
-            await asyncio.sleep(self._check_interval)
+            interval = await self._read_check_interval()
+            woke = await dispatch_kick.wait(timeout=interval)
+            if woke:
+                # Coalesce a burst: a short debounce lets several near-simultaneous
+                # kicks collapse into a single check_queue pass. Clear the event
+                # BEFORE looping back into check_queue so a kick landing mid-check
+                # re-sets it and triggers exactly one follow-up pass (no lost wakeup).
+                debounce = await self._read_kick_debounce()
+                await asyncio.sleep(debounce)
+                dispatch_kick.clear()
+                reasons = dispatch_kick.drain_reasons()
+                logger.info("Scheduler woken by: %s", DispatchKick.summarize(reasons))
 
     def stop(self):
         """Stop the scheduler."""
@@ -1504,6 +1524,29 @@ class PrintScheduler:
                 return default
         return default
 
+    async def _get_float_setting(self, db: AsyncSession, key: str, default: float) -> float:
+        """Read a float setting from the database, falling back to ``default``."""
+        result = await db.execute(select(Settings).where(Settings.key == key))
+        setting = result.scalar_one_or_none()
+        if setting and setting.value is not None:
+            try:
+                return float(setting.value)
+            except (TypeError, ValueError):
+                return default
+        return default
+
+    async def _read_check_interval(self) -> int:
+        """Fallback poll interval for the main loop (``queue_check_interval_seconds``, clamped 5-300)."""
+        async with async_session() as db:
+            value = await self._get_int_setting(db, "queue_check_interval_seconds", default=30)
+        return max(5, min(300, value))
+
+    async def _read_kick_debounce(self) -> float:
+        """Burst-coalescing debounce after a kick (``dispatch_kick_debounce_seconds``, clamped 0.2-10)."""
+        async with async_session() as db:
+            value = await self._get_float_setting(db, "dispatch_kick_debounce_seconds", default=1.0)
+        return max(0.2, min(10.0, value))
+
     async def _stagger_budget(self, db: AsyncSession) -> int:
         """How many more prints may START this stagger window (power management).
 
@@ -2302,17 +2345,39 @@ class PrintScheduler:
         # opaque 553. The firmware only reports USB presence (state.sdcard) in a
         # FULL status report, which Bambuddy requests on connect / manual
         # refresh — so a stick pulled while the printer idles goes unnoticed
-        # until dispatch fails. Ask for a fresh full report, wait briefly for it
-        # to land, then read the live flag. Fail-OPEN: ONLY an explicit False
-        # (drive confirmed absent) holds dispatch; None/missing (never reported /
-        # stale) proceeds, mirroring the UI chip's fail-safe. This is a WAIT, not
-        # a failure — the item stays pending, no manual_start, no retry burn; the
-        # next tick requests another fresh report and self-clears it when the
-        # drive returns (via the capability gate's existing waiting_reason reset
-        # below, since this block sits BEFORE it on the dispatch path).
-        printer_manager.request_status_update(item.printer_id)
-        await asyncio.sleep(_USB_PREFLIGHT_WAIT_S)
+        # until dispatch fails. Fail-OPEN: ONLY an explicit False (drive confirmed
+        # absent) holds dispatch; None/missing (never reported / stale) proceeds,
+        # mirroring the UI chip's fail-safe. This is a WAIT, not a failure — the item
+        # stays pending, no manual_start, no retry burn; the next tick re-checks and
+        # self-clears it when the drive returns (via the capability gate's existing
+        # waiting_reason reset below, since this block sits BEFORE it on the path).
+        # Smart pre-flight (latency Phase A): the firmware reports USB presence only
+        # inside a FULL status report. If one already landed within the fresh window
+        # we trust the cached flag (no request, no wait). Otherwise request a fresh
+        # report and wait on the client's full-report Event — which fires the instant
+        # a report carrying `sdcard` merges — up to the max-wait cap, then read.
+        fresh_window = max(
+            0, min(120, await self._get_int_setting(db, "usb_preflight_fresh_window_seconds", default=10))
+        )
+        max_wait = max(0.0, min(10.0, await self._get_float_setting(db, "usb_preflight_max_wait_seconds", default=2.5)))
         usb_status = printer_manager.get_status(item.printer_id)
+        last_report_at = getattr(usb_status, "last_full_report_at", 0.0) if usb_status is not None else 0.0
+        is_fresh = (
+            isinstance(last_report_at, (int, float))
+            and last_report_at > 0.0
+            and (time.monotonic() - last_report_at) <= fresh_window
+        )
+        if not is_fresh:
+            client = printer_manager.get_client(item.printer_id)
+            arm = getattr(client, "arm_full_report_wait", None) if client is not None else None
+            report_event = arm() if arm is not None else None
+            printer_manager.request_status_update(item.printer_id)
+            if report_event is not None and max_wait > 0.0:
+                try:
+                    await asyncio.wait_for(report_event.wait(), max_wait)
+                except asyncio.TimeoutError:
+                    pass
+            usb_status = printer_manager.get_status(item.printer_id)
         if usb_status is not None and getattr(usb_status, "sdcard", None) is False:
             # Dedupe like the low-spool waiting notification: only fire on the
             # transition INTO the hold (waiting_reason wasn't already

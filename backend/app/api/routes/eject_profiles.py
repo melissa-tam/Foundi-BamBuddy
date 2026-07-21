@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +56,8 @@ from backend.app.utils.threemf_tools import (
     repack_3mf_with_gcode,
     zero_slice_usage_metadata,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/eject-profiles", tags=["eject-profiles"])
 
@@ -464,6 +467,14 @@ async def dispatch_dry_run_eject_profile(
     await db.commit()
     queue_item = items[0]
     await db.refresh(queue_item)
+
+    # Wake the scheduler so the dry-run item dispatches immediately (latency Phase A).
+    try:
+        from backend.app.services.dispatch_kick import dispatch_kick
+
+        dispatch_kick.kick("dry_run_enqueue", body.printer_id)
+    except Exception:
+        logger.debug("dispatch kick failed after dry-run enqueue (non-fatal)", exc_info=True)
 
     return EjectDryRunDispatchResponse(
         queue_item_id=queue_item.id,

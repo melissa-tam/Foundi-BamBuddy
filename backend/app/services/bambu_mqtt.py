@@ -367,6 +367,11 @@ class PrinterState:
     kprofiles: list = field(default_factory=list)  # List of KProfile
     sdcard: bool = False  # SD card inserted
     store_to_sdcard: bool = False  # Store sent files on SD card (home_flag bit 11)
+    # Monotonic timestamp (time.monotonic, NOT wall-clock; 0.0 = never) of the last
+    # FULL status report — a report carrying the `sdcard` key, which the H2 fleet
+    # emits only in a full pushall. The USB pre-flight uses it to skip the request +
+    # wait when a fresh report already landed (latency Phase A).
+    last_full_report_at: float = 0.0
     timelapse: bool = False  # Timelapse recording active
     ipcam: bool = False  # Live view / camera streaming enabled
     wifi_signal: int | None = None  # WiFi signal strength in dBm
@@ -669,6 +674,12 @@ class BambuMQTTClient:
         self._sequence_id: int = 0
         self._pending_kprofile_response: asyncio.Event | None = None
         self._kprofile_response_data: list | None = None
+
+        # Full-report wait (latency Phase A USB pre-flight): armed by the scheduler
+        # before it requests a status update; set (thread-safe, from the MQTT thread)
+        # when the next full report carrying `sdcard` merges into state, so the
+        # pre-flight proceeds the instant the fresh report lands instead of sleeping.
+        self._full_report_event: asyncio.Event | None = None
 
         # Xcam hold timers - OrcaSlicer pattern: ignore incoming data for 3 seconds after command
         # Key: module_name, Value: timestamp when command was sent
@@ -3040,6 +3051,11 @@ class BambuMQTTClient:
                 self.state.sdcard = "HAS_SDCARD" in raw_sdcard.upper() or raw_sdcard.lower() in ("true", "normal", "1")
             else:
                 self.state.sdcard = bool(raw_sdcard)
+            # A payload carrying `sdcard` is a FULL report — stamp it and wake any
+            # armed USB pre-flight waiter (latency Phase A). Runs on the MQTT thread,
+            # so the Event.set is marshalled onto the loop.
+            self.state.last_full_report_at = time.monotonic()
+            self._signal_full_report()
 
         if home_flag is not None:
             store_to_sdcard = bool((home_flag >> 11) & 1)
@@ -3675,6 +3691,36 @@ class BambuMQTTClient:
             }
             logger.debug("[%s] Requesting firmware version info", self.serial_number)
             self._client.publish(self.topic_publish, json.dumps(message), qos=1)
+
+    def arm_full_report_wait(self) -> asyncio.Event:
+        """Create/reset the full-report event and return it (latency Phase A).
+
+        Call from the event-loop thread just before ``request_status_update()``:
+        the returned Event fires when the next full report (a payload carrying
+        ``sdcard``) merges into state, letting the USB pre-flight proceed the
+        instant fresh data lands instead of sleeping a fixed window. Captures the
+        running loop so the MQTT-thread ``Event.set`` can be marshalled back.
+        """
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        event = self._full_report_event
+        if event is None:
+            event = self._full_report_event = asyncio.Event()
+        else:
+            event.clear()
+        return event
+
+    def _signal_full_report(self) -> None:
+        """Wake an armed full-report waiter. Runs on the MQTT thread → marshal the set."""
+        event = self._full_report_event
+        if event is None:
+            return
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(event.set)
+        else:
+            event.set()
 
     def request_status_update(self) -> bool:
         """Request a full status update from the printer (public API).

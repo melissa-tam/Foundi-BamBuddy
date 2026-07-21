@@ -53,7 +53,8 @@ def _usb_env(*, status, capability=None):
 
     ``status`` is the object ``printer_manager.get_status`` returns. ``capability``
     (a ``CapabilityDecision`` or None) overrides the capability gate; None leaves
-    the real gate in place. The pre-flight settle wait is zeroed.
+    the real gate in place. ``get_client`` is stubbed to ``None`` so the smart
+    pre-flight takes the no-client path (request, no event wait) — no sleep.
     """
     notif = AsyncMock()
     upload = AsyncMock(return_value=True)
@@ -62,7 +63,7 @@ def _usb_env(*, status, capability=None):
         stack.enter_context(patch.object(printer_manager, "is_connected", return_value=True))
         stack.enter_context(patch.object(printer_manager, "request_status_update", MagicMock(return_value=True)))
         stack.enter_context(patch.object(printer_manager, "get_status", MagicMock(return_value=status)))
-        stack.enter_context(patch.object(ps_module, "_USB_PREFLIGHT_WAIT_S", 0))
+        stack.enter_context(patch.object(printer_manager, "get_client", MagicMock(return_value=None)))
         stack.enter_context(patch.object(ps_module.notification_service, "on_queue_job_waiting", notif))
         stack.enter_context(patch.object(ps_module, "upload_file_async", upload))
         stack.enter_context(patch.object(ps_module, "with_ftp_retry", ftp_retry))
@@ -231,10 +232,11 @@ def cq_scheduler(monkeypatch, test_engine):
     monkeypatch.setattr(s, "_power_off_if_needed", AsyncMock())
     monkeypatch.setattr(sched_mod.notification_service, "on_queue_job_assigned", AsyncMock())
     monkeypatch.setattr(sched_mod.notification_service, "on_queue_job_waiting", AsyncMock())
-    # Real _start_print reaches the USB/capability gates; zero the settle wait.
-    monkeypatch.setattr(ps_module, "_USB_PREFLIGHT_WAIT_S", 0)
+    # Real _start_print reaches the USB/capability gates; stub get_client to None so
+    # the smart pre-flight takes the no-client path (request, no event wait) — no sleep.
     monkeypatch.setattr(ps_module.printer_manager, "is_connected", MagicMock(return_value=True))
     monkeypatch.setattr(ps_module.printer_manager, "request_status_update", MagicMock(return_value=True))
+    monkeypatch.setattr(ps_module.printer_manager, "get_client", MagicMock(return_value=None))
     monkeypatch.setattr(
         "backend.app.services.capability_gate.check_dispatch_capability",
         AsyncMock(return_value=CapabilityDecision(ok=True)),

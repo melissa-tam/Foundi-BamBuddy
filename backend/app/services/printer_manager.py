@@ -305,7 +305,21 @@ class PrinterManager:
         if awaiting:
             self._awaiting_plate_clear.add(printer_id)
         else:
+            was_awaiting = printer_id in self._awaiting_plate_clear
             self._awaiting_plate_clear.discard(printer_id)
+            if was_awaiting:
+                # Gate released (manual clear / eject-verified completion / FA
+                # approve / startup hygiene all funnel through here): the printer can
+                # dispatch again, so wake the scheduler immediately (latency Phase A).
+                # Transition-guarded — only a real True→False change kicks, so a
+                # redundant clear never re-fires. Lazy import keeps this manager a
+                # leaf w.r.t. the scheduler; guarded so a kick can't break the gate.
+                try:
+                    from backend.app.services.dispatch_kick import dispatch_kick
+
+                    dispatch_kick.kick("plate_gate_release", printer_id)
+                except Exception:
+                    logger.debug("dispatch kick failed on plate-gate release (non-fatal)", exc_info=True)
         # Only create the coroutine when there is a loop to run it on — otherwise Python
         # emits "coroutine was never awaited" warnings (e.g. in sync unit tests).
         if self._loop and self._loop.is_running():

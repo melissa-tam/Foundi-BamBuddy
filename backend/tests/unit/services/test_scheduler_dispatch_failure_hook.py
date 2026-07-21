@@ -141,8 +141,9 @@ def _usb_preflight_env(*, status):
     USB pre-flight and its downstream dispatch touch.
 
     ``status`` is the object ``printer_manager.get_status`` returns (or ``None``
-    to simulate 'no live status at all'). The 2.5 s settle wait is zeroed so the
-    test doesn't actually sleep. Yields the mocks for assertions.
+    to simulate 'no live status at all'). ``get_client`` is stubbed to ``None`` so
+    the smart pre-flight takes the no-client path (request, no event wait) and the
+    test doesn't sleep. Yields the mocks for assertions.
     """
     req = MagicMock(return_value=True)
     notif = AsyncMock()
@@ -152,7 +153,7 @@ def _usb_preflight_env(*, status):
         stack.enter_context(patch.object(printer_manager, "is_connected", return_value=True))
         stack.enter_context(patch.object(printer_manager, "request_status_update", req))
         stack.enter_context(patch.object(printer_manager, "get_status", MagicMock(return_value=status)))
-        stack.enter_context(patch.object(ps_module, "_USB_PREFLIGHT_WAIT_S", 0))
+        stack.enter_context(patch.object(printer_manager, "get_client", MagicMock(return_value=None)))
         stack.enter_context(patch.object(ps_module.notification_service, "on_queue_job_waiting", notif))
         stack.enter_context(patch.object(ps_module, "upload_file_async", upload))
         stack.enter_context(patch.object(ps_module, "with_ftp_retry", ftp_retry))

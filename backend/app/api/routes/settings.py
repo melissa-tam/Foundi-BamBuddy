@@ -156,6 +156,8 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "low_stock_threshold",
             "farm_cooldown_stall_epsilon_c",
             "farm_cooldown_plateau_eject_margin_c",
+            "dispatch_kick_debounce_seconds",
+            "usb_preflight_max_wait_seconds",
         ]:
             settings_dict[setting.key] = float(setting.value)
         elif setting.key in [
@@ -169,6 +171,8 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "mqtt_port",
             "stagger_group_size",
             "stagger_interval_minutes",
+            "queue_check_interval_seconds",
+            "usb_preflight_fresh_window_seconds",
             "forecast_global_lead_time_days",
             "session_max_hours",
             "min_start_spool_g",

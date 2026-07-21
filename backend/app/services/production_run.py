@@ -299,6 +299,16 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
         )
 
     await db.commit()
+
+    # Wake the scheduler so the run's fresh queue items dispatch immediately
+    # (latency Phase A). Run spans printers → no single printer_id. Guarded.
+    try:
+        from backend.app.services.dispatch_kick import dispatch_kick
+
+        dispatch_kick.kick("run_create")
+    except Exception:
+        logger.debug("dispatch kick failed after run create (non-fatal)", exc_info=True)
+
     return await _load_run(db, batch.id)
 
 
@@ -869,6 +879,16 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
         # (same ordering the farm_policy notify sites rely on).
         run = await _load_run(db, run_id)
         await notification_service.on_run_resumed(run.name, _sku_code(run), topped_up, db)
+
+        # Wake the scheduler so resumed / topped-up items dispatch immediately
+        # (latency Phase A). Guarded — never let a kick failure break resume.
+        try:
+            from backend.app.services.dispatch_kick import dispatch_kick
+
+            dispatch_kick.kick("run_resume")
+        except Exception:
+            logger.debug("dispatch kick failed after run resume (non-fatal)", exc_info=True)
+
         return await _load_run(db, run_id)
     else:
         if action == "pause":

@@ -209,6 +209,17 @@ async def release_filament_staged(db: AsyncSession, printer_id: int | None = Non
 
     if released:
         await db.commit()
+        # Wake the scheduler so freshly un-staged work dispatches immediately
+        # (latency Phase A). Placed in the SERVICE — the single release path — so
+        # every caller (route button, AMS-change hook, run resume, periodic net)
+        # kicks exactly once without any of them double-firing. Guarded: a kick
+        # failure must never turn a successful release into an error.
+        try:
+            from backend.app.services.dispatch_kick import dispatch_kick
+
+            dispatch_kick.kick("release_staged", printer_id)
+        except Exception:
+            logger.debug("dispatch kick failed after staged release (non-fatal)", exc_info=True)
     return released
 
 
