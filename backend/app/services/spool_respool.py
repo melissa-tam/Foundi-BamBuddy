@@ -110,6 +110,12 @@ _feeder_since: dict[int, tuple[int, float]] = {}
 _pending_swaps: dict[int, tuple[int, int, float]] = {}
 _commanded_loads: dict[int, tuple[int, float]] = {}
 
+# A hardware runout that stamps a spool spent while its gram ledger still shows more
+# than this remaining is a drift / initial-state signal worth surfacing in triage
+# (reused core, a mid-life row minted as full, or accrual drift) — not silent loss.
+# The spent stamp still stands (hardware evidence is authoritative); this only logs.
+_SPENT_LEDGER_REMAIN_WARN_G = 150.0
+
 # Seconds a tray_now value must hold unchanged during RUNNING to count as the stable
 # feeder, and for a pending backup swap to confirm into a spent stamp.
 _SWAP_CONFIRM_S = 60.0
@@ -374,6 +380,25 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
     # pure loss: it destroyed the true gram ledger and made a FALSE spent stamp
     # unrecoverable (2026-07-19). Leaving grams intact lets the evidence-gated
     # dismissal un-spend restore the exact prior weight losslessly.
+    #
+    # Surface a spent stamp landing on a fat ledger remainder: a hardware runout with
+    # lots of grams still on the books is the drift / initial-state contradiction (the
+    # tagged path already raises the trigger=spent respool prompt and the tagless path
+    # the next-cycle W5 fresh-roll prompt, but neither names THIS gap). No new prompt
+    # machinery — the WARNING is the triage floor.
+    remaining_g = float(spool.label_weight or 0) - float(spool.weight_used or 0)
+    if remaining_g > _SPENT_LEDGER_REMAIN_WARN_G:
+        logger.warning(
+            "Spool %d marked spent (printer %d AMS%d-T%d) with %.0f g still on the ledger "
+            "(> %.0f g floor) — hardware runout with a fat remainder signals drift or an "
+            "initial-state error (reused core / mid-life row minted as full), not silent loss",
+            spool.id,
+            printer_id,
+            ams_id,
+            tray_id,
+            remaining_g,
+            _SPENT_LEDGER_REMAIN_WARN_G,
+        )
     await db.commit()
     logger.info(
         "Marked spool %d spent (printer %d AMS%d-T%d, hardware runout)",

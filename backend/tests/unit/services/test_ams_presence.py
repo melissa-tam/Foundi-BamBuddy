@@ -1243,3 +1243,143 @@ class TestEngagedFilamentDefer:
         assert ams_presence._filament_engaged(1) is False  # missing attr → unloaded default
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: None)
         assert ams_presence._filament_engaged(1) is False  # printer gone → not engaged
+
+
+class TestLoadedAtReStamp:
+    """A QUALIFIED genuine presence GAIN adjudicates the currently-bound row via
+    spool_tag_matcher.stamp_loaded_for_slot — the re-stampable FIFO ordinal (006-H2S).
+    ``qualified`` is the WIDER gate than note_physical_cycle's ``physical_cycle``: a
+    MEASURED >= 5 s absence OR an unknown-duration one (boot-spanning / coalesced edges)
+    both fire it, honouring rule 2's restart-durability contract. A MEASURED sub-5 s flap,
+    an echo, a drying flap, and the first-push seed all suppress it."""
+
+    @pytest.fixture(autouse=True)
+    def _spy_stamp(self, monkeypatch):
+        from backend.app.services import spool_tag_matcher, spool_tagless
+
+        stamp = AsyncMock(return_value=True)
+        monkeypatch.setattr(spool_tag_matcher, "stamp_loaded_for_slot", stamp)
+        # Keep note_physical_cycle inert so the physical_cycle block doesn't open a session.
+        monkeypatch.setattr(spool_tagless, "note_physical_cycle", AsyncMock())
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
+        return stamp
+
+    async def test_qualified_absence_fires_once(self, db_session, monkeypatch, _spy_stamp):
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - (
+            ams_presence._MIN_PHYSICAL_ABSENT_S + 1
+        )
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain
+        _spy_stamp.assert_awaited_once_with(db_session, 1, 0, 0)
+
+    async def test_gain_after_boot_absent_seed_invokes_adjudicator(self, db_session, monkeypatch, _spy_stamp):
+        # Server restarted with the slot EMPTY (the first push seeds it absent, leaving NO
+        # _absent_since entry), then a roll is inserted later. absent_for is None → UNKNOWN
+        # duration → qualified True but physical_cycle False. The FIFO re-stamp must still
+        # adjudicate (rule 2's restart-durability contract); the mint/prompt latch does not.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # boot seed: absent
+        assert (1, 0, 0) not in ams_presence._absent_since  # no absence start ever observed
+        await ams_presence.on_ams_change(
+            1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session
+        )  # later insert → gain
+        _spy_stamp.assert_awaited_once_with(db_session, 1, 0, 0)
+
+    async def test_short_flap_does_not_fire(self, db_session, monkeypatch, _spy_stamp):
+        # A sub-_MIN_PHYSICAL_ABSENT_S flap is a runout-instant firmware state flap, not a
+        # physical re-seat — the 5 s wire-flap debounce holds the adjudicator.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss (stamp now)
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain ~0 s later
+        _spy_stamp.assert_not_awaited()
+
+    async def test_first_push_seed_never_fires(self, db_session, monkeypatch, _spy_stamp):
+        client = MagicMock()
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)]), client=client)
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # first push
+        _spy_stamp.assert_not_awaited()
+
+    async def test_echo_gain_does_not_fire(self, db_session, monkeypatch, _spy_stamp):
+        # An identify-flap echo gain is swallowed before the physical_cycle block even
+        # though the backdated absence would otherwise qualify.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - 10
+        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic()  # arm the echo flag
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # echo gain
+        _spy_stamp.assert_not_awaited()
+
+    async def test_drying_gain_does_not_fire(self, db_session, monkeypatch, _spy_stamp):
+        monkeypatch.setattr(ams_presence, "unit_drying", lambda pid, aid: True)
+        client = MagicMock()
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - 10
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain while drying
+        _spy_stamp.assert_not_awaited()
+
+
+class TestIdleGainNeedSurvivesDefer:
+    """R4: a deferred / suppressed idle-gain discovery need is never LOST. command_identify
+    stamps note_identity_learned ONLY on a successful wire command, so every defer
+    (engaged filament, 30 s identify-gate refusal) leaves the unanswered physical cycle
+    intact — identify_needed still returns 'discovery', which the terminal sweep re-fires.
+    A successful read, by contrast, answers the cycle and the untouched tagless slot is
+    never re-read again (wire-safety doctrine)."""
+
+    async def test_engaged_filament_defer_preserves_discovery_need(self, db_session, monkeypatch):
+        _arm_cycle(1, 0, 0)  # an unanswered qualified physical cycle (a >=5 s reseat)
+        tray = _tray(0, state=11)  # present, untagged
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        # tray_now=0 → filament engaged → command_identify defers before the wire.
+        _patch_pm(monkeypatch, status=_pstate([tray], gcode_state="IDLE", tray_now=0), client=client)
+
+        ok, msg = await ams_presence.command_identify(1, 0, 0, source="idle_gain", reason="discovery")
+        assert ok is False and msg == "filament engaged"
+        client.ams_refresh_tray.assert_not_called()  # never reached the wire, stamped nothing
+        reason = await ams_presence.identify_needed(db_session, 1, 0, 0, tray, spoolman_active=False)
+        assert reason == "discovery"  # need survives → terminal sweep will catch it
+
+    async def test_gate_refusal_defer_preserves_discovery_need(self, db_session, monkeypatch):
+        _arm_cycle(1, 0, 0)
+        tray = _tray(0, state=11)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (False, "identify gate active")  # 30 s gate refused
+        _patch_pm(monkeypatch, status=_pstate([tray], gcode_state="IDLE"), client=client)
+
+        ok, _msg = await ams_presence.command_identify(1, 0, 0, source="idle_gain", reason="discovery")
+        assert ok is False
+        client.ams_refresh_tray.assert_called_once_with(0, 0)  # tried the wire, was refused
+        reason = await ams_presence.identify_needed(db_session, 1, 0, 0, tray, spoolman_active=False)
+        assert reason == "discovery"  # refused command stamps no identity-learned
+
+    async def test_successful_read_answers_the_cycle(self, db_session, monkeypatch):
+        _arm_cycle(1, 0, 0)
+        tray = _tray(0, state=11)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([tray], gcode_state="IDLE"), client=client)
+
+        ok, _msg = await ams_presence.command_identify(1, 0, 0, source="idle_gain", reason="discovery")
+        assert ok is True
+        reason = await ams_presence.identify_needed(db_session, 1, 0, 0, tray, spoolman_active=False)
+        assert reason is None  # cycle answered; an untouched tagless slot is never re-read

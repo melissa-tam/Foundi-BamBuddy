@@ -3777,6 +3777,39 @@ async def run_migrations(conn):
             {"cutoff": _esc_cutoff},
         )
 
+    # Migration (FIFO seating-order fix, 006-H2S): re-stampable ``loaded_at``
+    # ordinal separate from the write-once ``first_loaded_at`` history. TIMESTAMP
+    # NULL is the dialect-safe form shared by the adjacent spool.*_at columns
+    # (SQLite + Postgres; SQLAlchemy DateTime round-trips ISO strings on SQLite
+    # regardless of affinity). Idempotent ADD COLUMN (_safe_execute swallows
+    # "duplicate column name" / "already exists").
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN loaded_at TIMESTAMP NULL")
+
+    # Backfill: an in-service spool gets loaded_at = COALESCE(first_loaded_at,
+    # created_at) — its best available seating proxy until a real novelty event
+    # (binding change / never-fed re-seat) re-stamps it to now. "In service" =
+    # has a first_loaded_at stamp OR is currently bound to a slot. Pristine, never-
+    # assigned inventory spools stay NULL (the selector falls back for them too).
+    # Idempotent via the IS NULL guard — never overwrites a stamp set here or later
+    # by a binding/gain hook. Plain conn.execute (DML) so a failure is fatal, never
+    # swallowed — mirrors the first_loaded_at backfill above.
+    await conn.execute(
+        text(
+            "UPDATE spool SET loaded_at = COALESCE(first_loaded_at, created_at) "
+            "WHERE loaded_at IS NULL AND ("
+            "first_loaded_at IS NOT NULL "
+            "OR id IN (SELECT spool_id FROM spool_assignment))"
+        )
+    )
+
+    # Migration (R1): raise the min-start floor default 120 → 150 g. Only a stored
+    # value still holding the OLD default is migrated to the new one; a deliberately
+    # different operator value is left untouched, and an absent row lets the schema
+    # default (150) materialise at read time. Idempotent by construction (the
+    # rewritten row no longer matches value='120'). Plain conn.execute (DML) per the
+    # prefer_lowest_filament migration convention above.
+    await conn.execute(text("UPDATE settings SET value = '150' WHERE key = 'min_start_spool_g' AND value = '120'"))
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),

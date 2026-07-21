@@ -12,11 +12,15 @@ setting:
 * ``lowest_remaining`` — prefer the most-spent matching spool. Gated on the
   printer's AMS Filament Backup so we never sort toward a near-empty spool the
   printer can't switch away from (#1766 — see :func:`effective_policy`).
-* ``first_loaded`` (farm default) — FIFO by first-in-service time
-  (``Spool.first_loaded_at`` / Spoolman ``first_used``), so the oldest roll is
-  drained first. When AMS Backup can't cover a mid-print switch, a *smart-cover*
-  partition keeps a candidate that can finish the job on its own ahead of an
-  older one that would run dry.
+* ``first_loaded`` (farm default) — FIFO by time-in-AMS: the roll that has been
+  seated longest is drained first. The ordinal is when the roll CURRENTLY in the
+  tray became seated (``Spool.loaded_at``, re-stamped on a binding change or a
+  never-fed re-seat; falls back to the write-once ``first_loaded_at`` then
+  ``created_at`` / Spoolman ``first_used``) — NOT the bound ledger row's age.
+  006-H2S proved the row-age reading let a stale binding lend its age to a fresh
+  roll and invert FIFO. When AMS Backup can't cover a mid-print switch, a
+  *smart-cover* partition keeps a candidate that can finish the job on its own
+  ahead of an older one that would run dry.
 
 Plus a minimum-start-weight rule (``min_start_spool_g``): a spool whose *known*
 remaining grams fall below the floor can never be the STARTING spool of a print
@@ -59,7 +63,7 @@ logger = logging.getLogger(__name__)
 # / min_start_spool_g (guarded by test_spool_selection.py's defaults-drift test).
 SELECTION_POLICIES: tuple[str, ...] = ("slot_order", "lowest_remaining", "first_loaded")
 DEFAULT_SELECTION_POLICY = "first_loaded"
-DEFAULT_MIN_START_SPOOL_G = 120
+DEFAULT_MIN_START_SPOOL_G = 150
 # Machine waiting_reason token for a job held because its starting spool is below
 # the minimum-start floor. Rendered by QueuePage; released by farm_staging.
 WAITING_REASON_START_MIN = "start_spool_below_minimum"
@@ -72,9 +76,14 @@ class SlotInventory:
     ``remaining_g`` is the operator's authoritative remaining weight (Bambuddy
     ``label_weight - weight_used`` or Spoolman ``remaining_weight``); ``None``
     when the slot has no inventory binding (the sort then falls back to the MQTT
-    ``remain`` percentage). ``first_loaded_ord`` is epoch seconds of
-    ``COALESCE(first_loaded_at, created_at)`` (Spoolman: ``first_used``) — the
-    FIFO ordinal; ``None`` when unknown/unbound.
+    ``remain`` percentage). ``first_loaded_ord`` is the FIFO ordinal in epoch
+    seconds — time-in-AMS, i.e. when the roll currently in the tray last became
+    seated: ``COALESCE(loaded_at, first_loaded_at, created_at)`` internally
+    (Spoolman: ``first_used``); ``None`` when unknown/unbound. ``ord_src`` names
+    which source won (``"loaded_at"`` = a genuine reseat/binding stamp, else a
+    stale-ledger fallback ``"first_loaded_at"``/``"created_at"``, or ``"first_used"``
+    in Spoolman mode) so the ``[spool-select]`` trace shows why a slot sorts where it
+    does.
 
     ``out_of_rotation`` is the feed-fault hard-exclude flag: a spool flagged with a
     mid-print feed fault (jam / tangle) is out of service and must never be selected.
@@ -87,6 +96,7 @@ class SlotInventory:
 
     remaining_g: float | None
     first_loaded_ord: float | None
+    ord_src: str | None = None
     out_of_rotation: bool = False
     spent: bool = False
 
@@ -436,6 +446,7 @@ def _trace_rows(rows: list[dict], inv: dict[int, SlotInventory] | None) -> list[
                 "remain": f.get("remain"),
                 "inv_g": si.remaining_g if si else None,
                 "first_ord": si.first_loaded_ord if si else None,
+                "ord_src": si.ord_src if si else None,
             }
         )
     return out
@@ -446,10 +457,18 @@ def _trace_rows(rows: list[dict], inv: dict[int, SlotInventory] | None) -> list[
 # with the first-loaded ordinal, in one query per mode).
 # ---------------------------------------------------------------------------
 def _dt_to_epoch(dt: datetime | None) -> float | None:
-    """Epoch seconds for a datetime (naive treated as its stored wall clock —
-    consistent across all spools, which is all FIFO ordering needs)."""
+    """Epoch seconds for a datetime, treating a naive value as UTC.
+
+    Every stamp source is UTC — ``utcnow()`` (``loaded_at`` / ``first_loaded_at``)
+    and SQLite's ``created_at`` server-default — but SQLite returns them naive.
+    ``datetime.timestamp()`` on a naive value assumes LOCAL time, shifting every
+    ordinal by the host's UTC offset (harmless while uniform, but a real inversion
+    hazard the moment any source or consumer mixes bases). Pinning naive → UTC makes
+    the result an absolute epoch (surfaced via :func:`epoch_to_iso` / the trace)."""
     if dt is None:
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
     try:
         return dt.timestamp()
     except (OverflowError, OSError, ValueError):
@@ -511,7 +530,11 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
             remaining_g, first_ord = await _fetch_spoolman_slot(spoolman_id)
             if remaining_g is None and first_ord is None:
                 continue
-            out[gtid] = SlotInventory(remaining_g=remaining_g, first_loaded_ord=first_ord)
+            out[gtid] = SlotInventory(
+                remaining_g=remaining_g,
+                first_loaded_ord=first_ord,
+                ord_src="first_used" if first_ord is not None else None,
+            )
         return out
 
     # Internal inventory mode (default).
@@ -528,10 +551,21 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
         label = float(spool.label_weight or 0)
         used = float(spool.weight_used or 0)
         remaining_g = max(0.0, label - used)
-        first_ord = _dt_to_epoch(spool.first_loaded_at or spool.created_at)
+        # Seating-order precedence: the re-stampable loaded_at (a real re-seat /
+        # binding change) beats the write-once first_loaded_at history, which beats
+        # created_at. ord_src records which one won so the trace tells a genuine
+        # reseat stamp from a stale-ledger fallback (006-H2S FIFO fix).
+        if spool.loaded_at is not None:
+            ord_src = "loaded_at"
+        elif spool.first_loaded_at is not None:
+            ord_src = "first_loaded_at"
+        else:
+            ord_src = "created_at"
+        first_ord = _dt_to_epoch(spool.loaded_at or spool.first_loaded_at or spool.created_at)
         out[gtid] = SlotInventory(
             remaining_g=remaining_g,
             first_loaded_ord=first_ord,
+            ord_src=ord_src,
             out_of_rotation=spool.feed_fault_at is not None,
             spent=spool.spent_at is not None,
         )

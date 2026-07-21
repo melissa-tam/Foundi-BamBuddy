@@ -1637,3 +1637,46 @@ def test_marker_machinery_removed():
         "_marker_matches",
     ):
         assert not hasattr(spool_tagless, name), f"{name} should be removed"
+
+
+# --- loaded_at re-stampable FIFO ordinal (006-H2S) -------------------------
+
+
+class TestLoadedAtStamp:
+    """``loaded_at`` (the re-stampable FIFO ordinal) is stamped when a tagless roll
+    first binds a slot (auto_assign / bare-tray auto-config) and RE-stamped when a
+    slot-move re-binds an existing ledger row in place."""
+
+    async def test_bare_tray_autoconfig_stamps_loaded_at(self, db_session, printer_factory, env):
+        env.settings["tagless_default_filament"] = json.dumps(
+            {"brand": "Bambu Lab", "material": "PETG", "subtype": "HF", "rgba": "000000FF"}
+        )
+        printer = await printer_factory()
+        handled = await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare())
+        assert handled is True
+        sa = await _assignment(db_session, printer.id)
+        spool = await db_session.get(Spool, sa.spool_id)
+        assert spool.loaded_at is not None
+
+    async def test_mint_and_assign_stamps_loaded_at(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        await spool_tagless.handle_tagless_slot(db_session, printer.id, 0, 0, _tray("PETG"), None, [])
+        sa = await _assignment(db_session, printer.id)
+        spool = await db_session.get(Spool, sa.spool_id)
+        assert spool.loaded_at is not None
+
+    async def test_slot_move_restamps_loaded_at(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        spool_id = await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+        seeded = await db_session.get(Spool, spool_id)
+        assert seeded.loaded_at is None  # _seed_assignment leaves it unset
+
+        ams_data = _ams(0, [_empty_tray(0), {**_tray("PETG", color="112233FF"), "id": 1}])
+        handled = await spool_tagless.handle_tagless_slot(
+            db_session, printer.id, 0, 1, _tray("PETG", color="112233FF"), None, ams_data
+        )
+        assert handled is True
+        moved = await _assignment(db_session, printer.id, ams_id=0, tray_id=1)
+        assert moved.spool_id == spool_id  # same ledger row re-bound
+        await db_session.refresh(seeded)
+        assert seeded.loaded_at is not None  # slot-move re-bind re-stamped the ordinal

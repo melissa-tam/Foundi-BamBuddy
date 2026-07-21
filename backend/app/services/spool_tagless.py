@@ -63,6 +63,7 @@ from backend.app.services.spool_tag_matcher import (
     is_valid_tag,
     parse_tray_fields,
     stamp_first_loaded,
+    stamp_loaded,
 )
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_ids import GENERIC_FILAMENT_IDS
@@ -483,6 +484,9 @@ async def _assign_from_setting(
         )
     )
     old = existing.scalar_one_or_none()
+    # Capture the outgoing pairing before the delete so loaded_at re-stamps only on
+    # a genuine binding change (new roll), not a same-spool upsert replay.
+    old_spool_id = old.spool_id if old is not None else None
     if old is not None:
         await db.delete(old)
         await db.flush()
@@ -497,6 +501,8 @@ async def _assign_from_setting(
     db.add(assignment)
     await db.flush()
     stamp_first_loaded(spool)
+    if old_spool_id != spool.id:
+        stamp_loaded(spool)
 
 
 async def _push_config(db: AsyncSession, spool: Spool, printer_id: int, ams_id: int, tray_id: int, tray: dict) -> bool:
@@ -939,6 +945,10 @@ async def _maybe_move_tagless_assignment(
     asg.ams_id = ams_id
     asg.tray_id = tray_id
     _refresh_assignment_fingerprint(asg, tray)
+    # Slot-move re-bind mutates the assignment in place (the upsert pairing-change
+    # guard never sees it), so re-stamp the FIFO ordinal here: the roll physically
+    # became seated in THIS slot now. spool is selectinload-ed on the query above.
+    stamp_loaded(asg.spool)
     await db.commit()
     await _broadcast_auto_assigned(printer_id, ams_id, tray_id, asg.spool_id, origin="tagless")
     logger.info(

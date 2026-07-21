@@ -99,7 +99,9 @@ class AppSettings(BaseModel):
     # Spool selection policy for farm dispatch — replaces the legacy boolean
     # ``prefer_lowest_filament``. 'slot_order' keeps the AMS slot ordering,
     # 'lowest_remaining' prefers the most-spent matching spool, 'first_loaded'
-    # (default) is FIFO by first-in-service time (see Spool.first_loaded_at).
+    # (default) is FIFO by time-in-AMS — the roll currently seated longest is
+    # drained first (Spool.loaded_at, re-stamped on a real re-seat / binding change;
+    # NOT the bound ledger row's age).
     spool_selection_policy: str = Field(
         default="first_loaded",
         description="When multiple AMS spools match: 'slot_order', 'lowest_remaining', or 'first_loaded' (FIFO)",
@@ -108,7 +110,7 @@ class AppSettings(BaseModel):
     # STARTING spool of a print (it may still finish one already in progress).
     # 0 disables the guard.
     min_start_spool_g: int = Field(
-        default=120,
+        default=150,
         ge=0,
         le=10000,
         description="Minimum remaining grams for a spool to START a print; 0 disables the guard",

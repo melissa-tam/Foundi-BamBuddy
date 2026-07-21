@@ -7,6 +7,7 @@ from backend.app.models.color_catalog import ColorCatalogEntry
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services.spool_tag_matcher import (
+    NEVER_FED_MAX_G,
     auto_assign_spool,
     create_spool_from_tray,
     find_matching_untagged_spool,
@@ -14,6 +15,8 @@ from backend.app.services.spool_tag_matcher import (
     is_bambu_tag,
     is_valid_tag,
     link_tag_to_inventory_spool,
+    stamp_loaded,
+    stamp_loaded_for_slot,
 )
 
 # -- helpers -----------------------------------------------------------------
@@ -1782,6 +1785,177 @@ async def test_auto_assign_stamps_first_loaded_once(db_session, printer_factory)
     await auto_assign_spool(printer.id, 1, 0, spool, mock_pm, db_session)
     await db_session.commit()
     assert spool.first_loaded_at == stamped
+
+
+# -- loaded_at re-stampable FIFO ordinal (006-H2S) --------------------------
+
+
+def _mock_pm():
+    from unittest.mock import MagicMock
+
+    pm = MagicMock()
+    pm.get_status.return_value = None
+    pm.get_client.return_value = None
+    return pm
+
+
+async def _fresh_spool(db_session, **kwargs):
+    spool = Spool(material="PLA", label_weight=1000, core_weight=250, **kwargs)
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.flush()
+    return spool
+
+
+async def _bind_spool(db_session, printer_id, ams_id, tray_id, spool):
+    """Directly create a SpoolAssignment (no MQTT) so an adjudication test can start
+    from a bound slot."""
+    db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id))
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_auto_assign_stamps_loaded_at_on_new_binding(db_session, printer_factory):
+    """A first binding stamps loaded_at (the re-stampable FIFO ordinal)."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session)
+    assert spool.loaded_at is None
+    await auto_assign_spool(printer.id, 0, 0, spool, _mock_pm(), db_session)
+    await db_session.commit()
+    assert spool.loaded_at is not None
+
+
+@pytest.mark.asyncio
+async def test_auto_assign_no_restamp_on_same_spool_replay(db_session, printer_factory):
+    """Re-detecting the SAME spool on the SAME slot (upsert replay) keeps loaded_at —
+    the pairing did not change, so the roll's seating order must not reset."""
+    import asyncio
+
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session)
+    await auto_assign_spool(printer.id, 0, 0, spool, _mock_pm(), db_session)
+    await db_session.commit()
+    stamped = spool.loaded_at
+    assert stamped is not None
+
+    await asyncio.sleep(0.01)
+    await auto_assign_spool(printer.id, 0, 0, spool, _mock_pm(), db_session)  # same spool, same slot
+    await db_session.commit()
+    assert spool.loaded_at == stamped
+
+
+@pytest.mark.asyncio
+async def test_auto_assign_restamps_on_binding_change(db_session, printer_factory):
+    """Binding a DIFFERENT spool into a slot that held another one re-stamps the new
+    spool's loaded_at — a binding change is a reliable novelty event."""
+    import asyncio
+
+    printer = await printer_factory()
+    spool_a = await _fresh_spool(db_session)
+    spool_b = await _fresh_spool(db_session)
+    await auto_assign_spool(printer.id, 0, 0, spool_a, _mock_pm(), db_session)  # slot holds A
+    await auto_assign_spool(printer.id, 0, 1, spool_b, _mock_pm(), db_session)  # B lands elsewhere first
+    await db_session.commit()
+    b_first = spool_b.loaded_at
+    assert b_first is not None
+
+    await asyncio.sleep(0.01)
+    await auto_assign_spool(printer.id, 0, 0, spool_b, _mock_pm(), db_session)  # re-bind B onto A's slot
+    await db_session.commit()
+    assert spool_b.loaded_at is not None and spool_b.loaded_at > b_first
+
+
+@pytest.mark.asyncio
+async def test_stamp_loaded_for_slot_stamps_never_fed(db_session, printer_factory):
+    """A never-fed bound row (weight_used < NEVER_FED_MAX_G, no tag, not spent) is
+    re-stamped on a re-seat — it holds no consumption seniority (rule 2)."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session, weight_used=0.0)
+    await _bind_spool(db_session, printer.id, 0, 0, spool)
+    assert spool.loaded_at is None
+    stamped = await stamp_loaded_for_slot(db_session, printer.id, 0, 0)
+    assert stamped is True
+    assert spool.loaded_at is not None
+
+
+@pytest.mark.asyncio
+async def test_stamp_loaded_for_slot_keeps_mid_life(db_session, printer_factory):
+    """A mid-life bound row (has fed >= floor) keeps position on a re-seat — the
+    dominant flow is maintenance of the SAME roll (rule 3). ANY absence, no stamp."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session, weight_used=400.0, loaded_at=None)
+    await _bind_spool(db_session, printer.id, 0, 0, spool)
+    stamped = await stamp_loaded_for_slot(db_session, printer.id, 0, 0)
+    assert stamped is False
+    assert spool.loaded_at is None
+
+
+@pytest.mark.asyncio
+async def test_stamp_loaded_for_slot_skips_spent(db_session, printer_factory):
+    """A spent bound row is skipped — the spent latch owns the slot; its replacement
+    mint stamps at bind time, not here (even though weight_used is 0)."""
+    from datetime import datetime
+
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session, weight_used=0.0, spent_at=datetime.utcnow())
+    await _bind_spool(db_session, printer.id, 0, 0, spool)
+    stamped = await stamp_loaded_for_slot(db_session, printer.id, 0, 0)
+    assert stamped is False
+    assert spool.loaded_at is None
+
+
+@pytest.mark.asyncio
+async def test_stamp_loaded_for_slot_skips_tagged(db_session, printer_factory):
+    """An RFID-tagged bound row is skipped — identity is adjudicated by the reconcile
+    (a same-tag re-seat keeps position; a tag change re-binds and stamps there)."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session, weight_used=0.0, tag_uid="AABBCCDD11223344")
+    await _bind_spool(db_session, printer.id, 0, 0, spool)
+    stamped = await stamp_loaded_for_slot(db_session, printer.id, 0, 0)
+    assert stamped is False
+    assert spool.loaded_at is None
+
+
+@pytest.mark.asyncio
+async def test_stamp_loaded_for_slot_boundary_at_never_fed_max(db_session, printer_factory):
+    """The boundary is exclusive: weight_used == NEVER_FED_MAX_G is 'has fed' (no
+    stamp); just below it is never-fed (stamp)."""
+    printer = await printer_factory()
+    at_floor = await _fresh_spool(db_session, weight_used=NEVER_FED_MAX_G)
+    below = await _fresh_spool(db_session, weight_used=NEVER_FED_MAX_G - 0.1)
+    await _bind_spool(db_session, printer.id, 0, 0, at_floor)
+    await _bind_spool(db_session, printer.id, 0, 1, below)
+    assert await stamp_loaded_for_slot(db_session, printer.id, 0, 0) is False
+    assert at_floor.loaded_at is None
+    assert await stamp_loaded_for_slot(db_session, printer.id, 0, 1) is True
+    assert below.loaded_at is not None
+
+
+@pytest.mark.asyncio
+async def test_stamp_loaded_for_slot_noops_unbound(db_session, printer_factory):
+    """An unbound slot has nothing to adjudicate → no-op (False)."""
+    printer = await printer_factory()
+    assert await stamp_loaded_for_slot(db_session, printer.id, 3, 2) is False
+
+
+def test_stamp_loaded_for_slot_takes_no_timing_input():
+    """The adjudicator's signature carries NO duration/absence parameter — the decision
+    is grams-state + identity only, never elapsed time (v3 semantics)."""
+    import inspect
+
+    params = list(inspect.signature(stamp_loaded_for_slot).parameters)
+    assert params == ["db", "printer_id", "ams_id", "tray_id"]
+
+
+def test_stamp_loaded_is_unconditional():
+    """stamp_loaded always writes (callers own the churn guard) — unlike write-once
+    stamp_first_loaded."""
+    from types import SimpleNamespace
+
+    s = SimpleNamespace(loaded_at="OLD")
+    stamp_loaded(s)
+    assert s.loaded_at != "OLD" and s.loaded_at is not None
 
 
 # -- K-profile drift re-apply (F3: extracted from main.on_ams_change) --------

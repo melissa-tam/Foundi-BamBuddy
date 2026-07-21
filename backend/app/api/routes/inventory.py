@@ -1917,6 +1917,9 @@ async def assign_spool(
         )
     )
     old = existing.scalar_one_or_none()
+    # Capture the outgoing pairing before the delete so the loaded_at re-stamp fires
+    # only on a genuine binding change, not a same-spool re-assign of the roll here.
+    old_spool_id = old.spool_id if old is not None else None
     if old:
         await db.delete(old)
         await db.flush()
@@ -1931,9 +1934,14 @@ async def assign_spool(
     )
     db.add(assignment)
     # First-in-service stamp (FIFO substrate) — idempotent, single stamping origin.
-    from backend.app.services.spool_tag_matcher import stamp_first_loaded
+    from backend.app.services.spool_tag_matcher import stamp_first_loaded, stamp_loaded
 
     stamp_first_loaded(spool)
+    # Re-stampable FIFO ordinal: a manual bind to a DIFFERENT spool is a novelty
+    # event (operator seated a new roll and pointed the slot at it); a re-assign of
+    # the same spool keeps position.
+    if old_spool_id != spool.id:
+        stamp_loaded(spool)
     await db.commit()
     await db.refresh(assignment)
 

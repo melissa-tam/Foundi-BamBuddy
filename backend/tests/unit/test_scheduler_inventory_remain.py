@@ -42,11 +42,12 @@ def _make_async_session_returning(rows: list):
     return db
 
 
-def _spool(*, label_weight, weight_used, first_loaded_at=None, created_at=None, spent_at=None):
+def _spool(*, label_weight, weight_used, loaded_at=None, first_loaded_at=None, created_at=None, spent_at=None):
     """Internal-mode spool stub with the attributes build_slot_inventory reads."""
     return SimpleNamespace(
         label_weight=label_weight,
         weight_used=weight_used,
+        loaded_at=loaded_at,
         first_loaded_at=first_loaded_at,
         created_at=created_at or datetime(2026, 1, 1, tzinfo=timezone.utc),
         feed_fault_at=None,
@@ -122,6 +123,73 @@ class TestInternalInventoryOverrides:
             out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
         assert out[0].first_loaded_ord == first.timestamp()
         assert out[1].first_loaded_ord == created.timestamp()
+        # ord_src names the source that won: first_loaded_at then created_at.
+        assert out[0].ord_src == "first_loaded_at"
+        assert out[1].ord_src == "created_at"
+
+    @pytest.mark.asyncio
+    async def test_loaded_at_beats_first_loaded_at(self):
+        """The re-stampable ``loaded_at`` (a real re-seat) wins the ordinal over the
+        write-once ``first_loaded_at`` history — the whole 006-H2S FIFO fix: a fresh
+        roll re-seated into a slot whose ledger row is OLD must sort by when the roll
+        became seated, not by the stale row age. ord_src reflects the winner."""
+        loaded_ts = datetime(2026, 7, 21, tzinfo=timezone.utc)  # re-seated recently
+        first_ts = datetime(2026, 2, 1, tzinfo=timezone.utc)  # old ledger row age
+        rows = [
+            SimpleNamespace(
+                ams_id=0,
+                tray_id=0,
+                spool=_spool(label_weight=1000, weight_used=0, loaded_at=loaded_ts, first_loaded_at=first_ts),
+            ),
+        ]
+        loaded = [{"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False}]
+        db = _make_async_session_returning(rows)
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        assert out[0].first_loaded_ord == loaded_ts.timestamp()
+        assert out[0].ord_src == "loaded_at"
+
+    @pytest.mark.asyncio
+    async def test_ordinal_three_step_fallback_chain(self):
+        """loaded_at → first_loaded_at → created_at, in that precedence, each tagged
+        by ord_src so the trace tells a genuine reseat stamp from a stale fallback."""
+        created = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        first = datetime(2026, 2, 1, tzinfo=timezone.utc)
+        loaded_ts = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        rows = [
+            SimpleNamespace(  # all three present → loaded_at
+                ams_id=0,
+                tray_id=0,
+                spool=_spool(
+                    label_weight=1000, weight_used=0, loaded_at=loaded_ts, first_loaded_at=first, created_at=created
+                ),
+            ),
+            SimpleNamespace(  # no loaded_at → first_loaded_at
+                ams_id=0,
+                tray_id=1,
+                spool=_spool(
+                    label_weight=1000, weight_used=0, loaded_at=None, first_loaded_at=first, created_at=created
+                ),
+            ),
+            SimpleNamespace(  # neither → created_at
+                ams_id=0,
+                tray_id=2,
+                spool=_spool(
+                    label_weight=1000, weight_used=0, loaded_at=None, first_loaded_at=None, created_at=created
+                ),
+            ),
+        ]
+        loaded = [
+            {"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False},
+            {"ams_id": 0, "tray_id": 1, "global_tray_id": 1, "is_external": False},
+            {"ams_id": 0, "tray_id": 2, "global_tray_id": 2, "is_external": False},
+        ]
+        db = _make_async_session_returning(rows)
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        assert (out[0].first_loaded_ord, out[0].ord_src) == (loaded_ts.timestamp(), "loaded_at")
+        assert (out[1].first_loaded_ord, out[1].ord_src) == (first.timestamp(), "first_loaded_at")
+        assert (out[2].first_loaded_ord, out[2].ord_src) == (created.timestamp(), "created_at")
 
     @pytest.mark.asyncio
     async def test_skips_external_slots(self):
@@ -211,7 +279,27 @@ class TestSpoolmanModeOverrides:
             out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
         assert out[0].remaining_g == 720.0
         assert out[0].first_loaded_ord == 1000.0
+        assert out[0].ord_src == "first_used"
         assert out[2].remaining_g == 80.0
+
+
+class TestDtToEpoch:
+    """``_dt_to_epoch`` pins a naive datetime to UTC so a naive stamp and its aware-UTC
+    twin yield the SAME absolute epoch — the latent clock hazard 006-H2S flagged (SQLite
+    hands stamps back naive; ``.timestamp()`` would otherwise read them as local)."""
+
+    def test_naive_utc_equals_aware_utc_twin(self):
+        from backend.app.services.spool_selection import _dt_to_epoch
+
+        naive = datetime(2026, 5, 1, 12, 0, 0)
+        aware = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+        assert _dt_to_epoch(naive) == _dt_to_epoch(aware)
+        assert _dt_to_epoch(aware) == aware.timestamp()
+
+    def test_none_is_none(self):
+        from backend.app.services.spool_selection import _dt_to_epoch
+
+        assert _dt_to_epoch(None) is None
 
     @pytest.mark.asyncio
     async def test_spoolman_unreachable_skips_silently(self):

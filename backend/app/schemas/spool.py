@@ -232,8 +232,13 @@ class SpoolResponse(SpoolBase):
     # HMS short code that flagged the feed fault (e.g. "0700_8010").
     feed_fault_code: str | None = None
     # FIFO substrate: when this spool FIRST entered service. Read-only; stamped
-    # server-side on first assignment. NULL = never loaded.
+    # server-side on first assignment (write-once history). NULL = never loaded.
     first_loaded_at: datetime | None = None
+    # FIFO ordinal: when the physical roll currently in the tray entered service —
+    # the re-stampable seating order the selector sorts by. Read-only, server-
+    # stamped (deliberately ABSENT from SpoolUpdate); NULL falls back to
+    # first_loaded_at / created_at.
+    loaded_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     k_profiles: list[SpoolKProfileResponse] = []

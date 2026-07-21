@@ -5,14 +5,17 @@ Tests 3MF-primary tracking (Path 1) and AMS remain% delta fallback
 """
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services.usage_tracker import (
     PrintSession,
     _active_sessions,
     _archive_colors_from_spools,
+    _assign_segments_to_slots,
     _spool_color_to_hex,
     _track_from_3mf,
     on_print_complete,
@@ -1072,3 +1075,453 @@ class TestArchiveFilamentColorRewrite:
             )
 
         assert archive.filament_color == "#161616"
+
+
+def _split_state(tray_change_log, *, total_layers=100, progress=100, layer_num=100, tray_now=0, last_loaded_tray=0):
+    """Printer state carrying a REAL tray_change_log list for split tests.
+
+    ``_make_printer_state`` returns a bare MagicMock whose ``tray_change_log`` is
+    an auto-attr (not a list), which the tracker's isinstance guard treats as
+    empty — good for the no-split cases but useless when a split is the point.
+    """
+    return SimpleNamespace(
+        raw_data={},
+        tray_change_log=list(tray_change_log),
+        total_layers=total_layers,
+        progress=progress,
+        layer_num=layer_num,
+        tray_now=tray_now,
+        last_loaded_tray=last_loaded_tray,
+    )
+
+
+def _mock_settings_path():
+    """Patched app settings whose base_dir / anything resolves to an existing path."""
+    mock_settings = MagicMock()
+    mock_path = MagicMock()
+    mock_path.exists.return_value = True
+    mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+    return mock_settings, mock_path
+
+
+class TestAssignSegmentsToSlots:
+    """`_assign_segments_to_slots` groups the whole-print tray change log per slot."""
+
+    def test_single_filament_gets_all_segments(self):
+        # One active filament → every segment fed it, mapping irrelevant.
+        assert _assign_segments_to_slots([(0, 0), (1, 30), (3, 60)], None, [1]) == {1: [(0, 0), (1, 30), (3, 60)]}
+
+    def test_empty_log_returns_empty(self):
+        assert _assign_segments_to_slots([], [0, 1], [1, 2]) == {}
+
+    def test_multi_filament_reverse_maps_and_orphan_inherits(self):
+        # slot1→tray0, slot2→tray1; tray3 is an unmapped backup that engaged
+        # while slot1 (tray0) was feeding → it inherits slot1.
+        out = _assign_segments_to_slots([(0, 0), (1, 20), (0, 40), (3, 60)], [0, 1], [1, 2])
+        assert out[1] == [(0, 0), (0, 40), (3, 60)]
+        assert out[2] == [(1, 20)]
+
+    def test_multi_filament_without_mapping_returns_empty(self):
+        # No slicer mapping to attribute segments → refuse to guess.
+        assert _assign_segments_to_slots([(0, 0), (1, 30)], None, [1, 2]) == {}
+
+    def test_zero_usage_slot_dropped(self):
+        # Multi-filament: slot2 (tray1) has zero usage → its segment is dropped
+        # while slot1 and slot3 keep theirs. (A single nonzero slot instead takes
+        # the "all segments feed it" fast path, mapping-independent.)
+        out = _assign_segments_to_slots([(0, 0), (1, 20), (2, 40)], [0, 1, 2], [1, 3])
+        assert out == {1: [(0, 0)], 3: [(2, 40)]}
+
+
+class TestMultiFeederSplitAllPaths:
+    """The per-feeder split fires in the shared `_track_from_3mf` (used by the
+    primary queue path, the 3MF fallback path, reconcile, and foreign prints),
+    for single- AND multi-filament prints."""
+
+    @pytest.mark.asyncio
+    async def test_single_filament_multi_feeder_splits_by_layer_span(self):
+        """AMS backup: one colour fed from tray0 then tray1 splits proportionally.
+
+        Reproduces the 006 shape — a spool runs dry mid-print and the AMS auto-
+        refills from a sibling tray; each tray's spool must be charged its span,
+        not the whole print dumped on the print-start mapped slot.
+        """
+        spool0 = _make_spool(id=10, label_weight=1000, weight_used=0)
+        spool1 = _make_spool(id=20, label_weight=1000, weight_used=0)
+        assign0 = _make_assignment(spool_id=10, ams_id=0, tray_id=0)
+        assign1 = _make_assignment(spool_id=20, ams_id=0, tray_id=1)
+        archive = MagicMock()
+        archive.file_path = "archives/backup.3mf"
+        archive.filament_color = None
+
+        db = AsyncMock()
+        db.execute = AsyncMock(
+            side_effect=[
+                MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assign0)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool0)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assign1)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool1)),
+            ]
+        )
+
+        pm = _make_printer_manager(_split_state([(0, 0), (1, 40)], tray_now=1, last_loaded_tray=1))
+        filament_usage = [{"slot_id": 1, "used_g": 100.0, "type": "PLA", "color": ""}]
+
+        mock_settings, _ = _mock_settings_path()
+        with (
+            patch("backend.app.core.config.settings", mock_settings),
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
+            patch("backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf", return_value=None),
+        ):
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="completed",
+                print_name="backup",
+                handled_trays=set(),
+                printer_manager=pm,
+                db=db,
+                ams_mapping=[0],  # slicer said tray0 — but the printer fed tray1 too
+            )
+
+        # tray0 got layers 0-40 (40 g), tray1 the remainder (60 g).
+        by_tray = {(r["ams_id"], r["tray_id"]): r for r in results}
+        assert by_tray[(0, 0)]["weight_used"] == 40.0
+        assert by_tray[(0, 0)]["spool_id"] == 10
+        assert by_tray[(0, 1)]["weight_used"] == 60.0
+        assert by_tray[(0, 1)]["spool_id"] == 20
+        assert spool0.weight_used == 40.0
+        assert spool1.weight_used == 60.0
+        # Both fed spools stamped last_used.
+        assert spool0.last_used is not None and spool1.last_used is not None
+
+    @pytest.mark.asyncio
+    async def test_single_feeder_unchanged(self):
+        """A one-entry change log is not a split — full weight to the one tray."""
+        spool = _make_spool(id=7, label_weight=1000, weight_used=0)
+        assign = _make_assignment(spool_id=7, ams_id=0, tray_id=2)
+        archive = MagicMock()
+        archive.file_path = "archives/single.3mf"
+        archive.filament_color = None
+
+        db = AsyncMock()
+        db.execute = AsyncMock(
+            side_effect=[
+                MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assign)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool)),
+            ]
+        )
+
+        pm = _make_printer_manager(_split_state([(2, 0)], tray_now=2, last_loaded_tray=2))
+        filament_usage = [{"slot_id": 1, "used_g": 55.0, "type": "PLA", "color": ""}]
+
+        mock_settings, _ = _mock_settings_path()
+        with (
+            patch("backend.app.core.config.settings", mock_settings),
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
+        ):
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="completed",
+                print_name="single",
+                handled_trays=set(),
+                printer_manager=pm,
+                db=db,
+                ams_mapping=[2],
+            )
+
+        assert len(results) == 1
+        assert results[0]["ams_id"] == 0 and results[0]["tray_id"] == 2
+        assert results[0]["weight_used"] == 55.0
+        assert spool.weight_used == 55.0
+
+    @pytest.mark.asyncio
+    async def test_multi_filament_backup_splits_per_slot(self):
+        """Multi-colour print: slot1 backup-switches (tray0→tray3), slot2 steady.
+
+        The old `len(nonzero_slots) == 1` gate skipped the split entirely for any
+        print using >=2 filament slots, so slot1's backup roll (tray3) was charged
+        nothing and its share was dumped on tray0. Now slot1 splits across its own
+        feeders while slot2 charges only its mapped tray — no cross-slot leakage.
+        """
+        spool0 = _make_spool(id=10, label_weight=1000, weight_used=0)  # slot1 home tray0
+        spool3 = _make_spool(id=30, label_weight=1000, weight_used=0)  # slot1 backup tray3
+        spool1 = _make_spool(id=20, label_weight=1000, weight_used=0)  # slot2 tray1
+        assign0 = _make_assignment(spool_id=10, ams_id=0, tray_id=0)
+        assign3 = _make_assignment(spool_id=30, ams_id=0, tray_id=3)
+        assign1 = _make_assignment(spool_id=20, ams_id=0, tray_id=1)
+        archive = MagicMock()
+        archive.file_path = "archives/twocolor.3mf"
+        archive.filament_color = None
+
+        db = AsyncMock()
+        db.execute = AsyncMock(
+            side_effect=[
+                MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),
+                # slot1 split: tray0 then tray3 (per_tray insertion order)
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assign0)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool0)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assign3)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool3)),
+                # slot2 normal path: tray1
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assign1)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool1)),
+            ]
+        )
+
+        pm = _make_printer_manager(_split_state([(0, 0), (1, 20), (0, 40), (3, 60)], tray_now=3, last_loaded_tray=3))
+        filament_usage = [
+            {"slot_id": 1, "used_g": 60.0, "type": "PLA", "color": "#FF0000"},
+            {"slot_id": 2, "used_g": 40.0, "type": "PLA", "color": "#00FF00"},
+        ]
+
+        mock_settings, _ = _mock_settings_path()
+        with (
+            patch("backend.app.core.config.settings", mock_settings),
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
+            patch("backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf", return_value=None),
+        ):
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="completed",
+                print_name="twocolor",
+                handled_trays=set(),
+                printer_manager=pm,
+                db=db,
+                ams_mapping=[0, 1],  # slot1→tray0, slot2→tray1
+            )
+
+        by_tray = {(r["ams_id"], r["tray_id"]): r for r in results}
+        # slot1 (60 g) split across its feeders tray0 (0-60 linear) and tray3 (remainder).
+        assert by_tray[(0, 0)]["slot_id"] == 1
+        assert by_tray[(0, 3)]["slot_id"] == 1
+        assert round(by_tray[(0, 0)]["weight_used"] + by_tray[(0, 3)]["weight_used"], 1) == 60.0
+        assert by_tray[(0, 3)]["weight_used"] > 0  # backup roll is no longer 0 g
+        assert spool3.weight_used > 0
+        # slot2 (40 g) charged only to its own tray1 — no leakage from slot1's split.
+        assert by_tray[(0, 1)]["slot_id"] == 2
+        assert by_tray[(0, 1)]["weight_used"] == 40.0
+        assert spool1.weight_used == 40.0
+
+
+class TestForeignPrintCharging:
+    """R3: a foreign / screen-started print (no farm queue item) still reaches the
+    same 3MF charging path — accounting only, no farm-unit or gate side effects."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_sessions(self):
+        _active_sessions.clear()
+        yield
+        _active_sessions.clear()
+
+    @pytest.fixture(autouse=True)
+    def _mock_get_setting(self):
+        with patch(
+            "backend.app.api.routes.settings.get_setting",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_foreign_single_feeder_charges_observed_tray(self):
+        """No ams_mapping and no queue item — the feeder resolves from live tray_now."""
+        spool = _make_spool(id=9, label_weight=1000, weight_used=0)
+        assign = _make_assignment(spool_id=9, ams_id=0, tray_id=0)
+        archive = MagicMock()
+        archive.file_path = "archives/foreign.3mf"
+        archive.filament_color = None
+
+        db = AsyncMock()
+        db.execute = AsyncMock(
+            side_effect=[
+                MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=None)),  # no queue item
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assign)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool)),
+            ]
+        )
+
+        # tray_now_at_start feeds the single-filament fallback; no queue mapping.
+        pm = _make_printer_manager(_split_state([(0, 0)], tray_now=0, last_loaded_tray=0))
+        filament_usage = [{"slot_id": 1, "used_g": 33.0, "type": "PLA", "color": ""}]
+
+        mock_settings, _ = _mock_settings_path()
+        with (
+            patch("backend.app.core.config.settings", mock_settings),
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
+        ):
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="completed",
+                print_name="foreign_lan_print",
+                handled_trays=set(),
+                printer_manager=pm,
+                db=db,
+                ams_mapping=None,  # foreign print: nothing dispatched it
+                tray_now_at_start=0,
+            )
+
+        assert len(results) == 1
+        assert results[0]["ams_id"] == 0 and results[0]["tray_id"] == 0
+        assert results[0]["weight_used"] == 33.0
+        assert spool.weight_used == 33.0
+
+    @pytest.mark.asyncio
+    async def test_foreign_multi_feeder_splits(self):
+        """A foreign single-colour print fed from two trays splits identically —
+        the split needs no queue mapping (single active filament)."""
+        spool0 = _make_spool(id=11, label_weight=1000, weight_used=0)
+        spool1 = _make_spool(id=12, label_weight=1000, weight_used=0)
+        assign0 = _make_assignment(spool_id=11, ams_id=0, tray_id=0)
+        assign1 = _make_assignment(spool_id=12, ams_id=0, tray_id=1)
+        archive = MagicMock()
+        archive.file_path = "archives/foreign_backup.3mf"
+        archive.filament_color = None
+
+        db = AsyncMock()
+        db.execute = AsyncMock(
+            side_effect=[
+                MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=None)),  # no queue item
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assign0)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool0)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assign1)),
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool1)),
+            ]
+        )
+
+        pm = _make_printer_manager(_split_state([(0, 0), (1, 25)], tray_now=1, last_loaded_tray=1))
+        filament_usage = [{"slot_id": 1, "used_g": 80.0, "type": "PLA", "color": ""}]
+
+        mock_settings, _ = _mock_settings_path()
+        with (
+            patch("backend.app.core.config.settings", mock_settings),
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
+            patch("backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf", return_value=None),
+        ):
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="completed",
+                print_name="foreign_backup",
+                handled_trays=set(),
+                printer_manager=pm,
+                db=db,
+                ams_mapping=None,
+            )
+
+        by_tray = {(r["ams_id"], r["tray_id"]): r for r in results}
+        assert set(by_tray) == {(0, 0), (0, 1)}
+        assert round(sum(r["weight_used"] for r in results), 1) == 80.0
+        assert by_tray[(0, 0)]["weight_used"] == 20.0  # layers 0-25 of 100
+        assert by_tray[(0, 1)]["weight_used"] == 60.0  # remainder
+        assert spool0.weight_used == 20.0 and spool1.weight_used == 60.0
+
+    @pytest.mark.asyncio
+    async def test_foreign_completion_charges_without_farm_unit_mutation(self):
+        """End-to-end via on_print_complete: a foreign session (plate_id=None,
+        no ams_mapping) charges the spool and adds ONLY SpoolUsageHistory rows —
+        never a PrintQueueItem — so farm queue state is untouched."""
+        from backend.app.models.print_queue import PrintQueueItem
+
+        spool = _make_spool(id=5, label_weight=1000, weight_used=0)
+        assign = _make_assignment(spool_id=5, ams_id=0, tray_id=0)
+        archive = MagicMock()
+        archive.file_path = "archives/foreign_e2e.3mf"
+        archive.filament_color = "#000000"
+        archive.filament_used_grams = 30.0  # == tracked → no untracked top-up
+
+        # Foreign print: session exists (on_print_start runs for every non-eject
+        # print) but carries no plate_id / ams_mapping and no farm queue linkage.
+        _active_sessions[1] = PrintSession(
+            printer_id=1,
+            print_name="foreign_e2e",
+            started_at=datetime.now(timezone.utc),
+            tray_remain_start={},  # skip the remain%-delta fallback
+            tray_now_at_start=0,
+            spool_assignments={},
+            ams_mapping=None,
+            plate_id=None,
+        )
+
+        db = AsyncMock()
+        db.execute = AsyncMock(
+            side_effect=[
+                MagicMock(scalar_one_or_none=MagicMock(return_value=None)),  # idempotency: started_at None
+                MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),  # _track archive
+                MagicMock(scalar_one_or_none=MagicMock(return_value=None)),  # no queue item
+                MagicMock(scalar_one_or_none=MagicMock(return_value=assign)),  # live assignment
+                MagicMock(scalar_one_or_none=MagicMock(return_value=spool)),  # spool
+                MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),  # cost re-select
+            ]
+        )
+
+        pm = _make_printer_manager(_split_state([(0, 0)], tray_now=0, last_loaded_tray=0))
+        filament_usage = [{"slot_id": 1, "used_g": 30.0, "type": "PLA", "color": ""}]
+
+        mock_settings, _ = _mock_settings_path()
+        with (
+            patch("backend.app.core.config.settings", mock_settings),
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
+            patch("backend.app.utils.threemf_tools.count_plates_in_slice_info", return_value=1),
+        ):
+            results = await on_print_complete(1, {"status": "completed"}, pm, db, archive_id=100)
+
+        # The foreign print WAS charged.
+        assert len(results) == 1
+        assert results[0]["spool_id"] == 5
+        assert results[0]["weight_used"] == 30.0
+        assert spool.weight_used == 30.0
+        # No farm-unit mutation: only SpoolUsageHistory rows were added, never a
+        # PrintQueueItem (usage tracking is pure accounting).
+        added = [c.args[0] for c in db.add.call_args_list]
+        assert added, "expected a usage-history row"
+        assert all(isinstance(obj, SpoolUsageHistory) for obj in added)
+        assert not any(isinstance(obj, PrintQueueItem) for obj in added)
+
+
+class TestIdempotencyGuard:
+    """A duplicate completion (reconcile racing the MQTT terminal, or a manual
+    re-finalize) must not double-charge."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_sessions(self):
+        _active_sessions.clear()
+        yield
+        _active_sessions.clear()
+
+    @pytest.fixture(autouse=True)
+    def _mock_get_setting(self):
+        with patch(
+            "backend.app.api.routes.settings.get_setting",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_duplicate_completion_is_noop(self):
+        """A usage-history row at/after the archive's started_at means THIS run
+        already finalized → the second completion returns [] and charges nothing."""
+        db = AsyncMock()
+        db.execute = AsyncMock(
+            side_effect=[
+                # started_at load (non-None) then usage-count >= started_at → 1.
+                MagicMock(scalar_one_or_none=MagicMock(return_value=datetime.now(timezone.utc))),
+                MagicMock(scalar=MagicMock(return_value=1)),
+            ]
+        )
+        pm = _make_printer_manager(_split_state([(0, 0)]))
+
+        results = await on_print_complete(1, {"status": "completed"}, pm, db, archive_id=100)
+
+        assert results == []
+        db.commit.assert_not_called()
+        # Bailed at the guard: only the two guard queries ran, no spool lookups.
+        assert db.execute.await_count == 2

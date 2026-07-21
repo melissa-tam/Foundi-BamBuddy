@@ -201,6 +201,81 @@ def _match_slots_by_color(
     return result
 
 
+def _global_tray_to_ams_key(global_tray_id: int) -> tuple[int, int]:
+    """Convert a global tray id to its ``(ams_id, tray_id)`` assignment key.
+
+    254/255 → external spool (sentinel ams 255); ≥128 → AMS-HT (one slot per
+    unit); else a regular 4-slot AMS. Single origin shared by the remain%-delta
+    fallback and the 3MF per-segment split so the encoding never drifts.
+    """
+    if global_tray_id >= 254:
+        return (255, global_tray_id - 254)
+    if global_tray_id >= 128:
+        return (global_tray_id, 0)
+    return (global_tray_id // 4, global_tray_id % 4)
+
+
+def _assign_segments_to_slots(
+    tray_change_log: list,
+    slot_to_tray: list | None,
+    nonzero_slot_ids: list[int],
+) -> dict[int, list[tuple[int, int]]]:
+    """Partition a print's whole-run tray-change log into per-slot feeder segments.
+
+    ``tray_change_log`` is the printer's temporal record of ``tray_now`` switches
+    (``[(global_tray_id, layer_num), ...]``) spanning the WHOLE print, so a
+    multi-colour print interleaves every colour's segments and an AMS
+    auto-refill / backup switch (#957) appends a sibling tray. To split each 3MF
+    filament's weight to the tray that actually fed it, the log is first grouped
+    per slot:
+
+    * One active filament → every segment fed it (the classic single-filament
+      split — mapping-independent and unchanged).
+    * Several active filaments WITH a slicer slot→tray mapping → each segment's
+      tray is reverse-mapped to its slot; an *orphan* tray (a backup sibling
+      mapped to no slot) inherits the immediately-preceding segment's slot,
+      because a backup engages the instant the running spool dries — while that
+      colour is still extruding, so the tray just before it in the log is the one
+      it is standing in for. A leading orphan (no predecessor) is dropped.
+    * Several active filaments with NO resolved mapping → unattributable, return
+      ``{}`` so the caller charges each slot to its position-default tray, as
+      before (never a wrong guess).
+
+    Returns ``{slot_id: [(global_tray_id, start_layer), ...]}`` in layer order;
+    a slot whose segment list has <2 distinct trays is left to the normal path.
+    """
+    segments: list[tuple[int, int]] = []
+    for change in tray_change_log or []:
+        if isinstance(change, (tuple, list)) and len(change) >= 2 and isinstance(change[0], int):
+            layer = change[1] if isinstance(change[1], int) else 0
+            segments.append((change[0], layer))
+    if not segments:
+        return {}
+
+    if len(nonzero_slot_ids) == 1:
+        return {nonzero_slot_ids[0]: segments}
+
+    reverse: dict[int, int] = {}
+    if slot_to_tray:
+        for idx, tray in enumerate(slot_to_tray):
+            if isinstance(tray, int) and tray >= 0:
+                reverse.setdefault(tray, idx + 1)  # slot_id is 1-based
+    if not reverse:
+        return {}
+
+    grouped: dict[int, list[tuple[int, int]]] = {}
+    prev_slot: int | None = None
+    for tray, layer in segments:
+        slot = reverse.get(tray, prev_slot)  # orphan/backup inherits the preceding segment
+        if slot is None:
+            continue  # leading orphan — no colour to attribute it to
+        prev_slot = slot
+        grouped.setdefault(slot, []).append((tray, layer))
+
+    nonzero = set(nonzero_slot_ids)
+    return {sid: segs for sid, segs in grouped.items() if sid in nonzero}
+
+
 @dataclass
 class PrintSession:
     printer_id: int
@@ -637,11 +712,7 @@ async def on_print_complete(
             # makes that slot's remain% drop to 0, which the fallback below
             # would otherwise charge to the originally-assigned spool.
             def _global_to_ams_key(global_tray_id: int) -> tuple[int, int]:
-                if global_tray_id >= 254:
-                    return (255, global_tray_id - 254)
-                if global_tray_id >= 128:
-                    return (global_tray_id, 0)
-                return (global_tray_id // 4, global_tray_id % 4)
+                return _global_tray_to_ams_key(global_tray_id)
 
             print_used_keys: set[tuple[int, int]] = set()
             if ams_mapping:
@@ -1115,24 +1186,39 @@ async def _track_from_3mf(
         mapping_source or "none",
     )
 
-    # 5. For single-filament non-queue prints, use tray_now from printer state
-    #    Priority: tray_change_log (multi-tray split) > tray_now_at_start > current tray_now
-    #              > last_loaded_tray > vt_tray check
-    #
-    # tray_change_log evidence wins over slot_to_tray when present: if the
-    # printer fed from multiple trays mid-print (AMS auto-fallback when one
-    # spool runs out, #957), the slicer's mapping captured at print start
-    # is stale and needs to be replaced with per-layer split attribution.
+    # 5. Resolve mid-print tray attribution.
+    #    The printer's tray_change_log (temporal record of tray_now switches)
+    #    drives a per-segment weight SPLIT whenever a filament fed from >1 tray —
+    #    AMS auto-refill / backup when a spool runs dry (#957). It is consulted
+    #    for ALL slot counts, not only single-filament prints: a multi-colour run
+    #    whose primary colour backup-switched mid-print must still credit the
+    #    sibling tray rather than dumping its whole share on the print-start
+    #    mapped slot (#006). Segments are grouped per slot first (a colour's own
+    #    home tray + the backups that stood in for it); a lone single-filament
+    #    print with no resolved mapping and no split falls back to live tray_now.
     nonzero_slots = [u for u in filament_usage if u.get("used_g", 0) > 0]
+    nonzero_slot_ids = [u.get("slot_id", 0) for u in nonzero_slots]
     tray_now_override: int | None = None
-    tray_changes: list[tuple[int, int]] = []  # [(global_tray_id, layer_num), ...]
-    state = printer_manager.get_status(printer_id) if len(nonzero_slots) == 1 else None
-    if state is not None:
-        tray_changes = getattr(state, "tray_change_log", []) or []
 
-    if len(tray_changes) > 1:
-        # Multi-tray usage detected — splitting takes over regardless of slot_to_tray.
-        logger.info("[UsageTracker] 3MF: tray change log: %s (will split weight)", tray_changes)
+    split_state = printer_manager.get_status(printer_id)
+    _raw_log = getattr(split_state, "tray_change_log", None)
+    tray_changes: list[tuple[int, int]] = list(_raw_log) if isinstance(_raw_log, (list, tuple)) else []
+    _raw_total = getattr(split_state, "total_layers", 0)
+    split_total_layers = _raw_total if isinstance(_raw_total, int) else 0
+
+    slot_segments = _assign_segments_to_slots(tray_changes, slot_to_tray, nonzero_slot_ids)
+    any_split = any(len({t for t, _ in (slot_segments.get(sid) or [])}) > 1 for sid in nonzero_slot_ids)
+
+    # `state` keeps its original single-filament meaning for the tray_now
+    # fallback below and downstream partial-scaling references.
+    state = split_state if len(nonzero_slots) == 1 else None
+
+    if any_split:
+        logger.info(
+            "[UsageTracker] 3MF: tray_change_log=%s -> per-slot segments=%s (will split weight)",
+            tray_changes,
+            slot_segments,
+        )
     elif not slot_to_tray and len(nonzero_slots) == 1:
         if 0 <= tray_now_at_start <= 254:
             tray_now_override = tray_now_at_start
@@ -1209,8 +1295,9 @@ async def _track_from_3mf(
         if used_g <= 0:
             continue
 
-        # --- Mid-print tray switch: split weight across trays ---
-        if len(tray_changes) > 1:
+        # --- Mid-print tray switch: split THIS slot's weight across its feeders ---
+        this_slot_segments = slot_segments.get(slot_id) or []
+        if len({t for t, _ in this_slot_segments}) > 1:
             # Compute total weight for this slot (same logic as normal path)
             if layer_grams and slot_id in layer_grams:
                 total_weight = layer_grams[slot_id]
@@ -1241,15 +1328,22 @@ async def _track_from_3mf(
             diameter = split_props.get("diameter", 1.75)
             filament_id = slot_id - 1  # 0-based for gcode
 
+            # Accumulate grams per feeder tray. A slot can feed the same tray in
+            # more than one span (its colour prints, yields to another colour,
+            # then resumes on the same tray), so aggregate before writing one
+            # history row per spool. The last segment carries the rounding
+            # remainder so the parts sum to exactly total_weight.
+            seg_count = len(this_slot_segments)
+            per_tray_grams: dict[int, float] = {}
             sum_previous = 0.0
-            for seg_idx, (tray_global, seg_start_layer) in enumerate(tray_changes):
-                is_last = seg_idx + 1 >= len(tray_changes)
+            for seg_idx, (tray_global, seg_start_layer) in enumerate(this_slot_segments):
+                is_last = seg_idx + 1 >= seg_count
 
                 if is_last:
                     # Last segment: remainder to avoid rounding drift
                     segment_grams = total_weight - sum_previous
                 elif split_layer_usage:
-                    seg_end_layer = tray_changes[seg_idx + 1][1]
+                    seg_end_layer = this_slot_segments[seg_idx + 1][1]
                     mm_at_start = get_cumulative_usage_at_layer(split_layer_usage, seg_start_layer).get(filament_id, 0)
                     mm_at_end = get_cumulative_usage_at_layer(split_layer_usage, seg_end_layer).get(filament_id, 0)
                     segment_grams = mm_to_grams(mm_at_end - mm_at_start, diameter, density)
@@ -1258,52 +1352,41 @@ async def _track_from_3mf(
                     # Cascade denominators because firmware on some models (P1S
                     # observed) resets `total_layer_num` to 0 at print end —
                     # `last_layer_num` is the print's last-valid layer captured
-                    # mid-print and survives that reset (same shape as the
-                    # `last_progress` fallback at line 1040). Equal-split is the
+                    # mid-print and survives that reset. Equal-split is the
                     # last-resort fence: still wrong, but bounded — never dumps
                     # the entire print onto the last segment, which was the
                     # original #1771 symptom for the reporter (P1S, AMS Backup
                     # fed from spool 1 then spool 2, all 260 g credited to
                     # spool 2 even though spool 1 had given up its 180 g).
-                    seg_end_layer = tray_changes[seg_idx + 1][1]
-                    denom = (state.total_layers if state else 0) or last_layer_num
+                    seg_end_layer = this_slot_segments[seg_idx + 1][1]
+                    denom = split_total_layers or last_layer_num
                     if denom > 0:
                         segment_grams = total_weight * (seg_end_layer - seg_start_layer) / denom
                     else:
                         # No layer information available from any source —
-                        # spread evenly across segments. The last segment will
-                        # get the rounding remainder via the `is_last` branch
-                        # above on its own iteration.
-                        segment_grams = total_weight / len(tray_changes)
+                        # spread evenly across segments.
+                        segment_grams = total_weight / seg_count
 
                 sum_previous += segment_grams
-                if segment_grams <= 0:
+                if segment_grams > 0:
+                    per_tray_grams[tray_global] = per_tray_grams.get(tray_global, 0.0) + segment_grams
+
+            for tray_global, tray_grams in per_tray_grams.items():
+                if tray_grams <= 0:
                     continue
 
-                # Convert global tray ID to (ams_id, tray_id)
-                if tray_global >= 254:
-                    seg_ams_id = 255
-                    seg_tray_id = tray_global - 254
-                elif tray_global >= 128:
-                    seg_ams_id = tray_global
-                    seg_tray_id = 0
-                else:
-                    seg_ams_id = tray_global // 4
-                    seg_tray_id = tray_global % 4
-
+                seg_ams_id, seg_tray_id = _global_tray_to_ams_key(tray_global)
                 seg_key = (seg_ams_id, seg_tray_id)
                 if seg_key in handled_trays:
                     continue
 
                 logger.info(
-                    "[UsageTracker] 3MF split: segment %d tray=%d (AMS%d-T%d) layers %d-%s -> %.1fg",
-                    seg_idx,
+                    "[UsageTracker] 3MF split: slot %d tray=%d (AMS%d-T%d) -> %.1fg",
+                    slot_id,
                     tray_global,
                     seg_ams_id,
                     seg_tray_id,
-                    seg_start_layer,
-                    tray_changes[seg_idx + 1][1] if not is_last else "end",
-                    segment_grams,
+                    tray_grams,
                 )
 
                 seg_spool_id = await _resolve_spool_id_for_tray(
@@ -1328,21 +1411,21 @@ async def _track_from_3mf(
                 if not spool:
                     continue
 
-                spool.weight_used = (spool.weight_used or 0) + segment_grams
+                spool.weight_used = (spool.weight_used or 0) + tray_grams
                 spool.last_used = datetime.now(timezone.utc)
 
-                percent = round(segment_grams / (spool.label_weight or 1000) * 100)
+                percent = round(tray_grams / (spool.label_weight or 1000) * 100)
 
                 cost = None
                 cost_per_kg = spool.cost_per_kg if spool.cost_per_kg is not None else default_filament_cost
                 if cost_per_kg > 0:
-                    cost = round((segment_grams / 1000.0) * cost_per_kg, 2)
+                    cost = round((tray_grams / 1000.0) * cost_per_kg, 2)
 
                 history = SpoolUsageHistory(
                     spool_id=spool.id,
                     printer_id=printer_id,
                     print_name=print_name,
-                    weight_used=round(segment_grams, 1),
+                    weight_used=round(tray_grams, 1),
                     percent_used=percent,
                     status=status,
                     cost=cost,
@@ -1354,7 +1437,7 @@ async def _track_from_3mf(
                 results.append(
                     {
                         "spool_id": spool.id,
-                        "weight_used": round(segment_grams, 1),
+                        "weight_used": round(tray_grams, 1),
                         "percent_used": percent,
                         "ams_id": seg_ams_id,
                         "tray_id": seg_tray_id,
@@ -1366,10 +1449,9 @@ async def _track_from_3mf(
                 )
 
                 logger.info(
-                    "[UsageTracker] Spool %d consumed %.1fg (3MF split seg%d) on printer %d AMS%d-T%d (%s)",
+                    "[UsageTracker] Spool %d consumed %.1fg (3MF split) on printer %d AMS%d-T%d (%s)",
                     spool.id,
-                    segment_grams,
-                    seg_idx,
+                    tray_grams,
                     printer_id,
                     seg_ams_id,
                     seg_tray_id,

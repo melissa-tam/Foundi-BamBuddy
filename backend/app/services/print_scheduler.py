@@ -2925,6 +2925,13 @@ class PrintScheduler:
                 return "already_moved_on"
             item.status = "pending"
             item.started_at = None
+            # Clear the scheduler-owned AMS mapping too: it was computed for this
+            # printer's AMS slot layout at the failed dispatch, and a stale mapping
+            # would replay against current AMS truth. The `if not item.ams_mapping`
+            # gate (~:394) recomputes it on the retry; identical clear + rationale
+            # already live on the model-hold un-pin path (~:2330). printer_id pinning
+            # is deliberately left untouched.
+            item.ams_mapping = None
             await db.commit()
             return "reverted"
 

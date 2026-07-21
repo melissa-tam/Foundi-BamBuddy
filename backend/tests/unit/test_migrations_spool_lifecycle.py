@@ -298,3 +298,147 @@ async def test_remap_is_idempotent(engine, session_maker):
         settings = await _settings_map(conn)
     assert settings.get("spool_selection_policy") == "lowest_remaining"
     assert "prefer_lowest_filament" not in settings
+
+
+# ---------------------------------------------------------------------------
+# FIFO seating-order fix: loaded_at column + backfill
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migration_readds_loaded_at_column(engine):
+    """Dropping the column simulates a pre-migration schema; run_migrations re-adds it
+    (idempotent ADD COLUMN)."""
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE spool DROP COLUMN loaded_at"))
+        assert "loaded_at" not in await _spool_columns(conn)
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        assert "loaded_at" in await _spool_columns(conn)
+    # Re-add is idempotent — a second run does not raise on the existing column.
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+
+
+@pytest.mark.asyncio
+async def test_loaded_at_backfill_coalesce_order(engine, session_maker):
+    """Backfill = COALESCE(first_loaded_at, created_at) for in-service rows; a pristine
+    never-assigned spool stays NULL. A distinct first_loaded_at proves COALESCE prefers
+    it over created_at (not just that both happen to equal created_at)."""
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    distinct_first = datetime(2026, 6, 15, 8, 0, 0)  # != _FIXED_CREATED
+    async with session_maker() as session:
+        # first_loaded_at pre-set and distinct → loaded_at must copy IT, not created_at.
+        with_first = await _make_spool(session, first_loaded_at=distinct_first)
+        # bound, no first_loaded_at: WI-1 stamps first_loaded_at=created_at, so loaded_at
+        # resolves to created_at (the in-service COALESCE-fallback value).
+        bound = await _make_spool(session)
+        pristine = await _make_spool(session)
+        session.add(SpoolAssignment(spool_id=bound.id, printer_id=1, ams_id=0, tray_id=0))
+        await session.commit()
+        ids = {"with_first": with_first.id, "bound": bound.id, "pristine": pristine.id}
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        rows = (await conn.execute(text("SELECT id, loaded_at, first_loaded_at, created_at FROM spool"))).fetchall()
+    by_id = {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+    loaded, first, _created = by_id[ids["with_first"]]
+    assert loaded is not None and loaded == first, "loaded_at should copy the distinct first_loaded_at"
+
+    loaded, first, created = by_id[ids["bound"]]
+    assert loaded is not None and loaded == created == first, "bound row → loaded_at = created_at"
+
+    assert by_id[ids["pristine"]][0] is None, "pristine unassigned spool must stay NULL"
+
+
+@pytest.mark.asyncio
+async def test_loaded_at_backfill_never_overwrites_and_is_idempotent(engine, session_maker):
+    """An existing loaded_at stamp is never clobbered (even when first_loaded_at differs),
+    and running the migration twice is a no-op."""
+    prior_loaded = datetime(2026, 7, 20, 10, 0, 0)
+    older_first = datetime(2026, 1, 1, 12, 0, 0)
+    async with session_maker() as session:
+        stamped = await _make_spool(session, loaded_at=prior_loaded, first_loaded_at=older_first)
+        pristine = await _make_spool(session)
+        await session.commit()
+        stamped_id, pristine_id = stamped.id, pristine.id
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        first_pass = {r[0]: r[1] for r in (await conn.execute(text("SELECT id, loaded_at FROM spool"))).fetchall()}
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        second_pass = {r[0]: r[1] for r in (await conn.execute(text("SELECT id, loaded_at FROM spool"))).fetchall()}
+
+    assert first_pass == second_pass, "second run must not change any loaded_at"
+    # The pre-existing stamp survived (not overwritten to first_loaded_at).
+    assert first_pass[stamped_id] is not None and first_pass[stamped_id] != str(older_first)
+    assert first_pass[pristine_id] is None
+
+
+# ---------------------------------------------------------------------------
+# R1: min_start_spool_g default 120 -> 150 migration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_min_start_old_default_migrated(engine, session_maker):
+    """A stored value still on the OLD default (120) is bumped to the new default 150."""
+    async with session_maker() as session:
+        await _seed_settings(session, min_start_spool_g="120")
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        settings = await _settings_map(conn)
+    assert settings.get("min_start_spool_g") == "150"
+
+
+@pytest.mark.asyncio
+async def test_min_start_custom_value_untouched(engine, session_maker):
+    """A deliberately-different operator value (not the old default) is left alone."""
+    async with session_maker() as session:
+        await _seed_settings(session, min_start_spool_g="80")
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        settings = await _settings_map(conn)
+    assert settings.get("min_start_spool_g") == "80"
+
+
+@pytest.mark.asyncio
+async def test_min_start_absent_stays_absent(engine):
+    """No stored row → the migration creates nothing (schema default 150 materialises at
+    read time)."""
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        settings = await _settings_map(conn)
+    assert "min_start_spool_g" not in settings
+
+
+@pytest.mark.asyncio
+async def test_min_start_migration_idempotent(engine, session_maker):
+    """Running twice keeps 150 (the second pass no longer matches value='120')."""
+    async with session_maker() as session:
+        await _seed_settings(session, min_start_spool_g="120")
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        settings = await _settings_map(conn)
+    assert settings.get("min_start_spool_g") == "150"

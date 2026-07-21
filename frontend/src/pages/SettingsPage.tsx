@@ -949,7 +949,7 @@ export function SettingsPage() {
       settings.ams_history_retention_days !== localSettings.ams_history_retention_days ||
       settings.disable_filament_warnings !== localSettings.disable_filament_warnings ||
       (settings.spool_selection_policy ?? 'first_loaded') !== (localSettings.spool_selection_policy ?? 'first_loaded') ||
-      (settings.min_start_spool_g ?? 120) !== (localSettings.min_start_spool_g ?? 120) ||
+      (settings.min_start_spool_g ?? 150) !== (localSettings.min_start_spool_g ?? 150) ||
       (settings.spool_recovery_enabled ?? true) !== (localSettings.spool_recovery_enabled ?? true) ||
       (settings.spool_recovery_max_attempts ?? 2) !== (localSettings.spool_recovery_max_attempts ?? 2) ||
       (settings.spool_recovery_step_timeout_s ?? 90) !== (localSettings.spool_recovery_step_timeout_s ?? 90) ||
@@ -5152,7 +5152,7 @@ export function SettingsPage() {
                     type="number"
                     min={0}
                     max={10000}
-                    value={localSettings.min_start_spool_g ?? 120}
+                    value={localSettings.min_start_spool_g ?? 150}
                     onChange={(e) => updateSetting('min_start_spool_g', Math.max(0, Math.min(10000, parseInt(e.target.value) || 0)))}
                     className="w-32 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />

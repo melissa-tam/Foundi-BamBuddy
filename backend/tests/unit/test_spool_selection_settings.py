@@ -23,7 +23,7 @@ class TestDefaults:
     def test_new_field_defaults(self):
         s = AppSettings()
         assert s.spool_selection_policy == "first_loaded"
-        assert s.min_start_spool_g == 120
+        assert s.min_start_spool_g == 150  # R1: floor raised 120 -> 150
         assert s.auto_add_untagged is True
 
     def test_tagless_default_filament_default_shape(self):

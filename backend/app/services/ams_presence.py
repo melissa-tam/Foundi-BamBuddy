@@ -741,15 +741,18 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                     # not silently re-enter rotation from a drying flap.
                     # Best-effort — a failure must never break the AMS callback.
                     if not unit_drying(printer_id, ams_id):
+                        # ``qualified`` = a genuine gain that is NOT a MEASURED sub-5 s
+                        # flap: the preceding absence either lasted >= _MIN_PHYSICAL_ABSENT_S
+                        # OR its start was never observed (boot-seed / two coalesced edges),
+                        # so its duration is UNKNOWN — not a flap, it qualifies (see the
+                        # absence-consume comment above). ``physical_cycle`` is the STRICTER
+                        # measured->=5 s subset. The two gate different actions below.
+                        qualified = absent_for is None or absent_for >= _MIN_PHYSICAL_ABSENT_S
+
                         # Record the change for the identify lanes. Drying-gated with
                         # the rest: a drying cycle disengages trays with no physical
                         # event, and change evidence must mean somebody moved a spool.
-                        _note_gain(
-                            printer_id,
-                            ams_id,
-                            tray_id,
-                            qualified=absent_for is None or absent_for >= _MIN_PHYSICAL_ABSENT_S,
-                        )
+                        _note_gain(printer_id, ams_id, tray_id, qualified=qualified)
 
                         try:
                             from backend.app.services.spool_recovery import clear_on_reinsert
@@ -763,10 +766,11 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                                 tray_id,
                             )
 
-                        # W1/W5: a genuine gain after a QUALIFIED physical absence is a
-                        # real roll swap. Record the cycle so the spent-binding latch
-                        # releases (branch 3 / bare-tray) + the fresh-roll prompt fires.
-                        # Guarded like the clear above; never break the AMS callback.
+                        # W1/W5 spent-binding-latch release + fresh-roll prompt fire ONLY on
+                        # the STRICT ``physical_cycle`` (a MEASURED >= 5 s absence). Minting a
+                        # spool row or prompting on a false positive is expensive, so the
+                        # unknown-duration case is deliberately excluded here. Guarded like
+                        # the clear above; never break the AMS callback.
                         if physical_cycle:
                             try:
                                 from backend.app.services import spool_tagless
@@ -775,6 +779,28 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                             except Exception:  # noqa: BLE001 — best-effort physical-cycle note
                                 logger.exception(
                                     "AMS presence: physical-cycle note failed for printer %d AMS%d-T%d",
+                                    printer_id,
+                                    ams_id,
+                                    tray_id,
+                                )
+
+                        # Re-stampable FIFO ordinal (006-H2S) fires on the WIDER
+                        # ``qualified`` gate — a boot-spanning / unknown-duration re-seat
+                        # must still adjudicate to honour rule 2's restart-durability
+                        # contract, and a wrong re-stamp is only a FIFO demotion, never an
+                        # expensive mint/prompt (the deliberate two-tier asymmetry vs the
+                        # strict physical_cycle gate above). A MEASURED sub-5 s flap still
+                        # fires nothing. The grams-state + identity DECISION inside the
+                        # adjudicator consults no timing — this gate is only the wire-flap
+                        # debounce. Best-effort — never break the AMS callback.
+                        if qualified:
+                            try:
+                                from backend.app.services.spool_tag_matcher import stamp_loaded_for_slot
+
+                                await stamp_loaded_for_slot(db, printer_id, ams_id, tray_id)
+                            except Exception:  # noqa: BLE001 — best-effort loaded_at re-stamp
+                                logger.exception(
+                                    "AMS presence: loaded_at re-stamp failed for printer %d AMS%d-T%d",
                                     printer_id,
                                     ams_id,
                                     tray_id,
