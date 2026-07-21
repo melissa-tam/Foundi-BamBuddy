@@ -667,7 +667,7 @@ async def test_extruder_overload_triggers_recovery(db_session, printer_factory, 
     refreshed = await db_session.get(PrintQueueItem, item.id)
     assert refreshed.waiting_reason is None  # cleared on success
     jammed_after = await db_session.get(Spool, jammed.id)
-    assert jammed_after.feed_fault_at is not None  # original still marked at step-2
+    assert jammed_after.feed_fault_at is not None  # original still marked at the swap-commit boundary
     assert jammed_after.feed_fault_code == "0300_801E"
 
 
@@ -695,7 +695,7 @@ async def test_extruder_side_rejam_keeps_replacement_in_rotation(
     replacement_after = await db_session.get(Spool, replacement.id)
     assert replacement_after.feed_fault_at is None  # extruder-side → kept in rotation
     original_after = await db_session.get(Spool, original.id)
-    assert original_after.feed_fault_at is not None  # original marked at step-2
+    assert original_after.feed_fault_at is not None  # original marked at the swap-commit boundary
     refreshed = await db_session.get(PrintQueueItem, item.id)
     assert json.loads(refreshed.ams_mapping) == [2, -1, -1, -1]  # landed on tray2
 
@@ -1366,7 +1366,8 @@ async def test_abort_clears_oor_when_resumed_on_jammed_feeder(
     db_session, printer_factory, install_settings, monkeypatch
 ):
     """An external actor resumes ON the jammed feeder (RUNNING + tray_now == the
-    jammed global tray): the out-of-rotation flag stamped at step-2 is cleared."""
+    jammed global tray): the out-of-rotation flag stamped at the swap-commit boundary
+    is cleared."""
     install_settings()
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)  # single-feeder mapping [0]
@@ -2000,14 +2001,18 @@ async def test_reset_outcome_auto_refault_returns_ok_no_self_pause(monkeypatch):
 
 async def test_reset_recovered_self_heals_without_swap(db_session, printer_factory, install_settings, monkeypatch):
     """Reset (b): the firmware reset fully self-heals (fault clears, RUNNING stable,
-    the change completed on the jammed feeder). Recovery ends success with NO swap:
-    the jammed spool's out-of-rotation flag (stamped at step 2) is cleared, the
-    per-job flap counter is incremented, and no unload/load is ever sent."""
+    the change completed on the jammed feeder). Recovery ends success with NO swap and
+    NO out-of-rotation: the swap-commit boundary is never reached, so the jammed spool
+    is never stamped (``feed_fault_at`` stays None throughout) and the swap-framed
+    alert is never sent — the dedicated self-heal notification fires exactly once, the
+    per-job flap counter increments, and no unload/load is ever sent."""
     install_settings(step_timeout_s=1.0)
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
-    jammed = await _bind_spool(db_session, printer.id, 0, 0)  # jammed tray0, OOR-marked at step 2
+    jammed = await _bind_spool(db_session, printer.id, 0, 0)  # jammed tray0 — never OOR-stamped on a self-heal
     succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+    oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+    self_healed = _spy(monkeypatch, "on_spool_recovery_self_healed")
     state = _make_state(tray_now=0, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
     client = _SelfHealClient(state)
     _wire(monkeypatch, state, client)
@@ -2021,11 +2026,22 @@ async def test_reset_recovered_self_heals_without_swap(db_session, printer_facto
     assert state.state == "RUNNING"
     assert spool_recovery._success_counts[(printer.id, "task-1")] == 1  # counted toward the flap cap
     succeeded.assert_not_awaited()  # a no-swap self-heal never sends the swap-framed alert
+    oor.assert_not_awaited()  # nothing taken out of rotation — the commit boundary was never reached
+
+    # The dedicated self-heal notification fires exactly once, carrying the incident.
+    self_healed.assert_awaited_once()
+    kwargs = self_healed.call_args.kwargs
+    assert kwargs["printer_id"] == printer.id
+    assert kwargs["job_name"] == "SKU007"  # incident.job_name
+    assert kwargs["layer"] == 50  # incident.layer_at_fault
+    assert kwargs["code"] == "0700_8010"
+    assert kwargs["slot_desc"] == "AMS0 slot 0"  # jammed global tray 0 → AMS0 slot 0
+    assert kwargs["spool_desc"] == "Bambu PETG Green"  # _spool_label of the jammed spool
 
     db_session.expunge_all()
-    cleared = await db_session.get(Spool, jammed.id)
-    assert cleared.feed_fault_at is None  # OOR flag cleared (self-heal on the jammed feeder)
-    assert cleared.feed_fault_code is None
+    unstamped = await db_session.get(Spool, jammed.id)
+    assert unstamped.feed_fault_at is None  # never stamped (no commit boundary on a self-heal)
+    assert unstamped.feed_fault_code is None
     refreshed = await db_session.get(PrintQueueItem, item.id)
     assert refreshed.waiting_reason is None
     assert json.loads(refreshed.ams_mapping) == [0, -1, -1, -1]  # mapping unchanged (no swap)
@@ -2036,12 +2052,14 @@ async def test_reset_never_moves_escalates_stuck_reset_failed(
 ):
     """Reset (d): the AMS ignores even the reset resume (state never leaves PAUSE +
     non-idle) → recovery escalates the new stuck_reset_failed reason, never touching
-    the unload."""
+    the unload. The feeder is genuinely wedged, so the jammed spool IS taken out of
+    rotation at this commit boundary — before the escalation."""
     install_settings(step_timeout_s=0.05)
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
+    jammed = await _bind_spool(db_session, printer.id, 0, 0)  # jammed tray0
     failed = _spy(monkeypatch, "on_spool_recovery_failed")
-    _spy(monkeypatch, "on_spool_out_of_rotation")
+    oor = _spy(monkeypatch, "on_spool_out_of_rotation")
     state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
     client = _WedgedClient(state)
     _wire(monkeypatch, state, client)
@@ -2054,8 +2072,10 @@ async def test_reset_never_moves_escalates_stuck_reset_failed(
     assert ("unload",) not in client.calls  # escalated before the unload
     assert _escalated_reasons(caplog) == ["stuck_reset_failed"]
     assert "buffer/feeder" in failed.call_args.kwargs["detail"]  # points at the physical fix
+    oor.assert_awaited_once()  # the wedged feeder's spool taken out of rotation at the commit boundary
     assert state.state == "PAUSE"  # never resumed blind
     db_session.expunge_all()
+    assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None  # stamped before escalating
     assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_FAILED
 
 
@@ -2179,3 +2199,196 @@ async def test_abort_records_no_escalation_row(db_session, printer_factory, inst
         .all()
     )
     assert rows == []  # abort never records an escalation
+
+
+# ===========================================================================
+# Truth-ordered out-of-rotation (2026-07-20): stamping/notification is bound to the
+# SWAP-COMMIT boundary (right before the first unload), NOT to entry — so a no-swap
+# firmware self-heal never stamps or announces a spool the print keeps using, and a
+# post-commit escalation correctly KEEPS the stamp.
+# ===========================================================================
+
+
+async def test_oor_stamped_once_at_swap_commit(db_session, printer_factory, install_settings, monkeypatch):
+    """The jammed spool is taken out of rotation exactly ONCE, at the swap-commit
+    boundary (right before the first unload) — never at entry and never re-stamped on
+    a later candidate round. A first-round load that never confirms forces a second
+    round; the commit-stamp guard keeps the jammed-spool OOR notify at a single call."""
+    install_settings(max_attempts=2, step_timeout_s=0.05)
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    jammed = await _bind_spool(db_session, printer.id, 0, 0)  # jammed tray0
+    state = _make_state(trays=[_ams_tray(0), _ams_tray(1), _ams_tray(2)])
+    # load_after=3 with max_attempts=2 → round 1's two load sends never confirm (advance
+    # to round 2), round 2's third send confirms and the swap resumes.
+    client = FakeClient(state, load_after=3)
+    oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+    unload_seen_at_oor: list[bool] = []
+
+    async def _record(*_a, **_k):
+        unload_seen_at_oor.append(any(c[0] == "unload" for c in client.calls))
+
+    oor.side_effect = _record
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    await task
+
+    assert state.state == "RUNNING"  # the swap landed after the extra round
+    assert client.calls.count(("unload",)) == 2  # two candidate rounds ran
+    oor.assert_awaited_once()  # the jammed spool taken out of rotation exactly once
+    assert unload_seen_at_oor == [False]  # ...and BEFORE the first unload
+    db_session.expunge_all()
+    assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None  # jammed left OOR
+    refreshed = await db_session.get(PrintQueueItem, item.id)
+    assert json.loads(refreshed.ams_mapping) == [2, -1, -1, -1]  # landed on tray2
+
+
+async def test_pre_commit_abort_leaves_no_stamp(db_session, printer_factory, install_settings, monkeypatch):
+    """External interference DURING the reset wait (live state disappears before the
+    swap-commit boundary) → abort. Nothing is committed, so the jammed spool is NEVER
+    taken out of rotation and no OOR notification is sent."""
+    install_settings(step_timeout_s=0.05)
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    jammed = await _bind_spool(db_session, printer.id, 0, 0)  # jammed tray0
+    oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+    state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
+    client = _WedgedClient(state)  # the reset resume is accepted but the AMS never moves
+
+    # Live state is present for the PAUSE-wait poll and the reset's wedge check, then
+    # disappears during the reset WAIT (a disconnect) → _reset_stuck_change returns
+    # "abort" before the commit boundary.
+    polls = {"n": 0}
+
+    def _status(_pid):
+        polls["n"] += 1
+        return state if polls["n"] <= 2 else None
+
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_status", _status)
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: client)
+
+    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    await task
+
+    assert ("unload",) not in client.calls  # aborted before the swap round
+    oor.assert_not_awaited()  # nothing committed → no out-of-rotation notify
+    db_session.expunge_all()
+    assert (await db_session.get(Spool, jammed.id)).feed_fault_at is None  # never stamped
+
+
+async def test_extruder_side_stamps_feeding_spool_at_commit(db_session, printer_factory, install_settings, monkeypatch):
+    """An extruder-side-only fault still commits the swap: the FEEDING spool is taken
+    out of rotation at the commit boundary. A re-jam of the replacement keeps that
+    replacement IN rotation (the extruder is the common factor, not the spool), so no
+    second OOR notify fires."""
+    install_settings()
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    original = await _bind_spool(db_session, printer.id, 0, 0)  # feeding tray0
+    replacement = await _bind_spool(db_session, printer.id, 0, 1)  # tray1 re-jams
+    oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+    state = _make_state(trays=[_ams_tray(0), _ams_tray(1), _ams_tray(2)], hms=[_extruder_hms()])
+    client = FakeClient(state, resume_repauses=2)  # tray1 re-jams both cycles; tray2 succeeds
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0300_801E"}, state)
+    await task
+
+    assert state.state == "RUNNING"
+    oor.assert_awaited_once()  # only the feeding spool announced — the replacement stays in rotation
+    db_session.expunge_all()
+    assert (await db_session.get(Spool, original.id)).feed_fault_at is not None  # feeding spool stamped at commit
+    assert (await db_session.get(Spool, replacement.id)).feed_fault_at is None  # extruder-side → kept in rotation
+    refreshed = await db_session.get(PrintQueueItem, item.id)
+    assert json.loads(refreshed.ams_mapping) == [2, -1, -1, -1]  # landed on tray2
+
+
+async def test_ams_drying_escalation_keeps_commit_stamp(
+    db_session, printer_factory, install_settings, monkeypatch, caplog
+):
+    """A post-commit escalation KEEPS the out-of-rotation stamp: the jammed spool is
+    committed out of rotation right before the unload, then the unload finds the AMS
+    drying → escalate ams_drying. The commit-boundary stamp means 'recovery is
+    abandoning this spool', so it correctly stays."""
+    install_settings()
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    jammed = await _bind_spool(db_session, printer.id, 0, 0)  # jammed tray0
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+    state = _make_state(trays=[_ams_tray(0), _ams_tray(1)])
+    client = FakeClient(state, write_refusal="drying")  # the AMS is drying → writes refused
+    _wire(monkeypatch, state, client)
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
+        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+        await task
+
+    assert ("unload",) not in client.calls  # a drying lane is never written to
+    assert _escalated_reasons(caplog) == ["ams_drying"]
+    oor.assert_awaited_once()  # the commit stamp fired before the drying refusal
+    failed.assert_awaited_once()
+    db_session.expunge_all()
+    assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None  # stamp KEPT across the escalation
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_FAILED
+
+
+# ===========================================================================
+# will_own: the public predicate the HMS notify pipeline uses to SUPPRESS a raw
+# per-code alert for a fault recovery will OWN (its lifecycle notifications carry the
+# incident). Mirrors only the on_feed_fault_hms entry gates whose failure means
+# "nobody will notify".
+# ===========================================================================
+
+
+async def test_will_own_true_when_enabled_and_farm_item_printing(db_session, printer_factory):
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id, subtask="task-1")
+    state = _make_state(subtask="task-1")
+
+    assert await spool_recovery.will_own(db_session, printer.id, state) is True
+
+
+async def test_will_own_false_when_setting_disabled(db_session, printer_factory, monkeypatch):
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id, subtask="task-1")
+    state = _make_state(subtask="task-1")
+
+    async def _disabled(_db, key, default):
+        return False if key == "spool_recovery_enabled" else default
+
+    monkeypatch.setattr(spool_recovery, "_read_bool", _disabled)
+
+    assert await spool_recovery.will_own(db_session, printer.id, state) is False
+
+
+async def test_will_own_false_when_escalation_latched(db_session, printer_factory):
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id, subtask="task-1")
+    state = _make_state(subtask="task-1")
+    spool_recovery._escalated.add((printer.id, "task-1"))  # already given up on this (printer, job)
+
+    assert await spool_recovery.will_own(db_session, printer.id, state) is False
+
+
+async def test_will_own_false_when_no_farm_item(db_session, printer_factory):
+    printer = await printer_factory()
+    # No farm item dispatched for this subtask → a foreign / non-farm job.
+    state = _make_state(subtask="foreign-task")
+
+    assert await spool_recovery.will_own(db_session, printer.id, state) is False
+
+
+async def test_will_own_false_when_db_read_raises(db_session, printer_factory, monkeypatch):
+    """Fail toward notifying: any exception in the predicate returns False so a raw
+    alert is never suppressed on the strength of a read that errored."""
+    printer = await printer_factory()
+    state = _make_state(subtask="task-1")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(spool_recovery, "_resolve_farm_item", _boom)
+
+    assert await spool_recovery.will_own(db_session, printer.id, state) is False
