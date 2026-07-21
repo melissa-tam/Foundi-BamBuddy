@@ -114,6 +114,24 @@ def parse_ams_filament_backup_from_cfg(cfg_raw: object) -> bool | None:
         return None
 
 
+def _parse_tray_exist_bits(value: str | int | None) -> int | None:
+    """Parse a firmware ``tray_exist_bits`` value (hex string, or int) to an int.
+
+    Firmware sends the bitmask as a hex string; ints are tolerated for defensive
+    symmetry. ``None`` / empty / unparseable → ``None`` (the caller reads that as
+    "this push carried no bitmask"). A genuine ``"0"`` parses to ``0`` — all slots
+    empty is a real answer, distinct from "absent". Used by the ``_handle_ams_data``
+    last-seen cache; ``apply_tray_exist_bits`` keeps its own inline parse so its
+    bit=0 / power-off contract stays byte-identical.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return value if isinstance(value, int) else int(value, 16)
+    except (ValueError, TypeError):
+        return None
+
+
 def apply_tray_exist_bits(
     units: list,
     tray_exist_bits_str: str | int | None,
@@ -121,15 +139,25 @@ def apply_tray_exist_bits(
     power_on_flag: bool = True,
     log_label: str | None = None,
 ) -> int:
-    """Wipe stale per-tray filament fields on slots whose `tray_exist_bits` bit is 0.
+    """Canonicalize per-tray `state` from `tray_exist_bits` in BOTH directions.
 
     `tray_exist_bits` is firmware's canonical "which slots have a spool" bitmask
-    (BambuStudio uses it too). For every slot whose bit is 0, promote the tray
-    `state` to 9 (firmware's "no spool" code) and clear `tray_type` / `tray_color`
-    / `tray_info_idx` / `tag_uid` / `tray_uuid` / `remain` etc so downstream
-    readers (Bambuddy's AMS card, the VP slicer-facing cache, inventory short-
-    circuits keyed on `state in {9, 10}`) all see one canonical empty-slot signal
-    instead of guessing from payload shape (#1322, #147).
+    (BambuStudio uses it too). This helper reconciles the per-tray `state` against
+    it so downstream readers keyed on `state` see one signal instead of guessing
+    from payload shape (#1322, #147):
+
+    * bit clear (empty): promote the tray `state` to 9 (firmware's "no spool"
+      code) and clear `tray_type` / `tray_color` / `tray_info_idx` / `tag_uid` /
+      `tray_uuid` / `remain` etc.
+    * bit set (occupied) with a stuck `state == 9`: promote it to 10 ("spool
+      present, filament not in feeder"). A spool inserted mid-print gets no
+      auto-read and the per-tray `state` stays 9 while the bitmask already reports
+      it present (003-H2S: shown "?" on-screen, invisible to Bambuddy for hours) —
+      the presence/identify/auto-config pipeline keys on `state ∈ {10, 11}`, so a
+      stuck 9 with its bit set is invisible to all of it. State 0 (H2C long-idle
+      "AMS detail not reported" dialect) and 10/11 are left untouched — only the
+      empty-code 9 is the stuck-unread quirk. Identity fields are NOT touched here
+      (a present slot may legitimately carry none yet).
 
     Two callers share this helper to keep their views consistent:
 
@@ -196,6 +224,18 @@ def apply_tray_exist_bits(
             global_bit = ams_id * 4 + tray_id
             slot_exists = (tray_exist_bits >> global_bit) & 1
             if slot_exists:
+                # Occupied per the bitmask: promote a stuck state-9 slot (the
+                # mid-print-insert quirk — firmware never auto-read it, so state
+                # stays 9 with the bit set) to 10 so presence-keyed readers see
+                # it. Tolerate str/int state. Only 9 is promoted: 0 is the H2C
+                # long-idle "detail not reported" dialect and 10/11 are already
+                # present — none of those is the stuck-unread quirk.
+                try:
+                    norm_state = int(tray.get("state"))
+                except (TypeError, ValueError):
+                    norm_state = None
+                if norm_state == 9:
+                    tray["state"] = 10
                 continue
             tray["state"] = 9
             if tray.get("tray_type"):
@@ -669,6 +709,16 @@ class BambuMQTTClient:
         self._raw_message_handlers: list[Callable[[str, bytes], None]] = []
         self._disconnection_event: threading.Event | None = None
         self._previous_ams_hash: str | None = None  # Track AMS changes
+        # Last-seen tray_exist_bits (firmware's canonical "which slots hold a
+        # spool" bitmask), cached whenever a payload carries it. Consulted by the
+        # incremental stale-clear in _handle_ams_data so a stuck state-9 partial
+        # for a slot the bitmask still marks occupied does not wipe a seated
+        # spool's identity. DELIBERATELY not reset on disconnect: the merged AMS
+        # state in state.raw_data persists across reconnects, so keeping the
+        # bitmask cache the same lifetime keeps the two consistent (a reconnect
+        # that carries fresh bits overwrites it; one that does not keeps the last
+        # truth, matching the merged trays it guards). None = never seen.
+        self._last_tray_exist_bits: int | None = None
 
         # Cache AMS firmware/SN from get_version in case it arrives before AMS status
         # Key: ams_id (int). Value: {'sw_ver': str, 'sn': str}
@@ -1741,6 +1791,28 @@ class BambuMQTTClient:
             return candidates.pop()
         return None
 
+    def _slot_exist_bit_known_set(self, ams_id, tray_id) -> bool:
+        """True when the last-seen tray_exist_bits positively marks this slot occupied.
+
+        Guards the incremental stale-clear: a stuck state-9 partial for a slot the
+        bitmask still reports present (the mid-print-insert quirk — 003-H2S) must
+        NOT wipe the seated spool's identity. A missing cache (never seen a
+        bitmask) or a 0 bit returns False so the stale-clear fires exactly as
+        before. AMS-HT (id >= 128) uses a separate addressing scheme and is never
+        matched here, mirroring apply_tray_exist_bits.
+        """
+        bits = self._last_tray_exist_bits
+        if bits is None:
+            return False
+        try:
+            a = int(ams_id)
+            t = int(tray_id)
+        except (TypeError, ValueError):
+            return False
+        if a < 0 or a >= 128 or t < 0:
+            return False
+        return bool((bits >> (a * 4 + t)) & 1)
+
     def _handle_ams_data(self, ams_data):
         """Handle AMS data changes for Spoolman integration.
 
@@ -1759,6 +1831,16 @@ class BambuMQTTClient:
             non_list_fields = {k: v for k, v in ams_data.items() if k != "ams"}
             if non_list_fields:
                 logger.debug("[%s] AMS dict fields: %s", self.serial_number, non_list_fields)
+
+            # Cache the last-seen tray_exist_bits before the merge below, so both
+            # the incremental stale-clear guard and the apply fallback can tell a
+            # stuck state-9 partial for an OCCUPIED slot from a genuine removal
+            # even when the minimal {id, state} partial firmware sends omits the
+            # field. Only overwrite when this push actually carries it (a partial
+            # without it keeps the last truth).
+            _exist_bits = _parse_tray_exist_bits(ams_data.get("tray_exist_bits"))
+            if _exist_bits is not None:
+                self._last_tray_exist_bits = _exist_bits
 
             # IMPORTANT: Parse ams_status FIRST before tray_now, so we have fresh status
             # when checking if we're in filament change mode for tray_now disambiguation
@@ -2056,7 +2138,12 @@ class BambuMQTTClient:
                             # (trays disengage to state 10) it drove the identity-
                             # wipe → RFID re-read storm behind HMS 0700_C069. Any
                             # other value (9=empty, 8, 0, unknown / unparseable)
-                            # clears the stale tray_type/tray_color (#784).
+                            # clears the stale tray_type/tray_color (#784) — UNLESS
+                            # the last-seen tray_exist_bits still marks the slot
+                            # occupied: a mid-print insert can sit at state 9 with
+                            # its bit set (003-H2S), and this minimal {id, state}
+                            # partial must not wipe the seated spool's identity
+                            # (apply_tray_exist_bits below then promotes it 9→10).
                             tray_state = new_tray.get("state")
                             try:
                                 norm_tray_state = int(tray_state) if tray_state is not None else None
@@ -2067,6 +2154,7 @@ class BambuMQTTClient:
                                 and norm_tray_state not in TRAY_PRESENT_STATES
                                 and "tray_type" not in new_tray
                                 and merged_tray.get("tray_type")
+                                and not self._slot_exist_bit_known_set(ams_id, tray_id)
                             ):
                                 logger.info(
                                     "[%s] AMS %s tray %s: state=%s (not loaded) — clearing stale tray data",
@@ -2147,14 +2235,26 @@ class BambuMQTTClient:
         # Convert back to list, sorted by ID for consistent ordering
         merged_ams = sorted(existing_by_id.values(), key=lambda x: x.get("id", 0))
 
-        # Empty-slot cleanup via tray_exist_bits (#147, #1322, #765, #1365).
-        # Shared with the VP bridge cache so the slicer-facing view stays in
-        # sync with Bambuddy's AMS card (#1726). See the helper's docstring
-        # for the full rationale and the printer-shutdown guard.
+        # Empty-slot cleanup + present-slot promotion via tray_exist_bits
+        # (#147, #1322, #765, #1365; 9→10 promotion 003-H2S). Shared with the VP
+        # bridge cache so the slicer-facing view stays in sync with Bambuddy's
+        # AMS card (#1726). See the helper's docstring for the full rationale and
+        # the printer-shutdown guard.
+        #
+        # When THIS push carries tray_exist_bits pass the raw value through
+        # unchanged (the helper's own bit=0 / power-off parse contract is
+        # byte-identical). When it OMITS the field — the minimal {id, state}
+        # partial H2D sends — fall back to the last-seen bitmask so a stuck
+        # state-9 slot the bitmask still marks occupied is promoted 9→10 on that
+        # partial too (and idempotently re-wiped if it marks it empty), instead
+        # of sitting invisible until the next full push.
         if isinstance(ams_data, dict):
+            _bits_for_apply = ams_data.get("tray_exist_bits")
+            if _bits_for_apply is None:
+                _bits_for_apply = self._last_tray_exist_bits
             apply_tray_exist_bits(
                 merged_ams,
-                ams_data.get("tray_exist_bits"),
+                _bits_for_apply,
                 power_on_flag=ams_data.get("power_on_flag", True),
                 log_label=self.serial_number,
             )

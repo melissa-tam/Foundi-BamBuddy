@@ -90,9 +90,26 @@ describe('AmsUnitCard', () => {
     expect(screen.getByText('ABS')).toBeDefined();
   });
 
-  it('shows "Empty" for firmware-confirmed empty slot (state 9/10)', () => {
+  it('shows "Empty" for firmware-confirmed empty slot (state 9)', () => {
     render(<AmsUnitCard unit={makeUnit()} activeSlot={null} />);
     expect(screen.getByText('Empty')).toBeDefined();
+  });
+
+  it('shows "?" for a present-but-unconfigured slot promoted to state 10 (003-H2S)', () => {
+    // A spool inserted mid-print gets no auto-read; bambu_mqtt promotes it 9→10
+    // ("present, not fed"). state 10 means a spool IS seated, so it must read as
+    // present-but-unidentified ("?"), never "Empty".
+    const unit = makeUnit({
+      tray: [
+        makeTray({ id: 0, tray_type: 'PLA', remain: 80 }),
+        makeTray({ id: 1, tray_type: 'ABS', remain: 10 }),
+        makeTray({ id: 2, tray_type: 'PETG', remain: 50 }),
+        makeTray({ id: 3, tray_color: null, tray_type: '', remain: -1, state: 10 } as Partial<AMSTray> & { state: number }),
+      ],
+    });
+    render(<AmsUnitCard unit={unit} activeSlot={null} />);
+    expect(screen.getByText('?')).toBeDefined();
+    expect(screen.queryByText('Empty')).toBeNull();
   });
 
   it('shows "?" for loaded-but-unconfigured slot (#1694)', () => {

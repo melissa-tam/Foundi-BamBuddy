@@ -865,21 +865,26 @@ function TemperatureIndicator({ temp, goodThreshold = 28, fairThreshold = 35, on
 
 /** Classify an empty AMS slot for UI rendering (#1322 follow-up).
  *
- *  "physical" — firmware positively confirmed no spool (state 9 or 10). The
- *  bambu_mqtt handler now promotes tray_exist_bits=0 slots to state=9, so
- *  every empty-by-bitmask slot lands here regardless of firmware payload
- *  shape.
+ *  The bambu_mqtt handler canonicalizes state against tray_exist_bits in BOTH
+ *  directions: an empty-by-bitmask slot is promoted to state=9, and an OCCUPIED
+ *  slot stuck at state 9 (a spool inserted mid-print gets no auto-read —
+ *  003-H2S) is promoted to state=10 ("present, not fed"). So state alone is the
+ *  authoritative empty/present signal here.
  *
- *  "reset" — tray_type is missing/empty but firmware hasn't confirmed
- *  emptiness (state is null, 3, or any non-9/10 value). Typically a slot
- *  the user cleared with "Reset Slot" where a physical spool may still be
- *  loaded but unassigned.
+ *  "physical" — firmware positively confirmed no spool (state 9). Every
+ *  empty-by-bitmask slot lands here regardless of firmware payload shape.
+ *
+ *  "reset" — a spool may be present but its material isn't configured: state 10
+ *  (present, promoted from a mid-print insert), or tray_type missing/empty while
+ *  firmware hasn't confirmed emptiness (state null, 3, or any non-9 value —
+ *  e.g. a slot the user cleared with "Reset Slot"). Rendered as "?" (present but
+ *  unidentified), never "Empty".
  *
  *  Returns null when the slot is loaded (tray_type is present).
  */
 function getEmptySlotKind(tray: { tray_type?: string | null; state?: number | null } | null | undefined): 'physical' | 'reset' | null {
   if (tray?.tray_type) return null;
-  return (tray?.state === 9 || tray?.state === 10) ? 'physical' : 'reset';
+  return tray?.state === 9 ? 'physical' : 'reset';
 }
 
 

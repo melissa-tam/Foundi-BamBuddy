@@ -11,12 +11,15 @@ function isTrayEmpty(tray: AMSTray): boolean {
 }
 
 // Mirror of PrintersPage.getEmptySlotKind (#1694): 'physical' when firmware
-// confirms no spool (state 9/10), 'reset' when tray_type is absent but the
-// firmware hasn't confirmed empty (= spool loaded, slot just unconfigured).
+// confirms no spool (state 9), 'reset' when a spool may be present but its
+// material isn't configured (state 10 — a mid-print insert promoted 9→10, or
+// tray_type absent while firmware hasn't confirmed empty). state 10 means the
+// spool IS seated (003-H2S), so it must read "?" (present, unidentified), not
+// "Empty" — keep in lockstep with PrintersPage.
 function getEmptySlotKind(tray: AMSTray): 'physical' | 'reset' | null {
   if (tray.tray_type) return null;
   const state = (tray as { state?: number | null }).state ?? null;
-  return state === 9 || state === 10 ? 'physical' : 'reset';
+  return state === 9 ? 'physical' : 'reset';
 }
 
 function getAmsName(id: number): string {

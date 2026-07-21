@@ -1517,3 +1517,26 @@ class TestIdentifyFlapNotAQualifiedCycle:
         await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain ~0 s later
 
         assert ams_presence.last_physical_cycle_age(1, 0, 0) is None
+
+
+class TestPromotedState10DrivesDiscovery:
+    """003-H2S: apply_tray_exist_bits now promotes a stuck mid-print-insert slot
+    9→10. That merged state-10 tray must flow the presence pipeline — _tray_present
+    True, and with a qualified physical cycle recorded but unanswered, identify_needed
+    returns 'discovery' (one read whose expected tagless failure is suppressed
+    farm-side). An untouched state-10 slot with NO unanswered cycle stays None, so
+    the discovery is driven by the change, not by presence alone."""
+
+    async def test_state10_untagged_with_unanswered_cycle_needs_discovery(self, db_session):
+        tray = _tray(0, state=10)  # promoted "present, not fed", still unconfigured/untagged
+        assert ams_presence._tray_present(tray) is True
+        _arm_cycle(1, 0, 0)  # a qualified physical cycle recorded, not yet answered
+        reason = await ams_presence.identify_needed(db_session, 1, 0, 0, tray, spoolman_active=False)
+        assert reason == "discovery"
+
+    async def test_state10_untagged_without_cycle_is_none(self, db_session):
+        # Control: presence alone is not a discovery trigger — an untouched tagless
+        # slot must never be read (the 0700_0081 factory the need-check closes).
+        tray = _tray(0, state=10)
+        reason = await ams_presence.identify_needed(db_session, 1, 0, 0, tray, spoolman_active=False)
+        assert reason is None

@@ -1333,6 +1333,59 @@ class TestApplyTrayExistBitsHelper:
         assert cleared == 0
         assert units[0]["tray"][0]["state"] == 9
 
+    def test_promotes_stuck_state_nine_to_ten_when_bit_set(self):
+        """003-H2S incident: a spool inserted mid-print gets no auto-read — the
+        tray sits at state 9 while tray_exist_bits already marks the slot
+        occupied. The bit=1 branch promotes it to 10 ("present, not fed") so the
+        presence/identify/auto-config pipeline (keyed on state ∈ {10, 11}) sees
+        it. A promotion is NOT a wipe → the cleared counter stays 0."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 2, "state": 9}]}]
+        cleared = apply_tray_exist_bits(units, "4", power_on_flag=True)  # bit 2 set
+        assert cleared == 0
+        assert units[0]["tray"][0]["state"] == 10
+        assert isinstance(units[0]["tray"][0]["state"], int)
+
+    def test_promotes_stuck_state_nine_string_variant_identity_untouched(self):
+        """Raw wire may carry state as a string — "9" must promote too, and the
+        promotion must not touch identity fields (a bare present spool carries
+        none yet)."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 0, "state": "9", "tray_type": "", "tag_uid": "0000000000000000"}]}]
+        apply_tray_exist_bits(units, "1", power_on_flag=True)  # bit 0 set
+        tray = units[0]["tray"][0]
+        assert tray["state"] == 10
+        assert tray["tray_type"] == ""
+        assert tray["tag_uid"] == "0000000000000000"
+
+    def test_state_zero_with_bit_set_not_promoted(self):
+        """State 0 is the H2C long-idle "AMS detail not reported" dialect, not the
+        stuck-unread quirk — a set bit must NOT promote it to 10."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 0, "state": 0}]}]
+        apply_tray_exist_bits(units, "1", power_on_flag=True)
+        assert units[0]["tray"][0]["state"] == 0
+
+    def test_present_states_with_bit_set_untouched(self):
+        """State 10/11 already mean present — a set bit leaves them alone."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 0, "state": 11}, {"id": 1, "state": 10}]}]
+        apply_tray_exist_bits(units, "3", power_on_flag=True)  # bits 0,1 set
+        assert units[0]["tray"][0]["state"] == 11
+        assert units[0]["tray"][1]["state"] == 10
+
+    def test_no_bits_no_promotion(self):
+        """No tray_exist_bits in the payload → helper no-ops (no promotion)."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 0, "state": 9}]}]
+        assert apply_tray_exist_bits(units, None) == 0
+        assert units[0]["tray"][0]["state"] == 9  # untouched
+
 
 class TestNozzleRackData:
     """Tests for nozzle rack data parsing from H2 series device.nozzle.info."""
@@ -6977,3 +7030,98 @@ class TestTrayClearPresenceConsistency:
         client.state.raw_data["ams"][0]["dry_time"] = 60
         self._partial_state(client, 10)
         assert self._tray_type(client) == "PETG"
+
+
+class TestTrayExistBitsStatePromotionMerge:
+    """003-H2S: a full tagless spool inserted mid-print gets no auto-read — the
+    per-tray state stays 9 while tray_exist_bits already marks the slot present.
+    _handle_ams_data must promote such a slot 9→10 so the presence/identify/
+    auto-config pipeline sees it, and the incremental stale-clear must not wipe a
+    slot the last-seen bitmask still marks occupied."""
+
+    @pytest.fixture
+    def client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        c = BambuMQTTClient(ip_address="192.168.1.100", serial_number="PROMO1", access_code="12345678")
+        c._client = MagicMock()
+        c.state.connected = True
+        return c
+
+    @staticmethod
+    def _tray(client, ams_idx=0, tray_idx=0):
+        return client.state.raw_data["ams"][ams_idx]["tray"][tray_idx]
+
+    def test_incident_full_push_state9_bit_set_promotes(self, client):
+        # Unconfigured slot 2 reports state 9, but tray_exist_bits (0x4 = bit 2)
+        # says it holds a spool: promote to 10, leave the (empty) identity alone.
+        client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 2, "state": 9}]}], "tray_exist_bits": "4"})
+        tray = self._tray(client, 0, 0)
+        assert tray["state"] == 10
+        assert isinstance(tray["state"], int)
+        assert not tray.get("tray_type")  # promotion never fabricates identity
+
+    def test_incident_full_push_state9_string_variant_promotes(self, client):
+        client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 2, "state": "9"}]}], "tray_exist_bits": "4"})
+        assert self._tray(client, 0, 0)["state"] == 10
+
+    def test_state9_partial_with_cached_bit_set_preserves_and_promotes(self, client):
+        # Push 1 carries the bitmask (slot 0 present) and configures the slot.
+        client._handle_ams_data(
+            {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [{"id": 0, "state": 11, "tray_type": "PETG", "tray_color": "008000FF", "remain": 80}],
+                    }
+                ],
+                "tray_exist_bits": "1",
+            }
+        )
+        # Push 2 is a minimal H2D-style {id, state:9} partial with NO tray_exist_bits.
+        # The cached bit (1) both blocks the stale-clear AND drives the 9→10 promotion.
+        client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}]})
+        tray = self._tray(client, 0, 0)
+        assert tray["tray_type"] == "PETG"  # identity preserved (no wipe)
+        assert tray["state"] == 10  # stuck 9 promoted via the cached bit
+
+    def test_state9_partial_with_cached_bit_clear_still_wipes(self, client):
+        # Push 1: slot 0 present + configured (cache -> 0x1).
+        client._handle_ams_data(
+            {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [{"id": 0, "state": 11, "tray_type": "PETG", "tray_color": "008000FF", "remain": 80}],
+                    }
+                ],
+                "tray_exist_bits": "1",
+            }
+        )
+        # Push 2: shutdown-shaped push (no `ams` list) carrying tray_exist_bits=0 +
+        # power_on_flag=False. It updates the cache to 0 but preserves slot data
+        # (the #765 shutdown early-return). Now the cache says slot 0 is empty.
+        client._handle_ams_data({"tray_exist_bits": "0", "power_on_flag": False})
+        assert self._tray(client, 0, 0)["tray_type"] == "PETG"  # shutdown preserved it
+        # Push 3: minimal {id, state:9} partial. Cached bit 0 → the stale-clear
+        # fires exactly as before the fix.
+        client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}]})
+        assert self._tray(client, 0, 0)["tray_type"] == ""
+
+    def test_state9_partial_no_cache_still_wipes(self, client):
+        # No push ever carried tray_exist_bits → cache stays None → wipe fires.
+        client._handle_ams_data(
+            {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [{"id": 0, "state": 11, "tray_type": "PETG", "tray_color": "008000FF", "remain": 80}],
+                    }
+                ]
+            }
+        )
+        assert client._last_tray_exist_bits is None
+        client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}]})
+        assert self._tray(client, 0, 0)["tray_type"] == ""
