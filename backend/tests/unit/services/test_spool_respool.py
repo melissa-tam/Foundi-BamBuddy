@@ -562,6 +562,35 @@ def _running(tray_now, *, present=(0, 1, 2), subtask_id="job-A"):
     return state
 
 
+def _running_wiped(tray_now, *, seated=(), wiped=(), subtask_id="job-A"):
+    """A RUNNING push where ``seated`` trays hold a spool and ``wiped`` trays have run
+    fully to empty — the exist-bits wipe (``bambu_mqtt.apply_tray_exist_bits``) forced
+    state 9 / blank tray_type, so ``_tray_present`` reads them absent though the tray
+    dict is still in the AMS payload. Models the run-to-empty backup switch behind the
+    2026-07-21 003-H2S incident.
+    """
+    state = MagicMock()
+    state.state = "RUNNING"
+    state.tray_now = tray_now
+    state.subtask_id = subtask_id
+    trays = [{"id": t, **_tray()} for t in seated]
+    trays += [
+        {
+            "id": t,
+            "state": 9,
+            "tray_type": "",
+            "tray_color": "",
+            "tag_uid": "0000000000000000",
+            "tray_uuid": "00000000000000000000000000000000",
+            "remain": 0,
+        }
+        for t in wiped
+    ]
+    trays.sort(key=lambda d: d["id"])
+    state.raw_data = {"ams": [{"id": 0, "tray": trays}]}
+    return state
+
+
 async def _bind_at(db, printer_id, ams_id, tray_id, *, weight_used=500.0):
     spool = Spool(material="PETG", label_weight=1000, core_weight=250, weight_used=weight_used)
     spool.k_profiles = []
@@ -635,17 +664,85 @@ async def test_backup_swap_drops_on_flap_back_to_departed(db_session, printer_fa
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_drops_when_departed_no_longer_present(db_session, printer_factory, fake_clock):
-    """The departed spool physically gone (tray reads empty) = ordinary unload → drop."""
-    printer = await printer_factory()
-    spool = await _bind_at(db_session, printer.id, 0, 0)
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+async def test_backup_swap_run_to_empty_departed_absent_stamps_incident_pin(db_session, printer_factory, fake_clock):
+    """INCIDENT PIN (2026-07-21 12:54:55, 003-H2S). A tagless roll on the stable feeder
+    (tray 1) runs FULLY dry mid-print: the firmware backup-switches to tray 0, then the
+    exist-bits wipe forces tray 1 to state 9 / blank tray_type WITHIN the confirm window
+    (the departed tray reads absent). Tray 0 keeps feeding past _SWAP_CONFIRM_S. A
+    departed-tray absence right after a mid-print backup switch IS the run-to-empty
+    signal, so the departed spool STILL gets stamped spent.
 
-    await capture_backup_swap(db_session, printer.id, _running(1))  # pending 0→1
+    Pre-fix (drop-on-absent): the first push where tray 1 read absent dropped the
+    pending swap before the confirm window elapsed, so nothing was ever stamped — the
+    incident's unstamped rows. Mutation-verified: restoring the ``not _tray_present``
+    drop in ``_resolve_pending_swap`` makes this assert False (no stamp).
+    """
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 1, weight_used=500.0)  # the run-dry feeder
+    await _establish_stable_feeder(db_session, printer.id, 1, fake_clock, present=(0, 1))
+
+    # Edge 1→0 opens the pending swap; tray 1 still seated at the edge (the wipe lags).
+    assert await capture_backup_swap(db_session, printer.id, _running(0, present=(0, 1))) is None
+
+    # Within the window tray 1's exist bit clears → state 9 / blank tray_type (absent).
+    fake_clock["t"] += 10
+    assert await capture_backup_swap(db_session, printer.id, _running_wiped(0, seated=(0,), wiped=(1,))) is None
+
+    # Tray 0 keeps feeding past the confirm window with tray 1 still absent → STAMP.
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    # tray 0 no longer present in the AMS payload → departed spool removed.
-    marked = await capture_backup_swap(db_session, printer.id, _running(1, present=(1, 2)))
+    marked = await capture_backup_swap(db_session, printer.id, _running_wiped(0, seated=(0,), wiped=(1,)))
+    assert marked is not None and marked.id == spool.id  # departed run-dry spool stamped though absent
+    assert marked.spent_at is not None
+    assert marked.weight_used == 500.0  # true ledger preserved (the label floor is gone)
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_chained_double_switch_stamps_both(db_session, printer_factory, fake_clock):
+    """The full 003-H2S sequence: tray 1 runs dry (→ tray 0), then ~151 s later tray 0
+    runs dry (→ tray 3). Each switch opens and confirms its OWN pending swap (the gap
+    exceeds _SWAP_CONFIRM_S), and each departed tray goes absent via the exist-bits wipe
+    within its window — BOTH departed spools are stamped spent. Pins that the age-alone
+    confirm handles the chained switch (the second edge does not cancel the first)."""
+    printer = await printer_factory()
+    spool1 = await _bind_at(db_session, printer.id, 0, 1, weight_used=400.0)  # first to run dry
+    spool0 = await _bind_at(db_session, printer.id, 0, 0, weight_used=600.0)  # second to run dry
+    await _establish_stable_feeder(db_session, printer.id, 1, fake_clock, present=(0, 1, 3))
+
+    # Switch 1: 1→0. Tray 1 seated at the edge, then wiped within its window.
+    assert await capture_backup_swap(db_session, printer.id, _running(0, present=(0, 1, 3))) is None
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    marked1 = await capture_backup_swap(db_session, printer.id, _running_wiped(0, seated=(0, 3), wiped=(1,)))
+    assert marked1 is not None and marked1.id == spool1.id  # tray 1 stamped though absent
+    assert spool_respool._stable_feeder.get(printer.id) == 0  # tray 0 is now the confirmed feeder
+
+    # Switch 2: 0→3. Tray 0 seated at the edge, then wiped within its window.
+    assert await capture_backup_swap(db_session, printer.id, _running_wiped(3, seated=(0, 3), wiped=(1,))) is None
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    marked0 = await capture_backup_swap(db_session, printer.id, _running_wiped(3, seated=(3,), wiped=(0, 1)))
+    assert marked0 is not None and marked0.id == spool0.id  # tray 0 stamped though absent
+
+    assert (await db_session.get(Spool, spool1.id)).spent_at is not None
+    assert (await db_session.get(Spool, spool0.id)).spent_at is not None
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_transient_walk_within_window_departed_present_no_stamp(
+    db_session, printer_factory, fake_clock
+):
+    """Keep-drop pin: a pending swap whose tray_now moves off ``cur`` to a THIRD tray
+    BEFORE the confirm window elapses is a transient walk, not a settled backup switch —
+    it drops and stamps nothing (the departed tray still present). Contrasts with the
+    run-to-empty absence, which now stamps: the transient `current != cur` drop survives
+    the fix intact."""
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=500.0)
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock, present=(0, 1, 2))
+
+    await capture_backup_swap(db_session, printer.id, _running(1, present=(0, 1, 2)))  # pending 0→1
+    fake_clock["t"] += 10  # still within the window
+    marked = await capture_backup_swap(db_session, printer.id, _running(2, present=(0, 1, 2)))  # walked to tray 2
     assert marked is None
+    assert printer.id not in spool_respool._pending_swaps  # dropped as a transient walk
     assert (await db_session.get(Spool, spool.id)).spent_at is None
 
 

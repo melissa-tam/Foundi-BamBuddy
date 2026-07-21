@@ -661,20 +661,28 @@ async def _resolve_pending_swap(db: AsyncSession, printer_id: int, state, curren
     """Resolve an open pending backup swap against the current push.
 
     STAMP the departed tray spent when the new tray has fed stably for
-    ``_SWAP_CONFIRM_S`` and the departed spool is still seated (a genuine firmware
-    backup switch — the departed ran dry). This also covers the "a new edge resolves
-    the old first" case: once age ≥ the window with the departed present, the swap is
-    confirmed even if tray_now has since moved off ``cur`` to a third tray. DROP
+    ``_SWAP_CONFIRM_S`` with the print still RUNNING and tray_now not returned to the
+    departed feeder — a genuine firmware backup switch, the departed ran dry. The
+    departed tray reading ABSENT at confirm time does NOT invalidate: a tagless roll
+    run fully to empty passes its tail through, and the exist-bits wipe
+    (``bambu_mqtt.apply_tray_exist_bits``) forces the emptied slot to state 9 / blank
+    tray_type WITHIN the confirm window — so a departed-tray absence right after a
+    mid-print backup switch IS the run-to-empty signal, not an ordinary unload (the
+    2026-07-21 003-H2S incident, where dropping on absence left both run-dry rows
+    unstamped). The rare proactive operator pull is covered by the fat-remainder
+    WARNING in :func:`_mark_tray_spent` plus the "Same spool" un-spend path. Confirming
+    on age alone also covers the "a new edge resolves the old first" case: once the
+    window elapses the swap confirms even if tray_now has since moved off ``cur`` to a
+    third tray, so the chained 1→0→3 double switch stamps both departed spools. DROP
     (never stamp) if the print left RUNNING, tray_now returned to the departed feeder
-    (it's feeding again → it did not run out), the departed spool is physically gone
-    (ordinary unload), or tray_now moved off ``cur`` before the window elapsed
-    (transient). Otherwise keep waiting."""
+    (it's feeding again → it did not run out), or tray_now moved off ``cur`` before the
+    window elapsed (transient walk). Otherwise keep waiting."""
     pending = _pending_swaps.get(printer_id)
     if pending is None:
         return None
     prev, cur, opened_ts = pending
     # Invalidating conditions first — the swap never happened / can't be trusted.
-    if (not running) or (current == prev) or (not _tray_present(state, prev)):
+    if (not running) or (current == prev):
         _pending_swaps.pop(printer_id, None)
         return None
     if _monotonic() - opened_ts >= _SWAP_CONFIRM_S:
@@ -683,7 +691,7 @@ async def _resolve_pending_swap(db: AsyncSession, printer_id: int, state, curren
     if current != cur:
         _pending_swaps.pop(printer_id, None)  # moved off `cur` before confirming → transient
         return None
-    return None  # still on `cur`, within the window, departed present → keep waiting
+    return None  # still on `cur`, within the window → keep waiting
 
 
 async def capture_backup_swap(db: AsyncSession, printer_id: int, state) -> Spool | None:
