@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -155,6 +156,69 @@ def _safe_unlink(path: Path | None) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Foreign-donor FTPS re-fetch cache (latency Phase D1)
+# --------------------------------------------------------------------------- #
+# The foreign "Eject now" flow resolves a donor 3MF TWICE: once on the confirm-409
+# (which may FTPS-download the donor) and again on the confirmed POST; the AUTO
+# foreign path (identify → cooldown watch → dispatch) fetches twice for the same
+# reason. This module-level TTL cache lets the FIRST resolve DEPOSIT the fetched temp
+# file and the SECOND resolve CONSUME it — turning two FTPS downloads into one.
+#
+# Key = ``(printer_id, gate_subtask)`` where ``gate_subtask`` is the printer's
+# ``plate_gate_subtask_id`` — the SAME gate both the 409 and the confirm operate on
+# (one gate per printer). A gate RE-RAISE for a DIFFERENT subtask yields a different
+# key, so a stale donor is never served for a new foreign print. Only the expensive
+# re-fetch (``tmp_path is not None``) is ever cached; an on-disk archive donor (nothing
+# to clean up) is a no-op deposit. Entries expire after ``_FOREIGN_DONOR_TTL_S`` and are
+# swept (files unlinked) lazily on every access. A CONSUMED entry is removed — the
+# consumer owns the file's lifecycle exactly as a fresh fetch does today.
+_FOREIGN_DONOR_TTL_S = 600.0  # ~10 min
+_foreign_donor_cache: dict[tuple[int, str], tuple[Path, float]] = {}
+
+
+def _foreign_cache_key(printer: Printer) -> tuple[int, str]:
+    """The cache key for ``printer``'s current foreign-plate gate."""
+    return (printer.id, printer.plate_gate_subtask_id or "")
+
+
+def _sweep_expired_donors(now: float) -> None:
+    """Unlink + drop every cache entry past its TTL (lazy sweep, on each access)."""
+    for key in [k for k, (_p, exp) in _foreign_donor_cache.items() if exp <= now]:
+        path, _exp = _foreign_donor_cache.pop(key)
+        _safe_unlink(path)
+
+
+def _foreign_cache_put(key: tuple[int, str], path: Path | None) -> None:
+    """DEPOSIT a re-fetched donor temp file under ``key`` (no-op for ``None``).
+
+    An existing entry for the key is unlinked first (never leak a superseded temp)."""
+    now = time.monotonic()
+    _sweep_expired_donors(now)
+    if path is None:
+        return
+    existing = _foreign_donor_cache.pop(key, None)
+    if existing is not None and existing[0] != path:
+        _safe_unlink(existing[0])
+    _foreign_donor_cache[key] = (path, now + _FOREIGN_DONOR_TTL_S)
+
+
+def _foreign_cache_take(key: tuple[int, str]) -> Path | None:
+    """CONSUME (pop) the cached donor for ``key`` — the caller now owns the file.
+
+    Returns the path when a live, on-disk entry exists; ``None`` on miss / expiry /
+    a vanished file (a stale entry is unlinked and dropped)."""
+    _sweep_expired_donors(time.monotonic())
+    entry = _foreign_donor_cache.pop(key, None)
+    if entry is None:
+        return None
+    path, _exp = entry
+    if not path.is_file():
+        _safe_unlink(path)
+        return None
+    return path
 
 
 def _thermal_gate(state, threshold: float, *, allow_hot: bool) -> None:
@@ -370,9 +434,10 @@ async def _resolve_foreign_source(db: AsyncSession, printer: Printer) -> _Foreig
     if archive is None:
         raise ManualEjectError("no_eligible_unit", _FOREIGN_UNRESOLVABLE_MSG, status_code=409)
 
-    # (b) donor file — on disk if the archive copy exists, else FTPS re-fetch. A
-    # download-failed archive carries file_path="" (the fallback row), so guard on
-    # is_file(), never bare exists() (base_dir/"" is a directory).
+    # (b) donor file — on disk if the archive copy exists, else a Phase-D1 cached
+    # re-fetch, else a fresh FTPS re-fetch. A download-failed archive carries
+    # file_path="" (the fallback row), so guard on is_file(), never bare exists()
+    # (base_dir/"" is a directory).
     donor_path: Path | None = None
     tmp_path: Path | None = None
     if archive.file_path:
@@ -380,7 +445,12 @@ async def _resolve_foreign_source(db: AsyncSession, printer: Printer) -> _Foreig
         if disk.is_file():
             donor_path = disk
     if donor_path is None:
-        tmp_path = await _fetch_foreign_donor(printer, archive.filename)
+        # A prior resolve (the confirm-409, or the auto path's identify) may have
+        # DEPOSITED the fetched donor for this exact gate — consume it and skip the
+        # second download entirely (caller owns the file, same as a fresh fetch).
+        tmp_path = _foreign_cache_take(_foreign_cache_key(printer))
+        if tmp_path is None:
+            tmp_path = await _fetch_foreign_donor(printer, archive.filename)
         if tmp_path is None:
             raise ManualEjectError("no_eligible_unit", _FOREIGN_UNRESOLVABLE_MSG, status_code=409)
         donor_path = tmp_path
@@ -527,10 +597,11 @@ async def _manual_eject_foreign(
         if source is None:
             raise strict_err
 
-    # First call (no profile chosen) → the confirm prompt. Drop the temp re-fetch; the
-    # confirm call re-resolves it (idempotent) once a profile is picked.
+    # First call (no profile chosen) → the confirm prompt. DEPOSIT the temp re-fetch
+    # (Phase D1) keyed by this gate so the confirm call consumes it instead of
+    # re-downloading; an on-disk archive donor (tmp_path=None) deposits nothing.
     if eject_profile_id is None:
-        _safe_unlink(source.tmp_path)
+        _foreign_cache_put(_foreign_cache_key(printer), source.tmp_path)
         suggested = await _suggest_eject_profile_id(db, printer.id)
         raise ForeignPlateEject(
             print_name=source.print_name,
@@ -687,7 +758,12 @@ async def identify_farm_file_foreign(
         if source.max_z > profile.max_part_height_mm:
             return None
     finally:
-        _safe_unlink(source.tmp_path)
+        # DEPOSIT the re-fetched donor (Phase D1) so the LATER auto-eject dispatch
+        # (dispatch_identified_foreign_eject, after the cooldown watch) consumes it
+        # instead of downloading again. Keyed by the gate; expires with the TTL if the
+        # cooldown outlives it (dispatch then re-fetches — fail-open). An on-disk donor
+        # (tmp_path=None) deposits nothing.
+        _foreign_cache_put(_foreign_cache_key(printer), source.tmp_path)
 
     logger.info(
         "identify_farm_file_foreign: printer %s foreign plate IS the farm's own file "

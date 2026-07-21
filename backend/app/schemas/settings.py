@@ -455,6 +455,23 @@ class AppSettings(BaseModel):
         le=10,
         description="Max concurrent per-printer dispatches (FTPS upload + start) within one scheduler tick (latency Phase B)",
     )
+    # Eject-upload de-duplication (latency Phase D2). When ON, the eject file's
+    # remote name carries the first 8 hex of its content build-key; before
+    # uploading, the printer is probed (FTPS SIZE) for that exact name and an
+    # exact byte-size match skips the upload entirely. Fail-open: any probe error
+    # / mismatch / absence uploads as normal.
+    eject_upload_skip_identical: bool = Field(
+        default=False,
+        description="Skip re-uploading an eject file already present on the printer USB (exact name + byte-size match)",
+    )
+    # Slim eject / dry-run 3MF (latency Phase D3, hardware-ladder gated in ops).
+    # When ON, the motion-only eject/dry-run 3MF omits the donor's object meshes
+    # (3D/Objects/*) and per-plate thumbnails — the bulk of the container — keeping
+    # every config member, the gcode+md5 replacement and the scene stub byte-identical.
+    eject_slim_3mf: bool = Field(
+        default=False,
+        description="Strip object meshes + plate thumbnails from the motion-only eject/dry-run 3MF (smaller, faster upload)",
+    )
 
     # Plate-clear confirmation for queue scheduling
     require_plate_clear: bool = Field(
@@ -770,6 +787,8 @@ class AppSettingsUpdate(BaseModel):
     usb_preflight_fresh_window_seconds: int | None = Field(default=None, ge=0, le=120)
     usb_preflight_max_wait_seconds: float | None = Field(default=None, ge=0, le=10)
     dispatch_parallel_limit: int | None = Field(default=None, ge=1, le=10)
+    eject_upload_skip_identical: bool | None = None
+    eject_slim_3mf: bool | None = None
     require_plate_clear: bool | None = None
     farm_usb_auto_cleanup: bool | None = None
     queue_shortest_first: bool | None = None

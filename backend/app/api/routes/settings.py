@@ -146,6 +146,8 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "local_login_enabled",
             "erp_db_ssl",
             "stagger_dynamic_release",
+            "eject_upload_skip_identical",
+            "eject_slim_3mf",
         ]:
             settings_dict[setting.key] = setting.value.lower() == "true"
         elif setting.key in [

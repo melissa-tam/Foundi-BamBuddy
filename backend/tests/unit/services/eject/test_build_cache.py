@@ -36,18 +36,20 @@ async def test_miss_then_hit_same_inputs(tmp_path):
     cache = tmp_path / "cache"
     src = _make_source(tmp_path)
 
-    out1 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
+    out1, key1 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
     # Exactly one cached artifact after the miss.
     cached = list(cache.glob("*.3mf"))
     assert len(cached) == 1
     assert _read_plate(out1) == _EJECT_GCODE.encode("utf-8")
 
-    out2 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
+    out2, key2 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
     # A HIT reuses the same single cache entry (no new artifact) and returns a
-    # DISTINCT caller-owned copy.
+    # DISTINCT caller-owned copy — the build KEY is stable across hit and miss.
     assert len(list(cache.glob("*.3mf"))) == 1
     assert out1 != out2
     assert out2 != cached[0]
+    assert key1 == key2
+    assert cached[0].stem == key1  # the key names the cache entry
     assert _read_plate(out2) == _EJECT_GCODE.encode("utf-8")
 
     out1.unlink(missing_ok=True)
@@ -58,7 +60,7 @@ async def test_returned_path_is_copy_not_cache_file(tmp_path):
     cache = tmp_path / "cache"
     src = _make_source(tmp_path)
 
-    out = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
+    out, _key = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
     cached = list(cache.glob("*.3mf"))
     assert len(cached) == 1
     # Unlinking the returned path must NOT remove the cache entry (contract: callers
@@ -67,7 +69,7 @@ async def test_returned_path_is_copy_not_cache_file(tmp_path):
     assert cached[0].exists()
 
     # The next call is still a hit off the surviving cache file.
-    out2 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
+    out2, _key2 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
     assert len(list(cache.glob("*.3mf"))) == 1
     out2.unlink(missing_ok=True)
 
@@ -76,8 +78,8 @@ async def test_gcode_change_is_a_new_key(tmp_path):
     cache = tmp_path / "cache"
     src = _make_source(tmp_path)
 
-    o1 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
-    o2 = await get_or_build_eject_file(src, 1, _EJECT_GCODE + "M18\n", cache_dir=cache)
+    o1, _ = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
+    o2, _ = await get_or_build_eject_file(src, 1, _EJECT_GCODE + "M18\n", cache_dir=cache)
     # Distinct gcode → distinct cache entries.
     assert len(list(cache.glob("*.3mf"))) == 2
     o1.unlink(missing_ok=True)
@@ -88,22 +90,36 @@ async def test_plate_change_is_a_new_key(tmp_path):
     cache = tmp_path / "cache"
     src = _make_source(tmp_path)
 
-    o1 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
-    o2 = await get_or_build_eject_file(src, 2, _EJECT_GCODE, cache_dir=cache)
+    o1, _ = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
+    o2, _ = await get_or_build_eject_file(src, 2, _EJECT_GCODE, cache_dir=cache)
     assert len(list(cache.glob("*.3mf"))) == 2
     o1.unlink(missing_ok=True)
     o2.unlink(missing_ok=True)
+
+
+async def test_slim_flag_is_a_new_key(tmp_path):
+    # A slim and a full artifact of the SAME donor+gcode must be DISTINCT cache
+    # entries (different content → different key), and the slim build's key differs.
+    cache = tmp_path / "cache"
+    src = _make_source(tmp_path)
+
+    o_full, key_full = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache, slim=False)
+    o_slim, key_slim = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache, slim=True)
+    assert key_full != key_slim
+    assert len(list(cache.glob("*.3mf"))) == 2
+    o_full.unlink(missing_ok=True)
+    o_slim.unlink(missing_ok=True)
 
 
 async def test_source_mtime_change_is_a_new_key(tmp_path):
     cache = tmp_path / "cache"
     src = _make_source(tmp_path)
 
-    o1 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
+    o1, _ = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
     # Bump the donor's mtime (an edit / re-slice) — same size, new key.
     st = src.stat()
     os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
-    o2 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
+    o2, _ = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
     assert len(list(cache.glob("*.3mf"))) == 2
     o1.unlink(missing_ok=True)
     o2.unlink(missing_ok=True)
@@ -117,7 +133,7 @@ async def test_lru_evicts_oldest_beyond_cap(tmp_path, monkeypatch):
     outs = []
     for i in range(5):
         # Distinct gcode text → distinct keys → 5 inserts against a cap of 3.
-        out = await get_or_build_eject_file(src, 1, _EJECT_GCODE + f"; n{i}\n", cache_dir=cache)
+        out, _ = await get_or_build_eject_file(src, 1, _EJECT_GCODE + f"; n{i}\n", cache_dir=cache)
         outs.append(out)
         # Space mtimes so eviction order is deterministic.
         await asyncio.sleep(0.01)
@@ -144,11 +160,14 @@ async def test_concurrent_same_key_both_succeed(tmp_path):
     src = _make_source(tmp_path)
 
     results = await asyncio.gather(*[get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache) for _ in range(6)])
+    paths = [p for p, _k in results]
+    keys = {k for _p, k in results}
     # Every concurrent caller got a valid, distinct, correctly-built artifact...
-    assert len({str(p) for p in results}) == 6
-    for out in results:
+    assert len({str(p) for p in paths}) == 6
+    for out in paths:
         assert _read_plate(out) == _EJECT_GCODE.encode("utf-8")
-    # ...and the cache converged to a single entry for the shared key.
+    # ...sharing the ONE build key, and the cache converged to a single entry.
+    assert len(keys) == 1
     assert len(list(cache.glob("*.3mf"))) == 1
-    for out in results:
+    for out in paths:
         out.unlink(missing_ok=True)

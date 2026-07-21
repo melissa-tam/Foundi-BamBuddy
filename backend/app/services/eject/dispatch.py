@@ -68,7 +68,9 @@ async def build_part_present_eject_file(
     plate_id: int,
     profile: EjectProfile,
     geometry: ModelGeometry,
-) -> Path:
+    *,
+    slim: bool = False,
+) -> tuple[Path, str]:
     """Build a standalone PART-PRESENT, MOTION-ONLY eject-only ``.gcode.3mf`` for ``plate_id``.
 
     The plate's G-code is REPLACED ENTIRELY (via ``repack_3mf_with_gcode``, MD5
@@ -89,12 +91,15 @@ async def build_part_present_eject_file(
     The artifact is built ONE-PASS (``repack_3mf_eject``): the plate G-code+MD5
     replacement and the ``slice_info.config`` usage-zeroing happen in a single ZIP
     rewrite, so this motion-only file reports ZERO filament / print-time usage — it
-    extrudes nothing, and must not inherit the donor's plate weight / prediction. The
-    build runs OFF the event loop and is cached by ``(gcode, donor, plate)`` via
-    :func:`get_or_build_eject_file` (latency Phase C2); the cheap gcode
-    generation+validation stays here (the cache key needs the final gcode text).
+    extrudes nothing, and must not inherit the donor's plate weight / prediction. When
+    ``slim`` (latency Phase D3, caller-supplied from the ``eject_slim_3mf`` setting) the
+    object meshes + plate thumbnails are dropped too. The build runs OFF the event loop
+    and is cached by ``(gcode, donor, plate, slim)`` via :func:`get_or_build_eject_file`
+    (latency Phase C2); the cheap gcode generation+validation stays here (the cache key
+    needs the final gcode text).
 
-    Returns the temp ``.gcode.3mf`` :class:`Path` (caller cleans it up). Raises
+    Returns ``(path, build_key)`` — the temp ``.gcode.3mf`` :class:`Path` (caller cleans
+    it up) and the content-addressed build key (for the Phase D2 de-dupe probe). Raises
     :class:`EjectGenerationError` on any failure.
     """
     max_z = _parse_max_z_height(Path(source_path), plate_id)
@@ -107,6 +112,6 @@ async def build_part_present_eject_file(
         raise EjectGenerationError("Part-present eject validation failed: " + "; ".join(validation.errors))
 
     try:
-        return await get_or_build_eject_file(Path(source_path), plate_id, block)
+        return await get_or_build_eject_file(Path(source_path), plate_id, block, slim=slim)
     except EjectBuildError as exc:
         raise EjectGenerationError(f"Failed to repack the part-present eject 3mf: {exc}") from exc

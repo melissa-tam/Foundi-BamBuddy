@@ -25,6 +25,7 @@ from backend.app.utils.threemf_tools import (
     list_gcode_plate_ids,
     mm_to_grams,
     parse_gcode_layer_filament_usage,
+    read_plate_gcode_header,
     read_plate_gcode_machine_end,
     repack_3mf_eject,
     repack_3mf_with_gcode,
@@ -1237,3 +1238,135 @@ class TestRepack3mfEjectZeroing:
             legacy.unlink(missing_ok=True)
             legacy_two_pass.unlink(missing_ok=True)
             one_pass.unlink(missing_ok=True)
+
+
+class TestRepack3mfEjectSlim:
+    """Phase D3: ``slim=True`` drops the object meshes + per-plate thumbnails (the
+    container bulk) while keeping EVERY other member byte-identical. Member names
+    mirror a real production 3MF (H2C_Test_Cube_Right_Nozzle.3mf) — critically the
+    no-light thumbnail is ``plate_no_light_N.png`` (number trails "no_light")."""
+
+    _SLICE_INFO = TestRepack3mfEjectZeroing._SLICE_INFO
+    _GCODE = b"; HEADER_BLOCK_START\n; max_z_height: 18.00\n; HEADER_BLOCK_END\nG28 X Y\n"
+    _MD5 = b"ABCDEF0123456789ABCDEF0123456789"
+    _NEW_GCODE = (
+        "; HEADER_BLOCK_START\n; max_z_height: 18.00\n; HEADER_BLOCK_END\n"
+        "; EXECUTABLE_BLOCK_START\nM17\nG28 X Y\n; EXECUTABLE_BLOCK_END\n"
+    )
+
+    # The mesh + thumbnail members that MUST be dropped, sized large with
+    # near-incompressible (random) payloads — like real meshes / PNGs — so the drop
+    # actually shrinks the DEFLATE-compressed container drastically.
+    _DROP_MEMBERS = {
+        "3D/Objects/object_1.model": b"<mesh/>" + os.urandom(200_000),
+        "3D/Objects/object_2.model": b"<mesh/>" + os.urandom(200_000),
+        "Metadata/plate_1.png": b"\x89PNG" + os.urandom(50_000),
+        "Metadata/plate_1_small.png": b"\x89PNG" + os.urandom(10_000),
+        "Metadata/plate_no_light_1.png": b"\x89PNG" + os.urandom(30_000),
+        "Metadata/top_1.png": b"\x89PNG" + os.urandom(10_000),
+        "Metadata/pick_1.png": b"\x89PNG" + os.urandom(10_000),
+    }
+    _KEEP_MEMBERS = {
+        "[Content_Types].xml": b"<Types/>",
+        "_rels/.rels": b"<Relationships/>",
+        "3D/3dmodel.model": b"<model/>",  # scene stub — NOT under 3D/Objects/
+        "3D/_rels/3dmodel.model.rels": b"<Relationships/>",
+        "Metadata/plate_1.json": b"{}",
+        "Metadata/project_settings.config": b'{"k":1}',
+        "Metadata/model_settings.config": b"<config/>",
+        "Metadata/cut_information.xml": b"<cut/>",
+        "Metadata/filament_sequence.json": b"[]",
+    }
+
+    @classmethod
+    def _write_realistic_3mf(cls, tmp_path, name="art.gcode.3mf"):
+        path = tmp_path / name
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("Metadata/slice_info.config", cls._SLICE_INFO)
+            zf.writestr("Metadata/plate_1.gcode", cls._GCODE)
+            zf.writestr("Metadata/plate_1.gcode.md5", cls._MD5)
+            for member, data in {**cls._KEEP_MEMBERS, **cls._DROP_MEMBERS}.items():
+                zf.writestr(member, data)
+        return path
+
+    @staticmethod
+    def _members(path):
+        with zipfile.ZipFile(path, "r") as zf:
+            return {name: zf.read(name) for name in zf.namelist()}
+
+    def test_slim_off_keeps_full_member_set(self, tmp_path):
+        # Regression: slim=False (default) must NOT drop anything — the equivalence
+        # test above still holds and every mesh/thumbnail rides along.
+        src = self._write_realistic_3mf(tmp_path)
+        out = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=False)
+        try:
+            members = self._members(out)
+            for dropped in self._DROP_MEMBERS:
+                assert dropped in members
+        finally:
+            out.unlink(missing_ok=True)
+
+    def test_slim_drops_exactly_mesh_and_thumbnail_families(self, tmp_path):
+        src = self._write_realistic_3mf(tmp_path)
+        full = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=False)
+        slim = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=True)
+        try:
+            full_names = set(self._members(full))
+            slim_names = set(self._members(slim))
+            # The removed set is EXACTLY the mesh + thumbnail families.
+            assert full_names - slim_names == set(self._DROP_MEMBERS)
+            # Every other member survives.
+            for keep in self._KEEP_MEMBERS:
+                assert keep in slim_names
+            assert "Metadata/plate_1.gcode" in slim_names
+            assert "Metadata/plate_1.gcode.md5" in slim_names
+            assert "Metadata/slice_info.config" in slim_names
+        finally:
+            full.unlink(missing_ok=True)
+            slim.unlink(missing_ok=True)
+
+    def test_slim_keeps_config_members_byte_identical(self, tmp_path):
+        src = self._write_realistic_3mf(tmp_path)
+        full = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=False)
+        slim = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=True)
+        try:
+            full_members = self._members(full)
+            slim_members = self._members(slim)
+            # Every KEPT member is byte-identical between full and slim (incl. the
+            # scene stub, the zeroed slice_info, the gcode + md5 replacement).
+            for name in slim_members:
+                assert slim_members[name] == full_members[name], name
+        finally:
+            full.unlink(missing_ok=True)
+            slim.unlink(missing_ok=True)
+
+    def test_slim_md5_sidecar_correct_and_output_smaller(self, tmp_path):
+        import hashlib
+
+        src = self._write_realistic_3mf(tmp_path)
+        slim = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=True)
+        try:
+            members = self._members(slim)
+            gcode = members["Metadata/plate_1.gcode"]
+            md5 = members["Metadata/plate_1.gcode.md5"]
+            assert gcode == self._NEW_GCODE.encode("utf-8")
+            assert md5 == hashlib.md5(gcode, usedforsecurity=False).hexdigest().upper().encode("ascii")
+            assert not md5.endswith(b"\n")
+            # The mesh + thumbnail bulk is gone → the slim file is drastically smaller.
+            assert slim.stat().st_size < src.stat().st_size // 2
+        finally:
+            slim.unlink(missing_ok=True)
+
+    def test_slim_output_parses_with_repo_reader(self, tmp_path):
+        # The generated slim eject file must still parse with the repo's own 3MF
+        # reader (the plate gcode header is what dispatch re-reads for max_z).
+        src = self._write_realistic_3mf(tmp_path)
+        slim = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=True)
+        try:
+            header = read_plate_gcode_header(slim, 1)
+            assert header.get("max_z_height") == "18.00"
+            # slice usage still reads as zeroed (the eject file extrudes nothing).
+            assert extract_print_time_from_3mf(slim, plate_id=1) == 0
+            assert list_gcode_plate_ids(slim) == [1]
+        finally:
+            slim.unlink(missing_ok=True)

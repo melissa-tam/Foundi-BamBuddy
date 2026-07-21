@@ -13,6 +13,8 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.eject import remote
+from backend.app.services.eject.dispatch import build_part_present_eject_file
+from backend.app.services.eject.geometry import get_geometry_required
 from backend.app.services.printer_manager import printer_manager
 
 pytestmark = pytest.mark.asyncio
@@ -451,6 +453,151 @@ class TestDispatchForeignEject:
             assert exc.value.status_code == 409
         finally:
             source.unlink(missing_ok=True)
+
+
+class TestSkipIdenticalEjectUpload:
+    """Phase D2: when ``eject_upload_skip_identical`` is ON, the eject file's remote
+    name carries the first 8 hex of its content build-key, and an FTPS SIZE probe that
+    matches (exact bytes) skips the upload. Default OFF uploads exactly as before."""
+
+    @staticmethod
+    def _emit_capture():
+        """A patch for eject_progress.emit_eject_progress capturing (phase, pct)."""
+        events: list[tuple[str, float | None]] = []
+
+        def _emit(*, printer_id, queue_item_id, phase, progress_pct=None, detail=None):
+            events.append((phase, progress_pct))
+
+        return events, _emit
+
+    async def test_off_no_probe_uploads_with_bare_name(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            start = MagicMock(return_value=True)
+            upload = AsyncMock(return_value=True)
+            probe = AsyncMock(return_value=999)
+            c1, _c2, _c3 = _ftp_patches()  # only reuse the is_connected patch
+            with (
+                c1,
+                patch(
+                    "backend.app.services.bambu_ftp.get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0, 30))
+                ),
+                patch("backend.app.services.bambu_ftp.upload_file_async", upload),
+                patch("backend.app.services.bambu_ftp.get_file_size_async", probe),
+                patch.object(remote, "_read_eject_dispatch_flags", AsyncMock(return_value=(False, False))),
+                patch.object(printer_manager, "start_print", start),
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
+                )
+            # OFF → no SIZE probe, a normal upload, and the bare historical name.
+            probe.assert_not_awaited()
+            upload.assert_awaited_once()
+            assert start.call_args.args[1] == f"eject_production_item{item.id}.3mf"
+        finally:
+            remote.pop_pending_eject(printer.id)
+            source.unlink(missing_ok=True)
+
+    async def test_on_size_match_skips_upload_still_sends(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            # Pre-build the SAME artifact to learn its exact size + content key (the
+            # build is deterministic + cached, so the dispatch's build is byte-identical).
+            geometry = await get_geometry_required(db_session, "H2S", require_validated=True)
+            prof = await db_session.get(EjectProfile, item.eject_profile_id)
+            pre_path, build_key = await build_part_present_eject_file(source, 1, prof, geometry, slim=False)
+            expected_size = pre_path.stat().st_size
+            pre_path.unlink(missing_ok=True)
+
+            start = MagicMock(return_value=True)
+            upload = AsyncMock(return_value=True)
+            probe = AsyncMock(return_value=expected_size)  # exact byte match → skip
+            events, emit = self._emit_capture()
+            c1, _c2, _c3 = _ftp_patches()
+            with (
+                c1,
+                patch(
+                    "backend.app.services.bambu_ftp.get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0, 30))
+                ),
+                patch("backend.app.services.bambu_ftp.upload_file_async", upload),
+                patch("backend.app.services.bambu_ftp.get_file_size_async", probe),
+                patch.object(remote, "_read_eject_dispatch_flags", AsyncMock(return_value=(False, True))),
+                patch.object(remote.eject_progress, "emit_eject_progress", emit),
+                patch.object(printer_manager, "start_print", start),
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
+                )
+            # The probe ran on the HASHED name; the exact size matched → NO upload.
+            probe.assert_awaited_once()
+            expected_name = f"eject_production_item{item.id}_{build_key[:8]}.3mf"
+            assert probe.await_args.args[2] == f"/{expected_name}"
+            upload.assert_not_awaited()
+            # start_print still fires on the SAME hashed name (project_file consistent).
+            assert start.call_args.args[1] == expected_name
+            # The uploading→sent transition is still emitted (jump straight to sent).
+            phases = [p for p, _pct in events]
+            assert ("uploading", 100.0) in events
+            assert "sent" in phases
+            assert "failed" not in phases
+            # Pending registered → the eject is live exactly as an uploaded one.
+            assert remote.peek_pending_eject(printer.id) is not None
+        finally:
+            remote.pop_pending_eject(printer.id)
+            source.unlink(missing_ok=True)
+
+    @pytest.mark.parametrize("probe_return", [None, 111111])
+    async def test_on_absent_or_mismatch_uploads_failopen(self, db_session, probe_return):
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            start = MagicMock(return_value=True)
+            upload = AsyncMock(return_value=True)
+            probe = AsyncMock(return_value=probe_return)  # absent (None) / wrong size
+            c1, _c2, _c3 = _ftp_patches()
+            with (
+                c1,
+                patch(
+                    "backend.app.services.bambu_ftp.get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0, 30))
+                ),
+                patch("backend.app.services.bambu_ftp.upload_file_async", upload),
+                patch("backend.app.services.bambu_ftp.get_file_size_async", probe),
+                patch.object(remote, "_read_eject_dispatch_flags", AsyncMock(return_value=(False, True))),
+                patch.object(printer_manager, "start_print", start),
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
+                )
+            # Probe ran but did not match → fail-open upload on the hashed name.
+            probe.assert_awaited_once()
+            upload.assert_awaited_once()
+            started = start.call_args.args[1]
+            import re as _re
+
+            assert _re.fullmatch(rf"eject_production_item{item.id}_[0-9a-f]{{8}}\.3mf", started)
+        finally:
+            remote.pop_pending_eject(printer.id)
+            source.unlink(missing_ok=True)
+
+    async def test_hashed_name_still_correlates_as_our_eject(self):
+        # The echoed subtask_name is derived from the dispatched filename, so a hashed
+        # name must still parse as our eject AND match its hash-less pending stem.
+        assert remote.parse_eject_job_name("eject_production_item32_ab12cd34") == ("production", 32)
+        assert remote.parse_eject_job_name("eject_production_item32_ab12cd34.3mf") == ("production", 32)
+        assert remote.is_eject_job_name("eject_manual_p7_deadbeef") is True
+        remote.register_pending_eject(9301, remote.PendingEject("production", 1, 32))
+        try:
+            with patch.object(printer_manager, "get_client", return_value=None):
+                # Hashed echo → still our eject (suffix stripped before the compare).
+                assert remote.matches_pending_eject(9301, None, subtask_name="eject_production_item32_ab12cd34") is True
+                # Wrong item id under a hash → still a positive mismatch.
+                assert (
+                    remote.matches_pending_eject(9301, None, subtask_name="eject_production_item99_ab12cd34") is False
+                )
+        finally:
+            remote.pop_pending_eject(9301)
 
 
 class TestDispatchPartPresentEjectProfileGuard:

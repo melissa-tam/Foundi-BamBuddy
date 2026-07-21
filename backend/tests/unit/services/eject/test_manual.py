@@ -504,9 +504,7 @@ class TestManualEjectForeignFallbackLastFarmItem:
             prof = EjectProfile(name="fblib-ep", cooldown_temp_c=30.0)
             db_session.add(prof)
             await db_session.flush()
-            lf = await _mk_ondisk_library_file(
-                db_session, filename="Farm Widget.gcode.3mf", file_path=str(source)
-            )
+            lf = await _mk_ondisk_library_file(db_session, filename="Farm Widget.gcode.3mf", file_path=str(source))
             await _mk_farm_item(
                 db_session,
                 printer_id=printer.id,
@@ -565,9 +563,7 @@ class TestManualEjectForeignFallbackLastFarmItem:
                 filename="arch.gcode.3mf",
                 print_name="Arch Widget",
             )
-            lf = await _mk_ondisk_library_file(
-                db_session, filename="Lib Widget.gcode.3mf", file_path=str(source_lib)
-            )
+            lf = await _mk_ondisk_library_file(db_session, filename="Lib Widget.gcode.3mf", file_path=str(source_lib))
             await _mk_farm_item(
                 db_session,
                 printer_id=printer.id,
@@ -646,9 +642,7 @@ class TestManualEjectForeignFallbackLastFarmItem:
         bare = _make_bare_3mf()
         try:
             printer = await _mk_printer(db_session, "FBBARE", gate="")
-            lf = await _mk_ondisk_library_file(
-                db_session, filename="Bare.gcode.3mf", file_path=str(bare)
-            )
+            lf = await _mk_ondisk_library_file(db_session, filename="Bare.gcode.3mf", file_path=str(bare))
             await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, plate_id=1)
             await db_session.commit()
             c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
@@ -809,6 +803,199 @@ class TestIdentifyFarmFileForeign:
             assert result is None
         finally:
             source.unlink(missing_ok=True)
+
+
+def _donor_bytes() -> bytes:
+    """Valid foreign-donor 3MF bytes (plate_1 + max_z 18mm) for a re-fetch mock."""
+    src = _make_source_3mf()
+    try:
+        return src.read_bytes()
+    finally:
+        src.unlink(missing_ok=True)
+
+
+class _FetchCounter:
+    """A stand-in for ``download_file_try_paths_async`` that WRITES a valid donor to the
+    requested temp path (so the fetched file is real) and counts each fetch — the
+    Phase D1 dedupe assertion (a cached deposit means the second resolve fetches 0)."""
+
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self.calls = 0
+
+    async def __call__(self, ip, code, remote_paths, dest, printer_model=None):
+        self.calls += 1
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        Path(dest).write_bytes(self.payload)
+        return True
+
+
+@pytest.fixture(autouse=True)
+def _clear_foreign_donor_cache():
+    """Isolate the module-level Phase D1 donor cache between tests (unlink temp files)."""
+    manual._foreign_donor_cache.clear()
+    yield
+    for _key, (path, _exp) in list(manual._foreign_donor_cache.items()):
+        path.unlink(missing_ok=True)
+    manual._foreign_donor_cache.clear()
+
+
+class TestForeignDonorCache:
+    """Phase D1: the foreign 'Eject now' flow re-fetches the donor only ONCE — the 409
+    DEPOSITS the fetched temp, the confirm CONSUMES it. The auto path (identify →
+    dispatch) dedupes the same way. A gate re-raise for a DIFFERENT subtask never serves
+    the stale donor, and an expired entry is unlinked + re-fetched."""
+
+    async def _fetching_printer(self, db, name, gate="SUB-F", filename="gone.gcode.3mf"):
+        """A printer + a download-failed fallback archive (file_path="") so the donor
+        resolves via the FTPS re-fetch path (the branch the cache covers)."""
+        printer = await _mk_printer(db, name, gate=gate)
+        await _mk_archive(db, printer_id=printer.id, subtask=gate, file_path="", filename=filename)
+        return printer
+
+    async def test_409_deposits_and_confirm_consumes_no_second_fetch(self, db_session):
+        printer = await self._fetching_printer(db_session, "D1A")
+        prof = EjectProfile(name="d1a-ep", cooldown_temp_c=30.0)
+        db_session.add(prof)
+        await db_session.flush()
+        await db_session.commit()
+        fetch = _FetchCounter(_donor_bytes())
+        # First call (no profile) → the confirm prompt; the donor is fetched + deposited.
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
+            pytest.raises(manual.ForeignPlateEject),
+        ):
+            await manual.manual_eject(db_session, printer.id)
+        assert fetch.calls == 1
+        assert len(manual._foreign_donor_cache) == 1  # deposited
+        # Second call (profile chosen) → CONSUMES the deposit; NO second fetch.
+        dispatch = AsyncMock()
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
+            patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
+        ):
+            result = await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
+        assert result == {"mode": "dispatched", "queue_item_id": None}
+        assert fetch.calls == 1  # consumed the cache — no re-download
+        assert len(manual._foreign_donor_cache) == 0  # consumed entry removed
+        dispatch.assert_awaited_once()
+
+    async def test_expired_entry_is_unlinked_and_refetched(self, db_session):
+        printer = await self._fetching_printer(db_session, "D1B")
+        prof = EjectProfile(name="d1b-ep", cooldown_temp_c=30.0)
+        db_session.add(prof)
+        await db_session.flush()
+        await db_session.commit()
+        fetch = _FetchCounter(_donor_bytes())
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
+            pytest.raises(manual.ForeignPlateEject),
+        ):
+            await manual.manual_eject(db_session, printer.id)
+        assert fetch.calls == 1
+        # Force the deposited entry to look expired, then confirm → sweep unlinks it +
+        # re-fetch (a fresh download).
+        ((key, (deposited_path, _exp)),) = list(manual._foreign_donor_cache.items())
+        manual._foreign_donor_cache[key] = (deposited_path, -1.0)
+        assert deposited_path.is_file()
+        dispatch = AsyncMock()
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
+            patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
+        ):
+            await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
+        assert fetch.calls == 2  # expired → re-fetched
+        assert not deposited_path.is_file()  # the expired temp was unlinked by the sweep
+
+    async def test_different_gate_does_not_consume_stale_donor(self, db_session):
+        printer = await self._fetching_printer(db_session, "D1C", gate="SUB-A", filename="a.gcode.3mf")
+        prof = EjectProfile(name="d1c-ep", cooldown_temp_c=30.0)
+        db_session.add(prof)
+        await db_session.flush()
+        await db_session.commit()
+        fetch = _FetchCounter(_donor_bytes())
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
+            pytest.raises(manual.ForeignPlateEject),
+        ):
+            await manual.manual_eject(db_session, printer.id)
+        assert fetch.calls == 1
+        # A NEW foreign print raises a DIFFERENT gate subtask on the same printer.
+        printer.plate_gate_subtask_id = "SUB-B"
+        await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-B", file_path="", filename="b.gcode.3mf")
+        await db_session.commit()
+        dispatch = AsyncMock()
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
+            patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
+        ):
+            await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
+        # The gate-B confirm did NOT serve the gate-A donor → a fresh fetch.
+        assert fetch.calls == 2
+
+    async def test_auto_path_identify_then_dispatch_fetches_once(self, db_session, seed_geometry, monkeypatch):
+        import contextlib
+
+        printer = await _mk_printer(db_session, "D1D", gate="SUB-F")  # H2S → validated
+        prof = EjectProfile(name="d1d-ep", cooldown_temp_c=30.0, max_part_height_mm=42.0)
+        db_session.add(prof)
+        await db_session.flush()
+        lf = await _mk_library_file(db_session, "Farm Widget.gcode.3mf")
+        await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, eject_profile_id=prof.id)
+        # Download-failed fallback archive → the auto path also resolves via re-fetch.
+        await _mk_archive(
+            db_session, printer_id=printer.id, subtask="SUB-F", file_path="", filename="Farm_Widget.gcode.3mf"
+        )
+        await db_session.commit()
+        fetch = _FetchCounter(_donor_bytes())
+
+        @contextlib.asynccontextmanager
+        async def _fake_session():
+            yield db_session
+
+        monkeypatch.setattr("backend.app.core.database.async_session", _fake_session, raising=False)
+
+        with patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch):
+            identified = await manual.identify_farm_file_foreign(
+                db_session, printer.id, subtask_name="Farm_Widget", filename="Farm_Widget.gcode.3mf"
+            )
+            assert identified is not None
+            assert fetch.calls == 1  # identify fetched + deposited
+            dispatch = AsyncMock()
+            with patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch):
+                await manual.dispatch_identified_foreign_eject(printer_id=printer.id, profile_id=identified.profile_id)
+        assert fetch.calls == 1  # dispatch consumed the deposit — no second fetch
+        dispatch.assert_awaited_once()
 
 
 class TestDispatchIdentifiedForeignEject:

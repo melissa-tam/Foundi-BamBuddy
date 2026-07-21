@@ -819,6 +819,38 @@ def list_gcode_plate_ids(source_path: Path) -> list[int]:
 
 _SLICE_INFO_NAME = "Metadata/slice_info.config"
 
+# --- Slim eject 3MF drop-list (latency Phase D3) ----------------------------
+# A DROP-LIST (not an allow-list) is deliberate: it removes only the two proven-
+# bulky, motion-irrelevant member FAMILIES and keeps EVERYTHING else — every small
+# config member firmware might parse — byte-identical. The patterns are derived
+# from a real production corpus file (H2C_Test_Cube_Right_Nozzle.3mf) and match the
+# codebase's own archive reader (see api/routes/archives.py plate-thumbnail scans):
+#
+#   * ``3D/Objects/*``            — the per-object meshes (multi-MB; the bulk). Note
+#                                    ``3D/3dmodel.model`` (the scene stub) is NOT under
+#                                    ``3D/Objects/`` and is KEPT.
+#   * ``Metadata/plate_N.png``           — the main plate render
+#   * ``Metadata/plate_N_small.png``     — small variant
+#   * ``Metadata/plate_no_light_N.png``  — no-light variant (the number trails
+#                                          "no_light" in the REAL corpus, not
+#                                          ``plate_N_no_light.png``)
+#   * ``Metadata/top_N.png`` / ``Metadata/pick_N.png`` — top-down / pick previews
+#
+# The predicate can never match the plate gcode, its ``.gcode.md5`` sidecar, any
+# ``.config`` member, ``plate_N.json``, or the scene stub, so the slim build stays a
+# valid, parseable 3MF (the eject gcode + MD5 replacement always survives).
+_SLIM_DROP_THUMB_RE = re.compile(
+    r"^Metadata/(?:plate_\d+|plate_\d+_small|plate_no_light_\d+|top_\d+|pick_\d+)\.png$",
+    re.IGNORECASE,
+)
+
+
+def _slim_should_drop(name: str) -> bool:
+    """True when ``name`` is a mesh/thumbnail member the slim eject build omits."""
+    if name.startswith("3D/Objects/"):
+        return True
+    return bool(_SLIM_DROP_THUMB_RE.match(name))
+
 
 def _write_repacked_3mf(
     source_path: Path,
@@ -826,6 +858,7 @@ def _write_repacked_3mf(
     gcode_bytes: bytes,
     *,
     extra_replacements: dict[str, bytes] | None = None,
+    drop_members=None,
 ) -> Path:
     """Copy `source_path` to a new temp 3MF with `target_gcode` replaced by
     `gcode_bytes` (and, optionally, each member in `extra_replacements` replaced
@@ -842,8 +875,11 @@ def _write_repacked_3mf(
     swap other members — e.g. the zeroed ``slice_info.config`` — in the SAME pass
     instead of a second full ZIP rewrite (latency Phase C1). The plate-gcode +
     ``.md5`` replacement always wins over an ``extra_replacements`` entry for the
-    same names. Every non-replaced member is copied verbatim, keeping its original
-    compression. Caller owns the returned temp file.
+    same names. `drop_members` (``Callable[[str], bool] | None``) OMITS every member
+    it returns True for (the slim eject build's mesh/thumbnail drop-list, Phase D3);
+    it never applies to the plate gcode / its ``.md5`` (those are replaced, not
+    dropped). Every non-replaced, non-dropped member is copied verbatim, keeping its
+    original compression. Caller owns the returned temp file.
     """
     import tempfile
 
@@ -867,6 +903,9 @@ def _write_repacked_3mf(
                     zf_write.writestr(info, gcode_bytes)
                 elif item == md5_name:
                     zf_write.writestr(info, md5_value)
+                elif drop_members is not None and drop_members(item):
+                    # Slim build: omit mesh/thumbnail bulk (never the gcode/md5).
+                    continue
                 elif item in extra:
                     zf_write.writestr(info, extra[item])
                 else:
@@ -947,7 +986,9 @@ def zero_slice_usage_bytes(original: bytes) -> bytes | None:
     return new_bytes
 
 
-def repack_3mf_eject(source_path: Path, plate_id: int, gcode_text: str, *, zero_usage: bool = True) -> Path | None:
+def repack_3mf_eject(
+    source_path: Path, plate_id: int, gcode_text: str, *, zero_usage: bool = True, slim: bool = False
+) -> Path | None:
     """ONE-PASS eject-file build: the single public entry the farm's motion-only
     eject / dry-run builders use.
 
@@ -956,9 +997,15 @@ def repack_3mf_eject(source_path: Path, plate_id: int, gcode_text: str, *, zero_
     `zero_usage` — replaces ``Metadata/slice_info.config`` with its usage-zeroed
     form (:func:`zero_slice_usage_bytes`). This collapses the former two-pass
     composition (``repack_3mf_with_gcode`` then a whole-file ``slice_info`` rewrite)
-    into one read/re-deflate pass (latency Phase C1); the produced container is
-    byte-equivalent to that two-pass output — same members, same replacements, same
-    MD5 sidecar semantics (uppercase hex, no trailing newline).
+    into one read/re-deflate pass (latency Phase C1); with ``slim=False`` the produced
+    container is byte-equivalent to that two-pass output — same members, same
+    replacements, same MD5 sidecar semantics (uppercase hex, no trailing newline).
+
+    When ``slim`` (latency Phase D3), the object meshes (``3D/Objects/*``) and the
+    per-plate thumbnails (:data:`_SLIM_DROP_THUMB_RE`) are OMITTED — the motion-only
+    eject needs neither, and they are the bulk of the container. Everything else,
+    including the ``3D/3dmodel.model`` scene stub and every config member, stays
+    byte-identical.
 
     Returns the temp ``.gcode.3mf`` :class:`Path`, or ``None`` if the plate has no
     gcode member or repacking fails. Caller owns the returned temp file.
@@ -974,7 +1021,13 @@ def repack_3mf_eject(source_path: Path, plate_id: int, gcode_text: str, *, zero_
                 zeroed = zero_slice_usage_bytes(zf.read(_SLICE_INFO_NAME))
                 if zeroed is not None:
                     extra = {_SLICE_INFO_NAME: zeroed}
-        return _write_repacked_3mf(source_path, target_gcode, gcode_text.encode("utf-8"), extra_replacements=extra)
+        return _write_repacked_3mf(
+            source_path,
+            target_gcode,
+            gcode_text.encode("utf-8"),
+            extra_replacements=extra,
+            drop_members=_slim_should_drop if slim else None,
+        )
     except Exception:
         return None
 

@@ -282,8 +282,23 @@ async def preview_eject_profile(
     )
 
 
+async def _read_eject_slim_setting(db: AsyncSession) -> bool:
+    """The ``eject_slim_3mf`` toggle (Phase D3), default OFF — read by the eject/dry-run
+    builders so ``build_cache`` stays DB-free."""
+    from backend.app.api.routes.settings import get_setting
+
+    raw = await get_setting(db, "eject_slim_3mf")
+    return raw is not None and str(raw).strip().lower() == "true"
+
+
 async def _build_dryrun_3mf(
-    source_path: Path, plate_index: int, profile: EjectProfile, max_z: float, geometry: ModelGeometry
+    source_path: Path,
+    plate_index: int,
+    profile: EjectProfile,
+    max_z: float,
+    geometry: ModelGeometry,
+    *,
+    slim: bool = False,
 ) -> Path:
     """Generate + validate the motion-only eject block and repack into a temp
     dry-run ``.gcode.3mf``.
@@ -317,7 +332,8 @@ async def _build_dryrun_3mf(
 
     dryrun_gcode = _build_dryrun_gcode(source_path, plate_index, eject_block, geometry)
     try:
-        return await get_or_build_eject_file(source_path, plate_index, dryrun_gcode)
+        out_path, _build_key = await get_or_build_eject_file(source_path, plate_index, dryrun_gcode, slim=slim)
+        return out_path
     except EjectBuildError as exc:
         raise HTTPException(status_code=422, detail=f"Plate {plate_index} has no G-code to replace") from exc
 
@@ -334,7 +350,8 @@ async def dry_run_eject_profile(
     source_path = await _resolve_source_3mf(db, body.library_file_id)
     max_z = _read_max_z_or_422(source_path, body.plate_index)
 
-    out_path = await _build_dryrun_3mf(source_path, body.plate_index, profile, max_z, geometry)
+    slim = await _read_eject_slim_setting(db)
+    out_path = await _build_dryrun_3mf(source_path, body.plate_index, profile, max_z, geometry, slim=slim)
 
     safe_profile = re.sub(r"[^A-Za-z0-9_.-]+", "_", profile.name).strip("_") or "profile"
     safe_file = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(source_path).stem).strip("_") or "file"
@@ -415,7 +432,8 @@ async def dispatch_dry_run_eject_profile(
         )
 
     max_z = _read_max_z_or_422(source_path, body.plate_index)
-    out_path = await _build_dryrun_3mf(source_path, body.plate_index, profile, max_z, geometry)
+    slim = await _read_eject_slim_setting(db)
+    out_path = await _build_dryrun_3mf(source_path, body.plate_index, profile, max_z, geometry, slim=slim)
 
     try:
         file_bytes = out_path.read_bytes()
