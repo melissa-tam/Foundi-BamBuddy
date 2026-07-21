@@ -15,6 +15,16 @@ and a suggested profile) so the UI can render an eject-profile picker; the secon
 supplies the chosen ``eject_profile_id`` and dispatches the sweep. A farm-known-but-
 ineligible gate (e.g. an unapproved first article) is NEVER treated as foreign.
 
+The MANUAL foreign path carries one extra, purely-local fallback the fail-closed AUTO
+path does NOT: a screen-RESTART of the farm's OWN USB file echoes a degenerate identity
+(empty ``subtask_id``, ``subtask_name="project_file"``), so the gate id is blank AND the
+auto-archive is the download-failed fallback row (``file_path=""``) — the strict archive
+resolver finds nothing usable. But the farm still KNOWS what is on the plate: the most-
+recently-started queue item on the printer carries the library/archive it was dispatched
+from. When the strict resolver 409s, :func:`_manual_eject_foreign` falls back to
+:func:`_resolve_foreign_source_from_last_farm_item` (on-disk donor only) before giving up;
+if THAT can't resolve either, the original 409 is re-raised unchanged.
+
 The service composes the existing eject primitives — it NEVER hand-rolls a dispatch.
 When a cooldown watch is armed it merely signals that watch's single ``_do_release``
 path (``request_release_now``) so there is no parallel dispatch race; otherwise it
@@ -400,6 +410,89 @@ async def _resolve_foreign_source(db: AsyncSession, printer: Printer) -> _Foreig
     )
 
 
+async def _resolve_foreign_source_from_last_farm_item(db: AsyncSession, printer: Printer) -> _ForeignSource | None:
+    """MANUAL-only donor fallback: resolve the plate from the printer's last farm item.
+
+    The strict :func:`_resolve_foreign_source` ties the donor to the *archive that
+    raised the gate*. That fails for the screen-RESTART incident shape — a blank gate
+    id + a download-failed fallback archive (``file_path=""``) carry no usable donor.
+    The farm still knows the plate's contents though: the most-recently-started queue
+    item on this printer records the library file / archive it was dispatched from.
+
+    Donor resolution is ON DISK ONLY (never an FTPS re-fetch — the strict path already
+    tried the wire; this is the last, purely-local fallback), in priority order:
+
+    * (a) ``item.archive_id`` → :class:`PrintArchive` whose ``file_path`` is non-empty
+      and exists on disk (``base_dir / file_path``);
+    * (b) else ``item.library_file_id`` → :class:`LibraryFile` resolved with the
+      established absolute-or-``base_dir`` pattern (``print_scheduler`` line ~1249);
+    * (c) neither on disk → ``None``.
+
+    Plate id prefers the item's own ``plate_id`` when the donor actually carries it,
+    else the filename-hint / single-G-code-plate resolution (never a blind guess); the
+    plate's ``max_z`` is parsed from its G-code header exactly like the strict resolver.
+    Any unresolved step returns ``None`` so the caller re-raises the ORIGINAL strict 409
+    (the by-hand-clear behaviour is unchanged when the plate is genuinely unresolvable).
+
+    The returned donor is always on disk, so ``tmp_path`` is ``None`` — there is nothing
+    for the caller to clean up. Used ONLY by :func:`_manual_eject_foreign`; the strict
+    resolver stays fail-closed for the AUTO foreign-eject path (a farm red line)."""
+    from backend.app.core.config import settings as app_settings
+    from backend.app.models.library import LibraryFile
+
+    item = await _latest_started_item(db, printer.id)
+    if item is None:
+        return None
+
+    # (a)/(b) donor on disk — the archived copy is preferred, else the library source.
+    donor_path: Path | None = None
+    display_name: str | None = None  # names the donor for the plate-id filename hint
+    print_name: str | None = None  # the operator-facing name for the confirm dialog
+    if item.archive_id is not None:
+        archive = await db.get(PrintArchive, item.archive_id)
+        if archive is not None and archive.file_path:
+            disk = app_settings.base_dir / archive.file_path
+            if disk.is_file():
+                donor_path = disk
+                display_name = archive.filename
+                print_name = archive.print_name or archive.filename
+    if donor_path is None and item.library_file_id is not None:
+        library_file = await db.get(LibraryFile, item.library_file_id)
+        if library_file is not None:
+            lib_path = Path(library_file.file_path)
+            resolved = lib_path if lib_path.is_absolute() else app_settings.base_dir / library_file.file_path
+            if resolved.is_file():
+                donor_path = resolved
+                display_name = library_file.filename
+                print_name = library_file.filename
+    if donor_path is None:
+        return None
+
+    # Plate id: the item's own plate when the donor actually carries it, else the
+    # filename-hint / single-G-code-plate resolution — never a blind guess.
+    plates = list_gcode_plate_ids(donor_path)
+    if not plates:
+        return None
+    if item.plate_id is not None and item.plate_id in plates:
+        plate_id = item.plate_id
+    else:
+        plate_id = _resolve_foreign_plate_id(donor_path, display_name)
+        if plate_id is None:
+            return None
+
+    # max_z from the plate's G-code header, parsed exactly as _resolve_foreign_source.
+    header = read_plate_gcode_header(donor_path, plate_id)
+    raw = header.get("max_z_height")
+    try:
+        max_z = float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        max_z = None
+    if max_z is None:
+        return None
+
+    return _ForeignSource(donor_path=donor_path, plate_id=plate_id, max_z=max_z, print_name=print_name, tmp_path=None)
+
+
 async def _manual_eject_foreign(
     db: AsyncSession,
     printer: Printer,
@@ -411,8 +504,10 @@ async def _manual_eject_foreign(
     """The foreign-plate branch of ``manual_eject`` (called when no farm-known unit
     resolves). A farm-known-but-ineligible gate (a queue item stamped with the gate's
     subtask — e.g. an unapproved first article) is NEVER weakened into a foreign sweep:
-    it keeps today's ``no_eligible_unit`` 409. Otherwise the foreign donor is resolved,
-    and with no ``eject_profile_id`` the confirm prompt (:class:`ForeignPlateEject`) is
+    it keeps today's ``no_eligible_unit`` 409. Otherwise the foreign donor is resolved
+    — the strict archive resolver first, then the on-disk last-farm-item fallback for the
+    screen-RESTART shape the strict resolver can't tie (:func:`_resolve_foreign_source_from_last_farm_item`)
+    — and with no ``eject_profile_id`` the confirm prompt (:class:`ForeignPlateEject`) is
     raised; with one the eject is dispatched via ``dispatch_foreign_eject``."""
     gate = printer.plate_gate_subtask_id
     if gate:
@@ -420,7 +515,17 @@ async def _manual_eject_foreign(
         if known.scalar_one_or_none() is not None:
             raise ManualEjectError("no_eligible_unit", _NO_ELIGIBLE_MSG, status_code=409)
 
-    source = await _resolve_foreign_source(db, printer)
+    try:
+        source = await _resolve_foreign_source(db, printer)
+    except ManualEjectError as strict_err:
+        # The strict resolver (shared, fail-closed, with the AUTO path) could not tie the
+        # gate to a donor — the screen-RESTART incident: a blank gate id + a download-
+        # failed fallback archive. Try the on-disk last-farm-item fallback; if THAT can't
+        # resolve either, re-raise the ORIGINAL error so the 409 message/behaviour is
+        # unchanged when the plate is genuinely unresolvable.
+        source = await _resolve_foreign_source_from_last_farm_item(db, printer)
+        if source is None:
+            raise strict_err
 
     # First call (no profile chosen) → the confirm prompt. Drop the temp re-fetch; the
     # confirm call re-resolves it (idempotent) once a profile is picked.

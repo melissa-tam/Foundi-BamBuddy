@@ -602,6 +602,32 @@ class TestOnTerminalStatusArming:
         mon.on_terminal_status(7, "completed", queue_item_id=42)
         assert calls == [(7, 42)]
 
+    def test_returns_false_without_queue_item_id(self, monkeypatch):
+        # No queue item → no arm, and the bool result the caller keys the escalation-only
+        # fallback off is False.
+        mon, calls = self._mon_with_recording_start(monkeypatch)
+        assert mon.on_terminal_status(7, "completed", queue_item_id=None) is False
+        assert calls == []
+
+    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled"])
+    def test_returns_false_on_non_success(self, status, monkeypatch):
+        mon, calls = self._mon_with_recording_start(monkeypatch)
+        assert mon.on_terminal_status(7, status, queue_item_id=42) is False
+        assert calls == []
+
+    def test_returns_true_when_it_arms(self, monkeypatch):
+        # Arms a cooldown watch → returns the _start_watch result (True here).
+        mon, calls = self._mon_with_recording_start(monkeypatch)
+        assert mon.on_terminal_status(7, "completed", queue_item_id=42) is True
+        assert calls == [(7, 42)]
+
+    def test_returns_false_when_start_watch_dedupes(self, monkeypatch):
+        # A watch already in flight → _start_watch returns False → on_terminal_status
+        # propagates that False (the caller then arms the escalation-only hold).
+        mon = EjectCooldownMonitor()
+        monkeypatch.setattr(mon, "_start_watch", lambda pid, qid: False)
+        assert mon.on_terminal_status(7, "completed", queue_item_id=42) is False
+
 
 class _FakeGateManager:
     """Scripted gate/status source for the escalation-only watch. Advances one

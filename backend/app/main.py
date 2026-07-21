@@ -4794,7 +4794,10 @@ async def on_print_complete(printer_id: int, data: dict):
     # a foreign/local print can finish onto the bed. Persisted to DB so the gate
     # survives Auto Off power cycles and Bambuddy restarts.
     _final_status = data.get("status", "completed")
-    _payload_subtask = data.get("subtask_id")
+    # Normalise a degenerate echo (empty / whitespace subtask id — the screen-RESTART
+    # shape) to NULL so the gate stores None, never a raw '' that no resolver can tie
+    # back to a queue item. Matches resolve_terminal_item's own normalization.
+    _payload_subtask = (data.get("subtask_id") or "").strip() or None
     if _final_status in ("completed", "failed", "aborted", "cancelled"):
         if no_deposit or _is_eject_job:
             # Nothing was deposited (dry-run eject, or stopped pre-first-layer), OR
@@ -4920,11 +4923,25 @@ async def on_print_complete(printer_id: int, data: dict):
             # raised). Arm the identity cooldown auto-clear ONLY for an id-/name-
             # confirmed eject completion; fallback/none don't arm (queue_item_id=None).
             printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=_payload_subtask)
-            eject_cooldown_monitor.on_terminal_status(
+            _armed = eject_cooldown_monitor.on_terminal_status(
                 printer_id,
                 _final_status,
                 queue_item_id=_resolved_item_id if _auto_clear_ok else None,
             )
+            if not _armed and (_resolved_is_farm or _farm_targets_printer):
+                # The gate was raised for an unattributed ("none"-verdict) deposit — no
+                # cooldown watch armed (queue_item_id None, or a non-success terminal). Do
+                # NOT leave the printer armless: a gated, watch-less printer sits stalled
+                # until a restart's rearm arms the escalation-only hold (the exact silent
+                # stall this closes). Arm it now (self-deduped against any in-flight watch).
+                # Gated on farm involvement so a pure-upstream toggle-on install (global
+                # toggle only, no farm work) is left exactly as upstream would leave it.
+                if eject_cooldown_monitor.start_escalation_only_watch(printer_id):
+                    logger.info(
+                        "[CALLBACK] printer %s: unattributed deposit gated with no cooldown watch — "
+                        "arming escalation-only hold (no auto-clear)",
+                        printer_id,
+                    )
         else:
             logger.info(
                 "[CALLBACK] printer %s: terminal (%s) with deposit but no farm involvement and "

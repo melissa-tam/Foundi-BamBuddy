@@ -440,22 +440,255 @@ async def _mk_library_file(db, filename):
     return lf
 
 
-async def _mk_farm_item(db, *, printer_id, library_file_id=None, eject_profile_id=None, batch_id=None):
+async def _mk_farm_item(
+    db,
+    *,
+    printer_id,
+    library_file_id=None,
+    eject_profile_id=None,
+    batch_id=None,
+    archive_id=None,
+    plate_id=None,
+    status="cancelled",
+):
     """A farm queue item (eject_profile_id OR a farm batch) dispatched to a printer —
-    the identity anchor identify_farm_file_foreign matches a foreign echo against."""
+    the identity anchor identify_farm_file_foreign matches a foreign echo against, and
+    the donor anchor the last-farm-item foreign fallback resolves the plate from."""
     item = PrintQueueItem(
         printer_id=printer_id,
-        status="cancelled",  # the incident shape: farm units were cancelled
+        status=status,  # the incident shape: farm units were cancelled
         first_article=False,
         eject_profile_id=eject_profile_id,
         library_file_id=library_file_id,
+        archive_id=archive_id,
         batch_id=batch_id,
+        plate_id=plate_id,
         started_at=datetime.now(timezone.utc),
         position=1,
     )
     db.add(item)
     await db.flush()
     return item
+
+
+async def _mk_ondisk_library_file(db, *, filename, file_path):
+    """A library row whose ``file_path`` is a REAL on-disk (absolute) donor — the anchor
+    the last-farm-item foreign fallback resolves the plate from."""
+    lf = LibraryFile(filename=filename, file_path=file_path, file_type="3mf", file_size=1)
+    db.add(lf)
+    await db.flush()
+    return lf
+
+
+def _make_bare_3mf() -> Path:
+    """A .gcode.3mf with NO G-code plate (only a model) — list_gcode_plate_ids → []."""
+    fd, name = tempfile.mkstemp(suffix=".gcode.3mf")
+    os.close(fd)
+    path = Path(name)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("3D/3dmodel.model", "<model/>")
+    return path
+
+
+class TestManualEjectForeignFallbackLastFarmItem:
+    """The screen-RESTART incident fix: when the strict archive resolver 409s (blank
+    gate id + download-failed fallback archive), the MANUAL foreign path falls back to
+    the printer's last-started farm item's on-disk donor before giving up. The strict
+    AUTO path stays fail-closed (unchanged)."""
+
+    @pytest.mark.parametrize("gate", ["", None])
+    async def test_blank_gate_falls_back_to_last_item_library_donor(self, db_session, gate):
+        source = _make_source_3mf()  # plate_1, max_z 18.0mm
+        try:
+            printer = await _mk_printer(db_session, "FBLIB", gate=gate)
+            prof = EjectProfile(name="fblib-ep", cooldown_temp_c=30.0)
+            db_session.add(prof)
+            await db_session.flush()
+            lf = await _mk_ondisk_library_file(
+                db_session, filename="Farm Widget.gcode.3mf", file_path=str(source)
+            )
+            await _mk_farm_item(
+                db_session,
+                printer_id=printer.id,
+                library_file_id=lf.id,
+                eject_profile_id=prof.id,
+                plate_id=1,
+            )
+            await db_session.commit()
+            # First call (no profile) → the confirm prompt, carrying the item's donor.
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                pytest.raises(manual.ForeignPlateEject) as exc,
+            ):
+                await manual.manual_eject(db_session, printer.id)
+            assert exc.value.code == "foreign_plate"
+            assert exc.value.print_name == "Farm Widget.gcode.3mf"
+            assert exc.value.max_z_height_mm == 18.0
+            # Second call (profile chosen) → dispatch the sweep with the fallback donor.
+            dispatch = AsyncMock()
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
+            ):
+                result = await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
+            assert result == {"mode": "dispatched", "queue_item_id": None}
+            dispatch.assert_awaited_once()
+            assert dispatch.await_args.kwargs["printer_id"] == printer.id
+            assert dispatch.await_args.kwargs["profile_id"] == prof.id
+            assert dispatch.await_args.kwargs["plate_id"] == 1  # the item's own plate
+            assert dispatch.await_args.kwargs["source_path"] == source  # the on-disk fallback donor
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_archive_donor_preferred_over_library(self, db_session):
+        source_arch = _make_source_3mf()
+        source_lib = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "FBARCH", gate="")
+            prof = EjectProfile(name="fbarch-ep", cooldown_temp_c=30.0)
+            db_session.add(prof)
+            await db_session.flush()
+            # Archive donor (subtask "OTHER" → the strict gate resolver never finds it).
+            archive = await _mk_archive(
+                db_session,
+                printer_id=printer.id,
+                subtask="OTHER",
+                file_path=str(source_arch),
+                filename="arch.gcode.3mf",
+                print_name="Arch Widget",
+            )
+            lf = await _mk_ondisk_library_file(
+                db_session, filename="Lib Widget.gcode.3mf", file_path=str(source_lib)
+            )
+            await _mk_farm_item(
+                db_session,
+                printer_id=printer.id,
+                archive_id=archive.id,
+                library_file_id=lf.id,
+                eject_profile_id=prof.id,
+                plate_id=1,
+            )
+            await db_session.commit()
+            # Confirm prompt names the ARCHIVE donor (its print_name), not the library.
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                pytest.raises(manual.ForeignPlateEject) as exc,
+            ):
+                await manual.manual_eject(db_session, printer.id)
+            assert exc.value.print_name == "Arch Widget"
+            # And the dispatch uses the archive path, not the library path.
+            dispatch = AsyncMock()
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
+            ):
+                await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
+            assert dispatch.await_args.kwargs["source_path"] == source_arch
+        finally:
+            source_arch.unlink(missing_ok=True)
+            source_lib.unlink(missing_ok=True)
+
+    async def test_no_last_item_refuses_unchanged(self, db_session):
+        # No queue item at all → fallback returns None → the ORIGINAL strict 409.
+        printer = await _mk_printer(db_session, "FBNONE", gate="")
+        await db_session.commit()
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            pytest.raises(manual.ManualEjectError) as exc,
+        ):
+            await manual.manual_eject(db_session, printer.id)
+        assert exc.value.code == "no_eligible_unit"
+        assert "Could not resolve the file" in str(exc.value)
+        assert not isinstance(exc.value, manual.ForeignPlateEject)
+
+    async def test_donor_missing_on_disk_refuses_unchanged(self, db_session):
+        # The last item's library donor is not on disk → fallback None → strict 409.
+        printer = await _mk_printer(db_session, "FBMISS", gate="")
+        lf = await _mk_ondisk_library_file(
+            db_session, filename="Gone.gcode.3mf", file_path="/nonexistent/Gone.gcode.3mf"
+        )
+        await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, plate_id=1)
+        await db_session.commit()
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            pytest.raises(manual.ManualEjectError) as exc,
+        ):
+            await manual.manual_eject(db_session, printer.id)
+        assert exc.value.code == "no_eligible_unit"
+        assert "Could not resolve the file" in str(exc.value)
+
+    async def test_donor_without_gcode_plate_refuses_unchanged(self, db_session):
+        # The donor exists but carries no G-code plate → fallback None → strict 409.
+        bare = _make_bare_3mf()
+        try:
+            printer = await _mk_printer(db_session, "FBBARE", gate="")
+            lf = await _mk_ondisk_library_file(
+                db_session, filename="Bare.gcode.3mf", file_path=str(bare)
+            )
+            await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, plate_id=1)
+            await db_session.commit()
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                pytest.raises(manual.ManualEjectError) as exc,
+            ):
+                await manual.manual_eject(db_session, printer.id)
+            assert exc.value.code == "no_eligible_unit"
+            assert "Could not resolve the file" in str(exc.value)
+        finally:
+            bare.unlink(missing_ok=True)
+
+    async def test_nonblank_gate_matching_item_never_reaches_foreign_resolution(self, db_session):
+        # Regression: a NON-empty gate whose id matches a queue item (an unapproved first
+        # article) still 409s with the "No farm-known finished unit" message and NEVER
+        # touches either foreign resolver.
+        printer = await _mk_printer(db_session, "FBFA", gate="SUB-1")
+        await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1", first_article=True)
+        await db_session.commit()
+        strict = AsyncMock()
+        fallback = AsyncMock()
+        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            c3,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            patch.object(manual, "_resolve_foreign_source", strict),
+            patch.object(manual, "_resolve_foreign_source_from_last_farm_item", fallback),
+            pytest.raises(manual.ManualEjectError) as exc,
+        ):
+            await manual.manual_eject(db_session, printer.id)
+        assert exc.value.code == "no_eligible_unit"
+        assert "No farm-known finished unit" in str(exc.value)
+        strict.assert_not_called()
+        fallback.assert_not_called()
 
 
 class TestCanonicalNames:

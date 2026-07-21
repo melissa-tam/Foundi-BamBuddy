@@ -839,7 +839,7 @@ class EjectCooldownMonitor:
             return True
         return False
 
-    def on_terminal_status(self, printer_id: int, final_status: str, queue_item_id: int | None = None) -> None:
+    def on_terminal_status(self, printer_id: int, final_status: str, queue_item_id: int | None = None) -> bool:
         """Hook called once from ``main.on_print_complete`` for every terminal status.
 
         Arms a background cooldown watch ONLY when the finished job was positively
@@ -847,10 +847,15 @@ class EjectCooldownMonitor:
         successfully; the watch then keys its release threshold off THAT item. A
         terminal that could not be attributed to the dispatched unit (foreign/none,
         or an upgrade-day NULL-key fallback → ``queue_item_id`` None) never
-        auto-clears — the plate-clear gate stays set for a human."""
+        auto-clears — the plate-clear gate stays set for a human.
+
+        Returns ``True`` when a cooldown watch was armed (the ``_start_watch`` result),
+        ``False`` otherwise (non-success terminal, no queue item, or a watch already in
+        flight). The caller uses this to arm the escalation-only hold for an unattributed
+        deposit so a gated printer is never left watch-less."""
         if not should_auto_clear(final_status) or queue_item_id is None:
-            return
-        self._start_watch(printer_id, queue_item_id)
+            return False
+        return self._start_watch(printer_id, queue_item_id)
 
     def start_escalation_only_watch(self, printer_id: int) -> bool:
         """Arm the foreign-deposit gate watch: holds the gate (never auto-clears),
