@@ -8,7 +8,7 @@ backup-swap, auto re-spool, one-click prompt) including the Tier-3 evidence gate
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -33,6 +33,7 @@ from backend.app.services.spool_respool import (
     maybe_auto_or_prompt_respool,
     note_commanded_load,
     rebroadcast_unresolved_respool_prompts,
+    reset_swap_edge_state,
     respool_tag,
     should_evaluate_respool,
 )
@@ -544,12 +545,19 @@ async def test_mark_spent_ignores_non_runout_codes(db_session, printer_factory):
 # -- Tier 1: backup-swap detector (stable-feeder + pending-confirm rebuild) ----
 
 
-def _running(tray_now, *, present=(0, 1, 2)):
+def _running(tray_now, *, present=(0, 1, 2), subtask_id="job-A"):
     """A RUNNING printer state with every ``present`` AMS tray seated (non-empty
-    tray_type), feeding ``tray_now``."""
+    tray_type), feeding ``tray_now`` under job ``subtask_id``.
+
+    The backup-swap detector is now per-job (a subtask_id change is a boundary that
+    discards cross-job edge state), so pushes within a single test share a stable
+    ``subtask_id`` by default — otherwise a bare ``MagicMock`` auto-creates a distinct
+    ``subtask_id`` per instance and every push would read as a job boundary.
+    """
     state = MagicMock()
     state.state = "RUNNING"
     state.tray_now = tray_now
+    state.subtask_id = subtask_id
     state.raw_data = {"ams": [{"id": 0, "tray": [{"id": t, **_tray()} for t in present]}]}
     return state
 
@@ -565,11 +573,16 @@ async def _bind_at(db, printer_id, ams_id, tray_id, *, weight_used=500.0):
     return spool
 
 
-async def _establish_stable_feeder(db, printer_id, tray, clock, *, present=(0, 1, 2)):
-    """Two RUNNING pushes ≥ _SWAP_CONFIRM_S apart make ``tray`` the stable feeder."""
-    await capture_backup_swap(db, printer_id, _running(tray, present=present))
+async def _establish_stable_feeder(db, printer_id, tray, clock, *, present=(0, 1, 2), subtask_id="job-A"):
+    """Make ``tray`` the confirmed stable feeder under one job identity.
+
+    The first push seeds the job/edge state (a boundary that opens nothing); two
+    further pushes ≥ _SWAP_CONFIRM_S apart under the SAME subtask confirm the feeder.
+    """
+    await capture_backup_swap(db, printer_id, _running(tray, present=present, subtask_id=subtask_id))
+    await capture_backup_swap(db, printer_id, _running(tray, present=present, subtask_id=subtask_id))
     clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    await capture_backup_swap(db, printer_id, _running(tray, present=present))
+    await capture_backup_swap(db, printer_id, _running(tray, present=present, subtask_id=subtask_id))
     assert spool_respool._stable_feeder.get(printer_id) == tray
 
 
@@ -710,6 +723,107 @@ async def test_backup_swap_noop_when_not_running(db_session, printer_factory):
     idle.tray_now = 1
     idle.raw_data = {"ams": [{"id": 0, "tray": [{"id": 0, **_tray()}]}]}
     assert await capture_backup_swap(db_session, printer.id, idle) is None
+
+
+# -- Tier 1: job-boundary edge reset (2026-07-20 spool-106 false-stamp) ---------
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_no_stamp_across_job_boundary_incident_pin(db_session, printer_factory, fake_clock):
+    """INCIDENT PIN (2026-07-20 02:40, spool 106 falsely stamped spent).
+
+    Job A feeds tray 0 for > 60 s (stable feeder 0). The next job B is dispatch-mapped
+    to tray 2 — a NORMAL FIFO spool selection, not a runout. Pre-fix the per-printer
+    edge state crossed the job boundary, so the 0→2 feeder change read as a mid-job
+    firmware backup switch and stamped tray 0's still-full spool spent after the 60 s
+    confirm (the roll never emptied — same tag bound, ~250 g fed afterward). With the
+    fix the subtask A→B change resets the edge state, so nothing is stamped.
+
+    Mutation-verified: with the boundary check disabled this asserts False (the pending
+    swap confirms and stamps tray 0).
+    """
+    printer = await printer_factory()
+    tray0_spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=250.0)  # must NOT be stamped
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock, subtask_id="A")
+
+    # Job B (new subtask) is dispatch-mapped to tray 2; tray 0 is still seated.
+    assert await capture_backup_swap(db_session, printer.id, _running(2, subtask_id="B")) is None
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    marked = await capture_backup_swap(db_session, printer.id, _running(2, subtask_id="B"))
+
+    assert marked is None
+    assert (await db_session.get(Spool, tray0_spool.id)).spent_at is None
+    assert printer.id not in spool_respool._pending_swaps
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_eject_interlude_between_jobs_no_false_stamp(db_session, printer_factory, fake_clock):
+    """Eject-shaped interlude: job A feeds tray 0 (stable), then a server-dispatched
+    eject job runs RUNNING with tray_now=255 (no filament) under its own subtask, then
+    job B is dispatch-mapped to tray 2. The RUNNING eject pushes never fire the
+    not-running cleanup (that is why the stale stable feeder survived pre-fix); with the
+    fix each subtask change (A→eject→B) resets the edge state, so tray 0 is not stamped.
+    """
+    printer = await printer_factory()
+    tray0_spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=250.0)
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock, subtask_id="A")
+
+    # Eject job: RUNNING, tray_now=255 (no filament), distinct subtask → no cleanup.
+    await capture_backup_swap(db_session, printer.id, _running(255, subtask_id="eject"))
+    fake_clock["t"] += 5
+    await capture_backup_swap(db_session, printer.id, _running(255, subtask_id="eject"))
+    assert printer.id not in spool_respool._stable_feeder  # the boundary reset cleared it
+
+    # Job B mapped to tray 2, tray 0 still seated, past the confirm window.
+    assert await capture_backup_swap(db_session, printer.id, _running(2, subtask_id="B")) is None
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    marked = await capture_backup_swap(db_session, printer.id, _running(2, subtask_id="B"))
+
+    assert marked is None
+    assert (await db_session.get(Spool, tray0_spool.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_reset_swap_edge_state_clears_printer_and_opens_no_swap(db_session, printer_factory, fake_clock):
+    """The job-boundary reset hook (called from main.on_print_start / on_print_complete)
+    drops that printer's edge trackers; the next push re-seeds ``_last_tray_now`` with
+    prev ``None`` and opens no pending swap (no confirmed stable feeder survives)."""
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0)
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)  # stable feeder 0 armed
+
+    reset_swap_edge_state(printer.id)
+
+    assert printer.id not in spool_respool._last_tray_now
+    assert printer.id not in spool_respool._feeder_since
+    assert printer.id not in spool_respool._stable_feeder
+    assert printer.id not in spool_respool._pending_swaps
+
+    # The next push (still subtask job-A) merely re-seeds; the immediate 0→1 edge cannot
+    # open a pending because there is no confirmed stable feeder after the reset.
+    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None
+    assert printer.id not in spool_respool._pending_swaps
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None
+    assert (await db_session.get(Spool, spool.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_same_subtask_genuine_switch_still_stamps(db_session, printer_factory, fake_clock):
+    """Regression guard for the job-boundary fix: a genuine mid-job firmware backup
+    switch happens under an UNCHANGED subtask_id and must STILL stamp. Same subtask 'J'
+    throughout: stable feeder 0, edge 0→1, tray 0 still seated, 60 s confirm → stamped.
+    """
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=500.0)
+    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock, subtask_id="J")
+
+    assert await capture_backup_swap(db_session, printer.id, _running(1, subtask_id="J")) is None
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    marked = await capture_backup_swap(db_session, printer.id, _running(1, subtask_id="J"))
+
+    assert marked is not None and marked.id == spool.id
+    assert marked.spent_at is not None
 
 
 # -- Tier 2 / 3 gate ---------------------------------------------------------
@@ -875,6 +989,160 @@ async def test_gate_tier3_dismissal_survives_dedup_clear(db_session, printer_fac
     await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
 
     assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+
+
+# -- R4: spent-tier dismissal honored per physical cycle ---------------------
+
+
+@pytest.mark.asyncio
+async def test_spent_dismissal_stands_no_cycle_suppresses_auto_and_prompt(db_session, printer_factory, monkeypatch):
+    """R4 test 1 (MUTATION PIN). A spent + loaded spool the operator answered
+    "Same spool" on, with NO physical cycle recorded since (the accessor returns
+    None — e.g. right after a restart), broadcasts NOTHING and does NOT auto-respool
+    even with respool_auto_enabled ON and a last brand set. This is the whole fix:
+    the false spent stamp on spool 106 re-fired for days because the spent branch
+    ignored the dismissal.
+
+    Mutation-verified: with the `_dismissal_stands` gate removed the auto path runs —
+    a fresh spool is minted, the donor is archived, and both asserts below flip.
+    """
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=True)
+    donor.respool_dismissed_at = datetime.utcnow()
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db_session, "respool_last_brand", "Polymaker")  # auto WOULD fire if the gate were gone
+    await set_setting(db_session, "respool_auto_enabled", "true")
+    await db_session.commit()
+    # No _record_physical_cycle: last_physical_cycle_age → None → dismissal stands.
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
+    broadcasts = _spy_broadcast(monkeypatch)
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
+
+    assert result is None  # no auto-respool
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []  # no prompt
+    assert (await db_session.get(Spool, donor.id)).archived_at is None  # donor untouched
+
+
+@pytest.mark.asyncio
+async def test_spent_dismissal_cycle_after_rearms_prompt_when_auto_off(db_session, printer_factory, monkeypatch):
+    """R4 test 2 (auto OFF). A qualified physical cycle STRICTLY AFTER the dismissal
+    re-arms the spent branch: the one-click prompt fires again (a genuine roll swap
+    on a dismissed slot must surface)."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=True)
+    donor.respool_dismissed_at = datetime.utcnow() - timedelta(seconds=100)  # dismissed 100 s ago
+    await db_session.commit()
+    _record_physical_cycle(printer.id, age_s=0.0)  # cycle just now → age (~0) < 100 → after dismissal
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
+    broadcasts = _spy_broadcast(monkeypatch)
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
+
+    assert result is None  # auto off → prompt, not a mint
+    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
+    assert len(prompts) == 1
+    assert prompts[0]["trigger"] == "spent"
+
+
+@pytest.mark.asyncio
+async def test_spent_dismissal_cycle_after_rearms_auto_when_auto_on(db_session, printer_factory, monkeypatch):
+    """R4 test 2 (auto ON). The same post-dismissal cycle re-arms the Tier-2 auto
+    path — the spent + loaded tag re-spools to a fresh row."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=True)
+    donor.respool_dismissed_at = datetime.utcnow() - timedelta(seconds=100)
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db_session, "respool_last_brand", "Polymaker")
+    await set_setting(db_session, "respool_auto_enabled", "true")
+    await db_session.commit()
+    _record_physical_cycle(printer.id, age_s=0.0)  # cycle after the dismissal → re-arm
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
+
+    assert result is not None and result is not donor  # a fresh re-spooled row
+    assert result.tag_type == RESPOOL_TAG_TYPE
+    assert result.weight_locked is True
+    assert result.weight_used == 0  # the auto path ran and minted a fresh full spool
+
+
+@pytest.mark.asyncio
+async def test_spent_dismissal_cycle_before_stays_suppressed(db_session, printer_factory, monkeypatch):
+    """R4 test 3. A cycle that predates the dismissal (age > seconds since the
+    dismissal) does NOT re-arm — the operator answered "Same spool" AFTER that cycle,
+    so the branch stays suppressed."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=True)
+    donor.respool_dismissed_at = datetime.utcnow()  # dismissed now (seconds since ≈ 0)
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db_session, "respool_last_brand", "Polymaker")
+    await set_setting(db_session, "respool_auto_enabled", "true")
+    await db_session.commit()
+    _record_physical_cycle(printer.id, age_s=100.0)  # cycle 100 s ago → age (100) ≥ 0 → predates
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
+    broadcasts = _spy_broadcast(monkeypatch)
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
+
+    assert result is None
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+    assert (await db_session.get(Spool, donor.id)).archived_at is None  # donor untouched
+
+
+# -- R5: prompt provenance payload fields ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_respool_prompt_payload_carries_provenance(db_session, printer_factory, monkeypatch):
+    """R5. The spent-tier prompt payload carries the additive provenance fields so
+    the UI can show the evidence and its age: spent_at + spent_age_s, the live AMS
+    remain %, the ledger-implied remain %, and when the roll became bound."""
+    printer = await printer_factory()
+    # Spent, loaded, NOT dismissed, auto OFF → a clean spent prompt fires.
+    donor = await _make_donor(db_session, spent=True, weight_used=990.0)  # ledger 1% of a 1000 g label
+    await db_session.commit()
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))  # tray remain=100
+    broadcasts = _spy_broadcast(monkeypatch)
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
+
+    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
+    assert len(prompts) == 1
+    p = prompts[0]
+    assert p["trigger"] == "spent"
+    assert isinstance(p["spent_at"], str) and p["spent_at"]  # ISO string
+    assert isinstance(p["spent_age_s"], float) and p["spent_age_s"] >= 0.0
+    assert p["ams_remain_pct"] == 100  # live tray remain
+    assert p["ledger_remain_pct"] == pytest.approx(1.0)  # (1000 - 990) / 1000 * 100
+    assert isinstance(p["bound_since"], str) and p["bound_since"]  # created_at fallback
+
+
+@pytest.mark.asyncio
+async def test_respool_prompt_payload_nulls_when_absent(db_session, printer_factory, monkeypatch):
+    """The provenance fields degrade to None cleanly: a non-spent near-empty prompt
+    has no spent_at/spent_age_s, and a garbage tray remain yields no ams_remain_pct
+    (the parse discipline of _remain_jump_reading), while the ledger % still computes."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=False, weight_used=990.0)  # remaining 10 <= 30 → near_empty
+    await db_session.commit()
+    _record_physical_cycle(printer.id)  # swap evidence Tier 3 requires
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
+    broadcasts = _spy_broadcast(monkeypatch)
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11, tray_type="PETG"), donor)
+
+    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
+    assert len(prompts) == 1
+    p = prompts[0]
+    assert p["trigger"] == "near_empty"
+    assert p["spent_at"] is None
+    assert p["spent_age_s"] is None
+    assert p["ams_remain_pct"] == 100  # a valid remain still parses
+    assert p["ledger_remain_pct"] == pytest.approx(1.0)
 
 
 # -- Tier 2 auto-brand fallback to the tagless default (3b-5) ----------------

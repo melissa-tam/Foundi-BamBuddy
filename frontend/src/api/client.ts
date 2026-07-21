@@ -2968,6 +2968,13 @@ export interface RespoolPromptMessage {
   brand_prefill: string | null;
   label_weight_prefill: number | null;
   trigger?: RespoolTrigger | null;
+  /** Provenance (additive): let the operator tell a stale question from a fresh
+   *  detection. Absent on the manual tray-menu path, hence optional. */
+  spent_at?: string | null;
+  spent_age_s?: number | null;
+  ams_remain_pct?: number | null;
+  ledger_remain_pct?: number | null;
+  bound_since?: string | null;
 }
 
 /** WS `spool_auto_assigned` payload — a spool was auto-bound to an AMS slot.

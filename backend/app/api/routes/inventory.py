@@ -1451,8 +1451,10 @@ async def dismiss_respool_prompt(
     prompt dedup (`spool_respool._respool_prompt_dedup`) is process-memory and is
     deliberately cleared when the slot reports empty, so a deliberately-run-down
     near-empty spool would otherwise re-prompt forever. Idempotent: re-stamping an
-    already-dismissed spool is fine (200). Hardware-certain spent (tier 1/2 auto
-    re-spool) is NOT gated by this flag, so a genuine exhaustion still surfaces.
+    already-dismissed spool is fine (200). Spent-tier reactions (tier 1/2) honor this
+    flag PER PHYSICAL CYCLE — a dismissal suppresses them until a qualified roll swap
+    occurs on the slot after the answer, so a genuine exhaustion (itself a swap) still
+    surfaces while a standing false spent stamp stops re-reacting.
 
     Broadcasts ``respool_prompt_dismissed`` with the optional slot triple so open
     clients drop the matching prompt. 404 for an unknown spool.

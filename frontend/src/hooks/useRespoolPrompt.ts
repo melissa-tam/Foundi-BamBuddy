@@ -5,6 +5,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { api } from '../api/client';
 import type { Printer, RespoolPromptMessage } from '../api/client';
+import { formatDuration } from '../utils/date';
 import {
   slotKey,
   useSlotPrompt,
@@ -92,17 +93,49 @@ export function useRespoolPrompt() {
       const printers = queryClient.getQueryData<Printer[]>(['printers']);
       const printerName =
         printers?.find(p => p.id === prompt.printer_id)?.name ?? `Printer ${prompt.printer_id}`;
-      // Say the true thing. A `near_empty` prompt means the record is nearly used
-      // up and somebody handled the slot — it is NOT evidence of a reused tag, and
-      // announcing one was how two false "reused RFID spool" popups reached the
-      // operator (2026-07-20). `spent` / `remain_jump` (and the manual tray-menu
-      // path, which carries no trigger) keep the reused-tag framing.
-      const nearEmpty = prompt.trigger === 'near_empty';
+      const base = { printer: printerName, slot: prompt.tray_id + 1 };
+
+      // Provenance clause shared by the spent and remain_jump copies: only when
+      // BOTH the live AMS % and the ledger % are known does it say the numbers the
+      // operator needs to judge a stale question ("AMS reports ~X%; records say Y%").
+      const numbersClause = (): string | null => {
+        const ams = prompt.ams_remain_pct;
+        const ledger = prompt.ledger_remain_pct;
+        if (ams == null || ledger == null) return null;
+        return t('inventory.respool.spentToastNumbers', { ams, ledger: Math.round(ledger) });
+      };
+      const appended = (message: string, clause: string | null): string =>
+        clause ? `${message} ${clause}` : message;
+
+      // Say the true thing, with provenance:
+      //  - `spent` with a known age → state the evidence (a runout signal) and how
+      //    long ago it fired, so a days-old false stamp reads as stale, not fresh.
+      //  - `near_empty` → the record is nearly used up and somebody handled the
+      //    slot; it is NOT a reused tag (announcing one was how two false popups
+      //    reached the operator, 2026-07-20). Append the grams still on the ledger.
+      //  - `remain_jump` (and the manual tray-menu path, which carries no trigger,
+      //    and a `spent` prompt with no age) keep the reused-tag framing.
+      let message: string;
+      if (prompt.trigger === 'spent' && prompt.spent_age_s != null && Number.isFinite(prompt.spent_age_s)) {
+        message = appended(
+          t('inventory.respool.spentToast', { ...base, age: formatDuration(prompt.spent_age_s) }),
+          numbersClause(),
+        );
+      } else if (prompt.trigger === 'near_empty') {
+        message = t('inventory.respool.nearEmptyToast', base);
+        const grams = prompt.donor_remaining_g;
+        if (grams != null && Number.isFinite(grams) && grams >= 0) {
+          message = `${message} ${t('inventory.respool.nearEmptyToastRemaining', { remaining: Math.round(grams) })}`;
+        }
+      } else {
+        message = t('inventory.respool.reusedTagToast', base);
+        if (prompt.trigger === 'remain_jump') {
+          message = appended(message, numbersClause());
+        }
+      }
+
       return {
-        message: t(
-          nearEmpty ? 'inventory.respool.nearEmptyToast' : 'inventory.respool.reusedTagToast',
-          { printer: printerName, slot: prompt.tray_id + 1 },
-        ),
+        message,
         type: 'warning',
         actions: [
           {

@@ -2797,6 +2797,18 @@ async def on_print_start(printer_id: int, data: dict):
     # Clear any stale user-stopped flag from previous print cycles
     _user_stopped_printers.discard(printer_id)
 
+    # Backup-swap edge state is per-printer and must not survive a print boundary: a
+    # feeder change chosen by the NEXT job's dispatch mapping would otherwise read as a
+    # mid-job firmware backup switch and falsely stamp the departed spool spent
+    # (2026-07-20). Reset BEFORE the eject short-circuit below — an eject job is a
+    # boundary too. Guarded like the note_status_push seed; the logic lives in the service.
+    try:
+        from backend.app.services.spool_respool import reset_swap_edge_state
+
+        reset_swap_edge_state(printer_id)
+    except Exception as _rse:  # noqa: BLE001 — edge-state reset must never crash the start callback
+        logger.warning("[RESPOOL] backup-swap edge reset failed on print start for printer %s: %s", printer_id, _rse)
+
     # #1721: drop any leftover pre-captured finish frame from a prior print
     # so a never-consumed cache entry can't bleed into the new print's photo.
     _stage22_finish_frames.pop(printer_id, None)
@@ -4604,6 +4616,17 @@ async def on_print_complete(printer_id: int, data: dict):
         logger.info("[TIMING] %s: %.3fs elapsed", section, elapsed)
 
     logger.info("[CALLBACK] on_print_complete started for printer %s", printer_id)
+
+    # Symmetric to on_print_start: drop the per-printer backup-swap edge state at every
+    # terminal so it never carries into the next print (2026-07-20 false-spent
+    # incident). Unconditional — runs for every terminal, incl. eject sweeps. Guarded;
+    # the logic lives in the service.
+    try:
+        from backend.app.services.spool_respool import reset_swap_edge_state
+
+        reset_swap_edge_state(printer_id)
+    except Exception as _rse:  # noqa: BLE001 — edge-state reset must never crash the completion callback
+        logger.warning("[RESPOOL] backup-swap edge reset failed on print complete for printer %s: %s", printer_id, _rse)
 
     # Drop the 3MF download cache for this printer (#972). The print is over,
     # nothing else legitimately needs the bytes; keeping them would only risk

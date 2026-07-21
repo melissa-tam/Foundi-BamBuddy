@@ -1383,3 +1383,137 @@ class TestIdleGainNeedSurvivesDefer:
         assert ok is True
         reason = await ams_presence.identify_needed(db_session, 1, 0, 0, tray, spoolman_active=False)
         assert reason is None  # cycle answered; an untouched tagless slot is never re-read
+
+
+class TestIdentifyFlapNotAQualifiedCycle:
+    """Incident 2026-07-21 (printer 5, unattended): overnight RFID re-reads on
+    tagless slots flapped the tray ABSENT→PRESENT for ~10–20 s, and the ≥5 s gain
+    qualifier banked each flap as a QUALIFIED physical cycle — which
+    ``spool_respool._swap_evidence`` reads as "somebody physically cycled a roll",
+    so a Tier-3 respool prompt woke the operator over a roll nobody touched.
+
+    Invariant: an absence an identify explains must NEVER produce a QUALIFIED physical
+    cycle (``last_physical_cycle_age`` stays None), however long it ran. The ≥5 s
+    filter still measures duration only — identity is a separate, ANDed gate. A real
+    human swap with NO identify activity anywhere is untouched, and the pre-existing
+    echo-swallow / sub-5 s-flap guards are unchanged.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _inert_gain_consumers(self, monkeypatch):
+        # The GAIN edge fires clear_on_reinsert unconditionally and (when the tiers
+        # open) note_physical_cycle / stamp_loaded_for_slot. Keep all three inert so a
+        # case asserts purely on whether a QUALIFIED cycle was RECORDED, not on the DB.
+        from backend.app.services import spool_tag_matcher, spool_tagless
+
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
+        monkeypatch.setattr(spool_tagless, "note_physical_cycle", AsyncMock())
+        monkeypatch.setattr(spool_tag_matcher, "stamp_loaded_for_slot", AsyncMock(return_value=True))
+
+    async def test_state9_commanded_identify_flap_is_not_a_qualified_cycle(self, db_session, monkeypatch):
+        # THE incident pin (fails on pre-fix code — verified by mutation). A commanded
+        # identify on a SEATED-yet-unread (state 9) slot: record_reread never arms the
+        # echo there, so the old echo lane cannot see the flap — the leak. The AMS is
+        # IDENTIFYING while the tray is unloaded, which is what now disqualifies the gain.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = _pstate(
+            [_tray(0, state=9)],
+            gcode_state="RUNNING",  # RUNNING → the idle-gain re-read lane stays out of it
+            ams_status_main=ams_presence.AMS_STATUS_IDENTIFYING,
+        )
+        _patch_pm(monkeypatch, status=status, client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+
+        # Commanded identify while the tray reports state 9 → NO echo armed (the leak).
+        ok, _ = await ams_presence.command_identify(1, 0, 0, source="terminal_sweep", reason="rfid_refresh")
+        assert ok is True
+        assert ams_presence._echo_pending == {}  # state-9 slot: echo lane blind to this flap
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # identify unloads
+        assert ams_presence._absent_under_identify[(1, 0, 0)] is True  # flagged at the absence start
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - (
+            ams_presence._MIN_PHYSICAL_ABSENT_S + 1
+        )  # ≥5 s absence — the exact duration the old qualifier trusted
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # settle-back gain
+
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) is None  # NO qualified cycle recorded
+        assert ams_presence.recent_gain_age(1, 0, 0) is not None  # the non-qualified gain stamp still updates
+
+    async def test_firmware_autonomous_read_flap_is_not_a_qualified_cycle(self, db_session, monkeypatch):
+        # No command_identify at all — a firmware-AUTONOMOUS re-read. It leaves no echo
+        # and no command, so ONLY the unit-scoped ams_status_main == IDENTIFYING signal
+        # observed during the absence can disqualify it. It must.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = _pstate(
+            [_tray(0, state=9)], gcode_state="RUNNING", ams_status_main=ams_presence.AMS_STATUS_IDENTIFYING
+        )
+        _patch_pm(monkeypatch, status=status, client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        assert ams_presence._echo_pending == {}  # nobody commanded anything
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # autonomous unload
+        assert ams_presence._absent_under_identify[(1, 0, 0)] is True
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - (
+            ams_presence._MIN_PHYSICAL_ABSENT_S + 1
+        )
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # settle-back gain
+
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) is None
+        client.ams_refresh_tray.assert_not_called()  # firmware did the read; the farm commanded nothing
+
+    async def test_real_human_swap_with_no_identify_is_qualified(self, db_session, monkeypatch):
+        # The other side of the gate: a ≥5 s absence with NO identify activity anywhere
+        # (ams idle, no echo, no command) is a genuine roll swap and DOES record a
+        # qualified cycle — the evidence _swap_evidence needs to prompt a real refill.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = _pstate([_tray(0, state=9)], gcode_state="RUNNING", ams_status_main=0)  # ams idle throughout
+        _patch_pm(monkeypatch, status=status, client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # human pulls it
+        assert ams_presence._absent_under_identify[(1, 0, 0)] is False  # no identify to explain it
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - (
+            ams_presence._MIN_PHYSICAL_ABSENT_S + 1
+        )
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # reseated
+
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) < 1.0  # qualified cycle recorded
+
+    async def test_echo_armed_present_slot_identify_unchanged(self, db_session, monkeypatch):
+        # Regression guard: a commanded identify on a PRESENT slot arms the echo, and
+        # the settle-back gain is swallowed BEFORE the qualifier — exactly as today. No
+        # qualified cycle either way; behaviour is identical pre/post fix.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(
+            monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE", ams_status_main=0), client=client
+        )
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        ams_presence.record_reread(1, 0, 0)  # present slot → echo armed
+        assert (1, 0, 0) in ams_presence._echo_pending
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # identify flap loss
+        await ams_presence.on_ams_change(
+            1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session
+        )  # echo gain swallowed
+
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) is None  # swallowed → never a cycle
+
+    async def test_sub_5s_flap_still_unqualified(self, db_session, monkeypatch):
+        # Regression guard: a MEASURED sub-5 s flap (a runout-instant firmware state
+        # flap, no identify) is unqualified by the duration filter, unchanged by this fix.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(
+            monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="RUNNING", ams_status_main=0), client=client
+        )
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss (stamp now)
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain ~0 s later
+
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) is None

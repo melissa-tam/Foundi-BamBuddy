@@ -100,12 +100,34 @@ describe('useRespoolPrompt', () => {
     expect(result.current.activeContext).toBeNull();
   });
 
-  it('words a near_empty prompt as a roll replacement, not a detected reused tag', () => {
+  it('words a near_empty prompt as a roll replacement and appends the remaining grams', () => {
     renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
-    act(() => dispatchPrompt(makePrompt({ trigger: 'near_empty' })));
+    act(() => dispatchPrompt(makePrompt({ trigger: 'near_empty', donor_remaining_g: 18 })));
 
     const [, message] = showPersistentToast.mock.calls[0];
-    expect(message).toBe('inventory.respool.nearEmptyToast');
+    // Roll-replacement framing (not a detected reused tag), with the grams clause appended.
+    expect(message).toBe('inventory.respool.nearEmptyToast inventory.respool.nearEmptyToastRemaining');
+  });
+
+  it('words a spent prompt with its age and appends the provenance numbers', () => {
+    renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
+    act(() =>
+      dispatchPrompt(
+        makePrompt({ trigger: 'spent', spent_age_s: 7200, ams_remain_pct: 100, ledger_remain_pct: 4 }),
+      ),
+    );
+
+    const [, message] = showPersistentToast.mock.calls[0];
+    // The age-bearing spent copy, plus the AMS-vs-ledger numbers clause.
+    expect(message).toBe('inventory.respool.spentToast inventory.respool.spentToastNumbers');
+  });
+
+  it('falls back to the reused-tag wording for a spent prompt with no age', () => {
+    renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
+    act(() => dispatchPrompt(makePrompt({ trigger: 'spent' }))); // spent_age_s absent
+
+    const [, message] = showPersistentToast.mock.calls[0];
+    expect(message).toBe('inventory.respool.reusedTagToast');
   });
 
   it('keeps the reused-tag wording for spent and remain_jump prompts', () => {

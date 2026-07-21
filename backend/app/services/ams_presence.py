@@ -108,6 +108,15 @@ _absent_since: dict[tuple[int, int, int], float] = {}
 # constant, not operator-tunable.
 _MIN_PHYSICAL_ABSENT_S = 5.0
 
+# (printer_id, ams_id, tray_id) -> whether the slot's CURRENT absence began under
+# identify activity (:func:`_identify_explains_absence` at the PRESENT→ABSENT edge).
+# An RFID identify UNLOADS the tray for ~10–20 s, so that absence is a read flap and
+# NOT a roll swap: its later gain must be recorded UNQUALIFIED however long it ran —
+# the ≥ _MIN_PHYSICAL_ABSENT_S filter measures duration, NEVER identity. Parallel to
+# _absent_since (set and popped in lockstep with it); a missing entry reads as "not
+# identify-explained", the same conservative default every edge map here takes.
+_absent_under_identify: dict[tuple[int, int, int], bool] = {}
+
 # Printers whose first on_ams_change (post-restart) has been processed. The first
 # push only seeds the presence map (no re-read); later pushes act on gains.
 _primed: set[int] = set()
@@ -179,6 +188,7 @@ def _reset_state() -> None:
     """Test hook: clear all module-level edge state between cases."""
     _last_presence.clear()
     _absent_since.clear()
+    _absent_under_identify.clear()
     _primed.clear()
     _swept_subtasks.clear()
     _echo_pending.clear()
@@ -289,6 +299,35 @@ def identify_in_flight(printer_id: int, ams_id: int, tray_id: int) -> bool:
         return True
     ts = _echo_pending.get((printer_id, ams_id, tray_id))
     return ts is not None and time.monotonic() - ts < _IDENTIFY_ACTIVE_S
+
+
+def _identify_explains_absence(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """True when an identify — not a human — explains this slot's absence RIGHT NOW.
+
+    An RFID identify UNLOADS the tray for ~10–20 s, so the slot reads ABSENT and then
+    PRESENT again: a gain whose preceding absence clears the ≥ ``_MIN_PHYSICAL_ABSENT_S``
+    flap filter yet moved no roll. Recorded at the PRESENT→ABSENT edge (where the signal
+    is freshest) and re-checked at the GAIN edge, so such a gain is never banked as a
+    QUALIFIED physical cycle — the discovery / W1-mint / FIFO-restamp evidence a HUMAN
+    roll swap leaves. This narrows what counts as a human roll movement; it never widens
+    it, and it never overrides the ≥5 s duration filter — the two gate the gain together.
+
+    Delegates to :func:`identify_in_flight`, whose two arms are precisely the "an identify
+    is happening NOW" signals: SLOT-scoped ``_echo_pending`` fresh (a read WE commanded on
+    a then-present slot — the common case, and the one that keeps a genuine swap on a
+    DIFFERENT slot from being suppressed) and, as a secondary, unit-scoped
+    ``ams_status_main == AMS_STATUS_IDENTIFYING`` — the ONLY signal a state-9
+    seated-yet-unread commanded read leaves (``record_reread`` deliberately never arms the
+    echo on a state-9 slot, so the incident's flap slips the echo lane) and the ONLY signal
+    a firmware-AUTONOMOUS re-read, which carries no command at all, leaves at all.
+
+    Both arms are LIVE / self-clearing on purpose. A lingering "we last read this slot N s
+    ago" timestamp (``_slot_read_at`` / a commanded-read stamp) is deliberately NOT used:
+    it cannot tell an identify still unloading the tray from a genuine human pull made
+    AFTER that identify already settled — the identify's own flap having been consumed by
+    then — and would over-suppress the reseat that follows. ``ams_status_main`` returns to
+    idle the moment the identify ends, which is exactly that distinction. Never raises."""
+    return identify_in_flight(printer_id, ams_id, tray_id)
 
 
 # --- Change-evidence ledger -----------------------------------------------
@@ -698,8 +737,13 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                 if not present and prev:
                     # PRESENT→ABSENT: stamp the absence start so a later genuine GAIN
                     # can tell a real physical roll swap (≥ _MIN_PHYSICAL_ABSENT_S)
-                    # from a runout-instant state flap (sub-second).
+                    # from a runout-instant state flap (sub-second). Alongside it,
+                    # record — while the signal is freshest — whether an identify
+                    # explains this absence: an identify unloads the tray for ~10–20 s,
+                    # a read flap the later gain must never bank as a QUALIFIED cycle
+                    # however long it runs (duration ≠ identity, the doctrine's rule 6).
                     _absent_since[key] = time.monotonic()
+                    _absent_under_identify[key] = _identify_explains_absence(printer_id, ams_id, tray_id)
 
                 if present and not prev:
                     # Echo-consume FIRST: a re-read we commanded on this present
@@ -731,7 +775,18 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                     # positive is expensive while a suppressed discovery read is not.
                     absent_at = _absent_since.pop(key, None)
                     absent_for = None if absent_at is None else time.monotonic() - absent_at
-                    physical_cycle = absent_for is not None and absent_for >= _MIN_PHYSICAL_ABSENT_S
+                    # An identify unloads the tray: an absence that BEGAN under identify
+                    # activity (flag captured at its start edge, freshest there), or one
+                    # still explained by an in-flight identify at THIS gain, is a read flap
+                    # and never a physical cycle — no matter how long it ran. The ≥5 s
+                    # filter measures duration, never identity (rule 6); the two gate the
+                    # gain together below.
+                    identify_explained = _absent_under_identify.pop(key, False) or _identify_explains_absence(
+                        printer_id, ams_id, tray_id
+                    )
+                    physical_cycle = (
+                        absent_for is not None and absent_for >= _MIN_PHYSICAL_ABSENT_S and not identify_explained
+                    )
 
                     # Genuine physical re-insert: clear any feed-fault out-of-
                     # rotation flag. NOT idle-gated (a spool untangled and re-
@@ -747,7 +802,13 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                         # so its duration is UNKNOWN — not a flap, it qualifies (see the
                         # absence-consume comment above). ``physical_cycle`` is the STRICTER
                         # measured->=5 s subset. The two gate different actions below.
-                        qualified = absent_for is None or absent_for >= _MIN_PHYSICAL_ABSENT_S
+                        # An identify-explained absence is a read flap, never a human roll
+                        # movement, so it disqualifies BOTH tiers (the invariant this fix
+                        # adds); a missing/unknown-duration absence still qualifies ONLY
+                        # when no identify explains it.
+                        qualified = (
+                            absent_for is None or absent_for >= _MIN_PHYSICAL_ABSENT_S
+                        ) and not identify_explained
 
                         # Record the change for the identify lanes. Drying-gated with
                         # the rest: a drying cycle disengages trays with no physical

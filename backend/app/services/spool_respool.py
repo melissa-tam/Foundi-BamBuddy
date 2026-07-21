@@ -12,12 +12,21 @@ certainty tiers:
   ``spool.spent_at`` — the certainty key. Never set by gram estimates.
 * **Tier 2 — automatic re-spool** (`maybe_auto_or_prompt_respool`): a tag arrival
   resolving to a spent, LOADED tray physically cannot be the old (empty) spool,
-  so it re-spools with no operator involvement.
+  so it re-spools with no operator involvement — unless a standing "Same spool"
+  dismissal still holds for the slot (see below).
 * **Tier 3 — one-click prompt** (`maybe_auto_or_prompt_respool`): uncertain cases
   (spent_at NULL) broadcast a ``respool_prompt`` WS event mirroring the
   ``unknown_tag`` flow — but ONLY with physical evidence that the roll could have
   changed (a recent presence cycle on the slot, :func:`_swap_evidence`). A merely
   run-down seated spool, and an impossible ledger row, prompt nothing.
+
+"Same spool" is honored PER PHYSICAL CYCLE for the spent tier: once the operator
+answers "Same spool" (``respool_dismissed_at`` stamped), the whole spent branch —
+Tier-2 auto AND any spent-tier prompt — stays suppressed until a qualified ≥5 s
+presence cycle occurs on the slot AFTER the answer (:func:`_dismissal_stands`).
+Replacing the roll is such a cycle, so genuine exhaustion still surfaces, but a
+standing false spent stamp stops re-reacting (and, with auto on, stops minting
+phantom fresh rows) the moment it is dismissed.
 
 The core operation `respool_tag` disposes the donor, mints a fresh full
 third-party spool (weight_locked, spent_at NULL), copies K-profiles, re-assigns
@@ -110,6 +119,25 @@ _feeder_since: dict[int, tuple[int, float]] = {}
 _pending_swaps: dict[int, tuple[int, int, float]] = {}
 _commanded_loads: dict[int, tuple[int, float]] = {}
 
+# Sentinel distinguishing "no backup-swap sample recorded yet" from a genuine
+# subtask_id of ``None`` (an idle / degenerate-echo push), so the FIRST sample per
+# printer is treated as a job boundary (which merely seeds).
+_NO_JOB = object()
+
+# Per-printer job identity (``subtask_id``) observed at the last backup-swap sample
+# (2026-07-20 false-spent incident). The edge dicts above are keyed by printer only,
+# so their state outlives a job boundary whenever no not-RUNNING AMS delta happens to
+# arrive between jobs — idle gaps emit few/no AMS deltas, and eject jobs run
+# state=RUNNING so the ``if not running`` cleanup never fires. A feeder change chosen
+# by the NEXT job's dispatch mapping then looked identical to a mid-job firmware backup
+# switch and stamped the departed spool spent (spool 106, printer 5, AMS0-T0, 02:40).
+# This records the job each edge sample was taken under so :func:`capture_backup_swap`
+# recognises a changed subtask_id (incl. ``None``↔value) as a boundary and DISCARDS the
+# cross-job edge instead of confirming a swap. Process-lifetime like the edge dicts;
+# cleared by :func:`_reset_state`. The job-boundary reset hooks in ``main`` clear the
+# edge dicts but deliberately NOT this marker — it is this belt-and-braces layer's own.
+_last_sample_job: dict[int, object] = {}
+
 # A hardware runout that stamps a spool spent while its gram ledger still shows more
 # than this remaining is a drift / initial-state signal worth surfacing in triage
 # (reused core, a mid-life row minted as full, or accrual drift) — not silent loss.
@@ -170,6 +198,7 @@ def _reset_state() -> None:
     _feeder_since.clear()
     _pending_swaps.clear()
     _commanded_loads.clear()
+    _last_sample_job.clear()
     _respool_prompt_dedup.clear()
     _jump_seen.clear()
     _spent_dedup.clear()
@@ -192,6 +221,26 @@ def note_commanded_load(printer_id: int, target_tray: int) -> None:
     operator swaps can never be mistaken for a firmware runout and spend the
     departed spool (the 006 false-stamp mode)."""
     _commanded_loads[printer_id] = (target_tray, _monotonic())
+
+
+def reset_swap_edge_state(printer_id: int) -> None:
+    """Clear the backup-swap edge state for ``printer_id`` at a job boundary.
+
+    Called (guarded) from ``main.on_print_start`` — BEFORE its eject short-circuit,
+    because an eject job is a job boundary too — and ``main.on_print_complete`` so the
+    per-printer edge bookkeeping never carries from one print into the next: a feeder
+    change chosen by the NEXT job's dispatch mapping must not read as a mid-job
+    firmware backup switch and stamp the departed spool spent (the 2026-07-20
+    false-spent incident). After a reset the next AMS-delta push merely re-seeds
+    ``_last_tray_now`` (prev ``None`` → no edge possible). Drops only the four swap
+    trackers; :data:`_last_sample_job` is owned by the belt-and-braces boundary check
+    in :func:`capture_backup_swap` and is intentionally left intact. Idempotent; pure
+    in-memory; never raises.
+    """
+    _last_tray_now.pop(printer_id, None)
+    _feeder_since.pop(printer_id, None)
+    _stable_feeder.pop(printer_id, None)
+    _pending_swaps.pop(printer_id, None)
 
 
 class RespoolError(Exception):
@@ -653,6 +702,20 @@ async def capture_backup_swap(db: AsyncSession, printer_id: int, state) -> Spool
     current = getattr(state, "tray_now", 255)
     running = getattr(state, "state", None) == "RUNNING"
 
+    # Belt-and-braces cross-job discard (2026-07-20). The primary guard is the
+    # job-boundary reset hooked into main.on_print_start / on_print_complete; this
+    # covers a missed or lagging hook. Edge state sampled under a DIFFERENT subtask_id
+    # (a ``None``↔value change counts) belongs to another print, so reset it, re-seed
+    # ``_last_tray_now`` from this push, and open NO pending swap on this call. A
+    # genuine mid-job backup switch keeps the same subtask_id and falls through to the
+    # detector below, stamping exactly as it does today.
+    current_job = getattr(state, "subtask_id", None)
+    if _last_sample_job.get(printer_id, _NO_JOB) != current_job:
+        reset_swap_edge_state(printer_id)
+        _last_sample_job[printer_id] = current_job
+        _last_tray_now[printer_id] = current
+        return None
+
     # Resolve any open pending swap against THIS push first (may stamp or drop).
     marked = await _resolve_pending_swap(db, printer_id, state, current, running)
 
@@ -761,6 +824,33 @@ async def _build_respool_prompt_payload(
     brand_prefill = (await _respool_last_brand(db)) or None
     donor_remaining = float((donor.label_weight or 0) - (donor.weight_used or 0))
 
+    # Provenance (R5): so the operator can tell a stale question from a fresh
+    # detection. Additive to the frozen contract; each field recomputes identically
+    # on a reconnect replay from the same durable donor row + live tray (the
+    # age fields excepted — they are inherently now-relative).
+    spent_at = donor.spent_at
+    spent_at_iso = spent_at.isoformat() if spent_at is not None else None
+    spent_age_s = max(0.0, (datetime.utcnow() - spent_at).total_seconds()) if spent_at is not None else None
+
+    # AMS live tray remain %, 1..100 or None — the same parse discipline
+    # :func:`_remain_jump_reading` uses (integer %, out-of-range / garbage → None).
+    ams_remain_pct: int | None = None
+    try:
+        remain_val = int(tray.get("remain"))
+    except (TypeError, ValueError):
+        remain_val = None
+    if remain_val is not None and 1 <= remain_val <= 100:
+        ams_remain_pct = remain_val
+
+    # Ledger-implied remaining %, clamped at 0 like _remain_jump_reading's ledger_pct.
+    label_weight = donor.label_weight or 0
+    ledger_remain_pct = (
+        max(0.0, (label_weight - (donor.weight_used or 0)) / label_weight * 100.0) if label_weight > 0 else None
+    )
+
+    bound_since_dt = donor.loaded_at or donor.first_loaded_at or donor.created_at
+    bound_since = bound_since_dt.isoformat() if bound_since_dt is not None else None
+
     return {
         "type": "respool_prompt",
         "printer_id": printer_id,
@@ -777,6 +867,11 @@ async def _build_respool_prompt_payload(
         "brand_prefill": brand_prefill,
         "label_weight_prefill": label_weight_prefill,
         "trigger": await _classify_trigger(db, donor),
+        "spent_at": spent_at_iso,
+        "spent_age_s": spent_age_s,
+        "ams_remain_pct": ams_remain_pct,
+        "ledger_remain_pct": ledger_remain_pct,
+        "bound_since": bound_since,
     }
 
 
@@ -938,6 +1033,49 @@ def _swap_evidence(printer_id: int, ams_id: int, tray_id: int) -> bool:
     return age is not None and age <= _RESPOOL_SWAP_EVIDENCE_S
 
 
+def _dismissal_stands(spool: Spool, printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Does the operator's "Same spool" dismissal still hold for this SPENT slot?
+
+    "Same spool" means the physical roll has not changed — so stop reacting until it
+    physically does. The dismissal STANDS (and the caller suppresses the whole spent
+    branch, auto re-spool AND prompt alike) while ``respool_dismissed_at`` is set and
+    NO qualified physical presence cycle has happened on the slot SINCE that answer.
+    A qualified cycle strictly AFTER the dismissal re-arms the branch: replacing a
+    roll is itself a ≥5 s presence cycle, so genuine exhaustion still surfaces.
+
+    Both spans are measured from now: ``seconds_since_dismissal`` is wall-clock
+    (``respool_dismissed_at`` is naive-UTC via ``datetime.utcnow()``) and the cycle
+    ``age`` from :func:`ams_presence.last_physical_cycle_age` is monotonic — both
+    count elapsed seconds at the same rate, so a cycle whose age is SHORTER than the
+    since-dismissal span happened after the dismissal. A ``None`` age (no cycle known
+    — the state after every restart, when the in-memory ledger is empty) keeps the
+    dismissal standing: a real post-restart swap records a fresh cycle live and
+    re-arms then.
+
+    Non-consuming, defensive local import (same convention as :func:`_swap_evidence`);
+    never raises — a lookup failure fails quiet to "dismissal stands".
+    """
+    if spool.respool_dismissed_at is None:
+        return False
+    seconds_since_dismissal = max(0.0, (datetime.utcnow() - spool.respool_dismissed_at).total_seconds())
+    try:
+        from backend.app.services import ams_presence
+
+        age = ams_presence.last_physical_cycle_age(printer_id, ams_id, tray_id)
+    except Exception:  # noqa: BLE001 — must never break the AMS callback chain
+        logger.debug(
+            "Dismissal-stands cycle lookup failed for printer %s AMS%s-T%s — treating the dismissal as standing",
+            printer_id,
+            ams_id,
+            tray_id,
+            exc_info=True,
+        )
+        return True
+    if age is None:
+        return True
+    return age >= seconds_since_dismissal
+
+
 def _ledger_corrupt(spool: Spool) -> bool:
     """Is this row's gram ledger physically impossible?
 
@@ -1063,6 +1201,10 @@ async def maybe_auto_or_prompt_respool(
 ) -> Spool | None:
     """Tier 2/3 gate for a tag arrival that resolved to inventory ``spool``.
 
+    * Dismissal gate (spent branch): when ``respool_dismissed_at`` is set and no
+      qualified physical cycle has happened on the slot since the answer
+      (:func:`_dismissal_stands`), the whole spent branch — Tier-2 auto AND prompt —
+      is suppressed. A qualified roll swap after the answer re-arms it.
     * Tier 2 (auto): ``spool.spent_at`` set AND the tray is LOADED → the physical
       spool cannot be the spent one, so re-spool with the server-held last brand
       and return the NEW spool (the caller must skip its own auto-assign — the
@@ -1084,6 +1226,14 @@ async def maybe_auto_or_prompt_respool(
     if spool.spent_at is not None:
         if not _tray_loaded(tray):
             return None  # spent but not loaded → dead spool re-inserted, no trigger
+        if _dismissal_stands(spool, printer_id, ams_id, tray_id):
+            # "Same spool" was answered and the physical roll has not changed since
+            # (no qualified presence cycle after the dismissal), so suppress the ENTIRE
+            # spent branch — auto re-spool AND prompt. This is what stops a standing
+            # FALSE spent stamp from re-firing forever; with auto enabled it also stops
+            # every tag re-read from minting a phantom fresh row. A qualified swap after
+            # the answer re-arms the branch, so a genuine later exhaustion still surfaces.
+            return None
         if not await _respool_auto_enabled(db):
             # Tier-2 auto re-spool disabled (default): a spent+loaded tag arrival
             # surfaces the one-click prompt instead of silently minting a fresh row,
@@ -1168,12 +1318,15 @@ async def maybe_auto_or_prompt_respool(
             float((spool.label_weight or 0) - (spool.weight_used or 0)),
         )
         return None
-    # Suppress permanently once the operator answered "Same spool"
-    # (respool_dismissed_at stamped): a deliberately-run-down near-empty spool
-    # must not re-prompt on every reseat / AMS power-cycle / server restart (the
-    # in-memory dedup cannot survive those). This gate is TIER-3 ONLY — a
-    # hardware-certain spent event (the spent_at branch above) is never gated by
-    # the dismissal, so a genuine exhaustion still auto-respools/prompts.
+    # Suppress once the operator answered "Same spool" (respool_dismissed_at
+    # stamped): a deliberately-run-down near-empty spool must not re-prompt on every
+    # reseat / AMS power-cycle / server restart (the in-memory dedup cannot survive
+    # those). Tier-3 suppression here is PERMANENT for the row — a non-spent
+    # near-empty spool only becomes interesting again once it is actually re-spooled
+    # (which clears the row). The spent branch ABOVE reads the SAME dismissal
+    # differently: there it holds only per physical cycle (:func:`_dismissal_stands`),
+    # re-arming on a qualified roll swap after the answer, because a genuine hardware
+    # exhaustion must still surface.
     if spool.respool_dismissed_at is not None:
         return None
     # (2) A prompt needs a REASON and EVIDENCE. The reason is the ledger reading
