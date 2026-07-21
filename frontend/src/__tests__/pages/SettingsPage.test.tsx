@@ -622,6 +622,29 @@ describe('SettingsPage', () => {
       });
     });
 
+    it('shows power-stagger dynamic-release settings on Workflow tab', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Workflow')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Workflow'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Power stagger')).toBeInTheDocument();
+        expect(screen.getByText('Release a slot once the bed is hot')).toBeInTheDocument();
+        expect(screen.getByText('At-temperature margin (°C)')).toBeInTheDocument();
+        expect(screen.getByText('Heat-up grace (seconds)')).toBeInTheDocument();
+      });
+
+      // Field is wired to its setting value (default 120 for heat-up grace).
+      expect(
+        (screen.getByLabelText('Heat-up grace (seconds)') as HTMLInputElement).value,
+      ).toBe('120');
+    });
+
     it('shows auto-drying settings on Workflow tab', async () => {
       const user = userEvent.setup();
       render(<SettingsPage />);
@@ -692,6 +715,93 @@ describe('SettingsPage', () => {
 
       await waitFor(() => {
         expect(screen.getByText(/overridden per print in the print dialog/)).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('Farm tab — dispatch responsiveness', () => {
+    it('renders the Dispatch responsiveness card with field values', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Farm'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Dispatch responsiveness')).toBeInTheDocument();
+      });
+
+      // Numeric fields render seeded to their backend defaults (mockSettings
+      // omits them, so the component's `?? default` fallbacks show through).
+      expect(
+        (screen.getByLabelText('Fallback check interval (sec)') as HTMLInputElement).value,
+      ).toBe('30');
+      expect(
+        (screen.getByLabelText('Simultaneous printer starts') as HTMLInputElement).value,
+      ).toBe('3');
+      expect(
+        (screen.getByLabelText('USB check max wait (sec)') as HTMLInputElement).value,
+      ).toBe('2.5');
+
+      // The two probe/hardware-gated toggles carry an explicit warning line.
+      expect(
+        screen.getByText(/run the full eject hardware ladder/i),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/only after the live eject probe confirms/i),
+      ).toBeInTheDocument();
+    });
+
+    it('round-trips a numeric change through the save endpoint', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const input = await waitFor(() =>
+        screen.getByLabelText('Fallback check interval (sec)'),
+      );
+
+      fireEvent.change(input, { target: { value: '45' } });
+
+      // Save is debounced (~500ms); the PUT payload must carry the new value.
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          expect(receivedBody!.queue_check_interval_seconds).toBe(45);
+        },
+        { timeout: 5000 },
+      );
+    });
+
+    it('cross-tab search finds the Dispatch responsiveness card', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      const searchBox = await waitFor(() =>
+        screen.getByPlaceholderText(/Search settings/),
+      );
+
+      await user.type(searchBox, 'responsiveness');
+
+      await waitFor(() => {
+        // The result dropdown lists the card label even though we are still on
+        // the default General tab (the card itself is not rendered yet).
+        expect(screen.getByText('Dispatch responsiveness')).toBeInTheDocument();
       });
     });
   });

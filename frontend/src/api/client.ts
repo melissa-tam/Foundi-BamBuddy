@@ -1286,6 +1286,13 @@ export interface AppSettings {
   // Staggered batch start defaults
   stagger_group_size: number;
   stagger_interval_minutes: number;
+  // Power stagger — dynamic slot release. When enabled, a staggered slot frees
+  // as soon as the printer's bed reaches target (within the epsilon) instead of
+  // waiting out the full interval; an idle-bed printer gets a heat-up grace
+  // before its slot is freed.
+  stagger_dynamic_release: boolean;
+  stagger_release_epsilon_c: number;
+  stagger_heatup_grace_seconds: number;
   // Plate-clear confirmation
   require_plate_clear: boolean;
   // Farm production defaults (Phase 3) — prefill the start-run dialog's
@@ -1319,6 +1326,17 @@ export interface AppSettings {
   // USB storage-low auto-cleanup: on a "USB full" HMS fault, auto-delete old
   // camera recordings then oldest unused print files so dispatch keeps working.
   farm_usb_auto_cleanup: boolean;
+  // Dispatch responsiveness (latency-reduction wave). Event kicks make dispatch
+  // immediate; these tune the fallback poll, kick coalescing, USB-preflight
+  // freshness, upload concurrency, and eject-file upload optimizations.
+  queue_check_interval_seconds: number;
+  dispatch_kick_debounce_seconds: number;
+  usb_preflight_fresh_window_seconds: number;
+  usb_preflight_max_wait_seconds: number;
+  dispatch_parallel_limit: number;
+  // Eject-file upload optimizations — both HARDWARE/probe-gated (default off).
+  eject_upload_skip_identical: boolean;
+  eject_slim_3mf: boolean;
   // Shortest job first scheduling
   queue_shortest_first: boolean;
   // User-configurable presets for the printer-card popovers (JSON arrays of 3 ints).

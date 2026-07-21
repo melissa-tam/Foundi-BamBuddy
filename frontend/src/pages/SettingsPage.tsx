@@ -71,12 +71,14 @@ registerSettingsSearch({ labelKey: 'settings.messageTemplates', tab: 'notificati
 registerSettingsSearch({ labelKey: 'settings.defaultPrintOptions', labelFallback: 'Default Print Options', tab: 'queue', keywords: 'print bed leveling flow calibration vibration first layer timelapse', anchor: 'card-print-options' });
 registerSettingsSearch({ labelKey: 'settings.tempFanPresetsTitle', labelFallback: 'Temperature & Fan Presets', tab: 'queue', keywords: 'temperature fan presets nozzle bed chamber quick buttons popover', anchor: 'card-temp-fan-presets' });
 registerSettingsSearch({ labelKey: 'settings.staggeredStart', labelFallback: 'Staggered Start', tab: 'queue', keywords: 'staggered batch delay start queue group', anchor: 'card-staggered' });
+registerSettingsSearch({ labelKey: 'settings.powerStagger', labelFallback: 'Power stagger', tab: 'queue', keywords: 'power stagger dynamic release bed target temperature epsilon heat up heatup grace idle slot free early inrush surge', anchor: 'card-power-stagger' });
 registerSettingsSearch({ labelKey: 'settings.plateClear', labelFallback: 'Plate-Clear Confirmation', tab: 'queue', keywords: 'plate clear confirm auto queue', anchor: 'card-plate' });
 registerSettingsSearch({ labelKey: 'settings.gcodeInjection', labelFallback: 'G-code Injection', tab: 'queue', keywords: 'gcode injection start end autoprint farmloop swapmod autoclear printflow', anchor: 'card-gcode' });
 registerSettingsSearch({ labelKey: 'settings.slicerCard', labelFallback: 'Slicer', tab: 'queue', keywords: 'slicer orcaslicer bambustudio orca bambu api sidecar url docker preferred', anchor: 'card-slicer' });
 registerSettingsSearch({ labelKey: 'settings.queueDrying', tab: 'queue', keywords: 'drying presets temperature time humidity ams', anchor: 'card-drying' });
 registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog', anchor: 'card-farm-production' });
 registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown stall window epsilon plateau min cooling per check give up timer close enough margin release threshold warn floor bed temperature quarantine', anchor: 'card-farm-cooldown' });
+registerSettingsSearch({ labelKey: 'settings.dispatchResponsiveness', labelFallback: 'Dispatch responsiveness', tab: 'farm', keywords: 'dispatch responsiveness latency poll interval queue check kick debounce coalesce usb preflight fresh window max wait parallel concurrency upload skip identical slim 3mf mesh thumbnail eject file speed', anchor: 'card-dispatch-responsiveness' });
 registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool prompt threshold reused tag grams rfid', anchor: 'card-filamentchecks' });
 registerSettingsSearch({ labelKey: 'settings.printModal', tab: 'filament', keywords: 'print modal custom mapping', anchor: 'card-printmodal' });
 registerSettingsSearch({ labelKey: 'settings.amsDisplayThresholds', tab: 'filament', keywords: 'ams humidity temperature threshold history retention', anchor: 'card-amsthresholds' });
@@ -1000,6 +1002,9 @@ export function SettingsPage() {
       (settings.default_nozzle_offset_cali ?? true) !== (localSettings.default_nozzle_offset_cali ?? true) ||
       (settings.stagger_group_size ?? 2) !== (localSettings.stagger_group_size ?? 2) ||
       (settings.stagger_interval_minutes ?? 5) !== (localSettings.stagger_interval_minutes ?? 5) ||
+      (settings.stagger_dynamic_release ?? true) !== (localSettings.stagger_dynamic_release ?? true) ||
+      (settings.stagger_release_epsilon_c ?? 2) !== (localSettings.stagger_release_epsilon_c ?? 2) ||
+      (settings.stagger_heatup_grace_seconds ?? 120) !== (localSettings.stagger_heatup_grace_seconds ?? 120) ||
       (settings.require_plate_clear ?? false) !== (localSettings.require_plate_clear ?? false) ||
       (settings.farm_retry_max_per_unit ?? 1) !== (localSettings.farm_retry_max_per_unit ?? 1) ||
       (settings.farm_escalate_consecutive_failures ?? 2) !== (localSettings.farm_escalate_consecutive_failures ?? 2) ||
@@ -1012,6 +1017,13 @@ export function SettingsPage() {
       (settings.farm_cooldown_max_hold_minutes ?? 180) !== (localSettings.farm_cooldown_max_hold_minutes ?? 180) ||
       (settings.farm_cooldown_plateau_eject_margin_c ?? 3) !== (localSettings.farm_cooldown_plateau_eject_margin_c ?? 3) ||
       (settings.farm_usb_auto_cleanup ?? true) !== (localSettings.farm_usb_auto_cleanup ?? true) ||
+      (settings.queue_check_interval_seconds ?? 30) !== (localSettings.queue_check_interval_seconds ?? 30) ||
+      (settings.dispatch_kick_debounce_seconds ?? 1) !== (localSettings.dispatch_kick_debounce_seconds ?? 1) ||
+      (settings.usb_preflight_fresh_window_seconds ?? 10) !== (localSettings.usb_preflight_fresh_window_seconds ?? 10) ||
+      (settings.usb_preflight_max_wait_seconds ?? 2.5) !== (localSettings.usb_preflight_max_wait_seconds ?? 2.5) ||
+      (settings.dispatch_parallel_limit ?? 3) !== (localSettings.dispatch_parallel_limit ?? 3) ||
+      (settings.eject_upload_skip_identical ?? false) !== (localSettings.eject_upload_skip_identical ?? false) ||
+      (settings.eject_slim_3mf ?? false) !== (localSettings.eject_slim_3mf ?? false) ||
       (settings.nozzle_temp_presets ?? '') !== (localSettings.nozzle_temp_presets ?? '') ||
       (settings.bed_temp_presets ?? '') !== (localSettings.bed_temp_presets ?? '') ||
       (settings.chamber_temp_presets ?? '') !== (localSettings.chamber_temp_presets ?? '') ||
@@ -1112,6 +1124,9 @@ export function SettingsPage() {
         default_nozzle_offset_cali: localSettings.default_nozzle_offset_cali,
         stagger_group_size: localSettings.stagger_group_size,
         stagger_interval_minutes: localSettings.stagger_interval_minutes,
+        stagger_dynamic_release: localSettings.stagger_dynamic_release,
+        stagger_release_epsilon_c: localSettings.stagger_release_epsilon_c,
+        stagger_heatup_grace_seconds: localSettings.stagger_heatup_grace_seconds,
         require_plate_clear: localSettings.require_plate_clear,
         farm_retry_max_per_unit: localSettings.farm_retry_max_per_unit,
         farm_escalate_consecutive_failures: localSettings.farm_escalate_consecutive_failures,
@@ -1125,6 +1140,13 @@ export function SettingsPage() {
         farm_cooldown_max_hold_minutes: localSettings.farm_cooldown_max_hold_minutes,
         farm_cooldown_plateau_eject_margin_c: localSettings.farm_cooldown_plateau_eject_margin_c,
         farm_usb_auto_cleanup: localSettings.farm_usb_auto_cleanup,
+        queue_check_interval_seconds: localSettings.queue_check_interval_seconds,
+        dispatch_kick_debounce_seconds: localSettings.dispatch_kick_debounce_seconds,
+        usb_preflight_fresh_window_seconds: localSettings.usb_preflight_fresh_window_seconds,
+        usb_preflight_max_wait_seconds: localSettings.usb_preflight_max_wait_seconds,
+        dispatch_parallel_limit: localSettings.dispatch_parallel_limit,
+        eject_upload_skip_identical: localSettings.eject_upload_skip_identical,
+        eject_slim_3mf: localSettings.eject_slim_3mf,
         nozzle_temp_presets: localSettings.nozzle_temp_presets,
         bed_temp_presets: localSettings.bed_temp_presets,
         chamber_temp_presets: localSettings.chamber_temp_presets,
@@ -4291,6 +4313,84 @@ export function SettingsPage() {
             </CardContent>
           </Card>
 
+          {/* Power stagger — dynamic slot release (kept beside Staggered Start
+              so all stagger controls live together). */}
+          <Card id="card-power-stagger">
+            <CardHeader>
+              <h3 className="text-base font-semibold text-white flex items-center gap-2">
+                <Zap className="w-4 h-4 text-bambu-green" />
+                {t('settings.powerStagger', 'Power stagger')}
+              </h3>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-xs text-bambu-gray">
+                {t('settings.powerStaggerDescription', 'Free a stagger slot the moment a printer stops drawing heat-up power, instead of always waiting out the full interval. Lets the next printer start sooner while still limiting simultaneous power draw.')}
+              </p>
+              <div className="flex items-center justify-between">
+                <div className="flex-1 mr-4">
+                  <p className="text-sm text-white">
+                    {t('settings.staggerDynamicRelease', 'Release a slot once the bed is hot')}
+                  </p>
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.staggerDynamicReleaseHelp', 'When on, the next printer may start as soon as the current one finishes heating its bed, rather than waiting for the whole interval to pass. When off, every slot waits the full interval.')}
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={localSettings.stagger_dynamic_release ?? true}
+                    onChange={(e) => updateSetting('stagger_dynamic_release', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
+              </div>
+              <div className="flex gap-4">
+                <div className="flex-1">
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="stagger-release-epsilon" className="block text-xs text-bambu-gray">
+                      {t('settings.staggerReleaseEpsilon', 'At-temperature margin (°C)')}
+                    </label>
+                    <InfoHint text={t('settings.staggerReleaseEpsilonHelp')} />
+                  </div>
+                  <input
+                    id="stagger-release-epsilon"
+                    type="number"
+                    min={0}
+                    max={10}
+                    step={0.1}
+                    value={localSettings.stagger_release_epsilon_c ?? 2}
+                    onChange={(e) => updateSetting('stagger_release_epsilon_c', Math.max(0, Math.min(10, parseFloat(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.staggerReleaseEpsilonHelp', 'How close to the target bed temperature counts as "hot enough" to free the slot early. Larger releases the next printer sooner.')}
+                  </p>
+                </div>
+                <div className="flex-1">
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="stagger-heatup-grace" className="block text-xs text-bambu-gray">
+                      {t('settings.staggerHeatupGrace', 'Heat-up grace (seconds)')}
+                    </label>
+                    <InfoHint text={t('settings.staggerHeatupGraceHelp')} />
+                  </div>
+                  <input
+                    id="stagger-heatup-grace"
+                    type="number"
+                    min={30}
+                    max={600}
+                    value={localSettings.stagger_heatup_grace_seconds ?? 120}
+                    onChange={(e) => updateSetting('stagger_heatup_grace_seconds', Math.max(30, Math.min(600, parseInt(e.target.value) || 120)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.staggerHeatupGraceHelp', 'If a printer has not started heating its bed yet, wait this long before freeing its slot anyway, so an idle printer does not hold up the batch.')}
+                  </p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
           {/* Plate-Clear Confirmation */}
           <Card id="card-plate">
             <CardHeader>
@@ -5076,6 +5176,171 @@ export function SettingsPage() {
                     {t('settings.farmCooldownPlateauMarginHelp', 'If cooling stalls but the bed is within this many degrees of the eject temperature, treat it as cooled and eject; stuck hotter than that quarantines the printer.')}
                   </p>
                 </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Dispatch responsiveness — latency-reduction tuning (poll fallback,
+              kick coalescing, USB preflight freshness, upload concurrency,
+              eject-file upload optimizations). */}
+          <Card id="card-dispatch-responsiveness">
+            <CardHeader>
+              <h3 className="text-base font-semibold text-white flex items-center gap-2">
+                <Zap className="w-4 h-4 text-bambu-green" />
+                {t('settings.dispatchResponsiveness', 'Dispatch responsiveness')}
+              </h3>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-xs text-bambu-gray">
+                {t('settings.dispatchResponsivenessDescription', 'Fine-tune how quickly the farm reacts and starts the next print. The farm normally reacts to events instantly — these are the safety-net timers and limits behind that. The defaults are good for most shops.')}
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="queue-check-interval" className="block text-xs text-bambu-gray">
+                      {t('settings.queueCheckInterval', 'Fallback check interval (sec)')}
+                    </label>
+                    <InfoHint text={t('settings.queueCheckIntervalHelp')} />
+                  </div>
+                  <input
+                    id="queue-check-interval"
+                    type="number"
+                    min={5}
+                    max={300}
+                    value={localSettings.queue_check_interval_seconds ?? 30}
+                    onChange={(e) => updateSetting('queue_check_interval_seconds', Math.max(5, Math.min(300, parseInt(e.target.value) || 30)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.queueCheckIntervalHelp', 'How often the farm re-checks the queue even when nothing happened. A backstop in case a live event is missed — lower reacts sooner but polls more (5–300).')}
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="dispatch-kick-debounce" className="block text-xs text-bambu-gray">
+                      {t('settings.dispatchKickDebounce', 'Burst settle delay (sec)')}
+                    </label>
+                    <InfoHint text={t('settings.dispatchKickDebounceHelp')} />
+                  </div>
+                  <input
+                    id="dispatch-kick-debounce"
+                    type="number"
+                    min={0.2}
+                    max={10}
+                    step={0.1}
+                    value={localSettings.dispatch_kick_debounce_seconds ?? 1}
+                    onChange={(e) => updateSetting('dispatch_kick_debounce_seconds', Math.max(0.2, Math.min(10, parseFloat(e.target.value) || 1)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.dispatchKickDebounceHelp', 'When several things happen at once, wait this brief moment to bundle them into a single dispatch pass instead of many. Higher batches more; lower reacts faster (0.2–10).')}
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="usb-preflight-fresh" className="block text-xs text-bambu-gray">
+                      {t('settings.usbPreflightFreshWindow', 'USB check freshness (sec)')}
+                    </label>
+                    <InfoHint text={t('settings.usbPreflightFreshWindowHelp')} />
+                  </div>
+                  <input
+                    id="usb-preflight-fresh"
+                    type="number"
+                    min={0}
+                    max={120}
+                    value={localSettings.usb_preflight_fresh_window_seconds ?? 10}
+                    onChange={(e) => updateSetting('usb_preflight_fresh_window_seconds', Math.max(0, Math.min(120, parseInt(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.usbPreflightFreshWindowHelp', 'Trust a recent "USB drive present" report this many seconds old before re-checking. Higher skips redundant checks; 0 always re-checks (0–120).')}
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="usb-preflight-max-wait" className="block text-xs text-bambu-gray">
+                      {t('settings.usbPreflightMaxWait', 'USB check max wait (sec)')}
+                    </label>
+                    <InfoHint text={t('settings.usbPreflightMaxWaitHelp')} />
+                  </div>
+                  <input
+                    id="usb-preflight-max-wait"
+                    type="number"
+                    min={0}
+                    max={10}
+                    step={0.1}
+                    value={localSettings.usb_preflight_max_wait_seconds ?? 2.5}
+                    onChange={(e) => updateSetting('usb_preflight_max_wait_seconds', Math.max(0, Math.min(10, parseFloat(e.target.value) || 0)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.usbPreflightMaxWaitHelp', 'How long to wait for a fresh "USB present" report before starting a print anyway. Higher is more cautious; lower dispatches sooner (0–10).')}
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="dispatch-parallel-limit" className="block text-xs text-bambu-gray">
+                      {t('settings.dispatchParallelLimit', 'Simultaneous printer starts')}
+                    </label>
+                    <InfoHint text={t('settings.dispatchParallelLimitHelp')} />
+                  </div>
+                  <input
+                    id="dispatch-parallel-limit"
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={localSettings.dispatch_parallel_limit ?? 3}
+                    onChange={(e) => updateSetting('dispatch_parallel_limit', Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.dispatchParallelLimitHelp', 'How many printers can upload and start at the same time in one pass. Higher clears a big queue faster; lower is gentler on the network (1–10).')}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center justify-between pt-1">
+                <div className="flex-1 mr-4">
+                  <p className="text-sm text-white">
+                    {t('settings.ejectUploadSkipIdentical', 'Reuse eject files already on the USB drive')}
+                  </p>
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.ejectUploadSkipIdenticalHelp', 'Skip re-uploading an eject file when the identical one is already on the printer’s USB drive, saving a few seconds per eject.')}
+                  </p>
+                  <div role="alert" className="text-xs text-amber-200 bg-amber-900/20 border border-amber-700/40 rounded p-2 mt-2">
+                    {t('settings.ejectUploadSkipIdenticalWarning', 'Enable only after the live eject probe confirms the file on the drive is reused correctly. If in doubt, leave off — a re-upload always guarantees the right file.')}
+                  </div>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={localSettings.eject_upload_skip_identical ?? false}
+                    onChange={(e) => updateSetting('eject_upload_skip_identical', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
+              </div>
+              <div className="flex items-center justify-between pt-1">
+                <div className="flex-1 mr-4">
+                  <p className="text-sm text-white">
+                    {t('settings.ejectSlim3mf', 'Slim down eject files')}
+                  </p>
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.ejectSlim3mfHelp', 'Strip the 3D model and preview image out of eject files so they upload faster — the eject motion itself is unchanged.')}
+                  </p>
+                  <div role="alert" className="text-xs text-amber-200 bg-amber-900/20 border border-amber-700/40 rounded p-2 mt-2">
+                    {t('settings.ejectSlim3mfWarning', 'Hardware-gated: run the full eject hardware ladder with slimmed files before enabling for unattended production. Leave off until that ladder passes.')}
+                  </div>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={localSettings.eject_slim_3mf ?? false}
+                    onChange={(e) => updateSetting('eject_slim_3mf', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
               </div>
             </CardContent>
           </Card>
