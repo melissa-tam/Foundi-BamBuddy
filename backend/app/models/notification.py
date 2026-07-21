@@ -120,6 +120,9 @@ class NotificationProvider(Base):
     on_spool_recovery_succeeded = Column(Boolean, default=True)  # farm: mid-print jam auto-recovered
     on_spool_recovery_failed = Column(Boolean, default=True)  # farm: jam recovery escalated, printer left paused
     on_spool_out_of_rotation = Column(Boolean, default=True)  # farm: spool flagged out of rotation after feed fault
+    on_spool_recovery_self_healed = Column(
+        Boolean, default=True
+    )  # farm: feed fault cleared by a firmware retry on the SAME spool (no swap, no out-of-rotation)
     on_cooldown_escalation = Column(
         Boolean, default=True
     )  # Post-print eject cooldown running long (bed still above threshold past the escalation window)

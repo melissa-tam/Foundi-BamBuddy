@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backend.app.services import notification_service as notification_service_module, notify_dedup
-from backend.app.services.notification_service import NotificationService
+from backend.app.services.notification_service import NotificationService, compose_hms_error_summary
 
 
 class TestNotificationService:
@@ -2909,7 +2909,7 @@ class TestOnCooldownEscalation:
 class TestSpoolRecoveryNotifications:
     """Farm mid-print spool-jam auto-recovery events (services/spool_recovery.py).
 
-    Three printer-alarm events mirroring ``on_run_unit_stopped``/``on_storage_low``:
+    Four printer-alarm events mirroring ``on_run_unit_stopped``/``on_storage_low``:
     provider-boolean gated, ``force_immediate`` (a printer alarm, not a run-lifecycle
     event). Each pair proves the toggle-ON provider receives the message with its
     template variables rendered and the toggle-OFF provider is filtered out.
@@ -3069,13 +3069,70 @@ class TestSpoolRecoveryNotifications:
 
             mock_send.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_on_spool_recovery_self_healed_sends_when_enabled(self, service, mock_provider, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("Feed fault self-healed — 001-H2S", "body")
+
+            await service.on_spool_recovery_self_healed(
+                7,
+                "001-H2S",
+                "SKU007 plate",
+                142,
+                "Bambu PETG (RFID a1b2)",
+                "AMS1 slot 1",
+                "0700_8010",
+                mock_db,
+            )
+
+            mock_get.assert_awaited_once_with(mock_db, "on_spool_recovery_self_healed", 7)
+            _, event, variables = mock_build.call_args.args
+            assert event == "spool_recovery_self_healed"
+            assert variables == {
+                "printer_name": "001-H2S",
+                "job_name": "SKU007 plate",
+                "layer": "142",
+                "spool_desc": "Bambu PETG (RFID a1b2)",
+                "slot_desc": "AMS1 slot 1",
+                "code": "0700_8010",
+            }
+            mock_send.assert_awaited_once()
+            assert mock_send.call_args.args[4] == "spool_recovery_self_healed"
+            assert mock_send.call_args.args[5] == 7
+            assert mock_send.call_args.kwargs["force_immediate"] is True
+            assert mock_send.call_args.kwargs["variables"] == variables
+
+    @pytest.mark.asyncio
+    async def test_on_spool_recovery_self_healed_skipped_when_disabled(self, service, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = []  # provider boolean off → filtered out
+
+            await service.on_spool_recovery_self_healed(
+                7, "001-H2S", "SKU007 plate", 142, "Bambu PETG", "AMS1 slot 1", "0700_8010", mock_db
+            )
+
+            mock_send.assert_not_called()
+
     def test_spool_recovery_templates_seeded_and_render(self, service):
-        """The three spool-recovery templates exist and substitute their variables
+        """The four spool-recovery templates exist and substitute their variables
         (proves the template + variable contract for each event)."""
         from backend.app.models.notification_template import DEFAULT_TEMPLATES
 
         by_type = {t["event_type"]: t for t in DEFAULT_TEMPLATES}
-        for event_type in ("spool_recovery_succeeded", "spool_recovery_failed", "spool_out_of_rotation"):
+        for event_type in (
+            "spool_recovery_succeeded",
+            "spool_recovery_failed",
+            "spool_out_of_rotation",
+            "spool_recovery_self_healed",
+        ):
             assert event_type in by_type, f"missing seed for {event_type}"
 
         succeeded = service._render_template(
@@ -3106,6 +3163,20 @@ class TestSpoolRecoveryNotifications:
             },
         )
         assert "Bambu PETG" in out and "AMS 1 slot 3" in out and "07C0_2000" in out
+
+        self_healed = service._render_template(
+            by_type["spool_recovery_self_healed"]["body_template"],
+            {
+                "printer_name": "001-H2S",
+                "job_name": "SKU007 plate",
+                "layer": "142",
+                "spool_desc": "Bambu PETG",
+                "slot_desc": "AMS1 slot 1",
+                "code": "0700_8010",
+            },
+        )
+        # The no-swap self-heal copy must be truthfully framed: same spool, nothing to do.
+        assert "same spool" in self_healed and "no action needed" in self_healed
 
 
 class TestOnStorageLowWording:
@@ -3292,3 +3363,46 @@ class TestQueueJobWaitingDedup:
             return_value=time.time() + notification_service_module._QUEUE_WAITING_RENOTIFY_S + 1,
         ):
             assert await self._fire(service, db) == 1
+
+
+class TestComposeHmsErrorSummary:
+    """The pure aggregator that collapses a status push's surviving HMS codes into
+    ONE printer-error message (2026-07-20: one physical feed fault sent 4 separate
+    Discord messages under the old per-code send)."""
+
+    def test_single_code_preserves_module_title_and_prefixes_code(self):
+        error_type, error_detail = compose_hms_error_summary(
+            [{"short_code": "0700_8010", "description": "AMS filament tangle", "module_name": "AMS/Filament"}]
+        )
+        assert error_type == "AMS/Filament Error"
+        assert error_detail == "0700_8010 — AMS filament tangle"
+
+    def test_multi_module_uses_generic_count_title(self):
+        error_type, error_detail = compose_hms_error_summary(
+            [
+                {"short_code": "0700_8010", "description": "AMS tangle", "module_name": "AMS/Filament"},
+                {"short_code": "0300_801E", "description": "Extruder overloaded", "module_name": "Print/Task"},
+            ]
+        )
+        assert error_type == "Printer Errors (2)"
+        assert "0700_8010 — AMS tangle" in error_detail
+        assert "0300_801E — Extruder overloaded" in error_detail
+
+    def test_triple_same_short_code_collapses_to_one_x3_line(self):
+        """Three per-slot 0700_0081 instances render as one line with a ×3 suffix."""
+        entry = {"short_code": "0700_0081", "description": "Failed to read the filament", "module_name": "AMS/Filament"}
+        error_type, error_detail = compose_hms_error_summary([dict(entry), dict(entry), dict(entry)])
+        assert error_type == "AMS/Filament Error"
+        assert error_detail == "0700_0081 — Failed to read the filament ×3"
+        assert "\n" not in error_detail  # collapsed to a single line
+
+    def test_first_seen_order_is_preserved(self):
+        error_type, error_detail = compose_hms_error_summary(
+            [
+                {"short_code": "0700_4025", "description": "Second", "module_name": "AMS/Filament"},
+                {"short_code": "0700_0081", "description": "First", "module_name": "AMS/Filament"},
+            ]
+        )
+        lines = error_detail.split("\n")
+        assert lines[0].startswith("0700_4025")
+        assert lines[1].startswith("0700_0081")

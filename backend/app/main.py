@@ -1383,6 +1383,17 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # ledger self-bounds (prunes absent-too-long codes) and is per-printer.
         new_error_codes = notify_dedup.new_codes(printer_id, current_error_codes, time.time())
 
+        # Recoverable feed-fault / runout short codes among the NEW codes, computed
+        # ONCE here so the notify session's recovery-owned suppression and the
+        # spool-recovery spawn below read the SAME set. hms_short_code is hoisted to
+        # here (it also feeds the plate-occupancy and runout hooks further down).
+        from backend.app.services.hms_errors import _code_word, hms_short_code, runout_slot_from_hms
+        from backend.app.services.spool_recovery import RECOVERABLE_HMS_CODES
+
+        _new_recoverable = {
+            hms_short_code(e.attr, e.code) for e in current_hms_errors if e.full_code in new_error_codes
+        } & RECOVERABLE_HMS_CODES
+
         if new_error_codes:
             # Get the actual new errors for the notification.
             # Severity semantics (Bambu): 1=fatal, 2=serious, 3=common, 4=info.
@@ -1411,17 +1422,32 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         0x12: "Chamber",
                     }
 
-                    from backend.app.services import ams_presence
+                    from backend.app.services import ams_presence, spool_recovery
                     from backend.app.services.hms_catalog import lookup_full_code
                     from backend.app.services.hms_errors import get_error_description
+                    from backend.app.services.notification_service import compose_hms_error_summary
 
                     # Capture camera snapshot once for all error notifications
                     error_image_data = await _capture_snapshot_for_notification(
                         printer_id, printer, logging.getLogger(__name__)
                     )
 
-                    sent_count = 0
-                    notified_short_codes: list[str] = []
+                    # Recovery-owned suppression (2026-07-20): a single physical feed
+                    # fault emits several HMS codes and the recovery state machine sends
+                    # its OWN lifecycle notifications, so raw per-code alerts here would
+                    # double-notify (one fault produced 4 Discord messages). When
+                    # recovery will own the incident, drop the raw alerts. will_own
+                    # already fails closed; the guard is belt-and-braces so a predicate
+                    # error can never silence the raw alerts.
+                    owned = False
+                    if _new_recoverable:
+                        try:
+                            owned = await spool_recovery.will_own(db, printer_id, state)
+                        except Exception:  # noqa: BLE001 — never suppress on a crashed predicate
+                            owned = False
+
+                    entries: list[dict] = []
+                    suppressed_owned: list[str] = []
                     all_new_short_codes: list[str] = []
                     for error in new_errors:
                         module_name = module_names.get(error.module, f"Module 0x{error.module:02X}")
@@ -1459,25 +1485,47 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         # which could shadow unrelated codes sharing the truncation).
                         if error.full_code in HMS_STORAGE_LOW_FULL_CODES:
                             continue
+                        # Recovery-owned suppression: this fault will be carried by the
+                        # spool-recovery state machine's own lifecycle notifications, so a
+                        # raw per-code alert would double-notify. Still stamp the durable
+                        # ledger (recovery's messages satisfy "operator informed", and
+                        # without the row a standing owned code would re-blast at the next
+                        # deploy via seed_standing). The companion predicate is attr-aware:
+                        # never match the bare short string "0700_0001" — it collides with
+                        # the slot-attributed runout family.
+                        if owned and (
+                            short_code in RECOVERABLE_HMS_CODES
+                            or runout_slot_from_hms(error.attr, _code_word(error.code)) is not None
+                        ):
+                            await notify_dedup.record_sent(
+                                db,
+                                notify_dedup.HMS_SCOPE,
+                                notify_dedup.hms_ledger_key(printer_id, error.full_code),
+                                time.time(),
+                            )
+                            suppressed_owned.append(short_code)
+                            logging.getLogger(__name__).debug(
+                                "[HMS] printer %s code %s suppressed — recovery owns the incident",
+                                printer_id,
+                                short_code,
+                            )
+                            continue
 
-                        error_type = f"{module_name} Error"
-                        error_detail = description
-
-                        await notification_service.on_printer_error(
-                            printer_id, printer_name, error_type, db, error_detail, image_data=error_image_data
-                        )
-                        sent_count += 1
-                        notified_short_codes.append(short_code)
-                        # Durable "we alerted on this" stamp (Phase D). Only an
-                        # ACTUAL send is recorded, so the next process's
-                        # seed_standing suppresses exactly the standing incidents
-                        # the operator already knows about and nothing else. Never
-                        # raises (the service swallows + logs its own failures).
+                        # Durable "we informed the operator" stamp (Phase D). Only an
+                        # ACTUAL notification is recorded, so the next process's
+                        # seed_standing suppresses exactly the standing incidents the
+                        # operator already knows about and nothing else. Never raises (the
+                        # service swallows + logs its own failures).
                         await notify_dedup.record_sent(
                             db,
                             notify_dedup.HMS_SCOPE,
                             notify_dedup.hms_ledger_key(printer_id, error.full_code),
                             time.time(),
+                        )
+                        # Aggregated into ONE message after the loop (see below) instead
+                        # of a send per code.
+                        entries.append(
+                            {"short_code": short_code, "description": description, "module_name": module_name}
                         )
 
                     # Full forensic trail: every NEW short code this cycle, INCLUDING
@@ -1491,12 +1539,26 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                             ", ".join(all_new_short_codes),
                         )
 
-                    if sent_count:
+                    # ONE aggregated message per printer per push: a single physical
+                    # fault emits several codes at once, and the old per-code send fired
+                    # one message each (4 for one 2026-07-20 feed fault). The snapshot
+                    # captured above rides the single message.
+                    if entries:
+                        error_type, error_detail = compose_hms_error_summary(entries)
+                        await notification_service.on_printer_error(
+                            printer_id, printer_name, error_type, db, error_detail, image_data=error_image_data
+                        )
+
+                    if entries or suppressed_owned:
+                        _counts: dict[str, int] = {}
+                        for _e in entries:
+                            _counts[_e["short_code"]] = _counts.get(_e["short_code"], 0) + 1
+                        _notified = [f"{c}×{n}" if n > 1 else c for c, n in _counts.items()]
                         logging.getLogger(__name__).info(
-                            "[HMS] Sent notification for %d error(s) on printer %s: %s",
-                            sent_count,
+                            "[HMS] printer %s: notified %s in one message; suppressed as recovery-owned %s",
                             printer_id,
-                            ", ".join(notified_short_codes),
+                            _notified,
+                            sorted(set(suppressed_owned)),
                         )
 
                     # Also publish to MQTT relay
@@ -1524,8 +1586,6 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             # a farm unit is printing here, raise a human-clear-only plate gate + flag
             # the unit so the loop shows the hold instead of silently stalling. Own
             # session, fully guarded — the codes stay in hms_errors (they ARE faults).
-            from backend.app.services.hms_errors import hms_short_code
-
             _new_occupancy = {
                 hms_short_code(e.attr, e.code) for e in current_hms_errors if e.full_code in new_error_codes
             } & _HMS_PLATE_OCCUPANCY_CODES
@@ -1584,13 +1644,9 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             # tangle / assist-motor overload) — or a runout the firmware backup
             # failed to rescue — PAUSEs a farm print with no self-recovery. Spawn
             # the recovery state machine (unload → out-of-rotation → swap →
-            # resume). All gating + orchestration lives in spool_recovery; this is
-            # a guarded fire-and-forget hook only (clone of the runout hook above).
-            from backend.app.services.spool_recovery import RECOVERABLE_HMS_CODES
-
-            _new_recoverable = {
-                hms_short_code(e.attr, e.code) for e in current_hms_errors if e.full_code in new_error_codes
-            } & RECOVERABLE_HMS_CODES
+            # resume). All gating + orchestration lives in spool_recovery; this is a
+            # guarded fire-and-forget hook only. Reuses the _new_recoverable set computed
+            # once above (which also drives the notify recovery-owned suppression).
             if _new_recoverable:
                 try:
                     from backend.app.services.spool_recovery import on_feed_fault_hms

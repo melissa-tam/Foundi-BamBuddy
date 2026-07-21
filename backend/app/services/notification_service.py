@@ -75,6 +75,55 @@ def _looks_like_cloudflare_challenge(response: httpx.Response) -> bool:
     return "just a moment" in body or "cf-chl-bypass" in body or "cf-chl-opt" in body or "challenge-platform" in body
 
 
+def compose_hms_error_summary(entries: list[dict]) -> tuple[str, str]:
+    """Compose ONE printer-error notification from a printer's new HMS codes.
+
+    Aggregation exists because a single physical fault emits several HMS codes at
+    once (a precursor, a companion, then the fault itself). The old per-code send
+    fired one message per code — 2026-07-20 a single feed fault produced FOUR
+    Discord messages within a minute. This collapses a status push's surviving
+    codes into one message.
+
+    ``entries`` arrive AFTER every per-code filter (severity, no-description,
+    suppress-set, expected-read-failure, storage-low, recovery-owned) has already
+    dropped the codes that must not notify — each is
+    ``{"short_code": str, "description": str, "module_name": str}``.
+
+    Behaviour:
+      * codes are deduped by ``short_code`` in first-seen order; a code seen k>1
+        times renders once with a trailing `` ×k`` suffix;
+      * one body line per unique code: ``"{short_code} — {description}"`` (plus the
+        ×k suffix when k>1);
+      * the title is ``"{module_name} Error"`` when every surviving line shares one
+        module (preserving the single-code title copy), else
+        ``"Printer Errors ({n})"`` with ``n`` = the unique-code count;
+      * the detail is the lines joined with newlines.
+    """
+    ordered: list[str] = []
+    counts: dict[str, int] = {}
+    first: dict[str, dict] = {}
+    for entry in entries:
+        code = entry["short_code"]
+        if code not in counts:
+            ordered.append(code)
+            first[code] = entry
+        counts[code] = counts.get(code, 0) + 1
+
+    lines: list[str] = []
+    for code in ordered:
+        line = f"{code} — {first[code]['description']}"
+        if counts[code] > 1:
+            line += f" ×{counts[code]}"
+        lines.append(line)
+
+    modules = {first[code]["module_name"] for code in ordered}
+    if len(modules) == 1:
+        error_type = f"{next(iter(modules))} Error"
+    else:
+        error_type = f"Printer Errors ({len(ordered)})"
+    return error_type, "\n".join(lines)
+
+
 class NotificationService:
     """Service for sending notifications through various providers."""
 
@@ -2311,6 +2360,53 @@ class NotificationService:
             message,
             db,
             "spool_recovery_succeeded",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_spool_recovery_self_healed(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        job_name: str,
+        layer: int | str,
+        spool_desc: str,
+        slot_desc: str,
+        code: str,
+        db: AsyncSession,
+    ):
+        """Fire when a mid-print feed fault cleared itself on a firmware retry.
+
+        A firmware CONTINUE (touchscreen resume) un-wedged the paused change on the
+        SAME feeder — no spool was swapped and nothing was taken out of rotation, so
+        the swap-framed ``spool_recovery_succeeded`` copy would be a lie (2026-07-20
+        incident: the out-of-rotation alert fired at entry, the reset then self-healed
+        on the same spool, and the operator was misled). This is the truthful close for that
+        no-swap self-heal: still printing, nothing for the operator to do. A printer
+        alarm — defaults ON, ``force_immediate`` — mirroring
+        ``on_spool_recovery_succeeded``/``on_spool_out_of_rotation``."""
+        providers = await self._get_providers_for_event(db, "on_spool_recovery_self_healed", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "job_name": job_name,
+            "layer": str(layer),
+            "spool_desc": spool_desc,
+            "slot_desc": slot_desc,
+            "code": code,
+        }
+
+        title, message = await self._build_message_from_template(db, "spool_recovery_self_healed", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "spool_recovery_self_healed",
             printer_id,
             printer_name,
             force_immediate=True,

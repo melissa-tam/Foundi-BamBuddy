@@ -10,13 +10,20 @@ This module is the single owner of the recovery state machine. On a recoverable
 HMS (feed fault, or a runout the firmware backup failed to rescue) during a FARM
 print it reproduces the operator's proven manual recovery sequence:
 
-    (printer already PAUSEd) → [reset a wedged filament-change] → unload → confirm
-    the AMS finished the unload cycle (see :func:`_confirm_unloaded`) → mark the
-    jammed spool out of rotation → select the next eligible loaded spool → load it
-    → confirm ``tray_now == target`` (the first load may not take — resend) →
+    (printer already PAUSEd) → [reset a wedged filament-change] → (SWAP COMMIT: take
+    the jammed spool out of rotation) → unload → confirm the AMS finished the unload
+    cycle (see :func:`_confirm_unloaded`) → select the next eligible loaded spool →
+    load it → confirm ``tray_now == target`` (the first load may not take — resend) →
     resume → confirm RUNNING and hold stable (a lingering fault may need one extra
     pause/resume cycle) → SUCCESS. If nothing works: escalate — notify and leave
     the printer PAUSED for a human, never resume blind.
+
+    Out-of-rotation stamping/notification is bound to the SWAP-COMMIT boundary (the
+    step just before the first unload), NOT to entry: a no-swap firmware self-heal
+    (the reset frees the change on the same spool) must never stamp or announce a
+    spool the print keeps running on, and fires its own truthful self-heal
+    notification instead (2026-07-20 incident — an entry-time stamp+announce, then a
+    same-spool self-heal 90 s later, misled the operator).
 
     W1 (009-H2S 2026-07-20): after a feed fault the AMS can sit WEDGED mid
     filament-change (gcode_state PAUSE, ``ams_status_main`` non-idle) where it
@@ -659,6 +666,39 @@ async def on_feed_fault_hms(printer_id: int, new_short_codes, state) -> asyncio.
         return None
 
 
+async def will_own(db: AsyncSession, printer_id: int, state) -> bool:
+    """Would a NEW recoverable HMS arriving on this printer right now be OWNED by
+    the recovery state machine (which then carries the incident through its own
+    lifecycle notifications: recovering / succeeded / self-healed / out-of-rotation /
+    failed)?
+
+    (1) It exists so the HMS notify pipeline (main.py) can SUPPRESS the raw per-code
+        alert for a fault recovery will own — the incident's lifecycle notifications
+        are the operator-facing signal, and a duplicate raw alert would double-notify.
+    (2) It deliberately mirrors ONLY the :func:`on_feed_fault_hms` entry gates whose
+        failure means "nobody will notify": the escalation/abort latch, the enabled
+        setting, and a matching printing farm item. The gates it does NOT mirror — the
+        ``_handled`` dedup, an already-``_active_tasks`` incident, and the
+        immediate-escalate verdicts (multi-feeder / unresolved tray / success cap) —
+        are all cases recovery ALREADY OWNS, so suppressing the raw alert stays correct
+        there (a raw alert would be the duplicate).
+    (3) It MUST be kept in sync with :func:`on_feed_fault_hms`'s gates.
+
+    Fail toward notifying: any exception returns False (never suppress a raw alert on
+    the strength of a predicate that errored)."""
+    try:
+        # job_id derived exactly as in on_feed_fault_hms.
+        job_id = (getattr(state, "subtask_id", None) or "").strip()
+        if (printer_id, job_id) in _escalated:
+            return False
+        if not await _read_bool(db, "spool_recovery_enabled", _DEFAULT_ENABLED):
+            return False
+        return await _resolve_farm_item(db, printer_id, job_id) is not None
+    except Exception:  # noqa: BLE001 — a suppression predicate must never crash the notify path
+        logger.exception("spool_recovery: will_own predicate failed for printer %s", printer_id)
+        return False
+
+
 # --- driver -----------------------------------------------------------------
 
 
@@ -680,8 +720,10 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             logger.info("spool_recovery: printer %s never PAUSEd (firmware rescue / transient) — incident closed", pid)
             return
 
-        # (2) Show the operator a live status; take the jammed spool out of
-        #     rotation (feed-fault incidents only — a runout spool is SPENT).
+        # (2) Show the operator a live status. Out-of-rotation stamping/notification
+        #     is DEFERRED to the swap-commit boundary in the loop below (feed-fault
+        #     incidents only — a runout spool is SPENT): a no-swap firmware self-heal
+        #     must neither stamp nor announce a spool the print keeps using.
         await _stamp_recovering(incident)
 
         # A filament RUNOUT escalates IMMEDIATELY — no unload/select/load. Firmware
@@ -695,9 +737,6 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             await _escalate(incident, "runout_needs_refill")
             return
 
-        if incident.jammed_global_tray is not None:
-            await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
-
         # (3) Try up to _MAX_CANDIDATES replacement trays. Every round runs a
         #     stuck-change reset first (W1) and then its own unload cycle — the
         #     009-H2S fix: after a feed fault the AMS can sit wedged mid-change,
@@ -706,6 +745,10 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
         #     loading again.
         tried: set[int] = set()
         evidence = _RecoveryEvidence()
+        # The jammed spool is taken out of rotation exactly ONCE, at the swap-commit
+        # boundary (a reset that leaves recovery committed to a swap or wedged), never
+        # at entry — so a no-swap self-heal leaves the spool untouched.
+        oor_stamped = False
         for _round in range(_MAX_CANDIDATES):
             # W1: reset an AMS wedged mid filament-change before touching the unload.
             reset = await _reset_stuck_change(incident, client)
@@ -713,22 +756,38 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                 await _abort(incident)
                 return
             if reset == "fail":
+                # The feeder is genuinely wedged — hands are needed and the jammed
+                # spool is legitimately out of rotation. Commit the stamp (once) at
+                # this boundary, THEN escalate.
+                if not oor_stamped and incident.jammed_global_tray is not None:
+                    await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
+                    oor_stamped = True
                 await _escalate(incident, "stuck_reset_failed")
                 return
             if reset == "recovered":
                 # Same-feeder self-heal: the firmware reset cleared the jam with no
-                # swap. Clear the jammed spool's out-of-rotation flag exactly the way
-                # _abort does when an operator resumes on the jammed feeder, count the
-                # self-heal toward the per-job flap cap, and close as a no-swap
-                # success — never resume/swap on top of a running print.
+                # swap. The swap-commit boundary was never reached, so THIS incident
+                # stamped nothing; the _clear_oor call below is now a safety net for a
+                # flag a PREVIOUS incident on this feeder may have left. Count the
+                # self-heal toward the per-job flap cap and close as a no-swap success
+                # (which fires the truthful self-heal notification) — never resume/swap
+                # on top of a running print.
                 from backend.app.core.database import async_session
 
                 async with async_session() as db:
                     await _clear_oor_if_resumed_on_jammed_feeder(db, incident)
                 await _succeed(incident, incident.jammed_global_tray, swapped=False)
                 return
-            # reset in ("skipped", "ok") → fall through to the unload step. On "ok"
-            # the AMS now answers; on "skipped" (idle AMS) nothing changed.
+            # reset in ("skipped", "ok") → the swap is COMMITTED: take the jammed spool
+            # out of rotation ONCE, right before the first unload. Boundary semantics:
+            # the stamp means "recovery is abandoning this spool", so every escalation
+            # that can follow this point (ams_drying, unload_failed, load exhaustion)
+            # correctly KEEPS the stamp; only a clean swap-and-resume or an
+            # external-takeover abort resolves it (the latter's _clear reverses it when
+            # the operator resumed on the jammed feeder).
+            if not oor_stamped and incident.jammed_global_tray is not None:
+                await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
+                oor_stamped = True
             unload = await _unload_and_confirm(incident, client)
             if unload not in ("ok", "skipped"):
                 _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict=f"unload_{unload}")
@@ -1719,9 +1778,10 @@ async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = T
     the item's ams_mapping and fire the ``spool_recovery_succeeded`` notification
     (its copy is swap-and-out-of-rotation framed). ``swapped=False`` is the W1
     no-swap self-heal (a firmware reset freed the wedged change on the SAME feeder,
-    ``target == jammed``): the mapping is unchanged and the swap-framed template —
-    which would claim a swap AND that the donor is out of rotation, both false here
-    — is deliberately NOT sent; the cleared pause + INFO log are the signal.
+    ``target == jammed``): the mapping is unchanged and, because the swap-framed
+    template would falsely claim both a swap and an out-of-rotation donor, the
+    dedicated ``spool_recovery_self_healed`` notification is sent instead — truthful
+    "cleared on the same spool, still printing, no action needed" copy.
     """
     from backend.app.core.database import async_session
     from backend.app.models.printer import Printer
@@ -1757,6 +1817,36 @@ async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = T
                     )
                 except Exception:  # noqa: BLE001 — notification failure is non-fatal
                     logger.exception("spool_recovery: success notification failed for printer %s", incident.printer_id)
+            else:
+                # No-swap self-heal: nothing was swapped and nothing is out of
+                # rotation, so send the truthful self-heal alert (the swap-framed
+                # succeeded copy would be false). slot_desc mirrors _mark_out_of_
+                # rotation's "AMS{ams_id} slot {tray_id}" format; a null jammed tray
+                # falls back to a safe generic.
+                jammed = incident.jammed_global_tray
+                if jammed is None:
+                    slot_desc = "the same slot"
+                else:
+                    ams_id, tray_id = _decode_global_tray(jammed)
+                    slot_desc = f"AMS{ams_id} slot {tray_id}" if ams_id is not None else f"tray {jammed}"
+                spool_desc = await _describe_slot(db, incident.printer_id, jammed)
+                printer = await db.get(Printer, incident.printer_id)
+                printer_name = (printer.name if printer else None) or f"printer {incident.printer_id}"
+                try:
+                    await notification_service.on_spool_recovery_self_healed(
+                        printer_id=incident.printer_id,
+                        printer_name=printer_name,
+                        job_name=incident.job_name,
+                        layer=incident.layer_at_fault,
+                        spool_desc=spool_desc,
+                        slot_desc=slot_desc,
+                        code=incident.code,
+                        db=db,
+                    )
+                except Exception:  # noqa: BLE001 — notification failure is non-fatal
+                    logger.exception(
+                        "spool_recovery: self-heal notification failed for printer %s", incident.printer_id
+                    )
         if swapped:
             logger.info(
                 "spool_recovery: printer %s RECOVERED at layer %s — swapped %s → %s and resumed",

@@ -3435,10 +3435,12 @@ async def run_migrations(conn):
         ("on_first_article_approved", "1", "TRUE"),
         # Mid-print spool-jam recovery (automatic feed-fault recovery): the
         # swap-and-resume succeeded / failed, and a jammed spool was taken out
-        # of rotation.
+        # of rotation. self_healed = a firmware retry cleared the fault on the
+        # SAME spool (no swap) — a truthful close distinct from the swap copy.
         ("on_spool_recovery_succeeded", "1", "TRUE"),
         ("on_spool_recovery_failed", "1", "TRUE"),
         ("on_spool_out_of_rotation", "1", "TRUE"),
+        ("on_spool_recovery_self_healed", "1", "TRUE"),
     ):
         _default = _sqlite_default if is_sqlite() else _pg_default
         await _safe_execute(conn, f"ALTER TABLE notification_providers ADD COLUMN {_col} BOOLEAN DEFAULT {_default}")

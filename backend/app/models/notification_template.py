@@ -262,6 +262,12 @@ DEFAULT_TEMPLATES = [
         "title_template": "Spool out of rotation — {printer_name}",
         "body_template": "{spool_desc} in {slot_desc} triggered feed fault {code}. It will not be auto-selected until removed and re-inserted (or cleared in Inventory).",
     },
+    {
+        "event_type": "spool_recovery_self_healed",
+        "name": "Spool Feed Fault Self-Healed",
+        "title_template": "Feed fault self-healed — {printer_name}",
+        "body_template": "{printer_name}: feed fault {code} at layer {layer} during '{job_name}' cleared after a firmware retry on the same spool ({spool_desc} in {slot_desc}) — still printing, no action needed.",
+    },
     # Post-print eject cooldown running long. A NEW event (not a reword of
     # plate_not_empty) so an existing install picks up this honest copy on
     # restart — seeding only INSERTs missing event types. {detail} carries the

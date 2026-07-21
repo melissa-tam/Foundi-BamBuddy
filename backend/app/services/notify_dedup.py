@@ -23,9 +23,14 @@ printer per process) and pre-marks as *already seen* every live code we have
 provably alerted on before. A live code with NO durable row is left alone — a
 fault that arose while the server was down MUST still notify.
 
-The durable table is written ONLY where an alert actually went out
+The durable table is written ONLY where the operator was actually informed
 (:func:`record_sent`), never speculatively: a row means "we told the operator
-about this", so absence always fails towards notifying.
+about this", so absence always fails towards notifying. "Informed" includes the
+recovery-owned case: when spool_recovery owns an incident the raw per-code HMS
+alert is SUPPRESSED (recovery's own lifecycle notifications are the operator
+signal), but the code is still recorded at suppression time — otherwise a standing
+owned code, having never stamped a row, would re-blast at the next deploy via
+:func:`seed_standing`.
 
 Module-level in-memory state is process-lifetime, matching the fork's other
 event-edge bookkeeping (``ams_presence._last_presence``,
