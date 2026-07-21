@@ -395,7 +395,8 @@ class TestFarmItemEnforcesPlateClearGate:
             # the global toggle is OFF, the exact incident condition.
             patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=False)),
             patch.object(scheduler, "_check_auto_drying", AsyncMock()),
-            patch.object(scheduler, "_stagger_budget", AsyncMock(return_value=99)),
+            # Phase E: budget is owned by the module singleton (patch it there).
+            patch("backend.app.services.print_scheduler.stagger_policy.budget", AsyncMock(return_value=99)),
             patch.object(scheduler, "_compute_ams_mapping_for_printer", AsyncMock(return_value=MatchOutcome(mapping=None))),
             patch.object(scheduler, "_block_on_filament_deficit", AsyncMock(return_value=False)),
             patch.object(scheduler, "_start_print", start_print_mock),

@@ -415,6 +415,25 @@ class AppSettings(BaseModel):
     stagger_interval_minutes: int = Field(
         default=3, ge=1, le=60, description="Minutes between staggered printer groups"
     )
+    # Bed-temperature dynamic release (latency Phase E). A started printer holds a
+    # stagger slot only while its bed is still ramping; the slot frees the moment
+    # the bed reaches target − epsilon. The interval window stays the hard ceiling.
+    stagger_dynamic_release: bool = Field(
+        default=True,
+        description="Free a stagger slot when a printer's bed reaches target instead of waiting out the whole interval window",
+    )
+    stagger_release_epsilon_c: float = Field(
+        default=2.0,
+        ge=0,
+        le=10,
+        description="Degrees below bed target at which a printer's stagger slot is released",
+    )
+    stagger_heatup_grace_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=600,
+        description="Seconds a just-started printer occupies a stagger slot before its bed reports a target (firmware pre-heat prep)",
+    )
 
     # Event-driven dispatch tunables (latency Phase A). The scheduler wakes on a
     # kick when work arrives; the interval is only the fallback safety-net poll.
@@ -743,6 +762,9 @@ class AppSettingsUpdate(BaseModel):
     default_nozzle_offset_cali: bool | None = None
     stagger_group_size: int | None = Field(default=None, ge=1, le=50)
     stagger_interval_minutes: int | None = Field(default=None, ge=1, le=60)
+    stagger_dynamic_release: bool | None = None
+    stagger_release_epsilon_c: float | None = Field(default=None, ge=0, le=10)
+    stagger_heatup_grace_seconds: int | None = Field(default=None, ge=30, le=600)
     queue_check_interval_seconds: int | None = Field(default=None, ge=5, le=300)
     dispatch_kick_debounce_seconds: float | None = Field(default=None, ge=0.2, le=10)
     usb_preflight_fresh_window_seconds: int | None = Field(default=None, ge=0, le=120)

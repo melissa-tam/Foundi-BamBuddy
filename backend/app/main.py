@@ -1105,6 +1105,19 @@ async def _maybe_notify_printer_offline(printer_id: int) -> None:
 async def on_printer_status_change(printer_id: int, state: PrinterState):
     """Handle printer status changes - broadcast via WebSocket."""
     logger = logging.getLogger(__name__)
+
+    # Stagger bed-ramp watch (latency Phase E): every status push is the
+    # observation point for a just-started printer's bed reaching target. If this
+    # printer is armed, the policy fires a one-shot ``bed_at_target`` dispatch kick
+    # so the freed stagger slot is admitted immediately instead of at the next
+    # fallback poll. Cheap no-op for un-watched printers; guarded like the Phase A
+    # kick hooks so an observation-side failure never breaks status broadcast.
+    try:
+        from backend.app.services.stagger import stagger_policy
+
+        stagger_policy.on_status_push(printer_id, state)
+    except Exception as _stagger_exc:  # noqa: BLE001
+        logger.debug("stagger on_status_push failed for printer %s: %s", printer_id, _stagger_exc)
     # Connected-edge reconciliation (#1542 follow-up). When the printer
     # transitions disconnected → connected — which covers both Bambuddy
     # startup (no prior connection) and a mid-session MQTT reconnect — fire

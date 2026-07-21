@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -49,6 +49,7 @@ from backend.app.services.spool_selection import (
     match_filaments_to_slots,
     normalize_color_for_compare,
 )
+from backend.app.services.stagger import stagger_policy
 from backend.app.services.usb_storage import upload_in_flight
 from backend.app.utils.filament_types import canonical_filament_type as _canonical_filament_type
 from backend.app.utils.filename import derive_remote_filename
@@ -288,13 +289,17 @@ class PrintScheduler:
                 if self._printer_in_dispatch_hold(held_printer_id):
                     busy_printers.add(held_printer_id)
 
-            # Power-stagger budget (#Phase4): how many more prints may BEGIN
-            # heating this tick without exceeding stagger_group_size starts inside
-            # the current stagger_interval_minutes window. Derived by query from
-            # started_at so it's restart-safe. Decremented on each real start
-            # below; when it hits 0 the remaining eligible items simply wait for a
-            # later tick (logged at debug).
-            stagger_remaining = await self._stagger_budget(db)
+            # Power-stagger budget (#Phase4 / Phase E): how many more prints may
+            # BEGIN heating this tick. Owned by the stagger_policy module: budget =
+            # group_size − (in-flight + still-ramping recent starts), so the bed-
+            # temperature dynamic release frees a slot the moment a bed reaches
+            # target (the time window stays the hard ceiling). Restart-safe — it
+            # re-derives from durable started_at rows + live status. The local
+            # ``stagger_remaining`` below is only the INTRA-tick gate; the module's
+            # in-flight set (armed by note_dispatch_planned at each plan site) is
+            # the cross-tick source of truth that stops a kick landing mid-gather
+            # from over-admitting a heater.
+            stagger_remaining = await stagger_policy.budget(db)
 
             # Log skip reasons once per queue check (not per item)
             skip_reasons: dict[str, int] = {}
@@ -499,6 +504,11 @@ class PrintScheduler:
                     # concurrent re-fetch sees the full assignment.
                     self._plan_dispatch(dispatch_plan, planned_printers, item.id, dispatch_printer_id)
                     busy_printers.add(dispatch_printer_id)
+                    # Enter the module in-flight set (Phase E): this is the durable-
+                    # across-kicks record of an admitted-but-not-yet-started heater
+                    # and arms the bed-at-target ramp-watch. The local decrement
+                    # below stays as the intra-tick gate.
+                    stagger_policy.note_dispatch_planned(dispatch_printer_id, item.id)
                     # Consume a stagger-window slot at PLAN time: the gate below must
                     # see this pick when deciding later items THIS tick, and the real
                     # "printing" outcome isn't known until the concurrent phase.
@@ -717,6 +727,9 @@ class PrintScheduler:
                         await db.commit()
                         self._plan_dispatch(dispatch_plan, planned_printers, item.id, assigned_printer_id)
                         busy_printers.add(assigned_printer_id)
+                        # Enter the module in-flight set + arm the ramp-watch (Phase
+                        # E; see direct-path note).
+                        stagger_policy.note_dispatch_planned(assigned_printer_id, item.id)
                         # Consume a stagger slot at plan time (see direct-path note).
                         stagger_remaining -= 1
 
@@ -1596,29 +1609,6 @@ class PrintScheduler:
         value = await self._get_int_setting(db, "dispatch_parallel_limit", default=3)
         return max(1, min(10, value))
 
-    async def _stagger_budget(self, db: AsyncSession) -> int:
-        """How many more prints may START this stagger window (power management).
-
-        Consumes the persisted ``stagger_group_size`` (max printers allowed to
-        begin heating within one window) and ``stagger_interval_minutes`` (window
-        length). Recent starts are derived BY QUERY from ``print_queue.started_at``
-        so a backend restart can't unleash a thundering herd — the sliding window
-        is reconstructed from durable state, not in-memory counters. A large
-        ``stagger_group_size`` effectively disables staggering (the window budget
-        is never reached). Returns the remaining budget (>= 0) for this tick.
-        """
-        group_size = await self._get_int_setting(db, "stagger_group_size", default=2)
-        interval_minutes = await self._get_int_setting(db, "stagger_interval_minutes", default=3)
-        if group_size <= 0 or interval_minutes <= 0:
-            # Defensive: schema clamps these to >=1, but a hand-edited row could
-            # slip through — treat non-positive config as "staggering off".
-            return group_size if group_size > 0 else 1_000_000
-        window_start = datetime.now(timezone.utc) - timedelta(minutes=interval_minutes)
-        recent_starts = await db.scalar(
-            select(func.count(PrintQueueItem.id)).where(PrintQueueItem.started_at >= window_start)
-        )
-        return max(0, group_size - int(recent_starts or 0))
-
     async def _get_drying_presets(self, db: AsyncSession) -> dict[str, dict[str, int]]:
         """Get drying presets (user-configured or built-in defaults)."""
         result = await db.execute(select(Settings).where(Settings.key == "drying_presets"))
@@ -2415,42 +2405,52 @@ class PrintScheduler:
           hold paths inside ``_start_print`` (USB pre-flight / capability) leave
           the item pending by design and are NOT failures — they return normally.
         """
-        async with sem, async_session() as session:
-            item = await session.get(PrintQueueItem, item_id)
-            if item is None:
-                logger.warning("Dispatch (printer %s): queue item %s vanished — skipping", printer_id, item_id)
-                return
-            if item.status != "pending":
-                logger.info(
-                    "Dispatch (printer %s): queue item %s no longer pending (status=%s) — skipping",
-                    printer_id,
-                    item_id,
-                    item.status,
-                )
-                return
-            try:
-                await self._start_print(session, item)
-            except Exception as exc:  # noqa: BLE001 — one task must not kill the gather
-                logger.exception("Dispatch (printer %s): queue item %s crashed during start", printer_id, item_id)
+        # Phase E: guarantee the stagger in-flight slot frees on EVERY exit path —
+        # success (started_at/status flip lets the durable window record take
+        # over), failure/skip/hold (slot frees immediately) — so a kick can't
+        # over-admit a heater against a stale in-flight entry. The ramp-watch is
+        # left armed (it fires when the bed reaches target while printing).
+        try:
+            async with sem, async_session() as session:
+                item = await session.get(PrintQueueItem, item_id)
+                if item is None:
+                    logger.warning("Dispatch (printer %s): queue item %s vanished — skipping", printer_id, item_id)
+                    return
+                if item.status != "pending":
+                    logger.info(
+                        "Dispatch (printer %s): queue item %s no longer pending (status=%s) — skipping",
+                        printer_id,
+                        item_id,
+                        item.status,
+                    )
+                    return
                 try:
-                    # _start_print may have rolled the session back mid-failure;
-                    # re-fetch before routing through the terminal-failure path.
-                    fresh = await session.get(PrintQueueItem, item_id)
-                    if fresh is not None and fresh.status == "pending":
-                        await self._fail_queue_item(session, fresh, f"Dispatch error: {exc}")
-                except Exception:
-                    logger.exception("Dispatch (printer %s): could not fail item %s after crash", printer_id, item_id)
-                return
+                    await self._start_print(session, item)
+                except Exception as exc:  # noqa: BLE001 — one task must not kill the gather
+                    logger.exception("Dispatch (printer %s): queue item %s crashed during start", printer_id, item_id)
+                    try:
+                        # _start_print may have rolled the session back mid-failure;
+                        # re-fetch before routing through the terminal-failure path.
+                        fresh = await session.get(PrintQueueItem, item_id)
+                        if fresh is not None and fresh.status == "pending":
+                            await self._fail_queue_item(session, fresh, f"Dispatch error: {exc}")
+                    except Exception:
+                        logger.exception(
+                            "Dispatch (printer %s): could not fail item %s after crash", printer_id, item_id
+                        )
+                    return
 
-            # Outcome-based bookkeeping (moved from the old inline loop, now that
-            # dispatch runs concurrently): a real dispatch ("printing") ends this
-            # unit's hold-unpinned notification-suppression window — a later hold on
-            # a NEW assignment is a fresh transition. A USB/capability HOLD leaves
-            # the item pending and keeps the guard. Re-read the status durably
-            # rather than touching a possibly-expired attribute after the commits.
-            outcome = await session.get(PrintQueueItem, item_id)
-            if outcome is not None and outcome.status == "printing":
-                self._hold_unpinned_items.discard(item_id)
+                # Outcome-based bookkeeping (moved from the old inline loop, now that
+                # dispatch runs concurrently): a real dispatch ("printing") ends this
+                # unit's hold-unpinned notification-suppression window — a later hold on
+                # a NEW assignment is a fresh transition. A USB/capability HOLD leaves
+                # the item pending and keeps the guard. Re-read the status durably
+                # rather than touching a possibly-expired attribute after the commits.
+                outcome = await session.get(PrintQueueItem, item_id)
+                if outcome is not None and outcome.status == "printing":
+                    self._hold_unpinned_items.discard(item_id)
+        finally:
+            stagger_policy.note_dispatch_settled(item_id)
 
     async def _start_print(self, db: AsyncSession, item: PrintQueueItem):
         """Upload file and start print for a queue item.

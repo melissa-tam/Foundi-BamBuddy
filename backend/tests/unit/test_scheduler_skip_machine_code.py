@@ -31,7 +31,9 @@ def scheduler(monkeypatch, test_engine):
     monkeypatch.setattr(s, "_is_printer_idle", lambda pid: True)
     monkeypatch.setattr(s, "_check_previous_success", AsyncMock(return_value=False))
     monkeypatch.setattr(s, "_get_job_name", AsyncMock(return_value="job"))
-    monkeypatch.setattr(s, "_stagger_budget", AsyncMock(return_value=99))
+    # Phase E: budget moved to the module singleton — stub it there + reset state.
+    sched_mod.stagger_policy.reset()
+    monkeypatch.setattr(sched_mod.stagger_policy, "budget", AsyncMock(return_value=99))
     monkeypatch.setattr(s, "_check_auto_drying", AsyncMock())
     monkeypatch.setattr(sched_mod.printer_manager, "is_connected", lambda pid: True)
     monkeypatch.setattr(sched_mod.notification_service, "on_queue_job_skipped", AsyncMock())

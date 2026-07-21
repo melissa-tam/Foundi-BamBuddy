@@ -200,7 +200,9 @@ def cq_scheduler(monkeypatch, test_engine):
     monkeypatch.setattr(sched_mod, "async_session", maker)
 
     s = PrintScheduler()
-    monkeypatch.setattr(s, "_stagger_budget", AsyncMock(return_value=99))
+    # Phase E: budget moved to the module singleton — stub it there + reset state.
+    sched_mod.stagger_policy.reset()
+    monkeypatch.setattr(sched_mod.stagger_policy, "budget", AsyncMock(return_value=99))
     monkeypatch.setattr(s, "_check_auto_drying", AsyncMock())
     monkeypatch.setattr(s, "_get_job_name", AsyncMock(return_value="job"))
     monkeypatch.setattr(s, "_compute_ams_mapping_for_printer", AsyncMock(return_value=MatchOutcome(mapping=[0])))

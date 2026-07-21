@@ -145,6 +145,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "ldap_auto_provision",
             "local_login_enabled",
             "erp_db_ssl",
+            "stagger_dynamic_release",
         ]:
             settings_dict[setting.key] = setting.value.lower() == "true"
         elif setting.key in [
@@ -158,6 +159,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "farm_cooldown_plateau_eject_margin_c",
             "dispatch_kick_debounce_seconds",
             "usb_preflight_max_wait_seconds",
+            "stagger_release_epsilon_c",
         ]:
             settings_dict[setting.key] = float(setting.value)
         elif setting.key in [
@@ -171,6 +173,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "mqtt_port",
             "stagger_group_size",
             "stagger_interval_minutes",
+            "stagger_heatup_grace_seconds",
             "queue_check_interval_seconds",
             "usb_preflight_fresh_window_seconds",
             "dispatch_parallel_limit",

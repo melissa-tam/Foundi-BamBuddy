@@ -40,7 +40,10 @@ def pd_scheduler(monkeypatch, test_engine):
     monkeypatch.setattr(sched_mod, "async_session", maker)
 
     s = PrintScheduler()
-    monkeypatch.setattr(s, "_stagger_budget", AsyncMock(return_value=99))
+    # Phase E: budget is owned by the module singleton — stub it there + reset the
+    # in-flight set so a prior test's dispatch can't leak into this tick.
+    sched_mod.stagger_policy.reset()
+    monkeypatch.setattr(sched_mod.stagger_policy, "budget", AsyncMock(return_value=99))
     monkeypatch.setattr(s, "_check_auto_drying", AsyncMock())
     monkeypatch.setattr(s, "_block_on_filament_deficit", AsyncMock(return_value=False))
     monkeypatch.setattr(s, "_is_printer_idle", MagicMock(return_value=True))
