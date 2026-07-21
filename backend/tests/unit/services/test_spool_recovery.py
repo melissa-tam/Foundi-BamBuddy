@@ -2110,6 +2110,90 @@ async def test_stuck_reset_budget_spent_no_second_resume(monkeypatch):
     assert client.calls.count(("resume",)) == 1  # NO second resume
 
 
+async def test_incident_pin_engaged_feeder_assist_fault_skips_reset_and_swaps(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """THE 006-H2S INCIDENT PIN (2026-07-21 04:14): an extruder-side 0300_801E feed
+    fault mid-print with the feeder still ENGAGED — gcode_state PAUSE, tray_now 3,
+    ams_status_main 3 (assist). There is no interrupted filament-change for a resume
+    to continue, so the W1 reset MUST be skipped: the first command on the wire is the
+    unload (not a resume), and the proven unload → load → resume swap machine runs —
+    exactly the sequence the operator used to recover by hand. Zero human touch.
+
+    (Regression pin for the pre-fix bug where ams_status_main != 0 unconditionally
+    entered the reset, which predictably failed and escalated stuck_reset_failed
+    without ever trying the swap the AMS would have accepted.)"""
+    install_settings()
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id, ams_mapping="[3, -1, -1, -1]")
+    jammed = await _bind_spool(db_session, printer.id, 0, 3)  # jammed feeder = global tray 3
+    succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+    # tray_now 3 (engaged) + assist(3); replacement tray1 is the only other loaded tray.
+    state = _make_state(tray_now=3, ams_status_main=3, trays=[_ams_tray(1), _ams_tray(3)], hms=[_extruder_hms()])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0300_801E"}, state)
+    assert task is not None
+    await task
+
+    published = [c for c in client.calls if c[0] in ("resume", "pause", "unload", "load")]
+    assert published, "recovery published no AMS commands at all"
+    assert published[0] == ("unload",), f"reset skipped → the first wire command must be the unload, got {published}"
+    assert published.index(("unload",)) < published.index(("resume",))  # unload precedes the swap's resume
+    assert client.calls.count(("resume",)) == 1  # only the swap resume — no reset resume was ever published
+    assert ("pause",) not in client.calls  # no stuck-change self-pause on an assist fault
+    assert ("load", 1) in client.calls  # swapped onto the replacement tray
+    assert state.state == "RUNNING"  # self-healed via the swap
+    succeeded.assert_awaited_once()  # closed as a swapped success
+
+    db_session.expunge_all()
+    refreshed = await db_session.get(PrintQueueItem, item.id)
+    assert refreshed.waiting_reason is None
+    assert json.loads(refreshed.ams_mapping) == [1, -1, -1, -1]  # jammed 3 → replacement 1
+    jammed_after = await db_session.get(Spool, jammed.id)
+    assert jammed_after.feed_fault_at is not None  # jammed spool taken out of rotation at the swap-commit boundary
+    assert jammed_after.feed_fault_code == "0300_801E"
+
+
+@pytest.mark.parametrize("ams_main", [2, 3, 4])
+async def test_reset_skipped_for_non_filament_change_states(ams_main, monkeypatch):
+    """Only ams_status_main == 1 (filament_change) is resume-resettable (009 evidence).
+    assist(3), identifying(2) and calibration(4) are NOT stuck changes: the reset is a
+    no-op ('skipped') that publishes NO resume and spends NO reset budget, so the
+    unload→swap machine owns the round (006-H2S 2026-07-21)."""
+    state = _make_state(tray_now=3, ams_status_main=ams_main)
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+    incident = _incident(7, step_timeout_s=1.0)
+
+    verdict = await spool_recovery._reset_stuck_change(incident, client)
+
+    assert verdict == "skipped"
+    assert client.calls == []  # nothing published on a non-filament-change AMS
+    assert (7, "task-1") not in spool_recovery._stuck_resets  # no reset budget spent
+
+
+async def test_confirm_unloaded_ok_after_engaged_assist_returns_to_idle(monkeypatch):
+    """`_confirm_unloaded` path (a) for the 006-H2S engaged-feeder case: the AMS starts
+    non-idle at ams_status_main 3 with tray_now 3 (filament still engaged); the change
+    cycle is observed running and completion is its return to idle with nothing feeding
+    (the operator's unload settled tray_now 3 → 255 in seconds)."""
+    state = _make_state(tray_now=3, ams_status_main=3)
+
+    def _on_poll(n, st):
+        if n >= 3:  # the commanded unload's change cycle completes
+            st.ams_status_main = 0
+            st.tray_now = 255
+
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client, on_poll=_on_poll)
+
+    verdict = await spool_recovery._confirm_unloaded(_incident(7, step_timeout_s=1.0))
+
+    assert verdict == "ok"
+
+
 # ===========================================================================
 # W2: durable repeat-jam quarantine off the recovery_escalation ledger.
 # ===========================================================================

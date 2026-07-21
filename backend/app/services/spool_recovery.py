@@ -26,14 +26,18 @@ print it reproduces the operator's proven manual recovery sequence:
     same-spool self-heal 90 s later, misled the operator).
 
     W1 (009-H2S 2026-07-20): after a feed fault the AMS can sit WEDGED mid
-    filament-change (gcode_state PAUSE, ``ams_status_main`` non-idle) where it
-    silently ignores every unload — recovery's two AND the operator's two were all
-    no-ops for hours. The ONLY verb that freed it was a ``resume`` (the touchscreen
-    CONTINUE for the standing 07008010). So every candidate round now runs
-    :func:`_reset_stuck_change` FIRST: on an idle AMS it is a no-op; on a wedged one
-    it re-issues the firmware CONTINUE and reads the outcome — the firmware may
-    self-heal outright (no swap), re-fault and re-pause on its own, or hang RUNNING
-    in an incomplete change (the live case) which we re-pause before the swap round.
+    filament-change (gcode_state PAUSE, ``ams_status_main == 1``) where it silently
+    ignores every unload — recovery's two AND the operator's two were all no-ops for
+    hours. The ONLY verb that freed it was a ``resume`` (the touchscreen CONTINUE for
+    the standing 07008010). So every candidate round now runs
+    :func:`_reset_stuck_change` FIRST: on any other ``ams_status_main`` it is a no-op;
+    on a wedged filament-change it re-issues the firmware CONTINUE and reads the
+    outcome — the firmware may self-heal outright (no swap), re-fault and re-pause on
+    its own, or hang RUNNING in an incomplete change (the live case) which we re-pause
+    before the swap round. A non-``1`` non-idle state is NOT a wedge: 006-H2S
+    2026-07-21 faulted at ``ams_status_main == 3`` (assist) with the feeder still
+    engaged and the unload was accepted immediately — that round skips the reset and
+    runs the swap machine directly.
 
     W2: a printer whose recovery escalates repeatedly within a rolling window is
     quarantined off the durable ``recovery_escalation`` ledger — a recurring AMS jam
@@ -92,7 +96,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE
+from backend.app.services.bambu_mqtt import AMS_STATUS_FILAMENT_CHANGE, AMS_STATUS_IDLE
 from backend.app.services.hms_errors import hms_short_code
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_respool import RUNOUT_HMS_CODES, _decode_global_tray
@@ -943,10 +947,14 @@ async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
     ``abort`` — live state was lost mid-reset (disconnect / external actor).
 
     Entry gate (else ``skipped``): the wedge must be LIVE — gcode_state PAUSE AND
-    ``ams_status_main`` non-idle (``!= AMS_STATUS_IDLE``). Wire evidence (009-H2S
-    2026-07-20): a resume is the ONLY verb that unwedged the stuck change after
-    FOUR unloads (recovery's two + the operator's two) were silently ignored — it
-    is literally the touchscreen CONTINUE for the standing 07008010.
+    ``ams_status_main == 1`` (filament_change). Non-idle alone is NOT a wedge: only
+    main=1 is resume-resettable. Wire evidence (009-H2S 2026-07-20): a resume is the
+    ONLY verb that unwedged the stuck change after FOUR unloads (recovery's two + the
+    operator's two) were silently ignored — it is literally the touchscreen CONTINUE
+    for the standing 07008010. Counter-evidence (006-H2S 2026-07-21): an extruder
+    ``0300_801E`` fault with ``ams_status_main == 3`` (assist) and the feeder still
+    engaged is NOT a stuck change — the unload is accepted immediately, so that round
+    skips this reset and runs the unload→swap machine directly.
     """
     pid = incident.printer_id
     key = (pid, incident.job_id)
@@ -960,8 +968,14 @@ async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
     if getattr(st, "state", None) != "PAUSE":
         return "skipped"
     initial_ams = getattr(st, "ams_status_main", None)
-    if initial_ams == AMS_STATUS_IDLE:
-        return "skipped"  # AMS idle → not a wedged change; the unload owns this round
+    if initial_ams != AMS_STATUS_FILAMENT_CHANGE:
+        # Only main=1 is resume-resettable (009-H2S 2026-07-20 evidence). idle(0),
+        # assist(3), identifying(2), calibration(4) and any unknown value are NOT
+        # stuck filament-changes — the unload→swap machine owns those rounds and its
+        # verbs ARE accepted there (006-H2S 2026-07-21: 0300_801E with the feeder
+        # still engaged at ams_status_main=3 — the operator's unload/load/resume all
+        # took while this branch had been giving up on a resume that could not help).
+        return "skipped"
 
     # The AMS is wedged mid-change. Spend a reset and re-issue the firmware CONTINUE.
     _stuck_resets[key] = _stuck_resets.get(key, 0) + 1

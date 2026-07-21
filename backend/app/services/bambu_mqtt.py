@@ -45,6 +45,14 @@ AMS_STATUS_IDENTIFYING = 2
 # self-heal on 2026-07-20).
 AMS_STATUS_IDLE = 0
 
+# AMS main status 1 = filament_change: the ONLY state in which the AMS ignores
+# every unload/load and only the firmware CONTINUE (a ``resume``) frees it (009-H2S
+# 2026-07-20 — four unloads were silent no-ops until the resume unwedged it). An
+# assist (3) fault, by contrast, leaves the feeder engaged and DOES accept unloads
+# (006-H2S 2026-07-21). Exported so spool_recovery keys the stuck-change reset off
+# this one origin.
+AMS_STATUS_FILAMENT_CHANGE = 1
+
 # Tray `state` codes that mean a spool is physically PRESENT: 11 = loaded, 10 =
 # "spool present, filament not in feeder" (see the merge comment in
 # _handle_ams_data). Wiping tray identity for a present spool is the bug behind the
