@@ -173,6 +173,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "stagger_interval_minutes",
             "queue_check_interval_seconds",
             "usb_preflight_fresh_window_seconds",
+            "dispatch_parallel_limit",
             "forecast_global_lead_time_days",
             "session_max_hours",
             "min_start_spool_g",

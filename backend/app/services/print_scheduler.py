@@ -309,6 +309,17 @@ class PrintScheduler:
             # one per unit (the incident sent 10).
             notified_short_groups: set[tuple[int | None, str | None]] = set()
 
+            # Tick-local dispatch plan (latency Phase B): selection/gating below
+            # stays sequential on THIS session (it mutates busy_printers, stagger
+            # budget, deficit bookkeeping and persists AMS mappings), but instead of
+            # awaiting the slow _start_print inline it records (queue_item_id,
+            # printer_id) pairs here. After both selection loops finish, the plan is
+            # dispatched concurrently so one printer's slow FTPS upload no longer
+            # pushes another printer's dispatch to a later tick. ``planned_printers``
+            # enforces one printer per tick's plan (point 6).
+            dispatch_plan: list[tuple[int, int]] = []
+            planned_printers: set[int] = set()
+
             for item in items:
                 # Check scheduled time first (scheduled_time is stored in UTC from ISO string)
                 if item.scheduled_time:
@@ -469,21 +480,28 @@ class PrintScheduler:
                     # _start_print commits it). Other tokens are managed elsewhere.
                     if item.waiting_reason == "stagger_hold":
                         item.waiting_reason = None
-                    # Capture the assignment BEFORE dispatch: _start_print releases a
-                    # model-targeted unit's scheduler-made pin (printer_id→None) when it
-                    # holds at the USB/capability gate, so item.printer_id may be None on
-                    # return. For a genuinely user-pinned unit (no target_model) this
-                    # local equals item.printer_id throughout, so behaviour is unchanged.
+                    # The printer targeted by this dispatch, captured for the SJF
+                    # been_jumped marking below. Under Phase B the actual dispatch
+                    # (and any USB/capability un-pin it performs) runs later on its
+                    # own session, so this tick session's item.printer_id is stable
+                    # through the marking — but keep the local for clarity and parity
+                    # with the model path.
                     dispatch_printer_id = item.printer_id
-                    # Start the print
-                    await self._start_print(db, item)
+                    # Plan the dispatch (latency Phase B): the slow FTPS upload +
+                    # start command runs concurrently AFTER both selection loops
+                    # finish (in _start_print_by_id on its own session), so one
+                    # printer's slow upload no longer delays another's dispatch to a
+                    # later tick. Selection stays sequential, so busy_printers /
+                    # stagger budget / SJF bookkeeping below still observe every
+                    # prior pick this tick. A user-pinned item's printer_id + mapping
+                    # are already persisted (mapping committed just above), so the
+                    # concurrent re-fetch sees the full assignment.
+                    self._plan_dispatch(dispatch_plan, planned_printers, item.id, dispatch_printer_id)
                     busy_printers.add(dispatch_printer_id)
-                    if item.status == "printing":
-                        stagger_remaining -= 1
-                        # A legacy-pinned model unit whose printer recovered
-                        # dispatches through THIS path — end its hold-unpinned
-                        # notification-suppression window too.
-                        self._hold_unpinned_items.discard(item.id)
+                    # Consume a stagger-window slot at PLAN time: the gate below must
+                    # see this pick when deciding later items THIS tick, and the real
+                    # "printing" outcome isn't known until the concurrent phase.
+                    stagger_remaining -= 1
 
                     # SJF starvation guard: mark items that were jumped. Compare against
                     # the captured pre-dispatch printer id — never item.printer_id, which
@@ -691,13 +709,15 @@ class PrintScheduler:
                                 db=db,
                             )
 
-                        await self._start_print(db, item)
+                        # Persist the assignment (printer_id + ams_mapping set just
+                        # above) BEFORE planning: the concurrent _start_print_by_id
+                        # re-fetches this item on its OWN session, so an uncommitted
+                        # assignment would be invisible there.
+                        await db.commit()
+                        self._plan_dispatch(dispatch_plan, planned_printers, item.id, assigned_printer_id)
                         busy_printers.add(assigned_printer_id)
-                        if item.status == "printing":
-                            stagger_remaining -= 1
-                            # Real dispatch ends the suppression window — a later
-                            # hold on a NEW assignment is a new transition.
-                            self._hold_unpinned_items.discard(item.id)
+                        # Consume a stagger slot at plan time (see direct-path note).
+                        stagger_remaining -= 1
 
                         # SJF starvation guard: mark model-based items that were jumped
                         if sjf_enabled and item.print_time_seconds is not None:
@@ -749,6 +769,25 @@ class PrintScheduler:
                             # waiting and the reason requires user action.
                             if last_waiting_reason and not was_waiting and not self._is_busy_only(last_waiting_reason):
                                 await self._notify_queue_waiting(db, item, last_waiting_reason, item.target_model)
+
+            # Concurrent dispatch (latency Phase B): selection above ran
+            # sequentially and recorded (queue_item_id, printer_id) pairs; now fire
+            # the slow per-printer work (FTPS delete+upload + start command) in
+            # parallel — bounded by dispatch_parallel_limit — so a slow upload to
+            # printer A no longer delays printer B's dispatch to the next tick. Each
+            # task opens its OWN session and re-fetches, so the tick session's
+            # in-loop assignments must be durable first: read the limit, then a
+            # single final commit releases this session's transaction and persists
+            # any pending assignment/waiting_reason writes before the re-fetch. The
+            # gather awaits here, so check_queue's single-flight invariant holds.
+            if dispatch_plan:
+                limit = await self._read_dispatch_parallel_limit(db)
+                await db.commit()
+                sem = asyncio.Semaphore(limit)
+                await asyncio.gather(
+                    *(self._start_print_by_id(item_id, printer_id, sem) for item_id, printer_id in dispatch_plan),
+                    return_exceptions=True,
+                )
 
             # Log summary of skip reasons (helps diagnose why queue items aren't starting)
             if skip_reasons:
@@ -1547,6 +1586,15 @@ class PrintScheduler:
             value = await self._get_float_setting(db, "dispatch_kick_debounce_seconds", default=1.0)
         return max(0.2, min(10.0, value))
 
+    async def _read_dispatch_parallel_limit(self, db: AsyncSession) -> int:
+        """Max concurrent per-printer dispatches per tick (``dispatch_parallel_limit``, clamped 1-10).
+
+        Read once per tick on the tick session (latency Phase B). A limit of 1
+        preserves the pre-Phase-B serial dispatch order exactly.
+        """
+        value = await self._get_int_setting(db, "dispatch_parallel_limit", default=3)
+        return max(1, min(10, value))
+
     async def _stagger_budget(self, db: AsyncSession) -> int:
         """How many more prints may START this stagger window (power management).
 
@@ -2313,6 +2361,85 @@ class PrintScheduler:
             await on_terminal(db, item.printer_id, item.id, "failed")
         except Exception as farm_err:  # noqa: BLE001 — policy must never break dispatch
             logger.warning("Queue item %s: farm policy hook (dispatch failure) failed: %s", item.id, farm_err)
+
+    def _plan_dispatch(
+        self,
+        dispatch_plan: list[tuple[int, int]],
+        planned_printers: set[int],
+        item_id: int,
+        printer_id: int,
+    ) -> None:
+        """Record a planned (queue_item, printer) dispatch for the concurrent phase.
+
+        One printer may appear at most once per tick's plan (point 6): the
+        selection loop already guarantees this by adding each pick to
+        busy_printers before the next candidate search, so a second entry for the
+        same printer would be a selection bug — guard cheaply and drop it rather
+        than double-dispatch onto one machine.
+        """
+        if printer_id in planned_printers:
+            logger.error(
+                "Dispatch plan already targets printer %s (item %s) — dropping duplicate plan entry",
+                printer_id,
+                item_id,
+            )
+            return
+        planned_printers.add(printer_id)
+        dispatch_plan.append((item_id, printer_id))
+
+    async def _start_print_by_id(self, item_id: int, printer_id: int, sem: asyncio.Semaphore) -> None:
+        """Run one planned dispatch concurrently on its OWN session (latency Phase B).
+
+        Bounded by ``sem`` (``dispatch_parallel_limit``). A fresh session lets the
+        slow FTPS-upload + start work for one printer overlap another printer's —
+        the tick's selection loop already committed every assignment, so this
+        re-fetches the item by id. Guards:
+
+        - Idempotency: proceed only if the re-fetched item is still ``pending``. A
+          concurrent completion/cancel/failure (or a duplicate plan entry) means
+          someone else owns it — log and skip, never re-dispatch.
+        - Isolation: one task's crash must neither kill the ``gather`` nor strand
+          the item in 'pending'. Any unexpected exception routes through the same
+          ``_fail_queue_item`` path ``_start_print`` uses for its own failures. The
+          hold paths inside ``_start_print`` (USB pre-flight / capability) leave
+          the item pending by design and are NOT failures — they return normally.
+        """
+        async with sem, async_session() as session:
+            item = await session.get(PrintQueueItem, item_id)
+            if item is None:
+                logger.warning("Dispatch (printer %s): queue item %s vanished — skipping", printer_id, item_id)
+                return
+            if item.status != "pending":
+                logger.info(
+                    "Dispatch (printer %s): queue item %s no longer pending (status=%s) — skipping",
+                    printer_id,
+                    item_id,
+                    item.status,
+                )
+                return
+            try:
+                await self._start_print(session, item)
+            except Exception as exc:  # noqa: BLE001 — one task must not kill the gather
+                logger.exception("Dispatch (printer %s): queue item %s crashed during start", printer_id, item_id)
+                try:
+                    # _start_print may have rolled the session back mid-failure;
+                    # re-fetch before routing through the terminal-failure path.
+                    fresh = await session.get(PrintQueueItem, item_id)
+                    if fresh is not None and fresh.status == "pending":
+                        await self._fail_queue_item(session, fresh, f"Dispatch error: {exc}")
+                except Exception:
+                    logger.exception("Dispatch (printer %s): could not fail item %s after crash", printer_id, item_id)
+                return
+
+            # Outcome-based bookkeeping (moved from the old inline loop, now that
+            # dispatch runs concurrently): a real dispatch ("printing") ends this
+            # unit's hold-unpinned notification-suppression window — a later hold on
+            # a NEW assignment is a fresh transition. A USB/capability HOLD leaves
+            # the item pending and keeps the guard. Re-read the status durably
+            # rather than touching a possibly-expired attribute after the commits.
+            outcome = await session.get(PrintQueueItem, item_id)
+            if outcome is not None and outcome.status == "printing":
+                self._hold_unpinned_items.discard(item_id)
 
     async def _start_print(self, db: AsyncSession, item: PrintQueueItem):
         """Upload file and start print for a queue item.

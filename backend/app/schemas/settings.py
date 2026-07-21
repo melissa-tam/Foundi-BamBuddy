@@ -430,6 +430,12 @@ class AppSettings(BaseModel):
     usb_preflight_max_wait_seconds: float = Field(
         default=2.5, ge=0, le=10, description="Max wait for a fresh full report during USB pre-flight before proceeding"
     )
+    dispatch_parallel_limit: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Max concurrent per-printer dispatches (FTPS upload + start) within one scheduler tick (latency Phase B)",
+    )
 
     # Plate-clear confirmation for queue scheduling
     require_plate_clear: bool = Field(
@@ -741,6 +747,7 @@ class AppSettingsUpdate(BaseModel):
     dispatch_kick_debounce_seconds: float | None = Field(default=None, ge=0.2, le=10)
     usb_preflight_fresh_window_seconds: int | None = Field(default=None, ge=0, le=120)
     usb_preflight_max_wait_seconds: float | None = Field(default=None, ge=0, le=10)
+    dispatch_parallel_limit: int | None = Field(default=None, ge=1, le=10)
     require_plate_clear: bool | None = None
     farm_usb_auto_cleanup: bool | None = None
     queue_shortest_first: bool | None = None

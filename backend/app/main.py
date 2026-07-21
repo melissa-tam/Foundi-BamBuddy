@@ -2940,9 +2940,18 @@ async def on_print_start(printer_id: int, data: dict):
                         f"Confidence: {plate_result.confidence:.0%}, Diff: {plate_result.difference_percent:.1f}%"
                     )
                     client = printer_manager.get_client(printer_id)
-                    if client:
-                        client.pause_print()
+                    if client and client.pause_print():
                         logger.info("[PLATE CHECK] Print paused for printer %s", printer_id)
+                    else:
+                        # Safety-critical: objects are on the plate but the PAUSE
+                        # command was not delivered (no client / disconnected /
+                        # publish rejected). Surface it loudly — a silent drop here
+                        # lets the print keep running over foreign objects.
+                        logger.warning(
+                            "[PLATE CHECK] Objects on plate for printer %s but PAUSE was NOT delivered "
+                            "(printer disconnected?) — print may still be running",
+                            printer_id,
+                        )
 
                     # Send notification about plate not empty
                     await ws_manager.broadcast(

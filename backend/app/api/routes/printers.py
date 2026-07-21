@@ -2824,7 +2824,7 @@ async def stop_print(
 
     success = client.stop_print()
     if not success:
-        raise HTTPException(500, "Failed to stop print")
+        raise HTTPException(502, "Failed to stop print — printer MQTT session not connected, command not delivered")
 
     # Mark this printer as user-stopped so on_print_complete reclassifies
     # the resulting "failed"/"aborted" MQTT status as "cancelled" — otherwise
@@ -2935,7 +2935,7 @@ async def pause_print(
 
     success = client.pause_print()
     if not success:
-        raise HTTPException(500, "Failed to pause print")
+        raise HTTPException(502, "Failed to pause print — printer MQTT session not connected, command not delivered")
 
     return {"success": True, "message": "Print pause command sent"}
 
@@ -2958,7 +2958,7 @@ async def resume_print(
 
     success = client.resume_print()
     if not success:
-        raise HTTPException(500, "Failed to resume print")
+        raise HTTPException(502, "Failed to resume print — printer MQTT session not connected, command not delivered")
 
     return {"success": True, "message": "Print resume command sent"}
 
@@ -2982,7 +2982,9 @@ async def set_print_speed(
 
     success = client.set_print_speed(mode)
     if not success:
-        raise HTTPException(500, "Failed to set print speed")
+        raise HTTPException(
+            502, "Failed to set print speed — printer MQTT session not connected, command not delivered"
+        )
 
     speed_names = {1: "Silent", 2: "Standard", 3: "Sport", 4: "Ludicrous"}
     return {"success": True, "message": f"Print speed set to {speed_names.get(mode, 'Unknown')}"}
@@ -3096,7 +3098,7 @@ async def set_fan_speed(
     pwm_speed = round(speed * 255 / 100)
     success = client.set_fan_speed(fan_id, pwm_speed)
     if not success:
-        raise HTTPException(500, "Failed to set fan speed")
+        raise HTTPException(502, "Failed to set fan speed — printer MQTT session not connected, command not delivered")
 
     fan_names = {"part": "Part cooling fan", "aux": "Auxiliary fan", "chamber": "Chamber fan"}
     return {"success": True, "message": f"{fan_names[fan]} set to {speed}%"}
@@ -3172,7 +3174,9 @@ async def set_chamber_light(
 
     success = client.set_chamber_light(on)
     if not success:
-        raise HTTPException(500, "Failed to control chamber light")
+        raise HTTPException(
+            502, "Failed to control chamber light — printer MQTT session not connected, command not delivered"
+        )
 
     return {"success": True, "message": f"Chamber light {'on' if on else 'off'}"}
 
@@ -3233,7 +3237,9 @@ async def bed_jog(
         lines.append("M211 S1")
 
     if not client.send_gcode("\n".join(lines)):
-        raise HTTPException(500, "Failed to send bed-jog command")
+        raise HTTPException(
+            502, "Failed to send bed-jog command — printer MQTT session not connected, command not delivered"
+        )
 
     return {"success": True, "message": f"Bed jog {distance:+.1f} mm sent"}
 
@@ -3266,7 +3272,9 @@ async def xy_jog(
         axes.append(f"Y{y:.2f}")
 
     if not client.send_gcode("\n".join(["G91", f"G1 {' '.join(axes)} F6000", "G90"])):
-        raise HTTPException(500, "Failed to send XY jog command")
+        raise HTTPException(
+            502, "Failed to send XY jog command — printer MQTT session not connected, command not delivered"
+        )
 
     return {"success": True, "message": f"XY jog X{x:+.1f} Y{y:+.1f} mm sent"}
 
@@ -3299,7 +3307,9 @@ async def extruder_jog(
         raise HTTPException(400, "Printer not connected")
 
     if not client.send_gcode("\n".join(["M83", f"G1 E{distance:.2f} F300", "M82"])):
-        raise HTTPException(500, "Failed to send extruder jog command")
+        raise HTTPException(
+            502, "Failed to send extruder jog command — printer MQTT session not connected, command not delivered"
+        )
 
     return {"success": True, "message": f"Extruder jog {distance:+.1f} mm sent"}
 
@@ -3346,7 +3356,9 @@ async def home_axes(
         raise HTTPException(400, "Printer not connected")
 
     if not client.home_axes():
-        raise HTTPException(500, "Failed to send home command")
+        raise HTTPException(
+            502, "Failed to send home command — printer MQTT session not connected, command not delivered"
+        )
 
     return {"success": True, "message": "Full auto-home sequence sent"}
 

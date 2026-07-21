@@ -4302,20 +4302,57 @@ class BambuMQTTClient:
             self._client = None
             self.state.connected = False
 
-    def send_command(self, command: dict):
-        """Send a command to the printer."""
-        if self._client and self.state.connected:
-            # Log outgoing message if logging is enabled
-            if self._logging_enabled:
-                self._message_log.append(
-                    MQTTLogEntry(
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                        topic=self.topic_publish,
-                        direction="out",
-                        payload=command,
-                    )
+    @staticmethod
+    def _command_verb(command: dict) -> str:
+        """Best-effort extraction of a Bambu command's nested ``command`` verb.
+
+        Payloads are shaped ``{"print": {"command": "stop", ...}}`` /
+        ``{"xcam": {...}}`` etc. Used only for log context, so it never raises.
+        """
+        try:
+            for value in command.values():
+                if isinstance(value, dict) and "command" in value:
+                    return str(value["command"])
+        except AttributeError:
+            pass
+        return "unknown"
+
+    def send_command(self, command: dict) -> bool:
+        """Send a command to the printer.
+
+        Returns True once the command is published, False when the MQTT client is
+        missing/disconnected (the command is dropped) or the broker rejects the
+        publish. A drop is WARNING-logged with the command verb + serial so a
+        silent no-op can never hide a lost printer command.
+        """
+        if not self._client or not self.state.connected:
+            logger.warning(
+                "[%s] Dropped MQTT command '%s' — client not connected",
+                self.serial_number,
+                self._command_verb(command),
+            )
+            return False
+        # Log outgoing message if logging is enabled
+        if self._logging_enabled:
+            self._message_log.append(
+                MQTTLogEntry(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    topic=self.topic_publish,
+                    direction="out",
+                    payload=command,
                 )
-            self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+            )
+        info = self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        rc = getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS)
+        if rc != mqtt.MQTT_ERR_SUCCESS:
+            logger.warning(
+                "[%s] MQTT publish for command '%s' rejected (rc=%s)",
+                self.serial_number,
+                self._command_verb(command),
+                rc,
+            )
+            return False
+        return True
 
     def enable_logging(self, enabled: bool = True):
         """Enable or disable MQTT message logging."""

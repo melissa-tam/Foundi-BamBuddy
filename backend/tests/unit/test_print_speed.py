@@ -34,7 +34,7 @@ class TestPrintSpeedAPI:
 
     @pytest.mark.asyncio
     async def test_print_speed_failure(self, async_client: AsyncClient, printer_factory):
-        """Verify 500 when client fails to set speed."""
+        """Verify 502 when client fails to set speed (dropped command, B2)."""
         printer = await printer_factory(name="Test Printer")
 
         mock_client = MagicMock()
@@ -45,7 +45,7 @@ class TestPrintSpeedAPI:
 
             response = await async_client.post(f"/api/v1/printers/{printer.id}/print-speed?mode=2")
 
-            assert response.status_code == 500
+            assert response.status_code == 502
             assert "failed" in response.json()["detail"].lower()
 
     @pytest.mark.asyncio

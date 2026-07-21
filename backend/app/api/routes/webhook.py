@@ -205,11 +205,22 @@ async def webhook_stop_print(
     if status.state != "RUNNING":
         raise HTTPException(status_code=409, detail="No print in progress")
 
+    # printer_manager.stop_print is synchronous and returns a bool (True once the
+    # stop command is published, False when the MQTT session is gone). It was
+    # previously ``await``ed — awaiting a bool raises TypeError — and its result
+    # was discarded, so a dropped stop returned HTTP 200 "Print stopped". Capture
+    # the bool and fail loudly when the command was not delivered.
     try:
-        await printer_manager.stop_print(printer_id)
+        stopped = printer_manager.stop_print(printer_id)
     except Exception as e:
         logger.error("Failed to stop print: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+    if not stopped:
+        raise HTTPException(
+            status_code=502,
+            detail="printer MQTT session not connected — command not delivered",
+        )
 
     return {"message": "Print stopped"}
 

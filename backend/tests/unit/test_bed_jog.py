@@ -47,7 +47,8 @@ class TestBedJogAPI:
         with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/bed-jog?distance=10")
-            assert response.status_code == 500
+            # B2: a dropped command (send_gcode False) is now a 502, not a 500.
+            assert response.status_code == 502
 
     @pytest.mark.asyncio
     async def test_bed_jog_success_without_force(self, async_client: AsyncClient, printer_factory):
@@ -170,14 +171,14 @@ class TestHomeAxesAPI:
 
     @pytest.mark.asyncio
     async def test_home_axes_send_failure(self, async_client: AsyncClient, printer_factory):
-        # home_axes() returning False (the MQTT publish failed) -> 500.
+        # home_axes() returning False (the MQTT publish failed) -> 502 (B2).
         printer = await printer_factory(name="P1")
         mock_client = MagicMock()
         mock_client.home_axes.return_value = False
         with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/home-axes?axes=all")
-            assert response.status_code == 500
+            assert response.status_code == 502
 
     @pytest.mark.asyncio
     async def test_home_axes_not_connected(self, async_client: AsyncClient, printer_factory):
