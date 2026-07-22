@@ -1241,10 +1241,11 @@ class TestRepack3mfEjectZeroing:
 
 
 class TestRepack3mfEjectSlim:
-    """Phase D3: ``slim=True`` drops the object meshes + per-plate thumbnails (the
-    container bulk) while keeping EVERY other member byte-identical. Member names
-    mirror a real production 3MF (H2C_Test_Cube_Right_Nozzle.3mf) — critically the
-    no-light thumbnail is ``plate_no_light_N.png`` (number trails "no_light")."""
+    """Slim is the PERMANENT eject build: ``repack_3mf_eject`` always drops the object
+    meshes + per-plate thumbnails (the container bulk) while keeping EVERY other member
+    byte-identical to the donor. Member names mirror a real production 3MF
+    (H2C_Test_Cube_Right_Nozzle.3mf) — critically the no-light thumbnail is
+    ``plate_no_light_N.png`` (number trails "no_light")."""
 
     _SLICE_INFO = TestRepack3mfEjectZeroing._SLICE_INFO
     _GCODE = b"; HEADER_BLOCK_START\n; max_z_height: 18.00\n; HEADER_BLOCK_END\nG28 X Y\n"
@@ -1294,27 +1295,14 @@ class TestRepack3mfEjectSlim:
         with zipfile.ZipFile(path, "r") as zf:
             return {name: zf.read(name) for name in zf.namelist()}
 
-    def test_slim_off_keeps_full_member_set(self, tmp_path):
-        # Regression: slim=False (default) must NOT drop anything — the equivalence
-        # test above still holds and every mesh/thumbnail rides along.
-        src = self._write_realistic_3mf(tmp_path)
-        out = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=False)
-        try:
-            members = self._members(out)
-            for dropped in self._DROP_MEMBERS:
-                assert dropped in members
-        finally:
-            out.unlink(missing_ok=True)
-
     def test_slim_drops_exactly_mesh_and_thumbnail_families(self, tmp_path):
         src = self._write_realistic_3mf(tmp_path)
-        full = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=False)
-        slim = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=True)
+        slim = repack_3mf_eject(src, 1, self._NEW_GCODE)
         try:
-            full_names = set(self._members(full))
+            source_names = set(self._members(src))
             slim_names = set(self._members(slim))
             # The removed set is EXACTLY the mesh + thumbnail families.
-            assert full_names - slim_names == set(self._DROP_MEMBERS)
+            assert source_names - slim_names == set(self._DROP_MEMBERS)
             # Every other member survives.
             for keep in self._KEEP_MEMBERS:
                 assert keep in slim_names
@@ -1322,29 +1310,27 @@ class TestRepack3mfEjectSlim:
             assert "Metadata/plate_1.gcode.md5" in slim_names
             assert "Metadata/slice_info.config" in slim_names
         finally:
-            full.unlink(missing_ok=True)
             slim.unlink(missing_ok=True)
 
     def test_slim_keeps_config_members_byte_identical(self, tmp_path):
         src = self._write_realistic_3mf(tmp_path)
-        full = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=False)
-        slim = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=True)
+        slim = repack_3mf_eject(src, 1, self._NEW_GCODE)
         try:
-            full_members = self._members(full)
+            source_members = self._members(src)
             slim_members = self._members(slim)
-            # Every KEPT member is byte-identical between full and slim (incl. the
-            # scene stub, the zeroed slice_info, the gcode + md5 replacement).
-            for name in slim_members:
-                assert slim_members[name] == full_members[name], name
+            # Every KEPT-and-untouched member is byte-identical to the donor (the scene
+            # stub + every config member). The three REPLACED members (gcode, md5,
+            # zeroed slice_info) are covered by the other tests.
+            for name in self._KEEP_MEMBERS:
+                assert slim_members[name] == source_members[name], name
         finally:
-            full.unlink(missing_ok=True)
             slim.unlink(missing_ok=True)
 
     def test_slim_md5_sidecar_correct_and_output_smaller(self, tmp_path):
         import hashlib
 
         src = self._write_realistic_3mf(tmp_path)
-        slim = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=True)
+        slim = repack_3mf_eject(src, 1, self._NEW_GCODE)
         try:
             members = self._members(slim)
             gcode = members["Metadata/plate_1.gcode"]
@@ -1361,7 +1347,7 @@ class TestRepack3mfEjectSlim:
         # The generated slim eject file must still parse with the repo's own 3MF
         # reader (the plate gcode header is what dispatch re-reads for max_z).
         src = self._write_realistic_3mf(tmp_path)
-        slim = repack_3mf_eject(src, 1, self._NEW_GCODE, slim=True)
+        slim = repack_3mf_eject(src, 1, self._NEW_GCODE)
         try:
             header = read_plate_gcode_header(slim, 1)
             assert header.get("max_z_height") == "18.00"

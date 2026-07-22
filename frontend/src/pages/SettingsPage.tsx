@@ -1022,8 +1022,6 @@ export function SettingsPage() {
       (settings.usb_preflight_fresh_window_seconds ?? 10) !== (localSettings.usb_preflight_fresh_window_seconds ?? 10) ||
       (settings.usb_preflight_max_wait_seconds ?? 2.5) !== (localSettings.usb_preflight_max_wait_seconds ?? 2.5) ||
       (settings.dispatch_parallel_limit ?? 3) !== (localSettings.dispatch_parallel_limit ?? 3) ||
-      (settings.eject_upload_skip_identical ?? false) !== (localSettings.eject_upload_skip_identical ?? false) ||
-      (settings.eject_slim_3mf ?? false) !== (localSettings.eject_slim_3mf ?? false) ||
       (settings.nozzle_temp_presets ?? '') !== (localSettings.nozzle_temp_presets ?? '') ||
       (settings.bed_temp_presets ?? '') !== (localSettings.bed_temp_presets ?? '') ||
       (settings.chamber_temp_presets ?? '') !== (localSettings.chamber_temp_presets ?? '') ||
@@ -1145,8 +1143,6 @@ export function SettingsPage() {
         usb_preflight_fresh_window_seconds: localSettings.usb_preflight_fresh_window_seconds,
         usb_preflight_max_wait_seconds: localSettings.usb_preflight_max_wait_seconds,
         dispatch_parallel_limit: localSettings.dispatch_parallel_limit,
-        eject_upload_skip_identical: localSettings.eject_upload_skip_identical,
-        eject_slim_3mf: localSettings.eject_slim_3mf,
         nozzle_temp_presets: localSettings.nozzle_temp_presets,
         bed_temp_presets: localSettings.bed_temp_presets,
         chamber_temp_presets: localSettings.chamber_temp_presets,
@@ -5297,50 +5293,6 @@ export function SettingsPage() {
                     {t('settings.dispatchParallelLimitHelp', 'How many printers can upload and start at the same time in one pass. Higher clears a big queue faster; lower is gentler on the network (1–10).')}
                   </p>
                 </div>
-              </div>
-              <div className="flex items-center justify-between pt-1">
-                <div className="flex-1 mr-4">
-                  <p className="text-sm text-white">
-                    {t('settings.ejectUploadSkipIdentical', 'Reuse eject files already on the USB drive')}
-                  </p>
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.ejectUploadSkipIdenticalHelp', 'Skip re-uploading an eject file when the identical one is already on the printer’s USB drive, saving a few seconds per eject.')}
-                  </p>
-                  <div role="alert" className="text-xs text-amber-200 bg-amber-900/20 border border-amber-700/40 rounded p-2 mt-2">
-                    {t('settings.ejectUploadSkipIdenticalWarning', 'Enable only after the live eject probe confirms the file on the drive is reused correctly. If in doubt, leave off — a re-upload always guarantees the right file.')}
-                  </div>
-                </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={localSettings.eject_upload_skip_identical ?? false}
-                    onChange={(e) => updateSetting('eject_upload_skip_identical', e.target.checked)}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
-                </label>
-              </div>
-              <div className="flex items-center justify-between pt-1">
-                <div className="flex-1 mr-4">
-                  <p className="text-sm text-white">
-                    {t('settings.ejectSlim3mf', 'Slim down eject files')}
-                  </p>
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.ejectSlim3mfHelp', 'Strip the 3D model and preview image out of eject files so they upload faster — the eject motion itself is unchanged.')}
-                  </p>
-                  <div role="alert" className="text-xs text-amber-200 bg-amber-900/20 border border-amber-700/40 rounded p-2 mt-2">
-                    {t('settings.ejectSlim3mfWarning', 'Hardware-gated: run the full eject hardware ladder with slimmed files before enabling for unattended production. Leave off until that ladder passes.')}
-                  </div>
-                </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={localSettings.eject_slim_3mf ?? false}
-                    onChange={(e) => updateSetting('eject_slim_3mf', e.target.checked)}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
-                </label>
               </div>
             </CardContent>
           </Card>

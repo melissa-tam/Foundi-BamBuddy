@@ -1334,9 +1334,6 @@ export interface AppSettings {
   usb_preflight_fresh_window_seconds: number;
   usb_preflight_max_wait_seconds: number;
   dispatch_parallel_limit: number;
-  // Eject-file upload optimizations — both HARDWARE/probe-gated (default off).
-  eject_upload_skip_identical: boolean;
-  eject_slim_3mf: boolean;
   // Shortest job first scheduling
   queue_shortest_first: boolean;
   // User-configurable presets for the printer-card popovers (JSON arrays of 3 ints).

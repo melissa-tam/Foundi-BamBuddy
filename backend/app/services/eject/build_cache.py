@@ -61,14 +61,12 @@ def _resolve_cache_dir(cache_dir: Path | None) -> Path:
     return cache_dir
 
 
-def _cache_key(source_path: Path, plate_id: int, eject_gcode: str, slim: bool) -> str:
-    """sha256 hex over ``(eject gcode, source size, source mtime_ns, plate id, slim)``.
+def _cache_key(source_path: Path, plate_id: int, eject_gcode: str) -> str:
+    """sha256 hex over ``(eject gcode, source size, source mtime_ns, plate id)``.
 
     Source SIZE + MTIME (not a full content hash) key the donor: an edited /
     re-sliced donor changes at least one, invalidating the entry, without paying to
-    re-hash a potentially hundreds-of-MB 3MF on every dispatch. ``slim`` is part of
-    the key because a slim and a full artifact of the SAME donor+gcode are different
-    files (Phase D3) — they must never collide in the cache."""
+    re-hash a potentially hundreds-of-MB 3MF on every dispatch."""
     st = source_path.stat()
     h = hashlib.sha256()
     for part in (
@@ -76,7 +74,6 @@ def _cache_key(source_path: Path, plate_id: int, eject_gcode: str, slim: bool) -
         str(st.st_size).encode(),
         str(st.st_mtime_ns).encode(),
         str(plate_id).encode(),
-        b"slim" if slim else b"full",
     ):
         h.update(part)
         h.update(b"\x00")
@@ -107,14 +104,14 @@ def _fresh_copy_of(cache_file: Path) -> Path:
 
 
 def _build_and_store(
-    source_path: Path, plate_id: int, eject_gcode: str, cache_dir: Path, cache_file: Path, slim: bool
+    source_path: Path, plate_id: int, eject_gcode: str, cache_dir: Path, cache_file: Path
 ) -> Path:
     """Synchronous (worker-thread) miss path: one-pass build, atomically install into
     the cache, evict, and return the freshly-built temp file for the caller.
 
     The built temp is returned directly as the caller-owned copy (it is a distinct
     file from the cached one), so a miss copies bytes exactly once (built → cache)."""
-    built = repack_3mf_eject(source_path, plate_id, eject_gcode, zero_usage=True, slim=slim)
+    built = repack_3mf_eject(source_path, plate_id, eject_gcode, zero_usage=True)
     if built is None:
         raise EjectBuildError(f"Eject repack produced no file for plate {plate_id} of {source_path}")
     # Install atomically: copy into a sibling temp within the cache dir, then
@@ -140,15 +137,12 @@ async def get_or_build_eject_file(
     eject_gcode: str,
     *,
     cache_dir: Path | None = None,
-    slim: bool = False,
-) -> tuple[Path, str]:
-    """Return ``(path, build_key)`` for the built eject ``.gcode.3mf`` of
-    ``(source, plate, gcode, slim)``.
+) -> Path:
+    """Return the built eject ``.gcode.3mf`` :class:`Path` for ``(source, plate, gcode)``.
 
-    ``path`` is a freshly-copied, caller-owned temp file (safe to unlink without
-    harming the cache); ``build_key`` is the content-addressed sha256 key (the SAME
-    value that names the cache entry) — exposed so a caller can derive a content-stable
-    remote filename / de-dupe probe (latency Phase D2) without re-hashing.
+    The path is a freshly-copied, caller-owned temp file (safe to unlink without
+    harming the cache). The content-addressed sha256 key names the cache entry and is
+    kept internal to this module.
 
     HIT: copy the cached artifact to a fresh temp path (off the loop) and return it.
     MISS: run the one-pass build in a worker thread, store it in the cache, return the
@@ -163,20 +157,19 @@ async def get_or_build_eject_file(
         _swept = True
         await asyncio.to_thread(_evict_lru, cdir)
 
-    key = await asyncio.to_thread(_cache_key, source_path, plate_id, eject_gcode, slim)
+    key = await asyncio.to_thread(_cache_key, source_path, plate_id, eject_gcode)
     cache_file = cdir / f"{key}.3mf"
 
     if cache_file.exists():
-        return await _hit(cache_file), key
+        return await _hit(cache_file)
 
     lock = _build_locks.setdefault(key, asyncio.Lock())
     async with lock:
         # Re-check under the lock: a concurrent builder for this key may have just
         # populated the cache while we waited.
         if cache_file.exists():
-            return await _hit(cache_file), key
-        built = await asyncio.to_thread(_build_and_store, source_path, plate_id, eject_gcode, cdir, cache_file, slim)
-        return built, key
+            return await _hit(cache_file)
+        return await asyncio.to_thread(_build_and_store, source_path, plate_id, eject_gcode, cdir, cache_file)
 
 
 async def _hit(cache_file: Path) -> Path:

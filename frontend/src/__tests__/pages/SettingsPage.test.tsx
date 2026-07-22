@@ -745,14 +745,6 @@ describe('SettingsPage', () => {
       expect(
         (screen.getByLabelText('USB check max wait (sec)') as HTMLInputElement).value,
       ).toBe('2.5');
-
-      // The two probe/hardware-gated toggles carry an explicit warning line.
-      expect(
-        screen.getByText(/run the full eject hardware ladder/i),
-      ).toBeInTheDocument();
-      expect(
-        screen.getByText(/only after the live eject probe confirms/i),
-      ).toBeInTheDocument();
     });
 
     it('round-trips a numeric change through the save endpoint', async () => {

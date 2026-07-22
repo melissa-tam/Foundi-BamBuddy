@@ -5519,8 +5519,13 @@ async def on_print_complete(printer_id: int, data: dict):
                                     select(LibraryFile).where(LibraryFile.id == queue_item.library_file_id)
                                 )
                                 lib_file = lib_result.scalar_one_or_none()
-                                if lib_file and lib_file.print_time_seconds:
-                                    no_archive_data["print_time_seconds"] = lib_file.print_time_seconds
+                                # LibraryFile has NO print_time_seconds column — the
+                                # estimate lives in its file_metadata JSON (which may
+                                # itself be None). Reading the attribute crashed here.
+                                lib_meta = (lib_file.file_metadata or {}) if lib_file else {}
+                                lib_print_time = lib_meta.get("print_time_seconds")
+                                if lib_print_time:
+                                    no_archive_data["print_time_seconds"] = lib_print_time
                     except Exception as lookup_err:
                         logger.debug(
                             "[NOTIFY-BG] Could not look up queue item for no-archive notification: %s", lookup_err

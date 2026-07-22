@@ -986,26 +986,25 @@ def zero_slice_usage_bytes(original: bytes) -> bytes | None:
     return new_bytes
 
 
-def repack_3mf_eject(
-    source_path: Path, plate_id: int, gcode_text: str, *, zero_usage: bool = True, slim: bool = False
-) -> Path | None:
+def repack_3mf_eject(source_path: Path, plate_id: int, gcode_text: str, *, zero_usage: bool = True) -> Path | None:
     """ONE-PASS eject-file build: the single public entry the farm's motion-only
     eject / dry-run builders use.
 
     In a SINGLE zip rewrite it (a) REPLACES plate `plate_id`'s G-code with
-    `gcode_text` and recomputes the ``.gcode.md5`` sidecar, and (b) — when
-    `zero_usage` — replaces ``Metadata/slice_info.config`` with its usage-zeroed
-    form (:func:`zero_slice_usage_bytes`). This collapses the former two-pass
-    composition (``repack_3mf_with_gcode`` then a whole-file ``slice_info`` rewrite)
-    into one read/re-deflate pass (latency Phase C1); with ``slim=False`` the produced
-    container is byte-equivalent to that two-pass output — same members, same
-    replacements, same MD5 sidecar semantics (uppercase hex, no trailing newline).
+    `gcode_text` and recomputes the ``.gcode.md5`` sidecar, (b) — when `zero_usage` —
+    replaces ``Metadata/slice_info.config`` with its usage-zeroed form
+    (:func:`zero_slice_usage_bytes`), and (c) DROPS the members the slim eject build
+    omits (:func:`_slim_should_drop`): the object meshes (``3D/Objects/*``) and the
+    per-plate thumbnails (:data:`_SLIM_DROP_THUMB_RE`). This collapses the former
+    two-pass composition (``repack_3mf_with_gcode`` then a whole-file ``slice_info``
+    rewrite) into one read/re-deflate pass (latency Phase C1).
 
-    When ``slim`` (latency Phase D3), the object meshes (``3D/Objects/*``) and the
-    per-plate thumbnails (:data:`_SLIM_DROP_THUMB_RE`) are OMITTED — the motion-only
-    eject needs neither, and they are the bulk of the container. Everything else,
-    including the ``3D/3dmodel.model`` scene stub and every config member, stays
-    byte-identical.
+    Slim is the PERMANENT eject build: the motion-only eject needs neither meshes nor
+    thumbnails and they are the bulk of the container, so they are always dropped.
+    Never dropped: the plate gcode + its ``.gcode.md5`` sidecar, any config member,
+    ``plate_N.json``, or the ``3D/3dmodel.model`` scene stub — every kept member stays
+    byte-identical to the donor (apart from the gcode / md5 / zeroed slice_info
+    replacements), so the result is a valid, parseable 3MF.
 
     Returns the temp ``.gcode.3mf`` :class:`Path`, or ``None`` if the plate has no
     gcode member or repacking fails. Caller owns the returned temp file.
@@ -1026,7 +1025,7 @@ def repack_3mf_eject(
             target_gcode,
             gcode_text.encode("utf-8"),
             extra_replacements=extra,
-            drop_members=_slim_should_drop if slim else None,
+            drop_members=_slim_should_drop,
         )
     except Exception:
         return None

@@ -1079,46 +1079,6 @@ async def list_files_async(
         return []
 
 
-async def get_file_size_async(
-    ip_address: str,
-    access_code: str,
-    remote_path: str,
-    timeout: float = 30.0,
-    socket_timeout: float | None = None,
-    printer_model: str | None = None,
-) -> int | None:
-    """Async wrapper for an FTPS SIZE probe on ``remote_path``.
-
-    Returns the server-reported byte size, or ``None`` when the file is absent /
-    unreadable / the connection fails — every failure collapses to ``None`` so
-    callers can treat "size known and equal" as the only positive signal (the
-    Phase D2 skip-if-identical eject de-dupe is fail-open on any None).
-
-    Args:
-        socket_timeout: FTP socket timeout for slow connections (e.g., A1 printers)
-        printer_model: Printer model for A1-specific workarounds
-    """
-    loop = asyncio.get_event_loop()
-
-    def _size() -> int | None:
-        client = BambuFTPClient(ip_address, access_code, timeout=socket_timeout, printer_model=printer_model)
-        if client.connect():
-            try:
-                return client.get_file_size(remote_path)
-            finally:
-                client.disconnect()
-        return None
-
-    try:
-        return await asyncio.wait_for(loop.run_in_executor(None, _size), timeout=timeout)
-    except TimeoutError:
-        logger.warning("FTP SIZE probe timed out after %ss for %s", timeout, remote_path)
-        return None
-    except Exception as exc:  # noqa: BLE001 — any probe failure is "size unknown" (fail-open)
-        logger.debug("FTP SIZE probe failed for %s: %s", remote_path, exc)
-        return None
-
-
 async def delete_file_async(
     ip_address: str,
     access_code: str,

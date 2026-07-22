@@ -80,17 +80,7 @@ _PENDING_EJECT_STALE_TTL_H = 24
 # Case-insensitive; the printer echoes the stem verbatim as ``subtask_name`` (it is
 # derived from the dispatched filename in ``bambu_mqtt.start_print``). For the manual
 # form the trailing integer is the PRINTER id (there is no queue item).
-#
-# The optional trailing ``_<8 hex>`` is the Phase D2 skip-if-identical content-key
-# suffix: when ``eject_upload_skip_identical`` is ON the eject file's remote name (and
-# therefore the echoed subtask_name) carries the first 8 hex of its build key. Matching
-# it here keeps the id extraction — and every terminal-correlation consumer — identical
-# whether or not the suffix is present.
-_EJECT_NAME_RE = re.compile(r"^eject_(?:(fa|production)_item|manual_p)(\d+)(?:_[0-9a-f]{8})?$", re.IGNORECASE)
-
-# Strips the optional Phase D2 build-key suffix from an already-extension-stripped eject
-# stem so the identity comparison in ``matches_pending_eject`` sees the hash-less form.
-_EJECT_HASH_SUFFIX_RE = re.compile(r"_[0-9a-f]{8}$", re.IGNORECASE)
+_EJECT_NAME_RE = re.compile(r"^eject_(?:(fa|production)_item|manual_p)(\d+)$", re.IGNORECASE)
 
 
 def _eject_name_stem(name: str) -> str:
@@ -195,11 +185,7 @@ def matches_pending_eject(
         elif pending.queue_item_id is not None:
             expected_stem = expected_eject_stem(pending)
         if expected_stem is not None:
-            # Strip the optional Phase D2 build-key suffix so a skip-identical eject
-            # (whose echoed name carries ``_<8hex>``) still matches its hash-less
-            # expected stem.
-            echoed_stem = _EJECT_HASH_SUFFIX_RE.sub("", _eject_name_stem(subtask_name))
-            name_mismatch = echoed_stem.lower() != expected_stem.lower()
+            name_mismatch = _eject_name_stem(subtask_name).lower() != expected_stem.lower()
     return not (id_mismatch or name_mismatch)
 
 
@@ -309,19 +295,6 @@ async def hydrate_pending_ejects_from_db() -> int:
     return hydrated
 
 
-async def _read_eject_dispatch_flags(db: AsyncSession) -> tuple[bool, bool]:
-    """``(slim, skip_identical)`` from the ``eject_slim_3mf`` / ``eject_upload_skip_identical``
-    settings (both default OFF). Read here so ``build_cache`` / ``dispatch`` stay DB-free
-    and the flags are resolved once per dispatch."""
-    from backend.app.api.routes.settings import get_setting
-
-    async def _flag(key: str) -> bool:
-        raw = await get_setting(db, key)
-        return raw is not None and str(raw).strip().lower() == "true"
-
-    return await _flag("eject_slim_3mf"), await _flag("eject_upload_skip_identical")
-
-
 class EjectDispatchError(RuntimeError):
     """A part-present eject could not be dispatched.
 
@@ -406,10 +379,9 @@ async def dispatch_part_present_eject(
 
     source_path = await _resolve_source_path(db, item)
     plate_id = item.plate_id or 1
-    slim, skip_identical = await _read_eject_dispatch_flags(db)
     eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=queue_item_id, phase="building")
     try:
-        eject_path, build_key = await build_part_present_eject_file(source_path, plate_id, profile, geometry, slim=slim)
+        eject_path = await build_part_present_eject_file(source_path, plate_id, profile, geometry)
     except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=queue_item_id, phase="failed")
         raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc
@@ -425,8 +397,6 @@ async def dispatch_part_present_eject(
             job_stem=f"eject_{purpose}_item{queue_item_id}",
             plate_id=plate_id,
             pending=pending,
-            build_key=build_key,
-            skip_identical=skip_identical,
         )
     logger.info(
         "eject.remote: dispatched %s eject for item %s (run %s) on printer %s",
@@ -475,12 +445,9 @@ async def dispatch_foreign_eject(
     if profile is None:
         raise EjectDispatchError("Eject profile not found", status_code=409)
 
-    slim, skip_identical = await _read_eject_dispatch_flags(db)
     eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=None, phase="building")
     try:
-        eject_path, build_key = await build_part_present_eject_file(
-            Path(source_path), plate_id, profile, geometry, slim=slim
-        )
+        eject_path = await build_part_present_eject_file(Path(source_path), plate_id, profile, geometry)
     except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=None, phase="failed")
         raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc
@@ -496,8 +463,6 @@ async def dispatch_foreign_eject(
             job_stem=f"eject_manual_p{printer_id}",
             plate_id=plate_id,
             pending=pending,
-            build_key=build_key,
-            skip_identical=skip_identical,
         )
     logger.info(
         "eject.remote: dispatched manual (foreign-plate) eject on printer %s (plate %s, profile %s)",
@@ -515,8 +480,6 @@ async def _upload_start_register_eject(
     job_stem: str,
     plate_id: int,
     pending: PendingEject,
-    build_key: str = "",
-    skip_identical: bool = False,
 ) -> None:
     """Shared eject tail: FTPS-upload the built eject file (honouring the FTP retry
     settings), start it with EVERY pre-print calibration OFF, then register + durably
@@ -524,30 +487,16 @@ async def _upload_start_register_eject(
     registered unless ``start_print`` was accepted. Raises :class:`EjectDispatchError`
     (502) on upload / start failure.
 
-    When ``skip_identical`` (Phase D2), the remote name carries the first 8 hex of
-    ``build_key`` (``{job_stem}_{key8}``) so the SAME content always maps to the SAME
-    name, and the printer is probed (FTPS SIZE) for that exact name before uploading:
-    an exact byte-size match skips the upload entirely (the identical file is already on
-    the USB) and jumps straight to ``sent``. Any probe error / mismatch / absence
-    uploads as normal (fail-open). The ``start_print`` file, the MQTT ``project_file``
-    param (plate path, keyed by ``plate_id``, unchanged) and the eventual SD cleanup all
-    key off the SAME ``remote_filename`` — the hashed name never drifts.
+    The ``start_print`` file, the MQTT ``project_file`` param (plate path, keyed by
+    ``plate_id``) and the eventual SD cleanup all key off the SAME ``remote_filename``
+    (the bare ``job_stem``).
     """
     import asyncio
 
-    from backend.app.services.bambu_ftp import (
-        get_file_size_async,
-        get_ftp_retry_settings,
-        upload_file_async,
-        with_ftp_retry,
-    )
+    from backend.app.services.bambu_ftp import get_ftp_retry_settings, upload_file_async, with_ftp_retry
     from backend.app.utils.filename import derive_remote_filename
 
-    # Phase D2: a content-stable stem (job_stem + 8-hex build key) makes "same name +
-    # same byte size" a reliable identical-file signal. Default OFF → the exact
-    # historical name (no suffix).
-    stem = f"{job_stem}_{build_key[:8]}" if (skip_identical and build_key) else job_stem
-    remote_filename = derive_remote_filename(f"{stem}.gcode.3mf")
+    remote_filename = derive_remote_filename(f"{job_stem}.gcode.3mf")
     remote_path = f"/{remote_filename}"
     ftp_retry_enabled, ftp_retry_count, ftp_retry_delay, ftp_timeout = await get_ftp_retry_settings()
 
@@ -564,74 +513,39 @@ async def _upload_start_register_eject(
             )
         )
 
-    # Phase D2 de-dupe probe: if the identical file (exact name + byte size) is already
-    # on the USB, skip the upload. Fail-open — any None/mismatch falls through to upload.
-    skipped = False
-    if skip_identical and build_key:
-        try:
-            local_size = eject_path.stat().st_size
-        except OSError:
-            local_size = None
-        remote_size = await get_file_size_async(
-            printer.ip_address,
-            printer.access_code,
-            remote_path,
-            socket_timeout=ftp_timeout,
-            printer_model=printer.model,
-        )
-        if local_size is not None and remote_size == local_size:
-            skipped = True
-            logger.info(
-                "eject.remote: %s eject already on USB as %s (%d bytes) — skipping upload (Phase D2)",
-                pending.purpose,
-                remote_filename,
-                local_size,
+    try:
+        if ftp_retry_enabled:
+            uploaded = await with_ftp_retry(
+                upload_file_async,
+                printer.ip_address,
+                printer.access_code,
+                eject_path,
+                remote_path,
+                socket_timeout=ftp_timeout,
+                printer_model=printer.model,
+                progress_callback=_on_upload_progress,
+                max_retries=ftp_retry_count,
+                retry_delay=ftp_retry_delay,
+                operation_name=f"Upload {pending.purpose} eject to {printer.name}",
             )
-            # Still emit the uploading→sent transition (jump straight to complete).
-            eject_progress.emit_eject_progress(
-                printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="uploading", progress_pct=100.0
+        else:
+            uploaded = await upload_file_async(
+                printer.ip_address,
+                printer.access_code,
+                eject_path,
+                remote_path,
+                socket_timeout=ftp_timeout,
+                printer_model=printer.model,
+                progress_callback=_on_upload_progress,
             )
-
-    if skipped:
-        uploaded = True
+    except Exception as exc:  # noqa: BLE001
+        uploaded = False
+        logger.error("eject.remote: %s eject upload error: %s", pending.purpose, exc)
+    finally:
         try:
             eject_path.unlink(missing_ok=True)
         except OSError:
             pass
-    else:
-        try:
-            if ftp_retry_enabled:
-                uploaded = await with_ftp_retry(
-                    upload_file_async,
-                    printer.ip_address,
-                    printer.access_code,
-                    eject_path,
-                    remote_path,
-                    socket_timeout=ftp_timeout,
-                    printer_model=printer.model,
-                    progress_callback=_on_upload_progress,
-                    max_retries=ftp_retry_count,
-                    retry_delay=ftp_retry_delay,
-                    operation_name=f"Upload {pending.purpose} eject to {printer.name}",
-                )
-            else:
-                uploaded = await upload_file_async(
-                    printer.ip_address,
-                    printer.access_code,
-                    eject_path,
-                    remote_path,
-                    socket_timeout=ftp_timeout,
-                    printer_model=printer.model,
-                    progress_callback=_on_upload_progress,
-                )
-        except Exception as exc:  # noqa: BLE001
-            uploaded = False
-            logger.error("eject.remote: %s eject upload error: %s", pending.purpose, exc)
-        finally:
-            try:
-                eject_path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
     if not uploaded:
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="failed")

@@ -3810,6 +3810,14 @@ async def run_migrations(conn):
     # prefer_lowest_filament migration convention above.
     await conn.execute(text("UPDATE settings SET value = '150' WHERE key = 'min_start_spool_g' AND value = '120'"))
 
+    # Cleanup: drop the retired eject-latency toggles. Slim eject/dry-run builds are
+    # now always-on (no flag) and the skip-if-identical upload de-dupe was deleted
+    # outright (it never fired in production), so both settings rows are dead. Plain
+    # conn.execute (DML) per the obsolete-key cleanup convention above; idempotent — a
+    # re-run simply matches zero rows.
+    for key in ("eject_slim_3mf", "eject_upload_skip_identical"):
+        await conn.execute(text("DELETE FROM settings WHERE key = :key"), {"key": key})
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),

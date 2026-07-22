@@ -79,6 +79,25 @@ _ACTIVE_PRINT_STATES: frozenset[str] = frozenset({"PREPARE", "SLICING", "RUNNING
 # ``_canonical_filament_type`` to preserve the existing call sites).
 
 
+def _derive_estimated_time(archive, library_file) -> int | None:
+    """Estimated print time (seconds) for a job-started notification, from whichever
+    source the dispatched item has.
+
+    Prefers the archive's parsed ``print_time_seconds`` column; falls back to the
+    library file, whose estimate lives in its ``file_metadata`` JSON — ``LibraryFile``
+    has NO ``print_time_seconds`` column, so reading one raised ``AttributeError`` and
+    crashed dispatch for any file whose metadata carried no estimate (the established
+    read is ``file_metadata.get("print_time_seconds")``; see ``routes/library.py``).
+    ``file_metadata`` itself may be ``None``. Returns ``None`` when neither source has a
+    (truthy) estimate."""
+    if archive is not None and archive.print_time_seconds:
+        return archive.print_time_seconds
+    if library_file is not None:
+        meta = library_file.file_metadata or {}
+        return meta.get("print_time_seconds") or None
+    return None
+
+
 class PrintScheduler:
     """Background scheduler that processes the print queue."""
 
@@ -3007,11 +3026,7 @@ class PrintScheduler:
                 )
 
             # Get estimated time for notification
-            estimated_time = None
-            if archive and archive.print_time_seconds:
-                estimated_time = archive.print_time_seconds
-            elif library_file and library_file.print_time_seconds:
-                estimated_time = library_file.print_time_seconds
+            estimated_time = _derive_estimated_time(archive, library_file)
 
             # Send job started notification
             await notification_service.on_queue_job_started(

@@ -87,7 +87,7 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf()
         out = None
         try:
-            out, _key = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            out = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
             gcode = _read_plate_gcode(out)
         finally:
             src.unlink(missing_ok=True)
@@ -118,7 +118,7 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf()
         out = None
         try:
-            out, _key = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            out = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
             with zipfile.ZipFile(out, "r") as zf:
                 gcode_bytes = zf.read("Metadata/plate_1.gcode")
                 md5 = zf.read("Metadata/plate_1.gcode.md5").decode("ascii")
@@ -154,7 +154,7 @@ class TestBuildPartPresentEjectFile:
             assert any(s["used_g"] > 0 for s in donor_slots)
             assert extract_print_time_from_3mf(src, plate_id=1) == 16735
 
-            out, _key = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            out = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
             slots = extract_filament_usage_from_3mf(out, plate_id=1)
             prediction = extract_print_time_from_3mf(out, plate_id=1)
         finally:
@@ -176,7 +176,7 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf()
         out = None
         try:
-            out, _key = await build_part_present_eject_file(src, 1, _profile(), H2C_GEOMETRY)
+            out = await build_part_present_eject_file(src, 1, _profile(), H2C_GEOMETRY)
             gcode = _read_plate_gcode(out)
         finally:
             src.unlink(missing_ok=True)
