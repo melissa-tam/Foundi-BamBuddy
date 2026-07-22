@@ -847,7 +847,7 @@ class TestSpoolSelectionSettings:
         assert response.status_code == 200
         result = response.json()
         assert result["spool_selection_policy"] == "first_loaded"
-        assert result["min_start_spool_g"] == 120
+        assert result["min_start_spool_g"] == 150
         assert result["auto_add_untagged"] is True
         import json as _json
 
