@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
+from time import monotonic
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
@@ -60,8 +61,10 @@ from backend.app.services import ams_presence
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_tag_matcher import (
     auto_assign_spool,
+    is_bambu_tag,
     is_valid_tag,
     parse_tray_fields,
+    reapply_k_profile_if_drifted,
     stamp_first_loaded,
     stamp_loaded,
 )
@@ -134,13 +137,26 @@ _fresh_prompt_unanswered: set[tuple[int, int, int]] = set()
 # the firmware groups on — tray_info_idx AND both nozzle temps — not tray_info_idx alone.
 _identity_reconciled: set[tuple[int, int, int]] = set()
 
+# Minimum spacing between two :func:`reconcile_slot_config` passes. The scheduler
+# tick that drives it is kick-driven (a dispatch burst wakes it repeatedly within
+# seconds), so the pass carries its OWN floor instead of inheriting the tick
+# cadence. Wide enough to cost nothing in steady state, tight enough that a
+# refused AMS write is re-pushed within one settle window.
+_RECONCILE_MIN_INTERVAL_S = 20.0
+
+# monotonic() stamp of the last reconcile pass — the only session state that lane
+# keeps (everything else it acts on is derived from live state + DB each pass).
+_last_reconcile_at: float | None = None
+
 
 def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
+    global _last_reconcile_at
     _autoconfig_window.reset()
     _pending_physical_cycles.clear()
     _fresh_prompt_unanswered.clear()
     _identity_reconciled.clear()
+    _last_reconcile_at = None
 
 
 # --- state / predicate helpers ---------------------------------------------
@@ -525,9 +541,11 @@ async def _push_config(db: AsyncSession, spool: Spool, printer_id: int, ams_id: 
         # (walking spool.k_profiles on a pre-existing DB spool) used to fail EVERY
         # push here and was fixed at apply_spool_to_slot_via_mqtt. What remains is a
         # genuinely transient MQTT/config failure — while the slot stays bare the
-        # bare-tray trigger re-fires on subsequent AMS pushes (gated by
-        # _AUTOCONFIG_RETRY_S), so a transient miss is retried; a stuck-bare slot
-        # eventually escalates via spool_recovery's forced sweep.
+        # bare-tray trigger re-fires (gated by _AUTOCONFIG_RETRY_S) so a transient
+        # miss is retried. An AMS push only re-fires it while the AMS state HASH
+        # keeps changing (bambu_mqtt's anti-storm gate) — the guaranteed lane is the
+        # scheduler tick's reconcile_slot_config; a stuck-bare slot eventually
+        # escalates via spool_recovery's forced sweep.
         logger.exception(
             "Bare-tray config push failed for spool %d on printer %d AMS%d-T%d",
             spool.id,
@@ -1350,9 +1368,13 @@ async def maybe_autoconfigure_bare_tray(
 
     Trigger: tray PRESENT (state 10/11) AND tray_type empty AND no valid tag AND
     ``auto_add_untagged`` AND a non-empty ``tagless_default_filament`` setting.
-    The config push self-heals: while the slot stays bare, the trigger persists
-    across AMS pushes (gated by :data:`_AUTOCONFIG_RETRY_S`) until the firmware
-    reports a non-empty tray_type and the slot leaves this branch.
+    The config push self-heals through TWO service lanes (gated by
+    :data:`_AUTOCONFIG_RETRY_S` either way) until the firmware reports a non-empty
+    tray_type and the slot leaves this branch: ``main.on_ams_change``'s bare-tray
+    branch while the AMS state keeps churning, and :func:`reconcile_slot_config` on
+    the scheduler tick. The second lane is the guaranteed one — the callback is
+    change-gated on ``bambu_mqtt``'s AMS state hash, so a settled AMS stops firing
+    it entirely (2026-07-24 incident).
 
     ``force=True`` bypasses ONLY the :data:`_AUTOCONFIG_RETRY_S` window (every
     other guard — presence, tray_type-empty, RFID, settings, operator/RFID-bound
@@ -1449,6 +1471,123 @@ async def maybe_autoconfigure_bare_tray(
 
     await _push_config(db, spool, printer_id, ams_id, tray_id, tray)
     return True
+
+
+# --- durable slot-config reconcile (scheduler tick) ------------------------
+
+
+async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> int:
+    """Re-drive slot config the firmware never applied — the DURABLE retry lane.
+
+    Incident (2026-07-24): three slots (printer 3 AMS0-T0/T2, printer 5 AMS0-T3)
+    held minted+assigned ledger rows against a BLANK firmware tray config for 15+
+    minutes until a human intervened. Their ``ams_filament_setting`` writes had been
+    refused by the wire-safety gates (per-printer identify gate / drying), and
+    nothing retried: every re-push trigger hangs off ``main.on_ams_change``, which
+    ``bambu_mqtt`` fires ONLY when its AMS state hash changes (the deliberate
+    anti-storm gate). Once the AMS settled, the hash froze, the callback stopped
+    firing, and the refused write was simply lost. The RFID K-profile re-apply has
+    the same shape — one change-gated caller, fire-and-forget publish.
+
+    This is the state-derived backstop for both. Each scheduler tick it walks the
+    live merged AMS of every active printer and re-drives the two owning service
+    functions: :func:`maybe_autoconfigure_bare_tray` for a still-bare slot,
+    ``spool_tag_matcher.reapply_k_profile_if_drifted`` for a Bambu-tagged bound one.
+    Both keep every guard they carry (RFID early-exit, spent latch, identify/drying
+    defer, mint settle, operator/RFID-bound never-overwrite, their own retry
+    windows) — this lane supplies the missing OCCASION to retry, never a new
+    permission. Nothing is remembered between passes beyond the throttle stamp: the
+    work is re-derived from live merged state plus the DB, so it is restart-safe by
+    construction.
+
+    ``manager``/``now`` are injectable for tests. Returns the number of publishes
+    attempted.
+    """
+    global _last_reconcile_at
+    now = monotonic() if now is None else now
+    if _last_reconcile_at is not None and (now - _last_reconcile_at) < _RECONCILE_MIN_INTERVAL_S:
+        return 0
+    _last_reconcile_at = now
+
+    from backend.app.api.routes.settings import get_setting
+
+    # Spoolman owns AMS slots in its mode — main.on_ams_change gates the whole
+    # tagless block the same way, and this lane must not reach past that gate.
+    spoolman = await get_setting(db, "spoolman_enabled")
+    if spoolman is not None and spoolman.lower() == "true":
+        return 0
+
+    from backend.app.models.printer import Printer  # local import: cycle avoidance
+
+    pushed = 0
+    printer_ids = (await db.execute(select(Printer.id).where(Printer.is_active.is_(True)))).scalars().all()
+    for printer_id in printer_ids:
+        state = manager.get_status(printer_id)
+        if state is None or not getattr(state, "raw_data", None):
+            continue  # disconnected / never connected — no live slots to reconcile
+        ams = state.raw_data.get("ams", [])
+        if isinstance(ams, dict):
+            ams = ams.get("ams", [])
+        if not ams:
+            continue
+        res = await db.execute(
+            select(SpoolAssignment)
+            .options(selectinload(SpoolAssignment.spool))
+            .where(SpoolAssignment.printer_id == printer_id)
+        )
+        bound = {(a.ams_id, a.tray_id): a for a in res.scalars().all()}
+
+        for unit in ams:
+            if not isinstance(unit, dict):
+                continue
+            try:
+                ams_id = int(unit.get("id", -1))
+            except (TypeError, ValueError):
+                continue
+            for tray in unit.get("tray", []) or []:
+                if not isinstance(tray, dict):
+                    continue
+                try:
+                    tray_id = int(tray.get("id", -1))
+                except (TypeError, ValueError):
+                    continue
+                tag_uid = tray.get("tag_uid", "") or ""
+                tray_uuid = tray.get("tray_uuid", "") or ""
+                assignment = bound.get((ams_id, tray_id))
+                # Per-slot guard: one wedged slot must not strand the rest of the
+                # fleet's reconcile for the whole pass (the tick's own guard would
+                # abandon every printer after this one).
+                try:
+                    if (
+                        tray_present(tray)
+                        and not (tray.get("tray_type") or "").strip()
+                        and not is_valid_tag(tag_uid, tray_uuid)
+                    ):
+                        # BARE — the incident shape. The callee owns every guard,
+                        # including the operator/RFID-bound never-overwrite: a config
+                        # write racing a firmware tag read is the 2026-07-18 HMS
+                        # 0700_0081 class, so the re-push stays ams_auto-only.
+                        if await maybe_autoconfigure_bare_tray(db, printer_id, ams_id, tray_id, tray):
+                            pushed += 1
+                    elif (
+                        assignment is not None
+                        and assignment.spool is not None
+                        and is_bambu_tag(tag_uid, tray_uuid, tray.get("tray_info_idx", ""))
+                    ):
+                        # TAGGED — drifted calibration. Internally rate-limited and
+                        # cheap when the spool carries no stored K-profile.
+                        if await reapply_k_profile_if_drifted(
+                            db, printer_id, ams_id, tray_id, tray, assignment.spool, state
+                        ):
+                            pushed += 1
+                except Exception:  # noqa: BLE001 — one bad slot must not abort the pass
+                    logger.exception(
+                        "Slot-config reconcile failed for printer %d AMS%d-T%d",
+                        printer_id,
+                        ams_id,
+                        tray_id,
+                    )
+    return pushed
 
 
 # --- dedup lifecycle -------------------------------------------------------
