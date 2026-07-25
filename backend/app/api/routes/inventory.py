@@ -263,7 +263,11 @@ async def apply_spool_to_slot_via_mqtt(
         # The filament-setting write was refused (AMS identifying/drying, or offline).
         # Do NOT proceed to extrusion_cali_sel or persist a slot-preset row for a
         # write that never reached the printer — the preset row must not record a
-        # config that did not land. A later AMS push re-applies once the AMS settles.
+        # config that did not land. Two lanes re-apply it: the AMS callback while the
+        # AMS state keeps churning (change-gated on bambu_mqtt's state hash, so a
+        # SETTLED AMS never re-fires it — the 2026-07-24 15-minute blank-slot
+        # incident), and spool_tagless.reconcile_slot_config on the scheduler tick,
+        # which is the durable backstop that does not depend on state churn.
         logger.warning(
             "Spool assign: ams_filament_setting refused for spool %d AMS%d-T%d on printer %d "
             "(AMS busy identifying/drying, or offline) — skipping calibration + preset persist",

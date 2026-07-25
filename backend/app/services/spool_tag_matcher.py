@@ -877,7 +877,11 @@ async def reapply_k_profile_if_drifted(
     inspected and not retried inside the window — it self-heals on a later drift tick
     once the window elapses, which is the whole point of the gate (the un-gated
     version re-fired on every push, storming the AMS during exactly the identify flap
-    that caused the drift). Returns True when a re-apply was published.
+    that caused the drift). That later tick is now GUARANTEED: the AMS callback only
+    re-fires while the AMS state hash churns (2026-07-24 incident — a settled AMS
+    never re-fires it), so ``spool_tagless.reconcile_slot_config`` re-drives this
+    from the scheduler tick regardless of state churn. Returns True when a re-apply
+    was published.
     """
     if spool is None:
         return False

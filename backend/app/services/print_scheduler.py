@@ -225,6 +225,18 @@ class PrintScheduler:
             except Exception:
                 logger.exception("Attention-reminder watch failed (non-fatal)")
 
+            # Slot-config reconcile (2026-07-24): a refused AMS config write (identify
+            # gate / drying) had NO durable retry — the AMS callback is change-gated
+            # (bambu_mqtt ams-hash), so once the AMS settles the refused write was lost
+            # and the slot stayed unconfigured (bare tray) or on drifted calibration.
+            # State-derived re-push each tick; internally throttled + per-slot windowed.
+            try:
+                from backend.app.services.spool_tagless import reconcile_slot_config
+
+                await reconcile_slot_config(db)
+            except Exception:
+                logger.exception("Slot-config reconcile failed (non-fatal)")
+
             # Staged-completeness safety net (D8): the low-spool release triggers
             # (AMS change / run resume / banner button) can all MISS — a
             # fully-loaded printer going idle fires no event, stranding staged
