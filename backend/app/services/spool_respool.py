@@ -917,27 +917,25 @@ async def _broadcast_respool_prompt(
     )
 
 
-async def rebroadcast_unresolved_respool_prompts(db: AsyncSession, send) -> int:
-    """Replay every still-unresolved ``respool_prompt`` to a (re)connecting client.
+async def pending_respool_prompts(db: AsyncSession) -> list[dict]:
+    """Every still-unresolved ``respool_prompt``, as ready-to-send WS payloads.
 
-    The ``respool_prompt`` WS event is fire-once — ``ws_manager.broadcast`` reaches
-    only sockets connected at emit time and keeps no backlog — so a client that was
-    disconnected when a prompt fired never learns of it (F2). This replays the
-    prompts tracked in the in-memory per-slot dedup (:data:`_respool_prompt_dedup`,
-    the very records the live gate populates) to the single ``send`` coroutine (the
-    reconnecting socket's ``send_json``). It bypasses the dedup *guard* (which would
-    suppress a re-send) but never mutates the dedup state.
+    The ONE snapshot of what is outstanding, consumed by the reconnect replay
+    (:func:`rebroadcast_unresolved_respool_prompts`) and the REST fallback
+    (``GET /inventory/prompts/pending``) so the two can never disagree.
 
-    A dedup entry alone is NOT proof the prompt is still open: the durable answer
-    lives in the DB, and the dismissal route stamps ``respool_dismissed_at`` WITHOUT
-    clearing this in-memory dedup. So each slot is re-validated before re-sending —
-    the slot must still physically hold the same tag, and the tag's donor row must
-    still resolve, be un-dismissed, and un-archived. Returns the number re-sent.
-    Never raises (a reconnect must never break on a farm-side hook); no-op in
-    Spoolman mode.
+    Candidates come from the in-memory per-slot dedup (:data:`_respool_prompt_dedup`,
+    the very records the live gate populates) — this tier keeps no durable state by
+    design, unlike the tagless fresh-roll prompt's stamp. A dedup entry alone is NOT
+    proof the prompt is still open: the durable answer lives in the DB, and the
+    dismissal route stamps ``respool_dismissed_at`` WITHOUT clearing the dedup. So each
+    slot is re-validated — the slot must still physically hold the SAME tag, and the
+    tag's donor row must still resolve, be un-dismissed and un-archived. Stale entries
+    are skipped, never mutated (the dedup clears on its own empty-slot edge). Empty in
+    Spoolman mode. Raises nothing the callers do not already guard.
     """
     if await _spoolman_enabled(db):
-        return 0
+        return []
 
     from backend.app.services.printer_manager import printer_manager
 
@@ -948,13 +946,13 @@ async def rebroadcast_unresolved_respool_prompts(db: AsyncSession, send) -> int:
         for (ams_id, tray_id), (tag_uid, tray_uuid) in slots.items()
     ]
 
-    sent = 0
+    payloads: list[dict] = []
     for pid, ams_id, tray_id, tag_uid, tray_uuid in snapshot:
         try:
             state = printer_manager.get_status(pid)
             tray = _resolve_live_tray(state, ams_id, tray_id)
-            # Replay only while the SAME tag still physically occupies the slot; a
-            # gone / re-tagged slot is stale (the dedup clears on the empty edge).
+            # Only while the SAME tag still physically occupies the slot; a gone /
+            # re-tagged slot is stale.
             if not tray or not tray.get("tray_type"):
                 continue
             if (tray.get("tag_uid") or "") != tag_uid or (tray.get("tray_uuid") or "") != tray_uuid:
@@ -962,14 +960,44 @@ async def rebroadcast_unresolved_respool_prompts(db: AsyncSession, send) -> int:
             donor = await get_spool_by_tag(db, tag_uid, tray_uuid)
             # Durable resolution signals: a re-spool archives/hard-deletes the donor
             # (and clears the dedup); a dismissal stamps respool_dismissed_at without
-            # touching the dedup — both must suppress the replay.
+            # touching the dedup — both must suppress the prompt.
             if donor is None or donor.archived_at is not None or donor.respool_dismissed_at is not None:
                 continue
-            payload = await _build_respool_prompt_payload(db, pid, ams_id, tray_id, tray, donor)
+            payloads.append(await _build_respool_prompt_payload(db, pid, ams_id, tray_id, tray, donor))
+        except Exception:  # noqa: BLE001 — one slot's failure must not abort the snapshot
+            logger.exception("respool_prompt snapshot failed for printer %s AMS%d-T%d", pid, ams_id, tray_id)
+    return payloads
+
+
+async def rebroadcast_unresolved_respool_prompts(db: AsyncSession, send) -> int:
+    """Replay every still-unresolved ``respool_prompt`` to a (re)connecting client.
+
+    The ``respool_prompt`` WS event is fire-once — ``ws_manager.broadcast`` reaches
+    only sockets connected at emit time and keeps no backlog — so a client that was
+    disconnected when a prompt fired never learns of it (F2). This sends the
+    re-validated snapshot :func:`pending_respool_prompts` builds to the single ``send``
+    coroutine (the reconnecting socket's ``send_json``), bypassing the dedup *guard*
+    (which would suppress a re-send) without mutating the dedup state. Returns the
+    number re-sent. Never raises (a reconnect must never break on a farm-side hook).
+    """
+    try:
+        payloads = await pending_respool_prompts(db)
+    except Exception:  # noqa: BLE001 — a reconnect must never break on the replay hook
+        logger.exception("respool_prompt re-broadcast snapshot failed")
+        return 0
+
+    sent = 0
+    for payload in payloads:
+        try:
             await send(payload)
             sent += 1
         except Exception:  # noqa: BLE001 — one slot's failure must not abort the replay
-            logger.exception("respool_prompt re-broadcast failed for printer %s AMS%d-T%d", pid, ams_id, tray_id)
+            logger.exception(
+                "respool_prompt re-broadcast failed for printer %s AMS%s-T%s",
+                payload.get("printer_id"),
+                payload.get("ams_id"),
+                payload.get("tray_id"),
+            )
 
     if sent:
         logger.info("Re-broadcast %d unresolved respool_prompt(s) to a (re)connecting client", sent)

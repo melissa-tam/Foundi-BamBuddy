@@ -1109,8 +1109,13 @@ async def _seed_fresh_prompt_spool(db_session, printer_id, *, used, spent=False)
     return sid
 
 
+async def _pending_stamp(db, spool_id):
+    """The durable fresh-roll pending stamp for a row, read back from the DB."""
+    return (await db.get(Spool, spool_id)).fresh_prompt_pending_at
+
+
 class TestFreshRollPrompt:
-    async def test_non_spent_past_threshold_prompts_and_pops(self, db_session, printer_factory, env):
+    async def test_non_spent_past_threshold_prompts_and_stamps(self, db_session, printer_factory, env):
         printer = await printer_factory()
         sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=750)  # 75% >= 70%
         key = (printer.id, 0, 0)
@@ -1120,7 +1125,7 @@ class TestFreshRollPrompt:
         assert payload["type"] == "tagless_fresh_prompt"
         assert payload["spool_id"] == sid and payload["material"] == "PETG"
         assert payload["remaining_g"] == 250.0 and payload["rgba"] == "112233FF"
-        assert key in spool_tagless._fresh_prompt_unanswered
+        assert await _pending_stamp(db_session, sid) is not None  # DURABLE, not process memory
         assert key not in spool_tagless._pending_physical_cycles  # popped (processed)
 
     async def test_spent_silent_keeps_pending(self, db_session, printer_factory, env):
@@ -1134,35 +1139,45 @@ class TestFreshRollPrompt:
 
     async def test_sub_threshold_pops_no_prompt(self, db_session, printer_factory, env):
         printer = await printer_factory()
-        await _seed_fresh_prompt_spool(db_session, printer.id, used=100)  # 10% < 70%
+        sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=100)  # 10% < 70%
         key = (printer.id, 0, 0)
         spool_tagless._pending_physical_cycles.add(key)
         await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
         env.ws.assert_not_awaited()
+        assert await _pending_stamp(db_session, sid) is None  # nothing asked → nothing stamped
         assert key not in spool_tagless._pending_physical_cycles  # popped, no-op
 
-    async def test_dedup_no_second_prompt_same_cycle(self, db_session, printer_factory, env):
+    async def test_every_new_cycle_reasks_and_refreshes_the_stamp(self, db_session, printer_factory, env):
+        """Operator contract (2026-07-25): every new qualified physical cycle re-asks.
+        This function only runs ON a cycle edge, so an outstanding stamp is REFRESHED,
+        never used to suppress — the old in-memory dedup made a stuck entry silence the
+        slot for the rest of the process."""
         printer = await printer_factory()
-        await _seed_fresh_prompt_spool(db_session, printer.id, used=750)
+        sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=750)
         key = (printer.id, 0, 0)
         spool_tagless._pending_physical_cycles.add(key)
         await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
         assert env.ws.await_count == 1
-        spool_tagless._pending_physical_cycles.add(key)  # another cycle, still unanswered
+        first = await _pending_stamp(db_session, sid)
+
+        spool_tagless._pending_physical_cycles.add(key)  # another roll swap, still unanswered
         await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
-        assert env.ws.await_count == 1  # suppressed while unanswered
+        assert env.ws.await_count == 2  # re-asks
+        assert await _pending_stamp(db_session, sid) >= first  # stamp refreshed, never dropped
 
     async def test_reasks_after_answer_clears(self, db_session, printer_factory, env):
         printer = await printer_factory()
-        await _seed_fresh_prompt_spool(db_session, printer.id, used=750)
+        sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=750)
         key = (printer.id, 0, 0)
         spool_tagless._pending_physical_cycles.add(key)
         await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
         assert env.ws.await_count == 1
-        spool_tagless.clear_fresh_prompt(printer.id, 0, 0)  # operator answered
+        await spool_tagless.clear_fresh_prompt(db_session, await db_session.get(Spool, sid))  # operator answered
+        assert await _pending_stamp(db_session, sid) is None
         spool_tagless._pending_physical_cycles.add(key)  # a NEW qualified cycle
         await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
         assert env.ws.await_count == 2  # re-asks
+        assert await _pending_stamp(db_session, sid) is not None
 
     async def test_threshold_is_seventy_percent(self, db_session, printer_factory, env):
         """F4 (operator 2026-07-20): the prompt waits until the roll is ≥70 % consumed
@@ -1221,13 +1236,24 @@ class TestNotePhysicalCycle:
 
 
 class TestTaglessReplay:
+    """The snapshot + replay pair, driven ENTIRELY from the durable stamp — no module
+    state is armed anywhere in this class (``_clean_state`` wipes it), which is the
+    point: the 19:39 prompt reached zero websocket clients and a 21:20 restart wiped
+    the RAM set, so the replay had nothing to replay."""
+
     def _present_state(self):
         return SimpleNamespace(raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PETG"}]}]})
 
-    async def test_resends_valid_unanswered(self, db_session, printer_factory, monkeypatch):
+    async def _stamp(self, db_session, spool_id):
+        spool = await db_session.get(Spool, spool_id)
+        spool.fresh_prompt_pending_at = datetime.utcnow()
+        await db_session.commit()
+
+    async def test_resends_stamped_prompt_after_a_restart(self, db_session, printer_factory, monkeypatch):
         printer = await printer_factory()
         sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=700)
-        spool_tagless._fresh_prompt_unanswered.add((printer.id, 0, 0))
+        await self._stamp(db_session, sid)
+        spool_tagless._reset_state()  # "restart": every in-memory ledger is gone
         monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: self._present_state())
         send = AsyncMock()
         n = await spool_tagless.rebroadcast_unresolved_tagless_prompts(db_session, send)
@@ -1235,25 +1261,48 @@ class TestTaglessReplay:
         payload = send.await_args.args[0]
         assert payload["type"] == "tagless_fresh_prompt" and payload["spool_id"] == sid
 
-    async def test_drops_stale_spent(self, db_session, printer_factory, monkeypatch):
+    async def test_unstamped_row_is_not_replayed(self, db_session, printer_factory, monkeypatch):
         printer = await printer_factory()
-        await _seed_fresh_prompt_spool(db_session, printer.id, used=700, spent=True)
-        spool_tagless._fresh_prompt_unanswered.add((printer.id, 0, 0))
+        await _seed_fresh_prompt_spool(db_session, printer.id, used=700)  # eligible but never asked
         monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: self._present_state())
         send = AsyncMock()
-        n = await spool_tagless.rebroadcast_unresolved_tagless_prompts(db_session, send)
-        assert n == 0  # spent row -> dropped
+        assert await spool_tagless.rebroadcast_unresolved_tagless_prompts(db_session, send) == 0
         send.assert_not_awaited()
 
-    async def test_drops_when_slot_absent(self, db_session, printer_factory, monkeypatch):
+    @pytest.mark.parametrize("invalidate", ["spent", "archived", "tagged", "unbound"])
+    async def test_snapshot_drops_rows_the_prompt_no_longer_applies_to(
+        self, db_session, printer_factory, monkeypatch, invalidate
+    ):
         printer = await printer_factory()
-        await _seed_fresh_prompt_spool(db_session, printer.id, used=700)
-        spool_tagless._fresh_prompt_unanswered.add((printer.id, 0, 0))
+        sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=700)
+        await self._stamp(db_session, sid)
+        spool = await db_session.get(Spool, sid)
+        if invalidate == "spent":
+            spool.spent_at = datetime.utcnow()  # W1 owns it silently, no prompt
+        elif invalidate == "archived":
+            spool.archived_at = datetime.utcnow()
+        elif invalidate == "tagged":
+            spool.tag_uid = _VALID_TAG  # RFID row — the tagless prompt never applies
+        else:
+            sa = await _assignment(db_session, printer.id)
+            await db_session.delete(sa)
+        await db_session.commit()
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: self._present_state())
+        assert await spool_tagless.pending_fresh_prompts(db_session) == []
+
+    async def test_snapshot_drops_when_slot_absent(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=700)
+        await self._stamp(db_session, sid)
         monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: None)  # printer gone
-        send = AsyncMock()
-        n = await spool_tagless.rebroadcast_unresolved_tagless_prompts(db_session, send)
-        assert n == 0
-        send.assert_not_awaited()
+        assert await spool_tagless.pending_fresh_prompts(db_session) == []
+        # The stamp is NOT cleared by a failed validation — an offline printer must
+        # still prompt once it is back.
+        assert await _pending_stamp(db_session, sid) is not None
+
+    async def test_ram_set_is_gone(self):
+        """No dual path: the in-memory unanswered set is deleted outright."""
+        assert not hasattr(spool_tagless, "_fresh_prompt_unanswered")
 
 
 # --- E1: shared generic-identity override ----------------------------------
@@ -1584,10 +1633,14 @@ class TestMintSettleDefer:
         sa = await _assignment(db_session, printer.id)
         assert sa is not None and sa.spool_id == sid  # binding untouched by the defer
 
-    async def test_existing_binding_transition_is_not_deferred(self, db_session, printer_factory, env, monkeypatch):
+    async def test_existing_binding_transition_mints_but_holds_the_wire(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
         # A SPENT binding released by a qualified physical cycle mints its replacement
         # even while the gain is fresh — the cycle IS the insertion evidence, and the
-        # row it replaces is an existing binding, not a first sighting.
+        # row it replaces is an existing binding, not a first sighting. The LEDGER
+        # transition is not deferred; the WIRE write is (2026-07-25): a fresh roll one
+        # second into its firmware read must not be configured out from under it.
         printer = await printer_factory()
         await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF", spent=True)
         spool_tagless._pending_physical_cycles.add((printer.id, 0, 0))
@@ -1598,6 +1651,7 @@ class TestMintSettleDefer:
         assert handled is True
         sa = await _assignment(db_session, printer.id)
         assert sa is not None and sa.spool.spent_at is None  # replacement bound
+        env.apply.assert_not_awaited()  # ...but nothing published into the unresolved slot
 
     async def test_bare_tray_first_mint_defers_without_burning_the_window(
         self, db_session, printer_factory, env, monkeypatch
@@ -1609,22 +1663,195 @@ class TestMintSettleDefer:
         env.apply.assert_not_awaited()
         assert (printer.id, 0, 0) not in spool_tagless._autoconfig_window  # window not burned
         # Settled → mints + pushes immediately (no wait for the retry cadence).
-        self._gain(monkeypatch, 6.0)
+        self._gain(monkeypatch, spool_tagless._CONFIG_SETTLE_S + 1.0)
         assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is True
         env.apply.assert_awaited_once()
 
-    async def test_bare_tray_re_push_of_a_tracked_slot_is_not_deferred(
+
+class TestConfigSettleGate:
+    """2026-07-25 CLOBBER PIN — a fresh Bambu-tagged roll dropped into a slot that still
+    carries a surviving tagless binding reads BARE for ~1 s while the firmware runs its
+    own RFID read. The re-push arm had NO settle defer (only fresh MINTS waited), so the
+    config write landed inside that window, destroyed the RFID-detected state — which the
+    firmware never retries — and left the slot as the tagless default with a phantom
+    binding for six hours. Nothing may publish an identity into an unresolved slot."""
+
+    def _gain(self, monkeypatch, age):
+        monkeypatch.setattr("backend.app.services.ams_presence.recent_gain_age", lambda *a: age)
+
+    def _unanswered(self, monkeypatch, unanswered, cycle_age=None):
+        monkeypatch.setattr("backend.app.services.ams_presence.identity_unanswered", lambda *a: unanswered)
+        monkeypatch.setattr("backend.app.services.ams_presence.last_physical_cycle_age", lambda *a: cycle_age)
+
+    async def _track_slot(self, db_session, printer, env, monkeypatch):
+        """Mint + bind our own ams_auto default on the slot, then reset the retry
+        window — leaving exactly the tracked-slot RE-PUSH state the incident hit."""
+        self._gain(monkeypatch, None)
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is True
+        env.apply.reset_mock()
+        spool_tagless.clear_autoconfig_dedup(printer.id, 0, 0)
+
+    async def test_tracked_slot_re_push_defers_inside_the_gain_window(
         self, db_session, printer_factory, env, monkeypatch
     ):
         printer = await printer_factory()
-        self._gain(monkeypatch, 6.0)
+        await self._track_slot(db_session, printer, env, monkeypatch)
+
+        self._gain(monkeypatch, 1.0)  # inserted 1 s ago — the firmware read is in flight
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is False
+        env.apply.assert_not_awaited()  # the clobber that made the phantom binding
+        assert (printer.id, 0, 0) not in spool_tagless._autoconfig_window  # window not burned
+
+        # Past the settle window the same slot re-pushes immediately — one delay, not a
+        # stall, and no fresh row minted for the roll already tracked.
+        self._gain(monkeypatch, spool_tagless._CONFIG_SETTLE_S + 1.0)
         assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is True
-        spool_tagless.clear_autoconfig_dedup(printer.id, 0, 0)  # window elapsed
-        self._gain(monkeypatch, 1.0)  # a fresh gain on an ALREADY-tracked slot
-        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is True
-        assert env.apply.await_count == 2  # re-push, not a mint → never deferred
+        env.apply.assert_awaited_once()
         count = await db_session.scalar(select(func.count(Spool.id)).where(Spool.data_origin == "ams_auto"))
         assert count == 1
+
+    async def test_unanswered_cycle_defers_then_fails_open_past_the_cap(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
+        # Second arm: the gain is old, but the farm still does not know WHAT is in the
+        # slot (a qualified cycle nothing has answered). Publishing an identity there is
+        # a guess that overwrites the real one.
+        printer = await printer_factory()
+        await self._track_slot(db_session, printer, env, monkeypatch)
+        self._gain(monkeypatch, 300.0)
+
+        self._unanswered(monkeypatch, True, cycle_age=300.0)
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is False
+        env.apply.assert_not_awaited()
+        assert (printer.id, 0, 0) not in spool_tagless._autoconfig_window
+
+        # Past _CONFIG_SETTLE_MAX_S no firmware read can still be running: fail OPEN so a
+        # genuinely tagless roll (whose read can never succeed) is delayed once, not forever.
+        self._unanswered(monkeypatch, True, cycle_age=spool_tagless._CONFIG_SETTLE_MAX_S + 1.0)
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is True
+        env.apply.assert_awaited_once()
+
+    async def test_push_config_is_the_funnel(self, db_session, printer_factory, env, monkeypatch):
+        # Every tagless config-write path goes through _push_config, so the gate is
+        # enforced there too — a caller that reaches it while settling publishes nothing.
+        printer = await printer_factory()
+        sid = await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+        spool = await db_session.get(Spool, sid)
+        self._gain(monkeypatch, 1.0)
+        assert await spool_tagless._push_config(db_session, spool, printer.id, 0, 0, _tray("PETG")) is False
+        env.apply.assert_not_awaited()
+        self._gain(monkeypatch, spool_tagless._CONFIG_SETTLE_S + 1.0)
+        assert await spool_tagless._push_config(db_session, spool, printer.id, 0, 0, _tray("PETG")) is True
+        env.apply.assert_awaited_once()
+
+    async def test_settled_slot_with_no_history_is_never_gated(self, db_session, printer_factory, env, monkeypatch):
+        # A restart / never-observed slot (no gain stamp, no pending question) reads as
+        # settled: the gate can never wedge a slot it has no evidence about.
+        printer = await printer_factory()
+        self._gain(monkeypatch, None)
+        self._unanswered(monkeypatch, False)
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is True
+        env.apply.assert_awaited_once()
+
+    async def test_unreadable_printer_state_keeps_the_gate_on(self, db_session, printer_factory, env, monkeypatch):
+        """The mid-print carve-out below fails SAFE: a printer whose state cannot be
+        read (disconnected — ``env`` already returns None here) is NOT assumed
+        mid-print, so the gate stays active and the wire stays protected."""
+        printer = await printer_factory()
+        await self._track_slot(db_session, printer, env, monkeypatch)
+        self._gain(monkeypatch, 1.0)
+
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is False
+        env.apply.assert_not_awaited()
+
+    def test_busy_read_failure_direction_is_stated_per_caller(self, monkeypatch):
+        """One predicate, two safe directions: the idle-only identity reconcile resolves
+        an unreadable state to BUSY (never write), the settle gate to NOT-mid-print (keep
+        the gate on). Both mean "protect the wire"; only the polarity differs."""
+
+        def _raise(pid):
+            raise RuntimeError("offline")
+
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", _raise)
+        assert spool_tagless._printer_busy(1) is True
+        assert spool_tagless._printer_busy(1, on_error=False) is False
+
+
+class TestMidPrintIsNotGated:
+    """The gate protects the firmware's post-insert AUTO-READ window, and that window
+    only exists while IDLE: mid-print insertions get no automatic RFID read and no
+    retroactive read at FINISH (mqtt-protocol.md:61, live-verified H2S fw 01.01.02.00).
+    Gating there would protect nothing AND starve spool_recovery's forced bare-tray
+    enrollment — a jam is exactly PAUSE + a freshly-gained slot — which doctrine rule 1
+    forbids (never defer a recoverable state to a human)."""
+
+    def _gain(self, monkeypatch, age):
+        monkeypatch.setattr("backend.app.services.ams_presence.recent_gain_age", lambda *a: age)
+
+    def _printer_state(self, monkeypatch, gcode_state):
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: SimpleNamespace(state=gcode_state))
+
+    async def test_jam_recovery_enrollment_publishes_during_a_pause(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
+        """RECOVERY PIN — spool_recovery's forced sweep enrolling an operator-inserted
+        backup spool mid-jam: printer PAUSEd, slot gained seconds ago. It must configure
+        the slot NOW so the roll joins the firmware backup pool and the print can resume;
+        deferring a recoverable state to a human is doctrine rule 1's whole prohibition.
+
+        Gain age 8 s clears the pre-existing F1 mint settle (5 s, untouched by this wave)
+        and sits deep INSIDE the 30 s config-settle window — so this pins the carve-out
+        and nothing else."""
+        printer = await printer_factory()
+        self._printer_state(monkeypatch, "PAUSE")
+        self._gain(monkeypatch, 8.0)
+
+        assert (
+            await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True) is True
+        )
+        env.apply.assert_awaited_once()
+
+    async def test_paused_re_push_of_a_tracked_slot_is_immediate(self, db_session, printer_factory, env, monkeypatch):
+        """The other half of the jam flow: the backup spool is ALREADY our ams_auto row
+        (enrolled on a previous pass) and only needs its config re-pushed. No mint is
+        involved, so not even F1 applies — a 1 s-old gain publishes at once."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+        self._printer_state(monkeypatch, "PAUSE")
+        self._gain(monkeypatch, 1.0)
+
+        assert (
+            await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True) is True
+        )
+        env.apply.assert_awaited_once()
+
+    async def test_push_config_publishes_while_running_despite_an_unanswered_cycle(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
+        printer = await printer_factory()
+        sid = await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+        spool = await db_session.get(Spool, sid)
+        self._printer_state(monkeypatch, "RUNNING")
+        self._gain(monkeypatch, 1.0)
+        monkeypatch.setattr("backend.app.services.ams_presence.identity_unanswered", lambda *a: True)
+        monkeypatch.setattr("backend.app.services.ams_presence.last_physical_cycle_age", lambda *a: 5.0)
+
+        assert await spool_tagless._push_config(db_session, spool, printer.id, 0, 0, _tray("PETG")) is True
+        env.apply.assert_awaited_once()
+
+    @pytest.mark.parametrize("gcode_state", ["IDLE", "FINISH"])
+    async def test_idle_and_finish_are_still_gated(self, db_session, printer_factory, env, monkeypatch, gcode_state):
+        """Control: the carve-out is RUNNING/PAUSE only — an idle printer between prints
+        is exactly when the firmware DOES auto-read an insert."""
+        printer = await printer_factory()
+        self._printer_state(monkeypatch, gcode_state)
+        self._gain(monkeypatch, 1.0)
+
+        assert (
+            await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True)
+            is False
+        )
+        env.apply.assert_not_awaited()
 
 
 def test_marker_machinery_removed():

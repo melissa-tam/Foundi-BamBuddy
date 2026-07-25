@@ -1540,3 +1540,74 @@ class TestPromotedState10DrivesDiscovery:
         tray = _tray(0, state=10)
         reason = await ams_presence.identify_needed(db_session, 1, 0, 0, tray, spoolman_active=False)
         assert reason is None
+
+
+class TestOwedIdentityUnansweredAccessor:
+    """``identity_unanswered`` is the public, non-consuming view of the discovery
+    evidence that spool_tagless's config-settle gate reads — the fork's one answer to
+    "does anybody know what is in this slot?"."""
+
+    def test_mirrors_the_private_evidence_test(self):
+        assert ams_presence.identity_unanswered(1, 0, 0) is False
+        _arm_cycle(1, 0, 0)
+        assert ams_presence.identity_unanswered(1, 0, 0) is True
+        ams_presence.note_identity_learned(1, 0, 0)  # a read answered it
+        assert ams_presence.identity_unanswered(1, 0, 0) is False
+
+    def test_asking_does_not_consume_the_evidence(self):
+        _arm_cycle(1, 0, 0)
+        for _ in range(3):
+            assert ams_presence.identity_unanswered(1, 0, 0) is True
+
+
+class TestOwedReadObservability:
+    """2026-07-25: the owed discovery read deferred QUIETLY (one DEBUG) for six hours.
+    A defer that lasts past _OWED_READ_WARN_AFTER_S is no longer pacing — it is a
+    standing unknown identity, and it says so once an hour."""
+
+    def _client(self, *, refusal=None):
+        client = MagicMock()
+        client.ams_write_refusal.return_value = refusal
+        client.ams_unit_drying.return_value = False
+        client.ams_refresh_tray.return_value = (True, "ok")
+        return client
+
+    async def _run(self, db_session, monkeypatch, *, cycle_age, tray_now=1, gcode_state="IDLE"):
+        client = self._client()
+        state = _pstate([_tray(0, state=11)], gcode_state=gcode_state, tray_now=tray_now)
+        _patch_pm(monkeypatch, status=state, client=client)
+        _arm_cycle(1, 0, 0, age=cycle_age)
+        return await ams_presence.maybe_command_owed_identify(db_session, 1, 0, 0, _tray(0, state=11), state), client
+
+    async def test_warns_once_then_suppresses_within_the_rewarn_window(self, db_session, monkeypatch, caplog):
+        with caplog.at_level(logging.DEBUG, logger="backend.app.services.ams_presence"):
+            ok, client = await self._run(db_session, monkeypatch, cycle_age=ams_presence._OWED_READ_WARN_AFTER_S + 60)
+            assert ok is False
+            client.ams_refresh_tray.assert_not_called()
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert len(warnings) == 1
+            assert "identity unknown" in warnings[0].getMessage()
+            assert "filament engaged" in warnings[0].getMessage()
+
+            # Same slot again inside the re-warn window → still deferred, but silent.
+            await ams_presence.maybe_command_owed_identify(
+                db_session, 1, 0, 0, _tray(0, state=11), ams_presence.printer_manager.get_status(1)
+            )
+            assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+
+    async def test_recent_cycle_defers_without_warning(self, db_session, monkeypatch, caplog):
+        with caplog.at_level(logging.DEBUG, logger="backend.app.services.ams_presence"):
+            ok, client = await self._run(db_session, monkeypatch, cycle_age=30.0)
+        assert ok is False
+        client.ams_refresh_tray.assert_not_called()
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]  # ordinary pacing
+
+    async def test_disengaged_idle_slot_is_read_not_warned(self, db_session, monkeypatch, caplog):
+        with caplog.at_level(logging.DEBUG, logger="backend.app.services.ams_presence"):
+            ok, client = await self._run(
+                db_session, monkeypatch, cycle_age=ams_presence._OWED_READ_WARN_AFTER_S + 60, tray_now=255
+            )
+        assert ok is True
+        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert ams_presence._unanswered_cycle(1, 0, 0) is False  # the read answered it

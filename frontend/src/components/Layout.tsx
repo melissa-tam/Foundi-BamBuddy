@@ -15,6 +15,7 @@ import { useSponsorPrompt } from '../hooks/useSponsorPrompt';
 import { useUnknownTagPrompt } from '../hooks/useUnknownTagPrompt';
 import { useRespoolPrompt } from '../hooks/useRespoolPrompt';
 import { useTaglessFreshPrompt } from '../hooks/useTaglessFreshPrompt';
+import { usePendingPromptSync } from '../hooks/usePendingPromptSync';
 import { RespoolTagModal } from './RespoolTagModal';
 import { TaglessFreshModal } from './TaglessFreshModal';
 import { useAuth } from '../contexts/AuthContext';
@@ -134,6 +135,11 @@ export function Layout() {
   // non-RFID roll is consumed past half its label weight (W5). Side-effect only;
   // the hook owns its toasts, and its review modal is rendered below.
   const taglessFreshPrompt = useTaglessFreshPrompt();
+  // Prompt recovery lane — replays every still-unanswered per-slot prompt on
+  // load and on each websocket reconnect, so a broadcast this tab was not
+  // connected for is not lost forever. Must sit AFTER the prompt hooks: it
+  // dispatches the very window events they listen for.
+  usePendingPromptSync();
 
   // Fetch default sidebar order via a public endpoint (no settings:read needed)
   const { data: defaultSidebarData } = useQuery({

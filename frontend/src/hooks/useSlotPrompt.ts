@@ -7,14 +7,17 @@ import { useToast, type ToastAction, type ToastType } from '../contexts/ToastCon
  * (fresh untagged roll) consume. Extracted so the two flows can't diverge.
  *
  * What it owns:
- *   - a per-slot queue keyed `${printer}|${ams}|${tray}` (dedup guard: a repeat
- *     event for a slot already queued never stacks a second toast),
+ *   - a per-slot queue keyed `${printer}|${ams}|${tray}` (one entry per slot: a
+ *     repeat event REPLACES the queued payload instead of stacking a second),
  *   - a persistent warning-toast raised/refreshed per queued slot (idempotent by
  *     toast id — re-running never duplicates), cleared on answer,
  *   - cross-client dismissal via a WS→window-event bridge (another client
  *     answered → clear the matching slot's toast + queue entry here too),
- *   - reconnect replay: the raise effect re-runs whenever the queue changes, so a
- *     backend re-broadcast (bridged to `eventName`) re-raises cleanly.
+ *   - replay = re-raise: because a repeat event swaps the queued entry, the
+ *     array identity changes and the raise effect re-runs. A still-visible toast
+ *     is refreshed in place; a toast the operator X-ed away comes BACK. X means
+ *     "not now", never an answer — only answering, a cross-client dismissal, or
+ *     resolution settles the question (operator decision, 2026-07-25).
  *
  * What the caller owns (per-flow divergence): the toast copy + actions
  * (`renderToast`), how an incoming window-event detail becomes a queued prompt
@@ -131,23 +134,36 @@ export function useSlotPrompt<T extends SlotTriple>(
     [removeSlot, dequeue, dismissSlotToast],
   );
 
-  // Enqueue on a fresh event (dedup per slot). The backend dedupes per slot too,
-  // so a repeat here is the same unanswered prompt — keep the first.
+  // Enqueue on a fresh event; on a REPLAY of an already-queued slot swap the
+  // payload in (never stack a second entry). The backend dedupes per slot too,
+  // so a repeat here is the same unanswered question with fresher numbers — and
+  // the new array identity is what re-runs the raise effect below, which is how
+  // an X-dismissed toast comes back. Returning `prev` unchanged (the old
+  // behaviour) silently swallowed every replay: once X-ed, the prompt could
+  // never be seen again in this tab.
   useEffect(() => {
     if (!isAuthed) return;
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<unknown>).detail;
       const prompt = toPromptRef.current(detail);
       if (!prompt) return;
-      setQueue(prev => (prev.some(p => sameSlot(p, prompt)) ? prev : [...prev, prompt]));
+      setQueue(prev => {
+        const index = prev.findIndex(p => sameSlot(p, prompt));
+        if (index === -1) return [...prev, prompt];
+        const next = [...prev];
+        next[index] = prompt;
+        return next;
+      });
     };
     window.addEventListener(eventName, handler);
     return () => window.removeEventListener(eventName, handler);
   }, [isAuthed, eventName]);
 
-  // Raise / refresh one persistent toast per queued slot. Idempotent by toast id,
-  // so re-running (a new slot joins, or the copy changes on language switch)
-  // never stacks duplicates.
+  // Raise / refresh one persistent toast per queued slot. `showPersistentToast`
+  // is idempotent by toast id — it updates a live toast in place — so re-running
+  // (a new slot joins, a replay swaps a payload, the copy changes on language
+  // switch) never stacks duplicates, while a slot whose toast was X-ed away has
+  // no live toast to update and is therefore raised afresh.
   useEffect(() => {
     for (const prompt of queue) {
       const content = renderToast(prompt, helpers);

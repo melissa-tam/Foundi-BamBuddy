@@ -84,6 +84,13 @@ class Spool(Base):
     # still surfaces. Stamped ONLY via POST /inventory/spools/{id}/respool-dismiss
     # (the single mutator — deliberately absent from SpoolUpdate).
     respool_dismissed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # Durable "a tagless fresh-roll prompt (W5) is awaiting an operator answer for
+    # this row" stamp — the per-CYCLE prompt's only state. Process memory could not
+    # hold it: a broadcast with no client connected reached nobody, a restart wiped
+    # the set, and the reconnect replay then had nothing to replay (2026-07-24).
+    # Re-stamped (not deduped away) on every new qualified physical cycle — that IS
+    # the per-cycle re-ask — and NULLed by either answer (fresh / same).
+    fresh_prompt_pending_at: Mapped[datetime | None] = mapped_column(DateTime)
     # Out-of-rotation marker: set when a feed-fault HMS (stuck/tangled spool)
     # triggers mid-print recovery on this spool's tray; NULL = in rotation.
     # Cleared on physical remove+re-insert (ams_presence edge) or manual PATCH.

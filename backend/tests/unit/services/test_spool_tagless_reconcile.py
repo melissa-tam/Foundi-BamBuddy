@@ -25,7 +25,7 @@ from sqlalchemy.orm import selectinload
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
-from backend.app.services import spool_tag_matcher, spool_tagless
+from backend.app.services import ams_presence, spool_tag_matcher, spool_tagless
 
 pytestmark = pytest.mark.asyncio
 
@@ -41,9 +41,11 @@ _PAST_WINDOW = _T0 + spool_tagless._RECONCILE_MIN_INTERVAL_S + 1.0
 @pytest.fixture(autouse=True)
 def _clean_state():
     spool_tagless._reset_state()
+    ams_presence._reset_state()  # the owed-identify arm reads its change-evidence ledgers
     spool_tag_matcher._kdrift_window.reset()  # the K-drift arm rides this window
     yield
     spool_tagless._reset_state()
+    ams_presence._reset_state()
     spool_tag_matcher._kdrift_window.reset()
 
 
@@ -125,14 +127,20 @@ def _tagged_tray(tray_id=0, *, cali_idx=3):
     }
 
 
-def _state(trays, *, ams_id=0, wrapped=False):
-    """Live merged state carrying one AMS unit. ``wrapped`` uses the dict-wrapper shape."""
+def _state(trays, *, ams_id=0, wrapped=False, gcode_state="IDLE", tray_now=255):
+    """Live merged state carrying one AMS unit. ``wrapped`` uses the dict-wrapper shape.
+
+    ``tray_now`` defaults to 255 (nothing engaged) so the owed-identify arm's
+    engaged-filament pre-check reads as clear; engaged cases pass a real tray id.
+    """
     ams = [{"id": ams_id, "tray": trays}]
     return SimpleNamespace(
-        state="IDLE",
+        state=gcode_state,
         raw_data={"ams": {"ams": ams} if wrapped else ams},
         ams_extruder_map=None,
         nozzles=[],
+        tray_now=tray_now,
+        ams_status_main=0,
     )
 
 
@@ -389,6 +397,155 @@ class TestKDriftArm:
 
         assert await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0) == 0
         assert env.client.cali_calls == []
+
+
+# --- K: the owed-discovery-read arm ----------------------------------------
+
+
+class _IdentifyClient:
+    """Client stub for the identify arm — wire-safe by default, records every read."""
+
+    def __init__(self, *, refusal=None, drying=False):
+        self.refusal = refusal
+        self.drying = drying
+        self.reads: list[tuple[int, int]] = []
+
+    def ams_write_refusal(self, ams_id):
+        return self.refusal
+
+    def ams_unit_drying(self, ams_id):
+        return self.drying
+
+    def ams_refresh_tray(self, ams_id, tray_id):
+        self.reads.append((ams_id, tray_id))
+        return (True, "ok")
+
+    def extrusion_cali_sel(self, **kw):
+        return True
+
+
+class TestOwedIdentifyArm:
+    """2026-07-25 INCIDENT PIN — a slot the farm KNEW had physically changed sat
+    unidentified for six hours. ``identify_needed`` returned "discovery" the whole time,
+    but both event-driven lanes refused it: the idle-gain lane only fires on the gain
+    itself, and the terminal sweep's engaged-filament pre-check defers every slot while
+    filament sits in the extruder path — which on a continuously-loaded printer is
+    always. The scheduler-tick walk is the drain that has no such dependency."""
+
+    def _wire(self, monkeypatch, state, *, client=None):
+        client = client or _IdentifyClient()
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: state)
+        return client
+
+    def _arm_cycle(self, printer_id, ams_id=0, tray_id=0):
+        """An unanswered QUALIFIED physical cycle — somebody swapped a roll here and
+        nothing has established what it is."""
+        ams_presence._physical_cycle_at[(printer_id, ams_id, tray_id)] = ams_presence.time.monotonic()
+
+    async def test_owed_read_is_commanded_and_the_config_write_waits_for_it(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
+        """Both halves of the fix in one pass: an unidentified slot is READ, and it is
+        NOT configured meanwhile — publishing an identity into a slot whose identity is
+        an open question is the clobber that cost 6 h of phantom binding."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id)
+        state = _state([_bare_tray()])
+        client = self._wire(monkeypatch, state)
+        self._arm_cycle(printer.id)
+        manager = _FakeManager({printer.id: state})
+
+        pushed = await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+
+        assert client.reads == [(0, 0)]  # the owed discovery read finally goes out
+        assert pushed == 0
+        env.apply.assert_not_awaited()  # nothing published into the unresolved slot
+        assert (printer.id, 0, 0) not in spool_tagless._autoconfig_window  # window not burned
+
+    async def test_engaged_filament_defers_and_preserves_the_evidence(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id)
+        state = _state([_bare_tray()], tray_now=1)  # filament engaged — the client would refuse
+        client = self._wire(monkeypatch, state)
+        self._arm_cycle(printer.id)
+        manager = _FakeManager({printer.id: state})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+
+        assert client.reads == []
+        assert ams_presence._unanswered_cycle(printer.id, 0, 0) is True  # retried next pass
+
+    async def test_printing_printer_is_never_read(self, db_session, printer_factory, env, monkeypatch):
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id)
+        state = _state([_bare_tray()], gcode_state="RUNNING")
+        client = self._wire(monkeypatch, state)
+        self._arm_cycle(printer.id)
+        manager = _FakeManager({printer.id: state})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+
+        assert client.reads == []
+
+    async def test_client_refusal_defers(self, db_session, printer_factory, env, monkeypatch):
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id)
+        state = _state([_bare_tray()])
+        client = self._wire(monkeypatch, state, client=_IdentifyClient(refusal="AMS is drying"))
+        self._arm_cycle(printer.id)
+        manager = _FakeManager({printer.id: state})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+
+        assert client.reads == []
+        assert ams_presence._unanswered_cycle(printer.id, 0, 0) is True
+
+    async def test_at_most_one_read_per_printer_per_pass(self, db_session, printer_factory, env, monkeypatch):
+        """The client's per-printer identify gate would refuse the rest anyway — and a
+        lane that provokes its own refusal WARNINGs is the noise this fork keeps out."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 0)
+        await _seed_assignment(db_session, printer.id, 0, 1)
+        state = _state([_bare_tray(0), _bare_tray(1)])
+        client = self._wire(monkeypatch, state)
+        self._arm_cycle(printer.id, 0, 0)
+        self._arm_cycle(printer.id, 0, 1)
+        manager = _FakeManager({printer.id: state})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+
+        assert len(client.reads) == 1
+
+    async def test_untouched_tagless_slot_is_never_read(self, db_session, printer_factory, env, monkeypatch):
+        """DOCTRINE GUARD: no physical cycle ⇒ no read. A commanded RFID read on an
+        untouched tagless slot can only fail, and that failure is the standing
+        0700_2X00_0001_0081 this fork spent a wave eliminating. The config re-push still
+        happens — the slot's identity was never in question."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id)
+        state = _state([_bare_tray()])
+        client = self._wire(monkeypatch, state)
+        manager = _FakeManager({printer.id: state})
+
+        assert await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0) == 1
+        assert client.reads == []
+
+    async def test_tagged_slot_gets_no_refresh_from_this_lane(self, db_session, printer_factory, env, monkeypatch):
+        """DOCTRINE GUARD: ``rfid_refresh`` is between-prints policy (the terminal
+        sweep's). A tagged slot yields it on EVERY evaluation, so honouring it on a 20 s
+        cadence would re-flap every tagged tray in the fleet forever."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, tag_uid=_BAMBU_TAG, data_origin="rfid_auto")
+        state = _state([_tagged_tray()])
+        client = self._wire(monkeypatch, state)
+        manager = _FakeManager({printer.id: state})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+
+        assert client.reads == []
 
 
 # --- B: scheduler registration ---------------------------------------------

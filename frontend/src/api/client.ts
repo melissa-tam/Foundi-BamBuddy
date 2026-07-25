@@ -181,8 +181,12 @@ async function request<T>(
       ? (detail as Record<string, unknown>)
       : null;
 
-    // Handle 401 Unauthorized - only clear token if it's actually invalid
-    // Don't clear on "Authentication required" which might be a timing issue
+    // Handle 401 Unauthorized - clear the token when the session is unusable.
+    // "Authentication required" is the backend's no-Authorization-header variant:
+    // treating it as a recoverable timing blip left tabs in a permanent 401 loop
+    // (prod 2026-07-24: a tab retried the ws-token mint every 3s for hours, never
+    // redirected to /login, and so received NO websocket broadcasts at all).
+    // A session that cannot present a usable token is expired, not "timing".
     if (response.status === 401) {
       const invalidTokenMessages = [
         'Could not validate credentials',
@@ -190,6 +194,7 @@ async function request<T>(
         'User not found or inactive',
         'Invalid API key',
         'API key has expired',
+        'Authentication required',
       ];
       if (invalidTokenMessages.some(m => message.includes(m))) {
         setAuthToken(null);
@@ -3013,6 +3018,16 @@ export interface TaglessFreshPromptMessage {
   rgba: string | null;
 }
 
+/** `GET /inventory/prompts/pending` — every operator question that is still
+ *  live, so a client that MISSED the websocket broadcast (token loop, tab opened
+ *  later, connection drop) can recover it. Entries are byte-identical to the
+ *  corresponding WS event payloads, which is what lets `usePendingPromptSync`
+ *  replay them through the same window-event bridge the WS handler uses. */
+export interface PendingPromptsResponse {
+  fresh: TaglessFreshPromptMessage[];
+  respool: RespoolPromptMessage[];
+}
+
 // ── Live dispatch/eject phase feedback (Phase C latency-reduction) ──────────
 // Two WS message types give the operator live feedback during the ~6 s upload
 // + ~45 s firmware-prep window that otherwise looks dead between the queue
@@ -5698,6 +5713,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  // Recovery lane for the per-slot operator prompts (fresh-roll + re-spool):
+  // list the questions that are still unanswered. The websocket broadcast is
+  // fire-and-forget — a client that was not connected when it fired had no way
+  // to learn about it — so `usePendingPromptSync` polls this on load and on
+  // every websocket (re)connect and replays the entries locally.
+  getPendingPrompts: () => request<PendingPromptsResponse>('/inventory/prompts/pending'),
   getSpoolmanSettings: () =>
     request<{ spoolman_enabled: string; spoolman_url: string; spoolman_sync_mode: string; spoolman_disable_weight_sync: string; spoolman_report_partial_usage: string; auto_add_unknown_rfid: string; }>('/settings/spoolman'),
   updateSpoolmanSettings: (data: { spoolman_enabled?: string; spoolman_url?: string; spoolman_sync_mode?: string; spoolman_disable_weight_sync?: string; spoolman_report_partial_usage?: string; auto_add_unknown_rfid?: string; }) =>

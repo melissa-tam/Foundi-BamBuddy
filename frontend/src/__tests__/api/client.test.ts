@@ -174,7 +174,7 @@ describe('API Client Auth Header', () => {
     expect(sessionStorageMock.removeItem).toHaveBeenCalledWith('auth_token');
   });
 
-  it('does not clear token on 401 with generic auth error', async () => {
+  it('clears token on 401 "Authentication required" (the no-usable-session variant)', async () => {
     server.use(
       http.get('/api/v1/settings/spoolman', () => {
         return HttpResponse.json(
@@ -184,8 +184,8 @@ describe('API Client Auth Header', () => {
       })
     );
 
-    setAuthToken('valid-token');
-    expect(getAuthToken()).toBe('valid-token');
+    setAuthToken('unusable-token');
+    expect(getAuthToken()).toBe('unusable-token');
 
     try {
       await api.getSpoolmanSettings();
@@ -193,8 +193,12 @@ describe('API Client Auth Header', () => {
       // Expected to throw
     }
 
-    // Token should NOT be cleared for generic auth errors (might be timing issue)
-    expect(getAuthToken()).toBe('valid-token');
+    // Treating this variant as a recoverable "timing issue" was the bug: the tab
+    // kept a token the server refuses to accept, never redirected to /login, and
+    // retried forever (prod 2026-07-24 — hours of ws-token mint failures, so the
+    // tab received no websocket broadcasts at all).
+    expect(getAuthToken()).toBeNull();
+    expect(sessionStorageMock.removeItem).toHaveBeenCalledWith('auth_token');
   });
 
   it("dispatches 'auth:expired' event on 401 with invalid token message (#1698)", async () => {
@@ -221,11 +225,37 @@ describe('API Client Auth Header', () => {
     window.removeEventListener('auth:expired', listener);
   });
 
-  it("does not dispatch 'auth:expired' on 401 with generic auth error (#1698)", async () => {
+  it("dispatches 'auth:expired' on 401 \"Authentication required\" so the tab redirects", async () => {
     server.use(
       http.get('/api/v1/settings/spoolman', () => {
         return HttpResponse.json(
           { detail: 'Authentication required' },
+          { status: 401 }
+        );
+      })
+    );
+
+    setAuthToken('unusable-token');
+    const listener = vi.fn();
+    window.addEventListener('auth:expired', listener);
+
+    try {
+      await api.getSpoolmanSettings();
+    } catch {
+      // Expected to throw
+    }
+
+    // Without this the 401 loop is permanent: no token clear, no redirect, and a
+    // silent retry every 3s (the ws-token mint) that keeps the tab broadcast-deaf.
+    expect(listener).toHaveBeenCalledTimes(1);
+    window.removeEventListener('auth:expired', listener);
+  });
+
+  it('leaves the token alone on a 401 that is not a session-expiry variant', async () => {
+    server.use(
+      http.get('/api/v1/settings/spoolman', () => {
+        return HttpResponse.json(
+          { detail: 'Two-factor challenge pending' },
           { status: 401 }
         );
       })
@@ -241,7 +271,9 @@ describe('API Client Auth Header', () => {
       // Expected to throw
     }
 
-    // Generic 401s might be timing issues, not real expiries — must NOT redirect.
+    // The expiry literals are a closed list — a 401 that means something else
+    // (a challenge, a permission problem) must not log the operator out.
+    expect(getAuthToken()).toBe('valid-token');
     expect(listener).not.toHaveBeenCalled();
     window.removeEventListener('auth:expired', listener);
   });
