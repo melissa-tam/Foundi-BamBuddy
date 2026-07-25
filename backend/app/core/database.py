@@ -3818,6 +3818,15 @@ async def run_migrations(conn):
     for key in ("eject_slim_3mf", "eject_upload_skip_identical"):
         await conn.execute(text("DELETE FROM settings WHERE key = :key"), {"key": key})
 
+    # Migration (W5 durable fresh-roll prompt): the tagless "is this a fresh roll?"
+    # prompt kept its only state in process memory, so a broadcast that reached zero
+    # connected clients — or any restart — lost it permanently and the reconnect
+    # replay had nothing to replay (2026-07-24 prod). The stamp lives on the row it
+    # asks about; NULL = no prompt outstanding. TIMESTAMP NULL is the dialect-safe
+    # form shared by the adjacent spool.*_at columns (SQLite + Postgres). Idempotent
+    # ADD COLUMN (_safe_execute swallows "duplicate column name" / "already exists").
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN fresh_prompt_pending_at TIMESTAMP NULL")
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),

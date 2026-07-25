@@ -86,13 +86,14 @@ class TestTaglessFreshRoute:
         monkeypatch.setattr(spool_tagless.ws_manager, "broadcast", ws)
         printer = await printer_factory()
         spool = await _seed(db_session, printer.id)
-        spool_tagless._fresh_prompt_unanswered.add((printer.id, 0, 0))
+        spool.fresh_prompt_pending_at = datetime.utcnow()  # the prompt is outstanding
+        await db_session.commit()
 
         req = TaglessFreshRequest(printer_id=printer.id, ams_id=0, tray_id=0, answer="same")
         result = await answer_tagless_fresh(spool.id, req, db=db_session, _=None)
 
         assert result.id == spool.id  # same row returned, unchanged
-        assert (printer.id, 0, 0) not in spool_tagless._fresh_prompt_unanswered  # per-cycle entry cleared
+        assert spool.fresh_prompt_pending_at is None  # durable per-cycle stamp cleared
         types = [c.args[0]["type"] for c in ws.await_args_list]
         assert "tagless_fresh_prompt_dismissed" in types
         await db_session.refresh(spool)
@@ -114,7 +115,8 @@ class TestTaglessFreshRoute:
 
         printer = await printer_factory()
         spool = await _seed(db_session, printer.id)  # black PETG fingerprint-matches the schema default
-        spool_tagless._fresh_prompt_unanswered.add((printer.id, 0, 0))
+        spool.fresh_prompt_pending_at = datetime.utcnow()
+        await db_session.commit()
 
         req = TaglessFreshRequest(
             printer_id=printer.id,
@@ -136,7 +138,8 @@ class TestTaglessFreshRoute:
         await db_session.refresh(spool)
         assert spool.archived_at is not None  # old row archived (grams preserved)
         assert await _assignment_spool_id(db_session, printer.id) == result.id  # rebound to the new row
-        assert (printer.id, 0, 0) not in spool_tagless._fresh_prompt_unanswered
+        assert spool.fresh_prompt_pending_at is None  # departed row's prompt answered
+        assert result.fresh_prompt_pending_at is None  # the replacement starts unasked
         types = [c.args[0]["type"] for c in ws.await_args_list]
         assert "spool_auto_assigned" in types
         assert "inventory_changed" in types

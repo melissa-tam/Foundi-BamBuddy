@@ -3,7 +3,8 @@
  * useRespoolPrompt's tests — the two hooks share the `useSlotPrompt` mechanics:
  * - Starts with no open modal
  * - Raises a persistent toast (NOT a modal) on a `tagless-fresh-prompt` event
- * - Dedupes repeat events for the same slot (one toast)
+ * - Keeps repeat events for the same slot on one toast id (never stacks)
+ * - Re-raises the slot toast on a replay, so an X-ed ("not now") prompt returns
  * - "Same roll" POSTs answer:"same" with the spool id + slot triple, then clears
  * - The `tagless-fresh-prompt-dismissed` window event clears the matching slot
  * - "Review…" opens the modal; closeModal clears it
@@ -94,13 +95,35 @@ describe('useTaglessFreshPrompt', () => {
     expect(result.current.activeContext).toBeNull();
   });
 
-  it('dedupes a repeat event for the same slot to a single toast', () => {
+  it('keeps a repeat event for the same slot on ONE toast id (never stacks a second)', () => {
     renderHook(() => useTaglessFreshPrompt(), { wrapper: createWrapper() });
     act(() => {
       dispatchPrompt(makePrompt());
       dispatchPrompt(makePrompt({ remaining_g: 300 }));
     });
+    // One queue entry per slot, so every raise targets the same deterministic
+    // toast id — `showPersistentToast` updates that toast in place.
+    const ids = showPersistentToast.mock.calls.map(call => call[0]);
+    expect(new Set(ids)).toEqual(new Set(['tagless-fresh-1-0-2']));
+  });
+
+  it('re-raises the slot toast on a replayed prompt (X on a toast is "not now", not an answer)', () => {
+    renderHook(() => useTaglessFreshPrompt(), { wrapper: createWrapper() });
+    act(() => dispatchPrompt(makePrompt()));
     expect(showPersistentToast).toHaveBeenCalledTimes(1);
+
+    // The operator may have X-ed the toast away — that hides it without
+    // answering, and the queue entry survives. A later replay (WS re-broadcast
+    // or the `usePendingPromptSync` REST lane) must raise the prompt AGAIN;
+    // swallowing it (the old behaviour) made the question unreachable in this
+    // tab for good. ToastContext dedupes by id, so a still-visible toast is
+    // refreshed rather than duplicated (pinned in useSlotPrompt.test.tsx).
+    act(() => dispatchPrompt(makePrompt({ remaining_g: 300 })));
+    expect(showPersistentToast).toHaveBeenCalledTimes(2);
+    expect(showPersistentToast.mock.calls.map(call => call[0])).toEqual([
+      'tagless-fresh-1-0-2',
+      'tagless-fresh-1-0-2',
+    ]);
   });
 
   it('"Same roll" POSTs answer:"same" with the spool id + slot triple and clears the toast', async () => {

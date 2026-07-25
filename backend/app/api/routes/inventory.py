@@ -170,7 +170,27 @@ async def apply_spool_to_slot_via_mqtt(
                 or ""
             )
             if generic:
-                tray_info_idx = generic
+                # This branch COMPOSES an identity instead of resolving one, so it
+                # would otherwise bypass the resolver's generic→tagless-default
+                # substitution and publish a bare GFG99 — which splits the firmware's
+                # auto-refill backup group (the 011-H2S no-auto-refill cause, and again
+                # on that same printer's three trays at 2026-07-25 01:55 via this exact
+                # path: every offending row stores an EMPTY slicer_filament, on which
+                # resolve_slicer_filament returns ~145 lines before its substitution
+                # chokepoint). Re-enter the ONE resolver with the composed id rather
+                # than re-implementing the substitution here: a fingerprint-matching row
+                # comes back as the default's specific id + temps, anything else comes
+                # back unchanged.
+                tray_info_idx, setting_id, _generic_sub_brand, temp_min, temp_max = await resolve_slicer_filament(
+                    db=db,
+                    current_user=current_user,
+                    slicer_filament=generic,
+                    slicer_filament_name=None,
+                    material=spool.material,
+                    rgba=spool.rgba,
+                    nozzle_temp_min=spool.nozzle_temp_min,
+                    nozzle_temp_max=spool.nozzle_temp_max,
+                )
 
     # Ensure setting_id is always derivable from tray_info_idx. The local-preset
     # path above sets tray_info_idx to a generic ID (e.g. "GFL99") but leaves
@@ -1516,10 +1536,10 @@ async def dismiss_respool_prompt(
 class TaglessFreshRequest(BaseModel):
     """Body for ``POST /inventory/spools/{id}/tagless-fresh`` (W5).
 
-    ``answer="same"`` clears the fresh-roll prompt for THIS physical cycle only (no
-    permanent stamp — the next qualified cycle re-asks). ``answer="fresh"`` archives
-    the current tagless row and mints a replacement, applying the optional
-    brand/label_weight/cost_per_kg/note to the new row.
+    ``answer="same"`` clears the fresh-roll prompt for THIS physical cycle only (it
+    NULLs the row's pending stamp; the next qualified cycle re-stamps and re-asks).
+    ``answer="fresh"`` archives the current tagless row and mints a replacement,
+    applying the optional brand/label_weight/cost_per_kg/note to the new row.
     """
 
     printer_id: int
@@ -1541,10 +1561,11 @@ async def answer_tagless_fresh(
 ):
     """Answer the W5 tagless fresh-roll prompt for a slot.
 
-    * ``answer="same"`` — the operator confirms it is the SAME roll: clear the prompt's
-      per-cycle unanswered entry and broadcast ``tagless_fresh_prompt_dismissed`` so open
-      clients drop the toast. NO permanent stamp (deliberate divergence from the respool
-      prompt) — the next qualified physical cycle re-asks.
+    * ``answer="same"`` — the operator confirms it is the SAME roll: NULL the row's
+      ``fresh_prompt_pending_at`` stamp and broadcast ``tagless_fresh_prompt_dismissed``
+      so open clients drop the toast. NO permanent suppression (deliberate divergence
+      from the respool prompt's ``respool_dismissed_at``) — the next qualified physical
+      cycle re-stamps and re-asks.
     * ``answer="fresh"`` — a fresh roll is on the slot: archive the current tagless row
       (grams preserved), mint + bind + push a replacement (default-vs-tray via the shared
       W1 transition) with the optional brand/label_weight/cost_per_kg/note; broadcast the
@@ -1560,7 +1581,7 @@ async def answer_tagless_fresh(
         raise HTTPException(404, "Spool not found")
 
     if req.answer == "same":
-        spool_tagless.clear_fresh_prompt(req.printer_id, req.ams_id, req.tray_id)
+        await spool_tagless.clear_fresh_prompt(db, spool)
         await spool_tagless.broadcast_tagless_fresh_dismissed(req.printer_id, req.ams_id, req.tray_id)
         return spool
 
@@ -1586,6 +1607,35 @@ async def answer_tagless_fresh(
     await ws_manager.broadcast({"type": "inventory_changed"})
     result = await db.execute(select(Spool).options(selectinload(Spool.k_profiles)).where(Spool.id == new_spool.id))
     return result.scalar_one()
+
+
+@router.get("/prompts/pending")
+async def list_pending_slot_prompts(
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_READ),
+):
+    """Every slot prompt still awaiting an operator answer, for a client that missed it.
+
+    The prompt events are fire-once websocket broadcasts: ``ws_manager.broadcast``
+    reaches only sockets connected at emit time and keeps no backlog, so a prompt
+    raised while the UI was closed reached nobody (2026-07-24: a fresh-roll prompt
+    fired at 19:39 to zero clients and was never seen). The websocket replay covers a
+    RE-connect; this is the fallback for a client that has no reconnect to ride —
+    first paint after a cold start, or a poll.
+
+    Returns ``{"fresh": [...], "respool": [...]}`` — the SAME payload dicts the
+    websocket sends (``type: "tagless_fresh_prompt"`` / ``"respool_prompt"``), from the
+    same two snapshot builders the replay uses, so the two surfaces can never disagree.
+    Both lists are re-validated against live + durable state; stale prompts are
+    dropped, never mutated.
+    """
+    from backend.app.services.spool_respool import pending_respool_prompts
+    from backend.app.services.spool_tagless import pending_fresh_prompts
+
+    return {
+        "fresh": await pending_fresh_prompts(db),
+        "respool": await pending_respool_prompts(db),
+    }
 
 
 @router.post("/spools/reset-consumed-counter-bulk")

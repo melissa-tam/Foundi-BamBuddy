@@ -151,6 +151,9 @@ export function useWebSocket() {
     ws.onopen = () => {
       if (import.meta.env.MODE !== 'test') console.log('[WebSocket] Connected');
       setIsConnected(true);
+      // Broadcasts sent while we were disconnected are gone for good — tell the
+      // recovery lane (`usePendingPromptSync`) to re-fetch anything still live.
+      window.dispatchEvent(new Event('ws-connected'));
       // Start ping interval
       pingInterval = window.setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {

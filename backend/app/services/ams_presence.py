@@ -43,6 +43,13 @@ spool inserted while idle or mid-print that the firmware never auto-reads:
 
   Results flow the normal RFID pipeline; this module does not duplicate it.
 
+* :func:`maybe_command_owed_identify` — the DRAIN, called per slot from
+  ``spool_tagless.reconcile_slot_config``'s scheduler-tick walk. Both lanes above are
+  event-shaped and can miss a ``"discovery"`` verdict forever (a gain during a print is
+  never re-read; the terminal sweep defers every slot while filament is engaged, which
+  on a continuously-loaded printer is always). This one supplies the missing OCCASION —
+  the same need check, the same wire-safety refusals, discovery reads only.
+
 Every ``ams_get_rfid`` the farm issues goes through the single commander
 :func:`command_identify`, which owns the need check, the echo-consume arming, the
 read bookkeeping and the discovery stamp.
@@ -183,6 +190,24 @@ _DISCOVERY_READ_WINDOW_S = 60.0
 # dialect or missing data (H2C idle empties report 0) and is never acted on.
 _IDENTIFIABLE_STATES = (9, *TRAY_PRESENT_STATES)
 
+# (printer_id, ams_id, tray_id) -> time.monotonic() of the last "this slot's owed
+# discovery read is still blocked" WARNING. An owed read defers QUIETLY by design
+# (one DEBUG), which is why a slot whose identity was unknown for six hours produced
+# no operator-visible signal at all (2026-07-25). Past _OWED_READ_WARN_AFTER_S the
+# defer stops being routine pacing and becomes a standing unknown, so it warns —
+# once per _OWED_READ_REWARN_S per slot, never per pass.
+_owed_read_warned_at: dict[tuple[int, int, int], float] = {}
+
+# How long a slot may sit physically-changed-but-unidentified before the deferral
+# is worth a WARNING. Generous: an ordinary engaged-filament defer resolves at the
+# next terminal (one print), so anything past 10 minutes means the printer never
+# got there — the incident's shape.
+_OWED_READ_WARN_AFTER_S = 600.0
+
+# Per-slot re-warn spacing. A continuously-printing farm can hold an owed read for
+# hours; one line an hour keeps it visible without becoming the log's own noise.
+_OWED_READ_REWARN_S = 3600.0
+
 
 def _reset_state() -> None:
     """Test hook: clear all module-level edge state between cases."""
@@ -196,6 +221,7 @@ def _reset_state() -> None:
     _physical_cycle_at.clear()
     _slot_read_at.clear()
     _discovery_read_at.clear()
+    _owed_read_warned_at.clear()
 
 
 # --- Tray / state predicates ----------------------------------------------
@@ -368,6 +394,19 @@ def _unanswered_cycle(printer_id: int, ams_id: int, tray_id: int) -> bool:
         return False
     read_at = _slot_read_at.get(key)
     return read_at is None or cycle_at > read_at
+
+
+def identity_unanswered(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """This slot physically changed and the farm has not yet resolved what is in it.
+
+    Public read-only view of the discovery lane's evidence (:func:`_unanswered_cycle`)
+    for consumers OUTSIDE the identify lane — notably ``spool_tagless``'s config-settle
+    gate, which must never publish an identity into a slot whose own identity is still
+    an open question (a config write landing inside the firmware's insert-read window
+    destroys the RFID-detected state and the firmware never retries). Non-consuming:
+    asking never spends the evidence.
+    """
+    return _unanswered_cycle(printer_id, ams_id, tray_id)
 
 
 def last_physical_cycle_age(printer_id: int, ams_id: int, tray_id: int) -> float | None:
@@ -651,6 +690,109 @@ async def command_identify(
             msg,
         )
     return ok, msg
+
+
+def _warn_owed_read_blocked(printer_id: int, ams_id: int, tray_id: int, blocker: str) -> None:
+    """WARN once per :data:`_OWED_READ_REWARN_S` that a long-owed discovery read is blocked.
+
+    Only for a slot whose last qualified physical cycle is older than
+    :data:`_OWED_READ_WARN_AFTER_S`: below that the defer is ordinary pacing (the next
+    terminal drains it). Above it, the farm has been carrying an unknown identity for
+    the whole window — the 2026-07-25 shape, where the read stayed owed for six hours
+    behind a permanently-engaged extruder and said nothing.
+    """
+    key = (printer_id, ams_id, tray_id)
+    age = last_physical_cycle_age(printer_id, ams_id, tray_id)
+    if age is None or age <= _OWED_READ_WARN_AFTER_S:
+        return
+    now = time.monotonic()
+    last = _owed_read_warned_at.get(key)
+    if last is not None and now - last < _OWED_READ_REWARN_S:
+        return
+    _owed_read_warned_at[key] = now
+    logger.warning(
+        "[Printer %s] AMS%d slot%d physically changed %.0fs ago, identity unknown, discovery read deferred: %s",
+        printer_id,
+        ams_id,
+        tray_id,
+        age,
+        blocker,
+    )
+
+
+async def maybe_command_owed_identify(
+    db: AsyncSession,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    tray: dict,
+    state,
+    *,
+    spoolman_active: bool = False,
+) -> bool:
+    """Spend an OWED discovery read on a slot when the wire is safe. Returns True if commanded.
+
+    The third lane that can drain :func:`identify_needed`'s ``"discovery"`` verdict,
+    after the idle presence gain and the terminal sweep. Both of those can miss it
+    indefinitely: a gain that lands while the printer is RUNNING is never re-read, and
+    the terminal sweep's engaged-filament pre-check defers every slot while filament
+    sits in the extruder path — which on a continuously-loaded printer is always
+    (2026-07-25: a slot changed at 19:39 was still unidentified at 01:55, six hours and
+    many terminals later). Called from ``spool_tagless.reconcile_slot_config``'s
+    state-derived walk, which supplies the missing OCCASION and nothing else.
+
+    DISCOVERY ONLY — deliberately narrower than :func:`identify_needed`'s full verdict
+    set. ``"rfid_refresh"`` is a between-prints policy (the terminal sweep's job): a
+    tagged slot always yields it, so honouring it on a ~20 s reconcile cadence would
+    re-flap every tagged tray in the fleet forever. Same reasoning the idle-gain lane
+    states for itself.
+
+    Refuses (silently, spending nothing) while the printer is RUNNING/PAUSE, while
+    filament is engaged, while the unit is drying, and whenever the client's own
+    pre-flight (:meth:`ams_write_refusal`) says the wire is unsafe — the eligibility is
+    left untouched for the next pass. The two "printer is busy with a job" refusals
+    escalate to a WARNING once the read has been owed past
+    :data:`_OWED_READ_WARN_AFTER_S`. The read itself goes through
+    :func:`command_identify`, so echo arming / identity-learned / discovery stamps stay
+    identical to every other lane's. Never raises — the caller is a scheduler tick.
+    """
+    try:
+        # Cheap evidence pre-check: discovery is the only verdict this lane spends, and
+        # an unanswered cycle is its whole test — so a fleet with nothing to discover
+        # costs no DB query at all.
+        if not _unanswered_cycle(printer_id, ams_id, tray_id):
+            return False
+        reason = await identify_needed(db, printer_id, ams_id, tray_id, tray, spoolman_active)
+        if reason != "discovery":
+            return False
+
+        if _printer_running(state):
+            _warn_owed_read_blocked(printer_id, ams_id, tray_id, "printer is mid-job")
+            return False
+        if _filament_engaged(printer_id):
+            _warn_owed_read_blocked(printer_id, ams_id, tray_id, "filament engaged")
+            return False
+        if unit_drying(printer_id, ams_id):
+            return False
+        client = printer_manager.get_client(printer_id)
+        if client is None:
+            return False
+        refusal = client.ams_write_refusal(ams_id)
+        if refusal is not None:
+            logger.debug(
+                "[Printer %s] owed discovery read deferred: AMS%d slot%d — %s",
+                printer_id,
+                ams_id,
+                tray_id,
+                refusal,
+            )
+            return False
+
+        ok, _msg = await command_identify(printer_id, ams_id, tray_id, source="reconcile", reason=reason)
+        return ok
+    except Exception:  # noqa: BLE001 — a scheduler-tick lane must never raise
+        logger.exception("Owed discovery read failed for printer %s AMS%d-T%d", printer_id, ams_id, tray_id)
+        return False
 
 
 def is_expected_read_failure(printer_id: int, attr: int, code: int) -> bool:

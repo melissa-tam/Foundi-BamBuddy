@@ -31,12 +31,14 @@ Continuity rules:
   hard-deletes it (no usage ledger) or archives it (has one).
 
 Module edge state (``_autoconfig_window``, ``_pending_physical_cycles``,
-``_fresh_prompt_unanswered``, ``_identity_reconciled``) mirrors the fork's other
-event-edge bookkeeping (``spool_respool._last_tray_now``). It is lost on restart —
-worst case a bare-tray config re-push waits one AMS push, a spent slot stays
-latched+excluded until a pull/reseat (honest, not silent), an unanswered fresh-roll
-prompt re-asks on the next physical cycle, and the one-shot identity reconcile is
-re-armed (it re-checks live divergence first, so a converged slot stays silent).
+``_identity_reconciled``) mirrors the fork's other event-edge bookkeeping
+(``spool_respool._last_tray_now``). It is lost on restart — worst case a bare-tray
+config re-push waits one AMS push, a spent slot stays latched+excluded until a
+pull/reseat (honest, not silent), and the one-shot identity reconcile is re-armed
+(it re-checks live divergence first, so a converged slot stays silent). The
+fresh-roll prompt is deliberately NOT in that set: its state is the durable
+``Spool.fresh_prompt_pending_at`` stamp, because a question nobody was connected to
+hear must survive both an empty websocket list and a restart.
 
 ``stamp_first_loaded`` lives in ``spool_tag_matcher`` (the lowest module every
 assignment-creating caller already imports); this module re-exports it via import
@@ -122,12 +124,6 @@ _pending_physical_cycles: set[tuple[int, int, int]] = set()
 # noise.
 _FRESH_ROLL_PROMPT_USED_FRAC = 0.7
 
-# (printer_id, ams_id, tray_id) of tagless fresh-roll prompts awaiting an operator
-# answer (W5). PER-CYCLE dedup (deliberately NOT the permanent respool_dismissed_at):
-# cleared by either tagless-fresh answer and re-armed on the next qualified physical
-# cycle, so each new roll swap asks again. Lost on restart (re-asks next cycle).
-_fresh_prompt_unanswered: set[tuple[int, int, int]] = set()
-
 # (printer_id, ams_id, tray_id) of slots whose live identity has been EVALUATED
 # against the resolver this process (E3/W6) — either found converged or re-pushed once.
 # A stale spool row can keep re-publishing an identity (a GENERIC id, or divergent
@@ -148,13 +144,28 @@ _RECONCILE_MIN_INTERVAL_S = 20.0
 # keeps (everything else it acts on is derived from live state + DB each pass).
 _last_reconcile_at: float | None = None
 
+# Settle delay before the farm may publish a filament IDENTITY into a slot. A spool
+# inserted into a slot that still carries a surviving tagless binding looks BARE for
+# ~1 s while the firmware runs its own RFID read; an ``ams_filament_setting`` write
+# landing in that window destroys the RFID-detected state and the firmware never
+# retries (2026-07-25: a fresh Bambu-tagged roll sat as the tagless default with a
+# phantom binding for 6 h). 30 s ≈ the fork's own identify bounds
+# (``ams_presence._IDENTIFY_ACTIVE_S`` / the client's ``_IDENTIFY_GATE_S``), i.e. the
+# window in which a firmware read may still be running.
+_CONFIG_SETTLE_S = 30.0
+
+# Hard cap on the second settle arm (an UNANSWERED physical cycle — the farm does not
+# yet know what is in the slot). After 10 minutes no firmware read can still be
+# running, so the gate fails OPEN: a genuinely tagless roll is delayed once, never
+# stranded, and the reconcile lane guarantees the eventual push either way.
+_CONFIG_SETTLE_MAX_S = 600.0
+
 
 def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
     global _last_reconcile_at
     _autoconfig_window.reset()
     _pending_physical_cycles.clear()
-    _fresh_prompt_unanswered.clear()
     _identity_reconciled.clear()
     _last_reconcile_at = None
 
@@ -521,9 +532,65 @@ async def _assign_from_setting(
         stamp_loaded(spool)
 
 
+def _config_settling(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """True while a slot's identity is still UNRESOLVED and must not be written to.
+
+    Scope: the gate exists to protect the firmware's post-insert AUTO-READ window, and
+    that window only exists while the printer is IDLE. Mid-print insertions are never
+    auto-read — no automatic RFID read, possibly not even a presence-bit flip, and no
+    retroactive read at FINISH (``bambu-ecosystem/resources/mqtt-protocol.md:61``,
+    live-verified H2S AMS 2 fw 01.01.02.00) — so during RUNNING/PAUSE there is no read
+    to clobber and the gate would be pure cost. Worse than cost: it would starve
+    ``spool_recovery``'s forced bare-tray sweep, whose whole job is enrolling an
+    operator-inserted backup spool DURING a jam (printer PAUSEd, slot freshly gained —
+    precisely when both arms below are active), and deferring a recoverable state to a
+    human is what doctrine rule 1 forbids. An UNREADABLE state is not treated as
+    mid-print (``on_error=False``), so an unknown printer keeps the gate ON.
+
+    While idle, two arms, either sufficient:
+
+    * the slot gained presence less than :data:`_CONFIG_SETTLE_S` ago — the firmware's
+      own insert-read may still be in flight, and our write would kill it;
+    * the farm has an UNANSWERED qualified physical cycle for the slot
+      (``ams_presence.identity_unanswered``) less than :data:`_CONFIG_SETTLE_MAX_S`
+      old — somebody moved a roll here and nothing has established what it is, so any
+      identity we publish is a guess that overwrites the real answer.
+
+    A slot with no recorded gain and no pending question (restart, never observed,
+    long-settled) reads as settled, so the gate can never wedge a slot. Distinct from
+    :func:`_mint_settling` (F1), which guards phantom MINTS over a much shorter window
+    — this one guards the WIRE.
+    """
+    if _printer_busy(printer_id, on_error=False):
+        return False  # mid-print: no firmware auto-read exists to protect
+    gain_age = ams_presence.recent_gain_age(printer_id, ams_id, tray_id)
+    if gain_age is not None and gain_age < _CONFIG_SETTLE_S:
+        return True
+    if not ams_presence.identity_unanswered(printer_id, ams_id, tray_id):
+        return False
+    cycle_age = ams_presence.last_physical_cycle_age(printer_id, ams_id, tray_id)
+    return cycle_age is not None and cycle_age < _CONFIG_SETTLE_MAX_S
+
+
 async def _push_config(db: AsyncSession, spool: Spool, printer_id: int, ams_id: int, tray_id: int, tray: dict) -> bool:
-    """Publish the default filament config to the slot (bare-tray path only)."""
+    """Publish the tagless filament config to the slot — the module's ONE wire write.
+
+    The single funnel for all four tagless config-write paths (first bare-tray mint,
+    bound re-push, :func:`_replace_row_after_cycle`, :func:`_maybe_reconcile_slot_identity`),
+    which is why the settle gate lives here: no path may publish an identity into a
+    slot whose own identity is still unresolved (:func:`_config_settling`). Returns
+    False without publishing when the slot is settling or the push fails.
+    """
     from backend.app.api.routes.inventory import apply_spool_to_slot_via_mqtt
+
+    if _config_settling(printer_id, ams_id, tray_id):
+        logger.debug(
+            "Deferring tagless config push for printer %d AMS%d-T%d: slot identity still settling",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return False
 
     try:
         return await apply_spool_to_slot_via_mqtt(
@@ -741,9 +808,17 @@ async def broadcast_tagless_fresh_dismissed(printer_id: int, ams_id: int, tray_i
     )
 
 
-def clear_fresh_prompt(printer_id: int, ams_id: int, tray_id: int) -> None:
-    """Clear a slot's fresh-roll prompt unanswered entry (route answer / release)."""
-    _fresh_prompt_unanswered.discard((printer_id, ams_id, tray_id))
+async def clear_fresh_prompt(db: AsyncSession, spool: Spool) -> None:
+    """Answer a spool's fresh-roll prompt — NULL the durable pending stamp.
+
+    Both answers land here ("Fresh roll" via :func:`apply_fresh_roll`, "Same spool"
+    via the tagless-fresh route). Idempotent: an already-clear row is a no-op, so a
+    double answer or a replayed toast costs nothing.
+    """
+    if spool.fresh_prompt_pending_at is None:
+        return
+    spool.fresh_prompt_pending_at = None
+    await db.commit()
 
 
 async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> None:
@@ -751,10 +826,15 @@ async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: in
 
     Reads the slot's kept assignment. A SPENT bound row leaves the pending cycle for
     the W1 spent→mint transition (certain fresh roll — silent, no prompt). A NON-spent
-    row consumed past :data:`_FRESH_ROLL_PROMPT_USED_FRAC` of its label, still
-    unanswered for this cycle, broadcasts ``tagless_fresh_prompt`` and records the
-    unanswered entry. Every non-spent outcome (prompt or sub-threshold) POPs the
-    pending cycle — no latch is involved for non-spent rows.
+    row consumed past :data:`_FRESH_ROLL_PROMPT_USED_FRAC` of its label broadcasts
+    ``tagless_fresh_prompt`` and stamps ``fresh_prompt_pending_at``. Every non-spent
+    outcome (prompt or sub-threshold) POPs the pending cycle — no latch is involved for
+    non-spent rows.
+
+    This function runs only on a qualified-cycle edge, so the stamp is RE-stamped
+    rather than deduped against: each new roll swap re-asks, which is the per-cycle
+    contract the old in-memory set promised and never delivered (a stuck entry
+    suppressed the slot's prompts for the rest of the process).
     """
     key = (printer_id, ams_id, tray_id)
     res = await db.execute(
@@ -775,9 +855,10 @@ async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: in
         return  # leave the pending cycle for the W1 spent→mint transition (silent)
     label = spool.label_weight or 0
     used = spool.weight_used or 0
-    if label > 0 and used >= _FRESH_ROLL_PROMPT_USED_FRAC * label and key not in _fresh_prompt_unanswered:
+    if label > 0 and used >= _FRESH_ROLL_PROMPT_USED_FRAC * label:
+        spool.fresh_prompt_pending_at = datetime.utcnow()
+        await db.commit()
         await _broadcast_tagless_fresh_prompt(printer_id, ams_id, tray_id, spool)
-        _fresh_prompt_unanswered.add(key)
         logger.info(
             "tagless_fresh_prompt broadcast: printer=%d AMS%d-T%d spool=%d used=%.0f/%d g",
             printer_id,
@@ -827,7 +908,7 @@ async def apply_fresh_roll(
     """Answer a W5 fresh-roll prompt with "Fresh roll" — archive the current tagless
     row and mint+bind+push a replacement (default-vs-tray via the shared transition),
     applying the operator's optional brand/label_weight/cost_per_kg/note to the new row.
-    Clears the prompt's unanswered entry. Returns the new spool. Raises ``ValueError``
+    Clears the departed row's pending stamp. Returns the new spool. Raises ``ValueError``
     when the slot's live tray can't be resolved (the route maps it to HTTP 409)."""
     tray = _live_tray(printer_id, ams_id, tray_id)
     if tray is None:
@@ -841,50 +922,72 @@ async def apply_fresh_roll(
         spool,
         new_fields={"brand": brand, "label_weight": label_weight, "cost_per_kg": cost_per_kg, "note": note},
     )
-    clear_fresh_prompt(printer_id, ams_id, tray_id)
+    await clear_fresh_prompt(db, spool)
     _pending_physical_cycles.discard((printer_id, ams_id, tray_id))
     return new_spool
+
+
+async def pending_fresh_prompts(db: AsyncSession) -> list[dict]:
+    """Every still-open tagless fresh-roll prompt, as ready-to-send WS payloads (W5).
+
+    The ONE snapshot of the durable ``fresh_prompt_pending_at`` stamp, consumed by both
+    the reconnect replay (:func:`rebroadcast_unresolved_tagless_prompts`) and the REST
+    fallback (``GET /inventory/prompts/pending``) so the two can never disagree about
+    what is outstanding.
+
+    A stamp alone is not proof the prompt still applies: it is re-validated against
+    durable state (the row must still be bound, tagless, non-spent, non-archived) and
+    LIVE state (the slot must still physically hold a spool). Stale rows are skipped,
+    never mutated — the stamp is cleared only by an operator answer, and a slot that is
+    merely offline right now must still prompt when it comes back.
+    """
+    res = await db.execute(
+        select(SpoolAssignment)
+        .options(selectinload(SpoolAssignment.spool))
+        .join(Spool, SpoolAssignment.spool_id == Spool.id)
+        .where(
+            Spool.fresh_prompt_pending_at.is_not(None),
+            Spool.archived_at.is_(None),
+            Spool.spent_at.is_(None),
+        )
+    )
+    payloads: list[dict] = []
+    for assignment in res.scalars().all():
+        spool = assignment.spool
+        if spool is None or not is_tagless_spool(spool):
+            continue
+        tray = _live_tray(assignment.printer_id, assignment.ams_id, assignment.tray_id)
+        if tray is None or not tray_present(tray):
+            continue
+        payloads.append(_tagless_fresh_payload(assignment.printer_id, assignment.ams_id, assignment.tray_id, spool))
+    return payloads
 
 
 async def rebroadcast_unresolved_tagless_prompts(db: AsyncSession, send) -> int:
     """Replay unresolved ``tagless_fresh_prompt`` events to a (re)connecting client (W5).
 
     Sibling of ``spool_respool.rebroadcast_unresolved_respool_prompts``. The prompt WS
-    event is fire-once (``ws_manager.broadcast`` keeps no backlog), so a client that was
-    disconnected when a prompt fired never learns of it. Re-validate each unanswered
-    entry against durable + live state before re-sending — the assignment must still
-    exist, the spool must still be tagless + non-spent + non-archived, and the slot must
-    still be physically present. A stale entry is skipped (never mutates the set — the
-    per-cycle set is cleared only by an answer or a new cycle). Returns the count
+    event is fire-once (``ws_manager.broadcast`` keeps no backlog and no-ops entirely
+    when nobody is connected — the 19:39 prompt that reached zero clients), so this
+    replays the durable snapshot :func:`pending_fresh_prompts` builds. Returns the count
     re-sent. Never raises (a reconnect must not break on a farm-side hook).
     """
-    snapshot = list(_fresh_prompt_unanswered)
     sent = 0
-    for printer_id, ams_id, tray_id in snapshot:
+    try:
+        payloads = await pending_fresh_prompts(db)
+    except Exception:  # noqa: BLE001 — a reconnect must never break on the replay hook
+        logger.exception("tagless_fresh_prompt re-broadcast snapshot failed")
+        return 0
+    for payload in payloads:
         try:
-            res = await db.execute(
-                select(SpoolAssignment)
-                .options(selectinload(SpoolAssignment.spool))
-                .where(
-                    SpoolAssignment.printer_id == printer_id,
-                    SpoolAssignment.ams_id == ams_id,
-                    SpoolAssignment.tray_id == tray_id,
-                )
-            )
-            assignment = res.scalar_one_or_none()
-            spool = assignment.spool if assignment is not None else None
-            if spool is None or not is_tagless_spool(spool):
-                continue
-            if spool.spent_at is not None or spool.archived_at is not None:
-                continue
-            tray = _live_tray(printer_id, ams_id, tray_id)
-            if tray is None or not tray_present(tray):
-                continue
-            await send(_tagless_fresh_payload(printer_id, ams_id, tray_id, spool))
+            await send(payload)
             sent += 1
         except Exception:  # noqa: BLE001 — one slot's failure must not abort the replay
             logger.exception(
-                "tagless_fresh_prompt re-broadcast failed for printer %s AMS%d-T%d", printer_id, ams_id, tray_id
+                "tagless_fresh_prompt re-broadcast failed for printer %s AMS%s-T%s",
+                payload.get("printer_id"),
+                payload.get("ams_id"),
+                payload.get("tray_id"),
             )
     if sent:
         logger.info("Re-broadcast %d unresolved tagless_fresh_prompt(s) to a (re)connecting client", sent)
@@ -994,19 +1097,22 @@ def _mint_settling(printer_id: int, ams_id: int, tray_id: int) -> bool:
     return age is not None and age < _MINT_SETTLE_S
 
 
-def _printer_busy(printer_id: int) -> bool:
+def _printer_busy(printer_id: int, *, on_error: bool = True) -> bool:
     """True while the printer is mid-job (RUNNING/PAUSE).
 
     Delegates to ``ams_presence._printer_running`` rather than re-deriving the
     predicate: that module already owns the running-state reading every AMS-side
     guard shares, and a second copy is exactly the drift this fork avoids. Never
-    raises — an unreachable printer reads as busy (the conservative answer for the
-    idle-only reconcile below).
+    raises — ``on_error`` is what an unreadable state resolves to, and the two callers
+    need OPPOSITE safe directions, so each states its own: the idle-only identity
+    reconcile takes the default True (unknown ⇒ assume busy ⇒ do not write), while
+    :func:`_config_settling` passes False (unknown ⇒ assume idle ⇒ keep the settle gate
+    ON). Both resolve to "protect the wire"; only the polarity differs.
     """
     try:
         return ams_presence._printer_running(printer_manager.get_status(printer_id))
     except Exception:  # noqa: BLE001 — must never break the AMS callback chain
-        return True
+        return on_error
 
 
 def _live_nozzle_temp(tray: dict, key: str) -> int | None:
@@ -1100,6 +1206,18 @@ async def _maybe_reconcile_slot_identity(
                 ams_id,
                 tray_id,
                 refusal,
+            )
+            return False
+        if _config_settling(printer_id, ams_id, tray_id):
+            # Same class as the refusal above — a DEFERRAL, so it must be checked here
+            # and not left to _push_config's funnel gate: the one shot is armed on the
+            # next line, and burning it on a push that never went out would strand the
+            # divergent slot for the rest of the process.
+            logger.debug(
+                "Deferring slot-identity reconcile for printer %d AMS%d-T%d: slot identity still settling",
+                printer_id,
+                ams_id,
+                tray_id,
             )
             return False
         _identity_reconciled.add(key)  # one shot, armed BEFORE the push so it cannot loop
@@ -1451,6 +1569,24 @@ async def maybe_autoconfigure_bare_tray(
         )
         return False
 
+    # Never publish an identity into an UNRESOLVED slot (:func:`_config_settling`):
+    # a spool inserted over a surviving tagless binding reads BARE for ~1 s while the
+    # firmware runs its own RFID read, and a config write landing in that window
+    # destroys the RFID-detected state permanently (2026-07-25). This applies to the
+    # re-push arm as much as the mint arm — the 6-hour phantom binding came from a
+    # re-push — so it sits below the assignment lookup and above the retry window,
+    # mirroring the identify/drying defers: a deferred push must not burn the window.
+    # _push_config carries the same gate as the funnel backstop; failing here first is
+    # what keeps the cadence intact.
+    if _config_settling(printer_id, ams_id, tray_id):
+        logger.debug(
+            "Deferring bare-tray auto-config for printer %d AMS%d-T%d: slot identity still settling",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return False
+
     # The retry-cadence gate is the LAST guard: every ineligible/deferred path above
     # returns without stamping, so the window is armed only by an attempt that is
     # actually about to publish. force= clears the previous stamp instead of skipping
@@ -1490,11 +1626,14 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
     the same shape — one change-gated caller, fire-and-forget publish.
 
     This is the state-derived backstop for both. Each scheduler tick it walks the
-    live merged AMS of every active printer and re-drives the two owning service
+    live merged AMS of every active printer and re-drives the owning service
     functions: :func:`maybe_autoconfigure_bare_tray` for a still-bare slot,
-    ``spool_tag_matcher.reapply_k_profile_if_drifted`` for a Bambu-tagged bound one.
-    Both keep every guard they carry (RFID early-exit, spent latch, identify/drying
-    defer, mint settle, operator/RFID-bound never-overwrite, their own retry
+    ``spool_tag_matcher.reapply_k_profile_if_drifted`` for a Bambu-tagged bound one,
+    and ``ams_presence.maybe_command_owed_identify`` for a slot whose owed DISCOVERY
+    read the event-driven identify lanes never got to (2026-07-25: six hours behind a
+    permanently-engaged extruder). All three keep every guard they carry (RFID
+    early-exit, spent latch, identify/drying defer, mint settle, config settle,
+    operator/RFID-bound never-overwrite, wire-safety refusals, their own retry
     windows) — this lane supplies the missing OCCASION to retry, never a new
     permission. Nothing is remembered between passes beyond the throttle stamp: the
     work is re-derived from live merged state plus the DB, so it is restart-safe by
@@ -1536,6 +1675,10 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
             .where(SpoolAssignment.printer_id == printer_id)
         )
         bound = {(a.ams_id, a.tray_id): a for a in res.scalars().all()}
+        # At most ONE commanded discovery read per printer per pass: the client's
+        # per-printer identify gate would refuse the rest anyway, and provoking that
+        # refusal from our own loop is how a lane starts logging WARNINGs about itself.
+        identify_spent = False
 
         for unit in ams:
             if not isinstance(unit, dict):
@@ -1580,6 +1723,18 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
                             db, printer_id, ams_id, tray_id, tray, assignment.spool, state
                         ):
                             pushed += 1
+
+                    # OWED DISCOVERY READ — the identity twin of the config re-push
+                    # above. A slot the farm knows changed but has never identified is
+                    # exactly what makes every config decision for it a guess (and what
+                    # holds the settle gate open). Both event-driven identify lanes can
+                    # miss it forever on a busy printer, so this state-derived pass is
+                    # the drain. The callee owns every guard (need, running, engaged,
+                    # drying, client refusal) — this supplies only the occasion.
+                    if not identify_spent and await ams_presence.maybe_command_owed_identify(
+                        db, printer_id, ams_id, tray_id, tray, state
+                    ):
+                        identify_spent = True
                 except Exception:  # noqa: BLE001 — one bad slot must not abort the pass
                     logger.exception(
                         "Slot-config reconcile failed for printer %d AMS%d-T%d",
