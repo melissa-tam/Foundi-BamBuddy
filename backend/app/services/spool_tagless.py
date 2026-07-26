@@ -1154,6 +1154,16 @@ async def _maybe_reconcile_slot_identity(
     divergence and never forces a push. When ANY dimension diverges, re-push the slot
     config once so the fleet converges without a migration or a repair tool.
 
+    The resolver runs with ``generic_fallback=True`` because the DETECT site needs the
+    same rescue the PUSH site has had since 46db0bbb. A legacy row with a NULL
+    ``slicer_filament`` resolved to the EMPTY identity, which this function read as
+    "nothing resolvable", consuming the one shot without ever comparing anything
+    (006-H2S, 2026-07-26: a bound slot sat live at ``GFG99`` while the fleet identity
+    is ``GFG02`` — outside the firmware's auto-refill backup group and outside dispatch
+    idx-matching, so the printer ran out with a full roll aboard). The material-composed
+    identity is what the push would actually write, so it is also what divergence must
+    be measured against.
+
     Gated three ways: the printer must be IDLE (a config write mid-print is exactly
     what the AMS-write doctrine forbids), the client must not be refusing AMS writes
     (drying / identifying / identify gate), and a per-slot once-per-process set caps
@@ -1177,6 +1187,7 @@ async def _maybe_reconcile_slot_identity(
             rgba=spool.rgba,
             nozzle_temp_min=spool.nozzle_temp_min,
             nozzle_temp_max=spool.nozzle_temp_max,
+            generic_fallback=True,
         )
         live_idx = (tray.get("tray_info_idx") or "").strip()
         live_tmin = _live_nozzle_temp(tray, "nozzle_temp_min")

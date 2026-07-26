@@ -1497,6 +1497,46 @@ class TestSlotIdentityReconcile:
         assert resolver.await_count == 1
         env.apply.assert_not_awaited()
 
+    async def test_null_slicer_filament_row_still_detects_the_split(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
+        """006-H2S, 2026-07-26: a legacy tagless row with a NULL ``slicer_filament``
+        bound to a slot the printer holds at ``GFG99`` while the fleet identity is
+        ``GFG02`` — outside the firmware's auto-refill backup group and outside
+        dispatch idx-matching, so the printer ran out with a full roll aboard.
+
+        The REAL resolver runs here (no stub): pre-fix it returned the empty identity
+        for such a row, the detector read that as "nothing resolvable", and the one
+        shot was consumed without a single dimension ever being compared. With
+        ``generic_fallback=True`` the row resolves to what the push would actually
+        write — the tagless default's GFG02 — and the id divergence is caught."""
+        printer = await printer_factory()
+        env.settings["tagless_default_filament"] = json.dumps(
+            {
+                "brand": "Bambu Lab",
+                "material": "PETG",
+                "subtype": "HF",
+                "rgba": "000000FF",
+                "slicer_filament": "GFG02",
+                "nozzle_temp_min": 230,
+                "nozzle_temp_max": 270,
+            }
+        )
+        await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="000000FF")
+        spool = (await _assignment(db_session, printer.id)).spool
+        assert spool.slicer_filament is None  # the incident's row shape
+
+        tray = _tray("PETG", color="000000FF")
+        tray["tray_info_idx"] = "GFG99"  # the split id the printer actually holds
+        tray["nozzle_temp_min"] = 230  # temps ALREADY agree — only the id diverges
+        tray["nozzle_temp_max"] = 270
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_client", lambda pid: _FakeClient())
+
+        assert (printer.id, 0, 0) not in spool_tagless._identity_reconciled
+        assert await spool_tagless._maybe_reconcile_slot_identity(db_session, printer.id, 0, 0, tray, spool) is True
+        env.apply.assert_awaited_once()  # _push_config's one wire write
+        assert (printer.id, 0, 0) in spool_tagless._identity_reconciled  # consumed only after the push
+
 
 class TestReconcileBoundSlotIdentities:
     """W6 defect (b): on a busy farm the AMS-change pushes that reach the reconcile

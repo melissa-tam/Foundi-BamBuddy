@@ -18,6 +18,7 @@ official preset) even when ``tray_info_idx`` is cleared.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -321,4 +322,110 @@ class TestGenericIdOverride:
             nozzle_temp_min=220,
             nozzle_temp_max=260,
         )
+        assert (tray_info_idx, setting_id, tmin, tmax) == ("GFG02", "GFSG02", 230, 270)
+
+
+class TestGenericFallback:
+    """``generic_fallback=True``: a row whose stored identity names NO filament but
+    whose MATERIAL does is re-composed and re-resolved, so it still lands on the
+    substitution chokepoint. This is the rescue the push composer hand-rolled until
+    2026-07-26; the detect site (spool_tagless._maybe_reconcile_slot_identity) was
+    blind to exactly these rows, which is how 006-H2S's slot sat on GFG99 — outside
+    the firmware's auto-refill backup group — with a full roll aboard."""
+
+    _DEFAULT_JSON = json.dumps(
+        {
+            "brand": "Bambu Lab",
+            "material": "PETG",
+            "subtype": "HF",
+            "rgba": "000000FF",
+            "slicer_filament": "GFG02",
+            "nozzle_temp_min": 230,
+            "nozzle_temp_max": 270,
+        }
+    )
+
+    def _tagless_default(self, monkeypatch):
+        """Seed the real tagless default the substitution reads (same lane as
+        TestGenericIdOverride's end-to-end case — no stubbing of the collaborator)."""
+
+        async def fake_get_setting(db, key):
+            return self._DEFAULT_JSON if key == "tagless_default_filament" else None
+
+        monkeypatch.setattr("backend.app.api.routes.settings.get_setting", fake_get_setting)
+
+    @pytest.mark.asyncio
+    async def test_null_slicer_filament_resolves_to_the_defaults_specific_identity(self, monkeypatch):
+        """The 006-H2S row shape: slicer_filament NULL, material PETG, colour matching
+        the tagless default. Composing GFG99 and stopping there would keep the slot out
+        of the backup group — the re-entry must upgrade it to the default's GFG02."""
+        self._tagless_default(monkeypatch)
+        db = MagicMock()
+        tray_info_idx, setting_id, _sub, tmin, tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament=None,
+            slicer_filament_name=None,
+            material="PETG",
+            rgba="000000FF",
+            generic_fallback=True,
+        )
+        assert tray_info_idx == "GFG02"  # not "" and NOT the composed GFG99
+        assert setting_id == "GFSG02"
+        assert (tmin, tmax) == (230, 270)
+
+    @pytest.mark.asyncio
+    async def test_flag_off_keeps_the_empty_result(self, monkeypatch):
+        """Default False must leave every pre-existing caller byte-identical: the same
+        row still resolves to nothing, and owning the fallback stays the caller's job."""
+        self._tagless_default(monkeypatch)
+        db = MagicMock()
+        tray_info_idx, setting_id, sub_brand, _tmin, _tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament=None,
+            slicer_filament_name=None,
+            material="PETG",
+            rgba="000000FF",
+        )
+        assert (tray_info_idx, setting_id, sub_brand) == ("", "", None)
+
+    @pytest.mark.asyncio
+    async def test_no_generic_composes_returns_the_empty_result(self, monkeypatch):
+        """No material, or one with no generic id, has nothing to compose FROM — the
+        flag is a rescue, never an invention."""
+        self._tagless_default(monkeypatch)
+        db = MagicMock()
+        for material in (None, "UNOBTAINIUM"):
+            tray_info_idx, setting_id, sub_brand, _tmin, _tmax = await resolve_slicer_filament(
+                db=db,
+                current_user=None,
+                slicer_filament=None,
+                slicer_filament_name=None,
+                material=material,
+                rgba="000000FF",
+                generic_fallback=True,
+            )
+            assert (tray_info_idx, setting_id, sub_brand) == ("", "", None), material
+
+    @pytest.mark.asyncio
+    async def test_sanitised_away_free_text_also_honours_the_flag(self, monkeypatch):
+        """The OTHER empty shape: free-text 'PETG' survives normalisation but the
+        defensive filter clears it as a literal material name. Both shapes share one
+        fallback exit, so this must land on the same identity as a NULL row."""
+        self._tagless_default(monkeypatch)
+        db = MagicMock()
+        with patch(
+            "backend.app.api.routes.cloud.build_authenticated_cloud",
+            AsyncMock(return_value=None),
+        ):
+            tray_info_idx, setting_id, _sub, tmin, tmax = await resolve_slicer_filament(
+                db=db,
+                current_user=None,
+                slicer_filament="PETG",
+                slicer_filament_name=None,
+                material="PETG",
+                rgba="000000FF",
+                generic_fallback=True,
+            )
         assert (tray_info_idx, setting_id, tmin, tmax) == ("GFG02", "GFSG02", 230, 270)

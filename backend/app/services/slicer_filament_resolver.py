@@ -14,8 +14,12 @@ Resolver outcomes:
 
 - Returns ``("", "", None)`` when ``slicer_filament`` is empty, unresolvable,
   or sanitised away as a slicer-rejected value (literal material name,
-  PFUS / PFCN cloud setting_id). The caller is responsible for the
-  generic-material fallback when this happens.
+  PFUS / PFCN cloud setting_id) — UNLESS the caller passes
+  ``generic_fallback=True``, in which case the identity is re-composed from
+  the spool's MATERIAL and re-resolved through this same function (so the
+  generic id it composes still passes the ``override_generic_identity``
+  substitution). Without that flag the caller owns the generic-material
+  fallback.
 - Returns ``(tray_info_idx, setting_id, sub_brand_override)`` otherwise.
   The third element is non-empty when a cloud-detail lookup or a local-
   preset name provides a more specific brand label than the spool's own
@@ -104,6 +108,7 @@ async def resolve_slicer_filament(
     rgba: str | None = None,
     nozzle_temp_min: int | None = None,
     nozzle_temp_max: int | None = None,
+    generic_fallback: bool = False,
 ) -> tuple[str, str, str | None, int, int]:
     """Resolve a spool's stored identity to the COMPLETE printer-side wire tuple.
 
@@ -126,6 +131,13 @@ async def resolve_slicer_filament(
     so the WHOLE wire identity is composed here and the two write-site consumers
     can't diverge (W4). Optional so pre-W4 callers still type-check.
 
+    ``generic_fallback``: opt-in rescue for a row whose stored identity names no
+    filament but whose MATERIAL does. When the FINAL ``tray_info_idx`` would be
+    empty — an empty/NULL ``slicer_filament``, or a value the sanitiser cleared —
+    the generic id for the material is composed and re-resolved through this same
+    function once. Default False keeps every caller that owns its own fallback
+    byte-identical.
+
     A resolved GENERIC id (``GFG99`` …) is finally re-composed as the configured
     tagless default's SPECIFIC identity — id, setting_id and temps — when the
     spool fingerprint-matches that default (``spool_tagless.override_generic_identity``),
@@ -140,88 +152,91 @@ async def resolve_slicer_filament(
     """
     temp_min, temp_max = await _resolve_nozzle_temps(db, material, rgba, nozzle_temp_min, nozzle_temp_max)
 
-    sf = (slicer_filament or "").strip()
-    if not sf:
-        return ("", "", None, temp_min, temp_max)
-
     tray_info_idx = ""
     setting_id = ""
     sub_brand_override: str | None = None
 
-    base_sf = sf.split("_")[0] if "_" in sf else sf
+    # An empty stored identity resolves nothing, but must still reach the single
+    # generic-material fallback below — the sanitised-away case shares that exit and
+    # the two must not answer a legacy row differently.
+    sf = (slicer_filament or "").strip()
+    if sf:
+        base_sf = sf.split("_")[0] if "_" in sf else sf
 
-    # Cloud-side preset IDs in three known shapes:
-    #   GFS…   — Bambu official cloud preset
-    #   PFUS…  — cloud user-created preset
-    #   PFCN…  — cloud shared / partner preset (e.g. Polymaker's "(Custom)"
-    #            Bambu Lab H2D variant, #1648)
-    # All three need a cloud-detail lookup to extract the underlying
-    # filament_id; without it the raw cloud id ends up in tray_info_idx
-    # and the printer's calibration table can't resolve it.
-    if base_sf.startswith("GFS") or base_sf.startswith("PFUS") or base_sf.startswith("PFCN"):
-        setting_id = base_sf
-        try:
-            from backend.app.api.routes.cloud import build_authenticated_cloud
+        # Cloud-side preset IDs in three known shapes:
+        #   GFS…   — Bambu official cloud preset
+        #   PFUS…  — cloud user-created preset
+        #   PFCN…  — cloud shared / partner preset (e.g. Polymaker's "(Custom)"
+        #            Bambu Lab H2D variant, #1648)
+        # All three need a cloud-detail lookup to extract the underlying
+        # filament_id; without it the raw cloud id ends up in tray_info_idx
+        # and the printer's calibration table can't resolve it.
+        if base_sf.startswith("GFS") or base_sf.startswith("PFUS") or base_sf.startswith("PFCN"):
+            setting_id = base_sf
+            try:
+                from backend.app.api.routes.cloud import build_authenticated_cloud
 
-            cloud = await build_authenticated_cloud(db, current_user)
-            if cloud is not None and cloud.is_authenticated:
-                try:
-                    detail = await cloud.get_setting_detail(base_sf)
-                    if detail.get("filament_id"):
-                        tray_info_idx = detail["filament_id"]
-                        cloud_name = detail.get("name", "")
-                        if cloud_name:
-                            sub_brand_override = cloud_name.replace(r"@.*$", "").split("@")[0].strip()
-                    elif detail.get("base_id"):
-                        bid = detail["base_id"].split("_")[0]
-                        if bid.startswith("GFS") and len(bid) >= 5:
-                            tray_info_idx = f"GF{bid[3:]}"
-                        else:
-                            tray_info_idx = bid
-                finally:
-                    await cloud.close()
-            elif cloud is not None:
-                await cloud.close()
-        except Exception as e:
-            logger.warning("Slicer-filament resolve: cloud lookup failed for %r: %s", sf, e)
-
-        if not tray_info_idx:
-            tray_info_idx, setting_id = normalize_slicer_filament(sf)
-    elif base_sf.startswith("GF"):
-        tray_info_idx, setting_id = normalize_slicer_filament(sf)
-    else:
-        try:
-            local_id = int(sf)
-            from backend.app.models.local_preset import LocalPreset as LP
-
-            lp_result = await db.execute(select(LP).where(LP.id == local_id, LP.preset_type == "filament"))
-            lp = lp_result.scalar_one_or_none()
-            if lp:
-                # Local preset's setting JSON carries the printer-recognized
-                # filament_id (e.g. "P4d64437") — use that directly so the
-                # slicer can resolve the specific preset. Falls through to
-                # generic material id only when the JSON doesn't carry one.
-                lp_filament_id = ""
-                if lp.setting:
+                cloud = await build_authenticated_cloud(db, current_user)
+                if cloud is not None and cloud.is_authenticated:
                     try:
-                        setting_data = json.loads(lp.setting)
-                        raw_fid = setting_data.get("filament_id")
-                        if isinstance(raw_fid, str) and raw_fid:
-                            lp_filament_id = raw_fid
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
-                if lp_filament_id:
-                    tray_info_idx = lp_filament_id
-                    setting_id = filament_id_to_setting_id(lp_filament_id)
-                else:
-                    mat = (material or lp.filament_type or "").upper().strip()
-                    tray_info_idx = (
-                        GENERIC_FILAMENT_IDS.get(mat) or GENERIC_FILAMENT_IDS.get(mat.split("-")[0].split(" ")[0]) or ""
-                    )
-                if lp.name:
-                    sub_brand_override = lp.name.split("@")[0].strip()
-        except (ValueError, TypeError):
+                        detail = await cloud.get_setting_detail(base_sf)
+                        if detail.get("filament_id"):
+                            tray_info_idx = detail["filament_id"]
+                            cloud_name = detail.get("name", "")
+                            if cloud_name:
+                                sub_brand_override = cloud_name.replace(r"@.*$", "").split("@")[0].strip()
+                        elif detail.get("base_id"):
+                            bid = detail["base_id"].split("_")[0]
+                            if bid.startswith("GFS") and len(bid) >= 5:
+                                tray_info_idx = f"GF{bid[3:]}"
+                            else:
+                                tray_info_idx = bid
+                    finally:
+                        await cloud.close()
+                elif cloud is not None:
+                    await cloud.close()
+            except Exception as e:
+                logger.warning("Slicer-filament resolve: cloud lookup failed for %r: %s", sf, e)
+
+            if not tray_info_idx:
+                tray_info_idx, setting_id = normalize_slicer_filament(sf)
+        elif base_sf.startswith("GF"):
             tray_info_idx, setting_id = normalize_slicer_filament(sf)
+        else:
+            try:
+                local_id = int(sf)
+                from backend.app.models.local_preset import LocalPreset as LP
+
+                lp_result = await db.execute(select(LP).where(LP.id == local_id, LP.preset_type == "filament"))
+                lp = lp_result.scalar_one_or_none()
+                if lp:
+                    # Local preset's setting JSON carries the printer-recognized
+                    # filament_id (e.g. "P4d64437") — use that directly so the
+                    # slicer can resolve the specific preset. Falls through to
+                    # generic material id only when the JSON doesn't carry one.
+                    lp_filament_id = ""
+                    if lp.setting:
+                        try:
+                            setting_data = json.loads(lp.setting)
+                            raw_fid = setting_data.get("filament_id")
+                            if isinstance(raw_fid, str) and raw_fid:
+                                lp_filament_id = raw_fid
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+                    if lp_filament_id:
+                        tray_info_idx = lp_filament_id
+                        setting_id = filament_id_to_setting_id(lp_filament_id)
+                    else:
+                        mat = (material or lp.filament_type or "").upper().strip()
+                        tray_info_idx = (
+                            GENERIC_FILAMENT_IDS.get(mat)
+                            or GENERIC_FILAMENT_IDS.get(mat.split("-")[0].split(" ")[0])
+                            or ""
+                        )
+                    if lp.name:
+                        sub_brand_override = lp.name.split("@")[0].strip()
+            except (ValueError, TypeError):
+                tray_info_idx, setting_id = normalize_slicer_filament(sf)
 
     # Realign tray_info_idx to a builtin whose name matches slicer_filament_name
     # when the current resolution lands on a builtin with a different name
@@ -299,5 +314,30 @@ async def resolve_slicer_filament(
             temp_min = int(override["nozzle_temp_min"])
         if override["nozzle_temp_max"] is not None:
             temp_max = int(override["nozzle_temp_max"])
+
+    # Generic-material fallback (2026-07-26), opt-in: the SINGLE exit for every shape
+    # that resolved no id — an empty/NULL slicer_filament and a sanitised-away value
+    # both arrive here. The composed generic id is deliberately NOT returned directly:
+    # re-entering routes it through override_generic_identity above, which is the only
+    # thing that turns a fingerprint-matching row into the fleet's SPECIFIC id instead
+    # of a GFG99 that splits the firmware's auto-refill backup group. Re-entry is one
+    # level deep (generic_fallback=False) and only from a non-empty composed id, so it
+    # cannot recurse. No material, or one with no generic id, keeps the empty result —
+    # a caller with a preserved setting_id (#1815) therefore never loses it.
+    if not tray_info_idx and generic_fallback:
+        mat = (material or "").upper().strip()
+        generic = GENERIC_FILAMENT_IDS.get(mat) or GENERIC_FILAMENT_IDS.get(mat.split("-")[0].split(" ")[0]) or ""
+        if generic:
+            return await resolve_slicer_filament(
+                db=db,
+                current_user=current_user,
+                slicer_filament=generic,
+                slicer_filament_name=None,
+                material=material,
+                rgba=rgba,
+                nozzle_temp_min=nozzle_temp_min,
+                nozzle_temp_max=nozzle_temp_max,
+                generic_fallback=False,
+            )
 
     return (tray_info_idx, setting_id, sub_brand_override, temp_min, temp_max)
