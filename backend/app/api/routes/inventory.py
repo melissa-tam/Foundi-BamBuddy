@@ -163,34 +163,29 @@ async def apply_spool_to_slot_via_mqtt(
         ):
             tray_info_idx = current_tray_info_idx
         elif tray_type:
-            material = tray_type.upper().strip()
-            generic = (
-                GENERIC_FILAMENT_IDS.get(material)
-                or GENERIC_FILAMENT_IDS.get(material.split("-")[0].split(" ")[0])
-                or ""
+            # Nothing resolvable in the row, only a MATERIAL. Composing an identity
+            # HERE would bypass the resolver's generic→tagless-default substitution
+            # and publish a bare GFG99 — which splits the firmware's auto-refill
+            # backup group (the 011-H2S no-auto-refill cause, and again on that same
+            # printer's three trays at 2026-07-25 01:55 via this exact path: every
+            # offending row stores an EMPTY slicer_filament, on which the resolver
+            # returned long before its substitution chokepoint). The composition +
+            # re-entry now lives IN the resolver behind `generic_fallback` so the
+            # DETECT site (spool_tagless._maybe_reconcile_slot_identity, blind to the
+            # same rows until 006-H2S 2026-07-26) shares one implementation: a
+            # fingerprint-matching row comes back as the tagless default's specific
+            # id + temps, anything else comes back unchanged.
+            tray_info_idx, setting_id, _generic_sub_brand, temp_min, temp_max = await resolve_slicer_filament(
+                db=db,
+                current_user=current_user,
+                slicer_filament=spool.slicer_filament,
+                slicer_filament_name=spool.slicer_filament_name,
+                material=spool.material,
+                rgba=spool.rgba,
+                nozzle_temp_min=spool.nozzle_temp_min,
+                nozzle_temp_max=spool.nozzle_temp_max,
+                generic_fallback=True,
             )
-            if generic:
-                # This branch COMPOSES an identity instead of resolving one, so it
-                # would otherwise bypass the resolver's generic→tagless-default
-                # substitution and publish a bare GFG99 — which splits the firmware's
-                # auto-refill backup group (the 011-H2S no-auto-refill cause, and again
-                # on that same printer's three trays at 2026-07-25 01:55 via this exact
-                # path: every offending row stores an EMPTY slicer_filament, on which
-                # resolve_slicer_filament returns ~145 lines before its substitution
-                # chokepoint). Re-enter the ONE resolver with the composed id rather
-                # than re-implementing the substitution here: a fingerprint-matching row
-                # comes back as the default's specific id + temps, anything else comes
-                # back unchanged.
-                tray_info_idx, setting_id, _generic_sub_brand, temp_min, temp_max = await resolve_slicer_filament(
-                    db=db,
-                    current_user=current_user,
-                    slicer_filament=generic,
-                    slicer_filament_name=None,
-                    material=spool.material,
-                    rgba=spool.rgba,
-                    nozzle_temp_min=spool.nozzle_temp_min,
-                    nozzle_temp_max=spool.nozzle_temp_max,
-                )
 
     # Ensure setting_id is always derivable from tray_info_idx. The local-preset
     # path above sets tray_info_idx to a generic ID (e.g. "GFL99") but leaves
