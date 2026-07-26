@@ -1820,7 +1820,8 @@ class TestConfigSettleGate:
 class TestMidPrintIsNotGated:
     """The gate protects the firmware's post-insert AUTO-READ window, and that window
     only exists while IDLE: mid-print insertions get no automatic RFID read and no
-    retroactive read at FINISH (mqtt-protocol.md:61, live-verified H2S fw 01.01.02.00).
+    retroactive read at FINISH (`bambu-ams-behavior/resources/ams-wire-behavior.md`
+    §"Mid-print insertions are not auto-read", live-verified H2S fw 01.01.02.00).
     Gating there would protect nothing AND starve spool_recovery's forced bare-tray
     enrollment — a jam is exactly PAUSE + a freshly-gained slot — which doctrine rule 1
     forbids (never defer a recoverable state to a human)."""

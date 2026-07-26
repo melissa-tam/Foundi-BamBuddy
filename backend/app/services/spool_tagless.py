@@ -538,9 +538,10 @@ def _config_settling(printer_id: int, ams_id: int, tray_id: int) -> bool:
     Scope: the gate exists to protect the firmware's post-insert AUTO-READ window, and
     that window only exists while the printer is IDLE. Mid-print insertions are never
     auto-read — no automatic RFID read, possibly not even a presence-bit flip, and no
-    retroactive read at FINISH (``bambu-ecosystem/resources/mqtt-protocol.md:61``,
-    live-verified H2S AMS 2 fw 01.01.02.00) — so during RUNNING/PAUSE there is no read
-    to clobber and the gate would be pure cost. Worse than cost: it would starve
+    retroactive read at FINISH (``bambu-ams-behavior/resources/ams-wire-behavior.md``
+    §"Mid-print insertions are not auto-read", live-verified H2S AMS 2 fw 01.01.02.00) —
+    so during RUNNING/PAUSE there is no read to clobber and the gate would be pure cost.
+    Worse than cost: it would starve
     ``spool_recovery``'s forced bare-tray sweep, whose whole job is enrolling an
     operator-inserted backup spool DURING a jam (printer PAUSEd, slot freshly gained —
     precisely when both arms below are active), and deferring a recoverable state to a
