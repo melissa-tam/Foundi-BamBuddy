@@ -1583,3 +1583,67 @@ class TestTerminalWaitingReasonHygiene:
         await farm_policy.on_terminal(db_session, 3, item.id, "cancelled")
         await db_session.refresh(item)
         assert item.waiting_reason == "print_paused_stalled"  # untouched (non-farm)
+
+
+class TestRecoverPrinterIgnoresNonFarmBatches:
+    """006-H2S 2026-07-26: a plain upstream ``PrintBatch`` (no ``sku_file_id``) left
+    ``paused`` with an item on the printer was swept into the resume loop.
+    ``transition_run`` cannot drive a non-run batch and raised; the per-run guard only
+    LOGS, so one zombie batch turned every Recover click into a silent no-op for the
+    real runs behind it. The candidate query is now farm-scoped — the same
+    ``sku_file_id IS NOT NULL`` predicate ``spool_recovery._resolve_farm_item`` uses."""
+
+    async def _mk_printer(self, db, name):
+        p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(p)
+        await db.flush()
+        return p
+
+    async def test_non_farm_paused_batch_is_never_passed_to_transition_run(self, db_session):
+        printer = await self._mk_printer(db_session, "REC4")
+        zombie = PrintBatch(name="upstream batch", status="paused")  # sku_file_id is NULL
+        db_session.add(zombie)
+        await db_session.flush()
+        db_session.add(
+            PrintQueueItem(batch_id=zombie.id, printer_id=printer.id, status="pending", plate_id=1, position=700)
+        )
+        await db_session.commit()
+
+        with patch("backend.app.services.production_run.transition_run", new_callable=AsyncMock) as transition:
+            summary = await farm_policy.recover_printer(db_session, printer.id)
+
+        transition.assert_not_awaited()  # the zombie never reached the run machinery
+        assert summary["runs_resumed"] == []
+        await db_session.refresh(zombie)
+        assert zombie.status == "paused"  # untouched, not silently mutated
+
+    async def test_a_real_run_still_resumes_alongside_a_zombie_batch(self, db_session):
+        """The regression the fix targets: the farm run behind the zombie must resume."""
+        printer = await self._mk_printer(db_session, "REC5")
+        zombie = PrintBatch(name="upstream batch", status="paused")
+        db_session.add(zombie)
+        await db_session.flush()
+        db_session.add(
+            PrintQueueItem(batch_id=zombie.id, printer_id=printer.id, status="pending", plate_id=1, position=710)
+        )
+        batch, _prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        batch.status = "paused"
+        db_session.add(
+            PrintQueueItem(
+                batch_id=batch.id,
+                printer_id=printer.id,
+                status="pending",
+                manual_start=True,
+                plate_id=1,
+                position=711,
+            )
+        )
+        await db_session.commit()
+
+        summary = await farm_policy.recover_printer(db_session, printer.id)
+
+        assert summary["runs_resumed"] == [batch.id]
+        await db_session.refresh(batch)
+        await db_session.refresh(zombie)
+        assert batch.status == "active"
+        assert zombie.status == "paused"

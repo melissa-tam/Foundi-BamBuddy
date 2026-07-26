@@ -149,6 +149,14 @@ class AppSettings(BaseModel):
         le=1000,
         description="Below this layer, spools under min_start_spool_g stay ineligible as mid-print replacements",
     )
+    # A filament RUNOUT escalates for a SAME-slot refill and leaves the print
+    # PAUSEd. Default ON (006-H2S 2026-07-26): the refill itself is the operator's
+    # go-ahead, so making them walk back to press Resume is the deferral doctrine
+    # rule 1 forbids. Off = the print waits for a manual resume as before.
+    runout_auto_resume_enabled: bool = Field(
+        default=True,
+        description="Resume a runout-paused print automatically when the demanded AMS slot is refilled",
+    )
     # Structured default filament pushed to BARE (unconfigured) tagless trays,
     # stored as a JSON string (mirrors gcode_snippets). Empty string = feature
     # off (nothing pushed). Shape validated on write against TaglessDefaultFilament.
@@ -691,6 +699,7 @@ class AppSettingsUpdate(BaseModel):
     spool_recovery_max_attempts: int | None = Field(default=None, ge=1, le=5)
     spool_recovery_step_timeout_s: int | None = Field(default=None, ge=15, le=600)
     spool_recovery_protect_layers: int | None = Field(default=None, ge=0, le=1000)
+    runout_auto_resume_enabled: bool | None = None
     tagless_default_filament: str | None = None
     check_updates: bool | None = None
     check_printer_firmware: bool | None = None

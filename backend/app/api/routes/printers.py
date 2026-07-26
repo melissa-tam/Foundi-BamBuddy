@@ -48,7 +48,7 @@ from backend.app.services.bambu_ftp import (
     get_storage_info_async,
     list_files_async,
 )
-from backend.app.services.hms_errors import hms_error_payload
+from backend.app.services.hms_errors import current_runout_demand, hms_error_payload, runout_hold_active
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
 from backend.app.services.printer_manager import (
     _eject_watch_payload,
@@ -60,6 +60,7 @@ from backend.app.services.printer_manager import (
     supports_drying,
     supports_drying_while_printing,
 )
+from backend.app.services.spool_recovery import runout_slot_desc
 from backend.app.utils.http import build_content_disposition
 
 logger = logging.getLogger(__name__)
@@ -3830,6 +3831,9 @@ async def ams_load(
     - 0..15: AMS slot, computed as ams_id * 4 + slot_id
     - 254: external spool (single-external printers, or Ext-L on dual-nozzle H2D)
     - 255: Ext-R on dual-nozzle H2D
+
+    Refused with 409 while the printer is PAUSEd holding for a same-slot filament
+    refill — see the gate below.
     """
     if tray_id not in range(16) and tray_id not in (254, 255):
         raise HTTPException(400, "tray_id must be 0..15 (AMS slot), 254 (external / Ext-L), or 255 (Ext-R)")
@@ -3842,6 +3846,27 @@ async def ams_load(
     client = printer_manager.get_client(printer_id)
     if not client:
         raise HTTPException(400, "Printer not connected")
+
+    # Runout-hold gate (006-H2S 2026-07-26 — the incident's actual vector). While the
+    # printer is PAUSEd waiting for a same-slot refill, the AMS executes NO filament
+    # change: the operator's Load click on slot 2 returned 200, published an
+    # ams_change_filament, moved nothing — and LATCHED in firmware, resurfacing at the
+    # resume 12 h later as a bogus demand for slot 2. A 200 that silently arms a
+    # future fault is worse than a refusal, so refuse and say what to do instead.
+    state = printer_manager.get_status(printer_id)
+    if runout_hold_active(state):
+        demand = current_runout_demand(getattr(state, "hms_errors", None) or [])
+        where = runout_slot_desc(demand[0] * 4 + demand[1]) if demand else None
+        raise HTTPException(
+            409,
+            (
+                f"{printer.name} is PAUSEd waiting for a filament refill in "
+                f"{where or 'the slot that ran out'}. The AMS executes no load in this state — the "
+                "request would latch in the firmware and resurface at the resume as a bogus demand for "
+                f"this slot (006-H2S 2026-07-26). Insert filament into {where or 'the slot that ran out'} "
+                "and the print resumes from there."
+            ),
+        )
 
     # Mark this as an operator-commanded load so the backup-swap detector does not
     # mistake the resulting tray_now edge for a firmware runout and spend the

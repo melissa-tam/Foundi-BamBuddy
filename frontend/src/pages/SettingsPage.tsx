@@ -956,6 +956,7 @@ export function SettingsPage() {
       (settings.spool_recovery_max_attempts ?? 2) !== (localSettings.spool_recovery_max_attempts ?? 2) ||
       (settings.spool_recovery_step_timeout_s ?? 90) !== (localSettings.spool_recovery_step_timeout_s ?? 90) ||
       (settings.spool_recovery_protect_layers ?? 7) !== (localSettings.spool_recovery_protect_layers ?? 7) ||
+      (settings.runout_auto_resume_enabled ?? true) !== (localSettings.runout_auto_resume_enabled ?? true) ||
       (settings.auto_add_untagged ?? true) !== (localSettings.auto_add_untagged ?? true) ||
       (settings.tagless_default_filament ?? '') !== (localSettings.tagless_default_filament ?? '') ||
       (settings.queue_drying_enabled ?? false) !== (localSettings.queue_drying_enabled ?? false) ||
@@ -1073,6 +1074,7 @@ export function SettingsPage() {
         spool_selection_policy: localSettings.spool_selection_policy,
         min_start_spool_g: localSettings.min_start_spool_g,
         spool_recovery_enabled: localSettings.spool_recovery_enabled,
+        runout_auto_resume_enabled: localSettings.runout_auto_resume_enabled,
         spool_recovery_max_attempts: localSettings.spool_recovery_max_attempts,
         spool_recovery_step_timeout_s: localSettings.spool_recovery_step_timeout_s,
         spool_recovery_protect_layers: localSettings.spool_recovery_protect_layers,
@@ -5448,6 +5450,27 @@ export function SettingsPage() {
                     </div>
                   </div>
                 )}
+                {/* Runout refill auto-resume — independent of the jam-recovery
+                    master toggle above: a runout escalates for a same-slot refill
+                    and never enters the swap machine. */}
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-white">{t('settings.runoutAutoResumeEnabled')}</p>
+                    <p className="text-sm text-bambu-gray">
+                      {t('settings.runoutAutoResumeEnabledDesc')}
+                    </p>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      aria-label={t('settings.runoutAutoResumeEnabled')}
+                      checked={localSettings.runout_auto_resume_enabled ?? true}
+                      onChange={(e) => updateSetting('runout_auto_resume_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                  </label>
+                </div>
                 {/* Auto-add untagged trays */}
                 <div className="flex items-center justify-between">
                   <div>

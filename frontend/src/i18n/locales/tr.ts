@@ -2315,6 +2315,8 @@ export default {
     minStartSpoolDesc: 'Kalan gramajı bu değerin altındaki bir makara asla baskı BAŞLATAMAZ (devam eden bir baskıyı yine de bitirebilir). 0 alt sınırı devre dışı bırakır.',
     spoolRecoveryEnabled: 'Otomatik makara sıkışması kurtarma',
     spoolRecoveryEnabledDesc: 'Bir AMS besleme arızası (dolaşma) bir çiftlik baskısını duraklattığında, otomatik olarak uygun bir sonraki makaraya geçer ve devam eder. Sıkışan makara, yeniden takılana kadar rotasyon dışı bırakılır.',
+    runoutAutoResumeEnabled: 'Filament takviyesinden sonra otomatik devam et',
+    runoutAutoResumeEnabledDesc: 'Bir baskı belirli bir AMS yuvasındaki filamenti beklerken duraklatıldığında, o yuva doldurulur dolmaz otomatik olarak devam eder. Kapalı = baskı elle devam ettirilmeyi bekler.',
     spoolRecoveryMaxAttempts: 'Maks. kurtarma denemesi',
     spoolRecoveryMaxAttemptsDesc: 'Baskıyı bir kişi için duraklatılmış bırakmadan önce kaç makaranın deneneceği (1-5).',
     spoolRecoveryStepTimeout: 'Adım zaman aşımı (saniye)',

@@ -2311,6 +2311,8 @@ export default {
     minStartSpoolDesc: 'Eine Spule mit weniger Restgramm als hier angegeben kann einen Druck nie STARTEN (einen laufenden aber noch beenden). 0 deaktiviert die Untergrenze.',
     spoolRecoveryEnabled: 'Automatische Spulenstau-Wiederherstellung',
     spoolRecoveryEnabledDesc: 'Wenn ein AMS-Förderfehler (Verheddern) einen Farm-Druck pausiert, automatisch auf die nächste geeignete Spule wechseln und fortsetzen. Die gestaute Spule wird bis zum erneuten Einlegen aus der Rotation genommen.',
+    runoutAutoResumeEnabled: 'Automatisch fortsetzen nach Filament-Nachfüllung',
+    runoutAutoResumeEnabledDesc: 'Wenn ein Druck pausiert und auf Filament in einem bestimmten AMS-Fach wartet, wird er automatisch fortgesetzt, sobald dieses Fach nachgefüllt ist. Aus = der Druck wartet auf manuelles Fortsetzen.',
     spoolRecoveryMaxAttempts: 'Max. Wiederherstellungsversuche',
     spoolRecoveryMaxAttemptsDesc: 'Wie viele Spulen probiert werden, bevor der Druck für einen Menschen pausiert bleibt (1–5).',
     spoolRecoveryStepTimeout: 'Schritt-Timeout (Sekunden)',

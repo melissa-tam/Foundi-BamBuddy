@@ -396,3 +396,135 @@ class TestHmsErrorPayloadRunoutSlot:
     def test_slot_agnostic_8011_omits_slot(self):
         err = _fake_hms_error(code="0x8011", attr=0x07000000, module=7, severity=2, full_code="0700000000008011")
         assert "runout_slot" not in hms_error_payload(err)
+
+
+# ===========================================================================
+# Runout DEMAND decoder + shared runout-hold predicate (006-H2S 2026-07-26)
+# ===========================================================================
+# The incident's two live hms[] snapshots, in the firmware's own list order and in
+# the shape the MQTT parser hands every consumer (HMSError: int attr + hex-string
+# code). 01:23 — slot 1 had auto-switched, slot 3 was the standing DEMAND, and the
+# bare slot-agnostic 8011 sat alongside. 13:51 — a slot-2 demand had been APPENDED
+# (a second roll emptied), which is the move the escalation never told the operator
+# about.
+_D_SLOT1_AUTOSWITCHED = _fake_hms_error(  # 0700_2000_0003_0002 — INFO, never a demand
+    code="0x30002", attr=0x07002000, module=7, severity=3, full_code="0700200000030002"
+)
+_D_SLOT3_DEMAND = _fake_hms_error(  # 0700_2200_0002_0001 — "Please insert a new filament."
+    code="0x20001", attr=0x07002200, module=7, severity=2, full_code="0700220000020001"
+)
+_D_SLOT2_DEMAND = _fake_hms_error(  # 0700_2100_0002_0001 — the 13:51 arrival
+    code="0x20001", attr=0x07002100, module=7, severity=2, full_code="0700210000020001"
+)
+_D_BARE_8011 = _fake_hms_error(  # slot-agnostic "insert into the SAME AMS slot"
+    code="0x8011", attr=0x07000000, module=7, severity=2, full_code="0700000000008011"
+)
+
+_INCIDENT_0123 = [_D_SLOT1_AUTOSWITCHED, _D_SLOT3_DEMAND, _D_BARE_8011]
+_INCIDENT_1351 = [*_INCIDENT_0123, _D_SLOT2_DEMAND]
+
+
+class TestCurrentRunoutDemand:
+    """Which slot is the firmware asking for RIGHT NOW — the decoder that replaced
+    the dispatch-mapping guess that sent the operator to the wrong slot."""
+
+    def test_incident_0123_names_slot_3(self):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        # The escalation said "AMS A slot 1" off the mapping; the wire said slot 3.
+        assert current_runout_demand(_INCIDENT_0123) == (0, 2)
+
+    def test_incident_1351_appended_demand_wins(self):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        # Firmware APPENDS: the newest demand is last, so slot 2 is the live ask.
+        assert current_runout_demand(_INCIDENT_1351) == (0, 1)
+
+    def test_empty_list_is_none(self):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        assert current_runout_demand([]) is None
+        assert current_runout_demand(None) is None
+
+    def test_no_demand_family_member_is_none(self):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        # Auto-switched INFO + the slot-agnostic 8011: both name a runout, neither asks.
+        assert current_runout_demand([_D_SLOT1_AUTOSWITCHED, _D_BARE_8011]) is None
+
+    def test_auto_switched_never_counts_even_alone(self):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        # "…has run out and automatically switched to the slot with the same
+        # filament" — the backup already rescued the print; nothing is demanded.
+        assert current_runout_demand([_D_SLOT1_AUTOSWITCHED]) is None
+
+    def test_purge_abnormal_variant_is_not_a_demand(self):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        # 0x00020005 — "…and purging the old filament went abnormally; please check
+        # whether the filament is stuck in the tool head." A tool-head ask, not an
+        # insert ask, so the refill assist must not treat it as one.
+        purge = _fake_hms_error(code="0x20005", attr=0x07002100, module=7, full_code="0700210000020005")
+        assert current_runout_demand([purge]) is None
+
+    def test_please_wait_variant_is_not_a_demand(self):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        # 0x00030001 — "…Please wait while old filament is purged." An in-progress
+        # notice; the firmware has not asked for anything yet.
+        wait = _fake_hms_error(code="0x30001", attr=0x07002000, module=7, severity=3, full_code="0700200000030001")
+        assert current_runout_demand([wait]) is None
+
+    def test_demand_still_found_after_a_later_non_demand(self):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        # Last DEMAND wins — a later non-demand entry must not blank the answer.
+        assert current_runout_demand([_D_SLOT3_DEMAND, _D_BARE_8011, _D_SLOT1_AUTOSWITCHED]) == (0, 2)
+
+    def test_malformed_entry_is_skipped_not_raised(self):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        junk = SimpleNamespace(code=object(), attr="not-an-int")
+        assert current_runout_demand([junk, _D_SLOT3_DEMAND]) == (0, 2)
+
+    def test_non_ams_module_with_the_demand_code_is_rejected(self):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        motion = _fake_hms_error(code="0x20001", attr=0x03002000, module=3, full_code="0300200000020001")
+        assert current_runout_demand([motion]) is None
+
+
+class TestRunoutHoldActive:
+    """The shared PAUSE+runout predicate behind the guidance, the refill auto-resume
+    and the /ams/load 409 — so they can never disagree about the hold state."""
+
+    def _state(self, gcode_state, hms):
+        return SimpleNamespace(state=gcode_state, hms_errors=hms)
+
+    def test_pause_with_bare_8011_is_a_hold(self):
+        from backend.app.services.hms_errors import runout_hold_active
+
+        assert runout_hold_active(self._state("PAUSE", [_D_BARE_8011])) is True
+
+    def test_pause_with_a_slot_demand_is_a_hold(self):
+        from backend.app.services.hms_errors import runout_hold_active
+
+        assert runout_hold_active(self._state("PAUSE", [_D_SLOT3_DEMAND])) is True
+
+    def test_running_is_never_a_hold(self):
+        from backend.app.services.hms_errors import runout_hold_active
+
+        assert runout_hold_active(self._state("RUNNING", _INCIDENT_0123)) is False
+
+    def test_pause_without_runout_codes_is_not_a_hold(self):
+        from backend.app.services.hms_errors import runout_hold_active
+
+        door = _fake_hms_error(code="0x8042", attr=0x03000000, module=3, full_code="0300000000008042")
+        assert runout_hold_active(self._state("PAUSE", [door])) is False
+
+    def test_missing_state_fails_closed(self):
+        from backend.app.services.hms_errors import runout_hold_active
+
+        assert runout_hold_active(None) is False
+        assert runout_hold_active(SimpleNamespace()) is False

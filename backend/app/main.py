@@ -1653,6 +1653,23 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         "[RESPOOL] spent-on-runout capture failed for printer %s: %s", printer_id, _re
                     )
 
+            # Runout DEMAND-CHANGE guidance refresh (006-H2S 2026-07-26). While a
+            # unit sits ESCALATED on a runout, the firmware can move its demand to a
+            # DIFFERENT slot (a second roll empties, or the operator refilled the
+            # wrong one). Recovery's escalation latch correctly refuses to re-enter —
+            # but it also swallowed every trace of the move, leaving the operator with
+            # the original slot in hand for 12 h. This re-announces the escalation
+            # with the FRESH slot; it is GUIDANCE ONLY and never touches the latch.
+            # Orchestration + dedup live in spool_recovery; this is a guarded hook.
+            try:
+                from backend.app.services.spool_recovery import maybe_refresh_runout_guidance
+
+                await maybe_refresh_runout_guidance(printer_id, new_error_codes, state)
+            except Exception as _ge:  # noqa: BLE001 — hook must never crash the status flow
+                logging.getLogger(__name__).warning(
+                    "[SPOOL-RECOVERY] runout guidance refresh failed for printer %s: %s", printer_id, _ge
+                )
+
             # Automatic mid-print spool-jam recovery: a NEW feed-fault HMS (AMS
             # tangle / assist-motor overload) — or a runout the firmware backup
             # failed to rescue — PAUSEs a farm print with no self-recovery. Spawn

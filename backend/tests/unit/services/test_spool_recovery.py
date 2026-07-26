@@ -105,6 +105,28 @@ def _runout_hms():
     return HMSError(code="8004", attr=0x03000000, module=3, severity=2)
 
 
+# --- 006-H2S 2026-07-26 runout wire shapes ---------------------------------
+# The slot-attributed DEMAND ("AMS A Slot N filament has run out. Please insert a
+# new filament."). Its SHORT code is "0700_0001", which is deliberately NOT a
+# trigger — the bare 8011 below is what fires recovery, while this entry is what
+# names the slot the firmware actually wants.
+def _runout_demand_hms(ams_id=0, tray_id=2):
+    attr = 0x07000000 | (ams_id << 16) | ((0x20 + tray_id) << 8)
+    return HMSError(code="0x20001", attr=attr, module=7, severity=2, full_code=f"{attr:08X}00020001")
+
+
+def _runout_autoswitched_hms(ams_id=0, tray_id=0):
+    """ "…has run out and automatically switched…" — INFO, never a demand."""
+    attr = 0x07000000 | (ams_id << 16) | ((0x20 + tray_id) << 8)
+    return HMSError(code="0x30002", attr=attr, module=7, severity=3, full_code=f"{attr:08X}00030002")
+
+
+def _runout_same_slot_hms():
+    """The slot-agnostic 0700_8011 "insert into the SAME AMS slot" runout — the
+    code that actually triggers recovery, and which names no slot at all."""
+    return HMSError(code="8011", attr=0x07000000, module=7, severity=2, full_code="0700000000008011")
+
+
 def _extruder_hms():
     # attr>>16 == 0x0300, code == 0x801E -> "0300_801E" (main extruder overloaded).
     return HMSError(code="801E", attr=0x03000000, module=3, severity=2)
@@ -2476,3 +2498,314 @@ async def test_will_own_false_when_db_read_raises(db_session, printer_factory, m
     monkeypatch.setattr(spool_recovery, "_resolve_farm_item", _boom)
 
     assert await spool_recovery.will_own(db_session, printer.id, state) is False
+
+
+# ===========================================================================
+# F2 — the escalation names the slot the FIRMWARE demands (006-H2S 2026-07-26)
+# ===========================================================================
+
+
+async def test_runout_escalation_names_the_firmware_demanded_slot(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """THE incident pin. Dispatch mapping [0], tray_now 255 (nothing feeding), and a
+    standing 0700_2200_0002_0001 demand for slot 3. The old resolver answered the
+    mapping's global tray 0 and told the operator "AMS A slot 1" — a slot the printer
+    was not asking for and would not have resumed on. Firmware demand is primary now."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id, ams_mapping="[0, -1, -1, -1]")
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(
+        tray_now=255,  # nothing feeding — the live-tray fallback has nothing to say
+        hms=[_runout_autoswitched_hms(0, 0), _runout_demand_hms(0, 2), _runout_same_slot_hms()],
+    )
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_feed_fault_hms(printer.id, {"0700_8011"}, state)
+    assert task is not None
+    await task
+
+    failed.assert_awaited_once()
+    assert failed.call_args.kwargs["runout_slot"] == "AMS A slot 3"
+    assert failed.call_args.kwargs["is_feed_fault"] is False
+
+
+def test_resolve_jammed_tray_prefers_the_demand_over_mapping_and_tray_now():
+    """Unit-level pin on the resolver itself: mapping [0] + tray_now 255 + a slot-3
+    demand resolves to GLOBAL TRAY 2 (= AMS A slot 3), verdict single."""
+    from types import SimpleNamespace
+
+    item = SimpleNamespace(ams_mapping="[0, -1, -1, -1]")
+    state = SimpleNamespace(tray_now=255, hms_errors=[_runout_demand_hms(0, 2), _runout_same_slot_hms()])
+
+    assert spool_recovery._resolve_jammed_tray(item, state, is_feed_fault=False) == (2, "single")
+    assert spool_recovery.runout_slot_desc(2) == "AMS A slot 3"
+
+
+def test_resolve_jammed_tray_feed_fault_ignores_any_demand():
+    """A FEED FAULT keeps the mapping/tray_now inference untouched — the 8010 family
+    carries no slot attribution and must not be re-attributed by a stale runout."""
+    from types import SimpleNamespace
+
+    item = SimpleNamespace(ams_mapping="[0, -1, -1, -1]")
+    state = SimpleNamespace(tray_now=255, hms_errors=[_runout_demand_hms(0, 2)])
+
+    assert spool_recovery._resolve_jammed_tray(item, state, is_feed_fault=True) == (0, "single")
+
+
+def test_resolve_jammed_tray_runout_falls_back_when_no_demand():
+    """No demand on the wire (bare 8011 only) → the existing mapping/tray_now logic
+    is still the answer, unchanged."""
+    from types import SimpleNamespace
+
+    item = SimpleNamespace(ams_mapping="[1, -1, -1, -1]")
+    state = SimpleNamespace(tray_now=255, hms_errors=[_runout_same_slot_hms()])
+
+    assert spool_recovery._resolve_jammed_tray(item, state, is_feed_fault=False) == (1, "single")
+
+
+# ===========================================================================
+# F2 — guidance refresh when the firmware's demand MOVES
+# ===========================================================================
+
+
+async def _runout_held_item(db, printer_id, *, subtask="task-1"):
+    """A farm unit already ESCALATED on a runout (the state the refresh acts on)."""
+    item = await _farm_item(db, printer_id, subtask=subtask)
+    item.waiting_reason = WAITING_REASON_RUNOUT
+    await db.commit()
+    return item
+
+
+async def test_demand_move_refreshes_guidance_once(db_session, printer_factory, monkeypatch):
+    """13:51: a slot-2 demand is APPENDED while the unit sits escalated on the slot-3
+    guidance. Exactly one refresh notification, carrying the NEW slot."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    moved = _runout_demand_hms(0, 1)
+    state = _make_state(hms=[_runout_demand_hms(0, 2), _runout_same_slot_hms(), moved])
+
+    fired = await spool_recovery.maybe_refresh_runout_guidance(printer.id, {moved.full_code}, state)
+
+    assert fired is True
+    failed.assert_awaited_once()
+    assert failed.call_args.kwargs["runout_slot"] == "AMS A slot 2"
+    assert failed.call_args.kwargs["is_feed_fault"] is False
+    assert "NOW asking" in failed.call_args.kwargs["detail"]
+
+
+async def test_same_demand_again_does_not_re_notify(db_session, printer_factory, monkeypatch):
+    """A standing demand re-delivered on later pushes is one continuing incident."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    moved = _runout_demand_hms(0, 1)
+    state = _make_state(hms=[_runout_demand_hms(0, 2), moved])
+
+    await spool_recovery.maybe_refresh_runout_guidance(printer.id, {moved.full_code}, state)
+    second = await spool_recovery.maybe_refresh_runout_guidance(printer.id, {moved.full_code}, state)
+
+    assert second is False
+    assert failed.await_count == 1
+
+
+async def test_refresh_leaves_the_escalation_latch_untouched(db_session, printer_factory, monkeypatch):
+    """Guidance only: the refresh must never re-arm recovery on a job it gave up on,
+    and must never clear the hold token."""
+    printer = await printer_factory()
+    item = await _runout_held_item(db_session, printer.id)
+    _spy(monkeypatch, "on_spool_recovery_failed")
+    spool_recovery._escalated.add((printer.id, "task-1"))
+    moved = _runout_demand_hms(0, 1)
+    state = _make_state(hms=[moved])
+
+    assert await spool_recovery.maybe_refresh_runout_guidance(printer.id, {moved.full_code}, state) is True
+
+    assert (printer.id, "task-1") in spool_recovery._escalated  # latch intact
+    assert printer.id not in spool_recovery._active_tasks  # no recovery re-entry
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_RUNOUT
+
+
+async def test_no_refresh_without_a_runout_held_unit(db_session, printer_factory, monkeypatch):
+    """Nothing is escalated here, so there is no guidance to correct."""
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)  # printing, but no runout hold
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    moved = _runout_demand_hms(0, 1)
+
+    fired = await spool_recovery.maybe_refresh_runout_guidance(printer.id, {moved.full_code}, _make_state(hms=[moved]))
+
+    assert fired is False
+    failed.assert_not_awaited()
+
+
+async def test_no_refresh_when_the_new_code_is_not_a_demand(db_session, printer_factory, monkeypatch):
+    """An unrelated NEW code arriving alongside a STANDING demand must not
+    re-announce it — only a demand arrival does."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    unrelated = HMSError(code="0x4025", attr=0x07010000, module=7, severity=2, full_code="0701000000004025")
+    state = _make_state(hms=[_runout_demand_hms(0, 2), unrelated])
+
+    fired = await spool_recovery.maybe_refresh_runout_guidance(printer.id, {unrelated.full_code}, state)
+
+    assert fired is False
+    failed.assert_not_awaited()
+
+
+# ===========================================================================
+# F3 — refill auto-resume (default ON)
+# ===========================================================================
+
+
+@pytest.fixture
+def _fast_resume(monkeypatch):
+    """Zero the AMS settle dwell so the two-phase gate runs without wall-clock."""
+    monkeypatch.setattr(spool_recovery, "_RUNOUT_RESUME_SETTLE_S", 0.0)
+    monkeypatch.setattr(spool_recovery, "_RUNOUT_RESUME_CONFIRM_S", 0.05)
+
+
+def _runout_paused_state(*, tray_id=2, gcode_state="PAUSE"):
+    return _make_state(
+        gcode_state=gcode_state,
+        tray_now=255,
+        hms=[_runout_demand_hms(0, tray_id), _runout_same_slot_hms()],
+    )
+
+
+async def test_refill_on_the_demanded_slot_resumes_once(db_session, printer_factory, monkeypatch, _fast_resume):
+    """The operator refills the slot the printer asked for; the farm resumes instead
+    of making them walk back and press a button (doctrine rule 1)."""
+    printer = await printer_factory()
+    item = await _runout_held_item(db_session, printer.id)
+    resumed = _spy(monkeypatch, "on_runout_auto_resumed")
+    state = _runout_paused_state(tray_id=2)
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is True
+
+    assert client.calls.count(("resume",)) == 1  # exactly one resume published
+    assert state.state == "RUNNING"
+    resumed.assert_awaited_once()
+    assert resumed.call_args.kwargs["slot_desc"] == "AMS A slot 3"
+    db_session.expunge_all()
+    # The hold is no longer true — a RUNNING print must not keep a phantom hold token.
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+
+async def test_refill_on_a_different_slot_does_nothing(db_session, printer_factory, monkeypatch, _fast_resume):
+    """A gain on a slot the firmware is NOT demanding is not the refill this print is
+    waiting for — resuming on it would restart straight into the same runout."""
+    printer = await printer_factory()
+    item = await _runout_held_item(db_session, printer.id)
+    resumed = _spy(monkeypatch, "on_runout_auto_resumed")
+    state = _runout_paused_state(tray_id=2)  # firmware demands slot index 2
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 1) is False
+
+    assert client.calls == []
+    assert state.state == "PAUSE"
+    resumed.assert_not_awaited()
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_RUNOUT
+
+
+async def test_operator_resumed_during_the_settle_is_success_not_failure(
+    db_session, printer_factory, monkeypatch, _fast_resume
+):
+    """The state moved to RUNNING before our resume landed — the print is going, so
+    stand down silently. No second resume, no failure handling."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    resumed = _spy(monkeypatch, "on_runout_auto_resumed")
+    state = _runout_paused_state(tray_id=2)
+    client = FakeClient(state)
+
+    polls = {"n": 0}
+
+    def _status(_pid):
+        polls["n"] += 1
+        if polls["n"] > 1:  # the operator hit Resume between the two gate passes
+            state.state = "RUNNING"
+        return state
+
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_status", _status)
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: client)
+
+    assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is False
+
+    assert client.calls == []  # never published on top of a running print
+    resumed.assert_not_awaited()
+
+
+async def test_setting_off_disables_the_assist(db_session, printer_factory, monkeypatch, _fast_resume):
+    from backend.app.api.routes.settings import set_setting
+
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    await set_setting(db_session, "runout_auto_resume_enabled", "false")
+    await db_session.commit()
+    state = _runout_paused_state(tray_id=2)
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is False
+    assert client.calls == []
+    assert state.state == "PAUSE"
+
+
+async def test_resume_send_rejected_stands_aside(db_session, printer_factory, monkeypatch, _fast_resume):
+    """An offline/rejected send: no retry, no quarantine, no out-of-rotation stamp —
+    the escalation's guidance stays exactly as it was so the manual path still works."""
+    printer = await printer_factory()
+    item = await _runout_held_item(db_session, printer.id)
+    resumed = _spy(monkeypatch, "on_runout_auto_resumed")
+    oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+    state = _runout_paused_state(tray_id=2)
+    client = FakeClient(state, resume_ret=False)
+    _wire(monkeypatch, state, client)
+
+    assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is False
+
+    assert client.calls.count(("resume",)) == 1  # tried exactly once, never retried
+    assert state.state == "PAUSE"
+    resumed.assert_not_awaited()
+    oor.assert_not_awaited()
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_RUNOUT
+
+
+async def test_no_runout_hold_means_no_assist(db_session, printer_factory, monkeypatch, _fast_resume):
+    """A PAUSE with a demand but no ESCALATED farm unit is not ours to resume."""
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)  # printing, no runout hold token
+    state = _runout_paused_state(tray_id=2)
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is False
+    assert client.calls == []
+
+
+async def test_assist_never_raises_on_a_broken_client(db_session, printer_factory, monkeypatch, _fast_resume):
+    """Presence-edge hook: invariant 10 — it may never crash the AMS callback."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    state = _runout_paused_state(tray_id=2)
+
+    class _Boom:
+        def resume_print(self):
+            raise RuntimeError("wire down")
+
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_status", lambda _pid: state)
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: _Boom())
+
+    assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is False

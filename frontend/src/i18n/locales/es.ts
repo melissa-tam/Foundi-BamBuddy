@@ -2314,6 +2314,8 @@ export default {
     minStartSpoolDesc: 'Una bobina con menos gramos restantes que este valor nunca puede INICIAR una impresión (pero puede terminar una en curso). 0 desactiva el límite.',
     spoolRecoveryEnabled: 'Recuperación automática de atascos de bobina',
     spoolRecoveryEnabledDesc: 'Cuando un fallo de alimentación del AMS (enredo) pausa una impresión de la granja, cambia automáticamente a la siguiente bobina apta y reanuda. La bobina atascada queda fuera de rotación hasta volver a insertarla.',
+    runoutAutoResumeEnabled: 'Reanudar automáticamente tras recargar filamento',
+    runoutAutoResumeEnabledDesc: 'Cuando una impresión está en pausa esperando filamento en una ranura AMS concreta, se reanuda automáticamente en cuanto se recarga esa ranura. Desactivado = la impresión espera una reanudación manual.',
     spoolRecoveryMaxAttempts: 'Máx. intentos de recuperación',
     spoolRecoveryMaxAttemptsDesc: 'Cuántas bobinas probar antes de dejar la impresión en pausa para una persona (1-5).',
     spoolRecoveryStepTimeout: 'Tiempo de espera por paso (segundos)',

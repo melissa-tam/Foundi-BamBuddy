@@ -97,7 +97,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services.bambu_mqtt import AMS_STATUS_FILAMENT_CHANGE, AMS_STATUS_IDLE
-from backend.app.services.hms_errors import hms_short_code
+from backend.app.services.hms_errors import current_runout_demand, hms_short_code
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_respool import RUNOUT_HMS_CODES, _decode_global_tray
 
@@ -209,6 +209,16 @@ _RECOVERY_HARD_MIN_G = 5
 # genuinely wedged and needs hands, so a second resume would only loop, not heal.
 _MAX_STUCK_RESETS = 1
 
+# Refill auto-resume timing (code constants, NOT operator knobs — precedent
+# _UNLOAD_GRACE_S). The AMS needs to register the freshly-inserted filament before a
+# resume can land: a resume published on the presence edge itself races the firmware's
+# own tray-state settle and is rejected. 15 s mirrors the operator's proven manual
+# gap (_UNLOAD_GRACE_S) — long enough to settle, short enough that the operator is
+# still standing at the printer.
+_RUNOUT_RESUME_SETTLE_S = 15.0
+# Bound on how long we wait for RUNNING after the resume before standing aside.
+_RUNOUT_RESUME_CONFIRM_S = 30.0
+
 # tray_now sentinel: no filament fed (unloaded). 255 on H2-series.
 _NO_FILAMENT = 255
 
@@ -223,6 +233,11 @@ _DEFAULT_ENABLED = True
 _DEFAULT_MAX_ATTEMPTS = 2
 _DEFAULT_STEP_TIMEOUT_S = 90
 _DEFAULT_PROTECT_LAYERS = 7
+# Refill auto-resume (006-H2S 2026-07-26). Default ON: the runout escalation leaves
+# the printer PAUSEd for a same-slot refill, and the refill itself is the operator's
+# "go" — making them walk back to a screen afterwards is exactly the deferral
+# doctrine rule 1 forbids.
+_DEFAULT_RUNOUT_AUTO_RESUME = True
 
 # Human-facing escalation reasons for the failed notification.
 _ESCALATE_DETAIL: dict[str, str] = {
@@ -356,6 +371,12 @@ _success_counts: dict[tuple[int, str], int] = {}
 # escalates instead of swapping again (code constant, precedent _MAX_CANDIDATES).
 _MAX_SUCCESSES_PER_JOB = 3
 
+# Runout guidance-refresh dedup (006-H2S 2026-07-26): (printer_id, job_id,
+# global_tray) demand moves already announced this process lifetime, so ONE demand
+# change produces ONE notification however many status pushes carry it, while a
+# LATER move to a different slot still announces.
+_runout_guidance_sent: set[tuple[int, str, int]] = set()
+
 # Per-job stuck-change reset budget: (printer_id, job_id) -> firmware resets
 # (resumes) already published this incident. Bounds the wedged-change reset to
 # _MAX_STUCK_RESETS; a frozen RecoveryIncident cannot carry a mutable counter, so
@@ -381,6 +402,7 @@ def _reset_state() -> None:
     _escalated.clear()
     _success_counts.clear()
     _stuck_resets.clear()
+    _runout_guidance_sent.clear()
 
 
 def has_live_recovery(printer_id: int) -> bool:
@@ -482,10 +504,14 @@ def _rewrite_mapping(raw: str | None, jammed: int | None, target: int) -> str | 
     return json.dumps(rewritten)
 
 
-def _runout_slot_desc(global_tray: int | None) -> str | None:
+def runout_slot_desc(global_tray: int | None) -> str | None:
     """Human slot name for the runout notification ("AMS A slot 1") from a regular
     AMS global tray (letter = A + g//4, slot = g%4 + 1). ``None`` for AMS-HT /
-    external / unresolved trays (no clean letter+slot mapping)."""
+    external / unresolved trays (no clean letter+slot mapping).
+
+    PUBLIC because ``farm_stall``'s hourly runout reminder renders the same slot
+    name (006-H2S 2026-07-26) — one origin for the wording, so the escalation, the
+    guidance refresh and the reminder can never disagree about what a slot is called."""
     if global_tray is None or not (0 <= global_tray <= 127):
         return None
     return f"AMS {chr(ord('A') + global_tray // 4)} slot {global_tray % 4 + 1}"
@@ -546,14 +572,34 @@ async def _resolve_farm_item(db: AsyncSession, printer_id: int, job_id: str) -> 
     return result.scalar_one_or_none()
 
 
-def _resolve_jammed_tray(item: PrintQueueItem, state) -> tuple[int | None, str]:
+def _resolve_jammed_tray(item: PrintQueueItem, state, *, is_feed_fault: bool = True) -> tuple[int | None, str]:
     """Which global tray jammed, and the feeder verdict.
 
     ``single`` — a deterministic single-feeder farm job (mapping feeder, else the
     live ``tray_now``). ``multi_feeder`` — >1 mapped feeder: a tray swap is
     unsound (firmware re-loads the original slot), so the caller escalates.
     ``none`` — nothing resolvable. Adapts ``spool_respool._resolve_exhausted_tray``.
+
+    For a RUNOUT incident (``is_feed_fault=False``) the FIRMWARE'S OWN DEMAND is
+    PRIMARY and the mapping/``tray_now`` inference is only the fallback. 006-H2S
+    2026-07-26: mapping ``[0]``, ``tray_now`` 255 (nothing feeding) and a standing
+    ``0700_2200_0002_0001`` demand for slot 3 — the inference answered global tray 0
+    and the escalation told the operator to refill "AMS A slot 1", which the printer
+    was not asking for and would not have resumed on. The demand decoder answers
+    slot 3 (global tray 2) from the wire. A demand also settles the feeder verdict as
+    ``single``: it names ONE exact slot to refill, which is honest guidance even on a
+    multi-feeder job (a runout escalates for a same-slot refill either way — it never
+    enters the swap machine, doctrine invariant 9).
+
+    Feed faults are untouched: the ``8010`` family carries no slot attribution, so
+    jam attribution stays mapping/``tray_now``-based.
     """
+    if not is_feed_fault:
+        demand = current_runout_demand(getattr(state, "hms_errors", None) or [])
+        if demand is not None:
+            ams_id, tray_id = demand
+            return ams_id * 4 + tray_id, "single"
+
     feeders: list[int] = []
     if item.ams_mapping:
         try:
@@ -627,11 +673,14 @@ async def on_feed_fault_hms(printer_id: int, new_short_codes, state) -> asyncio.
             # We own this incident now — dedup so a repeated HMS push is a no-op.
             _handled.add(dedup_key)
 
-            jammed, verdict = _resolve_jammed_tray(item, state)
+            # ``feed`` is resolved BEFORE the tray so the resolver knows whether this
+            # is a runout (firmware demand is primary) or a feed fault (mapping /
+            # tray_now inference) — see _resolve_jammed_tray.
+            feed = recoverable & FEED_FAULT_HMS_CODES
+            jammed, verdict = _resolve_jammed_tray(item, state, is_feed_fault=bool(feed))
             printer = await db.get(Printer, printer_id)
             printer_name = (printer.name if printer else None) or f"printer {printer_id}"
             job_name = (getattr(state, "subtask_name", None) or "").strip() or "print"
-            feed = recoverable & FEED_FAULT_HMS_CODES
             incident = RecoveryIncident(
                 printer_id=printer_id,
                 job_id=job_id,
@@ -1899,7 +1948,7 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
     # A jam that couldn't be recovered keeps WAITING_REASON_FAILED; a RUNOUT gets its
     # own token (distinct UI copy: refill the SAME slot, don't swap).
     token = WAITING_REASON_FAILED if incident.is_feed_fault else WAITING_REASON_RUNOUT
-    slot_hint = None if incident.is_feed_fault else _runout_slot_desc(incident.jammed_global_tray)
+    slot_hint = None if incident.is_feed_fault else runout_slot_desc(incident.jammed_global_tray)
     try:
         async with async_session() as db:
             item = await db.get(PrintQueueItem, incident.item_id)
@@ -2030,6 +2079,270 @@ async def _clear_oor_if_resumed_on_jammed_feeder(db: AsyncSession, incident: Rec
         await _clear_out_of_rotation_for_slot(db, incident.printer_id, ams_id, tray_id, tray)
     except Exception:  # noqa: BLE001 — best-effort; abort must never raise
         logger.exception("spool_recovery: self-resume out-of-rotation clear failed for printer %s", incident.printer_id)
+
+
+# --- runout guidance + refill auto-resume (006-H2S 2026-07-26) --------------
+# Both entries below are GUIDANCE/ASSIST lanes layered on top of an ALREADY
+# ESCALATED runout. Neither touches the ``_escalated`` latch and neither re-enters
+# the swap state machine: a runout escalates for a same-slot refill (doctrine
+# invariant 9), and that verdict stands. They only stop the operator being told the
+# wrong slot, and stop a correctly-refilled printer sitting PAUSEd waiting for a
+# button press nobody is there to give.
+
+
+async def _runout_held_item(db: AsyncSession, printer_id: int) -> PrintQueueItem | None:
+    """The still-``printing`` farm unit on this printer that is holding on an
+    ESCALATED runout (``WAITING_REASON_RUNOUT``), or None.
+
+    The single shared gate for both lanes below: without it there is no escalated
+    runout to re-guide or auto-resume, so neither may act."""
+    result = await db.execute(
+        select(PrintQueueItem)
+        .where(PrintQueueItem.printer_id == printer_id)
+        .where(PrintQueueItem.status == "printing")
+        .where(PrintQueueItem.waiting_reason == WAITING_REASON_RUNOUT)
+        .order_by(PrintQueueItem.started_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def maybe_refresh_runout_guidance(printer_id: int, new_full_codes, state) -> bool:
+    """Re-announce the runout escalation when the firmware's DEMAND MOVES to a new slot.
+
+    006-H2S 2026-07-26: after the escalation, a fresh slot-attributed runout arrived
+    on a DIFFERENT slot while the unit sat on ``WAITING_REASON_RUNOUT``. The recovery
+    dedup/latch correctly suppressed a second recovery attempt — but it also
+    suppressed every trace of the change, so the operator's only guidance stayed the
+    original (and, per F2, wrong) slot. This lane closes that gap: guidance-only,
+    it re-fires the escalation's OWN ``on_spool_recovery_failed`` event carrying the
+    FRESH slot. The ``_escalated`` latch is deliberately NOT touched — recovery has
+    given up on this job and must stay given-up.
+
+    Fires only when a NEW code this push is demand-family AND a farm unit here holds
+    ``WAITING_REASON_RUNOUT``. Deduped per ``(printer_id, job_id, global_tray)`` so
+    one demand move notifies once no matter how many pushes carry it, while a LATER
+    move to another slot announces again. Returns True when it notified.
+
+    Called (guarded) from ``main.on_printer_status_change``'s HMS pipeline. Never
+    raises — invariant 10.
+    """
+    try:
+        hms_list = getattr(state, "hms_errors", None) or []
+        new_codes = set(new_full_codes or ())
+        if not new_codes or not hms_list:
+            return False
+        # Trigger: at least one of THIS push's new codes is a demand. Without this a
+        # standing demand would re-announce on every unrelated HMS arrival.
+        fresh = [e for e in hms_list if getattr(e, "full_code", None) in new_codes]
+        if current_runout_demand(fresh) is None:
+            return False
+        # Guidance: the CURRENT demand across the whole list (last wins) — the slot
+        # the printer is asking for right now, which is what the operator must fill.
+        demand = current_runout_demand(hms_list)
+        if demand is None:
+            return False
+        global_tray = demand[0] * 4 + demand[1]
+        job_id = (getattr(state, "subtask_id", None) or "").strip()
+        key = (printer_id, job_id, global_tray)
+        if key in _runout_guidance_sent:
+            return False
+
+        from backend.app.core.database import async_session
+        from backend.app.models.printer import Printer
+        from backend.app.services.notification_service import notification_service
+
+        async with async_session() as db:
+            item = await _runout_held_item(db, printer_id)
+            if item is None:
+                return False
+            printer = await db.get(Printer, printer_id)
+            printer_name = (printer.name if printer else None) or f"printer {printer_id}"
+            job_name = (getattr(state, "subtask_name", None) or "").strip() or "print"
+            slot_desc = runout_slot_desc(global_tray)
+            _runout_guidance_sent.add(key)
+            await notification_service.on_spool_recovery_failed(
+                printer_id=printer_id,
+                printer_name=printer_name,
+                job_name=job_name,
+                detail=(
+                    f"The printer is NOW asking for filament in {slot_desc or 'a different slot'} — "
+                    "the slot it needs has CHANGED since the first alert. Insert filament there "
+                    "(the print resumes by itself once the AMS sees it)."
+                ),
+                db=db,
+                is_feed_fault=False,
+                runout_slot=slot_desc,
+            )
+        logger.info(
+            "spool_recovery: printer %s runout demand moved to global tray %s (%s) — guidance refreshed",
+            printer_id,
+            global_tray,
+            slot_desc,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — a guidance hook must never crash the status flow
+        logger.exception("spool_recovery: runout guidance refresh failed for printer %s", printer_id)
+        return False
+
+
+def _refill_slot_is_demanded(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Is the printer PAUSEd demanding filament in EXACTLY this slot? Pure and
+    DB-free — the cheap pre-gate the presence edge runs before it is worth opening a
+    session (see :func:`maybe_auto_resume_on_refill`). The full gate re-checks this
+    together with the farm-unit hold."""
+    st = _get_state(printer_id)
+    if st is None or getattr(st, "state", None) != "PAUSE":
+        return False
+    return current_runout_demand(getattr(st, "hms_errors", None) or []) == (ams_id, tray_id)
+
+
+async def _refill_resume_ready(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> str:
+    """Are ALL the auto-resume preconditions true right now?
+
+    Returns ``"ready"``, ``"running"`` (already resumed — success, nothing to do), or
+    ``"no"``. Evaluated twice: once on the presence edge and once again after the
+    settle wait, because the operator may have resumed on the screen meanwhile."""
+    st = _get_state(printer_id)
+    live = getattr(st, "state", None) if st is not None else None
+    if live == "RUNNING":
+        return "running"
+    if live != "PAUSE":
+        return "no"
+    # The firmware must still be demanding THIS slot. A demand for a different slot
+    # means the gained roll is not what the print is waiting for.
+    if current_runout_demand(getattr(st, "hms_errors", None) or []) != (ams_id, tray_id):
+        return "no"
+    return "ready" if await _runout_held_item(db, printer_id) is not None else "no"
+
+
+async def maybe_auto_resume_on_refill(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Resume a runout-held print when the DEMANDED slot is physically refilled.
+
+    006-H2S 2026-07-26: the runout escalation leaves the print PAUSEd for a same-slot
+    refill, and the refill itself is the operator's "go" — but the print then sat
+    waiting for someone to press Resume. Doctrine rule 1 (minimal human interaction):
+    the recoverable half of this state is recoverable without hands.
+
+    Called fire-and-forget from the ``ams_presence`` presence-GAIN edge, so it fires
+    exactly once per physical insert — no persistent state is needed to bound it.
+    Acts ONLY when every one of these holds, on the edge AND again after the settle:
+    the setting ``runout_auto_resume_enabled`` is on, the printer is in live PAUSE, a
+    farm unit here holds ``WAITING_REASON_RUNOUT``, and the firmware's CURRENT demand
+    is exactly the slot that gained. A gain on any other slot is not the refill the
+    print is waiting for and is ignored.
+
+    On failure it stands aside — no retry, no quarantine, no out-of-rotation stamp,
+    and the escalation's guidance stays exactly as it was, so the operator's manual
+    resume is still the reliable path. Returns True only on a confirmed RUNNING.
+    Never raises — invariant 10.
+    """
+    try:
+        # Pure, DB-free pre-gate FIRST. This runs on EVERY physical spool insert on
+        # every printer, and almost none of them are a runout refill — opening a
+        # session just to read a setting before knowing that is pure waste (it showed
+        # up as a measurable slowdown across the suite). The two legs here are the
+        # cheap half of _refill_resume_ready, which re-checks everything below.
+        if not _refill_slot_is_demanded(printer_id, ams_id, tray_id):
+            return False
+
+        from backend.app.core.database import async_session
+
+        async with async_session() as db:
+            if not await _read_bool(db, "runout_auto_resume_enabled", _DEFAULT_RUNOUT_AUTO_RESUME):
+                return False
+            if await _refill_resume_ready(db, printer_id, ams_id, tray_id) != "ready":
+                return False
+
+        # Let the AMS register the insert; a resume published on the edge itself
+        # races the firmware's tray-state settle and is simply rejected.
+        await asyncio.sleep(_RUNOUT_RESUME_SETTLE_S)
+
+        async with async_session() as db:
+            verdict = await _refill_resume_ready(db, printer_id, ams_id, tray_id)
+        if verdict == "running":
+            logger.info(
+                "spool_recovery: printer %s already RUNNING after the AMS%d-T%d refill "
+                "(operator resumed) — auto-resume stood down",
+                printer_id,
+                ams_id,
+                tray_id,
+            )
+            return False
+        if verdict != "ready":
+            logger.info(
+                "spool_recovery: printer %s refill auto-resume stood down after settle "
+                "(state/demand/hold changed) — AMS%d-T%d",
+                printer_id,
+                ams_id,
+                tray_id,
+            )
+            return False
+
+        client = printer_manager.get_client(printer_id)
+        if client is None:
+            logger.info("spool_recovery: printer %s has no client — refill auto-resume skipped", printer_id)
+            return False
+        if not client.resume_print():
+            logger.info(
+                "spool_recovery: printer %s resume_print send returned False (offline?) — "
+                "refill auto-resume stands aside, escalation guidance stands",
+                printer_id,
+            )
+            return False
+        if not await _await_state(printer_id, {"RUNNING"}, _RUNOUT_RESUME_CONFIRM_S):
+            logger.info(
+                "spool_recovery: printer %s did not reach RUNNING within %.0fs after the refill resume — "
+                "standing aside (no retry); the escalation guidance stands",
+                printer_id,
+                _RUNOUT_RESUME_CONFIRM_S,
+            )
+            return False
+
+        await _clear_runout_hold_and_notify(printer_id, ams_id, tray_id)
+        logger.info(
+            "spool_recovery: printer %s RESUMED automatically after the AMS%d-T%d filament refill",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — a presence-edge hook must never crash the AMS callback
+        logger.exception("spool_recovery: refill auto-resume failed for printer %s", printer_id)
+        return False
+
+
+async def _clear_runout_hold_and_notify(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Post-resume bookkeeping: drop the now-false runout hold token and tell the
+    operator. Clearing the token matters — a RUNNING print still carrying
+    ``WAITING_REASON_RUNOUT`` shows a phantom hold on the run page and re-arms the
+    hourly attention reminder the moment the printer pauses again for any reason.
+    Best-effort; a failure here must not turn a successful resume into an error."""
+    from backend.app.core.database import async_session
+    from backend.app.models.printer import Printer
+    from backend.app.services.notification_service import notification_service
+
+    slot_desc = runout_slot_desc(ams_id * 4 + tray_id) or f"AMS{ams_id} slot {tray_id + 1}"
+    try:
+        async with async_session() as db:
+            item = await _runout_held_item(db, printer_id)
+            job_name = "print"
+            if item is not None:
+                item.waiting_reason = None
+                await db.commit()
+            printer = await db.get(Printer, printer_id)
+            printer_name = (printer.name if printer else None) or f"printer {printer_id}"
+            st = _get_state(printer_id)
+            job_name = (getattr(st, "subtask_name", None) or "").strip() or job_name
+            await notification_service.on_runout_auto_resumed(
+                printer_id=printer_id,
+                printer_name=printer_name,
+                job_name=job_name,
+                slot_desc=slot_desc,
+                db=db,
+            )
+    except Exception:  # noqa: BLE001 — bookkeeping must not undo a successful resume
+        logger.exception("spool_recovery: post-resume bookkeeping failed for printer %s", printer_id)
 
 
 # --- out-of-rotation clear (from the ams_presence presence-GAIN edge) --------

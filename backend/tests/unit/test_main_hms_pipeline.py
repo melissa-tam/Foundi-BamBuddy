@@ -93,6 +93,10 @@ class _Harness:
         self.record_sent = AsyncMock()
         self.seed_standing = AsyncMock(return_value=set())
         self.suppress_read_failure = False
+        # The runout guidance-refresh hook (006-H2S 2026-07-26) runs on every push
+        # that carries new codes and opens its OWN session, so it is stubbed here
+        # for the whole file; its behavior is pinned in test_spool_recovery.py.
+        self.guidance_refresh = AsyncMock(return_value=False)
 
     def __enter__(self):
         db = AsyncMock()
@@ -128,6 +132,10 @@ class _Harness:
             ),
             patch.object(notify_dedup, "record_sent", self.record_sent),
             patch.object(notify_dedup, "seed_standing", self.seed_standing),
+            patch(
+                "backend.app.services.spool_recovery.maybe_refresh_runout_guidance",
+                new=self.guidance_refresh,
+            ),
         ]
         for p in self._patches:
             p.start()
@@ -406,3 +414,40 @@ class TestRecoveryOwnedSuppression:
 
         will_own.assert_not_awaited()
         assert h.notify.on_printer_error.await_count == 1
+
+
+@pytest.mark.asyncio
+class TestRunoutGuidanceRefreshHook:
+    """006-H2S 2026-07-26 wiring pin: the HMS pipeline hands the guidance-refresh
+    lane THIS push's new full codes and the live state, and a hook failure can never
+    break the status flow (invariant 10). The lane's own decisions are pinned in
+    test_spool_recovery.py."""
+
+    async def test_hook_receives_the_new_full_codes_and_state(self):
+        state = _state([_RUNOUT_COMPANION])
+        with _Harness() as h:
+            await main_module.on_printer_status_change(5, state)
+
+        h.guidance_refresh.assert_awaited_once()
+        args = h.guidance_refresh.await_args.args
+        assert args[0] == 5
+        assert args[1] == {_RUNOUT_COMPANION.full_code}
+        assert args[2] is state
+
+    async def test_a_standing_code_does_not_re_invoke_the_hook(self):
+        """The hook rides ``new_error_codes``, so a code already alerted on this
+        lifetime does not re-trigger it."""
+        with _Harness() as h:
+            await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION], layer_num=1))
+            await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION], layer_num=2))
+
+        assert h.guidance_refresh.await_count == 1
+
+    async def test_hook_failure_does_not_break_the_status_flow(self):
+        with _Harness() as h:
+            h.guidance_refresh.side_effect = RuntimeError("boom")
+            await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION, _UNRELATED]))
+
+        # The push completed: the ordinary code still notified and still stamped.
+        assert h.notify.on_printer_error.await_count == 1
+        assert "0700_4025" in h.sent_bodies[0]

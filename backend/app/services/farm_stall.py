@@ -37,11 +37,13 @@ from backend.app.core.websocket import broadcast_production_run_changed
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services import notify_dedup
 from backend.app.services.farm_correlation import WAITING_REASON_PLATE_VISION
+from backend.app.services.hms_errors import current_runout_demand
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_recovery import (
     WAITING_REASON_FAILED,
     WAITING_REASON_RECOVERING,
     WAITING_REASON_RUNOUT,
+    runout_slot_desc,
 )
 
 if TYPE_CHECKING:
@@ -389,12 +391,12 @@ _PLATE_VISION_REMINDER_DETAIL = (
 )
 
 
-async def _remind_paused(db, notif, printer_id, printer_name, job_name, minutes) -> None:
+async def _remind_paused(db, notif, printer_id, printer_name, job_name, minutes, *, state=None) -> None:
     """Re-fire the pause-stall escalation's own event (WAITING_REASON_PAUSED)."""
     await notif.on_print_paused_stalled(printer_id, printer_name, job_name, minutes, db)
 
 
-async def _remind_jam(db, notif, printer_id, printer_name, job_name, minutes) -> None:
+async def _remind_jam(db, notif, printer_id, printer_name, job_name, minutes, *, state=None) -> None:
     """Re-fire the spool-recovery escalation's own event (WAITING_REASON_FAILED)."""
     await notif.on_spool_recovery_failed(
         printer_id=printer_id,
@@ -406,11 +408,16 @@ async def _remind_jam(db, notif, printer_id, printer_name, job_name, minutes) ->
     )
 
 
-async def _remind_runout(db, notif, printer_id, printer_name, job_name, minutes) -> None:
+async def _remind_runout(db, notif, printer_id, printer_name, job_name, minutes, *, state=None) -> None:
     """Re-fire the runout escalation's own event (WAITING_REASON_RUNOUT) — same
     ``on_spool_recovery_failed`` method, runout-framed copy (``is_feed_fault=False``).
-    The slot hint is not recoverable at the tick, so ``runout_slot=None`` (the copy
-    degrades to "the SAME slot")."""
+
+    The slot is decoded LIVE from the printer state the tick already fetched (006-H2S
+    2026-07-26): the reminder used to hardcode ``runout_slot=None``, so every hourly
+    nag degraded to "the SAME slot" and told an operator who had been given the WRONG
+    slot nothing new for 12 h. Reading the firmware's current demand each time also
+    means the reminder SELF-CORRECTS when the demand moves. ``None`` only when the
+    firmware names no slot (the bare ``07xx_8011``), which is the honest fallback."""
     await notif.on_spool_recovery_failed(
         printer_id=printer_id,
         printer_name=printer_name,
@@ -418,11 +425,21 @@ async def _remind_runout(db, notif, printer_id, printer_name, job_name, minutes)
         detail=_RUNOUT_REMINDER_DETAIL,
         db=db,
         is_feed_fault=False,
-        runout_slot=None,
+        runout_slot=_live_runout_slot(state),
     )
 
 
-async def _remind_plate_vision(db, notif, printer_id, printer_name, job_name, minutes) -> None:
+def _live_runout_slot(state) -> str | None:
+    """Human name of the slot the firmware is CURRENTLY demanding filament in, from
+    the live printer state — or ``None`` when it names none. Formatting comes from
+    ``spool_recovery.runout_slot_desc`` (one origin for the wording)."""
+    demand = current_runout_demand(getattr(state, "hms_errors", None) or [])
+    if demand is None:
+        return None
+    return runout_slot_desc(demand[0] * 4 + demand[1])
+
+
+async def _remind_plate_vision(db, notif, printer_id, printer_name, job_name, minutes, *, state=None) -> None:
     """Re-fire the native-vision plate hold's own event (WAITING_REASON_PLATE_VISION)."""
     await notif.on_plate_not_empty(printer_id, printer_name, db, source_detail=_PLATE_VISION_REMINDER_DETAIL)
 
@@ -513,7 +530,9 @@ async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager
             printer = await db.get(Printer, pid)
             printer_name = printer.name if printer is not None else f"printer {pid}"
             job_name = await _job_name(db, item)
-            await _ATTENTION_DISPATCH[reason](db, notification_service, pid, printer_name, job_name, minutes)
+            # ``st`` is the live status this tick already read above — passed, never
+            # re-fetched, so the runout reminder can name the CURRENTLY demanded slot.
+            await _ATTENTION_DISPATCH[reason](db, notification_service, pid, printer_name, job_name, minutes, state=st)
             logger.warning(
                 "farm_stall: printer %s STILL held (%s) %d min with unit %s printing — attention reminder re-fired",
                 pid,
