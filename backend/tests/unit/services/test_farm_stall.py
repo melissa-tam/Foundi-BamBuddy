@@ -8,6 +8,7 @@ off in the test engine.
 """
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -24,10 +25,19 @@ _W = farm_stall._ATTENTION_REMINDER_S  # attention-reminder window (3600 s)
 
 
 class _FakeState:
-    """Minimal live-status stand-in — the pause watch reads only ``.state``."""
+    """Minimal live-status stand-in — the pause watch reads ``.state``, and the
+    runout reminder additionally decodes ``.hms_errors`` for the demanded slot."""
 
-    def __init__(self, state: str | None):
+    def __init__(self, state: str | None, hms_errors: list | None = None):
         self.state = state
+        self.hms_errors = hms_errors or []
+
+
+def _runout_demand(ams_id: int, tray_id: int):
+    """A slot-attributed runout DEMAND ("AMS X Slot N ... Please insert a new
+    filament.") in the HMSError shape the decoder consumes."""
+    attr = 0x07000000 | (ams_id << 16) | ((0x20 + tray_id) << 8)
+    return SimpleNamespace(attr=attr, code="0x20001", full_code=f"{attr:08X}00020001")
 
 
 class _FakeManager:
@@ -572,3 +582,58 @@ class TestSchedulerHookGuard:
             mock_session.return_value.__aexit__ = AsyncMock(return_value=False)
             # Must not raise despite the attention watch blowing up.
             await scheduler.check_queue()
+
+
+class TestRunoutReminderNamesTheLiveSlot:
+    """006-H2S 2026-07-26: the hourly runout nag hardcoded ``runout_slot=None``, so
+    every re-fire degraded to "the SAME slot" and told an operator who had already
+    been sent to the WRONG slot nothing new for 12 h. It now decodes the firmware's
+    CURRENT demand from the live state the tick already read."""
+
+    async def test_reminder_carries_the_demanded_slot(self, db_session):
+        await _add_paused_held(db_session, 8, "filament_runout_recovery_failed")
+        # Firmware demands AMS A slot 2 (0-indexed tray 1).
+        mgr = _FakeManager({8: True}, {8: _FakeState("PAUSE", [_runout_demand(0, 1)])})
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_awaited_once()
+            assert mock_n.await_args.kwargs["runout_slot"] == "AMS A slot 2"
+
+    async def test_reminder_self_updates_when_the_demand_moves(self, db_session):
+        """The whole point: a demand that MOVES between windows must move the nag."""
+        await _add_paused_held(db_session, 8, "filament_runout_recovery_failed")
+        state = _FakeState("PAUSE", [_runout_demand(0, 2)])  # AMS A slot 3
+        mgr = _FakeManager({8: True}, {8: state})
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            assert mock_n.await_args.kwargs["runout_slot"] == "AMS A slot 3"
+            # A second roll empties; the firmware appends a demand for slot 2.
+            state.hms_errors.append(_runout_demand(0, 1))
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=2 * _W)
+            assert mock_n.await_args.kwargs["runout_slot"] == "AMS A slot 2"
+            assert mock_n.await_count == 2
+
+    async def test_slot_agnostic_runout_degrades_honestly_to_none(self, db_session):
+        """The bare 07xx_8011 names no slot, so ``None`` (the copy falls back to "the
+        SAME slot") is the honest answer — not a guess."""
+        await _add_paused_held(db_session, 8, "filament_runout_recovery_failed")
+        bare = SimpleNamespace(attr=0x07000000, code="0x8011", full_code="0700000000008011")
+        mgr = _FakeManager({8: True}, {8: _FakeState("PAUSE", [bare])})
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_awaited_once()
+            assert mock_n.await_args.kwargs["runout_slot"] is None
+
+    async def test_jam_reminder_is_unaffected_by_the_state_passthrough(self, db_session):
+        """The jam reminder takes the same ``state`` kwarg and must ignore it."""
+        await _add_paused_held(db_session, 7, "spool_jam_recovery_failed")
+        mgr = _FakeManager({7: True}, {7: _FakeState("PAUSE", [_runout_demand(0, 1)])})
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_awaited_once()
+            assert mock_n.await_args.kwargs["is_feed_fault"] is True
+            assert "runout_slot" not in mock_n.await_args.kwargs

@@ -969,6 +969,31 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                                 tray_id,
                             )
 
+                        # Refill auto-resume (006-H2S 2026-07-26): this gain may be the
+                        # same-slot refill a runout-escalated print is PAUSEd waiting
+                        # for. Spawned, not awaited — it sleeps out an AMS settle window
+                        # before resuming and must not hold the AMS callback. Through
+                        # spawn_background_task (core/tasks.py: the one sanctioned
+                        # create_task call site) so the sleeping task keeps a strong
+                        # reference and cannot be GC'd mid-wait. The service owns every
+                        # gate (setting, live PAUSE, the runout hold, and "the firmware
+                        # is demanding THIS slot") and never raises.
+                        try:
+                            from backend.app.core.tasks import spawn_background_task
+                            from backend.app.services.spool_recovery import maybe_auto_resume_on_refill
+
+                            spawn_background_task(
+                                maybe_auto_resume_on_refill(printer_id, ams_id, tray_id),
+                                name=f"runout-refill-resume-p{printer_id}-ams{ams_id}-t{tray_id}",
+                            )
+                        except Exception:  # noqa: BLE001 — best-effort assist
+                            logger.exception(
+                                "AMS presence: refill auto-resume spawn failed for printer %d AMS%d-T%d",
+                                printer_id,
+                                ams_id,
+                                tray_id,
+                            )
+
                         # W1/W5 spent-binding-latch release + fresh-roll prompt fire ONLY on
                         # the STRICT ``physical_cycle`` (a MEASURED >= 5 s absence). Minting a
                         # spool row or prompting on a false positive is expensive, so the

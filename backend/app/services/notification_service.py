@@ -2413,6 +2413,54 @@ class NotificationService:
             variables=variables,
         )
 
+    async def on_runout_auto_resumed(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        job_name: str,
+        slot_desc: str,
+        db: AsyncSession,
+    ):
+        """Fire when a runout-held print resumed itself because the demanded slot was refilled.
+
+        006-H2S 2026-07-26: a runout escalation leaves the print PAUSEd for a
+        same-slot refill; the refill IS the operator's go-ahead, so the farm resumes
+        rather than making them press a button (doctrine rule 1). This is the "you
+        don't need to go back to the printer" close.
+
+        Rides the ``on_spool_recovery_succeeded`` provider toggle — an operator who
+        wants to hear about unattended farm recoveries wants to hear about this one,
+        and it needs no new event column/template/migration. The copy is composed in
+        backend English rather than from the swap-framed
+        ``spool_recovery_succeeded`` template (which would falsely claim a donor and
+        a replacement spool) — the same one-event-two-copies precedent
+        :meth:`on_spool_recovery_failed` sets with ``is_feed_fault=False``. The
+        LOGGED/webhook ``event_type`` stays the truthful ``runout_auto_resumed``."""
+        providers = await self._get_providers_for_event(db, "on_spool_recovery_succeeded", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "job_name": job_name,
+            "slot_desc": slot_desc,
+        }
+        title = f"Filament refilled — print resumed on {printer_name}"
+        message = (
+            f"{printer_name}: filament refilled in {slot_desc} — '{job_name}' resumed automatically. No action needed."
+        )
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "runout_auto_resumed",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
     async def on_spool_recovery_failed(
         self,
         printer_id: int | None,

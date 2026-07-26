@@ -3,6 +3,7 @@
 Tests the full request/response cycle for /api/v1/printers/ endpoints.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import unquote
 
@@ -4029,3 +4030,112 @@ class TestExtruderJogAPI:
         assert response.status_code == 200
         sent = mock_client.send_gcode.call_args.args[0]
         assert "E-3.50" in sent
+
+
+class TestAMSLoadRunoutHoldGate:
+    """The 006-H2S 2026-07-26 incident's actual vector.
+
+    While the printer sits PAUSEd waiting for a same-slot filament refill, the AMS
+    executes NO filament change. The operator's Load click on slot 2 returned 200,
+    published an ``ams_change_filament``, moved nothing — and LATCHED in firmware,
+    resurfacing at the resume 12 h later as a bogus demand for slot 2. A 200 that
+    silently arms a future fault is worse than a refusal, so the route now 409s and
+    names the slot the firmware is actually asking for."""
+
+    _BARE_8011 = SimpleNamespace(attr=0x07000000, code="0x8011", full_code="0700000000008011")
+    # 0700_2200_0002_0001 — "AMS A Slot 3 filament has run out. Please insert a new filament."
+    _SLOT3_DEMAND = SimpleNamespace(attr=0x07002200, code="0x20001", full_code="0700220000020001")
+
+    def _state(self, gcode_state, hms):
+        return SimpleNamespace(state=gcode_state, hms_errors=hms)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_load_409s_while_paused_on_a_runout(self, async_client: AsyncClient, printer_factory):
+        printer = await printer_factory(name="006-H2S")
+        mock_client = MagicMock()
+        mock_client.ams_load_filament.return_value = True
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = self._state("PAUSE", [self._BARE_8011])
+
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=1")
+
+        assert response.status_code == 409
+        # Nothing was published — the latch can never be armed.
+        mock_client.ams_load_filament.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_409_names_the_demanded_slot(self, async_client: AsyncClient, printer_factory):
+        """The refusal has to be actionable: it must point at the slot the firmware
+        is demanding, not just say no."""
+        printer = await printer_factory(name="006-H2S")
+        mock_client = MagicMock()
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = self._state("PAUSE", [self._SLOT3_DEMAND, self._BARE_8011])
+
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=1")
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "AMS A slot 3" in detail
+        assert "latch" in detail.lower()
+        mock_client.ams_load_filament.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_running_printer_loads_normally(self, async_client: AsyncClient, printer_factory):
+        """A standing runout code on a RUNNING printer is not a hold — the gate needs
+        BOTH legs, so an ordinary load must not be collateral damage."""
+        printer = await printer_factory(name="P")
+        mock_client = MagicMock()
+        mock_client.ams_load_filament.return_value = True
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = self._state("RUNNING", [self._SLOT3_DEMAND])
+
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=5")
+
+        assert response.status_code == 200
+        mock_client.ams_load_filament.assert_called_once_with(5)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_paused_without_runout_codes_loads_normally(self, async_client: AsyncClient, printer_factory):
+        """A door-open pause is not a runout hold."""
+        printer = await printer_factory(name="P")
+        door = SimpleNamespace(attr=0x03000000, code="0x8042", full_code="0300000000008042")
+        mock_client = MagicMock()
+        mock_client.ams_load_filament.return_value = True
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = self._state("PAUSE", [door])
+
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=5")
+
+        assert response.status_code == 200
+        mock_client.ams_load_filament.assert_called_once_with(5)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_no_live_status_loads_normally(self, async_client: AsyncClient, printer_factory):
+        """No status yet (startup race) → the predicate fails closed to False; a gate
+        that errors must never block an operator's load."""
+        printer = await printer_factory(name="P")
+        mock_client = MagicMock()
+        mock_client.ams_load_filament.return_value = True
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = None
+
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=5")
+
+        assert response.status_code == 200
+        mock_client.ams_load_filament.assert_called_once_with(5)

@@ -1215,6 +1215,9 @@ export interface AppSettings {
   spool_recovery_max_attempts: number;        // Auto-swap attempts before escalating (1-5, default 2)
   spool_recovery_step_timeout_s: number;      // Per-step timeout while recovering (15-600s, default 90)
   spool_recovery_protect_layers: number;      // Skip auto-recovery within the first N layers (0-1000, default 7)
+  // Resume a runout-PAUSEd print automatically when the AMS slot the firmware is
+  // demanding gets refilled (006-H2S 2026-07-26). Default true.
+  runout_auto_resume_enabled: boolean;
   // Silently auto-create spool records for AMS trays that have no RFID tag.
   auto_add_untagged: boolean;
   // JSON string default filament pushed to BARE tagless trays (mirrors

@@ -2219,6 +2219,8 @@ export default {
     minStartSpoolDesc: '잔량이 이 그램 수 미만인 스풀은 인쇄를 시작할 수 없습니다(진행 중인 인쇄는 완료 가능). 0이면 하한을 비활성화합니다.',
     spoolRecoveryEnabled: '스풀 걸림 자동 복구',
     spoolRecoveryEnabledDesc: 'AMS 공급 오류(엉킴)로 팜 인쇄가 일시정지되면 자동으로 다음 사용 가능한 스풀로 교체하고 재개합니다. 걸린 스풀은 다시 삽입할 때까지 로테이션에서 제외됩니다.',
+    runoutAutoResumeEnabled: '필라멘트 보충 후 자동 재개',
+    runoutAutoResumeEnabledDesc: '특정 AMS 슬롯의 필라멘트를 기다리며 인쇄가 일시정지된 경우, 해당 슬롯이 보충되면 자동으로 재개합니다. 끄면 수동 재개를 기다립니다.',
     spoolRecoveryMaxAttempts: '최대 복구 시도 횟수',
     spoolRecoveryMaxAttemptsDesc: '인쇄를 담당자용으로 일시정지 상태로 두기 전에 시도할 스풀 수(1~5).',
     spoolRecoveryStepTimeout: '단계 시간 제한(초)',

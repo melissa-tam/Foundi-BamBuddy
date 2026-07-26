@@ -940,6 +940,31 @@ def lookup_description_any(attr: int | str, code: int | str) -> str | None:
 # absent — it names no slot, so the resolver falls back to tray_now/mapping there.
 _RUNOUT_SLOT_CODE32: frozenset[int] = frozenset({0x00020001, 0x00020005, 0x00030001, 0x00030002})
 
+# The DEMAND subset of :data:`_RUNOUT_SLOT_CODE32` — the code words that mean "the
+# firmware is asking for filament in THIS slot RIGHT NOW". Every member of the
+# parent set names a slot; only these members name a slot the operator must FILL.
+# Classified 006-H2S 2026-07-26 from the vendored catalog text of the ``0700_2X00``
+# family (``app/data/hms_error_text_en.json.gz``, quoted verbatim below):
+#
+#   * 0x00020001 IN — "AMS A Slot 3 filament has run out. Please insert a new
+#     filament." The canonical insert-here demand, and the exact code standing on
+#     006-H2S for slot 3 (``0700_2200_0002_0001``) while the escalation text named
+#     slot 1 off the stale dispatch mapping.
+#   * 0x00020005 OUT — "AMS A Slot 1 filament has run out, and purging the old
+#     filament went abnormally; please check whether the filament is stuck in the
+#     tool head." The ask is a TOOL-HEAD inspection, not an insert; treating it as a
+#     demand would let the refill auto-resume drive a print back into a purge fault.
+#   * 0x00030001 OUT — "AMS A Slot 1 filament has run out. Please wait while old
+#     filament is purged." An in-progress notice ("please wait"), not an ask —
+#     the firmware follows it with the 0x00020001 demand or the 0x00030002
+#     auto-switch, whichever way the purge lands.
+#   * 0x00030002 OUT — "AMS A Slot 1 filament has run out and automatically
+#     switched to the slot with the same filament." NEVER a demand: the firmware
+#     backup already rescued the print and nothing is being asked for. It remains
+#     VALID SPENT EVIDENCE, which is why ``spool_respool._resolve_exhausted_tray``
+#     deliberately keeps consuming the whole parent set — do not narrow that.
+_RUNOUT_DEMAND_CODE32: frozenset[int] = frozenset({0x00020001})
+
 
 def ams_slot_from_attr(attr: int) -> tuple[int, int] | None:
     """Decode the AMS unit + slot a slot-attributed HMS ``attr`` names, or ``None``.
@@ -1042,6 +1067,90 @@ def _code_word(code: int | str) -> int:
     if isinstance(code, str):
         return int(code.replace("0x", ""), 16) if code else 0
     return int(code or 0)
+
+
+def current_runout_demand(hms_list) -> tuple[int, int] | None:
+    """The ``(ams_id, tray_id)`` the firmware is CURRENTLY demanding filament in.
+
+    The canonical answer to "which slot does the printer want refilled" — the ONE
+    decoder every runout-guidance consumer reads (escalation text, hourly reminders,
+    the refill auto-resume gate, the load-route 409). 006-H2S 2026-07-26: the
+    escalation named "AMS A slot 1" because it took the slot from the DISPATCH
+    MAPPING while the firmware's own demand for slot 3 was standing right there in
+    ``hms_errors`` as ``0700_2200_0002_0001``; the operator refilled the wrong slot
+    and the print sat 12 h.
+
+    Only the DEMAND family counts (:data:`_RUNOUT_DEMAND_CODE32` — see its comment
+    for the per-code catalog evidence): a "please wait while purging", a
+    purge-abnormal runout and an "automatically switched" INFO all name a slot but
+    ask for nothing. The bare ``07xx_8011`` "insert into the same AMS slot" runout
+    names NO slot and so never matches — callers fall back to their own attribution.
+
+    LAST match wins: the firmware APPENDS newer faults, so a demand that MOVED (a
+    second roll runs out, or the operator refilled the wrong slot) is the later
+    entry. Proven from the incident's own list order — at 01:23 the list was
+    [slot-1 auto-switched, slot-3 demand, bare 8011] → slot 3; at 13:51 a slot-2
+    demand had been appended → slot 2.
+
+    Pure decode over any HMSError-shaped sequence (``.attr`` + ``.code``, the same
+    shapes :func:`runout_slot_from_hms` consumers pass). A malformed entry is
+    skipped, never raised — this runs inside MQTT callbacks (invariant 10).
+    """
+    demand: tuple[int, int] | None = None
+    for e in hms_list or []:
+        try:
+            if _code_word(getattr(e, "code", 0)) not in _RUNOUT_DEMAND_CODE32:
+                continue
+            slot = ams_slot_from_attr(int(getattr(e, "attr", 0) or 0))
+        except (TypeError, ValueError):  # a malformed HMS entry must not break the decode
+            continue
+        if slot is not None:
+            demand = slot
+    return demand
+
+
+def runout_hold_active(state) -> bool:
+    """True when the printer is PAUSEd holding for a same-slot filament refill.
+
+    The shared predicate behind every runout-hold decision (guidance refresh, refill
+    auto-resume, the ``/ams/load`` 409 gate) so they can never disagree about
+    whether the printer is in the state where the AMS executes no filament change.
+    Two legs, both required:
+
+    * live ``gcode_state == "PAUSE"``, and
+    * a runout code standing in ``hms_errors`` — either the slot-agnostic
+      "insert into the SAME slot" family (``RUNOUT_HMS_CODES``) or any
+      slot-attributed DEMAND (:func:`current_runout_demand`).
+
+    Wire-proven in this state (006-H2S 2026-07-26, matching the 2026-07-19
+    cross-slot finding): a load command produces NO AMS motion, LATCHES in firmware,
+    and resurfaces at the operator's eventual resume as a bogus demand for the
+    latched slot — 12 h later in the incident.
+
+    ``RUNOUT_HMS_CODES`` is imported at CALL time on purpose: ``spool_respool`` owns
+    that constant (doctrine invariant 1, one origin per magic value) and imports
+    THIS module at module scope, so a module-level import here would be circular.
+    Fails closed (False) on a malformed/absent state — a predicate that errors must
+    never block an operator's load.
+    """
+    try:
+        if (getattr(state, "state", None) or "") != "PAUSE":
+            return False
+        hms_list = getattr(state, "hms_errors", None) or []
+        if current_runout_demand(hms_list) is not None:
+            return True
+
+        from backend.app.services.spool_respool import RUNOUT_HMS_CODES
+
+        for e in hms_list:
+            try:
+                if hms_short_code(e.attr, e.code) in RUNOUT_HMS_CODES:
+                    return True
+            except Exception:  # noqa: BLE001 — a malformed HMS entry must not break the predicate
+                continue
+        return False
+    except Exception:  # noqa: BLE001 — a gate predicate must never raise into a callback/route
+        return False
 
 
 def hms_error_payload(e) -> dict:

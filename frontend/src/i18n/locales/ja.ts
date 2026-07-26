@@ -2310,6 +2310,8 @@ export default {
     minStartSpoolDesc: '残量がこのグラム数を下回るスプールは印刷を開始できません（進行中の印刷は完了できます）。0 で下限を無効にします。',
     spoolRecoveryEnabled: 'スプール詰まりの自動復旧',
     spoolRecoveryEnabledDesc: 'AMSの送り出しエラー（絡まり）でファーム印刷が一時停止したとき、自動的に次の対象スプールに切り替えて再開します。詰まったスプールは、再挿入するまでローテーションから外されます。',
+    runoutAutoResumeEnabled: 'フィラメント補充後に自動再開',
+    runoutAutoResumeEnabledDesc: '特定のAMSスロットのフィラメント待ちで印刷が一時停止している場合、そのスロットが補充され次第、自動的に再開します。オフ = 手動での再開を待ちます。',
     spoolRecoveryMaxAttempts: '最大復旧試行回数',
     spoolRecoveryMaxAttemptsDesc: '印刷を担当者向けに一時停止したままにする前に試すスプールの数（1〜5）。',
     spoolRecoveryStepTimeout: 'ステップのタイムアウト（秒）',

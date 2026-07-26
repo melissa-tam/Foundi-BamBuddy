@@ -2267,6 +2267,8 @@ export default {
     minStartSpoolDesc: 'Une bobine avec moins de grammes restants que cette valeur ne peut jamais DÉMARRER une impression (elle peut toutefois en terminer une en cours). 0 désactive le seuil.',
     spoolRecoveryEnabled: 'Récupération automatique des bourrages de bobine',
     spoolRecoveryEnabledDesc: 'Lorsqu\'un défaut d\'alimentation de l\'AMS (emmêlement) met une impression de la ferme en pause, bascule automatiquement vers la prochaine bobine éligible et reprend. La bobine bloquée est retirée de la rotation jusqu\'à sa réinsertion.',
+    runoutAutoResumeEnabled: 'Reprise automatique après un rechargement de filament',
+    runoutAutoResumeEnabledDesc: 'Lorsqu\'une impression est en pause en attente de filament dans un emplacement AMS précis, elle reprend automatiquement dès que cet emplacement est rechargé. Désactivé = l\'impression attend une reprise manuelle.',
     spoolRecoveryMaxAttempts: 'Tentatives de récupération max.',
     spoolRecoveryMaxAttemptsDesc: 'Nombre de bobines à essayer avant de laisser l\'impression en pause pour un humain (1-5).',
     spoolRecoveryStepTimeout: 'Délai par étape (secondes)',

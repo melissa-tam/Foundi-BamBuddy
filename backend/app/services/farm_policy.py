@@ -616,11 +616,21 @@ async def recover_printer(db: AsyncSession, printer_id: int) -> dict:
     #    operator's rejection — that run has its own resume affordance on the run
     #    page. Exclude in Python (dialect-safe: first_article_state is NULL for
     #    non-FA runs, which a SQL ``!= 'rejected'`` would wrongly drop).
+    #
+    #    Restricted to FARM runs (``sku_file_id IS NOT NULL``) — the same predicate
+    #    ``spool_recovery._resolve_farm_item`` and ``spool_respool`` use to mean "this
+    #    batch is a farm production run". A ``PrintBatch`` left ``paused`` with a
+    #    NULL ``sku_file_id`` (SET-NULL after SKU-file deletion, or a plain upstream
+    #    batch) reads as 404 to ``transition_run`` — every Recover click then logs a
+    #    full traceback per zombie and reports it missing from ``runs_resumed``
+    #    (006-H2S 2026-07-26: batches 36/41). Filtering in SQL is the fix; the
+    #    per-run catch stays as the belt for genuine transition failures.
     result = await db.execute(
         select(PrintBatch.id, PrintBatch.first_article_state)
         .join(PrintQueueItem, PrintQueueItem.batch_id == PrintBatch.id)
         .where(PrintQueueItem.printer_id == printer_id)
         .where(PrintBatch.status == "paused")
+        .where(PrintBatch.sku_file_id.is_not(None))
         .distinct()
     )
     paused_batch_ids = [bid for bid, fa_state in result.all() if fa_state != "rejected"]

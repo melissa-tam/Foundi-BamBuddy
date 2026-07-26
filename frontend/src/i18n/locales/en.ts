@@ -2327,6 +2327,8 @@ export default {
     minStartSpoolDesc: 'A spool below this many grams remaining can never START a print (it may still finish one in progress). 0 disables the floor.',
     spoolRecoveryEnabled: 'Automatic spool-jam recovery',
     spoolRecoveryEnabledDesc: 'When an AMS feed fault (tangle) pauses a farm print, automatically swap to the next eligible spool and resume. The jammed spool is flagged out of rotation until re-inserted.',
+    runoutAutoResumeEnabled: 'Auto-resume after a filament refill',
+    runoutAutoResumeEnabledDesc: 'When a print is paused waiting for filament in a specific AMS slot, resume it automatically once that slot is refilled. Off = the print waits for a manual resume.',
     spoolRecoveryMaxAttempts: 'Max recovery attempts',
     spoolRecoveryMaxAttemptsDesc: 'How many spools to try before leaving the print paused for a human (1-5).',
     spoolRecoveryStepTimeout: 'Step timeout (seconds)',

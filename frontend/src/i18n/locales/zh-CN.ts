@@ -2312,6 +2312,8 @@ export default {
     minStartSpoolDesc: '剩余克数低于此值的料卷永远无法开始打印（但可以完成正在进行的打印）。0 表示禁用下限。',
     spoolRecoveryEnabled: '料卷卡料自动恢复',
     spoolRecoveryEnabledDesc: '当 AMS 送料故障（缠绕）暂停农场打印时，自动切换到下一个符合条件的料卷并恢复。卡住的料卷在重新插入之前会被移出轮换。',
+    runoutAutoResumeEnabled: '补充耗材后自动恢复',
+    runoutAutoResumeEnabledDesc: '当打印因等待某个 AMS 槽位的耗材而暂停时，该槽位补充后自动恢复打印。关闭 = 打印等待手动恢复。',
     spoolRecoveryMaxAttempts: '最大恢复尝试次数',
     spoolRecoveryMaxAttemptsDesc: '在为人工留下暂停的打印之前，尝试多少个料卷（1-5）。',
     spoolRecoveryStepTimeout: '单步超时（秒）',
