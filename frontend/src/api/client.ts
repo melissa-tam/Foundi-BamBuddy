@@ -80,10 +80,14 @@ export function setAuthToken(token: string | null, persistence: TokenPersistence
     console.warn('setAuthToken: sessionStorage unavailable, token kept in-memory only', err);
   }
   try {
-    if (!token) {
-      localStorage.removeItem('auth_token');
-    } else if (persistence === 'persistent') {
+    if (token && persistence === 'persistent') {
       localStorage.setItem('auth_token', token);
+    } else {
+      // Every other case clears localStorage — including a session-only write.
+      // sessionStorage is empty after a browser restart, so a token left over
+      // from an earlier "Remember Me" login would shadow the session-only
+      // login the user just asked for.
+      localStorage.removeItem('auth_token');
     }
   } catch (err) {
     console.warn('setAuthToken: localStorage operation failed', err);

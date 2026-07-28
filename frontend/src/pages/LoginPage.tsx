@@ -19,8 +19,55 @@ type LoginStep = 'credentials' | '2fa' | 'reset-password';
 const REMEMBER_ME_KEY = 'auth_remember_me';
 const POST_LOGIN_REDIRECT_KEY = 'auth_post_login_redirect';
 
+// localStorage (not sessionStorage): the checkbox state and the last username
+// are durable preferences that must survive a browser restart — that is the
+// whole point of "Remember Me". An absent preference means unchecked, so the
+// opt-in default is unchanged for anyone who never ticked the box.
+const REMEMBER_ME_PREF_KEY = 'auth_remember_me_pref';
+const LAST_USERNAME_KEY = 'auth_last_username';
+
 function toPersistence(remember: boolean): TokenPersistence {
   return remember ? 'persistent' : 'session';
+}
+
+function readRememberMePref(): boolean {
+  try {
+    return localStorage.getItem(REMEMBER_ME_PREF_KEY) === '1';
+  } catch (err) {
+    console.warn('readRememberMePref: localStorage unavailable, defaulting to unchecked', err);
+    return false;
+  }
+}
+
+function persistRememberMePref(remember: boolean): void {
+  try {
+    localStorage.setItem(REMEMBER_ME_PREF_KEY, remember ? '1' : '0');
+  } catch (err) {
+    console.warn('persistRememberMePref: localStorage unavailable, Remember Me preference will not survive a restart', err);
+  }
+}
+
+function readLastUsername(): string {
+  try {
+    return localStorage.getItem(LAST_USERNAME_KEY) ?? '';
+  } catch (err) {
+    console.warn('readLastUsername: localStorage unavailable, username prefill skipped', err);
+    return '';
+  }
+}
+
+// Only remembered logins keep the username around; unticking the box on a
+// successful login is the user's way of forgetting the previous one.
+function persistLastUsername(remember: boolean, username: string): void {
+  try {
+    if (remember) {
+      localStorage.setItem(LAST_USERNAME_KEY, username);
+    } else {
+      localStorage.removeItem(LAST_USERNAME_KEY);
+    }
+  } catch (err) {
+    console.warn('persistLastUsername: localStorage unavailable, username prefill will not persist', err);
+  }
 }
 
 function consumeSavedRememberMe(): boolean {
@@ -133,7 +180,7 @@ export function LoginPage() {
   }
 
   // Credentials step state
-  const [username, setUsername] = useState('');
+  const [username, setUsername] = useState(() => readLastUsername());
   const [password, setPassword] = useState('');
   const [showForgotPassword, setShowForgotPassword] = useState(false);
   const [forgotEmail, setForgotEmail] = useState('');
@@ -148,7 +195,7 @@ export function LoginPage() {
   const [emailOTPSent, setEmailOTPSent] = useState(false);
   const twoFAInputRef = useRef<HTMLInputElement>(null);
 
-  const [rememberMe, setRememberMe] = useState(false);
+  const [rememberMe, setRememberMe] = useState(() => readRememberMePref());
 
   // H-6: Password reset step state
   const [resetToken, setResetToken] = useState('');
@@ -304,6 +351,7 @@ export function LoginPage() {
         else setTwoFAMethod('backup');
         setStep('2fa');
       } else if (resp.access_token && resp.user) {
+        persistLastUsername(rememberMe, username);
         showToast(t('login.loginSuccess'));
         navigate(resolvePostLoginRedirect(), { replace: true });
       }
@@ -360,6 +408,9 @@ export function LoginPage() {
     onSuccess: (resp: LoginResponse) => {
       if (resp.access_token && resp.user) {
         loginWithToken(resp.access_token, resp.user, toPersistence(rememberMe));
+        // The credentials step is still mounted, so `username` holds what the
+        // user typed before the 2FA challenge interrupted the login.
+        persistLastUsername(rememberMe, username);
         showToast(t('login.loginSuccess'));
         navigate(resolvePostLoginRedirect(), { replace: true });
       } else {
@@ -762,7 +813,10 @@ export function LoginPage() {
               id="remember-me"
               type="checkbox"
               checked={rememberMe}
-              onChange={(e) => setRememberMe(e.target.checked)}
+              onChange={(e) => {
+                setRememberMe(e.target.checked);
+                persistRememberMePref(e.target.checked);
+              }}
               className="h-4 w-4 rounded border-bambu-dark-tertiary bg-bambu-dark-secondary text-bambu-green focus:ring-bambu-green/50 cursor-pointer"
             />
             <label htmlFor="remember-me" className="text-sm text-bambu-gray cursor-pointer">

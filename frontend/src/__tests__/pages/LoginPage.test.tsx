@@ -448,6 +448,144 @@ describe('LoginPage', () => {
     });
   });
 
+  // The checkbox state and the last username are remembered in localStorage so
+  // "Remember Me" survives a browser restart — the tab-scoped sessionStorage
+  // carrier (auth_remember_me) only bridges the OIDC provider round-trip.
+  describe('Remember Me preference persistence', () => {
+    const REMEMBER_ME_PREF_KEY = 'auth_remember_me_pref';
+    const LAST_USERNAME_KEY = 'auth_last_username';
+
+    const mockUser = {
+      id: 1,
+      username: 'testuser',
+      role: 'admin' as const,
+      is_active: true,
+      created_at: new Date().toISOString(),
+    };
+
+    /** Back localStorage.getItem with a fixed key→value map (absent ⇒ null). */
+    function stubStoredValues(values: Record<string, string>) {
+      vi.mocked(localStorage.getItem).mockImplementation(
+        (key: string) => values[key] ?? null
+      );
+    }
+
+    beforeEach(() => {
+      vi.mocked(localStorage.setItem).mockClear();
+      vi.mocked(localStorage.removeItem).mockClear();
+      sessionStorage.clear();
+      server.use(
+        http.post('/api/v1/auth/login', () =>
+          HttpResponse.json({
+            access_token: 'test-token',
+            token_type: 'bearer',
+            user: mockUser,
+          })
+        ),
+        // Prevent checkAuthStatus from clearing the token when getCurrentUser is called
+        http.get('/api/v1/auth/me', () => HttpResponse.json(mockUser))
+      );
+    });
+
+    afterEach(() => {
+      // Restore the bare setup.ts mock (getItem ⇒ undefined) for other tests.
+      vi.mocked(localStorage.getItem).mockReset();
+    });
+
+    it('leaves the checkbox unchecked when no preference is stored', async () => {
+      render(<LoginPage />);
+
+      await waitFor(() => {
+        expect(screen.getByRole('checkbox', { name: /Remember Me/i })).toBeInTheDocument();
+      });
+
+      expect(screen.getByRole('checkbox', { name: /Remember Me/i })).not.toBeChecked();
+    });
+
+    it('pre-checks the checkbox when the stored preference is "1"', async () => {
+      stubStoredValues({ [REMEMBER_ME_PREF_KEY]: '1' });
+      render(<LoginPage />);
+
+      await waitFor(() => {
+        expect(screen.getByRole('checkbox', { name: /Remember Me/i })).toBeChecked();
+      });
+    });
+
+    it('leaves the checkbox unchecked when the stored preference is "0"', async () => {
+      stubStoredValues({ [REMEMBER_ME_PREF_KEY]: '0' });
+      render(<LoginPage />);
+
+      await waitFor(() => {
+        expect(screen.getByRole('checkbox', { name: /Remember Me/i })).toBeInTheDocument();
+      });
+
+      expect(screen.getByRole('checkbox', { name: /Remember Me/i })).not.toBeChecked();
+    });
+
+    it('writes the preference when the checkbox is toggled', async () => {
+      const user = userEvent.setup();
+      render(<LoginPage />);
+
+      await waitFor(() => {
+        expect(screen.getByRole('checkbox', { name: /Remember Me/i })).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByRole('checkbox', { name: /Remember Me/i }));
+      expect(vi.mocked(localStorage.setItem)).toHaveBeenCalledWith(REMEMBER_ME_PREF_KEY, '1');
+
+      await user.click(screen.getByRole('checkbox', { name: /Remember Me/i }));
+      expect(vi.mocked(localStorage.setItem)).toHaveBeenCalledWith(REMEMBER_ME_PREF_KEY, '0');
+    });
+
+    it('prefills the username field from the stored last username', async () => {
+      stubStoredValues({ [REMEMBER_ME_PREF_KEY]: '1', [LAST_USERNAME_KEY]: 'stored-user' });
+      render(<LoginPage />);
+
+      await waitFor(() => {
+        expect(screen.getByLabelText(/Username/i)).toHaveValue('stored-user');
+      });
+    });
+
+    it('stores the username on a successful login with Remember Me on', async () => {
+      stubStoredValues({ [REMEMBER_ME_PREF_KEY]: '1' });
+      const user = userEvent.setup();
+      render(<LoginPage />);
+
+      await waitFor(() => {
+        expect(screen.getByRole('checkbox', { name: /Remember Me/i })).toBeChecked();
+      });
+
+      await user.type(screen.getByLabelText(/Username/i), 'testuser');
+      await user.type(screen.getByLabelText(/Password/i), 'testpassword');
+      await user.click(screen.getByRole('button', { name: /Sign in/i }));
+
+      await waitFor(() => {
+        expect(vi.mocked(localStorage.setItem)).toHaveBeenCalledWith(LAST_USERNAME_KEY, 'testuser');
+      });
+      // The pre-checked box must still drive token persistence
+      expect(vi.mocked(localStorage.setItem)).toHaveBeenCalledWith('auth_token', 'test-token');
+    });
+
+    it('forgets the stored username on a successful login with Remember Me off', async () => {
+      stubStoredValues({ [REMEMBER_ME_PREF_KEY]: '0', [LAST_USERNAME_KEY]: 'stored-user' });
+      const user = userEvent.setup();
+      render(<LoginPage />);
+
+      await waitFor(() => {
+        expect(screen.getByLabelText(/Username/i)).toHaveValue('stored-user');
+      });
+
+      await user.type(screen.getByLabelText(/Password/i), 'testpassword');
+      await user.click(screen.getByRole('button', { name: /Sign in/i }));
+
+      await waitFor(() => {
+        expect(vi.mocked(localStorage.removeItem)).toHaveBeenCalledWith(LAST_USERNAME_KEY);
+      });
+      expect(vi.mocked(localStorage.setItem)).not.toHaveBeenCalledWith(LAST_USERNAME_KEY, expect.any(String));
+      expect(vi.mocked(localStorage.setItem)).not.toHaveBeenCalledWith('auth_token', expect.any(String));
+    });
+  });
+
   describe('OIDC with Remember Me', () => {
     const mockUser = {
       id: 1,

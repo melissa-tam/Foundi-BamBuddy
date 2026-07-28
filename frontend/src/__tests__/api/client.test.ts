@@ -66,6 +66,23 @@ describe('Auth Token Management', () => {
     expect(vi.mocked(localStorage.setItem)).not.toHaveBeenCalledWith('auth_token', expect.any(String));
   });
 
+  it("setAuthToken('session') evicts a token persisted by an earlier 'persistent' call", () => {
+    // Regression: a leftover localStorage token outlives the tab, and the
+    // module-load read falls back to it once sessionStorage is empty after a
+    // browser restart — silently resurrecting the account the user just
+    // logged out of / replaced with a session-only login.
+    setAuthToken('persisted-token', 'persistent');
+    vi.mocked(localStorage.setItem).mockClear();
+    vi.mocked(localStorage.removeItem).mockClear();
+
+    setAuthToken('session-token', 'session');
+
+    expect(vi.mocked(localStorage.removeItem)).toHaveBeenCalledWith('auth_token');
+    expect(vi.mocked(localStorage.setItem)).not.toHaveBeenCalledWith('auth_token', expect.any(String));
+    expect(sessionStorageMock.setItem).toHaveBeenCalledWith('auth_token', 'session-token');
+    expect(getAuthToken()).toBe('session-token');
+  });
+
   it('setAuthToken(null) removes from both storages regardless of previous persistence', () => {
     setAuthToken('some-token', 'persistent');
     vi.mocked(localStorage.setItem).mockClear();
