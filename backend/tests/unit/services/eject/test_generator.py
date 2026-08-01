@@ -14,7 +14,7 @@ from backend.app.services.eject.generator import (
     estimate_runtime_s,
     generate_eject_gcode,
 )
-from backend.app.services.eject.remote import EJECT_RUNTIME_GUARD_FACTOR
+from backend.app.services.eject.remote import eject_abort_deadline_s
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
 from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
@@ -633,14 +633,15 @@ class TestEstimateRuntime:
 
     def test_incident_shape_matches_observed_nominal(self):
         # THE calibration: the single-pass profile running on 2026-07-31 executed in
-        # 80-83 s across eight nominal ejects. The estimate must land in that
-        # neighbourhood — too low and the guard fires on healthy sweeps, too high and
-        # the 179 s incident slips under the ×1.5 threshold.
+        # 80-83 s across 11 nominal ejects. The estimate must land in that
+        # neighbourhood — too low and the watchdog aborts healthy sweeps, too high and
+        # the deadline drifts out past the incident's stall.
         seconds = estimate_runtime_s(_INCIDENT_SHAPE_BLOCK)
         assert 67.0 <= seconds <= 97.0, f"estimated {seconds:.1f}s, expected 82±15s"
-        # And the incident's 179 s must be caught while a nominal 82 s is not.
-        assert seconds * EJECT_RUNTIME_GUARD_FACTOR < 179.0
-        assert seconds * EJECT_RUNTIME_GUARD_FACTOR >= 82.0
+        # The watchdog must fire well before the incident's 179 s while leaving every
+        # nominal 80-83 s sweep untouched.
+        assert eject_abort_deadline_s(seconds) < 179.0
+        assert eject_abort_deadline_s(seconds) >= 83.0
 
 
 class TestBuildSummaryLog:

@@ -1,5 +1,6 @@
 """Tests for the shared part-present eject dispatcher (eject.remote)."""
 
+import asyncio
 import os
 import tempfile
 import zipfile
@@ -528,14 +529,57 @@ class TestDispatchPartPresentEjectProfileGuard:
             source.unlink(missing_ok=True)
 
 
-class TestEjectRuntimeGuard:
-    """The runtime guard's two primitives (2026-07-31 gouged-plate incident).
+class _FakeSleep:
+    """A ``sleep`` stand-in that records each requested delay and returns at once.
 
-    A stalled bed-drop leaves NO trace in MQTT — no Z telemetry, no HMS — and the
-    job still reports ``completed``. Elapsed execution time is the only signature,
-    so it is measured from the printer's own START echo to its terminal."""
+    Lets a watchdog test drive the full deadline → stop → retry sequence without any
+    wall-clock wait, while still asserting WHAT was waited on."""
 
-    async def test_mark_started_stamps_once_and_is_idempotent(self):
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
+
+
+def _armed(pid_item: int = 5, **kw) -> remote.PendingEject:
+    """A started production pending — what the watchdog is armed with."""
+    kw.setdefault("expected_runtime_s", 83.0)
+    kw.setdefault("started_at", datetime.now(timezone.utc) - timedelta(seconds=104))
+    return remote.PendingEject("production", 1, pid_item, **kw)
+
+
+class TestEjectAbortDeadline:
+    """The abort deadline in all three regimes (2026-07-31 gouged-plate incident).
+
+    A stalled bed-drop leaves NO trace in MQTT — no Z telemetry, no HMS — and the job
+    still reports ``completed``. Elapsed execution time is the only signature, so the
+    watchdog turns the build's estimate into a deadline and stops the job at it."""
+
+    async def test_short_profile_gets_the_twenty_second_floor(self):
+        # 25% of 40 s is 10 s — below the floor. The floor protects against TELEMETRY
+        # (the FINISH echo is what cancels the watchdog), not against motion.
+        assert remote.eject_abort_deadline_s(40.0) == 60.0
+
+    async def test_mid_range_profile_gets_the_fraction(self):
+        assert remote.eject_abort_deadline_s(160.0) == 200.0
+
+    async def test_long_profile_is_capped_at_sixty_seconds(self):
+        # A ~7 min multi-pass eject must not inherit minutes of scraping margin, which
+        # a pure ×1.5 factor (600 s → 900 s) would hand it.
+        assert remote.eject_abort_deadline_s(400.0) == 460.0
+
+    async def test_production_calibration(self):
+        # 11 measured production ejects ran 80-83 s against this 83 s estimate; the
+        # sweep phase starts ~45 s in, so 103.75 s pre-empts any pre-sweep stall
+        # longer than 59 s (the incident's was ~97 s).
+        assert remote.eject_abort_deadline_s(83.0) == 103.75
+
+
+class TestRuntimeWatchdogArming:
+    """The START echo is the only moment a deadline can be measured from."""
+
+    async def test_mark_started_stamps_once_and_arms_one_watchdog(self):
         pid = 90001
         remote.register_pending_eject(pid, remote.PendingEject("production", 1, 5, expected_runtime_s=82.0))
         try:
@@ -543,53 +587,195 @@ class TestEjectRuntimeGuard:
             remote.mark_pending_eject_started(pid)
             first = remote.peek_pending_eject(pid).started_at
             assert first is not None
+            assert pid in remote._runtime_watchdogs
+            armed_task = remote._runtime_watchdogs[pid]
             # A duplicate/replayed start echo must NOT restart the clock — that would
-            # shorten a measured runtime back under the threshold.
+            # shorten a measured runtime back under the deadline — nor double-arm.
             remote.mark_pending_eject_started(pid)
             assert remote.peek_pending_eject(pid).started_at == first
+            assert remote._runtime_watchdogs[pid] is armed_task
             # The rest of the identity survives the re-registration.
             pending = remote.peek_pending_eject(pid)
             assert (pending.purpose, pending.run_id, pending.queue_item_id) == ("production", 1, 5)
             assert pending.expected_runtime_s == 82.0
+            assert pending.runtime_exceeded_at is None
         finally:
+            await remote.cancel_runtime_watchdog(pid)
             remote.pop_pending_eject(pid)
 
     async def test_mark_started_on_absent_pending_is_a_noop(self):
         remote.mark_pending_eject_started(90002)  # must not raise
         assert remote.peek_pending_eject(90002) is None
+        assert 90002 not in remote._runtime_watchdogs
 
-    async def test_anomaly_stands_down_without_both_inputs(self):
-        # A rehydrated (post-restart) pending has neither field; a pending whose start
-        # echo never arrived has no stamp. Absent evidence never converts a genuinely
-        # completed sweep into a held plate.
-        started = datetime.now(timezone.utc) - timedelta(seconds=600)
-        assert remote.eject_runtime_anomaly(remote.PendingEject("production", 1, 5)) is None
-        assert remote.eject_runtime_anomaly(remote.PendingEject("production", 1, 5, expected_runtime_s=82.0)) is None
-        assert remote.eject_runtime_anomaly(remote.PendingEject("production", 1, 5, started_at=started)) is None
+    async def test_pending_without_an_estimate_never_arms(self):
+        # A rehydrated post-restart pending carries no estimate: there is nothing to
+        # judge against, and the startup reconciler already owns those gates.
+        pid = 90003
+        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 5))
+        try:
+            remote.mark_pending_eject_started(pid)
+            assert remote.peek_pending_eject(pid).started_at is not None  # still stamped
+            assert pid not in remote._runtime_watchdogs
+        finally:
+            remote.pop_pending_eject(pid)
 
-    async def test_at_or_under_threshold_is_nominal(self):
-        # 82 s expected → 123 s threshold. The eight nominal ejects on the incident's
-        # profile ran 80-83 s; even a doubled-latency 120 s sweep stays nominal.
-        now = datetime.now(timezone.utc)
-        for elapsed in (80.0, 83.0, 120.0, 123.0):
-            pending = remote.PendingEject(
-                "production", 1, 5, expected_runtime_s=82.0, started_at=now - timedelta(seconds=elapsed)
-            )
-            assert remote.eject_runtime_anomaly(pending, now=now) is None, elapsed
 
-    async def test_over_threshold_reports_actual_and_expected(self):
-        # The incident itself: 179 s against an 82 s estimate.
-        now = datetime.now(timezone.utc)
-        pending = remote.PendingEject(
-            "production", 1, 5, expected_runtime_s=82.0, started_at=now - timedelta(seconds=179)
-        )
-        anomaly = remote.eject_runtime_anomaly(pending, now=now)
-        assert anomaly is not None
-        actual_s, expected_s = anomaly
-        assert actual_s == pytest.approx(179.0, abs=0.5)
-        assert expected_s == 82.0
+class TestRuntimeWatchdogFires:
+    """Past the deadline the watchdog stops the machine MID-JOB — the whole point of
+    replacing the terminal-time judgement: the stall accrues in the drop/return phase,
+    so stopping now happens before the sweep can scrape the plate."""
 
-    async def test_guard_factor_is_the_documented_one_five(self):
-        # Cited by number in the terminal handler's WARNING and in the operator's
-        # escalation text; a silent change would move the whole calibration.
-        assert remote.EJECT_RUNTIME_GUARD_FACTOR == 1.5
+    @staticmethod
+    def _run(pid: int, armed: remote.PendingEject, sleep: _FakeSleep):
+        """Spawn the watchdog exactly as the arming path does, so the test exercises
+        the real registry lifecycle (including the ``finally`` deregistration)."""
+        from backend.app.core.tasks import spawn_background_task
+
+        task = spawn_background_task(remote._runtime_watchdog(pid, armed, sleep=sleep), name=f"wd-test-{pid}")
+        remote._runtime_watchdogs[pid] = task
+        return task
+
+    async def test_marks_before_stopping_then_notifies_escalates_and_deregisters(self):
+        from backend.app.services.eject import monitor as monitor_mod
+
+        pid = 90010
+        armed = _armed()
+        remote.register_pending_eject(pid, armed)
+        sleep = _FakeSleep()
+        mark_at_stop: list[object] = []
+
+        def _stop(printer_id: int) -> bool:
+            # Captured INSIDE the stop: a terminal racing the stop must already find
+            # the mark set, or it would release the gate onto an unverified plate.
+            mark_at_stop.append(remote.peek_pending_eject(printer_id).runtime_exceeded_at)
+            return True
+
+        try:
+            with (
+                patch.object(printer_manager, "stop_print", MagicMock(side_effect=_stop)) as stop,
+                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
+                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
+            ):
+                await self._run(pid, armed, sleep)
+            assert sleep.delays == [103.75]  # the 83 s estimate's deadline
+            stop.assert_called_once_with(pid)
+            assert mark_at_stop and mark_at_stop[0] is not None
+            assert remote.peek_pending_eject(pid).runtime_exceeded_at is not None
+            notify.assert_awaited_once()
+            detail = notify.await_args.kwargs["source_detail"]
+            assert "STOPPED" in detail and "104" in detail and "83" in detail
+            escalate.assert_called_once_with(pid)
+            assert pid not in remote._runtime_watchdogs  # deregistered on exit
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_undelivered_stop_is_retried_exactly_once(self):
+        # stop_print returning False means the command was NOT delivered (no live MQTT
+        # session). One retry, then proceed regardless — the mark alone already keeps
+        # the gate closed, and the operator is paged either way.
+        from backend.app.services.eject import monitor as monitor_mod
+
+        pid = 90011
+        armed = _armed()
+        remote.register_pending_eject(pid, armed)
+        sleep = _FakeSleep()
+        try:
+            with (
+                patch.object(printer_manager, "stop_print", MagicMock(return_value=False)) as stop,
+                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
+                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
+            ):
+                await self._run(pid, armed, sleep)
+            assert stop.call_count == 2
+            assert sleep.delays == [103.75, remote._STOP_RETRY_DELAY_S]
+            assert remote.peek_pending_eject(pid).runtime_exceeded_at is not None
+            notify.assert_awaited_once()
+            escalate.assert_called_once_with(pid)
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_notify_failure_never_kills_the_escalation(self):
+        from backend.app.services.eject import monitor as monitor_mod
+
+        pid = 90012
+        armed = _armed()
+        remote.register_pending_eject(pid, armed)
+        try:
+            with (
+                patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
+                patch.object(
+                    monitor_mod,
+                    "_default_notify_plate_not_empty",
+                    new_callable=AsyncMock,
+                    side_effect=RuntimeError("smtp down"),
+                ),
+                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
+            ):
+                await self._run(pid, armed, _FakeSleep())
+            escalate.assert_called_once_with(pid)
+            assert pid not in remote._runtime_watchdogs
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_superseded_pending_stands_the_watchdog_down(self):
+        # The eject this task was armed for resolved while it slept and a NEW one was
+        # dispatched onto the same printer. Stopping now would abort a healthy job.
+        from backend.app.services.eject import monitor as monitor_mod
+
+        pid = 90013
+        armed = _armed(5)
+        successor = _armed(6)
+        remote.register_pending_eject(pid, successor)
+        try:
+            with (
+                patch.object(printer_manager, "stop_print", MagicMock(return_value=True)) as stop,
+                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
+                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
+            ):
+                await self._run(pid, armed, _FakeSleep())
+            stop.assert_not_called()
+            notify.assert_not_awaited()
+            escalate.assert_not_called()
+            assert remote.peek_pending_eject(pid).runtime_exceeded_at is None  # successor unmarked
+            assert pid not in remote._runtime_watchdogs
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_resolved_pending_stands_the_watchdog_down(self):
+        pid = 90014
+        with patch.object(printer_manager, "stop_print", MagicMock(return_value=True)) as stop:
+            await self._run(pid, _armed(), _FakeSleep())
+        stop.assert_not_called()
+        assert pid not in remote._runtime_watchdogs
+
+
+class TestRuntimeWatchdogCancellation:
+    """Cancellation is the NORMAL exit — a nominal eject never reaches the fire path."""
+
+    async def test_clear_pending_eject_cancels_and_removes_the_watchdog(self, db_session):
+        pid = 90020
+        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 5, expected_runtime_s=82.0))
+        remote.mark_pending_eject_started(pid)
+        task = remote._runtime_watchdogs[pid]
+        await remote.clear_pending_eject(db_session, pid)
+        assert task.cancelled()
+        assert pid not in remote._runtime_watchdogs
+        assert remote.peek_pending_eject(pid) is None
+
+    async def test_registering_a_new_eject_cancels_a_stale_watchdog(self):
+        pid = 90021
+        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 5, expected_runtime_s=82.0))
+        remote.mark_pending_eject_started(pid)
+        stale = remote._runtime_watchdogs[pid]
+        try:
+            # A stale watchdog would judge the NEW sweep against the OLD deadline.
+            remote.register_pending_eject(pid, remote.PendingEject("production", 1, 6, expected_runtime_s=82.0))
+            assert pid not in remote._runtime_watchdogs
+            with pytest.raises(asyncio.CancelledError):
+                await stale
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_cancelling_when_nothing_is_armed_is_a_noop(self):
+        await remote.cancel_runtime_watchdog(90022)  # must not raise
