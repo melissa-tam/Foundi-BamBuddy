@@ -17,10 +17,12 @@ migration regression tests in this suite).
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from backend.app.core.database import run_migrations
@@ -442,3 +444,139 @@ async def test_min_start_migration_idempotent(engine, session_maker):
     async with engine.connect() as conn:
         settings = await _settings_map(conn)
     assert settings.get("min_start_spool_g") == "150"
+
+
+# ---------------------------------------------------------------------------
+# 012-H2S: duplicate spool bindings deduped, then ux_spool_assignment_spool_id
+# ---------------------------------------------------------------------------
+
+_DB_LOGGER = "backend.app.core.database"
+_DUP_WARNING = "dropping stale duplicate spool binding"
+
+# The table exactly as it was BEFORE the structural invariant landed: the SLOT is
+# unique, ``spool_id`` is not — which is how one roll came to be bound to two trays.
+# ``create_all`` builds the post-fix table from the model, so the pre-migration shape
+# has to be re-created by hand (SQLite cannot drop a column constraint).
+_PRE_UNIQUE_SPOOL_ASSIGNMENT_DDL = """
+CREATE TABLE spool_assignment (
+    id INTEGER NOT NULL,
+    spool_id INTEGER NOT NULL,
+    printer_id INTEGER NOT NULL,
+    ams_id INTEGER NOT NULL,
+    tray_id INTEGER NOT NULL,
+    fingerprint_color VARCHAR(8),
+    fingerprint_type VARCHAR(50),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE (printer_id, ams_id, tray_id),
+    FOREIGN KEY(spool_id) REFERENCES spool (id) ON DELETE CASCADE,
+    FOREIGN KEY(printer_id) REFERENCES printers (id) ON DELETE CASCADE
+)
+"""
+
+
+async def _downgrade_spool_assignment(engine) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP TABLE spool_assignment"))
+        await conn.execute(text(_PRE_UNIQUE_SPOOL_ASSIGNMENT_DDL))
+
+
+async def _binding_rows(conn) -> list[tuple]:
+    rows = (
+        await conn.execute(text("SELECT id, spool_id, printer_id, ams_id, tray_id FROM spool_assignment ORDER BY id"))
+    ).fetchall()
+    return [tuple(r) for r in rows]
+
+
+async def _has_unique_spool_index(conn) -> bool:
+    row = (
+        await conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ux_spool_assignment_spool_id'")
+        )
+    ).fetchone()
+    return row is not None
+
+
+async def _seed_pre_migration_bindings(engine, session_maker) -> tuple[int, int]:
+    """Spool X bound to TWO slots (older row id 10 < newer row id 20) plus one clean
+    binding for spool Y (row 30). Explicit ids so "newest = MAX(id)" is decidable."""
+    async with session_maker() as session:
+        duped = await _make_spool(session, material="PLA")
+        clean = await _make_spool(session, material="PETG")
+        await session.commit()
+        duped_id, clean_id = duped.id, clean.id
+
+    async with engine.begin() as conn:
+        for row_id, spool_id, tray_id in ((10, duped_id, 0), (20, duped_id, 1), (30, clean_id, 2)):
+            await conn.execute(
+                text(
+                    "INSERT INTO spool_assignment (id, spool_id, printer_id, ams_id, tray_id) "
+                    "VALUES (:id, :spool_id, 1, 0, :tray_id)"
+                ),
+                {"id": row_id, "spool_id": spool_id, "tray_id": tray_id},
+            )
+    return duped_id, clean_id
+
+
+@pytest.mark.asyncio
+async def test_duplicate_bindings_deduped_to_newest_then_index_created(engine, session_maker, caplog):
+    """Pre-existing duplicates (S10) are dropped keeping MAX(id) — the most recent
+    physical observation — each drop WARN-logged, untouched spools left alone, and the
+    unique index lands afterwards and is enforced."""
+    await _downgrade_spool_assignment(engine)
+    duped_id, clean_id = await _seed_pre_migration_bindings(engine, session_maker)
+
+    async with engine.connect() as conn:
+        assert await _has_unique_spool_index(conn) is False, "pre-migration schema must not have the index"
+        assert len(await _binding_rows(conn)) == 3
+
+    with caplog.at_level(logging.WARNING, logger=_DB_LOGGER):
+        async with engine.begin() as conn:
+            await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        rows = await _binding_rows(conn)
+        assert await _has_unique_spool_index(conn) is True
+
+    assert rows == [
+        (20, duped_id, 1, 0, 1),  # newest binding of the duplicated spool survived
+        (30, clean_id, 1, 0, 2),  # the clean binding is untouched
+    ]
+
+    warnings = [r.getMessage() for r in caplog.records if _DUP_WARNING in r.getMessage()]
+    assert len(warnings) == 1, "exactly the one doomed row is warned about"
+    assert warnings[0].startswith(f"{_DUP_WARNING}: spool {duped_id} -> printer 1 AMS0-T0 (row 10, created ")
+    assert warnings[0].endswith("newest binding kept")
+    assert f"spool {clean_id} ->" not in warnings[0], "the clean binding is never named as doomed"
+
+    # Fail-loud afterwards: a second binding for the untouched spool is refused.
+    with pytest.raises(IntegrityError):
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("INSERT INTO spool_assignment (spool_id, printer_id, ams_id, tray_id) VALUES (:sid, 1, 0, 3)"),
+                {"sid": clean_id},
+            )
+
+
+@pytest.mark.asyncio
+async def test_binding_dedupe_is_idempotent(engine, session_maker, caplog):
+    """A second pass deletes nothing more and warns about nothing (the table already
+    holds one row per spool, and CREATE UNIQUE INDEX IF NOT EXISTS is a no-op)."""
+    await _downgrade_spool_assignment(engine)
+    await _seed_pre_migration_bindings(engine, session_maker)
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        first_pass = await _binding_rows(conn)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=_DB_LOGGER):
+        async with engine.begin() as conn:
+            await run_migrations(conn)
+    async with engine.connect() as conn:
+        second_pass = await _binding_rows(conn)
+        assert await _has_unique_spool_index(conn) is True
+
+    assert second_pass == first_pass, "the second pass must delete nothing further"
+    assert [r.getMessage() for r in caplog.records if _DUP_WARNING in r.getMessage()] == []

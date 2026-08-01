@@ -12,7 +12,14 @@ class SpoolAssignment(Base):
     __tablename__ = "spool_assignment"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    spool_id: Mapped[int] = mapped_column(ForeignKey("spool.id", ondelete="CASCADE"))
+    # UNIQUE: one spool row is bound to at most ONE AMS slot, fleet-wide, at every
+    # instant — a physical roll is in exactly one place, so a re-bind is a MOVE
+    # (``services.spool_binding.bind_spool_to_slot``), never a copy. 012-H2S
+    # (2026-07-30): a copy left spool 120 on two trays for 22 h and both presented
+    # the same ledger to the start gate. Fresh installs get the constraint from
+    # here; already-migrated DBs from the dedupe-then-index block in
+    # ``core.database.run_migrations`` (index ``ux_spool_assignment_spool_id``).
+    spool_id: Mapped[int] = mapped_column(ForeignKey("spool.id", ondelete="CASCADE"), unique=True)
     printer_id: Mapped[int] = mapped_column(ForeignKey("printers.id", ondelete="CASCADE"))
     ams_id: Mapped[int] = mapped_column(Integer)  # 0-3, 128+ (HT), 254/255 (ext)
     tray_id: Mapped[int] = mapped_column(Integer)  # 0-3

@@ -1247,7 +1247,7 @@ class TestEngagedFilamentDefer:
 
 class TestLoadedAtReStamp:
     """A QUALIFIED genuine presence GAIN adjudicates the currently-bound row via
-    spool_tag_matcher.stamp_loaded_for_slot — the re-stampable FIFO ordinal (006-H2S).
+    spool_binding.stamp_loaded_for_slot — the re-stampable FIFO ordinal (006-H2S).
     ``qualified`` is the WIDER gate than note_physical_cycle's ``physical_cycle``: a
     MEASURED >= 5 s absence OR an unknown-duration one (boot-spanning / coalesced edges)
     both fire it, honouring rule 2's restart-durability contract. A MEASURED sub-5 s flap,
@@ -1255,10 +1255,10 @@ class TestLoadedAtReStamp:
 
     @pytest.fixture(autouse=True)
     def _spy_stamp(self, monkeypatch):
-        from backend.app.services import spool_tag_matcher, spool_tagless
+        from backend.app.services import spool_binding, spool_tagless
 
         stamp = AsyncMock(return_value=True)
-        monkeypatch.setattr(spool_tag_matcher, "stamp_loaded_for_slot", stamp)
+        monkeypatch.setattr(spool_binding, "stamp_loaded_for_slot", stamp)
         # Keep note_physical_cycle inert so the physical_cycle block doesn't open a session.
         monkeypatch.setattr(spool_tagless, "note_physical_cycle", AsyncMock())
         monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
@@ -1404,11 +1404,11 @@ class TestIdentifyFlapNotAQualifiedCycle:
         # The GAIN edge fires clear_on_reinsert unconditionally and (when the tiers
         # open) note_physical_cycle / stamp_loaded_for_slot. Keep all three inert so a
         # case asserts purely on whether a QUALIFIED cycle was RECORDED, not on the DB.
-        from backend.app.services import spool_tag_matcher, spool_tagless
+        from backend.app.services import spool_binding, spool_tagless
 
         monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
         monkeypatch.setattr(spool_tagless, "note_physical_cycle", AsyncMock())
-        monkeypatch.setattr(spool_tag_matcher, "stamp_loaded_for_slot", AsyncMock(return_value=True))
+        monkeypatch.setattr(spool_binding, "stamp_loaded_for_slot", AsyncMock(return_value=True))
 
     async def test_state9_commanded_identify_flap_is_not_a_qualified_cycle(self, db_session, monkeypatch):
         # THE incident pin (fails on pre-fix code — verified by mutation). A commanded

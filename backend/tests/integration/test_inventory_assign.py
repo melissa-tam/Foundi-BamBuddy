@@ -1277,6 +1277,59 @@ class TestAssignSpoolPfcnCloudPreset:
             assert call_kwargs.kwargs["setting_id"] == "PFCN80e80c1f79db85"
 
 
+class TestAssignMovesExistingBinding:
+    """012-H2S: ``POST /assignments`` binds through ``spool_binding.bind_spool_to_slot``,
+    so assigning a spool that is currently bound to another slot MOVES it. Before the
+    fix the route deleted only the target slot's row and the spool ended up bound to two
+    trays at once, feeding one ledger to two feeders."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_assign_moves_spool_off_its_previous_slot(
+        self, async_client: AsyncClient, printer_factory, spool_factory
+    ):
+        printer = await printer_factory(name="H2S")
+        spool = await spool_factory(material="PETG")
+
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+        mock_client.extrusion_cali_sel.return_value = True
+        status = _make_mock_status(
+            ams_data=[
+                {
+                    "id": 0,
+                    "tray": [
+                        {"id": 0, "state": 11, "tray_type": "PETG"},
+                        {"id": 1, "state": 11, "tray_type": "PETG"},
+                    ],
+                }
+            ]
+        )
+
+        with patch("backend.app.services.printer_manager.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = status
+
+            first = await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 0, "tray_id": 0},
+            )
+            assert first.status_code == 200
+
+            second = await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 0, "tray_id": 1},
+            )
+            assert second.status_code == 200
+            assert second.json()["tray_id"] == 1
+
+        listing = await async_client.get("/api/v1/inventory/assignments")
+        assert listing.status_code == 200
+        mine = [a for a in listing.json() if a["spool_id"] == spool.id]
+        assert len(mine) == 1, "the roll is in exactly one place — the old row must be gone"
+        assert (mine[0]["ams_id"], mine[0]["tray_id"]) == (0, 1)
+
+
 class TestAssignSpoolReleasesStaged:
     """W6.3: a successful manual assign releases low-spool staged (``filament_short``)
     units immediately — the deficit changes via the new DB assignment, so it must

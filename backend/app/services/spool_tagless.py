@@ -40,9 +40,10 @@ fresh-roll prompt is deliberately NOT in that set: its state is the durable
 ``Spool.fresh_prompt_pending_at`` stamp, because a question nobody was connected to
 hear must survive both an empty websocket list and a restart.
 
-``stamp_first_loaded`` lives in ``spool_tag_matcher`` (the lowest module every
-assignment-creating caller already imports); this module re-exports it via import
-so callers keep one implementation and there is no import cycle.
+Binding writes (``_assign_from_setting``) and the FIFO stamps live in
+``spool_binding`` — the lowest module every assignment-creating caller imports and
+the single writer that enforces "one spool ⇔ at most one AMS slot, fleet-wide".
+This module imports them so there is one implementation and no import cycle.
 """
 
 from __future__ import annotations
@@ -61,14 +62,13 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services import ams_presence
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.spool_binding import bind_spool_to_slot, stamp_loaded
 from backend.app.services.spool_tag_matcher import (
     auto_assign_spool,
     is_bambu_tag,
     is_valid_tag,
     parse_tray_fields,
     reapply_k_profile_if_drifted,
-    stamp_first_loaded,
-    stamp_loaded,
 )
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_ids import GENERIC_FILAMENT_IDS
@@ -502,34 +502,21 @@ async def _assign_from_setting(
     fingerprint would be empty and re-trip the SpoolBuddy empty-fingerprint
     replay. Seeding fingerprint_color/type from the default filament suppresses
     that and makes the later Hook B fingerprint-match a no-op.
+
+    The binding itself (move semantics + the FIFO stamps) belongs to
+    ``spool_binding.bind_spool_to_slot``; this wrapper only owns the fingerprint
+    seeding.
     """
-    existing = await db.execute(
-        select(SpoolAssignment).where(
-            SpoolAssignment.printer_id == printer_id,
-            SpoolAssignment.ams_id == ams_id,
-            SpoolAssignment.tray_id == tray_id,
-        )
-    )
-    old = existing.scalar_one_or_none()
-    # Capture the outgoing pairing before the delete so loaded_at re-stamps only on
-    # a genuine binding change (new roll), not a same-spool upsert replay.
-    old_spool_id = old.spool_id if old is not None else None
-    if old is not None:
-        await db.delete(old)
-        await db.flush()
-    assignment = SpoolAssignment(
-        spool_id=spool.id,
+    await bind_spool_to_slot(
+        db,
+        spool,
         printer_id=printer_id,
         ams_id=ams_id,
         tray_id=tray_id,
         fingerprint_color=default.get("rgba") or "",
         fingerprint_type=default.get("material") or "",
+        origin="tagless_setting",
     )
-    db.add(assignment)
-    await db.flush()
-    stamp_first_loaded(spool)
-    if old_spool_id != spool.id:
-        stamp_loaded(spool)
 
 
 def _config_settling(printer_id: int, ams_id: int, tray_id: int) -> bool:

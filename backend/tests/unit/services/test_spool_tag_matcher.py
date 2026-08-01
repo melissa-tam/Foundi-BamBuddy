@@ -7,7 +7,6 @@ from backend.app.models.color_catalog import ColorCatalogEntry
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services.spool_tag_matcher import (
-    NEVER_FED_MAX_G,
     auto_assign_spool,
     create_spool_from_tray,
     find_matching_untagged_spool,
@@ -15,8 +14,6 @@ from backend.app.services.spool_tag_matcher import (
     is_bambu_tag,
     is_valid_tag,
     link_tag_to_inventory_spool,
-    stamp_loaded,
-    stamp_loaded_for_slot,
 )
 
 # -- helpers -----------------------------------------------------------------
@@ -1808,13 +1805,6 @@ async def _fresh_spool(db_session, **kwargs):
     return spool
 
 
-async def _bind_spool(db_session, printer_id, ams_id, tray_id, spool):
-    """Directly create a SpoolAssignment (no MQTT) so an adjudication test can start
-    from a bound slot."""
-    db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id))
-    await db_session.commit()
-
-
 @pytest.mark.asyncio
 async def test_auto_assign_stamps_loaded_at_on_new_binding(db_session, printer_factory):
     """A first binding stamps loaded_at (the re-stampable FIFO ordinal)."""
@@ -1866,96 +1856,34 @@ async def test_auto_assign_restamps_on_binding_change(db_session, printer_factor
     assert spool_b.loaded_at is not None and spool_b.loaded_at > b_first
 
 
-@pytest.mark.asyncio
-async def test_stamp_loaded_for_slot_stamps_never_fed(db_session, printer_factory):
-    """A never-fed bound row (weight_used < NEVER_FED_MAX_G, no tag, not spent) is
-    re-stamped on a re-seat — it holds no consumption seniority (rule 2)."""
-    printer = await printer_factory()
-    spool = await _fresh_spool(db_session, weight_used=0.0)
-    await _bind_spool(db_session, printer.id, 0, 0, spool)
-    assert spool.loaded_at is None
-    stamped = await stamp_loaded_for_slot(db_session, printer.id, 0, 0)
-    assert stamped is True
-    assert spool.loaded_at is not None
+# -- move semantics through the RFID funnel (012-H2S) -----------------------
+# The stamp functions themselves moved to services/spool_binding.py; their unit
+# tests live in test_spool_binding.py beside them.
 
 
 @pytest.mark.asyncio
-async def test_stamp_loaded_for_slot_keeps_mid_life(db_session, printer_factory):
-    """A mid-life bound row (has fed >= floor) keeps position on a re-seat — the
-    dominant flow is maintenance of the SAME roll (rule 3). ANY absence, no stamp."""
-    printer = await printer_factory()
-    spool = await _fresh_spool(db_session, weight_used=400.0, loaded_at=None)
-    await _bind_spool(db_session, printer.id, 0, 0, spool)
-    stamped = await stamp_loaded_for_slot(db_session, printer.id, 0, 0)
-    assert stamped is False
-    assert spool.loaded_at is None
-
-
-@pytest.mark.asyncio
-async def test_stamp_loaded_for_slot_skips_spent(db_session, printer_factory):
-    """A spent bound row is skipped — the spent latch owns the slot; its replacement
-    mint stamps at bind time, not here (even though weight_used is 0)."""
-    from datetime import datetime
+async def test_auto_assign_moves_spool_off_its_previous_slot(db_session, printer_factory):
+    """Incident replay (012-H2S): the RFID funnel re-assigning a roll to another tray
+    of the same printer must MOVE it — the tray-0 row is gone, exactly one binding
+    remains. The pre-fix funnel deleted only the TARGET slot's row, so spool 120 stayed
+    bound to tray 0 while also bound to tray 1 and both trays presented one ledger to
+    the start gate."""
+    from sqlalchemy import select
 
     printer = await printer_factory()
-    spool = await _fresh_spool(db_session, weight_used=0.0, spent_at=datetime.utcnow())
-    await _bind_spool(db_session, printer.id, 0, 0, spool)
-    stamped = await stamp_loaded_for_slot(db_session, printer.id, 0, 0)
-    assert stamped is False
-    assert spool.loaded_at is None
+    spool = await _fresh_spool(db_session)
+    await auto_assign_spool(printer.id, 0, 0, spool, _mock_pm(), db_session)
+    await db_session.commit()
 
+    await auto_assign_spool(printer.id, 0, 1, spool, _mock_pm(), db_session)
+    await db_session.commit()
 
-@pytest.mark.asyncio
-async def test_stamp_loaded_for_slot_skips_tagged(db_session, printer_factory):
-    """An RFID-tagged bound row is skipped — identity is adjudicated by the reconcile
-    (a same-tag re-seat keeps position; a tag change re-binds and stamps there)."""
-    printer = await printer_factory()
-    spool = await _fresh_spool(db_session, weight_used=0.0, tag_uid="AABBCCDD11223344")
-    await _bind_spool(db_session, printer.id, 0, 0, spool)
-    stamped = await stamp_loaded_for_slot(db_session, printer.id, 0, 0)
-    assert stamped is False
-    assert spool.loaded_at is None
-
-
-@pytest.mark.asyncio
-async def test_stamp_loaded_for_slot_boundary_at_never_fed_max(db_session, printer_factory):
-    """The boundary is exclusive: weight_used == NEVER_FED_MAX_G is 'has fed' (no
-    stamp); just below it is never-fed (stamp)."""
-    printer = await printer_factory()
-    at_floor = await _fresh_spool(db_session, weight_used=NEVER_FED_MAX_G)
-    below = await _fresh_spool(db_session, weight_used=NEVER_FED_MAX_G - 0.1)
-    await _bind_spool(db_session, printer.id, 0, 0, at_floor)
-    await _bind_spool(db_session, printer.id, 0, 1, below)
-    assert await stamp_loaded_for_slot(db_session, printer.id, 0, 0) is False
-    assert at_floor.loaded_at is None
-    assert await stamp_loaded_for_slot(db_session, printer.id, 0, 1) is True
-    assert below.loaded_at is not None
-
-
-@pytest.mark.asyncio
-async def test_stamp_loaded_for_slot_noops_unbound(db_session, printer_factory):
-    """An unbound slot has nothing to adjudicate → no-op (False)."""
-    printer = await printer_factory()
-    assert await stamp_loaded_for_slot(db_session, printer.id, 3, 2) is False
-
-
-def test_stamp_loaded_for_slot_takes_no_timing_input():
-    """The adjudicator's signature carries NO duration/absence parameter — the decision
-    is grams-state + identity only, never elapsed time (v3 semantics)."""
-    import inspect
-
-    params = list(inspect.signature(stamp_loaded_for_slot).parameters)
-    assert params == ["db", "printer_id", "ams_id", "tray_id"]
-
-
-def test_stamp_loaded_is_unconditional():
-    """stamp_loaded always writes (callers own the churn guard) — unlike write-once
-    stamp_first_loaded."""
-    from types import SimpleNamespace
-
-    s = SimpleNamespace(loaded_at="OLD")
-    stamp_loaded(s)
-    assert s.loaded_at != "OLD" and s.loaded_at is not None
+    result = await db_session.execute(select(SpoolAssignment).where(SpoolAssignment.spool_id == spool.id))
+    rows = result.scalars().all()
+    assert len(rows) == 1
+    assert (rows[0].printer_id, rows[0].ams_id, rows[0].tray_id) == (printer.id, 0, 1)
+    all_rows = (await db_session.execute(select(SpoolAssignment))).scalars().all()
+    assert len(all_rows) == 1, "the stale tray-0 binding must be gone, not merely superseded"
 
 
 # -- K-profile drift re-apply (F3: extracted from main.on_ams_change) --------

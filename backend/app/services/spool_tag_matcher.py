@@ -2,7 +2,6 @@
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
 
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
+from backend.app.services.spool_binding import bind_spool_to_slot
 from backend.app.utils.printer_models import extruder_for_ams, nozzle_for_ams_unit
 from backend.app.utils.retry_window import RetryWindow
 from backend.app.utils.tag_normalization import (
@@ -24,12 +24,6 @@ logger = logging.getLogger(__name__)
 ZERO_TAG_UID = "0000000000000000"
 ZERO_TRAY_UUID = "00000000000000000000000000000000"
 
-# Consumption below this (grams) counts as "never fed": load-purge noise, not real
-# print consumption. A never-fed row holds no seating seniority, so a physical
-# re-seat of one re-stamps its ``loaded_at`` (006-H2S FIFO rule 2). A row that has
-# fed >= this keeps position on a re-seat (maintenance of the SAME roll — rule 3).
-NEVER_FED_MAX_G = 10.0
-
 # Minimum spacing between K-profile drift re-applies on ONE slot. The drift check
 # runs on every AMS push, and an identify's tray-state flap republishes cali_idx
 # repeatedly — un-gated that is one extrusion_cali_sel per push into an AMS that is
@@ -38,96 +32,6 @@ NEVER_FED_MAX_G = 10.0
 _KDRIFT_RETRY_S = 30.0
 
 _kdrift_window = RetryWindow(_KDRIFT_RETRY_S)
-
-
-def stamp_first_loaded(spool: Spool) -> None:
-    """Stamp ``Spool.first_loaded_at`` the first time a spool enters service.
-
-    Single stamping origin for the FIFO substrate: called wherever a spool
-    acquires its first ``SpoolAssignment`` — the RFID auto-assign path
-    (:func:`auto_assign_spool`), the manual ``POST /assignments`` route, and the
-    tagless bare-tray auto-config (``services.spool_tagless``). Idempotent: only
-    writes when the column is still NULL, so a spool pulled and re-assigned keeps
-    its original in-service timestamp (the spool-selection policy orders
-    candidates oldest-first).
-
-    Lives here — not in ``spool_tagless`` — because this is the lowest module all
-    three assignment-creating callers already import: ``spool_tagless`` imports
-    ``spool_tag_matcher`` (not the reverse) and the inventory route imports it
-    too, so defining it here is the one clean direction with no import cycle.
-    """
-    if spool.first_loaded_at is None:
-        spool.first_loaded_at = datetime.utcnow()
-
-
-def stamp_loaded(spool: Spool) -> None:
-    """Unconditionally stamp ``Spool.loaded_at`` = now — the re-stampable FIFO ordinal.
-
-    Always writes (unlike write-once :func:`stamp_first_loaded`): callers own the churn
-    guard. Binding-change sites call it only when the slot→spool pairing actually changed
-    (never on a same-spool upsert replay); the presence-gain adjudicator
-    (:func:`stamp_loaded_for_slot`) decides whether a re-seat of the currently-bound row
-    qualifies. ``loaded_at`` tracks when the physical roll currently in the tray became
-    seated, so the ``first_loaded`` selection policy drains the oldest ACTUAL roll first
-    (006-H2S: ``first_loaded_at`` was a write-once ledger row age that a stale binding
-    lent to a fresh roll, inverting FIFO).
-    """
-    spool.loaded_at = datetime.utcnow()
-
-
-async def stamp_loaded_for_slot(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> bool:
-    """Adjudicate a presence-GAIN re-seat and re-stamp ``loaded_at`` when the roll is new.
-
-    Applied to the row CURRENTLY bound to the slot on a debounced genuine presence gain
-    (called best-effort from ``ams_presence.on_ams_change``). The decision is GRAMS-STATE
-    + identity only — never elapsed time (the ≥5 s presence filter upstream is a wire
-    debounce, not an identity signal):
-
-    * ``tag_uid`` set → skip. RFID identity is adjudicated by the AMS reconcile — a
-      same-tag re-seat preserves the binding untouched (position kept); a tag change
-      re-binds through :func:`auto_assign_spool` (stamped there by the pairing-change guard).
-    * ``spent_at`` set → skip. The spent latch owns the slot; the replacement mint is
-      stamped at bind time (:func:`stamp_loaded` on the binding change).
-    * ``weight_used`` < :data:`NEVER_FED_MAX_G` → stamp. A row that has consumed nothing
-      holds no consumption seniority — new-vs-same full roll is ledger-equivalent, so the
-      re-seat is the deterministic new-roll answer (006-H2S rule 2, tonight's case).
-    * else (mid-life, has fed) → no stamp. The dominant re-seat of a fed roll is
-      maintenance (jam fix / untangle / drying) of the SAME roll — position and grams both
-      keep; a true mid-life tagless swap is undecidable without a tag / wire remain and is
-      left to the ≥70 %-used fresh-roll prompt or manual respool (006-H2S rule 3).
-
-    Commits the shared session on a stamp (commit precedent:
-    ``spool_recovery._clear_out_of_rotation_for_slot``). Returns True when it stamped.
-    """
-    res = await db.execute(
-        select(SpoolAssignment)
-        .options(selectinload(SpoolAssignment.spool))
-        .where(
-            SpoolAssignment.printer_id == printer_id,
-            SpoolAssignment.ams_id == ams_id,
-            SpoolAssignment.tray_id == tray_id,
-        )
-    )
-    sa = res.scalar_one_or_none()
-    if sa is None or sa.spool is None:
-        return False  # unbound slot — nothing to adjudicate
-    spool = sa.spool
-    if spool.tag_uid:
-        return False  # RFID identity is adjudicated by the reconcile, not here
-    if spool.spent_at is not None:
-        return False  # spent latch owns the slot; the mint stamps at bind time
-    if float(spool.weight_used or 0) >= NEVER_FED_MAX_G:
-        return False  # mid-life row: a maintenance re-seat keeps position
-    stamp_loaded(spool)
-    await db.commit()
-    logger.info(
-        "Re-stamped loaded_at on never-fed spool %d (printer %d AMS%d-T%d re-seat)",
-        spool.id,
-        printer_id,
-        ams_id,
-        tray_id,
-    )
-    return True
 
 
 def is_valid_tag(tag_uid: str, tray_uuid: str) -> bool:
@@ -715,43 +619,18 @@ async def auto_assign_spool(
             fingerprint_color = tray.get("tray_color", "")
             fingerprint_type = tray.get("tray_type", "")
 
-    # Upsert: remove old assignment for this slot
-    existing = await db.execute(
-        select(SpoolAssignment).where(
-            SpoolAssignment.printer_id == printer_id,
-            SpoolAssignment.ams_id == ams_id,
-            SpoolAssignment.tray_id == tray_id,
-        )
-    )
-    old = existing.scalar_one_or_none()
-    # Capture the outgoing pairing BEFORE the delete so the loaded_at re-stamp below
-    # can tell a genuine binding CHANGE (new roll → re-stamp) from a same-spool
-    # upsert replay (re-detect of the roll already here → keep position).
-    old_spool_id = old.spool_id if old is not None else None
-    if old:
-        await db.delete(old)
-        await db.flush()
-
-    assignment = SpoolAssignment(
-        spool_id=spool.id,
+    # Bind with MOVE semantics (one spool ⇔ at most one slot, fleet-wide) and the
+    # FIFO stamps — ``spool_binding`` is the single binding writer.
+    assignment = await bind_spool_to_slot(
+        db,
+        spool,
         printer_id=printer_id,
         ams_id=ams_id,
         tray_id=tray_id,
         fingerprint_color=fingerprint_color,
         fingerprint_type=fingerprint_type,
+        origin="rfid_auto",
     )
-    db.add(assignment)
-    await db.flush()
-
-    # First-in-service stamp (FIFO substrate). Idempotent — only the first
-    # assignment sets it; a spool pulled and re-assigned keeps its timestamp.
-    stamp_first_loaded(spool)
-    # Re-stampable FIFO ordinal: a binding CHANGE to a different spool row (RFID
-    # auto-assign, tagless mint, respool re-bind, from-slot route — all new-row
-    # callers) is a reliable novelty event, so the seating order rides it. A same-
-    # spool upsert replay keeps position.
-    if old_spool_id != spool.id:
-        stamp_loaded(spool)
 
     # Apply K-profile via MQTT (if available)
     # NOTE: Do NOT send ams_set_filament_setting here. This function is only

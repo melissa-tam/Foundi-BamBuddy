@@ -715,6 +715,36 @@ class TestBareTray:
         env.apply.assert_not_awaited()
 
 
+# --- move semantics at the tagless bind site (012-H2S) ---------------------
+
+
+class TestAssignFromSettingMoves:
+    """``_assign_from_setting`` binds through ``spool_binding.bind_spool_to_slot``, so a
+    spool already bound to another slot is MOVED, never copied — one spool ⇔ at most one
+    slot, fleet-wide. The pre-fix helper deleted only the target slot's row."""
+
+    async def test_moves_spool_bound_to_another_slot(self, db_session, printer_factory):
+        printer = await printer_factory()
+        spool_id = await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+        spool = await db_session.get(Spool, spool_id)
+
+        await spool_tagless._assign_from_setting(
+            db_session, spool, printer.id, 0, 2, {"material": "PETG", "rgba": "000000FF"}
+        )
+        await db_session.commit()
+
+        rows = (
+            (await db_session.execute(select(SpoolAssignment).where(SpoolAssignment.spool_id == spool_id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1, "the roll moved — the source binding must be gone"
+        assert (rows[0].ams_id, rows[0].tray_id) == (0, 2)
+        assert rows[0].fingerprint_color == "000000FF"  # seeded from the SETTING
+        assert rows[0].fingerprint_type == "PETG"
+        assert await _assignment(db_session, printer.id, 0, 0) is None  # source slot released
+
+
 # --- provisional disposal on RFID takeover ---------------------------------
 
 

@@ -3827,6 +3827,49 @@ async def run_migrations(conn):
     # ADD COLUMN (_safe_execute swallows "duplicate column name" / "already exists").
     await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN fresh_prompt_pending_at TIMESTAMP NULL")
 
+    # Migration (012-H2S structural invariant): one spool row is bound to at most ONE
+    # AMS slot, fleet-wide. ``spool_assignment`` constrained only (printer, ams, tray),
+    # so a roll moved between trays was recorded as a COPY — spool 120 sat on two trays
+    # of one printer for 22 h, both trays presented that one ledger to the
+    # ``min_start_spool_g`` start gate, and a ~22 g roll cleared the 150 g gate and ran
+    # out on layer 1. ``services.spool_binding.bind_spool_to_slot`` is now the single
+    # writer (move semantics); this index makes any bypass fail loudly instead of
+    # silently forking a ledger. Dedupe strictly BEFORE the index — a missed dedupe
+    # would abort startup on the CREATE UNIQUE INDEX (_safe_execute does NOT swallow an
+    # IntegrityError), which is the intended loud failure but not a reason to leave
+    # known duplicates behind.
+    _dup_binding_predicate = "id NOT IN (SELECT MAX(id) FROM spool_assignment GROUP BY spool_id)"
+    _dup_bindings = (
+        await conn.execute(
+            text(
+                "SELECT id, spool_id, printer_id, ams_id, tray_id, created_at "
+                f"FROM spool_assignment WHERE {_dup_binding_predicate}"
+            )
+        )
+    ).fetchall()
+    for _row in _dup_bindings:
+        logger.warning(
+            "dropping stale duplicate spool binding: spool %s -> printer %s AMS%s-T%s (row %s, created %s); "
+            "newest binding kept",
+            _row[1],
+            _row[2],
+            _row[3],
+            _row[4],
+            _row[0],
+            _row[5],
+        )
+    # MAX(id) = newest = the most recent physical observation, so the surviving row is
+    # the roll's current location; if it is ever wrong the next AMS fold-in converges it
+    # through the same move semantics. Idempotent (a clean table matches zero rows) and
+    # valid on both SQLite and Postgres. DML → conn.execute inside begin_nested (never
+    # swallowed), per this module's migration convention.
+    async with conn.begin_nested():
+        await conn.execute(text(f"DELETE FROM spool_assignment WHERE {_dup_binding_predicate}"))
+    await _safe_execute(
+        conn,
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_spool_assignment_spool_id ON spool_assignment (spool_id)",
+    )
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),

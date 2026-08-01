@@ -100,13 +100,14 @@ class Spool(Base):
     # The HMS short code (e.g. "0700_8010") that flagged the feed fault.
     feed_fault_code: Mapped[str | None] = mapped_column(String(16))
     # FIFO substrate: when this spool FIRST entered service (first time it got a
-    # SpoolAssignment). WRITE-ONCE ledger history (``stamp_first_loaded`` only
-    # writes when NULL) — do NOT consume this as the physical seating order. NULL
-    # = never loaded (a pristine, never-assigned inventory spool).
+    # SpoolAssignment). WRITE-ONCE ledger history
+    # (``spool_binding.stamp_first_loaded`` only writes when NULL) — do NOT consume
+    # this as the physical seating order. NULL = never loaded (a pristine,
+    # never-assigned inventory spool).
     first_loaded_at: Mapped[datetime | None] = mapped_column(DateTime)
     # FIFO ordinal: when the physical roll CURRENTLY in the tray entered service —
     # the re-stampable seating order the ``first_loaded`` selection policy sorts by.
-    # Re-stamped (``stamp_loaded`` / ``stamp_loaded_for_slot``) on a binding change
+    # Re-stamped (``spool_binding.stamp_loaded`` / ``.stamp_loaded_for_slot``) on a binding change
     # to a different spool row and on a never-fed row's re-seat; a mid-life or
     # RFID-same-tag re-seat keeps its value (grams-state + identity adjudicated, no
     # timing input). Distinct from ``first_loaded_at`` (write-once history), which

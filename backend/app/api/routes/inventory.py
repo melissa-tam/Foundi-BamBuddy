@@ -53,6 +53,7 @@ from backend.app.services.location_service import (
     rename_location as rename_location_record,
 )
 from backend.app.services.slicer_filament_resolver import resolve_slicer_filament
+from backend.app.services.spool_binding import bind_spool_to_slot
 from backend.app.services.spool_csv import (
     MAX_CSV_IMPORT_BYTES,
     ImportPreview,
@@ -1959,40 +1960,19 @@ async def assign_spool(
                 if isinstance(raw_state, int):
                     tray_state = raw_state
 
-    # 3. Upsert assignment (replace if same printer+ams+tray)
-    existing = await db.execute(
-        select(SpoolAssignment).where(
-            SpoolAssignment.printer_id == data.printer_id,
-            SpoolAssignment.ams_id == data.ams_id,
-            SpoolAssignment.tray_id == data.tray_id,
-        )
-    )
-    old = existing.scalar_one_or_none()
-    # Capture the outgoing pairing before the delete so the loaded_at re-stamp fires
-    # only on a genuine binding change, not a same-spool re-assign of the roll here.
-    old_spool_id = old.spool_id if old is not None else None
-    if old:
-        await db.delete(old)
-        await db.flush()
-
-    assignment = SpoolAssignment(
-        spool_id=data.spool_id,
+    # 3. Bind the spool to the slot. ``spool_binding`` is the single binding writer:
+    # it upserts the target slot, MOVES the spool off any slot it was already bound
+    # to (one spool ⇔ at most one slot, fleet-wide) and owns the FIFO stamps.
+    assignment = await bind_spool_to_slot(
+        db,
+        spool,
         printer_id=data.printer_id,
         ams_id=data.ams_id,
         tray_id=data.tray_id,
         fingerprint_color=fingerprint_color,
         fingerprint_type=fingerprint_type,
+        origin="manual_api",
     )
-    db.add(assignment)
-    # First-in-service stamp (FIFO substrate) — idempotent, single stamping origin.
-    from backend.app.services.spool_tag_matcher import stamp_first_loaded, stamp_loaded
-
-    stamp_first_loaded(spool)
-    # Re-stampable FIFO ordinal: a manual bind to a DIFFERENT spool is a novelty
-    # event (operator seated a new roll and pointed the slot at it); a re-assign of
-    # the same spool keeps position.
-    if old_spool_id != spool.id:
-        stamp_loaded(spool)
     await db.commit()
     await db.refresh(assignment)
 

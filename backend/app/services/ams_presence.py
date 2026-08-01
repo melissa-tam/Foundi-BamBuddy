@@ -1023,7 +1023,7 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                         # debounce. Best-effort — never break the AMS callback.
                         if qualified:
                             try:
-                                from backend.app.services.spool_tag_matcher import stamp_loaded_for_slot
+                                from backend.app.services.spool_binding import stamp_loaded_for_slot
 
                                 await stamp_loaded_for_slot(db, printer_id, ams_id, tray_id)
                             except Exception:  # noqa: BLE001 — best-effort loaded_at re-stamp
