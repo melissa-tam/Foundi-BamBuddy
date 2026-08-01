@@ -77,7 +77,7 @@ export const DEFAULT_EJECT_PROFILE_PARAMS: EjectProfileParams = {
   x_passes: 11,
   x_margin_mm: 3,
   front_overhang_mm: 2,
-  back_overhang_mm: 2,
+  back_overhang_mm: 15,
   eject_speed_mm_min: 3000,
   skim_speed_mm_min: 1500,
   cooling_fan_assist: true,

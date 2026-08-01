@@ -40,7 +40,7 @@ class EjectProfileBase(BaseModel):
     x_passes: int = Field(default=11, ge=1, le=100)
     x_margin_mm: float = Field(default=3.0, ge=0)
     front_overhang_mm: float = Field(default=2.0, ge=0)
-    back_overhang_mm: float = Field(default=2.0, ge=0)
+    back_overhang_mm: float = Field(default=15.0, ge=0)
     eject_speed_mm_min: int = Field(default=3000, gt=0)
     skim_speed_mm_min: int = Field(default=1500, gt=0)
     cooling_fan_assist: bool = True
