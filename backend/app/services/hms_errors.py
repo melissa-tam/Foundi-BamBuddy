@@ -965,6 +965,31 @@ _RUNOUT_SLOT_CODE32: frozenset[int] = frozenset({0x00020001, 0x00020005, 0x00030
 #     deliberately keeps consuming the whole parent set — do not narrow that.
 _RUNOUT_DEMAND_CODE32: frozenset[int] = frozenset({0x00020001})
 
+# The SPENT-EVIDENCE subset of :data:`_RUNOUT_SLOT_CODE32` — the code words whose
+# catalog text is the firmware's own statement that a roll PHYSICALLY RAN DRY, and
+# so may stamp ``spool.spent_at`` (``spool_respool.mark_spent_on_slot_runout``).
+# Deliberately narrower than both sets above, because a spent stamp is a ledger
+# mutation on the operator's inventory — a false one archives a healthy roll:
+#
+#   * 0x00030002 IN — "AMS A Slot 1 filament has run out and automatically switched
+#     to the slot with the same filament." The one family member that can ONLY mean
+#     the roll ended: the firmware is not asking for anything, it is REPORTING a
+#     completed backup switch it would never perform on a slot still feeding.
+#   * 0x00020001 OUT — the bare demand. 006-H2S 2026-07-26 proved firmware can latch
+#     a BOGUS demand for a slot that never ran dry (a load command issued during a
+#     runout hold resurfaced 12 h later as a demand for the latched slot); stamping
+#     on a demand would have marked a healthy roll spent.
+#   * 0x00030001 OUT — "please wait while old filament is purged" is transitional and
+#     is ALWAYS followed by the demand or by the 0x00030002 auto-switch, whichever way
+#     the purge lands — so it adds zero coverage while inheriting the demand's risk.
+#   * 0x00020005 OUT — purge-abnormal, entangled with a tool-head fault ("check whether
+#     the filament is stuck in the tool head") where a misread of the runout itself is
+#     plausible. Residual coverage stays with the Tier-3 / fresh-roll prompts.
+#
+# All four remain in :data:`_RUNOUT_SLOT_CODE32` — this narrowing governs only WHETHER
+# to stamp, never slot RESOLUTION, which must keep consuming the whole parent set.
+_RUNOUT_AUTO_SWITCH_SPENT_CODE32: frozenset[int] = frozenset({0x00030002})
+
 
 def ams_slot_from_attr(attr: int) -> tuple[int, int] | None:
     """Decode the AMS unit + slot a slot-attributed HMS ``attr`` names, or ``None``.

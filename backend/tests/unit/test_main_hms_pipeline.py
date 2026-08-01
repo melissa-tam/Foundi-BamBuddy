@@ -451,3 +451,87 @@ class TestRunoutGuidanceRefreshHook:
         # The push completed: the ordinary code still notified and still stamped.
         assert h.notify.on_printer_error.await_count == 1
         assert "0700_4025" in h.sent_bodies[0]
+
+
+# The firmware's "ran out and automatically switched" statement: code word 0x00030002
+# on attr 0x07002200 (AMS0 slot 3 → tray 2). Its short code is "0700_0002", which the
+# pipeline must NEVER match as a bare string — the slot byte and the code-word high
+# bits that separate it from the demand both live outside the short code.
+_AUTO_SWITCH = _err(code="0x30002", attr=0x07002200, module=0x07, full_code="0700220000030002")
+
+
+@pytest.mark.asyncio
+class TestSlotRunoutSpentHook:
+    """Fix-1 wiring pin: the pipeline builds the auto-switch spent events itself
+    (full_code + attr + code word per entry, so chained multi-slot runouts survive the
+    hand-off) and hands them to the trigger in its own session. The trigger's own
+    decisions are pinned in test_spool_respool.py."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_respool_state(self):
+        from backend.app.services import spool_respool
+
+        spool_respool._reset_state()
+        yield
+        spool_respool._reset_state()
+
+    async def test_new_auto_switch_code_invokes_the_hook_with_the_event_tuple(self):
+        state = _state([_AUTO_SWITCH])
+        with (
+            _Harness(),
+            patch(
+                "backend.app.services.spool_respool.mark_spent_on_slot_runout",
+                new=AsyncMock(return_value=[]),
+            ) as hook,
+        ):
+            await main_module.on_printer_status_change(5, state)
+
+        hook.assert_awaited_once()
+        args = hook.await_args.args
+        assert args[1] == 5
+        assert args[2] == [(_AUTO_SWITCH.full_code, 0x07002200, 0x00030002)]
+        assert args[3] is state
+
+    async def test_demand_family_codes_never_reach_the_hook(self):
+        """Only the auto-switch code word is spent evidence. The bare demand decodes a
+        slot just as well, so the pipeline filter is the only thing keeping a
+        firmware-latched bogus demand (006-H2S) from archiving a healthy roll."""
+        with (
+            _Harness(),
+            patch(
+                "backend.app.services.spool_respool.mark_spent_on_slot_runout",
+                new=AsyncMock(return_value=[]),
+            ) as hook,
+        ):
+            await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION]))
+
+        hook.assert_not_awaited()
+
+    async def test_a_standing_code_does_not_re_invoke_the_hook(self):
+        """The hook rides ``new_error_codes``, so the auto-switch code standing across
+        later pushes is one incident — it must not re-stamp whatever is bound now."""
+        with (
+            _Harness(),
+            patch(
+                "backend.app.services.spool_respool.mark_spent_on_slot_runout",
+                new=AsyncMock(return_value=[]),
+            ) as hook,
+        ):
+            await main_module.on_printer_status_change(5, _state([_AUTO_SWITCH], layer_num=1))
+            await main_module.on_printer_status_change(5, _state([_AUTO_SWITCH], layer_num=2))
+
+        assert hook.await_count == 1
+
+    async def test_hook_failure_does_not_break_the_status_flow(self):
+        with (
+            _Harness() as h,
+            patch(
+                "backend.app.services.spool_respool.mark_spent_on_slot_runout",
+                new=AsyncMock(side_effect=RuntimeError("boom")),
+            ),
+        ):
+            await main_module.on_printer_status_change(5, _state([_AUTO_SWITCH, _UNRELATED]))
+
+        # The push completed: the ordinary code still notified and still stamped.
+        assert h.notify.on_printer_error.await_count == 1
+        assert "0700_4025" in h.sent_bodies[0]

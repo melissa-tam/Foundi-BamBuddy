@@ -7,9 +7,14 @@ spool ledger would otherwise map the tag to the SPENT donor row (weight_used ≈
 guard. This module is the single owner of the re-spool operation and its three
 certainty tiers:
 
-* **Tier 1 — spent-certain marking** (`mark_spent_on_runout`, `capture_backup_swap`):
-  a hardware runout signal (runout HMS / seamless AMS backup-swap) stamps
-  ``spool.spent_at`` — the certainty key. Never set by gram estimates.
+* **Tier 1 — spent-certain marking** (`mark_spent_on_runout`,
+  `mark_spent_on_slot_runout`, `sample_status_push` + `confirm_backup_swaps`): a
+  hardware runout signal (unrescued runout HMS / the firmware's own auto-switch
+  statement / seamless AMS backup-swap) stamps ``spool.spent_at`` — the certainty
+  key. Never set by gram estimates. The backup-swap detector is a SAMPLER/CONFIRMER
+  pair, not one call: the sync sampler runs on every status push (~1 Hz) because the
+  tray_now edge it watches is invisible to the AMS-hash-gated callback, and only a
+  confirmed departure pays for a DB session.
 * **Tier 2 — automatic re-spool** (`maybe_auto_or_prompt_respool`): a tag arrival
   resolving to a spent, LOADED tray physically cannot be the old (empty) spool,
   so it re-spools with no operator involvement — unless a standing "Same spool"
@@ -64,6 +69,8 @@ from backend.app.services.spool_tag_matcher import (
 from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -131,7 +138,7 @@ _NO_JOB = object()
 # state=RUNNING so the ``if not running`` cleanup never fires. A feeder change chosen
 # by the NEXT job's dispatch mapping then looked identical to a mid-job firmware backup
 # switch and stamped the departed spool spent (spool 106, printer 5, AMS0-T0, 02:40).
-# This records the job each edge sample was taken under so :func:`capture_backup_swap`
+# This records the job each edge sample was taken under so :func:`sample_status_push`
 # recognises a changed subtask_id (incl. ``None``↔value) as a boundary and DISCARDS the
 # cross-job edge instead of confirming a swap. Process-lifetime like the edge dicts;
 # cleared by :func:`_reset_state`. The job-boundary reset hooks in ``main`` clear the
@@ -190,6 +197,18 @@ _spent_dedup: set[tuple[int, object, int]] = set()
 _runout_seeded: set[int] = set()
 _seeded_runout_codes: dict[int, set[str]] = {}
 
+# S1 for the slot-attributed auto-switch family (:func:`mark_spent_on_slot_runout`),
+# keyed by the LOSSLESS ``full_code`` rather than the short code its sibling above
+# uses. The short code is unusable as identity here: ``hms_short_code`` keeps only
+# ``code & 0xFFFF``, dropping the code-word high bits that separate the demand
+# (0x00020001) from the purge notice (0x00030001) — both render ``07xx_0001`` — and
+# it keeps only ``attr >> 16``, dropping the slot byte, so all four slots of one AMS
+# render identically. Seeding on the short code would therefore suppress a genuine
+# NEW runout on a DIFFERENT slot, which is exactly the chained multi-slot case this
+# trigger exists for. Same lifecycle as the sets above: seeded once per printer per
+# process by :func:`note_status_push`, intersection-pruned on every later push.
+_seeded_slot_runout_full: dict[int, set[str]] = {}
+
 
 def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
@@ -204,6 +223,7 @@ def _reset_state() -> None:
     _spent_dedup.clear()
     _runout_seeded.clear()
     _seeded_runout_codes.clear()
+    _seeded_slot_runout_full.clear()
 
 
 def _monotonic() -> float:
@@ -234,7 +254,7 @@ def reset_swap_edge_state(printer_id: int) -> None:
     false-spent incident). After a reset the next AMS-delta push merely re-seeds
     ``_last_tray_now`` (prev ``None`` → no edge possible). Drops only the four swap
     trackers; :data:`_last_sample_job` is owned by the belt-and-braces boundary check
-    in :func:`capture_backup_swap` and is intentionally left intact. Idempotent; pure
+    in :func:`sample_status_push` and is intentionally left intact. Idempotent; pure
     in-memory; never raises.
     """
     _last_tray_now.pop(printer_id, None)
@@ -373,20 +393,6 @@ def _resolve_live_tray(state, ams_id: int, tray_id: int) -> dict | None:
     return None
 
 
-def _tray_present(state, global_tray: int) -> bool:
-    """Exist-bit proxy: does the tray at ``global_tray`` still hold a spool?
-
-    The raw AMS exist-bit field is hardware-probe-pinned; until then a present
-    spool is read as a non-empty ``tray_type`` in the live AMS data for the
-    decoded slot. Used only by the backup-swap detector.
-    """
-    ams_id, tray_id = _decode_global_tray(global_tray)
-    if ams_id is None:
-        return False
-    tray = _resolve_live_tray(state, ams_id, tray_id)
-    return bool(tray and (tray.get("tray_type") or "").strip())
-
-
 def _tray_loaded(tray: dict) -> bool:
     """Filament-loaded heuristic — mirrors main.on_ams_change (:1643 semantics).
 
@@ -487,15 +493,37 @@ def _runout_slot_global_tray(state) -> int | None:
 async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> int | None:
     """Which tray ran out.
 
-    Firmware slot attribution is PRIMARY: when a live ``0700_2X00`` runout HMS names
-    the slot (:func:`_runout_slot_global_tray`), that global tray wins outright — it
-    is the ground truth on this fleet and outranks all inference. Otherwise (the
-    slot-agnostic ``07xx_8011`` "insert same slot" runout) fall back to inference:
-    prefer the live feeding ``tray_now`` over the dispatched farm ams_mapping for a
-    single-feeder job (the mapping can be stale after a firmware backup-switch /
-    operator reload), falling back to the mapping when ``tray_now`` is
-    unloaded/unknown (255/None). ``last_loaded_tray`` remains un-consulted here (the
-    firmware-named slot supersedes it); the multi-feeder fail-safe is unchanged."""
+    Firmware slot attribution is PRIMARY, and within it the CURRENT DEMAND outranks the
+    first decodable entry. Order:
+
+    1. :func:`hms_errors.current_runout_demand` — the slot the firmware is asking to
+       have FILLED right now. This trigger only ever fires on the UNRESCUED families
+       (``RUNOUT_HMS_CODES``), and by definition the unrescued slot is the demanded one.
+    2. :func:`_runout_slot_global_tray` — first-hit decode over the whole slot-attributed
+       family, for an unrescued runout that names a slot but raises no standing demand.
+    3. Inference: prefer the live feeding ``tray_now`` over the dispatched farm
+       ams_mapping for a single-feeder job (the mapping can be stale after a firmware
+       backup-switch / operator reload), falling back to the mapping when ``tray_now``
+       is unloaded/unknown (255/None). ``last_loaded_tray`` remains un-consulted (the
+       firmware-named slot supersedes it); the multi-feeder fail-safe is unchanged.
+
+    Step 1 is load-bearing for the CHAINED case. The firmware APPENDS newer faults, so
+    the first-hit decode returns the OLDEST slot-attributed entry — after a rescue-then-
+    unrescued sequence that is the slot the auto-switch trigger has ALREADY stamped,
+    whereupon ``_spent_dedup`` swallows this stamp and the actually-unrescued roll is
+    never marked. 006-H2S 2026-07-26 carried exactly that list shape (an older
+    auto-switched slot-1 entry ahead of the standing slot-3 demand).
+
+    The ``isinstance`` guard keeps the decode fail-closed on an absent / non-list
+    ``hms_errors`` (MagicMock states in tests, a degenerate push in production), so
+    inference stays the fallback rather than raising into a callback."""
+    hms_list = getattr(state, "hms_errors", None)
+    if isinstance(hms_list, list):
+        from backend.app.services.hms_errors import current_runout_demand
+
+        demanded = current_runout_demand(hms_list)
+        if demanded is not None:
+            return demanded[0] * 4 + demanded[1]
     decoded = _runout_slot_global_tray(state)
     if decoded is not None:
         return decoded
@@ -550,6 +578,36 @@ def _live_runout_codes(state) -> set[str]:
     return out & RUNOUT_HMS_CODES
 
 
+def _live_slot_runout_full(state) -> set[str]:
+    """``full_code``s of the slot-attributed AUTO-SWITCH runouts currently live on
+    ``state`` — the S1 seed alphabet of :func:`mark_spent_on_slot_runout`.
+
+    Two conjunctive conditions, matching that trigger's own filter exactly so the seed
+    can never be narrower than what stamps: the code word is in the spent-evidence
+    subset (:data:`hms_errors._RUNOUT_AUTO_SWITCH_SPENT_CODE32`) AND its attr decodes
+    to a real slot. An entry whose slot fails to decode can never stamp, so seeding it
+    would only risk suppressing an unrelated code that happens to share its full_code.
+    """
+    from backend.app.services.hms_errors import (
+        _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
+        _code_word,
+        runout_slot_from_hms,
+    )
+
+    out: set[str] = set()
+    for e in getattr(state, "hms_errors", None) or []:
+        try:
+            code_word = _code_word(getattr(e, "code", 0))
+            if code_word not in _RUNOUT_AUTO_SWITCH_SPENT_CODE32:
+                continue
+            if runout_slot_from_hms(int(getattr(e, "attr", 0) or 0), code_word) is None:
+                continue
+            out.add(str(getattr(e, "full_code", "") or ""))
+        except Exception:  # noqa: BLE001 — a malformed HMS entry must not crash seeding
+            continue
+    return out
+
+
 def note_status_push(printer_id: int, state) -> None:
     """Seed / maintain the per-printer restart-replay runout-suppression set (S1).
 
@@ -566,8 +624,15 @@ def note_status_push(printer_id: int, state) -> None:
     observed live at the first push) never stamps spent — the tray's true state is
     unknowable across the gap, so we fail safe. That case is bounded by the pause-
     stall watchdog (the print sits PAUSEd and escalates) and the Tier-3 respool prompt
-    when the reused tag next arrives. Pure set bookkeeping; the caller owns guarding."""
+    when the reused tag next arrives. Pure set bookkeeping; the caller owns guarding.
+
+    Maintains BOTH runout seeds off the same one-shot and the same "real report" gate:
+    the short-code set for :func:`mark_spent_on_runout` and the full-code set for
+    :func:`mark_spent_on_slot_runout`. One seeding pass, so the two triggers can never
+    disagree about which push was the first — a second one-shot could latch on a
+    different push and leave one family unguarded across the restart."""
     live = _live_runout_codes(state)
+    live_slot_full = _live_slot_runout_full(state)
     if printer_id not in _runout_seeded:
         # The one-shot seed must capture a REAL printer report. A fresh
         # PrinterState defaults to state="unknown" and the connect-time
@@ -579,11 +644,15 @@ def note_status_push(printer_id: int, state) -> None:
             return
         _runout_seeded.add(printer_id)
         _seeded_runout_codes[printer_id] = set(live)
+        _seeded_slot_runout_full[printer_id] = set(live_slot_full)
         return
     seeded = _seeded_runout_codes.get(printer_id)
     if seeded:
         # Drop any seeded code no longer live so a genuine recurrence later stamps.
         seeded.intersection_update(live)
+    seeded_full = _seeded_slot_runout_full.get(printer_id)
+    if seeded_full:
+        seeded_full.intersection_update(live_slot_full)
 
 
 async def mark_spent_on_runout(db: AsyncSession, printer_id: int, new_short_codes, state) -> Spool | None:
@@ -627,6 +696,79 @@ async def mark_spent_on_runout(db: AsyncSession, printer_id: int, new_short_code
     return spool
 
 
+async def mark_spent_on_slot_runout(db: AsyncSession, printer_id: int, events, state) -> list[Spool]:
+    """Tier 1: a NEW firmware AUTO-SWITCH runout stamps spent_at on the slot IT named.
+
+    The sibling of :func:`mark_spent_on_runout` for the case that trigger structurally
+    cannot see: a runout the AMS backup RESCUED. ``RUNOUT_HMS_CODES`` is the UNRESCUED
+    vocabulary (0300_8004 + 07xx_8011 — "insert filament", print held), so a successful
+    auto-refill — which raises only the slot-attributed ``0700_2X00`` family and keeps
+    printing — never stamped anything. Fleet evidence 2026-07-30: four confirmed
+    auto-refills across three printers, zero spent stamps; the un-stamped rows then
+    surfaced as spurious "Fresh roll?" prompts on the eventual physical swap
+    (a SPENT row takes the silent spent→mint path instead).
+
+    ``events`` are ``(full_code, attr, code_word)`` tuples the caller has already
+    established are NEW this push. Attribution is ATTR-PRIMARY and PER EVENT — the
+    firmware names the exhausted slot in the attr, and one print can chain several
+    (005-H2S 2026-07-30 ran three rolls dry inside a single job, its completion gram
+    split proving four trays fed). Resolving once per push, or through tray_now, would
+    stamp only one of them; the per-event loop stamps each, and each has its own
+    ``_spent_dedup`` key so a re-raise of the same slot in the same job still can't
+    double-stamp the roll the operator has since inserted.
+
+    Only :data:`hms_errors._RUNOUT_AUTO_SWITCH_SPENT_CODE32` may reach here — see that
+    constant for why the bare demand (0x00020001) is NOT spent evidence: 006-H2S proved
+    firmware can latch a bogus demand for a slot that never ran dry, and a demand-driven
+    stamp would have archived a healthy roll.
+
+    Returns the spools stamped by THIS call (empty when nothing qualified). No-op in
+    Spoolman mode; skips S1 restart replays; delegates the stamp itself to the shared
+    :func:`_mark_tray_spent` so the idempotency and fat-remainder WARNING are identical.
+    """
+    if await _spoolman_enabled(db):
+        return []
+    from backend.app.services.hms_errors import _RUNOUT_AUTO_SWITCH_SPENT_CODE32, runout_slot_from_hms
+
+    seeded = _seeded_slot_runout_full.get(printer_id) or set()
+    subtask_id = getattr(state, "subtask_id", None)
+    stamped: list[Spool] = []
+    for full_code, attr, code_word in events or []:
+        # Re-assert the trigger vocabulary here, exactly as :func:`mark_spent_on_runout`
+        # re-intersects RUNOUT_HMS_CODES despite its caller having filtered too. The
+        # wider slot-attributed family decodes a slot just fine, so a caller that hands
+        # over a bare DEMAND would silently archive a healthy roll — the 006 false-stamp
+        # class. The narrow set is this function's contract, so it fails closed on it.
+        if code_word not in _RUNOUT_AUTO_SWITCH_SPENT_CODE32:
+            continue
+        # S1: a code already live at the first status push after a restart is a replay
+        # of a PRE-restart runout, NOT a fresh exhaustion — stamping now would mis-mark
+        # whatever spool is bound to the slot NOW (a fresh roll after an operator swap).
+        if full_code in seeded:
+            logger.info(
+                "Restart-replayed slot runout on printer %d (%s already live at first status push) "
+                "— not stamping spent",
+                printer_id,
+                full_code,
+            )
+            continue
+        slot = runout_slot_from_hms(attr, code_word)
+        if slot is None:
+            continue
+        ams_id, tray_id = slot
+        global_tray = ams_id * 4 + tray_id
+        # Incident dedup: one spent stamp per (printer, job, tray), shared with the
+        # unrescued trigger so a runout seen by BOTH families stamps exactly once.
+        key = (printer_id, subtask_id, global_tray)
+        if key in _spent_dedup:
+            continue
+        spool = await _mark_tray_spent(db, printer_id, global_tray)
+        if spool is not None:
+            _spent_dedup.add(key)
+            stamped.append(spool)
+    return stamped
+
+
 def _consume_commanded_load(printer_id: int, current: int) -> bool:
     """True (consuming the marker) when ``current`` matches an unexpired load WE
     issued — our own recovery/UI swap, never a firmware runout. A stale marker is
@@ -657,10 +799,11 @@ def _update_stable_feeder(printer_id: int, current: int) -> None:
         _stable_feeder[printer_id] = current
 
 
-async def _resolve_pending_swap(db: AsyncSession, printer_id: int, state, current: int, running: bool) -> Spool | None:
-    """Resolve an open pending backup swap against the current push.
+def _resolve_pending_swap(printer_id: int, current: int, running: bool) -> int | None:
+    """Resolve an open pending backup swap against the current push; returns the
+    DEPARTED global tray when it confirms, else ``None``.
 
-    STAMP the departed tray spent when the new tray has fed stably for
+    CONFIRM the departed tray as run-dry when the new tray has fed stably for
     ``_SWAP_CONFIRM_S`` with the print still RUNNING and tray_now not returned to the
     departed feeder — a genuine firmware backup switch, the departed ran dry. The
     departed tray reading ABSENT at confirm time does NOT invalidate: a tagless roll
@@ -674,9 +817,12 @@ async def _resolve_pending_swap(db: AsyncSession, printer_id: int, state, curren
     on age alone also covers the "a new edge resolves the old first" case: once the
     window elapses the swap confirms even if tray_now has since moved off ``cur`` to a
     third tray, so the chained 1→0→3 double switch stamps both departed spools. DROP
-    (never stamp) if the print left RUNNING, tray_now returned to the departed feeder
+    (never confirm) if the print left RUNNING, tray_now returned to the departed feeder
     (it's feeding again → it did not run out), or tray_now moved off ``cur`` before the
-    window elapsed (transient walk). Otherwise keep waiting."""
+    window elapsed (transient walk). Otherwise keep waiting.
+
+    Pure in-memory and synchronous: the stamp itself belongs to
+    :func:`confirm_backup_swaps`, which owns the only DB session on this path."""
     pending = _pending_swaps.get(printer_id)
     if pending is None:
         return None
@@ -687,26 +833,36 @@ async def _resolve_pending_swap(db: AsyncSession, printer_id: int, state, curren
         return None
     if _monotonic() - opened_ts >= _SWAP_CONFIRM_S:
         _pending_swaps.pop(printer_id, None)
-        return await _mark_tray_spent(db, printer_id, prev)
+        return prev
     if current != cur:
         _pending_swaps.pop(printer_id, None)  # moved off `cur` before confirming → transient
         return None
     return None  # still on `cur`, within the window → keep waiting
 
 
-async def capture_backup_swap(db: AsyncSession, printer_id: int, state) -> Spool | None:
-    """Tier 1: seamless AMS backup-swap detector (runout with no HMS), corroborated.
+def sample_status_push(printer_id: int, state) -> list[int]:
+    """Tier 1: seamless AMS backup-swap detector (runout with no HMS), corroborated —
+    the SAMPLING half. Returns the departed global trays whose pending swap CONFIRMED
+    on this push (hand them to :func:`confirm_backup_swaps`).
 
-    A genuine firmware backup switch (the stable feeder ran dry, the AMS switched to
-    a sibling that now feeds on) marks the departed spool spent. Two false-fire modes
-    the bare last-tray edge suffered (2026-07-19) are gated out: our own commanded
-    loads are suppressed (:func:`_consume_commanded_load`), and only an edge DEPARTING
-    the confirmed stable feeder — held into a pending swap that confirms after
-    ``_SWAP_CONFIRM_S`` — can stamp, so the runout-time tray walk can't. No-op in
-    Spoolman mode.
+    Called on EVERY status push (``main.on_printer_status_change``, ~1 Hz per printer)
+    beside :func:`note_status_push`, because that is the only cadence at which the
+    signal exists. The AMS-change callback this detector used to hang off is gated on
+    bambu_mqtt's AMS hash, and ``tray_now`` is deliberately NOT hashed
+    (``bambu_mqtt._ams_hash``) — so a seamless auto-switch surfaced there only when the
+    drained slot's exist-bit wipe happened to change the hash, and ``_update_stable_feeder``
+    (two same-value observations ≥ ``_SWAP_CONFIRM_S`` apart) was routinely starved of
+    the samples it needs to arm at all. Fleet evidence 2026-07-30/31: four confirmed
+    firmware auto-refills, zero spent stamps.
+
+    Hence: sync, pure in-memory, NO DB and NO awaits — a per-push hook may not open a
+    session (the Spoolman gate that used to run per AMS change now lives in
+    :func:`confirm_backup_swaps`, which only runs on a confirmation). False-fire gating
+    is unchanged: our own commanded loads are suppressed
+    (:func:`_consume_commanded_load`), and only an edge DEPARTING the confirmed stable
+    feeder — held into a pending swap that confirms after ``_SWAP_CONFIRM_S`` — can
+    qualify, so the runout-time tray walk can't.
     """
-    if await _spoolman_enabled(db):
-        return None
     current = getattr(state, "tray_now", 255)
     running = getattr(state, "state", None) == "RUNNING"
 
@@ -716,16 +872,20 @@ async def capture_backup_swap(db: AsyncSession, printer_id: int, state) -> Spool
     # (a ``None``↔value change counts) belongs to another print, so reset it, re-seed
     # ``_last_tray_now`` from this push, and open NO pending swap on this call. A
     # genuine mid-job backup switch keeps the same subtask_id and falls through to the
-    # detector below, stamping exactly as it does today.
+    # detector below, confirming exactly as it does today.
     current_job = getattr(state, "subtask_id", None)
     if _last_sample_job.get(printer_id, _NO_JOB) != current_job:
         reset_swap_edge_state(printer_id)
         _last_sample_job[printer_id] = current_job
         _last_tray_now[printer_id] = current
-        return None
+        return []
 
-    # Resolve any open pending swap against THIS push first (may stamp or drop).
-    marked = await _resolve_pending_swap(db, printer_id, state, current, running)
+    # Resolve any open pending swap against THIS push first (may confirm or drop). A
+    # list because the caller's contract is uniform, never because one push can carry
+    # two: a swap opened on this push can only confirm on a LATER one (the window is
+    # checked against ``opened_ts``), so at most one tray departs per call.
+    departed = _resolve_pending_swap(printer_id, current, running)
+    confirmed: list[int] = [] if departed is None else [departed]
 
     prev = _last_tray_now.get(printer_id)
     _last_tray_now[printer_id] = current
@@ -735,27 +895,99 @@ async def capture_backup_swap(db: AsyncSession, printer_id: int, state) -> Spool
         # RUNNING push after an idle period can't fire a false swap.
         _feeder_since.pop(printer_id, None)
         _stable_feeder.pop(printer_id, None)
-        return marked
+        return confirmed
 
     _update_stable_feeder(printer_id, current)
 
     if prev is None or prev == current:
-        return marked
+        return confirmed
     if prev < 0 or prev >= 254:
-        return marked  # departed from an unloaded / external sentinel — not a swap edge
+        return confirmed  # departed from an unloaded / external sentinel — not a swap edge
     if not (0 <= current <= 253):
-        return marked  # switched to unloaded/external, not an AMS backup switch
+        return confirmed  # switched to unloaded/external, not an AMS backup switch
     if _consume_commanded_load(printer_id, current):
-        return marked  # our own recovery/UI swap — never a firmware runout
+        return confirmed  # our own recovery/UI swap — never a firmware runout
     if _stable_feeder.get(printer_id) != prev:
-        return marked  # departed tray was not the stable feeder → transient walk edge
-    if not _tray_present(state, prev):
-        return marked  # departed spool physically gone → ordinary unload, not a runout
+        return confirmed  # departed tray was not the stable feeder → transient walk edge
 
-    # A qualifying edge off the stable feeder: open a pending swap. It confirms into
-    # a spent stamp only if the new tray feeds stably for _SWAP_CONFIRM_S.
+    # NO open-time presence check on ``prev``. The line above already guarantees it is
+    # the CONFIRMED stable feeder, and a stable feeder that reads absent at the edge IS
+    # the run-to-empty signature — the exist-bit wipe lands with, or before, the very
+    # push that makes the edge visible at all. Vetoing on absence here therefore killed
+    # precisely the genuine run-dry detections it was meant to filter (fleet evidence
+    # 2026-07-30/31: four auto-refills, zero stamps); the ordinary-unload case it aimed
+    # at is covered instead by the fat-remainder WARNING plus the "Same spool" un-spend
+    # path. :func:`_resolve_pending_swap` already states the same tolerance at confirm
+    # time — the two ends of one window now agree.
+    #
+    # A qualifying edge off the stable feeder: open a pending swap. It confirms into a
+    # spent stamp only if the new tray feeds stably for _SWAP_CONFIRM_S.
     _pending_swaps[printer_id] = (prev, current, _monotonic())
-    return marked
+    return confirmed
+
+
+async def confirm_backup_swaps(
+    printer_id: int,
+    departed_trays: list[int],
+    *,
+    session_factory: Callable | None = None,
+) -> list[Spool]:
+    """Tier 1 backup swap, the CONFIRMING half: stamp each departed tray's spool spent.
+
+    Owns the only DB work on this path — its own session, because the per-push sampler
+    that feeds it runs inside the status callback and must not hold one. The Spoolman
+    gate lives HERE for the same reason: it is a settings read, and reading it on every
+    push (~1 Hz × fleet) to answer a question that matters only on a confirmation is
+    pure load. Fire-and-forget from ``main``, so it is fully guarded and returns the
+    stamped spools rather than raising (an exception would land in an orphaned task).
+
+    ``session_factory`` exists so a caller can supply the session maker; ``None`` means
+    the application's :data:`core.database.async_session` (imported lazily, matching the
+    other own-session services).
+    """
+    if not departed_trays:
+        return []
+    stamped: list[Spool] = []
+    try:
+        if session_factory is None:
+            from backend.app.core.database import async_session
+
+            session_factory = async_session
+        async with session_factory() as db:
+            if await _spoolman_enabled(db):
+                return []
+            for global_tray in departed_trays:
+                spool = await _mark_tray_spent(db, printer_id, global_tray)
+                if spool is not None:
+                    stamped.append(spool)
+    except Exception as e:  # noqa: BLE001 — a fire-and-forget task must never raise
+        logger.warning("Backup-swap confirm failed for printer %s trays %s: %s", printer_id, departed_trays, e)
+    return stamped
+
+
+async def capture_backup_swap(db: AsyncSession, printer_id: int, state) -> Spool | None:
+    """Sample + confirm in one call against the CALLER's session — tests-only entry point.
+
+    Production drives the two halves separately (:func:`sample_status_push` per status
+    push, :func:`confirm_backup_swaps` as a fire-and-forget task) because the sampling
+    cadence and the session-bearing work have different homes. This facade keeps the
+    single-call shape the incident-pin suite exercises: it runs the same sampler and
+    stamps through the same :func:`_mark_tray_spent`, so there is one implementation of
+    the decision logic and the pins keep testing what production runs.
+
+    Returns the first spool stamped by this call (or ``None``), matching the pre-split
+    signature. No-op in Spoolman mode.
+    """
+    departed = sample_status_push(printer_id, state)
+    if not departed:
+        return None
+    if await _spoolman_enabled(db):
+        return None
+    for global_tray in departed:
+        spool = await _mark_tray_spent(db, printer_id, global_tray)
+        if spool is not None:
+            return spool
+    return None
 
 
 # --- Tier 2 / 3: automatic re-spool or prompt ------------------------------

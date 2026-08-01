@@ -1357,6 +1357,23 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             "[RESPOOL] runout replay-seed hook failed for printer %s: %s", printer_id, _ne
         )
 
+    # Re-spool Tier 1, HMS-FREE runout: the seamless AMS backup swap. Sampled HERE, on
+    # every status push, and NOT from the AMS-change callback — that callback is gated
+    # on bambu_mqtt's AMS hash and tray_now is deliberately not hashed, so the tray_now
+    # edge this detector lives on was visible there only by accident (the drained slot's
+    # exist-bit wipe) and the stable-feeder window was starved of samples outright. The
+    # sampler is sync, in-memory and session-free precisely so it can ride this ~1 Hz
+    # cadence; only a CONFIRMED departure pays for a session, fired and forgotten with
+    # the Spoolman gate inside it.
+    try:
+        from backend.app.services.spool_respool import confirm_backup_swaps, sample_status_push
+
+        _departed_trays = sample_status_push(printer_id, state)
+        if _departed_trays:
+            asyncio.create_task(confirm_backup_swaps(printer_id, _departed_trays))
+    except Exception as _bse:  # noqa: BLE001 — sampling must never crash the status flow
+        logging.getLogger(__name__).warning("[RESPOOL] backup-swap sampler failed for printer %s: %s", printer_id, _bse)
+
     # Restart-replay HMS suppression (Phase D). Same one-shot shape as the runout
     # seed above and gated on the same "real report" rule: on the FIRST status push
     # per printer per process, every live code we have PROVABLY alerted on before
@@ -1400,7 +1417,12 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # ONCE here so the notify session's recovery-owned suppression and the
         # spool-recovery spawn below read the SAME set. hms_short_code is hoisted to
         # here (it also feeds the plate-occupancy and runout hooks further down).
-        from backend.app.services.hms_errors import _code_word, hms_short_code, runout_slot_from_hms
+        from backend.app.services.hms_errors import (
+            _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
+            _code_word,
+            hms_short_code,
+            runout_slot_from_hms,
+        )
         from backend.app.services.spool_recovery import RECOVERABLE_HMS_CODES
 
         _new_recoverable = {
@@ -1651,6 +1673,34 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                 except Exception as _re:  # noqa: BLE001 — capture must never crash the status flow
                     logging.getLogger(__name__).warning(
                         "[RESPOOL] spent-on-runout capture failed for printer %s: %s", printer_id, _re
+                    )
+
+            # Re-spool Tier 1, RESCUED runout: the sibling of the hook above for the
+            # runout the AMS backup handled itself. That one keys off RUNOUT_HMS_CODES
+            # — the UNRESCUED vocabulary — so a successful firmware auto-refill (which
+            # only raises the slot-attributed 0700_2X00 family and keeps printing) never
+            # stamped anything, and the un-stamped row later surfaced as a spurious
+            # "Fresh roll?" prompt on the physical swap. Attribution is the firmware's
+            # own attr, so the events carry (full_code, attr, code_word) per entry and
+            # the service stamps EACH — one job can chain several slot runouts. Only the
+            # auto-switch code word qualifies as spent evidence (the bare demand can be a
+            # firmware-latched bogus ask); the wider family stays slot-RESOLUTION only.
+            _new_slot_runout = [
+                (e.full_code, int(e.attr or 0), _code_word(e.code))
+                for e in current_hms_errors
+                if e.full_code in new_error_codes
+                and _code_word(e.code) in _RUNOUT_AUTO_SWITCH_SPENT_CODE32
+                and runout_slot_from_hms(int(e.attr or 0), _code_word(e.code)) is not None
+            ]
+            if _new_slot_runout:
+                try:
+                    from backend.app.services.spool_respool import mark_spent_on_slot_runout
+
+                    async with async_session() as _slot_respool_db:
+                        await mark_spent_on_slot_runout(_slot_respool_db, printer_id, _new_slot_runout, state)
+                except Exception as _sre:  # noqa: BLE001 — capture must never crash the status flow
+                    logging.getLogger(__name__).warning(
+                        "[RESPOOL] spent-on-slot-runout capture failed for printer %s: %s", printer_id, _sre
                     )
 
             # Runout DEMAND-CHANGE guidance refresh (006-H2S 2026-07-26). While a
@@ -2071,7 +2121,6 @@ async def on_ams_change(printer_id: int, ams_data: list):
                 from backend.app.services import spool_tagless
                 from backend.app.services.spool_respool import (
                     RESPOOL_TAG_TYPE,
-                    capture_backup_swap,
                     clear_respool_prompt_dedup,
                     maybe_auto_or_prompt_respool,
                     should_evaluate_respool,
@@ -2106,16 +2155,6 @@ async def on_ams_change(printer_id: int, ams_data: list):
                     logger.warning("AMS presence tracking failed for printer %s: %s", printer_id, _ape)
 
                 if not _spoolman_on or _spoolman_on.lower() != "true":
-                    # Reused-tag Tier 1: seamless AMS backup-swap runout detector (a
-                    # runout that may raise no HMS). One call per AMS push; the service
-                    # owns the tray_now edge state and is guarded so the AMS path never
-                    # breaks on a farm-side failure.
-                    try:
-                        _swap_state = printer_manager.get_status(printer_id)
-                        if _swap_state is not None:
-                            await capture_backup_swap(db, printer_id, _swap_state)
-                    except Exception as _bse:  # noqa: BLE001 — must never crash the AMS callback
-                        logger.warning("Backup-swap capture failed for printer %s: %s", printer_id, _bse)
                     # Whether AMS remain% may be folded into weight_used this sweep —
                     # computed once (durable legs: live gcode_state + printing-archive),
                     # replacing the restart-fragile _active_sessions snapshot (#880).

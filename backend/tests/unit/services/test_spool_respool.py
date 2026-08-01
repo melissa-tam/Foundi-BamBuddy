@@ -22,6 +22,7 @@ from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import spool_respool
 from backend.app.services.bambu_mqtt import HMSError
+from backend.app.services.hms_errors import hms_short_code
 from backend.app.services.spool_respool import (
     RESPOOL_TAG_TYPE,
     RespoolError,
@@ -30,6 +31,7 @@ from backend.app.services.spool_respool import (
     _remain_jump_reading,
     capture_backup_swap,
     mark_spent_on_runout,
+    mark_spent_on_slot_runout,
     maybe_auto_or_prompt_respool,
     note_commanded_load,
     rebroadcast_unresolved_respool_prompts,
@@ -565,9 +567,12 @@ def _running(tray_now, *, present=(0, 1, 2), subtask_id="job-A"):
 def _running_wiped(tray_now, *, seated=(), wiped=(), subtask_id="job-A"):
     """A RUNNING push where ``seated`` trays hold a spool and ``wiped`` trays have run
     fully to empty — the exist-bits wipe (``bambu_mqtt.apply_tray_exist_bits``) forced
-    state 9 / blank tray_type, so ``_tray_present`` reads them absent though the tray
+    state 9 / blank tray_type, so any presence read of them is ABSENT though the tray
     dict is still in the AMS payload. Models the run-to-empty backup switch behind the
-    2026-07-21 003-H2S incident.
+    2026-07-21 003-H2S incident. The detector no longer reads tray presence at all (the
+    open-time veto and its ``_tray_present`` helper are deleted): a departed stable
+    feeder that vanishes IS the run-dry signature, at open time and at confirm time
+    alike, which is exactly what these pushes assert.
     """
     state = MagicMock()
     state.state = "RUNNING"
@@ -674,8 +679,10 @@ async def test_backup_swap_run_to_empty_departed_absent_stamps_incident_pin(db_s
 
     Pre-fix (drop-on-absent): the first push where tray 1 read absent dropped the
     pending swap before the confirm window elapsed, so nothing was ever stamped — the
-    incident's unstamped rows. Mutation-verified: restoring the ``not _tray_present``
-    drop in ``_resolve_pending_swap`` makes this assert False (no stamp).
+    incident's unstamped rows. Today ``_resolve_pending_swap`` reads no presence at
+    all — CONFIRM-TIME TOLERANCE is the mechanism. Mutation-verified: re-adding a
+    departed-tray absence drop there (the deleted ``_tray_present`` check) makes this
+    assert False (no stamp).
     """
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 1, weight_used=500.0)  # the run-dry feeder
@@ -2184,3 +2191,454 @@ async def test_resolve_falls_back_to_tray_now_on_8011_only(db_session, printer_f
     marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state)
 
     assert marked is not None and marked.id == at_tray1.id  # tray_now fallback used
+
+
+@pytest.mark.asyncio
+async def test_resolve_8011_prefers_current_demand_over_first_decode_hit(db_session, printer_factory):
+    """006-H2S list shape: an OLDER auto-switched slot-1 entry sits ahead of the NEWER
+    slot-3 demand (firmware APPENDS). First-hit decode returns the oldest — the slot
+    the auto-switch trigger has already stamped — so ``_spent_dedup`` would swallow the
+    stamp and the actually-unrescued roll would never be marked. The standing DEMAND is
+    the unrescued slot and must win."""
+    printer = await printer_factory()
+    rescued = await _new_spool(db_session, weight_used=990)  # slot 1 = tray 0, already switched away from
+    unrescued = await _new_spool(db_session, weight_used=980)  # slot 3 = tray 2, the one held for
+    await _assign(db_session, printer.id, 0, 0, rescued.id)
+    await _assign(db_session, printer.id, 0, 2, unrescued.id)
+    await db_session.commit()
+
+    state = _make_state(0, 0, _tray(), gcode_state="PAUSE", tray_now=0)
+    state.subtask_id = "job-chained"
+    state.hms_errors = [
+        _slot_runout_err(attr=0x07002000, code=0x00030002),  # older: slot 1 auto-switched
+        _slot_runout_err(attr=0x07002200, code=0x00020001),  # newer: slot 3 demand (standing)
+        HMSError(code="8011", attr=0x07000000, module=7, severity=2),  # the trigger
+    ]
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state)
+
+    assert marked is not None and marked.id == unrescued.id  # the demanded slot
+    assert (await db_session.get(Spool, rescued.id)).spent_at is None  # first-hit target untouched
+
+
+# -- Fix 1: the firmware AUTO-SWITCH runout (a RESCUED runout stamps spent too) --
+# ``RUNOUT_HMS_CODES`` is the UNRESCUED vocabulary, so a successful AMS auto-refill
+# raised only the slot-attributed 0700_2X00 family and stamped nothing (fleet evidence
+# 2026-07-30: four confirmed auto-refills, zero stamps). The un-stamped rows then
+# surfaced as spurious "Fresh roll?" prompts on the eventual physical swap.
+
+
+def _slot_runout_err(*, attr: int, code: int) -> HMSError:
+    """A slot-attributed runout HMSError carrying the LOSSLESS ``full_code`` the new
+    family is identified by (the short code drops both the code-word high bits and the
+    slot byte, so it cannot tell 0x00020001 from 0x00030001, or slot 0 from slot 3)."""
+    return HMSError(
+        code=hex(code),
+        attr=attr,
+        module=7,
+        severity=2,
+        full_code=f"{attr:08X}{code:08X}",
+    )
+
+
+def _slot_event(err: HMSError) -> tuple[str, int, int]:
+    """The ``(full_code, attr, code_word)`` tuple main's pipeline hands the trigger."""
+    return (err.full_code, err.attr, int(err.code, 16))
+
+
+@pytest.mark.asyncio
+async def test_slot_runout_auto_switch_stamps_decoded_slot(db_session, printer_factory):
+    """The 009-H2S 2026-07-30 08:32 shape: 0x00030002 on attr 0x07002200 (AMS0 slot 3 =
+    tray 2) while the print keeps RUNNING off the backup slot. The attr names the
+    exhausted slot outright — tray_now points at the slot now FEEDING, so inference
+    would stamp the wrong (healthy) roll."""
+    printer = await printer_factory()
+    feeding = await _new_spool(db_session, weight_used=100)  # the backup that took over
+    exhausted = await _new_spool(db_session, weight_used=970)
+    await _assign(db_session, printer.id, 0, 0, feeding.id)
+    await _assign(db_session, printer.id, 0, 2, exhausted.id)
+    await db_session.commit()
+
+    state = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=0)  # feeding elsewhere
+    state.subtask_id = "job-auto"
+    err = _slot_runout_err(attr=0x07002200, code=0x00030002)
+    state.hms_errors = [err]
+
+    stamped = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(err)], state)
+
+    assert [s.id for s in stamped] == [exhausted.id]
+    assert (await db_session.get(Spool, exhausted.id)).spent_at is not None
+    assert (await db_session.get(Spool, feeding.id)).spent_at is None  # tray_now target untouched
+
+
+@pytest.mark.asyncio
+async def test_slot_runout_chained_multi_slot_each_stamps(db_session, printer_factory):
+    """The 005-H2S 2026-07-30 three-roll print: several slots run dry inside ONE job.
+    Attribution is per EVENT, so distinct attrs stamp distinct spools — resolving once
+    per push (or via tray_now) would stamp only one of them."""
+    printer = await printer_factory()
+    at_t0 = await _new_spool(db_session, weight_used=950)
+    at_t1 = await _new_spool(db_session, weight_used=960)
+    await _assign(db_session, printer.id, 0, 0, at_t0.id)
+    await _assign(db_session, printer.id, 0, 1, at_t1.id)
+    await db_session.commit()
+
+    state = _make_state(0, 0, _tray(), gcode_state="RUNNING", tray_now=2)
+    state.subtask_id = "job-chained"  # ONE job — the dedup key must still separate them
+    e0 = _slot_runout_err(attr=0x07002000, code=0x00030002)  # AMS0 slot 1 → tray 0
+    e1 = _slot_runout_err(attr=0x07002100, code=0x00030002)  # AMS0 slot 2 → tray 1
+    state.hms_errors = [e0, e1]
+
+    stamped = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(e0), _slot_event(e1)], state)
+
+    assert sorted(s.id for s in stamped) == sorted([at_t0.id, at_t1.id])
+    assert (await db_session.get(Spool, at_t0.id)).spent_at is not None
+    assert (await db_session.get(Spool, at_t1.id)).spent_at is not None
+
+
+@pytest.mark.asyncio
+async def test_slot_runout_demand_code_never_stamps(db_session, printer_factory):
+    """006-H2S latched-load pin. Every OTHER member of the slot-attributed family
+    decodes a slot perfectly well, so only the code-word gate stops them: a bare demand
+    can be a firmware-latched bogus ask for a slot that never ran dry, the purge notice
+    is transitional, and purge-abnormal is entangled with a tool-head fault. Pinned at
+    BOTH layers — the trigger's own re-assert and main's pipeline filter."""
+    from backend.app.services.hms_errors import _RUNOUT_AUTO_SWITCH_SPENT_CODE32, _code_word, runout_slot_from_hms
+
+    printer = await printer_factory()
+    healthy = await _new_spool(db_session, weight_used=300)
+    await _assign(db_session, printer.id, 0, 2, healthy.id)
+    await db_session.commit()
+
+    state = _make_state(0, 2, _tray(), gcode_state="PAUSE", tray_now=255)
+    state.subtask_id = "job-latched"
+    errs = [
+        _slot_runout_err(attr=0x07002200, code=0x00020001),  # bare demand
+        _slot_runout_err(attr=0x07002200, code=0x00030001),  # "please wait, purging"
+        _slot_runout_err(attr=0x07002200, code=0x00020005),  # purge-abnormal
+    ]
+
+    # Layer 1 — main's pipeline filter would never build an event for any of them,
+    # even though each decodes to a real slot (so the gate is the code word alone).
+    for err in errs:
+        code_word = _code_word(err.code)
+        assert runout_slot_from_hms(err.attr, code_word) is not None
+        assert code_word not in _RUNOUT_AUTO_SWITCH_SPENT_CODE32
+
+    # Layer 2 — handed to the trigger anyway, it fails closed on its own contract.
+    stamped = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(e) for e in errs], state)
+
+    assert stamped == []
+    assert (await db_session.get(Spool, healthy.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_slot_runout_seed_replay_noops_then_clear_refire_stamps(db_session, printer_factory):
+    """S1 for the new family: a code live at the first post-restart push is a replay of
+    a PRE-restart runout, not a fresh exhaustion. It stays suppressed until it clears
+    from ``hms_errors``, after which a genuine re-fire stamps."""
+    printer = await printer_factory()
+    spool = await _new_spool(db_session, weight_used=400)
+    await _assign(db_session, printer.id, 0, 2, spool.id)
+    await db_session.commit()
+
+    err = _slot_runout_err(attr=0x07002200, code=0x00030002)
+
+    s1 = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=0)
+    s1.subtask_id = "job-1"
+    s1.hms_errors = [err]
+    spool_respool.note_status_push(printer.id, s1)  # seeds the standing full_code
+
+    assert await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(err)], s1) == []
+    assert (await db_session.get(Spool, spool.id)).spent_at is None
+
+    s2 = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=0)
+    s2.hms_errors = []  # the code cleared → dropped from the seed
+    spool_respool.note_status_push(printer.id, s2)
+
+    s3 = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=0)
+    s3.subtask_id = "job-2"
+    s3.hms_errors = [err]
+    stamped = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(err)], s3)
+
+    assert [s.id for s in stamped] == [spool.id]
+    assert (await db_session.get(Spool, spool.id)).spent_at is not None
+
+
+@pytest.mark.asyncio
+async def test_slot_runout_seed_is_full_code_scoped_so_another_slot_still_stamps(db_session, printer_factory):
+    """Why the seed is keyed by ``full_code`` and not the short code: both slots render
+    ``0700_0002``, so a short-code seed would suppress a genuinely NEW runout on a
+    DIFFERENT slot — exactly the chained case this trigger exists for."""
+    printer = await printer_factory()
+    seeded_slot = await _new_spool(db_session, weight_used=990)
+    other_slot = await _new_spool(db_session, weight_used=970)
+    await _assign(db_session, printer.id, 0, 0, seeded_slot.id)
+    await _assign(db_session, printer.id, 0, 2, other_slot.id)
+    await db_session.commit()
+
+    standing = _slot_runout_err(attr=0x07002000, code=0x00030002)  # live across the restart
+    fresh = _slot_runout_err(attr=0x07002200, code=0x00030002)  # a NEW slot running dry
+    assert hms_short_code(standing.attr, standing.code) == hms_short_code(fresh.attr, fresh.code)
+
+    seed = _make_state(0, 0, _tray(), gcode_state="RUNNING", tray_now=1)
+    seed.subtask_id = "job-1"
+    seed.hms_errors = [standing]
+    spool_respool.note_status_push(printer.id, seed)
+
+    fire = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=1)
+    fire.subtask_id = "job-1"
+    fire.hms_errors = [standing, fresh]
+    stamped = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(standing), _slot_event(fresh)], fire)
+
+    assert [s.id for s in stamped] == [other_slot.id]  # only the un-seeded slot
+    assert (await db_session.get(Spool, seeded_slot.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_slot_runout_restart_replay_fresh_spool_not_stamped(db_session, printer_factory):
+    """End-to-end restart scenario for the new family (mirror of the 8011 pin): the
+    donor stamps pre-restart; the restart drops the in-memory dedup; the operator swaps
+    a fresh roll onto the slot; the same auto-switch code is still live at the first
+    post-restart push — the fresh roll must NOT be stamped."""
+    printer = await printer_factory()
+    donor = await _new_spool(db_session, weight_used=400)
+    await _assign(db_session, printer.id, 0, 2, donor.id)
+    await db_session.commit()
+
+    err = _slot_runout_err(attr=0x07002200, code=0x00030002)
+    pre = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=0)
+    pre.subtask_id = "job-1"
+    pre.hms_errors = [err]
+    stamped = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(err)], pre)
+    assert [s.id for s in stamped] == [donor.id]
+
+    spool_respool._reset_state()  # a server restart loses the dedup AND the seed
+
+    assignment = (
+        await db_session.execute(
+            select(SpoolAssignment).where(
+                SpoolAssignment.printer_id == printer.id,
+                SpoolAssignment.ams_id == 0,
+                SpoolAssignment.tray_id == 2,
+            )
+        )
+    ).scalar_one()
+    fresh = await _new_spool(db_session, weight_used=0)
+    assignment.spool_id = fresh.id
+    await db_session.commit()
+
+    post = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=0)
+    post.subtask_id = "job-1"
+    post.hms_errors = [err]
+    spool_respool.note_status_push(printer.id, post)  # first post-restart push seeds it
+
+    assert await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(err)], post) == []
+    assert (await db_session.get(Spool, fresh.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_slot_runout_same_job_dedup_one_stamp(db_session, printer_factory):
+    """A re-raised auto-switch on the SAME (printer, job, slot) must not stamp the
+    replacement roll the operator has since inserted (the 18:56 misattribution class)."""
+    printer = await printer_factory()
+    donor = await _new_spool(db_session, weight_used=990)
+    await _assign(db_session, printer.id, 0, 2, donor.id)
+    await db_session.commit()
+
+    state = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=0)
+    state.subtask_id = "job-1"
+    err = _slot_runout_err(attr=0x07002200, code=0x00030002)
+    state.hms_errors = [err]
+
+    first = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(err)], state)
+    assert [s.id for s in first] == [donor.id]
+
+    assignment = (
+        await db_session.execute(
+            select(SpoolAssignment).where(
+                SpoolAssignment.printer_id == printer.id,
+                SpoolAssignment.ams_id == 0,
+                SpoolAssignment.tray_id == 2,
+            )
+        )
+    ).scalar_one()
+    replacement = await _new_spool(db_session, weight_used=0)
+    assignment.spool_id = replacement.id
+    await db_session.commit()
+
+    assert await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(err)], state) == []
+    assert (await db_session.get(Spool, replacement.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_slot_runout_spoolman_noop(db_session, printer_factory):
+    """Spoolman owns the spool lifecycle → every Tier-1 entry point no-ops."""
+    from backend.app.api.routes.settings import set_setting
+
+    printer = await printer_factory()
+    spool = await _new_spool(db_session, weight_used=990)
+    await _assign(db_session, printer.id, 0, 2, spool.id)
+    await set_setting(db_session, "spoolman_enabled", "true")
+    await db_session.commit()
+
+    state = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=0)
+    state.subtask_id = "job-1"
+    err = _slot_runout_err(attr=0x07002200, code=0x00030002)
+
+    assert await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(err)], state) == []
+    assert (await db_session.get(Spool, spool.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_slot_runout_ams_ht_attr_fails_closed(db_session, printer_factory):
+    """AMS-HT units carry unit ids ≥ 0x80, which ``ams_slot_from_attr`` rejects (unit
+    must be ≤ 7). The decode fails closed rather than folding the id into a wrong AMS,
+    so nothing is stamped — Path B's tray_now sampler remains the cover there."""
+    from backend.app.services.hms_errors import ams_slot_from_attr
+
+    printer = await printer_factory()
+    spool = await _new_spool(db_session, weight_used=990)
+    await _assign(db_session, printer.id, 0, 2, spool.id)
+    await db_session.commit()
+
+    state = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=0)
+    state.subtask_id = "job-1"
+    err = _slot_runout_err(attr=0x07802200, code=0x00030002)  # unit id 0x80 = AMS-HT
+    assert ams_slot_from_attr(err.attr) is None
+
+    assert await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(err)], state) == []
+    assert (await db_session.get(Spool, spool.id)).spent_at is None
+
+
+# -- Fix 2: Path B per-push sampling + the deleted open-time absence veto --------
+# The backup-swap detector used to hang off the AMS-change callback, which fires only
+# on an AMS HASH change — and tray_now is deliberately not hashed. The switch therefore
+# became visible only when the drained slot's exist-bit wipe moved the hash, and at that
+# exact observation the open-time ``_tray_present(state, prev)`` gate read the departed
+# slot ABSENT and vetoed the pending swap: the event that revealed the edge was the event
+# the gate rejected. Fleet evidence 2026-07-30/31: four confirmed auto-refills, zero
+# stamps. The detector is now a per-push sampler (no DB) + a confirm task (own session).
+
+
+def _sampler_stable_feeder(printer_id, tray, clock, *, present=(0, 1, 2), subtask_id="job-A"):
+    """Confirm ``tray`` as the stable feeder driving :func:`sample_status_push` DIRECTLY
+    — the production path, where the samples arrive ~1 Hz instead of only on AMS-hash
+    changes. Same three-push shape as ``_establish_stable_feeder``: a seeding boundary
+    push, then two same-value samples ≥ _SWAP_CONFIRM_S apart. Nothing confirms."""
+    for _ in range(2):
+        assert (
+            spool_respool.sample_status_push(printer_id, _running(tray, present=present, subtask_id=subtask_id)) == []
+        )
+    clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    assert spool_respool.sample_status_push(printer_id, _running(tray, present=present, subtask_id=subtask_id)) == []
+    assert spool_respool._stable_feeder.get(printer_id) == tray
+
+
+def _own_session_factory(test_engine):
+    """An independent session maker on the test engine — the shape
+    :func:`confirm_backup_swaps` takes in production (``core.database.async_session``),
+    so the confirm half is exercised opening and committing its OWN session rather than
+    borrowing the test's."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    return async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+@pytest.mark.asyncio
+async def test_backup_swap_open_time_absent_departed_still_stamps(db_session, printer_factory, fake_clock):
+    """INCIDENT PIN (2026-07-30 08:32, 009-H2S / printer 7). The stable feeder (tray 1)
+    runs dry and the firmware auto-switches to tray 0. The exist-bit wipe lands WITH the
+    push that first reveals the edge, so the departed tray already reads absent (state 9
+    / blank tray_type) at OPEN time, not merely at confirm time. The pending swap must
+    still open and confirm — a stable feeder that vanished exactly as tray_now left it IS
+    the run-to-empty signature, which is why the open-time veto was deleted.
+
+    Distinct from the 2026-07-21 003-H2S pin above: there the departed tray was still
+    seated at the edge and only wiped inside the window (the CONFIRM-time tolerance).
+    Mutation-verified: restoring ``if not _tray_present(state, prev): return confirmed``
+    in ``sample_status_push`` makes this assert False (no pending, no stamp).
+    """
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 1, weight_used=500.0)  # the run-dry feeder
+    await _establish_stable_feeder(db_session, printer.id, 1, fake_clock, present=(0, 1))
+
+    # The edge push itself already carries the wipe: tray_now 1→0 AND tray 1 absent.
+    assert await capture_backup_swap(db_session, printer.id, _running_wiped(0, seated=(0,), wiped=(1,))) is None
+    assert spool_respool._pending_swaps.get(printer.id) == (1, 0, fake_clock["t"])  # opened despite absence
+
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    marked = await capture_backup_swap(db_session, printer.id, _running_wiped(0, seated=(0,), wiped=(1,)))
+
+    assert marked is not None and marked.id == spool.id
+    assert marked.spent_at is not None
+    assert marked.weight_used == 500.0  # true ledger preserved
+
+
+@pytest.mark.asyncio
+async def test_sample_status_push_confirms_and_confirm_task_stamps(
+    db_session, test_engine, printer_factory, fake_clock
+):
+    """The production wiring end to end: the sync sampler carries every push, reports the
+    departed tray on the push that confirms, and the async confirmer — on its OWN session,
+    as ``main`` fires it — turns that into the spent stamp."""
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=500.0)
+
+    _sampler_stable_feeder(printer.id, 0, fake_clock)
+
+    # Edge 0→1 opens the pending swap; the sampler reports nothing yet.
+    assert spool_respool.sample_status_push(printer.id, _running(1)) == []
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    departed = spool_respool.sample_status_push(printer.id, _running(1))
+    assert departed == [0]  # the departed GLOBAL tray, not the new feeder
+
+    stamped = await spool_respool.confirm_backup_swaps(
+        printer.id, departed, session_factory=_own_session_factory(test_engine)
+    )
+
+    assert [s.id for s in stamped] == [spool.id]
+    await db_session.refresh(spool)  # the stamp was committed by the confirmer's session
+    assert spool.spent_at is not None
+    assert spool.weight_used == 500.0
+
+
+@pytest.mark.asyncio
+async def test_confirm_backup_swaps_spoolman_noop(db_session, test_engine, printer_factory):
+    """Spoolman owns the spool lifecycle → the confirmer stamps nothing even with a
+    confirmed departure. The gate lives HERE and not in the sampler: it is a settings
+    read, and the sampler runs on every status push."""
+    from backend.app.api.routes.settings import set_setting
+
+    printer = await printer_factory()
+    spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=500.0)
+    await set_setting(db_session, "spoolman_enabled", "true")
+    await db_session.commit()
+
+    stamped = await spool_respool.confirm_backup_swaps(
+        printer.id, [0], session_factory=_own_session_factory(test_engine)
+    )
+
+    assert stamped == []
+    await db_session.refresh(spool)
+    assert spool.spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_sample_status_push_job_boundary_discards(db_session, printer_factory, fake_clock):
+    """The 2026-07-20 spool-106 boundary pin, through the sampler: job A's stable feeder
+    must not make job B's dispatch-mapped feeder change look like a firmware backup
+    switch. A subtask change (incl. ``None``↔value) discards the edge state, so no
+    departure is ever reported and the still-full roll is not stamped."""
+    printer = await printer_factory()
+    tray0_spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=250.0)  # must NOT be stamped
+
+    _sampler_stable_feeder(printer.id, 0, fake_clock, subtask_id="A")
+
+    # Job B: the boundary resets the edge trackers and re-seeds tray_now — no pending.
+    assert spool_respool.sample_status_push(printer.id, _running(2, subtask_id="B")) == []
+    assert printer.id not in spool_respool._stable_feeder
+    assert printer.id not in spool_respool._pending_swaps
+
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    assert spool_respool.sample_status_push(printer.id, _running(2, subtask_id="B")) == []
+    assert (await db_session.get(Spool, tray0_spool.id)).spent_at is None
