@@ -22,6 +22,7 @@ it propagate as a dispatch failure it retries.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 from dataclasses import dataclass
@@ -59,11 +60,22 @@ class PendingEject:
     between dispatch and terminal can rehydrate the entry (W1). The plate gate is
     persisted independently and only auto-clears once the eject's terminal (live or
     reconciled) is positively matched.
+
+    ``expected_runtime_s`` (from the build) and ``started_at`` (stamped when the
+    printer echoes the sweep's START) are the runtime guard's two inputs — see
+    :func:`eject_runtime_anomaly`. Both default to None and BOTH are None on a
+    rehydrated entry: the durable mirror is a single timestamp column on the queue
+    unit, not the built artifact, so a restart between dispatch and terminal cannot
+    reconstruct either. The guard then stands down, which is the intended degrade —
+    a post-restart eject already falls into the unverifiable-path handling
+    (``rearm_on_startup`` degrades those gates to escalation-only holds).
     """
 
     purpose: EjectPurpose
     run_id: int | None
     queue_item_id: int | None
+    expected_runtime_s: float | None = None
+    started_at: datetime | None = None
 
 
 # printer_id -> the one in-flight eject on that printer.
@@ -73,6 +85,19 @@ _pending_eject: dict[int, PendingEject] = {}
 # crash that never cleared and are dropped (NULLed) with a WARNING rather than
 # rehydrated — no eject stays "in flight" across a day-long outage.
 _PENDING_EJECT_STALE_TTL_H = 24
+
+# How far past its estimate an eject may run before the sweep is UNVERIFIED.
+#
+# Calibrated on the 2026-07-31 gouged-plate incident (H2S): an ejected part lodged
+# under the heatbed, the next eject's bed-drop — an OPEN-LOOP absolute move, since
+# the validator forbids re-homing Z with a part on the plate — stalled against it,
+# lost steps, and returned the bed too high, so the sweep gouged the build plate.
+# The job still reported ``completed``: there is no Z telemetry in MQTT and no HMS
+# fires for a silent stall, leaving RUNTIME as the only observable signature. Eight
+# nominal ejects on that profile ran 80-83 s (≈123 s at this factor); the incident
+# ran 179 s. The margin is wide on purpose — the guard's only cost when it is wrong
+# is one printer waiting for a human, while missing a real stall costs a plate.
+EJECT_RUNTIME_GUARD_FACTOR = 1.5
 
 # The canonical eject-job-name convention, minted at dispatch. Two shapes:
 #   * queue-item-bound (production / first-article): ``eject_{purpose}_item{queue_item_id}``
@@ -142,6 +167,43 @@ def peek_pending_eject(printer_id: int) -> PendingEject | None:
 def pending_eject_printer_ids() -> list[int]:
     """Printer ids that currently have a pending eject (live or hydrated)."""
     return list(_pending_eject.keys())
+
+
+def mark_pending_eject_started(printer_id: int) -> None:
+    """Stamp the pending eject on ``printer_id`` with the moment the sweep STARTED.
+
+    Called from the print-START callback, i.e. when the printer has echoed that it
+    began executing the eject file — not when we uploaded or commanded it. Only that
+    edge measures machine time: upload + job spin-up vary with file size and FTPS
+    conditions and would otherwise be charged to the sweep.
+
+    IDEMPOTENT by first-write-wins: a duplicate/replayed start echo keeps the
+    original stamp, so a chatty printer can never shorten a measured runtime into
+    looking nominal. A no-op when nothing is registered (a non-eject start, or a
+    hydrated entry whose printer re-echoes)."""
+    pending = _pending_eject.get(printer_id)
+    if pending is None or pending.started_at is not None:
+        return
+    _pending_eject[printer_id] = dataclasses.replace(pending, started_at=datetime.now(timezone.utc))
+
+
+def eject_runtime_anomaly(pending: PendingEject, *, now: datetime | None = None) -> tuple[float, float] | None:
+    """``(actual_s, expected_s)`` when this eject ran anomalously long, else None.
+
+    The runtime guard's single decision. Returns None — stands down — unless BOTH
+    inputs are present: a rehydrated (post-restart) pending carries neither, and an
+    eject whose start echo never arrived carries no ``started_at``. Fail-open is
+    correct here because the guard is a SUPPLEMENT to the terminal-status check, not
+    a replacement: absent evidence must not turn a genuinely completed sweep into a
+    held plate.
+
+    ``now`` is injectable so the caller can log and decide against one instant."""
+    if pending.started_at is None or pending.expected_runtime_s is None:
+        return None
+    actual_s = ((now or datetime.now(timezone.utc)) - pending.started_at).total_seconds()
+    if actual_s > pending.expected_runtime_s * EJECT_RUNTIME_GUARD_FACTOR:
+        return (actual_s, pending.expected_runtime_s)
+    return None
 
 
 def matches_pending_eject(
@@ -381,19 +443,26 @@ async def dispatch_part_present_eject(
     plate_id = item.plate_id or 1
     eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=queue_item_id, phase="building")
     try:
-        eject_path = await build_part_present_eject_file(source_path, plate_id, profile, geometry)
+        built = await build_part_present_eject_file(source_path, plate_id, profile, geometry)
     except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=queue_item_id, phase="failed")
         raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc
 
-    pending = PendingEject(purpose=purpose, run_id=run_id, queue_item_id=queue_item_id)
+    # Carry the build's runtime estimate into the pending: the terminal handler is
+    # the only place it can be used, and by then the built file is long deleted.
+    pending = PendingEject(
+        purpose=purpose,
+        run_id=run_id,
+        queue_item_id=queue_item_id,
+        expected_runtime_s=built.expected_runtime_s,
+    )
     # The eject file's FTPS upload transiently drops the H2S sdcard flag; mark the
     # printer upload-in-flight so the USB-drop verifier ignores that dispatch blip.
     async with upload_in_flight(printer.id):
         await _upload_start_register_eject(
             db,
             printer=printer,
-            eject_path=eject_path,
+            eject_path=built.path,
             job_stem=f"eject_{purpose}_item{queue_item_id}",
             plate_id=plate_id,
             pending=pending,
@@ -447,19 +516,24 @@ async def dispatch_foreign_eject(
 
     eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=None, phase="building")
     try:
-        eject_path = await build_part_present_eject_file(Path(source_path), plate_id, profile, geometry)
+        built = await build_part_present_eject_file(Path(source_path), plate_id, profile, geometry)
     except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=None, phase="failed")
         raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc
 
-    pending = PendingEject(purpose="manual", run_id=None, queue_item_id=None)
+    # A manual/foreign sweep carries the estimate too — it never gates the plate
+    # (an operator is present, and this path owns no run), but the terminal handler
+    # logs the comparison so a foreign donor's ejects join the same runtime series.
+    pending = PendingEject(
+        purpose="manual", run_id=None, queue_item_id=None, expected_runtime_s=built.expected_runtime_s
+    )
     # Same as the production path: the FTPS upload transiently drops the H2S sdcard
     # flag; mark the printer upload-in-flight so the USB-drop verifier ignores the blip.
     async with upload_in_flight(printer.id):
         await _upload_start_register_eject(
             db,
             printer=printer,
-            eject_path=eject_path,
+            eject_path=built.path,
             job_stem=f"eject_manual_p{printer_id}",
             plate_id=plate_id,
             pending=pending,

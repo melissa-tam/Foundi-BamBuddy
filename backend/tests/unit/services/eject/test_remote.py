@@ -3,6 +3,7 @@
 import os
 import tempfile
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -94,9 +95,14 @@ class TestDispatchPartPresentEject:
                 await remote.dispatch_part_present_eject(
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=555
                 )
-            # Pending registered with the typed tuple.
+            # Pending registered with the typed identity...
             pending = remote.peek_pending_eject(printer.id)
-            assert pending == remote.PendingEject("production", 555, item.id)
+            assert (pending.purpose, pending.run_id, pending.queue_item_id) == ("production", 555, item.id)
+            # ...carrying the build's runtime estimate for the terminal-side guard,
+            # and NOT yet started (that stamp lands on the printer's start echo).
+            assert pending.expected_runtime_s is not None
+            assert pending.expected_runtime_s > 0
+            assert pending.started_at is None
             # EVERY pre-print calibration OFF (never probe/shake with a part present).
             start.assert_called_once()
             kwargs = start.call_args.kwargs
@@ -392,8 +398,11 @@ class TestDispatchForeignEject:
                     db_session, printer_id=printer.id, profile_id=prof.id, source_path=source, plate_id=1
                 )
             pending = remote.peek_pending_eject(printer.id)
-            assert pending == remote.PendingEject("manual", None, None)
-            assert pending.queue_item_id is None
+            assert (pending.purpose, pending.run_id, pending.queue_item_id) == ("manual", None, None)
+            # A manual sweep carries the estimate too (logged at its terminal), but
+            # never gates the plate on it — an operator is standing at the machine.
+            assert pending.expected_runtime_s is not None
+            assert pending.expected_runtime_s > 0
             # The uploaded/started filename derives from the printer-keyed manual stem.
             started_name = start.call_args.args[1]
             assert started_name == f"eject_manual_p{printer.id}.3mf"
@@ -517,3 +526,70 @@ class TestDispatchPartPresentEjectProfileGuard:
             assert "eject profile" in str(exc.value).lower()
         finally:
             source.unlink(missing_ok=True)
+
+
+class TestEjectRuntimeGuard:
+    """The runtime guard's two primitives (2026-07-31 gouged-plate incident).
+
+    A stalled bed-drop leaves NO trace in MQTT — no Z telemetry, no HMS — and the
+    job still reports ``completed``. Elapsed execution time is the only signature,
+    so it is measured from the printer's own START echo to its terminal."""
+
+    async def test_mark_started_stamps_once_and_is_idempotent(self):
+        pid = 90001
+        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 5, expected_runtime_s=82.0))
+        try:
+            assert remote.peek_pending_eject(pid).started_at is None
+            remote.mark_pending_eject_started(pid)
+            first = remote.peek_pending_eject(pid).started_at
+            assert first is not None
+            # A duplicate/replayed start echo must NOT restart the clock — that would
+            # shorten a measured runtime back under the threshold.
+            remote.mark_pending_eject_started(pid)
+            assert remote.peek_pending_eject(pid).started_at == first
+            # The rest of the identity survives the re-registration.
+            pending = remote.peek_pending_eject(pid)
+            assert (pending.purpose, pending.run_id, pending.queue_item_id) == ("production", 1, 5)
+            assert pending.expected_runtime_s == 82.0
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_mark_started_on_absent_pending_is_a_noop(self):
+        remote.mark_pending_eject_started(90002)  # must not raise
+        assert remote.peek_pending_eject(90002) is None
+
+    async def test_anomaly_stands_down_without_both_inputs(self):
+        # A rehydrated (post-restart) pending has neither field; a pending whose start
+        # echo never arrived has no stamp. Absent evidence never converts a genuinely
+        # completed sweep into a held plate.
+        started = datetime.now(timezone.utc) - timedelta(seconds=600)
+        assert remote.eject_runtime_anomaly(remote.PendingEject("production", 1, 5)) is None
+        assert remote.eject_runtime_anomaly(remote.PendingEject("production", 1, 5, expected_runtime_s=82.0)) is None
+        assert remote.eject_runtime_anomaly(remote.PendingEject("production", 1, 5, started_at=started)) is None
+
+    async def test_at_or_under_threshold_is_nominal(self):
+        # 82 s expected → 123 s threshold. The eight nominal ejects on the incident's
+        # profile ran 80-83 s; even a doubled-latency 120 s sweep stays nominal.
+        now = datetime.now(timezone.utc)
+        for elapsed in (80.0, 83.0, 120.0, 123.0):
+            pending = remote.PendingEject(
+                "production", 1, 5, expected_runtime_s=82.0, started_at=now - timedelta(seconds=elapsed)
+            )
+            assert remote.eject_runtime_anomaly(pending, now=now) is None, elapsed
+
+    async def test_over_threshold_reports_actual_and_expected(self):
+        # The incident itself: 179 s against an 82 s estimate.
+        now = datetime.now(timezone.utc)
+        pending = remote.PendingEject(
+            "production", 1, 5, expected_runtime_s=82.0, started_at=now - timedelta(seconds=179)
+        )
+        anomaly = remote.eject_runtime_anomaly(pending, now=now)
+        assert anomaly is not None
+        actual_s, expected_s = anomaly
+        assert actual_s == pytest.approx(179.0, abs=0.5)
+        assert expected_s == 82.0
+
+    async def test_guard_factor_is_the_documented_one_five(self):
+        # Cited by number in the terminal handler's WARNING and in the operator's
+        # escalation text; a silent change would move the whole calibration.
+        assert remote.EJECT_RUNTIME_GUARD_FACTOR == 1.5

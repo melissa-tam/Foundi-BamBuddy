@@ -2870,8 +2870,14 @@ async def on_print_start(printer_id: int, data: dict):
         )
         # Eject-progress telemetry (C4): the sweep has started printing on the printer.
         from backend.app.services.eject import progress as _eject_progress
-        from backend.app.services.eject.remote import peek_pending_eject as _peek_pending_eject
+        from backend.app.services.eject.remote import (
+            mark_pending_eject_started as _mark_pending_eject_started,
+            peek_pending_eject as _peek_pending_eject,
+        )
 
+        # Runtime guard (2026-07-31): this echo is the only moment the sweep's own
+        # execution clock starts. Idempotent — a duplicate start keeps the first stamp.
+        _mark_pending_eject_started(printer_id)
         _pending = _peek_pending_eject(printer_id)
         _eject_progress.emit_eject_progress(
             printer_id=printer_id,

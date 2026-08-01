@@ -1432,6 +1432,136 @@ class TestOnTerminalEjectHandling:
             remote.pop_pending_eject(printer.id)
 
 
+class TestProductionEjectRuntimeGuard:
+    """A production eject that ran far longer than its estimate is UNVERIFIED.
+
+    2026-07-31 incident: an ejected part lodged under the heatbed; the next eject's
+    open-loop bed-drop stalled against it and lost Z steps, so the bed returned high
+    and the sweep gouged the plate. The job still ended ``completed`` (179 s vs the
+    80-83 s of every nominal eject) and auto-released the gate onto the damaged
+    plate. Runtime is the only observable signature — there is no Z telemetry and no
+    HMS fires."""
+
+    async def _mk_printer(self, db, name):
+        p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(p)
+        await db.flush()
+        return p
+
+    @staticmethod
+    def _fake_client(subtask):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(last_dispatch_subtask_id=subtask)
+
+    async def test_overlong_completed_eject_holds_gate_and_escalates(self, db_session):
+        from backend.app.services.eject import monitor as monitor_mod, remote
+
+        printer = await self._mk_printer(db_session, "RGslow")
+        batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        remote.register_pending_eject(
+            printer.id,
+            remote.PendingEject(
+                "production",
+                batch.id,
+                111,
+                expected_runtime_s=82.0,
+                started_at=datetime.now(timezone.utc) - timedelta(seconds=179),
+            ),
+        )
+        cleared = []
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+                patch.object(
+                    farm_policy.printer_manager,
+                    "set_awaiting_plate_clear",
+                    side_effect=lambda pid, v, **kw: cleared.append((pid, v)),
+                ),
+                patch.object(farm_policy, "quarantine_printer", new_callable=AsyncMock) as quarantine,
+                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
+                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
+            ):
+                await farm_policy.on_terminal(db_session, printer.id, None, "completed", completed_subtask_id="SUB-E")
+            assert remote.peek_pending_eject(printer.id) is None  # job ended → popped
+            assert cleared == []  # gate KEPT — the plate waits for a human
+            escalate.assert_called_once_with(printer.id)
+            notify.assert_awaited_once()
+            # The operator is told the runtime, not just "plate not empty".
+            detail = notify.await_args.kwargs["source_detail"]
+            assert "179" in detail and "82" in detail
+            # A gate hold already takes the printer out of rotation; quarantining on a
+            # suspicion would also fail the run's other printers' rebalance.
+            quarantine.assert_not_awaited()
+            await db_session.refresh(printer)
+            assert printer.quarantined is False
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+    async def test_nominal_runtime_releases_gate_as_before(self, db_session):
+        from backend.app.services.eject import monitor as monitor_mod, remote
+
+        printer = await self._mk_printer(db_session, "RGok")
+        batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        remote.register_pending_eject(
+            printer.id,
+            remote.PendingEject(
+                "production",
+                batch.id,
+                112,
+                expected_runtime_s=82.0,
+                started_at=datetime.now(timezone.utc) - timedelta(seconds=81),
+            ),
+        )
+        cleared = []
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+                patch.object(
+                    farm_policy.printer_manager,
+                    "set_awaiting_plate_clear",
+                    side_effect=lambda pid, v, **kw: cleared.append((pid, v)),
+                ),
+                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
+                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
+            ):
+                await farm_policy.on_terminal(db_session, printer.id, None, "completed", completed_subtask_id="SUB-E")
+            assert cleared == [(printer.id, False)]  # unchanged behaviour
+            escalate.assert_not_called()
+            notify.assert_not_awaited()
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+    async def test_guard_stands_down_on_a_rehydrated_pending(self, db_session):
+        # A pending rebuilt from the durable stamp after a restart carries neither the
+        # estimate nor the start time (the mirror is one timestamp column, not the
+        # built artifact). Absent evidence must not convert a completed sweep into a
+        # held plate — the post-restart gate already degrades to escalation-only.
+        from backend.app.services.eject import monitor as monitor_mod, remote
+
+        printer = await self._mk_printer(db_session, "RGhyd")
+        batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        remote.register_pending_eject(printer.id, remote.PendingEject("production", batch.id, 113))
+        cleared = []
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+                patch.object(
+                    farm_policy.printer_manager,
+                    "set_awaiting_plate_clear",
+                    side_effect=lambda pid, v, **kw: cleared.append((pid, v)),
+                ),
+                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
+                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
+            ):
+                await farm_policy.on_terminal(db_session, printer.id, None, "completed", completed_subtask_id="SUB-E")
+            assert cleared == [(printer.id, False)]  # gate released
+            escalate.assert_not_called()
+            notify.assert_not_awaited()
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+
 class TestFaEjectCooldownGate:
     """approve-with-remote-eject honours the release threshold: hot bed defers to
     the FA cooldown watch (motion-only file must not sweep a hot plate); cold bed
