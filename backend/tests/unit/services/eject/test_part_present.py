@@ -9,8 +9,12 @@ from pathlib import Path
 import pytest
 
 from backend.app.models.eject_profile import EjectProfile
-from backend.app.services.eject.dispatch import build_part_present_eject_file
-from backend.app.services.eject.generator import EjectGenerationError
+from backend.app.services.eject.dispatch import BuiltEject, build_part_present_eject_file
+from backend.app.services.eject.generator import (
+    EJECT_RUNTIME_OVERHEAD_S,
+    EjectGenerationError,
+    estimate_runtime_s,
+)
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
 from backend.app.utils.threemf_tools import (
     extract_filament_usage_from_3mf,
@@ -87,7 +91,7 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf()
         out = None
         try:
-            out = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            out = (await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)).path
             gcode = _read_plate_gcode(out)
         finally:
             src.unlink(missing_ok=True)
@@ -118,7 +122,7 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf()
         out = None
         try:
-            out = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            out = (await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)).path
             with zipfile.ZipFile(out, "r") as zf:
                 gcode_bytes = zf.read("Metadata/plate_1.gcode")
                 md5 = zf.read("Metadata/plate_1.gcode.md5").decode("ascii")
@@ -154,7 +158,7 @@ class TestBuildPartPresentEjectFile:
             assert any(s["used_g"] > 0 for s in donor_slots)
             assert extract_print_time_from_3mf(src, plate_id=1) == 16735
 
-            out = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            out = (await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)).path
             slots = extract_filament_usage_from_3mf(out, plate_id=1)
             prediction = extract_print_time_from_3mf(out, plate_id=1)
         finally:
@@ -167,6 +171,27 @@ class TestBuildPartPresentEjectFile:
         assert prediction == 0
 
     @pytest.mark.asyncio
+    async def test_returns_path_plus_runtime_estimate(self):
+        # The build is the ONLY place the expected runtime is derivable (it needs the
+        # exact block generated for this part height / profile / geometry), and it is
+        # consumed much later at the eject's terminal — so it travels with the
+        # artifact rather than being re-derived from a file that is deleted by then.
+        src = _make_3mf()
+        built = None
+        try:
+            built = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            assert isinstance(built, BuiltEject)
+            assert built.path.exists()
+            # The estimate is of the EJECT BLOCK — what actually replaced the plate
+            # G-code — so it must exceed the fixed overhead by the sweep's motion.
+            assert built.expected_runtime_s > EJECT_RUNTIME_OVERHEAD_S
+            assert built.expected_runtime_s == estimate_runtime_s(_read_plate_gcode(built.path))
+        finally:
+            src.unlink(missing_ok=True)
+            if built:
+                built.path.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
     async def test_h2c_dual_nozzle_home_flows_through_shared_path(self):
         # The part-present builder flows through the SAME generator + validator as
         # production injection: an H2C build must carry the dual-nozzle
@@ -176,7 +201,7 @@ class TestBuildPartPresentEjectFile:
         src = _make_3mf()
         out = None
         try:
-            out = await build_part_present_eject_file(src, 1, _profile(), H2C_GEOMETRY)
+            out = (await build_part_present_eject_file(src, 1, _profile(), H2C_GEOMETRY)).path
             gcode = _read_plate_gcode(out)
         finally:
             src.unlink(missing_ok=True)

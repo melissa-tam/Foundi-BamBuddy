@@ -1,14 +1,20 @@
 """Golden-structure tests for the eject G-code generator."""
 
+import logging
+import math
+import pathlib
 from dataclasses import replace
 
 import pytest
 
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.generator import (
+    EJECT_RUNTIME_OVERHEAD_S,
     EjectGenerationError,
+    estimate_runtime_s,
     generate_eject_gcode,
 )
+from backend.app.services.eject.remote import EJECT_RUNTIME_GUARD_FACTOR
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
 from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
@@ -515,3 +521,147 @@ class TestBedslingerBedDropGuard:
         assert "bed-drop release assist" not in gcode
         result = validate_eject_gcode(gcode, profile, 30.0, geom)
         assert result.ok, result.errors
+
+
+# The single-pass shape that was running in production on 2026-07-31: bed-drop from
+# the lift height to the machine bottom and back, then ONE sweep lane at F3000 across
+# the 324 mm Y span, then park. Hand-built (not generated) so the calibration figures
+# it pins — 80-83 s observed nominal, 179 s during the gouged-plate incident — stay
+# readable next to the assertion instead of hiding behind a profile fixture.
+_INCIDENT_SHAPE_BLOCK = """\
+; ===== FARM EJECT BLOCK profile=singlepass =====
+M17
+G28 X Y
+G90
+G1 Z60.1 F900
+M140 S0
+; --- bed-drop release assist: full down + return ---
+G1 Z340 F900
+G1 Z60.1 F900
+; --- sweep ---
+G1 X3 Y322 F9000
+G1 Z50 F600
+G1 X3 F9000
+G1 Y-2 F3000
+G1 Y322 F9000
+G1 Z60.1 F900
+G1 X170 Y160 F9000
+M400 S1
+M18
+"""
+
+
+class TestEstimateRuntime:
+    """The runtime estimator behind the eject runtime guard (2026-07-31 incident).
+
+    It exists to answer ONE question — "did this sweep take far longer than the
+    motion it was told to perform?" — so these pin the rules that keep the estimate
+    honest, not a precise duration."""
+
+    def test_every_golden_lands_in_a_sane_band(self):
+        # Finite, above the fixed overhead, and nowhere near a runaway. The committed
+        # goldens lock the 4-descent × 11-lane recipe (55 full-width sweeps), so they
+        # score ~590-640 s — an order of magnitude above the single-pass production
+        # profile. The band is deliberately wide: this asserts the estimator never
+        # returns garbage for a real block, while the shape-specific calibration is
+        # pinned by test_incident_shape_matches_observed_nominal below.
+        golden_dir = pathlib.Path(__file__).parent / "golden"
+        goldens = sorted(golden_dir.glob("*.gcode"))
+        assert goldens, "golden fixtures missing"
+        for path in goldens:
+            seconds = estimate_runtime_s(path.read_text())
+            assert math.isfinite(seconds)
+            assert EJECT_RUNTIME_OVERHEAD_S < seconds < 900, f"{path.name} estimated {seconds:.1f}s"
+
+    def test_bed_drop_pair_is_counted(self):
+        # The drop goldens differ from their namesakes ONLY by the bed-drop pair
+        # (lift 40 → 290 → 40 at F900 = 500 mm ≈ 33.3 s). That move is the one that
+        # stalled in the incident, so it must be fully inside the estimate.
+        golden_dir = pathlib.Path(__file__).parent / "golden"
+        plain = estimate_runtime_s((golden_dir / "default_h2s_z30.gcode").read_text())
+        with_drop = estimate_runtime_s((golden_dir / "drop_h2s_z30.gcode").read_text())
+        assert with_drop - plain == pytest.approx(500.0 / 900.0 * 60.0, abs=0.01)
+
+    def test_dwell_inside_a_conditional_block_is_not_counted(self):
+        # The stock finish tail's air-purification blocks each hold an M400 S180 that
+        # fires only when the firmware set print_finish_air_filt_flag — no farm printer
+        # does. Counting them would add 360 s and make the guard unable to ever fire.
+        skipped = "M622 J1\nM400 S180\nM623\n"
+        counted = "M400 S180\n"
+        assert estimate_runtime_s(skipped) == pytest.approx(EJECT_RUNTIME_OVERHEAD_S)
+        assert estimate_runtime_s(counted) == pytest.approx(EJECT_RUNTIME_OVERHEAD_S + 180.0)
+
+    def test_conditional_prepare_line_also_opens_the_skip(self):
+        # The stock tail opens with `M622.1 S0` before the J1/J2 arms; everything from
+        # it to the next M623 is conditional either way.
+        gcode = "M622.1 S0\nM1002 judge_flag print_finish_air_filt_flag\nM400 S180\nM623\nM400 S1\n"
+        assert estimate_runtime_s(gcode) == pytest.approx(EJECT_RUNTIME_OVERHEAD_S + 1.0)
+
+    def test_bare_m400_dwells_zero(self):
+        assert estimate_runtime_s("M400\n") == pytest.approx(EJECT_RUNTIME_OVERHEAD_S)
+
+    def test_modal_feedrate_persists_across_lines(self):
+        # F is modal: the second move carries no F and must inherit F600, not be
+        # dropped as feedless. 60 mm at F600 = 6 s per move.
+        gcode = "G28 X Y\nG1 X60 F600\nG1 X120\n"
+        assert estimate_runtime_s(gcode) == pytest.approx(EJECT_RUNTIME_OVERHEAD_S + 12.0)
+
+    def test_move_before_any_feedrate_contributes_nothing(self):
+        # Defensive: the generator always emits an explicit F, so a feedless leading
+        # move means the input is not one of ours — score it 0 rather than guess.
+        assert estimate_runtime_s("G28 X Y\nG1 X100\n") == pytest.approx(EJECT_RUNTIME_OVERHEAD_S)
+
+    def test_unknown_axis_first_move_contributes_zero(self):
+        # G28 zeroes X/Y but NEVER Z (the eject prologue must not home Z with a part
+        # on the plate), so the prologue's first Z lift has no known origin and is
+        # unmeasurable. It still makes Z known — the bed-drop that follows IS counted.
+        prologue_only = "M17\nG28 X Y\nG90\nG1 Z60 F900\n"
+        assert estimate_runtime_s(prologue_only) == pytest.approx(EJECT_RUNTIME_OVERHEAD_S)
+        then_dropped = prologue_only + "G1 Z340 F900\n"
+        assert estimate_runtime_s(then_dropped) == pytest.approx(EJECT_RUNTIME_OVERHEAD_S + 280.0 / 900.0 * 60.0)
+
+    def test_torque_home_dialect_zeroes_xy_like_the_bare_form(self):
+        # Dual-nozzle models home with G28 X T300 / G28 Y T300 (a bare G28 X Y
+        # stall-loops that firmware). Both dialects must establish the same datum,
+        # or every H2C estimate would silently lose its first sweep move.
+        bare = "G28 X Y\nG1 X60 Y0 F600\n"
+        torque = "G28 X T300\nG28 Y T300\nG1 X60 Y0 F600\n"
+        assert estimate_runtime_s(torque) == pytest.approx(estimate_runtime_s(bare))
+
+    def test_comments_are_stripped(self):
+        assert estimate_runtime_s("; G1 X999 F60\n") == pytest.approx(EJECT_RUNTIME_OVERHEAD_S)
+
+    def test_incident_shape_matches_observed_nominal(self):
+        # THE calibration: the single-pass profile running on 2026-07-31 executed in
+        # 80-83 s across eight nominal ejects. The estimate must land in that
+        # neighbourhood — too low and the guard fires on healthy sweeps, too high and
+        # the 179 s incident slips under the ×1.5 threshold.
+        seconds = estimate_runtime_s(_INCIDENT_SHAPE_BLOCK)
+        assert 67.0 <= seconds <= 97.0, f"estimated {seconds:.1f}s, expected 82±15s"
+        # And the incident's 179 s must be caught while a nominal 82 s is not.
+        assert seconds * EJECT_RUNTIME_GUARD_FACTOR < 179.0
+        assert seconds * EJECT_RUNTIME_GUARD_FACTOR >= 82.0
+
+
+class TestBuildSummaryLog:
+    """The build emits exactly one INFO line carrying the geometry it just baked in.
+
+    The emitted G-code is never persisted (it lives inside a temp artifact), so
+    before this line the 2026-07-31 incident could only be reconstructed by
+    re-deriving the block through the preview endpoint."""
+
+    def test_summary_names_the_drop_target(self, caplog):
+        with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):
+            generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY)
+        lines = [r.getMessage() for r in caplog.records]
+        assert len(lines) == 1
+        assert "model=H2S" in lines[0]
+        assert "max_z=30" in lines[0]
+        assert "lift_z=40" in lines[0]
+        assert "drop_z=290" in lines[0]  # z_travel 340 - clearance 50
+        assert "lanes=11" in lines[0]
+
+    def test_summary_says_off_when_bed_drop_disabled(self, caplog):
+        with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):
+            generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
+        assert "drop_z=off" in caplog.records[0].getMessage()

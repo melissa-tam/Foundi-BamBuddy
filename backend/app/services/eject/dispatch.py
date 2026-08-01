@@ -12,6 +12,8 @@ pure, reusable pieces that survived that move:
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,6 +23,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.services.eject.build_cache import EjectBuildError, get_or_build_eject_file
 from backend.app.services.eject.generator import (
     EjectGenerationError,
+    estimate_runtime_s,
     generate_eject_gcode,
 )
 from backend.app.services.eject.validator import validate_eject_gcode
@@ -31,6 +34,23 @@ if TYPE_CHECKING:
 
     from backend.app.models.eject_profile import EjectProfile
     from backend.app.services.eject.geometry import ModelGeometry
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class BuiltEject:
+    """A built eject artifact plus the runtime the machine is expected to need for it.
+
+    The estimate travels WITH the file because it is only derivable at build time
+    (from the exact block that was generated for this part height / profile /
+    geometry) and is consumed much later, at the eject job's terminal, to decide
+    whether the sweep can be trusted. Dispatch threads it onto the
+    :class:`~backend.app.services.eject.remote.PendingEject` that survives until then.
+    """
+
+    path: Path
+    expected_runtime_s: float
 
 
 def _parse_max_z_height(source_path: Path, plate_id: int) -> float | None:
@@ -68,7 +88,7 @@ async def build_part_present_eject_file(
     plate_id: int,
     profile: EjectProfile,
     geometry: ModelGeometry,
-) -> Path:
+) -> BuiltEject:
     """Build a standalone PART-PRESENT, MOTION-ONLY eject-only ``.gcode.3mf`` for ``plate_id``.
 
     The plate's G-code is REPLACED ENTIRELY (via ``repack_3mf_with_gcode``, MD5
@@ -95,7 +115,10 @@ async def build_part_present_eject_file(
     :func:`get_or_build_eject_file` (latency Phase C2); the cheap gcode
     generation+validation stays here (the cache key needs the final gcode text).
 
-    Returns the temp ``.gcode.3mf`` :class:`Path` (caller cleans it up). Raises
+    Returns a :class:`BuiltEject` — the temp ``.gcode.3mf`` path (caller cleans it
+    up) plus the runtime the block is expected to take. The estimate is taken from
+    the EJECT BLOCK text, which is exactly what replaces the plate G-code, i.e.
+    exactly what the printer executes; anything else in the archive is inert. Raises
     :class:`EjectGenerationError` on any failure.
     """
     max_z = _parse_max_z_height(Path(source_path), plate_id)
@@ -106,8 +129,18 @@ async def build_part_present_eject_file(
     validation = validate_eject_gcode(block, profile, max_z, geometry)
     if not validation.ok:
         raise EjectGenerationError("Part-present eject validation failed: " + "; ".join(validation.errors))
+    expected_runtime_s = estimate_runtime_s(block)
 
     try:
-        return await get_or_build_eject_file(Path(source_path), plate_id, block)
+        path = await get_or_build_eject_file(Path(source_path), plate_id, block)
     except EjectBuildError as exc:
         raise EjectGenerationError(f"Failed to repack the part-present eject 3mf: {exc}") from exc
+    logger.info(
+        "eject.dispatch: built part-present eject from %s plate %s (max_z %.2fmm, profile %r) — expected runtime %.0fs",
+        Path(source_path).name,
+        plate_id,
+        max_z,
+        profile.name,
+        expected_runtime_s,
+    )
+    return BuiltEject(path=path, expected_runtime_s=expected_runtime_s)

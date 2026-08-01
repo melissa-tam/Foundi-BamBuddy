@@ -17,6 +17,13 @@ rectangle and the envelope both arrive as a :class:`ModelGeometry` resolved from
 the ``printer_model_geometry`` registry (``services.eject.geometry``), so adding
 a printer model is a DB row, not a code change.
 
+The module also owns :func:`estimate_runtime_s`, the EXPECTED execution time of a
+generated block. There is no Z telemetry in the MQTT feed, so an eject whose
+bed-drop stalls against an obstruction (lost steps, bed returning too high) still
+reports ``completed`` — job RUNTIME is the only observable signature of that
+failure. The estimate is what the runtime guard compares the eject's real
+execution time against (``eject.remote.eject_runtime_anomaly``).
+
 Two optional tunings narrow the sweep: an X sub-band (``sweep_x_min_mm`` /
 ``sweep_x_max_mm``) confines the lanes to part of the bed width instead of the
 full width, and ``sweep_start_frac`` starts the descending sweep at a fraction
@@ -38,6 +45,8 @@ closed.
 
 from __future__ import annotations
 
+import logging
+import math
 from typing import TYPE_CHECKING
 
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME, is_bedslinger_model, is_dual_nozzle_model
@@ -45,6 +54,8 @@ from backend.app.utils.printer_models import DUAL_NOZZLE_HOME, is_bedslinger_mod
 if TYPE_CHECKING:
     from backend.app.models.eject_profile import EjectProfile
     from backend.app.services.eject.geometry import ModelGeometry
+
+logger = logging.getLogger(__name__)
 
 # Minimum width (mm) of an explicit X sweep sub-band. Narrower than this the
 # toolhead cannot reliably clear a part across the band, so a tighter band is a
@@ -58,6 +69,16 @@ SWEEP_BAND_MIN_WIDTH_MM = 10.0
 # module constant (not an inline literal) so the same value is the validator's
 # park-Z floor for the upper-Z ceiling guard (``_fmt(10.0)`` == "10", byte-identical).
 PARK_Z_MM = 10.0
+
+# Non-motion seconds every eject job spends regardless of its geometry: the
+# firmware's job spin-up before the first move, the finish-chime epilogue
+# (``M1006`` melody, which the motion math cannot see) and the FINISH publish
+# latency that lands the terminal in our callback. CALIBRATED FROM PRODUCTION: the
+# motion math below scores the current single-pass profile at ~57 s while eight
+# nominal ejects executed in 80-83 s wall clock. Added once to every estimate — it
+# is deliberately generous, because the guard that consumes the estimate must
+# never fire on a healthy sweep.
+EJECT_RUNTIME_OVERHEAD_S = 25.0
 
 # The dual-nozzle homing forms (``DUAL_NOZZLE_HOME`` / ``DUAL_NOZZLE_FULL_HOME``)
 # live in ``utils.printer_models`` — the single canonical source of truth shared
@@ -159,6 +180,101 @@ def _linspace(start: float, end: float, count: int) -> list[float]:
 def block_start_marker(profile: EjectProfile) -> str:
     """The exact block-start marker comment for `profile` (also used by validator)."""
     return f"{BLOCK_START_PREFIX}{profile.name} ====="
+
+
+def estimate_runtime_s(gcode: str) -> float:
+    """Expected wall-clock execution time (seconds) of an eject block.
+
+    A deliberately small kinematic model — constant-velocity moves at the modal
+    feedrate, no acceleration/jerk profile — because it feeds a ×1.5 anomaly
+    threshold, not a progress bar. It systematically UNDER-states a real machine
+    (which must accelerate into every move), which is the safe direction: the
+    :data:`EJECT_RUNTIME_OVERHEAD_S` constant absorbs the difference and the guard
+    factor absorbs the rest.
+
+    Domain rules baked in:
+
+    * **``M622``/``M623`` conditional blocks are skipped entirely.** The stock
+      finish tail's air-purification blocks each hold an ``M400 S180``; those fire
+      only when the firmware set ``print_finish_air_filt_flag``, which no farm
+      printer does. Counting them would add 360 s to every estimate and make the
+      guard structurally unable to fire.
+    * **``G28`` (any dialect — ``G28 X Y``, the dual-nozzle torque forms
+      ``G28 X T300`` / ``G28 Y T300``) zeroes X and Y and leaves Z UNKNOWN.** The
+      eject prologue never homes Z (a part sits on the plate), so the block's Z
+      datum is whatever the finished print left behind and is not derivable here.
+    * **A move on an axis with no known prior position contributes 0 mm.** The
+      prologue's first ``G1 Z<lift> F900`` is exactly this case: real, but
+      unmeasurable. It becomes known afterwards, so the bed-drop pair that follows
+      — the move that stalled in the 2026-07-31 under-bed-obstruction incident —
+      IS fully counted.
+    * ``M400 S<n>`` outside a skipped block dwells ``n`` seconds; a bare ``M400``
+      (queue drain) dwells 0.
+    * A move emitted before any feedrate has been seen contributes no time
+      (defensive — the generator always emits an explicit F).
+    """
+    total_s = 0.0
+    feed_mm_min: float | None = None
+    # None = position not yet known on that axis (see the G28/unknown-axis rules).
+    pos: dict[str, float | None] = {"X": None, "Y": None, "Z": None}
+    in_conditional = False
+
+    for raw_line in gcode.splitlines():
+        code = raw_line.split(";", 1)[0].strip()
+        if not code:
+            continue
+        # ``M622.1 S0`` (the conditional PREPARE) also opens the skip: everything
+        # from it to the next ``M623`` is firmware-conditional either way, and the
+        # dwell we must not count lives inside.
+        if code.startswith("M622"):
+            in_conditional = True
+            continue
+        if in_conditional:
+            if code.startswith("M623"):
+                in_conditional = False
+            continue
+
+        tokens = code.split()
+        word = tokens[0].upper()
+
+        if word.startswith("G28"):
+            pos["X"] = 0.0
+            pos["Y"] = 0.0
+            continue
+
+        if word == "M400":
+            for token in tokens[1:]:
+                if token[0].upper() == "S":
+                    try:
+                        total_s += float(token[1:])
+                    except ValueError:
+                        pass
+                    break
+            continue
+
+        if word not in ("G0", "G1"):
+            continue
+
+        # Per-axis distance against the LAST KNOWN position; an axis whose prior
+        # position is unknown contributes 0 to this move and becomes known after it.
+        squared = 0.0
+        for token in tokens[1:]:
+            axis = token[0].upper()
+            try:
+                value = float(token[1:])
+            except ValueError:
+                continue
+            if axis == "F":
+                feed_mm_min = value
+            elif axis in pos:
+                prior = pos[axis]
+                if prior is not None:
+                    squared += (value - prior) ** 2
+                pos[axis] = value
+        if feed_mm_min and squared > 0:
+            total_s += math.sqrt(squared) / feed_mm_min * 60.0
+
+    return total_s + EJECT_RUNTIME_OVERHEAD_S
 
 
 def generate_eject_gcode(
@@ -295,6 +411,7 @@ def generate_eject_gcode(
     # height — a mechanical jolt to release a part the sweep alone can't shift.
     # NULL clearance = assist off (the 5 golden fixtures stay byte-identical).
     bed_drop = profile.bed_drop_clearance_mm
+    drop_z: float | None = None
     if bed_drop is not None:
         if is_bedslinger_model(geometry.model_key):
             # A bed-slinger's bed is fixed in Z (the gantry carries Z), so there is
@@ -365,4 +482,24 @@ def generate_eject_gcode(
     lines.append(COMPLETION_EPILOGUE)
 
     lines.append(BLOCK_END_MARKER)
+
+    # The ONE place these numbers are recorded. The emitted G-code is never
+    # persisted (the artifact is a temp file, the block only ever lived inside it),
+    # so before this line the 2026-07-31 gouged-plate incident could only be
+    # reconstructed by re-deriving the geometry through the preview endpoint. Every
+    # figure a post-incident reader needs about what the machine was told to do —
+    # the bed-drop target above all — is here, per built file.
+    logger.info(
+        "eject.generator: built block profile=%r model=%s max_z=%smm lift_z=%s drop_z=%s "
+        "sweep_z=%s lanes=%d span=[%s, %s]",
+        profile.name,
+        geometry.model_key,
+        _fmt(max_z_height),
+        _fmt(lift_z),
+        _fmt(drop_z) if drop_z is not None else "off",
+        [_fmt(z) for z in z_levels],
+        len(x_lanes),
+        _fmt(lane_lo),
+        _fmt(lane_hi),
+    )
     return "\n".join(lines) + "\n"
