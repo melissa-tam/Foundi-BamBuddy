@@ -38,7 +38,7 @@ class EjectProfile(Base):
     x_passes: Mapped[int] = mapped_column(Integer, default=11, nullable=False)
     x_margin_mm: Mapped[float] = mapped_column(Float, default=3.0, nullable=False)
     front_overhang_mm: Mapped[float] = mapped_column(Float, default=2.0, nullable=False)
-    back_overhang_mm: Mapped[float] = mapped_column(Float, default=2.0, nullable=False)
+    back_overhang_mm: Mapped[float] = mapped_column(Float, default=15.0, nullable=False)
 
     # Optional X sweep sub-band (mm). When BOTH are set, the sweep lanes span
     # [sweep_x_min_mm, sweep_x_max_mm] instead of the full margin-inset bed
