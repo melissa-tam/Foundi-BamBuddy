@@ -276,10 +276,11 @@ async def on_terminal(
                 # incident's timeline had to be rebuilt by hand from print history
                 # because nothing ever recorded how long a sweep took; one INFO line
                 # per eject makes "is 179 s unusual?" answerable from the logs alone.
-                # One instant is captured here and reused by the guard below, so the
-                # line an operator reads and the decision taken cannot disagree.
-                now = datetime.now(timezone.utc)
-                actual_s = (now - pending.started_at).total_seconds() if pending.started_at is not None else None
+                actual_s = (
+                    (datetime.now(timezone.utc) - pending.started_at).total_seconds()
+                    if pending.started_at is not None
+                    else None
+                )
                 if actual_s is not None:
                     logger.info(
                         "farm_policy: %s eject on printer %s ran %.0fs (expected %s)",
@@ -288,6 +289,32 @@ async def on_terminal(
                         actual_s,
                         f"{pending.expected_runtime_s:.0f}s" if pending.expected_runtime_s is not None else "n/a",
                     )
+                if pending.runtime_exceeded_at is not None:
+                    # The in-flight watchdog already stopped this job and paged the
+                    # operator. Whatever status the printer echoed — cancelled/failed
+                    # from our stop, or completed when the stop lost the race or an
+                    # MQTT drop let the file run out — the sweep is UNVERIFIED: never
+                    # release the gate, never finalise an FA approval, never quarantine
+                    # (an obstruction suspicion is not a hardware fault; the held gate
+                    # alone parks the printer). Purpose-independent: a stalling machine
+                    # deserves stopping no matter who asked for the sweep. No
+                    # notification here — the watchdog owns paging, so honouring the
+                    # mark can never double-alert.
+                    logger.warning(
+                        "farm_policy: %s eject on printer %s ended '%s' after the in-flight watchdog stopped it "
+                        "(ran %s vs expected %s) — sweep UNVERIFIED, plate stays gated for a human",
+                        pending.purpose,
+                        printer_id,
+                        final_status,
+                        f"{actual_s:.0f}s" if actual_s is not None else "n/a",
+                        f"{pending.expected_runtime_s:.0f}s" if pending.expected_runtime_s is not None else "n/a",
+                    )
+                    # Lazy import: the monitor imports farm_policy, so a module-level
+                    # import here is a cycle (same pattern as _dispatch_remote_eject).
+                    from backend.app.services.eject.monitor import eject_cooldown_monitor
+
+                    eject_cooldown_monitor.start_escalation_only_watch(printer_id)  # idempotent re-arm
+                    return
                 if pending.purpose == "fa":
                     if final_status == "completed":
                         if pending.run_id is not None:
@@ -328,56 +355,6 @@ async def on_terminal(
                     return
                 # production eject
                 if final_status == "completed":
-                    # RUNTIME GUARD (2026-07-31 gouged-plate incident): "completed" only
-                    # proves the file ran to EOF, not that the toolhead followed it. A
-                    # part lodged under the heatbed stalled the bed-drop — an open-loop
-                    # absolute move, because the validator forbids re-homing Z with a
-                    # part on the plate — costing steps, so the bed came back high and
-                    # the sweep gouged the plate. Nothing in the MQTT feed sees that (no
-                    # Z telemetry, no HMS): the job just took 179 s instead of 80-83 s,
-                    # then auto-released the gate onto a damaged plate. An over-long
-                    # sweep is therefore UNVERIFIED, not successful. Only fa/manual are
-                    # exempt: an FA plate is held for operator inspection regardless, and
-                    # a manual eject has the operator standing at the machine.
-                    anomaly = eject_remote.eject_runtime_anomaly(pending, now=now)
-                    if anomaly is not None:
-                        anomalous_s, expected_s = anomaly
-                        logger.warning(
-                            "farm_policy: production eject on printer %s ran %.0fs vs expected %.0fs "
-                            "(>%.1fx) — sweep UNVERIFIED, suspect an under-bed obstruction or Z steps lost "
-                            "during the bed-drop; plate stays gated for a human (no quarantine)",
-                            printer_id,
-                            anomalous_s,
-                            expected_s,
-                            eject_remote.EJECT_RUNTIME_GUARD_FACTOR,
-                        )
-                        # Immediate escalation — the operator must inspect the plate
-                        # (and the machine's underside) before anything prints on it.
-                        # Lazy import: the monitor imports farm_policy, so a module-level
-                        # import here is a cycle (same pattern as _dispatch_remote_eject).
-                        from backend.app.services.eject.monitor import (
-                            _default_notify_plate_not_empty,
-                            eject_cooldown_monitor,
-                        )
-
-                        try:
-                            await _default_notify_plate_not_empty(
-                                printer_id,
-                                source_detail=(
-                                    f"the eject sweep ran {anomalous_s:.0f}s instead of the expected "
-                                    f"{expected_s:.0f}s — it may have stalled against an obstruction. "
-                                    "Check under the heatbed and inspect the build plate before resuming."
-                                ),
-                            )
-                        except Exception:  # noqa: BLE001 — a notify failure must not abort terminal handling
-                            logger.exception(
-                                "farm_policy: runtime-anomaly notification failed for printer %s", printer_id
-                            )
-                        # Re-escalate on the existing cadence if the alert is ignored; the
-                        # raised gate alone takes the printer out of rotation (and un-pins
-                        # model-targeted units), so no quarantine and no run pause.
-                        eject_cooldown_monitor.start_escalation_only_watch(printer_id)
-                        return
                     printer_manager.set_awaiting_plate_clear(printer_id, False)
                     logger.info(
                         "farm_policy: production eject on printer %s completed — plate-clear gate released", printer_id

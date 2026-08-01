@@ -21,8 +21,9 @@ The module also owns :func:`estimate_runtime_s`, the EXPECTED execution time of 
 generated block. There is no Z telemetry in the MQTT feed, so an eject whose
 bed-drop stalls against an obstruction (lost steps, bed returning too high) still
 reports ``completed`` — job RUNTIME is the only observable signature of that
-failure. The estimate is what the runtime guard compares the eject's real
-execution time against (``eject.remote.eject_runtime_anomaly``).
+failure. The estimate is what the in-flight runtime watchdog turns into an abort
+deadline (``eject.remote.eject_abort_deadline_s``), so an eject still executing at
+that deadline is STOPPED mid-job instead of judged after the fact.
 
 Two optional tunings narrow the sweep: an X sub-band (``sweep_x_min_mm`` /
 ``sweep_x_max_mm``) confines the lanes to part of the bed width instead of the

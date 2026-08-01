@@ -22,9 +22,11 @@ it propagate as a dispatch failure it retries.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +34,7 @@ from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import select
 
+from backend.app.core.tasks import spawn_background_task
 from backend.app.models.archive import PrintArchive
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.library import LibraryFile
@@ -62,13 +65,20 @@ class PendingEject:
     reconciled) is positively matched.
 
     ``expected_runtime_s`` (from the build) and ``started_at`` (stamped when the
-    printer echoes the sweep's START) are the runtime guard's two inputs — see
-    :func:`eject_runtime_anomaly`. Both default to None and BOTH are None on a
+    printer echoes the sweep's START) are what the in-flight runtime watchdog arms
+    on — see :func:`_runtime_watchdog`. Both default to None and BOTH are None on a
     rehydrated entry: the durable mirror is a single timestamp column on the queue
     unit, not the built artifact, so a restart between dispatch and terminal cannot
-    reconstruct either. The guard then stands down, which is the intended degrade —
+    reconstruct either. The watchdog then never arms, which is the intended degrade —
     a post-restart eject already falls into the unverifiable-path handling
     (``rearm_on_startup`` degrades those gates to escalation-only holds).
+
+    ``runtime_exceeded_at`` is that watchdog's verdict, and the watchdog is the ONE
+    authority on eject runtime: it stamps this mark the moment the abort deadline
+    passes (before it even sends the stop, so a terminal racing in must already see
+    it). The terminal handler only HONORS the mark — it never re-computes a runtime
+    judgement of its own, so the machine cannot be stopped on one criterion and then
+    judged on another.
     """
 
     purpose: EjectPurpose
@@ -76,28 +86,59 @@ class PendingEject:
     queue_item_id: int | None
     expected_runtime_s: float | None = None
     started_at: datetime | None = None
+    runtime_exceeded_at: datetime | None = None
 
 
 # printer_id -> the one in-flight eject on that printer.
 _pending_eject: dict[int, PendingEject] = {}
+
+# printer_id -> the armed runtime watchdog for that printer's in-flight eject.
+# One entry at most: an eject is one-per-printer by construction, and every path
+# that ends an eject (resolution, or a new dispatch) drops the entry.
+_runtime_watchdogs: dict[int, asyncio.Task] = {}
 
 # Rows whose durable eject stamp is older than this at startup are treated as a
 # crash that never cleared and are dropped (NULLed) with a WARNING rather than
 # rehydrated — no eject stays "in flight" across a day-long outage.
 _PENDING_EJECT_STALE_TTL_H = 24
 
-# How far past its estimate an eject may run before the sweep is UNVERIFIED.
+# How far past its estimate an eject may run before the watchdog STOPS the job.
 #
 # Calibrated on the 2026-07-31 gouged-plate incident (H2S): an ejected part lodged
 # under the heatbed, the next eject's bed-drop — an OPEN-LOOP absolute move, since
 # the validator forbids re-homing Z with a part on the plate — stalled against it,
 # lost steps, and returned the bed too high, so the sweep gouged the build plate.
 # The job still reported ``completed``: there is no Z telemetry in MQTT and no HMS
-# fires for a silent stall, leaving RUNTIME as the only observable signature. Eight
-# nominal ejects on that profile ran 80-83 s (≈123 s at this factor); the incident
-# ran 179 s. The margin is wide on purpose — the guard's only cost when it is wrong
-# is one printer waiting for a human, while missing a real stall costs a plate.
-EJECT_RUNTIME_GUARD_FACTOR = 1.5
+# fires for a silent stall, leaving RUNTIME as the only observable signature.
+#
+# 11 measured production ejects all ran 80-83 s against an 83 s estimate (the
+# estimator lands within ~3 s of the machine), so that profile's deadline is ~104 s.
+# The stall accrues in the drop/return phase, which precedes the sweep at ~45 s in,
+# so firing at +21 s pre-empts any pre-sweep stall longer than 59 s — the incident's
+# was ~97 s. Nominal ejects finish with ~20 s of margin to spare.
+#
+# The 20 s FLOOR protects against TELEMETRY, not motion: it is the printer's FINISH
+# echo over MQTT that cancels the watchdog, so on a short profile the floor is what
+# keeps an ordinary connection hiccup from aborting a perfectly healthy sweep. The
+# 60 s CAP stops a long multi-pass eject (~10 min) from inheriting minutes of
+# scraping margin, which a pure ×1.5 factor would hand it.
+EJECT_ABORT_MARGIN_FRAC = 0.25
+EJECT_ABORT_MARGIN_MIN_S = 20.0
+EJECT_ABORT_MARGIN_MAX_S = 60.0
+
+# Delay before the single stop-command retry when the first send was not delivered.
+_STOP_RETRY_DELAY_S = 5.0
+
+
+def eject_abort_deadline_s(expected_runtime_s: float) -> float:
+    """Seconds of execution after which an eject is aborted mid-flight.
+
+    ``expected`` plus a margin of 25% of the estimate, clamped to [20 s, 60 s]."""
+    margin_s = min(
+        max(expected_runtime_s * EJECT_ABORT_MARGIN_FRAC, EJECT_ABORT_MARGIN_MIN_S), EJECT_ABORT_MARGIN_MAX_S
+    )
+    return expected_runtime_s + margin_s
+
 
 # The canonical eject-job-name convention, minted at dispatch. Two shapes:
 #   * queue-item-bound (production / first-article): ``eject_{purpose}_item{queue_item_id}``
@@ -153,6 +194,15 @@ def expected_eject_stem(pending: PendingEject) -> str:
 
 
 def register_pending_eject(printer_id: int, pending: PendingEject) -> None:
+    # A watchdog left over from a previous eject on this printer must never survive
+    # into the new one — it would judge THIS sweep against the PREVIOUS deadline and
+    # stop a healthy job. Cancelling here is the synchronous half (this function is
+    # called off the dispatch path, which cannot await); the coroutine's own
+    # ``finally`` deregisters, and its identity re-check is the belt for a cancel
+    # that lands after the deadline already elapsed.
+    stale = _runtime_watchdogs.pop(printer_id, None)
+    if stale is not None:
+        stale.cancel()
     _pending_eject[printer_id] = pending
 
 
@@ -180,30 +230,130 @@ def mark_pending_eject_started(printer_id: int) -> None:
     IDEMPOTENT by first-write-wins: a duplicate/replayed start echo keeps the
     original stamp, so a chatty printer can never shorten a measured runtime into
     looking nominal. A no-op when nothing is registered (a non-eject start, or a
-    hydrated entry whose printer re-echoes)."""
+    hydrated entry whose printer re-echoes).
+
+    This edge also ARMS the in-flight runtime watchdog, because it is the first
+    moment a deadline can be measured from. Two cases never arm: a pending with no
+    ``expected_runtime_s`` (a rehydrated post-restart entry — there is no estimate to
+    judge against, and the startup reconciler already owns those gates fail-closed),
+    and a printer that already has a watchdog registered."""
     pending = _pending_eject.get(printer_id)
     if pending is None or pending.started_at is not None:
         return
-    _pending_eject[printer_id] = dataclasses.replace(pending, started_at=datetime.now(timezone.utc))
+    started = dataclasses.replace(pending, started_at=datetime.now(timezone.utc))
+    _pending_eject[printer_id] = started
+    if started.expected_runtime_s is None or printer_id in _runtime_watchdogs:
+        return
+    _runtime_watchdogs[printer_id] = spawn_background_task(
+        _runtime_watchdog(printer_id, started), name=f"eject-runtime-watchdog-{printer_id}"
+    )
 
 
-def eject_runtime_anomaly(pending: PendingEject, *, now: datetime | None = None) -> tuple[float, float] | None:
-    """``(actual_s, expected_s)`` when this eject ran anomalously long, else None.
+async def _runtime_watchdog(
+    printer_id: int,
+    armed: PendingEject,
+    *,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Stop the eject on ``printer_id`` if it is still executing at its abort deadline.
 
-    The runtime guard's single decision. Returns None — stands down — unless BOTH
-    inputs are present: a rehydrated (post-restart) pending carries neither, and an
-    eject whose start echo never arrived carries no ``started_at``. Fail-open is
-    correct here because the guard is a SUPPLEMENT to the terminal-status check, not
-    a replacement: absent evidence must not turn a genuinely completed sweep into a
-    held plate.
+    This is the machine-stopping half of the 2026-07-31 gouged-plate response, and it
+    acts DURING the job rather than at its terminal: the stall accrues in the bed
+    drop/return phase, which finishes before the sweep begins, so a job still running
+    past its deadline is stopped while the toolhead has not yet dragged across the
+    plate. Judging the same evidence at the terminal — as the mechanism this replaces
+    did — can only ever report a scrape that already happened.
 
-    ``now`` is injectable so the caller can log and decide against one instant."""
-    if pending.started_at is None or pending.expected_runtime_s is None:
-        return None
-    actual_s = ((now or datetime.now(timezone.utc)) - pending.started_at).total_seconds()
-    if actual_s > pending.expected_runtime_s * EJECT_RUNTIME_GUARD_FACTOR:
-        return (actual_s, pending.expected_runtime_s)
-    return None
+    The normal exit is CANCELLATION: :func:`clear_pending_eject` cancels this task the
+    instant the eject's terminal is consumed, so a nominal sweep never reaches the
+    body below. The identity re-check after the sleep is the belt for the races that
+    cancellation loses (a terminal handled between wake-up and re-check, or a new
+    eject dispatched onto the printer). ``sleep`` is injectable so tests can drive the
+    whole sequence without wall-clock waits."""
+    # The arming gate refuses a pending with no estimate, so this is always a float.
+    deadline_s = eject_abort_deadline_s(armed.expected_runtime_s)  # type: ignore[arg-type]
+    try:
+        await sleep(deadline_s)
+        current = peek_pending_eject(printer_id)
+        if current is None or (
+            current.queue_item_id,
+            current.purpose,
+            current.started_at,
+        ) != (armed.queue_item_id, armed.purpose, armed.started_at):
+            # Resolved or superseded while we slept — the sweep this task was armed
+            # for no longer owns the printer, and stopping now would abort someone
+            # else's job.
+            return
+
+        # Stamp the mark FIRST. A terminal racing this task must find the verdict
+        # already set: the mark is what keeps the plate gated, so a terminal that
+        # slipped past an unmarked pending would release the gate onto a plate the
+        # printer was about to be stopped over.
+        fired_at = datetime.now(timezone.utc)
+        _pending_eject[printer_id] = dataclasses.replace(current, runtime_exceeded_at=fired_at)
+        elapsed_s = (fired_at - (current.started_at or fired_at)).total_seconds()
+        logger.warning(
+            "eject.remote: eject on printer %s still running at %.0fs (expected %.0fs, deadline %.0fs) — "
+            "suspect an under-bed obstruction or Z steps lost during the bed-drop; "
+            "stopping the eject job mid-flight before the sweep can scrape the plate",
+            printer_id,
+            elapsed_s,
+            armed.expected_runtime_s,
+            deadline_s,
+        )
+
+        # Deliberately NOT via mark_printer_stopped_by_user: this is not an operator
+        # stop, and nothing downstream may read the echoed status as intent. The mark
+        # — not whatever terminal the printer reports — drives terminal handling.
+        delivered = printer_manager.stop_print(printer_id)
+        if not delivered:
+            logger.warning(
+                "eject.remote: stop command for printer %s was NOT delivered (no live MQTT session) — retrying once",
+                printer_id,
+            )
+            await sleep(_STOP_RETRY_DELAY_S)
+            delivered = printer_manager.stop_print(printer_id)
+        # Proceed either way: an undelivered stop leaves the sweep running, but the
+        # mark already guarantees no terminal can release the gate, and the operator
+        # is being paged below.
+        logger.warning(
+            "eject.remote: mid-flight eject stop on printer %s %s",
+            printer_id,
+            "delivered" if delivered else "COULD NOT BE DELIVERED — the job may still be running",
+        )
+
+        # Lazy import: the monitor imports this module, so a module-level import here
+        # is a cycle (same precedent as farm_policy's monitor imports).
+        from backend.app.services.eject.monitor import _default_notify_plate_not_empty, eject_cooldown_monitor
+
+        try:
+            await _default_notify_plate_not_empty(
+                printer_id,
+                source_detail=(
+                    f"the eject sweep was STOPPED mid-job after {elapsed_s:.0f}s against an expected "
+                    f"{armed.expected_runtime_s:.0f}s — it may have stalled against an obstruction. "
+                    "Check under the heatbed and inspect the build plate before clearing it."
+                ),
+            )
+        except Exception:  # noqa: BLE001 — a notify failure must never kill the watchdog
+            logger.exception("eject.remote: mid-flight abort notification failed for printer %s", printer_id)
+        # Re-escalate on the standard cadence if the alert is ignored. Self-deduping,
+        # so an escalation-only watch already holding this gate is left alone.
+        eject_cooldown_monitor.start_escalation_only_watch(printer_id)
+    finally:
+        _runtime_watchdogs.pop(printer_id, None)
+
+
+async def cancel_runtime_watchdog(printer_id: int) -> None:
+    """Cancel and deregister ``printer_id``'s runtime watchdog, if one is armed."""
+    task = _runtime_watchdogs.pop(printer_id, None)
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass  # Expected — the eject resolved before its abort deadline.
 
 
 def matches_pending_eject(
@@ -272,8 +422,13 @@ async def clear_pending_eject(db: AsyncSession, printer_id: int) -> PendingEject
 
     Printer-scoped NULL (not just the popped entry's item) so a crash that stamped
     more than one row for a printer can't leave an orphan stamp behind. Returns the
-    popped :class:`PendingEject` (or None). Commits only when a stamp was cleared."""
+    popped :class:`PendingEject` (or None). Commits only when a stamp was cleared.
+
+    This is also where the in-flight runtime watchdog is cancelled: EVERY consumed
+    eject terminal funnels through here, so one cancel covers all of them and no
+    resolved eject can leave a task waiting to stop a printer that already finished."""
     pending = pop_pending_eject(printer_id)
+    await cancel_runtime_watchdog(printer_id)
     result = await db.execute(
         select(PrintQueueItem).where(
             PrintQueueItem.printer_id == printer_id,
@@ -565,8 +720,6 @@ async def _upload_start_register_eject(
     ``plate_id``) and the eventual SD cleanup all key off the SAME ``remote_filename``
     (the bare ``job_stem``).
     """
-    import asyncio
-
     from backend.app.services.bambu_ftp import get_ftp_retry_settings, upload_file_async, with_ftp_retry
     from backend.app.utils.filename import derive_remote_filename
 
