@@ -6,7 +6,7 @@ import zipfile
 
 import pytest
 
-from backend.app.services.print_scheduler import PrintScheduler
+from backend.app.services.print_scheduler import PrintScheduler, _present_candidates
 from backend.app.services.spool_selection import SlotInventory, match_filaments_to_slots
 from backend.app.utils.threemf_tools import extract_nozzle_mapping_from_3mf
 
@@ -179,6 +179,69 @@ class TestBuildLoadedFilaments:
         result = scheduler._build_loaded_filaments(MockStatus())
         assert len(result) == 1
         assert result[0]["type"] == "PLA"
+
+
+class TestPresentCandidates:
+    """W4: the dispatch-candidate presence gate at the two matcher call sites.
+
+    Deliberately NOT inside ``_build_loaded_filaments`` — ``spool_recovery`` reads
+    the JAMMED tray's identity out of that same builder and must keep seeing it.
+    Gates on ``present is False`` only, so it fails OPEN.
+    """
+
+    def test_cleared_tray_entry_is_dropped(self):
+        """The one shape that may be excluded: a non-present state code beside an
+        asserted-empty filament type."""
+        entries = [
+            {"type": "", "state": 9, "global_tray_id": 0},
+            {"type": "PETG", "state": 11, "global_tray_id": 1},
+        ]
+        assert [f["global_tray_id"] for f in _present_candidates(entries)] == [1]
+
+    @pytest.mark.parametrize(
+        ("state", "why"),
+        [
+            (9, "004-H2S state-9-while-feeding dialect"),
+            (3, "A1-family/P1S always-state-3 dialect"),
+            (27, "008-H2C unknown dialect code on a visibly loaded tray"),
+            (None, "partial push carried no state"),
+            ("nonsense", "unparseable state"),
+        ],
+    )
+    def test_unknown_presence_stays_eligible(self, state, why):
+        """Excluding these would block dispatch on healthy hardware — the far worse
+        failure. A configured tray is never dropped on a state code alone."""
+        entries = [{"type": "PETG", "state": state, "global_tray_id": 0}]
+        assert _present_candidates(entries) == entries, why
+
+    @pytest.mark.parametrize("state", [10, 11])
+    def test_seated_states_stay_eligible(self, state):
+        entries = [{"type": "PETG", "state": state, "global_tray_id": 0}]
+        assert _present_candidates(entries) == entries
+
+    def test_todays_builder_output_is_unchanged_by_the_gate(self):
+        """The builder only emits entries for a NON-empty tray_type, so the two rules
+        agree and nothing is dropped today. The gate makes that agreement explicit
+        and single-origin instead of implicit in a truthiness test."""
+        scheduler = PrintScheduler()
+
+        class MockStatus:
+            raw_data = {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [
+                            {"id": 0, "tray_type": "PLA", "tray_color": "FF0000", "state": 11},
+                            {"id": 1, "tray_type": "PETG", "tray_color": "00FF00", "state": 9},
+                            {"id": 2, "tray_type": "", "tray_color": "", "state": 9},
+                        ],
+                    }
+                ]
+            }
+
+        built = scheduler._build_loaded_filaments(MockStatus())
+        assert len(built) == 2  # the cleared tray never became a candidate at all
+        assert _present_candidates(built) == built
 
 
 class TestMatchFilamentsToSlots:

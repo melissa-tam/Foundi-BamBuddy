@@ -96,6 +96,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
+from backend.app.services import tray_fields
 from backend.app.services.bambu_mqtt import AMS_STATUS_FILAMENT_CHANGE, AMS_STATUS_IDLE
 from backend.app.services.hms_errors import current_runout_demand, hms_short_code
 from backend.app.services.printer_manager import printer_manager
@@ -1411,7 +1412,6 @@ async def _match_candidates(
     given requirement. Returns ``(global_tray_id | None, only_low)``."""
     from backend.app.api.routes.settings import get_setting
     from backend.app.core.database import async_session
-    from backend.app.services.bambu_mqtt import TRAY_PRESENT_STATES
     from backend.app.services.print_scheduler import scheduler
     from backend.app.services.spool_selection import (
         _read_min_start_g,
@@ -1422,15 +1422,18 @@ async def _match_candidates(
 
     def _present(f: dict) -> bool:
         # Drop a candidate whose tray reports an explicit non-present state (e.g.
-        # 9 = seated-but-unsensed): a load there is doomed. FAIL OPEN when the state
+        # 9 = seated-but-unsensed): a LOAD there is doomed. FAIL OPEN when the state
         # is None/unparseable — dialect variance must never exclude a real candidate.
-        st = f.get("state")
-        if st is None:
-            return True
-        try:
-            return int(st) in TRAY_PRESENT_STATES
-        except (TypeError, ValueError):
-            return True
+        #
+        # This is the LOAD-VIABILITY reading of the shared rule, deliberately
+        # stricter than the release/consumer reading: for a replacement load the
+        # tray's residual config must not soften a non-present state code (a
+        # configured-but-unsensed tray is precisely the doomed case), so the
+        # ``tray_type`` argument is pinned to the asserted-empty ``""``. The state
+        # vocabulary and its parse still come from ONE origin
+        # (``tray_fields.tray_presence`` / ``TRAY_PRESENT_STATES``), and the
+        # tri-state is mapped fail-open with ``is not False`` exactly as before.
+        return tray_fields.tray_presence(tray_fields.parse_tray_state(f.get("state")), "") is not False
 
     loaded_all = scheduler._build_loaded_filaments(status)
     candidates = [

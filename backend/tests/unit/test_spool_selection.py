@@ -341,6 +341,39 @@ class TestSpentExclusion:
         assert "excluded_oor=[0]" in trace
         assert "excluded_spent=[1]" in trace
 
+    def test_archived_excluded_like_spent(self):
+        """An ARCHIVED (retired) row is hard-excluded too. Repairs archive a rotten
+        row without necessarily rebinding the slot, and until 2026-08-02 such a row
+        stayed a live START candidate."""
+        loaded = [_loaded(0, tray_id=0, color="#FF0000")]
+        inv = {0: SlotInventory(remaining_g=500.0, first_loaded_ord=None, archived=True)}
+        out = _match([_req(color="#FF0000")], loaded, policy="slot_order", inv=inv, min_start_g=0)
+        assert out.mapping == [-1]
+        assert out.start_blocked_slots == []  # excluded, never merely floor-dropped
+
+    def test_archived_trace_names_its_own_reason(self, caplog):
+        """The three hard-exclude reasons stay SEPARATE in the decision trace, so a
+        vanished slot is explainable (jam vs run-dry vs retired row)."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1), _loaded(2, tray_id=2), _loaded(3, tray_id=3)]
+        inv = {
+            0: SlotInventory(remaining_g=500.0, first_loaded_ord=50.0, out_of_rotation=True),
+            1: SlotInventory(remaining_g=500.0, first_loaded_ord=100.0, spent=True),
+            2: SlotInventory(remaining_g=500.0, first_loaded_ord=150.0, archived=True),
+            3: SlotInventory(remaining_g=500.0, first_loaded_ord=200.0),  # live
+        }
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_selection"):
+            out = _match([_req()], loaded, policy="first_loaded", inv=inv)
+        assert out.mapping == [3]
+        trace = "\n".join(r.message for r in caplog.records)
+        assert "excluded_oor=[0]" in trace
+        assert "excluded_spent=[1]" in trace
+        assert "excluded_archived=[2]" in trace
+
+    def test_archived_false_default_preserves_behavior(self):
+        """archived defaults to False — untouched inventories select as before."""
+        inv = SlotInventory(remaining_g=500.0, first_loaded_ord=100.0)
+        assert inv.archived is False
+
     def test_spent_false_default_preserves_behavior(self):
         """spent defaults to False — a plain FIFO happy case (no flag set) still
         picks the oldest spool unchanged."""

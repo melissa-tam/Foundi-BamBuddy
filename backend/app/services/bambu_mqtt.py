@@ -24,6 +24,7 @@ import paho.mqtt.client as mqtt
 from backend.app.services.hms_actions import HMSAction, get_actions_for_error_code
 from backend.app.services.hms_errors import hms_severity
 from backend.app.services.tray_fields import (
+    TRAY_PRESENT_STATES,
     ZERO_TAG_UID,
     ZERO_TRAY_UUID,
     parse_tray_exist_bits,
@@ -60,14 +61,11 @@ AMS_STATUS_IDLE = 0
 # this one origin.
 AMS_STATUS_FILAMENT_CHANGE = 1
 
-# Tray `state` codes that mean a spool is physically PRESENT: 11 = loaded, 10 =
-# "spool present, filament not in feeder" (see the merge comment in
-# _handle_ams_data). Wiping tray identity for a present spool is the bug behind the
-# AMS-drying incident (drying disengages trays to state 10, and the identity wipe
-# then storms the RFID pipeline into HMS 0700_C069) and behind routine load/unload
-# transit wipes (~50×/week fleet-wide). Exported so ams_presence keys presence off
-# one origin.
-TRAY_PRESENT_STATES = (10, 11)
+# Tray `state` codes that mean a spool is physically PRESENT — DEFINED in
+# ``tray_fields`` (beside the parser that reads the field and the ``tray_presence``
+# rule built on it) and imported above; re-exported here because ``ams_presence``,
+# ``tray_observation`` and ``spool_recovery`` have always keyed presence off
+# ``bambu_mqtt.TRAY_PRESENT_STATES``, and it is the same tuple object either way.
 
 # AMS drying latch. `dry_time` (minutes remaining) is the primary "unit is drying"
 # signal, but the firmware only reports it once a cycle is under way. A monotonic

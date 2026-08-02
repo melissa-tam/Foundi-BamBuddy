@@ -8,6 +8,7 @@ from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.services.bambu_mqtt import PrinterState
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.tray_fields import tray_presence_map
 
 
 def _global_tray_from_assignment(ams_id: int, tray_id: int) -> int:
@@ -143,15 +144,24 @@ async def notify_missing_spool_assignments_on_print_start(
                     SpoolmanSlotAssignment.__table__.select().where(SpoolmanSlotAssignment.printer_id == printer_id)
                 )
             ).fetchall()
+            # A binding on a tray that reads EMPTY on the wire is a stale location
+            # claim, not an assignment: counting it here false-suppressed the very
+            # alert this function exists for (the print maps a tray nobody has
+            # assigned a real spool to). Tri-state, gating on ``is False`` only —
+            # an offline printer or a partial push leaves presence UNKNOWN and the
+            # row keeps counting, exactly as before.
+            state = printer_manager.get_status(printer_id)
+            presence = tray_presence_map(getattr(state, "raw_data", None))
             assigned_global_trays = {
-                _global_tray_from_assignment(row.ams_id, row.tray_id) for row in (*legacy_rows, *spoolman_rows)
+                _global_tray_from_assignment(row.ams_id, row.tray_id)
+                for row in (*legacy_rows, *spoolman_rows)
+                if presence.get((row.ams_id, row.tray_id)) is not False
             }
 
             missing_global = sorted(used_global_trays - assigned_global_trays)
             if not missing_global:
                 return
 
-            state = printer_manager.get_status(printer_id)
             missing_slots = []
             for global_id in missing_global:
                 profile, color = _tray_profile_and_color_for_global_id(state, global_id)

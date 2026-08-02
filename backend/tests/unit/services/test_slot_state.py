@@ -752,7 +752,7 @@ class TestRow4TaglessLane:
     )
     def test_pre_config_one_shot_applies_on_every_dialect(self, tray, label):
         """FINDING A. The A1-family and P1S firmwares report a CONSTANT ``state=3`` (and
-        some pushes omit ``state`` entirely), so ``_derive_present`` can only ever answer
+        some pushes omit ``state`` entirely), so ``tray_fields.tray_presence`` can only ever answer
         UNKNOWN for them. Gating the one-shot on ``present is True`` therefore left those
         printers "awaiting insert" FOREVER — the roll seated, configured, and never
         applied (upstream #1322, which the pre-cutover replay handled). The gate is

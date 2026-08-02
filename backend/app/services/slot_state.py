@@ -448,7 +448,7 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         #
         # The gate is ``present is not False``, NOT ``present is True``: the A1-family
         # and P1S firmwares report a CONSTANT ``state=3`` (some pushes omit ``state``
-        # altogether), so ``tray_observation._derive_present`` can only answer None for
+        # altogether), so ``tray_fields.tray_presence`` can only answer None for
         # them and a ``present is True`` gate left every one of those dialects "awaiting
         # insert" FOREVER — the roll physically seated, configured, and never applied
         # (upstream #1322; the pre-cutover replay handled exactly this shape).

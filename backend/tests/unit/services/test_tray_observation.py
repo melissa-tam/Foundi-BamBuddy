@@ -24,6 +24,9 @@ from backend.app.services.tray_fields import (
     parse_tray_exist_bits,
     parse_tray_state,
     slot_exist_bit_set,
+    tray_presence,
+    tray_presence_from_dict,
+    tray_presence_map,
 )
 from backend.app.services.tray_observation import (
     TrayObservation,
@@ -313,6 +316,139 @@ class TestPresence:
     )
     def test_occupancy_signal(self, tray, expected):
         assert observe_tray(1, 0, tray).occupancy_signal is expected
+
+
+# --- the SHARED presence rule (W4): one origin for every consumer -----------
+
+
+class TestSharedPresenceRule:
+    """``tray_fields.tray_presence`` is THE rule; ``observe_tray`` is one caller.
+
+    Every downstream consumer (assignments API, sync-ams-weights, deficit pricer,
+    scheduler candidates, unassigned-tray alert, K-persist route) gates on this
+    function's ``is False``, so its truth table is pinned here directly — an
+    observation and an API row can never disagree about whether a slot is empty.
+    """
+
+    @pytest.mark.parametrize("state", [10, 11])
+    def test_present_states_are_true(self, state):
+        assert tray_presence(state, None) is True
+        assert tray_presence(state, "") is True  # a present state outranks an empty type
+
+    def test_cleared_tray_shape_is_the_only_false(self):
+        assert tray_presence(9, "") is False
+
+    @pytest.mark.parametrize(
+        ("state", "tray_type", "why"),
+        [
+            (9, None, "state 9 but the push asserted no tray_type"),
+            (9, "PETG", "004-H2S state-9-while-feeding dialect"),
+            (3, "PLA", "A1-family/P1S always-state-3 dialect"),
+            (None, "", "no parseable state at all"),
+            (None, None, "nothing asserted"),
+        ],
+    )
+    def test_unknown_stays_unknown(self, state, tray_type, why):
+        assert tray_presence(state, tray_type) is None, why
+
+    def test_exist_bit_vetoes_false_but_never_manufactures_true(self):
+        assert tray_presence(9, "", exist_bit=True) is None
+        assert tray_presence(9, "", exist_bit=False) is False
+        assert tray_presence(3, "PETG", exist_bit=True) is None
+
+    def test_observe_tray_uses_this_exact_rule(self):
+        """No second presence implementation: the observation layer's answer IS this."""
+        assert observe_tray(1, 0, STALE_EMPTY_TRAY).present is tray_presence(9, "")
+
+
+class TestPresenceFromMergedDict:
+    """``tray_presence_from_dict`` — the merged-data convenience.
+
+    Same rule, parsing ``state``/``tray_type`` out of a tray dict with the module's
+    own parsers so a status-reading consumer cannot drift from the pipeline.
+    """
+
+    def test_cleared_tray_dict_is_false(self):
+        assert tray_presence_from_dict({"id": 2, "state": 9, "tray_type": ""}) is False
+
+    def test_string_state_parses(self):
+        assert tray_presence_from_dict({"state": "11", "tray_type": "PETG"}) is True
+        assert tray_presence_from_dict({"state": "9", "tray_type": ""}) is False
+
+    def test_missing_tray_type_key_is_not_asserted_empty(self):
+        """Key ABSENT means the push said nothing — never "empty"."""
+        assert tray_presence_from_dict({"state": 9}) is None
+
+    def test_explicit_null_tray_type_is_asserted_empty(self):
+        assert tray_presence_from_dict({"state": 9, "tray_type": None}) is False
+
+    def test_whitespace_type_is_empty(self):
+        assert tray_presence_from_dict({"state": 9, "tray_type": "   "}) is False
+
+    def test_loaded_tray_is_true(self):
+        assert tray_presence_from_dict({"state": 11, "tray_type": "PETG"}) is True
+
+    @pytest.mark.parametrize("bad", [None, [], "tray", 7])
+    def test_non_dict_is_unknown(self, bad):
+        assert tray_presence_from_dict(bad) is None
+
+    def test_no_exist_bit_is_consulted(self):
+        """The merged view keeps no honest per-tray bitmask copy, so none is used —
+        a stale bit would manufacture a veto out of nothing."""
+        assert tray_presence_from_dict({"state": 9, "tray_type": "", "tray_exist_bits": "f"}) is False
+
+
+class TestPresenceMap:
+    """``tray_presence_map`` — every slot in a live/merged payload, one pass."""
+
+    def test_full_status_dict_shape(self):
+        payload = {
+            "ams": [
+                {
+                    "id": 0,
+                    "tray": [
+                        {"id": 0, "state": 11, "tray_type": "PETG"},
+                        {"id": 1, "state": 9, "tray_type": ""},
+                        {"id": 2, "state": 9, "tray_type": "PETG"},
+                    ],
+                }
+            ]
+        }
+        assert tray_presence_map(payload) == {(0, 0): True, (0, 1): False, (0, 2): None}
+
+    def test_nested_ams_wrapper_shape(self):
+        payload = {"ams": {"ams": [{"id": 1, "tray": [{"id": 3, "state": 9, "tray_type": ""}]}]}}
+        assert tray_presence_map(payload) == {(1, 3): False}
+
+    def test_bare_unit_list_shape(self):
+        assert tray_presence_map([{"id": 0, "tray": [{"id": 0, "state": 10}]}]) == {(0, 0): True}
+
+    @pytest.mark.parametrize("payload", [None, {}, {"ams": None}, "nonsense", 5])
+    def test_unreadable_payload_is_empty_map(self, payload):
+        """An unreadable payload yields no evidence — never a fabricated False."""
+        assert tray_presence_map(payload) == {}
+
+    def test_malformed_entries_are_skipped_not_fatal(self):
+        payload = {
+            "ams": [
+                "not-a-unit",
+                {"tray": [{"id": 0, "state": 9, "tray_type": ""}]},  # unit without an id
+                {"id": 0, "tray": "not-a-list"},
+                {"id": 2, "tray": [None, {"state": 11}, {"id": 1, "state": 11, "tray_type": "PLA"}]},
+            ]
+        }
+        # Only the fully-addressable tray survives; nothing raises.
+        assert tray_presence_map(payload) == {(2, 1): True}
+
+    def test_slots_the_payload_omits_are_absent_not_false(self):
+        """Silence about a slot is not an observation of it — consumers reading
+        ``.get(key)`` must see None (unknown), never False (release-authorizing)."""
+        payload = {"ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PETG"}]}]}
+        assert tray_presence_map(payload).get((0, 3)) is None
+
+    def test_ams_ht_high_ids_are_mapped(self):
+        payload = {"ams": [{"id": 128, "tray": [{"id": 0, "state": 9, "tray_type": ""}]}]}
+        assert tray_presence_map(payload) == {(128, 0): False}
 
 
 # --- observe_ams_push: walking a whole push ---------------------------------

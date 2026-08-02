@@ -11,6 +11,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from time import monotonic
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,8 +19,275 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
+from backend.app.services.tray_fields import normalized_tag_uid, normalized_tray_uuid
 
 logger = logging.getLogger(__name__)
+
+# gcode_state values that mean a print is actively running (or about to feed
+# filament). Folding AMS remain% into weight_used during any of these
+# double-counts this module's precise per-print 3MF deduction (#880).
+_ACTIVE_PRINT_GCODE_STATES = ("RUNNING", "PAUSE", "PREPARE", "SLICING")
+
+
+async def ams_weight_sync_allowed(db: AsyncSession, printer_id: int, state) -> bool:
+    """Whether a caller may fold this printer's AMS remain% into spool
+    ``weight_used`` right now.
+
+    The precise per-print deduction is this module's job at completion (3MF /
+    G-code). Folding the low-resolution AMS remain% in WHILE a print is active
+    double-counts (#880). The former guard snapshotted the in-memory
+    ``_active_sessions`` set, which a server restart mid-print wiped — the sync
+    then ran against a live print and double-counted. Both legs here are durable:
+
+    - the live gcode_state is a settled (non-active) one — a missing / ``unknown``
+      state fails closed (possibly-active, sync NOT allowed); and
+    - no PrintArchive for this printer is still ``status="printing"`` (covers a
+      live state that lags the DB).
+
+    Lives here (with the deduction it protects) rather than in ``main``: both the
+    push-driven sync in ``main.on_ams_change`` and the manual
+    ``POST /inventory/sync-ams-weights`` recovery tool gate on this one origin.
+    """
+    if state is None:
+        return False
+    live_state = (getattr(state, "state", None) or "").upper()
+    if not live_state or live_state == "UNKNOWN" or live_state in _ACTIVE_PRINT_GCODE_STATES:
+        return False
+
+    from backend.app.models.archive import PrintArchive
+
+    result = await db.execute(
+        select(PrintArchive.id)
+        .where(PrintArchive.printer_id == printer_id)
+        .where(PrintArchive.status == "printing")
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is None
+
+
+# ── Tagged-ledger DECREASE reconcile (W6) ────────────────────────────────────
+#
+# The push-driven weight sync in ``main.on_ams_change`` is INCREASE-ONLY by
+# design: the AMS remain% is integer-resolution (10 g steps on a 1 kg roll) and
+# must never overwrite the precise 3MF/G-code deduction computed here. The cost of
+# that rule is that a ledger which over-counts can never heal itself — production
+# spool 37 sat at 899 g used against a wire-FULL roll for two weeks (the grams were
+# charged while the row was stale-bound to another printer's tray on 07-17), and
+# the only bidirectional path was the manual sync tool.
+#
+# Doctrine rule 8: for a TAGGED row the wire remain IS truth — the firmware read
+# the roll's own RFID chip. So a large, stable contradiction in the decrease
+# direction is repaired automatically, with a WARNING + an operator notification
+# because a silent ledger rewrite is exactly what nobody should ship.
+#
+# Deliberately NOT a prompt: hardware truth is knowable here (doctrine rule 1).
+# Deliberately NOT applied to tagless rows: they have no wire truth to defer to.
+_LEDGER_DECREASE_MARGIN_PCT = 50.0
+
+# Corroboration, mirroring ``spool_respool._JUMP_MIN_PUSHES`` / ``_JUMP_STABLE_S``:
+# one push is not evidence (the AMS re-reports a tray on every state change), so
+# the contradiction must HOLD across at least two pushes spanning ten seconds. A
+# push that stops reading as a contradiction drops the window entirely. Process
+# lifetime only — a restart simply re-corroborates.
+_LEDGER_DECREASE_MIN_PUSHES = 2
+_LEDGER_DECREASE_STABLE_S = 10.0
+
+# (printer_id, ams_id, tray_id) -> (first_seen_monotonic, observation_count)
+_ledger_decrease_seen: dict[tuple[int, int, int], tuple[float, int]] = {}
+
+
+def clear_ledger_decrease_window(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Drop a slot's decrease-reconcile corroboration (called on the empty edge).
+
+    An emptied slot invalidates everything learned about the roll that was in it;
+    without this, a half-corroborated window could carry across a roll swap and let
+    the NEXT roll's first qualifying push fire immediately. Twin of
+    ``spool_respool.clear_respool_prompt_dedup``, called from the same edge.
+    """
+    _ledger_decrease_seen.pop((printer_id, ams_id, tray_id), None)
+
+
+def _reset_ledger_decrease_state() -> None:
+    """Test hook: clear the corroboration ledger between cases."""
+    _ledger_decrease_seen.clear()
+
+
+def _wire_identity_is_the_bound_row(spool: Spool, tray: dict) -> bool:
+    """True when the roll ON THE WIRE is provably the row we are about to rewrite.
+
+    The whole justification for writing a ledger down is "the firmware read THIS
+    roll's chip", so the identity must agree before the grams do. UUID-PRIMARY, per
+    the corrected 2026-08-01 identity law: a Bambu roll carries TWO RFID tags
+    sharing one ``tray_uuid``, so a differing ``tag_uid`` beside an agreeing uuid is
+    a sibling read of the same roll — not a swap. Only when neither side asserts a
+    uuid does the tag decide.
+
+    Refuses (False) whenever nothing is comparable: a tagless row, an untagged
+    tray, or a partial push asserting neither member. Silence is never agreement —
+    a slot mid-swap that the pipeline has not resolved yet must not have the
+    departing row's ledger rewritten from the arriving roll's remain%.
+    """
+    wire_uuid = normalized_tray_uuid(tray.get("tray_uuid"))
+    row_uuid = normalized_tray_uuid(spool.tray_uuid)
+    if wire_uuid is not None and row_uuid is not None:
+        return wire_uuid == row_uuid
+
+    wire_tag = normalized_tag_uid(tray.get("tag_uid"))
+    row_tag = normalized_tag_uid(spool.tag_uid)
+    if wire_tag is not None and row_tag is not None:
+        return wire_tag == row_tag
+
+    return False
+
+
+async def maybe_reconcile_tagged_ledger_decrease(
+    db: AsyncSession,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    tray: dict,
+    spool: Spool,
+    *,
+    sync_allowed: bool,
+) -> bool:
+    """Write a TAGGED spool's ``weight_used`` DOWN to the wire's remain%.
+
+    Fires only when every gate below holds; returns True iff the ledger was
+    written. Internal-inventory mode only — the caller runs inside
+    ``on_ams_change``'s Spoolman gate (Spoolman owns its own weights).
+
+    1. ``sync_allowed`` — the caller's ``ams_weight_sync_allowed`` verdict: the
+       printer is idle and no archive is still ``printing``. Mid-print the usage
+       tracker owns the ledger and the wire lags a live extrusion.
+    2. The wire identity IS the bound row (:func:`_wire_identity_is_the_bound_row`,
+       uuid-primary) — a tagless row has no wire truth to defer to, and a slot
+       holding a DIFFERENT roll must never have this row's ledger rewritten from
+       it — and the row is not ``weight_locked`` (an operator-pinned weight is
+       never overwritten).
+    3. The reading is trustworthy (``spool_respool.remain_reading_untrustworthy``:
+       no identify in flight, unit not drying) and ``remain`` parses to 1..100.
+    4. No re-spool prompt is open on the slot: the operator is already being asked
+       whether this tag moved onto a fresh roll, and answering it automatically —
+       in the wrong direction — is how a donor's history gets erased.
+    5. The contradiction is at least :data:`_LEDGER_DECREASE_MARGIN_PCT`
+       points-of-label and has HELD across
+       :data:`_LEDGER_DECREASE_MIN_PUSHES` pushes spanning
+       :data:`_LEDGER_DECREASE_STABLE_S`.
+
+    Prod acceptance case: spool 37 (label 1000 g, used 899.28 g, wire remain
+    100%) → margin ≈ 90 points → ``weight_used`` 899.3 → 0.0 after the second
+    stable push.
+    """
+    from backend.app.services.spool_respool import (
+        remain_jump_margin,
+        remain_reading_untrustworthy,
+        respool_prompt_open_for_slot,
+    )
+
+    key = (printer_id, ams_id, tray_id)
+
+    margin = remain_jump_margin(spool, tray)
+    if (
+        not sync_allowed
+        or not _wire_identity_is_the_bound_row(spool, tray)
+        or spool.weight_locked
+        or margin is None
+        or margin < _LEDGER_DECREASE_MARGIN_PCT
+    ):
+        # The condition must HOLD, not merely have happened once.
+        _ledger_decrease_seen.pop(key, None)
+        return False
+
+    if remain_reading_untrustworthy(printer_id, ams_id, tray_id):
+        # Neither fires nor counts — an in-flux reading is not evidence either way.
+        return False
+
+    if respool_prompt_open_for_slot(printer_id, ams_id, tray_id):
+        logger.debug(
+            "[ledger-reconcile] spool %d (printer %d AMS%d-T%d) deferring to an open re-spool prompt",
+            spool.id,
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return False
+
+    now = monotonic()
+    first_seen, count = _ledger_decrease_seen.get(key, (now, 0))
+    count += 1
+    _ledger_decrease_seen[key] = (first_seen, count)
+    if count < _LEDGER_DECREASE_MIN_PUSHES or (now - first_seen) < _LEDGER_DECREASE_STABLE_S:
+        return False
+
+    remain_val = int(tray.get("remain"))
+    label_weight = float(spool.label_weight or 0)
+    wire_used = round(label_weight * (100 - remain_val) / 100.0, 1)
+    current_used = round(float(spool.weight_used or 0), 1)
+    if wire_used >= current_used:
+        # Margin says decrease but the grams do not (a rounding edge) — nothing to do.
+        _ledger_decrease_seen.pop(key, None)
+        return False
+
+    logger.warning(
+        "[ledger-reconcile] spool %d weight_used %.1f -> %.1f (wire remain %d%% contradicts ledger by %.0f pts; "
+        "doctrine rule 8 — wire remain is truth for tagged rows)",
+        spool.id,
+        current_used,
+        wire_used,
+        remain_val,
+        margin,
+    )
+    spool.weight_used = wire_used
+    await db.commit()
+    _ledger_decrease_seen.pop(key, None)
+
+    await _notify_ledger_reconciled(db, printer_id, ams_id, tray_id, spool, current_used, wire_used, remain_val)
+    return True
+
+
+async def _notify_ledger_reconciled(
+    db: AsyncSession,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    spool: Spool,
+    old_used: float,
+    new_used: float,
+    remain_val: int,
+) -> None:
+    """Tell the operator the ledger was rewritten. Never raises.
+
+    Rides the existing AMS-issue channel (``on_printer_error`` — "AMS issues,
+    etc.", the same one HMS summaries use) rather than minting a new event type:
+    an automatic write to the gram ledger must be visible wherever AMS trouble
+    already is, and the notification surface stays as it was configured.
+    """
+    try:
+        from backend.app.models.printer import Printer
+        from backend.app.services.notification_service import notification_service
+
+        printer = await db.get(Printer, printer_id)
+        printer_name = printer.name if printer else f"Printer {printer_id}"
+        detail = (
+            f"Spool #{spool.id} on AMS{ams_id}-T{tray_id} read {remain_val}% full on the wire while the "
+            f"ledger held {old_used:.1f} g used. The RFID reading is authoritative for a tagged roll, so "
+            f"weight_used was corrected to {new_used:.1f} g."
+        )
+        await notification_service.on_printer_error(
+            printer_id,
+            printer_name,
+            "Spool ledger corrected",
+            db,
+            detail,
+        )
+    except Exception:  # noqa: BLE001 — the ledger write already succeeded; never undo it over a notify
+        logger.exception(
+            "[ledger-reconcile] notification failed for spool %d (printer %d AMS%d-T%d)",
+            spool.id,
+            printer_id,
+            ams_id,
+            tray_id,
+        )
 
 
 def _decode_mqtt_mapping(mapping_raw: list | None) -> list[int] | None:

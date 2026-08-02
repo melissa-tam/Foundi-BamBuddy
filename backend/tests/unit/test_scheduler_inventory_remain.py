@@ -42,7 +42,16 @@ def _make_async_session_returning(rows: list):
     return db
 
 
-def _spool(*, label_weight, weight_used, loaded_at=None, first_loaded_at=None, created_at=None, spent_at=None):
+def _spool(
+    *,
+    label_weight,
+    weight_used,
+    loaded_at=None,
+    first_loaded_at=None,
+    created_at=None,
+    spent_at=None,
+    archived_at=None,
+):
     """Internal-mode spool stub with the attributes build_slot_inventory reads."""
     return SimpleNamespace(
         label_weight=label_weight,
@@ -52,6 +61,7 @@ def _spool(*, label_weight, weight_used, loaded_at=None, first_loaded_at=None, c
         created_at=created_at or datetime(2026, 1, 1, tzinfo=timezone.utc),
         feed_fault_at=None,
         spent_at=spent_at,
+        archived_at=archived_at,
     )
 
 
@@ -95,6 +105,29 @@ class TestInternalInventoryOverrides:
             out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
         assert out[0].spent is True and out[0].out_of_rotation is False
         assert out[1].spent is False and out[1].out_of_rotation is False
+
+    @pytest.mark.asyncio
+    async def test_archived_flag_propagates(self):
+        """``SlotInventory.archived`` mirrors ``spool.archived_at`` (W4). A repair
+        that archives a rotten row without rebinding the slot left that row a live
+        START candidate — ``archived_at`` was never filtered anywhere in selection."""
+        archived_spool = _spool(label_weight=1000, weight_used=0, archived_at=datetime(2026, 5, 1, tzinfo=timezone.utc))
+        live_spool = _spool(label_weight=1000, weight_used=0)
+        rows = [
+            SimpleNamespace(ams_id=0, tray_id=0, spool=archived_spool),
+            SimpleNamespace(ams_id=0, tray_id=1, spool=live_spool),
+        ]
+        loaded = [
+            {"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False},
+            {"ams_id": 0, "tray_id": 1, "global_tray_id": 1, "is_external": False},
+        ]
+        db = _make_async_session_returning(rows)
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        # Kept SEPARATE from spent/out_of_rotation — the three reasons differ
+        # operationally and the [spool-select] trace names each one.
+        assert out[0].archived is True and out[0].spent is False and out[0].out_of_rotation is False
+        assert out[1].archived is False
 
     @pytest.mark.asyncio
     async def test_first_loaded_ordinal_prefers_first_loaded_at(self):

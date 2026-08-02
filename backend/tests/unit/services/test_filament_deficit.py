@@ -661,3 +661,94 @@ class TestFilamentDeficitSpentGuard:
         )
         assert len(deficit) == 1  # spent contributes 0 -> pool < required
         assert deficit[0].remaining_grams == 0.0
+
+
+class TestFilamentDeficitPresenceGate:
+    """W4: a binding on a tray that reads EMPTY prices as 0, not as its ledger.
+
+    Five prod slots held a stale binding on a physically empty tray (003-T2 spool
+    140 at 932 g the worst). Pricing those grams as "available" is how a stale spool
+    HIDES a real deficit and lets dispatch start a print into an empty slot.
+    Tri-state: only the verified cleared-tray shape counts — unknown fails open.
+    """
+
+    @staticmethod
+    def _status(printer_id: int, trays: list[dict], *, ams_id: int = 0):
+        from types import SimpleNamespace
+        from unittest.mock import patch as _patch
+
+        fake_state = SimpleNamespace(
+            ams_filament_backup=False,
+            ams_extruder_map={},
+            raw_data={"ams": [{"id": ams_id, "tray": trays}]},
+        )
+        return _patch(
+            "backend.app.services.printer_manager.printer_manager.get_status",
+            lambda pid: fake_state if pid == printer_id else None,
+        )
+
+    async def _run(self, db_session, item, printer_id, trays):
+        with (
+            patch("backend.app.services.filament_deficit.app_settings.base_dir", Path("/")),
+            self._status(printer_id, trays),
+        ):
+            return await compute_deficit_for_queue_item(db_session, item)
+
+    async def _fixture(self, db_session, printer_factory, tmp_path, *, weight_used: float):
+        printer = await printer_factory()
+        archive = await _setup_archive_3mf(
+            db_session,
+            tmp_path,
+            [{"id": "1", "type": "PLA", "color": "#FFFFFF", "used_g": "100.0"}],
+        )
+        spool = await _spool(db_session, label_weight=1000, weight_used=weight_used)
+        await _assign(db_session, printer_id=printer.id, spool_id=spool.id, ams_id=0, tray_id=0)
+        item = await _queue_item(db_session, printer_id=printer.id, archive=archive, ams_mapping=[0])
+        return printer, item
+
+    @pytest.mark.asyncio
+    async def test_cleared_tray_prices_as_empty_and_surfaces_the_deficit(self, db_session, printer_factory, tmp_path):
+        """The stale-binding case: the ledger says 900 g left, the slot is empty."""
+        printer, item = await self._fixture(db_session, printer_factory, tmp_path, weight_used=100.0)
+
+        deficit = await self._run(db_session, item, printer.id, [{"id": 0, "state": 9, "tray_type": "", "remain": 0}])
+
+        assert len(deficit) == 1
+        assert deficit[0].remaining_grams == 0.0
+        assert deficit[0].required_grams == 100.0
+
+    @pytest.mark.asyncio
+    async def test_seated_tray_prices_from_the_ledger_as_before(self, db_session, printer_factory, tmp_path):
+        printer, item = await self._fixture(db_session, printer_factory, tmp_path, weight_used=100.0)
+
+        deficit = await self._run(
+            db_session, item, printer.id, [{"id": 0, "state": 11, "tray_type": "PLA", "remain": 90}]
+        )
+
+        assert deficit == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_presence_fails_open(self, db_session, printer_factory, tmp_path):
+        """The A1-family always-state-3 dialect reads UNKNOWN — pricing is untouched,
+        because blocking dispatch on healthy hardware is the worse failure."""
+        printer, item = await self._fixture(db_session, printer_factory, tmp_path, weight_used=100.0)
+
+        deficit = await self._run(
+            db_session, item, printer.id, [{"id": 0, "state": 3, "tray_type": "PLA", "remain": 90}]
+        )
+
+        assert deficit == []
+
+    @pytest.mark.asyncio
+    async def test_offline_printer_prices_as_before(self, db_session, printer_factory, tmp_path):
+        """No live status → no presence evidence → the ledger still decides."""
+        printer, item = await self._fixture(db_session, printer_factory, tmp_path, weight_used=970.0)
+
+        with (
+            patch("backend.app.services.filament_deficit.app_settings.base_dir", Path("/")),
+            patch("backend.app.services.printer_manager.printer_manager.get_status", lambda pid: None),
+        ):
+            deficit = await compute_deficit_for_queue_item(db_session, item)
+
+        assert len(deficit) == 1
+        assert deficit[0].remaining_grams == 30.0

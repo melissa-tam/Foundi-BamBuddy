@@ -3059,6 +3059,63 @@ class TestConfigureAmsSlotPersistsKProfile:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_cleared_tray_skips_persist_but_still_sends_mqtt(
+        self,
+        async_client: AsyncClient,
+        db_session,
+        printer_factory,
+    ):
+        """W4 presence gate: the bound tray reads the cleared-tray shape, so the
+        binding is a stale location claim and the profile would land on a roll that
+        is not in the machine. The MQTT configure still goes out (the operator asked
+        for it); only the DB write is withheld."""
+        from backend.app.models.spool import Spool
+        from backend.app.models.spool_assignment import SpoolAssignment
+        from backend.app.models.spool_k_profile import SpoolKProfile
+
+        printer = await printer_factory(model="H2D")
+        spool = Spool(material="PLA", color_name="Red", rgba="FF0000FF")
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=printer.id, ams_id=0, tray_id=3))
+        await db_session.commit()
+
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+        mock_client.extrusion_cali_sel.return_value = True
+        mock_client.extrusion_cali_set.return_value = True
+        mock_client.request_status_update.return_value = True
+
+        mock_state = MagicMock()
+        mock_state.ams_extruder_map = {"0": 0}
+        mock_state.raw_data = {"ams": [{"id": 0, "tray": [{"id": 3, "state": 9, "tray_type": "", "remain": 0}]}]}
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = mock_state
+
+            response = await async_client.post(
+                f"/api/v1/printers/{printer.id}/slots/0/3/configure",
+                params={
+                    "tray_info_idx": "PFUSdev01",
+                    "tray_type": "PLA",
+                    "tray_sub_brands": "Devil Design PLA",
+                    "tray_color": "FF0000FF",
+                    "nozzle_temp_min": 220,
+                    "nozzle_temp_max": 240,
+                    "cali_idx": 7,
+                    "nozzle_diameter": "0.4",
+                    "k_value": 0.028,
+                },
+            )
+
+        assert response.status_code == 200
+        mock_client.extrusion_cali_sel.assert_called_once()  # wire command unaffected
+        kps = (await db_session.execute(select(SpoolKProfile))).scalars().all()
+        assert kps == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_zero_cali_idx_persists(
         self,
         async_client: AsyncClient,

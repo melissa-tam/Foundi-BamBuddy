@@ -43,6 +43,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.services.filament_requirements import extract_filament_requirements
+from backend.app.services.tray_fields import tray_presence_map
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,23 @@ def _normalize_color_for_id(raw: str | None) -> str:
     if len(s) == 8:  # RRGGBBAA → strip alpha
         s = s[:6]
     return s
+
+
+def _live_tray_presence(printer_id: int) -> dict[tuple[int, int], bool | None]:
+    """``{(ams_id, tray_id) → tri-state presence}`` from the printer's LIVE trays.
+
+    Thin read of ``printer_manager`` status through the one shared rule
+    (``tray_fields.tray_presence_map``); ``{}`` when no live state is available, so
+    an offline printer prices exactly as it does today. Callers gate on
+    ``is False`` only.
+    """
+    try:
+        from backend.app.services.printer_manager import printer_manager
+    except ImportError:
+        return {}
+
+    state = printer_manager.get_status(printer_id)
+    return tray_presence_map(getattr(state, "raw_data", None))
 
 
 def _live_tray_identities(printer_id: int) -> dict[tuple[int, int], str]:
@@ -356,6 +374,11 @@ async def compute_deficit_for_queue_item(
     # Live tray identities drive backup-ON pooling only; skip the read entirely
     # when backup is OFF so the per-slot path (phase 2) is untouched.
     live_ids = _live_tray_identities(printer_id) if backup_on else {}
+    # Tri-state live presence for every slot on the printer (one shared rule).
+    # A binding on a tray that reads EMPTY is a stale location claim — pricing its
+    # ledger grams as "available" is how a stale spool HIDES a real deficit and lets
+    # dispatch start a print with nothing in the slot.
+    live_presence = _live_tray_presence(printer_id)
 
     # ------------------------------------------------------------------ phase 1
     # Resolve each requirement to (ams_id, tray_id, identity, remaining_grams).
@@ -447,6 +470,13 @@ async def compute_deficit_for_queue_item(
                 if label_weight <= 0:
                     continue
                 remaining = max(0.0, label_weight - weight_used)
+
+        if live_presence.get((ams_id, tray_id)) is False:
+            # The mapped tray reads the cleared-tray shape: whatever the binding
+            # claims, there is nothing in the slot to print with. KNOWN empty (0.0),
+            # not undetermined — undetermined would `continue` below and silently
+            # pass the check. Unknown presence is left untouched (fail open).
+            remaining = 0.0
 
         if remaining is None:
             # Unable to determine remaining grams — preserve pre-#1762 behaviour
@@ -553,6 +583,13 @@ async def compute_deficit_for_queue_item(
                 grams_by_slot[slot_key] = None
                 continue
             grams_by_slot[slot_key] = max(0.0, label_weight - weight_used)
+
+    # Same presence rule as phase 1, applied to the POOL: a binding whose tray reads
+    # EMPTY contributes 0.0, never its ledger grams and never "undetermined" (which
+    # would make the whole identity open-ended and unblockable).
+    for slot_key, present in live_presence.items():
+        if present is False and slot_key in grams_by_slot:
+            grams_by_slot[slot_key] = 0.0
 
     # Iterate LIVE TRAYS: each contributes its grams to the pool, or marks its
     # identity open-ended when the grams can't be determined.

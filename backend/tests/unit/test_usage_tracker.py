@@ -2900,29 +2900,29 @@ class TestUsageIntegrityIntegration:
 
 
 class TestAmsWeightSyncAllowed:
-    """Truth table for main._ams_weight_sync_allowed()."""
+    """Truth table for usage_tracker.ams_weight_sync_allowed()."""
 
     @pytest.mark.asyncio
     async def test_active_state_blocks(self, db_session, printer_factory):
-        from backend.app.main import _ams_weight_sync_allowed
+        from backend.app.services.usage_tracker import ams_weight_sync_allowed
 
         printer = await printer_factory()
         for active in ("RUNNING", "PAUSE", "PREPARE", "SLICING"):
-            assert await _ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state=active)) is False
+            assert await ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state=active)) is False
 
     @pytest.mark.asyncio
     async def test_none_and_unknown_state_block(self, db_session, printer_factory):
-        from backend.app.main import _ams_weight_sync_allowed
+        from backend.app.services.usage_tracker import ams_weight_sync_allowed
 
         printer = await printer_factory()
-        assert await _ams_weight_sync_allowed(db_session, printer.id, None) is False
-        assert await _ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state=None)) is False
-        assert await _ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state="unknown")) is False
+        assert await ams_weight_sync_allowed(db_session, printer.id, None) is False
+        assert await ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state=None)) is False
+        assert await ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state="unknown")) is False
 
     @pytest.mark.asyncio
     async def test_idle_with_printing_archive_blocks(self, db_session, printer_factory):
-        from backend.app.main import _ams_weight_sync_allowed
         from backend.app.models.archive import PrintArchive
+        from backend.app.services.usage_tracker import ams_weight_sync_allowed
 
         printer = await printer_factory()
         db_session.add(
@@ -2935,12 +2935,12 @@ class TestAmsWeightSyncAllowed:
             )
         )
         await db_session.commit()
-        assert await _ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state="IDLE")) is False
+        assert await ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state="IDLE")) is False
 
     @pytest.mark.asyncio
     async def test_idle_no_printing_archive_allows(self, db_session, printer_factory):
-        from backend.app.main import _ams_weight_sync_allowed
         from backend.app.models.archive import PrintArchive
+        from backend.app.services.usage_tracker import ams_weight_sync_allowed
 
         printer = await printer_factory()
         # A settled archive for the same printer must not block the sync.
@@ -2954,4 +2954,4 @@ class TestAmsWeightSyncAllowed:
             )
         )
         await db_session.commit()
-        assert await _ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state="IDLE")) is True
+        assert await ams_weight_sync_allowed(db_session, printer.id, SimpleNamespace(state="IDLE")) is True

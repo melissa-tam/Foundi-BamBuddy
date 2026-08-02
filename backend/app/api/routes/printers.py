@@ -61,6 +61,7 @@ from backend.app.services.printer_manager import (
     supports_drying_while_printing,
 )
 from backend.app.services.spool_recovery import runout_slot_desc
+from backend.app.services.tray_fields import tray_presence_map
 from backend.app.utils.http import build_content_disposition
 
 logger = logging.getLogger(__name__)
@@ -2466,6 +2467,15 @@ async def configure_ams_slot(
                     slot_extruder = slot_state.ams_extruder_map.get(str(ams_id))
             kp_extruder = slot_extruder if slot_extruder is not None else 0
 
+            # Presence gate: never write a K-profile onto the spool bound to a tray
+            # that reads EMPTY on the wire. The MQTT command above still went out
+            # (the operator is configuring a slot), but that binding is a stale
+            # location claim and the profile would land on a roll that is not in the
+            # machine — poisoning it for wherever that roll actually goes next.
+            # Tri-state, gating on ``is False`` only: unknown presence persists as
+            # before.
+            slot_absent = tray_presence_map(getattr(slot_state, "raw_data", None)).get((ams_id, tray_id)) is False
+
             # Spoolman SlotAssignment first — has UniqueConstraint, idempotent.
             sm_result = await db.execute(
                 select(SpoolmanSlotAssignment).where(
@@ -2475,7 +2485,15 @@ async def configure_ams_slot(
                 )
             )
             sm_assignment = sm_result.scalar_one_or_none()
-            if sm_assignment:
+            if slot_absent:
+                logger.info(
+                    "[configure_ams_slot] Slot printer=%d ams=%d tray=%d reads EMPTY on the wire — "
+                    "K-profile NOT persisted (its binding is a stale location claim)",
+                    printer_id,
+                    ams_id,
+                    tray_id,
+                )
+            elif sm_assignment:
                 existing = await db.execute(
                     select(SpoolmanKProfile).where(
                         SpoolmanKProfile.spoolman_spool_id == sm_assignment.spoolman_spool_id,

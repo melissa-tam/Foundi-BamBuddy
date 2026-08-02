@@ -169,3 +169,72 @@ async def test_mixed_mode_union_covers_all_used_trays():
 
     mock_ws.assert_not_awaited()
     mock_notify.assert_not_awaited()
+
+
+def _patches_with_state(session, state):
+    """``_patches`` but with a LIVE printer state so the presence gate has evidence."""
+    p_session, _p_status, p_ws, p_notify = _patches(session)
+    return (
+        p_session,
+        patch(
+            "backend.app.services.spool_assignment_notifications.printer_manager.get_status",
+            return_value=state,
+        ),
+        p_ws,
+        p_notify,
+    )
+
+
+def _state(trays: list[dict], *, ams_id: int = 0):
+    return SimpleNamespace(raw_data={"ams": [{"id": ams_id, "tray": trays}]})
+
+
+@pytest.mark.asyncio
+async def test_binding_on_a_cleared_tray_no_longer_suppresses_the_alert():
+    """W4 — a binding whose tray reads EMPTY on the wire is a stale location claim,
+    not an assignment. Counting it here false-suppressed the very alert this
+    function exists for: the print maps a tray with nothing in it."""
+    logger = logging.getLogger(__name__)
+    data = {"ams_mapping": [0], "raw_data": {}}  # print uses A1
+
+    session = _FakeSession("Printer A", legacy=[SimpleNamespace(ams_id=0, tray_id=0)])
+    state = _state([{"id": 0, "state": 9, "tray_type": "", "remain": 0}])
+    p_session, p_status, p_ws, p_notify = _patches_with_state(session, state)
+    with p_session, p_status, p_ws as mock_ws, p_notify as mock_notify:
+        await notify_missing_spool_assignments_on_print_start(1, data, logger)
+
+    mock_ws.assert_awaited_once()
+    assert mock_ws.await_args.kwargs["missing_slots"][0]["slot"] == "A1"
+    mock_notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_binding_on_a_seated_tray_still_suppresses_the_alert():
+    logger = logging.getLogger(__name__)
+    data = {"ams_mapping": [0], "raw_data": {}}
+
+    session = _FakeSession("Printer A", legacy=[SimpleNamespace(ams_id=0, tray_id=0)])
+    state = _state([{"id": 0, "state": 11, "tray_type": "PETG", "remain": 80}])
+    p_session, p_status, p_ws, p_notify = _patches_with_state(session, state)
+    with p_session, p_status, p_ws as mock_ws, p_notify as mock_notify:
+        await notify_missing_spool_assignments_on_print_start(1, data, logger)
+
+    mock_ws.assert_not_awaited()
+    mock_notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_presence_keeps_the_binding_counted():
+    """Fail open: an offline printer (no live state) or a dialect that never reports
+    presence leaves the row counting exactly as it did before this gate existed."""
+    logger = logging.getLogger(__name__)
+    data = {"ams_mapping": [0], "raw_data": {}}
+
+    session = _FakeSession("Printer A", legacy=[SimpleNamespace(ams_id=0, tray_id=0)])
+    state = _state([{"id": 0, "state": 3, "tray_type": "PLA", "remain": 50}])  # A1-family dialect
+    p_session, p_status, p_ws, p_notify = _patches_with_state(session, state)
+    with p_session, p_status, p_ws as mock_ws, p_notify as mock_notify:
+        await notify_missing_spool_assignments_on_print_start(1, data, logger)
+
+    mock_ws.assert_not_awaited()
+    mock_notify.assert_not_awaited()

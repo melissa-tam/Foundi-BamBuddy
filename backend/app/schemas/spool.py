@@ -268,6 +268,13 @@ class SpoolAssignmentResponse(BaseModel):
     configured: bool = False
     pending_config: bool = False  # True when slot was empty at assign time; will configure on insert
     ams_label: str | None = None  # User-defined friendly name for the AMS unit
+    # Tri-state LIVE presence of the bound tray (``tray_fields.tray_presence``):
+    # True = something is seated, False = the verified cleared-tray shape (this
+    # binding is a stale location claim), None = unknown (printer offline, partial
+    # push, or a dialect that never reports presence). Derived per request from the
+    # live status — never stored — so a consumer can distinguish "empty" from
+    # "we don't know" instead of guessing. Read-only; ignored on input.
+    present: bool | None = None
 
     class Config:
         from_attributes = True

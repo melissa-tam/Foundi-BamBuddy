@@ -1009,6 +1009,24 @@ def clear_respool_prompt_dedup(printer_id: int, ams_id: int, tray_id: int) -> No
     _jump_seen.pop((printer_id, ams_id, tray_id), None)
 
 
+def respool_prompt_open_for_slot(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """True when a ``respool_prompt`` has been raised for this slot and not retired.
+
+    Reads the same per-slot dedup :func:`pending_respool_prompts` snapshots from —
+    an entry means "we asked the operator about the roll currently in this slot".
+    It is deliberately the CHEAP, conservative reading: no DB round-trip and no
+    re-validation, so a prompt the operator has since answered may still read open
+    until the slot's empty edge clears the dedup.
+
+    That bias is the correct one for its consumer. The tagged-ledger DECREASE
+    reconcile defers to a pending prompt (the operator is being asked whether the
+    tag moved onto a fresh roll — an automatic write-down would answer that
+    question for them, and wrongly if a re-spool follows), and deferring one cycle
+    too long costs nothing while writing one cycle too early costs the ledger.
+    """
+    return (ams_id, tray_id) in _respool_prompt_dedup.get(printer_id, {})
+
+
 def _count_trays_in_ams(state, ams_id: int) -> int:
     for unit in _iter_ams_units(state):
         if isinstance(unit, dict) and int(unit.get("id", -1)) == ams_id:
@@ -1360,13 +1378,18 @@ def _ledger_corrupt(spool: Spool) -> bool:
     return (used - label) > _LEDGER_CORRUPT_TOL_G
 
 
-def _remain_reading_untrustworthy(printer_id: int, ams_id: int, tray_id: int) -> bool:
+def remain_reading_untrustworthy(printer_id: int, ams_id: int, tray_id: int) -> bool:
     """True while the tray's ``remain`` reading cannot be trusted for corroboration.
 
     A commanded identify in flight (the value is mid-re-read) or a drying unit (trays
     disengage and re-report) both produce transient tray payloads. Fails CLOSED
     (unknown → untrustworthy → no jump) and never raises, same contract as
     :func:`_swap_evidence`.
+
+    Public because the tagged-ledger DECREASE reconcile in ``usage_tracker`` must
+    apply the SAME trust rule as the re-spool trigger — a lane that wrote the
+    ledger down from a mid-identify reading would be the very corruption both
+    lanes exist to prevent.
     """
     try:
         from backend.app.services import ams_presence
@@ -1385,17 +1408,50 @@ def _remain_reading_untrustworthy(printer_id: int, ams_id: int, tray_id: int) ->
         return True
 
 
+def remain_jump_margin(spool: Spool, tray: dict) -> float | None:
+    """Points-of-label by which the tray's WIRE remain% exceeds the ledger's.
+
+    ``remain − (label_weight − weight_used) / label_weight × 100``, i.e. how far
+    the firmware's reading of the physical roll disagrees with what the gram
+    ledger claims is left, expressed in percentage points of the label weight.
+    Positive = the wire says there is MORE filament than the ledger believes.
+
+    ``None`` when the arithmetic does not apply at all: no valid RFID tag on the
+    tray (an untagged roll has no wire truth to compare against), a non-positive
+    label weight, or a ``remain`` that does not parse to an int in 1..100 (0 and
+    −1 are firmware's "no reading", not "empty").
+
+    THE one origin for that comparison. Two lanes consume it and must never drift
+    apart: the re-spool trigger below (≥ :data:`_RESPOOL_REMAIN_JUMP_PCT`, a
+    reused core carried the tag onto a fresh roll) and the tagged-ledger DECREASE
+    reconcile in ``usage_tracker`` (≥ 50 points, doctrine rule 8 — for a tagged row
+    the wire remain is truth and the ledger gets written DOWN).
+    """
+    if not is_valid_tag(tray.get("tag_uid", "") or "", tray.get("tray_uuid", "") or ""):
+        return None
+    label_weight = spool.label_weight or 0
+    if label_weight <= 0:
+        return None
+    try:
+        remain = int(tray.get("remain"))
+    except (TypeError, ValueError):
+        return None
+    if not (1 <= remain <= 100):
+        return None
+    ledger_pct = max(0, label_weight - (spool.weight_used or 0)) / label_weight * 100
+    return remain - ledger_pct
+
+
 def _remain_jump_reading(spool: Spool, tray: dict) -> bool:
     """Detect a reused-core refill the gram ledger cannot see.
 
     A reused Bambu core carries its RFID tag onto a FRESH roll, so the firmware
     re-reads the tray as ~full (``remain`` ≈ 100%) while our ledger still holds the
     donor's near-spent ``weight_used``. The tag identity is CORRECT, so RFID
-    re-reads never fix it — only a re-spool resets the ledger. True iff the tray
-    carries a valid tag, the spool has a positive label weight, the tray ``remain``
-    parses to an int in 1..100, and it exceeds the ledger's implied remaining % by
-    at least :data:`_RESPOOL_REMAIN_JUMP_PCT`. A weight-locked fresh row (ledger
-    ≈100%) cannot jump — ``remain`` cannot exceed 100 by 30 — so no special-case is
+    re-reads never fix it — only a re-spool resets the ledger. True iff
+    :func:`remain_jump_margin` is computable and at least
+    :data:`_RESPOOL_REMAIN_JUMP_PCT`. A weight-locked fresh row (ledger ≈100%)
+    cannot jump — ``remain`` cannot exceed 100 by 30 — so no special-case is
     needed for it.
 
     This is the INSTANTANEOUS reading only: pure arithmetic over one tray payload,
@@ -1404,19 +1460,8 @@ def _remain_jump_reading(spool: Spool, tray: dict) -> bool:
     deliberate question about the live tray, with no push history to corroborate
     against) consumes this one.
     """
-    if not is_valid_tag(tray.get("tag_uid", "") or "", tray.get("tray_uuid", "") or ""):
-        return False
-    label_weight = spool.label_weight or 0
-    if label_weight <= 0:
-        return False
-    try:
-        remain = int(tray.get("remain"))
-    except (TypeError, ValueError):
-        return False
-    if not (1 <= remain <= 100):
-        return False
-    ledger_pct = max(0, label_weight - (spool.weight_used or 0)) / label_weight * 100
-    return (remain - ledger_pct) >= _RESPOOL_REMAIN_JUMP_PCT
+    margin = remain_jump_margin(spool, tray)
+    return margin is not None and margin >= _RESPOOL_REMAIN_JUMP_PCT
 
 
 def _remain_jump(spool: Spool, tray: dict, printer_id: int, ams_id: int, tray_id: int) -> bool:
@@ -1438,7 +1483,7 @@ def _remain_jump(spool: Spool, tray: dict, printer_id: int, ams_id: int, tray_id
     if not _remain_jump_reading(spool, tray):
         _jump_seen.pop(key, None)
         return False
-    if _remain_reading_untrustworthy(printer_id, ams_id, tray_id):
+    if remain_reading_untrustworthy(printer_id, ams_id, tray_id):
         return False
     now = _monotonic()
     first_seen, count = _jump_seen.get(key, (now, 0))

@@ -133,6 +133,12 @@ _FRESH_ROLL_PROMPT_USED_FRAC = 0.7
 # refused AMS write is re-pushed within one settle window.
 _RECONCILE_MIN_INTERVAL_S = 20.0
 
+# gcode_state values during which the AMS is busy and silently ignores slot-config
+# writes. Republishing into one of these does not converge — it just fills the log
+# (2026-07-27: 998 lines over four hours on 002-H2S AMS0-T1). The reconcile lane
+# keeps the OCCASION on a busy printer but skips the publish.
+_CONFIG_PUSH_BUSY_STATES = ("RUNNING", "PAUSE")
+
 # monotonic() stamp of the last reconcile pass — the only session state that lane
 # keeps (everything else it acts on is derived from live state + DB each pass).
 _last_reconcile_at: float | None = None
@@ -1239,6 +1245,11 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
     work is re-derived from live merged state plus the DB, so it is restart-safe by
     construction.
 
+    One backoff on top (2026-07-27): while the printer is RUNNING/PAUSE the AMS
+    ignores config writes, so the bare-tray arm keeps the occasion but skips the
+    publish (:data:`_CONFIG_PUSH_BUSY_STATES`) instead of re-firing every 30 s for
+    hours. Its retry window is left unburned, so the first settled pass re-pushes.
+
     ``manager``/``now`` are injectable for tests. Returns the number of publishes
     attempted.
     """
@@ -1275,6 +1286,12 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
             .where(SpoolAssignment.printer_id == printer_id)
         )
         bound = {(a.ams_id, a.tray_id): a for a in res.scalars().all()}
+        # A printer that is RUNNING or PAUSEd has a busy AMS that silently drops
+        # config writes; the bare-tray arm backs off on it (see below). The K-drift
+        # arm keeps its own gates and the owed-identify arm already self-refuses
+        # mid-print, so neither is touched here.
+        busy_state = (getattr(state, "state", None) or "").upper()
+        printer_busy = busy_state in _CONFIG_PUSH_BUSY_STATES
         # At most ONE commanded discovery read per printer per pass: the client's
         # per-printer identify gate would refuse the rest anyway, and provoking that
         # refusal from our own loop is how a lane starts logging WARNINGs about itself.
@@ -1310,7 +1327,25 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
                         # including the operator/RFID-bound never-overwrite: a config
                         # write racing a firmware tag read is the 2026-07-18 HMS
                         # 0700_0081 class, so the re-push stays ams_auto-only.
-                        if await maybe_autoconfigure_bare_tray(db, printer_id, ams_id, tray_id, tray):
+                        if printer_busy:
+                            # BUSY BACKOFF (2026-07-27, 002-T1): a printing/paused AMS
+                            # ignores config writes, and this lane re-fired every 30 s
+                            # for FOUR HOURS (998 log lines) without converging. Skip
+                            # the PUBLISH only — the retry window is deliberately left
+                            # unburned (the callee is what stamps it), so the very
+                            # first pass after the printer settles re-pushes
+                            # immediately instead of waiting out the cadence. Same
+                            # "supply the occasion, never a new permission" contract
+                            # as the identify/drying defers.
+                            logger.debug(
+                                "Slot-config reconcile: printer %d AMS%d-T%d bare-tray re-push skipped "
+                                "— printer is %s (a busy AMS ignores config writes)",
+                                printer_id,
+                                ams_id,
+                                tray_id,
+                                busy_state,
+                            )
+                        elif await maybe_autoconfigure_bare_tray(db, printer_id, ams_id, tray_id, tray):
                             pushed += 1
                     elif (
                         assignment is not None

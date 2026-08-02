@@ -62,6 +62,7 @@ from backend.app.services.spool_csv import (
     serialize,
 )
 from backend.app.services.spoolman import SpoolmanClient, get_spoolman_client, init_spoolman_client
+from backend.app.services.tray_fields import parse_int_field, tray_presence_from_dict, tray_presence_map
 from backend.app.utils.filament_ids import (
     GENERIC_FILAMENT_IDS,
     MATERIAL_TEMPS,
@@ -1853,11 +1854,16 @@ async def list_assignments(
     # Build (printer_id, ams_id) -> ams_serial map from live printer states.
     # Fetch all statuses in one call rather than one get_status() call per printer.
     serial_map: dict[tuple[int, int], str] = {}
+    # Tri-state live presence per (printer_id, ams_id, tray_id) from the SAME
+    # statuses — one shared rule (``tray_fields.tray_presence``), so an assignment
+    # row and the observation pipeline can never disagree about an empty slot.
+    presence_map: dict[int, dict[tuple[int, int], bool | None]] = {}
     seen_printer_ids: set[int] = {a.printer_id for a in assignments}
     all_statuses = printer_manager.get_all_statuses()
     for pid in seen_printer_ids:
         state = all_statuses.get(pid)
         if state and state.raw_data:
+            presence_map[pid] = tray_presence_map(state.raw_data)
             for ams_unit in state.raw_data.get("ams", []):
                 sn = str(ams_unit.get("sn") or ams_unit.get("serial_number") or "")
                 if sn:
@@ -1886,6 +1892,9 @@ async def list_assignments(
     responses: list[SpoolAssignmentResponse] = []
     for a in assignments:
         resp = SpoolAssignmentResponse.model_validate(a)
+        # Additive tri-state presence. A printer we hold no live status for is
+        # simply absent from the map → None ("unknown"), never False.
+        resp.present = presence_map.get(a.printer_id, {}).get((a.ams_id, a.tray_id))
         sn = serial_map.get((a.printer_id, a.ams_id))
         if sn and sn in label_by_serial:
             resp.ams_label = label_by_serial[sn]
@@ -2314,9 +2323,23 @@ async def sync_weights_from_ams(
 
     Overwrites the database weight_used for every assigned spool using the
     current AMS remain% from connected printers.  This is a manual recovery
-    tool — it bypasses the normal "only increase" guard.
+    tool — it bypasses the normal "only increase" guard, but NOT the three
+    guards that keep it from destroying data (W4, 2026-08-02):
+
+    * **Presence** — a slot whose live tray reads the cleared-tray shape
+      (``tray_presence`` ``is False``) is skipped. Its binding is a stale
+      location claim; the tray's ``remain`` describes nothing.
+    * **remain 1..100** — ``remain=0`` used to pass here (the on-push sync has
+      always required 1..100) and computed ``weight_used = label_weight``, so one
+      run over a fleet with cleared trays wrote every one of those rolls to
+      "empty". 0 is firmware's "no reading", not "no filament".
+    * **Mid-print** — the per-printer ``usage_tracker.ams_weight_sync_allowed``
+      gate (the same durable one ``on_ams_change`` uses): folding the
+      low-resolution AMS remain% in while a print is running double-counts the
+      usage tracker's precise per-print 3MF deduction (#880).
     """
     from backend.app.services.printer_manager import printer_manager
+    from backend.app.services.usage_tracker import ams_weight_sync_allowed
 
     result = await db.execute(select(SpoolAssignment).options(selectinload(SpoolAssignment.spool)))
     assignments = list(result.scalars().all())
@@ -2324,6 +2347,9 @@ async def sync_weights_from_ams(
 
     synced = 0
     skipped = 0
+    # One mid-print verdict per printer (the gate hits the DB), memoised across
+    # that printer's slots.
+    sync_allowed_by_printer: dict[int, bool] = {}
 
     for assignment in assignments:
         spool = assignment.spool
@@ -2347,6 +2373,20 @@ async def sync_weights_from_ams(
             skipped += 1
             continue
 
+        if assignment.printer_id not in sync_allowed_by_printer:
+            sync_allowed_by_printer[assignment.printer_id] = await ams_weight_sync_allowed(
+                db, assignment.printer_id, state
+            )
+        if not sync_allowed_by_printer[assignment.printer_id]:
+            logger.info(
+                "AMS weight sync: printer %d is mid-print (or its state is unknown) — skipping spool %d; "
+                "the usage tracker owns this print's deduction",
+                assignment.printer_id,
+                spool.id,
+            )
+            skipped += 1
+            continue
+
         ams_raw = state.raw_data.get("ams", [])
         if isinstance(ams_raw, dict):
             ams_raw = ams_raw.get("ams", [])
@@ -2358,6 +2398,18 @@ async def sync_weights_from_ams(
                 assignment.printer_id,
                 assignment.ams_id,
                 assignment.tray_id,
+            )
+            skipped += 1
+            continue
+
+        if tray_presence_from_dict(tray) is False:
+            logger.info(
+                "AMS weight sync: printer %d AMS%d-T%d reads EMPTY on the wire — skipping spool %d "
+                "(stale binding; its remain%% describes no roll)",
+                assignment.printer_id,
+                assignment.ams_id,
+                assignment.tray_id,
+                spool.id,
             )
             skipped += 1
             continue
@@ -2374,8 +2426,18 @@ async def sync_weights_from_ams(
             skipped += 1
             continue
 
-        if remain_val < 0 or remain_val > 100:
-            logger.debug("AMS weight sync: invalid remain=%s for spool %d", remain_raw, spool.id)
+        # 1..100, matching the on-push sync exactly. remain=0 is firmware's "no
+        # reading" (and what a cleared tray reports), NOT a measured-empty roll —
+        # accepting it wrote weight_used = label_weight over real ledgers.
+        if remain_val < 1 or remain_val > 100:
+            logger.info(
+                "AMS weight sync: unusable remain=%s for spool %d (printer %d AMS%d-T%d) — skipping",
+                remain_raw,
+                spool.id,
+                assignment.printer_id,
+                assignment.ams_id,
+                assignment.tray_id,
+            )
             skipped += 1
             continue
 
@@ -2404,14 +2466,21 @@ async def sync_weights_from_ams(
 
 
 def _find_tray_in_ams_data(ams_data: list, ams_id: int, tray_id: int) -> dict | None:
-    """Find a specific tray in the AMS data structure."""
+    """Find a specific tray in the AMS data structure.
+
+    Malformed units/trays (non-dicts, unparseable ids) are skipped rather than
+    raising — a live wire payload is not a schema, and a lookup miss must never
+    500 a read-only listing.
+    """
     if not ams_data:
         return None
     for ams_unit in ams_data:
-        if int(ams_unit.get("id", -1)) != ams_id:
+        if not isinstance(ams_unit, dict):
             continue
-        for tray in ams_unit.get("tray", []):
-            if int(tray.get("id", -1)) == tray_id:
+        if parse_int_field(ams_unit.get("id")) != ams_id:
+            continue
+        for tray in ams_unit.get("tray", []) or []:
+            if isinstance(tray, dict) and parse_int_field(tray.get("id")) == tray_id:
                 return tray
     return None
 

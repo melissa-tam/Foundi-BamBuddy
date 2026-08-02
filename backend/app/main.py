@@ -1699,45 +1699,6 @@ def _is_bambu_uuid(tray_uuid: str) -> bool:
     return bool(tray_uuid) and tray_uuid not in ("", "0" * len(tray_uuid))
 
 
-# gcode_state values that mean a print is actively running (or about to feed
-# filament). Folding AMS remain% into weight_used during any of these
-# double-counts the usage tracker's precise per-print 3MF deduction (#880).
-_ACTIVE_PRINT_GCODE_STATES = ("RUNNING", "PAUSE", "PREPARE", "SLICING")
-
-
-async def _ams_weight_sync_allowed(db, printer_id: int, state) -> bool:
-    """Whether on_ams_change may fold this printer's AMS remain% into spool
-    weight_used right now.
-
-    The precise per-print deduction is the usage tracker's job at completion
-    (3MF / G-code). Folding the low-resolution AMS remain% in WHILE a print is
-    active double-counts (#880). The former guard snapshotted the in-memory
-    ``usage_tracker._active_sessions`` set, which a server restart mid-print
-    wiped — the sync then ran against a live print and double-counted. Both legs
-    here are durable:
-
-    - the live gcode_state is a settled (non-active) one — a missing / ``unknown``
-      state fails closed (possibly-active, sync NOT allowed); and
-    - no PrintArchive for this printer is still ``status="printing"`` (covers a
-      live state that lags the DB).
-    """
-    if state is None:
-        return False
-    live_state = (getattr(state, "state", None) or "").upper()
-    if not live_state or live_state == "UNKNOWN" or live_state in _ACTIVE_PRINT_GCODE_STATES:
-        return False
-
-    from backend.app.models.archive import PrintArchive
-
-    result = await db.execute(
-        select(PrintArchive.id)
-        .where(PrintArchive.printer_id == printer_id)
-        .where(PrintArchive.status == "printing")
-        .limit(1)
-    )
-    return result.scalar_one_or_none() is None
-
-
 async def on_ams_change(printer_id: int, ams_data: list):
     """Handle AMS data changes - sync to Spoolman if enabled and auto mode."""
     logger = logging.getLogger(__name__)
@@ -1800,6 +1761,11 @@ async def on_ams_change(printer_id: int, ams_data: list):
                 should_evaluate_respool,
             )
             from backend.app.services.spool_tag_matcher import reapply_k_profile_if_drifted
+            from backend.app.services.usage_tracker import (
+                ams_weight_sync_allowed,
+                clear_ledger_decrease_window,
+                maybe_reconcile_tagged_ledger_decrease,
+            )
 
             # Presence tracking runs in BOTH modes: presence edges, physical-cycle tiers
             # and the identify pipeline are wire facts, not inventory policy. Guarded —
@@ -1816,7 +1782,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                 # Whether AMS remain% may be folded into weight_used this sweep —
                 # computed once (durable legs: live gcode_state + printing-archive),
                 # replacing the restart-fragile _active_sessions snapshot (#880).
-                _ams_sync_allowed = await _ams_weight_sync_allowed(
+                _ams_sync_allowed = await ams_weight_sync_allowed(
                     db, printer_id, printer_manager.get_status(printer_id)
                 )
                 for ams_unit in ams_data:
@@ -1858,6 +1824,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                             # (``slot_pipeline._process_observation``), which owns that
                             # prompt end to end.
                             clear_respool_prompt_dedup(printer_id, ams_id, tray_id)
+                            clear_ledger_decrease_window(printer_id, ams_id, tray_id)
                             spool_tagless.clear_autoconfig_dedup(printer_id, ams_id, tray_id)
                             continue
 
@@ -1925,6 +1892,33 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                     )
                                     existing_assignment.spool.weight_used = new_used
                                     await db.commit()
+
+                        # DECREASE lane (W6) — the increase-only sync above cannot
+                        # heal a ledger that over-counts, so a tagged row whose WIRE
+                        # remain contradicts it stays wrong forever (prod spool 37:
+                        # 899 g used against a wire-full roll, grams misattributed
+                        # while the row was stale-bound elsewhere on 07-17). Doctrine
+                        # rule 8: for a TAGGED row the wire remain IS truth. Every
+                        # gate (tagged, idle, trustworthy reading, no pending respool
+                        # prompt, ≥50-point contradiction stable across pushes) lives
+                        # in the callee.
+                        try:
+                            await maybe_reconcile_tagged_ledger_decrease(
+                                db,
+                                printer_id,
+                                ams_id,
+                                tray_id,
+                                tray,
+                                existing_assignment.spool,
+                                sync_allowed=_ams_sync_allowed,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Tagged-ledger decrease reconcile failed for printer %d AMS%d-T%d",
+                                printer_id,
+                                ams_id,
+                                tray_id,
+                            )
 
                         # Re-apply the spool's stored K-profile when the live tray's
                         # cali_idx drifted (owned by spool_tag_matcher, rate-limited

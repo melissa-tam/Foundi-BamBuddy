@@ -23,8 +23,10 @@ Contract notes:
   about to mutate — every value is copied into a frozen object, nothing aliases
   the wire dict.
 * Field parsing is shared with ``bambu_mqtt`` through ``services.tray_fields``
-  (one origin — a second wire parser would drift), and presence keys off
-  ``bambu_mqtt.TRAY_PRESENT_STATES`` (one origin for that magic value).
+  (one origin — a second wire parser would drift), and presence IS
+  ``tray_fields.tray_presence`` — the same tri-state rule every downstream
+  consumer gates on, so an observation and an assignments-API row can never
+  disagree about whether a slot is empty.
 * Pure: no DB, no awaits, no module state.
 """
 
@@ -33,14 +35,15 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from backend.app.services.bambu_mqtt import TRAY_PRESENT_STATES
 from backend.app.services.tray_fields import (
+    asserted_str_field,
     normalized_tag_uid,
     normalized_tray_uuid,
     parse_int_field,
     parse_tray_exist_bits,
     parse_tray_state,
     slot_exist_bit_set,
+    tray_presence,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,17 +59,12 @@ CONFIG_KEYS = ("tray_type", "tray_color", "tray_info_idx", "tray_sub_brands")
 class TrayObservation:
     """What ONE AMS push said about ONE tray. Immutable, self-describing.
 
-    Tri-state ``present`` (doctrine: presence ≠ identity):
-
-    * ``True``  — ``state`` is in ``TRAY_PRESENT_STATES`` (10 = seated, 11 = fed).
-    * ``False`` — ``state`` parsed, is not a present code, AND ``tray_type`` was
-      asserted EMPTY. That pair is the verified prod cleared-tray shape (state 9 +
-      ``tray_type: ""``); it is the only shape that may drive a release.
-    * ``None``  — anything else: no parseable state (partial push), a dialect that
-      never reports presence (the A1-family/P1S always-``state=3`` firmwares), a
-      state-9 slot that still asserts a filament type (the 004-H2S
-      state-9-while-feeding dialect), or a state/bitmask CONTRADICTION. Unknown
-      always beats a guessed "empty" — consumers gate on ``present is False``.
+    Tri-state ``present`` (doctrine: presence ≠ identity) — computed by
+    :func:`tray_fields.tray_presence`, which owns the rule and documents every
+    branch. In short: ``True`` = a present state code, ``False`` = the verified
+    prod cleared-tray shape (non-present state + asserted-empty ``tray_type``,
+    with no contradicting exist bit), ``None`` = everything else. Unknown always
+    beats a guessed "empty" — consumers gate on ``present is False``.
     """
 
     printer_id: int
@@ -140,15 +138,13 @@ def _asserted(tray: dict, keys: tuple[str, ...]) -> bool:
 
 
 def _str_field(tray: dict, key: str) -> str | None:
-    """Asserted string field: ``None`` when absent, stripped value when present."""
-    if key not in tray:
-        return None
-    value = tray.get(key)
-    if value is None:
-        # An explicit null asserts "nothing here" for a string field — the merge
-        # treats null and "" the same way in its always-update list.
-        return ""
-    return str(value).strip()
+    """Asserted string field — delegates to ``tray_fields.asserted_str_field``.
+
+    Kept as a local name because every field below reads through it; the rule
+    itself lives in ``tray_fields`` so the merged-data presence convenience
+    (``tray_presence_from_dict``) applies EXACTLY the same assertion semantics.
+    """
+    return asserted_str_field(tray, key)
 
 
 def observe_tray(
@@ -194,7 +190,7 @@ def observe_tray(
     if exist_bits is not None and isinstance(ams_id, int) and 0 <= ams_id < 128 and tray_id >= 0:
         bit = slot_exist_bit_set(exist_bits, ams_id, tray_id)
 
-    present = _derive_present(state, tray_type, bit)
+    present = tray_presence(state, tray_type, bit)
 
     return TrayObservation(
         printer_id=printer_id,
@@ -215,22 +211,6 @@ def observe_tray(
         nozzle_temp_max=parse_int_field(tray.get("nozzle_temp_max")),
         exist_bit=bit,
     )
-
-
-def _derive_present(state: int | None, tray_type: str | None, exist_bit: bool | None) -> bool | None:
-    """The tri-state presence rule. See :class:`TrayObservation` for the contract."""
-    if state in TRAY_PRESENT_STATES:
-        return True
-    if state is not None and tray_type == "":
-        # Cleared-tray shape. One veto: the push's own bitmask still marks the slot
-        # occupied (the 003-H2S mid-print-insert quirk, where the per-tray state
-        # sticks at 9 while the bitmask reports the spool — the merge pipeline
-        # promotes exactly this case 9→10 downstream). Contradiction resolves to
-        # UNKNOWN, never to EMPTY, because "empty" is what authorizes a release.
-        if exist_bit is True:
-            return None
-        return False
-    return None
 
 
 def observe_ams_push(printer_id: int, ams_payload: object) -> list[TrayObservation]:

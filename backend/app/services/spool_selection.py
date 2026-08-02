@@ -30,12 +30,13 @@ below the floor the requirement's slot is reported in
 distinct reason instead of silently dispatching or falling back to a mismatch.
 
 Above every policy sits a hard exclude of unusable spools: a spool flagged with a
-mid-print feed fault (``Spool.feed_fault_at`` → :attr:`SlotInventory.out_of_rotation`)
-OR a spent spool (``Spool.spent_at`` → :attr:`SlotInventory.spent`) is removed from
-the candidate set before any eligibility split, so it can never start a print, be
-staged, or surface in ``start_blocked_slots`` — it is simply invisible to selection
-until the condition clears. This exclusion is unconditional: a jammed or spent spool
-never starts a print regardless of the selection policy or the minimum-start floor.
+mid-print feed fault (``Spool.feed_fault_at`` → :attr:`SlotInventory.out_of_rotation`),
+a spent spool (``Spool.spent_at`` → :attr:`SlotInventory.spent`), or an ARCHIVED row
+(``Spool.archived_at`` → :attr:`SlotInventory.archived`) is removed from the candidate
+set before any eligibility split, so it can never start a print, be staged, or surface
+in ``start_blocked_slots`` — it is simply invisible to selection until the condition
+clears. This exclusion is unconditional: a jammed, spent or retired spool never starts
+a print regardless of the selection policy or the minimum-start floor.
 """
 
 from __future__ import annotations
@@ -88,10 +89,14 @@ class SlotInventory:
     ``out_of_rotation`` is the feed-fault hard-exclude flag: a spool flagged with a
     mid-print feed fault (jam / tangle) is out of service and must never be selected.
     ``spent`` is the run-dry hard-exclude flag: a spool marked spent has no filament
-    left to start with. Both are kept SEPARATE (their log/operator semantics differ)
-    and both hard-exclude the slot. Only the internal inventory mode can set them
-    (``Spool.feed_fault_at`` / ``Spool.spent_at``); Spoolman has no such concept, so
-    they stay ``False`` there.
+    left to start with. ``archived`` is the retired-row hard-exclude flag: an
+    archived spool has been taken out of inventory by an operator or by a donor
+    disposal, and an archived-but-still-bound row was a live START candidate until
+    2026-08-02 (repairs that archived a rotten row without rebinding the slot left
+    it selectable). All three are kept SEPARATE (their log/operator semantics
+    differ) and all three hard-exclude the slot. Only the internal inventory mode
+    can set them (``Spool.feed_fault_at`` / ``spent_at`` / ``archived_at``);
+    Spoolman has no such concept, so they stay ``False`` there.
     """
 
     remaining_g: float | None
@@ -99,6 +104,7 @@ class SlotInventory:
     ord_src: str | None = None
     out_of_rotation: bool = False
     spent: bool = False
+    archived: bool = False
 
 
 @dataclass
@@ -322,13 +328,15 @@ def match_filaments_to_slots(
         available = [f for f in loaded if f["global_tray_id"] not in used_tray_ids]
 
         # (0) Unusable-spool hard exclude: a jammed / feed-fault spool
-        # (out_of_rotation) OR a spent spool leaves the candidate set entirely
-        # BEFORE any eligibility split, so neither can ever start a print, be
-        # staged, or surface in start_blocked_slots — regardless of the policy or
-        # the minimum-start floor. The two reasons are kept SEPARATE so the trace
-        # names why a slot vanished (jam vs run-dry differ operationally).
+        # (out_of_rotation), a spent spool, or an ARCHIVED (retired) row leaves the
+        # candidate set entirely BEFORE any eligibility split, so none can ever
+        # start a print, be staged, or surface in start_blocked_slots — regardless
+        # of the policy or the minimum-start floor. The three reasons are kept
+        # SEPARATE so the trace names why a slot vanished (jam vs run-dry vs
+        # retired-row differ operationally).
         excluded_oor: list[int] = []
         excluded_spent: list[int] = []
+        excluded_archived: list[int] = []
         if inv:
             kept: list[dict] = []
             for f in available:
@@ -337,6 +345,8 @@ def match_filaments_to_slots(
                     excluded_oor.append(f["global_tray_id"])
                 elif si is not None and si.spent:
                     excluded_spent.append(f["global_tray_id"])
+                elif si is not None and si.archived:
+                    excluded_archived.append(f["global_tray_id"])
                 else:
                     kept.append(f)
             available = kept
@@ -373,7 +383,7 @@ def match_filaments_to_slots(
         if trace:
             logger.info(
                 "[spool-select] slot=%s type=%r color=%r tii=%r nozzle=%s policy=%s min_start=%s; "
-                "eligible=%s dropped=%s excluded_oor=%s excluded_spent=%s",
+                "eligible=%s dropped=%s excluded_oor=%s excluded_spent=%s excluded_archived=%s",
                 slot_id,
                 req_type_repr(req),
                 req.get("color", ""),
@@ -385,6 +395,7 @@ def match_filaments_to_slots(
                 _trace_rows(dropped, inv),
                 excluded_oor,
                 excluded_spent,
+                excluded_archived,
             )
 
         # (4) bucket scan on eligible; dropped-only match ⇒ start-blocked.
@@ -568,6 +579,7 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
             ord_src=ord_src,
             out_of_rotation=spool.feed_fault_at is not None,
             spent=spool.spent_at is not None,
+            archived=spool.archived_at is not None,
         )
     return out
 

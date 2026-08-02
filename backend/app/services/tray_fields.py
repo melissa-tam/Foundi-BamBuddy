@@ -22,6 +22,18 @@ from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tra
 ZERO_TAG_UID = "0000000000000000"
 ZERO_TRAY_UUID = "00000000000000000000000000000000"
 
+# Tray `state` codes that mean a spool is physically PRESENT: 11 = loaded, 10 =
+# "spool present, filament not in feeder" (see the merge comment in
+# ``bambu_mqtt._handle_ams_data``). Wiping tray identity for a present spool is the
+# bug behind the AMS-drying incident (drying disengages trays to state 10, and the
+# identity wipe then storms the RFID pipeline into HMS 0700_C069) and behind routine
+# load/unload transit wipes (~50×/week fleet-wide). It lives HERE, beside the parser
+# that reads the field, because :func:`tray_presence` — the one presence rule every
+# consumer gates on — needs it and ``bambu_mqtt`` already imports this module (the
+# reverse import would be a cycle). ``bambu_mqtt`` re-exports the same tuple object,
+# so ``ams_presence``/``tray_observation``/``spool_recovery`` keep their one origin.
+TRAY_PRESENT_STATES = (10, 11)
+
 
 def parse_int_field(raw: object) -> int | None:
     """Parse a numeric tray field to ``int``, or ``None`` when it asserts nothing.
@@ -89,6 +101,115 @@ def slot_exist_bit_set(bits: int | None, ams_id: object, tray_id: object) -> boo
     if a < 0 or a >= 128 or t < 0:
         return False
     return bool((bits >> (a * 4 + t)) & 1)
+
+
+def asserted_str_field(tray: dict, key: str) -> str | None:
+    """A tray dict's string field with ASSERTION preserved.
+
+    ``None`` when the push carried no such key (this push said nothing about it),
+    ``""`` when it carried an explicit null or an empty/whitespace value (the push
+    asserts "nothing here" — the merge treats null and ``""`` identically in its
+    always-update list), otherwise the stripped value. The distinction is
+    load-bearing for :func:`tray_presence`: only an ASSERTED-empty ``tray_type``
+    may drive a release.
+    """
+    if key not in tray:
+        return None
+    value = tray.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def tray_presence(state: int | None, tray_type: str | None, exist_bit: bool | None = None) -> bool | None:
+    """THE tri-state presence rule for one tray — presence ≠ identity.
+
+    One origin for every consumer (the observation layer, the assignments API, the
+    weight-sync tool, the deficit pricer, the scheduler's candidate filter, the
+    unassigned-tray alert, the K-persist route). Answers:
+
+    * ``True``  — ``state`` is in :data:`TRAY_PRESENT_STATES` (10 = seated, 11 = fed).
+    * ``False`` — ``state`` parsed, is not a present code, AND ``tray_type`` was
+      asserted EMPTY (``""``). That pair is the verified prod cleared-tray shape
+      (state 9 + ``tray_type: ""``); it is the ONLY shape that may drive a release
+      or a consumer skip. One veto: when the push's own ``tray_exist_bits`` still
+      marks the slot occupied (the 003-H2S mid-print-insert quirk, where the
+      per-tray state sticks at 9 while the bitmask reports the spool), the
+      contradiction resolves to UNKNOWN — never to EMPTY, because "empty" is what
+      authorizes destructive action.
+    * ``None``  — anything else: no parseable state (a partial push), a dialect that
+      never reports presence (the A1-family/P1S always-``state=3`` firmwares), or a
+      state-9 slot that still asserts a filament type (the 004-H2S
+      state-9-while-feeding dialect).
+
+    Consumers gate on ``is False`` ONLY — unknown always fails OPEN.
+
+    ``tray_type`` must carry assertion (see :func:`asserted_str_field`): ``None``
+    means "not asserted", ``""`` means "asserted empty".
+    """
+    if state in TRAY_PRESENT_STATES:
+        return True
+    if state is not None and tray_type == "":
+        if exist_bit is True:
+            return None
+        return False
+    return None
+
+
+def tray_presence_from_dict(tray: object) -> bool | None:
+    """:func:`tray_presence` for a MERGED AMS tray dict (the display-side shape).
+
+    Convenience for the consumers that read ``printer_manager`` status rather than
+    a raw pre-merge push: parses ``state`` and ``tray_type`` with THIS module's own
+    parsers so a merged-data consumer can never disagree with the observation layer.
+
+    No exist-bit is consulted: the bitmask is a per-PUSH sibling field, and the
+    merged view keeps no honest per-tray copy of it, so passing a stale bit would
+    manufacture a veto. Omitting it can only make the answer *less* decisive
+    (``False`` instead of ``None``) for the one 003-H2S shape — and the merge's own
+    9→10 promotion already resolves that case before a consumer sees it.
+    """
+    if not isinstance(tray, dict):
+        return None
+    return tray_presence(parse_tray_state(tray.get("state")), asserted_str_field(tray, "tray_type"))
+
+
+def tray_presence_map(ams_payload: object) -> dict[tuple[int, int], bool | None]:
+    """``{(ams_id, tray_id): present}`` for every tray in a live/merged AMS payload.
+
+    Accepts what ``PrinterState.raw_data`` actually holds — the full status dict
+    (``{"ams": [...]}`` or the nested ``{"ams": {"ams": [...]}}`` variant), a bare
+    unit list, or ``None`` — and never raises: an unreadable payload yields ``{}``,
+    which every consumer reads as "no presence evidence" (fail open). Slots the
+    payload does not mention are ABSENT FROM THE MAP, never ``False``: silence
+    about a slot is not an observation of it.
+    """
+    units = ams_payload
+    if isinstance(units, dict):
+        units = units.get("ams")
+        if isinstance(units, dict):
+            units = units.get("ams")
+    if not isinstance(units, list):
+        return {}
+
+    out: dict[tuple[int, int], bool | None] = {}
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        ams_id = parse_int_field(unit.get("id"))
+        if ams_id is None:
+            continue
+        trays = unit.get("tray")
+        if not isinstance(trays, list):
+            continue
+        for tray in trays:
+            if not isinstance(tray, dict):
+                continue
+            tray_id = parse_int_field(tray.get("id"))
+            if tray_id is None:
+                continue
+            out[(ams_id, tray_id)] = tray_presence_from_dict(tray)
+    return out
 
 
 def normalized_tag_uid(value: object) -> str | None:

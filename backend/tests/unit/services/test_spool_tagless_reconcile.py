@@ -287,6 +287,50 @@ class TestDeferredSlot:
         env.apply.assert_awaited_once()
 
 
+# --- F2: busy-AMS backoff ---------------------------------------------------
+
+
+class TestBusyBackoff:
+    """2026-07-27 (002-H2S AMS0-T1): four hours of 30-second config re-pushes — 998
+    log lines — into a busy AMS that silently drops every one. The lane keeps the
+    OCCASION on a printing/paused printer but skips the PUBLISH."""
+
+    @pytest.mark.parametrize("gcode_state", ["RUNNING", "PAUSE"])
+    async def test_busy_printer_skips_the_bare_tray_publish(self, db_session, printer_factory, env, gcode_state):
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id)
+        manager = _FakeManager({printer.id: _state([_bare_tray()], gcode_state=gcode_state)})
+
+        assert await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0) == 0
+        env.apply.assert_not_awaited()
+
+    async def test_the_retry_window_is_left_unburned(self, db_session, printer_factory, env):
+        """A skipped publish must not consume the slot's retry window: the FIRST pass
+        after the printer settles re-pushes immediately instead of waiting out the
+        cadence (same contract as the identify/drying defers)."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id)
+        busy = _FakeManager({printer.id: _state([_bare_tray()], gcode_state="RUNNING")})
+
+        assert await spool_tagless.reconcile_slot_config(db_session, manager=busy, now=_T0) == 0
+        assert (printer.id, 0, 0) not in spool_tagless._autoconfig_window
+
+        idle = _FakeManager({printer.id: _state([_bare_tray()])})
+        assert await spool_tagless.reconcile_slot_config(db_session, manager=idle, now=_PAST_WINDOW) == 1
+        env.apply.assert_awaited_once()
+
+    @pytest.mark.parametrize("gcode_state", ["IDLE", "FINISH", "FAILED", "PREPARE"])
+    async def test_settled_and_pre_print_states_still_publish(self, db_session, printer_factory, env, gcode_state):
+        """Only RUNNING/PAUSE are the ignoring states — nothing else is held back
+        (PREPARE has not engaged the AMS yet, and the callee owns its own guards)."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id)
+        manager = _FakeManager({printer.id: _state([_bare_tray()], gcode_state=gcode_state)})
+
+        assert await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0) == 1
+        env.apply.assert_awaited_once()
+
+
 # --- G/H/I: pass-level gates ------------------------------------------------
 
 

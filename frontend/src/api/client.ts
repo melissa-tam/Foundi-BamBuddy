@@ -3227,6 +3227,13 @@ export interface SpoolAssignment {
    *  binding reads "awaiting insert" rather than a stale claim. Optional because
    *  pre-migration snapshots and object-literal test fixtures predate the column. */
   pre_configured_at?: string | null;
+  /** Tri-state LIVE presence of the bound tray, derived per request from the
+   *  printer's status (never stored): true = something is seated, false = the
+   *  slot reads the verified cleared-tray shape (this binding is a stale location
+   *  claim), null/undefined = unknown (printer offline, partial push, or a
+   *  firmware dialect that never reports presence). Consumers must branch on
+   *  `=== false` only — unknown always fails open. */
+  present?: boolean | null;
 }
 
 export interface FilamentSkuSettings {

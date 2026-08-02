@@ -50,6 +50,7 @@ from backend.app.services.spool_selection import (
     normalize_color_for_compare,
 )
 from backend.app.services.stagger import stagger_policy
+from backend.app.services.tray_fields import parse_tray_state, tray_presence
 from backend.app.services.usb_storage import upload_in_flight
 from backend.app.utils.filament_types import canonical_filament_type as _canonical_filament_type
 from backend.app.utils.filename import derive_remote_filename
@@ -96,6 +97,29 @@ def _derive_estimated_time(archive, library_file) -> int | None:
         meta = library_file.file_metadata or {}
         return meta.get("print_time_seconds") or None
     return None
+
+
+def _present_candidates(loaded: list[dict]) -> list[dict]:
+    """Drop loaded-filament entries whose live tray reads EMPTY on the wire.
+
+    The presence gate for DISPATCH candidates, applied at the two call sites that
+    match filaments to slots — deliberately NOT inside ``_build_loaded_filaments``,
+    because ``spool_recovery`` reads the JAMMED tray's identity out of that same
+    builder and must keep seeing it.
+
+    Gates on ``present is False`` only (``tray_fields.tray_presence``, one origin),
+    so it fails OPEN: a partial push, an offline dialect that never reports
+    presence, or the 004-H2S state-9-while-feeding shape all read UNKNOWN and stay
+    eligible. Excluding those would block dispatch on healthy hardware, which is a
+    far worse failure than the one this guards.
+
+    In today's builder output nothing is dropped — an entry is only emitted for a
+    tray with a NON-empty ``tray_type``, and the cleared-tray shape requires an
+    asserted-empty one. That is the point: the two rules agree, and this makes the
+    agreement explicit and single-origin instead of implicit in a truthiness test,
+    so a future builder change cannot silently make stale trays dispatchable.
+    """
+    return [f for f in loaded if tray_presence(parse_tray_state(f.get("state")), f.get("type")) is not False]
 
 
 class PrintScheduler:
@@ -1261,8 +1285,9 @@ class PrintScheduler:
             except (json.JSONDecodeError, KeyError, TypeError) as e:
                 logger.warning("Failed to apply filament overrides for queue item %s: %s", item.id, e)
 
-        # Build loaded filaments from printer status
-        loaded_filaments = self._build_loaded_filaments(status)
+        # Build loaded filaments from printer status, then drop any candidate whose
+        # live tray reads the cleared-tray shape (see _present_candidates).
+        loaded_filaments = _present_candidates(self._build_loaded_filaments(status))
         if not loaded_filaments:
             logger.debug("No filaments loaded on printer %s", printer_id)
             return MatchOutcome(mapping=None)
@@ -1305,7 +1330,7 @@ class PrintScheduler:
 
         Returns a ``MatchOutcome`` (mapping None when the AMS has no filaments).
         """
-        loaded = self._build_loaded_filaments(status)
+        loaded = _present_candidates(self._build_loaded_filaments(status))
         if not loaded:
             return MatchOutcome(mapping=None)
 
