@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { ConfirmModal } from './ConfirmModal';
+import { InlineAlert } from './ui/InlineAlert';
 import { api } from '../api/client';
 import type { InventorySpool, Printer, TaglessFreshPromptMessage } from '../api/client';
 import { useToast } from '../contexts/ToastContext';
@@ -9,12 +10,18 @@ import { getAmsLabel } from '../utils/amsHelpers';
 import { getSwatchStyle } from '../utils/colors';
 
 /**
- * Fresh-roll confirmation for a tagless (non-RFID) slot (W5). Opened from the
- * "Review…" action on the `tagless_fresh_prompt` toast when a tagless roll has
- * been consumed past half its label weight. Confirming ("Fresh roll") archives
- * the current tagless row and mints a replacement; the optional brand / label
- * weight / cost / note ride the new row. Cancelling just drops the modal — the
- * quick "Same roll" answer lives on the toast.
+ * Fresh-roll confirmation for a tagless (non-RFID) slot (W5).
+ *
+ * Two entry points, ONE component and ONE request (`tagless-fresh`,
+ * `answer: "fresh"`):
+ *  - the `tagless_fresh_prompt` toast's "Review…" action, when a tagless roll
+ *    has been consumed past half its label weight (the default framing), and
+ *  - the operator's per-slot "New roll…" verb (`manual`, W5a), which carries no
+ *    prompt at all — the copy then states plainly that the current ledger row is
+ *    retired and a fresh full row takes over.
+ * Confirming archives the current tagless row and mints a replacement; the
+ * optional brand / label weight / cost / note ride the new row. Cancelling just
+ * drops the modal — the quick "Same roll" answer lives on the toast.
  *
  * Deliberately lean vs `RespoolTagModal`: a tagless roll has no RFID tag, so
  * there is no tag identity, no donor record, and every field is optional.
@@ -25,12 +32,19 @@ interface TaglessFreshModalProps {
   context: TaglessFreshPromptMessage | null;
   /** Called after a successful fresh-roll mint AND when the operator cancels. */
   onClose: () => void;
+  /** Operator-initiated "New roll…" verb rather than an answer to a pending
+   *  prompt: swaps the "used past its label weight" framing for the explicit
+   *  retire-and-replace statement. */
+  manual?: boolean;
+  /** Grams already charged to the row being retired. Shown in the `manual`
+   *  headline copy so the operator sees exactly what is being archived. */
+  usedGrams?: number | null;
 }
 
 const inputClass =
   'w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm placeholder:text-bambu-gray focus:outline-none focus:border-bambu-green';
 
-export function TaglessFreshModal({ context, onClose }: TaglessFreshModalProps) {
+export function TaglessFreshModal({ context, onClose, manual = false, usedGrams }: TaglessFreshModalProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { showToast } = useToast();
@@ -87,22 +101,6 @@ export function TaglessFreshModal({ context, onClose }: TaglessFreshModalProps) 
     [allSpools, material],
   );
 
-  // Reset the form whenever a different slot's context arrives.
-  useEffect(() => {
-    if (!context) return;
-    setBrand('');
-    setLabelWeight('');
-    setCostPerKg('');
-    setCostTouched(false);
-    setNote('');
-  }, [context]);
-
-  // Seed / recompute cost from the chosen brand until the operator edits it.
-  useEffect(() => {
-    if (!context || costTouched) return;
-    setCostPerKg(suggestCostForBrand(brand));
-  }, [context, brand, costTouched, suggestCostForBrand]);
-
   const freshMutation = useMutation({
     mutationFn: () => {
       if (!context) throw new Error('no context');
@@ -128,10 +126,31 @@ export function TaglessFreshModal({ context, onClose }: TaglessFreshModalProps) 
       }
       onClose();
     },
-    onError: (error: Error) => {
-      showToast(error.message || t('inventory.freshRoll.failed'), 'error');
-    },
+    // No error toast: the dialog is the surface in focus, so the backend's
+    // user-actionable detail (the tagless-fresh 400 guards) is rendered inline
+    // below — the repo's documented failure-surfacing convention
+    // (`ToastContext.TOAST_DURATION_MS`).
   });
+
+  const { reset: resetFreshMutation } = freshMutation;
+
+  // Reset the form whenever a different slot's context arrives — including the
+  // mutation, so a previous slot's failure never greets the next open.
+  useEffect(() => {
+    if (!context) return;
+    setBrand('');
+    setLabelWeight('');
+    setCostPerKg('');
+    setCostTouched(false);
+    setNote('');
+    resetFreshMutation();
+  }, [context, resetFreshMutation]);
+
+  // Seed / recompute cost from the chosen brand until the operator edits it.
+  useEffect(() => {
+    if (!context || costTouched) return;
+    setCostPerKg(suggestCostForBrand(brand));
+  }, [context, brand, costTouched, suggestCostForBrand]);
 
   if (!context) return null;
 
@@ -142,12 +161,17 @@ export function TaglessFreshModal({ context, onClose }: TaglessFreshModalProps) 
   const location = `${printerName} • ${amsLabel} • ${slotLabel}`;
   const swatchStyle = context.rgba ? getSwatchStyle(context.rgba) : undefined;
   const materialLabel = context.material || '—';
+  const retiredGrams = Math.max(0, Math.round(usedGrams ?? 0));
 
   return (
     <ConfirmModal
-      title={t('inventory.freshRoll.title')}
-      message={t('inventory.freshRoll.message', { location })}
-      confirmText={t('inventory.freshRoll.confirm')}
+      title={manual ? t('inventory.freshRoll.manualTitle') : t('inventory.freshRoll.title')}
+      message={
+        manual
+          ? t('inventory.freshRoll.manualMessage', { location, grams: retiredGrams })
+          : t('inventory.freshRoll.message', { location })
+      }
+      confirmText={manual ? t('inventory.freshRoll.manualConfirm') : t('inventory.freshRoll.confirm')}
       cancelText={t('common.cancel')}
       variant="default"
       isLoading={freshMutation.isPending}
@@ -158,6 +182,16 @@ export function TaglessFreshModal({ context, onClose }: TaglessFreshModalProps) 
       onCancel={onClose}
     >
       <div className="space-y-3">
+        {/* Backend refusal (the tagless-fresh 400 guards) stays on screen next to
+            the button that triggered it. */}
+        {freshMutation.isError && (
+          <InlineAlert severity="error">
+            {freshMutation.error instanceof Error && freshMutation.error.message
+              ? freshMutation.error.message
+              : t('inventory.freshRoll.failed')}
+          </InlineAlert>
+        )}
+
         {/* Material + colour swatch + remaining grams — the plain-language headline */}
         <div className="flex items-center gap-3 p-3 rounded-lg bg-bambu-dark-secondary border border-bambu-dark-tertiary">
           {swatchStyle && (

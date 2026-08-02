@@ -3222,6 +3222,11 @@ export interface SpoolAssignment {
   pending_config?: boolean;  // Slot was empty at assign time; will configure on insert
   created_at: string;
   ams_label?: string | null;  // User-defined friendly name for the AMS unit
+  /** Deliberate bind-to-empty (SpoolBuddy weigh-then-assign): the operator bound
+   *  a spool to a slot that has nothing in it yet, so an EMPTY slot carrying this
+   *  binding reads "awaiting insert" rather than a stale claim. Optional because
+   *  pre-migration snapshots and object-literal test fixtures predate the column. */
+  pre_configured_at?: string | null;
 }
 
 export interface FilamentSkuSettings {

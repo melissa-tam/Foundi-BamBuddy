@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '../utils';
+import { render, screen, fireEvent, waitFor, within } from '../utils';
 import { FilamentHoverCard, EmptySlotHoverCard } from '../../components/FilamentHoverCard';
 
 const baseFilamentData = {
@@ -396,5 +396,185 @@ describe('EmptySlotHoverCard (#1133)', () => {
     await waitFor(() => expect(screen.getByText(/assign spool/i)).toBeInTheDocument());
     fireEvent.click(screen.getByText(/assign spool/i));
     expect(onAssign).toHaveBeenCalledTimes(1);
+  });
+});
+
+// W5a — a binding that outlives the filament. Before this the empty-slot card
+// carried NO assignment information at all, so a stale or latched claim was
+// both invisible and unclearable from the printer card (the 2026-08 stale-empty
+// class of incident). The three states must be distinguishable by TEXT, not by
+// colour alone.
+describe('EmptySlotHoverCard binding block (W5a)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  const baseBinding = {
+    spoolId: 140,
+    label: 'Overture PETG - Black',
+    usedGrams: 820,
+    spent: false,
+    preConfigured: false,
+  };
+
+  async function openCard(ui: React.ReactElement) {
+    const result = render(ui);
+    fireEvent.mouseEnter(result.container.firstElementChild as HTMLElement);
+    vi.advanceTimersByTime(100);
+    await waitFor(() => expect(screen.getByText(/empty/i)).toBeInTheDocument());
+    return result;
+  }
+
+  it('shows no binding block and no clear verb when nothing is bound', async () => {
+    await openCard(
+      <EmptySlotHoverCard onClearSlot={vi.fn()}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>
+    );
+    expect(screen.queryByText(/still assigned/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /clear/i })).not.toBeInTheDocument();
+  });
+
+  it('names the bound spool, its record id and the grams already charged to it', async () => {
+    await openCard(
+      <EmptySlotHoverCard binding={baseBinding}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>
+    );
+    expect(screen.getByText(/still assigned/i)).toBeInTheDocument();
+    expect(screen.getByText('Overture PETG - Black')).toBeInTheDocument();
+    expect(screen.getByText('#140')).toBeInTheDocument();
+    expect(screen.getByText('820 g used')).toBeInTheDocument();
+  });
+
+  it('reads "not inserted" for a plain lingering binding', async () => {
+    await openCard(
+      <EmptySlotHoverCard binding={baseBinding}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>
+    );
+    expect(screen.getByText(/not inserted/i)).toBeInTheDocument();
+  });
+
+  it('reads "awaiting insert (pre-configured)" for a deliberate bind-to-empty', async () => {
+    await openCard(
+      <EmptySlotHoverCard binding={{ ...baseBinding, preConfigured: true }}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>
+    );
+    expect(screen.getByText(/awaiting insert \(pre-configured\)/i)).toBeInTheDocument();
+    expect(screen.queryByText(/^not inserted$/i)).not.toBeInTheDocument();
+  });
+
+  it('reads "ran out — awaiting new roll" for the spent runout latch', async () => {
+    await openCard(
+      <EmptySlotHoverCard binding={{ ...baseBinding, spent: true }}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>
+    );
+    expect(screen.getByText(/ran out — awaiting new roll/i)).toBeInTheDocument();
+  });
+
+  it('lets the runout latch win over pre-configured — it is the more actionable truth', async () => {
+    await openCard(
+      <EmptySlotHoverCard binding={{ ...baseBinding, spent: true, preConfigured: true }}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>
+    );
+    expect(screen.getByText(/ran out — awaiting new roll/i)).toBeInTheDocument();
+    expect(screen.queryByText(/awaiting insert/i)).not.toBeInTheDocument();
+  });
+
+  it('hides the clear verb when the caller supplies no handler', async () => {
+    await openCard(
+      <EmptySlotHoverCard binding={baseBinding}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>
+    );
+    expect(screen.queryByRole('button', { name: /clear the slot binding/i })).not.toBeInTheDocument();
+  });
+
+  it('releases the binding only after the confirm dialog is accepted', async () => {
+    const onClearSlot = vi.fn();
+    await openCard(
+      <EmptySlotHoverCard binding={baseBinding} onClearSlot={onClearSlot}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /clear the slot binding for Overture PETG - Black/i }));
+    await waitFor(() => expect(screen.getByText(/clear this slot\?/i)).toBeInTheDocument());
+    // Nothing has been released yet — the click only opened the dialog.
+    expect(onClearSlot).not.toHaveBeenCalled();
+    // The dialog explains that usage survives the release (no data is lost).
+    expect(screen.getByText(/returns to inventory with its recorded usage intact/i)).toBeInTheDocument();
+
+    const dialog = screen.getByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: /^Clear slot$/i }));
+    expect(onClearSlot).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not release the binding when the confirm dialog is cancelled', async () => {
+    const onClearSlot = vi.fn();
+    await openCard(
+      <EmptySlotHoverCard binding={baseBinding} onClearSlot={onClearSlot}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /clear the slot binding for/i }));
+    await waitFor(() => expect(screen.getByText(/clear this slot\?/i)).toBeInTheDocument());
+    const dialog = screen.getByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: /cancel/i }));
+
+    expect(onClearSlot).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByText(/clear this slot\?/i)).not.toBeInTheDocument());
+  });
+});
+
+// W5a — the tagless counterpart of "Re-spool tag…". Only the caller knows
+// whether the bound row carries a tag, so the card renders the verb purely on
+// the presence of the handler.
+describe('FilamentHoverCard "New roll…" verb (W5a)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  it('renders the verb and invokes the handler when a tagless roll is bound', async () => {
+    const onNewRoll = vi.fn();
+    renderWithHover(
+      <FilamentHoverCard
+        data={baseFilamentData}
+        inventory={{
+          assignedSpool: { id: 140, material: 'PETG', brand: 'Overture', color_name: 'Black' },
+          onNewRoll,
+        }}
+      >
+        <div>trigger</div>
+      </FilamentHoverCard>
+    );
+    vi.advanceTimersByTime(100);
+
+    const button = await screen.findByRole('button', { name: /New roll/i });
+    fireEvent.click(button);
+    expect(onNewRoll).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits the verb for a tagged roll (the caller passes no handler)', async () => {
+    renderWithHover(
+      <FilamentHoverCard
+        data={baseFilamentData}
+        inventory={{
+          assignedSpool: { id: 140, material: 'PETG', brand: 'Overture', color_name: 'Black' },
+          onRespoolTag: vi.fn(),
+        }}
+      >
+        <div>trigger</div>
+      </FilamentHoverCard>
+    );
+    vi.advanceTimersByTime(100);
+
+    await screen.findByRole('button', { name: /Re-spool tag/i });
+    expect(screen.queryByRole('button', { name: /New roll/i })).not.toBeInTheDocument();
   });
 });

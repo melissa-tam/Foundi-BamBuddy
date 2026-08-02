@@ -92,7 +92,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
 import { formatDateOnly, formatETA, formatDuration, parseUTCDate } from '../utils/date';
-import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, RespoolPromptMessage } from '../api/client';
+import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, RespoolPromptMessage, TaglessFreshPromptMessage } from '../api/client';
 import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
@@ -114,9 +114,11 @@ import { AmsBackupModal } from '../components/AmsBackupModal';
 import { HeaterHistoryModal } from '../components/HeaterHistoryModal';
 import type { HeaterSensorKind } from '../api/client';
 import { FilamentHoverCard, EmptySlotHoverCard } from '../components/FilamentHoverCard';
+import type { EmptySlotBinding } from '../components/FilamentHoverCard';
 import { LinkSpoolModal } from '../components/LinkSpoolModal';
 import { AssignSpoolModal } from '../components/AssignSpoolModal';
 import { RespoolTagModal } from '../components/RespoolTagModal';
+import { TaglessFreshModal } from '../components/TaglessFreshModal';
 import { ConfigureAmsSlotModal } from '../components/ConfigureAmsSlotModal';
 import { useToast } from '../contexts/ToastContext';
 import { ChamberLight } from '../components/icons/ChamberLight';
@@ -1892,6 +1894,10 @@ function PrinterCard({
   } | null>(null);
   // Manual "Re-spool tag…" tray action — opens RespoolTagModal for the slot.
   const [respoolContext, setRespoolContext] = useState<RespoolPromptMessage | null>(null);
+  // Manual "New roll…" tray action (W5a) — the tagless counterpart of
+  // "Re-spool tag…". Carries the retired row's used grams alongside the prompt
+  // payload so the confirm copy can name exactly what is being archived.
+  const [newRollContext, setNewRollContext] = useState<{ prompt: TaglessFreshPromptMessage; usedGrams: number } | null>(null);
   const [configureSlotModal, setConfigureSlotModal] = useState<{
     amsId: number;
     trayId: number;
@@ -3069,6 +3075,49 @@ function PrinterCard({
 
   const footerActionButtonClass = '!h-8 !min-h-8 !px-2 !py-0';
   const footerIconButtonClass = '!h-8 !min-h-8 !w-8 !px-0 !py-0';
+
+  /**
+   * "New roll…" verb for a slot whose bound spool carries NO RFID tag (W5a).
+   *
+   * A tagged roll announces its own replacement over the wire; an untagged one
+   * cannot, so the operator's click IS the swap signal. Returns `undefined`
+   * (verb hidden) when nothing is bound or the bound row is tagged — the tagged
+   * case is served by "Re-spool tag…" instead.
+   */
+  const newRollAction = (amsId: number, trayId: number, assignment: SpoolAssignment | undefined) => {
+    const spool = assignment?.spool;
+    if (!spool || spool.tag_uid) return undefined;
+    return () => setNewRollContext({
+      prompt: {
+        printer_id: printer.id,
+        ams_id: amsId,
+        tray_id: trayId,
+        spool_id: spool.id,
+        remaining_g: Math.max(0, Math.round(spool.label_weight - spool.weight_used)),
+        material: spool.material,
+        rgba: spool.rgba,
+      },
+      usedGrams: Math.max(0, Math.round(spool.weight_used ?? 0)),
+    });
+  };
+
+  /**
+   * A binding that outlived the filament, for the EMPTY-slot hover card (W5a).
+   * Maps the API rows onto the card's flags; the card owns the wording. Returns
+   * `null` when the slot has no inventory binding at all (the common case).
+   */
+  const emptySlotBinding = (assignment: SpoolAssignment | undefined): EmptySlotBinding | null => {
+    const spool = assignment?.spool;
+    if (!assignment || !spool) return null;
+    return {
+      spoolId: spool.id,
+      label: `${spool.brand ? `${spool.brand} ` : ''}${spool.material}${spool.color_name ? ` - ${spool.color_name}` : ''}`,
+      usedGrams: Math.max(0, Math.round(spool.weight_used ?? 0)),
+      spent: !!spool.spent_at,
+      preConfigured: !!assignment.pre_configured_at,
+    };
+  };
+
   const renderAmsSlotActions = ({
     amsId,
     slotId,
@@ -5173,6 +5222,7 @@ function PrinterCard({
                                               brand_prefill: null,
                                               label_weight_prefill: null,
                                             }) : undefined,
+                                            onNewRoll: newRollAction(ams.id, slotIdx, assignment),
                                             isAssigned: !!assignment || isBambuLabSpool(tray),
                                           };
                                         })()}
@@ -5197,6 +5247,8 @@ function PrinterCard({
                                     ) : (
                                       <EmptySlotHoverCard
                                         kind={emptyKind ?? undefined}
+                                        binding={emptySlotBinding(inventoryAssignment)}
+                                        onClearSlot={() => onUnassignSpool?.(printer.id, ams.id, slotIdx)}
                                         actions={renderAmsSlotActions({
                                           amsId: ams.id,
                                           slotId: slotIdx,
@@ -5553,6 +5605,7 @@ function PrinterCard({
                                           brand_prefill: null,
                                           label_weight_prefill: null,
                                         }) : undefined,
+                                        onNewRoll: newRollAction(ams.id, htSlotId, assignment),
                                         isAssigned: !!assignment || isBambuLabSpool(tray),
                                       };
                                     })()}
@@ -5577,6 +5630,8 @@ function PrinterCard({
                                 ) : (
                                   <EmptySlotHoverCard
                                     kind={emptyKind ?? undefined}
+                                    binding={emptySlotBinding(htInventoryAssignment)}
+                                    onClearSlot={() => onUnassignSpool?.(printer.id, ams.id, htSlotId)}
                                     actions={renderAmsSlotActions({
                                       amsId: ams.id,
                                       slotId: htSlotId,
@@ -5843,6 +5898,7 @@ function PrinterCard({
                                             brand_prefill: null,
                                             label_weight_prefill: null,
                                           }) : undefined,
+                                          onNewRoll: newRollAction(255, slotTrayId, assignment),
                                           isAssigned: !!assignment || isBambuLabSpool(extTray),
                                         };
                                       })()}
@@ -5867,6 +5923,8 @@ function PrinterCard({
                                   ) : (
                                     <EmptySlotHoverCard
                                       kind={emptyKind ?? undefined}
+                                      binding={emptySlotBinding(extInventoryAssignment)}
+                                      onClearSlot={() => onUnassignSpool?.(printer.id, 255, slotTrayId)}
                                       actions={renderAmsSlotActions({
                                         amsId: 255,
                                         slotId: slotTrayId,
@@ -6851,6 +6909,14 @@ function PrinterCard({
       <RespoolTagModal
         context={respoolContext}
         onClose={() => setRespoolContext(null)}
+      />
+
+      {/* New-roll Modal (manual tray action on a TAGLESS slot, W5a) */}
+      <TaglessFreshModal
+        context={newRollContext?.prompt ?? null}
+        usedGrams={newRollContext?.usedGrams ?? null}
+        manual
+        onClose={() => setNewRollContext(null)}
       />
 
       {/* Configure AMS Slot Modal */}

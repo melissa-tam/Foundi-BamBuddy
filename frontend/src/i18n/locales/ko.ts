@@ -4357,6 +4357,11 @@ export default {
       costPlaceholder: '선택 사항',
       noteLabel: '메모',
       notePlaceholder: '선택 사항',
+      manualAction: '새 롤…',
+      manualDesc: '이 기록을 마감하고 새 기록을 시작합니다',
+      manualTitle: '새 롤로 표시할까요?',
+      manualMessage: '{{location}}의 기록({{grams}} g 사용)을 마감하고 이 슬롯에 새 전량 기록을 만듭니다. 실제로 롤을 교체한 뒤에만 실행하세요.',
+      manualConfirm: '새 롤로 표시',
     },
     respool: {
       action: '태그 재스풀…',
@@ -4393,6 +4398,7 @@ export default {
       costPlaceholder: '선택 사항',
       noteLabel: '메모',
       notePlaceholder: '선택 사항',
+      actionDesc: '이 Bambu 태그를 새 롤로 옮깁니다',
     },
     bulk: {
       selectAllVisible: '표시된 항목 모두 선택',
@@ -4787,7 +4793,18 @@ export default {
     slotUnconfigured: '?',
     outOfRotation: '로테이션 제외 — 스풀 걸림 감지됨. 스풀을 다시 삽입하거나 플래그를 해제하면 다시 사용할 수 있습니다',
     outOfRotationShort: '로테이션 제외',
-    emptySlotReset: '필라멘트가 할당되지 않음'
+    emptySlotReset: '필라멘트가 할당되지 않음',
+    emptySlotBinding: {
+      title: '여전히 할당됨',
+      used: '{{grams}} g 사용',
+      ranOut: '소진됨 — 새 롤 대기 중',
+      awaitingInsert: '삽입 대기 중(사전 구성됨)',
+      notInserted: '삽입되지 않음',
+      clear: '슬롯 해제',
+      clearAria: '{{spool}}의 슬롯 할당 해제',
+      clearTitle: '이 슬롯을 해제할까요?',
+      clearMessage: '{{spool}}을(를) 이 슬롯에서 해제합니다. 스풀은 기록된 사용량을 유지한 채 재고로 돌아가며 삭제되는 것은 없습니다.',
+    },
   },
   printModal: {
     selectPrinter: '프린터 선택',

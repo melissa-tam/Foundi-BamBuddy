@@ -2,9 +2,10 @@ import { useState, useRef, useEffect, useLayoutEffect, useId, type ReactNode } f
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { Droplets, Copy, Check, Settings2, Package, Unlink, RefreshCw } from 'lucide-react';
+import { Droplets, Copy, Check, Settings2, Package, PackagePlus, Unlink, RefreshCw, AlertTriangle, Clock, MinusCircle } from 'lucide-react';
 import { isLightColor } from '../utils/colors';
 import { Modal } from './ui/Modal';
+import { ConfirmModal } from './ConfirmModal';
 
 interface FilamentData {
   vendor: 'Bambu Lab' | 'Generic';
@@ -35,6 +36,11 @@ interface InventoryConfig {
   // Reused-tag re-spool: set only when the tray carries a valid RFID identity
   // (tag_uid / tray_uuid). Opens the manual re-spool modal for the slot.
   onRespoolTag?: () => void;
+  // Tagless "New roll…" (W5a): set ONLY when the slot's bound spool carries no
+  // tag_uid. Retires the current ledger row and mints a fresh full one, which is
+  // the operator's only signal that an untagged roll was physically swapped —
+  // a tagless slot has no RFID event to infer it from.
+  onNewRoll?: () => void;
 }
 
 interface ConfigureSlotConfig {
@@ -431,10 +437,26 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                         e.stopPropagation();
                         inventory.onRespoolTag?.();
                       }}
+                      aria-label={t('inventory.respool.action')}
                       className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue"
                     >
                       <RefreshCw className="w-3.5 h-3.5" />
                       {t('inventory.respool.action')}
+                    </button>
+                  )}
+                  {/* Tagless counterpart of "Re-spool tag…": the untagged roll on
+                      this slot was physically replaced. */}
+                  {inventory.onNewRoll && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        inventory.onNewRoll?.();
+                      }}
+                      aria-label={t('inventory.freshRoll.manualAction')}
+                      className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue"
+                    >
+                      <PackagePlus className="w-3.5 h-3.5" />
+                      {t('inventory.freshRoll.manualAction')}
                     </button>
                   )}
                 </div>
@@ -520,6 +542,27 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
   );
 }
 
+/**
+ * A spool binding that survives on a slot the printer reports EMPTY (W5a).
+ *
+ * Three shapes reach this state and the operator must be able to tell them
+ * apart: the runout latch (`spool.spent_at` — the roll ran dry and the binding
+ * is deliberately held until a qualified swap), the deliberate bind-to-empty
+ * (`assignment.pre_configured_at` — SpoolBuddy weigh-then-assign, the roll has
+ * not been inserted yet), and everything else (a stale claim nobody cleared).
+ * Callers map the API rows onto these flags; the card owns the wording.
+ */
+export interface EmptySlotBinding {
+  spoolId: number;
+  /** Brand + material + colour, already composed by the caller. */
+  label: string;
+  usedGrams: number;
+  /** `spool.spent_at` is set — ran out, awaiting a new roll. */
+  spent: boolean;
+  /** `assignment.pre_configured_at` is set — awaiting the physical insert. */
+  preConfigured: boolean;
+}
+
 interface EmptySlotHoverCardProps {
   children: ReactNode;
   className?: string;
@@ -531,11 +574,21 @@ interface EmptySlotHoverCardProps {
   // surfaces the user-cleared label; undefined / "physical" keeps the
   // historical "Empty slot" wording.
   kind?: 'physical' | 'reset';
+  // W5a: a binding that outlived the filament. Without this the empty-slot card
+  // showed NO assignment information at all, so a lingering binding was both
+  // invisible and unclearable from the printer card.
+  binding?: EmptySlotBinding | null;
+  // Releases `binding` from the slot (DELETE /inventory/assignments/…). Gated
+  // behind a confirm dialog; omit to hide the verb (e.g. no permission).
+  onClearSlot?: () => void;
+  /** Keeps the confirm dialog in its busy state while the DELETE is in flight. */
+  clearPending?: boolean;
 }
 
-export function EmptySlotHoverCard({ children, className = '', configureSlot, onAssignSpool, actions, kind }: EmptySlotHoverCardProps) {
+export function EmptySlotHoverCard({ children, className = '', configureSlot, onAssignSpool, actions, kind, binding, onClearSlot, clearPending }: EmptySlotHoverCardProps) {
   const { t } = useTranslation();
   const [isVisible, setIsVisible] = useState(false);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
   // Screen-space coords for the portaled card — same pattern as
   // FilamentHoverCard, see comment there (#1336 follow-up).
   const [coords, setCoords] = useState<{ top: number; left: number } | null>(null);
@@ -585,6 +638,17 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
     };
   }, [isVisible]);
 
+  // Status wording is never carried by colour alone: each state pairs an icon
+  // with an explicit sentence (WCAG 1.4.1). Spent wins over pre-configured —
+  // a runout latch is the more specific, more actionable truth.
+  const bindingStatus = binding
+    ? binding.spent
+      ? { Icon: AlertTriangle, className: 'text-amber-400', text: t('ams.emptySlotBinding.ranOut') }
+      : binding.preConfigured
+        ? { Icon: Clock, className: 'text-bambu-blue', text: t('ams.emptySlotBinding.awaitingInsert') }
+        : { Icon: MinusCircle, className: 'text-bambu-gray', text: t('ams.emptySlotBinding.notInserted') }
+    : null;
+
   return (
     <div
       ref={triggerRef}
@@ -613,9 +677,38 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
             <div className="px-3 py-1.5 text-xs text-bambu-gray whitespace-nowrap">
               {kind === 'reset' ? t('ams.emptySlotReset') : t('ams.emptySlot')}
             </div>
+            {/* Lingering binding on a physically empty slot (W5a). */}
+            {binding && bindingStatus && (
+              <div className="px-3 pb-2 pt-1 w-52 border-t border-bambu-dark-tertiary space-y-1">
+                <p className="text-[10px] uppercase tracking-wider text-bambu-gray font-medium">
+                  {t('ams.emptySlotBinding.title')}
+                </p>
+                <div className="flex items-baseline gap-1.5 min-w-0">
+                  <p className="text-xs text-white truncate">{binding.label}</p>
+                  <span className="text-[10px] font-mono text-bambu-gray shrink-0">#{binding.spoolId}</span>
+                </div>
+                <p className="text-[10px] text-bambu-gray">
+                  {t('ams.emptySlotBinding.used', { grams: binding.usedGrams })}
+                </p>
+                <p className={`text-[10px] flex items-start gap-1 ${bindingStatus.className}`}>
+                  <bindingStatus.Icon className="w-3 h-3 mt-px shrink-0" aria-hidden="true" />
+                  <span>{bindingStatus.text}</span>
+                </p>
+              </div>
+            )}
             {/* Configure slot button */}
-            {(configureSlot?.enabled || onAssignSpool || actions) && (
+            {(configureSlot?.enabled || onAssignSpool || actions || (binding && onClearSlot)) && (
               <div className="px-2 pb-2 space-y-1">
+                {binding && onClearSlot && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setShowClearConfirm(true); }}
+                    aria-label={t('ams.emptySlotBinding.clearAria', { spool: binding.label })}
+                    className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-amber-500/20 hover:bg-amber-500/30 text-amber-400"
+                  >
+                    <Unlink className="w-3.5 h-3.5" />
+                    {t('ams.emptySlotBinding.clear')}
+                  </button>
+                )}
                 {configureSlot?.enabled && (
                   <button
                     onClick={(e) => {
@@ -654,6 +747,26 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
           " />
         </div>,
         document.body,
+      )}
+
+      {/* Clear-slot confirmation. Rendered from the always-mounted trigger (not
+          the hover popover, which unmounts on mouse-out) so the dialog survives
+          the pointer leaving the slot. */}
+      {showClearConfirm && binding && (
+        <ConfirmModal
+          title={t('ams.emptySlotBinding.clearTitle')}
+          message={t('ams.emptySlotBinding.clearMessage', { spool: binding.label })}
+          confirmText={t('ams.emptySlotBinding.clear')}
+          cancelText={t('common.cancel')}
+          variant="warning"
+          overlayZIndex="z-[100]"
+          isLoading={!!clearPending}
+          onConfirm={() => {
+            onClearSlot?.();
+            setShowClearConfirm(false);
+          }}
+          onCancel={() => setShowClearConfirm(false)}
+        />
       )}
     </div>
   );
