@@ -10,9 +10,37 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.models.printer import Printer
 from backend.app.services.bambu_mqtt import BambuMQTTClient, MQTTLogEntry, PrinterState, get_stage_name
 from backend.app.services.hms_errors import hms_error_payload
+from backend.app.services.tray_observation import TrayObservation, observe_ams_push
 from backend.app.utils.printer_models import A1_FAMILY_MODELS, canon_model
 
 logger = logging.getLogger(__name__)
+
+
+async def _run_slot_pipeline_pass(printer_id: int, observations: list[TrayObservation]) -> None:
+    """Run ONE slot-pipeline pass for a raw AMS push, in its own session.
+
+    The pipeline is the fork's single identity/binding decider; this is only its
+    transport from the MQTT thread. Own session (the callback owns no request scope),
+    live client handed in for the read-only wire-safety inputs, and fully guarded — the
+    pipeline never raises by contract, and neither may its transport.
+
+    Imports are function-local: ``slot_pipeline`` pulls in the models and the settings
+    route, and importing that at ``printer_manager`` module scope closes an import cycle
+    (services → routes → services).
+    """
+    try:
+        from backend.app.core.database import async_session
+        from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
+
+        async with async_session() as db:
+            await run_slot_pipeline(
+                printer_id,
+                observations,
+                PipelineDeps(db=db, client=printer_manager.get_client(printer_id)),
+            )
+    except Exception:  # noqa: BLE001 — a farm-side failure must never break the AMS chain
+        logger.exception("Slot pipeline pass failed for printer %s", printer_id)
+
 
 # Models that have a real chamber temperature sensor
 # Based on Home Assistant Bambu Lab integration
@@ -595,6 +623,30 @@ class PrinterManager:
             if self._on_ams_change:
                 self._schedule_async(self._on_ams_change(printer_id, ams_data))
 
+        def on_ams_push_raw(ams_payload):
+            """Feed the slot pipeline from the RAW pre-merge push.
+
+            Two things happen here and the ORDER is the contract. The observations are
+            built SYNCHRONOUSLY, on the MQTT thread, while the wire dicts still hold only
+            what this push asserted — the client mutates them into merged display state
+            the instant this returns. They are frozen, fully-owned objects, so no copy is
+            needed and nothing downstream can be poisoned by the merge. Only then is the
+            pass scheduled, fire-and-forget, onto the event loop.
+
+            The printer id lives HERE, not in the client: ``BambuMQTTClient`` is keyed by
+            serial and knows nothing of the DB, and an observation is addressed by
+            ``(printer_id, ams_id, tray_id)``. Keeping the id in this closure is what lets
+            the client hook stay a three-line upstream edit.
+            """
+            try:
+                observations = observe_ams_push(printer_id, ams_payload)
+            except Exception:
+                logger.exception("Failed to build AMS observations for printer %s", printer_id)
+                return
+            if not observations:
+                return
+            self._schedule_async(_run_slot_pipeline_pass(printer_id, observations))
+
         def on_layer_change(layer_num: int):
             if self._on_layer_change:
                 self._schedule_async(self._on_layer_change(printer_id, layer_num))
@@ -616,6 +668,7 @@ class PrinterManager:
             on_print_start=on_print_start,
             on_print_complete=on_print_complete,
             on_ams_change=on_ams_change,
+            on_ams_push_raw=on_ams_push_raw,
             on_layer_change=on_layer_change,
             on_bed_temp_update=on_bed_temp_update,
             on_drying_complete=on_drying_complete,

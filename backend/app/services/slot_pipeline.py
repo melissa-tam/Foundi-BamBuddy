@@ -13,7 +13,11 @@ What this module owns:
   (``spool_tag_matcher.find_spool_sharing_tray_uuid``), then EXACT tag equality. The
   tag resolver's tolerant variance lanes (``get_spool_by_tag``) are deliberately NOT
   used — their widening is for legacy callers, and a widened row reaching the table as
-  if it were a certainty is the false-merge hazard the 2026-08-01 audit named.
+  if it were a certainty is the false-merge hazard the 2026-08-01 audit named. When
+  NOTHING owns an asserted identity, one further lookup asks whether an operator row
+  already IS this roll (:func:`_untagged_claim_candidate`) — the weigh-then-assign
+  pre-config row, then ``find_matching_untagged_spool``'s attract lane — so the tag
+  lands on that row instead of minting a 1000 g stranger beside it.
 * **Context** — the wire-safety inputs (drying / identify-in-flight / settle windows)
   the table treats as authoritative, read-only. Per cross-cutting invariant 2 a caller
   may DEFER on them but never pre-approve a write: the client re-evaluates at publish
@@ -28,8 +32,9 @@ What this module owns:
      the second half of the 007-H2C flip-flop fix (the writer's move damper is the
      first — ``spool_binding._MOVE_DAMPER_S``).
 * **Serialization** — one asyncio lock per printer, so two pushes for one printer can
-  never interleave their read-decide-write windows (this replaces ``main.py``'s
-  ``_get_ams_assignment_lock`` at the W3b cutover; same pattern, ``main.py:540-548``).
+  never interleave their read-decide-write windows. This IS the fork's assignment lock
+  now: W3b deleted ``main.py``'s ``_get_ams_assignment_lock``, because with identity
+  decided in exactly one place the lock belongs with the decider.
 
 **Never raises** (cross-cutting invariant 10): every entry point is fully guarded and a
 single poisoned slot logs ERROR and is skipped — the rest of the pass still runs. A
@@ -40,9 +45,15 @@ the one structured line :func:`slot_state.format_slot_event` produces, through t
 existing log pipeline / ``support/logs`` endpoint. KEEP / DEFER / NONE are DEBUG — they
 happen on every push of every slot and would drown the lane.
 
-Scope note (W3a): this module is NEW and UNWIRED. ``main.py``'s phase-1/phase-2 blocks,
-``spool_tagless.handle_tagless_slot`` and the ``ams_presence`` lanes still own production
-until W3b deletes them and points the callback here.
+Feed (W3b): RAW pre-merge pushes, not the merged display state. ``bambu_mqtt``'s
+``on_ams_push_raw`` hook fires inside ``_handle_ams_data`` BEFORE the tray merge;
+``printer_manager`` builds the observations synchronously in that callback (owned frozen
+objects — the merge may mutate the wire dicts the instant it returns) and schedules this
+pass fire-and-forget. The merged payload stays display-only: its deliberate
+never-clear-identity rule is what produced the 001-T3 chimera, so it must never reach a
+binding decision. ``main.on_ams_change`` still runs, but only as a LEDGER/WIRE consumer
+lane (respool gate, increase-only weight sync, K-profile drift, bare-tray config) — it
+reads the binding this module writes and never decides identity.
 """
 
 from __future__ import annotations
@@ -73,7 +84,12 @@ from backend.app.services.slot_state import (
     resolve,
 )
 from backend.app.services.spool_binding import bind_spool_to_slot, release_spool_from_slot
-from backend.app.services.spool_tag_matcher import create_spool_from_tray, find_spool_sharing_tray_uuid
+from backend.app.services.spool_tag_matcher import (
+    create_spool_from_tray,
+    find_matching_untagged_spool,
+    find_spool_sharing_tray_uuid,
+    link_tag_to_inventory_spool,
+)
 from backend.app.services.tray_observation import TrayObservation
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_types import canonical_filament_type
@@ -91,11 +107,22 @@ ORIGIN_BIND = "pipeline"
 ORIGIN_RECLAIM = "pipeline_reclaim"
 ORIGIN_MINT = "pipeline_mint"
 ORIGIN_PRECONFIG = "pipeline_preconfig"
+# An identity landing on an operator-created untagged inventory row (the attract lane).
+# Its own origin so the writer's INFO trail distinguishes "the tag found its row" from a
+# plain identity bind when an operator reads back why a row gained a tag.
+ORIGIN_CLAIM = "pipeline_claim"
+
+# The two decisions that LINK this push's identity onto the row they bind, instead of
+# minting a stranger beside it. Both are BINDs, so they ride the ordinary bind path and
+# only differ in the three extra things they owe: the identity link, the pre-config
+# marker clear, and NO config push.
+_IDENTITY_CLAIM_REASONS = frozenset({"pre_configured_apply_identity", "identity_claims_untagged_row"})
 
 # Orchestrator-side release reason. Deliberately NOT in ``slot_state.RESOLUTION_REASONS``:
 # an assignment whose spool row is gone never reaches the table at all (there is nothing
 # to build a BindingView from), so the table can neither emit nor own this reason.
-# Mirrors ``spool_tagless.py:1362``'s orphan drop, through the ONE unbind writer.
+# Mirrors the orphan drop the pre-cutover tagless branch tree performed, but through
+# the ONE unbind writer so it still leaves a structured release line.
 ORPHAN_RELEASE_REASON = "orphaned_assignment"
 
 # Decision reason → the identify NEED verdict the discovery lane understands
@@ -116,9 +143,12 @@ _IDENTIFY_VERDICT = {
 _RECLAIM_SCAN_LIMIT = 25
 
 # One lock per printer: a pass reads the slot's binding, decides, and writes, and two
-# concurrent pushes interleaving those steps is how a slot gets two assignment rows
-# (main.py:525-549 documents the IntegrityError this prevents). Process-lifetime, keyed
-# by printer id — passes for DIFFERENT printers stay fully concurrent.
+# concurrent pushes interleaving those steps is how a slot gets two assignment rows —
+# both read "no assignment for (printer, ams, tray)" and both INSERT, hitting the
+# spool_assignment_printer_id_ams_id_tray_id_key unique constraint (surfaced on Postgres;
+# SQLite's WAL serial writes hid it). MQTT bursts deliver two AMS pushes ~30 ms apart on
+# H2D + dual AMS, so this is not theoretical. Process-lifetime, keyed by printer id —
+# passes for DIFFERENT printers stay fully concurrent.
 _pipeline_locks: dict[int, asyncio.Lock] = {}
 
 # (slot, scanned tag) pairs whose sibling-tag KEEP has already been announced. A sibling
@@ -126,11 +156,22 @@ _pipeline_locks: dict[int, asyncio.Lock] = {}
 # needs the fact once, not 3600 times an hour.
 _sibling_logged: set[tuple[tuple[int, int, int], str]] = set()
 
+# Per-printer dedup for ``unknown_tag`` prompts: {printer_id: {(ams, tray): (tag, uuid)}}.
+# Re-broadcast only when the tag tuple CHANGES for a slot; cleared when the slot reports
+# empty or gets bound, so remove + reinsert reliably re-prompts. Moved here from
+# ``main.py`` at the W3b cutover: the prompt is now raised by exactly one decision
+# (``unknown_tag_prompt_owed``) and cleared by exactly two pipeline outcomes (a released
+# / empty slot and a successful bind), so its state belongs beside them. The Spoolman
+# lane in ``main.on_ams_change`` imports the two public helpers — one origin, one dedup
+# ledger, whichever mode raised the prompt.
+_unknown_tag_last_broadcast: dict[int, dict[tuple[int, int], tuple[str, str]]] = {}
+
 
 def _reset_state() -> None:
     """Test hook: clear module-level locks + dedup state between cases."""
     _pipeline_locks.clear()
     _sibling_logged.clear()
+    _unknown_tag_last_broadcast.clear()
 
 
 # --- injectables ------------------------------------------------------------
@@ -262,12 +303,28 @@ async def run_slot_pipeline(
     runs. Returns one :class:`AppliedTransition` per slot considered.
     """
     transitions: list[AppliedTransition] = []
+    # Slots per AMS unit in THIS push — the unknown-tag prompt payload carries it so the
+    # kiosk can lay out the unit. Derived from the observations rather than threaded from
+    # the wire dict, because the observations ARE this push's view of the unit.
+    # Read defensively (``getattr``, not ``obs.ams_id``): this runs OUTSIDE the per-slot
+    # guard below, so one malformed entry must not cost the whole pass — invariant 10.
+    tray_counts: dict[int, int] = {}
+    for obs in observations:
+        ams_id = getattr(obs, "ams_id", None)
+        if isinstance(ams_id, int):
+            tray_counts[ams_id] = tray_counts.get(ams_id, 0) + 1
     try:
+        if await _spoolman_owns_slots(deps):
+            # Spoolman mode owns AMS slots end-to-end (its own sync lane in
+            # ``main.on_ams_change``, and ``settings.py``'s mode switch wipes the
+            # internal assignments outright). The pipeline stands down entirely rather
+            # than deciding identity for rows it does not own.
+            return transitions
         async with _pipeline_lock(printer_id):
             seen: set[int] = set()
             for obs in observations:
                 try:
-                    transition = await _process_observation(obs, deps, seen)
+                    transition = await _process_observation(obs, deps, seen, tray_counts)
                 except Exception:  # noqa: BLE001 — one bad slot must never abort the pass
                     logger.exception(
                         "[slot-state] slot processing failed for printer %s slot %s",
@@ -283,6 +340,21 @@ async def run_slot_pipeline(
     return transitions
 
 
+async def _spoolman_owns_slots(deps: PipelineDeps) -> bool:
+    """Is this install in Spoolman mode? Unreadable setting = internal mode (run).
+
+    Fail-OPEN on purpose: the pipeline is the only thing keeping bindings wire-true in
+    the fork's default mode, and silently standing down because one setting read failed
+    would strand every slot. A genuine Spoolman install answers this read reliably.
+    """
+    try:
+        raw = await deps.setting("spoolman_enabled")
+    except Exception:  # noqa: BLE001 — an unreadable setting is not evidence of Spoolman
+        logger.exception("[slot-state] spoolman_enabled lookup failed — running the pass")
+        return False
+    return bool(raw) and raw.lower() == "true"
+
+
 async def _rollback(deps: PipelineDeps) -> None:
     try:
         await deps.db.rollback()
@@ -293,8 +365,19 @@ async def _rollback(deps: PipelineDeps) -> None:
 # --- one slot ---------------------------------------------------------------
 
 
-async def _process_observation(obs: TrayObservation, deps: PipelineDeps, seen: set[int]) -> AppliedTransition | None:
+async def _process_observation(
+    obs: TrayObservation, deps: PipelineDeps, seen: set[int], tray_counts: dict[int, int] | None = None
+) -> AppliedTransition | None:
     printer_id, ams_id, tray_id = obs.slot
+
+    if obs.present is False:
+        # An emptied slot invalidates any prompt raised for the roll that just left, so
+        # reinserting one re-prompts. Kept here rather than in a decision branch because
+        # it must happen for a BOUND slot (which releases) and an UNBOUND one (which
+        # decides NONE) alike. Sibling clears for the respool prompt and the bare-tray
+        # auto-config window live in ``main.on_ams_change``'s consumer loop — those are
+        # consumer-lane state, not identity.
+        clear_unknown_tag_dedup(printer_id, ams_id, tray_id)
 
     assignment = await _load_assignment(deps.db, printer_id, ams_id, tray_id)
     if assignment is not None and assignment.spool is None:
@@ -310,7 +393,7 @@ async def _process_observation(obs: TrayObservation, deps: PipelineDeps, seen: s
     decision = resolve(obs, state, ctx)
     from_state = _believed_state(binding)
 
-    decision, applied = await _apply(obs, deps, assignment, decision, seen)
+    decision, applied = await _apply(obs, deps, assignment, decision, seen, tray_counts or {})
 
     if applied:
         logger.info("%s", format_slot_event(printer_id, ams_id, tray_id, from_state, state, decision))
@@ -444,6 +527,36 @@ async def _identity_candidate(db: AsyncSession, obs: TrayObservation) -> Spool |
     return None
 
 
+async def _untagged_claim_candidate(
+    db: AsyncSession, obs: TrayObservation, binding: BindingView | None
+) -> Spool | None:
+    """The operator row this newly-identified roll plausibly IS. Strict priority.
+
+    Only consulted when the push asserted an identity AND no row already OWNS it
+    (:func:`_identity_candidate` came back empty), so this costs one extra query in the
+    worst case and none on the common path.
+
+    1. **The slot's own pre-configured binding**, when its spool carries no tag/uuid.
+       SpoolBuddy weigh-then-assign binds a WEIGHED row to an empty slot; the tag the
+       AMS reads when that roll is inserted belongs to that row. Resolved from the
+       binding already loaded for this slot — no query at all. It has to be a separate
+       priority because :func:`find_matching_untagged_spool` excludes every row that
+       holds an assignment (``~assignments.any()``), which is exactly what this row is.
+    2. **The attract lane** — ``find_matching_untagged_spool``: an unassigned, untagged,
+       non-archived, Bambu-or-unset-brand, material+colour-matching operator row, never
+       an auto-minted ``ams_auto`` one. Its criteria are the contract here; this calls it
+       rather than restating them, so "a row that can attract a tag" keeps one meaning.
+    """
+    if binding is not None and binding.pre_configured and not (binding.tag_uid or binding.tray_uuid):
+        spool = await db.get(Spool, binding.spool_id)
+        # Re-read the ROW rather than trusting the view: the view's identity fields are a
+        # snapshot, and linking a tag onto a row that already carries one would be the
+        # duplicate-identity hazard this whole lane exists to avoid.
+        if spool is not None and spool.archived_at is None and _is_tagless(spool):
+            return spool
+    return await find_matching_untagged_spool(db, _tray_dict(obs))
+
+
 def _fingerprint_compatible(obs: TrayObservation, spool: Spool) -> bool:
     """Same physical filament as this push, judged on the SPOOL's own identity.
 
@@ -491,10 +604,18 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
     printer_id, ams_id, tray_id = obs.slot
 
     identity_candidate = None
+    untagged_claim_candidate = None
     if obs.identity_asserted:
         candidate = await _identity_candidate(deps.db, obs)
         if candidate is not None:
             identity_candidate = _spool_view(candidate)
+        else:
+            # No row owns this identity — before the table can mint a stranger, ask
+            # whether an operator already logged this roll (weighed pre-config row, or
+            # an untagged inventory row awaiting its tag).
+            claim = await _untagged_claim_candidate(deps.db, obs, binding)
+            if claim is not None:
+                untagged_claim_candidate = _spool_view(claim)
 
     last_location_candidate = None
     if binding is None and obs.config_nonempty and not obs.identity_asserted:
@@ -505,6 +626,7 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
     return ResolutionContext(
         binding=binding,
         identity_candidate=identity_candidate,
+        untagged_claim_candidate=untagged_claim_candidate,
         last_location_candidate=last_location_candidate,
         qualified_cycle_pending=spool_tagless.qualified_cycle_pending(printer_id, ams_id, tray_id),
         auto_add_unknown=await _auto_add_unknown(deps),
@@ -517,7 +639,7 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
 
 
 async def _auto_add_unknown(deps: PipelineDeps) -> bool:
-    """``auto_add_unknown_rfid`` — unset means ON (mirrors ``main.py:2141-2142``)."""
+    """``auto_add_unknown_rfid`` — unset means ON (the pre-cutover default)."""
     raw = await deps.setting("auto_add_unknown_rfid")
     return raw is None or raw.lower() == "true"
 
@@ -581,6 +703,7 @@ async def _apply(
     assignment: SpoolAssignment | None,
     decision: Decision,
     seen: set[int],
+    tray_counts: dict[int, int],
 ) -> tuple[Decision, bool]:
     """Perform ``decision``. Returns the decision actually applied (a MINT may convert
     to a BIND) and whether the binding ledger changed."""
@@ -610,6 +733,10 @@ async def _apply(
     if decision.reason in _IDENTIFY_VERDICT:
         printer_id, ams_id, tray_id = obs.slot
         await deps.identify(printer_id, ams_id, tray_id, decision.reason)
+    elif decision.reason == "unknown_tag_prompt_owed":
+        # Auto-add is OFF and no row owns this roll: the table refuses to mint, so the
+        # operator gets the durable-per-slot prompt instead.
+        await _prompt_unknown_tag(obs, deps, tray_counts)
     logger.debug(
         "[slot-state] printer=%d A%dT%d %s reason=%s",
         obs.printer_id,
@@ -629,9 +756,10 @@ async def _apply_keep(
         _log_sibling_read(obs, decision)
     if assignment is None or not obs.config_nonempty:
         return
-    # Fingerprint refresh — mirrors main.py:1938-1953 / spool_tagless._refresh_assignment_
-    # fingerprint: the snapshot tracks what the slot currently reports, so a
-    # re-configured (but same) roll does not read as a different filament next push.
+    # Fingerprint refresh: the snapshot tracks what the slot currently reports, so a
+    # re-configured (but same) roll does not read as a different filament on the next
+    # push. Not a binding change — the same refresh both pre-cutover lanes performed on
+    # a keep, now with one implementation.
     cur_color = obs.tray_color or ""
     cur_type = obs.tray_type or ""
     if (assignment.fingerprint_color or "").upper() == cur_color.upper() and (
@@ -673,6 +801,26 @@ def _log_sibling_read(obs: TrayObservation, decision: Decision) -> None:
         scanned or "-",
         (obs.tray_uuid or "-"),
     )
+
+
+async def _prompt_unknown_tag(obs: TrayObservation, deps: PipelineDeps, tray_counts: dict[int, int]) -> None:
+    """Raise the operator's "add this roll" prompt for an unowned identity. Guarded."""
+    printer_id, ams_id, tray_id = obs.slot
+    try:
+        await broadcast_unknown_tag(
+            printer_id=printer_id,
+            ams_id=ams_id,
+            tray_id=tray_id,
+            tag_uid=obs.tag_uid or "",
+            tray_uuid=obs.tray_uuid or "",
+            tray_type=obs.tray_type,
+            tray_color=obs.tray_color,
+            tray_sub_brands=obs.tray_sub_brands,
+            tray_count=tray_counts.get(ams_id),
+            emit=deps.emit,
+        )
+    except Exception:  # noqa: BLE001 — a prompt failure must not unwind the pass
+        logger.exception("[slot-state] unknown-tag prompt failed for printer %d A%dT%d", printer_id, ams_id, tray_id)
 
 
 def _duplicate_in_pass(obs: TrayObservation, spool_id: int | None, seen: set[int]) -> bool:
@@ -722,10 +870,24 @@ async def _bind_spool(
     *,
     fingerprint: tuple[str, str] | None = None,
 ) -> tuple[Decision, bool]:
-    """The shared BIND write: the ONE binding writer + the pre-config one-shot."""
+    """The shared BIND write: the ONE binding writer + the pre-config one-shot.
+
+    Three flavours, all one write: a plain identity bind, the tagless pre-config
+    one-shot (``pre_configured_apply`` — pushes the deferred config), and the two
+    identity-CLAIM binds (:data:`_IDENTITY_CLAIM_REASONS` — link the tag onto the row,
+    never push).
+    """
     printer_id, ams_id, tray_id = obs.slot
     pre_config = decision.reason == "pre_configured_apply"
+    claims_identity = decision.reason in _IDENTITY_CLAIM_REASONS
+    pre_config_row = pre_config or decision.reason == "pre_configured_apply_identity"
     fp_color, fp_type = fingerprint if fingerprint is not None else (obs.tray_color or "", obs.tray_type or "")
+
+    origin = ORIGIN_BIND
+    if pre_config_row:
+        origin = ORIGIN_PRECONFIG
+    elif claims_identity:
+        origin = ORIGIN_CLAIM
 
     assignment = await bind_spool_to_slot(
         deps.db,
@@ -735,20 +897,33 @@ async def _bind_spool(
         tray_id=tray_id,
         fingerprint_color=fp_color,
         fingerprint_type=fp_type,
-        origin=ORIGIN_PRECONFIG if pre_config else ORIGIN_BIND,
+        origin=origin,
     )
     if assignment is None:
         # Damped move — the writer already logged the WARNING and wrote nothing, so
         # there is no binding change to announce.
         return decision, False
-    if pre_config:
-        # One-shot apply (main.py:2021-2054 semantics): the operator's intent is now a
-        # real location claim, so the marker is cleared and the deferred configuration
-        # finally goes out to the slot the firmware refused it on while empty.
+    if claims_identity:
+        # The roll is now positively identified and this row IS that roll, so the
+        # observed identity lands ON it — one ledger row for one physical roll, with the
+        # operator's own weight/label/cost intact. Through the existing linker so the
+        # ``rfid_linked`` origin, the slicer-preset backfill and the INFO grammar stay
+        # identical to the pre-cutover attract lane. It flushes; the commit is below.
+        await link_tag_to_inventory_spool(deps.db, spool, _tray_dict(obs))
+    if pre_config_row:
+        # One-shot apply (the SpoolBuddy pre-config replay's semantics): the intent is now a
+        # real location claim, so the marker is cleared. (The writer rebuilds the row, so
+        # this is belt-and-braces on a column that already defaults to NULL — stated
+        # explicitly because the marker's clearing is the semantic, not a side effect.)
         assignment.pre_configured_at = None
     await deps.db.commit()
     seen.add(spool.id)
     if pre_config:
+        # The deferred configuration finally goes out to the slot the firmware refused
+        # it on while empty. NEVER on an identity-claim bind: that roll's configuration
+        # is RFID-owned, and pushing ``ams_filament_setting`` over a BL-read slot
+        # destroys the RFID-detected state (eye → pen in Studio) — the same no-push rule
+        # ``spool_tag_matcher.auto_assign_spool`` states for BL spools.
         await deps.push_slot_config(spool, printer_id, ams_id, tray_id, _tray_dict(obs))
     await _emit_auto_assigned(obs, deps, spool)
     return decision, True
@@ -887,9 +1062,11 @@ async def _apply_replace_spent(
 ) -> tuple[Decision, bool]:
     """The W1 silent spent→mint: the drained row retires, its replacement takes the slot.
 
-    Mirrors ``spool_tagless._replace_row_after_cycle`` (spool_tagless.py:665-726) — the
-    function W3b deletes — with ONE deliberate difference, stated here so the change is
-    not mistaken for drift: the departed row is disposed through the fork's canonical
+    This is the WIRE lane's spent→fresh transition. ``spool_tagless._replace_row_after_cycle``
+    survives as the OPERATOR lane's executor (the "New roll" verb answering a fresh-roll
+    prompt) and the two must stay behaviourally aligned; the ONE deliberate difference is
+    stated here so it is not mistaken for drift: the departed row is disposed through the
+    fork's canonical
     disposal (``dispose_provisional_on_tag``), so a PRISTINE auto-minted row (no usage
     ledger) is hard-deleted instead of leaving an archived 0 g husk, while any
     ledger-bearing row is archived exactly as before. A row that is not ours to dispose
@@ -1032,13 +1209,17 @@ def _tray_dict_from_spec(obs: TrayObservation, spec: dict) -> dict:
 
 
 async def _emit_auto_assigned(obs: TrayObservation, deps: PipelineDeps, spool: Spool) -> None:
-    """``spool_auto_assigned`` — the existing vocabulary (main.py:2390-2398).
+    """``spool_auto_assigned`` — the fork's existing assignment-announce vocabulary.
 
     ``origin="tagless"`` is added for a row with no RFID identity, which is what the
     frontend toasts on (``useWebSocket.ts`` case ``spool_auto_assigned``); a tagged
     payload stays byte-identical to the RFID lane's.
     """
     printer_id, ams_id, tray_id = obs.slot
+    # The slot now has an owner, so any prompt raised for it is answered — drop the
+    # dedup so a LATER unknown roll in this slot prompts again. This is the single
+    # choke point every successful bind funnels through.
+    clear_unknown_tag_dedup(printer_id, ams_id, tray_id)
     payload: dict = {
         "type": "spool_auto_assigned",
         "printer_id": printer_id,
@@ -1049,6 +1230,84 @@ async def _emit_auto_assigned(obs: TrayObservation, deps: PipelineDeps, spool: S
     if _is_tagless(spool):
         payload["origin"] = "tagless"
     await deps.emit(payload)
+
+
+async def broadcast_unknown_tag(
+    *,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    tag_uid: str,
+    tray_uuid: str,
+    tray_type: str | None = None,
+    tray_color: str | None = None,
+    tray_sub_brands: str | None = None,
+    tray_count: int | None = None,
+    emit: Broadcaster | None = None,
+) -> None:
+    """Raise the ``unknown_tag`` operator prompt for a slot, deduped per (slot, tag).
+
+    Fired when auto-add is OFF and a roll no inventory row owns is sitting in a slot
+    (decision ``unknown_tag_prompt_owed``), and by the Spoolman lane for the same
+    situation on its side. Repeated MQTT pushes for one slot+tag must not spam the UI,
+    so the tag tuple is remembered and only a CHANGE re-broadcasts.
+
+    ``emit`` lets the pipeline route through :meth:`PipelineDeps.emit` (test-injectable);
+    the Spoolman caller omits it and goes straight to the websocket manager.
+    """
+    slot_key = (ams_id, tray_id)
+    tag_key = (tag_uid or "", tray_uuid or "")
+    per_printer = _unknown_tag_last_broadcast.setdefault(printer_id, {})
+    if per_printer.get(slot_key) == tag_key:
+        logger.debug(
+            "unknown_tag deduped for printer=%d AMS=%d slot=%d tag=%s",
+            printer_id,
+            ams_id,
+            tray_id,
+            tag_key[0][:8] or tag_key[1][:8] or "(none)",
+        )
+        return
+    logger.info(
+        "unknown_tag broadcast: printer=%d AMS=%d slot=%d type=%r color=%r tag=%s",
+        printer_id,
+        ams_id,
+        tray_id,
+        tray_type,
+        tray_color,
+        tag_key[0][:8] or tag_key[1][:8] or "(none)",
+    )
+    # Broadcast first; only commit the dedup if the WS write succeeds. If the broadcast
+    # raises, the next push retries instead of being permanently silenced by a poisoned
+    # dedup entry.
+    payload = {
+        "type": "unknown_tag",
+        "printer_id": printer_id,
+        "ams_id": ams_id,
+        "tray_id": tray_id,
+        "tag_uid": tag_uid,
+        "tray_uuid": tray_uuid,
+        "tray_type": tray_type,
+        "tray_color": tray_color,
+        "tray_sub_brands": tray_sub_brands,
+        "tray_count": tray_count,
+    }
+    if emit is not None:
+        await emit(payload)
+    else:
+        await ws_manager.broadcast(payload)
+    per_printer[slot_key] = tag_key
+
+
+def clear_unknown_tag_dedup(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Drop a slot's cached prompt tag, so the next unknown roll there re-prompts.
+
+    Called when the slot reports EMPTY and when a bind resolves it — the two moments
+    that make the previous prompt obsolete.
+    """
+    per_printer = _unknown_tag_last_broadcast.get(printer_id)
+    if per_printer is None:
+        return
+    per_printer.pop((ams_id, tray_id), None)
 
 
 async def _emit_assignment_changed(obs: TrayObservation, deps: PipelineDeps) -> None:
@@ -1068,5 +1327,7 @@ async def _emit_assignment_changed(obs: TrayObservation, deps: PipelineDeps) -> 
 __all__ = [
     "AppliedTransition",
     "PipelineDeps",
+    "broadcast_unknown_tag",
+    "clear_unknown_tag_dedup",
     "run_slot_pipeline",
 ]

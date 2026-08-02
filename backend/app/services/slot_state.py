@@ -118,6 +118,8 @@ RESOLUTION_REASONS = frozenset(
         "identity_ambiguous_owed_full_read",
         "identity_resolved_candidate",
         "partial_identity_owed_full_read",
+        "pre_configured_apply_identity",
+        "identity_claims_untagged_row",
         "unknown_identity_auto_add",
         "unknown_tag_prompt_owed",
         # Row 3 — empty on the wire.
@@ -202,6 +204,24 @@ class ResolutionContext:
     # identity. The table re-checks whatever arrives against the observation
     # (:func:`identity_relation`), so a widened row cannot be smuggled in as a match.
     identity_candidate: SpoolView | None = None
+    # An operator-created row that plausibly IS this newly-identified roll, so the tag
+    # LANDS ON it instead of minting a stranger beside it. Resolved by the orchestrator
+    # with strict priority:
+    #
+    # 1. the slot's own PRE-CONFIGURED binding's spool, when that spool carries no
+    #    tag/uuid of its own — SpoolBuddy weigh-then-assign: the operator weighed a roll
+    #    (label 750 g, say), bound it to the slot, and is now inserting it; the tag the
+    #    AMS reads at insert belongs to THAT row, and minting a fresh 1000 g rfid_auto
+    #    row would orphan the weight the operator just measured;
+    # 2. otherwise ``spool_tag_matcher.find_matching_untagged_spool`` semantics — an
+    #    unassigned, untagged, non-archived, fingerprint-compatible operator row (never
+    #    an auto-minted ``ams_auto`` one), which is the attract-to-inventory lane the
+    #    pre-cutover unknown-tag path ran BEFORE it ever considered minting.
+    #
+    # None = no such row; the table then mints/prompts exactly as before. The table
+    # consumes this only under the same evidence gate as MINT (the full identity pair),
+    # so a partial read can never land a tag on an operator's row.
+    untagged_claim_candidate: SpoolView | None = None
     # Most-recent non-archived, non-spent, fingerprint-compatible spool whose last
     # location IS this slot (doctrine rule 7 reclaim donor).
     last_location_candidate: SpoolView | None = None
@@ -346,6 +366,31 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
             # carried no uuid is indistinguishable from a brand-new roll, and minting
             # on it is exactly how one roll becomes two rows. Wait for the full read.
             return Decision(DecisionKind.DEFER, reason="partial_identity_owed_full_read")
+
+        # 2.4 — nothing OWNS this identity, but an operator row may still BE this roll.
+        # Pre-cutover an unknown tag first tried ``find_matching_untagged_spool`` and,
+        # on a hit, ``link_tag_to_inventory_spool`` moved the identity onto that row; a
+        # bound slot never reached the mint lane at all, so a weigh-then-assign
+        # pre-config row simply received its roll's tag at insert. Post-cutover the
+        # table minted a fresh 1000 g ``rfid_auto`` row instead and orphaned the
+        # operator's weighed one. This restores the attract lane, under the SAME
+        # evidence gate as the MINT below (the full pair — the partial DEFER above
+        # already returned), and ahead of both MINT and the prompt: a roll an operator
+        # already logged is not an unknown roll, so there is nothing to auto-add and
+        # nothing to ask about.
+        #
+        # A pre-config binding's spool carries no identity of its own, so 2.1 cannot
+        # match it, 2.2's tagless-livelock gate deliberately lets it fall through, and
+        # 2.3 finds no owner — which is exactly what routes it here.
+        claim = ctx.untagged_claim_candidate
+        if claim is not None:
+            if binding is not None and binding.pre_configured and claim.spool_id == binding.spool_id:
+                # The slot's own pre-configured row: the operator's intent and the
+                # firmware's read are the same roll. The BIND is a same-spool, same-slot
+                # upsert; the identity link + marker clear are the writer's business.
+                return Decision(DecisionKind.BIND, spool_id=claim.spool_id, reason="pre_configured_apply_identity")
+            return Decision(DecisionKind.BIND, spool_id=claim.spool_id, reason="identity_claims_untagged_row")
+
         if ctx.auto_add_unknown:
             # Full pair, unknown to the inventory → genuinely new. Both members are
             # recorded, so the next sibling read of this roll resolves on the uuid.
@@ -400,16 +445,26 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         # 4b — the pre-config one-shot: something got inserted into a slot the
         # operator pre-assigned, so apply that intent now (push config + stamp the
         # fingerprint + clear pre_configured_at — all writer-side).
-        if binding is not None and binding.pre_configured:
-            if obs.present is True:
-                return Decision(DecisionKind.BIND, spool_id=binding.spool_id, reason="pre_configured_apply")
-            return Decision(DecisionKind.KEEP, spool_id=binding.spool_id, reason="pre_configured_awaiting_insert")
+        #
+        # The gate is ``present is not False``, NOT ``present is True``: the A1-family
+        # and P1S firmwares report a CONSTANT ``state=3`` (some pushes omit ``state``
+        # altogether), so ``tray_observation._derive_present`` can only answer None for
+        # them and a ``present is True`` gate left every one of those dialects "awaiting
+        # insert" FOREVER — the roll physically seated, configured, and never applied
+        # (upstream #1322; the pre-cutover replay handled exactly this shape).
+        # Reaching row 4 already proves ``present is not False`` twice over — row 3 owns
+        # every present-False push, and the cleared shape that makes presence False
+        # asserts an EMPTY ``tray_type`` while this row needs a non-empty one — so the
+        # KEEP arm that used to sit here was unreachable and is deleted rather than left
+        # as a branch no push can take. Awaiting-insert is row 3's / row 5's answer.
+        if binding is not None and binding.pre_configured and obs.present is not False:
+            return Decision(DecisionKind.BIND, spool_id=binding.spool_id, reason="pre_configured_apply")
 
         # 4b′ — the row bound here is TAGGED, but this push carried no RFID fields.
         # That is not evidence the roll left: periodic AMS pushes routinely omit
         # identity (which is exactly why the merge preserves it), and a tagged row
         # is only ever re-decided by the tag lane or by the empty shape at row 3.
-        # Mirrors today's `handle_tagless_slot` branch (2) "not ours" return.
+        # Mirrors the pre-cutover tagless branch tree's (2) "not ours" return.
         if binding is not None and not binding.is_tagless:
             return Decision(DecisionKind.KEEP, spool_id=binding.spool_id, reason="tagged_row_awaits_tag_lane")
 

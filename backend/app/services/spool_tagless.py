@@ -1,42 +1,43 @@
-"""Tagless (non-RFID) spool lifecycle — single owner (fork farm feature).
+"""Tagless (non-RFID) spool support lanes — wire config, minting, operator verbs.
 
-Every AMS tray holding a non-RFID spool becomes silently tracked so the farm's
-gram accounting and FIFO spool-selection see it like any other roll:
+**Scope after the W3b cutover.** Deciding WHAT is in a tray and WHICH ledger row it
+is belongs to ``slot_state`` (the decision table) and ``slot_pipeline`` (the one
+orchestrator). This module no longer decides identity: its 7-branch
+``handle_tagless_slot`` tree, the in-place ``_maybe_move_tagless_assignment`` rebind
+and the terminal-time identity reconcile were deleted, not re-homed. What remains is
+everything AROUND that decision, in three groups:
 
-* **Configured tagless tray** — the firmware reports a ``tray_type`` the operator
-  set in the slicer, but there is no RFID tag: auto-mint a
-  ``data_origin="ams_auto"`` spool from the tray fields and bind it
-  (:func:`handle_tagless_slot`, "Hook B" in ``main.on_ams_change``).
-* **BARE tray** — a spool is physically present but nothing is configured
-  (``tray_type`` empty, state 10/11): additionally push a configured default
-  filament to the printer so the slot is usable, including mid-print where the
-  configured slot joins the firmware backup pool
-  (:func:`maybe_autoconfigure_bare_tray`, decision D3b).
+* **Minting + tagless defaults** — :func:`mint_tagless_spool`,
+  :func:`tagless_default_filament`, :func:`override_generic_identity`. The pipeline
+  calls these to execute a MINT it decided on; the shapes are unchanged.
+* **Wire config (a sibling lane, NOT identity)** — :func:`maybe_autoconfigure_bare_tray`
+  pushes the default filament to a BARE tray (spool present, ``tray_type`` empty,
+  state 10/11) so the slot is usable, including mid-print where it joins the firmware
+  backup pool (decision D3b). The pipeline classifies a bare tray
+  ``OCCUPIED_UNRESOLVED`` and mutates no binding; this lane gives the firmware a
+  configuration so the NEXT push carries a filament type and enters the pipeline's
+  tagless lane. :func:`reconcile_slot_config` is its durable scheduler-tick retry lane
+  (plus K-drift and owed-identify arms), because ``main.on_ams_change`` is
+  change-gated and a settled AMS stops firing it (2026-07-24 incident).
+* **Operator verbs + the prompts behind them** — the W5 fresh-roll prompt
+  (:func:`note_physical_cycle` → :func:`_maybe_prompt_fresh_roll`, durable on
+  ``Spool.fresh_prompt_pending_at``) and its executor :func:`apply_fresh_roll`, which
+  answers "New roll" by archiving the current row and minting its replacement through
+  :func:`_replace_row_after_cycle`. The WIRE equivalent of that transition is the
+  pipeline's ``REPLACE_SPENT``; the two must stay behaviourally aligned.
+  :func:`dispose_provisional_on_tag` retires an auto-minted provisional row when a
+  real RFID tag claims its slot (hard-delete with no usage ledger, else archive).
 
-Continuity rules:
+The W1 spent latch itself is unchanged and now lives in the table (``spool.spent_at``
++ the binding IS the durable "this tray ran dry" state); this module still owns the
+qualified-physical-cycle signal that releases it
+(:func:`qualified_cycle_pending` / :func:`consume_qualified_cycle`).
 
-* **Sticky rebind** — a tagless spool pulled for drying and returned re-binds to
-  the SAME ledger row: :func:`should_keep_on_empty` keeps the assignment while
-  the slot is empty; :func:`fingerprint_matches` re-binds on return. Operator
-  edits to a minted spool are NEVER overwritten.
-* **Spent-binding latch (W1)** — a spool marked ``spent_at`` keeps its binding
-  while the tray remains continuously present (:func:`should_keep_on_empty` keeps
-  spent rows too); the spent binding IS the durable "this tray ran dry" latch.
-  "Ran-dry mints new" fires ONLY after a qualified physical absence
-  (:func:`note_physical_cycle` records the cycle; branch (3) /
-  :func:`maybe_autoconfigure_bare_tray` consume it) — a runout-instant state flap
-  can no longer phantom-mint a fresh row over a still-present spool.
-* **Provisional disposal** — an auto-minted tagless row is provisional; when a
-  real RFID tag later claims the slot, :func:`dispose_provisional_on_tag`
-  hard-deletes it (no usage ledger) or archives it (has one).
-
-Module edge state (``_autoconfig_window``, ``_pending_physical_cycles``,
-``_identity_reconciled``) mirrors the fork's other event-edge bookkeeping
-(``spool_respool._last_tray_now``). It is lost on restart — worst case a bare-tray
-config re-push waits one AMS push, a spent slot stays latched+excluded until a
-pull/reseat (honest, not silent), and the one-shot identity reconcile is re-armed
-(it re-checks live divergence first, so a converged slot stays silent). The
-fresh-roll prompt is deliberately NOT in that set: its state is the durable
+Module edge state (``_autoconfig_window``, ``_pending_physical_cycles``) mirrors the
+fork's other event-edge bookkeeping (``spool_respool._last_tray_now``). It is lost on
+restart — worst case a bare-tray config re-push waits one AMS push and a spent slot
+stays latched until a pull/reseat (honest, not silent). The fresh-roll prompt is
+deliberately NOT in that set: its state is the durable
 ``Spool.fresh_prompt_pending_at`` stamp, because a question nobody was connected to
 hear must survive both an empty websocket list and a restart.
 
@@ -62,7 +63,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services import ams_presence
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.spool_binding import bind_spool_to_slot, stamp_loaded
+from backend.app.services.spool_binding import bind_spool_to_slot
 from backend.app.services.spool_tag_matcher import (
     auto_assign_spool,
     is_bambu_tag,
@@ -110,10 +111,11 @@ _MINT_SETTLE_S = 5.0
 
 # (printer_id, ams_id, tray_id) of slots that saw a QUALIFIED physical roll swap
 # (≥ _MIN_PHYSICAL_ABSENT_S absent → present, recorded by note_physical_cycle).
-# This is the spent-binding latch's RELEASE signal: handle_tagless_slot branch (3)
-# and maybe_autoconfigure_bare_tray consume it to mint the replacement over a spent
-# row. A spent row with NO pending cycle stays latched (no phantom mint). Popped
-# once processed on every branch; process-lifetime (a swap during downtime degrades
+# This is the spent-binding latch's RELEASE signal, consumed by the pipeline's
+# REPLACE_SPENT arm (via consume_qualified_cycle), by maybe_autoconfigure_bare_tray,
+# and by the operator's New-roll verb, to mint the replacement over a spent row. A
+# spent row with NO pending cycle stays latched (no phantom mint). Popped once
+# processed on every path; process-lifetime (a swap during downtime degrades
 # to a latched+excluded slot, released by pull/reseat — honest, not silent).
 _pending_physical_cycles: set[tuple[int, int, int]] = set()
 
@@ -123,15 +125,6 @@ _pending_physical_cycles: set[tuple[int, int, int]] = set()
 # earlier in a roll's life is routine (drying, slot juggling) and asking then is
 # noise.
 _FRESH_ROLL_PROMPT_USED_FRAC = 0.7
-
-# (printer_id, ams_id, tray_id) of slots whose live identity has been EVALUATED
-# against the resolver this process (E3/W6) — either found converged or re-pushed once.
-# A stale spool row can keep re-publishing an identity (a GENERIC id, or divergent
-# nozzle temps) that splits the firmware's auto-refill backup group; the reconcile
-# corrects it ONCE per slot per process, so a divergence can never loop and a fully
-# converged slot costs nothing on later pushes. Convergence is the WHOLE wire identity
-# the firmware groups on — tray_info_idx AND both nozzle temps — not tray_info_idx alone.
-_identity_reconciled: set[tuple[int, int, int]] = set()
 
 # Minimum spacing between two :func:`reconcile_slot_config` passes. The scheduler
 # tick that drives it is kick-driven (a dispatch burst wakes it repeatedly within
@@ -166,7 +159,6 @@ def _reset_state() -> None:
     global _last_reconcile_at
     _autoconfig_window.reset()
     _pending_physical_cycles.clear()
-    _identity_reconciled.clear()
     _last_reconcile_at = None
 
 
@@ -305,40 +297,6 @@ async def override_generic_identity(
     }
 
 
-def effectively_empty(spool: Spool, threshold_g: int) -> bool:
-    """Remaining grams at or below the 'effectively empty' threshold."""
-    remaining = (spool.label_weight or 0) - (spool.weight_used or 0)
-    return remaining <= threshold_g
-
-
-def should_keep_on_empty(assignment: SpoolAssignment, threshold_g: int) -> bool:
-    """Sticky-rebind decision for a slot that just went empty.
-
-    Keep the assignment (do NOT unlink) when the bound spool is a tagless roll that
-    is either SPENT (W1: the spent binding is the durable "this tray ran dry" latch
-    — kept until a physical roll swap releases it via :func:`note_physical_cycle`,
-    so a runout-instant flap can't phantom-mint a fresh row) OR live-but-not-
-    effectively-empty (pulled for drying and expected back). A non-spent near-empty
-    spool departing is a genuine removal; the caller should unlink it.
-    """
-    spool = assignment.spool
-    if spool is None or not is_tagless_spool(spool):
-        return False
-    if spool.spent_at is not None:
-        return True  # W1: keep the spent binding as the latch until a physical swap
-    return not effectively_empty(spool, threshold_g)
-
-
-def _refresh_assignment_fingerprint(assignment: SpoolAssignment, tray: dict) -> None:
-    cur_color = tray.get("tray_color", "") or ""
-    cur_type = tray.get("tray_type", "") or ""
-    if (assignment.fingerprint_color or "").upper() != cur_color.upper() or (
-        assignment.fingerprint_type or ""
-    ).upper() != cur_type.upper():
-        assignment.fingerprint_color = cur_color
-        assignment.fingerprint_type = cur_type
-
-
 # --- setting helpers --------------------------------------------------------
 
 
@@ -398,17 +356,6 @@ async def tagless_default_filament(db: AsyncSession) -> dict | None:
     copy of the parse, no second source of truth for the setting.
     """
     return await _tagless_default(db)
-
-
-async def effective_threshold(db: AsyncSession) -> int:
-    """The 'effectively empty' grams threshold (reuses ``respool_prompt_threshold_g``)."""
-    from backend.app.api.routes.settings import get_setting
-
-    raw = await get_setting(db, "respool_prompt_threshold_g")
-    try:
-        return int(raw) if raw is not None else 30
-    except (TypeError, ValueError):
-        return 30
 
 
 # --- minting ----------------------------------------------------------------
@@ -516,19 +463,28 @@ async def mint_tagless_spool(
 
 async def _assign_from_setting(
     db: AsyncSession, spool: Spool, printer_id: int, ams_id: int, tray_id: int, default: dict
-) -> None:
+) -> SpoolAssignment | None:
     """Bind a setting-minted spool with a fingerprint seeded from the SETTING.
 
     A bare tray reports an empty tray_type, so an auto_assign_spool-derived
     fingerprint would be empty and re-trip the SpoolBuddy empty-fingerprint
     replay. Seeding fingerprint_color/type from the default filament suppresses
-    that and makes the later Hook B fingerprint-match a no-op.
+    that and makes the decision table's later fingerprint-match a no-op (so the slot
+    resolves KEEP rather than "different filament" on the next push).
 
     The binding itself (move semantics + the FIFO stamps) belongs to
     ``spool_binding.bind_spool_to_slot``; this wrapper only owns the fingerprint
     seeding.
+
+    Returns the assignment, or **None when the writer REFUSED the bind** — its move
+    damper drops a repeated cross-slot move of one spool inside
+    ``spool_binding._MOVE_DAMPER_S`` (the 007-H2C flip-flop fix). Callers MUST honour
+    None: nothing was written, so pushing a slot config or broadcasting an assignment
+    for it would announce a binding that does not exist. A freshly minted row holds no
+    other binding and so can never be a MOVE — for those callers this is defence in
+    depth, not an expected path.
     """
-    await bind_spool_to_slot(
+    return await bind_spool_to_slot(
         db,
         spool,
         printer_id=printer_id,
@@ -584,9 +540,9 @@ def _config_settling(printer_id: int, ams_id: int, tray_id: int) -> bool:
 async def _push_config(db: AsyncSession, spool: Spool, printer_id: int, ams_id: int, tray_id: int, tray: dict) -> bool:
     """Publish the tagless filament config to the slot — the module's ONE wire write.
 
-    The single funnel for all four tagless config-write paths (first bare-tray mint,
-    bound re-push, :func:`_replace_row_after_cycle`, :func:`_maybe_reconcile_slot_identity`),
-    which is why the settle gate lives here: no path may publish an identity into a
+    The single funnel for every tagless config-write path (first bare-tray mint, bound
+    re-push, :func:`_replace_row_after_cycle`, and the pipeline's MINT/pre-config applies
+    through :func:`push_config_for_spool`), which is why the settle gate lives here: no path may publish an identity into a
     slot whose own identity is still unresolved (:func:`_config_settling`). Returns
     False without publishing when the slot is settling or the push fails.
     """
@@ -708,9 +664,13 @@ async def _replace_row_after_cycle(
 ) -> Spool:
     """Archive a departed tagless row and mint+bind+push its replacement (W1/W5).
 
-    The SINGLE spent-binding / fresh-roll transition, shared by
-    :func:`handle_tagless_slot` branch (3), :func:`maybe_autoconfigure_bare_tray`,
-    and the W5 tagless-fresh route. Default-mints from the configured tagless default
+    The OPERATOR lane's spent-binding / fresh-roll transition, shared by
+    :func:`maybe_autoconfigure_bare_tray` and the W5 tagless-fresh route
+    (:func:`apply_fresh_roll` — the "New roll" verb). The WIRE lane's equivalent is the
+    pipeline's ``REPLACE_SPENT`` arm (``slot_pipeline._apply_replace_spent``), which
+    mirrors this behaviour with one documented difference (it disposes a pristine
+    provisional row instead of archiving an empty husk); the two must stay aligned.
+    Default-mints from the configured tagless default
     when the tray is bare/absent OR still carries the departed row's config (firmware
     leftover — :func:`fingerprint_matches`), so a physically-fresh roll gets a clean
     4-dimension identity; else mints from the tray's own (genuinely different) config.
@@ -737,8 +697,20 @@ async def _replace_row_after_cycle(
     if use_default:
         new_spool = await mint_tagless_spool(db, default_filament=default)
         _apply_new_fields(new_spool, new_fields)
-        await _assign_from_setting(db, new_spool, printer_id, ams_id, tray_id, default)
+        bound = await _assign_from_setting(db, new_spool, printer_id, ams_id, tray_id, default)
         await db.commit()
+        if bound is None:
+            # The writer refused the bind (move damper). Nothing claims the slot, so
+            # publishing a config for it — or announcing an assignment — would be a lie.
+            logger.warning(
+                "Tagless replacement spool %d was not bound to printer %d AMS%d-T%d (writer refused) — "
+                "skipping the slot config push",
+                new_spool.id,
+                printer_id,
+                ams_id,
+                tray_id,
+            )
+            return new_spool
         await _push_config(db, new_spool, printer_id, ams_id, tray_id, tray or {})
     else:
         if not tray_configured:
@@ -898,8 +870,9 @@ async def note_physical_cycle(printer_id: int, ams_id: int, tray_id: int) -> Non
 
     Called (guarded, awaited) from ``ams_presence.on_ams_change`` on a genuine presence
     GAIN whose preceding absence lasted ≥ ``ams_presence._MIN_PHYSICAL_ABSENT_S``. Arms
-    :data:`_pending_physical_cycles` (the spent-binding latch's release signal that
-    branch (3) / :func:`maybe_autoconfigure_bare_tray` consume on the next push) then
+    :data:`_pending_physical_cycles` (the spent-binding latch's release signal that the
+    pipeline's REPLACE_SPENT arm / :func:`maybe_autoconfigure_bare_tray` consume on the
+    next push) then
     runs the W5 over-consumption prompt in its OWN session (mirrors
     ``ams_presence.on_printer_terminal``). Never raises — a farm-side failure must never
     break the AMS callback chain.
@@ -1041,93 +1014,7 @@ async def rebroadcast_unresolved_tagless_prompts(db: AsyncSession, send) -> int:
     return sent
 
 
-# --- Hook B: tagless-slot policy -------------------------------------------
-
-
-async def _maybe_move_tagless_assignment(
-    db: AsyncSession,
-    printer_id: int,
-    ams_id: int,
-    tray_id: int,
-    tray: dict,
-    ams_data: list,
-) -> bool:
-    """Re-bind a MOVED tagless roll to its existing ledger row instead of minting.
-
-    A tagless spool physically relocated to another slot on the SAME printer
-    leaves its old :class:`SpoolAssignment` sticky-kept over the now-empty source
-    slot (phase 1's :func:`should_keep_on_empty`). Without this, branch (1) of
-    :func:`handle_tagless_slot` would mint a SECOND spool for the same physical
-    roll — the ledger duplicate this closes.
-
-    A candidate is one of THIS printer's OTHER assignments whose spool is tagless,
-    not spent, and fingerprint-matches ``tray``, AND whose own slot is verifiably
-    EMPTY in the live ``ams_data`` (its tray dict is present with a blank
-    ``tray_type``). A slot ABSENT from the payload is unknowable, so it is NOT a
-    candidate. Cross-printer moves are never considered — we only query THIS
-    printer.
-
-    Returns True (caller should ``continue``) ONLY when exactly one candidate is
-    found and its assignment was moved to this slot. Zero candidates → False
-    (mint as usual). Two or more → False plus a WARNING naming the ambiguous
-    spool ids (mint rather than guess which roll moved).
-    """
-    from backend.app.api.routes.inventory import _find_tray_in_ams_data
-
-    res = await db.execute(
-        select(SpoolAssignment)
-        .options(selectinload(SpoolAssignment.spool))
-        .where(SpoolAssignment.printer_id == printer_id)
-    )
-    candidates: list[SpoolAssignment] = []
-    for asg in res.scalars().all():
-        if asg.ams_id == ams_id and asg.tray_id == tray_id:
-            continue  # the target slot itself (defensive — branch (1) has no row here)
-        spool = asg.spool
-        if spool is None or not is_tagless_spool(spool) or spool.spent_at is not None:
-            continue
-        if not fingerprint_matches(spool, tray):
-            continue
-        src_tray = _find_tray_in_ams_data(ams_data, asg.ams_id, asg.tray_id)
-        if src_tray is None:
-            continue  # source slot/unit absent from the payload → unknowable, not a candidate
-        if (src_tray.get("tray_type") or "").strip():
-            continue  # source slot still holds filament → not an empty source
-        candidates.append(asg)
-
-    if len(candidates) != 1:
-        if len(candidates) >= 2:
-            logger.warning(
-                "Tagless slot-move ambiguous on printer %d AMS%d-T%d: %d empty-source candidates "
-                "(spool ids %s) fingerprint-match — minting a fresh row instead of moving",
-                printer_id,
-                ams_id,
-                tray_id,
-                len(candidates),
-                [c.spool_id for c in candidates],
-            )
-        return False
-
-    asg = candidates[0]
-    old_ams_id, old_tray_id = asg.ams_id, asg.tray_id
-    asg.ams_id = ams_id
-    asg.tray_id = tray_id
-    _refresh_assignment_fingerprint(asg, tray)
-    # Slot-move re-bind mutates the assignment in place (the upsert pairing-change
-    # guard never sees it), so re-stamp the FIFO ordinal here: the roll physically
-    # became seated in THIS slot now. spool is selectinload-ed on the query above.
-    stamp_loaded(asg.spool)
-    await db.commit()
-    await _broadcast_auto_assigned(printer_id, ams_id, tray_id, asg.spool_id, origin="tagless")
-    logger.info(
-        "Tagless moved assignment (slot-move) spool %d from AMS%d-T%d to AMS%d-T%d",
-        asg.spool_id,
-        old_ams_id,
-        old_tray_id,
-        ams_id,
-        tray_id,
-    )
-    return True
+# --- settle / busy gates (read by the pipeline as decision inputs) ---------
 
 
 def _mint_settling(printer_id: int, ams_id: int, tray_id: int) -> bool:
@@ -1172,374 +1059,6 @@ def _printer_busy(printer_id: int, *, on_error: bool = True) -> bool:
         return ams_presence._printer_running(printer_manager.get_status(printer_id))
     except Exception:  # noqa: BLE001 — must never break the AMS callback chain
         return on_error
-
-
-def _live_nozzle_temp(tray: dict, key: str) -> int | None:
-    """A live tray's reported nozzle temperature as an int, or None when unset.
-
-    Mirrors ``spool_tag_matcher.parse_tray_fields``'s convention: a missing,
-    unparseable, or ZERO value is "unset" (the firmware reports 0 for an
-    unconfigured temp). An unset temp is no evidence of divergence for the identity
-    reconcile — only a temp the firmware POSITIVELY reports can diverge.
-    """
-    try:
-        v = int(tray.get(key))
-    except (TypeError, ValueError):
-        return None
-    return v or None
-
-
-def _temp_diverges(resolved_temp: int | None, live_temp: int | None) -> bool:
-    """True only when the firmware POSITIVELY reports a nozzle temp differing from the
-    resolver's. A resolver that produced no temp, or a slot that reported none this
-    push, is not divergence on that dimension (the id / other temp still can be)."""
-    return resolved_temp is not None and live_temp is not None and int(resolved_temp) != live_temp
-
-
-async def _maybe_reconcile_slot_identity(
-    db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, tray: dict, spool: Spool
-) -> bool:
-    """One-shot re-push when a bound slot's LIVE identity diverges from the resolver (E3/W6).
-
-    The rebind branch is one natural observation point (the slot is bound,
-    configured, and the firmware has just told us what it holds); the idle
-    terminal-callback sweep (:func:`reconcile_bound_slot_identities`) is the other.
-    Convergence is compared across the WHOLE wire identity the firmware's auto-refill
-    backup group keys on — ``tray_info_idx`` AND both nozzle temps — not
-    ``tray_info_idx`` alone: the 011-H2S state had trays on the right ``GFG02`` id but
-    STALE 220/260 temps beside a 230/270 peer, which a tray_info_idx-only check
-    declared converged (burning the one shot without ever healing the split group). A
-    temp the firmware did not report this push (missing/0 == unset) is no evidence of
-    divergence and never forces a push. When ANY dimension diverges, re-push the slot
-    config once so the fleet converges without a migration or a repair tool.
-
-    The resolver runs with ``generic_fallback=True`` because the DETECT site needs the
-    same rescue the PUSH site has had since 46db0bbb. A legacy row with a NULL
-    ``slicer_filament`` resolved to the EMPTY identity, which this function read as
-    "nothing resolvable", consuming the one shot without ever comparing anything
-    (006-H2S, 2026-07-26: a bound slot sat live at ``GFG99`` while the fleet identity
-    is ``GFG02`` — outside the firmware's auto-refill backup group and outside dispatch
-    idx-matching, so the printer ran out with a full roll aboard). The material-composed
-    identity is what the push would actually write, so it is also what divergence must
-    be measured against.
-
-    Gated three ways: the printer must be IDLE (a config write mid-print is exactly
-    what the AMS-write doctrine forbids), the client must not be refusing AMS writes
-    (drying / identifying / identify gate), and a per-slot once-per-process set caps
-    it at a single evaluation so a resolver that keeps disagreeing with the firmware
-    can never loop and a converged slot never re-resolves. Only DEFERRALS (busy /
-    disconnected / refused write) leave the shot unconsumed — a later push retries.
-    Returns True when a re-push was dispatched. Never raises.
-    """
-    key = (printer_id, ams_id, tray_id)
-    if key in _identity_reconciled:
-        return False
-    try:
-        from backend.app.services.slicer_filament_resolver import resolve_slicer_filament
-
-        resolved, _setting_id, _sub_brand, r_tmin, r_tmax = await resolve_slicer_filament(
-            db=db,
-            current_user=None,
-            slicer_filament=spool.slicer_filament,
-            slicer_filament_name=spool.slicer_filament_name,
-            material=spool.material,
-            rgba=spool.rgba,
-            nozzle_temp_min=spool.nozzle_temp_min,
-            nozzle_temp_max=spool.nozzle_temp_max,
-            generic_fallback=True,
-        )
-        live_idx = (tray.get("tray_info_idx") or "").strip()
-        live_tmin = _live_nozzle_temp(tray, "nozzle_temp_min")
-        live_tmax = _live_nozzle_temp(tray, "nozzle_temp_max")
-        converged = (
-            resolved == live_idx
-            and not _temp_diverges(r_tmin, live_tmin)
-            and not _temp_diverges(r_tmax, live_tmax)
-        )
-        if not resolved or converged:
-            # Nothing resolvable, or the slot already carries the whole identity: the
-            # reconcile is DONE for this slot. Consuming the shot here is what keeps a
-            # converged fleet (the steady state) at one resolver call per slot per
-            # process rather than one per AMS push.
-            _identity_reconciled.add(key)
-            return False
-        if _printer_busy(printer_id):
-            return False  # idle-only — retried on a later push
-        client = printer_manager.get_client(printer_id)
-        if client is None:
-            return False
-        refusal = client.ams_write_refusal(ams_id)
-        if refusal is not None:
-            logger.debug(
-                "Deferring slot-identity reconcile for printer %d AMS%d-T%d: %s",
-                printer_id,
-                ams_id,
-                tray_id,
-                refusal,
-            )
-            return False
-        if _config_settling(printer_id, ams_id, tray_id):
-            # Same class as the refusal above — a DEFERRAL, so it must be checked here
-            # and not left to _push_config's funnel gate: the one shot is armed on the
-            # next line, and burning it on a push that never went out would strand the
-            # divergent slot for the rest of the process.
-            logger.debug(
-                "Deferring slot-identity reconcile for printer %d AMS%d-T%d: slot identity still settling",
-                printer_id,
-                ams_id,
-                tray_id,
-            )
-            return False
-        _identity_reconciled.add(key)  # one shot, armed BEFORE the push so it cannot loop
-        logger.info(
-            "Reconciling slot identity on printer %d AMS%d-T%d: live idx=%r temps=%s/%s -> "
-            "idx=%r temps=%s/%s (spool %d)",
-            printer_id,
-            ams_id,
-            tray_id,
-            live_idx,
-            live_tmin,
-            live_tmax,
-            resolved,
-            r_tmin,
-            r_tmax,
-            spool.id,
-        )
-        await _push_config(db, spool, printer_id, ams_id, tray_id, tray)
-        return True
-    except Exception:  # noqa: BLE001 — a reconcile failure must not change the rebind outcome
-        logger.exception("Slot-identity reconcile failed for printer %d AMS%d-T%d", printer_id, ams_id, tray_id)
-        return False
-
-
-async def reconcile_bound_slot_identities(db: AsyncSession, printer_id: int) -> int:
-    """Idle sweep: re-push every bound+configured slot whose live identity diverges (E3/W6).
-
-    The SECOND call site for :func:`_maybe_reconcile_slot_identity` (one
-    implementation). ``handle_tagless_slot``'s rebind branch only reaches the
-    reconcile from an AMS-change push, and on a busy farm those pushes overwhelmingly
-    arrive WHILE printing — so the idle gate defers every one and a divergent slot
-    (011-H2S: tray_info_idx / stale-temps split) never gets its idle evaluation.
-    Called from the printer-terminal callback, where the printer is idle by
-    construction, this iterates the printer's live AMS trays and runs the same
-    once-per-process reconcile on every slot that is bound (a :class:`SpoolAssignment`)
-    and configured (non-empty ``tray_type`` AND ``tray_info_idx``).
-
-    Never raises (module never-crash-guard style); returns 0 on any unavailability
-    (unreachable printer, no merged state). Returns the number of slots re-pushed.
-    """
-    pushed = 0
-    try:
-        state = printer_manager.get_status(printer_id)
-    except Exception:  # noqa: BLE001 — an unreachable printer reconciles nothing
-        return 0
-    if state is None or not getattr(state, "raw_data", None):
-        return 0
-    ams = state.raw_data.get("ams")
-    if isinstance(ams, dict):
-        ams = ams.get("ams", [])
-    try:
-        for unit in ams or []:
-            if not isinstance(unit, dict):
-                continue
-            try:
-                ams_id = int(unit.get("id", -1))
-            except (TypeError, ValueError):
-                continue
-            for tray in unit.get("tray", []) or []:
-                if not isinstance(tray, dict):
-                    continue
-                if not (tray.get("tray_type") or "").strip():
-                    continue  # not configured — nothing to reconcile
-                if not (tray.get("tray_info_idx") or "").strip():
-                    continue  # not configured
-                try:
-                    tray_id = int(tray.get("id", -1))
-                except (TypeError, ValueError):
-                    continue
-                res = await db.execute(
-                    select(SpoolAssignment)
-                    .options(selectinload(SpoolAssignment.spool))
-                    .where(
-                        SpoolAssignment.printer_id == printer_id,
-                        SpoolAssignment.ams_id == ams_id,
-                        SpoolAssignment.tray_id == tray_id,
-                    )
-                )
-                assignment = res.scalar_one_or_none()
-                spool = assignment.spool if assignment is not None else None
-                if spool is None:
-                    continue  # not bound
-                if await _maybe_reconcile_slot_identity(db, printer_id, ams_id, tray_id, tray, spool):
-                    pushed += 1
-    except Exception:  # noqa: BLE001 — a farm-side sweep must never break the terminal callback
-        logger.exception("reconcile_bound_slot_identities failed for printer %d", printer_id)
-    return pushed
-
-
-async def handle_tagless_slot(
-    db: AsyncSession,
-    printer_id: int,
-    ams_id: int,
-    tray_id: int,
-    tray: dict,
-    existing_assignment: SpoolAssignment | None,
-    ams_data: list,
-) -> bool:
-    """Policy for a NON-empty tray with no valid RFID tag (native-loop Hook B).
-
-    Returns True when this module took ownership of the slot (the caller should
-    ``continue``), or False to let the existing tagged-spool paths run
-    (weight-sync, respool gate, K-profile re-apply). ``tray`` is guaranteed to
-    have a non-empty ``tray_type`` here — the empty-tray branch handles bare/empty.
-
-    ``ams_data`` is the full live AMS payload the caller is iterating; the
-    no-assignment branch uses it to detect a roll that physically MOVED from
-    another (now-empty) slot on THIS printer and re-bind its existing ledger row
-    instead of minting a duplicate (see :func:`_maybe_move_tagless_assignment`).
-    """
-    key = (printer_id, ams_id, tray_id)
-
-    # Defer while an RFID identify is in flight on this slot: minting/pushing now
-    # collides with the firmware's read and fails it (HMS 0700_2x00_0001_0081).
-    # Return True (NOT False): a falsy return falls through main.on_ams_change to
-    # the MUTATING spent→respool gate + AMS weight-sync (main.py ~:2077-2132);
-    # True makes the caller ``continue`` — do nothing else with this tray this pass.
-    # A later AMS push (after the identify settles) handles the slot normally.
-    if ams_presence.identify_in_flight(printer_id, ams_id, tray_id):
-        logger.debug(
-            "Deferring tagless handling for printer %d AMS%d-T%d: identify in flight",
-            printer_id,
-            ams_id,
-            tray_id,
-        )
-        return True
-
-    # Defer while the AMS unit is drying: minting/pushing config now disengages the
-    # drying tray and fails the cycle (HMS 0700_C069). Same True-return rationale as
-    # the identify defer above — a later push (after drying) handles the slot.
-    if ams_presence.unit_drying(printer_id, ams_id):
-        logger.debug(
-            "Deferring tagless handling for printer %d AMS%d-T%d: AMS unit is drying",
-            printer_id,
-            ams_id,
-            tray_id,
-        )
-        return True
-
-    # An assignment whose spool row was deleted is an orphan — drop it and treat
-    # the slot as unassigned.
-    if existing_assignment is not None and existing_assignment.spool is None:
-        await db.delete(existing_assignment)
-        await db.flush()
-        existing_assignment = None
-
-    if existing_assignment is not None:
-        spool = existing_assignment.spool
-
-        # (2) Bound to a TAGGED spool → RFID/respool flows own it (this also lets
-        # a spent TAGGED spool reach the respool gate). Not ours.
-        if not is_tagless_spool(spool):
-            return False
-
-        # (3) Bound spool is spent → the spent binding IS the durable "ran dry" latch
-        # (W1). Only a QUALIFIED physical roll swap — a pending cycle recorded by
-        # note_physical_cycle after a ≥ _MIN_PHYSICAL_ABSENT_S absence — releases it
-        # into a fresh mint; with no pending cycle the runout-instant state flap keeps
-        # the binding, so a phantom fresh row can no longer be minted over a
-        # still-present spool. _replace_row_after_cycle default-mints when the tray
-        # still carries the departed config (firmware leftover), else tray-mints.
-        if spool.spent_at is not None:
-            if not _tray_loaded(tray):
-                return True  # dead roll re-seated, filament not fed — no churn
-            if key not in _pending_physical_cycles:
-                logger.info(
-                    "Spent binding latched — awaiting physical roll swap (printer %d AMS%d-T%d spool %d)",
-                    printer_id,
-                    ams_id,
-                    tray_id,
-                    spool.id,
-                )
-                return True  # keep the binding: no archive, no unlink, no mint
-            _pending_physical_cycles.discard(key)  # consume the cycle
-            await _replace_row_after_cycle(db, printer_id, ams_id, tray_id, tray, spool)
-            return True
-
-        # (4) Same filament → rebind: refresh a drifted fingerprint, write NOTHING
-        # to the spool (operator edits are sacred). This is also the one place the
-        # farm sees an already-bound, already-configured slot's LIVE identity, so
-        # the one-shot identity reconcile (E3) rides here.
-        if fingerprint_matches(spool, tray):
-            _refresh_assignment_fingerprint(existing_assignment, tray)
-            await db.commit()
-            await _maybe_reconcile_slot_identity(db, printer_id, ams_id, tray_id, tray, spool)
-            return True
-
-        # (5) Different filament → mint a fresh row. Settle first: an insertion's
-        # first push (config seen, tag not yet read) must not mint a row the
-        # firmware's own RFID read then destroys. Checked BEFORE the unlink so a
-        # defer leaves the slot's state untouched for the next push.
-        if _mint_settling(printer_id, ams_id, tray_id):
-            logger.debug(
-                "Deferring tagless mint for printer %d AMS%d-T%d: insertion still settling",
-                printer_id,
-                ams_id,
-                tray_id,
-            )
-            return True
-
-        # Unlink (old spool stays active, just unbound), then mint from the tray.
-        await db.delete(existing_assignment)
-        await db.flush()
-        new_spool = await mint_tagless_spool(db, tray=tray)
-        await auto_assign_spool(
-            printer_id,
-            ams_id,
-            tray_id,
-            new_spool,
-            printer_manager,
-            db,
-            tray_info_idx=tray.get("tray_info_idx", "") or "",
-        )
-        await db.commit()
-        await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
-        return True
-
-    # (1) No assignment. Honour the feature switch.
-    if not await _auto_add_untagged(db):
-        return True  # feature off — leave the slot alone (handled = do nothing)
-
-    # Slot-move: a tagless roll physically relocated to this slot from another
-    # (now-empty) slot on THIS printer must re-bind its EXISTING ledger row, not
-    # mint a duplicate. Phase 1's sticky-keep leaves the source assignment intact
-    # over its empty slot, which is exactly the row we move here.
-    if await _maybe_move_tagless_assignment(db, printer_id, ams_id, tray_id, tray, ams_data):
-        return True
-
-    # Settle before minting a FRESH row (F1) — the slot-move above re-binds an
-    # EXISTING ledger row and is deliberately not deferred.
-    if _mint_settling(printer_id, ams_id, tray_id):
-        logger.debug(
-            "Deferring tagless mint for printer %d AMS%d-T%d: insertion still settling",
-            printer_id,
-            ams_id,
-            tray_id,
-        )
-        return True
-
-    new_spool = await mint_tagless_spool(db, tray=tray)
-    await auto_assign_spool(
-        printer_id,
-        ams_id,
-        tray_id,
-        new_spool,
-        printer_manager,
-        db,
-        tray_info_idx=tray.get("tray_info_idx", "") or "",
-    )
-    await db.commit()
-    await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
-    return True
 
 
 # --- D3b: bare-tray auto-config --------------------------------------------
@@ -1615,8 +1134,8 @@ async def maybe_autoconfigure_bare_tray(
 
     # W1: a spent ams_auto binding is the "ran dry" latch — never re-push a spent
     # row's config. Only a QUALIFIED physical roll swap (a pending cycle recorded by
-    # note_physical_cycle) releases it into the same archive→unlink→default-mint→push
-    # transition as branch (3). Checked BEFORE stamping the retry window so a latched
+    # note_physical_cycle) releases it into the archive→unlink→default-mint→push
+    # transition. Checked BEFORE stamping the retry window so a latched
     # slot never burns it.
     if assignment is not None and assignment.spool is not None and assignment.spool.spent_at is not None:
         if key not in _pending_physical_cycles:
@@ -1668,8 +1187,19 @@ async def maybe_autoconfigure_bare_tray(
 
     if assignment is None:
         spool = await mint_tagless_spool(db, default_filament=default)
-        await _assign_from_setting(db, spool, printer_id, ams_id, tray_id, default)
+        bound = await _assign_from_setting(db, spool, printer_id, ams_id, tray_id, default)
         await db.commit()
+        if bound is None:
+            # Writer refused the bind (move damper). Nothing owns the slot, so a config
+            # push would publish an identity for a binding that does not exist.
+            logger.warning(
+                "Bare-tray mint %d was not bound to printer %d AMS%d-T%d (writer refused) — no config push",
+                spool.id,
+                printer_id,
+                ams_id,
+                tray_id,
+            )
+            return False
     else:
         # Our own default already tracked but the firmware hasn't applied it yet
         # (failed / slow push) — re-push, don't re-mint.

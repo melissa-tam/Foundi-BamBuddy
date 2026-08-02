@@ -159,7 +159,7 @@ _SWAP_CONFIRM_S = 60.0
 _COMMANDED_LOAD_TTL_S = 600
 
 # Per-printer dedup for `respool_prompt` WS broadcasts, keyed
-# (ams_id, tray_id) -> (tag_uid, tray_uuid). Mirrors main._unknown_tag_last_broadcast:
+# (ams_id, tray_id) -> (tag_uid, tray_uuid). Mirrors slot_pipeline's unknown-tag dedup:
 # re-broadcast only when the tag tuple changes for the slot; cleared when the
 # slot goes empty so remove + reinsert re-prompts.
 _respool_prompt_dedup: dict[int, dict[tuple[int, int], tuple[str, str]]] = {}
@@ -1135,7 +1135,7 @@ async def _broadcast_respool_prompt(
     payload = await _build_respool_prompt_payload(db, printer_id, ams_id, tray_id, tray, donor)
 
     # Broadcast first; only commit the dedup if the WS write succeeds (mirrors
-    # main._broadcast_unknown_tag so a failed push retries on the next tick).
+    # slot_pipeline.broadcast_unknown_tag so a failed push retries on the next tick).
     await ws_manager.broadcast(payload)
     per_printer[slot_key] = tag_key
     logger.info(

@@ -518,105 +518,15 @@ def derive_failure_reason(status: str, hms_errors: list[dict] | None) -> str | N
 # {(printer_id, filename): created_by_id}
 _expected_print_creators: dict[tuple[int, str], int] = {}
 
-# Per-printer lock that serialises the spool-assignment side of on_ams_change
-# (auto-unlink stale + auto-assign new) when MQTT bursts deliver multiple AMS
-# updates for the same printer in quick succession (~30 ms apart, observed in
-# the wild on H2D + dual AMS).
+# Per-printer serialisation of AMS-driven assignment writes now lives with the writer:
+# ``slot_pipeline`` holds one asyncio lock per printer around its whole
+# read-decide-write window. The old ``_get_ams_assignment_lock`` here guarded two
+# inline phases that no longer exist (W3b cutover) — and the consumer loop below needs
+# no lock, because it only touches disjoint per-spool columns and never binds.
 #
-# Without this serialisation, two concurrent on_ams_change callbacks each read
-# "no assignment for (printer, ams, tray)", each call auto_assign_spool, and
-# the second commit hits
-#   IntegrityError: duplicate key value violates unique constraint
-#                   "spool_assignment_printer_id_ams_id_tray_id_key"
-# and, in the stale-cleanup phase, concurrent deletes of the same rows raise
-# StaleDataError / drop mutation batches. SQLite's WAL serial-write semantics had
-# been silently swallowing the race until optional Postgres support landed
-# (asyncpg allows true concurrent transactions and surfaces the violation).
-#
-# Scope is intentionally narrow: BOTH DB-mutating blocks (phase 1 unlink + phase 2
-# assign) run inside ONE lock acquisition spanning both, so callback-B's phase 1
-# can never interleave between callback-A's two phases. The Spoolman sync block
-# further down stays concurrent because it's network-bound and idempotent.
-_ams_assignment_locks: dict[int, asyncio.Lock] = {}
-
-
-def _get_ams_assignment_lock(printer_id: int) -> asyncio.Lock:
-    """Return the per-printer assignment lock, creating it on first use."""
-    lock = _ams_assignment_locks.get(printer_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _ams_assignment_locks[printer_id] = lock
-    return lock
-
-
-# Per-printer dedup for unknown_tag WS broadcasts. Keyed by
-# (ams_id, tray_id) -> (tag_uid, tray_uuid); we only re-broadcast when the
-# tag tuple changes for the slot. Cleared when the slot is reported empty
-# so remove + reinsert reliably re-prompts the UI.
-_unknown_tag_last_broadcast: dict[int, dict[tuple[int, int], tuple[str, str]]] = {}
-
-
-async def _broadcast_unknown_tag(
-    *,
-    printer_id: int,
-    ams_id: int,
-    tray_id: int,
-    tag_uid: str,
-    tray_uuid: str,
-    tray_type: str | None = None,
-    tray_color: str | None = None,
-    tray_sub_brands: str | None = None,
-    tray_count: int | None = None,
-) -> None:
-    """Broadcast unknown_tag, deduped so repeated MQTT pushes for the same slot+tag don't spam the UI."""
-    _logger = logging.getLogger(__name__)
-    slot_key = (ams_id, tray_id)
-    tag_key = (tag_uid or "", tray_uuid or "")
-    per_printer = _unknown_tag_last_broadcast.setdefault(printer_id, {})
-    if per_printer.get(slot_key) == tag_key:
-        _logger.debug(
-            "unknown_tag deduped for printer=%d AMS=%d slot=%d tag=%s",
-            printer_id,
-            ams_id,
-            tray_id,
-            tag_key[0][:8] or tag_key[1][:8] or "(none)",
-        )
-        return
-    _logger.info(
-        "unknown_tag broadcast: printer=%d AMS=%d slot=%d type=%r color=%r tag=%s",
-        printer_id,
-        ams_id,
-        tray_id,
-        tray_type,
-        tray_color,
-        tag_key[0][:8] or tag_key[1][:8] or "(none)",
-    )
-    # Broadcast first; only commit the dedup if the WS write succeeds.
-    # If broadcast raises, the next MQTT push retries instead of being
-    # permanently silenced by a poisoned dedup entry.
-    await ws_manager.broadcast(
-        {
-            "type": "unknown_tag",
-            "printer_id": printer_id,
-            "ams_id": ams_id,
-            "tray_id": tray_id,
-            "tag_uid": tag_uid,
-            "tray_uuid": tray_uuid,
-            "tray_type": tray_type,
-            "tray_color": tray_color,
-            "tray_sub_brands": tray_sub_brands,
-            "tray_count": tray_count,
-        }
-    )
-    per_printer[slot_key] = tag_key
-
-
-def _clear_unknown_tag_dedup(printer_id: int, ams_id: int, tray_id: int) -> None:
-    """Drop the cached last-broadcast tag for a slot (called when slot reports empty or gets matched)."""
-    per_printer = _unknown_tag_last_broadcast.get(printer_id)
-    if per_printer is None:
-        return
-    per_printer.pop((ams_id, tray_id), None)
+# The ``unknown_tag`` prompt + its per-slot dedup moved to ``slot_pipeline`` for the
+# same reason: one decision raises it and two pipeline outcomes clear it. The Spoolman
+# lane further down imports the two public helpers so there is still ONE dedup ledger.
 
 
 # TTL for expected-print entries: evict registrations older than this to prevent
@@ -1858,574 +1768,198 @@ async def on_ams_change(printer_id: int, ams_data: list):
     except Exception as e:
         logger.warning("Failed to broadcast AMS change for printer %s: %s", printer_id, e)
 
-    from backend.app.utils.color_utils import colors_similar as _colors_similar
+    # ---- LEDGER / WIRE CONSUMERS (W3b) -------------------------------------
+    #
+    # Identity and binding are decided in exactly ONE place: ``slot_pipeline``, fed by
+    # the RAW pre-merge push (``printer_manager.on_ams_push_raw``). What runs here READS
+    # the binding the pipeline wrote and maintains the things hanging off it — the
+    # re-spool gate, the increase-only weight sync, the K-profile drift re-apply — plus
+    # the bare-tray config lane and two per-slot dedup lifecycles.
+    #
+    # None of these creates, moves or deletes a SpoolAssignment, so none needs the old
+    # per-printer assignment lock: each touches only disjoint columns of the spool row
+    # already bound to its own slot (``weight_used`` / respool state / K-profile), and
+    # the slot each one visits is fixed by the payload it is iterating.
+    #
+    # The MERGED payload is the right input here, unlike for identity: every consumer
+    # keys off the slot's existing binding plus live wire numbers (remain, cali_idx),
+    # never off identity inference — so the merge's never-clear-identity rule (the
+    # 001-T3 chimera class) cannot mislead them, while its field preservation is exactly
+    # what a partial push needs.
+    try:
+        async with async_session() as db:
+            from sqlalchemy.orm import selectinload
 
-    async with _get_ams_assignment_lock(printer_id):
-        # Auto-unlink spool assignments with stale fingerprints
-        try:
-            async with async_session() as db:
-                from sqlalchemy.orm import selectinload
+            from backend.app.api.routes.settings import get_setting
+            from backend.app.models.spool import Spool
+            from backend.app.models.spool_assignment import SpoolAssignment as SA
+            from backend.app.services import spool_tagless
+            from backend.app.services.spool_respool import (
+                clear_respool_prompt_dedup,
+                maybe_auto_or_prompt_respool,
+                should_evaluate_respool,
+            )
+            from backend.app.services.spool_tag_matcher import reapply_k_profile_if_drifted
 
-                from backend.app.api.routes.inventory import _find_tray_in_ams_data
-                from backend.app.models.spool import Spool as _Spool
-                from backend.app.models.spool_assignment import SpoolAssignment as SA
-                from backend.app.services import spool_tagless
-                from backend.app.services.spool_tag_matcher import get_spool_by_tag
+            # Presence tracking runs in BOTH modes: presence edges, physical-cycle tiers
+            # and the identify pipeline are wire facts, not inventory policy. Guarded —
+            # never breaks the callback.
+            try:
+                from backend.app.services import ams_presence
 
-                # Sticky-rebind threshold ("effectively empty" grams) — read once for
-                # the whole cleanup loop.
-                _tagless_threshold = await spool_tagless.effective_threshold(db)
+                await ams_presence.on_ams_change(printer_id, ams_data, db)
+            except Exception as _ape:  # noqa: BLE001 — must never crash the AMS callback
+                logger.warning("AMS presence tracking failed for printer %s: %s", printer_id, _ape)
 
-                result = await db.execute(
-                    select(SA)
-                    .where(SA.printer_id == printer_id)
-                    .options(selectinload(SA.spool).selectinload(_Spool.k_profiles))
+            _spoolman_on = await get_setting(db, "spoolman_enabled")
+            if not _spoolman_on or _spoolman_on.lower() != "true":
+                # Whether AMS remain% may be folded into weight_used this sweep —
+                # computed once (durable legs: live gcode_state + printing-archive),
+                # replacing the restart-fragile _active_sessions snapshot (#880).
+                _ams_sync_allowed = await _ams_weight_sync_allowed(
+                    db, printer_id, printer_manager.get_status(printer_id)
                 )
-                stale = []
-                for assignment in result.scalars().all():
-                    # External spool assignments (ams_id=255) live in vt_tray, not AMS data
-                    if assignment.ams_id == 255:
-                        ps = printer_manager.get_status(printer_id)
-                        vt_tray_raw = ps.raw_data.get("vt_tray", []) if ps else []
-                        ext_id = assignment.tray_id + 254  # 0→254, 1→255
-                        current_tray = None
-                        for vt in vt_tray_raw:
-                            if isinstance(vt, dict) and int(vt.get("id", 254)) == ext_id:
-                                current_tray = vt
-                                break
-                        if not current_tray:
-                            # vt_tray data may not have arrived yet — keep assignment
+                for ams_unit in ams_data:
+                    if not isinstance(ams_unit, dict):
+                        continue
+                    ams_id = int(ams_unit.get("id", 0))
+                    for tray in ams_unit.get("tray", []):
+                        if not isinstance(tray, dict):
                             continue
-                    else:
-                        current_tray = _find_tray_in_ams_data(ams_data, assignment.ams_id, assignment.tray_id)
-                    if not current_tray:
-                        # Sticky rebind: a tagless spool pulled for drying (not spent,
-                        # not effectively empty) keeps its assignment so it re-binds to
-                        # the SAME ledger row on return. Its fingerprint is left intact
-                        # (blanking it would re-trip the SpoolBuddy replay).
-                        if spool_tagless.should_keep_on_empty(assignment, _tagless_threshold):
-                            logger.info(
-                                "Sticky rebind: keeping tagless assignment spool %d AMS%d-T%d over empty slot",
-                                assignment.spool_id,
-                                assignment.ams_id,
-                                assignment.tray_id,
-                            )
-                            continue
-                        logger.info(
-                            "Auto-unlink: spool %d AMS%d-T%d — tray not found in AMS data (slot empty?)",
-                            assignment.spool_id,
-                            assignment.ams_id,
-                            assignment.tray_id,
-                        )
-                        stale.append(assignment)  # Slot empty
-                    elif _is_bambu_uuid(current_tray.get("tray_uuid", "")):
-                        # A Bambu Lab spool is in this slot — check if it's the same spool
-                        # that's currently assigned. If yes, keep the assignment (avoids
-                        # unnecessary unlink/re-assign/ams_filament_setting cycle that clears
-                        # the printer's filament preset on every startup).
-                        tray_uuid = current_tray.get("tray_uuid", "")
-                        tag_uid = current_tray.get("tag_uid", "")
-                        spool = assignment.spool
-                        spool_matches = False
-                        if spool:
-                            if (spool.tray_uuid and spool.tray_uuid.upper() == tray_uuid.upper()) or (
-                                spool.tag_uid
-                                and tag_uid
-                                and tag_uid != "0000000000000000"
-                                and spool.tag_uid.upper() == tag_uid.upper()
-                            ):
-                                spool_matches = True
-                        if spool_matches:
-                            # Same BL spool still in slot — keep assignment, update fingerprint if needed
-                            cur_color = current_tray.get("tray_color", "")
-                            cur_type = current_tray.get("tray_type", "")
-                            fp_color = assignment.fingerprint_color or ""
-                            fp_type = assignment.fingerprint_type or ""
-                            if cur_color.upper() != fp_color.upper() or cur_type.upper() != fp_type.upper():
-                                assignment.fingerprint_color = cur_color
-                                assignment.fingerprint_type = cur_type
-                                logger.debug(
-                                    "Auto-unlink: spool %d AMS%d-T%d — same BL spool, updated fingerprint",
-                                    assignment.spool_id,
-                                    assignment.ams_id,
-                                    assignment.tray_id,
-                                )
-                            continue
-                        # Unlink damping: the "different" tray_uuid may be the SAME
-                        # physical tag read with reader variance (first char differs on
-                        # tag_uid, tray_uuid drifts) — printer 3 looped all day
-                        # 2026-07-14 between this unlink and the tolerant variance
-                        # re-assign. Resolve the scanned identifiers exactly as
-                        # auto-assign will; if they still point at the spool already
-                        # assigned here it is NOT a different roll, so skip the unlink.
-                        # converge=True persists the scanned identifiers onto the spool
-                        # once (this block owns the write + commits below) so the next
-                        # read is an exact match and the loop dies at most once per spool.
-                        _resolved = await get_spool_by_tag(db, tag_uid, tray_uuid, converge=True)
-                        if _resolved is not None and _resolved.id == assignment.spool_id:
-                            logger.info(
-                                "Auto-unlink damped: spool %d AMS%d-T%d — scanned tag resolves to the assigned "
-                                "spool (reader variance, not a different roll); keeping assignment",
-                                assignment.spool_id,
-                                assignment.ams_id,
-                                assignment.tray_id,
-                            )
-                            continue
-                        # Different BL spool or unrecognized — unlink so auto-assign can match
-                        logger.info(
-                            "Auto-unlink: spool %d AMS%d-T%d — different Bambu Lab spool detected (uuid=%s)",
-                            assignment.spool_id,
-                            assignment.ams_id,
-                            assignment.tray_id,
-                            tray_uuid,
-                        )
-                        # Provisional disposal: the departing spool was an auto-minted
-                        # tagless provisional row and a real RFID tag now owns the slot.
-                        # Hard-delete it (cascade removes this assignment) if it never
-                        # accrued a usage ledger, else archive it and unlink normally.
-                        if assignment.spool is not None and assignment.spool.data_origin == "ams_auto":
-                            _disp = await spool_tagless.dispose_provisional_on_tag(db, assignment.spool)
-                            if _disp == "hard-deleted":
-                                logger.info(
-                                    "Provisional tagless spool %d hard-deleted on RFID takeover (AMS%d-T%d)",
-                                    assignment.spool_id,
-                                    assignment.ams_id,
-                                    assignment.tray_id,
-                                )
-                                continue  # cascade removed the assignment — don't double-delete
-                        stale.append(assignment)
-                    else:
-                        cur_color = current_tray.get("tray_color", "")
-                        cur_type = current_tray.get("tray_type", "")
-                        cur_state = current_tray.get("state")
-                        fp_color = assignment.fingerprint_color or ""
-                        fp_type = assignment.fingerprint_type or ""
+                        tray_id = int(tray.get("id", 0))
 
-                        # SpoolBuddy pre-config replay: fingerprint_type empty means
-                        # the slot was empty when the user pre-assigned via SpoolBuddy
-                        # (the firmware drops ams_filament_setting on empty slots, so
-                        # MQTT was deferred). The moment any filament gets inserted
-                        # — Bambu RFID, 3rd-party, or even an existing-but-now-
-                        # reconfigured spool — fire the deferred configuration.
-                        # The "loaded" signal is state == 11 (Bambu's "filament fed to
-                        # extruder" code) OR, on firmwares that don't use the state
-                        # enum meaningfully, a non-empty tray_type when state is
-                        # NOT one of the firmware's explicit empty signals (9, 10).
-                        # state-only was wrong for firmwares that never set 11 — A1
-                        # Mini BMCU 01.07.02.00 and P1S Standard AMS 00.00.06.75 both
-                        # always report state=3 — so the replay never fired for them
-                        # (#1322). The state ∉ {9,10} guard keeps the firmware's
-                        # explicit "empty" signals authoritative over any stale
-                        # tray_type that might survive the relay's auto-clearing.
-                        loaded = cur_state == 11 or (cur_state not in (9, 10) and cur_type.strip())
-                        if not fp_type.strip() and loaded and assignment.spool:
-                            try:
-                                from backend.app.api.routes.inventory import (
-                                    apply_spool_to_slot_via_mqtt,
-                                )
-
-                                await apply_spool_to_slot_via_mqtt(
-                                    db=db,
-                                    current_user=None,
-                                    spool=assignment.spool,
-                                    printer_id=printer_id,
-                                    ams_id=assignment.ams_id,
-                                    tray_id=assignment.tray_id,
-                                    current_tray_info_idx=current_tray.get("tray_info_idx", ""),
-                                    current_tray_type=cur_type,
-                                )
-                                logger.info(
-                                    "SpoolBuddy pre-config applied on insert: spool %d → printer %d AMS%d-T%d",
-                                    assignment.spool_id,
-                                    printer_id,
-                                    assignment.ams_id,
-                                    assignment.tray_id,
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "Pre-config apply failed for spool %d on printer %d AMS%d-T%d",
-                                    assignment.spool_id,
-                                    printer_id,
-                                    assignment.ams_id,
-                                    assignment.tray_id,
-                                )
-                            assignment.fingerprint_color = cur_color
-                            assignment.fingerprint_type = cur_type
-                            continue
-
-                        if not cur_type.strip():
-                            # Slot cleared (tray dict present but filament type gone) —
-                            # distinct from a different NON-empty filament below. Run the
-                            # sticky-rebind check: keep a live tagless spool, else record
-                            # the spent leftover-config marker and unlink.
-                            if spool_tagless.should_keep_on_empty(assignment, _tagless_threshold):
-                                continue
-                            stale.append(assignment)
-                            continue
-
-                        if not _colors_similar(cur_color, fp_color) or cur_type.upper() != fp_type.upper():
-                            # Fingerprint mismatch — but check if tray now matches the
-                            # assigned spool (e.g. auto-configure changed the tray).
-                            spool = assignment.spool
-                            if spool:
-                                spool_color = (spool.rgba or "FFFFFFFF").upper()
-                                spool_type = (spool.material or "").upper()
-                                if _colors_similar(cur_color, spool_color) and cur_type.upper() == spool_type:
-                                    logger.info(
-                                        "Auto-unlink: spool %d AMS%d-T%d — fingerprint mismatch but tray matches spool, updating fp",
-                                        assignment.spool_id,
-                                        assignment.ams_id,
-                                        assignment.tray_id,
-                                    )
-                                    assignment.fingerprint_color = cur_color
-                                    assignment.fingerprint_type = cur_type
-                                    continue
-                            logger.info(
-                                "Auto-unlink: spool %d AMS%d-T%d — fingerprint mismatch (cur=%s/%s fp=%s/%s spool=%s/%s)",
-                                assignment.spool_id,
-                                assignment.ams_id,
-                                assignment.tray_id,
-                                cur_color,
-                                cur_type,
-                                fp_color,
-                                fp_type,
-                                spool.rgba if spool else "?",
-                                spool.material if spool else "?",
-                            )
-                            stale.append(assignment)  # Spool changed
-                for a in stale:
-                    await db.delete(a)
-                if stale:
-                    logger.info("Auto-unlinked %d stale spool assignments for printer %d", len(stale), printer_id)
-                # Commit any changes (stale deletions and/or fingerprint updates)
-                await db.commit()
-        except Exception as e:
-            logger.warning("Spool assignment cleanup failed: %s", e, exc_info=True)
-
-        # Auto-manage inventory spools from AMS tray data (skip if Spoolman manages AMS).
-        # This block AND the stale-cleanup above both run under the single
-        # _get_ams_assignment_lock(printer_id) acquired at the top of this section:
-        # MQTT bursts can deliver two AMS pushes ~30 ms apart, and without one lock
-        # spanning both phases the callbacks race — phase-1 deletes collide
-        # (StaleDataError / lost mutation batches) and callback-B's phase-1 can
-        # interleave between callback-A's two phases, and both read "no existing
-        # assignment" for the same (printer, ams, tray) and race to INSERT, hitting
-        # the spool_assignment_printer_id_ams_id_tray_id_key unique constraint on
-        # Postgres. SQLite's WAL serialises writes so the bug stayed latent there.
-        # See _ams_assignment_locks comment for details.
-        try:
-            async with async_session() as db:
-                from backend.app.api.routes.settings import get_setting
-                from backend.app.models.spool import Spool
-                from backend.app.models.spool_assignment import SpoolAssignment as SA
-                from backend.app.services import spool_tagless
-                from backend.app.services.spool_respool import (
-                    RESPOOL_TAG_TYPE,
-                    clear_respool_prompt_dedup,
-                    maybe_auto_or_prompt_respool,
-                    should_evaluate_respool,
-                )
-                from backend.app.services.spool_tag_matcher import (
-                    auto_assign_spool,
-                    create_spool_from_tray,
-                    find_matching_untagged_spool,
-                    get_spool_by_tag,
-                    is_bambu_tag,
-                    is_valid_tag,
-                    link_tag_to_inventory_spool,
-                    reapply_k_profile_if_drifted,
-                )
-                from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid
-
-                _spoolman_on = await get_setting(db, "spoolman_enabled")
-                _auto_add_raw = await get_setting(db, "auto_add_unknown_rfid")
-                _auto_add_unknown = _auto_add_raw is None or _auto_add_raw.lower() == "true"
-
-                # Presence-transition tracking (both Spoolman and native modes). On a
-                # presence gain while idle it fires an immediate per-slot RFID re-read
-                # so a Bambu spool resolves via the normal tag path fast; the terminal
-                # sweep handles mid-print refills at print end. Tagless spools are now
-                # auto-minted/configured by services.spool_tagless (Hook B + bare-tray
-                # auto-config below), not prompted. Guarded — never breaks the callback.
-                try:
-                    from backend.app.services import ams_presence
-
-                    await ams_presence.on_ams_change(printer_id, ams_data, db)
-                except Exception as _ape:  # noqa: BLE001 — must never crash the AMS callback
-                    logger.warning("AMS presence tracking failed for printer %s: %s", printer_id, _ape)
-
-                if not _spoolman_on or _spoolman_on.lower() != "true":
-                    # Whether AMS remain% may be folded into weight_used this sweep —
-                    # computed once (durable legs: live gcode_state + printing-archive),
-                    # replacing the restart-fragile _active_sessions snapshot (#880).
-                    _ams_sync_allowed = await _ams_weight_sync_allowed(
-                        db, printer_id, printer_manager.get_status(printer_id)
-                    )
-                    for ams_unit in ams_data:
-                        if not isinstance(ams_unit, dict):
-                            continue
-                        ams_id = int(ams_unit.get("id", 0))
-                        for tray in ams_unit.get("tray", []):
-                            if not isinstance(tray, dict):
-                                continue
-                            tray_id = int(tray.get("id", 0))
-                            tag_uid = tray.get("tag_uid", "")
-                            tray_uuid = tray.get("tray_uuid", "")
-                            tray_info_idx = tray.get("tray_info_idx", "")
-                            if not tray.get("tray_type"):
-                                if spool_tagless.tray_present(tray):
-                                    # BARE tray: a spool is physically present but nothing
-                                    # is configured. Push the default filament so the slot
-                                    # is usable (incl. mid-print backup pool) — D3b.
-                                    try:
-                                        await spool_tagless.maybe_autoconfigure_bare_tray(
-                                            db, printer_id, ams_id, tray_id, tray
-                                        )
-                                    except Exception as _bte:  # noqa: BLE001 — never crash the AMS callback
-                                        logger.warning(
-                                            "Bare-tray auto-config failed for printer %s AMS%d-T%d: %s",
-                                            printer_id,
-                                            ams_id,
-                                            tray_id,
-                                            _bte,
-                                        )
-                                    continue
-                                # Truly empty (state 9 / cleared) — drop any cached
-                                # unknown-tag / re-spool-prompt / bare-config dedup so
-                                # reinserting the same spool re-prompts.
-                                _clear_unknown_tag_dedup(printer_id, ams_id, tray_id)
-                                clear_respool_prompt_dedup(printer_id, ams_id, tray_id)
-                                spool_tagless.clear_autoconfig_dedup(printer_id, ams_id, tray_id)
-                                continue  # Empty slot
-                            # Check if assignment already exists for this slot
-                            existing = await db.execute(
-                                select(SA)
-                                .options(selectinload(SA.spool).selectinload(Spool.k_profiles))
-                                .where(SA.printer_id == printer_id, SA.ams_id == ams_id, SA.tray_id == tray_id)
-                            )
-                            existing_assignment = existing.scalar_one_or_none()
-
-                            # Hook B: tagless-slot policy. When the tray carries no valid
-                            # RFID tag, this owns the slot (mint / sticky-rebind /
-                            # spent-replace of the auto-minted tagless spool). It returns
-                            # False for a slot bound to a TAGGED spool so a spent tagged
-                            # spool still reaches the respool gate below.
-                            if not is_valid_tag(tag_uid, tray_uuid):
+                        if not tray.get("tray_type"):
+                            if spool_tagless.tray_present(tray):
+                                # BARE tray: a spool is physically present but nothing is
+                                # configured. This is a WIRE-CONFIG lane, not an identity
+                                # one — the pipeline resolves a bare slot as
+                                # OCCUPIED_UNRESOLVED and mutates no binding; this gives
+                                # the firmware a config so the NEXT push carries a
+                                # filament type and enters the pipeline's tagless lane
+                                # (its own default-mint binds through the one writer).
+                                # ``reconcile_slot_config`` is the durable retry lane;
+                                # this call site is what keeps it immediate (D3b).
                                 try:
-                                    _tagless_handled = await spool_tagless.handle_tagless_slot(
-                                        db, printer_id, ams_id, tray_id, tray, existing_assignment, ams_data
+                                    await spool_tagless.maybe_autoconfigure_bare_tray(
+                                        db, printer_id, ams_id, tray_id, tray
                                     )
-                                except Exception as _tse:  # noqa: BLE001 — never crash the AMS callback
+                                except Exception as _bte:  # noqa: BLE001 — never crash the AMS callback
                                     logger.warning(
-                                        "Tagless slot handling failed for printer %s AMS%d-T%d: %s",
+                                        "Bare-tray auto-config failed for printer %s AMS%d-T%d: %s",
                                         printer_id,
                                         ams_id,
                                         tray_id,
-                                        _tse,
-                                    )
-                                    _tagless_handled = False
-                                if _tagless_handled:
-                                    continue
-
-                            if existing_assignment:
-                                # Reused-tag Tier 2/3 (same-slot swap where the
-                                # assignment survived): run the respool gate when this
-                                # slot's spool was marked spent (hardware runout →
-                                # auto-respool/prompt) OR the tray reports far more
-                                # filament than the ledger holds (a reused core carried
-                                # the tag onto a fresh roll — remain-jump → prompt).
-                                # should_evaluate_respool is the single origin for that
-                                # jump test. A completed re-spool re-assigns the slot
-                                # itself, so skip the normal weight-sync path below.
-                                if existing_assignment.spool is not None and should_evaluate_respool(
-                                    existing_assignment.spool, tray, printer_id, ams_id, tray_id
-                                ):
-                                    try:
-                                        _respooled = await maybe_auto_or_prompt_respool(
-                                            db, printer_id, ams_id, tray_id, tray, existing_assignment.spool
-                                        )
-                                        if _respooled is not None:
-                                            continue
-                                    except Exception as _rse:  # noqa: BLE001 — never crash the AMS callback
-                                        logger.warning(
-                                            "Re-spool gate (existing assignment) failed for printer %s: %s",
-                                            printer_id,
-                                            _rse,
-                                        )
-                                # Sync spool weight_used from AMS remain — only INCREASE, never decrease.
-                                # The AMS remain% is low-resolution (integer %, i.e. 10g steps for 1kg spool)
-                                # and must not overwrite precise values from the usage tracker (3MF/G-code).
-                                # Skip during active prints: the usage tracker handles deduction
-                                # precisely via 3MF data on print completion. Without this guard the
-                                # AMS remain% SET and the usage tracker ADD both fire from the same
-                                # MQTT message, doubling the deduction (#880).
-                                if not _ams_sync_allowed:
-                                    continue
-                                remain_raw = tray.get("remain")
-                                if (
-                                    remain_raw is not None
-                                    and existing_assignment.spool
-                                    and not existing_assignment.spool.weight_locked
-                                ):
-                                    try:
-                                        remain_val = int(remain_raw)
-                                    except (TypeError, ValueError):
-                                        remain_val = -1
-                                    if 1 <= remain_val <= 100:
-                                        lw = existing_assignment.spool.label_weight or 1000
-                                        new_used = round(lw * (100 - remain_val) / 100.0, 1)
-                                        current_used = existing_assignment.spool.weight_used or 0
-                                        if new_used > current_used + 1:
-                                            logger.info(
-                                                "Weight sync: spool %d weight_used %s -> %s (remain=%d)",
-                                                existing_assignment.spool_id,
-                                                current_used,
-                                                new_used,
-                                                remain_val,
-                                            )
-                                            existing_assignment.spool.weight_used = new_used
-                                            await db.commit()
-
-                                # Re-apply the spool's stored K-profile when the live
-                                # tray's cali_idx drifted (owned by spool_tag_matcher,
-                                # rate-limited per slot).
-                                try:
-                                    await reapply_k_profile_if_drifted(
-                                        db,
-                                        printer_id,
-                                        ams_id,
-                                        tray_id,
-                                        tray,
-                                        existing_assignment.spool,
-                                        printer_manager.get_status(printer_id),
-                                    )
-                                except Exception:
-                                    logger.exception(
-                                        "K-profile re-apply failed for printer %d AMS%d-T%d",
-                                        printer_id,
-                                        ams_id,
-                                        tray_id,
+                                        _bte,
                                     )
                                 continue
+                            # Truly empty (state 9 / cleared) — drop the CONSUMER-lane
+                            # dedups so reinserting a spool re-prompts / re-configures.
+                            # The unknown-tag dedup's twin clear lives in the pipeline
+                            # (``slot_pipeline._process_observation``), which owns that
+                            # prompt end to end.
+                            clear_respool_prompt_dedup(printer_id, ams_id, tray_id)
+                            spool_tagless.clear_autoconfig_dedup(printer_id, ams_id, tray_id)
+                            continue
 
-                            if is_bambu_tag(tag_uid, tray_uuid, tray_info_idx):
-                                # BL spool with RFID tag: auto-match → inventory match → auto-create.
-                                # converge=True: this path owns the write, so a first-char/short-UID
-                                # variance match persists the scanned identifiers back onto the spool
-                                # once, ending the auto-unlink ⇄ re-assign reader-variance loop.
-                                spool = await get_spool_by_tag(db, tag_uid, tray_uuid, converge=True)
-                                if spool is not None:
-                                    # Sibling-tag observability (3-line hook): the
-                                    # donor's SECOND factory tag surfacing on a
-                                    # different physical spool (same tray_uuid, other
-                                    # tag_uid). Assignment proceeds unchanged; the fix
-                                    # is operator discipline (one tag per donor roll).
-                                    if (
-                                        spool.tag_type == RESPOOL_TAG_TYPE
-                                        and spool.tray_uuid
-                                        and tray_uuid
-                                        and normalize_tray_uuid(spool.tray_uuid) == normalize_tray_uuid(tray_uuid)
-                                        and spool.tag_uid
-                                        and tag_uid
-                                        and normalize_tag_uid(spool.tag_uid) != normalize_tag_uid(tag_uid)
-                                    ):
-                                        logger.warning(
-                                            "Sibling reused-tag on printer %d AMS%d-T%d: spool %d holds a different tag_uid "
-                                            "for the same tray_uuid — use only ONE tag per donor roll, discard the second",
-                                            printer_id,
-                                            ams_id,
-                                            tray_id,
-                                            spool.id,
-                                        )
-                                    # Reused-tag Tier 2/3 gate. A completed auto-respool
-                                    # re-assigns the slot to the fresh spool, so skip
-                                    # the donor auto-assign below.
-                                    try:
-                                        _respooled = await maybe_auto_or_prompt_respool(
-                                            db, printer_id, ams_id, tray_id, tray, spool
-                                        )
-                                        if _respooled is not None:
-                                            _clear_unknown_tag_dedup(printer_id, ams_id, tray_id)
-                                            continue
-                                    except Exception as _rse:  # noqa: BLE001 — never crash the AMS callback
-                                        logger.warning(
-                                            "Re-spool gate (arrival) failed for printer %s: %s", printer_id, _rse
-                                        )
-                                if not spool:
-                                    # Try matching an untagged inventory spool (same material/color)
-                                    spool = await find_matching_untagged_spool(db, tray)
-                                    if spool:
-                                        await link_tag_to_inventory_spool(db, spool, tray)
-                                    elif _auto_add_unknown:
-                                        spool = await create_spool_from_tray(db, tray)
-                                    else:
-                                        # Auto-add disabled: surface the slot so the
-                                        # user can add it manually via the UI.
-                                        await _broadcast_unknown_tag(
-                                            printer_id=printer_id,
-                                            ams_id=ams_id,
-                                            tray_id=tray_id,
-                                            tag_uid=tag_uid,
-                                            tray_uuid=tray_uuid,
-                                            tray_type=tray.get("tray_type"),
-                                            tray_color=tray.get("tray_color"),
-                                            tray_sub_brands=tray.get("tray_sub_brands"),
-                                            tray_count=len(ams_unit.get("tray", [])),
-                                        )
-                                        continue
-                                # Slot matched (existing tag, untagged inventory
-                                # match, or freshly auto-created spool) — drop any
-                                # stale dedup so a future tag swap re-prompts.
-                                _clear_unknown_tag_dedup(printer_id, ams_id, tray_id)
-                                await auto_assign_spool(
+                        existing = await db.execute(
+                            select(SA)
+                            .options(selectinload(SA.spool).selectinload(Spool.k_profiles))
+                            .where(SA.printer_id == printer_id, SA.ams_id == ams_id, SA.tray_id == tray_id)
+                        )
+                        existing_assignment = existing.scalar_one_or_none()
+                        if existing_assignment is None or existing_assignment.spool is None:
+                            # Unbound (or orphaned) slot: nothing to consume. Binding it
+                            # is the pipeline's job, never this loop's.
+                            continue
+
+                        # Reused-tag Tier 2/3 (same-slot swap where the assignment
+                        # survived): run the respool gate when this slot's spool was
+                        # marked spent (hardware runout → auto-respool/prompt) OR the
+                        # tray reports far more filament than the ledger holds (a reused
+                        # core carried the tag onto a fresh roll — remain-jump → prompt).
+                        # should_evaluate_respool is the single origin for that jump test.
+                        # A completed re-spool re-assigns the slot itself, so skip the
+                        # normal weight-sync path below.
+                        if should_evaluate_respool(existing_assignment.spool, tray, printer_id, ams_id, tray_id):
+                            try:
+                                _respooled = await maybe_auto_or_prompt_respool(
+                                    db, printer_id, ams_id, tray_id, tray, existing_assignment.spool
+                                )
+                                if _respooled is not None:
+                                    continue
+                            except Exception as _rse:  # noqa: BLE001 — never crash the AMS callback
+                                logger.warning(
+                                    "Re-spool gate failed for printer %s: %s",
                                     printer_id,
-                                    ams_id,
-                                    tray_id,
-                                    spool,
-                                    printer_manager,
-                                    db,
-                                    tray_info_idx=tray_info_idx,
+                                    _rse,
                                 )
-                                await db.commit()
-                                await ws_manager.broadcast(
-                                    {
-                                        "type": "spool_auto_assigned",
-                                        "printer_id": printer_id,
-                                        "ams_id": ams_id,
-                                        "tray_id": tray_id,
-                                        "spool_id": spool.id,
-                                    }
-                                )
-                                logger.info(
-                                    "RFID auto-assigned spool %d to printer %d AMS%d-T%d",
-                                    spool.id,
-                                    printer_id,
-                                    ams_id,
-                                    tray_id,
-                                )
-                            elif is_valid_tag(tag_uid, tray_uuid):
-                                # Non-BL spool with some tag — let user choose.
-                                await _broadcast_unknown_tag(
-                                    printer_id=printer_id,
-                                    ams_id=ams_id,
-                                    tray_id=tray_id,
-                                    tag_uid=tag_uid,
-                                    tray_uuid=tray_uuid,
-                                    tray_type=tray.get("tray_type"),
-                                    tray_color=tray.get("tray_color"),
-                                    tray_sub_brands=tray.get("tray_sub_brands"),
-                                    tray_count=len(ams_unit.get("tray", [])),
-                                )
-                            # No-tag slots are handled by Hook B (spool_tagless) above:
-                            # a configured tagless tray is auto-minted + bound, a bare
-                            # tray is auto-configured with the default filament.
-        except Exception as e:
-            logger.warning("RFID spool auto-assign failed: %s", e, exc_info=True)
+
+                        # Sync spool weight_used from AMS remain — only INCREASE, never decrease.
+                        # The AMS remain% is low-resolution (integer %, i.e. 10g steps for 1kg spool)
+                        # and must not overwrite precise values from the usage tracker (3MF/G-code).
+                        # Skip during active prints: the usage tracker handles deduction
+                        # precisely via 3MF data on print completion. Without this guard the
+                        # AMS remain% SET and the usage tracker ADD both fire from the same
+                        # MQTT message, doubling the deduction (#880). The K-profile re-apply
+                        # below sits UNDER the same gate, exactly as it did pre-cutover — the
+                        # scheduler-tick reconcile lane is what covers a slot mid-print.
+                        if not _ams_sync_allowed:
+                            continue
+                        remain_raw = tray.get("remain")
+                        if remain_raw is not None and not existing_assignment.spool.weight_locked:
+                            try:
+                                remain_val = int(remain_raw)
+                            except (TypeError, ValueError):
+                                remain_val = -1
+                            if 1 <= remain_val <= 100:
+                                lw = existing_assignment.spool.label_weight or 1000
+                                new_used = round(lw * (100 - remain_val) / 100.0, 1)
+                                current_used = existing_assignment.spool.weight_used or 0
+                                if new_used > current_used + 1:
+                                    logger.info(
+                                        "Weight sync: spool %d weight_used %s -> %s (remain=%d)",
+                                        existing_assignment.spool_id,
+                                        current_used,
+                                        new_used,
+                                        remain_val,
+                                    )
+                                    existing_assignment.spool.weight_used = new_used
+                                    await db.commit()
+
+                        # Re-apply the spool's stored K-profile when the live tray's
+                        # cali_idx drifted (owned by spool_tag_matcher, rate-limited
+                        # per slot).
+                        try:
+                            await reapply_k_profile_if_drifted(
+                                db,
+                                printer_id,
+                                ams_id,
+                                tray_id,
+                                tray,
+                                existing_assignment.spool,
+                                printer_manager.get_status(printer_id),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "K-profile re-apply failed for printer %d AMS%d-T%d",
+                                printer_id,
+                                ams_id,
+                                tray_id,
+                            )
+    except Exception as e:
+        logger.warning("AMS slot consumers failed: %s", e, exc_info=True)
 
     try:
         async with async_session() as db:
             from backend.app.api.routes.settings import get_setting
             from backend.app.models.printer import Printer
+
+            # The unknown-tag prompt + its per-slot dedup live in ``slot_pipeline`` (the
+            # internal-mode raiser). Spoolman mode reaches the same prompt for the same
+            # situation through these two public helpers, so the dedup ledger stays ONE
+            # ledger no matter which lane raised it — the pipeline itself stands down in
+            # this mode.
+            from backend.app.services.slot_pipeline import broadcast_unknown_tag, clear_unknown_tag_dedup
 
             # Check if Spoolman is enabled
             spoolman_enabled = await get_setting(db, "spoolman_enabled")
@@ -2535,7 +2069,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                         # and drop any cached unknown-tag broadcast so a
                         # reinserted spool re-prompts.
                         empty_slots.append((ams_id, tray_id_raw))
-                        _clear_unknown_tag_dedup(printer_id, ams_id, tray_id_raw)
+                        clear_unknown_tag_dedup(printer_id, ams_id, tray_id_raw)
                         continue
 
                     spool_tag = (
@@ -2564,7 +2098,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                         if result is None and spool_tag and not auto_add_unknown_rfid:
                             # Spoolman skipped auto-create per user setting — surface
                             # the slot so the UI can offer "+ Add to inventory".
-                            await _broadcast_unknown_tag(
+                            await broadcast_unknown_tag(
                                 printer_id=printer_id,
                                 ams_id=ams_id,
                                 tray_id=tray.tray_id,
@@ -2576,7 +2110,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                 tray_count=len(trays),
                             )
                         elif result:
-                            _clear_unknown_tag_dedup(printer_id, ams_id, tray.tray_id)
+                            clear_unknown_tag_dedup(printer_id, ams_id, tray.tray_id)
                         if result:
                             synced += 1
                             if result.get("id"):
@@ -4864,27 +4398,13 @@ async def on_print_complete(printer_id: int, data: dict):
         except Exception as _swe:  # noqa: BLE001 — sweep must never crash the callback
             logger.warning("AMS terminal re-read sweep failed to schedule for printer %s: %s", printer_id, _swe)
 
-        # W6 slot-identity reconcile: the printer is IDLE at a terminal by
-        # construction, which is exactly when spool_tagless's idle-gated reconcile can
-        # act. On a busy farm the AMS-change pushes that also reach the reconcile
-        # overwhelmingly arrive mid-print (deferred), so a slot whose live identity
-        # diverges from the resolver (011-H2S: tray_info_idx / stale nozzle temps
-        # splitting the firmware auto-refill backup group) never got an idle
-        # evaluation. Own session, fire-and-forget; the reconcile never raises and
-        # never blocks the callback.
-        try:
-            from backend.app.services import spool_tagless as _spool_tagless_reconcile
-
-            async def _reconcile_slot_identities():
-                try:
-                    async with async_session() as _rdb:
-                        await _spool_tagless_reconcile.reconcile_bound_slot_identities(_rdb, printer_id)
-                except Exception as _re:  # noqa: BLE001 — reconcile must never crash the callback
-                    logger.warning("Slot-identity reconcile failed for printer %s: %s", printer_id, _re)
-
-            asyncio.create_task(_reconcile_slot_identities())
-        except Exception as _re:  # noqa: BLE001 — reconcile must never crash the callback
-            logger.warning("Slot-identity reconcile failed to schedule for printer %s: %s", printer_id, _re)
+        # The terminal-time slot-IDENTITY reconcile that used to run here
+        # (``spool_tagless.reconcile_bound_slot_identities``) is gone at the W3b cutover.
+        # Its intent — a bound slot whose live identity has drifted gets re-decided while
+        # the printer is idle — is now the pipeline's: the sweep above produces the FULL
+        # RFID reads its DEFERs are waiting for, and the next raw push re-runs the whole
+        # decision table against them (a drifted-config KEEP refreshes the fingerprint,
+        # an unresolved slot draws an owed identify). One decider, no idle-only twin.
 
     no_deposit = deposited_nothing(
         is_dry_run=_resolved_is_dry_run,

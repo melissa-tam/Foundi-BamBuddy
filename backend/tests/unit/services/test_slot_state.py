@@ -129,6 +129,21 @@ class TestDeriveState:
         pre = _view(pre_configured=True)
         assert derive_state(_obs(present=True), pre) is SlotState.OCCUPIED_ASSUMED
 
+    def test_a_presence_less_dialect_keeps_classifying_pre_configured(self):
+        """The PRE_CONFIGURED arm keys on ``present is not True``, so an A1-family/P1S
+        push (constant ``state=3`` → presence UNKNOWN) classifies PRE_CONFIGURED even
+        though the roll IS seated and configured.
+
+        That stays correct after the finding-A fix, because the state names the DURABLE
+        intent while the resolver's row-4 one-shot is what consumes it — and that row
+        never reads the state (pinned in ``TestRow4TaglessLane``). Classification and
+        apply are deliberately decoupled here; tightening this arm to match the resolver
+        would instead delete the "awaiting insert" answer row 3 still needs."""
+        pre = _view(pre_configured=True)
+        obs = observe_tray(1, 0, {"id": 2, "state": 3, "tray_type": "PETG", "tray_color": "000000FF"})
+        assert obs.present is None
+        assert derive_state(obs, pre) is SlotState.PRE_CONFIGURED
+
     @pytest.mark.parametrize(
         ("obs_kwargs", "expected"),
         [
@@ -530,6 +545,125 @@ class TestRow2IdentityLane:
         assert decision.kind is DecisionKind.KEEP
 
 
+class TestRow2UntaggedClaim:
+    """FINDING B — a tagged insert must not displace the weighed row it belongs to.
+
+    Pre-cutover an unknown tag first tried ``spool_tag_matcher.find_matching_untagged_spool``
+    and, on a hit, ``link_tag_to_inventory_spool`` moved the identity ONTO that
+    operator-created row; a BOUND slot never reached the mint lane at all, so a
+    weigh-then-assign pre-config row simply received its roll's tag at insert. After the
+    cutover the table minted a fresh ``rfid_auto`` row (default 1000 g label) and
+    orphaned the operator's weighed one. ``untagged_claim_candidate`` restores both
+    shapes, under the SAME evidence gate as the mint it precedes.
+    """
+
+    TAG = "3CF1F3E700000100"
+    UUID = "8AC9EC0847FD41D0890870319F2E1975"
+
+    def _tagged(self, **kw):
+        return _obs(tag_uid=self.TAG, tray_uuid=self.UUID, **kw)
+
+    def test_the_slots_own_pre_config_row_claims_the_identity(self):
+        """The weighed row keeps its slot and takes the tag — no mint, no displacement."""
+        pre = _view(spool_id=210, pre_configured=True)
+        obs = self._tagged()
+        decision = resolve(
+            obs,
+            derive_state(obs, pre),
+            ResolutionContext(binding=pre, untagged_claim_candidate=pre, auto_add_unknown=True),
+        )
+        assert decision == Decision(DecisionKind.BIND, spool_id=210, reason="pre_configured_apply_identity")
+
+    def test_a_pre_config_binding_actually_reaches_the_claim_branch(self):
+        """PINNED, not assumed: the route to 2.4 runs THROUGH 2.2's tagless-livelock
+        gate. 2.1 cannot fire (a row asserting no identity is never ``same``), 2.2 defers
+        only a binding that DOES claim an identity, and 2.3 finds no owner. If 2.2 ever
+        started deferring identity-less bindings, this lane would go silently dead — so
+        the fall-through is asserted here rather than inferred."""
+        pre = _view(spool_id=210, pre_configured=True)
+        obs = self._tagged()
+        assert identity_relation(pre, obs) == "ambiguous"  # 2.1 cannot match
+        assert not (pre.tag_uid or pre.tray_uuid)  # 2.2's gate lets it through
+        # With no claim supplied the same push runs off the end of row 2 into the MINT —
+        # proof it was never stopped at 2.2.
+        fell_through = resolve(obs, derive_state(obs, pre), ResolutionContext(binding=pre, auto_add_unknown=True))
+        assert fell_through.kind is DecisionKind.MINT
+
+    def test_an_unbound_slot_attracts_an_untagged_inventory_row(self):
+        candidate = _view(spool_id=300)
+        obs = self._tagged()
+        decision = resolve(
+            obs,
+            derive_state(obs, None),
+            ResolutionContext(untagged_claim_candidate=candidate, auto_add_unknown=True),
+        )
+        assert decision == Decision(DecisionKind.BIND, spool_id=300, reason="identity_claims_untagged_row")
+
+    def test_a_claim_that_is_not_the_slots_pre_config_row_is_the_plain_attract(self):
+        """Reason discipline: ``pre_configured_apply_identity`` names the slot's OWN
+        pre-configured row (a same-spool upsert with a marker to clear); ANY other row is
+        the attract lane, where the writer's move semantics take the slot for it."""
+        pre = _view(spool_id=210, pre_configured=True)
+        other = _view(spool_id=300)
+        obs = self._tagged()
+        decision = resolve(
+            obs,
+            derive_state(obs, pre),
+            ResolutionContext(binding=pre, untagged_claim_candidate=other, auto_add_unknown=True),
+        )
+        assert decision == Decision(DecisionKind.BIND, spool_id=300, reason="identity_claims_untagged_row")
+
+    def test_mint_still_fires_with_no_claim_candidate(self):
+        """The mint lane is narrowed, not replaced: a genuinely new roll still mints."""
+        obs = self._tagged()
+        decision = resolve(obs, derive_state(obs, None), ResolutionContext(auto_add_unknown=True))
+        assert decision.kind is DecisionKind.MINT
+        assert decision.reason == "unknown_identity_auto_add"
+
+    @pytest.mark.parametrize(
+        ("obs_kwargs", "label"), [({"tag_uid": TAG}, "tag-only"), ({"tray_uuid": UUID}, "uuid-only")]
+    )
+    def test_partial_identity_still_defers_even_with_a_claim(self, obs_kwargs, label):
+        """The claim branch sits BEHIND the full-pair gate. Landing a tag on an
+        operator's row from a half-read carries the same duplicate hazard as minting from
+        one, and it would additionally write a wrong identity onto a row the operator
+        owns — strictly worse. The evidence gate lives in the TABLE, which is why the
+        orchestrator hands the candidate over even on a partial push."""
+        candidate = _view(spool_id=300)
+        obs = _obs(**obs_kwargs)
+        decision = resolve(
+            obs,
+            derive_state(obs, None),
+            ResolutionContext(untagged_claim_candidate=candidate, auto_add_unknown=True),
+        )
+        assert decision == Decision(DecisionKind.DEFER, reason="partial_identity_owed_full_read"), label
+
+    def test_a_claim_outranks_the_prompt_when_auto_add_is_off(self):
+        """A roll the operator already logged is not an unknown roll: nothing to
+        auto-add, nothing to ask about."""
+        candidate = _view(spool_id=300)
+        obs = self._tagged()
+        decision = resolve(
+            obs,
+            derive_state(obs, None),
+            ResolutionContext(untagged_claim_candidate=candidate, auto_add_unknown=False),
+        )
+        assert decision == Decision(DecisionKind.BIND, spool_id=300, reason="identity_claims_untagged_row")
+
+    def test_an_exact_owner_still_outranks_a_claim(self):
+        """2.3 is untouched: an EXACT identity owner is certainty, a claim is only a
+        plausibility, so the claim may never overtake it."""
+        owner = _view(spool_id=99, is_tagless=False, tag_uid=self.TAG, tray_uuid=self.UUID)
+        candidate = _view(spool_id=300)
+        obs = self._tagged()
+        decision = resolve(
+            obs,
+            derive_state(obs, None),
+            ResolutionContext(identity_candidate=owner, untagged_claim_candidate=candidate),
+        )
+        assert decision == Decision(DecisionKind.BIND, spool_id=99, reason="identity_resolved_candidate")
+
+
 # --- Row 3: release on empty ------------------------------------------------
 
 
@@ -608,6 +742,27 @@ class TestRow4TaglessLane:
         decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
         assert decision == Decision(DecisionKind.BIND, spool_id=210, reason="pre_configured_apply")
 
+    @pytest.mark.parametrize(
+        ("tray", "label"),
+        [
+            ({"id": 2, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"}, "a presence-reporting dialect"),
+            ({"id": 2, "state": 3, "tray_type": "PETG", "tray_color": "000000FF"}, "A1-family/P1S constant state=3"),
+            ({"id": 2, "tray_type": "PETG", "tray_color": "000000FF"}, "a push carrying no state at all"),
+        ],
+    )
+    def test_pre_config_one_shot_applies_on_every_dialect(self, tray, label):
+        """FINDING A. The A1-family and P1S firmwares report a CONSTANT ``state=3`` (and
+        some pushes omit ``state`` entirely), so ``_derive_present`` can only ever answer
+        UNKNOWN for them. Gating the one-shot on ``present is True`` therefore left those
+        printers "awaiting insert" FOREVER — the roll seated, configured, and never
+        applied (upstream #1322, which the pre-cutover replay handled). The gate is
+        ``present is not False``, and within row 4 that is never False."""
+        bound = _view(spool_id=210, pre_configured=True)
+        obs = observe_tray(1, 0, tray)
+        assert obs.present is not False, label
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
+        assert decision == Decision(DecisionKind.BIND, spool_id=210, reason="pre_configured_apply"), label
+
     def test_reclaim_preserves_the_row_of_a_roll_that_came_back(self):
         donor = _view(spool_id=168)
         obs = _obs()
@@ -670,8 +825,9 @@ class TestRow4TaglessLane:
     def test_a_tagged_row_is_never_re_decided_by_a_push_without_rfid_fields(self):
         """Periodic AMS pushes routinely omit tag_uid/tray_uuid — that is why the
         merge preserves them. A tagged binding must not be minted over just because
-        THIS push carried config and no identity (today: ``handle_tagless_slot``
-        branch 2 returns "not ours")."""
+        THIS push carried config and no identity (the pre-cutover tagless branch tree's
+        (2) "not ours" return, whose owner ``handle_tagless_slot`` the W3 cutover
+        deleted)."""
         bound = _view(spool_id=37, is_tagless=False, tag_uid="1C63F1E700000100", fingerprint_type="PLA")
         obs = _obs(tray_type="PETG", tray_color="FF0000FF")
         decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))

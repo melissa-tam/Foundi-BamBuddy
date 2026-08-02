@@ -171,11 +171,13 @@ async def apply_spool_to_slot_via_mqtt(
             # printer's three trays at 2026-07-25 01:55 via this exact path: every
             # offending row stores an EMPTY slicer_filament, on which the resolver
             # returned long before its substitution chokepoint). The composition +
-            # re-entry now lives IN the resolver behind `generic_fallback` so the
-            # DETECT site (spool_tagless._maybe_reconcile_slot_identity, blind to the
-            # same rows until 006-H2S 2026-07-26) shares one implementation: a
-            # fingerprint-matching row comes back as the tagless default's specific
-            # id + temps, anything else comes back unchanged.
+            # re-entry now lives IN the resolver behind `generic_fallback` so every
+            # caller shares one implementation: a fingerprint-matching row comes back
+            # as the tagless default's specific id + temps, anything else comes back
+            # unchanged. (The old per-slot DETECT site that first needed this,
+            # ``spool_tagless._maybe_reconcile_slot_identity``, was deleted at the W3b
+            # cutover — the resolver behaviour it forced is what remains, and is why
+            # the substitution belongs here rather than at any one caller.)
             tray_info_idx, setting_id, _generic_sub_brand, temp_min, temp_max = await resolve_slicer_filament(
                 db=db,
                 current_user=current_user,
@@ -1998,12 +2000,12 @@ async def assign_spool(
     # physically-loaded slot, even when tray_type is "" and state is 3.
     #
     # Trade-off for the truly-empty slot case: firmware drops the push
-    # silently (per Bambu's documented behavior), the SpoolAssignment row
-    # still has empty fingerprint_type because nothing in the assign path
-    # updates that column, and on_ams_change at main.py:1031-1054 still
-    # fires the deferred config when a spool eventually appears. So the
-    # SpoolBuddy weigh-then-assign-before-insert workflow continues to
-    # work — just without the optimization of skipping a no-op MQTT call.
+    # silently (per Bambu's documented behavior). The intent is recorded
+    # EXPLICITLY on ``spool_assignment.pre_configured_at`` below, and the
+    # slot pipeline's one-shot apply fires the deferred config when a spool
+    # eventually appears. So the SpoolBuddy weigh-then-assign-before-insert
+    # workflow continues to work — just without the optimization of
+    # skipping a no-op MQTT call.
     #
     # state ∈ {9, 10} stays as an explicit short-circuit so we don't churn
     # a doomed MQTT push when the firmware has positively confirmed "no
@@ -2025,11 +2027,30 @@ async def assign_spool(
             )
         except Exception as e:
             logger.warning("MQTT auto-configure failed for spool %d: %s", spool.id, e)
-    # pending_config is the "config not landed yet" UI marker. True when the
-    # firmware said empty, OR when MQTT couldn't actually publish (printer
-    # offline, no client, transient failure). on_ams_change replay re-fires
-    # the config in either case once the AMS reports a non-empty fingerprint.
-    pending_config = slot_is_definitely_empty or not configured
+    # "Config not landed yet" is now an EXPLICIT fact on the row, not an inference.
+    #
+    # It used to be read off a blank ``fingerprint_type`` — which is only ever blank
+    # because nothing in this path wrote one — and that guess was load-bearing for the
+    # deferred-config replay. It also mis-classified any legitimately blank fingerprint,
+    # and it could not survive the assign path ever learning to stamp a fingerprint.
+    # ``pre_configured_at`` says the thing directly: this binding is an operator INTENT
+    # whose configuration has not reached the slot yet.
+    #
+    # Set on both shapes the old inference covered: the firmware positively said the
+    # slot is empty (SpoolBuddy weigh-then-assign-before-insert), or the MQTT publish
+    # did not land (printer offline / no client / transient failure). The slot
+    # pipeline's one-shot apply (``pre_configured_apply``) pushes the configuration and
+    # clears this stamp the first time it sees something in the slot.
+    #
+    # Written on BOTH edges, because ``bind_spool_to_slot`` upserts an existing row: a
+    # re-assign whose config DID land must not inherit a stale stamp from a previous
+    # attempt, or the pipeline would keep reading the slot as "awaiting insert".
+    from datetime import datetime as _dt
+
+    _pending = slot_is_definitely_empty or not configured
+    assignment.pre_configured_at = _dt.utcnow() if _pending else None
+    await db.commit()
+    pending_config = assignment.pre_configured_at is not None
 
     # Return assignment with spool data
     result = await db.execute(

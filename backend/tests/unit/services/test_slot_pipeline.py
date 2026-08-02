@@ -345,6 +345,29 @@ async def test_pre_configured_apply_clears_the_marker_and_pushes_config(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_pre_configured_apply_on_a_presence_less_dialect(db_session, printer_factory, env):
+    """FINDING A, end to end. The A1-family and P1S firmwares report a CONSTANT
+    ``state=3``, so presence can only derive to UNKNOWN on them and the old
+    ``present is True`` gate left the operator's pre-configured row "awaiting insert"
+    forever — roll seated, configured, never applied (upstream #1322)."""
+    printer = await printer_factory()
+    spool = await _spool(db_session, material="PETG", rgba="000000FF")
+    await _bind_row(
+        db_session, spool, printer.id, 0, 2, fingerprint_color="", fingerprint_type="", pre_configured_at=_SENTINEL
+    )
+
+    obs = _obs(printer.id, {"id": 2, "state": 3, "tray_type": "PETG", "tray_color": "000000FF"})
+    assert obs.present is None, "this dialect never reports presence — that is the point"
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision == Decision(DecisionKind.BIND, spool_id=spool.id, reason="pre_configured_apply")
+    assert transitions[0].applied is True
+    row = await _assignment(db_session, printer.id, 0, 2)
+    assert row.pre_configured_at is None  # the one-shot is spent, not stuck
+    assert env.pushes == [(spool.id, printer.id, 0, 2)]
+
+
+@pytest.mark.asyncio
 async def test_pre_configured_awaiting_insert_is_left_alone(db_session, printer_factory, env):
     """A deliberate bind-to-empty is state, not a location claim: release-on-empty must
     never delete the operator's intent."""
@@ -455,6 +478,163 @@ async def test_mint_recheck_converts_to_bind_when_an_owner_appears(db_session, p
     assert transitions[0].applied is True
     assert await _spool_count(db_session) == 1  # no twin row
     assert (await _assignment(db_session, printer.id, 0, 0)).spool_id == owner.id
+
+
+class TestUntaggedClaim:
+    """FINDING B — a newly-identified roll lands on the operator's row for it.
+
+    Pre-cutover an unknown tag first tried ``find_matching_untagged_spool`` and, on a
+    hit, ``link_tag_to_inventory_spool`` moved the identity ONTO that row; a bound slot
+    never reached the mint lane at all, so a weigh-then-assign pre-config row simply
+    received its roll's tag at insert. After the cutover the table minted a fresh
+    ``rfid_auto`` row (default 1000 g label) beside it and orphaned the weighed one.
+
+    Both lanes are pinned here through the REAL writer and the REAL linker, because what
+    makes them correct is what they do NOT do: no second row, no displacement, no config
+    push over an RFID-owned slot.
+    """
+
+    TAG = "AABBCCDD00000100"
+    UUID = "8AC9EC0847FD41D0890870319F2E1975"
+
+    def _tagged(self, printer_id, tray_id=0, **overrides):
+        tray = {
+            "id": tray_id,
+            "state": 11,
+            "tag_uid": self.TAG,
+            "tray_uuid": self.UUID,
+            "tray_type": "PETG",
+            "tray_color": "000000FF",
+            "tray_info_idx": "GFG02",
+        }
+        tray.update(overrides)
+        return _obs(printer_id, tray)
+
+    @pytest.mark.asyncio
+    async def test_a_weighed_pre_config_row_receives_the_inserted_rolls_tag(self, db_session, printer_factory, env):
+        """THE REPLAY. SpoolBuddy weigh-then-assign: the operator weighed a 750 g roll,
+        bound it to an EMPTY slot, and is now inserting it. The tag the AMS reads at
+        insert belongs to that row — so the row keeps the slot, takes the identity, and
+        the measured label survives."""
+        printer = await printer_factory()
+        weighed = await _spool(
+            db_session, material="PETG", rgba="000000FF", label_weight=750, data_origin="manual", brand="Bambu Lab"
+        )
+        await _bind_row(
+            db_session,
+            weighed,
+            printer.id,
+            0,
+            2,
+            fingerprint_color="",
+            fingerprint_type="",
+            pre_configured_at=_SENTINEL,
+        )
+
+        transitions = await run_slot_pipeline(printer.id, [self._tagged(printer.id, tray_id=2)], _deps(db_session, env))
+
+        assert transitions[0].decision == Decision(
+            DecisionKind.BIND, spool_id=weighed.id, reason="pre_configured_apply_identity"
+        )
+        assert transitions[0].applied is True
+        # The row KEEPS the slot and the one-shot marker is spent.
+        row = await _assignment(db_session, printer.id, 0, 2)
+        assert row.spool_id == weighed.id
+        assert row.pre_configured_at is None
+        assert (row.fingerprint_color, row.fingerprint_type) == ("000000FF", "PETG")
+        # The identity is LINKED onto it — through the fork's one linker, so the origin
+        # and the slicer-preset backfill match the pre-cutover attract lane.
+        await db_session.refresh(weighed)
+        assert (weighed.tag_uid, weighed.tray_uuid) == (self.TAG, self.UUID)
+        assert weighed.data_origin == "rfid_linked"
+        assert weighed.slicer_filament == "GFG02"
+        # The operator's measurement is untouched, and no stranger row exists.
+        assert weighed.label_weight == 750
+        assert await _spool_count(db_session) == 1
+        # The roll's configuration is RFID-owned: pushing ams_filament_setting over a
+        # BL-read slot destroys the RFID-detected state (auto_assign_spool's rule).
+        assert env.pushes == []
+        assert env.types() == ["spool_auto_assigned"]
+        assert "origin" not in env.broadcasts[0]  # tagged shape, never origin="tagless"
+
+    @pytest.mark.asyncio
+    async def test_an_untagged_inventory_row_attracts_the_tag(self, db_session, printer_factory, env):
+        """The attract lane on an UNBOUND slot: an operator logged the roll (Quick Add,
+        no subtype, no tag) and now inserts it. ``find_matching_untagged_spool``'s
+        criteria decide, and the tag lands rather than duplicating the row."""
+        printer = await printer_factory()
+        logged = await _spool(
+            db_session, material="PETG", rgba="000000FF", brand="Bambu Lab", data_origin="manual", label_weight=1000
+        )
+        await db_session.commit()
+
+        transitions = await run_slot_pipeline(printer.id, [self._tagged(printer.id)], _deps(db_session, env))
+
+        assert transitions[0].decision == Decision(
+            DecisionKind.BIND, spool_id=logged.id, reason="identity_claims_untagged_row"
+        )
+        assert transitions[0].applied is True
+        assert (await _assignment(db_session, printer.id, 0, 0)).spool_id == logged.id
+        await db_session.refresh(logged)
+        assert (logged.tag_uid, logged.tray_uuid) == (self.TAG, self.UUID)
+        assert logged.data_origin == "rfid_linked"
+        assert await _spool_count(db_session) == 1  # attracted, not duplicated
+        assert env.pushes == []
+
+    @pytest.mark.asyncio
+    async def test_an_auto_minted_tagless_row_never_attracts_a_tag(self, db_session, printer_factory, env):
+        """The attract lane is for MANUALLY logged rolls only. The farm's own
+        silently-tracked ``ams_auto`` rows are excluded by the finder, so an arriving tag
+        mints its own row instead of hijacking one (the silent-tracking work item)."""
+        printer = await printer_factory()
+        auto = await _spool(db_session, material="PETG", rgba="000000FF", data_origin="ams_auto")
+        await db_session.commit()
+
+        transitions = await run_slot_pipeline(printer.id, [self._tagged(printer.id)], _deps(db_session, env))
+
+        assert transitions[0].decision.reason == "unknown_identity_auto_add"
+        await db_session.refresh(auto)
+        assert auto.tag_uid is None  # untouched
+        assert await _spool_count(db_session) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_different_filament_does_not_attract(self, db_session, printer_factory, env):
+        """MINT still fires (case d): a row that is not plausibly this roll is not a
+        claim candidate at all."""
+        printer = await printer_factory()
+        other = await _spool(db_session, material="PLA", rgba="FF0000FF", brand="Bambu Lab", data_origin="manual")
+        await db_session.commit()
+
+        transitions = await run_slot_pipeline(printer.id, [self._tagged(printer.id)], _deps(db_session, env))
+
+        assert transitions[0].decision.reason == "unknown_identity_auto_add"
+        await db_session.refresh(other)
+        assert other.tag_uid is None
+        assert await _spool_count(db_session) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_partial_read_never_lands_a_tag_on_an_operator_row(self, db_session, printer_factory, env):
+        """Case (e) at the orchestrator. The candidate IS resolved and handed over; the
+        TABLE's full-pair gate is what refuses it. Writing a half-read identity onto a
+        row the operator owns is strictly worse than minting from one."""
+        printer = await printer_factory()
+        logged = await _spool(db_session, material="PETG", rgba="000000FF", brand="Bambu Lab", data_origin="manual")
+        await db_session.commit()
+
+        # Tag asserted, uuid NOT carried by this frame — the sibling-chip read shape.
+        partial = _obs(
+            printer.id,
+            {"id": 0, "state": 11, "tag_uid": self.TAG, "tray_type": "PETG", "tray_color": "000000FF"},
+        )
+        assert partial.tray_uuid is None
+        transitions = await run_slot_pipeline(printer.id, [partial], _deps(db_session, env))
+
+        assert transitions[0].decision == Decision(DecisionKind.DEFER, reason="partial_identity_owed_full_read")
+        await db_session.refresh(logged)
+        assert logged.tag_uid is None  # the operator's row is untouched
+        assert await _assignment(db_session, printer.id, 0, 0) is None
+        assert env.identifies == [(printer.id, 0, 0, "partial_identity_owed_full_read")]
+        assert await _spool_count(db_session) == 1
 
 
 # --- RECLAIM ----------------------------------------------------------------
@@ -757,26 +937,34 @@ async def test_mid_print_unresolved_defers_without_an_identify(db_session, print
 # --- serialization + never-raise --------------------------------------------
 
 
+def _order_probe(order: list[str], tag: str):
+    """An identify hook that records when a pass enters and leaves its critical section."""
+
+    async def _identify(printer_id, ams_id, tray_id, reason):
+        order.append(f"{tag}-start")
+        await asyncio.sleep(0.01)
+        order.append(f"{tag}-end")
+
+    return _identify
+
+
 @pytest.mark.asyncio
 async def test_two_passes_for_one_printer_run_sequentially(db_session, printer_factory, env, monkeypatch):
-    """Read-decide-write must not interleave for one printer: that race is how a slot
-    gets two assignment rows (main.py:525-549)."""
+    """Read-decide-write must not interleave for one printer.
+
+    Two AMS pushes ~30 ms apart is ordinary MQTT burst behaviour; if both read "no
+    assignment for this slot" before either writes, both INSERT and the second one hits
+    the unique constraint. This lock is the fork's ONE defence against that (it replaced
+    ``main.py``'s per-printer assignment lock at the W3b cutover).
+    """
     printer = await printer_factory()
     order: list[str] = []
 
-    def _probe(tag: str):
-        async def _identify(printer_id, ams_id, tray_id, reason):
-            order.append(f"{tag}-start")
-            await asyncio.sleep(0.01)
-            order.append(f"{tag}-end")
-
-        return _identify
-
     obs = _obs(printer.id, {"id": 0, "state": 10})
     deps_a = _deps(db_session, env)
-    deps_a.schedule_identify = _probe("A")
+    deps_a.schedule_identify = _order_probe(order, "A")
     deps_b = _deps(db_session, env)
-    deps_b.schedule_identify = _probe("B")
+    deps_b.schedule_identify = _order_probe(order, "B")
 
     await asyncio.gather(
         run_slot_pipeline(printer.id, [obs], deps_a),
@@ -784,6 +972,49 @@ async def test_two_passes_for_one_printer_run_sequentially(db_session, printer_f
     )
 
     assert order in (["A-start", "A-end", "B-start", "B-end"], ["B-start", "B-end", "A-start", "A-end"])
+
+
+@pytest.mark.asyncio
+async def test_passes_for_different_printers_run_in_parallel(db_session, printer_factory, env):
+    """The lock is per-PRINTER, not global.
+
+    A fleet lock would serialise every printer's AMS traffic behind the slowest one —
+    the reason the pre-cutover lock was keyed by printer id too. Interleaved start/end
+    markers are the proof that two printers' passes overlap.
+    """
+    printer_a = await printer_factory()
+    printer_b = await printer_factory()
+    order: list[str] = []
+
+    deps_a = _deps(db_session, env)
+    deps_a.schedule_identify = _order_probe(order, "A")
+    deps_b = _deps(db_session, env)
+    deps_b.schedule_identify = _order_probe(order, "B")
+
+    await asyncio.gather(
+        run_slot_pipeline(printer_a.id, [_obs(printer_a.id, {"id": 0, "state": 10})], deps_a),
+        run_slot_pipeline(printer_b.id, [_obs(printer_b.id, {"id": 0, "state": 10})], deps_b),
+    )
+
+    assert order[:2] in (["A-start", "B-start"], ["B-start", "A-start"])  # both entered before either left
+
+
+@pytest.mark.asyncio
+async def test_the_pass_stands_down_entirely_under_spoolman(db_session, printer_factory, env):
+    """Spoolman mode owns AMS slots end to end (its own sync lane, and the mode switch
+    wipes the internal assignments). The pipeline must not decide identity for rows it
+    does not own — and must not merely skip WRITES, or a released binding would still
+    fire."""
+    printer = await printer_factory()
+    spool = await _spool(db_session, material="PETG", rgba="000000FF")
+    await _bind_row(db_session, spool, printer.id, 0, 1)
+    env.settings["spoolman_enabled"] = "true"
+
+    cleared = _obs(printer.id, {"id": 1, "state": 9, "tray_type": ""})  # would RELEASE in internal mode
+    transitions = await run_slot_pipeline(printer.id, [cleared], _deps(db_session, env))
+
+    assert transitions == []
+    assert await _assignment(db_session, printer.id, 0, 1) is not None  # binding untouched
 
 
 @pytest.mark.asyncio
@@ -800,6 +1031,96 @@ async def test_a_poisoned_observation_never_escapes_and_the_pass_continues(db_se
     assert [t.decision.kind for t in transitions] == [DecisionKind.RELEASE]  # the healthy slot still ran
     assert _records(caplog, logging.ERROR)
     assert await _assignment(db_session, printer.id, 0, 2) is None
+
+
+# --- unknown-tag prompt -----------------------------------------------------
+
+
+class TestUnknownTagPrompt:
+    """With auto-add OFF the table refuses to mint an unowned roll, and the operator
+    gets a per-slot prompt instead. The prompt and its dedup moved here from
+    ``main.py`` at the W3b cutover, because exactly one decision raises it and exactly
+    two pipeline outcomes — an emptied slot and a successful bind — clear it."""
+
+    TAG = "AABBCCDD00000100"
+    UUID = "8AC9EC0847FD41D0890870319F2E1975"
+
+    def _tagged(self, printer_id, tray_id=0, tag=None, uuid=None):
+        return _obs(
+            printer_id,
+            {
+                "id": tray_id,
+                "state": 11,
+                "tag_uid": tag or self.TAG,
+                "tray_uuid": uuid or self.UUID,
+                "tray_type": "PETG",
+                "tray_color": "000000FF",
+            },
+        )
+
+    def _prompts(self, env):
+        return [p for p in env.broadcasts if p.get("type") == "unknown_tag"]
+
+    @pytest.mark.asyncio
+    async def test_auto_add_off_prompts_instead_of_minting(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        env.settings["auto_add_unknown_rfid"] = "false"
+
+        transitions = await run_slot_pipeline(printer.id, [self._tagged(printer.id)], _deps(db_session, env))
+
+        assert transitions[0].decision.kind is DecisionKind.NONE
+        assert transitions[0].decision.reason == "unknown_tag_prompt_owed"
+        assert await _spool_count(db_session) == 0  # nothing minted behind the operator's back
+        prompt = self._prompts(env)[0]
+        assert (prompt["tag_uid"], prompt["tray_uuid"]) == (self.TAG, self.UUID)
+        assert prompt["tray_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_same_roll_prompts_once_not_once_per_push(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        env.settings["auto_add_unknown_rfid"] = "false"
+        deps = _deps(db_session, env)
+
+        for _ in range(3):
+            await run_slot_pipeline(printer.id, [self._tagged(printer.id)], deps)
+
+        assert len(self._prompts(env)) == 1
+
+    @pytest.mark.asyncio
+    async def test_emptying_the_slot_lets_the_next_roll_re_prompt(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        env.settings["auto_add_unknown_rfid"] = "false"
+        deps = _deps(db_session, env)
+
+        await run_slot_pipeline(printer.id, [self._tagged(printer.id)], deps)
+        await run_slot_pipeline(printer.id, [_obs(printer.id, {"id": 0, "state": 9, "tray_type": ""})], deps)
+        await run_slot_pipeline(printer.id, [self._tagged(printer.id)], deps)
+
+        assert len(self._prompts(env)) == 2  # remove + reinsert re-asks
+
+    @pytest.mark.asyncio
+    async def test_a_bind_answers_the_prompt(self, db_session, printer_factory, env):
+        """Once a row owns the slot the prompt is moot, so the dedup is dropped — a
+        LATER unknown roll in the same slot must be able to raise a fresh one."""
+        printer = await printer_factory()
+        env.settings["auto_add_unknown_rfid"] = "false"
+        deps = _deps(db_session, env)
+
+        await run_slot_pipeline(printer.id, [self._tagged(printer.id)], deps)
+        assert len(self._prompts(env)) == 1
+
+        # The operator adds it: auto-add back on, the same roll now mints + binds.
+        env.settings["auto_add_unknown_rfid"] = "true"
+        await run_slot_pipeline(printer.id, [self._tagged(printer.id)], deps)
+        assert await _assignment(db_session, printer.id, 0, 0) is not None
+
+        # A DIFFERENT unknown roll arrives in that slot with auto-add off again. Both
+        # identity members differ — a tag-only change would be a SIBLING read of the
+        # bound roll (uuid agreement wins) and must NOT prompt.
+        env.settings["auto_add_unknown_rfid"] = "false"
+        other = self._tagged(printer.id, tag="1122334400000100", uuid="0F8FCF6039964FB68F94A59F8B0897D8")
+        await run_slot_pipeline(printer.id, [other], deps)
+        assert len(self._prompts(env)) == 2
 
 
 # --- replay pins ------------------------------------------------------------

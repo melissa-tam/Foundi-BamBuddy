@@ -603,6 +603,7 @@ class BambuMQTTClient:
         on_print_start: Callable[[dict], None] | None = None,
         on_print_complete: Callable[[dict], None] | None = None,
         on_ams_change: Callable[[list], None] | None = None,
+        on_ams_push_raw: Callable[[object], None] | None = None,
         on_layer_change: Callable[[int], None] | None = None,
         on_bed_temp_update: Callable[[float], None] | None = None,
         on_drying_complete: Callable[[int], None] | None = None,
@@ -617,6 +618,15 @@ class BambuMQTTClient:
         self.on_print_start = on_print_start
         self.on_print_complete = on_print_complete
         self.on_ams_change = on_ams_change
+        # Fired with the RAW AMS payload of every push that carries tray data, BEFORE the
+        # merge below mutates those dicts, and BEFORE the change-hash gate that throttles
+        # ``on_ams_change``. Both properties are load-bearing for the spool pipeline: the
+        # merge deliberately never clears identity fields (so a merged tray can pair a new
+        # roll's tag_uid with the departed roll's tray_uuid), and the hash is computed on
+        # merged state, so an answer the farm explicitly asked for — a full RFID read that
+        # only adds the tray_uuid — would not change it and would never be delivered.
+        # Handlers MUST consume the payload synchronously; nothing here is copied.
+        self.on_ams_push_raw = on_ams_push_raw
         self.on_layer_change = on_layer_change
         self.on_bed_temp_update = on_bed_temp_update
         # #1349: fired when an AMS unit's dry_time falls from >0 to 0 — i.e.
@@ -2082,6 +2092,21 @@ class BambuMQTTClient:
         else:
             logger.warning("[%s] Unexpected AMS data format: %s", self.serial_number, type(ams_data))
             return
+
+        # RAW pre-merge hand-off — the LAST point at which the wire dicts still say only
+        # what this push said. Everything below merges them into the display state, which
+        # deliberately never clears identity fields, so from here on a tray can carry a
+        # new roll's tag_uid beside a departed roll's tray_uuid. The spool pipeline must
+        # never decide on that, so it is fed here. The handler is expected to consume the
+        # payload SYNCHRONOUSLY (it does: observations are built inline and are owned,
+        # frozen objects) — nothing is copied for it, and the merge mutates these dicts
+        # the moment this returns. Both payload shapes reach it; the caller unwraps.
+        # Guarded: a farm-side failure must never break the MQTT callback chain.
+        if self.on_ams_push_raw:
+            try:
+                self.on_ams_push_raw(ams_data)
+            except Exception:
+                logger.exception("[%s] Raw AMS push handler failed", self.serial_number)
 
         # Merge AMS data instead of replacing, to handle partial updates
         # During prints, the printer may only send updates for active AMS units

@@ -5,7 +5,8 @@ custom presets) takes priority, with slot reuse and generic fallback as
 lower-priority fallbacks.
 """
 
-from unittest.mock import MagicMock, patch
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -39,6 +40,37 @@ async def spool_factory(db_session: AsyncSession):
         return spool
 
     return _create_spool
+
+
+async def _assignment_row(db_session, printer_id, ams_id, tray_id):
+    """The slot's live SpoolAssignment, re-queried.
+
+    Always re-queried rather than refreshed from a held instance: the binding writer's
+    upsert may rebuild the row (move semantics), which expunges any instance a test
+    seeded earlier.
+    """
+    from sqlalchemy import select
+
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    res = await db_session.execute(
+        select(SpoolAssignment).where(
+            SpoolAssignment.printer_id == printer_id,
+            SpoolAssignment.ams_id == ams_id,
+            SpoolAssignment.tray_id == tray_id,
+        )
+    )
+    return res.scalar_one_or_none()
+
+
+async def _pre_configured_at(db_session, printer_id, ams_id, tray_id):
+    """The slot's explicit "configuration has not landed yet" stamp, straight from the DB.
+
+    Read here rather than trusted from the response so the route's marker and the value
+    the slot pipeline later consumes are pinned to be the same fact.
+    """
+    row = await _assignment_row(db_session, printer_id, ams_id, tray_id)
+    return None if row is None else row.pre_configured_at
 
 
 def _make_mock_status(ams_data=None, vt_tray=None, nozzles=None, ams_extruder_map=None):
@@ -592,18 +624,24 @@ class TestAssignSpoolLiveCaliIdx:
 class TestAssignSpoolEmptySlotPreConfig:
     """Assign path under ambiguous / explicit-empty AMS state.
 
-    Updated for the #1322 follow-up: only the firmware's *explicit* empty
-    signal (state ∈ {9, 10}) skips MQTT. Anything else — including the
-    SpoolBuddy weigh-then-assign-before-insert case where state/tray_type
-    can't tell us whether a spool is loaded — attempts MQTT. The deferred-
-    config workflow still works because on_ams_change at main.py:1031-1054
-    re-fires when an AMS push eventually reports the loaded slot.
+    Two facts are pinned together here. (1) Only the firmware's *explicit* empty
+    signal (state ∈ {9, 10}) skips MQTT (#1322 follow-up); anything else — including
+    the SpoolBuddy weigh-then-assign-before-insert case where state/tray_type cannot
+    tell us whether a spool is loaded — attempts MQTT. (2) When the configuration did
+    NOT land, the route records that as an EXPLICIT fact on
+    ``spool_assignment.pre_configured_at`` rather than leaving it to be inferred from a
+    blank ``fingerprint_type``, and the response's ``pending_config`` is read straight
+    off that column.
+
+    The deferred-config workflow itself is the slot pipeline's one-shot apply
+    (``pre_configured_apply``), driven below from a raw observation — the pre-cutover
+    replay inside ``main.on_ams_change`` is gone.
     """
 
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_empty_tray_type_without_state_still_fires_mqtt(
-        self, async_client: AsyncClient, printer_factory, spool_factory
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
     ):
         """tray_type='' with no state field: AMS can't tell us whether a
         spool is loaded. Trust the user's Assign click and fire MQTT —
@@ -632,11 +670,13 @@ class TestAssignSpoolEmptySlotPreConfig:
         body = response.json()
         assert body["pending_config"] is False
         assert body["configured"] is True
+        # The config landed → no "awaiting insert" marker is written.
+        assert await _pre_configured_at(db_session, printer.id, 2, 3) is None
 
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_no_ams_data_with_no_client_marks_pending(
-        self, async_client: AsyncClient, printer_factory, spool_factory
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
     ):
         """No AMS data + no MQTT client (printer offline, no telemetry):
         publish can't happen, so configured=False and pending_config=True so
@@ -660,11 +700,14 @@ class TestAssignSpoolEmptySlotPreConfig:
         body = response.json()
         assert body["pending_config"] is True
         assert body["configured"] is False
+        # ...and pending_config is READ OFF the explicit column, not inferred from a
+        # blank fingerprint. This stamp is what the pipeline's one-shot apply consumes.
+        assert await _pre_configured_at(db_session, printer.id, 0, 0) is not None
 
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_loaded_slot_publishes_mqtt_immediately(
-        self, async_client: AsyncClient, printer_factory, spool_factory
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
     ):
         """Loaded slot (tray_type non-empty) → MQTT fires + pending_config=False."""
         printer = await printer_factory(name="X1C")
@@ -692,22 +735,24 @@ class TestAssignSpoolEmptySlotPreConfig:
         assert body["pending_config"] is False
         assert body["configured"] is True
         mock_client.ams_set_filament_setting.assert_called_once()
+        assert await _pre_configured_at(db_session, printer.id, 0, 0) is None
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_on_ams_change_fires_config_when_pre_assigned_slot_loads(
+    async def test_pipeline_applies_the_pre_config_when_the_slot_loads(
         self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
     ):
-        """Pre-config replay: SpoolAssignment with empty fingerprint + slot now loaded → MQTT fires."""
-        from unittest.mock import AsyncMock
-
-        from backend.app.main import on_ams_change
+        """One-shot apply: a PRE-CONFIGURED binding whose slot now holds filament gets
+        its deferred configuration published, its fingerprint stamped, and the marker
+        cleared — all from the raw AMS observation, through the pipeline."""
         from backend.app.models.spool_assignment import SpoolAssignment
+        from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
+        from backend.app.services.slot_state import DecisionKind
+        from backend.app.services.tray_observation import observe_tray
 
         printer = await printer_factory(name="H2D")
         spool = await spool_factory(slicer_filament="GFL05", material="PLA")
 
-        # Pre-existing assignment with empty fingerprint (the SpoolBuddy state)
         pre_assignment = SpoolAssignment(
             spool_id=spool.id,
             printer_id=printer.id,
@@ -715,66 +760,71 @@ class TestAssignSpoolEmptySlotPreConfig:
             tray_id=3,
             fingerprint_color=None,
             fingerprint_type=None,
+            pre_configured_at=datetime.utcnow(),
         )
         db_session.add(pre_assignment)
         await db_session.commit()
 
-        # Filament has now been physically inserted into the slot.
-        # state=11 ("filament fed to extruder") is the load signal we trigger on.
-        ams_data = [{"id": 2, "tray": [{"id": 3, "tray_type": "PLA", "tray_color": "FF0000FF", "state": 11}]}]
+        # Filament has now been physically inserted: state=11 ("fed to extruder").
+        tray = {"id": 3, "tray_type": "PLA", "tray_color": "FF0000FF", "state": 11}
 
         mock_client = MagicMock()
         mock_client.ams_set_filament_setting.return_value = True
         mock_client.extrusion_cali_sel.return_value = True
+        mock_client.ams_unit_drying.return_value = False
+        mock_client.ams_write_refusal.return_value = None
 
-        status = _make_mock_status(ams_data=ams_data)
-        printer_info = MagicMock(name="H2D", serial_number="0948BB540200427")
+        status = _make_mock_status(ams_data=[{"id": 2, "tray": [tray]}])
 
         with (
-            patch("backend.app.main.printer_manager") as mock_pm_main,
             patch("backend.app.services.printer_manager.printer_manager") as mock_pm_inv,
-            patch("backend.app.main.mqtt_relay") as mock_relay,
-            patch("backend.app.main.ws_manager") as mock_ws,
+            patch("backend.app.services.slot_pipeline.ws_manager") as mock_ws,
         ):
-            mock_pm_main.get_printer.return_value = printer_info
-            mock_pm_main.get_status.return_value = status
-            mock_pm_main.get_client.return_value = mock_client
-            mock_pm_main.get_model.return_value = "H2D"
             mock_pm_inv.get_client.return_value = mock_client
             mock_pm_inv.get_status.return_value = status
-            mock_relay.on_ams_change = AsyncMock()
-            mock_ws.send_printer_status = AsyncMock()
             mock_ws.broadcast = AsyncMock()
 
-            await on_ams_change(printer.id, ams_data)
+            transitions = await run_slot_pipeline(
+                printer.id,
+                [observe_tray(printer.id, 2, tray)],
+                PipelineDeps(db=db_session, client=mock_client),
+            )
 
-        # Full filament setting was published when the slot transitioned to loaded
+        assert [t.decision.kind for t in transitions] == [DecisionKind.BIND]
+        assert transitions[0].decision.reason == "pre_configured_apply"
+
+        # The deferred filament setting was published for the right slot.
         mock_client.ams_set_filament_setting.assert_called_once()
         call_kwargs = mock_client.ams_set_filament_setting.call_args.kwargs
         assert call_kwargs["ams_id"] == 2
         assert call_kwargs["tray_id"] == 3
         assert call_kwargs["tray_info_idx"] == "GFL05"
 
-        # Fingerprint was updated so the next push doesn't re-fire
-        await db_session.refresh(pre_assignment)
-        assert pre_assignment.fingerprint_type == "PLA"
-        assert pre_assignment.fingerprint_color == "FF0000FF"
+        # The marker is a ONE-SHOT: cleared on apply, with the fingerprint now stamped
+        # so the next push reads the slot as an ordinary match. Re-queried rather than
+        # refreshed — the binding writer's upsert may rebuild the row, so the instance
+        # seeded above is not guaranteed to still be the live one.
+        applied = await _assignment_row(db_session, printer.id, 2, 3)
+        assert applied is not None
+        assert applied.spool_id == spool.id
+        assert applied.pre_configured_at is None
+        assert applied.fingerprint_type == "PLA"
+        assert applied.fingerprint_color == "FF0000FF"
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_on_ams_change_does_not_refire_for_already_configured_slot(
+    async def test_pipeline_does_not_refire_for_an_already_configured_slot(
         self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
     ):
-        """Once fingerprint_type is set, subsequent AMS pushes must not re-fire MQTT."""
-        from unittest.mock import AsyncMock
-
-        from backend.app.main import on_ams_change
+        """No pre-config marker + a matching fingerprint → KEEP: no second publish."""
         from backend.app.models.spool_assignment import SpoolAssignment
+        from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
+        from backend.app.services.slot_state import DecisionKind
+        from backend.app.services.tray_observation import observe_tray
 
         printer = await printer_factory(name="X1C")
         spool = await spool_factory(slicer_filament="GFL05", material="PLA")
 
-        # Assignment already configured (fingerprint stamped)
         configured_assignment = SpoolAssignment(
             spool_id=spool.id,
             printer_id=printer.id,
@@ -786,104 +836,78 @@ class TestAssignSpoolEmptySlotPreConfig:
         db_session.add(configured_assignment)
         await db_session.commit()
 
-        ams_data = [{"id": 0, "tray": [{"id": 0, "tray_type": "PLA", "tray_color": "FF0000FF", "state": 11}]}]
+        tray = {"id": 0, "tray_type": "PLA", "tray_color": "FF0000FF", "state": 11}
 
         mock_client = MagicMock()
         mock_client.ams_set_filament_setting.return_value = True
         mock_client.extrusion_cali_sel.return_value = True
+        mock_client.ams_unit_drying.return_value = False
+        mock_client.ams_write_refusal.return_value = None
 
-        status = _make_mock_status(ams_data=ams_data)
-        printer_info = MagicMock(name="X1C", serial_number="00M00A391800004")
+        status = _make_mock_status(ams_data=[{"id": 0, "tray": [tray]}])
 
         with (
-            patch("backend.app.main.printer_manager") as mock_pm_main,
             patch("backend.app.services.printer_manager.printer_manager") as mock_pm_inv,
-            patch("backend.app.main.mqtt_relay") as mock_relay,
-            patch("backend.app.main.ws_manager") as mock_ws,
+            patch("backend.app.services.slot_pipeline.ws_manager") as mock_ws,
         ):
-            mock_pm_main.get_printer.return_value = printer_info
-            mock_pm_main.get_status.return_value = status
-            mock_pm_main.get_client.return_value = mock_client
-            mock_pm_main.get_model.return_value = "X1C"
             mock_pm_inv.get_client.return_value = mock_client
             mock_pm_inv.get_status.return_value = status
-            mock_relay.on_ams_change = AsyncMock()
-            mock_ws.send_printer_status = AsyncMock()
             mock_ws.broadcast = AsyncMock()
 
-            await on_ams_change(printer.id, ams_data)
+            transitions = await run_slot_pipeline(
+                printer.id,
+                [observe_tray(printer.id, 0, tray)],
+                PipelineDeps(db=db_session, client=mock_client),
+            )
 
-        # Fingerprint was already set — re-fire path skipped
+        assert [t.decision.kind for t in transitions] == [DecisionKind.KEEP]
         mock_client.ams_set_filament_setting.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_on_ams_change_fires_replay_when_tray_type_appears_without_state_11(
+    async def test_pre_configured_binding_is_kept_while_the_slot_stays_empty(
         self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
     ):
-        """A1 Mini / P1S firmware variant of the SpoolBuddy pre-config replay
-        (#1322). The user pre-assigned via SpoolBuddy (fingerprint empty), then
-        configured the slot manually in Bambu Studio so tray_type went from ''
-        to 'PLA' — but state stays at 3 because these firmwares never set it
-        to 11. With state-only detection the replay never fired."""
-        from unittest.mock import AsyncMock
-
-        from backend.app.main import on_ams_change
+        """ "Awaiting insert" is an operator INTENT, not a stale location claim: an empty
+        slot releases a live binding (doctrine rule 9) but must NEVER release a
+        pre-configured one, or the weigh-then-assign workflow would erase itself."""
         from backend.app.models.spool_assignment import SpoolAssignment
+        from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
+        from backend.app.services.slot_state import DecisionKind
+        from backend.app.services.tray_observation import observe_tray
 
-        printer = await printer_factory(name="A1 mini")
+        printer = await printer_factory(name="X1C")
         spool = await spool_factory(slicer_filament="GFL05", material="PLA")
 
         pre_assignment = SpoolAssignment(
             spool_id=spool.id,
             printer_id=printer.id,
             ams_id=0,
-            tray_id=3,
+            tray_id=1,
             fingerprint_color=None,
             fingerprint_type=None,
+            pre_configured_at=datetime.utcnow(),
         )
         db_session.add(pre_assignment)
         await db_session.commit()
 
-        # state=3 (never goes to 11 on A1 Mini BMCU 01.07.02.00) but tray_type
-        # is now configured — the replay must fire on this transition too.
-        ams_data = [
-            {
-                "id": 0,
-                "tray": [{"id": 3, "tray_type": "PLA", "tray_color": "FF0000FF", "state": 3, "tray_info_idx": "GFL05"}],
-            }
-        ]
+        empty = {"id": 1, "state": 9, "tray_type": ""}
 
         mock_client = MagicMock()
-        mock_client.ams_set_filament_setting.return_value = True
-        mock_client.extrusion_cali_sel.return_value = True
+        mock_client.ams_unit_drying.return_value = False
+        mock_client.ams_write_refusal.return_value = None
 
-        status = _make_mock_status(ams_data=ams_data)
-        printer_info = MagicMock(name="A1 mini", serial_number="0309CA391800999")
-
-        with (
-            patch("backend.app.main.printer_manager") as mock_pm_main,
-            patch("backend.app.services.printer_manager.printer_manager") as mock_pm_inv,
-            patch("backend.app.main.mqtt_relay") as mock_relay,
-            patch("backend.app.main.ws_manager") as mock_ws,
-        ):
-            mock_pm_main.get_printer.return_value = printer_info
-            mock_pm_main.get_status.return_value = status
-            mock_pm_main.get_client.return_value = mock_client
-            mock_pm_main.get_model.return_value = "A1 mini"
-            mock_pm_inv.get_client.return_value = mock_client
-            mock_pm_inv.get_status.return_value = status
-            mock_relay.on_ams_change = AsyncMock()
-            mock_ws.send_printer_status = AsyncMock()
+        with patch("backend.app.services.slot_pipeline.ws_manager") as mock_ws:
             mock_ws.broadcast = AsyncMock()
+            transitions = await run_slot_pipeline(
+                printer.id,
+                [observe_tray(printer.id, 0, empty)],
+                PipelineDeps(db=db_session, client=mock_client),
+            )
 
-            await on_ams_change(printer.id, ams_data)
-
-        # Replay fired despite state never being 11 — the disjunction picked
-        # up tray_type going non-empty.
-        mock_client.ams_set_filament_setting.assert_called_once()
-        await db_session.refresh(pre_assignment)
-        assert pre_assignment.fingerprint_type == "PLA"
+        assert [t.decision.kind for t in transitions] == [DecisionKind.KEEP]
+        assert transitions[0].decision.reason == "pre_configured_awaiting_insert"
+        assert await _pre_configured_at(db_session, printer.id, 0, 1) is not None  # intent survives
 
 
 class TestAssignSpoolEmptyDetection:

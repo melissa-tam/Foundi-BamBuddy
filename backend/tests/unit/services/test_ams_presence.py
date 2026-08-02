@@ -842,7 +842,9 @@ class TestIdentifyCollisionRegression:
         from sqlalchemy import func, select
 
         from backend.app.models.spool import Spool
-        from backend.app.services import spool_tagless
+        from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
+        from backend.app.services.slot_state import DecisionKind
+        from backend.app.services.tray_observation import observe_tray
 
         monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
 
@@ -872,7 +874,12 @@ class TestIdentifyCollisionRegression:
         await ams_presence.on_printer_terminal(1)
         assert client.ams_refresh_tray.call_count == 1  # sweep skipped — still ONE identify total
 
-        # (3) Tagless config on the SAME slot must DEFER — nothing minted, no write.
+        # (3) The slot pipeline on the SAME slot must DEFER — nothing minted, no write.
+        # The real client arms its per-printer identify gate the moment it publishes an
+        # ams_get_rfid, and reports that as the "identify_in_flight" write refusal; the
+        # pipeline reads that refusal as row 1 of the decision table.
+        client.ams_write_refusal.return_value = "identify_in_flight"
+        client.ams_unit_drying.return_value = False
         tray = {
             "id": 0,
             "state": 11,
@@ -885,8 +892,17 @@ class TestIdentifyCollisionRegression:
             "tray_uuid": "0" * 32,
             "remain": 40,
         }
-        handled = await spool_tagless.handle_tagless_slot(db_session, 1, 0, 0, tray, None, [])
-        assert handled is True  # deferred → caller `continue`s (no respool-gate fall-through)
+
+        async def _no_settings(_key):
+            return None
+
+        transitions = await run_slot_pipeline(
+            1,
+            [observe_tray(1, 0, tray)],
+            PipelineDeps(db=db_session, client=client, get_setting=_no_settings),
+        )
+        assert [t.decision.kind for t in transitions] == [DecisionKind.DEFER]
+        assert transitions[0].decision.reason == "identify_in_flight"
         minted = await db_session.scalar(select(func.count(Spool.id)))
         assert minted == 0  # zero mints / filament-setting writes during the in-flight window
 
