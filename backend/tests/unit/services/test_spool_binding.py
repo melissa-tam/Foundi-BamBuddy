@@ -11,7 +11,10 @@ Two layers are covered:
 
 * :func:`bind_spool_to_slot` — the move-semantics sweep (S1 same-printer, S2
   cross-printer), the plain bind into an empty slot (S3), the same-slot replay stamp
-  semantics (S4), and slot-upsert replacement of a different spool.
+  semantics (S4), slot-upsert replacement of a different spool, the RECLAIM lane's
+  ``preserve_ordinal`` opt-out, and the MOVE damper.
+* :func:`release_spool_from_slot` — the ONE unbind writer: last-location stamp +
+  row deletion + the structured ``[slot-state]`` release line.
 * the DB's ``ux_spool_assignment_spool_id`` unique index — a RAW insert that bypasses
   the helper must die loudly with an IntegrityError (fail-loud proof).
 
@@ -28,16 +31,35 @@ import pytest
 from sqlalchemy import func, inspect as sa_inspect, select
 from sqlalchemy.exc import IntegrityError
 
+import backend.app.utils.retry_window as rw
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
+from backend.app.services import spool_binding
 from backend.app.services.spool_binding import (
     NEVER_FED_MAX_G,
+    OPERATOR_ORIGIN,
     bind_spool_to_slot,
+    release_spool_from_slot,
     stamp_loaded,
     stamp_loaded_for_slot,
 )
 
 _BINDING_LOGGER = "backend.app.services.spool_binding"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_move_damper():
+    """Hand every test an un-armed move damper.
+
+    The damper is a process-lifetime singleton keyed on ``spool.id`` alone, and each
+    test's in-memory DB restarts ids at 1 — so without this a legitimate move in one
+    test would silence the next test's move. Reset on BOTH sides so no test leaks a
+    stamp in either direction.
+    """
+    spool_binding._move_damper.reset()
+    yield
+    spool_binding._move_damper.reset()
+
 
 # A stamp value no clock can produce during a test run, so "unchanged" and
 # "re-stamped" are decidable without sleeping on wall-clock resolution.
@@ -63,7 +85,7 @@ async def _bind_spool(db_session, printer_id, ams_id, tray_id, spool):
     await db_session.commit()
 
 
-async def _bind(db_session, spool, printer_id, ams_id, tray_id, *, origin="rfid_auto"):
+async def _bind(db_session, spool, printer_id, ams_id, tray_id, *, origin="rfid_auto", preserve_ordinal=False):
     """Bind through the production writer and commit (callers own the commit)."""
     assignment = await bind_spool_to_slot(
         db_session,
@@ -74,9 +96,29 @@ async def _bind(db_session, spool, printer_id, ams_id, tray_id, *, origin="rfid_
         fingerprint_color="112233FF",
         fingerprint_type="PLA",
         origin=origin,
+        preserve_ordinal=preserve_ordinal,
     )
     await db_session.commit()
     return assignment
+
+
+async def _assignment_for_slot(db_session, printer_id, ams_id, tray_id) -> SpoolAssignment | None:
+    res = await db_session.execute(
+        select(SpoolAssignment).where(
+            SpoolAssignment.printer_id == printer_id,
+            SpoolAssignment.ams_id == ams_id,
+            SpoolAssignment.tray_id == tray_id,
+        )
+    )
+    return res.scalar_one_or_none()
+
+
+def _last_location(spool: Spool) -> tuple:
+    return (
+        spool.last_location_printer_id,
+        spool.last_location_ams_id,
+        spool.last_location_tray_id,
+    )
 
 
 async def _rows_for_spool(db_session, spool_id) -> list[SpoolAssignment]:
@@ -94,6 +136,10 @@ async def _total_assignments(db_session) -> int:
 
 def _info_messages(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == _BINDING_LOGGER and r.levelno == logging.INFO]
+
+
+def _warning_messages(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == _BINDING_LOGGER and r.levelno == logging.WARNING]
 
 
 # -- S1: same-printer tray -> tray move (THE incident) ------------------------
@@ -367,3 +413,268 @@ def test_stamp_loaded_is_unconditional():
     s = SimpleNamespace(loaded_at="OLD")
     stamp_loaded(s)
     assert s.loaded_at != "OLD" and s.loaded_at is not None
+
+
+# -- release_spool_from_slot: the ONE unbind writer ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_release_stamps_last_location_deletes_the_row_and_logs(db_session, printer_factory, caplog):
+    """An assignment is a LOCATION claim (doctrine rule 9): releasing it frees the slot,
+    keeps the roll's grams, and leaves the two artefacts the reclaim lane and the
+    forensics lane depend on — the ``last_location_*`` stamp and one ``[slot-state]``
+    release line naming the reason."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session, weight_used=412.5)
+    await _bind(db_session, spool, printer.id, 2, 3)
+    assignment = await _assignment_for_slot(db_session, printer.id, 2, 3)
+    assert _last_location(spool) == (None, None, None), "never released yet"
+
+    with caplog.at_level(logging.INFO, logger=_BINDING_LOGGER):
+        await release_spool_from_slot(db_session, assignment, reason="operator_clear")
+    await db_session.commit()
+
+    assert await _assignment_for_slot(db_session, printer.id, 2, 3) is None
+    assert await _rows_for_spool(db_session, spool.id) == [], "the roll is unbound inventory now"
+
+    await db_session.refresh(spool)
+    assert _last_location(spool) == (printer.id, 2, 3), "the departed slot is stamped on the row"
+    assert spool.last_location_at is not None
+    assert spool.weight_used == 412.5, "grams live on the spool row — a release costs no history"
+
+    expected = f"[slot-state] printer={printer.id} A2T3 release spool={spool.id} reason=operator_clear"
+    assert expected in _info_messages(caplog)
+
+
+@pytest.mark.asyncio
+async def test_release_frees_the_slot_even_without_a_spool_row(db_session, printer_factory, caplog):
+    """A binding whose spool row is gone (hand-delete / cascade race) is a bogus location
+    claim either way: the slot is still freed and still logged — only the stamp is
+    skipped, because there is nothing to stamp."""
+    printer = await printer_factory()
+    bystander = await _fresh_spool(db_session)
+    db_session.add(SpoolAssignment(spool_id=999_999, printer_id=printer.id, ams_id=0, tray_id=1))
+    await db_session.commit()
+    assignment = await _assignment_for_slot(db_session, printer.id, 0, 1)
+
+    with caplog.at_level(logging.INFO, logger=_BINDING_LOGGER):
+        await release_spool_from_slot(db_session, assignment, reason="cleared_tray")
+    await db_session.commit()
+
+    assert await _assignment_for_slot(db_session, printer.id, 0, 1) is None
+    assert f"[slot-state] printer={printer.id} A0T1 release spool=999999 reason=cleared_tray" in _info_messages(caplog)
+    await db_session.refresh(bystander)
+    assert _last_location(bystander) == (None, None, None), "no row to stamp — and none invented"
+
+
+# -- the sweep is a release too: last-location stamped on both branches --------
+
+
+@pytest.mark.asyncio
+async def test_move_stamps_the_last_location_of_the_slot_left_behind(db_session, printer_factory):
+    """A MOVE is also a release of the old slot, so the sweep stamps the OLD triple —
+    not the new one. Without this a roll moved (rather than cleanly released) would
+    carry no reclaim hint for the slot it actually vacated."""
+    source = await printer_factory()
+    destination = await printer_factory()
+    spool = await _fresh_spool(db_session)
+    await _bind(db_session, spool, source.id, 0, 2)
+
+    await _bind(db_session, spool, destination.id, 1, 3)
+
+    await db_session.refresh(spool)
+    assert _last_location(spool) == (source.id, 0, 2), "the VACATED slot is the last location"
+    assert spool.last_location_at is not None
+
+
+@pytest.mark.asyncio
+async def test_displacement_stamps_the_evicted_spools_last_location(db_session, printer_factory):
+    """The incumbent evicted from an occupied slot goes unbound fleet-wide — the one
+    binding-state change with no destination — so it gets the stamp that lets it
+    reclaim its grams if it is re-inserted."""
+    printer = await printer_factory()
+    incumbent = await _fresh_spool(db_session)
+    incoming = await _fresh_spool(db_session)
+    await _bind(db_session, incumbent, printer.id, 0, 0)
+
+    await _bind(db_session, incoming, printer.id, 0, 0)
+
+    await db_session.refresh(incumbent)
+    await db_session.refresh(incoming)
+    assert _last_location(incumbent) == (printer.id, 0, 0)
+    assert incumbent.last_location_at is not None
+    assert _last_location(incoming) == (None, None, None), "the arriving roll released nothing"
+
+
+@pytest.mark.asyncio
+async def test_same_slot_replay_stamps_no_last_location(db_session, printer_factory):
+    """A same-spool same-slot upsert replay is a non-event: the roll never left, so
+    stamping a last location would fabricate a departure that never happened."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session)
+    await _bind(db_session, spool, printer.id, 0, 0)
+
+    await _bind(db_session, spool, printer.id, 0, 0)
+
+    await db_session.refresh(spool)
+    assert _last_location(spool) == (None, None, None)
+    assert spool.last_location_at is None
+
+
+# -- preserve_ordinal: the RECLAIM lane keeps FIFO position (rule 7) ----------
+
+
+@pytest.mark.asyncio
+async def test_preserve_ordinal_skips_the_seating_restamp(db_session, printer_factory):
+    """A pulled-and-returned roll is the SAME roll: rebinding it must not reset its
+    seating order just because the binding row was rebuilt (doctrine rule 7 — a
+    mid-life re-seat keeps position). first_loaded_at stays write-once as always."""
+    printer = await printer_factory()
+    incumbent = await _fresh_spool(db_session)
+    returning = await _fresh_spool(db_session)
+    await _bind(db_session, incumbent, printer.id, 0, 0)  # slot occupied → a real pairing change
+    returning.loaded_at = _SENTINEL
+    returning.first_loaded_at = _SENTINEL
+    await db_session.commit()
+
+    await _bind(db_session, returning, printer.id, 0, 0, preserve_ordinal=True)
+
+    await db_session.refresh(returning)
+    assert returning.loaded_at == _SENTINEL, "a reclaim keeps FIFO position"
+    assert returning.first_loaded_at == _SENTINEL
+
+
+@pytest.mark.asyncio
+async def test_pairing_change_restamps_without_preserve_ordinal(db_session, printer_factory):
+    """The default is unchanged — the opt-out is explicit, never implicit."""
+    printer = await printer_factory()
+    incumbent = await _fresh_spool(db_session)
+    incoming = await _fresh_spool(db_session)
+    await _bind(db_session, incumbent, printer.id, 0, 0)
+    incoming.loaded_at = _SENTINEL
+    await db_session.commit()
+
+    await _bind(db_session, incoming, printer.id, 0, 0)
+
+    await db_session.refresh(incoming)
+    assert incoming.loaded_at != _SENTINEL
+
+
+# -- the MOVE damper (007-H2C spool-194 flip-flop storm) ----------------------
+
+
+@pytest.mark.asyncio
+async def test_second_move_inside_the_window_is_damped(db_session, printer_factory, caplog):
+    """The storm shape: one roll presented on two trays flips the binding back and forth,
+    each pass a delete+insert plus a FIFO rewrite (spool 194: 51 moves in 5 m 21 s). The
+    second move inside the window is REFUSED — None returned, DB untouched, one WARNING."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session)
+    await _bind(db_session, spool, printer.id, 1, 0)
+    await _bind(db_session, spool, printer.id, 1, 1)  # first move: allowed, arms the window
+    spool.loaded_at = _SENTINEL
+    await db_session.commit()
+
+    with caplog.at_level(logging.WARNING, logger=_BINDING_LOGGER):
+        damped = await _bind(db_session, spool, printer.id, 1, 0)  # the flip back
+
+    assert damped is None, "a damped bind reports that nothing happened"
+    rows = await _rows_for_spool(db_session, spool.id)
+    assert len(rows) == 1 and _slot(rows[0]) == (printer.id, 1, 1), "the binding did not move"
+    await db_session.refresh(spool)
+    assert spool.loaded_at == _SENTINEL, "and the FIFO ordinal was not rewritten"
+
+    warnings = _warning_messages(caplog)
+    assert len(warnings) == 1
+    assert warnings[0].startswith(f"[slot-state] damped move: spool {spool.id} -> printer {printer.id} A1T0 ")
+    assert "within 10s" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_first_bind_is_never_damped(db_session, printer_factory, caplog):
+    """A first bind is not a move: there is no other slot to flip from, and refusing it
+    would simply lose a state change. Two different rolls binding back-to-back both land."""
+    printer = await printer_factory()
+    first = await _fresh_spool(db_session)
+    second = await _fresh_spool(db_session)
+
+    with caplog.at_level(logging.WARNING, logger=_BINDING_LOGGER):
+        assert await _bind(db_session, first, printer.id, 0, 0) is not None
+        assert await _bind(db_session, second, printer.id, 0, 1) is not None
+
+    assert _warning_messages(caplog) == []
+    assert await _total_assignments(db_session) == 2
+
+
+@pytest.mark.asyncio
+async def test_same_slot_rebind_is_never_damped(db_session, printer_factory, caplog):
+    """A re-detect of the roll already seated is not a move either — the upsert replay
+    must keep working at wire cadence."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session)
+    await _bind(db_session, spool, printer.id, 0, 0)
+
+    with caplog.at_level(logging.WARNING, logger=_BINDING_LOGGER):
+        for _ in range(3):
+            assert await _bind(db_session, spool, printer.id, 0, 0) is not None
+
+    assert _warning_messages(caplog) == []
+    rows = await _rows_for_spool(db_session, spool.id)
+    assert len(rows) == 1 and _slot(rows[0]) == (printer.id, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_operator_move_is_never_damped(db_session, printer_factory, caplog):
+    """An operator's explicit assign is a statement of fact, not a wire observation, so
+    it always wins — even immediately after a wire move of the same roll. This is the
+    ONE behaviour ``origin`` changes."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session)
+    await _bind(db_session, spool, printer.id, 0, 0)
+    await _bind(db_session, spool, printer.id, 0, 1)  # wire move arms the window
+
+    with caplog.at_level(logging.WARNING, logger=_BINDING_LOGGER):
+        assignment = await _bind(db_session, spool, printer.id, 0, 2, origin=OPERATOR_ORIGIN)
+
+    assert assignment is not None
+    assert _warning_messages(caplog) == []
+    rows = await _rows_for_spool(db_session, spool.id)
+    assert len(rows) == 1 and _slot(rows[0]) == (printer.id, 0, 2)
+
+
+@pytest.mark.asyncio
+async def test_move_is_allowed_again_once_the_window_elapses(db_session, printer_factory):
+    """The damper is a damper, not a lock: a genuine later move still lands. Clock
+    injected (the fork's RetryWindow reads the module-level monotonic at call time)."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session)
+    await _bind(db_session, spool, printer.id, 0, 0)
+    await _bind(db_session, spool, printer.id, 0, 1)
+    assert await _bind(db_session, spool, printer.id, 0, 2) is None, "inside the window"
+
+    original = rw.monotonic
+    rw.monotonic = lambda: original() + spool_binding._MOVE_DAMPER_S + 1
+    try:
+        assert await _bind(db_session, spool, printer.id, 0, 2) is not None
+    finally:
+        rw.monotonic = original
+
+    rows = await _rows_for_spool(db_session, spool.id)
+    assert len(rows) == 1 and _slot(rows[0]) == (printer.id, 0, 2)
+
+
+@pytest.mark.asyncio
+async def test_damped_move_writes_no_last_location(db_session, printer_factory):
+    """A refused move must be a genuine no-op: the sweep never runs, so the roll's
+    last-location residue is not touched either."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session)
+    await _bind(db_session, spool, printer.id, 0, 0)
+    await _bind(db_session, spool, printer.id, 0, 1)
+    await db_session.refresh(spool)
+    stamped_before = (_last_location(spool), spool.last_location_at)
+
+    assert await _bind(db_session, spool, printer.id, 0, 0) is None
+
+    await db_session.refresh(spool)
+    assert (_last_location(spool), spool.last_location_at) == stamped_before

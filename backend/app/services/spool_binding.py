@@ -23,8 +23,15 @@ Home of the three FIFO stamps too: this is now the lowest module every
 assignment-creating caller imports (``spool_tag_matcher``, ``spool_tagless``, the
 inventory route and ``ams_presence`` all import it; it imports none of them), so the
 stamps live beside the writer that fires them with no import cycle and no
-function-level import workarounds. Imports here stay strictly downward — models and
-sqlalchemy only.
+function-level import workarounds. Imports here stay strictly downward — models,
+sqlalchemy and one leaf util only.
+
+Also home of the UNBIND half of the ledger (:func:`release_spool_from_slot`): an
+assignment claims WHERE a roll physically is (doctrine rule 9, operator-ratified
+2026-08-01), so a roll leaving a slot must drop the claim — while the row keeps its
+grams. The one durable residue of the departure is the ``spool.last_location_*``
+stamp this module writes, which is what lets a pulled-and-returned roll reclaim its
+gram history on re-insert.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ from sqlalchemy.orm import selectinload
 
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
+from backend.app.utils.retry_window import RetryWindow
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,6 +57,44 @@ logger = logging.getLogger(__name__)
 # re-seat of one re-stamps its ``loaded_at`` (006-H2S FIFO rule 2). A row that has
 # fed >= this keeps position on a re-seat (maintenance of the SAME roll — rule 3).
 NEVER_FED_MAX_G = 10.0
+
+# Minimum spacing between MOVE binds of ONE roll. A physical roll cannot be in two
+# trays, so two moves of the same spool inside this window are a wire artefact, not
+# two journeys: sticky identity across partial AMS pushes can present one tag on two
+# trays, and each pass then produces two moves (007-H2C, 2026-08-01: spool 194
+# ping-ponged AMS1-T0 ⇄ T1, 51 move lines in 5 m 21 s, each one a DB delete+insert, a
+# WS broadcast, an un-throttled cali publish and a ``loaded_at`` rewrite that shredded
+# the roll's FIFO seniority ~1440×). Keyed on ``spool.id`` ALONE — deliberately not
+# per-slot or per-printer, because the flip is BETWEEN slots and can cross printers.
+_MOVE_DAMPER_S = 10.0
+
+_move_damper = RetryWindow(_MOVE_DAMPER_S)
+
+# The one origin exempt from the move damper: an operator's explicit assign is a
+# statement of fact, not a wire observation, so it is never second-guessed. This is
+# the SOLE behavioural effect ``origin`` has — every other use is log attribution.
+OPERATOR_ORIGIN = "manual_api"
+
+
+def _stamp_last_location(spool: Spool, *, printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Record where ``spool`` was last physically bound, as of now.
+
+    Written ONLY from this module's two unbind paths (:func:`release_spool_from_slot`
+    and :func:`bind_spool_to_slot`'s sweep — a move or a displacement is also a
+    release of the OLD location). Documented denormalization: the same fact is in the
+    ``[slot-state] … release`` log line this module emits, and that log line is the
+    normal-form source, but logs are rotated while the reclaim lane must still work
+    weeks later and must stay a join-free column read on the candidate row. NULLs
+    mean "never released from a slot" — an in-service or never-bound roll.
+
+    ``last_location_printer_id`` deliberately carries NO foreign key: a deleted
+    printer must not cascade away a roll's gram-continuity hint, and the value is a
+    historical observation, not a live reference.
+    """
+    spool.last_location_printer_id = printer_id
+    spool.last_location_ams_id = ams_id
+    spool.last_location_tray_id = tray_id
+    spool.last_location_at = datetime.utcnow()
 
 
 def stamp_first_loaded(spool: Spool) -> None:
@@ -142,6 +188,50 @@ async def stamp_loaded_for_slot(db: AsyncSession, printer_id: int, ams_id: int, 
     return True
 
 
+async def release_spool_from_slot(db: AsyncSession, assignment: SpoolAssignment, *, reason: str) -> None:
+    """Drop one AMS-slot location claim — the ONE unbind writer.
+
+    An assignment row says WHERE a roll physically is (doctrine rule 9): the roll's
+    grams live on the spool row, so releasing a slot costs no ledger history. Every
+    deliberate unbind goes through here — the operator's ``DELETE /assignments``
+    route today, the wire pipeline's release-on-empty transition next — so the
+    departure always leaves the same two artefacts:
+
+    * ``spool.last_location_*`` stamped from the assignment's own triple
+      (:func:`_stamp_last_location`), the durable residue the reclaim lane reads when
+      the roll comes back: a pulled-for-drying roll re-inserted into the same slot is
+      rebound to its OWN row (grams continue) instead of minting a fresh 0 g one.
+    * one ``[slot-state]`` INFO line, the structured grammar the forensics lane
+      greps (``support/logs``) — the reason an incident is a query, not a session.
+
+    A missing spool row (hand-deleted / cascade race) still releases the slot: the
+    location claim is bogus either way, and only the stamp is skipped.
+
+    The caller keeps commit ownership (this only flushes), matching
+    :func:`bind_spool_to_slot` and every existing call site's transaction shape.
+    """
+    printer_id = assignment.printer_id
+    ams_id = assignment.ams_id
+    tray_id = assignment.tray_id
+    spool_id = assignment.spool_id
+
+    spool = await db.get(Spool, spool_id)
+    if spool is not None:
+        _stamp_last_location(spool, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id)
+
+    await db.delete(assignment)
+    await db.flush()
+
+    logger.info(
+        "[slot-state] printer=%d A%dT%d release spool=%d reason=%s",
+        printer_id,
+        ams_id,
+        tray_id,
+        spool_id,
+        reason,
+    )
+
+
 async def bind_spool_to_slot(
     db: AsyncSession,
     spool: Spool,
@@ -152,7 +242,8 @@ async def bind_spool_to_slot(
     fingerprint_color: str | None,
     fingerprint_type: str | None,
     origin: str,
-) -> SpoolAssignment:
+    preserve_ordinal: bool = False,
+) -> SpoolAssignment | None:
     """Bind ``spool`` to one AMS slot with MOVE semantics — the ONE binding writer.
 
     Every production path that creates a :class:`SpoolAssignment` goes through here
@@ -166,25 +257,43 @@ async def bind_spool_to_slot(
        is what distinguishes a genuine binding CHANGE (new roll here → re-stamp the
        FIFO ordinal) from a same-spool upsert replay (re-detect of the roll already
        seated → keep position).
-    2. Sweep: delete the target-slot row AND every other row bound to this spool on
+    2. Damp: if this spool already holds a binding on a DIFFERENT slot, the call is a
+       MOVE, and a second move of the same roll inside :data:`_MOVE_DAMPER_S` is
+       refused (returns None, nothing written) — see the constant for the 007-H2C
+       flip-flop storm it exists for. First binds and same-slot re-binds are never
+       damped (they are not moves), and neither is ``origin`` :data:`OPERATOR_ORIGIN`.
+    3. Sweep: delete the target-slot row AND every other row bound to this spool on
        ANY printer/AMS/tray. A roll that reappears elsewhere MOVED — the old binding
        is stale by physics, and leaving it is exactly the 012-H2S duplicate that fed
        one roll's grams into two trays' ledgers. Every binding-state CHANGE the sweep
-       makes leaves an INFO trail, in both directions: a row of THIS spool elsewhere
-       is logged as a move (from→to), and an INCUMBENT different spool on the target
-       slot is logged as a displacement (it goes unbound fleet-wide, so silence there
-       would be the one unrecorded state change). A same-spool same-slot replay
-       changes nothing and stays silent.
-    3. Flush BEFORE the insert. SQLAlchemy orders INSERTs before DELETEs within one
+       makes leaves an INFO trail AND stamps the departing roll's
+       ``last_location_*`` (a move / displacement is also a release of the old slot),
+       in both directions: a row of THIS spool elsewhere is logged as a move
+       (from→to), and an INCUMBENT different spool on the target slot is logged as a
+       displacement (it goes unbound fleet-wide, so silence there would be the one
+       unrecorded state change). A same-spool same-slot replay changes nothing: no
+       log, no stamp.
+    4. Flush BEFORE the insert. SQLAlchemy orders INSERTs before DELETEs within one
        flush, so without this the transient duplicate trips
        ``ux_spool_assignment_spool_id`` (and, on a same-slot replay, the
        ``(printer_id, ams_id, tray_id)`` constraint).
-    4. Create + add + flush the new row.
-    5. Stamp: :func:`stamp_first_loaded` always (write-once), :func:`stamp_loaded`
-       only when the pairing changed.
+    5. Create + add + flush the new row.
+    6. Stamp: :func:`stamp_first_loaded` always (write-once), :func:`stamp_loaded`
+       only when the pairing changed and ``preserve_ordinal`` is False.
+
+    ``preserve_ordinal`` is the RECLAIM lane's opt-out of step 6's re-stamp: a roll
+    pulled for drying / maintenance and returned is the SAME physical roll, so it
+    keeps its FIFO seating position (doctrine rule 7 — a mid-life re-seat keeps
+    position). Without it the reclaim would look like a new roll to the
+    ``first_loaded`` selector purely because the binding row was rebuilt.
 
     ``origin`` ("rfid_auto" | "tagless_setting" | "manual_api") is log attribution
-    only — it never changes behaviour, so no path can quietly earn an exemption.
+    plus exactly ONE behavioural carve-out — :data:`OPERATOR_ORIGIN` bypasses the
+    move damper, because an operator's explicit assign is a statement of fact rather
+    than a wire observation. No other exemption exists.
+
+    Returns the new assignment, or None when the move damper refused the call (the
+    DB is untouched — callers must treat None as "no binding change happened").
 
     The caller keeps commit ownership (this only flushes), matching every call site's
     existing transaction shape.
@@ -204,8 +313,27 @@ async def bind_spool_to_slot(
     if target is not None and all(row is not target for row in doomed):
         doomed.append(target)
 
+    # A row of this spool on another slot is the ONLY thing that makes this a move —
+    # evaluate the damper on nothing else, so a first bind and a same-slot re-bind
+    # can never be suppressed (they carry no flip-flop risk and refusing them would
+    # simply lose a state change).
+    is_move = any(row is not target for row in doomed)
+    if is_move and origin != OPERATOR_ORIGIN and not _move_damper.allow(spool.id):
+        logger.warning(
+            "[slot-state] damped move: spool %d -> printer %d A%dT%d (origin=%s) — another move of this "
+            "roll landed within %.0fs; a roll cannot be in two trays, so this is wire churn",
+            spool.id,
+            printer_id,
+            ams_id,
+            tray_id,
+            origin,
+            _MOVE_DAMPER_S,
+        )
+        return None
+
     for row in doomed:
         if row is not target:
+            _stamp_last_location(spool, printer_id=row.printer_id, ams_id=row.ams_id, tray_id=row.tray_id)
             logger.info(
                 "spool %d moved: unbound from printer %d AMS%d-T%d -> printer %d AMS%d-T%d (origin=%s)",
                 spool.id,
@@ -220,8 +348,12 @@ async def bind_spool_to_slot(
         elif old_spool_id != spool.id:
             # The incumbent of the target slot is a DIFFERENT roll: it loses its only
             # binding and goes unbound fleet-wide. Logged so the one binding-state
-            # change with no destination still leaves a trail (a same-spool replay,
-            # old_spool_id == spool.id, is a non-event and stays silent).
+            # change with no destination still leaves a trail, and stamped so the
+            # evicted roll can still reclaim its grams if it is re-inserted (a same-
+            # spool replay, old_spool_id == spool.id, is a non-event: neither).
+            incumbent = await db.get(Spool, old_spool_id)
+            if incumbent is not None:
+                _stamp_last_location(incumbent, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id)
             logger.info(
                 "spool %d displaced: unbound from printer %d AMS%d-T%d by spool %d (origin=%s)",
                 old_spool_id,
@@ -253,8 +385,9 @@ async def bind_spool_to_slot(
     # Re-stampable FIFO ordinal: a binding CHANGE to a different spool row (RFID
     # auto-assign, tagless mint, respool re-bind, from-slot route, manual assign —
     # all new-row callers) is a reliable novelty event, so the seating order rides
-    # it. A same-spool upsert replay keeps position.
-    if old_spool_id != spool.id:
+    # it. A same-spool upsert replay keeps position, and so does an explicit
+    # ``preserve_ordinal`` reclaim (the SAME roll returning — doctrine rule 7).
+    if old_spool_id != spool.id and not preserve_ordinal:
         stamp_loaded(spool)
 
     return assignment

@@ -11,6 +11,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.services.spool_binding import bind_spool_to_slot
+from backend.app.services.tray_fields import ZERO_TAG_UID, ZERO_TRAY_UUID
 from backend.app.utils.printer_models import extruder_for_ams, nozzle_for_ams_unit
 from backend.app.utils.retry_window import RetryWindow
 from backend.app.utils.tag_normalization import (
@@ -20,9 +21,11 @@ from backend.app.utils.tag_normalization import (
 
 logger = logging.getLogger(__name__)
 
-# Zero-value constants for tag validation
-ZERO_TAG_UID = "0000000000000000"
-ZERO_TRAY_UUID = "00000000000000000000000000000000"
+# NOTE: ``ZERO_TAG_UID``/``ZERO_TRAY_UUID`` are imported above from
+# ``services.tray_fields`` — ONE origin for that wire vocabulary, shared with the MQTT
+# merge and the observation layer (the byte-identical local copies this module used to
+# define are deleted). They stay importable from here: ``spool_respool`` and
+# ``api.routes.printers`` have always sourced them from this module.
 
 # Minimum spacing between K-profile drift re-applies on ONE slot. The drift check
 # runs on every AMS push, and an identify's tray-state flap republishes cali_idx
@@ -32,6 +35,19 @@ ZERO_TRAY_UUID = "00000000000000000000000000000000"
 _KDRIFT_RETRY_S = 30.0
 
 _kdrift_window = RetryWindow(_KDRIFT_RETRY_S)
+
+# Minimum spacing between IDENTICAL ``extrusion_cali_sel`` publishes on one slot from
+# the auto-assign lane. Every bind re-publishes the slot's calibration selection, so a
+# bind flap published one cali frame per pass into an AMS that was already churning
+# (007-H2C 2026-08-01: 51 binds in 5 m 21 s, each one a publish). Keyed on the SLOT
+# **and the cali_idx**: a re-publish of the value the slot already carries is pure
+# noise, while a CHANGED cali_idx forms a new key and goes out immediately — the
+# throttle can never delay a real calibration change. Deliberately a SEPARATE window
+# from :data:`_kdrift_window`: the drift lane's key is the slot alone, and sharing one
+# window would let either lane's attempt silence the other's.
+_CALI_SEL_RETRY_S = 30.0
+
+_cali_sel_window = RetryWindow(_CALI_SEL_RETRY_S)
 
 
 def is_valid_tag(tag_uid: str, tray_uuid: str) -> bool:
@@ -439,24 +455,81 @@ async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str, *, co
     the scanned tray_uuid already owned by a DIFFERENT non-archived spool —
     suppresses the variance match entirely, protecting the reused-tag re-spool
     sibling guard (which keys on tray_uuid uniqueness).
+
+    **``tray_uuid`` IS the spool's identity; ``tag_uid`` is a read of ONE of its two
+    chips (2026-08-01).** A Bambu roll carries TWO RFID tags — one per flange side —
+    that share a single ``tray_uuid``, and the AMS reads whichever side happens to face
+    its antenna (the sibling shape ``spool_respool.RespoolSiblingConflict`` was written
+    for). So on the exact-uuid path a stored ``tag_uid`` that DISAGREES with the scan is
+    the SAME roll read on its other chip, and the row is returned — logged INFO, never
+    refused, and never converged (rewriting the stored tag would just flip-flop as the
+    roll is re-seated; convergence belongs to the variance lane alone).
+
+    Verified live on production 2026-08-01, 4/4 slots: every slot whose wire
+    ``tag_uid`` differed from its bound spool's stored one matched EXACTLY on
+    ``tray_uuid`` and agreed with the ledger on remaining weight — spool 46
+    (EC96F1E7…/3CF1F3E7…, uuid 8AC9EC08…, 20 % ↔ 180 g), spool 194 (A5E7210D…/
+    95F6F50C…, uuid 3C78FA47…, 14 % ↔ 140 g), spool 196 (66839BE0…/D6385CEC…, uuid
+    0F8FCF60…, 100 % ↔ 1000 g), spool 186 (CBB0D0FE…/23383932…, uuid A74AC09B…,
+    100 % ↔ 1000 g). Minting on a tag-only disagreement would therefore have created a
+    DUPLICATE row for a single roll on all four.
+
+    **Cross-identifier refusal stays on the VARIANCE path only** (2026-08-01, plan
+    §"Root causes confirmed (RFID/binding lane)"): first-character tolerance covers a
+    reader quirk on ONE identifier and may never span a ``tray_uuid`` disagreement,
+    because both sides asserting different uuids is positive proof of a different roll.
     """
     tray_uuid_norm = _normalize_tray_uuid(tray_uuid)
     tag_uid_norm = _normalize_tag_uid(tag_uid)
     tray_uuid_valid = bool(
         tray_uuid_norm and tray_uuid_norm != ZERO_TRAY_UUID and tray_uuid_norm != "0" * len(tray_uuid_norm)
     )
+    tag_uid_valid = bool(tag_uid_norm and tag_uid_norm != ZERO_TAG_UID and tag_uid_norm != "0" * len(tag_uid_norm))
+
+    def _uuid_conflicts(stored_uuid: str | None) -> bool:
+        """True when the scan and ``stored_uuid`` are BOTH valid and DIFFER."""
+        if not tray_uuid_valid:
+            return False
+        stored = _normalize_tray_uuid(stored_uuid or "")
+        if not stored or stored == ZERO_TRAY_UUID or stored == "0" * len(stored):
+            return False
+        return stored != tray_uuid_norm
+
+    def _tag_conflicts(stored_tag: str | None) -> bool:
+        """True when the scan and ``stored_tag`` are BOTH valid and DIFFER."""
+        if not tag_uid_valid:
+            return False
+        stored = _normalize_tag_uid(stored_tag or "")
+        if not stored or stored == ZERO_TAG_UID or stored == "0" * len(stored):
+            return False
+        return stored != tag_uid_norm
 
     async def _accept_variance(candidate: Spool, kind: str) -> Spool | None:
         """Different-roll guard + one-time convergence for a variance match.
 
-        Returns ``candidate`` to accept the match, or None to skip it. When the
-        scanned tray_uuid is valid and already belongs to a DIFFERENT non-archived
-        spool, this is a genuine different-roll signal (a reused tag on a fresh
-        roll): skip the variance match so exact/uuid matching — or the caller's
-        unlink — stands, and never converge onto a colliding tray_uuid. On a real
-        variance match, ``converge`` callers persist the scanned identifiers onto
-        the spool once so the reader-variance loop cannot recur.
+        Returns ``candidate`` to accept the match, or None to skip it. Two distinct
+        refusals, both meaning "different roll":
+
+        * the scanned tray_uuid CONFLICTS with the candidate's own stored one (both
+          valid, different) — first-char tolerance covers a reader quirk on ONE
+          identifier, never a disagreement on the other;
+        * the scanned tray_uuid already belongs to a DIFFERENT non-archived spool (a
+          reused tag on a fresh roll) — exact/uuid matching, or the caller's unlink,
+          must stand instead, and a colliding uuid must never be converged onto.
+
+        On a real variance match, ``converge`` callers persist the scanned identifiers
+        onto the spool once so the reader-variance loop cannot recur.
         """
+        if _uuid_conflicts(candidate.tray_uuid):
+            logger.warning(
+                "Refusing %s variance match on spool %d: scanned tray_uuid %s conflicts with its stored %s "
+                "(both valid → different roll, not reader variance)",
+                kind,
+                candidate.id,
+                tray_uuid_norm,
+                _normalize_tray_uuid(candidate.tray_uuid),
+            )
+            return None
         if tray_uuid_valid:
             other = await db.execute(
                 select(Spool.id)
@@ -509,11 +582,25 @@ async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str, *, co
             .limit(1)
         )
         spool = result.scalar_one_or_none()
+        if spool is not None and _tag_conflicts(spool.tag_uid):
+            # SIBLING TAG, not a different roll (2026-08-01, 4/4 prod slots — see the
+            # docstring). The uuid is the roll's identity; the two chips on its flanges
+            # share it, so a scan from the far side legitimately disagrees with the one
+            # tag this row happens to store. Return the row and log it — deliberately
+            # WITHOUT converging the stored tag: whichever side faces the antenna is a
+            # property of how the roll was seated, not a reader defect to correct.
+            logger.info(
+                "[sibling-tag] tray_uuid match on spool %d: scanned tag %s differs from stored %s — "
+                "second RFID tag of the same roll (Bambu rolls carry two tags per tray_uuid); same spool",
+                spool.id,
+                tag_uid_norm,
+                _normalize_tag_uid(spool.tag_uid),
+            )
         if spool:
             return spool
 
     # Fall back to tag_uid
-    if tag_uid_norm and tag_uid_norm != ZERO_TAG_UID and tag_uid_norm != "0" * len(tag_uid_norm):
+    if tag_uid_valid:
         result = await db.execute(
             select(Spool)
             .options(selectinload(Spool.k_profiles), selectinload(Spool.assignments))
@@ -524,19 +611,29 @@ async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str, *, co
         if spool:
             return spool
 
-        # Compatibility fallback: some readers report 4-byte UID (8 hex) while
-        # stored values may contain longer forms. Prefer suffix match only.
+        # Compatibility fallback: some readers report a 4-byte UID (8 hex) while the
+        # stored value is the full 8-byte form, and one physical chip can read back
+        # with a different FIRST character across readers.
+        #
+        # Every pattern here constrains the WHOLE scanned uid (or all of it but the
+        # first character). The old `%{suffix8}` and `%{short_uid_body}%` dragnets are
+        # DELETED: Bambu tag uids all end "00000100", so a suffix-8 LIKE matched very
+        # nearly the entire inventory and any two distinct rolls could be merged onto
+        # one ledger row — with `converge=True` making the merge permanent
+        # (2026-08-01 false-merge hazard, plan §"Root causes confirmed").
         if len(tag_uid_norm) >= 8:
-            suffix8 = tag_uid_norm[-8:]
-            short_uid_body = tag_uid_norm[1:] if len(tag_uid_norm) == 8 else ""
-
-            # Build LIKE patterns for candidates search
             like_patterns = [
+                # Stored form carries the whole scanned uid at its end (legacy
+                # left-padded stored values).
                 func.upper(Spool.tag_uid).like(f"%{tag_uid_norm}"),
-                func.upper(Spool.tag_uid).like(f"%{suffix8}"),
+                # Genuine 8-char short read: a Bambu uid's DISTINCTIVE bytes are the
+                # LEADING ones (the trailing ones are the constant family suffix), so
+                # a short read is a PREFIX of the stored full form.
+                func.upper(Spool.tag_uid).like(f"{tag_uid_norm}%"),
+                # First-char reader variance, and nothing looser — `_` matches exactly
+                # ONE character, so this is "the same uid bar its first character".
+                func.upper(Spool.tag_uid).like(f"_{tag_uid_norm[1:]}%"),
             ]
-            if short_uid_body:
-                like_patterns.append(func.upper(Spool.tag_uid).like(f"%{short_uid_body}%"))
 
             candidates = await db.execute(
                 select(Spool)
@@ -554,9 +651,12 @@ async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str, *, co
                     continue
                 if candidate_uid == tag_uid_norm:
                     return candidate
-                if len(candidate_uid) > len(tag_uid_norm) and candidate_uid.endswith(tag_uid_norm):
+                # Length-difference relations are PREFIX-oriented (converted from the
+                # old suffix ones): a short read is the LEADING bytes of the full uid,
+                # in whichever direction the length difference happens to run.
+                if len(candidate_uid) > len(tag_uid_norm) and candidate_uid.startswith(tag_uid_norm):
                     return candidate
-                if len(tag_uid_norm) > len(candidate_uid) and tag_uid_norm.endswith(candidate_uid):
+                if len(tag_uid_norm) > len(candidate_uid) and tag_uid_norm.startswith(candidate_uid):
                     return candidate
                 # Backward-compatible matching: allow first-character mismatch
                 # when remaining characters match. This handles cases where the same
@@ -583,6 +683,37 @@ async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str, *, co
     return None
 
 
+async def find_spool_sharing_tray_uuid(db: AsyncSession, tray_uuid: str) -> Spool | None:
+    """The active spool row that OWNS ``tray_uuid`` — a uuid-OWNERSHIP lookup.
+
+    Narrower than :func:`get_spool_by_tag` on purpose. The resolver answers "which row
+    IS this roll?" over BOTH identifiers (uuid-primary, then the tag lane with its
+    variance tolerance); this answers only "does an active row already claim this
+    uuid?", with no tag fallback and no widening. Callers want the narrow question when
+    they adjudicate tag disagreements THEMSELVES rather than delegating:
+
+    * the W3 slot orchestrator's uuid-primary candidate lookup — the uuid-owning row is
+      the first candidate it offers ``slot_state.resolve``, the exact-tag row second;
+    * the re-spool sibling guard (``spool_respool.RespoolSiblingConflict``), which must
+      distinguish a reused-type row already holding this uuid (409) from the donor roll
+      itself, and so cannot accept a pre-made verdict.
+
+    Because a Bambu roll carries TWO RFID tags sharing one ``tray_uuid``, the returned
+    row's stored ``tag_uid`` may legitimately differ from any tag the caller scanned —
+    that is a sibling read of the same roll, not a signal to mint.
+    """
+    uuid_norm = _normalize_tray_uuid(tray_uuid)
+    if not uuid_norm or uuid_norm == ZERO_TRAY_UUID or uuid_norm == "0" * len(uuid_norm):
+        return None
+    result = await db.execute(
+        select(Spool)
+        .options(selectinload(Spool.k_profiles), selectinload(Spool.assignments))
+        .where(func.upper(Spool.tray_uuid) == uuid_norm, Spool.archived_at.is_(None))
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def auto_assign_spool(
     printer_id: int,
     ams_id: int,
@@ -591,13 +722,18 @@ async def auto_assign_spool(
     printer_manager,
     db: AsyncSession,
     tray_info_idx: str = "",
-) -> SpoolAssignment:
+) -> SpoolAssignment | None:
     """Create a SpoolAssignment and auto-configure the AMS slot via MQTT.
 
     For BL spools (RFID-detected), only K-profile commands are sent.
     ams_set_filament_setting is NOT sent because the firmware already has
     filament configuration from the RFID tag, and sending it would destroy
     the RFID-detected state (eye → pen icon in BambuStudio).
+
+    Returns None when the writer's move damper refused the bind (a second move of the
+    same roll within its window — wire churn, not a journey). Nothing is written and
+    nothing is published in that case, so callers must treat None as "no binding
+    change happened" rather than as a failure.
     """
     # Get current tray state for fingerprint
     fingerprint_color = None
@@ -631,6 +767,12 @@ async def auto_assign_spool(
         fingerprint_type=fingerprint_type,
         origin="rfid_auto",
     )
+    if assignment is None:
+        # The move damper refused this bind: the DB is untouched, so there is no new
+        # binding to calibrate, no slot-preset row to reconcile and nothing to
+        # announce. Returning early is what keeps a bind flap from also becoming a
+        # publish flap.
+        return None
 
     # Apply K-profile via MQTT (if available)
     # NOTE: Do NOT send ams_set_filament_setting here. This function is only
@@ -655,48 +797,72 @@ async def auto_assign_spool(
                 # under which the K-profile was calibrated. Use spool.slicer_filament
                 # (the preset assigned in inventory), falling back to tray's RFID value.
                 cali_filament_id = spool.slicer_filament or tray_info_idx or ""
-                client.extrusion_cali_sel(
-                    ams_id=ams_id,
-                    tray_id=tray_id,
-                    cali_idx=matching_kp.cali_idx,
-                    filament_id=cali_filament_id,
-                    nozzle_diameter=nozzle_diameter,
-                )
+                if _cali_sel_window.allow((printer_id, ams_id, tray_id, matching_kp.cali_idx)):
+                    client.extrusion_cali_sel(
+                        ams_id=ams_id,
+                        tray_id=tray_id,
+                        cali_idx=matching_kp.cali_idx,
+                        filament_id=cali_filament_id,
+                        nozzle_diameter=nozzle_diameter,
+                    )
 
-                # NOTE: Do NOT send extrusion_cali_set here. extrusion_cali_sel already
-                # selected the correct profile by cali_idx. Sending extrusion_cali_set
-                # with the same cali_idx would MODIFY the existing profile's metadata
-                # (extruder_id, nozzle_id, name), corrupting it.
+                    # NOTE: Do NOT send extrusion_cali_set here. extrusion_cali_sel already
+                    # selected the correct profile by cali_idx. Sending extrusion_cali_set
+                    # with the same cali_idx would MODIFY the existing profile's metadata
+                    # (extruder_id, nozzle_id, name), corrupting it.
 
-                logger.info(
-                    "Applied K-profile cali_idx=%d for spool %d on printer %d AMS%d-T%d",
-                    matching_kp.cali_idx,
-                    spool.id,
-                    printer_id,
-                    ams_id,
-                    tray_id,
-                )
+                    logger.info(
+                        "Applied K-profile cali_idx=%d for spool %d on printer %d AMS%d-T%d",
+                        matching_kp.cali_idx,
+                        spool.id,
+                        printer_id,
+                        ams_id,
+                        tray_id,
+                    )
+                else:
+                    logger.debug(
+                        "Throttled extrusion_cali_sel for spool %d on printer %d AMS%d-T%d: cali_idx=%d "
+                        "already published within %.0fs",
+                        spool.id,
+                        printer_id,
+                        ams_id,
+                        tray_id,
+                        matching_kp.cali_idx,
+                        _CALI_SEL_RETRY_S,
+                    )
             elif tray is not None:
                 # No stored K-profile: fall back to the slot's current live cali_idx
                 # so the printer keeps its existing calibration selection.
                 live_cali_idx = tray.get("cali_idx")
                 if live_cali_idx is not None and live_cali_idx >= 0:
                     cali_filament_id = spool.slicer_filament or tray_info_idx or ""
-                    client.extrusion_cali_sel(
-                        ams_id=ams_id,
-                        tray_id=tray_id,
-                        cali_idx=live_cali_idx,
-                        filament_id=cali_filament_id,
-                        nozzle_diameter=nozzle_diameter,
-                    )
-                    logger.info(
-                        "No stored K-profile for spool %d on printer %d AMS%d-T%d — preserved live cali_idx=%d",
-                        spool.id,
-                        printer_id,
-                        ams_id,
-                        tray_id,
-                        live_cali_idx,
-                    )
+                    if _cali_sel_window.allow((printer_id, ams_id, tray_id, live_cali_idx)):
+                        client.extrusion_cali_sel(
+                            ams_id=ams_id,
+                            tray_id=tray_id,
+                            cali_idx=live_cali_idx,
+                            filament_id=cali_filament_id,
+                            nozzle_diameter=nozzle_diameter,
+                        )
+                        logger.info(
+                            "No stored K-profile for spool %d on printer %d AMS%d-T%d — preserved live cali_idx=%d",
+                            spool.id,
+                            printer_id,
+                            ams_id,
+                            tray_id,
+                            live_cali_idx,
+                        )
+                    else:
+                        logger.debug(
+                            "Throttled extrusion_cali_sel for spool %d on printer %d AMS%d-T%d: live cali_idx=%d "
+                            "already published within %.0fs",
+                            spool.id,
+                            printer_id,
+                            ams_id,
+                            tray_id,
+                            live_cali_idx,
+                            _CALI_SEL_RETRY_S,
+                        )
 
             logger.info(
                 "Auto-assigned spool %d to printer %d AMS%d-T%d (RFID match)",

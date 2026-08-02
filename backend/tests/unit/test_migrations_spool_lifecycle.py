@@ -497,10 +497,29 @@ async def _has_unique_spool_index(conn) -> bool:
     return row is not None
 
 
+async def _make_printer(session, printer_id: int = 1):
+    """A real ``printers`` row. Bindings must point at one: the orphan purge (W2)
+    deletes assignments whose printer no longer exists, so a fixture that relied on
+    SQLite's unenforced FK would be swept away by the very migration under test."""
+    from backend.app.models.printer import Printer
+
+    printer = Printer(
+        id=printer_id,
+        name=f"P{printer_id}",
+        serial_number=f"SERIAL{printer_id}",
+        ip_address="127.0.0.1",
+        access_code="0000",
+    )
+    session.add(printer)
+    await session.flush()
+    return printer
+
+
 async def _seed_pre_migration_bindings(engine, session_maker) -> tuple[int, int]:
     """Spool X bound to TWO slots (older row id 10 < newer row id 20) plus one clean
     binding for spool Y (row 30). Explicit ids so "newest = MAX(id)" is decidable."""
     async with session_maker() as session:
+        await _make_printer(session)
         duped = await _make_spool(session, material="PLA")
         clean = await _make_spool(session, material="PETG")
         await session.commit()
@@ -580,3 +599,163 @@ async def test_binding_dedupe_is_idempotent(engine, session_maker, caplog):
 
     assert second_pass == first_pass, "the second pass must delete nothing further"
     assert [r.getMessage() for r in caplog.records if _DUP_WARNING in r.getMessage()] == []
+
+
+# ---------------------------------------------------------------------------
+# W2 (spool-core re-architecture): last-location residue, pre_configured_at
+# backfill, orphaned-binding purge
+# ---------------------------------------------------------------------------
+
+_LAST_LOCATION_COLUMNS = (
+    "last_location_printer_id",
+    "last_location_ams_id",
+    "last_location_tray_id",
+    "last_location_at",
+)
+
+
+async def _assignment_columns(conn) -> set[str]:
+    rows = (await conn.execute(text("PRAGMA table_info(spool_assignment)"))).fetchall()
+    return {row[1] for row in rows}
+
+
+@pytest.mark.asyncio
+async def test_migration_readds_the_five_w2_columns(engine):
+    """Dropping the five columns simulates a pre-W2 schema; run_migrations re-adds all
+    of them (four on spool, one on spool_assignment)."""
+    async with engine.begin() as conn:
+        for column in _LAST_LOCATION_COLUMNS:
+            await conn.execute(text(f"ALTER TABLE spool DROP COLUMN {column}"))
+        await conn.execute(text("ALTER TABLE spool_assignment DROP COLUMN pre_configured_at"))
+        assert not (await _spool_columns(conn)) & set(_LAST_LOCATION_COLUMNS)
+        assert "pre_configured_at" not in await _assignment_columns(conn)
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        assert set(_LAST_LOCATION_COLUMNS) <= await _spool_columns(conn)
+        assert "pre_configured_at" in await _assignment_columns(conn)
+
+
+@pytest.mark.asyncio
+async def test_blank_fingerprint_rows_are_backfilled_as_pre_configured(engine, session_maker):
+    """Pre-config intent used to be INFERRED from a blank fingerprint_type. Every row
+    carrying that shape today means exactly that, so the migration migrates it to the
+    explicit column — and leaves ordinary location claims (a real fingerprint) NULL."""
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    async with session_maker() as session:
+        await _make_printer(session)
+        blank = await _make_spool(session, material="PLA")
+        empty_string = await _make_spool(session, material="PETG")
+        claimed = await _make_spool(session, material="ABS")
+        session.add_all(
+            [
+                SpoolAssignment(spool_id=blank.id, printer_id=1, ams_id=0, tray_id=0, fingerprint_type=None),
+                SpoolAssignment(spool_id=empty_string.id, printer_id=1, ams_id=0, tray_id=1, fingerprint_type=""),
+                SpoolAssignment(spool_id=claimed.id, printer_id=1, ams_id=0, tray_id=2, fingerprint_type="PETG"),
+            ]
+        )
+        await session.commit()
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(text("SELECT tray_id, pre_configured_at FROM spool_assignment ORDER BY tray_id"))
+        ).fetchall()
+
+    assert rows[0][1] is not None, "NULL fingerprint == the old pre-configured inference"
+    assert rows[1][1] is not None, "empty-string fingerprint too"
+    assert rows[2][1] is None, "a row with a real fingerprint is an ordinary location claim"
+
+
+@pytest.mark.asyncio
+async def test_pre_configured_backfill_never_restamps(engine, session_maker):
+    """Idempotent by the IS NULL guard: a second pass must not move a stamp already
+    written (a re-run would otherwise re-date every pre-config on every restart)."""
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    async with session_maker() as session:
+        await _make_printer(session)
+        spool = await _make_spool(session, material="PLA")
+        session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0, fingerprint_type=""))
+        await session.commit()
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        first = (await conn.execute(text("SELECT pre_configured_at FROM spool_assignment"))).scalar_one()
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        second = (await conn.execute(text("SELECT pre_configured_at FROM spool_assignment"))).scalar_one()
+
+    assert first is not None
+    assert second == first
+
+
+@pytest.mark.asyncio
+async def test_orphaned_bindings_are_purged_and_counted(engine, session_maker, caplog):
+    """PRE-EXISTING bug: ``DELETE /printers/{id}`` never removed the printer's
+    SpoolAssignment rows and SQLite enforces no FK cascade, so every printer ever
+    deleted left invisible bindings that still held their spools "assigned". The
+    migration clears the rows already orphaned — and only those."""
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    async with session_maker() as session:
+        await _make_printer(session, printer_id=1)
+        live = await _make_spool(session, material="PLA")
+        orphaned = await _make_spool(session, material="PETG")
+        session.add_all(
+            [
+                SpoolAssignment(spool_id=live.id, printer_id=1, ams_id=0, tray_id=0),
+                SpoolAssignment(spool_id=orphaned.id, printer_id=42, ams_id=0, tray_id=1),  # printer 42 is gone
+            ]
+        )
+        await session.commit()
+        live_id, orphaned_id = live.id, orphaned.id
+
+    with caplog.at_level(logging.INFO, logger=_DB_LOGGER):
+        async with engine.begin() as conn:
+            await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(text("SELECT spool_id, printer_id FROM spool_assignment ORDER BY spool_id"))
+        ).fetchall()
+
+    assert [tuple(r) for r in rows] == [(live_id, 1)], "the live binding survives, the orphan is gone"
+    purge_lines = [r.getMessage() for r in caplog.records if "orphaned spool binding" in r.getMessage()]
+    assert len(purge_lines) == 1
+    assert purge_lines[0].startswith("purging 1 orphaned spool binding(s)")
+    assert f"spool {orphaned_id}→printer 42" in purge_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_orphan_purge_is_silent_and_idempotent_on_a_clean_table(engine, session_maker, caplog):
+    """A clean table matches zero rows: no deletions, and no log noise on every
+    restart of a healthy install."""
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    async with session_maker() as session:
+        await _make_printer(session)
+        spool = await _make_spool(session, material="PLA")
+        session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
+        await session.commit()
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_DB_LOGGER):
+        async with engine.begin() as conn:
+            await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        count = (await conn.execute(text("SELECT COUNT(*) FROM spool_assignment"))).scalar_one()
+
+    assert count == 1
+    assert [r.getMessage() for r in caplog.records if "orphaned spool binding" in r.getMessage()] == []

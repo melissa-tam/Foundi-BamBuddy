@@ -23,6 +23,13 @@ import paho.mqtt.client as mqtt
 
 from backend.app.services.hms_actions import HMSAction, get_actions_for_error_code
 from backend.app.services.hms_errors import hms_severity
+from backend.app.services.tray_fields import (
+    ZERO_TAG_UID,
+    ZERO_TRAY_UUID,
+    parse_tray_exist_bits,
+    parse_tray_state,
+    slot_exist_bit_set,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,24 +118,6 @@ def parse_ams_filament_backup_from_cfg(cfg_raw: object) -> bool | None:
     try:
         return bool((int(cfg_raw, 16) >> 18) & 1)
     except ValueError:
-        return None
-
-
-def _parse_tray_exist_bits(value: str | int | None) -> int | None:
-    """Parse a firmware ``tray_exist_bits`` value (hex string, or int) to an int.
-
-    Firmware sends the bitmask as a hex string; ints are tolerated for defensive
-    symmetry. ``None`` / empty / unparseable → ``None`` (the caller reads that as
-    "this push carried no bitmask"). A genuine ``"0"`` parses to ``0`` — all slots
-    empty is a real answer, distinct from "absent". Used by the ``_handle_ams_data``
-    last-seen cache; ``apply_tray_exist_bits`` keeps its own inline parse so its
-    bit=0 / power-off contract stays byte-identical.
-    """
-    if value is None or value == "":
-        return None
-    try:
-        return value if isinstance(value, int) else int(value, 16)
-    except (ValueError, TypeError):
         return None
 
 
@@ -230,10 +219,7 @@ def apply_tray_exist_bits(
                 # it. Tolerate str/int state. Only 9 is promoted: 0 is the H2C
                 # long-idle "detail not reported" dialect and 10/11 are already
                 # present — none of those is the stuck-unread quirk.
-                try:
-                    norm_state = int(tray.get("state"))
-                except (TypeError, ValueError):
-                    norm_state = None
+                norm_state = parse_tray_state(tray.get("state"))
                 if norm_state == 9:
                     tray["state"] = 10
                 continue
@@ -248,8 +234,8 @@ def apply_tray_exist_bits(
                 tray["tray_sub_brands"] = ""
                 tray["tray_color"] = ""
                 tray["tray_id_name"] = ""
-                tray["tag_uid"] = "0000000000000000"
-                tray["tray_uuid"] = "00000000000000000000000000000000"
+                tray["tag_uid"] = ZERO_TAG_UID
+                tray["tray_uuid"] = ZERO_TRAY_UUID
                 tray["tray_info_idx"] = ""
                 tray["remain"] = 0
                 cleared += 1
@@ -1800,18 +1786,11 @@ class BambuMQTTClient:
         bitmask) or a 0 bit returns False so the stale-clear fires exactly as
         before. AMS-HT (id >= 128) uses a separate addressing scheme and is never
         matched here, mirroring apply_tray_exist_bits.
+
+        The bit arithmetic itself lives in ``tray_fields.slot_exist_bit_set`` (one
+        origin — the observation layer reads the same bit for the same slot).
         """
-        bits = self._last_tray_exist_bits
-        if bits is None:
-            return False
-        try:
-            a = int(ams_id)
-            t = int(tray_id)
-        except (TypeError, ValueError):
-            return False
-        if a < 0 or a >= 128 or t < 0:
-            return False
-        return bool((bits >> (a * 4 + t)) & 1)
+        return slot_exist_bit_set(self._last_tray_exist_bits, ams_id, tray_id)
 
     def _handle_ams_data(self, ams_data):
         """Handle AMS data changes for Spoolman integration.
@@ -1838,7 +1817,7 @@ class BambuMQTTClient:
             # even when the minimal {id, state} partial firmware sends omits the
             # field. Only overwrite when this push actually carries it (a partial
             # without it keeps the last truth).
-            _exist_bits = _parse_tray_exist_bits(ams_data.get("tray_exist_bits"))
+            _exist_bits = parse_tray_exist_bits(ams_data.get("tray_exist_bits"))
             if _exist_bits is not None:
                 self._last_tray_exist_bits = _exist_bits
 
@@ -2145,10 +2124,7 @@ class BambuMQTTClient:
                             # partial must not wipe the seated spool's identity
                             # (apply_tray_exist_bits below then promotes it 9→10).
                             tray_state = new_tray.get("state")
-                            try:
-                                norm_tray_state = int(tray_state) if tray_state is not None else None
-                            except (TypeError, ValueError):
-                                norm_tray_state = None
+                            norm_tray_state = parse_tray_state(tray_state)
                             if (
                                 tray_state is not None
                                 and norm_tray_state not in TRAY_PRESENT_STATES
@@ -2174,8 +2150,8 @@ class BambuMQTTClient:
                                         "tray_color": "",
                                         "tray_id_name": "",
                                         "tray_info_idx": "",
-                                        "tag_uid": "0000000000000000",
-                                        "tray_uuid": "00000000000000000000000000000000",
+                                        "tag_uid": ZERO_TAG_UID,
+                                        "tray_uuid": ZERO_TRAY_UUID,
                                         "remain": 0,
                                         "k": None,
                                         "cali_idx": None,
@@ -2209,8 +2185,8 @@ class BambuMQTTClient:
                                     not in (
                                         None,
                                         "",
-                                        "0000000000000000",
-                                        "00000000000000000000000000000000",
+                                        ZERO_TAG_UID,
+                                        ZERO_TRAY_UUID,
                                     )
                                 ):
                                     merged_tray[key] = value

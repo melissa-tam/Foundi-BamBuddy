@@ -53,7 +53,7 @@ from backend.app.services.location_service import (
     rename_location as rename_location_record,
 )
 from backend.app.services.slicer_filament_resolver import resolve_slicer_filament
-from backend.app.services.spool_binding import bind_spool_to_slot
+from backend.app.services.spool_binding import bind_spool_to_slot, release_spool_from_slot
 from backend.app.services.spool_csv import (
     MAX_CSV_IMPORT_BYTES,
     ImportPreview,
@@ -2100,7 +2100,10 @@ async def unassign_spool(
     if not assignment:
         raise HTTPException(404, "Assignment not found")
 
-    await db.delete(assignment)
+    # Through the ONE unbind writer: stamps the roll's last physical location (so a
+    # re-insert reclaims its grams instead of minting a fresh row) and leaves the
+    # structured [slot-state] release line. A raw delete here would drop both.
+    await release_spool_from_slot(db, assignment, reason="operator_clear")
     await db.commit()
 
     await ws_manager.broadcast(

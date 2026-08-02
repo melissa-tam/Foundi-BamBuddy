@@ -25,6 +25,18 @@ class SpoolAssignment(Base):
     tray_id: Mapped[int] = mapped_column(Integer)  # 0-3
     fingerprint_color: Mapped[str | None] = mapped_column(String(8))  # tray_color snapshot
     fingerprint_type: Mapped[str | None] = mapped_column(String(50))  # tray_type snapshot
+    # Explicit "this binding is a PRE-CONFIGURED intent, not a physical location
+    # claim" marker: the operator deliberately bound a spool to an EMPTY slot
+    # (SpoolBuddy weigh-then-assign) so the next insert adopts that row. NULL = an
+    # ordinary location claim.
+    #
+    # Replaces the blank-fingerprint INFERENCE (``fingerprint_type in ("", None)``)
+    # that carried this meaning before 2026-08-01. That inference was fragile in both
+    # directions — a bind whose live tray fields simply were not readable yet looked
+    # pre-configured, and any writer that filled a fingerprint silently destroyed the
+    # intent — and release-on-empty must exempt these rows, so the meaning has to be
+    # asserted, not guessed. Cleared by the one-shot apply-on-insert.
+    pre_configured_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     spool: Mapped["Spool"] = relationship(back_populates="assignments")

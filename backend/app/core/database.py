@@ -3870,6 +3870,67 @@ async def run_migrations(conn):
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_spool_assignment_spool_id ON spool_assignment (spool_id)",
     )
 
+    # Migration (W2 spool-core re-architecture, 2026-08-01): the last physical slot a
+    # roll was RELEASED from. An assignment row is a LOCATION claim (doctrine rule 9),
+    # so a tray reading empty must drop it — but a roll pulled for drying and returned
+    # has to reclaim its own gram history rather than mint a fresh 0 g row, and the
+    # only thing left after the release is this stamp. Documented denormalization of
+    # the ``[slot-state] … release`` log line (see ``models.spool``): logs rotate,
+    # shelved rolls do not, and the reclaim lane must be a column read. Written ONLY
+    # by ``services.spool_binding``. No FK on the printer id — a historical
+    # observation, not a live reference. TIMESTAMP NULL / INTEGER are the dialect-safe
+    # forms shared by the adjacent spool columns (SQLite + Postgres); idempotent
+    # ADD COLUMN (_safe_execute swallows "duplicate column name" / "already exists").
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN last_location_printer_id INTEGER")
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN last_location_ams_id INTEGER")
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN last_location_tray_id INTEGER")
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN last_location_at TIMESTAMP NULL")
+
+    # Migration (W2): pre-configured assignments become an ASSERTED fact. Binding a
+    # spool to an empty slot on purpose (SpoolBuddy weigh-then-assign) was previously
+    # distinguishable only by a blank ``fingerprint_type`` — an inference that broke in
+    # both directions (an unreadable tray looked pre-configured; any writer filling the
+    # fingerprint erased the intent) and that release-on-empty must exempt.
+    await _safe_execute(conn, "ALTER TABLE spool_assignment ADD COLUMN pre_configured_at TIMESTAMP NULL")
+
+    # One-time backfill: every existing blank-fingerprint row carried exactly this
+    # meaning under the old inference, so it is migrated to the explicit column at the
+    # moment the column appears. Idempotent via the IS NULL guard (a re-run matches
+    # zero rows), and it never invents intent for a row a later writer stamps. DML →
+    # conn.execute inside begin_nested (never swallowed), per this module's convention.
+    async with conn.begin_nested():
+        await conn.execute(
+            text(
+                "UPDATE spool_assignment SET pre_configured_at = :now "
+                "WHERE (fingerprint_type IS NULL OR fingerprint_type = '') AND pre_configured_at IS NULL"
+            ),
+            {"now": _dt.utcnow()},
+        )
+
+    # Cleanup (W2, PRE-EXISTING bug): ``DELETE /printers/{id}`` never deleted the
+    # printer's SpoolAssignment rows and SQLite enforces no FK cascade (this module
+    # sets no ``PRAGMA foreign_keys=ON``), so every printer ever removed left its
+    # bindings behind — invisible rows that still hold their spools "assigned",
+    # hiding them from every picker. The route now deletes them explicitly; this
+    # clears the rows already orphaned. Idempotent (a clean table matches zero rows)
+    # and valid on both SQLite and Postgres.
+    _orphan_bindings = (
+        await conn.execute(
+            text(
+                "SELECT id, spool_id, printer_id FROM spool_assignment "
+                "WHERE printer_id NOT IN (SELECT id FROM printers)"
+            )
+        )
+    ).fetchall()
+    if _orphan_bindings:
+        logger.info(
+            "purging %d orphaned spool binding(s) whose printer no longer exists: %s",
+            len(_orphan_bindings),
+            ", ".join(f"spool {r[1]}→printer {r[2]} (row {r[0]})" for r in _orphan_bindings),
+        )
+        async with conn.begin_nested():
+            await conn.execute(text("DELETE FROM spool_assignment WHERE printer_id NOT IN (SELECT id FROM printers)"))
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),

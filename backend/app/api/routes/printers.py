@@ -398,6 +398,7 @@ async def delete_printer(
 
     from backend.app.models.archive import PrintArchive
     from backend.app.models.maintenance import MaintenanceHistory, PrinterMaintenance
+    from backend.app.models.spool_assignment import SpoolAssignment
     from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
@@ -416,8 +417,15 @@ async def delete_printer(
 
         await db.execute(update(PrintArchive).where(PrintArchive.printer_id == printer_id).values(printer_id=None))
 
-    # Delete slot assignments for this printer (SQLite doesn't enforce FK cascades)
+    # Delete slot assignments for this printer (SQLite doesn't enforce FK cascades).
+    # BOTH tables: the Spoolman-mode mapping AND the internal-inventory binding. The
+    # latter was missing until 2026-08-01, so every printer ever deleted orphaned its
+    # spool_assignment rows — invisible bindings that still held their spools
+    # "assigned" and hid them from every picker. The ON DELETE CASCADE on the FK is
+    # not enforcement here: this module opens SQLite without PRAGMA foreign_keys=ON,
+    # which is exactly why every other child table is deleted by hand above and below.
     await db.execute(sql_delete(SpoolmanSlotAssignment).where(SpoolmanSlotAssignment.printer_id == printer_id))
+    await db.execute(sql_delete(SpoolAssignment).where(SpoolAssignment.printer_id == printer_id))
 
     # Delete maintenance history and items for this printer
     # (SQLite doesn't enforce FK cascades, so do it explicitly)

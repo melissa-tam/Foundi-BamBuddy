@@ -1,11 +1,14 @@
 """Tests for spool_tag_matcher service — RFID auto-assign and relationship loading."""
 
+import logging
+
 import pytest
 from sqlalchemy import inspect
 
 from backend.app.models.color_catalog import ColorCatalogEntry
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
+from backend.app.services import spool_binding
 from backend.app.services.spool_tag_matcher import (
     auto_assign_spool,
     create_spool_from_tray,
@@ -15,6 +18,34 @@ from backend.app.services.spool_tag_matcher import (
     is_valid_tag,
     link_tag_to_inventory_spool,
 )
+
+_MATCHER_LOGGER = "backend.app.services.spool_tag_matcher"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_windows():
+    """Un-armed move damper + cali-sel throttle for every test.
+
+    Both are process-lifetime singletons keyed on DB ids / slot tuples that every
+    test's fresh in-memory DB restarts at 1 — so without this, one test's move or
+    publish silences the next test's. Reset on both sides.
+    """
+    from backend.app.services import spool_tag_matcher
+
+    spool_binding._move_damper.reset()
+    spool_tag_matcher._cali_sel_window.reset()
+    yield
+    spool_binding._move_damper.reset()
+    spool_tag_matcher._cali_sel_window.reset()
+
+
+def _matcher_warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == _MATCHER_LOGGER and r.levelno == logging.WARNING]
+
+
+def _matcher_infos(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == _MATCHER_LOGGER and r.levelno == logging.INFO]
+
 
 # -- helpers -----------------------------------------------------------------
 
@@ -302,14 +333,27 @@ async def test_get_spool_by_tag_no_false_positive_different_suffix(db_session):
     assert found is None, "Should not match when suffix differs"
 
 
-# -- variance convergence + different-roll guard (printer-3 flap fix) --------
+# -- variance convergence + the tray_uuid refusal (2026-08-01 re-architecture) --
+#
+# These pins were REWRITTEN with the resolver-hygiene wave. First-char/short-UID
+# tolerance exists for READER quirks on the TAG, and it may never span a ``tray_uuid``
+# disagreement: both sides asserting different uuids is positive proof of a different
+# roll, so the variance match is refused there and never converged (plan §"Root causes
+# confirmed (RFID/binding lane)" — the false-merge hazard). The pre-2026-08-01 shape of
+# these tests — variance ACCEPTED across a drifted tray_uuid, then converged onto it —
+# is exactly the merge the wave removes.
+#
+# The refusal is asymmetric ON PURPOSE, and the asymmetry is the correction of
+# 2026-08-01: see the sibling-tag section further down. A uuid disagreement falsifies;
+# a tag disagreement does not, because one roll carries two tags.
 
 
 @pytest.mark.asyncio
 async def test_variance_match_converges_scanned_identifiers(db_session):
-    """A converge=True variance match persists BOTH scanned tag_uid and tray_uuid
-    onto the spool, so the next read is an exact match — killing the auto-unlink ⇄
-    re-assign reader-variance loop (printer 3 looped all day 2026-07-14)."""
+    """A converge=True variance match persists the scanned tag_uid onto the spool, so
+    the next read is an exact match — killing the auto-unlink ⇄ re-assign reader-
+    variance loop (printer 3 looped all day 2026-07-14). The scan asserts no tray_uuid,
+    so there is nothing to disagree about and the reader quirk stands alone."""
     spool = Spool(
         material="PETG",
         tag_uid="8C0EF4E700000100",
@@ -323,17 +367,16 @@ async def test_variance_match_converges_scanned_identifiers(db_session):
     db_session.add(spool)
     await db_session.commit()
 
-    # Scan: first-char tag variance + an entirely different tray_uuid (reader drift).
-    found = await get_spool_by_tag(db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A", converge=True)
+    found = await get_spool_by_tag(db_session, "1C0EF4E700000100", "", converge=True)
     assert found is not None and found.id == spool.id
     await db_session.commit()
     await db_session.refresh(spool)
-    # Stored identifiers converged onto the scanned values.
+    # Converged onto the scanned tag; the uuid the scan never asserted is untouched.
     assert spool.tag_uid == "1C0EF4E700000100"
-    assert spool.tray_uuid == "C4A25BF1D9054983A9C2E73EE0CF4D5A"
+    assert spool.tray_uuid == "BBC7BDD79A66407BB334A9472E3717E6"
 
-    # The next read is now an EXACT tray_uuid match — no variance branch, loop dead.
-    again = await get_spool_by_tag(db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A")
+    # The next read is now an EXACT tag match — no variance branch, loop dead.
+    again = await get_spool_by_tag(db_session, "1C0EF4E700000100", "")
     assert again is not None and again.id == spool.id
 
 
@@ -354,7 +397,7 @@ async def test_variance_match_read_only_does_not_converge(db_session):
     db_session.add(spool)
     await db_session.commit()
 
-    found = await get_spool_by_tag(db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A")
+    found = await get_spool_by_tag(db_session, "1C0EF4E700000100", "")
     assert found is not None and found.id == spool.id
     await db_session.commit()
     await db_session.refresh(spool)
@@ -364,11 +407,47 @@ async def test_variance_match_read_only_does_not_converge(db_session):
 
 
 @pytest.mark.asyncio
-async def test_variance_suppressed_when_scanned_tray_uuid_owned_by_other_spool(db_session):
-    """Different-roll guard: when the scanned tray_uuid already belongs to a
-    DIFFERENT non-archived spool (a reused tag on a fresh roll), the tolerant
-    variance match must NOT hijack — the tray_uuid owner wins and the donor is
-    never converged. Protects the reused-tag re-spool sibling guard."""
+async def test_variance_refused_when_scanned_uuid_conflicts_with_the_candidates(db_session, caplog):
+    """CROSS-UUID REFUSAL: a first-char tag variance whose scan ALSO asserts a
+    different valid tray_uuid is a different roll, not a reader quirk. Refused — and
+    never converged, which is what used to make the merge permanent."""
+    spool = Spool(
+        material="PETG",
+        tag_uid="8C0EF4E700000100",
+        tray_uuid="BBC7BDD79A66407BB334A9472E3717E6",
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.commit()
+
+    with caplog.at_level(logging.WARNING, logger=_MATCHER_LOGGER):
+        found = await get_spool_by_tag(
+            db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A", converge=True
+        )
+
+    assert found is None, "both identifiers assert valid, disagreeing values → different roll"
+    await db_session.commit()
+    await db_session.refresh(spool)
+    assert spool.tag_uid == "8C0EF4E700000100", "nothing converged onto the refused candidate"
+    assert spool.tray_uuid == "BBC7BDD79A66407BB334A9472E3717E6"
+    assert any("Refusing first-char variance match" in m for m in _matcher_warnings(caplog))
+
+
+@pytest.mark.asyncio
+async def test_variance_suppressed_when_scanned_tray_uuid_owned_by_other_spool(db_session, caplog):
+    """Different-roll guard: when the scanned tray_uuid already belongs to a DIFFERENT
+    non-archived spool, the tolerant variance match must NOT hijack the donor — the
+    tray_uuid owner wins and the donor is never converged.
+
+    The uuid owner is reached on the uuid path and returned even though its stored tag
+    disagrees with the scan (sibling-tag acceptance). Whether a reused-type row holding
+    this uuid is really the roll in hand is the RE-SPOOL guard's question, adjudicated
+    in ``spool_respool`` — the resolver's job is only to name the row that owns the
+    uuid, and it must never answer with an unrelated row it merely tag-resembles."""
     donor = Spool(
         material="PETG",
         tag_uid="8C0EF4E700000100",
@@ -392,14 +471,22 @@ async def test_variance_suppressed_when_scanned_tray_uuid_owned_by_other_spool(d
     await db_session.commit()
 
     # tag_uid first-char varies vs donor, but tray_uuid == other's uuid.
-    found = await get_spool_by_tag(db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A", converge=True)
+    with caplog.at_level(logging.INFO, logger=_MATCHER_LOGGER):
+        found = await get_spool_by_tag(
+            db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A", converge=True
+        )
+
     # The tray_uuid owner is returned — NOT a variance hijack of the donor.
     assert found is not None and found.id == other.id
+    assert any("[sibling-tag]" in m for m in _matcher_infos(caplog))
     await db_session.commit()
     await db_session.refresh(donor)
-    # Donor never converged (its identifiers are untouched).
+    await db_session.refresh(other)
+    # Donor never converged (its identifiers are untouched)...
     assert donor.tag_uid == "8C0EF4E700000100"
     assert donor.tray_uuid == "BBC7BDD79A66407BB334A9472E3717E6"
+    # ...and neither was the row that WAS returned: the uuid path never converges.
+    assert other.tag_uid == "FFEE00112233AABB"
 
 
 @pytest.mark.asyncio
@@ -407,7 +494,12 @@ async def test_unlink_damping_resolves_scanned_tag_to_assigned_spool(db_session,
     """The auto-unlink damping decision: on an identifier mismatch, resolving the
     scanned tag via get_spool_by_tag returns the SAME spool already assigned to the
     tray (reader variance, not a different roll) → main.py skips the unlink. Models
-    printer 3's live DB row exactly. Convergence then makes the mismatch vanish."""
+    printer 3's live DB row. Convergence then makes the mismatch vanish.
+
+    REWRITTEN 2026-08-01: the drifted-uuid variant of this scan is now a REFUSAL (a
+    uuid disagreement is proof of another roll) — damping through the VARIANCE lane
+    survives only for a scan that asserts no conflicting uuid, which is the genuine
+    reader-variance shape."""
     printer = await printer_factory(model="H2S")
     spool = Spool(
         material="PETG",
@@ -425,15 +517,205 @@ async def test_unlink_damping_resolves_scanned_tag_to_assigned_spool(db_session,
     db_session.add(assignment)
     await db_session.commit()
 
-    # The scan the printer keeps sending (tag first-char variance, drifted uuid).
-    resolved = await get_spool_by_tag(db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A", converge=True)
+    # The scan the printer keeps sending (tag first-char variance, no uuid asserted).
+    resolved = await get_spool_by_tag(db_session, "1C0EF4E700000100", "", converge=True)
     # Damping predicate holds → main.py keeps the assignment (no unlink/re-assign).
     assert resolved is not None and resolved.id == assignment.spool_id
     await db_session.commit()
     await db_session.refresh(spool)
-    # And convergence updated the stored identifiers so the mismatch is gone: the
-    # next auto-unlink tick sees spool.tray_uuid == scanned → spool_matches, no flap.
-    assert spool.tray_uuid == "C4A25BF1D9054983A9C2E73EE0CF4D5A"
+    # And convergence updated the stored tag so the mismatch is gone: the next
+    # auto-unlink tick sees spool.tag_uid == scanned → spool_matches, no flap.
+    assert spool.tag_uid == "1C0EF4E700000100"
+
+
+# -- sibling tags: an exact-uuid match with a differing tag IS the same roll --
+#
+# The 2026-08-01 correction, and the reason the uuid path is asymmetric. A Bambu roll
+# carries TWO RFID tags — one per flange — sharing ONE tray_uuid, and the AMS reads
+# whichever side faces its antenna (the fork's own ``spool_respool``
+# ``RespoolSiblingConflict`` documents the shape). Verified live on production, 4/4
+# slots: every slot whose wire tag_uid differed from the bound spool's stored one
+# matched EXACTLY on tray_uuid and agreed with the ledger on remaining weight —
+# spool 46 (20 % ↔ 180 g), 194 (14 % ↔ 140 g), 196 (100 % ↔ 1000 g), 186 (100 % ↔
+# 1000 g). The earlier "chimera" reading of that disagreement (a departed roll's uuid
+# merged beside a new roll's tag) is RETRACTED: refusing these matches would have
+# minted a duplicate ledger row for each of the four rolls.
+
+
+@pytest.mark.asyncio
+async def test_exact_uuid_match_accepts_a_differing_stored_tag_as_a_sibling_read(db_session, caplog):
+    """A uuid match whose stored tag_uid disagrees resolves to that SAME row, and says
+    so at INFO. tray_uuid is the roll's identity; tag_uid is a read of one of its two
+    chips, so the disagreement is which flange faced the antenna — not which roll."""
+    roll = Spool(
+        material="PETG",
+        tag_uid="EC96F1E700000100",
+        tray_uuid="8AC9EC0847FD41D0890870319F2E1975",
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+        weight_used=820.0,
+    )
+    roll.k_profiles = []
+    roll.assignments = []
+    db_session.add(roll)
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger=_MATCHER_LOGGER):
+        found = await get_spool_by_tag(
+            db_session, "3CF1F3E700000100", "8AC9EC0847FD41D0890870319F2E1975", converge=True
+        )
+
+    assert found is not None and found.id == roll.id, "same tray_uuid → same roll, read on its other tag"
+    infos = _matcher_infos(caplog)
+    assert any("[sibling-tag]" in m and "second RFID tag of the same roll" in m for m in infos)
+    assert not any("Refusing tray_uuid match" in m for m in _matcher_warnings(caplog))
+
+    await db_session.commit()
+    await db_session.refresh(roll)
+    # NOT converged: which chip faces the antenna is a property of how the roll was
+    # seated, not a reader defect to correct — rewriting it would just flip-flop.
+    assert roll.tag_uid == "EC96F1E700000100", "the stored tag is left exactly as it was"
+    assert roll.tray_uuid == "8AC9EC0847FD41D0890870319F2E1975"
+    assert roll.weight_used == 820.0, "and one roll keeps ONE gram history"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("spool_id_label", "stored_tag", "wire_tag", "tray_uuid"),
+    [
+        ("46", "EC96F1E700000100", "3CF1F3E700000100", "8AC9EC0847FD41D0890870319F2E1975"),
+        ("194", "A5E7210D00000100", "95F6F50C00000100", "3C78FA47DFCC4F0C8C95566C77A73DCE"),
+        ("196", "66839BE000000100", "D6385CEC00000100", "0F8FCF6039964FB68F94A59F8B0897D8"),
+        ("186", "CBB0D0FE00000100", "2338393200000100", "A74AC09B2B8443BCB0112C15631EFCEC"),
+    ],
+)
+async def test_every_live_prod_sibling_slot_resolves_to_its_own_row(
+    db_session, spool_id_label, stored_tag, wire_tag, tray_uuid
+):
+    """The four production slots, 2026-08-01. Each would have minted a duplicate row
+    under the refusal rule. (Tags abbreviated in the incident note are written out with
+    the constant Bambu family suffix "00000100" every full value in that capture
+    carries; only the tag DISAGREEMENT and the uuid AGREEMENT are load-bearing.)"""
+    roll = Spool(
+        material="PETG",
+        tag_uid=stored_tag,
+        tray_uuid=tray_uuid,
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    roll.k_profiles = []
+    roll.assignments = []
+    db_session.add(roll)
+    await db_session.commit()
+
+    found = await get_spool_by_tag(db_session, wire_tag, tray_uuid, converge=True)
+    assert found is not None and found.id == roll.id, f"spool {spool_id_label}"
+    await db_session.commit()
+    await db_session.refresh(roll)
+    assert roll.tag_uid == stored_tag, f"spool {spool_id_label}: stored tag not rewritten"
+
+
+@pytest.mark.asyncio
+async def test_a_uuid_disagreement_still_refuses_on_the_variance_path(db_session, caplog):
+    """The asymmetry, pinned from the other side: tolerance on the TAG never spans a
+    tray_uuid disagreement, because two rolls cannot share a uuid."""
+    spool = Spool(
+        material="PETG",
+        tag_uid="8C0EF4E700000100",
+        tray_uuid="BBC7BDD79A66407BB334A9472E3717E6",
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.commit()
+
+    with caplog.at_level(logging.WARNING, logger=_MATCHER_LOGGER):
+        found = await get_spool_by_tag(
+            db_session, "1C0EF4E700000100", "C4A25BF1D9054983A9C2E73EE0CF4D5A", converge=True
+        )
+
+    assert found is None
+    assert any("Refusing first-char variance match" in m for m in _matcher_warnings(caplog))
+
+
+@pytest.mark.asyncio
+async def test_exact_uuid_match_stands_when_the_scan_asserts_no_tag(db_session, caplog):
+    """A uuid-only scan (no tag read yet) resolves normally and is not even a sibling
+    case — a missing identifier is not a disagreement, so nothing is logged."""
+    spool = Spool(
+        material="PETG",
+        tag_uid="EC9611F900000100",
+        tray_uuid="8AC9EC0839D14B2FA7BE9E3A2D5C1F44",
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger=_MATCHER_LOGGER):
+        found = await get_spool_by_tag(db_session, "", "8AC9EC0839D14B2FA7BE9E3A2D5C1F44")
+    assert found is not None and found.id == spool.id
+    assert not any("[sibling-tag]" in m for m in _matcher_infos(caplog))
+
+    zeros = await get_spool_by_tag(db_session, "0000000000000000", "8AC9EC0839D14B2FA7BE9E3A2D5C1F44")
+    assert zeros is not None and zeros.id == spool.id, "a zero tag asserts nothing either"
+
+
+# -- the false-merge pin: the constant Bambu family suffix is NOT identity ----
+
+
+@pytest.mark.asyncio
+async def test_distinct_tags_sharing_the_bambu_family_suffix_never_cross_match(db_session):
+    """Every Bambu tag_uid ends "00000100", so the deleted ``%{suffix8}`` LIKE matched
+    very nearly the whole inventory — and with converge=True the resulting variance
+    match rewrote a second roll's identity onto the first row permanently. Two distinct
+    16-char tags that share only that family suffix must resolve to NOTHING."""
+    for uid in ("8C0EF4E700000100", "1C63A2B400000100"):
+        s = Spool(material="PETG", tag_uid=uid, tag_type="bambulab", label_weight=1000, core_weight=250)
+        s.k_profiles = []
+        s.assignments = []
+        db_session.add(s)
+    await db_session.commit()
+
+    assert await get_spool_by_tag(db_session, "3CF1F3E700000100", "", converge=True) is None
+    # And no stored row was quietly rewritten on the way out.
+    for uid in ("8C0EF4E700000100", "1C63A2B400000100"):
+        assert await get_spool_by_tag(db_session, uid, "") is not None
+
+
+@pytest.mark.asyncio
+async def test_short_read_matches_by_leading_bytes(db_session):
+    """A 4-byte reader reports the LEADING 8 hex chars of the full uid (the trailing
+    ones are the constant family suffix), so a genuine short read matches by PREFIX."""
+    spool = Spool(material="PLA", tag_uid="A4501234CCDDEE88", label_weight=1000, core_weight=250)
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.commit()
+
+    found = await get_spool_by_tag(db_session, "A4501234", "")
+    assert found is not None and found.id == spool.id
+
+
+@pytest.mark.asyncio
+async def test_short_read_does_not_match_by_trailing_bytes(db_session):
+    """The mirror image of the pin above, and the whole point of it: an 8-char value
+    that happens to equal the stored tag's TAIL is not that tag."""
+    spool = Spool(material="PLA", tag_uid="A4501234CCDDEE88", label_weight=1000, core_weight=250)
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.commit()
+
+    assert await get_spool_by_tag(db_session, "CCDDEE88", "") is None
 
 
 # -- auto_assign_spool (SpoolAssignment creation) ---------------------------
@@ -2064,3 +2346,128 @@ async def test_kdrift_prefers_the_exact_extruder_profile(db_session, printer_fac
     state = SimpleNamespace(ams_extruder_map={"0": 1}, nozzles=None)
     assert await reapply_k_profile_if_drifted(db_session, printer.id, 0, 0, _TAGGED_TRAY, spool, state) is True
     assert kdrift_client.calls[0]["cali_idx"] == 9
+
+
+# -- cali-sel throttle on the auto-assign lane (007-H2C bind flap) -----------
+
+
+def _cali_pm(client):
+    """printer_manager stub whose live tray carries a cali_idx and whose client
+    records every extrusion_cali_sel publish."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    pm = MagicMock()
+    pm.get_status.return_value = SimpleNamespace(
+        raw_data={"ams": [{"id": "0", "tray": [{"id": "0", "tray_type": "PETG", "tray_color": "112233FF"}]}]},
+        ams_extruder_map=None,
+        nozzles=None,
+    )
+    pm.get_client.return_value = client
+    return pm
+
+
+async def _spool_with_cali(db_session, printer_id, cali_idx):
+    from backend.app.models.spool_k_profile import SpoolKProfile
+
+    spool = Spool(material="PETG", slicer_filament="GFG02", label_weight=1000, core_weight=250)
+    spool.k_profiles = []
+    spool.assignments = []
+    db_session.add(spool)
+    await db_session.flush()
+    db_session.add(
+        SpoolKProfile(spool_id=spool.id, printer_id=printer_id, nozzle_diameter="0.4", k_value=0.02, cali_idx=cali_idx)
+    )
+    await db_session.commit()
+    await db_session.refresh(spool, ["k_profiles"])
+    return spool
+
+
+@pytest.mark.asyncio
+async def test_cali_sel_identical_republish_is_throttled(db_session, printer_factory):
+    """Every bind re-published the slot's calibration selection, so a bind flap was
+    also a publish flap into an AMS that was already churning (007-H2C, 51 binds in
+    5 m 21 s). A republish of the value the slot already carries is suppressed."""
+    printer = await printer_factory()
+    spool = await _spool_with_cali(db_session, printer.id, 7)
+    client = _CaliClient()
+
+    for _ in range(3):  # same slot, same spool, same cali_idx — wire cadence
+        await auto_assign_spool(printer.id, 0, 0, spool, _cali_pm(client), db_session)
+        await db_session.commit()
+
+    assert len(client.calls) == 1, "identical republishes inside the window are suppressed"
+    assert client.calls[0]["cali_idx"] == 7
+
+
+@pytest.mark.asyncio
+async def test_cali_sel_changed_index_publishes_immediately(db_session, printer_factory):
+    """The key carries the cali_idx, so a CHANGED selection forms a NEW key and goes
+    out at once — the throttle can never delay a real calibration change."""
+    printer = await printer_factory()
+    spool = await _spool_with_cali(db_session, printer.id, 7)
+    client = _CaliClient()
+
+    await auto_assign_spool(printer.id, 0, 0, spool, _cali_pm(client), db_session)
+    await db_session.commit()
+
+    spool.k_profiles[0].cali_idx = 9
+    await db_session.commit()
+    await auto_assign_spool(printer.id, 0, 0, spool, _cali_pm(client), db_session)
+    await db_session.commit()
+
+    assert [c["cali_idx"] for c in client.calls] == [7, 9]
+
+
+@pytest.mark.asyncio
+async def test_cali_sel_window_reopens_after_it_elapses(db_session, printer_factory):
+    """A throttle, not a mute: the same selection is re-published once the window
+    passes (clock injected through the RetryWindow's module-level monotonic)."""
+    import backend.app.utils.retry_window as rw
+    from backend.app.services import spool_tag_matcher
+
+    printer = await printer_factory()
+    spool = await _spool_with_cali(db_session, printer.id, 7)
+    client = _CaliClient()
+
+    await auto_assign_spool(printer.id, 0, 0, spool, _cali_pm(client), db_session)
+    await db_session.commit()
+
+    original = rw.monotonic
+    rw.monotonic = lambda: original() + spool_tag_matcher._CALI_SEL_RETRY_S + 1
+    try:
+        await auto_assign_spool(printer.id, 0, 0, spool, _cali_pm(client), db_session)
+        await db_session.commit()
+    finally:
+        rw.monotonic = original
+
+    assert len(client.calls) == 2
+
+
+# -- auto_assign_spool propagates the writer's damper verdict ----------------
+
+
+@pytest.mark.asyncio
+async def test_auto_assign_returns_none_when_the_move_damper_refuses(db_session, printer_factory):
+    """The damper lives in the ONE writer, so the RFID funnel just propagates its
+    verdict: None means "no binding change happened" — the DB is untouched and no
+    calibration frame was published for a move that never took place."""
+    from sqlalchemy import select as sa_select
+
+    printer = await printer_factory()
+    spool = await _spool_with_cali(db_session, printer.id, 7)
+    client = _CaliClient()
+
+    assert await auto_assign_spool(printer.id, 0, 0, spool, _cali_pm(client), db_session) is not None
+    await db_session.commit()
+    assert await auto_assign_spool(printer.id, 0, 1, spool, _cali_pm(client), db_session) is not None  # 1st move
+    await db_session.commit()
+
+    damped = await auto_assign_spool(printer.id, 0, 0, spool, _cali_pm(client), db_session)  # flip back
+    await db_session.commit()
+
+    assert damped is None
+    result = await db_session.execute(sa_select(SpoolAssignment).where(SpoolAssignment.spool_id == spool.id))
+    rows = list(result.scalars().all())
+    assert len(rows) == 1 and (rows[0].ams_id, rows[0].tray_id) == (0, 1), "the binding did not flip back"
+    assert len(client.calls) == 2, "and no publish rode the refused bind"

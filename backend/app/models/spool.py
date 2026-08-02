@@ -115,6 +115,25 @@ class Spool(Base):
     # lent its age to a fresh roll). NULL falls back to ``first_loaded_at`` /
     # ``created_at`` in the selector.
     loaded_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # Last AMS slot this roll was RELEASED from, stamped by the one unbind writer
+    # (``spool_binding.release_spool_from_slot`` and the move/displacement sweep in
+    # ``bind_spool_to_slot``). NULL = never released from a slot.
+    #
+    # DOCUMENTED DENORMALIZATION (3NF exception, 2026-08-01): the identical fact is
+    # already in the ``[slot-state] … release`` log line the same writer emits, and
+    # that line is the normal-form source of record. It is duplicated onto the row
+    # because (a) logs are retention-rotated while a roll can sit on a drying shelf
+    # for weeks, and (b) the reclaim lane must find "the roll that last sat in THIS
+    # slot" as a plain indexed column read on candidate spools, not by parsing a log
+    # stream. Written ONLY by ``spool_binding`` — one writer, so it cannot drift.
+    #
+    # ``last_location_printer_id`` deliberately carries NO ForeignKey: it is a
+    # historical observation, not a live reference, and a deleted printer must not
+    # cascade away a roll's gram-continuity hint.
+    last_location_printer_id: Mapped[int | None] = mapped_column(Integer)
+    last_location_ams_id: Mapped[int | None] = mapped_column(Integer)
+    last_location_tray_id: Mapped[int | None] = mapped_column(Integer)
+    last_location_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
