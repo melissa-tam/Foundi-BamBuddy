@@ -4997,6 +4997,7 @@ export default {
       ranOut: 'épuisée — en attente d’une nouvelle bobine',
       awaitingInsert: 'en attente d’insertion (préconfigurée)',
       notInserted: 'non insérée',
+      elsewhereHint: '(non insérée — affectée à {{location}})',
       clear: 'Libérer l’emplacement',
       clearAria: 'Libérer l’affectation de l’emplacement pour {{spool}}',
       clearTitle: 'Libérer cet emplacement ?',

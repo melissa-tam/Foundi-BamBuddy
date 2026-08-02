@@ -2,8 +2,9 @@ import { useState, useRef, useEffect, useLayoutEffect, useId, type ReactNode } f
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { Droplets, Copy, Check, Settings2, Package, PackagePlus, Unlink, RefreshCw, AlertTriangle, Clock, MinusCircle } from 'lucide-react';
+import { Droplets, Copy, Check, Settings2, Package, PackagePlus, Unlink, RefreshCw } from 'lucide-react';
 import { isLightColor } from '../utils/colors';
+import { resolveSpoolBindingStatus } from '../utils/spoolBindingStatus';
 import { Modal } from './ui/Modal';
 import { ConfirmModal } from './ConfirmModal';
 
@@ -639,15 +640,10 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
   }, [isVisible]);
 
   // Status wording is never carried by colour alone: each state pairs an icon
-  // with an explicit sentence (WCAG 1.4.1). Spent wins over pre-configured —
-  // a runout latch is the more specific, more actionable truth.
-  const bindingStatus = binding
-    ? binding.spent
-      ? { Icon: AlertTriangle, className: 'text-amber-400', text: t('ams.emptySlotBinding.ranOut') }
-      : binding.preConfigured
-        ? { Icon: Clock, className: 'text-bambu-blue', text: t('ams.emptySlotBinding.awaitingInsert') }
-        : { Icon: MinusCircle, className: 'text-bambu-gray', text: t('ams.emptySlotBinding.notInserted') }
-    : null;
+  // with an explicit sentence (WCAG 1.4.1). Precedence (spent > pre-configured)
+  // and wording live in `resolveSpoolBindingStatus` — shared with the Inventory
+  // LOCATION column so the two surfaces can never drift apart.
+  const bindingStatus = binding ? resolveSpoolBindingStatus(binding) : null;
 
   return (
     <div
@@ -692,7 +688,7 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
                 </p>
                 <p className={`text-[10px] flex items-start gap-1 ${bindingStatus.className}`}>
                   <bindingStatus.Icon className="w-3 h-3 mt-px shrink-0" aria-hidden="true" />
-                  <span>{bindingStatus.text}</span>
+                  <span>{t(bindingStatus.i18nKey)}</span>
                 </p>
               </div>
             )}

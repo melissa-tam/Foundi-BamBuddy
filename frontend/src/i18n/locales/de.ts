@@ -5008,6 +5008,7 @@ export default {
       ranOut: 'aufgebraucht — wartet auf neue Rolle',
       awaitingInsert: 'wartet auf Einlegen (vorkonfiguriert)',
       notInserted: 'nicht eingelegt',
+      elsewhereHint: '(nicht eingelegt — zugewiesen an {{location}})',
       clear: 'Steckplatz leeren',
       clearAria: 'Zuweisung des Steckplatzes für {{spool}} aufheben',
       clearTitle: 'Diesen Steckplatz leeren?',

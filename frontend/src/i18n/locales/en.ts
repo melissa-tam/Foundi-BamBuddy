@@ -5034,6 +5034,7 @@ export default {
       ranOut: 'ran out — awaiting new roll',
       awaitingInsert: 'awaiting insert (pre-configured)',
       notInserted: 'not inserted',
+      elsewhereHint: '(not inserted — assigned to {{location}})',
       clear: 'Clear slot',
       clearAria: 'Clear the slot binding for {{spool}}',
       clearTitle: 'Clear this slot?',

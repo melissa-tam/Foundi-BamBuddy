@@ -4996,6 +4996,7 @@ export default {
       ranOut: 'esaurita — in attesa di una bobina nuova',
       awaitingInsert: 'in attesa di inserimento (preconfigurata)',
       notInserted: 'non inserita',
+      elsewhereHint: '(non inserita — assegnata a {{location}})',
       clear: 'Libera slot',
       clearAria: 'Libera l’assegnazione dello slot per {{spool}}',
       clearTitle: 'Liberare questo slot?',

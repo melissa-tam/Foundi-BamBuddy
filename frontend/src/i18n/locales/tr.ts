@@ -4986,6 +4986,7 @@ export default {
       ranOut: 'tükendi — yeni makara bekleniyor',
       awaitingInsert: 'takılması bekleniyor (ön tanımlı)',
       notInserted: 'takılmadı',
+      elsewhereHint: '(takılmadı — {{location}} yuvasına atanmış)',
       clear: 'Yuvayı boşalt',
       clearAria: '{{spool}} için yuva atamasını kaldır',
       clearTitle: 'Bu yuva boşaltılsın mı?',

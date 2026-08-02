@@ -6,7 +6,7 @@ import { Search, X, Package } from 'lucide-react';
 import { api } from '../../api/client';
 import type { InventorySpool } from '../../api/client';
 import { resolveSpoolColorName, getSwatchStyle, spoolColorString } from '../../utils/colors';
-import { formatSlotLabel } from '../../utils/amsHelpers';
+import { formatAssignmentSlotLabel } from '../../utils/amsHelpers';
 import { filterSpoolsByQuery } from '../../utils/inventorySearch';
 import { InventorySpoolInfoCard } from '../../components/spoolbuddy/InventorySpoolInfoCard';
 import { AssignToAmsModal } from '../../components/spoolbuddy/AssignToAmsModal';
@@ -37,9 +37,7 @@ function spoolDisplayName(spool: InventorySpool): string {
 }
 
 function assignmentLabel(a: SlotInfo): string {
-  const isExternal = a.ams_id === 254 || a.ams_id === 255;
-  const isHt = !isExternal && a.ams_id >= 128;
-  return formatSlotLabel(a.ams_id, a.tray_id, isHt, isExternal);
+  return formatAssignmentSlotLabel(a);
 }
 
 /* Spool circle — same style as AMS page tray slots */

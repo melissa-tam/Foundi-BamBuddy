@@ -5008,6 +5008,7 @@ export default {
       ranOut: '使い切り — 新しいロール待ち',
       awaitingInsert: '挿入待ち（事前設定済み）',
       notInserted: '未挿入',
+      elsewhereHint: '（未挿入 — {{location}} に割り当て済み）',
       clear: 'スロットを解除',
       clearAria: '{{spool}} のスロット割り当てを解除',
       clearTitle: 'このスロットを解除しますか？',

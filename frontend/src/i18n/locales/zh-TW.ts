@@ -4996,6 +4996,7 @@ export default {
       ranOut: '已用完 — 等待新線材卷',
       awaitingInsert: '等待裝入（已預先設定）',
       notInserted: '未裝入',
+      elsewhereHint: '（未裝入 — 已指派至 {{location}}）',
       clear: '清除插槽指派',
       clearAria: '清除 {{spool}} 的插槽指派',
       clearTitle: '清除此插槽的指派？',

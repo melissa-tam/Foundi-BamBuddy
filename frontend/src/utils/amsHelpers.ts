@@ -134,6 +134,20 @@ export function formatSlotLabel(
 }
 
 /**
+ * Slot label straight from an assignment-shaped row.
+ *
+ * "External" (ams_id 254/255) and "AMS-HT" (ams_id >= 128) are properties of
+ * `ams_id` itself, so every call site was re-deriving the same two booleans
+ * before it could call `formatSlotLabel`. One derivation, one place to fix when
+ * a new unit class shows up.
+ */
+export function formatAssignmentSlotLabel(slot: { ams_id: number; tray_id: number }): string {
+  const isExternal = slot.ams_id === 254 || slot.ams_id === 255;
+  const isHt = !isExternal && slot.ams_id >= 128;
+  return formatSlotLabel(slot.ams_id, slot.tray_id, isHt, isExternal);
+}
+
+/**
  * Calculate global tray ID for MQTT command.
  * Used in the ams_mapping array sent to the printer.
  * @param amsId - AMS unit ID (0-3 for regular AMS, 128+ for AMS-HT)

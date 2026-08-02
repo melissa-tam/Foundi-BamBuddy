@@ -28,7 +28,8 @@ import { useAuth } from '../contexts/AuthContext';
 import { resolveSpoolColorName } from '../utils/colors';
 import { getCurrencySymbol } from '../utils/currency';
 import { formatDateInput, parseUTCDate, type DateFormat } from '../utils/date';
-import { formatSlotLabel } from '../utils/amsHelpers';
+import { formatAssignmentSlotLabel } from '../utils/amsHelpers';
+import { resolveSpoolBindingStatus } from '../utils/spoolBindingStatus';
 import { filterSpoolsByQuery } from '../utils/inventorySearch';
 import {
   inventoryLocationsQueryKey,
@@ -161,6 +162,15 @@ type LocationDisplay = {
   ams_id: number;
   tray_id: number;
   ams_label: string | null;
+  /** Tri-state LIVE presence of the bound tray (W5b). Only `false` is
+   *  actionable — the slot verifiably reads cleared, so this location is a
+   *  claim on a shelf rather than filament in a printer. `true` / `null` /
+   *  absent all render exactly as before, so the Spoolman branch (which has no
+   *  presence data at all) is unaffected. */
+  present?: boolean | null;
+  /** `assignment.pre_configured_at` — bound to a slot deliberately BEFORE the
+   *  roll was inserted, which is a different story from a stale claim. */
+  pre_configured_at?: string | null;
 };
 
 type CellCtx = {
@@ -250,16 +260,36 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
       {spool.slicer_filament_name || spool.slicer_filament || '-'}
     </span>
   ),
-  location: ({ spool, assignmentMap }) => {
+  location: ({ spool, assignmentMap, t }) => {
     const assignment = assignmentMap[spool.id];
     if (!assignment) return <span className="text-sm text-bambu-gray">-</span>;
     const printerLabel = assignment.printer_name || `Printer ${assignment.printer_id}`;
-    const isExternal = assignment.ams_id === 254 || assignment.ams_id === 255;
-    const isHt = !isExternal && assignment.ams_id >= 128;
-    const slotLabel = formatSlotLabel(assignment.ams_id, assignment.tray_id, isHt, isExternal);
+    const slotLabel = formatAssignmentSlotLabel(assignment);
+    // W5b: the slot is verifiably EMPTY, so the badge alone would read as a lie
+    // ("in printer X slot A1" when the roll is on a shelf). Qualify it with the
+    // reason. Presence is tri-state and only `false` is evidence — `true`,
+    // `null` (offline / partial push / dialect that never reports presence) and
+    // absent all keep the historical badge, so this fails open.
+    const status = assignment.present === false
+      ? resolveSpoolBindingStatus({
+          spent: !!spool.spent_at,
+          preConfigured: !!assignment.pre_configured_at,
+        })
+      : null;
     return (
-      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-purple-500/20 text-purple-400">
-        {printerLabel} {slotLabel}{assignment.ams_label ? ` (${assignment.ams_label})` : ''}
+      <span className="inline-flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+        <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-purple-500/20 text-purple-400">
+          {printerLabel} {slotLabel}{assignment.ams_label ? ` (${assignment.ams_label})` : ''}
+        </span>
+        {status && (
+          // Secondary to the badge by size and position; the icon carries the
+          // severity tone while the sentence carries the meaning, so the state
+          // is never conveyed by colour alone (WCAG 1.4.1).
+          <span className="inline-flex items-center gap-0.5 text-[10px] text-bambu-gray whitespace-nowrap">
+            <status.Icon className={`w-3 h-3 shrink-0 ${status.className}`} aria-hidden="true" />
+            {t(status.i18nKey)}
+          </span>
+        )}
       </span>
     );
   },
@@ -418,10 +448,8 @@ const columnSortValues: Record<string, (spool: InventorySpool, assignmentMap: Re
   location: (s, am) => {
     const a = am[s.id];
     if (!a) return '';
-    const isExt = a.ams_id === 254 || a.ams_id === 255;
-    const isHt = !isExt && a.ams_id >= 128;
     const label = a.ams_label ? ` (${a.ams_label})` : '';
-    return `${a.printer_name || ''} ${formatSlotLabel(a.ams_id, a.tray_id, isHt, isExt)}${label}`;
+    return `${a.printer_name || ''} ${formatAssignmentSlotLabel(a)}${label}`;
   },
   storage_location: (s) => (s.storage_location || '').toLowerCase(),
   label_weight: (s) => s.label_weight,
@@ -1018,6 +1046,11 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
         ams_id: a.ams_id,
         tray_id: a.tray_id,
         ams_label: a.ams_label ?? null,
+        // Carried verbatim (incl. undefined) — the LOCATION cell branches on
+        // `=== false` only, so an older backend that omits the field keeps the
+        // pre-W5b rendering.
+        present: a.present,
+        pre_configured_at: a.pre_configured_at,
       };
     }
     for (const a of spoolmanSlotAssignments) {

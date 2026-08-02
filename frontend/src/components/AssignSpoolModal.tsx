@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { X, Loader2, Package, Search } from 'lucide-react';
+import { X, Loader2, Package, Search, MinusCircle } from 'lucide-react';
 import { api } from '../api/client';
 import type { InventorySpool, SpoolAssignment } from '../api/client';
 import { Button } from './Button';
 import { Modal } from './ui/Modal';
 import { ConfirmModal } from './ConfirmModal';
 import { useToast } from '../contexts/ToastContext';
+import { formatAssignmentSlotLabel } from '../utils/amsHelpers';
 import { filterSpoolsByQuery } from '../utils/inventorySearch';
 import { getSwatchStyle } from '../utils/colors';
 
@@ -234,12 +235,37 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
 
   if (!isOpen) return null;
 
-  // Filter out spools already assigned to other slots
-  const assignedSpoolIds = new Set(
-    (assignments || [])
-      .filter(a => !(a.printer_id === printerId && a.ams_id === amsId && a.tray_id === trayId))
-      .map(a => a.spool_id)
-  );
+  // Bindings held by OTHER slots, split by whether the roll is physically there.
+  //
+  // W5b: a binding whose tray reports `present === false` is a claim on a spool
+  // that is sitting on a SHELF, not filament loaded in another printer. Hiding
+  // those made the picker refuse the one spool the operator was holding — the
+  // stale claim silently vetoed the assign. They stay listed now, annotated with
+  // where the claim lives, because re-binding is safe: `bind_spool_to_slot` has
+  // move semantics (it sweeps the spool's old rows fleet-wide) rather than
+  // copying, which is exactly the invariant the 012-H2S layer-1 runout bought.
+  //
+  // `present` true / null / absent keep the historical hide. Unknown presence
+  // (printer offline, partial push, a dialect that never reports it) is never
+  // treated as evidence of absence.
+  const notInsertedElsewhere = new Map<number, SpoolAssignment>();
+  const assignedSpoolIds = new Set<number>();
+  for (const a of assignments || []) {
+    if (a.printer_id === printerId && a.ams_id === amsId && a.tray_id === trayId) continue;
+    if (a.present === false) {
+      // Defensive: a present binding elsewhere outranks an absent one. The
+      // one-spool-one-slot unique index makes a same-spool pair impossible, so
+      // this only guards a stale cache mid-rebind.
+      if (!assignedSpoolIds.has(a.spool_id)) notInsertedElsewhere.set(a.spool_id, a);
+    } else {
+      assignedSpoolIds.add(a.spool_id);
+      notInsertedElsewhere.delete(a.spool_id);
+    }
+  }
+
+  /** "Rocket A1" — where a not-inserted binding is currently parked. */
+  const claimLocation = (a: SpoolAssignment) =>
+    `${a.printer_name || `${t('common.printer')} ${a.printer_id}`} ${formatAssignmentSlotLabel(a)}`;
   // Show every spool that isn't already taken by another slot — including
   // RFID-tagged Bambu Lab spools (#1133). The earlier "manual spools only"
   // gate (tag_uid && tray_uuid both null) blocked the workflow where a
@@ -411,7 +437,12 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
               </div>
             ) : filteredSpools && filteredSpools.length > 0 ? (
               <div className="max-h-96 overflow-y-auto grid grid-cols-2 sm:grid-cols-3 gap-2">
-                {filteredSpools.map((spool: InventorySpool) => (
+                {filteredSpools.map((spool: InventorySpool) => {
+                  // A binding this spool still holds on a slot that reads empty
+                  // (W5b). Listed rather than hidden, but the operator has to be
+                  // told the claim exists — picking it here MOVES the binding.
+                  const staleClaim = notInsertedElsewhere.get(spool.id);
+                  return (
                   <button
                     key={spool.id}
                     onClick={() => { setSelectedSpoolId(spool.id); setSelectedSpoolmanSpoolId(null); }}
@@ -439,13 +470,25 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
                         {Math.max(0, Math.round(spool.label_weight - spool.weight_used))} / {spool.label_weight}g
                       </p>
                     )}
+                    {staleClaim && (
+                      <p
+                        className="text-[10px] text-amber-400/90 mt-1 flex items-center gap-1"
+                        title={t('ams.emptySlotBinding.elsewhereHint', { location: claimLocation(staleClaim) })}
+                      >
+                        <MinusCircle className="w-3 h-3 shrink-0" aria-hidden="true" />
+                        <span className="truncate">
+                          {t('ams.emptySlotBinding.elsewhereHint', { location: claimLocation(staleClaim) })}
+                        </span>
+                      </p>
+                    )}
                     {spool.note && (
                       <p className="text-[10px] text-bambu-gray/70 mt-1 truncate" title={spool.note}>
                         {spool.note}
                       </p>
                     )}
                   </button>
-                ))}
+                  );
+                })}
               </div>
             ) : availableSpools && availableSpools.length === 0 ? (
               <div className="text-center py-8 text-bambu-gray">
@@ -456,11 +499,16 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
                     immediately answerable: if `total fetched` is 0 the
                     backend / cache returned nothing; if it's > 0 then
                     the archived / assigned-elsewhere filter ate the
-                    spool and the toggle is the right escape hatch. */}
+                    spool and the toggle is the right escape hatch.
+                    The last count is listed-not-hidden (W5b): those
+                    spools ARE offered, so an empty picker with a
+                    non-zero tail means the tray-match filter ate
+                    them, not the assignment filter. */}
                 {spools && (
                   <p className="text-[10px] mt-2 opacity-60">
                     {spools.length} fetched · {spools.filter(s => s.archived_at).length} archived ·{' '}
-                    {spools.filter(s => assignedSpoolIds.has(s.id)).length} assigned to other slots
+                    {spools.filter(s => assignedSpoolIds.has(s.id)).length} assigned to other slots ·{' '}
+                    {spools.filter(s => notInsertedElsewhere.has(s.id)).length} claimed but not inserted (listed)
                   </p>
                 )}
               </div>

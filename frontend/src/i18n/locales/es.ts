@@ -5016,6 +5016,7 @@ export default {
       ranOut: 'se agotó — esperando bobina nueva',
       awaitingInsert: 'esperando inserción (preconfigurada)',
       notInserted: 'no insertada',
+      elsewhereHint: '(no insertada — asignada a {{location}})',
       clear: 'Liberar ranura',
       clearAria: 'Liberar la asignación de la ranura para {{spool}}',
       clearTitle: '¿Liberar esta ranura?',

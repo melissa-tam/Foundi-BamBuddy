@@ -414,6 +414,103 @@ describe('AssignSpoolModal', () => {
       expect.anything(),
     );
   });
+  // ── W5b: a binding on a slot that reads EMPTY is a shelf claim, not filament ──
+  //
+  // Hiding those spools made the picker refuse the very roll the operator was
+  // holding: a stale claim silently vetoed the assign with no way to see why.
+  // They are listed now, annotated with where the claim lives. Re-binding is
+  // safe because `bind_spool_to_slot` MOVES a spool (sweeping its old rows
+  // fleet-wide) rather than copying it.
+
+  it('lists a spool whose other-slot binding reports present=false', async () => {
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([manualSpool, anotherManualSpool]);
+    (api.getAssignments as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 99, spool_id: 3, printer_id: 4, printer_name: 'Rocket', ams_id: 0, tray_id: 1, present: false },
+    ]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Polymaker/)).toBeInTheDocument();
+    });
+    // Previously filtered out by `assignedSpoolIds`; now offered.
+    expect(screen.getByText(/Overture/)).toBeInTheDocument();
+  });
+
+  it('annotates the not-inserted spool with the slot still claiming it', async () => {
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([anotherManualSpool]);
+    (api.getAssignments as ReturnType<typeof vi.fn>).mockResolvedValue([
+      // formatSlotLabel(0, 1) => "A2"
+      { id: 99, spool_id: 3, printer_id: 4, printer_name: 'Rocket', ams_id: 0, tray_id: 1, present: false },
+    ]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Overture/)).toBeInTheDocument();
+    });
+    const hint = await screen.findByText(/not inserted — assigned to Rocket A2/);
+    expect(hint).toBeInTheDocument();
+  });
+
+  it('falls back to the printer id when the claiming assignment has no name', async () => {
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([anotherManualSpool]);
+    (api.getAssignments as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 99, spool_id: 3, printer_id: 4, printer_name: null, ams_id: 0, tray_id: 1, present: false },
+    ]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    expect(await screen.findByText(/assigned to Printer 4 A2/)).toBeInTheDocument();
+  });
+
+  it('still hides a spool whose other-slot binding reports present=true', async () => {
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([manualSpool, anotherManualSpool]);
+    (api.getAssignments as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 99, spool_id: 3, printer_id: 4, ams_id: 0, tray_id: 1, present: true },
+    ]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Polymaker/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Overture/)).not.toBeInTheDocument();
+  });
+
+  it('still hides a spool whose presence is unknown (null / field absent)', async () => {
+    // Unknown presence is never evidence of absence — an offline printer must
+    // not start handing its loaded spools out to other slots.
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([manualSpool, anotherManualSpool, blSpool]);
+    (api.getAssignments as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 99, spool_id: 3, printer_id: 4, ams_id: 0, tray_id: 1, present: null },
+      { id: 98, spool_id: 2, printer_id: 4, ams_id: 0, tray_id: 2 },
+    ]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Polymaker/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Overture/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Jade White/)).not.toBeInTheDocument();
+  });
+
+  it('does not annotate a spool bound to THIS slot', async () => {
+    // The current slot's own binding is never a competing claim, even when the
+    // tray momentarily reads empty (mid-swap).
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([manualSpool]);
+    (api.getAssignments as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 99, spool_id: 1, printer_id: 1, printer_name: 'Rocket', ams_id: 0, tray_id: 0, present: false },
+    ]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Polymaker/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/not inserted — assigned to/)).not.toBeInTheDocument();
+  });
 });
 
 describe('AssignSpoolModal — Spoolman enabled (T-Gap 7)', () => {

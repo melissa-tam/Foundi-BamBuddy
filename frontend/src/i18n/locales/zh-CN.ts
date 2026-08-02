@@ -4996,6 +4996,7 @@ export default {
       ranOut: '已用尽 — 等待新料卷',
       awaitingInsert: '等待装入（已预先配置）',
       notInserted: '未装入',
+      elsewhereHint: '（未装入 — 已绑定到 {{location}}）',
       clear: '解除槽位绑定',
       clearAria: '解除 {{spool}} 的槽位绑定',
       clearTitle: '解除该槽位的绑定？',

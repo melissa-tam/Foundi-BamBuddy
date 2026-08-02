@@ -4996,6 +4996,7 @@ export default {
       ranOut: 'acabou — aguardando rolo novo',
       awaitingInsert: 'aguardando inserção (pré-configurado)',
       notInserted: 'não inserido',
+      elsewhereHint: '(não inserido — atribuído a {{location}})',
       clear: 'Liberar slot',
       clearAria: 'Liberar a atribuição do slot para {{spool}}',
       clearTitle: 'Liberar este slot?',

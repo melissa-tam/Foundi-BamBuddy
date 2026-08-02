@@ -4800,6 +4800,7 @@ export default {
       ranOut: '소진됨 — 새 롤 대기 중',
       awaitingInsert: '삽입 대기 중(사전 구성됨)',
       notInserted: '삽입되지 않음',
+      elsewhereHint: '(삽입되지 않음 — {{location}}에 할당됨)',
       clear: '슬롯 해제',
       clearAria: '{{spool}}의 슬롯 할당 해제',
       clearTitle: '이 슬롯을 해제할까요?',
