@@ -201,6 +201,16 @@ def _tray_loaded(tray: dict) -> bool:
     return cur_state == 11 or (cur_state not in (9, 10) and bool(cur_type))
 
 
+def tray_loaded(tray: dict) -> bool:
+    """Public read-only view of :func:`_tray_loaded` for the slot pipeline (W3a).
+
+    The spent→mint transition must not fire on a dead roll that was re-seated without
+    filament being fed, and that gate is this predicate — so the orchestrator asks the
+    owner rather than re-deriving it (one implementation, no drift).
+    """
+    return _tray_loaded(tray)
+
+
 def _tray_material(tray: dict) -> str:
     """Best-effort material string from a tray dict (no DB), for fingerprinting."""
     tray_type = (tray.get("tray_type") or "").strip()
@@ -377,6 +387,17 @@ async def tagless_default_brand(db: AsyncSession) -> str:
     """
     default = await _tagless_default(db)
     return ((default or {}).get("brand") or "").strip()
+
+
+async def tagless_default_filament(db: AsyncSession) -> dict | None:
+    """The configured tagless-default filament dict, or None when the feature is off.
+
+    Public accessor over :func:`_tagless_default` (the single JSON parser) for the slot
+    pipeline, which hands the dict to the decision table as
+    ``ResolutionContext.tagless_default``. Same contract as the private parser — no
+    copy of the parse, no second source of truth for the setting.
+    """
+    return await _tagless_default(db)
 
 
 async def effective_threshold(db: AsyncSession) -> int:
@@ -609,6 +630,19 @@ async def _push_config(db: AsyncSession, spool: Spool, printer_id: int, ams_id: 
             tray_id,
         )
         return False
+
+
+async def push_config_for_spool(
+    db: AsyncSession, spool: Spool, printer_id: int, ams_id: int, tray_id: int, tray: dict
+) -> bool:
+    """Public entry to the module's ONE wire-write funnel (:func:`_push_config`).
+
+    Used by the slot pipeline (W3a) for the two writes it owns — the pre-configured
+    one-shot apply and a default-minted row's first identity push — so those go through
+    the same settle gate and the same failure handling as every existing config write.
+    No logic is duplicated at the call site: this is a delegation, nothing else.
+    """
+    return await _push_config(db, spool, printer_id, ams_id, tray_id, tray)
 
 
 async def _broadcast_auto_assigned(
@@ -881,6 +915,31 @@ async def note_physical_cycle(printer_id: int, ams_id: int, tray_id: int) -> Non
         logger.exception("note_physical_cycle W5 prompt failed for printer %d AMS%d-T%d", printer_id, ams_id, tray_id)
 
 
+def qualified_cycle_pending(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Is a QUALIFIED physical roll swap pending on this slot? PEEK — never consumes.
+
+    Read-only view of :data:`_pending_physical_cycles` for the slot pipeline, which
+    needs the fact as a decision INPUT (``ResolutionContext.qualified_cycle_pending``)
+    long before it knows whether the decision will spend it. Consumption is a separate,
+    explicit act (:func:`consume_qualified_cycle`) so a pass that decides to KEEP the
+    spent latch cannot silently swallow the swap evidence.
+    """
+    return (printer_id, ams_id, tray_id) in _pending_physical_cycles
+
+
+def consume_qualified_cycle(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Spend this slot's pending physical cycle. True when there was one to spend.
+
+    The W1 spent-latch RELEASE, popped exactly once — the same discard the branch-(3) /
+    bare-tray transitions perform, exposed for the slot pipeline's REPLACE_SPENT arm.
+    """
+    key = (printer_id, ams_id, tray_id)
+    if key not in _pending_physical_cycles:
+        return False
+    _pending_physical_cycles.discard(key)
+    return True
+
+
 async def apply_fresh_roll(
     db: AsyncSession,
     spool: Spool,
@@ -1083,6 +1142,18 @@ def _mint_settling(printer_id: int, ams_id: int, tray_id: int) -> bool:
     """
     age = ams_presence.recent_gain_age(printer_id, ams_id, tray_id)
     return age is not None and age < _MINT_SETTLE_S
+
+
+def slot_is_settling(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Is EITHER settle window open on this slot? Read-only, changes nothing.
+
+    The two windows guard different things and the slot pipeline needs both as one
+    decision input (``ResolutionContext.settling``): :func:`_mint_settling` (F1) stops a
+    fresh row being minted inside the firmware's own post-insert RFID read, and
+    :func:`_config_settling` stops an identity being PUBLISHED into a slot whose
+    identity is still an open question. Either one open means "not this push".
+    """
+    return _mint_settling(printer_id, ams_id, tray_id) or _config_settling(printer_id, ams_id, tray_id)
 
 
 def _printer_busy(printer_id: int, *, on_error: bool = True) -> bool:

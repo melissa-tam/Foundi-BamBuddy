@@ -248,6 +248,17 @@ def _printer_running(state) -> bool:
     return state is not None and getattr(state, "state", None) in ("RUNNING", "PAUSE")
 
 
+def printer_running(state) -> bool:
+    """Public read-only view of the RUNNING/PAUSE predicate (:func:`_printer_running`).
+
+    This module already owns the running-state reading every AMS-side guard shares
+    (``spool_tagless._printer_busy`` delegates here); the slot pipeline needs the same
+    answer for ``ResolutionContext.busy``, and a second copy is exactly the drift this
+    fork avoids. ``None`` (disconnected / never connected) is not evidence of a print.
+    """
+    return _printer_running(state)
+
+
 def _iter_ams_units(state) -> list:
     """Yield the AMS unit dicts from a printer state's merged raw_data."""
     if state is None:
