@@ -934,6 +934,185 @@ async def test_mid_print_unresolved_defers_without_an_identify(db_session, print
     assert env.identifies == []
 
 
+# --- the PRODUCTION identify default ----------------------------------------
+
+
+class _IdentifyProbe:
+    """A fake ``ams_presence`` identify surface: records what the default CONSULTS and
+    what it SPENDS.
+
+    Every other test in this file injects ``_Recorder.schedule_identify``, which pins
+    only that the pipeline owes a read. These tests remove that hook so the production
+    default runs for real, and this probe stands in for the two ``ams_presence``
+    functions it reaches — the need predicate and the single identify commander.
+    """
+
+    def __init__(self, need: str | None = None):
+        self.need = need
+        self.needs_asked: list[tuple[int, int, int, dict]] = []
+        self.commanded: list[tuple[int, int, int, str | None]] = []
+
+    async def identify_needed(self, db, printer_id, ams_id, tray_id, tray, spoolman_active):
+        self.needs_asked.append((printer_id, ams_id, tray_id, dict(tray)))
+        return self.need
+
+    async def command_identify(self, printer_id, ams_id, tray_id, *, source, reason=None, **kwargs):
+        self.commanded.append((printer_id, ams_id, tray_id, reason))
+        return True, "ok"
+
+
+@pytest.fixture
+def identify_probe(monkeypatch):
+    """Install an :class:`_IdentifyProbe` over ``ams_presence``'s identify surface."""
+
+    def _install(need: str | None = None) -> _IdentifyProbe:
+        probe = _IdentifyProbe(need)
+        monkeypatch.setattr(slot_pipeline.ams_presence, "identify_needed", probe.identify_needed)
+        monkeypatch.setattr(slot_pipeline.ams_presence, "command_identify", probe.command_identify)
+        return probe
+
+    return _install
+
+
+def _prod_identify_deps(db_session, recorder: _Recorder, client=None) -> PipelineDeps:
+    """Deps with NO identify hook injected, so ``PipelineDeps.identify`` runs its
+    production default."""
+    deps = _deps(db_session, recorder, client=client)
+    deps.schedule_identify = None
+    return deps
+
+
+class TestTheProductionIdentifyDefaultIsNeedDriven:
+    """008-H2C AMS2 slot2, 2026-08-02 — the permanent discovery-read loop.
+
+    A dialect-odd slot (state 9, no filament type, no tag, stuck exist bit) presented
+    presence=UNKNOWN with an occupancy signal, so it derived OCCUPIED_UNRESOLVED and
+    resolved ``NONE(identity_unresolved)`` on EVERY push — a standing condition, not an
+    event. The production default answered each one, so the farm logged
+    ``identify commanded: AMS2 slot2 (source=reconcile, reason=discovery)`` every ~30 s
+    (the client's identify gate was the ONLY thing pacing it) for a slot with nothing to
+    read.
+
+    Doctrine rule 3 / invariant 4: a DISCOVERY read is owed only for an UNANSWERED
+    QUALIFIED PHYSICAL CYCLE, and ``ams_presence.identify_needed`` is the one authority
+    on that. ``identity_unresolved`` is therefore a REQUEST the default must clear with
+    the predicate, never an entitlement.
+    """
+
+    # The prod slot's own RAW push shape.
+    PROD_TRAY = {"id": 2, "state": 9, "tray_type": ""}
+
+    # ``tray_exist_bits`` bit for AMS2 slot2 (``ams_id * 4 + tray_id``) — the stuck bit
+    # that vetoes the state-9 emptiness and leaves presence UNKNOWN.
+    PROD_EXIST_BITS = 1 << (2 * 4 + 2)
+
+    def _prod_obs(self, printer_id: int):
+        """AMS2 slot2 with the stuck exist bit vetoing the state-9 emptiness."""
+        obs = observe_tray(printer_id, 2, dict(self.PROD_TRAY), exist_bits=self.PROD_EXIST_BITS)
+        # The exact epistemic shape that makes this slot stand still forever: presence
+        # unknowable, occupancy signalled — so it can never be classified EMPTY either.
+        assert obs.present is None and obs.occupancy_signal is True
+        return obs
+
+    @pytest.mark.asyncio
+    async def test_a_standing_unknown_slot_is_never_read_on_a_cadence(
+        self, db_session, printer_factory, env, identify_probe, caplog
+    ):
+        """THE loop-shape pin: N passes over an unresolved, unbound, no-cycle slot must
+        spend ZERO identifies. One read per pass is the bug; a read per unanswered cycle
+        is the contract."""
+        printer = await printer_factory()
+        probe = identify_probe(need=None)
+        deps = _prod_identify_deps(db_session, env)
+
+        with caplog.at_level(logging.DEBUG, logger=_PIPELINE_LOGGER):
+            for _ in range(5):
+                transitions = await run_slot_pipeline(printer.id, [self._prod_obs(printer.id)], deps)
+                assert transitions[0].to_state is SlotState.OCCUPIED_UNRESOLVED
+                assert transitions[0].decision == Decision(DecisionKind.NONE, reason="identity_unresolved")
+
+        assert probe.commanded == []  # the read loop is gone...
+        assert len(probe.needs_asked) == 5  # ...because the need is asked every pass
+        # The predicate is fed THIS push's raw tray, addressed to the right slot.
+        assert probe.needs_asked[0][:3] == (printer.id, 2, 2)
+        assert probe.needs_asked[0][3] == self.PROD_TRAY
+        noop = [m for m in _records(caplog, logging.DEBUG) if "standing unknown is not a read reason" in m]
+        assert len(noop) == 5
+        assert f"printer={printer.id} A2T2" in noop[0]
+        assert await _spool_count(db_session) == 0  # and nothing was mutated either
+
+    @pytest.mark.asyncio
+    async def test_an_unanswered_qualified_cycle_still_gets_its_discovery_read(
+        self, db_session, printer_factory, env, identify_probe
+    ):
+        """The gate narrows the OCCASION, never the capability: a slot that genuinely
+        changed still buys its one answer."""
+        printer = await printer_factory()
+        probe = identify_probe(need="discovery")
+
+        await run_slot_pipeline(printer.id, [self._prod_obs(printer.id)], _prod_identify_deps(db_session, env))
+
+        assert probe.commanded == [(printer.id, 2, 2, "discovery")]
+
+    @pytest.mark.asyncio
+    async def test_the_predicates_own_verdict_is_what_gets_commanded(
+        self, db_session, printer_factory, env, identify_probe
+    ):
+        """The decision reason is a request, the predicate's answer is the verdict: a
+        slot the predicate finds live-tagged is read as ``rfid_refresh``, not as this
+        decision's ``discovery`` guess."""
+        printer = await printer_factory()
+        probe = identify_probe(need="rfid_refresh")
+
+        await run_slot_pipeline(printer.id, [self._prod_obs(printer.id)], _prod_identify_deps(db_session, env))
+
+        assert probe.commanded == [(printer.id, 2, 2, "rfid_refresh")]
+
+    @pytest.mark.asyncio
+    async def test_the_full_read_defer_is_not_need_gated(self, db_session, printer_factory, env, identify_probe):
+        """``identity_ambiguous_owed_full_read`` arises ONLY on a tag-asserting push over
+        a bound slot: the push itself is the evidence and the read is guaranteed
+        answerable, so it commands ``rfid_refresh`` without consulting the predicate at
+        all (which here would veto it)."""
+        printer = await printer_factory()
+        roll = await _spool(db_session, tag_uid=TAG_A, tray_uuid=UUID_1, material="PETG", rgba="000000FF")
+        await _bind_row(db_session, roll, printer.id, 0, 3)
+        probe = identify_probe(need=None)
+        deps = _prod_identify_deps(db_session, env)
+
+        # Tag-only disagreement against a binding that claims an identity.
+        obs = _obs(printer.id, {"id": 3, "state": 11, "tag_uid": TAG_B, "tray_type": "PETG"})
+        transitions = await run_slot_pipeline(printer.id, [obs], deps)
+
+        assert transitions[0].decision == Decision(DecisionKind.DEFER, reason="identity_ambiguous_owed_full_read")
+        assert probe.needs_asked == []
+        assert probe.commanded == [(printer.id, 0, 3, "rfid_refresh")]
+
+    @pytest.mark.asyncio
+    async def test_the_real_predicate_refuses_the_prod_slot(self, db_session, printer_factory, env, monkeypatch):
+        """The end-to-end pin, with the REAL ``identify_needed``.
+
+        Fed the 008-H2C slot's own raw push it answers None — state 9 is not presence,
+        so no ``rfid_refresh`` applies, and no qualified physical cycle was ever recorded
+        for the slot, so no discovery is owed. Only ``command_identify`` is faked (it
+        would otherwise reach for a live client).
+        """
+        printer = await printer_factory()
+        commanded: list[tuple[int, int, int, str | None]] = []
+
+        async def _record(printer_id, ams_id, tray_id, *, source, reason=None, **kwargs):
+            commanded.append((printer_id, ams_id, tray_id, reason))
+            return True, "ok"
+
+        monkeypatch.setattr(slot_pipeline.ams_presence, "command_identify", _record)
+        deps = _prod_identify_deps(db_session, env)
+
+        for _ in range(3):
+            await run_slot_pipeline(printer.id, [self._prod_obs(printer.id)], deps)
+
+        assert commanded == []
+
+
 # --- serialization + never-raise --------------------------------------------
 
 

@@ -127,15 +127,28 @@ ORPHAN_RELEASE_REASON = "orphaned_assignment"
 
 # Decision reason → the identify NEED verdict the discovery lane understands
 # (``ams_presence.identify_needed``). The two ``*_owed_full_read`` defers only ever
-# arise on a push that ASSERTED a tag, so the slot is tagged and a refresh is what is
-# owed; ``identity_unresolved`` arises with no identity asserted at all, which is the
-# discovery shape. Deriving the verdict from the reason avoids a second DB round-trip
-# to re-answer a question the table already answered.
+# arise on a push that ASSERTED a tag over a BOUND slot, so the slot is tagged, the read
+# is guaranteed answerable and the need is the push's own evidence — those pass straight
+# through as ``rfid_refresh``.
+#
+# ``identity_unresolved`` is NOT evidence of anything. It arises with no identity
+# asserted at all, and a slot can sit in it FOREVER (008-H2C AMS2 slot2, 2026-08-02: a
+# dialect-odd state with a stuck exist bit resolved NONE(identity_unresolved) on every
+# push, and the pipeline answered each one with a discovery identify — a permanent
+# ~30 s read loop on an EMPTY slot, throttled only by the client's identify gate).
+# Doctrine rule 3 / invariant 4: a discovery read is owed only for an UNANSWERED
+# QUALIFIED PHYSICAL CYCLE, so this verdict is a REQUEST that
+# :meth:`PipelineDeps.identify_verdict` must clear with ``ams_presence.identify_needed``
+# — the one need authority — before anything is spent.
 _IDENTIFY_VERDICT = {
     "identity_ambiguous_owed_full_read": "rfid_refresh",
     "partial_identity_owed_full_read": "rfid_refresh",
     "identity_unresolved": "discovery",
 }
+
+# The one verdict in :data:`_IDENTIFY_VERDICT` that is need-GATED rather than
+# evidence-backed (see the note above).
+_NEED_GATED_VERDICT = "discovery"
 
 # How many last-location rows to inspect before giving up on a reclaim donor. The query
 # is already ordered most-recent-first and filtered to ONE slot, so this is a runaway
@@ -220,28 +233,73 @@ class PipelineDeps:
         except Exception:  # noqa: BLE001 — a broadcast failure must not unwind the pass
             logger.exception("[slot-state] broadcast failed for %s", payload.get("type"))
 
-    async def identify(self, printer_id: int, ams_id: int, tray_id: int, reason: str) -> None:
-        """Ask the discovery lane for ONE read on this slot.
+    async def identify(self, printer_id: int, ams_id: int, tray_id: int, reason: str, tray: dict) -> None:
+        """Ask the discovery lane for ONE read on this slot — if one is actually owed.
 
-        Need-driven, never forced: ``command_identify`` re-checks the printer's state,
-        the engaged extruder, drying and the client's own refusal, and spends nothing
-        when any of them objects (doctrine rule 5 / invariant 4).
+        NEED-driven, never cadence-driven. ``command_identify`` re-checks WIRE SAFETY
+        (printer state, engaged extruder, drying, the client's own refusal), but wire
+        safety is not need: a standing-unknown slot passes every one of those checks and
+        would be read on every push forever. :meth:`identify_verdict` is what decides
+        whether this decision has EARNED a read at all (doctrine rule 3 / invariant 4).
+
+        ``tray`` is this push's raw tray dict — the evidence ``ams_presence.identify_needed``
+        judges. It is used ONLY by the production default; an injected
+        ``schedule_identify`` owns its own policy and keeps the 4-argument hook signature.
         """
         try:
             if self.schedule_identify is not None:
                 await self.schedule_identify(printer_id, ams_id, tray_id, reason)
+                return
+            verdict = await self.identify_verdict(printer_id, ams_id, tray_id, reason, tray)
+            if verdict is None:
                 return
             await ams_presence.command_identify(
                 printer_id,
                 ams_id,
                 tray_id,
                 source="reconcile",
-                reason=_IDENTIFY_VERDICT.get(reason, "discovery"),
+                reason=verdict,
             )
         except Exception:  # noqa: BLE001 — an identify failure must not unwind the pass
             logger.exception(
                 "[slot-state] identify scheduling failed for printer %d A%dT%d", printer_id, ams_id, tray_id
             )
+
+    async def identify_verdict(self, printer_id: int, ams_id: int, tray_id: int, reason: str, tray: dict) -> str | None:
+        """The ``ams_presence`` reason this decision has earned, or None to spend nothing.
+
+        Two shapes (see :data:`_IDENTIFY_VERDICT`):
+
+        * ``rfid_refresh`` — the two full-read defers. A tag WAS asserted over a bound
+          slot this very push, so the read is both owed and answerable; the evidence is
+          the push itself and re-deriving it would only cost a query.
+        * ``discovery`` — a REQUEST, never an entitlement. ``identify_needed`` is the
+          fork's one need authority (it owns the unanswered-qualified-cycle test), so it
+          answers here, and a ``None`` verdict means the slot has simply been unknown for
+          a while — which is not a reason to read it. Whatever reason it DOES return is
+          the one passed on, so a slot that turns out to be live-tagged gets the accurate
+          ``rfid_refresh`` rather than this decision's guess.
+
+        ``spoolman_active=False`` is a fact, not an assumption: :func:`run_slot_pipeline`
+        stands the whole pass down under Spoolman mode, so no Spoolman binding can reach
+        this call.
+
+        An unmapped reason returns None — fail-CLOSED, because the only cost of not
+        reading is a slot whose identity resolves one push later.
+        """
+        verdict = _IDENTIFY_VERDICT.get(reason)
+        if verdict != _NEED_GATED_VERDICT:
+            return verdict
+        need = await ams_presence.identify_needed(self.db, printer_id, ams_id, tray_id, tray, False)
+        if need is None:
+            logger.debug(
+                "[slot-state] printer=%d A%dT%d no identify need — standing unknown is not a read reason",
+                printer_id,
+                ams_id,
+                tray_id,
+            )
+            return None
+        return need
 
     async def push_slot_config(self, spool: Spool, printer_id: int, ams_id: int, tray_id: int, tray: dict) -> bool:
         """Publish a slot's filament identity through the ONE tagless config funnel
@@ -729,10 +787,12 @@ async def _apply(
         return await _apply_replace_spent(obs, deps, assignment, decision, seen)
 
     # DEFER / NONE: the two identity-owed shapes buy an answer instead of guessing;
-    # everything else is a deliberate no-op this push.
+    # everything else is a deliberate no-op this push. The observation's tray dict rides
+    # along as the evidence the need gate judges — the RAW push, same as everything else
+    # this module decides on.
     if decision.reason in _IDENTIFY_VERDICT:
         printer_id, ams_id, tray_id = obs.slot
-        await deps.identify(printer_id, ams_id, tray_id, decision.reason)
+        await deps.identify(printer_id, ams_id, tray_id, decision.reason, _tray_dict(obs))
     elif decision.reason == "unknown_tag_prompt_owed":
         # Auto-add is OFF and no row owns this roll: the table refuses to mint, so the
         # operator gets the durable-per-slot prompt instead.
