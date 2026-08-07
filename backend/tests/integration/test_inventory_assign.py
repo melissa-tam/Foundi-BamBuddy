@@ -1412,3 +1412,63 @@ class TestAssignSpoolReleasesStaged:
         assert refreshed.manual_start is False
         assert refreshed.filament_short is False
         assert refreshed.waiting_reason is None
+
+
+class TestUnassignDismissesAStaleFreshRollPrompt:
+    """``DELETE /assignments`` ends a location claim, so it ends the fresh-roll question
+    that named that slot too (2026-08-07: a stamp survived every kind of release and the
+    toast replayed for days for a slot whose roll had left).
+
+    The stamp is cleared by the ONE unbind writer (``spool_binding.release_spool_from_slot``,
+    which reports it); the route's only job is the cross-client dismissal — the same event
+    the operator's own answer emits.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_delete_clears_the_stamp_and_dismisses_the_toast(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session
+    ):
+        from sqlalchemy import select
+
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        printer = await printer_factory(name="H2S")
+        spool = await spool_factory(fresh_prompt_pending_at=datetime.utcnow())
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=printer.id, ams_id=0, tray_id=1))
+        await db_session.commit()
+        # Ids captured up front: the route deletes the assignment on its own session, and
+        # a held instance may be expired by the time the assertions run.
+        printer_id, spool_id = printer.id, spool.id
+
+        with patch(
+            "backend.app.services.spool_tagless.broadcast_tagless_fresh_dismissed", new_callable=AsyncMock
+        ) as dismissed:
+            response = await async_client.delete(f"/api/v1/inventory/assignments/{printer_id}/0/1")
+
+        assert response.status_code == 200
+        dismissed.assert_awaited_once_with(printer_id, 0, 1)
+        db_session.expire_all()
+        stamp = await db_session.scalar(select(Spool.fresh_prompt_pending_at).where(Spool.id == spool_id))
+        assert stamp is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_delete_of_an_unstamped_row_dismisses_nothing(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session
+    ):
+        """No stamp, no toast — the dismissal rides the writer's signal, never a blind emit."""
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        printer = await printer_factory(name="H2S")
+        spool = await spool_factory()
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=printer.id, ams_id=0, tray_id=1))
+        await db_session.commit()
+
+        with patch(
+            "backend.app.services.spool_tagless.broadcast_tagless_fresh_dismissed", new_callable=AsyncMock
+        ) as dismissed:
+            response = await async_client.delete(f"/api/v1/inventory/assignments/{printer.id}/0/1")
+
+        assert response.status_code == 200
+        dismissed.assert_not_awaited()
