@@ -22,6 +22,10 @@ Contract notes:
 * Built synchronously in the MQTT callback, PRE-merge, from dicts the merge is
   about to mutate — every value is copied into a frozen object, nothing aliases
   the wire dict.
+* PRE-merge, not pre-normalization: ``bambu_mqtt._normalize_cleared_trays`` runs
+  first and injects the asserted-empty shape into minimal ``{id, state == 9}``
+  partials that pass the exist-bit veto (deliberate), so "asserted" here means
+  asserted by the normalized wire.
 * Field parsing is shared with ``bambu_mqtt`` through ``services.tray_fields``
   (one origin — a second wire parser would drift), and presence IS
   ``tray_fields.tray_presence`` — the same tri-state rule every downstream

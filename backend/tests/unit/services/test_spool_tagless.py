@@ -744,8 +744,24 @@ async def _pending_stamp(db, spool_id):
     return (await db.get(Spool, spool_id)).fresh_prompt_pending_at
 
 
+@pytest.fixture
+def seated(env, monkeypatch):
+    """Make AMS0-T0 read PRESENT on the LIVE merged state.
+
+    The fresh-roll prompt re-checks presence at stamp time (2026-08-07): a cycle whose
+    slot is EMPTY by the time the question would be asked is discarded, because "is this
+    a fresh roll?" has no answer for an empty tray — and the stamp is DURABLE, so the
+    operator was left holding a toast about nothing. ``env`` deliberately leaves the
+    printer state None, so every prompting case seats its tray explicitly. Depends on
+    ``env`` so this patch is applied after (and wins over) that fixture's.
+    """
+    status = SimpleNamespace(raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PETG"}]}]})
+    monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: status)
+    return status
+
+
 class TestFreshRollPrompt:
-    async def test_non_spent_past_threshold_prompts_and_stamps(self, db_session, printer_factory, env):
+    async def test_non_spent_past_threshold_prompts_and_stamps(self, db_session, printer_factory, env, seated):
         printer = await printer_factory()
         sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=750)  # 75% >= 70%
         key = (printer.id, 0, 0)
@@ -758,6 +774,39 @@ class TestFreshRollPrompt:
         assert await _pending_stamp(db_session, sid) is not None  # DURABLE, not process memory
         assert key not in spool_tagless._pending_physical_cycles  # popped (processed)
 
+    async def test_absent_tray_at_prompt_time_discards_the_cycle(self, db_session, printer_factory, env, monkeypatch):
+        """2026-08-07: the prompt stamped + broadcast without re-checking that the slot
+        still HOLDS a roll. "Is this a fresh roll?" has no answer for an empty tray, and
+        the stamp is DURABLE — a phantom edge (an AMS engage transient, an identify flap)
+        or an operator who pulled the roll straight back out left a toast nobody could
+        honestly answer. Absent at prompt time ⇒ no stamp, no broadcast, cycle discarded.
+        """
+        printer = await printer_factory()
+        sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=750)  # well past 70 %
+        empty = SimpleNamespace(raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "state": 9, "tray_type": ""}]}]})
+        monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: empty)
+
+        key = (printer.id, 0, 0)
+        spool_tagless._pending_physical_cycles.add(key)
+        await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
+
+        env.ws.assert_not_awaited()
+        assert await _pending_stamp(db_session, sid) is None  # nothing durable was written
+        assert key not in spool_tagless._pending_physical_cycles  # phantom cycle discarded
+
+    async def test_unreachable_printer_at_prompt_time_discards_the_cycle(self, db_session, printer_factory, env):
+        # ``env`` leaves get_status returning None (printer gone / never connected). No
+        # live tray ⇒ presence is not established ⇒ the same fail-closed outcome.
+        printer = await printer_factory()
+        sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=750)
+        key = (printer.id, 0, 0)
+        spool_tagless._pending_physical_cycles.add(key)
+        await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
+
+        env.ws.assert_not_awaited()
+        assert await _pending_stamp(db_session, sid) is None
+        assert key not in spool_tagless._pending_physical_cycles
+
     async def test_spent_silent_keeps_pending(self, db_session, printer_factory, env):
         printer = await printer_factory()
         await _seed_fresh_prompt_spool(db_session, printer.id, used=750, spent=True)
@@ -767,7 +816,7 @@ class TestFreshRollPrompt:
         env.ws.assert_not_awaited()  # spent -> silent (the W1 spent->mint transition owns it)
         assert key in spool_tagless._pending_physical_cycles  # left for W1
 
-    async def test_sub_threshold_pops_no_prompt(self, db_session, printer_factory, env):
+    async def test_sub_threshold_pops_no_prompt(self, db_session, printer_factory, env, seated):
         printer = await printer_factory()
         sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=100)  # 10% < 70%
         key = (printer.id, 0, 0)
@@ -777,7 +826,7 @@ class TestFreshRollPrompt:
         assert await _pending_stamp(db_session, sid) is None  # nothing asked → nothing stamped
         assert key not in spool_tagless._pending_physical_cycles  # popped, no-op
 
-    async def test_every_new_cycle_reasks_and_refreshes_the_stamp(self, db_session, printer_factory, env):
+    async def test_every_new_cycle_reasks_and_refreshes_the_stamp(self, db_session, printer_factory, env, seated):
         """Operator contract (2026-07-25): every new qualified physical cycle re-asks.
         This function only runs ON a cycle edge, so an outstanding stamp is REFRESHED,
         never used to suppress — the old in-memory dedup made a stuck entry silence the
@@ -795,7 +844,7 @@ class TestFreshRollPrompt:
         assert env.ws.await_count == 2  # re-asks
         assert await _pending_stamp(db_session, sid) >= first  # stamp refreshed, never dropped
 
-    async def test_reasks_after_answer_clears(self, db_session, printer_factory, env):
+    async def test_reasks_after_answer_clears(self, db_session, printer_factory, env, seated):
         printer = await printer_factory()
         sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=750)
         key = (printer.id, 0, 0)
@@ -809,7 +858,7 @@ class TestFreshRollPrompt:
         assert env.ws.await_count == 2  # re-asks
         assert await _pending_stamp(db_session, sid) is not None
 
-    async def test_threshold_is_seventy_percent(self, db_session, printer_factory, env):
+    async def test_threshold_is_seventy_percent(self, db_session, printer_factory, env, seated):
         """F4 (operator 2026-07-20): the prompt waits until the roll is ≥70 % consumed
         (≤300 g left on a 1000 g label) — a swap earlier in the roll's life is routine
         and asking then is noise."""
@@ -849,7 +898,7 @@ def sessions(test_engine, monkeypatch):
 
 
 class TestNotePhysicalCycle:
-    async def test_records_pending_and_prompts_non_spent(self, db_session, printer_factory, env, sessions):
+    async def test_records_pending_and_prompts_non_spent(self, db_session, printer_factory, env, sessions, seated):
         printer = await printer_factory()
         sid = await _seed_fresh_prompt_spool(db_session, printer.id, used=700)
         await spool_tagless.note_physical_cycle(printer.id, 0, 0)
@@ -1236,3 +1285,84 @@ class TestLoadedAtStamp:
         sa = await _assignment(db_session, printer.id)
         spool = await db_session.get(Spool, sa.spool_id)
         assert spool.loaded_at is not None
+
+
+# --- W1: the spent latch is decided by the RUNOUT, not by the row's origin ---
+
+
+class TestBareTraySpentGuardOutranksTheOriginVeto:
+    """2026-08-07, printer 4 tray 2 — the third lock on the deadlocked slot.
+
+    ``maybe_autoconfigure_bare_tray`` checked the data-origin veto FIRST, so a spent
+    ``rfid_auto`` row (spool 212, 1121.5 g on a 1000 g label) returned False before the
+    spent+cycle escape could ever run: the replacement roll seated in that slot could not
+    take the archive→unlink→default-mint→push transition even with a qualified physical
+    cycle recorded. Spent-ness is decided by the runout, not by who minted the row.
+
+    The veto itself is unchanged and still first for every LIVE row — that is what it was
+    written for (never overwrite an operator's or the firmware's own identity).
+    """
+
+    async def _seed(self, db_session, printer_id, *, origin, spent):
+        spool = Spool(
+            material="PETG",
+            rgba="000000FF",
+            data_origin=origin,
+            tag_uid=_VALID_TAG if origin == "rfid_auto" else None,
+            spent_at=datetime.utcnow() if spent else None,
+        )
+        spool.k_profiles = []
+        spool.assignments = []
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=printer_id, ams_id=0, tray_id=0))
+        await db_session.commit()
+        return spool
+
+    async def test_spent_rfid_row_with_a_cycle_takes_the_replacement_transition(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        spent = await self._seed(db_session, printer.id, origin="rfid_auto", spent=True)
+        spool_tagless._pending_physical_cycles.add((printer.id, 0, 0))
+
+        handled = await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare())
+
+        assert handled is True
+        await db_session.refresh(spent)
+        assert spent.archived_at is not None  # the drained core retires, grams kept
+        sa = await _assignment(db_session, printer.id)
+        fresh = await db_session.get(Spool, sa.spool_id)
+        assert fresh.id != spent.id
+        assert fresh.spent_at is None and fresh.data_origin == "ams_auto"
+        env.apply.assert_awaited_once()  # the fresh row's config goes out to the slot
+        assert (printer.id, 0, 0) not in spool_tagless._pending_physical_cycles  # consumed exactly once
+
+    async def test_spent_rfid_row_without_a_cycle_stays_latched(self, db_session, printer_factory, env):
+        """The latch is not weakened by the reorder: no qualified physical cycle, no
+        transition — and the retry window is still not burned by a latched slot."""
+        printer = await printer_factory()
+        spent = await self._seed(db_session, printer.id, origin="rfid_auto", spent=True)
+
+        handled = await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare())
+
+        assert handled is False
+        await db_session.refresh(spent)
+        assert spent.archived_at is None
+        env.apply.assert_not_awaited()
+        assert (printer.id, 0, 0) not in spool_tagless._autoconfig_window
+
+    async def test_a_LIVE_rfid_row_is_still_vetoed_even_with_a_cycle(self, db_session, printer_factory, env):
+        """The veto's actual job, unchanged: a live non-``ams_auto`` row is never
+        overwritten, and a pending physical cycle is not a licence to overwrite one."""
+        printer = await printer_factory()
+        live = await self._seed(db_session, printer.id, origin="rfid_auto", spent=False)
+        spool_tagless._pending_physical_cycles.add((printer.id, 0, 0))
+
+        handled = await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare())
+
+        assert handled is False
+        await db_session.refresh(live)
+        assert live.archived_at is None
+        sa = await _assignment(db_session, printer.id)
+        assert sa.spool_id == live.id  # untouched
+        env.apply.assert_not_awaited()
+        assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles  # not consumed either

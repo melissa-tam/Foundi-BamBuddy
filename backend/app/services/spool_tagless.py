@@ -826,10 +826,10 @@ async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: in
 
     Reads the slot's kept assignment. A SPENT bound row leaves the pending cycle for
     the W1 spent→mint transition (certain fresh roll — silent, no prompt). A NON-spent
-    row consumed past :data:`_FRESH_ROLL_PROMPT_USED_FRAC` of its label broadcasts
-    ``tagless_fresh_prompt`` and stamps ``fresh_prompt_pending_at``. Every non-spent
-    outcome (prompt or sub-threshold) POPs the pending cycle — no latch is involved for
-    non-spent rows.
+    row whose tray is STILL PRESENT and is consumed past
+    :data:`_FRESH_ROLL_PROMPT_USED_FRAC` of its label broadcasts ``tagless_fresh_prompt``
+    and stamps ``fresh_prompt_pending_at``. Every non-spent outcome (prompt, absent tray,
+    or sub-threshold) POPs the pending cycle — no latch is involved for non-spent rows.
 
     This function runs only on a qualified-cycle edge, so the stamp is RE-stamped
     rather than deduped against: each new roll swap re-asks, which is the per-cycle
@@ -853,6 +853,25 @@ async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: in
         return
     if spool.spent_at is not None:
         return  # leave the pending cycle for the W1 spent→mint transition (silent)
+    # Presence re-check before the stamp (2026-08-07). The cycle that got us here is a
+    # presence GAIN, but the prompt asks "did you put a FRESH ROLL in this slot?" — a
+    # question with no answer when the slot is EMPTY right now. A phantom edge (an AMS
+    # engage transient, an identify flap) or an operator who pulled the roll straight
+    # back out both land here, and the durable ``fresh_prompt_pending_at`` stamp made
+    # that a toast the operator could not honestly answer. Re-read the LIVE merged tray
+    # through the module's own accessors — the tray a callback was handed is by then
+    # seconds stale, and the difference is exactly the case being filtered. Discard the
+    # cycle: an absent slot has nothing to prompt about and nothing to latch.
+    live = _live_tray(printer_id, ams_id, tray_id)
+    if live is None or not tray_present(live):
+        logger.debug(
+            "tagless_fresh_prompt skipped: printer=%d AMS%d-T%d — tray is not present at prompt time",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        _pending_physical_cycles.discard(key)
+        return
     label = spool.label_weight or 0
     used = spool.weight_used or 0
     if label > 0 and used >= _FRESH_ROLL_PROMPT_USED_FRAC * label:
@@ -1133,22 +1152,29 @@ async def maybe_autoconfigure_bare_tray(
         )
     )
     assignment = res.scalar_one_or_none()
-    if assignment is not None and (assignment.spool is None or assignment.spool.data_origin != DATA_ORIGIN):
-        # Operator- or RFID-bound slot (or an orphan) — never overwrite. Only our
-        # OWN auto-minted default is eligible for a self-healing re-push.
-        return False
 
-    # W1: a spent ams_auto binding is the "ran dry" latch — never re-push a spent
-    # row's config. Only a QUALIFIED physical roll swap (a pending cycle recorded by
+    # W1: a SPENT binding is the "ran dry" latch — never re-push a spent row's config.
+    # Only a QUALIFIED physical roll swap (a pending cycle recorded by
     # note_physical_cycle) releases it into the archive→unlink→default-mint→push
-    # transition. Checked BEFORE stamping the retry window so a latched
-    # slot never burns it.
+    # transition. Checked BEFORE stamping the retry window so a latched slot never burns
+    # it, and ABOVE the data-origin veto below because spent-ness is decided by the
+    # runout, not by who minted the row: an rfid_auto row that ran dry is a dead core
+    # like any other, and vetoing it first left a spent TAGGED row latching its slot
+    # against the fresh roll physically seated in it forever (printer 4 tray 2,
+    # 2026-08-07 — spool 212, 1121.5 g on a 1000 g label, a ~90 %-full replacement
+    # unread beneath it for a day). The veto still protects every LIVE non-ams_auto row,
+    # which is what it was written for.
     if assignment is not None and assignment.spool is not None and assignment.spool.spent_at is not None:
         if key not in _pending_physical_cycles:
             return False  # latched — no re-push of a spent slot's config
         _pending_physical_cycles.discard(key)  # consume the cycle
         await _replace_row_after_cycle(db, printer_id, ams_id, tray_id, tray, assignment.spool)
         return True
+
+    if assignment is not None and (assignment.spool is None or assignment.spool.data_origin != DATA_ORIGIN):
+        # Operator- or RFID-bound slot (or an orphan) — never overwrite. Only our
+        # OWN auto-minted default is eligible for a self-healing re-push.
+        return False
 
     # Settle before the FIRST mint on this slot (F1): a bare tray whose spool was
     # just inserted may still have the firmware's RFID read in flight, and a row

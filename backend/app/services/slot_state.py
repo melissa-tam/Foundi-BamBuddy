@@ -140,6 +140,10 @@ RESOLUTION_REASONS = frozenset(
         # Rows 5/6 — unresolved identity.
         "mid_print_unresolved",
         "identity_unresolved",
+        # A spent-latched binding under a tray that is PRESENT but says nothing: the
+        # roll seated there is a newcomer the farm has never named, so the slot owes a
+        # discovery read rather than another silent latch KEEP.
+        "spent_occupied_owed_identify",
         "no_signal",
     }
 )
@@ -427,10 +431,16 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
     # "No tag" is the fleet's common case for third-party rolls (doctrine rule 2:
     # the tagless default is assumed unless a tag or an operator says otherwise).
     if obs.config_nonempty:
-        # 4a — the W1 spent latch releases ONLY on a qualified physical cycle.
-        # Tagless rows only: a spent TAGGED row belongs to the respool tiers
-        # (doctrine rule 3), which the orchestrator runs off the tag lane.
-        if state is SlotState.SPENT_AWAITING_SWAP and binding is not None and binding.is_tagless:
+        # 4a — the W1 spent latch releases ONLY on a qualified physical cycle, for a
+        # spent binding of ANY tag-ness. The old "tagless rows only, a spent TAGGED row
+        # belongs to the respool tiers (doctrine rule 3)" reasoning was the deadlock: the
+        # tiers act when a TAG IS READ, which is ROW 2, not this row — and this row is
+        # reached precisely when no tag was read. So a spent tagged row met neither lane
+        # and latched its slot against the replacement roll forever (printer 4 tray 2,
+        # 2026-08-07: spool 212, spent, 1121.5 g on a 1000 g label, holding a ~90 %-full
+        # unread newcomer out of service for a full day). Rule 3 is untouched — a tag read
+        # over this slot still lands on row 2.1's KEEP and the tiers still own it there.
+        if state is SlotState.SPENT_AWAITING_SWAP and binding is not None:
             if ctx.qualified_cycle_pending:
                 return Decision(
                     DecisionKind.REPLACE_SPENT,
@@ -508,6 +518,27 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
     # -- Rows 5/6: nothing asserted about identity OR configuration ----------
     # Exempt bindings keep their latch/intent even with no evidence this push.
     if binding is not None and binding.spent:
+        if obs.present is True:
+            # Spent latch, but something IS seated (state 10/11) and this push asserted
+            # neither identity nor configuration for it. The drained roll's own state
+            # cannot explain a present tray forever: what sits there is a roll the farm
+            # has never named, and KEEPing the latch is what made the slot un-nameable —
+            # nothing owed an identify, so the newcomer's tag was never read (printer 4
+            # tray 2, 2026-08-07). Owe the read instead; the binding is still untouched
+            # here, exactly as row 5's unresolved arm leaves it.
+            #
+            # Presence must be the TRI-STATE True, not an exist bit: this arm exists to
+            # earn a discovery read, and ``ams_presence.identify_needed``'s spent-occupied
+            # arm gates on the same seated-state test. A verdict this table emits on
+            # weaker evidence than the need authority accepts is a read that is never
+            # spent — and a reason that never resolves anything.
+            if ctx.busy:
+                # Doctrine rule 5: mid-print inserts are never auto-read.
+                return Decision(DecisionKind.DEFER, reason="mid_print_unresolved")
+            return Decision(DecisionKind.NONE, reason="spent_occupied_owed_identify")
+        # Presence UNKNOWN (a push that said nothing about the slot): the latch is the
+        # durable state and an unknown is never resolved toward action. Presence False
+        # never reaches here — row 3 owns it, latch exemption included.
         return Decision(DecisionKind.KEEP, spool_id=binding.spool_id, reason="spent_latch")
     if binding is not None and binding.pre_configured:
         return Decision(DecisionKind.KEEP, spool_id=binding.spool_id, reason="pre_configured_awaiting_insert")

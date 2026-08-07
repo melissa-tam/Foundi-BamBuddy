@@ -467,6 +467,64 @@ async def test_release_frees_the_slot_even_without_a_spool_row(db_session, print
     assert _last_location(bystander) == (None, None, None), "no row to stamp — and none invented"
 
 
+@pytest.mark.asyncio
+async def test_release_clears_a_pending_fresh_roll_prompt_and_reports_it(db_session, printer_factory, caplog):
+    """A pending fresh-roll prompt asks the operator about the roll in ONE named slot, so
+    the release that ends that roll's location claim also ends the question — and RETURNS
+    the fact, because the cross-client toast dismissal is the caller's to send.
+
+    This is a deliberate reversal of the replay lane's "skip stale rows without mutating
+    them" rule (``spool_tagless.pending_fresh_prompts``): nothing durable is lost, because
+    the prompt is a PER-CYCLE contract — any roll returning to that slot raises a qualified
+    physical cycle, which re-stamps and re-asks (2026-08-07: a stale stamp kept replaying a
+    toast for a slot whose roll had left days earlier)."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session, fresh_prompt_pending_at=datetime.utcnow())
+    await _bind(db_session, spool, printer.id, 0, 1)
+    assignment = await _assignment_for_slot(db_session, printer.id, 0, 1)
+
+    with caplog.at_level(logging.INFO, logger=_BINDING_LOGGER):
+        prompt_cleared = await release_spool_from_slot(db_session, assignment, reason="cleared_tray")
+    await db_session.commit()
+
+    assert prompt_cleared is True
+    await db_session.refresh(spool)
+    assert spool.fresh_prompt_pending_at is None
+    assert _last_location(spool) == (printer.id, 0, 1), "the location residue is unaffected"
+    line = next(m for m in _info_messages(caplog) if "release spool=" in m)
+    assert line.endswith("reason=cleared_tray (fresh-roll prompt cleared)")
+
+
+@pytest.mark.asyncio
+async def test_release_reports_no_clear_when_no_prompt_was_pending(db_session, printer_factory, caplog):
+    """The signal is a FACT about this release, not a habit: an unstamped row reports
+    False, so a caller can never emit a dismissal for a toast that never existed."""
+    printer = await printer_factory()
+    spool = await _fresh_spool(db_session)
+    await _bind(db_session, spool, printer.id, 0, 1)
+    assignment = await _assignment_for_slot(db_session, printer.id, 0, 1)
+
+    with caplog.at_level(logging.INFO, logger=_BINDING_LOGGER):
+        prompt_cleared = await release_spool_from_slot(db_session, assignment, reason="cleared_tray")
+    await db_session.commit()
+
+    assert prompt_cleared is False
+    assert f"[slot-state] printer={printer.id} A0T1 release spool={spool.id} reason=cleared_tray" in _info_messages(
+        caplog
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_without_a_spool_row_reports_no_clear(db_session, printer_factory):
+    """No row, no stamp to clear — the orphan path answers honestly instead of guessing."""
+    printer = await printer_factory()
+    db_session.add(SpoolAssignment(spool_id=999_999, printer_id=printer.id, ams_id=0, tray_id=1))
+    await db_session.commit()
+    assignment = await _assignment_for_slot(db_session, printer.id, 0, 1)
+
+    assert await release_spool_from_slot(db_session, assignment, reason="orphaned_assignment") is False
+
+
 # -- the sweep is a release too: last-location stamped on both branches --------
 
 

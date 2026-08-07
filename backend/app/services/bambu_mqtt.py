@@ -67,6 +67,26 @@ AMS_STATUS_FILAMENT_CHANGE = 1
 # ``tray_observation`` and ``spool_recovery`` have always keyed presence off
 # ``bambu_mqtt.TRAY_PRESENT_STATES``, and it is the same tuple object either way.
 
+# The field set that spells "this slot is empty" on the wire. ONE origin: the raw
+# pre-merge normalizer (BambuMQTTClient._normalize_cleared_trays) and the merge's
+# own display-side stale-clear both inject exactly this set, so an observation and
+# the merged view can never disagree about what a cleared slot asserts. Identity
+# carries firmware's zero sentinels (absence is not an assertion); `k`/`cali_idx`
+# are None because an absent roll has no calibration. Copied into the target dict
+# by `dict.update` — never mutated in place.
+CLEARED_TRAY_FIELDS = {
+    "tray_type": "",
+    "tray_sub_brands": "",
+    "tray_color": "",
+    "tray_id_name": "",
+    "tray_info_idx": "",
+    "tag_uid": ZERO_TAG_UID,
+    "tray_uuid": ZERO_TRAY_UUID,
+    "remain": 0,
+    "k": None,
+    "cali_idx": None,
+}
+
 # AMS drying latch. `dry_time` (minutes remaining) is the primary "unit is drying"
 # signal, but the firmware only reports it once a cycle is under way. A monotonic
 # latch (deadline = start + cycle duration + slack) covers the gap before the first
@@ -1800,6 +1820,94 @@ class BambuMQTTClient:
         """
         return slot_exist_bit_set(self._last_tray_exist_bits, ams_id, tray_id)
 
+    def _normalize_cleared_trays(self, ams_data) -> None:
+        """Give minimal state-9 tray partials the asserted-cleared shape, IN PLACE.
+
+        Runs immediately BEFORE the raw pre-merge hand-off so the spool pipeline
+        observes the same clear the merge is about to apply to the display copy.
+        Without it a "boot-forgotten" tray emits ``{id, state: 9}`` at ~1 Hz
+        forever, ``tray_fields.tray_presence`` answers None (a state with no
+        ``tray_type`` assertion is UNKNOWN, never empty) and the pipeline's
+        release-on-empty (``slot_state`` row 3, doctrine rule 9) can never fire for
+        that slot — measured in prod on printer5-T3, printer6-T2, printer7-T1 and
+        printer4-T3, whose minimal partials carry no ``tray_type`` in ANY push,
+        pushall included.
+
+        Injection requires ALL of:
+
+        * ``state`` parses to STRICTLY 9, firmware's "no spool" code. Never 0 (the
+          H2C long-idle "detail not reported" dialect), 3 (the A1/P1S constant),
+          25/27 (H2C dialect values observed on visibly-loaded trays) or 8/26
+          (transitional) — asserting empty for those would authorize a destructive
+          release on a possibly-loaded tray.
+        * no ``tray_type`` key: the push must say NOTHING about content. A push
+          that asserts its own type is never overwritten, which is what makes the
+          004-H2S state-9-while-feeding dialect (state 9 + ``tray_type: "PETG"``)
+          safe here.
+        * no exist bit for the slot (003-H2S veto): a mid-print insert sits at
+          state 9 with its bitmask bit set. H2S sends no bitmask at all, so the
+          cache is empty and the veto is inert there — correct, because on that
+          fleet a minimal partial means boot-forgotten-empty.
+
+        The merged display copy decides only whether the injection is LOGGED, never
+        whether it happens: a copy still holding content makes this the clearing
+        EDGE (one INFO line — the same one the merge used to emit), and everything
+        else is the steady state and injects SILENTLY. Silence is what makes
+        release delivery recurrent — a release deferred once (drying, identify,
+        settling, restart) retries on the next partial instead of never.
+
+        Mutating the wire dicts here is safe by contract: the raw hook consumes them
+        synchronously into frozen observations, and the merge that follows reads an
+        asserted ``tray_type: ""`` exactly as a wire-asserted clear.
+        """
+        # Same unwrapping the merge does — dict payload carries the unit list under
+        # "ams", a bare list IS the unit list (the H2S shape).
+        units = ams_data.get("ams") if isinstance(ams_data, dict) else ams_data
+        if not isinstance(units, list):
+            return
+
+        # Keyed on the RAW id exactly like the merge's own `existing_by_id`: a copy
+        # looked up under a different key type than the merge uses would log the
+        # edge against a slot the merge treats as a different one.
+        merged_units = self.state.raw_data.get("ams") or []
+        merged_by_id = {u.get("id"): u for u in merged_units if isinstance(u, dict)}
+
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            trays = unit.get("tray")
+            if not isinstance(trays, list):
+                continue
+            ams_id = unit.get("id")
+            merged_unit = merged_by_id.get(ams_id)
+            merged_trays = (
+                {t.get("id"): t for t in merged_unit.get("tray", []) if isinstance(t, dict)}
+                if isinstance(merged_unit, dict)
+                else {}
+            )
+            for tray in trays:
+                if not isinstance(tray, dict):
+                    continue
+                if "tray_type" in tray:
+                    continue
+                # `parse_tray_state` returns None for an absent/unparseable state,
+                # which fails this comparison — strict 9 only.
+                if parse_tray_state(tray.get("state")) != 9:
+                    continue
+                tray_id = tray.get("id")
+                if self._slot_exist_bit_known_set(ams_id, tray_id):
+                    continue
+                merged_tray = merged_trays.get(tray_id)
+                if isinstance(merged_tray, dict) and merged_tray.get("tray_type"):
+                    logger.info(
+                        "[%s] AMS %s tray %s: state=%s (not loaded) — clearing stale tray data",
+                        self.serial_number,
+                        ams_id,
+                        tray_id,
+                        tray.get("state"),
+                    )
+                tray.update(CLEARED_TRAY_FIELDS)
+
     def _handle_ams_data(self, ams_data):
         """Handle AMS data changes for Spoolman integration.
 
@@ -2091,14 +2199,24 @@ class BambuMQTTClient:
             logger.warning("[%s] Unexpected AMS data format: %s", self.serial_number, type(ams_data))
             return
 
+        # Cleared-tray normalization runs FIRST, so the raw hand-off below carries the
+        # one interpretation the merge is about to apply to the display copy: a minimal
+        # {id, state} partial with state STRICTLY 9 and no exist bit means "empty", and
+        # must SAY so on the wire. Splitting authority the other way (merge-only, as it
+        # was) left boot-forgotten slots asserting nothing forever, so their presence
+        # read UNKNOWN and release-on-empty never fired. Strictness and the 003-H2S
+        # exist-bit veto live in the method's docstring.
+        self._normalize_cleared_trays(ams_data)
+
         # RAW pre-merge hand-off — the LAST point at which the wire dicts still say only
-        # what this push said. Everything below merges them into the display state, which
-        # deliberately never clears identity fields, so from here on a tray can carry a
-        # new roll's tag_uid beside a departed roll's tray_uuid. The spool pipeline must
-        # never decide on that, so it is fed here. The handler is expected to consume the
-        # payload SYNCHRONOUSLY (it does: observations are built inline and are owned,
-        # frozen objects) — nothing is copied for it, and the merge mutates these dicts
-        # the moment this returns. Both payload shapes reach it; the caller unwraps.
+        # what this push said (plus the normalization above). Everything below merges
+        # them into the display state, which deliberately never clears identity fields,
+        # so from here on a tray can carry a new roll's tag_uid beside a departed roll's
+        # tray_uuid. The spool pipeline must never decide on that, so it is fed here. The
+        # handler is expected to consume the payload SYNCHRONOUSLY (it does: observations
+        # are built inline and are owned, frozen objects) — nothing is copied for it, and
+        # the merge mutates these dicts the moment this returns. Both payload shapes reach
+        # it; the caller unwraps.
         # Guarded: a farm-side failure must never break the MQTT callback chain.
         if self.on_ams_push_raw:
             try:
@@ -2146,6 +2264,15 @@ class BambuMQTTClient:
                             # its bit set (003-H2S), and this minimal {id, state}
                             # partial must not wipe the seated spool's identity
                             # (apply_tray_exist_bits below then promotes it 9→10).
+                            #
+                            # DUTY NARROWED (split-authority normalization): a
+                            # state-9 partial that qualifies has already been given
+                            # the cleared shape by _normalize_cleared_trays above,
+                            # so it now carries "tray_type" and fails this block's
+                            # `not in new_tray` guard — no double clear, no double
+                            # log. What remains here is the DISPLAY-side clear for
+                            # the non-present, non-9 codes (8, 26, unparseable),
+                            # whose semantics are unchanged.
                             tray_state = new_tray.get("state")
                             norm_tray_state = parse_tray_state(tray_state)
                             if (
@@ -2165,21 +2292,9 @@ class BambuMQTTClient:
                                 slot_clearing = True
                                 # The incremental update only has {id, state} — inject
                                 # empty values for all content fields so the merge loop
-                                # below clears the stale data from merged_tray.
-                                new_tray.update(
-                                    {
-                                        "tray_type": "",
-                                        "tray_sub_brands": "",
-                                        "tray_color": "",
-                                        "tray_id_name": "",
-                                        "tray_info_idx": "",
-                                        "tag_uid": ZERO_TAG_UID,
-                                        "tray_uuid": ZERO_TRAY_UUID,
-                                        "remain": 0,
-                                        "k": None,
-                                        "cali_idx": None,
-                                    }
-                                )
+                                # below clears the stale data from merged_tray. Same
+                                # template the raw-side normalizer writes (one origin).
+                                new_tray.update(CLEARED_TRAY_FIELDS)
                             for key, value in new_tray.items():
                                 # Fields that should always be updated (even with empty/zero values):
                                 # - remain, k, id, cali_idx: status indicators where 0 is valid

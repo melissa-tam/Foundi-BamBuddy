@@ -7125,3 +7125,315 @@ class TestTrayExistBitsStatePromotionMerge:
         assert client._last_tray_exist_bits is None
         client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}]})
         assert self._tray(client, 0, 0)["tray_type"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Real captured wire shapes — prod H2S MQTT capture, 2026-08-07 (raw6/raw7).
+# Trimmed only by omission of unrelated pushes: the tray dicts themselves are
+# verbatim. Two facts these pin that hand-written fixtures kept getting wrong:
+# tray ids are STRINGS, and the payload reaching _handle_ams_data is a BARE LIST
+# with NO tray_exist_bits anywhere (so the 003-H2S veto is inert on this fleet).
+# ---------------------------------------------------------------------------
+CAPTURED_LOADED_TRAY = {
+    "bed_temp": "0",
+    "bed_temp_type": "0",
+    "cali_idx": -1,
+    "cols": ["000000FF"],
+    "ctype": 0,
+    "drying_temp": "65",
+    "drying_time": "8",
+    "id": "0",
+    "nozzle_temp_max": "260",
+    "nozzle_temp_min": "230",
+    "remain": 100,
+    "state": 11,
+    "tag_uid": "BC5F48E000000100",
+    "total_len": 330000,
+    "tray_color": "000000FF",
+    "tray_diameter": "1.75",
+    "tray_id_name": "G02-K0",
+    "tray_info_idx": "GFG02",
+    "tray_sub_brands": "PETG HF",
+    "tray_type": "PETG",
+    "tray_uuid": "4AA6142F7F724215A955139CDD759829",
+    "tray_weight": "1000",
+    "xcam_info": "000000000000000000000000",
+}
+
+CAPTURED_CLEARED_TRAY = {
+    "bed_temp": "0",
+    "bed_temp_type": "0",
+    "cali_idx": -1,
+    "cols": ["000000FF"],
+    "ctype": 0,
+    "drying_temp": "0",
+    "drying_time": "0",
+    "id": "1",
+    "nozzle_temp_max": "270",
+    "nozzle_temp_min": "230",
+    "remain": 0,
+    "state": 9,
+    "tag_uid": "0000000000000000",
+    "total_len": 330000,
+    "tray_color": "",
+    "tray_diameter": "1.75",
+    "tray_id_name": "",
+    "tray_info_idx": "",
+    "tray_sub_brands": "",
+    "tray_type": "",
+    "tray_uuid": "00000000000000000000000000000000",
+    "tray_weight": "0",
+    "xcam_info": "000000000000000000000000",
+}
+
+# The boot-forgotten slot: {id, state} and NOTHING else, in every push including
+# the 97-key pushall. Witnessed on printer5-T3 / printer6-T2 / printer7-T1 /
+# printer4-T3 at ~1 Hz for the whole capture window.
+CAPTURED_MINIMAL_TRAY = {"id": "2", "state": 9}
+
+CLEAR_LOG_TEXT = "clearing stale tray data"
+
+
+def _captured_tray(template, tray_id, **overrides):
+    """Captured tray template under a different slot id (wire ids are strings)."""
+    out = dict(template)
+    out["id"] = str(tray_id)
+    out.update(overrides)
+    return out
+
+
+class _RawCapture:
+    """Stands in for the spool pipeline on ``on_ams_push_raw``.
+
+    Consumes the hand-off the way production does — SYNCHRONOUSLY, building
+    observations inline — and additionally deep-copies the payload so a test can
+    assert on what the wire said at hand-off time, before the merge touches it.
+    """
+
+    def __init__(self, printer_id=1):
+        import copy as _copy
+
+        from backend.app.services.tray_observation import observe_ams_push
+
+        self._copy = _copy.deepcopy
+        self._observe = observe_ams_push
+        self.printer_id = printer_id
+        self.payloads = []
+        self.pushes = []
+
+    def __call__(self, payload):
+        self.payloads.append(self._copy(payload))
+        self.pushes.append(self._observe(self.printer_id, payload))
+
+    def last(self, ams_id, tray_id):
+        """The last push's observation for one slot (ids as ints, post-parse)."""
+        for obs in self.pushes[-1]:
+            if obs.ams_id == ams_id and obs.tray_id == tray_id:
+                return obs
+        raise AssertionError(f"no observation for A{ams_id}-T{tray_id}")
+
+    def last_wire_tray(self, ams_id, tray_id):
+        """The last push's RAW tray dict for one slot, frozen at hand-off."""
+        units = self.payloads[-1]
+        units = units.get("ams") if isinstance(units, dict) else units
+        for unit in units:
+            if str(unit.get("id")) != str(ams_id):
+                continue
+            for tray in unit.get("tray", []):
+                if str(tray.get("id")) == str(tray_id):
+                    return tray
+        raise AssertionError(f"no wire tray for A{ams_id}-T{tray_id}")
+
+
+class TestClearedTrayNormalization:
+    """Split-authority normalization of minimal state-9 partials (raw side).
+
+    ``_normalize_cleared_trays`` injects the asserted-cleared shape BEFORE the raw
+    pre-merge hand-off, so the spool pipeline sees the same clear the merge applies
+    to the display copy. Without it a boot-forgotten tray asserts nothing forever,
+    ``tray_presence`` answers None, and release-on-empty (doctrine rule 9) can never
+    fire for that slot. The merge's own block keeps only its non-9 display duty.
+    """
+
+    @pytest.fixture
+    def client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        client = BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST_H2S",
+            access_code="12345678",
+        )
+        client.on_ams_push_raw = _RawCapture()
+        return client
+
+    @staticmethod
+    def _capture(client):
+        return client.on_ams_push_raw
+
+    @staticmethod
+    def _push(client, trays, ams_id="0", **extra):
+        """One push in the captured shape: a bare unit list unless `extra` is given."""
+        units = [{"id": ams_id, "tray": trays}]
+        client._handle_ams_data({"ams": units, **extra} if extra else units)
+
+    @staticmethod
+    def _merged(client, ams_id, tray_id):
+        for unit in client.state.raw_data.get("ams", []):
+            if str(unit.get("id")) != str(ams_id):
+                continue
+            for tray in unit.get("tray", []):
+                if str(tray.get("id")) == str(tray_id):
+                    return tray
+        raise AssertionError(f"no merged tray for A{ams_id}-T{tray_id}")
+
+    @staticmethod
+    def _clear_logs(caplog):
+        return [r for r in caplog.records if CLEAR_LOG_TEXT in r.getMessage()]
+
+    def test_steady_state_arm_injects_silently_on_every_push(self, client, caplog):
+        """Merged copy already cleared -> inject on EVERY push, no log.
+
+        Recurrence is the point: a release deferred once (drying / identify /
+        settling / restart) must retry on the next partial instead of never.
+        """
+        import logging
+
+        self._push(client, [_captured_tray(CAPTURED_CLEARED_TRAY, 2)])
+        assert self._merged(client, 0, 2)["tray_type"] == ""
+
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+        for _ in range(3):
+            self._push(client, [dict(CAPTURED_MINIMAL_TRAY)])
+            wire = self._capture(client).last_wire_tray(0, 2)
+            assert wire["tray_type"] == "", "injection must repeat on every partial"
+            assert wire["tag_uid"] == "0000000000000000"
+            assert wire["remain"] == 0
+            assert self._capture(client).last(0, 2).present is False
+
+        assert self._clear_logs(caplog) == [], "steady-state arm is silent"
+
+    def test_edge_arm_injects_and_logs_once(self, client, caplog):
+        """Merged copy still holds content, no exist bits -> inject + ONE INFO line."""
+        import logging
+
+        self._push(client, [dict(CAPTURED_LOADED_TRAY)])
+        assert self._merged(client, 0, 0)["tray_type"] == "PETG"
+
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+        self._push(client, [{"id": "0", "state": 9}])
+
+        wire = self._capture(client).last_wire_tray(0, 0)
+        assert wire["tray_type"] == ""
+        assert self._capture(client).last(0, 0).present is False
+        assert len(self._clear_logs(caplog)) == 1
+
+        # Merge result unchanged from pre-split behaviour: display copy cleared,
+        # identity wiped through the same slot_clearing path.
+        merged = self._merged(client, 0, 0)
+        assert merged["tray_type"] == ""
+        assert merged["tray_color"] == ""
+        assert merged["tag_uid"] == "0000000000000000"
+        assert merged["tray_uuid"] == "00000000000000000000000000000000"
+        assert merged["remain"] == 0
+        assert merged["state"] == 9
+
+    def test_exist_bit_veto_blocks_injection(self, client, caplog):
+        """003-H2S: a mid-print insert sits at state 9 with its bit set — never clear."""
+        import logging
+
+        # Seed WITH a bitmask so the client caches it; bit 0 = AMS0 slot 0 occupied.
+        self._push(client, [dict(CAPTURED_LOADED_TRAY)], tray_exist_bits="1", power_on_flag=True)
+        assert client._last_tray_exist_bits == 1
+
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+        self._push(client, [{"id": "0", "state": 9}])
+
+        wire = self._capture(client).last_wire_tray(0, 0)
+        assert set(wire) == {"id", "state"}, "vetoed slot must reach the pipeline untouched"
+        assert self._capture(client).last(0, 0).present is None, "presence stays UNKNOWN under the veto"
+        assert self._merged(client, 0, 0)["tray_type"] == "PETG", "seated spool keeps its identity"
+        assert self._clear_logs(caplog) == []
+
+    @pytest.mark.parametrize("state", [0, 3, 8, 25, 26, 27])
+    def test_non_nine_states_never_inject(self, client, state):
+        """STRICTLY 9. 0 = H2C long-idle, 3 = A1/P1S constant, 25/27 = H2C dialect
+        on visibly-loaded trays, 8/26 = transitional — asserting empty for any of
+        them would authorize a release on a possibly-loaded tray."""
+        self._push(client, [_captured_tray(CAPTURED_CLEARED_TRAY, 2)])  # merged copy long-cleared
+        self._push(client, [{"id": "2", "state": state}])
+
+        assert set(self._capture(client).last_wire_tray(0, 2)) == {"id", "state"}
+        assert self._capture(client).last(0, 2).present is None
+
+    def test_state_8_still_clears_merged_display_copy(self, client, caplog):
+        """Upstream behaviour pinned: the merge-side block keeps its non-9 duty."""
+        import logging
+
+        self._push(client, [dict(CAPTURED_LOADED_TRAY)])
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+        self._push(client, [{"id": "0", "state": 8}])
+
+        # Raw side untouched (not state 9) — the merge alone clears the display copy.
+        assert set(self._capture(client).last_wire_tray(0, 0)) == {"id", "state"}
+        assert self._capture(client).last(0, 0).present is None
+        merged = self._merged(client, 0, 0)
+        assert merged["tray_type"] == ""
+        assert merged["tag_uid"] == "0000000000000000"
+        assert len(self._clear_logs(caplog)) == 1, "merge-side block logs the non-9 clear"
+
+    def test_feeding_dialect_tray_untouched(self, client):
+        """004-H2S state-9-while-feeding: the push asserts a type, so it is never
+        overwritten — and presence stays UNKNOWN, not empty."""
+        self._push(client, [{"id": "0", "state": 9, "tray_type": "PETG", "remain": -1}])
+
+        wire = self._capture(client).last_wire_tray(0, 0)
+        assert wire == {"id": "0", "state": 9, "tray_type": "PETG", "remain": -1}
+        assert self._capture(client).last(0, 0).present is None
+
+    def test_full_cleared_tray_passes_through_unmodified(self, client, caplog):
+        """A tray that already carries the cleared shape is not rewritten."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+        original = dict(CAPTURED_CLEARED_TRAY)
+        self._push(client, [dict(CAPTURED_CLEARED_TRAY)])
+
+        assert self._capture(client).last_wire_tray(0, 1) == original
+        assert self._capture(client).last(0, 1).present is False
+        assert self._clear_logs(caplog) == []
+
+    def test_state9_edge_logs_exactly_once_across_both_authorities(self, client, caplog):
+        """No double-processing: the raw-side injection makes the merge block's
+        ``"tray_type" not in new_tray`` guard False, so it cannot fire again."""
+        import logging
+
+        self._push(client, [dict(CAPTURED_LOADED_TRAY)])
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+        self._push(client, [{"id": "0", "state": 9}])
+
+        assert len(self._clear_logs(caplog)) == 1, "one clear, one log — not two"
+
+    def test_captured_boot_forgotten_slot_becomes_releasable(self, client, caplog):
+        """The measured prod push, verbatim: the minimal slot carries no tray_type
+        in ANY push, so its merged copy never holds one either. Presence must still
+        resolve to False — on the FIRST push and every push after it."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+        push = [
+            dict(CAPTURED_LOADED_TRAY),
+            _captured_tray(CAPTURED_CLEARED_TRAY, 1),
+            dict(CAPTURED_MINIMAL_TRAY),
+            _captured_tray(CAPTURED_CLEARED_TRAY, 3),
+        ]
+        for _ in range(2):
+            self._push(client, [dict(t) for t in push])
+            capture = self._capture(client)
+            assert capture.last(0, 0).present is True
+            assert capture.last(0, 1).present is False
+            assert capture.last(0, 2).present is False, "boot-forgotten slot must read EMPTY"
+            assert capture.last(0, 3).present is False
+
+        assert self._merged(client, 0, 2)["tray_type"] == ""
+        assert self._clear_logs(caplog) == [], "never-configured slot is not a clearing edge"

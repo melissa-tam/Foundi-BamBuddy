@@ -2131,10 +2131,19 @@ async def unassign_spool(
         raise HTTPException(404, "Assignment not found")
 
     # Through the ONE unbind writer: stamps the roll's last physical location (so a
-    # re-insert reclaims its grams instead of minting a fresh row) and leaves the
-    # structured [slot-state] release line. A raw delete here would drop both.
-    await release_spool_from_slot(db, assignment, reason="operator_clear")
+    # re-insert reclaims its grams instead of minting a fresh row), clears any pending
+    # fresh-roll prompt, and leaves the structured [slot-state] release line. A raw
+    # delete here would drop all three.
+    prompt_cleared = await release_spool_from_slot(db, assignment, reason="operator_clear")
     await db.commit()
+
+    if prompt_cleared:
+        # The roll this slot's fresh-roll question was about is no longer claimed to be
+        # there, so every open client drops the toast — same dismissal event the
+        # operator's own answer emits (``POST /spools/{id}/tagless-fresh``).
+        from backend.app.services import spool_tagless
+
+        await spool_tagless.broadcast_tagless_fresh_dismissed(printer_id, ams_id, tray_id)
 
     await ws_manager.broadcast(
         {

@@ -714,6 +714,217 @@ async def test_release_on_cleared_tray_stamps_last_location_and_deletes(db_sessi
     assert env.types() == ["spool_assignment_changed"]
 
 
+@pytest.fixture
+def dismissed(monkeypatch):
+    """Record every ``tagless_fresh_prompt_dismissed`` broadcast the pass emits.
+
+    The payload has ONE owner (``spool_tagless.broadcast_tagless_fresh_dismissed`` — the
+    same call the operator's own answer makes), so the pipeline calls it rather than
+    re-spelling the event through ``deps.emit``; this stands in for it.
+    """
+    calls: list[tuple[int, int, int]] = []
+
+    async def _record(printer_id: int, ams_id: int, tray_id: int) -> None:
+        calls.append((printer_id, ams_id, tray_id))
+
+    monkeypatch.setattr(slot_pipeline.spool_tagless, "broadcast_tagless_fresh_dismissed", _record)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_release_disposes_a_never_fed_provisional_ghost(db_session, printer_factory, env):
+    """A never-fed ``ams_auto`` row abandoned by an emptied tray is a GHOST: no grams, no
+    identity, no operator edits — nothing to keep. Left behind it becomes 0 g clutter in
+    Inventory (prod 2026-08-07: spools 239-242), so the release routes it through the ONE
+    disposal, which hard-deletes a pristine row."""
+    printer = await printer_factory()
+    ghost = await _spool(db_session, material="PETG", rgba="000000FF", data_origin="ams_auto")
+
+    await _bind_row(db_session, ghost, printer.id, 0, 2)
+
+    obs = _obs(printer.id, {"id": 2, "state": 9, "tray_type": ""})
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision == Decision(DecisionKind.RELEASE, spool_id=ghost.id, reason="cleared_tray")
+    assert await _assignment(db_session, printer.id, 0, 2) is None
+    assert await _spool_count(db_session) == 0  # the ghost is gone, not archived
+
+
+@pytest.mark.asyncio
+async def test_release_never_disposes_a_row_that_has_fed(db_session, printer_factory, env):
+    """The gate is grams, and the boundary is ``NEVER_FED_MAX_G``: a row at or above it
+    holds real consumption history (doctrine rule 4 — usage charges are the tagless truth
+    source), so a release only ever UNBINDS it. Its grams and its reclaim stamp stay."""
+    printer = await printer_factory()
+    fed = await _spool(
+        db_session,
+        material="PETG",
+        rgba="000000FF",
+        data_origin="ams_auto",
+        weight_used=spool_binding.NEVER_FED_MAX_G,
+    )
+    await _bind_row(db_session, fed, printer.id, 0, 2)
+
+    obs = _obs(printer.id, {"id": 2, "state": 9, "tray_type": ""})
+    await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    await db_session.refresh(fed)
+    assert fed.archived_at is None
+    assert fed.weight_used == spool_binding.NEVER_FED_MAX_G
+    assert fed.last_location_tray_id == 2  # unbound inventory, reclaimable
+    assert await _spool_count(db_session) == 1
+
+
+@pytest.mark.asyncio
+async def test_release_clears_a_pending_fresh_prompt_and_dismisses_the_toast(
+    db_session, printer_factory, env, dismissed
+):
+    """The fresh-roll prompt names a SLOT, so once the roll's location claim is gone the
+    question has no subject: the stamp is NULLed by the unbind writer and every open
+    client is told to drop the toast (2026-08-07: a stale prompt replayed for days for a
+    slot whose roll had left)."""
+    printer = await printer_factory()
+    spool = await _spool(
+        db_session,
+        material="PETG",
+        rgba="000000FF",
+        data_origin="ams_auto",
+        weight_used=800,
+        fresh_prompt_pending_at=datetime.utcnow(),
+    )
+    await _bind_row(db_session, spool, printer.id, 0, 2)
+
+    obs = _obs(printer.id, {"id": 2, "state": 9, "tray_type": ""})
+    await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    await db_session.refresh(spool)
+    assert spool.fresh_prompt_pending_at is None
+    assert dismissed == [(printer.id, 0, 2)]
+
+
+@pytest.mark.asyncio
+async def test_release_of_an_unstamped_row_dismisses_nothing(db_session, printer_factory, env, dismissed):
+    """No stamp, no toast: the dismissal rides the writer's signal, never a blind emit."""
+    printer = await printer_factory()
+    spool = await _spool(db_session, material="PETG", rgba="000000FF", weight_used=800)
+    await _bind_row(db_session, spool, printer.id, 0, 2)
+
+    obs = _obs(printer.id, {"id": 2, "state": 9, "tray_type": ""})
+    await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert dismissed == []
+
+
+# --- displaced-row disposal -------------------------------------------------
+
+
+async def _displace(db_session, printer_factory, env, incumbent_kwargs: dict):
+    """Seed ``incumbent`` on a slot, then let a positively-identified newcomer take it.
+
+    Returns ``(printer, incumbent, arriving)``. The BIND is row 2.3's
+    ``identity_resolved_candidate``: the wire uuid names a different row, so the writer's
+    move semantics unbind the incumbent fleet-wide — which is exactly the moment the
+    displaced row's fate has to be decided.
+    """
+    printer = await printer_factory()
+    incumbent = await _spool(db_session, material="PETG", rgba="000000FF", **incumbent_kwargs)
+    arriving = await _spool(db_session, tag_uid=TAG_B, tray_uuid=UUID_2, material="PETG", rgba="000000FF")
+    await _bind_row(db_session, incumbent, printer.id, 0, 1)
+
+    obs = _obs(
+        printer.id,
+        {"id": 1, "state": 11, "tag_uid": TAG_B, "tray_uuid": UUID_2, "tray_type": "PETG", "tray_color": "000000FF"},
+    )
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+    assert transitions[0].decision == Decision(
+        DecisionKind.BIND, spool_id=arriving.id, reason="identity_resolved_candidate"
+    )
+    assert (await _assignment(db_session, printer.id, 0, 1)).spool_id == arriving.id
+    return printer, incumbent, arriving
+
+
+@pytest.mark.asyncio
+async def test_a_displaced_pristine_ghost_is_hard_deleted(db_session, printer_factory, env):
+    """The 239-242 shape: an ``ams_auto`` row minted into an unresolved slot, then
+    displaced by the real identity the firmware finally read. It never fed and never
+    carried an identity, so it is deleted rather than left as an unbound 0 g row."""
+    _printer, ghost, arriving = await _displace(db_session, printer_factory, env, {"data_origin": "ams_auto"})
+    ghost_id = ghost.id
+
+    assert await db_session.get(Spool, ghost_id) is None
+    assert await _spool_count(db_session) == 1
+    assert (await db_session.get(Spool, arriving.id)).archived_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_displaced_ghost_with_a_usage_ledger_is_archived_not_deleted(db_session, printer_factory, env):
+    """Grams-state is the ghost GATE; the canonical disposal still decides delete-vs-archive
+    on the usage LEDGER. A repair full-weight reset makes 0 g used ≠ never used (doctrine
+    rule 8), so a row whose history survives its grams is archived — the two checks are
+    belt and braces, not duplicates."""
+    printer = await printer_factory()
+    ghost = await _spool(db_session, material="PETG", rgba="000000FF", data_origin="ams_auto")
+    db_session.add(SpoolUsageHistory(spool_id=ghost.id, weight_used=180, percent_used=18))
+    await db_session.commit()
+    arriving = await _spool(db_session, tag_uid=TAG_B, tray_uuid=UUID_2, material="PETG", rgba="000000FF")
+    await _bind_row(db_session, ghost, printer.id, 0, 1)
+
+    obs = _obs(
+        printer.id,
+        {"id": 1, "state": 11, "tag_uid": TAG_B, "tray_uuid": UUID_2, "tray_type": "PETG", "tray_color": "000000FF"},
+    )
+    await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    await db_session.refresh(ghost)
+    assert ghost.archived_at is not None
+    assert (await _assignment(db_session, printer.id, 0, 1)).spool_id == arriving.id
+
+
+@pytest.mark.asyncio
+async def test_a_displaced_spent_core_is_archived(db_session, printer_factory, env, caplog):
+    """Printer 4 tray 2's endgame: the newcomer's identity is positive proof the drained
+    core physically left, which is the same evidence REPLACE_SPENT acts on. An active
+    spent row goes on presenting a 0 g ledger to the selection and deficit lanes, so it
+    retires — with its grams (1121.5 g) intact."""
+    with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
+        printer, spent, _arriving = await _displace(
+            db_session,
+            printer_factory,
+            env,
+            {
+                "data_origin": "rfid_auto",
+                "tag_uid": TAG_A,
+                "tray_uuid": UUID_1,
+                "spent_at": datetime.utcnow(),
+                "weight_used": 1121.5,
+            },
+        )
+
+    await db_session.refresh(spent)
+    assert spent.archived_at is not None
+    assert spent.weight_used == 1121.5  # retired, not erased
+    assert any(f"spent spool {spent.id} archived — displaced" in m for m in _records(caplog, logging.INFO))
+    assert "A0T1" in next(m for m in _records(caplog, logging.INFO) if "archived — displaced" in m)
+
+
+@pytest.mark.asyncio
+async def test_a_displaced_live_row_is_left_exactly_as_the_writer_left_it(db_session, printer_factory, env):
+    """Neither lane applies to a live, fed, operator-visible row: it becomes unbound
+    inventory with its grams and its reclaim stamp — the existing move semantics, untouched."""
+    _printer, live, _arriving = await _displace(
+        db_session,
+        printer_factory,
+        env,
+        {"data_origin": "rfid_auto", "tag_uid": TAG_A, "tray_uuid": UUID_1, "weight_used": 400},
+    )
+
+    await db_session.refresh(live)
+    assert live.archived_at is None
+    assert live.weight_used == 400
+    assert live.last_location_tray_id == 1
+    assert await _spool_count(db_session) == 2
+
+
 @pytest.mark.asyncio
 async def test_orphaned_assignment_is_released(db_session, printer_factory, env, caplog):
     """An assignment that outlived its spool row is a bogus location claim (SQLite FKs
@@ -934,6 +1145,35 @@ async def test_mid_print_unresolved_defers_without_an_identify(db_session, print
     assert env.identifies == []
 
 
+@pytest.mark.asyncio
+async def test_spent_occupied_slot_owes_a_discovery_identify(db_session, printer_factory, env):
+    """Printer 4 tray 2 (2026-08-07): a spent ``rfid_auto`` latch over a seated roll the
+    wire never named owed NOTHING, so no identify was scheduled, so the newcomer's tag was
+    never read — a full day of nothing. The verdict now routes to the identify lane, and
+    still mutates no binding: naming the roll is what unlocks the slot, not guessing."""
+    printer = await printer_factory()
+    spent = await _spool(
+        db_session,
+        material="PETG",
+        rgba="000000FF",
+        data_origin="rfid_auto",
+        tag_uid=TAG_A,
+        tray_uuid=UUID_1,
+        spent_at=datetime.utcnow(),
+        weight_used=1121.5,
+    )
+    await _bind_row(db_session, spent, printer.id, 0, 2)
+
+    obs = _obs(printer.id, {"id": 2, "state": 10})
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision == Decision(DecisionKind.NONE, reason="spent_occupied_owed_identify")
+    assert transitions[0].applied is False
+    assert env.identifies == [(printer.id, 0, 2, "spent_occupied_owed_identify")]
+    assert (await _assignment(db_session, printer.id, 0, 2)).spool_id == spent.id  # nothing mutated
+    assert await _spool_count(db_session) == 1
+
+
 # --- the PRODUCTION identify default ----------------------------------------
 
 
@@ -1040,6 +1280,31 @@ class TestTheProductionIdentifyDefaultIsNeedDriven:
         assert len(noop) == 5
         assert f"printer={printer.id} A2T2" in noop[0]
         assert await _spool_count(db_session) == 0  # and nothing was mutated either
+
+    @pytest.mark.asyncio
+    async def test_the_spent_occupied_request_is_need_gated_the_same_way(
+        self, db_session, printer_factory, env, identify_probe
+    ):
+        """The spent-occupied verdict joins the SAME gate, deliberately: the predicate owns
+        the occasion (its spent-occupied arm — state 10, no wire tag, an open read occasion,
+        one attempt per occupancy epoch, because every failed read leaves a printer-side
+        0700_0081 that only a power-cycle clears). Declined ⇒ nothing spent; granted ⇒
+        commanded with the PREDICATE's reason."""
+        printer = await printer_factory()
+        spent = await _spool(
+            db_session, material="PETG", rgba="000000FF", data_origin="rfid_auto", spent_at=datetime.utcnow()
+        )
+        await _bind_row(db_session, spent, printer.id, 0, 2)
+        obs = _obs(printer.id, {"id": 2, "state": 10})
+
+        refused = identify_probe(need=None)
+        await run_slot_pipeline(printer.id, [obs], _prod_identify_deps(db_session, env))
+        assert refused.commanded == []
+        assert refused.needs_asked[0][:3] == (printer.id, 0, 2)
+
+        granted = identify_probe(need="discovery")
+        await run_slot_pipeline(printer.id, [obs], _prod_identify_deps(db_session, env))
+        assert granted.commanded == [(printer.id, 0, 2, "discovery")]
 
     @pytest.mark.asyncio
     async def test_an_unanswered_qualified_cycle_still_gets_its_discovery_read(

@@ -31,6 +31,11 @@ What this module owns:
   2. a per-pass **seen-set**: one spool may be applied at most once per push, which is
      the second half of the 007-H2C flip-flop fix (the writer's move damper is the
      first — ``spool_binding._MOVE_DAMPER_S``).
+
+  Application also owns what happens to the row a bind/release leaves BEHIND
+  (:func:`_dispose_displaced`, :func:`_dispose_ghost`): the writer unbinds an incumbent
+  fleet-wide and says nothing about the row itself, so a never-fed auto-minted ghost and
+  a displaced SPENT core would otherwise linger as active inventory forever.
 * **Serialization** — one asyncio lock per printer, so two pushes for one printer can
   never interleave their read-decide-write windows. This IS the fork's assignment lock
   now: W3b deleted ``main.py``'s ``_get_ams_assignment_lock``, because with identity
@@ -83,7 +88,7 @@ from backend.app.services.slot_state import (
     format_slot_event,
     resolve,
 )
-from backend.app.services.spool_binding import bind_spool_to_slot, release_spool_from_slot
+from backend.app.services.spool_binding import NEVER_FED_MAX_G, bind_spool_to_slot, release_spool_from_slot
 from backend.app.services.spool_tag_matcher import (
     create_spool_from_tray,
     find_matching_untagged_spool,
@@ -137,13 +142,20 @@ ORPHAN_RELEASE_REASON = "orphaned_assignment"
 # push, and the pipeline answered each one with a discovery identify — a permanent
 # ~30 s read loop on an EMPTY slot, throttled only by the client's identify gate).
 # Doctrine rule 3 / invariant 4: a discovery read is owed only for an UNANSWERED
-# QUALIFIED PHYSICAL CYCLE, so this verdict is a REQUEST that
-# :meth:`PipelineDeps.identify_verdict` must clear with ``ams_presence.identify_needed``
-# — the one need authority — before anything is spent.
+# QUALIFIED PHYSICAL CYCLE (or a spent-latched slot under an unidentified seated roll),
+# so this verdict is a REQUEST that :meth:`PipelineDeps.identify_verdict` must clear with
+# ``ams_presence.identify_needed`` — the one need authority — before anything is spent.
+#
+# ``spent_occupied_owed_identify`` is the same shape: the table has seen a seated,
+# unnamed roll over a spent latch, but WHETHER that earns a read is the predicate's call
+# (its spent-occupied arm: state 10, no wire tag, an open read occasion — one attempt per
+# occupancy epoch, because every failed read leaves a printer-side 0700_0081 that only a
+# power-cycle clears).
 _IDENTIFY_VERDICT = {
     "identity_ambiguous_owed_full_read": "rfid_refresh",
     "partial_identity_owed_full_read": "rfid_refresh",
     "identity_unresolved": "discovery",
+    "spent_occupied_owed_identify": "discovery",
 }
 
 # The one verdict in :data:`_IDENTIFY_VERDICT` that is need-GATED rather than
@@ -273,12 +285,15 @@ class PipelineDeps:
         * ``rfid_refresh`` — the two full-read defers. A tag WAS asserted over a bound
           slot this very push, so the read is both owed and answerable; the evidence is
           the push itself and re-deriving it would only cost a query.
-        * ``discovery`` — a REQUEST, never an entitlement. ``identify_needed`` is the
-          fork's one need authority (it owns the unanswered-qualified-cycle test), so it
-          answers here, and a ``None`` verdict means the slot has simply been unknown for
-          a while — which is not a reason to read it. Whatever reason it DOES return is
-          the one passed on, so a slot that turns out to be live-tagged gets the accurate
-          ``rfid_refresh`` rather than this decision's guess.
+        * ``discovery`` — a REQUEST, never an entitlement, whether it came from a
+          standing unknown or from a spent latch under a seated unnamed roll.
+          ``identify_needed`` is the fork's one need authority (it owns the
+          unanswered-qualified-cycle test AND the spent-occupied occasion), so it answers
+          here, and a ``None`` verdict means the condition is merely STANDING — already
+          read, or never a reason to read — which is not a reason to read it again.
+          Whatever reason it DOES return is the one passed on, so a slot that turns out
+          to be live-tagged gets the accurate ``rfid_refresh`` rather than this
+          decision's guess.
 
         ``spoolman_active=False`` is a fact, not an assumption: :func:`run_slot_pipeline`
         stands the whole pass down under Spoolman mode, so no Spoolman binding can reach
@@ -766,16 +781,21 @@ async def _apply(
     """Perform ``decision``. Returns the decision actually applied (a MINT may convert
     to a BIND) and whether the binding ledger changed."""
     kind = decision.kind
+    # The row this slot held BEFORE the writer runs — captured as an id, not an object,
+    # because the writer deletes the assignment and a detached instance is no longer a
+    # readable source. It is what tells a bind whether it DISPLACED something
+    # (:func:`_dispose_displaced`); a same-spool upsert displaces nobody.
+    prior_spool_id = assignment.spool_id if assignment is not None else None
 
     if kind is DecisionKind.KEEP:
         await _apply_keep(obs, deps, assignment, decision)
         return decision, False
 
     if kind is DecisionKind.BIND:
-        return await _apply_bind(obs, deps, decision, seen)
+        return await _apply_bind(obs, deps, decision, seen, prior_spool_id)
 
     if kind is DecisionKind.MINT:
-        return await _apply_mint(obs, deps, decision, seen)
+        return await _apply_mint(obs, deps, decision, seen, prior_spool_id)
 
     if kind is DecisionKind.RECLAIM:
         return await _apply_reclaim(obs, deps, decision, seen)
@@ -904,7 +924,7 @@ def _duplicate_in_pass(obs: TrayObservation, spool_id: int | None, seen: set[int
 
 
 async def _apply_bind(
-    obs: TrayObservation, deps: PipelineDeps, decision: Decision, seen: set[int]
+    obs: TrayObservation, deps: PipelineDeps, decision: Decision, seen: set[int], prior_spool_id: int | None = None
 ) -> tuple[Decision, bool]:
     if _duplicate_in_pass(obs, decision.spool_id, seen):
         return decision, False
@@ -918,7 +938,7 @@ async def _apply_bind(
             decision.spool_id,
         )
         return decision, False
-    return await _bind_spool(obs, deps, decision, spool, seen)
+    return await _bind_spool(obs, deps, decision, spool, seen, prior_spool_id=prior_spool_id)
 
 
 async def _bind_spool(
@@ -929,6 +949,7 @@ async def _bind_spool(
     seen: set[int],
     *,
     fingerprint: tuple[str, str] | None = None,
+    prior_spool_id: int | None = None,
 ) -> tuple[Decision, bool]:
     """The shared BIND write: the ONE binding writer + the pre-config one-shot.
 
@@ -978,6 +999,7 @@ async def _bind_spool(
         assignment.pre_configured_at = None
     await deps.db.commit()
     seen.add(spool.id)
+    await _dispose_displaced(obs, deps, prior_spool_id, spool.id)
     if pre_config:
         # The deferred configuration finally goes out to the slot the firmware refused
         # it on while empty. NEVER on an identity-claim bind: that roll's configuration
@@ -1038,14 +1060,130 @@ async def _apply_release(
 ) -> tuple[Decision, bool]:
     if assignment is None:
         return decision, False
-    await release_spool_from_slot(deps.db, assignment, reason=decision.reason)
+    printer_id, ams_id, tray_id = obs.slot
+    spool = assignment.spool
+    prompt_cleared = await release_spool_from_slot(deps.db, assignment, reason=decision.reason)
     await deps.db.commit()
+    if decision.reason == "cleared_tray":
+        # The roll left, so a never-fed ``ams_auto`` row it displaced-and-abandoned has
+        # nothing left to stand for: dispose it here rather than leave a 0 g ghost in
+        # Inventory (prod 2026-08-07: spools 239-242). Ledger-bearing rows are ONLY
+        # released — their grams are the tagless truth source (doctrine rule 4).
+        await _dispose_ghost(obs, deps, spool, "released")
+    if prompt_cleared:
+        # The physical subject of the fresh-roll question left the slot, so every open
+        # client must drop the toast it can no longer answer. Through the ONE dismissal
+        # broadcaster (``spool_tagless``), same payload the operator answers produce.
+        await _broadcast_prompt_dismissed(deps, printer_id, ams_id, tray_id)
     await _emit_assignment_changed(obs, deps)
     return decision, True
 
 
+async def _broadcast_prompt_dismissed(deps: PipelineDeps, printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Drop a slot's stale fresh-roll toast fleet-wide. Guarded — a broadcast failure
+    must never unwind a release that already landed (invariant 10)."""
+    try:
+        await spool_tagless.broadcast_tagless_fresh_dismissed(printer_id, ams_id, tray_id)
+    except Exception:  # noqa: BLE001 — the stamp is already NULL; the toast is cosmetic
+        logger.exception(
+            "[slot-state] fresh-roll dismissal broadcast failed for printer %d A%dT%d", printer_id, ams_id, tray_id
+        )
+
+
+async def _dispose_ghost(obs: TrayObservation, deps: PipelineDeps, spool: Spool | None, event: str) -> bool:
+    """Dispose a NEVER-FED auto-minted row that no longer holds its slot. True when disposed.
+
+    "Ghost" is the fork's own provisional row (``data_origin`` ``ams_auto``) that the
+    firmware never fed: minted from the tagless default while a slot was unresolved, then
+    displaced by the real identity or abandoned when the tray emptied. It carries no
+    grams, no operator edits and no identity, so leaving it makes Inventory a list of
+    rolls that do not exist (prod 2026-08-07: spools 239-242, all 0 g, all unbound).
+
+    ``spool_tagless.dispose_provisional_on_tag`` is THE disposal — it owns BOTH verdicts
+    already: whose row this is (anything not auto-minted comes back "kept" and is left
+    alone) and hard-delete vs archive (pristine vs ledger-bearing). So this adds exactly
+    ONE gate on top of it and restates none of it: :data:`NEVER_FED_MAX_G` grams. A row
+    that HAS fed is real consumption history whatever its origin (doctrine rule 4 — usage
+    charges are the tagless truth source), and rule 8's warning that 0 g used ≠ never used
+    is why the usage LEDGER still gets the final say inside the disposal.
+
+    Rule 7 safety: a never-fed row's re-seat re-stamps ``loaded_at`` by definition
+    (``spool_binding.stamp_loaded_for_slot``), so no FIFO seniority is destroyed here.
+    """
+    if spool is None or float(spool.weight_used or 0) >= NEVER_FED_MAX_G:
+        return False
+    printer_id, ams_id, tray_id = obs.slot
+    spool_id = spool.id
+    try:
+        disposition = await spool_tagless.dispose_provisional_on_tag(deps.db, spool)
+        if disposition == "kept":
+            return False
+        await deps.db.commit()
+    except Exception:  # noqa: BLE001 — a failed disposal must not unwind the binding write
+        logger.exception(
+            "[slot-state] ghost disposal failed for spool %s (printer %d A%dT%d)", spool_id, printer_id, ams_id, tray_id
+        )
+        await _rollback(deps)
+        return False
+    logger.info(
+        "[slot-state] printer=%d A%dT%d never-fed provisional spool %d %s (%s)",
+        printer_id,
+        ams_id,
+        tray_id,
+        spool_id,
+        disposition,
+        event,
+    )
+    return True
+
+
+async def _dispose_displaced(
+    obs: TrayObservation, deps: PipelineDeps, prior_spool_id: int | None, bound_spool_id: int
+) -> None:
+    """Route the row a successful bind just DISPLACED off this slot. Two lanes only.
+
+    The writer's move semantics unbind the incumbent fleet-wide (one spool ⇔ at most one
+    slot), which is correct for the ledger and silent about the row itself. Two kinds of
+    incumbent must not survive as active inventory:
+
+    * a never-fed ``ams_auto`` GHOST → :func:`_dispose_ghost` (the canonical disposal);
+    * a SPENT row of any origin → archived. The newcomer's identity is positive proof the
+      drained core physically left, which is the same evidence ``REPLACE_SPENT`` acts on
+      — a spent core displaced by a real roll is exhausted trash, and an active spent row
+      goes on presenting a 0 g ledger to the selection and deficit lanes.
+
+    Every OTHER displaced row is left exactly as the writer left it: unbound inventory
+    with its grams and its ``last_location_*`` reclaim stamp intact.
+    """
+    if prior_spool_id is None or prior_spool_id == bound_spool_id:
+        return  # a same-spool upsert displaces nobody
+    displaced = await deps.db.get(Spool, prior_spool_id)
+    if displaced is None:
+        return
+    if await _dispose_ghost(obs, deps, displaced, f"displaced by spool {bound_spool_id}"):
+        return
+    if displaced.spent_at is None or displaced.archived_at is not None:
+        return
+    printer_id, ams_id, tray_id = obs.slot
+    try:
+        displaced.archived_at = datetime.utcnow()
+        await deps.db.commit()
+    except Exception:  # noqa: BLE001 — a failed archive must not unwind the binding write
+        logger.exception("[slot-state] archiving displaced spent spool %d failed", displaced.id)
+        await _rollback(deps)
+        return
+    logger.info(
+        "[slot-state] printer=%d A%dT%d spent spool %d archived — displaced by spool %d",
+        printer_id,
+        ams_id,
+        tray_id,
+        displaced.id,
+        bound_spool_id,
+    )
+
+
 async def _apply_mint(
-    obs: TrayObservation, deps: PipelineDeps, decision: Decision, seen: set[int]
+    obs: TrayObservation, deps: PipelineDeps, decision: Decision, seen: set[int], prior_spool_id: int | None = None
 ) -> tuple[Decision, bool]:
     """MINT, with the last-second existence recheck.
 
@@ -1067,11 +1205,13 @@ async def _apply_mint(
             converted = Decision(DecisionKind.BIND, spool_id=owner.id, reason=decision.reason)
             if _duplicate_in_pass(obs, owner.id, seen):
                 return converted, False
-            return await _bind_spool(obs, deps, converted, owner, seen)
+            return await _bind_spool(obs, deps, converted, owner, seen, prior_spool_id=prior_spool_id)
 
     spool, from_default = await _mint_from_spec(deps, obs, decision.mint_spec or {})
     fingerprint = _mint_fingerprint(obs, decision.mint_spec or {}, from_default)
-    _decision, applied = await _bind_minted(obs, deps, decision, spool, seen, fingerprint, from_default)
+    _decision, applied = await _bind_minted(
+        obs, deps, decision, spool, seen, fingerprint, from_default, prior_spool_id=prior_spool_id
+    )
     return _decision, applied
 
 
@@ -1083,6 +1223,8 @@ async def _bind_minted(
     seen: set[int],
     fingerprint: tuple[str, str],
     from_default: bool,
+    *,
+    prior_spool_id: int | None = None,
 ) -> tuple[Decision, bool]:
     """Bind a freshly minted row. ``replace_existing`` is implicit: the writer's move
     semantics displace whatever held the slot, here and fleet-wide."""
@@ -1104,6 +1246,7 @@ async def _bind_minted(
         return decision, False
     await deps.db.commit()
     seen.add(spool.id)
+    await _dispose_displaced(obs, deps, prior_spool_id, spool.id)
     if from_default:
         # The tray is bare or still carries the DEPARTED row's config, so the firmware
         # does not yet hold this row's identity — push it, exactly as the bare-tray
@@ -1176,6 +1319,9 @@ async def _apply_replace_spent(
 
     spool, from_default = await _mint_from_spec(deps, obs, decision.mint_spec or {})
     fingerprint = _mint_fingerprint(obs, decision.mint_spec or {}, from_default)
+    # No ``prior_spool_id``: this arm disposed the departed row itself, above. Handing it
+    # to the displacement router would ask a second lane to dispose an already-disposed
+    # row — one disposal per departure, decided in one place.
     return await _bind_minted(obs, deps, decision, spool, seen, fingerprint, from_default)
 
 

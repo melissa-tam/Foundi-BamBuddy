@@ -2381,6 +2381,20 @@ async def on_print_start(printer_id: int, data: dict):
     # Clear any stale user-stopped flag from previous print cycles
     _user_stopped_printers.discard(printer_id)
 
+    # gcode_state → RUNNING edge for the AMS presence suppression tier. Starting a print
+    # engages the AMS, so trays disengage/re-seat with nobody having touched a roll;
+    # ams_presence disqualifies those edges BY CAUSE (doctrine rule 6 — never by a timer).
+    # This callback IS the RUNNING edge (bambu_mqtt fires it there, and its _was_running
+    # guard deliberately skips a PAUSE→RUNNING resume, so a runout refill made during a
+    # PAUSE keeps its fully qualified gain). Stamped before the eject short-circuit — an
+    # eject job engages the AMS the same way. Guarded: it must never crash the callback.
+    try:
+        from backend.app.services.ams_presence import note_running_edge
+
+        note_running_edge(printer_id)
+    except Exception as _re:  # noqa: BLE001 — edge stamping must never crash the start callback
+        logger.warning("[AMS-PRESENCE] running-edge stamp failed for printer %s: %s", printer_id, _re)
+
     # Backup-swap edge state is per-printer and must not survive a print boundary: a
     # feeder change chosen by the NEXT job's dispatch mapping would otherwise read as a
     # mid-job firmware backup switch and falsely stamp the departed spool spent

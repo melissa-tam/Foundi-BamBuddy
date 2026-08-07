@@ -14,6 +14,7 @@ slot can only produce. The old ``data_origin == "ams_auto"`` eligibility rule is
 """
 
 import logging
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -89,6 +90,26 @@ def _arm_cycle(printer_id=1, ams_id=0, tray_id=0, *, age=0.0):
     pull-and-reseat leaves behind — without replaying the whole presence sequence.
     The end-to-end path (loss → backdated absence → gain) is pinned separately."""
     ams_presence._physical_cycle_at[(printer_id, ams_id, tray_id)] = ams_presence.time.monotonic() - age
+
+
+def _arm_occasion(printer_id=1, ams_id=0, tray_id=0):
+    """Open a READ OCCASION for a slot — the permission every STANDING-evidence arm of
+    identify_needed requires (both rfid_refresh arms + the spent-occupied arm). In
+    production only a qualified physical cycle or the terminal's between-prints policy
+    opens one, and a commanded read consumes it."""
+    ams_presence.open_read_occasion(printer_id, ams_id, tray_id)
+
+
+def _stale_remain_tray(tray_id, **kw):
+    """A SEATED (state 10) tray whose wire ``remain`` never landed (-1).
+
+    THE shape the terminal's between-prints policy owes a refresh for: doctrine rule 8
+    makes wire remain% the truth for a tagged row, and usage_tracker's W6 ledger-decrease
+    repair has nothing to repair from until that read lands. A tagged slot reporting a
+    sane remain on its ordinary AMS pushes needs no commanded read at all."""
+    kw.setdefault("state", 10)
+    kw.setdefault("remain", -1)
+    return _tray(tray_id, **kw)
 
 
 async def _physically_cycle(db_session, printer_id=1, ams_id=0, tray_id=0, *, tray=None):
@@ -212,18 +233,25 @@ class TestOutOfRotationClear:
 
 class TestTerminalSweep:
     """on_printer_terminal commands exactly the identifies identify_needed asks for:
-    tagged slots (live or DB-bound) every terminal, physically-changed slots once,
-    and NOTHING for an untouched tagless slot — once per terminal transition."""
+    tagged slots whose between-prints policy opens a read occasion (wire remain missing
+    / ledger past label / spent-latched under an unidentified roll), physically-changed
+    slots once, and NOTHING for an untouched tagless slot — once per terminal
+    transition."""
 
     async def test_reads_tagged_and_changed_slots_only(self, db_session, sessions, monkeypatch):
         # (0,1) bound to an auto-minted TAGLESS spool + physically cycled → discovery.
         auto_spool = Spool(material="PETG", data_origin="ams_auto")
-        # (0,2) bound to a spool that carries an RFID identity → always refreshed.
+        # (0,2) bound to a spool that carries an RFID identity, wire remain missing →
+        # refreshed through the DB-bound arm (the tray shows no tag: the incomplete RFID
+        # read is exactly why its remain never landed).
         tagged_spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
-        db_session.add_all([auto_spool, tagged_spool])
+        # (0,3) the same shape with the tag ALSO visible on the wire → the live-tag arm.
+        live_spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid="FEDCBA0987654321")
+        db_session.add_all([auto_spool, tagged_spool, live_spool])
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=auto_spool.id, printer_id=1, ams_id=0, tray_id=1))
         db_session.add(SpoolAssignment(spool_id=tagged_spool.id, printer_id=1, ams_id=0, tray_id=2))
+        db_session.add(SpoolAssignment(spool_id=live_spool.id, printer_id=1, ams_id=0, tray_id=3))
         await db_session.commit()
         _arm_cycle(1, 0, 1)
 
@@ -242,8 +270,8 @@ class TestTerminalSweep:
                         "tray": [
                             _tray(0, state=11),  # SKIP: untouched tagless — the 0081 factory
                             _tray(1, state=11),  # discovery: tagless-bound, physically cycled
-                            _tray(2, state=11),  # rfid_refresh: DB-bound to a tagged spool
-                            _tray(3, state=11, tag=_VALID_TAG),  # rfid_refresh: live tag
+                            _stale_remain_tray(2),  # rfid_refresh: DB-bound tagged, remain never landed
+                            _stale_remain_tray(3, tag="FEDCBA0987654321"),  # rfid_refresh: live tag, remain missing
                         ],
                     },
                     {"id": 1, "tray": [_tray(0, state=0)]},  # skip: state 0 excluded
@@ -363,6 +391,11 @@ class TestTerminalSweep:
         assert ams_presence._unanswered_cycle(1, 0, 0) is False  # the firmware's answer counts
 
     async def test_once_per_transition_dedup(self, db_session, sessions, monkeypatch):
+        spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
+        await db_session.commit()
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
         client.wait_ams_settle = AsyncMock(return_value=True)
@@ -370,7 +403,9 @@ class TestTerminalSweep:
             state="FINISH",
             subtask_id="t1",
             ams_status_main=0,
-            raw_data={"ams": [{"id": 0, "tray": [_tray(0, state=11, tag=_VALID_TAG)]}]},  # always needed
+            # Live tag + wire remain missing → the between-prints policy owes a refresh
+            # at every terminal (one per terminal, not one per pass).
+            raw_data={"ams": [{"id": 0, "tray": [_stale_remain_tray(0, tag=_VALID_TAG)]}]},
         )
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
         monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
@@ -564,16 +599,36 @@ class TestIdentifyNeeded:
         return await ams_presence.identify_needed(db_session, 1, 0, tray_id, tray, False)
 
     async def test_live_tagged_is_refreshed(self, db_session):
-        # remain% for gram tracking + reused-core detection ride on this read.
+        # remain% for gram tracking + reused-core detection ride on this read — but only
+        # against an OPEN occasion (a qualified cycle, or the terminal's policy).
+        _arm_occasion()
         assert await self._needed(db_session, _tray(0, state=11, tag=_VALID_TAG)) == "rfid_refresh"
 
+    async def test_live_tagged_without_an_occasion_is_not_read(self, db_session):
+        # THE storm pin, live-tag arm: a tagged tray publishes its remain on every
+        # ordinary AMS push, so re-deriving "it is tagged" every pass is not a read reason.
+        assert await self._needed(db_session, _tray(0, state=11, tag=_VALID_TAG)) is None
+
     async def test_db_bound_tagged_is_refreshed(self, db_session):
+        _arm_occasion()
         spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
         await db_session.commit()
         assert await self._needed(db_session, _tray(0, state=11)) == "rfid_refresh"
+
+    async def test_db_bound_tagged_without_an_occasion_is_not_read(self, db_session):
+        # THE storm pin (2026-08-07, printers 6/10/…): a DB binding whose tagged spool the
+        # tray does not show is a STANDING condition. Re-derived on every reconcile /
+        # pipeline pass it owed a read every ~31 s forever, each command holding the
+        # printer's identify gate so the slot pipeline deferred every decision on it.
+        spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
+        await db_session.commit()
+        assert await self._needed(db_session, _tray(0, state=11)) is None
 
     async def test_db_bound_tagged_but_absent_is_not_read(self, db_session):
         # The bound spool was pulled: a read of an empty slot fails exactly like a
@@ -1143,7 +1198,7 @@ class TestEngagedFilamentDefer:
         # filament is unloaded (tray_now=255) the next terminal sends exactly one.
         await self._bind_tagged(db_session, 0, _VALID_TAG)
         client = self._client()
-        status = _pstate([_tray(0, state=11)], gcode_state="FINISH", subtask_id="t1", tray_now=1)  # slot 1 engaged
+        status = _pstate([_stale_remain_tray(0)], gcode_state="FINISH", subtask_id="t1", tray_now=1)  # slot 1 engaged
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
         monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
 
@@ -1182,7 +1237,7 @@ class TestEngagedFilamentDefer:
         await self._bind_tagged(db_session, 2, "FEDCBA0987654321")
         client = self._client()
         status = _pstate(
-            [_tray(0, state=11), _tray(1, state=11), _tray(2, state=11)],
+            [_stale_remain_tray(0), _tray(1, state=11), _stale_remain_tray(2)],
             gcode_state="FINISH",
             subtask_id="t1",
             tray_now=1,  # slot 1 engaged — blocks the whole AMS
@@ -1204,7 +1259,7 @@ class TestEngagedFilamentDefer:
         # once — no double-invocation.
         await self._bind_tagged(db_session, 0, _VALID_TAG)
         client = self._client()
-        status = _pstate([_tray(0, state=11)], gcode_state="FINISH", subtask_id="t1", tray_now=255)
+        status = _pstate([_stale_remain_tray(0)], gcode_state="FINISH", subtask_id="t1", tray_now=255)
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
         monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
 
@@ -1627,3 +1682,472 @@ class TestOwedReadObservability:
         client.ams_refresh_tray.assert_called_once_with(0, 0)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert ams_presence._unanswered_cycle(1, 0, 0) is False  # the read answered it
+
+
+class TestReadOccasionPacing:
+    """2026-08-07 identify storm: 1000 commanded reads on one printer in a day (367/368
+    on two more), one every ~31 s — the client's per-printer identify gate being the only
+    thing pacing them. Cause: a STANDING condition (a DB binding whose tagged spool the
+    tray does not show) re-derived the same ``rfid_refresh`` verdict on every reconcile /
+    pipeline pass. Because each command re-armed the 30 s gate and the drain re-commanded
+    the instant it cleared, the gate's duty cycle was ~100 % and the slot pipeline's
+    ``identify_in_flight`` row deferred EVERY slot decision on those printers.
+
+    The fix is an OCCASION: standing evidence buys ONE read, and only a new CAUSE (a
+    qualified physical cycle, or the terminal's between-prints policy) buys another.
+    Doctrine rule 6/7 — by cause, never by a timer laid over the verdict.
+    """
+
+    async def _bind(self, db_session, *, tag=_VALID_TAG, spent=None, tray_id=0, **kw):
+        spool = Spool(
+            material="PETG", data_origin="rfid_auto" if tag else "ams_auto", tag_uid=tag, spent_at=spent, **kw
+        )
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=tray_id))
+        await db_session.commit()
+        return spool
+
+    async def test_storm_shape_state9_bound_tagged_owes_nothing(self, db_session):
+        # The live printer-6/10 shape: a stale tagged binding on a tray that is NOT
+        # seated. A read here fails exactly like a tagless one and raises a
+        # never-clearing 0700_0081 — this is a RELEASE problem (doctrine rule 9), never
+        # a read reason. True with the occasion open OR closed: presence is the hard gate.
+        await self._bind(db_session)
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=9), False) is None
+        _arm_occasion()
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=9), False) is None
+
+    async def test_h2c_state0_bound_shape_owes_nothing(self, db_session):
+        # H2C idle empties report state 0 — an unknown dialect code, i.e. presence
+        # UNKNOWN. Unknown is not evidence of a seated spool, so it is never a read
+        # reason, occasion or no occasion.
+        await self._bind(db_session)
+        _arm_occasion()
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=0), False) is None
+
+    async def test_two_passes_over_an_unchanged_slot_command_at_most_one_read(self, db_session, monkeypatch):
+        # THE pacing pin. Two consecutive passes over a slot nothing happened to: the
+        # first spends the occasion, the second owes nothing at all.
+        await self._bind(db_session)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)]), client=client)
+        _arm_occasion()  # e.g. a terminal's between-prints policy opened one
+
+        tray = _tray(0, state=11)
+        for _ in range(2):
+            reason = await ams_presence.identify_needed(db_session, 1, 0, 0, tray, False)
+            if reason is not None:
+                await ams_presence.command_identify(1, 0, 0, source="reconcile", reason=reason)
+
+        assert client.ams_refresh_tray.call_count == 1
+        assert ams_presence._read_occasion_open(1, 0, 0) is False  # consumed by the read
+
+    async def test_a_new_qualified_cycle_reopens_the_occasion(self, db_session, monkeypatch):
+        # The gate narrows the OCCASION, never the capability: somebody moving a roll
+        # buys the slot another answer.
+        await self._bind(db_session)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)]), client=client)
+        _arm_occasion()
+        await ams_presence.command_identify(1, 0, 0, source="reconcile", reason="rfid_refresh")
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=11), False) is None
+
+        ams_presence._note_gain(1, 0, 0, qualified=True)  # a real pull+reseat
+        ams_presence.note_identity_learned(1, 0, 0)  # …whose discovery the firmware answered
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=11), False) == "rfid_refresh"
+
+    async def test_refusal_defers_without_waiting_and_without_burning_the_occasion(self, db_session, monkeypatch):
+        # Invariant 2: a caller may DEFER on a refused wire, never pre-approve — and
+        # never WAIT for the gate, because the gate it would wait on is armed by our own
+        # previous identify (that self-clocked loop IS the storm's cadence).
+        client = MagicMock()
+        client.ams_write_refusal.return_value = "identify_in_flight"
+        client.ams_unit_drying.return_value = False
+        client.ams_refresh_tray.return_value = (True, "ok")
+        client.wait_ams_settle = AsyncMock(return_value=True)
+        state = _pstate([_tray(0, state=11)], gcode_state="IDLE", tray_now=255)
+        _patch_pm(monkeypatch, status=state, client=client)
+        _arm_cycle(1, 0, 0)
+        _arm_occasion()
+
+        ok = await ams_presence.maybe_command_owed_identify(db_session, 1, 0, 0, _tray(0, state=11), state)
+
+        assert ok is False
+        client.ams_refresh_tray.assert_not_called()
+        client.wait_ams_settle.assert_not_awaited()  # deferred, never awaited the gate
+        assert ams_presence._unanswered_cycle(1, 0, 0) is True  # evidence untouched
+        assert ams_presence._read_occasion_open(1, 0, 0) is True  # occasion untouched
+
+    async def test_spent_occupied_state10_owes_one_discovery(self, db_session, monkeypatch):
+        # A spent-latched binding under a SEATED roll the wire cannot identify: the roll
+        # in the slot is a newcomer nobody has named. ``discovery`` (not rfid_refresh) is
+        # what suppresses its expected no-tag failure farm-side.
+        await self._bind(db_session, spent=datetime.utcnow())
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=10)]), client=client)
+        _arm_occasion()
+
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False) == "discovery"
+        await ams_presence.command_identify(1, 0, 0, source="terminal_sweep", reason="discovery")
+        # Second pass over the SAME occupancy epoch: nothing more is owed. Every failed
+        # read leaves a printer-side 0700_0081 that only a power-cycle clears (rule 5).
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False) is None
+
+        ams_presence._note_gain(1, 0, 0, qualified=True)  # a NEW roll goes in
+        ams_presence.note_identity_learned(1, 0, 0)  # cycle answered; the spent latch is not
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False) == "discovery"
+
+    async def test_spent_occupied_state11_owes_nothing(self, db_session):
+        # State 11 is the same roll threaded on to the hub — the documented shape a read
+        # cannot answer without unloading first. (A spent row that ALSO carries a tag can
+        # still take the answerable ``rfid_refresh`` arm at 11; this arm is for the
+        # unidentified newcomer, which is the tagless-latch shape.)
+        await self._bind(db_session, tag=None, spent=datetime.utcnow())
+        _arm_occasion()
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=11), False) is None
+
+    async def test_spent_occupied_with_a_live_tag_is_not_discovery(self, db_session):
+        # The wire named the roll: there is nothing to discover, and the read (if the
+        # occasion is open) is an answerable refresh, never an expected failure.
+        await self._bind(db_session, spent=datetime.utcnow())
+        _arm_occasion()
+        reason = await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10, tag=_VALID_TAG), False)
+        assert reason == "rfid_refresh"
+
+    async def test_spent_occupied_without_an_occasion_owes_nothing(self, db_session):
+        await self._bind(db_session, spent=datetime.utcnow())
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False) is None
+
+
+class TestProdShapeReplayThroughTheRealPredicate:
+    """c93ea73f's contract, replayed against the REAL predicate (the pipeline-side pin
+    lives in test_slot_pipeline.py and must stay green untouched).
+
+    008-H2C AMS2 slot2, 2026-08-02: a dialect-odd slot (state 9, no filament type, no
+    tag, stuck exist bit) resolved ``NONE(identity_unresolved)`` on EVERY push — a
+    standing condition, not an event — and the pipeline answered each one with a
+    discovery identify. ``identity_unresolved`` is a REQUEST this predicate must clear;
+    it clears it with None, because state 9 is not presence and no qualified physical
+    cycle was ever recorded.
+    """
+
+    PROD_TRAY = {"id": 2, "state": 9, "tray_type": ""}
+
+    async def test_three_passes_zero_reads(self, db_session):
+        for _ in range(3):
+            assert await ams_presence.identify_needed(db_session, 1, 2, 2, dict(self.PROD_TRAY), False) is None
+
+    async def test_three_passes_zero_reads_with_a_spent_binding(self, db_session):
+        # Same shape, now with a spent-latched binding on the slot — the newest arm.
+        # It requires a SEATED (state 10) tray, so the dialect-odd state-9 slot still
+        # buys nothing, occasion open or not.
+        spool = Spool(material="PETG", data_origin="ams_auto", spent_at=datetime.utcnow())
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=2, tray_id=2))
+        await db_session.commit()
+        _arm_occasion(1, 2, 2)
+
+        for _ in range(3):
+            assert await ams_presence.identify_needed(db_session, 1, 2, 2, dict(self.PROD_TRAY), False) is None
+
+
+class TestCauseBasedEdgeSuppressionWidened:
+    """Phantom qualified cycles (2026-08-07). Gain/absence edges fabricated by
+    NON-PHYSICAL causes were arming real actions — fresh-roll prompts for slots nobody
+    touched, never-fed ``loaded_at`` re-stamps. The 2026-07-21 wave disqualified
+    identify-explained edges but left three leaks: a read commanded on a state-9 tray
+    (``record_reread`` never arms there), a firmware-autonomous read whose IDENTIFYING
+    flag rises and falls between edges, and the print-start AMS engage transient.
+
+    Doctrine rule 6 / invariant 6: suppression is BY CAUSE — never a timer or damper on
+    gains. Presence itself still updates on a suppressed edge, and the recovery lanes
+    (``clear_on_reinsert`` / refill auto-resume) still fire: only the ACTION tiers that
+    assume a human moved a roll are withheld.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _inert_gain_consumers(self, monkeypatch):
+        from backend.app.services import spool_binding, spool_tagless
+
+        self.clear = AsyncMock()
+        self.note_cycle = AsyncMock()
+        self.restamp = AsyncMock(return_value=True)
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", self.clear)
+        monkeypatch.setattr(spool_tagless, "note_physical_cycle", self.note_cycle)
+        monkeypatch.setattr(spool_binding, "stamp_loaded_for_slot", self.restamp)
+
+    async def _cycle(self, db_session, *, mid_absence=None):
+        """seed present → loss → (optional mid-absence push) → backdated ≥5 s → gain."""
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - (
+            ams_presence._MIN_PHYSICAL_ABSENT_S + 1
+        )
+        if mid_absence is not None:
+            mid_absence()
+            await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+
+    async def test_state9_commanded_read_edge_is_not_a_qualified_cycle(self, db_session, monkeypatch):
+        # LEAK (b): a read commanded while the tray reports state 9 arms no echo, and the
+        # AMS never reports IDENTIFYING on a push we see — so the 07-21 wave's two arms
+        # are both blind and the ~15 s flap banked as a human roll swap.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = _pstate([_tray(0, state=9)], gcode_state="RUNNING", ams_status_main=0)
+        _patch_pm(monkeypatch, status=status, client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
+        ok, _ = await ams_presence.command_identify(1, 0, 0, source="terminal_sweep", reason="rfid_refresh")
+        assert ok is True and ams_presence._echo_pending == {}  # the echo lane is blind here
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
+        assert ams_presence._absent_under_identify[(1, 0, 0)] is False  # …and so is the loss-edge flag
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - (
+            ams_presence._MIN_PHYSICAL_ABSENT_S + 1
+        )
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) is None  # no qualified cycle
+        self.note_cycle.assert_not_awaited()  # no fresh-roll prompt
+        self.restamp.assert_not_awaited()  # no never-fed loaded_at re-stamp
+        self.clear.assert_awaited()  # …but the feed-fault clear still runs (presence is truth)
+
+    async def test_a_command_explains_only_one_flap(self, db_session, monkeypatch):
+        # The other side of leak (b): the cause is consumed by the first gain after it, so
+        # a genuine pull+reseat made AFTER the identify settled is still QUALIFIED. A
+        # lingering "we read this slot N s ago" stamp would swallow it — the failure mode
+        # _identify_explains_absence's docstring names.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = _pstate([_tray(0, state=9)], gcode_state="RUNNING", ams_status_main=0)
+        _patch_pm(monkeypatch, status=status, client=client)
+
+        await ams_presence.on_ams_change(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+        await ams_presence.command_identify(1, 0, 0, source="terminal_sweep", reason="rfid_refresh")
+        await self._cycle(db_session)  # the identify's own flap — suppressed
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) is None
+
+        await self._cycle(db_session)  # a human pull+reseat afterwards
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) < 1.0
+        self.note_cycle.assert_awaited_once()
+
+    async def test_identifying_observed_mid_absence_is_not_a_qualified_cycle(self, db_session, monkeypatch):
+        # LEAK (c): a firmware-AUTONOMOUS read. No command, and the IDENTIFYING flag is
+        # down again by the time the gain lands — only a SAMPLED observation from inside
+        # the absence window can explain it.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = _pstate([_tray(0, state=9)], gcode_state="RUNNING", ams_status_main=0)
+        _patch_pm(monkeypatch, status=status, client=client)
+
+        def _flag_identifying():
+            status.ams_status_main = ams_presence.AMS_STATUS_IDENTIFYING
+
+        await self._cycle(db_session, mid_absence=_flag_identifying)
+        assert ams_presence._identifying_seen_at.get(1) is not None
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) is None
+        self.note_cycle.assert_not_awaited()
+        client.ams_refresh_tray.assert_not_called()  # the farm commanded nothing
+
+    async def test_print_start_transient_is_not_a_qualified_cycle(self, db_session, monkeypatch):
+        # LEAK (d): starting a print engages the AMS; trays disengage and re-seat with
+        # nobody having touched a roll (2026-08-07 15:12:03, three printers).
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = _pstate([_tray(0, state=9)], gcode_state="RUNNING", ams_status_main=0)
+        _patch_pm(monkeypatch, status=status, client=client)
+
+        ams_presence.note_running_edge(1)
+        await self._cycle(db_session)
+
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) is None
+        self.note_cycle.assert_not_awaited()
+        self.restamp.assert_not_awaited()
+        self.clear.assert_awaited()  # jam recovery's re-insert clear is NOT withheld
+        assert ams_presence.recent_gain_age(1, 0, 0) is not None  # presence maps still update
+
+    async def test_a_stale_running_edge_suppresses_nothing(self, db_session, monkeypatch):
+        # The window is a CAUSE window, not a damper: past it the edge is judged exactly
+        # as it was before.
+        client = MagicMock()
+        status = _pstate([_tray(0, state=9)], gcode_state="RUNNING", ams_status_main=0)
+        _patch_pm(monkeypatch, status=status, client=client)
+
+        ams_presence._running_edge_at[1] = ams_presence.time.monotonic() - (ams_presence._RUNNING_EDGE_TRANSIENT_S + 5)
+        await self._cycle(db_session)
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) < 1.0
+        self.note_cycle.assert_awaited_once()
+
+    async def test_pause_window_gain_stays_fully_qualified(self, db_session, monkeypatch):
+        # NON-NEGOTIABLE: a gain while the printer sits in PAUSE is the same-slot runout
+        # refill / jam reinsert that spool_recovery.maybe_auto_resume_on_refill and
+        # clear_on_reinsert are waiting for. Even with a fresh RUNNING edge on the books,
+        # the print-start arm must not touch it.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = _pstate([_tray(0, state=9)], gcode_state="PAUSE", ams_status_main=0)
+        _patch_pm(monkeypatch, status=status, client=client)
+
+        ams_presence.note_running_edge(1)
+        await self._cycle(db_session)
+
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) < 1.0  # fully qualified
+        self.note_cycle.assert_awaited_once()
+        self.restamp.assert_awaited()
+        self.clear.assert_awaited()
+
+    async def test_real_pull_and_reinsert_while_idle_is_still_qualified(self, db_session, monkeypatch):
+        # The control: no command, no IDENTIFYING, no print start → a genuine roll swap.
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        status = _pstate([_tray(0, state=9)], gcode_state="IDLE", ams_status_main=0)
+        _patch_pm(monkeypatch, status=status, client=client)
+
+        await self._cycle(db_session)
+
+        assert ams_presence.last_physical_cycle_age(1, 0, 0) < 1.0
+        self.note_cycle.assert_awaited_once()
+        self.restamp.assert_awaited()
+
+
+class TestTerminalRemainRefresh:
+    """D4 (2026-08-07): bound TAGGED trays stuck at wire ``remain = -1`` — the full RFID
+    data read never completed — were never re-read, so
+    ``usage_tracker.maybe_reconcile_tagged_ledger_decrease`` (the W6 auto-repair) had no
+    wire truth and over-label ledgers persisted (live: a spool at 1899.9 g used against a
+    1000 g label). Doctrine rule 5 allows need-driven reads on RFID-bound slots; rule 8
+    makes wire remain% the truth for a tagged row.
+
+    The need is derived at the TERMINAL only — ``reconcile_slot_config``'s charter is
+    occasions, never new permission (``test_tagged_slot_gets_no_refresh_from_this_lane``
+    pins that lane from the other side).
+    """
+
+    async def _bound(self, db_session, **kw):
+        fields = {"material": "PETG", "data_origin": "rfid_auto", "tag_uid": _VALID_TAG, "label_weight": 1000}
+        fields.update(kw)
+        spool = Spool(**fields)
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
+        await db_session.commit()
+        return spool
+
+    async def _cause(self, db_session, tray):
+        return await ams_presence._terminal_read_occasion(db_session, 1, 0, 0, tray)
+
+    async def test_wire_remain_missing_owes_a_refresh(self, db_session):
+        await self._bound(db_session)
+        assert await self._cause(db_session, _tray(0, state=10, remain=-1)) == "wire_remain_missing"
+        assert await self._cause(db_session, _tray(0, state=10, remain=None)) == "wire_remain_missing"
+        assert await self._cause(db_session, _tray(0, state=10, remain="n/a")) == "wire_remain_missing"
+
+    async def test_ledger_past_label_owes_a_refresh(self, db_session):
+        await self._bound(db_session, weight_used=1899.9)
+        assert await self._cause(db_session, _tray(0, state=10, remain=42)) == "ledger_over_label"
+
+    async def test_healthy_tagged_slot_owes_nothing(self, db_session):
+        # The de-amplification: remain arrives on every ordinary AMS push for a tagged
+        # tray, so a healthy one needs no commanded read at all.
+        await self._bound(db_session, weight_used=250.0)
+        assert await self._cause(db_session, _tray(0, state=10, remain=75)) is None
+
+    async def test_weight_locked_owes_nothing(self, db_session):
+        # The operator owns this row's weight; a wire refresh must not fight it.
+        await self._bound(db_session, weight_used=1899.9, weight_locked=True)
+        assert await self._cause(db_session, _tray(0, state=10, remain=-1)) is None
+
+    async def test_state11_owes_nothing(self, db_session):
+        await self._bound(db_session)
+        assert await self._cause(db_session, _tray(0, state=11, remain=-1)) is None
+
+    async def test_state9_owes_nothing(self, db_session):
+        await self._bound(db_session)
+        assert await self._cause(db_session, _tray(0, state=9, remain=-1)) is None
+
+    async def test_tagless_row_owes_nothing(self, db_session):
+        # A tagless tray always reports remain = -1 (no wire fullness exists, rule 8) —
+        # reading it can only fail and mint a never-clearing 0700_0081.
+        await self._bound(db_session, data_origin="ams_auto", tag_uid=None)
+        assert await self._cause(db_session, _tray(0, state=10, remain=-1)) is None
+
+    async def test_unbound_slot_owes_nothing(self, db_session):
+        # No ledger row to repair; the pipeline binds a live tag from the push itself.
+        assert await self._cause(db_session, _tray(0, state=10, remain=-1, tag=_VALID_TAG)) is None
+
+    async def test_spent_binding_under_an_unidentified_roll_owes_discovery(self, db_session):
+        await self._bound(db_session, spent_at=datetime.utcnow())
+        assert await self._cause(db_session, _tray(0, state=10, remain=-1)) == "spent_occupied"
+
+    async def test_the_sweep_commands_the_refresh_through_the_one_guarded_path(self, db_session, sessions, monkeypatch):
+        # End to end: the occasion the policy opens is what identify_needed converts into
+        # a verdict, and command_identify is still the only commander.
+        await self._bound(db_session, weight_used=1899.9)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        client.wait_ams_settle = AsyncMock(return_value=True)
+        status = _pstate([_tray(0, state=10, remain=42, tag=_VALID_TAG)], gcode_state="FINISH", subtask_id="t1")
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+
+        await ams_presence.on_printer_terminal(1)
+        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        assert ams_presence._read_occasion_open(1, 0, 0) is False  # the read consumed it
+
+
+class TestStandingUnknownBroadcast:
+    """D5 (2026-08-07): ``_warn_owed_read_blocked`` only ever logged, so a slot whose
+    identity had been unknown for six hours produced nothing the operator could see. It
+    now also broadcasts, on the same bus and behind the SAME 1/hour/slot dedup — one
+    hourly signal, never a per-pass toast storm."""
+
+    def _client(self):
+        client = MagicMock()
+        client.ams_write_refusal.return_value = None
+        client.ams_unit_drying.return_value = False
+        client.ams_refresh_tray.return_value = (True, "ok")
+        return client
+
+    async def _defer(self, db_session, monkeypatch, printer_id):
+        state = _pstate([_tray(0, state=11)], gcode_state="IDLE", tray_now=1)  # filament engaged
+        _patch_pm(monkeypatch, status=state, client=self._client())
+        return await ams_presence.maybe_command_owed_identify(db_session, printer_id, 0, 0, _tray(0, state=11), state)
+
+    async def test_broadcasts_once_per_dedup_window_with_the_payload_shape(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        printer = await printer_factory(name="007-H2C")
+        ws = AsyncMock()
+        monkeypatch.setattr(ams_presence.ws_manager, "broadcast", ws)
+        _arm_cycle(printer.id, 0, 0, age=ams_presence._OWED_READ_WARN_AFTER_S + 60)
+
+        assert await self._defer(db_session, monkeypatch, printer.id) is False
+        assert ws.await_count == 1
+        assert ws.call_args.args[0] == {
+            "type": "slot_standing_unknown",
+            "printer_id": printer.id,
+            "printer_name": "007-H2C",
+            "ams_id": 0,
+            "tray_id": 0,
+        }
+
+        # Same slot again inside the re-warn window → still deferred, still silent.
+        await self._defer(db_session, monkeypatch, printer.id)
+        assert ws.await_count == 1
+
+    async def test_a_recent_cycle_broadcasts_nothing(self, db_session, printer_factory, monkeypatch):
+        # Below _OWED_READ_WARN_AFTER_S the defer is ordinary pacing — the next terminal
+        # drains it, and the operator has nothing to do.
+        printer = await printer_factory()
+        ws = AsyncMock()
+        monkeypatch.setattr(ams_presence.ws_manager, "broadcast", ws)
+        _arm_cycle(printer.id, 0, 0, age=5)
+
+        assert await self._defer(db_session, monkeypatch, printer.id) is False
+        ws.assert_not_awaited()

@@ -24,10 +24,14 @@ spool inserted while idle or mid-print that the firmware never auto-reads:
   print starts, so the between-prints window is where the farm reconciles. What it
   may command is decided per slot by :func:`identify_needed`:
 
-  - ``"rfid_refresh"`` — the slot is live-tagged, or DB-bound to a spool that
-    carries a tag identity. The read SUCCEEDS and refreshes ``remain`` (tagless gram
-    tracking's corroboration + reused-core respool detection), so it is always worth
-    issuing.
+  - ``"rfid_refresh"`` — the slot is live-tagged, or DB-bound to a spool that carries a
+    tag identity, AND a read OCCASION is open for it. The read SUCCEEDS and restores
+    ``remain`` (rule 8's wire truth for a tagged row, which the W6 ledger-decrease
+    repair has nothing to work from without). A healthy tagged slot publishes ``remain``
+    on every ordinary AMS push, so the occasion — a qualified physical cycle, or the
+    terminal's between-prints policy (:func:`_terminal_read_occasion`: wire remain
+    missing / ledger past label / a spent-latched binding under an unidentified roll) —
+    is what keeps this from becoming a per-pass read loop.
   - ``"discovery"`` — a qualified physical cycle was recorded for the slot since its
     last commanded/observed read and it is still unidentified: something changed and
     the farm does not know what. ONE read answers it either way — a tag gives full
@@ -68,10 +72,12 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from backend.app.core.websocket import ws_manager
 from backend.app.services import hms_errors
 from backend.app.services.bambu_mqtt import AMS_STATUS_IDENTIFYING, TRAY_PRESENT_STATES
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_tag_matcher import is_valid_tag
+from backend.app.services.tray_fields import parse_int_field
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -190,6 +196,71 @@ _DISCOVERY_READ_WINDOW_S = 60.0
 # dialect or missing data (H2C idle empties report 0) and is never acted on.
 _IDENTIFIABLE_STATES = (9, *TRAY_PRESENT_STATES)
 
+# The SEATED member of ``TRAY_PRESENT_STATES``: the roll sits in the tray and its tag
+# faces the reader. State 11 is the same roll with its filament threaded on to the hub —
+# present, but the shape a commanded read cannot answer without unloading first (which
+# is why the client refuses one while filament is engaged). The between-prints
+# remain-refresh and the spent-occupied discovery arm therefore both require 10
+# specifically; presence in general still means either (rule 5 / invariant 3).
+_TRAY_SEATED_STATE = 10
+
+# (printer_id, ams_id, tray_id) -> time.monotonic() at which a READ OCCASION opened for
+# the slot. An occasion is the farm's permission to spend ONE commanded read on
+# standing (as opposed to event-shaped) evidence — the ``rfid_refresh`` verdicts and the
+# spent-occupied discovery arm. Opened by exactly three causes and nothing else:
+#
+#   1. a new QUALIFIED physical cycle (:func:`_note_gain`) — somebody moved a roll;
+#   2. a terminal sweep whose between-prints policy has a reason for the slot
+#      (:func:`_terminal_read_occasion`);
+#   3. an operator/manual command (``enforce_need=False`` bypasses the need check
+#      entirely, so it needs no entry here).
+#
+# CONSUMED by :func:`command_identify` the moment a read is accepted by the client.
+# Without this, a STANDING condition (a DB binding whose tagged spool the tray does not
+# show) re-derived the same ``rfid_refresh`` verdict on every reconcile/pipeline pass and
+# the farm read the slot every ~31 s forever — the client's identify gate being the only
+# thing pacing it (2026-08-07: 1000 reads on one printer in a day, 367/368 on two more,
+# each command holding that printer's 30 s identify gate so the slot pipeline deferred
+# EVERY decision on the printer). Doctrine rule 6/7: the fix is BY CAUSE — a re-derivation
+# of the same evidence is not a new occasion — never a timer on top of the verdict.
+_read_occasion_at: dict[tuple[int, int, int], float] = {}
+
+# (printer_id, ams_id, tray_id) -> time.monotonic() at which WE commanded a read,
+# recorded for EVERY accepted command regardless of the tray's state at the time.
+# Deliberately NOT ``_echo_pending`` (which arms only on a state-10/11 slot, because an
+# identify on an empty slot leaves no presence edge to swallow): a read commanded on a
+# state-9 slot still runs a firmware identify cycle, and the tray flap that cycle
+# produces must be disqualified as a physical cycle just the same. This map is the
+# CAUSE record; ``_echo_pending`` remains the one-shot edge-swallow.
+_commanded_read_at: dict[tuple[int, int, int], float] = {}
+
+# printer_id -> time.monotonic() at which the unit was last OBSERVED reporting
+# ``ams_status_main == AMS_STATUS_IDENTIFYING``. A firmware-AUTONOMOUS read carries no
+# command of ours at all, so neither ``_echo_pending`` nor ``_commanded_read_at`` sees
+# it; sampling the flag on every AMS push turns it into a cause that outlives the
+# instant it was raised (the live check alone misses a read that started and finished
+# between two pushes, which is precisely the window a tray flap lives in).
+_identifying_seen_at: dict[int, float] = {}
+
+# printer_id -> time.monotonic() of the printer's last gcode_state transition INTO
+# RUNNING (stamped by :func:`note_running_edge` from main.py's print-start callback).
+# Starting a print engages the AMS: trays disengage and re-seat as filament is pulled
+# through, which the presence map sees as a loss/gain pair with nobody having touched a
+# roll (2026-08-07 15:12:03, phantom cycles on three printers coinciding with print
+# starts). NOT stamped on a PAUSE→RUNNING resume — bambu_mqtt's ``_was_running`` guard
+# suppresses on_print_start there — so a refill made during a runout PAUSE keeps its
+# fully qualified gain, which ``spool_recovery.maybe_auto_resume_on_refill`` and
+# ``clear_on_reinsert`` both depend on.
+_running_edge_at: dict[int, float] = {}
+
+# How long after a print-start RUNNING edge an AMS presence edge is still attributable
+# to the engage transient. A CAUSE window (like ``_IDENTIFY_ACTIVE_S`` and
+# ``_ECHO_PENDING_STALE_S``), not a duration filter on the gain itself: outside it the
+# edge is judged exactly as before, and inside it nothing but the print start is
+# claimed. Doctrine rule 6 forbids a timer that decides IDENTITY — this decides
+# CAUSATION, which is the distinction the whole suppression tier rests on.
+_RUNNING_EDGE_TRANSIENT_S = 10.0
+
 # (printer_id, ams_id, tray_id) -> time.monotonic() of the last "this slot's owed
 # discovery read is still blocked" WARNING. An owed read defers QUIETLY by design
 # (one DEBUG), which is why a slot whose identity was unknown for six hours produced
@@ -222,6 +293,10 @@ def _reset_state() -> None:
     _slot_read_at.clear()
     _discovery_read_at.clear()
     _owed_read_warned_at.clear()
+    _read_occasion_at.clear()
+    _commanded_read_at.clear()
+    _identifying_seen_at.clear()
+    _running_edge_at.clear()
 
 
 # --- Tray / state predicates ----------------------------------------------
@@ -367,6 +442,101 @@ def _identify_explains_absence(printer_id: int, ams_id: int, tray_id: int) -> bo
     return identify_in_flight(printer_id, ams_id, tray_id)
 
 
+def note_running_edge(printer_id: int) -> None:
+    """Stamp that ``printer_id``'s gcode_state has just transitioned INTO RUNNING.
+
+    Called from ``main.on_print_start`` — the one place the fork already observes that
+    transition (``bambu_mqtt`` fires the print-start callback on the RUNNING edge, and
+    its ``_was_running`` guard deliberately suppresses it for a PAUSE→RUNNING resume).
+    Starting a print engages the AMS and momentarily disengages trays, producing
+    presence loss/gain pairs that no human caused; :func:`_identify_explains_gain` uses
+    this stamp to disqualify those from the ACTION tiers. Presence itself still updates —
+    presence is truth (invariant 3); only the tiers that assume a human moved a roll are
+    withheld. Sync, in-memory, never raises: it is one dict write on a callback path.
+    """
+    _running_edge_at[printer_id] = time.monotonic()
+
+
+def _identify_explains_gain(
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    *,
+    absent_at: float | None,
+    commanded_at: float | None,
+    paused: bool,
+) -> bool:
+    """True when a NON-PHYSICAL cause — not a human — explains this presence GAIN.
+
+    The suppression is BY CAUSE and never by duration (doctrine rule 6 / invariant 6):
+    an edge with a machine explanation is disqualified however long its absence ran, and
+    an edge with none is judged on the ordinary ≥5 s flap filter alone. Four causes, each
+    closing a leak the 2026-07-21 wave left open:
+
+    a. an identify is explaining the absence RIGHT NOW — the slot-scoped echo flag or the
+       unit's live ``AMS_STATUS_IDENTIFYING`` (:func:`_identify_explains_absence`, kept
+       verbatim: it is the freshest signal, and it is also what the loss edge captured);
+    b. WE commanded a read on the slot, whatever the tray's state was at command time.
+       ``record_reread`` arms the echo flag only for a state-10/11 slot (an identify on an
+       empty slot leaves no edge to swallow), so a read commanded on a state-9 tray slipped
+       the whole suppression lane and its flap banked as a physical cycle. ``commanded_at``
+       is passed in ALREADY CONSUMED by the caller: a command explains at most ONE flap.
+       A lingering "we read this slot N s ago" stamp cannot tell an identify still
+       unloading the tray from a genuine human pull made after that identify settled —
+       :func:`_identify_explains_absence`'s docstring is explicit about that, and
+       one-shot consumption is what honours it;
+    c. the unit was OBSERVED identifying DURING the absence (``_identifying_seen_at``
+       stamped strictly after the absence began). A firmware-AUTONOMOUS read carries no
+       command at all and its flag can rise and fall between two edges, so neither (a)
+       nor (b) sees it. Window-scoped rather than time-boxed on purpose: an observation
+       from BEFORE this absence explains nothing about it;
+    d. the printer started a print inside :data:`_RUNNING_EDGE_TRANSIENT_S` before the
+       edge (``_running_edge_at``) — the AMS engage transient.
+
+    ``paused`` vetoes (d) outright: a gain while the printer sits in PAUSE is the runout
+    refill / jam reinsert that ``spool_recovery.maybe_auto_resume_on_refill`` and
+    ``clear_on_reinsert`` are waiting for, and it stays FULLY qualified. Never raises.
+    """
+    if _identify_explains_absence(printer_id, ams_id, tray_id):
+        return True
+    now = time.monotonic()
+    if commanded_at is not None and (
+        now - commanded_at < _IDENTIFY_ACTIVE_S or (absent_at is not None and commanded_at >= absent_at)
+    ):
+        return True
+    identifying_at = _identifying_seen_at.get(printer_id)
+    if identifying_at is not None and absent_at is not None and identifying_at > absent_at:
+        return True
+    if not paused:
+        edge = _running_edge_at.get(printer_id)
+        if edge is not None and now - edge <= _RUNNING_EDGE_TRANSIENT_S:
+            return True
+    return False
+
+
+# --- read-occasion ledger --------------------------------------------------
+
+
+def open_read_occasion(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Open a read occasion for a slot — the farm may spend ONE read on standing evidence.
+
+    See :data:`_read_occasion_at` for what may call this and why nothing else may. Idempotent
+    within an occasion: re-opening an already-open occasion still buys exactly one read,
+    because :func:`command_identify` consumes it.
+    """
+    _read_occasion_at[(printer_id, ams_id, tray_id)] = time.monotonic()
+
+
+def _read_occasion_open(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Is a read occasion open for this slot? Non-consuming."""
+    return (printer_id, ams_id, tray_id) in _read_occasion_at
+
+
+def _consume_read_occasion(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Spend the slot's read occasion. Called only from :func:`command_identify`."""
+    _read_occasion_at.pop((printer_id, ams_id, tray_id), None)
+
+
 # --- Change-evidence ledger -----------------------------------------------
 
 
@@ -375,7 +545,8 @@ def _note_gain(printer_id: int, ams_id: int, tray_id: int, *, qualified: bool) -
 
     ``qualified`` marks a gain that is NOT a sub-``_MIN_PHYSICAL_ABSENT_S`` flap, i.e.
     a real physical roll movement rather than the runout-instant state flap a firmware
-    backup switch produces. Only a qualified gain becomes discovery evidence; an
+    backup switch produces. Only a qualified gain becomes discovery evidence AND opens a
+    read occasion (the standing-evidence arms' permission to spend one read); an
     unqualified one still updates the gain stamp (:func:`recent_gain_age`).
     """
     now = time.monotonic()
@@ -383,6 +554,9 @@ def _note_gain(printer_id: int, ams_id: int, tray_id: int, *, qualified: bool) -
     _gain_at[key] = now
     if qualified:
         _physical_cycle_at[key] = now
+        # Somebody moved a roll here: whatever the DB believes about this slot is now a
+        # hypothesis, so the standing-evidence arms get their one read back.
+        _read_occasion_at[key] = now
 
 
 def note_identity_learned(printer_id: int, ams_id: int, tray_id: int) -> None:
@@ -495,8 +669,8 @@ async def _spoolman_active(db: AsyncSession) -> bool:
 
 async def _slot_assignment_context(
     db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, spoolman_active: bool
-) -> tuple[bool, bool]:
-    """Resolve ``(has_assignment, bound_spool_tagged)`` for a slot.
+) -> tuple[bool, bool, bool]:
+    """Resolve ``(has_assignment, bound_spool_tagged, bound_spool_spent)`` for a slot.
 
     The internal ``SpoolAssignment`` is the source of truth; when Spoolman mode is
     active a ``SpoolmanSlotAssignment`` also counts as an assignment. Tag identity is
@@ -506,10 +680,10 @@ async def _slot_assignment_context(
     Spoolman mirror stores no RFID identity), so such a slot can only qualify for a
     re-read through its LIVE tag or a discovery cycle.
 
-    ``bound_spool_tagged`` is what makes a slot worth re-reading at every terminal:
-    the read succeeds and refreshes ``remain`` for gram tracking and reused-core
-    detection. The old ``data_origin``/``spent`` fields are gone with the
-    origin-based sweep rule they served.
+    ``bound_spool_tagged`` is what makes a slot worth re-reading when a read occasion is
+    open: the read succeeds and refreshes ``remain`` for gram tracking and reused-core
+    detection. ``bound_spool_spent`` is ``spent_at`` — hardware exhaustion truth (doctrine
+    rule 8), never ``label − weight_used`` — and drives the spent-occupied discovery arm.
     """
     from backend.app.models.spool import Spool  # noqa: F401 — selectinload target
     from backend.app.models.spool_assignment import SpoolAssignment
@@ -528,7 +702,8 @@ async def _slot_assignment_context(
         tagged = sa.spool is not None and is_valid_tag(
             getattr(sa.spool, "tag_uid", "") or "", getattr(sa.spool, "tray_uuid", "") or ""
         )
-        return True, tagged
+        spent = sa.spool is not None and getattr(sa.spool, "spent_at", None) is not None
+        return True, tagged, spent
 
     if spoolman_active:
         from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
@@ -541,9 +716,9 @@ async def _slot_assignment_context(
             )
         )
         if res2.first() is not None:
-            return True, False
+            return True, False, False
 
-    return False, False
+    return False, False, False
 
 
 # --- Identify need + the single identify commander -------------------------
@@ -562,33 +737,64 @@ async def identify_needed(
     The single eligibility authority for every commanded ``ams_get_rfid``. Returns:
 
     * ``"rfid_refresh"`` — the slot is live-tagged, or DB-bound to a spool carrying a
-      tag identity. A tag can only be re-read from a SEATED spool, so this reason
-      additionally requires presence: commanding a read on a slot whose bound tagged
-      spool has been pulled would fail exactly like a tagless read and raise a
-      never-clearing ``0700_2X00_0001_0081``.
-    * ``"discovery"`` — a qualified physical cycle is unanswered since the slot's
-      identity was last learned and the tray is still unidentified. One read settles
+      tag identity, AND a read occasion is open. A tag can only be re-read from a SEATED
+      spool, so this reason additionally requires presence: commanding a read on a slot
+      whose bound tagged spool has been pulled would fail exactly like a tagless read and
+      raise a never-clearing ``0700_2X00_0001_0081``. A DB binding that outlives its roll
+      is a RELEASE problem (doctrine rule 9), never a read reason.
+    * ``"discovery"`` — either a qualified physical cycle is unanswered since the slot's
+      identity was last learned and the tray is still unidentified, or the binding is
+      spent-latched under an unidentified replacement roll (see below). One read settles
       it; a failure is the answer "no tag ⇒ tagless" and is suppressed farm-side.
-      Checked BEFORE the DB-bound-tagged rule on an untagged tray on purpose: once
+      The cycle arm is checked BEFORE the DB rules on an untagged tray on purpose: once
       something physically changed in the slot, the DB's idea of what is in it is a
       hypothesis, and the read must be treated as one that may legitimately fail.
     * ``None`` — everything else. An untouched tagless slot lands here, which is the
-      entire fix for the standing "failed to read the filament information" errors.
+      entire fix for the standing "failed to read the filament information" errors, and
+      so does every re-derivation of standing evidence whose occasion is already spent.
+
+    OCCASION PACING (2026-08-07). Every arm that rests on STANDING evidence — the two
+    ``rfid_refresh`` arms and the spent-occupied arm — is gated on an open read occasion
+    (:data:`_read_occasion_at`), which a commanded read consumes. The unanswered-cycle
+    arm needs no separate gate: it already carries its own one-read-per-change pacing
+    through ``_slot_read_at``. Without this, a standing condition re-derived on every
+    reconcile / pipeline pass re-owed the same read forever, and the resulting per-printer
+    identify-gate saturation deferred every slot decision on the printer. Doctrine rule
+    6/7: paced BY CAUSE (a fresh occasion), never by a timer laid over the verdict.
 
     Pure predicate: it never commands anything and never mutates the ledgers.
     """
-    if _norm_state(tray.get("state")) not in _IDENTIFIABLE_STATES:
-        return None  # unknown dialect / no data — never acted on
+    state = _norm_state(tray.get("state"))
+    if state not in _IDENTIFIABLE_STATES:
+        return None  # unknown dialect / no data — never acted on (H2C idle empties report 0)
 
     present = _tray_present(tray)
-    if present and _tray_tagged(tray):
+    live_tagged = present and _tray_tagged(tray)
+    occasion = _read_occasion_open(printer_id, ams_id, tray_id)
+
+    if live_tagged and occasion:
         return "rfid_refresh"
 
     if _unanswered_cycle(printer_id, ams_id, tray_id):
         return "discovery"
 
-    if present:
-        _has_assignment, bound_tagged = await _slot_assignment_context(db, printer_id, ams_id, tray_id, spoolman_active)
+    if present and occasion:
+        _has_assignment, bound_tagged, bound_spent = await _slot_assignment_context(
+            db, printer_id, ams_id, tray_id, spoolman_active
+        )
+        # Spent-occupied FIRST: a spent-latched binding under a seated roll the wire
+        # cannot identify means the roll in the slot is a NEWCOMER the farm has never
+        # named. The read may legitimately find no tag, so it must be classified
+        # ``discovery`` — that is what suppresses the expected read failure farm-side
+        # (rule 5 / invariant 4). Classifying it ``rfid_refresh`` because the SPENT row
+        # happens to carry a tag would both mis-name the read and let its expected
+        # failure escape as a fault. State 10 specifically: state 11 is the same roll
+        # threaded on to the hub, the documented shape a read cannot answer without
+        # unloading first. One attempt per occupancy epoch — every failed read leaves a
+        # printer-side 0700_0081 that only a power-cycle clears (rule 1: minimal human
+        # interaction cuts both ways — do not manufacture work for the operator).
+        if bound_spent and not live_tagged and state == _TRAY_SEATED_STATE:
+            return "discovery"
         if bound_tagged:
             return "rfid_refresh"
 
@@ -679,6 +885,15 @@ async def command_identify(
         # identify → no echo → nothing to arm, and no identity was learned either.
         record_reread(printer_id, ams_id, tray_id)
         note_identity_learned(printer_id, ams_id, tray_id)
+        # The read is spent: the slot's occasion closes until a NEW cause opens one (a
+        # qualified physical cycle or the next terminal's between-prints policy). This is
+        # what makes a standing condition cost ONE read instead of one per pass.
+        _consume_read_occasion(printer_id, ams_id, tray_id)
+        # Cause record for the presence-edge suppression tier — stamped for EVERY
+        # accepted command, including one on a state-9 tray, which ``record_reread``
+        # deliberately does not arm (an empty slot leaves no edge to swallow, but the
+        # identify cycle it starts still flaps the tray).
+        _commanded_read_at[key] = time.monotonic()
         if reason == "discovery":
             # The slot may legitimately have no tag: mark the read so the firmware's
             # "failed to read the filament information" answer is recognized as ours.
@@ -703,14 +918,44 @@ async def command_identify(
     return ok, msg
 
 
-def _warn_owed_read_blocked(printer_id: int, ams_id: int, tray_id: int, blocker: str) -> None:
-    """WARN once per :data:`_OWED_READ_REWARN_S` that a long-owed discovery read is blocked.
+async def _broadcast_standing_unknown(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Push the standing-unknown slot to the operator UI (same bus as ``tagless_fresh_prompt``).
+
+    A log WARNING is invisible to the person who can actually fix the slot, which is why
+    the 2026-07-25 six-hour unknown produced no operator signal at all. Rides the shared
+    ``ws_manager.broadcast`` helper — one bus, one payload shape, frontend consumer ships
+    separately. Never raises: an unreachable websocket layer must not abort the drain.
+    """
+    try:
+        from backend.app.models.printer import Printer
+
+        name = await db.scalar(select(Printer.name).where(Printer.id == printer_id))
+        await ws_manager.broadcast(
+            {
+                "type": "slot_standing_unknown",
+                "printer_id": printer_id,
+                "printer_name": name or f"Printer {printer_id}",
+                "ams_id": ams_id,
+                "tray_id": tray_id,
+            }
+        )
+    except Exception:  # noqa: BLE001 — observability must never break the drain
+        logger.exception(
+            "AMS presence: standing-unknown broadcast failed for printer %s AMS%d-T%d", printer_id, ams_id, tray_id
+        )
+
+
+async def _warn_owed_read_blocked(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, blocker: str) -> None:
+    """WARN + BROADCAST once per :data:`_OWED_READ_REWARN_S` that a long-owed discovery read is blocked.
 
     Only for a slot whose last qualified physical cycle is older than
     :data:`_OWED_READ_WARN_AFTER_S`: below that the defer is ordinary pacing (the next
     terminal drains it). Above it, the farm has been carrying an unknown identity for
     the whole window — the 2026-07-25 shape, where the read stayed owed for six hours
     behind a permanently-engaged extruder and said nothing.
+
+    The WS event rides the SAME dedup as the log line (one per slot per re-warn window),
+    so a permanently-blocked slot is one hourly signal, not a per-pass toast storm.
     """
     key = (printer_id, ams_id, tray_id)
     age = last_physical_cycle_age(printer_id, ams_id, tray_id)
@@ -729,6 +974,7 @@ def _warn_owed_read_blocked(printer_id: int, ams_id: int, tray_id: int, blocker:
         age,
         blocker,
     )
+    await _broadcast_standing_unknown(db, printer_id, ams_id, tray_id)
 
 
 async def maybe_command_owed_identify(
@@ -778,16 +1024,22 @@ async def maybe_command_owed_identify(
             return False
 
         if _printer_running(state):
-            _warn_owed_read_blocked(printer_id, ams_id, tray_id, "printer is mid-job")
+            await _warn_owed_read_blocked(db, printer_id, ams_id, tray_id, "printer is mid-job")
             return False
         if _filament_engaged(printer_id):
-            _warn_owed_read_blocked(printer_id, ams_id, tray_id, "filament engaged")
+            await _warn_owed_read_blocked(db, printer_id, ams_id, tray_id, "filament engaged")
             return False
         if unit_drying(printer_id, ams_id):
             return False
         client = printer_manager.get_client(printer_id)
         if client is None:
             return False
+        # DEFER on a refused wire, never WAIT for it (invariant 2: callers may defer,
+        # never pre-approve). This lane runs inside a scheduler tick that walks the whole
+        # fleet, and the gate it would be waiting on is armed by our OWN previous
+        # identify — awaiting ``wait_ams_settle`` here would turn the drain into a
+        # self-clocked command loop at exactly the gate's period, which is the 2026-08-07
+        # storm's cadence. The occasion is untouched, so the next pass retries for free.
         refusal = client.ams_write_refusal(ams_id)
         if refusal is not None:
             logger.debug(
@@ -861,6 +1113,17 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
 
         state = printer_manager.get_status(printer_id)
         running = _printer_running(state)
+        # A PAUSEd printer's gains are the ones the recovery machines are waiting for
+        # (runout refill / jam reinsert), so the print-start suppression never applies
+        # to them — pinned by test, because both machines break silently if it does.
+        paused = (getattr(state, "state", None) or "") == "PAUSE"
+
+        # Sample the unit's identify flag on every AMS push. A firmware-AUTONOMOUS read
+        # carries no command of ours, and its flag can rise and fall entirely between two
+        # pushes — so the LIVE check alone cannot explain a tray flap it caused. Sampling
+        # turns it into a cause with a window (:func:`_identify_explains_gain`).
+        if getattr(state, "ams_status_main", 0) == AMS_STATUS_IDENTIFYING:
+            _identifying_seen_at[printer_id] = time.monotonic()
 
         for ams_unit in ams_data or []:
             if not isinstance(ams_unit, dict):
@@ -899,6 +1162,14 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                     _absent_under_identify[key] = _identify_explains_absence(printer_id, ams_id, tray_id)
 
                 if present and not prev:
+                    # Consume the slot's commanded-read cause on the FIRST gain that
+                    # follows it, whichever gain that is: the identify's own echo (about
+                    # to be swallowed below) or the settle-back the qualifier judges. One
+                    # command explains one flap — leaving the stamp behind would suppress
+                    # the genuine pull+reseat that comes after the identify settled, the
+                    # exact over-suppression _identify_explains_absence warns about.
+                    commanded_at = _commanded_read_at.pop(key, None)
+
                     # Echo-consume FIRST: a re-read we commanded on this present
                     # slot flaps the firmware's tray state present→9→present
                     # (~20 s); the settle-back arrives here as a fresh gain. If a
@@ -928,14 +1199,21 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
                     # positive is expensive while a suppressed discovery read is not.
                     absent_at = _absent_since.pop(key, None)
                     absent_for = None if absent_at is None else time.monotonic() - absent_at
-                    # An identify unloads the tray: an absence that BEGAN under identify
-                    # activity (flag captured at its start edge, freshest there), or one
-                    # still explained by an in-flight identify at THIS gain, is a read flap
-                    # and never a physical cycle — no matter how long it ran. The ≥5 s
-                    # filter measures duration, never identity (rule 6); the two gate the
-                    # gain together below.
-                    identify_explained = _absent_under_identify.pop(key, False) or _identify_explains_absence(
-                        printer_id, ams_id, tray_id
+                    # An identify unloads the tray, and a print start engages the AMS:
+                    # an absence that BEGAN under identify activity (flag captured at its
+                    # start edge, freshest there), or one explained by ANY non-physical
+                    # cause inside the absence/gain window (a read we commanded whatever
+                    # the tray state was, an observed firmware-autonomous identify, or the
+                    # printer entering RUNNING), is a machine flap and never a physical
+                    # cycle — no matter how long it ran. The ≥5 s filter measures duration,
+                    # never identity (rule 6); the two gate the gain together below.
+                    identify_explained = _absent_under_identify.pop(key, False) or _identify_explains_gain(
+                        printer_id,
+                        ams_id,
+                        tray_id,
+                        absent_at=absent_at,
+                        commanded_at=commanded_at,
+                        paused=paused,
                     )
                     physical_cycle = (
                         absent_for is not None and absent_for >= _MIN_PHYSICAL_ABSENT_S and not identify_explained
@@ -1089,6 +1367,79 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
 # --- terminal RFID re-read sweep -------------------------------------------
 
 
+async def _terminal_read_occasion(
+    db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, tray: dict
+) -> str | None:
+    """The BETWEEN-PRINTS policy: does this terminal open a read occasion for the slot?
+
+    Doctrine rule 5 makes the terminal sweep load-bearing and need-driven in the same
+    breath: reconcile tagged slots' remain / identity, discover CHANGED slots, and read
+    nothing else — "never read-everything-every-print (that was the ``0700_0081``
+    factory)". This predicate is the "need" half for slots whose evidence is STANDING
+    rather than event-shaped; the changed-slot half is the unanswered physical cycle,
+    which carries its own occasion.
+
+    Two causes, both requiring state 10 (seated, tag facing the reader — state 11 is the
+    same roll threaded on to the hub, which a read cannot answer without unloading):
+
+    * ``wire_remain_missing`` / ``ledger_over_label`` — the bound roll is TAGGED, its
+      weight is not operator-locked, and either the wire never delivered a usable
+      ``remain`` (the full RFID data read did not complete: the tray reports ``-1`` /
+      nothing, often together with no ``tag_uid`` at all) or the ledger has run PAST the
+      label. Doctrine rule 8 makes wire remain% the truth for a tagged row, and
+      ``usage_tracker.maybe_reconcile_tagged_ledger_decrease`` (the W6 auto-repair) has
+      nothing to repair FROM until that read lands — which is how a live spool reached
+      1899.9 g used against a 1000 g label. A healthy tagged slot publishes ``remain`` on
+      every ordinary AMS push, so it needs no commanded read at all: that routine refresh
+      was pure cost, and it is what this predicate replaces.
+    * ``spent_occupied`` — the binding is spent-latched (rule 8: ``spent_at`` is the
+      exhaustion truth) and the seated roll carries no wire identity, i.e. an
+      unidentified NEWCOMER. :func:`identify_needed` classifies that read ``discovery``,
+      so its expected no-tag failure is suppressed farm-side.
+
+    Returns a short cause label for the log, or None. Read-only; the caller opens the
+    occasion. Never raises into the sweep — an unresolvable slot simply owes nothing.
+    """
+    from backend.app.models.spool import Spool  # noqa: F401 — selectinload target
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    if _norm_state(tray.get("state")) != _TRAY_SEATED_STATE:
+        return None
+
+    res = await db.execute(
+        select(SpoolAssignment)
+        .options(selectinload(SpoolAssignment.spool))
+        .where(
+            SpoolAssignment.printer_id == printer_id,
+            SpoolAssignment.ams_id == ams_id,
+            SpoolAssignment.tray_id == tray_id,
+        )
+    )
+    sa = res.scalar_one_or_none()
+    spool = sa.spool if sa is not None else None
+    if spool is None:
+        return None
+
+    live_tagged = _tray_tagged(tray)
+    if getattr(spool, "spent_at", None) is not None and not live_tagged:
+        return "spent_occupied"
+
+    if not is_valid_tag(getattr(spool, "tag_uid", "") or "", getattr(spool, "tray_uuid", "") or ""):
+        return None  # a tagless row has no wire remain to restore (rule 8)
+    if getattr(spool, "weight_locked", False):
+        return None  # the operator owns this row's weight; a wire refresh must not fight it
+
+    remain = parse_int_field(tray.get("remain"))
+    if remain is None or remain < 0:
+        return "wire_remain_missing"
+
+    label = spool.label_weight or 0
+    used = spool.weight_used or 0
+    if label > 0 and used > label:
+        return "ledger_over_label"
+    return None
+
+
 async def on_printer_terminal(printer_id: int) -> None:
     """Reconcile a printer's AMS slots when a print reaches a terminal state.
 
@@ -1098,9 +1449,12 @@ async def on_printer_terminal(printer_id: int) -> None:
     read gated on the client's ``wait_ams_settle`` so identifies never overlap.
     Never raises. Results flow the normal RFID pipeline.
 
-    Eligibility is :func:`identify_needed` and nothing else — tagged slots to refresh
-    their ``remain``, physically-changed slots for one discovery read, and NOTHING for
-    a slot nobody has touched.
+    Eligibility is :func:`identify_needed` and nothing else. What the terminal adds is
+    the between-prints OCCASION (:func:`_terminal_read_occasion`) — a bound tagged roll
+    whose wire ``remain`` never landed or whose ledger has run past its label, and a
+    spent-latched binding under an unidentified roll. Physically-changed slots bring
+    their own occasion; a slot nobody has touched, whose tagged roll is reporting a sane
+    ``remain`` on the ordinary AMS pushes, gets NOTHING.
     """
     try:
         # Dedup duplicate terminal callbacks: on_print_complete can fire several
@@ -1146,6 +1500,21 @@ async def on_printer_terminal(printer_id: int) -> None:
                         tray_id = int(tray.get("id", 0))
                     except (TypeError, ValueError):
                         continue
+                    # The between-prints policy is the terminal's own OCCASION source
+                    # (:data:`_read_occasion_at`); ``identify_needed`` stays the single
+                    # need authority that turns it into a verdict. Splitting it this way
+                    # keeps ONE eligibility rule for every lane — the sweep supplies the
+                    # occasion, never a private permission.
+                    cause = await _terminal_read_occasion(db, printer_id, ams_id, tray_id, tray)
+                    if cause is not None:
+                        open_read_occasion(printer_id, ams_id, tray_id)
+                        logger.debug(
+                            "[Printer %s] terminal AMS reconcile: AMS%d slot%d read occasion opened — %s",
+                            printer_id,
+                            ams_id,
+                            tray_id,
+                            cause,
+                        )
                     reason = await identify_needed(db, printer_id, ams_id, tray_id, tray, spoolman_active)
                     if reason is None:
                         continue

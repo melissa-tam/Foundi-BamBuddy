@@ -112,6 +112,11 @@ def asserted_str_field(tray: dict, key: str) -> str | None:
     always-update list), otherwise the stripped value. The distinction is
     load-bearing for :func:`tray_presence`: only an ASSERTED-empty ``tray_type``
     may drive a release.
+
+    "Asserted" means asserted by the NORMALIZED wire: the raw stream is normalized
+    before observation, so a minimal ``{id, state == 9}`` partial that passes the
+    exist-bit veto arrives carrying the injected asserted-empty shape (deliberate —
+    ``bambu_mqtt._normalize_cleared_trays``).
     """
     if key not in tray:
         return None
@@ -145,7 +150,12 @@ def tray_presence(state: int | None, tray_type: str | None, exist_bit: bool | No
     Consumers gate on ``is False`` ONLY — unknown always fails OPEN.
 
     ``tray_type`` must carry assertion (see :func:`asserted_str_field`): ``None``
-    means "not asserted", ``""`` means "asserted empty".
+    means "not asserted", ``""`` means "asserted empty". The raw stream is
+    normalized BEFORE observation, so a minimal ``{id, state == 9}`` partial that
+    passes the exist-bit veto reaches here with an injected asserted-empty shape
+    (deliberate — ``bambu_mqtt._normalize_cleared_trays``) and answers ``False``
+    instead of ``None``; that is the ONLY way a boot-forgotten slot ever becomes
+    releasable.
     """
     if state in TRAY_PRESENT_STATES:
         return True

@@ -833,18 +833,48 @@ class TestRow4TaglessLane:
         decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
         assert decision == Decision(DecisionKind.KEEP, spool_id=37, reason="tagged_row_awaits_tag_lane")
 
-    def test_a_spent_tagged_row_never_takes_the_tagless_replace_path(self):
-        """The respool tiers own reused tagged cores (doctrine rule 3); the silent
-        spent→mint is a TAGLESS-only transition."""
-        bound = _view(spool_id=37, is_tagless=False, tag_uid="1C63F1E700000100", spent=True)
+    def test_a_spent_TAGGED_row_is_replaced_on_a_qualified_cycle_too(self):
+        """2026-08-07 (printer 4 tray 2). Row 4a used to require ``is_tagless``, on the
+        reasoning that a spent TAGGED row belongs to the respool tiers (doctrine rule 3).
+        That was the deadlock: the tiers act when a TAG IS READ — row 2 — and row 4 is
+        reached precisely when no tag was read, so a spent tagged row met NEITHER lane and
+        latched its slot against the roll physically seated in it (spool 212, 1121.5 g on
+        a 1000 g label, a ~90 %-full replacement unread beneath it for a day). Spent-ness
+        is decided by the runout, not by who minted the row."""
+        bound = _view(spool_id=212, is_tagless=False, tag_uid="1C63F1E700000100", spent=True)
         obs = _obs()
         decision = resolve(
             obs,
             derive_state(obs, bound),
             ResolutionContext(binding=bound, qualified_cycle_pending=True, tagless_default=TAGLESS_DEFAULT),
         )
-        assert decision.kind is DecisionKind.KEEP
-        assert decision.reason == "tagged_row_awaits_tag_lane"
+        assert decision.kind is DecisionKind.REPLACE_SPENT
+        assert decision.spool_id == 212
+        assert decision.reason == "spent_swap_confirmed"
+        assert decision.mint_spec["source"] == "tagless_default"
+
+    def test_a_spent_TAGGED_row_still_latches_without_a_cycle(self):
+        """Rule 3 is untouched and the latch is not weakened: with no qualified physical
+        cycle the spent tagged row KEEPs, exactly like the tagless one — the runout-instant
+        flap must not phantom-mint over a still-present dead roll."""
+        bound = _view(spool_id=212, is_tagless=False, tag_uid="1C63F1E700000100", spent=True)
+        obs = _obs()
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
+        assert decision == Decision(DecisionKind.KEEP, spool_id=212, reason="spent_latch")
+
+    def test_a_tag_read_over_a_spent_row_still_belongs_to_row_2(self):
+        """The respool tiers' entry point is unchanged: a push that ASSERTS the bound
+        row's identity KEEPs at row 2.1, which is where the orchestrator runs them."""
+        tag = "1C63F1E700000100"
+        uuid = "8AC9EC0847FD41D0890870319F2E1975"
+        bound = _view(spool_id=212, is_tagless=False, tag_uid=tag, tray_uuid=uuid, spent=True)
+        obs = _obs(tag_uid=tag, tray_uuid=uuid)
+        decision = resolve(
+            obs,
+            derive_state(obs, bound),
+            ResolutionContext(binding=bound, qualified_cycle_pending=True, tagless_default=TAGLESS_DEFAULT),
+        )
+        assert decision == Decision(DecisionKind.KEEP, spool_id=212, reason="identity_matches_bound")
 
     def test_tagless_lane_runs_mid_print(self):
         """A configured tagless slot is OCCUPIED_ASSUMED, not UNRESOLVED — the
@@ -894,6 +924,78 @@ class TestRow5Unresolved:
         obs = self._bare(present=None, state=None, remain=None)
         decision = resolve(obs, derive_state(obs, None), ResolutionContext())
         assert decision == Decision(DecisionKind.NONE, reason="empty_unbound")
+
+
+class TestSpentOccupiedOwesAnIdentify:
+    """2026-08-07, printer 4 tray 2 — the spent latch that locked out its replacement.
+
+    A spent ``rfid_auto`` binding (spool 212, 1121.5 g used on a 1000 g label) sat over a
+    tray reading state 10 with a ~90 %-full roll in it that the wire had never named. The
+    unconditional rows-5/6 spent KEEP meant the slot owed NOTHING — no identify was ever
+    scheduled, so the newcomer's tag was never read, so the slot never left the latch. It
+    stood a full day with zero farm reaction.
+
+    A latch may explain a slot that is EMPTY (row 3's exemption — the core left) or a
+    slot that said NOTHING this push (presence unknown). It may not explain a PRESENT
+    tray forever: something is seated there, and the only thing that can name it is a
+    read. Nothing is mutated here — the verdict buys an answer, exactly like row 5's
+    unresolved arm."""
+
+    PRESENT_UNNAMED = {"id": 2, "state": 10}  # the prod shape: seated, no config, no tag
+
+    def _spent(self, **kw):
+        return _view(spool_id=212, spent=True, **kw)
+
+    @pytest.mark.parametrize(
+        ("view_kwargs", "label"),
+        [
+            ({}, "a tagless spent row"),
+            ({"is_tagless": False, "tag_uid": "1C63F1E700000100"}, "the prod rfid_auto spent row"),
+        ],
+    )
+    def test_idle_owes_a_discovery_read(self, view_kwargs, label):
+        bound = self._spent(**view_kwargs)
+        obs = observe_tray(4, 0, dict(self.PRESENT_UNNAMED))
+        assert (obs.present, obs.identity_asserted, obs.config_nonempty) == (True, False, False), label
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
+        assert decision == Decision(DecisionKind.NONE, reason="spent_occupied_owed_identify"), label
+
+    def test_busy_defers_instead(self):
+        """Doctrine rule 5: mid-print inserts are never auto-read — the same answer the
+        unresolved arm gives, so the mid-print no-touch rule keeps ONE meaning."""
+        bound = self._spent()
+        obs = observe_tray(4, 0, dict(self.PRESENT_UNNAMED))
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound, busy=True))
+        assert decision == Decision(DecisionKind.DEFER, reason="mid_print_unresolved")
+
+    def test_presence_unknown_still_latches(self):
+        """A push that says nothing about the slot is not evidence a roll is seated: the
+        latch is the durable state and an unknown is never resolved toward action."""
+        bound = self._spent()
+        obs = _obs(present=None, state=None, tray_type=None, tray_color=None, tray_info_idx=None, tray_sub_brands=None)
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
+        assert decision == Decision(DecisionKind.KEEP, spool_id=212, reason="spent_latch")
+
+    def test_an_exist_bit_alone_is_not_enough(self):
+        """The read arm gates on the TRI-STATE ``present is True`` — the same seated-state
+        test ``ams_presence.identify_needed``'s spent-occupied arm applies. A verdict
+        emitted on weaker evidence than the need authority accepts is a read that is never
+        spent, and a reason that never resolves anything (008-H2C's stuck exist bit is
+        exactly that shape)."""
+        bound = self._spent()
+        obs = observe_tray(4, 2, {"id": 2, "state": 9, "tray_type": ""}, exist_bits=1 << (2 * 4 + 2))
+        assert obs.present is None and obs.occupancy_signal is True
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
+        assert decision == Decision(DecisionKind.KEEP, spool_id=212, reason="spent_latch")
+
+    def test_an_empty_tray_keeps_the_row_3_latch(self):
+        """The boundary is unmoved: presence FALSE never reaches rows 5/6 — row 3 owns it,
+        and its spent exemption (the core physically left, the latch survives) stands."""
+        bound = self._spent()
+        obs = observe_tray(4, 0, {"id": 2, "state": 9, "tray_type": ""})
+        assert obs.present is False
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
+        assert decision == Decision(DecisionKind.KEEP, spool_id=212, reason="spent_latch_on_empty")
 
 
 # --- I/O-free contract ------------------------------------------------------

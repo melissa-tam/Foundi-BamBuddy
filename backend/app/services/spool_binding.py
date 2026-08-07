@@ -31,7 +31,8 @@ assignment claims WHERE a roll physically is (doctrine rule 9, operator-ratified
 2026-08-01), so a roll leaving a slot must drop the claim — while the row keeps its
 grams. The one durable residue of the departure is the ``spool.last_location_*``
 stamp this module writes, which is what lets a pulled-and-returned roll reclaim its
-gram history on re-insert.
+gram history on re-insert. The one durable memory it CLEARS is the row's pending
+fresh-roll prompt: that question names a slot, and its subject left with the roll.
 """
 
 from __future__ import annotations
@@ -188,14 +189,14 @@ async def stamp_loaded_for_slot(db: AsyncSession, printer_id: int, ams_id: int, 
     return True
 
 
-async def release_spool_from_slot(db: AsyncSession, assignment: SpoolAssignment, *, reason: str) -> None:
+async def release_spool_from_slot(db: AsyncSession, assignment: SpoolAssignment, *, reason: str) -> bool:
     """Drop one AMS-slot location claim — the ONE unbind writer.
 
     An assignment row says WHERE a roll physically is (doctrine rule 9): the roll's
     grams live on the spool row, so releasing a slot costs no ledger history. Every
     deliberate unbind goes through here — the operator's ``DELETE /assignments``
-    route today, the wire pipeline's release-on-empty transition next — so the
-    departure always leaves the same two artefacts:
+    route and the wire pipeline's release-on-empty transition — so the departure
+    always leaves the same two artefacts:
 
     * ``spool.last_location_*`` stamped from the assignment's own triple
       (:func:`_stamp_last_location`), the durable residue the reclaim lane reads when
@@ -203,6 +204,17 @@ async def release_spool_from_slot(db: AsyncSession, assignment: SpoolAssignment,
       rebound to its OWN row (grams continue) instead of minting a fresh 0 g one.
     * one ``[slot-state]`` INFO line, the structured grammar the forensics lane
       greps (``support/logs``) — the reason an incident is a query, not a session.
+
+    **The departing row's pending fresh-roll prompt is CLEARED here** (returned as
+    ``True`` so the caller can dismiss the toast cross-client). That is a deliberate
+    reversal of the replay lane's "skip stale rows without mutating them" choice
+    (``spool_tagless.pending_fresh_prompts``): a prompt asks the operator about the roll
+    in ONE named slot, and once that roll's location claim is gone the question has no
+    subject — the stamp then survived as a toast that replayed for days about a slot the
+    roll had left. Nothing durable is lost, because the prompt is a PER-CYCLE contract:
+    any return of any roll to that slot raises a qualified physical cycle, which
+    re-stamps and re-asks. A release that is really a MOVE (the roll went to another
+    slot) clears correctly for the same reason — the question named the slot it left.
 
     A missing spool row (hand-deleted / cascade race) still releases the slot: the
     location claim is bogus either way, and only the stamp is skipped.
@@ -215,21 +227,27 @@ async def release_spool_from_slot(db: AsyncSession, assignment: SpoolAssignment,
     tray_id = assignment.tray_id
     spool_id = assignment.spool_id
 
+    prompt_cleared = False
     spool = await db.get(Spool, spool_id)
     if spool is not None:
         _stamp_last_location(spool, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id)
+        if spool.fresh_prompt_pending_at is not None:
+            spool.fresh_prompt_pending_at = None
+            prompt_cleared = True
 
     await db.delete(assignment)
     await db.flush()
 
     logger.info(
-        "[slot-state] printer=%d A%dT%d release spool=%d reason=%s",
+        "[slot-state] printer=%d A%dT%d release spool=%d reason=%s%s",
         printer_id,
         ams_id,
         tray_id,
         spool_id,
         reason,
+        " (fresh-roll prompt cleared)" if prompt_cleared else "",
     )
+    return prompt_cleared
 
 
 async def bind_spool_to_slot(
