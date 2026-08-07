@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { Droplets, Copy, Check, Settings2, Package, PackagePlus, Unlink, RefreshCw } from 'lucide-react';
 import { isLightColor } from '../utils/colors';
+import type { EmptySlotKind } from '../utils/amsHelpers';
 import { resolveSpoolBindingStatus } from '../utils/spoolBindingStatus';
 import { Modal } from './ui/Modal';
 import { ConfirmModal } from './ConfirmModal';
@@ -570,11 +571,12 @@ interface EmptySlotHoverCardProps {
   configureSlot?: ConfigureSlotConfig;
   onAssignSpool?: () => void;
   actions?: ReactNode;
-  // #1322 follow-up: distinguish firmware-confirmed empty (state 9/10) from
-  // a user reset where the firmware still has a spool registered. "reset"
-  // surfaces the user-cleared label; undefined / "physical" keeps the
-  // historical "Empty slot" wording.
-  kind?: 'physical' | 'reset';
+  // #1322 follow-up: distinguish firmware-confirmed empty (state 9) from a user
+  // reset where the firmware still has a spool registered. "reset" surfaces the
+  // user-cleared label; "present" (state 10/11 with no material identity — a
+  // seated spool the AMS could not read) surfaces the unread-spool label;
+  // undefined / "physical" keeps the historical "Empty slot" wording.
+  kind?: EmptySlotKind;
   // W5a: a binding that outlived the filament. Without this the empty-slot card
   // showed NO assignment information at all, so a lingering binding was both
   // invisible and unclearable from the printer card.
@@ -671,7 +673,11 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
             rounded-md shadow-lg overflow-hidden
           ">
             <div className="px-3 py-1.5 text-xs text-bambu-gray whitespace-nowrap">
-              {kind === 'reset' ? t('ams.emptySlotReset') : t('ams.emptySlot')}
+              {kind === 'reset'
+                ? t('ams.emptySlotReset')
+                : kind === 'present'
+                  ? t('ams.slotPresentUnread')
+                  : t('ams.emptySlot')}
             </div>
             {/* Lingering binding on a physically empty slot (W5a). */}
             {binding && bindingStatus && (
