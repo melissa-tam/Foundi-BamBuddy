@@ -14,6 +14,7 @@ import {
   type SpoolAutoAssignedMessage,
   type SpoolRespooledMessage,
   type TaglessFreshPromptMessage,
+  type SlotStandingUnknownMessage,
 } from '../api/client';
 import { inventoryLocationsQueryKey } from '../utils/inventoryQueries';
 
@@ -604,6 +605,23 @@ export function useWebSocket() {
           new CustomEvent('tagless-fresh-prompt-dismissed', {
             detail: { printer_id: m.printer_id, ams_id: m.ams_id, tray_id: m.tray_id },
           }),
+        );
+        break;
+      }
+
+      case 'slot_standing_unknown': {
+        // A tray has held a spool the AMS can't read past the point where it
+        // could still be a transient read miss. Deliberately a plain transient
+        // warning toast, NOT a durable prompt lane: nothing to answer, nothing
+        // to dequeue — the slot itself renders the standing state, this is only
+        // the nudge to go look at the printer.
+        const m = message as unknown as SlotStandingUnknownMessage;
+        showToast(
+          t('ams.slotStandingUnknown', {
+            printer: m.printer_name || `Printer ${m.printer_id}`,
+            slot: (m.tray_id ?? 0) + 1,
+          }),
+          'warning',
         );
         break;
       }

@@ -4977,6 +4977,8 @@ export default {
     emptySlot: 'Boş yuva',
     slotEmpty: 'Boş',
     slotUnconfigured: '?',
+    slotPresentUnread: 'Makara var — tanınmıyor',
+    slotStandingUnknown: "{{printer}}: {{slot}} numaralı yuvada AMS'nin okuyamadığı bir makara var — kontrol edin",
     outOfRotation: 'Rotasyon dışı — makara sıkışması algılandı; yeniden kullanmak için makarayı yeniden takın veya işareti temizleyin',
     outOfRotationShort: 'Rotasyon dışı',
     emptySlotReset: 'Atanmış filament yok',

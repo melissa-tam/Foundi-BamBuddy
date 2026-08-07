@@ -4999,6 +4999,8 @@ export default {
     emptySlot: '空のスロット',
     slotEmpty: '空',
     slotUnconfigured: '?',
+    slotPresentUnread: 'スプールあり — 認識できません',
+    slotStandingUnknown: '{{printer}}: スロット {{slot}} に AMS が読み取れないスプールがあります — 確認してください',
     outOfRotation: 'ローテーション外 — スプール詰まりを検出。スプールを再挿入するかフラグを解除すると再利用できます',
     outOfRotationShort: 'ローテーション外',
     emptySlotReset: 'スプール未割当',

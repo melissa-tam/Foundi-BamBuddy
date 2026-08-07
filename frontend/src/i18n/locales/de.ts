@@ -4999,6 +4999,8 @@ export default {
     emptySlot: 'Leerer Slot',
     slotEmpty: 'Leer',
     slotUnconfigured: '?',
+    slotPresentUnread: 'Spule vorhanden — nicht erkannt',
+    slotStandingUnknown: '{{printer}}: In Slot {{slot}} liegt eine Spule, die das AMS nicht lesen kann — bitte prüfen',
     outOfRotation: 'Aus der Rotation — Spulenstau erkannt; Spule erneut einlegen oder Markierung löschen, um sie wiederzuverwenden',
     outOfRotationShort: 'Aus der Rotation',
     emptySlotReset: 'Keine Spule zugewiesen',

@@ -4791,6 +4791,8 @@ export default {
     remainingUnit: '남음',
     slotEmpty: '비어 있음',
     slotUnconfigured: '?',
+    slotPresentUnread: '스풀 있음 — 인식되지 않음',
+    slotStandingUnknown: '{{printer}}: 슬롯 {{slot}}에 AMS가 읽을 수 없는 스풀이 있습니다 — 확인하세요',
     outOfRotation: '로테이션 제외 — 스풀 걸림 감지됨. 스풀을 다시 삽입하거나 플래그를 해제하면 다시 사용할 수 있습니다',
     outOfRotationShort: '로테이션 제외',
     emptySlotReset: '필라멘트가 할당되지 않음',

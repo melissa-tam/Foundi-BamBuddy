@@ -127,7 +127,7 @@ import { SkipObjectsModal, SkipObjectsIcon } from '../components/SkipObjectsModa
 import { FileUploadModal } from '../components/FileUploadModal';
 import { PrintModal } from '../components/PrintModal';
 import { PrinterInfoModal } from '../components/PrinterInfoModal';
-import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, isBambuLabSpool } from '../utils/amsHelpers';
+import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, isBambuLabSpool, getEmptySlotKind, type EmptySlotKind } from '../utils/amsHelpers';
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
@@ -865,28 +865,14 @@ function TemperatureIndicator({ temp, goodThreshold = 28, fairThreshold = 35, on
 
 
 
-/** Classify an empty AMS slot for UI rendering (#1322 follow-up).
- *
- *  The bambu_mqtt handler canonicalizes state against tray_exist_bits in BOTH
- *  directions: an empty-by-bitmask slot is promoted to state=9, and an OCCUPIED
- *  slot stuck at state 9 (a spool inserted mid-print gets no auto-read —
- *  003-H2S) is promoted to state=10 ("present, not fed"). So state alone is the
- *  authoritative empty/present signal here.
- *
- *  "physical" — firmware positively confirmed no spool (state 9). Every
- *  empty-by-bitmask slot lands here regardless of firmware payload shape.
- *
- *  "reset" — a spool may be present but its material isn't configured: state 10
- *  (present, promoted from a mid-print insert), or tray_type missing/empty while
- *  firmware hasn't confirmed emptiness (state null, 3, or any non-9 value —
- *  e.g. a slot the user cleared with "Reset Slot"). Rendered as "?" (present but
- *  unidentified), never "Empty".
- *
- *  Returns null when the slot is loaded (tray_type is present).
- */
-function getEmptySlotKind(tray: { tray_type?: string | null; state?: number | null } | null | undefined): 'physical' | 'reset' | null {
-  if (tray?.tray_type) return null;
-  return tray?.state === 9 ? 'physical' : 'reset';
+/** Caption i18n key for an AMS slot carrying no material identity.
+ *  A 'present' slot (firmware says a spool IS seated, state 10/11, but it could
+ *  not be read) must never read "Empty" — that is exactly how 004-H2S hid a
+ *  ~90 % roll for a day. */
+function emptySlotLabelKey(kind: EmptySlotKind | null): string {
+  if (kind === 'present') return 'ams.slotPresentUnread';
+  if (kind === 'reset') return 'ams.slotUnconfigured';
+  return 'ams.slotEmpty';
 }
 
 
@@ -5092,7 +5078,7 @@ function PrinterCard({
                                       spentCore={spentCoreFlag}
                                     />
                                     <div className="text-[9px] text-white font-bold truncate">
-                                      {tray?.tray_type || t(emptyKind === 'reset' ? 'ams.slotUnconfigured' : 'ams.slotEmpty')}
+                                      {tray?.tray_type || t(emptySlotLabelKey(emptyKind))}
                                     </div>
                                     {/* Fill bar */}
                                     <div className="mt-1 h-1.5 bg-black/30 rounded-full overflow-hidden">
@@ -5392,7 +5378,7 @@ function PrinterCard({
                               spentCore={htSpentCore}
                             />
                             <div className="text-[9px] text-white font-bold truncate">
-                              {tray?.tray_type || t(emptyKind === 'reset' ? 'ams.slotUnconfigured' : 'ams.slotEmpty')}
+                              {tray?.tray_type || t(emptySlotLabelKey(emptyKind))}
                             </div>
                             {/* Fill bar */}
                             <div className="mt-1 h-1.5 bg-black/30 rounded-full overflow-hidden">
@@ -5782,7 +5768,10 @@ function PrinterCard({
                                     spentCore={!!extInventoryAssignment?.spool?.spent_at}
                                   />
                                   <div className={`text-[9px] font-bold truncate ${isEmpty ? 'text-white/40' : 'text-white'}`}>
-                                    {extTray.tray_type || t('ams.slotEmpty')}
+                                    {/* External holders keep the two-state caption (loaded / Empty);
+                                        only a seated-but-unread spool overrides it, so the operator
+                                        can tell "nothing here" from "something here I can't read". */}
+                                    {extTray.tray_type || t(emptyKind === 'present' ? 'ams.slotPresentUnread' : 'ams.slotEmpty')}
                                   </div>
                                   <div className="mt-1 h-1.5 bg-black/30 rounded-full overflow-hidden">
                                     {extEffectiveFill !== null && extEffectiveFill >= 0 && !isEmpty && (

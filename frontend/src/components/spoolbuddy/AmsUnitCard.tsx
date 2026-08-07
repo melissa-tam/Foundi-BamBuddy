@@ -1,5 +1,6 @@
+import { useTranslation } from 'react-i18next';
 import type { AMSUnit, AMSTray } from '../../api/client';
-import { getFillBarColor } from '../../utils/amsHelpers';
+import { getEmptySlotKind, getFillBarColor } from '../../utils/amsHelpers';
 
 function trayColorToCSS(color: string | null): string {
   if (!color) return '#808080';
@@ -8,18 +9,6 @@ function trayColorToCSS(color: string | null): string {
 
 function isTrayEmpty(tray: AMSTray): boolean {
   return !tray.tray_type || tray.tray_type === '';
-}
-
-// Mirror of PrintersPage.getEmptySlotKind (#1694): 'physical' when firmware
-// confirms no spool (state 9), 'reset' when a spool may be present but its
-// material isn't configured (state 10 — a mid-print insert promoted 9→10, or
-// tray_type absent while firmware hasn't confirmed empty). state 10 means the
-// spool IS seated (003-H2S), so it must read "?" (present, unidentified), not
-// "Empty" — keep in lockstep with PrintersPage.
-function getEmptySlotKind(tray: AMSTray): 'physical' | 'reset' | null {
-  if (tray.tray_type) return null;
-  const state = (tray as { state?: number | null }).state ?? null;
-  return state === 9 ? 'physical' : 'reset';
 }
 
 function getAmsName(id: number): string {
@@ -158,8 +147,13 @@ interface SpoolSlotProps {
 }
 
 function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, onClick }: SpoolSlotProps) {
+  const { t } = useTranslation();
   const isEmpty = isTrayEmpty(tray);
   const emptyKind = getEmptySlotKind(tray);
+  // Firmware says a spool IS seated (state 10/11) but it could not be read.
+  // Never draw that as an empty ring — 004-H2S hid a ~90 % roll that way.
+  const presentUnread = isEmpty && emptyKind === 'present';
+  const presentUnreadLabel = t('ams.slotPresentUnread');
   const color = trayColorToCSS(tray.tray_color);
   const amsFill = tray.remain !== null && tray.remain !== undefined && tray.remain >= 0 ? tray.remain : null;
   // If inventory says 0% but AMS reports positive remain, prefer AMS (#676)
@@ -176,9 +170,22 @@ function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, onCl
       {/* Spool visualization */}
       <div className="relative w-16 h-16 mb-1">
         {isEmpty ? (
-          <div className="w-full h-full rounded-full border-2 border-dashed border-gray-500 flex items-center justify-center">
-            <div className="w-3 h-3 rounded-full bg-gray-600" />
-          </div>
+          presentUnread ? (
+            // Solid warning-tone ring + "?" glyph (never colour alone); the
+            // aria-label/title carry the state for screen readers and hover.
+            <div
+              role="img"
+              aria-label={presentUnreadLabel}
+              title={presentUnreadLabel}
+              className="w-full h-full rounded-full border-2 border-solid border-amber-600 dark:border-amber-400 flex items-center justify-center text-amber-600 dark:text-amber-400 text-xl font-bold leading-none select-none"
+            >
+              ?
+            </div>
+          ) : (
+            <div className="w-full h-full rounded-full border-2 border-dashed border-gray-500 flex items-center justify-center">
+              <div className="w-3 h-3 rounded-full bg-gray-600" />
+            </div>
+          )
         ) : (
           <svg viewBox="0 0 56 56" className="w-full h-full">
             <circle cx="28" cy="28" r="26" fill={color} />
@@ -196,9 +203,11 @@ function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, onCl
       {/* Material type */}
       <span
         className="text-sm text-white/70 truncate max-w-full"
-        title={emptyKind === 'reset' ? 'Spool loaded — slot not configured' : undefined}
+        title={presentUnread ? presentUnreadLabel : emptyKind === 'reset' ? 'Spool loaded — slot not configured' : undefined}
       >
-        {isEmpty ? (emptyKind === 'reset' ? '?' : 'Empty') : tray.tray_type || 'Unknown'}
+        {isEmpty
+          ? (presentUnread ? presentUnreadLabel : emptyKind === 'reset' ? '?' : 'Empty')
+          : tray.tray_type || 'Unknown'}
       </span>
 
       {/* Fill level bar */}

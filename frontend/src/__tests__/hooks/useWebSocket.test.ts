@@ -23,6 +23,11 @@ vi.mock('react-i18next', () => ({
         const { printer, slots } = options as { printer: string; slots: string };
         return `Missing assignments for ${printer}: ${slots}`;
       }
+      if (key === 'ams.slotStandingUnknown' && options) {
+        // Interpolated so the test can pin the 1-based slot rendering.
+        const { printer, slot } = options as { printer: string; slot: number };
+        return `${printer} standing-unknown slot ${slot}`;
+      }
       return key;
     },
     i18n: {},
@@ -683,6 +688,37 @@ describe('useWebSocket hook', () => {
       expect(document.body.textContent).not.toContain('inventory.taglessMintToast');
 
       vi.useRealTimers();
+      vi.unstubAllGlobals();
+    });
+
+    it('toasts on slot_standing_unknown (transient nudge, no window event)', async () => {
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'slot_standing_unknown',
+          printer_id: 4,
+          printer_name: '004-H2S',
+          ams_id: 0,
+          tray_id: 2,
+        });
+      });
+
+      // tray_id 2 must render as slot 3 (1-based), matching the prompt hooks.
+      await waitFor(() => {
+        expect(document.body.textContent).toContain('004-H2S standing-unknown slot 3');
+      });
+
       vi.unstubAllGlobals();
     });
 

@@ -5007,6 +5007,8 @@ export default {
     emptySlot: 'Ranura vacía',
     slotEmpty: 'Vacía',
     slotUnconfigured: '?',
+    slotPresentUnread: 'Bobina presente — no reconocida',
+    slotStandingUnknown: '{{printer}}: la ranura {{slot}} tiene una bobina que el AMS no puede leer — revísala',
     outOfRotation: 'Fuera de rotación — atasco de bobina detectado; vuelve a insertar la bobina o borra la marca para reutilizarla',
     outOfRotationShort: 'Fuera de rotación',
     emptySlotReset: 'No hay filamento asignado',

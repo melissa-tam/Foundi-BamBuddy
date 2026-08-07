@@ -4988,6 +4988,8 @@ export default {
     emptySlot: 'Slot vide',
     slotEmpty: 'Vide',
     slotUnconfigured: '?',
+    slotPresentUnread: 'Bobine présente — non reconnue',
+    slotStandingUnknown: "{{printer}} : l'emplacement {{slot}} contient une bobine que l'AMS ne peut pas lire — à vérifier",
     outOfRotation: 'Hors rotation — bourrage de bobine détecté ; réinsérez la bobine ou effacez l\'indicateur pour la réutiliser',
     outOfRotationShort: 'Hors rotation',
     emptySlotReset: 'Aucune bobine assignée',

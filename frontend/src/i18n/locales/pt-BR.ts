@@ -4987,6 +4987,8 @@ export default {
     emptySlot: 'Slot vazio',
     slotEmpty: 'Vazio',
     slotUnconfigured: '?',
+    slotPresentUnread: 'Bobina presente — não reconhecida',
+    slotStandingUnknown: '{{printer}}: o slot {{slot}} tem uma bobina que o AMS não consegue ler — verifique',
     outOfRotation: 'Fora de rotação — travamento de bobina detectado; reinsira a bobina ou limpe a marcação para reutilizá-la',
     outOfRotationShort: 'Fora de rotação',
     emptySlotReset: 'Nenhum carretel atribuído',

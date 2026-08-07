@@ -4987,6 +4987,8 @@ export default {
     emptySlot: '空槽位',
     slotEmpty: '空',
     slotUnconfigured: '?',
+    slotPresentUnread: '有料卷 — 無法識別',
+    slotStandingUnknown: '{{printer}}: 槽位 {{slot}} 中有 AMS 無法讀取的料卷 — 請檢查',
     outOfRotation: '已移出輪替 — 偵測到料卷卡料；重新插入料卷或清除標記即可再次使用',
     outOfRotationShort: '已移出輪替',
     emptySlotReset: '未指派線材',

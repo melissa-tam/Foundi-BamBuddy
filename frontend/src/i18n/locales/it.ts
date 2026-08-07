@@ -4987,6 +4987,8 @@ export default {
     emptySlot: 'Slot vuoto',
     slotEmpty: 'Vuoto',
     slotUnconfigured: '?',
+    slotPresentUnread: 'Bobina presente — non riconosciuta',
+    slotStandingUnknown: "{{printer}}: nello slot {{slot}} c'è una bobina che l'AMS non riesce a leggere — controlla",
     outOfRotation: 'Fuori rotazione — rilevato inceppamento bobina; reinserisci la bobina o azzera il contrassegno per riutilizzarla',
     outOfRotationShort: 'Fuori rotazione',
     emptySlotReset: 'Nessuna bobina assegnata',

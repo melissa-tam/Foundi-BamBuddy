@@ -5025,6 +5025,8 @@ export default {
     emptySlot: 'Empty slot',
     slotEmpty: 'Empty',
     slotUnconfigured: '?',
+    slotPresentUnread: 'Spool present — unrecognized',
+    slotStandingUnknown: "{{printer}}: slot {{slot}} has a spool the AMS can't read — check it",
     outOfRotation: 'Out of rotation — spool jam detected; re-insert the spool or clear the flag to reuse it',
     outOfRotationShort: 'Out of rotation',
     emptySlotReset: 'No filament assigned',

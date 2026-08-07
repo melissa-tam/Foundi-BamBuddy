@@ -10,9 +10,14 @@
  *   isEmpty    - Whether the slot contains no filament.
  *   emptyKind  - Optional refinement of the empty state used to render the
  *                slot border (#1322 follow-up): "physical" for firmware-
- *                confirmed no spool (state 9/10), "reset" for slots where
- *                the user cleared the assignment but the firmware hasn't
- *                positively confirmed emptiness. Ignored when isEmpty is false.
+ *                confirmed no spool (state 9), "present" for a spool the
+ *                firmware says IS seated (state 10/11) but could not read,
+ *                "reset" for slots where the user cleared the assignment but
+ *                the firmware hasn't positively confirmed emptiness. Ignored
+ *                when isEmpty is false. "present" is the loud one: a solid
+ *                warning-tone ring plus a centred "?" glyph carrying an
+ *                aria-label + title, because an unread-but-seated roll used to
+ *                render indistinguishably from an empty slot (004-H2S).
  *   slotNumber - 1-based slot number to display inside the circle. Accepts
  *                a string for non-numeric labels (e.g. "L" / "R" for the
  *                dual-nozzle external trays, where carrying a separate
@@ -34,12 +39,13 @@
 
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, AlertCircle, RotateCcw } from 'lucide-react';
+import type { EmptySlotKind } from '../utils/amsHelpers';
 
 interface FilamentSlotCircleProps {
   trayColor?: string | null;
   trayType?: string | null;
   isEmpty: boolean;
-  emptyKind?: 'physical' | 'reset' | null;
+  emptyKind?: EmptySlotKind | null;
   slotNumber: number | string;
   outOfRotation?: boolean;
   ranOut?: boolean;
@@ -60,24 +66,49 @@ export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, sl
   // "cleared but possibly still has a spool the firmware hasn't confirmed
   // gone" rather than "definitely no spool".
   const emptyBorderColor = emptyKind === 'reset' ? '#3d3d3d' : '#666';
+  // A spool the firmware reports SEATED but could not read (state 10/11). It is
+  // not an empty slot and must not look like one: solid warning-tone ring +
+  // a "?" glyph in place of the slot number, both carrying the label so the
+  // state is never signalled by colour alone.
+  const presentUnread = isEmpty && emptyKind === 'present';
+  const presentUnreadLabel = t('ams.slotPresentUnread');
   const outOfRotationLabel = t('ams.outOfRotation');
   const ranOutLabel = t('printers.slot.ranOut');
   const spentCoreLabel = t('printers.slot.spentCore');
   return (
     <div
-      className="relative w-3.5 h-3.5 rounded-full mx-auto mb-0.5 border-2 flex items-center justify-center"
+      className={`relative w-3.5 h-3.5 rounded-full mx-auto mb-0.5 border-2 flex items-center justify-center${
+        presentUnread ? ' border-amber-600 dark:border-amber-400' : ''
+      }`}
+      title={presentUnread ? presentUnreadLabel : undefined}
       style={{
         backgroundColor: trayColor ? `#${trayColor}` : (trayType ? '#333' : 'transparent'),
-        borderColor: isEmpty ? emptyBorderColor : 'rgba(255,255,255,0.1)',
-        borderStyle: isEmpty ? 'dashed' : 'solid',
+        // The seated-but-unread ring comes from the theme-paired amber classes
+        // above (light: amber-600, dark: amber-400 — both clear 3:1 against the
+        // slot background); an inline borderColor here would override them.
+        ...(presentUnread
+          ? {}
+          : { borderColor: isEmpty ? emptyBorderColor : 'rgba(255,255,255,0.1)' }),
+        borderStyle: isEmpty && !presentUnread ? 'dashed' : 'solid',
       }}
     >
-      <span
-        className="text-[6px] font-bold leading-none select-none"
-        style={{ color: trayColor && isLightFilamentColor(trayColor) ? '#000' : '#fff' }}
-      >
-        {slotNumber}
-      </span>
+      {presentUnread ? (
+        <span
+          role="img"
+          aria-label={presentUnreadLabel}
+          title={presentUnreadLabel}
+          className="text-[7px] font-bold leading-none select-none text-amber-600 dark:text-amber-400"
+        >
+          ?
+        </span>
+      ) : (
+        <span
+          className="text-[6px] font-bold leading-none select-none"
+          style={{ color: trayColor && isLightFilamentColor(trayColor) ? '#000' : '#fff' }}
+        >
+          {slotNumber}
+        </span>
+      )}
       {outOfRotation && (
         // Corner warning badge. Not colour-only: an AlertTriangle glyph carries
         // the meaning; aria-label + title expose the tooltip text to screen

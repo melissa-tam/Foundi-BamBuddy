@@ -86,6 +86,62 @@ describe('FilamentSlotCircle', () => {
     expectColor(text.style.color, '#fff', 'rgb(255, 255, 255)');
   });
 
+  describe('seated-but-unread slot (emptyKind "present")', () => {
+    it('renders a "?" glyph instead of the slot number', () => {
+      render(<FilamentSlotCircle isEmpty={true} emptyKind="present" slotNumber={3} />);
+      expect(screen.getByText('?')).toBeInTheDocument();
+      expect(screen.queryByText('3')).not.toBeInTheDocument();
+    });
+
+    it('labels the glyph so the state is never colour-only', () => {
+      render(<FilamentSlotCircle isEmpty={true} emptyKind="present" slotNumber={3} />);
+      const glyph = screen.getByRole('img');
+      const label = glyph.getAttribute('aria-label');
+      expect(label).toBeTruthy();
+      // The key must have RESOLVED — a raw key here means a missing locale entry.
+      expect(label).not.toBe('ams.slotPresentUnread');
+      // title carries the same text for hover/keyboard discovery.
+      expect(glyph.getAttribute('title')).toBe(label);
+    });
+
+    it('uses a solid border so it cannot be mistaken for an empty slot', () => {
+      const { container } = render(
+        <FilamentSlotCircle isEmpty={true} emptyKind="present" slotNumber={1} />
+      );
+      const circle = container.firstChild as HTMLElement;
+      expect(circle.style.borderStyle).toBe('solid');
+      // The warning-tone ring comes from theme-paired classes, so no inline
+      // borderColor may be set (it would override them).
+      expect(circle.style.borderColor).toBe('');
+      expect(circle.className).toContain('border-amber-600');
+      expect(circle.className).toContain('dark:border-amber-400');
+    });
+
+    it('keeps the dashed empty look for physical and reset slots', () => {
+      for (const kind of ['physical', 'reset'] as const) {
+        const { container, unmount } = render(
+          <FilamentSlotCircle isEmpty={true} emptyKind={kind} slotNumber={2} />
+        );
+        const circle = container.firstChild as HTMLElement;
+        expect(circle.style.borderStyle).toBe('dashed');
+        expect(circle.className).not.toContain('border-amber-600');
+        expect(screen.getByText('2')).toBeInTheDocument();
+        expect(screen.queryByRole('img')).not.toBeInTheDocument();
+        unmount();
+      }
+    });
+
+    it('ignores emptyKind "present" when the slot is loaded', () => {
+      const { container } = render(
+        <FilamentSlotCircle trayColor="FF0000" trayType="PETG" isEmpty={false} emptyKind="present" slotNumber={4} />
+      );
+      const circle = container.firstChild as HTMLElement;
+      expect(screen.getByText('4')).toBeInTheDocument();
+      expect(screen.queryByText('?')).not.toBeInTheDocument();
+      expectColor(circle.style.borderColor, 'rgba(255,255,255,0.1)', 'rgba(255, 255, 255, 0.1)');
+    });
+  });
+
   describe('out-of-rotation badge', () => {
     it('renders the warning badge when outOfRotation is true', () => {
       render(

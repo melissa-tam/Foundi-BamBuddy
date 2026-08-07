@@ -3025,6 +3025,19 @@ export interface TaglessFreshPromptMessage {
   rgba: string | null;
 }
 
+/** WS `slot_standing_unknown` payload — a tray has held a spool the AMS cannot
+ *  read for long enough that it is no longer a transient read miss (004-H2S sat
+ *  like that for a day while the UI drew an empty slot). Drives a transient
+ *  warning toast only: unlike the respool / tagless-fresh prompts there is no
+ *  durable state, no dequeue and no dismissal to sync — it is a nudge to go look
+ *  at the printer, and the slot itself renders the standing state. */
+export interface SlotStandingUnknownMessage {
+  printer_id: number;
+  printer_name?: string | null;
+  ams_id: number;
+  tray_id: number;
+}
+
 /** `GET /inventory/prompts/pending` — every operator question that is still
  *  live, so a client that MISSED the websocket broadcast (token loop, tab opened
  *  later, connection drop) can recover it. Entries are byte-identical to the

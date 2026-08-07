@@ -457,6 +457,48 @@ export function isBambuLabSpool(tray: {
   return false;
 }
 
+/**
+ * Wire tray `state` values that mean a spool is PHYSICALLY SEATED in the tray.
+ * Client mirror of the backend one-origin constant
+ * `services/tray_fields.TRAY_PRESENT_STATES` — 10 = present/not fed,
+ * 11 = present/loaded. Never re-derive presence from tray_type emptiness.
+ */
+const TRAY_PRESENT_STATES: ReadonlySet<number> = new Set([10, 11]);
+
+/** How an AMS slot with no configured material should read to the operator. */
+export type EmptySlotKind = 'physical' | 'present' | 'reset';
+
+/** Classify a slot that carries no material identity (#1322 follow-up).
+ *
+ *  The bambu_mqtt handler canonicalizes state against tray_exist_bits in BOTH
+ *  directions: an empty-by-bitmask slot is promoted to state=9, and an OCCUPIED
+ *  slot stuck at state 9 (a spool inserted mid-print gets no auto-read —
+ *  003-H2S) is promoted to state=10 ("present, not fed"). So state alone is the
+ *  authoritative empty/present signal here.
+ *
+ *  "physical" — firmware positively confirmed no spool (state 9). Every
+ *  empty-by-bitmask slot lands here regardless of firmware payload shape.
+ *
+ *  "present" — firmware says a spool IS seated (state 10/11) but no material
+ *  identity came with it: the AMS never got a clean read. 004-H2S held a ~90 %
+ *  roll like this for a day while the UI drew an empty slot, so this kind MUST
+ *  render distinctly from both "empty" and "unconfigured".
+ *
+ *  "reset" — no material configured and firmware has confirmed neither presence
+ *  nor emptiness (state null, 3, or any other value — e.g. a slot the user
+ *  cleared with "Reset Slot"). Rendered as "?" (unidentified), never "Empty".
+ *
+ *  Returns null when the slot is loaded (tray_type is present).
+ */
+export function getEmptySlotKind(
+  tray: { tray_type?: string | null; state?: number | null } | null | undefined,
+): EmptySlotKind | null {
+  if (tray?.tray_type) return null;
+  if (tray?.state === 9) return 'physical';
+  if (tray?.state != null && TRAY_PRESENT_STATES.has(tray.state)) return 'present';
+  return 'reset';
+}
+
 export interface AmsTrayLike {
   id: number;
   tray_type: string | null | undefined;

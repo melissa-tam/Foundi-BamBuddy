@@ -5,19 +5,15 @@
  * - Shows fill level bars
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import React from 'react';
 import { AmsUnitCard } from '../../../components/spoolbuddy/AmsUnitCard';
 import type { AMSUnit, AMSTray } from '../../../api/client';
 
-vi.mock('../../../utils/amsHelpers', () => ({
-  getFillBarColor: (fill: number) => {
-    if (fill > 50) return '#00ae42';
-    if (fill >= 15) return '#f59e0b';
-    return '#ef4444';
-  },
-}));
+// No module mock: `utils/amsHelpers` is the single origin of both the fill-bar
+// thresholds and the slot-kind rule this file asserts, so it runs for real (the
+// old local getFillBarColor stub was a byte-identical copy of it).
 
 function makeTray(overrides: Partial<AMSTray> = {}): AMSTray {
   return {
@@ -95,10 +91,11 @@ describe('AmsUnitCard', () => {
     expect(screen.getByText('Empty')).toBeDefined();
   });
 
-  it('shows "?" for a present-but-unconfigured slot promoted to state 10 (003-H2S)', () => {
+  it('flags a seated-but-unread slot (state 10) as present, never "Empty" (003-H2S / 004-H2S)', () => {
     // A spool inserted mid-print gets no auto-read; bambu_mqtt promotes it 9→10
-    // ("present, not fed"). state 10 means a spool IS seated, so it must read as
-    // present-but-unidentified ("?"), never "Empty".
+    // ("present, not fed"). state 10 means a spool IS seated, so it must render
+    // its own distinct state — a labelled "?" ring plus the present caption —
+    // and never "Empty" (004-H2S hid a ~90 % roll behind an empty-looking slot).
     const unit = makeUnit({
       tray: [
         makeTray({ id: 0, tray_type: 'PLA', remain: 80 }),
@@ -108,7 +105,16 @@ describe('AmsUnitCard', () => {
       ],
     });
     render(<AmsUnitCard unit={unit} activeSlot={null} />);
-    expect(screen.getByText('?')).toBeDefined();
+
+    // The ring is an accessible image (state is never carried by colour alone).
+    const ring = screen.getByRole('img');
+    const label = ring.getAttribute('aria-label');
+    expect(label).toBeTruthy();
+    // A raw key here would mean a missing locale entry.
+    expect(label).not.toBe('ams.slotPresentUnread');
+    expect(ring.textContent).toBe('?');
+    // ...and the caption carries the same string instead of "Empty".
+    expect(screen.getAllByText(label as string).length).toBeGreaterThan(0);
     expect(screen.queryByText('Empty')).toBeNull();
   });
 
