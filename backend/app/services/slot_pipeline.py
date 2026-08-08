@@ -656,6 +656,35 @@ async def _last_location_candidate(db: AsyncSession, obs: TrayObservation) -> Sp
     stamps, which is what lets a pulled-and-returned roll keep its grams AND its FIFO
     position instead of minting a fresh 0 g row. Archived and spent rows are excluded:
     a retired roll may not reclaim a slot, and a spent one belongs to the W1 latch.
+
+    A donor that is BOUND SOMEWHERE ELSE is excluded too, and that exclusion is an
+    evidence-tier rule, not an optimisation. Reclaim is ASSUMPTION-tier ("a pulled roll
+    came back to where it was" — the stamp is residue, nothing observed it return); a live
+    binding is a POSITIVE location claim already written for that roll. So the asymmetry is
+    deliberate and load-bearing: an IDENTITY-tier bind (table row 2) may displace any
+    binding fleet-wide — the AMS read that roll's OWN tag THERE, which outranks every
+    assumption — while an assumption-tier reclaim may displace nothing.
+
+    Without it the two lanes ping-pong forever (prod 2026-08-07, spool 211): the operator
+    moved the roll from printer 10 A0T0 to printer 7 A0T1; p7's wire asserted the roll's
+    sibling tag + tray_uuid, so ``identity_resolved_candidate`` bound it there and the
+    writer's move semantics swept p10's row — correct. But p10's tray still carried config
+    residue (PETG, state 11 — another roll seated, no identity asserted) and spool 211's
+    ``last_location_*`` still pointed at p10 A0T0, so p10's very next evaluation reclaimed
+    the roll straight back and swept p7, which re-read the tag and took it again: ~1 Hz,
+    damped to one move per ``spool_binding._MOVE_DAMPER_S`` in each direction, converging
+    never.
+
+    The exclusion is a WHERE clause rather than a post-scan skip for two reasons: it is the
+    same ``~assignments.any()`` the attract lane already uses for its own hijack guard
+    (``spool_tag_matcher.find_matching_untagged_spool``), so "a row that already holds a
+    slot" keeps ONE meaning fork-wide; and :data:`_RECLAIM_SCAN_LIMIT` then spends its
+    budget on eligible donors only, so an OLDER honest donor for this slot stays reachable
+    behind a bound one. This lane is consulted only for an UNBOUND slot (table row 4c) and
+    ``spool_assignment.spool_id`` is unique, so ANY live assignment on a donor means
+    "bound elsewhere". When nothing survives, None is the doctrine-correct answer: the
+    table falls through to ``tagless_mint`` and the unidentified seated roll gets its own
+    fresh ledger row instead of inheriting one that provably lives in another tray.
     """
     printer_id, ams_id, tray_id = obs.slot
     res = await db.execute(
@@ -664,6 +693,9 @@ async def _last_location_candidate(db: AsyncSession, obs: TrayObservation) -> Sp
         .where(
             Spool.archived_at.is_(None),
             Spool.spent_at.is_(None),
+            # Bound elsewhere ⇒ not a donor. Assumption-tier evidence may never steal a
+            # roll from a live binding (2026-08-07, spool 211 p10 A0T0 ↔ p7 A0T1).
+            ~Spool.assignments.any(),
             Spool.last_location_printer_id == printer_id,
             Spool.last_location_ams_id == ams_id,
             Spool.last_location_tray_id == tray_id,

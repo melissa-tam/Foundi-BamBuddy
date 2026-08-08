@@ -691,6 +691,102 @@ async def test_a_different_filament_at_the_last_location_mints_instead(db_sessio
     assert (await _assignment(db_session, printer.id, 0, 3)).spool_id != donor.id
 
 
+@pytest.mark.asyncio
+async def test_reclaim_never_steals_a_live_binding(db_session, printer_factory, env):
+    """Assumption-tier evidence may never displace a POSITIVE location claim.
+
+    prod 2026-08-07, spool 211: the operator moved the roll from printer 10 A0T0 to
+    printer 7 A0T1. The identity lane bound it at p7 — correct, the wire read that roll's
+    own tag THERE — and the writer's move semantics swept p10's row. But p10's tray still
+    reported config residue (another roll seated, no identity asserted) and the roll's
+    ``last_location_*`` still pointed at p10, so the reclaim lane took it straight back and
+    the two lanes ping-ponged at ~1 Hz. A donor that is bound ELSEWHERE is not a donor: the
+    seated unknown roll mints its own row and the live binding is untouched.
+    """
+    p_a = await printer_factory()
+    p_b = await printer_factory()
+    donor = await _spool(db_session, material="PETG", rgba="000000FF", weight_used=400)
+    donor.last_location_printer_id = p_a.id
+    donor.last_location_ams_id = 0
+    donor.last_location_tray_id = 3
+    donor.last_location_at = datetime.utcnow()
+    await _bind_row(db_session, donor, p_b.id, 0, 1)  # the LIVE claim, on another printer
+
+    obs = _obs(p_a.id, {"id": 3, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"})
+    transitions = await run_slot_pipeline(p_a.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision.reason == "tagless_mint"  # NOT last_location_reclaim
+    assert transitions[0].applied is True
+    minted = await _assignment(db_session, p_a.id, 0, 3)
+    assert minted is not None
+    assert minted.spool_id != donor.id
+    live = await _assignment(db_session, p_b.id, 0, 1)
+    assert live is not None
+    assert live.spool_id == donor.id  # the roll never left the slot the wire put it in
+    await db_session.refresh(donor)
+    assert donor.weight_used == 400
+
+
+@pytest.mark.asyncio
+async def test_reclaim_still_works_for_a_returned_roll(db_session, printer_factory, env):
+    """Control arm for the guard above: the SAME setup with the donor bound NOWHERE still
+    reclaims. A live assignment is the only variable between the two cases, so the pair
+    pins the exclusion without eroding doctrine rule 7's gram + FIFO continuity."""
+    printer = await printer_factory()
+    donor = await _spool(db_session, material="PETG", rgba="000000FF", weight_used=400)
+    donor.last_location_printer_id = printer.id
+    donor.last_location_ams_id = 0
+    donor.last_location_tray_id = 3
+    donor.last_location_at = datetime.utcnow()
+    await db_session.commit()
+
+    obs = _obs(printer.id, {"id": 3, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"})
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision == Decision(DecisionKind.RECLAIM, spool_id=donor.id, reason="last_location_reclaim")
+    assert transitions[0].applied is True
+    assert (await _assignment(db_session, printer.id, 0, 3)).spool_id == donor.id
+    assert await _spool_count(db_session) == 1  # reclaimed, not re-minted
+
+
+@pytest.mark.asyncio
+async def test_an_identity_move_does_not_ping_pong_back_to_the_old_slot(db_session, printer_factory, env):
+    """The 2026-08-07 loop end to end, through the real writer.
+
+    Pass 1 is the identity bind on the new printer, whose move sweep is what stamps the
+    roll's ``last_location_*`` at the OLD slot. Pass 2 evaluates that vacated slot, which
+    still reports the departed roll's config and asserts no identity — the exact shape that
+    used to reclaim the roll back and restart the loop.
+
+    The DECISION is the pin, not merely the final ledger: a reclaim on pass 2 is a MOVE, so
+    the writer's damper would refuse this one and land the next, which is precisely why prod
+    ping-ponged at one write per ``spool_binding._MOVE_DAMPER_S`` instead of converging.
+    """
+    old = await printer_factory()
+    new = await printer_factory()
+    roll = await _spool(db_session, tag_uid=TAG_A, tray_uuid=UUID_1, material="PETG", rgba="000000FF", weight_used=612)
+    await _bind_row(db_session, roll, old.id, 0, 0)
+
+    # Pass 1 — the roll is now in the new printer and its wire reads the tag there.
+    arrived = _obs(
+        new.id,
+        {"id": 1, "state": 11, "tag_uid": TAG_A, "tray_uuid": UUID_1, "tray_type": "PETG", "tray_color": "000000FF"},
+    )
+    moved = await run_slot_pipeline(new.id, [arrived], _deps(db_session, env))
+
+    assert moved[0].decision == Decision(DecisionKind.BIND, spool_id=roll.id, reason="identity_resolved_candidate")
+    await db_session.refresh(roll)
+    assert (roll.last_location_printer_id, roll.last_location_ams_id, roll.last_location_tray_id) == (old.id, 0, 0)
+
+    # Pass 2 — the vacated slot: config residue from another seated roll, no identity.
+    residue = _obs(old.id, {"id": 0, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"})
+    back = await run_slot_pipeline(old.id, [residue], _deps(db_session, env))
+
+    assert back[0].decision.reason == "tagless_mint"  # NOT last_location_reclaim
+    assert (await _assignment(db_session, new.id, 0, 1)).spool_id == roll.id  # the bind stayed put
+    assert (await _assignment(db_session, old.id, 0, 0)).spool_id != roll.id
+
+
 # --- RELEASE ----------------------------------------------------------------
 
 
