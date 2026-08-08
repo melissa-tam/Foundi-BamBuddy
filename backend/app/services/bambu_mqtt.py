@@ -145,6 +145,7 @@ def apply_tray_exist_bits(
     *,
     power_on_flag: bool = True,
     log_label: str | None = None,
+    allow_demote: bool = True,
 ) -> int:
     """Canonicalize per-tray `state` from `tray_exist_bits` in BOTH directions.
 
@@ -185,6 +186,30 @@ def apply_tray_exist_bits(
     `tray_exist_bits_str` is expected as a hex string (firmware sends it that
     way). Ints are tolerated for defensive symmetry but typically not seen
     on the wire. ``None`` / empty / unparseable → no-op.
+
+    ``allow_demote`` expresses the EVIDENCE ASYMMETRY between the two directions,
+    and belongs to the FRESHNESS of the bitmask the caller passes:
+
+    * ``True`` (default) — the bits come from the CURRENT push and carry full
+      authority in both directions: a clear bit forces state 9 and wipes the
+      stale content fields (the #147 empty-slot cleanup, unchanged).
+    * ``False`` — the bits are a CACHED/last-seen mask (the ``_handle_ams_data``
+      fallback for a partial push that omits the field). Such a mask may still
+      PROMOTE (9→10; a stale set bit that is wrong only delays a removal by one
+      push) but must NEVER DEMOTE a tray that is itself asserting a physically
+      seated spool (``state ∈`` :data:`TRAY_PRESENT_STATES`) — that tray is fresh
+      POSITIVE evidence and it outranks stale NEGATIVE evidence. A non-present
+      tray still gets the (idempotent) clear. Same positive-evidence-only
+      asymmetry the raw-side normalizer already applies
+      (``_normalize_cleared_trays``: state-9-STRICT, exist-bit VETOED).
+
+      Incident 2026-08-07 (001-H2S slot 1): after a physical insert the tray
+      partials asserted state 10, but every push that omitted ``tray_exist_bits``
+      re-demoted the slot to "empty" from the bits cached while it was still
+      empty — silently (the wipe only logs when ``tray_type`` is truthy, and a
+      freshly inserted bare tray has none). The merged state, the AMS-change
+      hash's presence token, the change callback, auto-assignment and the UI
+      all un-saw the roll for 38 minutes.
 
     Mutates ``units`` in place. Returns the number of slots cleared.
     """
@@ -240,6 +265,13 @@ def apply_tray_exist_bits(
                 norm_state = parse_tray_state(tray.get("state"))
                 if norm_state == 9:
                     tray["state"] = 10
+                continue
+            # Empty per the bitmask. A caller that passed a CACHED mask
+            # (allow_demote=False) may not demote a tray whose own state asserts a
+            # seated spool: fresh positive evidence outranks stale negative
+            # evidence (2026-08-07 001-H2S — see the docstring). Non-present trays
+            # still take the idempotent clear below.
+            if not allow_demote and parse_tray_state(tray.get("state")) in TRAY_PRESENT_STATES:
                 continue
             tray["state"] = 9
             if tray.get("tray_type"):
@@ -2360,8 +2392,9 @@ class BambuMQTTClient:
         # byte-identical). When it OMITS the field — the minimal {id, state}
         # partial H2D sends — fall back to the last-seen bitmask so a stuck
         # state-9 slot the bitmask still marks occupied is promoted 9→10 on that
-        # partial too (and idempotently re-wiped if it marks it empty), instead
-        # of sitting invisible until the next full push.
+        # partial too (and idempotently re-wiped when it marks a NON-present tray
+        # empty), instead of sitting invisible until the next full push. A cached
+        # mask may never demote a tray asserting state 10/11 — see allow_demote.
         if isinstance(ams_data, dict):
             _bits_for_apply = ams_data.get("tray_exist_bits")
             if _bits_for_apply is None:
@@ -2371,6 +2404,9 @@ class BambuMQTTClient:
                 _bits_for_apply,
                 power_on_flag=ams_data.get("power_on_flag", True),
                 log_label=self.serial_number,
+                # Demotion needs FRESH evidence: only bits carried by THIS push may
+                # force a tray to empty; the cached fallback may promote only.
+                allow_demote=ams_data.get("tray_exist_bits") is not None,
             )
 
         self.state.raw_data["ams"] = merged_ams

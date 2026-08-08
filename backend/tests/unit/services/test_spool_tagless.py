@@ -1366,3 +1366,100 @@ class TestBareTraySpentGuardOutranksTheOriginVeto:
         assert sa.spool_id == live.id  # untouched
         env.apply.assert_not_awaited()
         assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles  # not consumed either
+
+
+# --- W1: a SPENT binding's release SIGNAL survives any tag-ness ---------------
+
+
+class TestSpentCycleSurvivesAnyTagness:
+    """2026-08-07 #2, spool 226 / 001-H2S slot 1 — the sibling lock of the class above.
+
+    Same root shape, one lane over: ``_maybe_prompt_fresh_roll`` checked TAG-NESS before
+    spent-ness, and it runs inside the very await that ARMS the pending cycle
+    (``note_physical_cycle``). A spent binding whose row carries an RFID identity therefore
+    destroyed its own release signal on the way in, so neither consumer — the pipeline's
+    ``REPLACE_SPENT`` arm nor ``maybe_autoconfigure_bare_tray``'s spent gate — ever saw a
+    cycle to spend, and the class above's reorder could not fire. Spent-ness is decided by
+    the RUNOUT, never by who minted the row.
+
+    Every case drives the REAL entry point ``note_physical_cycle``. Seeding
+    ``_pending_physical_cycles`` by hand is exactly how the bug shipped green: the existing
+    spent-swap cases start one await too late to see the arming path destroy it.
+    """
+
+    async def _seed_tagged(self, db_session, printer_id, *, spent, used=700):
+        """A slot bound to an RFID-identified row (both tag fields), 70 % consumed.
+
+        Past :data:`_FRESH_ROLL_PROMPT_USED_FRAC`, so a TAGLESS row in the same state
+        would prompt — any silence here is the tag-ness/spent decision, not the threshold.
+        """
+        sid = await _seed_assignment(
+            db_session, printer_id, 0, 0, material="PETG", rgba="112233FF", tag_uid=_VALID_TAG, spent=spent
+        )
+        spool = await db_session.get(Spool, sid)
+        spool.tray_uuid = "1" * 32
+        spool.label_weight = 1000
+        spool.weight_used = float(used)
+        await db_session.commit()
+        assert not spool_tagless.is_tagless_spool(spool)  # the case's whole premise
+        return spool
+
+    async def test_spent_tagged_row_leaves_the_cycle(self, db_session, printer_factory, env, sessions):
+        """The shipped bug's exact repro: the cycle must still be there afterwards.
+
+        ``env`` leaves the live printer state None, so the presence re-check would DISCARD
+        if the spent path fell through to it — the surviving cycle therefore also pins that
+        the spent return sits ABOVE that check (its consumers re-verify presence
+        themselves: the bare-tray gate needs ``tray_present``, ``REPLACE_SPENT`` its own
+        tray check).
+        """
+        printer = await printer_factory()
+        await self._seed_tagged(db_session, printer.id, spent=True)
+
+        await spool_tagless.note_physical_cycle(printer.id, 0, 0)
+
+        assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles  # left for W1
+        env.ws.assert_not_awaited()  # spent -> silent, never a fresh-roll prompt
+
+    async def test_non_spent_tagged_row_discards_the_cycle(self, db_session, printer_factory, env, sessions, seated):
+        """Today's correct behaviour, preserved by the reorder: a LIVE tagged row has no
+        tagless prompt to raise and no spent latch to release, so its cycle is spent right
+        here. The tray is SEATED and past the threshold, so the discard can only be the
+        tag-ness veto."""
+        printer = await printer_factory()
+        await self._seed_tagged(db_session, printer.id, spent=False)
+
+        await spool_tagless.note_physical_cycle(printer.id, 0, 0)
+
+        assert (printer.id, 0, 0) not in spool_tagless._pending_physical_cycles
+        env.ws.assert_not_awaited()
+
+    async def test_cycle_survives_and_releases_the_latch(self, db_session, printer_factory, env, sessions):
+        """End-to-end: a signal armed by the REAL entry point reaches the real consumer.
+
+        A spent TAGGED row plus the fresh roll physically seated in the slot (bare tray) —
+        the incident's exact state. The surviving cycle is the only thing that lets
+        ``maybe_autoconfigure_bare_tray`` take the archive → unlink → default-mint → push
+        transition instead of leaving the slot deadlocked.
+        """
+        printer = await printer_factory()
+        spent = await self._seed_tagged(db_session, printer.id, spent=True)
+        spent_id = spent.id
+
+        await spool_tagless.note_physical_cycle(printer.id, 0, 0)
+        handled = await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare())
+
+        assert handled is True
+        await db_session.refresh(spent)
+        assert spent.archived_at is not None  # the drained core retires...
+        rows = await db_session.scalar(select(func.count(Spool.id)).where(Spool.id == spent_id))
+        assert rows == 1  # ...and is NEVER deleted — the ledger row and its grams stay
+
+        sa = await _assignment(db_session, printer.id)
+        fresh = await db_session.get(Spool, sa.spool_id)
+        assert fresh.id != spent_id
+        assert fresh.spent_at is None and fresh.data_origin == "ams_auto"
+        assert spool_tagless.is_tagless_spool(fresh)  # the replacement is an untagged mint
+        assert fresh.loaded_at is not None  # FIFO ordinal stamped by the binding writer
+        env.apply.assert_awaited_once()  # the fresh row's identity goes out to the slot
+        assert (printer.id, 0, 0) not in spool_tagless._pending_physical_cycles  # consumed exactly once

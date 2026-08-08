@@ -998,6 +998,90 @@ class TestSpentOccupiedOwesAnIdentify:
         assert decision == Decision(DecisionKind.KEEP, spool_id=212, reason="spent_latch_on_empty")
 
 
+class TestSpentSwapOnANoTagRead:
+    """2026-08-07, spool 226 / 001-H2S slot 1 — the answer that concluded nothing.
+
+    A spent RFID-TAGGED binding sat on a slot into which the operator had inserted a fresh
+    TAGLESS roll. The spent-occupied arm above earned the slot a discovery read, and that
+    read answered NO TAG (the expected answer for every tagless roll) — but the arm only ever
+    handled the tag-FOUND outcome, which lands on row 2. The no-tag outcome concluded nothing:
+    the tray was bare, so row 4's qualified-cycle machinery was unreachable by construction,
+    and the slot re-owed a read it had already been given, forever.
+
+    A commanded read that found no chip over a binding that HAS one is positive proof of a
+    different roll — the same certainty class as a ``tray_uuid`` disagreement — so it
+    resolves here."""
+
+    PRESENT_UNNAMED = {"id": 1, "state": 10}  # the prod shape: seated, no config, no tag
+
+    def _tagged_spent(self, **kw):
+        return _view(spool_id=226, is_tagless=False, tag_uid="1C63F1E700000100", spent=True, **kw)
+
+    def _ctx(self, bound, **kw):
+        base = {
+            "binding": bound,
+            "no_tag_read_answered": True,
+            "tagless_default": TAGLESS_DEFAULT,
+        }
+        base.update(kw)
+        return ResolutionContext(**base)
+
+    def _resolve(self, bound, **kw):
+        obs = observe_tray(1, 0, dict(self.PRESENT_UNNAMED))
+        assert (obs.present, obs.identity_asserted, obs.config_nonempty) == (True, False, False)
+        return resolve(obs, derive_state(obs, bound), self._ctx(bound, **kw))
+
+    def test_the_no_tag_answer_swaps_the_spent_tagged_row(self):
+        bound = self._tagged_spent()
+        decision = self._resolve(bound)
+        assert decision.kind is DecisionKind.REPLACE_SPENT
+        assert decision.spool_id == 226
+        assert decision.reason == "spent_swap_no_tag_read"
+        # A bare tray has no fields to mint from, so the replacement comes from the
+        # configured tagless default — the same spec builder every default mint uses.
+        assert decision.mint_spec["source"] == "tagless_default"
+        assert decision.mint_spec["default_filament"] == TAGLESS_DEFAULT
+
+    def test_a_spent_TAGLESS_binding_is_deliberately_excluded(self):
+        """Over a spent TAGLESS row a no-tag read proves NOTHING: the same core reads the
+        same way before and after a swap (same-core ambiguity). That case keeps belonging to
+        the qualified-cycle machinery, which measures a PHYSICAL event instead."""
+        bound = _view(spool_id=226, spent=True)  # is_tagless=True
+        decision = self._resolve(bound)
+        assert decision == Decision(DecisionKind.NONE, reason="spent_occupied_owed_identify")
+
+    def test_without_the_evidence_the_slot_still_only_owes_a_read(self):
+        bound = self._tagged_spent()
+        decision = self._resolve(bound, no_tag_read_answered=False)
+        assert decision == Decision(DecisionKind.NONE, reason="spent_occupied_owed_identify")
+
+    def test_mid_print_still_defers(self):
+        """Doctrine rule 5 outranks the evidence: a mid-print insert is never auto-read and
+        never auto-swapped, so the answer is unchanged from today's."""
+        bound = self._tagged_spent()
+        decision = self._resolve(bound, busy=True)
+        assert decision == Decision(DecisionKind.DEFER, reason="mid_print_unresolved")
+
+    def test_no_tagless_default_configured_changes_nothing(self):
+        """With no default there is nothing to mint the replacement FROM, so the slot keeps
+        owing its read rather than binding a row with no identity at all."""
+        bound = self._tagged_spent()
+        decision = self._resolve(bound, tagless_default=None)
+        assert decision == Decision(DecisionKind.NONE, reason="spent_occupied_owed_identify")
+
+    def test_presence_unknown_still_latches_even_with_the_evidence(self):
+        """The row lives inside the ``present is True`` arm: a push that said nothing about
+        the slot is not evidence a roll is seated, and an unknown is never resolved toward a
+        binding write."""
+        bound = self._tagged_spent()
+        obs = _obs(present=None, state=None, tray_type=None, tray_color=None, tray_info_idx=None, tray_sub_brands=None)
+        decision = resolve(obs, derive_state(obs, bound), self._ctx(bound))
+        assert decision == Decision(DecisionKind.KEEP, spool_id=226, reason="spent_latch")
+
+    def test_the_reason_is_part_of_the_public_contract(self):
+        assert "spent_swap_no_tag_read" in RESOLUTION_REASONS
+
+
 # --- I/O-free contract ------------------------------------------------------
 
 

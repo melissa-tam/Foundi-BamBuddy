@@ -267,3 +267,32 @@ def _units_and_bits(ams_payload: object) -> tuple[list, int | None]:
     if isinstance(ams_payload, list):
         return ams_payload, None
     return [], None
+
+
+def observation_tray_dict(obs: TrayObservation) -> dict:
+    """The observation as a tray dict, for the existing tray-shaped helpers.
+
+    Only ASSERTED members are included — a key this push did not carry stays absent, so
+    the helpers see exactly what the wire said (the atomic-pair rule survives the
+    round-trip). The fork's ONE observation→dict projection: the slot pipeline's
+    decision/apply lanes and ``ams_presence``'s edge lanes judge the SAME push through
+    the same projection, so the tray-shaped helpers they share can never see two
+    different renderings of one wire assertion.
+    """
+    tray: dict = {"id": obs.tray_id}
+    if obs.state is not None:
+        tray["state"] = obs.state
+    for key, value in (
+        ("tag_uid", obs.tag_uid),
+        ("tray_uuid", obs.tray_uuid),
+        ("tray_type", obs.tray_type),
+        ("tray_color", obs.tray_color),
+        ("tray_info_idx", obs.tray_info_idx),
+        ("tray_sub_brands", obs.tray_sub_brands),
+        ("remain", obs.remain),
+        ("nozzle_temp_min", obs.nozzle_temp_min),
+        ("nozzle_temp_max", obs.nozzle_temp_max),
+    ):
+        if value is not None:
+            tray[key] = value
+    return tray

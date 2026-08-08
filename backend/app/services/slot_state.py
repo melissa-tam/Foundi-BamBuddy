@@ -144,6 +144,9 @@ RESOLUTION_REASONS = frozenset(
         # roll seated there is a newcomer the farm has never named, so the slot owes a
         # discovery read rather than another silent latch KEEP.
         "spent_occupied_owed_identify",
+        # …and the answer to that read, when it comes back NO TAG over a spent TAGGED
+        # binding: hardware-certain different roll — swap to the tagless default.
+        "spent_swap_no_tag_read",
         "no_signal",
     }
 )
@@ -233,6 +236,13 @@ class ResolutionContext:
     # slot — the ONLY thing that releases the W1 spent latch (doctrine rule 6:
     # duration is a flap filter, never identity).
     qualified_cycle_pending: bool = False
+    # A commanded DISCOVERY read on this slot ANSWERED "no tag" and the tray is still
+    # seated + bare (``ams_presence.read_answered_no_tag`` — the read economy owns the
+    # stamps, the observation lane supplies the tray facts). Hardware evidence, not a
+    # timer: the firmware was asked what is in the slot and said "nothing with a chip".
+    # Only ever computed for a SPENT, TAGGED binding (see row 5's
+    # ``spent_swap_no_tag_read``); False everywhere else, including "not yet asked".
+    no_tag_read_answered: bool = False
     auto_add_unknown: bool = True
     busy: bool = False  # printer RUNNING/PAUSE
     settling: bool = False  # mint/config settle window
@@ -440,6 +450,15 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         # 2026-08-07: spool 212, spent, 1121.5 g on a 1000 g label, holding a ~90 %-full
         # unread newcomer out of service for a full day). Rule 3 is untouched — a tag read
         # over this slot still lands on row 2.1's KEEP and the tiers still own it there.
+        #
+        # "Of ANY tag-ness" needs one honest qualification: the release SIGNAL only reaches
+        # this row because ``spool_tagless._maybe_prompt_fresh_roll`` checks spent-ness
+        # BEFORE tag-ness (fixed in this same wave) — a tagged spent binding whose cycle was
+        # instead routed to the fresh-roll prompt would never present
+        # ``qualified_cycle_pending`` here. And this row needs a CONFIGURED tray, so the
+        # constellations with no config and no cycle at all — a bare tray under a spent
+        # tagged binding, the 2026-08-07 spool 226 shape — cannot reach it: those resolve at
+        # rows 5/6 through ``spent_swap_no_tag_read`` instead.
         if state is SlotState.SPENT_AWAITING_SWAP and binding is not None:
             if ctx.qualified_cycle_pending:
                 return Decision(
@@ -532,6 +551,36 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
             # arm gates on the same seated-state test. A verdict this table emits on
             # weaker evidence than the need authority accepts is a read that is never
             # spent — and a reason that never resolves anything.
+
+            # 5a — the ANSWER to that discovery read, when it came back NO TAG. The arm
+            # above only ever handled the tag-FOUND outcome (a tag lands, row 2 decides);
+            # the no-tag answer — the expected one for every tagless roll — concluded
+            # NOTHING, so the slot went on re-owing a read it had already been given and
+            # parked forever (2026-08-07, spool 226 on 001-H2S slot 1: spent + tagged
+            # binding, a fresh TAGLESS roll seated in the slot, the read answered no-tag at
+            # 20:03 and the slot was still latched a day later). A commanded read that
+            # found no chip over a binding that HAS one is positive proof of a different
+            # roll — the same certainty class as a uuid disagreement — so it resolves here
+            # instead of waiting for evidence that can never arrive: the tray is bare, so
+            # row 4's cycle machinery is unreachable by construction.
+            #
+            # Scoped to TAGGED spent bindings on purpose. Over a spent TAGLESS binding a
+            # no-tag read proves nothing at all (the same core reads the same way before and
+            # after a swap — same-core ambiguity), so that case stays with the
+            # qualified-cycle machinery which measures a PHYSICAL event instead.
+            if (
+                binding is not None
+                and not binding.is_tagless
+                and not ctx.busy
+                and ctx.no_tag_read_answered
+                and ctx.tagless_default is not None
+            ):
+                return Decision(
+                    DecisionKind.REPLACE_SPENT,
+                    spool_id=binding.spool_id,
+                    mint_spec=_tagless_mint_spec(obs, ctx, departed=binding),
+                    reason="spent_swap_no_tag_read",
+                )
             if ctx.busy:
                 # Doctrine rule 5: mid-print inserts are never auto-read.
                 return Decision(DecisionKind.DEFER, reason="mid_print_unresolved")

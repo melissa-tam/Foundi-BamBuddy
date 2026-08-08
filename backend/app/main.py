@@ -1767,16 +1767,10 @@ async def on_ams_change(printer_id: int, ams_data: list):
                 maybe_reconcile_tagged_ledger_decrease,
             )
 
-            # Presence tracking runs in BOTH modes: presence edges, physical-cycle tiers
-            # and the identify pipeline are wire facts, not inventory policy. Guarded —
-            # never breaks the callback.
-            try:
-                from backend.app.services import ams_presence
-
-                await ams_presence.on_ams_change(printer_id, ams_data, db)
-            except Exception as _ape:  # noqa: BLE001 — must never crash the AMS callback
-                logger.warning("AMS presence tracking failed for printer %s: %s", printer_id, _ape)
-
+            # Presence edges ride the RAW observation stream since E1 (2026-08-07):
+            # ``ams_presence.on_tray_observations``, called from
+            # ``printer_manager._run_slot_pipeline_pass`` — the merged lane here keeps
+            # only display + the ledger-consumer duties below.
             _spoolman_on = await get_setting(db, "spoolman_enabled")
             if not _spoolman_on or _spoolman_on.lower() != "true":
                 # Whether AMS remain% may be folded into weight_used this sweep —

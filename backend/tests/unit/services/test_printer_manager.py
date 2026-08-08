@@ -1876,3 +1876,66 @@ class TestResolvePlateId:
             dispatched_subtask=None,
         )
         assert resolve_plate_id(state) is None
+
+
+class TestRunSlotPipelinePass:
+    """``_run_slot_pipeline_pass`` — the raw-push transport (E1, 2026-08-07).
+
+    ONE session carries TWO passes and the ORDER is the contract: ``ams_presence``
+    derives the push's presence edges BEFORE the table resolves the same push, so a gain
+    in this push has already armed its qualified cycle and opened its read occasion by
+    the time the pipeline asks whether the slot owes a read or a swap. The old split —
+    edges on the merged ``main.on_ams_change`` lane, decisions on this one — had no
+    ordering guarantee between them at all. Both passes are guarded INDEPENDENTLY."""
+
+    @pytest.fixture
+    def lanes(self, monkeypatch):
+        """Stub both passes onto a shared call log, and hand the pass a session that
+        needs no database (neither collaborator survives to use it)."""
+        import contextlib
+
+        import backend.app.core.database as core_db
+        from backend.app.services import ams_presence, slot_pipeline
+
+        calls: list[str] = []
+        sentinel_db = object()
+
+        @contextlib.asynccontextmanager
+        async def fake_session():
+            yield sentinel_db
+
+        async def presence(printer_id, observations, db):
+            calls.append("presence")
+
+        async def pipeline(printer_id, observations, deps):
+            calls.append("pipeline")
+
+        monkeypatch.setattr(core_db, "async_session", fake_session)
+        monkeypatch.setattr(ams_presence, "on_tray_observations", presence)
+        monkeypatch.setattr(slot_pipeline, "run_slot_pipeline", pipeline)
+        return calls
+
+    async def test_presence_pass_runs_before_the_pipeline(self, lanes):
+        from backend.app.services.printer_manager import _run_slot_pipeline_pass
+
+        await _run_slot_pipeline_pass(1, [])
+        assert lanes == ["presence", "pipeline"]
+
+    async def test_presence_failure_does_not_stop_the_pipeline(self, lanes, monkeypatch, caplog):
+        """A presence-pass exception is logged and swallowed on the spot: the push still
+        gets its identity/binding decision. The converse (the outer guard) is what keeps
+        a pipeline failure from escaping into the MQTT chain."""
+        from backend.app.services import ams_presence
+        from backend.app.services.printer_manager import _run_slot_pipeline_pass
+
+        async def boom(printer_id, observations, db):
+            lanes.append("presence")
+            raise RuntimeError("presence exploded")
+
+        monkeypatch.setattr(ams_presence, "on_tray_observations", boom)
+
+        with caplog.at_level(logging.ERROR):
+            await _run_slot_pipeline_pass(1, [])
+
+        assert lanes == ["presence", "pipeline"]  # the pipeline still ran
+        assert "AMS presence pass failed for printer 1" in caplog.text

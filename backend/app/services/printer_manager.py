@@ -17,12 +17,24 @@ logger = logging.getLogger(__name__)
 
 
 async def _run_slot_pipeline_pass(printer_id: int, observations: list[TrayObservation]) -> None:
-    """Run ONE slot-pipeline pass for a raw AMS push, in its own session.
+    """Run ONE presence pass + ONE slot-pipeline pass for a raw AMS push, in one session.
 
     The pipeline is the fork's single identity/binding decider; this is only its
     transport from the MQTT thread. Own session (the callback owns no request scope),
     live client handed in for the read-only wire-safety inputs, and fully guarded — the
     pipeline never raises by contract, and neither may its transport.
+
+    PRESENCE FIRST, AND THE ORDER IS THE POINT (E1, 2026-08-07). ``ams_presence`` derives
+    the push's presence EDGES before the table resolves the same push, so a gain in THIS
+    push has already armed its qualified cycle and opened its read occasion by the time
+    the pipeline asks whether the slot owes a read or a swap. A swap decision therefore
+    fires one pass earlier and DETERMINISTICALLY; the old split — edges on the merged
+    ``main.on_ams_change`` lane, decisions on this one — had no ordering guarantee at all
+    between them, and (the incident) could miss the edges entirely.
+
+    The two passes are guarded INDEPENDENTLY inside the shared session: a presence
+    failure must not cost the push its pipeline pass, and the outer guard keeps the
+    converse true. Both are best-effort by contract; neither may break the AMS chain.
 
     Imports are function-local: ``slot_pipeline`` pulls in the models and the settings
     route, and importing that at ``printer_manager`` module scope closes an import cycle
@@ -30,9 +42,15 @@ async def _run_slot_pipeline_pass(printer_id: int, observations: list[TrayObserv
     """
     try:
         from backend.app.core.database import async_session
+        from backend.app.services import ams_presence
         from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
 
         async with async_session() as db:
+            try:
+                await ams_presence.on_tray_observations(printer_id, observations, db)
+            except Exception:  # noqa: BLE001 — a presence failure must not cost the pipeline pass
+                logger.exception("AMS presence pass failed for printer %s", printer_id)
+
             await run_slot_pipeline(
                 printer_id,
                 observations,

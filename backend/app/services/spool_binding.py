@@ -137,7 +137,7 @@ async def stamp_loaded_for_slot(db: AsyncSession, printer_id: int, ams_id: int, 
     """Adjudicate a presence-GAIN re-seat and re-stamp ``loaded_at`` when the roll is new.
 
     Applied to the row CURRENTLY bound to the slot on a debounced genuine presence gain
-    (called best-effort from ``ams_presence.on_ams_change``). The decision is GRAMS-STATE
+    (called best-effort from ``ams_presence.on_tray_observations``). The decision is GRAMS-STATE
     + identity only — never elapsed time (the ≥5 s presence filter upstream is a wire
     debounce, not an identity signal):
 

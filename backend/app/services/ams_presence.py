@@ -7,8 +7,11 @@ spool staged-unit auto-release), but that pipeline only fires when the AMS
 change-hash changes. This module closes the gap the hash alone cannot see — a
 spool inserted while idle or mid-print that the firmware never auto-reads:
 
-* :func:`on_ams_change` — presence-transition tracking, called from
-  ``main.on_ams_change`` inside the existing per-printer lock. A genuine presence
+* :func:`on_tray_observations` — presence-transition tracking, called from
+  ``printer_manager._run_slot_pipeline_pass`` on the RAW observation stream, one pass
+  ahead of the slot pipeline that resolves the same push (E1, 2026-08-07: the merged
+  lane could be BLIND to a genuine insert, so presence edges moved to the lane that
+  already owns identity). A genuine presence
   GAIN is a CHANGE: it records the physical cycle that becomes the discovery lane's
   evidence, and while the printer is idle it immediately spends that evidence on one
   read so a Bambu spool resolves via the normal tag path within seconds. It NEVER
@@ -58,9 +61,13 @@ Every ``ams_get_rfid`` the farm issues goes through the single commander
 :func:`command_identify`, which owns the need check, the echo-consume arming, the
 read bookkeeping and the discovery stamp.
 
-Presence is POSITIVE-evidence-only: ``state ∈ {10, 11}`` is present; state 9,
-None, and unknown dialect codes (H2C idle empties report ``state=0``) all read
-absent, so an H2C never reads as phantom spools.
+Presence is TRI-STATE, owned by ``tray_fields.tray_presence`` (one origin for every
+consumer): ``state ∈ {10, 11}`` is present; a non-present state whose push ALSO asserts
+an empty ``tray_type`` is the verified prod cleared shape and reads absent; everything
+else — a partial push with no parseable state, an unknown dialect code (H2C idle empties
+report ``state=0``), a state-9 slot still asserting a filament type — reads UNKNOWN and
+derives NO edge. So an H2C never reads as phantom spools, and silence about a slot is
+never mistaken for an empty one.
 """
 
 from __future__ import annotations
@@ -78,6 +85,7 @@ from backend.app.services.bambu_mqtt import AMS_STATUS_IDENTIFYING, TRAY_PRESENT
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_tag_matcher import is_valid_tag
 from backend.app.services.tray_fields import parse_int_field
+from backend.app.services.tray_observation import TrayObservation, observation_tray_dict
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -130,8 +138,11 @@ _MIN_PHYSICAL_ABSENT_S = 5.0
 # identify-explained", the same conservative default every edge map here takes.
 _absent_under_identify: dict[tuple[int, int, int], bool] = {}
 
-# Printers whose first on_ams_change (post-restart) has been processed. The first
-# push only seeds the presence map (no re-read); later pushes act on gains.
+# Printers whose first observation batch (post-restart) has been processed. The first
+# batch only seeds the presence map (no re-read); later pushes act on gains. The connect
+# pushall carries every tray, so that batch is comprehensive; a tray first SEEN in a
+# later partial is a genuine gain with an unobserved absence start (see
+# :func:`on_tray_observations`).
 _primed: set[int] = set()
 
 # printer_id -> subtask_id already swept at its terminal. Dedupes duplicate
@@ -142,7 +153,7 @@ _swept_subtasks: dict[int, str] = {}
 # issued on a PRESENT slot. A commanded re-read (ams_get_rfid) on an occupied slot
 # makes the firmware run a ~20 s identify cycle during which the tray state flaps
 # present→9→present; the settle-back is a fresh absent→present GAIN edge that
-# on_ams_change would answer with ANOTHER re-read — a self-sustaining ~22 s loop.
+# on_tray_observations would answer with ANOTHER re-read — a self-sustaining ~22 s loop.
 # This one-shot flag lets the NEXT gain on the slot be recognized as our own
 # command's echo and swallowed exactly once. It is NOT a time-suppression window:
 # empty slots never arm (see record_reread), so a real insertion made right after
@@ -294,6 +305,7 @@ def _reset_state() -> None:
     _discovery_read_at.clear()
     _owed_read_warned_at.clear()
     _read_occasion_at.clear()
+    _spent_occupied_occasion_epoch.clear()
     _commanded_read_at.clear()
     _identifying_seen_at.clear()
     _running_edge_at.clear()
@@ -390,7 +402,7 @@ def record_reread(printer_id: int, ams_id: int, tray_id: int) -> None:
     by the client. It arms ``_echo_pending`` for the slot ONLY when the slot is
     present (state 10/11) at command time, so the next presence GAIN on that slot
     — the settle-back of the firmware's ~20 s identify flap — is recognized as our
-    own command's echo and swallowed exactly once (see :func:`on_ams_change`).
+    own command's echo and swallowed exactly once (see :func:`on_tray_observations`).
 
     An identify on an EMPTY (state 9/absent) slot produces NO edge at all, so an
     empty slot is deliberately NOT armed: arming it would eat a real insertion
@@ -535,6 +547,44 @@ def _read_occasion_open(printer_id: int, ams_id: int, tray_id: int) -> bool:
 def _consume_read_occasion(printer_id: int, ams_id: int, tray_id: int) -> None:
     """Spend the slot's read occasion. Called only from :func:`command_identify`."""
     _read_occasion_at.pop((printer_id, ams_id, tray_id), None)
+
+
+# (printer_id, ams_id, tray_id) -> the BOUND spool id whose spent-occupied constellation
+# has already bought its one read. The epoch key is the bound spool: a spent-occupied
+# constellation (a spent binding under a seated tray the wire cannot identify) is entitled
+# to exactly ONE commanded read per binding-EPOCH, and resolution (a swap, a displacement)
+# changes the bound spool, so a NEW spent constellation re-opens naturally. Keyed on the
+# spool rather than a timestamp because the read may already have been CONSUMED — an epoch
+# whose read is spent must not re-open, which a "is the occasion still open?" test cannot
+# tell from "was one never opened".
+_spent_occupied_occasion_epoch: dict[tuple[int, int, int], int] = {}
+
+
+def open_spent_occupied_occasion(printer_id: int, ams_id: int, tray_id: int, spool_id: int) -> None:
+    """Buy the ONE read a spent-occupied constellation is entitled to, once per epoch.
+
+    The 2026-08-07 liveness hole (spool 226, 001-H2S slot 1): the table emitted
+    ``NONE(spent_occupied_owed_identify)`` on every push, but the read it owed had no
+    ENTITLEMENT — read occasions open only on a qualified physical cycle, the terminal
+    sweep's between-prints policy, or a manual command, and the presence edges for that
+    insert were missed. The verdict is a standing request nothing could ever grant, so the
+    slot parked with a spent binding under a fresh roll indefinitely.
+
+    So the constellation buys its own occasion: the emitting decision is itself the cause
+    (doctrine rule 6/7 — pacing BY CAUSE, never a timer over the verdict), and the
+    binding-epoch key is what keeps it to one read. Idempotent within an epoch: a repeat
+    call for the same bound spool is a no-op even after :func:`command_identify` consumed
+    the occasion, which is what stops the re-derived verdict from becoming a read loop.
+
+    An EMPTY slot can never reach this — the emitting verdict requires ``present is True``
+    and ``identify_needed``'s spent-occupied arm additionally requires state 10 — so the
+    008-H2C empty-slot read-loop class stays closed. Sync, in-memory, never raises.
+    """
+    key = (printer_id, ams_id, tray_id)
+    if _spent_occupied_occasion_epoch.get(key) == spool_id:
+        return
+    _spent_occupied_occasion_epoch[key] = spool_id
+    open_read_occasion(printer_id, ams_id, tray_id)
 
 
 # --- Change-evidence ledger -----------------------------------------------
@@ -998,6 +1048,13 @@ async def maybe_command_owed_identify(
     many terminals later). Called from ``spool_tagless.reconcile_slot_config``'s
     state-derived walk, which supplies the missing OCCASION and nothing else.
 
+    It also spends a STANDING OCCASION that could not be commanded when it was opened —
+    the terminal sweep's between-prints policy and the spent-occupied constellation
+    (:func:`open_spent_occupied_occasion`) both open one from a lane that may be refused on
+    the spot (engaged filament, a busy wire), and before 2026-08-07 nothing drained those:
+    the pre-check required an unanswered CYCLE, which a standing constellation does not
+    have. An occasion is one read by construction, so draining it here cannot loop.
+
     DISCOVERY ONLY — deliberately narrower than :func:`identify_needed`'s full verdict
     set. ``"rfid_refresh"`` is a between-prints policy (the terminal sweep's job): a
     tagged slot always yields it, so honouring it on a ~20 s reconcile cadence would
@@ -1014,10 +1071,16 @@ async def maybe_command_owed_identify(
     identical to every other lane's. Never raises — the caller is a scheduler tick.
     """
     try:
-        # Cheap evidence pre-check: discovery is the only verdict this lane spends, and
-        # an unanswered cycle is its whole test — so a fleet with nothing to discover
-        # costs no DB query at all.
-        if not _unanswered_cycle(printer_id, ams_id, tray_id):
+        # Cheap evidence pre-check: discovery is the only verdict this lane spends, so a
+        # slot with neither of its two entitlements costs no DB query at all. An unanswered
+        # cycle is the event-shaped one; a STANDING OPEN OCCASION is the other, and it was
+        # missing — a slot whose occasion the terminal sweep or the spent-occupied
+        # constellation opened but could not command at open time (engaged filament, a
+        # refused wire, a missed presence edge) had NO drain at all, because the cycle test
+        # alone is False for it. That is the 2026-08-07 spool 226 shape. Cost for a slot
+        # WITH an open occasion: one ``identify_needed`` evaluation (with its DB peek) per
+        # reconcile pass, bounded — the first accepted command consumes the occasion.
+        if not _unanswered_cycle(printer_id, ams_id, tray_id) and not _read_occasion_open(printer_id, ams_id, tray_id):
             return False
         reason = await identify_needed(db, printer_id, ams_id, tray_id, tray, spoolman_active)
         if reason != "discovery":
@@ -1056,6 +1119,81 @@ async def maybe_command_owed_identify(
     except Exception:  # noqa: BLE001 — a scheduler-tick lane must never raise
         logger.exception("Owed discovery read failed for printer %s AMS%d-T%d", printer_id, ams_id, tray_id)
         return False
+
+
+# How long after a commanded DISCOVERY read the absence of a tag counts as that read's
+# ANSWER. The identify cycle a command starts runs ~10-20 s (hard-bounded by
+# :data:`_IDENTIFY_ACTIVE_S`), so 15 s is late enough that a read which WILL answer with a
+# tag has answered — the answer re-stamps ``_slot_read_at`` through
+# :func:`note_identity_learned` — and early enough that a parked slot resolves on the next
+# reconcile pass rather than the next print. A CAUSE window like every other constant here,
+# not a duration filter on identity.
+_NO_TAG_ANSWER_SETTLE_S = 15.0
+
+
+def read_answered_no_tag(printer_id: int, ams_id: int, tray_id: int, *, tray_seated: bool, tray_bare: bool) -> bool:
+    """Hardware evidence that the seated object is NOT the bound tagged roll.
+
+    The other half of the 2026-08-07 spool 226 deadlock. The owed discovery read DID
+    eventually fire (20:03 prod) and answered NO TAG — the expected answer for the tagless
+    roll the operator had inserted — and nothing consumed it: the tray stayed bare, so the
+    tagless lane's row 4 was unreachable, and the slot parked with the spent tagged binding
+    forever. This is the accessor that turns that silence into a fact the decision table can
+    conclude on (``spent_swap_no_tag_read``).
+
+    True iff ALL of:
+
+    * we ASKED this slot a question that can answer "no tag" — ``_discovery_read_at`` holds
+      a stamp for it (only :func:`command_identify` stamps it, only for a ``discovery``
+      read);
+    * at least :data:`_NO_TAG_ANSWER_SETTLE_S` has elapsed since that stamp;
+    * no identify is in flight on the slot (:func:`identify_in_flight`);
+    * ``_slot_read_at`` is NOT newer than the discovery stamp. A tag landing re-stamps it
+      through :func:`note_identity_learned` on the firmware's publish, so a newer value
+      means the read answered WITH a tag (or a newer read owns the slot) — either way this
+      is not a no-tag answer. Equal stamps are the command's own pair (identity-learned is
+      stamped immediately before the discovery stamp), not an answer;
+    * the caller's ``tray_seated`` and ``tray_bare`` are both True.
+
+    The tray facts are CALLER-SUPPLIED on purpose: the observation lane that declared the
+    debt adjudicates it, and this module must not re-derive presence from the merged view
+    (the merge can present a chimera — that is the whole reason observations exist).
+
+    The settle constant is a FLOOR, not the whole pacing: a read commanded on a slot that was
+    already PRESENT also armed the echo flag, so :func:`identify_in_flight` holds True for
+    :data:`_IDENTIFY_ACTIVE_S` (30 s) and the answer actually lands then. Both gates are
+    conservative in the same direction (later, never earlier), which is the correct bias for
+    a fact that authorizes retiring a ledger row.
+
+    A false positive — a transient read failure on a genuinely tagged roll — self-corrects:
+    the next successful read finds the tag and the identity lane displaces the never-fed
+    minted row. Pure in-memory peek, NON-consuming (``_discovery_read_at`` is never popped;
+    it also drives the ``0700_0081`` HMS suppression below), never raises.
+    """
+    if not (tray_seated and tray_bare):
+        return False
+    key = (printer_id, ams_id, tray_id)
+    stamp = _discovery_read_at.get(key)
+    if stamp is None:
+        return False
+    if time.monotonic() - stamp < _NO_TAG_ANSWER_SETTLE_S:
+        return False
+    if identify_in_flight(printer_id, ams_id, tray_id):
+        return False
+    read_at = _slot_read_at.get(key)
+    return not (read_at is not None and read_at > stamp)
+
+
+def tray_state_seated(state: int | None) -> bool:
+    """Is this raw tray state the SEATED-not-feeding shape (:data:`_TRAY_SEATED_STATE`)?
+
+    Public read of the constant this module already owns, for the consumers that hold a
+    parsed state rather than a tray dict (the slot pipeline's no-tag adjudication). State 11
+    is the same roll with its filament threaded on to the hub — feeding, and a feeding tray
+    must never be mint-swapped — so the distinction is load-bearing, not cosmetic. Mirrors
+    the :func:`printer_running` wrapper's role for ``_printer_running``.
+    """
+    return state == _TRAY_SEATED_STATE
 
 
 def is_expected_read_failure(printer_id: int, attr: int, code: int) -> bool:
@@ -1097,15 +1235,47 @@ def is_expected_read_failure(printer_id: int, attr: int, code: int) -> bool:
 # --- presence-gain RFID re-read -------------------------------------------
 
 
-async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> None:
-    """Track presence transitions for a printer's AMS trays.
+async def on_tray_observations(printer_id: int, observations: list[TrayObservation], db: AsyncSession) -> None:
+    """Track presence transitions for a printer's AMS trays, from the RAW push (E1).
 
-    Called from ``main.on_ams_change`` inside the per-printer assignment lock with
-    the merged tray state and an open session. On a presence GAIN while the
-    printer is idle it fires an immediate per-slot RFID re-read (so a Bambu spool
-    resolves via the tag path fast; mid-print refills are handled by the terminal
-    sweep). Never raises — a farm-side failure must never break the AMS callback
-    chain.
+    Called from ``printer_manager._run_slot_pipeline_pass`` with the observations of
+    ONE raw push and an open session, immediately BEFORE ``run_slot_pipeline`` resolves
+    that same push. On a presence GAIN while the printer is idle it fires an immediate
+    per-slot RFID re-read (so a Bambu spool resolves via the tag path fast; mid-print
+    refills are handled by the terminal sweep). Never raises — a farm-side failure must
+    never break the AMS callback chain.
+
+    WHY THE RAW LANE (2026-08-07, 001-H2S slot 1). Presence edges used to be fed from
+    ``main.on_ams_change`` with the MERGED payload, which runs only when bambu_mqtt's
+    change hash flips — and the merged view can be BLIND: a stale ``tray_exist_bits``
+    cache demoted a genuinely inserted roll back to "empty" on every push for 38
+    minutes, so the operator's insert AND their pull+reinsert produced NO edges at all
+    (no qualified cycle, no read occasion, no FIFO stamp) while the raw observation
+    lane — which has owned identity and binding since the 2026-08-02 cutover — saw the
+    roll the whole time. That cutover moved identity to the raw lane but left presence
+    behind; this finishes it. Edges and binding decisions now read the SAME push, so
+    they can no longer disagree about what the wire said, and the merged lane keeps
+    display + ledger-consumer duties only.
+
+    PRESENCE IS TRI-STATE HERE, and that is new-and-correct rather than a port defect.
+    The merged lane's ``_tray_present`` answered a BOOLEAN for every tray, so "this push
+    said nothing about the slot" was indistinguishable from "the slot is empty" and a
+    reduced mid-print push could manufacture a loss edge out of silence.
+    ``obs.present is None`` now means UNKNOWN: the tray's presence duties are skipped
+    entirely — ``_last_presence`` is left exactly as it was and NO edge is derived, so a
+    later real edge still has an honest ``prev`` to compare against. Unknown never
+    manufactures an edge (the doctrine's gate-on-``is False``-only rule, applied to
+    edges instead of releases).
+
+    FIRST-BATCH SEEDING. The first batch for a printer only seeds ``_last_presence`` —
+    a refill done while the server was down must not read as a fresh gain — and the
+    connect pushall carries every tray, so that batch is comprehensive. A tray that
+    first APPEARS in a LATER partial with ``prev`` unset and ``present is True`` is a
+    genuine gain whose absence START was never observed: ``absent_at`` is None, so it
+    takes the existing ``qualified=True, physical_cycle=False`` path — it OPENS a read
+    occasion but banks no measured cycle. That closes the boot-seeding hole (such a
+    gain used to fire nothing at all) without letting an unmeasured absence mint a
+    spool row or prompt the operator.
     """
     try:
         is_first = printer_id not in _primed
@@ -1125,241 +1295,240 @@ async def on_ams_change(printer_id: int, ams_data: list, db: AsyncSession) -> No
         if getattr(state, "ams_status_main", 0) == AMS_STATUS_IDENTIFYING:
             _identifying_seen_at[printer_id] = time.monotonic()
 
-        for ams_unit in ams_data or []:
-            if not isinstance(ams_unit, dict):
-                continue
-            try:
-                ams_id = int(ams_unit.get("id", 0))
-            except (TypeError, ValueError):
-                continue
-            for tray in ams_unit.get("tray", []) or []:
-                if not isinstance(tray, dict):
-                    continue
-                try:
-                    tray_id = int(tray.get("id", 0))
-                except (TypeError, ValueError):
-                    continue
+        for obs in observations:
+            ams_id = obs.ams_id
+            tray_id = obs.tray_id
+            key = obs.slot
+            present = obs.present
+            prev = _last_presence.get(key)
 
-                key = (printer_id, ams_id, tray_id)
-                present = _tray_present(tray)
-                prev = _last_presence.get(key)
+            # Only an ANSWER about presence updates the map (see the tri-state note in
+            # the docstring). ``None`` leaves ``prev`` standing and derives no edge.
+            if present is not None:
                 _last_presence[key] = present
 
-                if is_first:
-                    # First push after a (re)start only seeds the presence map so
-                    # a refill done while down doesn't read as a fresh gain.
-                    continue
+            if is_first:
+                # First batch after a (re)start only seeds the presence map so
+                # a refill done while down doesn't read as a fresh gain.
+                continue
 
-                if not present and prev:
-                    # PRESENT→ABSENT: stamp the absence start so a later genuine GAIN
-                    # can tell a real physical roll swap (≥ _MIN_PHYSICAL_ABSENT_S)
-                    # from a runout-instant state flap (sub-second). Alongside it,
-                    # record — while the signal is freshest — whether an identify
-                    # explains this absence: an identify unloads the tray for ~10–20 s,
-                    # a read flap the later gain must never bank as a QUALIFIED cycle
-                    # however long it runs (duration ≠ identity, the doctrine's rule 6).
-                    _absent_since[key] = time.monotonic()
-                    _absent_under_identify[key] = _identify_explains_absence(printer_id, ams_id, tray_id)
+            if present is False and prev:
+                # PRESENT→ABSENT: stamp the absence start so a later genuine GAIN
+                # can tell a real physical roll swap (≥ _MIN_PHYSICAL_ABSENT_S)
+                # from a runout-instant state flap (sub-second). Alongside it,
+                # record — while the signal is freshest — whether an identify
+                # explains this absence: an identify unloads the tray for ~10–20 s,
+                # a read flap the later gain must never bank as a QUALIFIED cycle
+                # however long it runs (duration ≠ identity, the doctrine's rule 6).
+                _absent_since[key] = time.monotonic()
+                _absent_under_identify[key] = _identify_explains_absence(printer_id, ams_id, tray_id)
 
-                if present and not prev:
-                    # Consume the slot's commanded-read cause on the FIRST gain that
-                    # follows it, whichever gain that is: the identify's own echo (about
-                    # to be swallowed below) or the settle-back the qualifier judges. One
-                    # command explains one flap — leaving the stamp behind would suppress
-                    # the genuine pull+reseat that comes after the identify settled, the
-                    # exact over-suppression _identify_explains_absence warns about.
-                    commanded_at = _commanded_read_at.pop(key, None)
+            if present is True and not prev:
+                # Consume the slot's commanded-read cause on the FIRST gain that
+                # follows it, whichever gain that is: the identify's own echo (about
+                # to be swallowed below) or the settle-back the qualifier judges. One
+                # command explains one flap — leaving the stamp behind would suppress
+                # the genuine pull+reseat that comes after the identify settled, the
+                # exact over-suppression _identify_explains_absence warns about.
+                commanded_at = _commanded_read_at.pop(key, None)
 
-                    # Echo-consume FIRST: a re-read we commanded on this present
-                    # slot flaps the firmware's tray state present→9→present
-                    # (~20 s); the settle-back arrives here as a fresh gain. If a
-                    # flag is armed for the slot, THIS gain is our command's own
-                    # echo — pop it and swallow the whole edge (no re-read AND no
-                    # feed-fault clear; the spool never physically moved). Popped
-                    # regardless of ``running`` — an echo can land as a print
-                    # starts. A stale flag (identify never ran) reads as no flag →
-                    # the gain acts normally.
-                    ts = _echo_pending.pop(key, None)
-                    if ts is not None and time.monotonic() - ts < _ECHO_PENDING_STALE_S:
-                        logger.debug(
-                            "AMS presence: swallowed re-read echo for printer %d AMS%d-T%d",
-                            printer_id,
-                            ams_id,
-                            tray_id,
-                        )
-                        continue
-
-                    # Consume the absence stamp for this genuine gain (an echo above
-                    # never reaches here). ≥ _MIN_PHYSICAL_ABSENT_S ⇒ a real physical
-                    # roll swap; a firmware runout state flap is sub-second → no cycle.
-                    # An absence we never saw START (slot absent since the first push,
-                    # or two edges coalesced into one payload) has UNKNOWN duration,
-                    # not a flap — it qualifies. spool_tagless keeps the stricter
-                    # measured-only rule below, because minting a spool row on a false
-                    # positive is expensive while a suppressed discovery read is not.
-                    absent_at = _absent_since.pop(key, None)
-                    absent_for = None if absent_at is None else time.monotonic() - absent_at
-                    # An identify unloads the tray, and a print start engages the AMS:
-                    # an absence that BEGAN under identify activity (flag captured at its
-                    # start edge, freshest there), or one explained by ANY non-physical
-                    # cause inside the absence/gain window (a read we commanded whatever
-                    # the tray state was, an observed firmware-autonomous identify, or the
-                    # printer entering RUNNING), is a machine flap and never a physical
-                    # cycle — no matter how long it ran. The ≥5 s filter measures duration,
-                    # never identity (rule 6); the two gate the gain together below.
-                    identify_explained = _absent_under_identify.pop(key, False) or _identify_explains_gain(
+                # Echo-consume FIRST: a re-read we commanded on this present
+                # slot flaps the firmware's tray state present→9→present
+                # (~20 s); the settle-back arrives here as a fresh gain. If a
+                # flag is armed for the slot, THIS gain is our command's own
+                # echo — pop it and swallow the whole edge (no re-read AND no
+                # feed-fault clear; the spool never physically moved). Popped
+                # regardless of ``running`` — an echo can land as a print
+                # starts. A stale flag (identify never ran) reads as no flag →
+                # the gain acts normally.
+                ts = _echo_pending.pop(key, None)
+                if ts is not None and time.monotonic() - ts < _ECHO_PENDING_STALE_S:
+                    logger.debug(
+                        "AMS presence: swallowed re-read echo for printer %d AMS%d-T%d",
                         printer_id,
                         ams_id,
                         tray_id,
-                        absent_at=absent_at,
-                        commanded_at=commanded_at,
-                        paused=paused,
                     )
-                    physical_cycle = (
-                        absent_for is not None and absent_for >= _MIN_PHYSICAL_ABSENT_S and not identify_explained
-                    )
+                    continue
 
-                    # Genuine physical re-insert: clear any feed-fault out-of-
-                    # rotation flag. NOT idle-gated (a spool untangled and re-
-                    # seated mid-print clears too) and NOT on the first-push seed.
-                    # Gated on NOT drying: a drying cycle flaps tray presence
-                    # (state → 10) with no physical event, and a jammed spool must
-                    # not silently re-enter rotation from a drying flap.
-                    # Best-effort — a failure must never break the AMS callback.
-                    if not unit_drying(printer_id, ams_id):
-                        # ``qualified`` = a genuine gain that is NOT a MEASURED sub-5 s
-                        # flap: the preceding absence either lasted >= _MIN_PHYSICAL_ABSENT_S
-                        # OR its start was never observed (boot-seed / two coalesced edges),
-                        # so its duration is UNKNOWN — not a flap, it qualifies (see the
-                        # absence-consume comment above). ``physical_cycle`` is the STRICTER
-                        # measured->=5 s subset. The two gate different actions below.
-                        # An identify-explained absence is a read flap, never a human roll
-                        # movement, so it disqualifies BOTH tiers (the invariant this fix
-                        # adds); a missing/unknown-duration absence still qualifies ONLY
-                        # when no identify explains it.
-                        qualified = (
-                            absent_for is None or absent_for >= _MIN_PHYSICAL_ABSENT_S
-                        ) and not identify_explained
+                # Consume the absence stamp for this genuine gain (an echo above
+                # never reaches here). ≥ _MIN_PHYSICAL_ABSENT_S ⇒ a real physical
+                # roll swap; a firmware runout state flap is sub-second → no cycle.
+                # An absence we never saw START (slot absent since the first push,
+                # a tray first appearing in a later partial, or two edges coalesced
+                # into one payload) has UNKNOWN duration, not a flap — it qualifies.
+                # spool_tagless keeps the stricter measured-only rule below, because
+                # minting a spool row on a false positive is expensive while a
+                # suppressed discovery read is not.
+                absent_at = _absent_since.pop(key, None)
+                absent_for = None if absent_at is None else time.monotonic() - absent_at
+                # An identify unloads the tray, and a print start engages the AMS:
+                # an absence that BEGAN under identify activity (flag captured at its
+                # start edge, freshest there), or one explained by ANY non-physical
+                # cause inside the absence/gain window (a read we commanded whatever
+                # the tray state was, an observed firmware-autonomous identify, or the
+                # printer entering RUNNING), is a machine flap and never a physical
+                # cycle — no matter how long it ran. The ≥5 s filter measures duration,
+                # never identity (rule 6); the two gate the gain together below.
+                identify_explained = _absent_under_identify.pop(key, False) or _identify_explains_gain(
+                    printer_id,
+                    ams_id,
+                    tray_id,
+                    absent_at=absent_at,
+                    commanded_at=commanded_at,
+                    paused=paused,
+                )
+                physical_cycle = (
+                    absent_for is not None and absent_for >= _MIN_PHYSICAL_ABSENT_S and not identify_explained
+                )
 
-                        # Record the change for the identify lanes. Drying-gated with
-                        # the rest: a drying cycle disengages trays with no physical
-                        # event, and change evidence must mean somebody moved a spool.
-                        _note_gain(printer_id, ams_id, tray_id, qualified=qualified)
+                # Genuine physical re-insert: clear any feed-fault out-of-
+                # rotation flag. NOT idle-gated (a spool untangled and re-
+                # seated mid-print clears too) and NOT on the first-batch seed.
+                # Gated on NOT drying: a drying cycle flaps tray presence
+                # (state → 10) with no physical event, and a jammed spool must
+                # not silently re-enter rotation from a drying flap.
+                # Best-effort — a failure must never break the AMS callback.
+                if not unit_drying(printer_id, ams_id):
+                    # ``qualified`` = a genuine gain that is NOT a MEASURED sub-5 s
+                    # flap: the preceding absence either lasted >= _MIN_PHYSICAL_ABSENT_S
+                    # OR its start was never observed (boot-seed / first sight in a later
+                    # partial / two coalesced edges), so its duration is UNKNOWN — not a
+                    # flap, it qualifies (see the absence-consume comment above).
+                    # ``physical_cycle`` is the STRICTER measured->=5 s subset. The two
+                    # gate different actions below.
+                    # An identify-explained absence is a read flap, never a human roll
+                    # movement, so it disqualifies BOTH tiers (the invariant this fix
+                    # adds); a missing/unknown-duration absence still qualifies ONLY
+                    # when no identify explains it.
+                    qualified = (absent_for is None or absent_for >= _MIN_PHYSICAL_ABSENT_S) and not identify_explained
 
-                        try:
-                            from backend.app.services.spool_recovery import clear_on_reinsert
+                    # Record the change for the identify lanes. Drying-gated with
+                    # the rest: a drying cycle disengages trays with no physical
+                    # event, and change evidence must mean somebody moved a spool.
+                    _note_gain(printer_id, ams_id, tray_id, qualified=qualified)
 
-                            await clear_on_reinsert(db, printer_id, ams_id, tray_id, tray)
-                        except Exception:  # noqa: BLE001 — best-effort clear
-                            logger.exception(
-                                "AMS presence: feed-fault clear failed for printer %d AMS%d-T%d",
-                                printer_id,
-                                ams_id,
-                                tray_id,
-                            )
-
-                        # Refill auto-resume (006-H2S 2026-07-26): this gain may be the
-                        # same-slot refill a runout-escalated print is PAUSEd waiting
-                        # for. Spawned, not awaited — it sleeps out an AMS settle window
-                        # before resuming and must not hold the AMS callback. Through
-                        # spawn_background_task (core/tasks.py: the one sanctioned
-                        # create_task call site) so the sleeping task keeps a strong
-                        # reference and cannot be GC'd mid-wait. The service owns every
-                        # gate (setting, live PAUSE, the runout hold, and "the firmware
-                        # is demanding THIS slot") and never raises.
-                        try:
-                            from backend.app.core.tasks import spawn_background_task
-                            from backend.app.services.spool_recovery import maybe_auto_resume_on_refill
-
-                            spawn_background_task(
-                                maybe_auto_resume_on_refill(printer_id, ams_id, tray_id),
-                                name=f"runout-refill-resume-p{printer_id}-ams{ams_id}-t{tray_id}",
-                            )
-                        except Exception:  # noqa: BLE001 — best-effort assist
-                            logger.exception(
-                                "AMS presence: refill auto-resume spawn failed for printer %d AMS%d-T%d",
-                                printer_id,
-                                ams_id,
-                                tray_id,
-                            )
-
-                        # W1/W5 spent-binding-latch release + fresh-roll prompt fire ONLY on
-                        # the STRICT ``physical_cycle`` (a MEASURED >= 5 s absence). Minting a
-                        # spool row or prompting on a false positive is expensive, so the
-                        # unknown-duration case is deliberately excluded here. Guarded like
-                        # the clear above; never break the AMS callback.
-                        if physical_cycle:
-                            try:
-                                from backend.app.services import spool_tagless
-
-                                await spool_tagless.note_physical_cycle(printer_id, ams_id, tray_id)
-                            except Exception:  # noqa: BLE001 — best-effort physical-cycle note
-                                logger.exception(
-                                    "AMS presence: physical-cycle note failed for printer %d AMS%d-T%d",
-                                    printer_id,
-                                    ams_id,
-                                    tray_id,
-                                )
-
-                        # Re-stampable FIFO ordinal (006-H2S) fires on the WIDER
-                        # ``qualified`` gate — a boot-spanning / unknown-duration re-seat
-                        # must still adjudicate to honour rule 2's restart-durability
-                        # contract, and a wrong re-stamp is only a FIFO demotion, never an
-                        # expensive mint/prompt (the deliberate two-tier asymmetry vs the
-                        # strict physical_cycle gate above). A MEASURED sub-5 s flap still
-                        # fires nothing. The grams-state + identity DECISION inside the
-                        # adjudicator consults no timing — this gate is only the wire-flap
-                        # debounce. Best-effort — never break the AMS callback.
-                        if qualified:
-                            try:
-                                from backend.app.services.spool_binding import stamp_loaded_for_slot
-
-                                await stamp_loaded_for_slot(db, printer_id, ams_id, tray_id)
-                            except Exception:  # noqa: BLE001 — best-effort loaded_at re-stamp
-                                logger.exception(
-                                    "AMS presence: loaded_at re-stamp failed for printer %d AMS%d-T%d",
-                                    printer_id,
-                                    ams_id,
-                                    tray_id,
-                                )
-
-                # The firmware answered for this slot: its identity is current, so an
-                # older physical cycle is no longer unanswered evidence and the
-                # terminal sweep must not spend a discovery read on it. Stamped on
-                # ANY push carrying a valid tag, not just gains — a tag that lands
-                # seconds after an insert is exactly the answer we were waiting for.
-                if _tray_tagged(tray):
-                    note_identity_learned(printer_id, ams_id, tray_id)
-
-                # Steady state: act only on a genuine presence GAIN, and only while
-                # the printer is idle. Firing ams_get_rfid during a print is unsafe;
-                # the terminal sweep handles mid-print refills. A LOSS only updates
-                # the map above (NO auto-unassign). Skip while drying — a drying flap
-                # is not a real insert and a re-read would fail the cycle. The need
-                # check (an untouched tagless slot must never be read) lives in
-                # identify_needed, evaluated with the tray we were just handed.
-                #
-                # This lane spends DISCOVERY reads only. The other verdict,
-                # "rfid_refresh", is a between-prints policy: at a gain the firmware
-                # has usually just read the tag itself (which is why the tray already
-                # carries one), so commanding a read here would only re-flap a slot
-                # whose identity is current. The terminal sweep does that refresh.
-                if present and not prev and not running and not unit_drying(printer_id, ams_id):
                     try:
-                        # Settings read stays on the gain path only — a physical
-                        # insert, not something every status push pays for.
-                        reason = await identify_needed(
-                            db, printer_id, ams_id, tray_id, tray, await _spoolman_active(db)
-                        )
-                        if reason == "discovery":
-                            await command_identify(printer_id, ams_id, tray_id, source="idle_gain", reason=reason)
-                    except Exception:  # noqa: BLE001 — best-effort re-read
+                        from backend.app.services.spool_recovery import clear_on_reinsert
+
+                        await clear_on_reinsert(db, printer_id, ams_id, tray_id, observation_tray_dict(obs))
+                    except Exception:  # noqa: BLE001 — best-effort clear
                         logger.exception(
-                            "AMS presence: immediate re-read failed for printer %d AMS%d-T%d",
+                            "AMS presence: feed-fault clear failed for printer %d AMS%d-T%d",
                             printer_id,
                             ams_id,
                             tray_id,
                         )
+
+                    # Refill auto-resume (006-H2S 2026-07-26): this gain may be the
+                    # same-slot refill a runout-escalated print is PAUSEd waiting
+                    # for. Spawned, not awaited — it sleeps out an AMS settle window
+                    # before resuming and must not hold the AMS callback. Through
+                    # spawn_background_task (core/tasks.py: the one sanctioned
+                    # create_task call site) so the sleeping task keeps a strong
+                    # reference and cannot be GC'd mid-wait. The service owns every
+                    # gate (setting, live PAUSE, the runout hold, and "the firmware
+                    # is demanding THIS slot") and never raises.
+                    try:
+                        from backend.app.core.tasks import spawn_background_task
+                        from backend.app.services.spool_recovery import maybe_auto_resume_on_refill
+
+                        spawn_background_task(
+                            maybe_auto_resume_on_refill(printer_id, ams_id, tray_id),
+                            name=f"runout-refill-resume-p{printer_id}-ams{ams_id}-t{tray_id}",
+                        )
+                    except Exception:  # noqa: BLE001 — best-effort assist
+                        logger.exception(
+                            "AMS presence: refill auto-resume spawn failed for printer %d AMS%d-T%d",
+                            printer_id,
+                            ams_id,
+                            tray_id,
+                        )
+
+                    # W1/W5 spent-binding-latch release + fresh-roll prompt fire ONLY on
+                    # the STRICT ``physical_cycle`` (a MEASURED >= 5 s absence). Minting a
+                    # spool row or prompting on a false positive is expensive, so the
+                    # unknown-duration case is deliberately excluded here. Guarded like
+                    # the clear above; never break the AMS callback.
+                    if physical_cycle:
+                        try:
+                            from backend.app.services import spool_tagless
+
+                            await spool_tagless.note_physical_cycle(printer_id, ams_id, tray_id)
+                        except Exception:  # noqa: BLE001 — best-effort physical-cycle note
+                            logger.exception(
+                                "AMS presence: physical-cycle note failed for printer %d AMS%d-T%d",
+                                printer_id,
+                                ams_id,
+                                tray_id,
+                            )
+
+                    # Re-stampable FIFO ordinal (006-H2S) fires on the WIDER
+                    # ``qualified`` gate — a boot-spanning / unknown-duration re-seat
+                    # must still adjudicate to honour rule 2's restart-durability
+                    # contract, and a wrong re-stamp is only a FIFO demotion, never an
+                    # expensive mint/prompt (the deliberate two-tier asymmetry vs the
+                    # strict physical_cycle gate above). A MEASURED sub-5 s flap still
+                    # fires nothing. The grams-state + identity DECISION inside the
+                    # adjudicator consults no timing — this gate is only the wire-flap
+                    # debounce. Best-effort — never break the AMS callback.
+                    if qualified:
+                        try:
+                            from backend.app.services.spool_binding import stamp_loaded_for_slot
+
+                            await stamp_loaded_for_slot(db, printer_id, ams_id, tray_id)
+                        except Exception:  # noqa: BLE001 — best-effort loaded_at re-stamp
+                            logger.exception(
+                                "AMS presence: loaded_at re-stamp failed for printer %d AMS%d-T%d",
+                                printer_id,
+                                ams_id,
+                                tray_id,
+                            )
+
+            # The firmware answered for this slot: its identity is current, so an
+            # older physical cycle is no longer unanswered evidence and the
+            # terminal sweep must not spend a discovery read on it. Stamped on
+            # ANY push carrying a valid tag, not just gains — a tag that lands
+            # seconds after an insert is exactly the answer we were waiting for —
+            # and deliberately INDEPENDENT of presence: a reduced push, or an
+            # always-``state=3`` dialect (A1 family / P1S), answers about identity
+            # while saying nothing about presence, and that answer still counts.
+            # ``identity_asserted`` is a STRONGER source than the merged lane's
+            # ``_tray_tagged``: it is the observation's ATOMIC pair, so a chimera
+            # (this push's tag beside a previous push's uuid, the 001-T3 class) can
+            # never be read as an answer here.
+            if obs.identity_asserted:
+                note_identity_learned(printer_id, ams_id, tray_id)
+
+            # Steady state: act only on a genuine presence GAIN, and only while
+            # the printer is idle. Firing ams_get_rfid during a print is unsafe;
+            # the terminal sweep handles mid-print refills. A LOSS only updates
+            # the map above (NO auto-unassign). Skip while drying — a drying flap
+            # is not a real insert and a re-read would fail the cycle. The need
+            # check (an untouched tagless slot must never be read) lives in
+            # identify_needed, evaluated with the tray this push asserted.
+            #
+            # This lane spends DISCOVERY reads only. The other verdict,
+            # "rfid_refresh", is a between-prints policy: at a gain the firmware
+            # has usually just read the tag itself (which is why the tray already
+            # carries one), so commanding a read here would only re-flap a slot
+            # whose identity is current. The terminal sweep does that refresh.
+            if present is True and not prev and not running and not unit_drying(printer_id, ams_id):
+                try:
+                    # Settings read stays on the gain path only — a physical
+                    # insert, not something every status push pays for.
+                    reason = await identify_needed(
+                        db, printer_id, ams_id, tray_id, observation_tray_dict(obs), await _spoolman_active(db)
+                    )
+                    if reason == "discovery":
+                        await command_identify(printer_id, ams_id, tray_id, source="idle_gain", reason=reason)
+                except Exception:  # noqa: BLE001 — best-effort re-read
+                    logger.exception(
+                        "AMS presence: immediate re-read failed for printer %d AMS%d-T%d",
+                        printer_id,
+                        ams_id,
+                        tray_id,
+                    )
     except Exception:  # noqa: BLE001 — must never crash the AMS callback chain
         logger.exception("AMS presence tracking failed for printer %s", printer_id)
 

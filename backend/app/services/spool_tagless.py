@@ -117,6 +117,14 @@ _MINT_SETTLE_S = 5.0
 # spent row with NO pending cycle stays latched (no phantom mint). Popped once
 # processed on every path; process-lifetime (a swap during downtime degrades
 # to a latched+excluded slot, released by pull/reseat — honest, not silent).
+#
+# SURVIVAL INVARIANT: a pending cycle on a SPENT-bound slot survives — regardless of
+# the bound row's tag-ness — until consumed by exactly ONE of the pipeline's
+# REPLACE_SPENT arm (:func:`consume_qualified_cycle`),
+# :func:`maybe_autoconfigure_bare_tray`'s spent gate, or :func:`apply_fresh_roll`. Only
+# NON-spent outcomes discard. :func:`_maybe_prompt_fresh_roll` upholds this by checking
+# spent-ness FIRST: it runs inside the same await that ARMS the entry, so any earlier
+# discard there destroys the release signal before a consumer can ever see it.
 _pending_physical_cycles: set[tuple[int, int, int]] = set()
 
 # Fraction of a tagless row's label weight consumed past which a physical cycle
@@ -824,12 +832,15 @@ async def clear_fresh_prompt(db: AsyncSession, spool: Spool) -> None:
 async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> None:
     """W5 over-consumption / fresh-roll prompt for a physical cycle on a tagless slot.
 
-    Reads the slot's kept assignment. A SPENT bound row leaves the pending cycle for
-    the W1 spent→mint transition (certain fresh roll — silent, no prompt). A NON-spent
-    row whose tray is STILL PRESENT and is consumed past
+    Reads the slot's kept assignment. A SPENT bound row **of any tag-ness** leaves the
+    pending cycle for the W1 spent→mint transition (certain fresh roll — silent, no
+    prompt). A NON-spent row whose tray is STILL PRESENT and is consumed past
     :data:`_FRESH_ROLL_PROMPT_USED_FRAC` of its label broadcasts ``tagless_fresh_prompt``
     and stamps ``fresh_prompt_pending_at``. Every non-spent outcome (prompt, absent tray,
     or sub-threshold) POPs the pending cycle — no latch is involved for non-spent rows.
+
+    The spent check running FIRST is load-bearing (see the
+    :data:`_pending_physical_cycles` survival invariant), not cosmetic ordering.
 
     This function runs only on a qualified-cycle edge, so the stamp is RE-stamped
     rather than deduped against: each new roll swap re-asks, which is the per-cycle
@@ -848,11 +859,20 @@ async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: in
     )
     assignment = res.scalar_one_or_none()
     spool = assignment.spool if assignment is not None else None
+    # SPENT FIRST, for ANY tag-ness — order is load-bearing, not style. Spent-ness is
+    # decided by the RUNOUT, never by whether the row carries an RFID identity, and this
+    # function runs inside the very await that ARMS the pending cycle
+    # (``note_physical_cycle``). With the tag-ness veto first, a spent TAGGED binding
+    # discarded its own release signal here before either consumer (the pipeline's
+    # REPLACE_SPENT arm, ``maybe_autoconfigure_bare_tray``'s spent gate) could ever see a
+    # cycle — the same shape as the origin-veto bug one lane over, and the second lock on
+    # the deadlocked slot (2026-08-07 #2, spool 226 / 001-H2S slot 1: a spent tagged row
+    # latching its slot against the fresh roll physically seated in it).
+    if spool is not None and spool.spent_at is not None:
+        return  # leave the pending cycle for the W1 spent→mint transition (silent)
     if spool is None or not is_tagless_spool(spool):
         _pending_physical_cycles.discard(key)  # nothing tagless bound to latch/prompt
         return
-    if spool.spent_at is not None:
-        return  # leave the pending cycle for the W1 spent→mint transition (silent)
     # Presence re-check before the stamp (2026-08-07). The cycle that got us here is a
     # presence GAIN, but the prompt asks "did you put a FRESH ROLL in this slot?" — a
     # question with no answer when the slot is EMPTY right now. A phantom edge (an AMS
@@ -893,7 +913,7 @@ async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: in
 async def note_physical_cycle(printer_id: int, ams_id: int, tray_id: int) -> None:
     """Record a QUALIFIED physical roll swap on a slot — the W1 latch release + W5 prompt.
 
-    Called (guarded, awaited) from ``ams_presence.on_ams_change`` on a genuine presence
+    Called (guarded, awaited) from ``ams_presence.on_tray_observations`` on a genuine presence
     GAIN whose preceding absence lasted ≥ ``ams_presence._MIN_PHYSICAL_ABSENT_S``. Arms
     :data:`_pending_physical_cycles` (the spent-binding latch's release signal that the
     pipeline's REPLACE_SPENT arm / :func:`maybe_autoconfigure_bare_tray` consume on the

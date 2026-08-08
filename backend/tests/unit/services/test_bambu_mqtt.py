@@ -1386,6 +1386,209 @@ class TestApplyTrayExistBitsHelper:
         assert apply_tray_exist_bits(units, None) == 0
         assert units[0]["tray"][0]["state"] == 9  # untouched
 
+    def test_fresh_bits_demote_present_tray_explicit_allow(self):
+        """Mirror-image pin for the FRESH direction: bits carried by the current
+        push keep full authority, so a clear bit demotes + wipes even a tray whose
+        own state says present. Passing allow_demote=True explicitly pins the
+        parameter's True branch (the default is asserted by the tests above)."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PETG", "remain": 75}]}]
+        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True, allow_demote=True)
+        assert cleared == 1
+        assert units[0]["tray"][0]["state"] == 9
+        assert units[0]["tray"][0]["tray_type"] == ""
+        assert units[0]["tray"][0]["remain"] == 0
+
+    def test_stale_bits_never_demote_seated_state_ten(self):
+        """2026-08-07 001-H2S repro: a CACHED bitmask (allow_demote=False) whose bit
+        is clear must NOT demote a tray asserting state 10 — a physical insert is
+        fresh positive evidence and outranks the stale negative bit. Left entirely
+        untouched: state AND content (the incident wiped it silently, because the
+        wipe only logs when tray_type is truthy and a fresh bare tray has none)."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 0, "state": 10, "tray_type": "PETG", "remain": 75}]}]
+        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True, allow_demote=False)
+        assert cleared == 0
+        assert units[0]["tray"][0]["state"] == 10
+        assert units[0]["tray"][0]["tray_type"] == "PETG"
+        assert units[0]["tray"][0]["remain"] == 75
+
+    def test_stale_bits_never_demote_seated_state_eleven(self):
+        """Same for state 11 (loaded/fed) — the other member of TRAY_PRESENT_STATES.
+        Tolerate the string form the raw wire sometimes carries."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [
+            {
+                "id": 0,
+                "tray": [
+                    {"id": 0, "state": 11, "tray_type": "PLA"},
+                    {"id": 1, "state": "11", "tray_type": "PETG"},
+                ],
+            }
+        ]
+        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True, allow_demote=False)
+        assert cleared == 0
+        assert units[0]["tray"][0]["state"] == 11
+        assert units[0]["tray"][0]["tray_type"] == "PLA"
+        # Untouched means untouched — the string state is not even normalized.
+        assert units[0]["tray"][1]["state"] == "11"
+        assert units[0]["tray"][1]["tray_type"] == "PETG"
+
+    def test_stale_bits_state_nine_is_idempotent_noop(self):
+        """A tray that already asserts empty (state 9, cleared content) is not
+        asserting presence, so the skip does not apply — and re-writing the same
+        empty shape changes nothing."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 0, "state": 9, "tray_type": "", "remain": 0}]}]
+        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True, allow_demote=False)
+        assert cleared == 0  # nothing to wipe → counter untouched
+        assert units[0]["tray"][0]["state"] == 9
+        assert units[0]["tray"][0]["tray_type"] == ""
+
+    def test_stale_bits_still_clear_non_present_tray_with_stale_content(self):
+        """The skip is scoped to trays ASSERTING presence. A non-present tray
+        (state 9 here, but equally 8 / 0 / unparseable) still takes the #147
+        stale-content cleanup from a cached mask."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 0, "state": 9, "tray_type": "PETG", "remain": 75}]}]
+        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True, allow_demote=False)
+        assert cleared == 1
+        assert units[0]["tray"][0]["state"] == 9
+        assert units[0]["tray"][0]["tray_type"] == ""
+        assert units[0]["tray"][0]["remain"] == 0
+
+    def test_stale_bits_still_promote_stuck_state_nine(self):
+        """Promotion is UNAFFECTED by allow_demote: a cached set bit may still
+        promote a stuck state-9 slot 9→10 (003-H2S). The asymmetry is deliberate —
+        a stale SET bit at worst delays a removal by one push, while a stale CLEAR
+        bit blinds the farm to a physical insert."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 0, "state": 9}, {"id": 1, "state": 9}]}]
+        # 0x1 = bit 0 set (promote), bit 1 clear (empty, stays 9).
+        cleared = apply_tray_exist_bits(units, "1", power_on_flag=True, allow_demote=False)
+        assert cleared == 0
+        assert units[0]["tray"][0]["state"] == 10
+        assert units[0]["tray"][1]["state"] == 9
+
+
+class TestAmsCachedExistBitsNeverDemote:
+    """`_handle_ams_data` call-site level: the cached-bitmask fallback may promote
+    but never demote (2026-08-07 001-H2S slot 1 — the farm was blind to a physical
+    spool insert for 38 minutes because every push that omitted tray_exist_bits
+    re-demoted the seated tray using bits cached while the slot was still empty).
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST_H2S",
+            access_code="12345678",
+        )
+
+    @staticmethod
+    def _tray(mqtt_client, tray_id, ams_id=0):
+        """Merged tray by ID — never by position: a partial push rebuilds the unit's
+        tray list from the trays IT carries, so positions are not stable."""
+        unit = next(u for u in mqtt_client.state.raw_data["ams"] if u.get("id") == ams_id)
+        return next(t for t in unit["tray"] if t.get("id") == tray_id)
+
+    @staticmethod
+    def _seed(mqtt_client, bits):
+        """Full push: slot 0 loaded, slot 1 empty — with `bits` on the wire."""
+        mqtt_client._handle_ams_data(
+            {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [
+                            {"id": 0, "tray_type": "PLA", "tray_color": "FF0000FF", "remain": 50, "state": 11},
+                            {"id": 1, "tray_type": "", "remain": 0, "state": 9},
+                        ],
+                    }
+                ],
+                "tray_exist_bits": bits,
+                "power_on_flag": True,
+            }
+        )
+
+    def test_insert_survives_pushes_that_omit_tray_exist_bits(self, mqtt_client):
+        """Incident repro. (a) bits "1" while slot 1 is empty seeds the cache with
+        that slot's bit CLEAR. (b) a partial that omits tray_exist_bits and asserts
+        state 10 for slot 1 (the physical insert) must keep state 10, and the
+        AMS-change callback must fire because the presence token flipped a→p."""
+        changes = []
+        mqtt_client.on_ams_change = changes.append
+
+        self._seed(mqtt_client, "1")  # bit 0 set, bit 1 clear
+        assert mqtt_client._last_tray_exist_bits == 1
+        assert self._tray(mqtt_client, 1)["state"] == 9
+        seeded_changes = len(changes)
+
+        # Physical insert into slot 1. H2S's follow-up pushes carry no bitmask.
+        mqtt_client._handle_ams_data(
+            {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [
+                            {"id": 0, "state": 11},
+                            {"id": 1, "state": 10},
+                        ],
+                    }
+                ]
+            }
+        )
+
+        assert self._tray(mqtt_client, 1)["state"] == 10, "cached clear bit must not re-demote a seated tray"
+        assert self._tray(mqtt_client, 0)["state"] == 11
+        assert len(changes) > seeded_changes, "presence token a→p must fire on_ams_change"
+
+    def test_repeated_bitless_pushes_keep_the_insert_visible(self, mqtt_client):
+        """The incident's shape was RECURRENT: ~1 Hz bitless pushes each re-demoted
+        the slot. Ten of them must leave the seated tray at 10."""
+        mqtt_client.on_ams_change = None
+        self._seed(mqtt_client, "1")
+
+        for _ in range(10):
+            mqtt_client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 11}, {"id": 1, "state": 10}]}]})
+
+        assert self._tray(mqtt_client, 1)["state"] == 10
+
+    def test_fresh_bits_still_demote_a_removed_slot(self, mqtt_client):
+        """The fix must not strand a genuine removal: a push that CARRIES the
+        bitmask keeps full demote authority even on a state-10 tray."""
+        self._seed(mqtt_client, "3")  # both bits set — slot 1's 9 promotes to 10
+        assert self._tray(mqtt_client, 1)["state"] == 10
+
+        # Roll pulled from slot 1; this push carries the fresh bitmask (bit 1 clear).
+        mqtt_client._handle_ams_data(
+            {
+                "ams": [{"id": 0, "tray": [{"id": 0, "state": 11}, {"id": 1, "state": 10}]}],
+                "tray_exist_bits": "1",
+                "power_on_flag": True,
+            }
+        )
+        assert self._tray(mqtt_client, 1)["state"] == 9, "fresh bits keep full demote authority"
+        assert self._tray(mqtt_client, 0)["state"] == 11
+
+    def test_cached_bits_still_promote_stuck_state_nine(self, mqtt_client):
+        """003-H2S regression: the cached fallback's promotion duty is intact."""
+        self._seed(mqtt_client, "3")  # bits 0,1 set — slot 1 occupied per firmware
+
+        # Bitless partial that sticks slot 1 at the empty code with its bit set.
+        mqtt_client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 11}, {"id": 1, "state": 9}]}]})
+
+        assert self._tray(mqtt_client, 1)["state"] == 10, "cached set bit must still promote 9→10"
+
 
 class TestNozzleRackData:
     """Tests for nozzle rack data parsing from H2 series device.nozzle.info."""

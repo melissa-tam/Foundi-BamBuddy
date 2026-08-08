@@ -95,7 +95,7 @@ from backend.app.services.spool_tag_matcher import (
     find_spool_sharing_tray_uuid,
     link_tag_to_inventory_spool,
 )
-from backend.app.services.tray_observation import TrayObservation
+from backend.app.services.tray_observation import TrayObservation, observation_tray_dict
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_types import canonical_filament_type
 
@@ -122,6 +122,13 @@ ORIGIN_CLAIM = "pipeline_claim"
 # only differ in the three extra things they owe: the identity link, the pre-config
 # marker clear, and NO config push.
 _IDENTITY_CLAIM_REASONS = frozenset({"pre_configured_apply_identity", "identity_claims_untagged_row"})
+
+# The REPLACE_SPENT reason whose evidence is an ANSWERED commanded read rather than a
+# qualified physical cycle (``slot_state`` row 5a, 2026-08-07 spool 226). The two differ in
+# exactly two places inside :func:`_apply_replace_spent` — the tray shape they accept and
+# whether a cycle is consumed — so the string is named once here instead of being spelled
+# out at both.
+_NO_TAG_SWAP_REASON = "spent_swap_no_tag_read"
 
 # Orchestrator-side release reason. Deliberately NOT in ``slot_state.RESOLUTION_REASONS``:
 # an assignment whose spool row is gone never reaches the table at all (there is nothing
@@ -627,7 +634,7 @@ async def _untagged_claim_candidate(
         # duplicate-identity hazard this whole lane exists to avoid.
         if spool is not None and spool.archived_at is None and _is_tagless(spool):
             return spool
-    return await find_matching_untagged_spool(db, _tray_dict(obs))
+    return await find_matching_untagged_spool(db, observation_tray_dict(obs))
 
 
 def _fingerprint_compatible(obs: TrayObservation, spool: Spool) -> bool:
@@ -702,6 +709,7 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
         untagged_claim_candidate=untagged_claim_candidate,
         last_location_candidate=last_location_candidate,
         qualified_cycle_pending=spool_tagless.qualified_cycle_pending(printer_id, ams_id, tray_id),
+        no_tag_read_answered=_no_tag_read_answered(obs, binding),
         auto_add_unknown=await _auto_add_unknown(deps),
         busy=_printer_busy(deps),
         settling=_settling(printer_id, ams_id, tray_id),
@@ -709,6 +717,37 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
         drying=_drying(deps, ams_id),
         tagless_default=await _tagless_default(deps),
     )
+
+
+def _no_tag_read_answered(obs: TrayObservation, binding: BindingView | None) -> bool:
+    """Did a commanded discovery read on this slot answer NO TAG over a spent TAGGED row?
+
+    Scoped to the ONE constellation the table's ``spent_swap_no_tag_read`` row can conclude
+    on (spent binding, tag-bearing row), so the ledger peek costs nothing on every other
+    slot. The TRAY facts are decided HERE, from this push's observation, and handed to
+    ``ams_presence`` — the read economy owns the read stamps, the observation lane owns
+    presence and assertion (``ams_presence`` must never re-derive either from the merged
+    view, which can be a chimera).
+
+    ``tray_seated`` is state 10 specifically, through ``ams_presence``'s own constant: state
+    11 means filament IS feeding, and a feeding tray must never be mint-swapped.
+    ``tray_bare`` is "this push asserted neither configuration nor identity" — the shape
+    that makes row 4's cycle lane unreachable in the first place.
+    """
+    if binding is None or not binding.spent or binding.is_tagless:
+        return False
+    printer_id, ams_id, tray_id = obs.slot
+    try:
+        return ams_presence.read_answered_no_tag(
+            printer_id,
+            ams_id,
+            tray_id,
+            tray_seated=ams_presence.tray_state_seated(obs.state),
+            tray_bare=not obs.config_nonempty and not obs.identity_asserted,
+        )
+    except Exception:  # noqa: BLE001 — an unreadable ledger is "no evidence", never a crash
+        logger.exception("[slot-state] no-tag read evidence lookup failed for printer %d A%dT%d", *obs.slot)
+        return False
 
 
 async def _auto_add_unknown(deps: PipelineDeps) -> bool:
@@ -812,7 +851,16 @@ async def _apply(
     # this module decides on.
     if decision.reason in _IDENTIFY_VERDICT:
         printer_id, ams_id, tray_id = obs.slot
-        await deps.identify(printer_id, ams_id, tray_id, decision.reason, _tray_dict(obs))
+        if decision.reason == "spent_occupied_owed_identify" and prior_spool_id is not None:
+            # The constellation buys its OWN occasion, before the need gate is consulted.
+            # Read occasions otherwise open only on a qualified physical cycle, a terminal
+            # sweep, or a manual command — so when the insert's presence edges were missed
+            # (2026-08-07, spool 226 on 001-H2S slot 1) this verdict was a standing request
+            # nothing could ever grant and the slot parked for a day. One read per
+            # binding-EPOCH, keyed on the bound spool inside ``ams_presence``, so a verdict
+            # re-derived on every push still costs exactly one read.
+            ams_presence.open_spent_occupied_occasion(printer_id, ams_id, tray_id, prior_spool_id)
+        await deps.identify(printer_id, ams_id, tray_id, decision.reason, observation_tray_dict(obs))
     elif decision.reason == "unknown_tag_prompt_owed":
         # Auto-add is OFF and no row owns this roll: the table refuses to mint, so the
         # operator gets the durable-per-slot prompt instead.
@@ -990,7 +1038,7 @@ async def _bind_spool(
         # operator's own weight/label/cost intact. Through the existing linker so the
         # ``rfid_linked`` origin, the slicer-preset backfill and the INFO grammar stay
         # identical to the pre-cutover attract lane. It flushes; the commit is below.
-        await link_tag_to_inventory_spool(deps.db, spool, _tray_dict(obs))
+        await link_tag_to_inventory_spool(deps.db, spool, observation_tray_dict(obs))
     if pre_config_row:
         # One-shot apply (the SpoolBuddy pre-config replay's semantics): the intent is now a
         # real location claim, so the marker is cleared. (The writer rebuilds the row, so
@@ -1006,7 +1054,7 @@ async def _bind_spool(
         # is RFID-owned, and pushing ``ams_filament_setting`` over a BL-read slot
         # destroys the RFID-detected state (eye → pen in Studio) — the same no-push rule
         # ``spool_tag_matcher.auto_assign_spool`` states for BL spools.
-        await deps.push_slot_config(spool, printer_id, ams_id, tray_id, _tray_dict(obs))
+        await deps.push_slot_config(spool, printer_id, ams_id, tray_id, observation_tray_dict(obs))
     await _emit_auto_assigned(obs, deps, spool)
     return decision, True
 
@@ -1251,7 +1299,7 @@ async def _bind_minted(
         # The tray is bare or still carries the DEPARTED row's config, so the firmware
         # does not yet hold this row's identity — push it, exactly as the bare-tray
         # auto-config and ``_replace_row_after_cycle`` do.
-        await deps.push_slot_config(spool, printer_id, ams_id, tray_id, _tray_dict(obs))
+        await deps.push_slot_config(spool, printer_id, ams_id, tray_id, observation_tray_dict(obs))
     await _emit_auto_assigned(obs, deps, spool)
     return decision, True
 
@@ -1275,25 +1323,57 @@ async def _apply_replace_spent(
     ledger-bearing row is archived exactly as before. A row that is not ours to dispose
     (operator-created) is archived too: the roll ran out and physically left, so it must
     not keep claiming a slot.
+
+    Serves the table's TWO spent-swap reasons, which differ only in what proves the roll
+    changed (and therefore in the tray shape they accept — see the pre-gate):
+
+    * ``spent_swap_confirmed`` — a QUALIFIED PHYSICAL CYCLE over a configured/fed tray. The
+      cycle is consumed here so a later push cannot replay the swap.
+    * ``spent_swap_no_tag_read`` — a commanded discovery read that ANSWERED NO TAG over a
+      seated BARE tray whose binding is tagged (2026-08-07, spool 226). There is no cycle to
+      consume; ``ams_presence``'s one-read-per-binding-epoch occasion is what makes that
+      evidence non-repeating.
+
+    Everything after the pre-gates is shared verbatim — one disposal, one mint funnel, one
+    writer — and the INFO line names the reason so prod triage can tell them apart.
     """
     printer_id, ams_id, tray_id = obs.slot
     if assignment is None or assignment.spool is None:
         return decision, False
+    no_tag_evidence = decision.reason == _NO_TAG_SWAP_REASON
 
     # Pre-gate: a dead roll re-seated without filament fed is not a swap — no churn
-    # (mirrors ``spool_tagless``'s ``_tray_loaded`` gate in branch (3)).
-    if not spool_tagless.tray_loaded(_tray_dict(obs)):
+    # (mirrors ``spool_tagless``'s ``_tray_loaded`` gate in branch (3)). That flap
+    # protection is CYCLE-shaped and stays EXACTLY as it was for ``spent_swap_confirmed``:
+    # there, "this tray is configured or fed" is the only corroboration the physical cycle
+    # has that a roll is really in the slot.
+    #
+    # ``spent_swap_no_tag_read`` corroborates differently and more strongly — the table
+    # already required observation-asserted presence AND an answered commanded read — and
+    # its tray is BARE by construction (that is why the cycle lane cannot reach it), so
+    # ``tray_loaded`` can only ever answer False for it. Accept the SEATED (state-10) shape
+    # the decision was made on; the answered read is what rules out a flap there.
+    tray_ok = (
+        ams_presence.tray_state_seated(obs.state)
+        if no_tag_evidence
+        else spool_tagless.tray_loaded(observation_tray_dict(obs))
+    )
+    if not tray_ok:
         logger.debug(
-            "[slot-state] printer=%d A%dT%d spent-replace skipped: tray present but not loaded",
+            "[slot-state] printer=%d A%dT%d spent-replace skipped: tray present but not loaded (reason=%s)",
             printer_id,
             ams_id,
             tray_id,
+            decision.reason,
         )
         return decision, False
 
     # Consume the qualified physical cycle — the ONE thing that releases the W1 latch,
-    # and it is spent exactly here so a later push cannot replay the same swap.
-    if not spool_tagless.consume_qualified_cycle(printer_id, ams_id, tray_id):
+    # and it is spent exactly here so a later push cannot replay the same swap. Only the
+    # CYCLE-evidence reason has one to consume: ``spent_swap_no_tag_read`` rests on the
+    # answered read (whose one-per-epoch pacing lives in ``ams_presence``), so demanding a
+    # cycle here would veto every swap this arm exists to perform.
+    if not no_tag_evidence and not spool_tagless.consume_qualified_cycle(printer_id, ams_id, tray_id):
         logger.debug(
             "[slot-state] printer=%d A%dT%d spent-replace skipped: no qualified cycle to consume",
             printer_id,
@@ -1309,12 +1389,13 @@ async def _apply_replace_spent(
         disposition = "archived"
     await deps.db.flush()
     logger.info(
-        "[slot-state] printer=%d A%dT%d spent spool %d %s on a qualified roll swap",
+        "[slot-state] printer=%d A%dT%d spent spool %d %s on a roll swap (reason=%s)",
         printer_id,
         ams_id,
         tray_id,
         departed.id,
         disposition,
+        decision.reason,
     )
 
     spool, from_default = await _mint_from_spec(deps, obs, decision.mint_spec or {})
@@ -1360,32 +1441,6 @@ def _mint_fingerprint(obs: TrayObservation, spec: dict, from_default: bool) -> t
         default = spec.get("default_filament") or {}
         return (default.get("rgba") or "", default.get("material") or "")
     return (obs.tray_color or "", obs.tray_type or "")
-
-
-def _tray_dict(obs: TrayObservation) -> dict:
-    """The observation as a tray dict, for the existing tray-shaped helpers.
-
-    Only ASSERTED members are included — a key this push did not carry stays absent, so
-    the helpers see exactly what the wire said (the atomic-pair rule survives the
-    round-trip).
-    """
-    tray: dict = {"id": obs.tray_id}
-    if obs.state is not None:
-        tray["state"] = obs.state
-    for key, value in (
-        ("tag_uid", obs.tag_uid),
-        ("tray_uuid", obs.tray_uuid),
-        ("tray_type", obs.tray_type),
-        ("tray_color", obs.tray_color),
-        ("tray_info_idx", obs.tray_info_idx),
-        ("tray_sub_brands", obs.tray_sub_brands),
-        ("remain", obs.remain),
-        ("nozzle_temp_min", obs.nozzle_temp_min),
-        ("nozzle_temp_max", obs.nozzle_temp_max),
-    ):
-        if value is not None:
-            tray[key] = value
-    return tray
 
 
 def _tray_dict_from_spec(obs: TrayObservation, spec: dict) -> dict:

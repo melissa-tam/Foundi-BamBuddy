@@ -28,7 +28,7 @@ from sqlalchemy import delete, func, select
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
-from backend.app.services import slot_pipeline, spool_binding, spool_tagless
+from backend.app.services import ams_presence, slot_pipeline, spool_binding, spool_tagless
 from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
 from backend.app.services.slot_state import Decision, DecisionKind, SlotState
 from backend.app.services.tray_observation import observe_tray
@@ -45,13 +45,19 @@ _SENTINEL = datetime(2020, 1, 2, 3, 4, 5)
 
 @pytest.fixture(autouse=True)
 def _clean_state():
-    """Every test starts with empty locks, dedup sets, cycles and move damper."""
+    """Every test starts with empty locks, dedup sets, cycles, move damper and read ledgers.
+
+    ``ams_presence`` is in the list because the pipeline now WRITES to its read economy (the
+    spent-occupied constellation opens its own read occasion), so a leaked epoch/occasion
+    would let one test grant another's slot a read it never earned."""
     slot_pipeline._reset_state()
     spool_tagless._reset_state()
+    ams_presence._reset_state()
     spool_binding._move_damper.reset()
     yield
     slot_pipeline._reset_state()
     spool_tagless._reset_state()
+    ams_presence._reset_state()
     spool_binding._move_damper.reset()
 
 
@@ -1089,6 +1095,150 @@ async def test_spent_latch_holds_without_a_qualified_cycle(db_session, printer_f
     assert await _spool_count(db_session) == 1
 
 
+# --- REPLACE_SPENT on an answered no-tag read (2026-08-07, spool 226) --------
+
+
+def _arm_no_tag_answer(printer_id, ams_id=0, tray_id=0, *, age=60.0):
+    """Stamp the slot as "we commanded a discovery read ``age`` s ago and no tag ever came".
+
+    The ledger shape ``ams_presence.read_answered_no_tag`` adjudicates: identity-learned
+    stamped immediately BEFORE the discovery stamp (``command_identify``'s own order, which is
+    what makes "a tag landed later" decidable), nothing in flight. Written directly, as the
+    presence suite's own ``_arm_cycle`` does — replaying a full read through the MQTT client
+    would pin the commander, which its own suite already owns."""
+    now = ams_presence.time.monotonic()
+    ams_presence._slot_read_at[(printer_id, ams_id, tray_id)] = now - age - 0.5
+    ams_presence._discovery_read_at[(printer_id, ams_id, tray_id)] = now - age
+
+
+async def _spent_tagged_slot(db_session, printer_id, ams_id=0, tray_id=0, **kw):
+    """A SPENT RFID-tagged row bound to a slot — the spool 226 shape."""
+    departed = await _spool(
+        db_session,
+        material="PETG",
+        rgba="000000FF",
+        data_origin="rfid_auto",
+        tag_uid=TAG_A,
+        tray_uuid=UUID_1,
+        spent_at=datetime.utcnow(),
+        **kw,
+    )
+    await _bind_row(db_session, departed, printer_id, ams_id, tray_id)
+    return departed
+
+
+@pytest.mark.asyncio
+async def test_an_answered_no_tag_read_swaps_the_spent_tagged_row(db_session, printer_factory, env, monkeypatch):
+    """The end-to-end fix. A spent TAGGED binding under a seated BARE tray whose commanded
+    discovery read answered NO TAG: the departed row is ARCHIVED (never deleted — it carries a
+    tag and a ledger), a fresh tagless row from the DEFAULT takes the slot through the one
+    binding writer, its identity is pushed to the firmware, and NO qualified cycle is consumed
+    — this arm's evidence is the answered read, and demanding a cycle it cannot have is what
+    would veto every swap it exists to perform."""
+    printer = await printer_factory()
+    env.settings["tagless_default_filament"] = _tagless_default_json()
+    departed = await _spent_tagged_slot(db_session, printer.id, 0, 1)
+    _arm_no_tag_answer(printer.id, 0, 1)
+    consumed: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(
+        slot_pipeline.spool_tagless,
+        "consume_qualified_cycle",
+        lambda p, a, t: (consumed.append((p, a, t)), True)[1],
+    )
+
+    obs = _obs(printer.id, {"id": 1, "state": 10})
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision.kind is DecisionKind.REPLACE_SPENT
+    assert transitions[0].decision.reason == "spent_swap_no_tag_read"
+    assert transitions[0].applied is True
+    assert consumed == []  # no cycle to consume, and none demanded
+
+    await db_session.refresh(departed)
+    assert departed.archived_at is not None  # archived, not deleted
+    row = await _assignment(db_session, printer.id, 0, 1)
+    assert row.spool_id != departed.id
+    minted = await db_session.get(Spool, row.spool_id)
+    assert (minted.tag_uid, minted.tray_uuid, minted.spent_at) == (None, None, None)
+    assert (minted.brand, minted.material, minted.rgba, minted.data_origin) == ("Acme", "PLA", "FF0000FF", "ams_auto")
+    assert (row.fingerprint_color, row.fingerprint_type) == ("FF0000FF", "PLA")
+    assert env.pushes == [(minted.id, printer.id, 0, 1)]  # the bare tray gets the row's identity
+
+
+@pytest.mark.asyncio
+async def test_the_swap_does_not_repeat_on_the_next_push(db_session, printer_factory, env):
+    """The stamps are NON-consuming (``_discovery_read_at`` also drives the 0700_0081 HMS
+    suppression), so idempotency has to come from the outcome: once the swap lands the binding
+    is no longer spent, the table stops emitting the reason, and the slot resolves as an
+    ordinary tagless row."""
+    printer = await printer_factory()
+    env.settings["tagless_default_filament"] = _tagless_default_json()
+    await _spent_tagged_slot(db_session, printer.id, 0, 1)
+    _arm_no_tag_answer(printer.id, 0, 1)
+    deps = _deps(db_session, env)
+
+    obs = _obs(printer.id, {"id": 1, "state": 10})
+    first = await run_slot_pipeline(printer.id, [obs], deps)
+    second = await run_slot_pipeline(printer.id, [obs], deps)
+
+    assert first[0].decision.reason == "spent_swap_no_tag_read"
+    assert second[0].applied is False
+    assert second[0].decision.reason != "spent_swap_no_tag_read"
+    assert await _spool_count(db_session) == 2  # the archived departed row + its replacement
+
+
+@pytest.mark.asyncio
+async def test_a_spent_TAGLESS_row_is_never_swapped_on_a_no_tag_read(db_session, printer_factory, env):
+    """Scoping pin: over a spent TAGLESS binding a no-tag read proves nothing (the same core
+    reads the same way before and after a swap), so the constellation keeps owing a read and
+    the qualified-cycle machinery keeps owning the case."""
+    printer = await printer_factory()
+    env.settings["tagless_default_filament"] = _tagless_default_json()
+    departed = await _spool(db_session, material="PETG", data_origin="ams_auto", spent_at=datetime.utcnow())
+    await _bind_row(db_session, departed, printer.id, 0, 1)
+    _arm_no_tag_answer(printer.id, 0, 1)
+
+    obs = _obs(printer.id, {"id": 1, "state": 10})
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision == Decision(DecisionKind.NONE, reason="spent_occupied_owed_identify")
+    assert (await _assignment(db_session, printer.id, 0, 1)).spool_id == departed.id
+    assert await _spool_count(db_session) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_feeding_tray_is_never_mint_swapped_on_a_no_tag_read(db_session, printer_factory, env):
+    """State 11 means filament IS feeding: whatever the read said, a tray mid-feed must not be
+    replaced under the print pulling from it. Only the SEATED (state-10) shape qualifies."""
+    printer = await printer_factory()
+    env.settings["tagless_default_filament"] = _tagless_default_json()
+    departed = await _spent_tagged_slot(db_session, printer.id, 0, 1)
+    _arm_no_tag_answer(printer.id, 0, 1)
+
+    obs = _obs(printer.id, {"id": 1, "state": 11})
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision.reason != "spent_swap_no_tag_read"
+    assert (await _assignment(db_session, printer.id, 0, 1)).spool_id == departed.id
+    assert await _spool_count(db_session) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_read_is_not_yet_an_answer(db_session, printer_factory, env):
+    """The settle floor, end to end: a read commanded seconds ago may still be running, so the
+    slot only owes its read — the swap waits for the answer to be an answer."""
+    printer = await printer_factory()
+    env.settings["tagless_default_filament"] = _tagless_default_json()
+    departed = await _spent_tagged_slot(db_session, printer.id, 0, 1)
+    _arm_no_tag_answer(printer.id, 0, 1, age=1.0)
+
+    obs = _obs(printer.id, {"id": 1, "state": 10})
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision == Decision(DecisionKind.NONE, reason="spent_occupied_owed_identify")
+    assert (await _assignment(db_session, printer.id, 0, 1)).spool_id == departed.id
+
+
 # --- DEFER / NONE -----------------------------------------------------------
 
 
@@ -1172,6 +1322,78 @@ async def test_spent_occupied_slot_owes_a_discovery_identify(db_session, printer
     assert env.identifies == [(printer.id, 0, 2, "spent_occupied_owed_identify")]
     assert (await _assignment(db_session, printer.id, 0, 2)).spool_id == spent.id  # nothing mutated
     assert await _spool_count(db_session) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_spent_occupied_verdict_buys_its_own_read_occasion(db_session, printer_factory, env):
+    """2026-08-07, spool 226 / 001-H2S slot 1 — the LIVENESS half.
+
+    The verdict above routed to the identify lane, but the read it owed had no ENTITLEMENT:
+    read occasions open only on a qualified physical cycle, a terminal sweep's between-prints
+    policy, or a manual command, and this insert's presence edges were all missed. So the
+    request stood forever against a read nobody would issue. The constellation now opens its
+    own occasion, keyed on the BOUND SPOOL so a verdict re-derived on every push still costs
+    exactly one read."""
+    printer = await printer_factory()
+    spent = await _spool(
+        db_session,
+        material="PETG",
+        data_origin="rfid_auto",
+        tag_uid=TAG_A,
+        tray_uuid=UUID_1,
+        spent_at=datetime.utcnow(),
+    )
+    await _bind_row(db_session, spent, printer.id, 0, 1)
+    obs = _obs(printer.id, {"id": 1, "state": 10})
+    deps = _deps(db_session, env)
+
+    for _ in range(3):  # the verdict re-derives on every push
+        transitions = await run_slot_pipeline(printer.id, [obs], deps)
+        assert transitions[0].decision.reason == "spent_occupied_owed_identify"
+
+    assert ams_presence._spent_occupied_occasion_epoch[(printer.id, 0, 1)] == spent.id
+    assert ams_presence._read_occasion_open(printer.id, 0, 1) is True
+
+    # Epoch semantics, through the real opener: the SAME bound spool never re-opens once the
+    # read is spent; a different bound spool is a new constellation and does.
+    ams_presence._consume_read_occasion(printer.id, 0, 1)
+    await run_slot_pipeline(printer.id, [obs], deps)
+    assert ams_presence._read_occasion_open(printer.id, 0, 1) is False
+    ams_presence.open_spent_occupied_occasion(printer.id, 0, 1, spent.id + 1)
+    assert ams_presence._read_occasion_open(printer.id, 0, 1) is True
+
+
+@pytest.mark.asyncio
+async def test_the_constellations_occasion_is_what_the_real_predicate_grants_the_read_on(
+    db_session, printer_factory, env, monkeypatch
+):
+    """THE liveness pin, through the REAL need authority (only the commander is faked).
+
+    ``identify_needed``'s spent-occupied arm requires an OPEN READ OCCASION, so before this
+    fix the whole loop was: verdict → need → None → nothing, on every push forever (spool 226
+    stood a day). With the constellation opening its own occasion the predicate grants the
+    read, and grants it as ``discovery`` — which is both what suppresses its expected no-tag
+    failure and what stamps the evidence ``read_answered_no_tag`` later adjudicates. The
+    epoch caps it at ONE read: a second pass over the same binding buys nothing."""
+    printer = await printer_factory()
+    await _spent_tagged_slot(db_session, printer.id, 0, 1)
+    commanded: list[tuple[int, int, int, str | None]] = []
+
+    async def _record(printer_id, ams_id, tray_id, *, source, reason=None, **kwargs):
+        commanded.append((printer_id, ams_id, tray_id, reason))
+        return True, "ok"
+
+    monkeypatch.setattr(slot_pipeline.ams_presence, "command_identify", _record)
+    deps = _prod_identify_deps(db_session, env)  # real identify_needed, no injected hook
+    obs = _obs(printer.id, {"id": 1, "state": 10})
+
+    await run_slot_pipeline(printer.id, [obs], deps)
+    assert commanded == [(printer.id, 0, 1, "discovery")]
+
+    # What the real commander does on a successful read — the fake cannot.
+    ams_presence._consume_read_occasion(printer.id, 0, 1)
+    await run_slot_pipeline(printer.id, [obs], deps)
+    assert len(commanded) == 1
 
 
 # --- the PRODUCTION identify default ----------------------------------------
