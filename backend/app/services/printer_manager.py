@@ -1103,6 +1103,17 @@ def _eject_watch_payload(printer_id: int | None) -> dict | None:
     return {"threshold_c": threshold} if threshold is not None else None
 
 
+def _open_incident_payload(printer_id: int | None) -> dict | None:
+    """The printer's OPEN AMS incident as ``{kind, status, slot_desc, created_at}``,
+    or None. A projection of the durable row, cached in memory (WS2b) — a cache miss
+    renders no chip and can never invent a hold."""
+    if not printer_id:
+        return None
+    from backend.app.services import printer_incidents
+
+    return printer_incidents.snapshot(printer_id)
+
+
 def printer_state_to_dict(
     state: PrinterState,
     printer_id: int | None = None,
@@ -1412,6 +1423,13 @@ def printer_state_to_dict(
         # escalation-only watch) is armed. Lazy import: the monitor imports this
         # module at import time, so the reverse edge must resolve at call time.
         "eject_watch": _eject_watch_payload(printer_id),
+        # Open AMS incident (WS2b): {kind, status, slot_desc, created_at} or null.
+        # A FOREIGN print's hold has no queue row and therefore no waiting_reason
+        # chip anywhere in the UI — this is the only place it can be seen. Read from
+        # the incident store's in-memory projection, never the DB: this serializer
+        # runs on every status broadcast. Lazy import for the same reason
+        # _eject_watch_payload is lazy (the service imports this module).
+        "open_incident": _open_incident_payload(printer_id),
     }
     # Add cover URL if there's an active print and printer_id is provided
     # Include PAUSE state so skip objects modal can show cover

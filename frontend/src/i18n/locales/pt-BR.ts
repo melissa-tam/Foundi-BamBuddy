@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: 'O filamento acabou — insira uma nova bobina no slot AMS marcado e retome',
+        spoolPhysicalFault: 'Falha física — precisa de intervenção, sem troca automática',
         printerOfflineStalled: 'Impressora offline no meio da impressão — resultado desconhecido até reconectar',
         printPausedStalled: 'Pausada na impressora — precisa de atenção (sem recuperação automática)',
         visionHold: 'Visão da impressora: placa não vazia — libere a placa e retome na impressora',
@@ -1147,6 +1148,12 @@ export default {
     },
     noUsb: 'Sem pendrive USB',
     noUsbHint: 'O envio vai falhar — insira um pendrive USB-A (FAT32/exFAT)',
+    incident: {
+      jam: 'Entupimento do AMS',
+      runout: 'Filamento acabou',
+      physical: 'Falha de filamento',
+      recovering: 'Recuperando',
+    },
     // Fans
     fans: {
       partCooling: 'Ventilador de resfriamento da peça',

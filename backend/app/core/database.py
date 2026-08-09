@@ -196,6 +196,7 @@ async def init_db():
         print_log,
         print_queue,
         printer,
+        printer_incident,
         printer_model_geometry,
         printer_sensor_history,
         project,
@@ -3423,6 +3424,10 @@ async def run_migrations(conn):
         # Pause-stall: a printing unit's CONNECTED printer sat unattended-PAUSEd
         # past the pause-stall grace (an HMS outside the recovery sets, door-open).
         ("on_print_paused_stalled", "1", "TRUE"),
+        # WS2b foreign-pause watch: a print the farm did not dispatch sat PAUSEd past
+        # the same grace with no AMS incident owning it (a vision trip on a LAN print
+        # is the common case) — the farm-item watch above can never see those.
+        ("on_foreign_print_paused", "1", "TRUE"),
         # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
         ("on_storage_low", "1", "TRUE"),
         # Cooldown escalation: post-print eject cooldown is running long (bed still
@@ -3980,6 +3985,70 @@ async def run_migrations(conn):
     await _safe_execute(
         conn,
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_hms_event_printer_code ON hms_event (printer_id, full_code)",
+    )
+
+    # Migration (WS2b, 2026-08-09): durable per-printer AMS incidents. The whole
+    # recovery/hold/auto-resume/escalation lifecycle lived in process-lifetime dicts
+    # reachable only through a matching FARM queue item — so 12 foreign-print runouts
+    # were stamped spent but never alerted, held or resumed; an escalation latch
+    # outlived the fault it was written for (a later, different fault on the same job
+    # could never be recovered); and every restart erased the lot while the standing
+    # HMS came straight back. Same dialect-branched shape as hms_event above.
+    await _safe_execute(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS printer_incident (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            printer_id INTEGER NOT NULL REFERENCES printers(id) ON DELETE CASCADE,
+            job_id VARCHAR(64) NOT NULL DEFAULT '',
+            item_id INTEGER REFERENCES print_queue(id) ON DELETE SET NULL,
+            kind VARCHAR(16) NOT NULL,
+            code VARCHAR(16) NOT NULL,
+            codes VARCHAR(256) NOT NULL,
+            slot_global_tray INTEGER,
+            status VARCHAR(16) NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            escalated_at TIMESTAMP,
+            resolved_at TIMESTAMP,
+            resolve_source VARCHAR(24)
+        )
+        """
+        if is_sqlite()
+        else """
+        CREATE TABLE IF NOT EXISTS printer_incident (
+            id SERIAL PRIMARY KEY,
+            printer_id INTEGER NOT NULL REFERENCES printers(id) ON DELETE CASCADE,
+            job_id VARCHAR(64) NOT NULL DEFAULT '',
+            item_id INTEGER REFERENCES print_queue(id) ON DELETE SET NULL,
+            kind VARCHAR(16) NOT NULL,
+            code VARCHAR(16) NOT NULL,
+            codes VARCHAR(256) NOT NULL,
+            slot_global_tray INTEGER,
+            status VARCHAR(16) NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            escalated_at TIMESTAMP,
+            resolved_at TIMESTAMP,
+            resolve_source VARCHAR(24)
+        )
+        """,
+    )
+    # ONE open incident per printer, enforced by a PARTIAL unique index (supported by
+    # SQLite >= 3.8 and PostgreSQL alike) — the durable successor of the in-memory
+    # exclusivity a restart used to erase. Closed incidents accumulate as history
+    # because they carry a resolved_at and fall outside the predicate. Same name the
+    # model declares, so create_all and this DDL converge on ONE index object.
+    await _safe_execute(
+        conn,
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_printer_incident_open "
+        "ON printer_incident (printer_id) WHERE resolved_at IS NULL",
+    )
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_printer_incident_job ON printer_incident (printer_id, job_id)",
+    )
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_printer_incident_item_id ON printer_incident (item_id)",
     )
 
 

@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: 'Filamento esaurito — inserisci una nuova bobina nello slot AMS indicato e riprendi',
+        spoolPhysicalFault: 'Guasto fisico — serve un intervento, nessuno scambio automatico',
         printerOfflineStalled: 'Stampante offline durante la stampa — esito sconosciuto finché non si riconnette',
         printPausedStalled: 'In pausa sulla stampante — richiede attenzione (nessun ripristino automatico)',
         visionHold: 'Visione della stampante: piatto non vuoto — libera il piatto, poi riprendi sulla stampante',
@@ -1147,6 +1148,12 @@ export default {
     },
     noUsb: 'Nessuna chiavetta USB',
     noUsbHint: 'L\'invio fallirà — inserisci una chiavetta USB-A (FAT32/exFAT)',
+    incident: {
+      jam: 'Inceppamento AMS',
+      runout: 'Filamento esaurito',
+      physical: 'Guasto filamento',
+      recovering: 'Ripristino',
+    },
     // Fans
     fans: {
       partCooling: 'Ventola raffreddamento parte',

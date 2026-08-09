@@ -253,6 +253,18 @@ class PrintScheduler:
             except Exception:
                 logger.exception("Pause-stall watch failed (non-fatal)")
 
+            # Foreign-pause watch (WS2b): a print the farm did NOT dispatch, PAUSEd
+            # past the same grace with no farm unit and no AMS incident owning it.
+            # Every other watch starts from a farm queue item, so a vision trip on a
+            # LAN print used to sit until a human noticed. Own guard, same as the
+            # sibling watches.
+            try:
+                from backend.app.services.farm_stall import check_foreign_paused_printers
+
+                await check_foreign_paused_printers(db)
+            except Exception:
+                logger.exception("Foreign-pause watch failed (non-fatal)")
+
             # Attention-reminder nag (W3): the offline / pause-stall / recovery /
             # runout escalations each alert only ONCE per incident, so a printer left
             # PAUSEd needing a human went silent for hours (2026-07-20). Re-fire the

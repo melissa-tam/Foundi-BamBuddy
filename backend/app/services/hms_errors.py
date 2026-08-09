@@ -1297,19 +1297,10 @@ _CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
 
 @dataclass(frozen=True)
 class _ShortRow:
-    """One classification in the lossy ``MMMM_CCCC`` short-code lane.
-
-    ``legacy_swap`` marks the members the jam-swap recovery machine has always
-    triggered on. It exists to keep that machine's trigger set BYTE-IDENTICAL while
-    the taxonomy already carries the wider classification: the send-out / feed-to-
-    extruder families below are MECHANICAL_FEED here but are NOT legacy-swap
-    members, so recovery does not act on them until the consumer wave widens the
-    derived sets deliberately.
-    """
+    """One classification in the lossy ``MMMM_CCCC`` short-code lane."""
 
     fault_class: AmsFaultClass
     extruder_side: bool = False
-    legacy_swap: bool = False
 
 
 _AMS_UNITS: tuple[str, ...] = ("0700", "0701", "0702", "0703", "0704", "0705", "0706", "0707")
@@ -1325,7 +1316,7 @@ _EXTERNAL_SPOOL: tuple[str, ...] = ("07FF",)
 # is exactly where that decision lives. On H2C the same short code means "A new AMS
 # detected" — a second reason a bare match is meaningless.
 _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
-    # -- MECHANICAL_FEED, legacy swap triggers --------------------------------
+    # -- MECHANICAL_FEED ------------------------------------------------------
     # "The AMS assist motor is overloaded. This could be due to entangled filament
     # or a stuck spool." / AMS-HT + AMS lite equivalents ("spool or filament may be
     # stuck"). All carry stuck-spool semantics and all PAUSE the print, so a false
@@ -1333,14 +1324,17 @@ _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
     (
         (*_AMS_UNITS, *_AMS_HT_UNITS, *_AMS_LITE_UNITS, "12FF"),
         "8010",
-        _ShortRow(_MECHANICAL, legacy_swap=True),
+        _ShortRow(_MECHANICAL),
     ),
     # "The extrusion motor is overloaded, please check the Assistant for details."
     # The MAIN extruder, not the AMS assist motor (004-H2S 2026-07-17 sat PAUSEd
     # ~2h40m because this code was outside the trigger set). A swap still helps,
     # but the extruder is the common factor on a re-fault.
-    (("0300",), "801E", _ShortRow(_MECHANICAL, extruder_side=True, legacy_swap=True)),
-    # -- MECHANICAL_FEED, taxonomy-only (NOT legacy swap triggers) ------------
+    (("0300",), "801E", _ShortRow(_MECHANICAL, extruder_side=True)),
+    # The send-out / feed-into-extruder families. Classified from the start (WS2a)
+    # and swap triggers since the 2026-08-09 operator-ratified widening (WS2b) —
+    # the fault they name is the same obstruction the 8010 family names, one step
+    # further along the path.
     # "The AMS failed to send out filament. You can clip the end of your filament
     # flat, and reinsert…" / external: "Failed to feed the filament outside the AMS…"
     ((*_AMS_UNITS, *_EXTERNAL_SPOOL), "8005", _ShortRow(_MECHANICAL)),
@@ -1428,12 +1422,9 @@ def _shorts_where(predicate: Callable[[_ShortRow], bool]) -> frozenset[str]:
 # Derived once at import — the consumer-facing sets. Each is a VIEW of the table
 # above, never a second literal (doctrine invariant 1).
 _RUNOUT_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFaultClass.RUNOUT)
-_RUNOUT_EXTERNAL_SHORTS: frozenset[str] = _shorts_where(
-    lambda r: r.fault_class is AmsFaultClass.RUNOUT_EXTERNAL
-)
+_RUNOUT_EXTERNAL_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFaultClass.RUNOUT_EXTERNAL)
 _MECHANICAL_FEED_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is _MECHANICAL)
 _EXTRUDER_SIDE_SHORTS: frozenset[str] = _shorts_where(lambda r: r.extruder_side)
-_LEGACY_SWAP_SHORTS: frozenset[str] = _shorts_where(lambda r: r.legacy_swap)
 
 
 def runout_short_codes() -> frozenset[str]:
@@ -1456,10 +1447,13 @@ def runout_external_short_codes() -> frozenset[str]:
 def mechanical_feed_short_codes() -> frozenset[str]:
     """Feed faults an obstruction or a slipping path causes — fresh filament can clear them.
 
-    WIDER than the jam-swap machine's live trigger set: the send-out (8005),
-    feed-into-extruder (8006) and feed-to-extruder (8028) families are classified
-    here but are not :data:`_LEGACY_SWAP_SHORTS` members, so recovery keeps its
-    historical scope until a consumer wave widens it deliberately.
+    Since the 2026-08-09 operator-ratified widening (WS2b) this IS the jam-swap
+    machine's trigger vocabulary: ``spool_recovery`` derives its two trigger sets by
+    splitting this class on :func:`extruder_side_short_codes`, with no second marker
+    in between. The WS2a ``legacy_swap`` pin that held the machine at the 8010/801E
+    subset was scaffolding for a behavior-neutral relocation and is deleted — a
+    marker whose only job is "do not act on the classification yet" cannot outlive
+    the wave that acts on it.
     """
     return _MECHANICAL_FEED_SHORTS
 
@@ -1471,17 +1465,6 @@ def extruder_side_short_codes() -> frozenset[str]:
     is what both faults share.
     """
     return _EXTRUDER_SIDE_SHORTS
-
-
-def legacy_swap_short_codes() -> frozenset[str]:
-    """The jam-swap machine's historical trigger vocabulary.
-
-    A behavior pin, not a classification: it exists so ``spool_recovery`` can derive
-    its trigger sets from this taxonomy without changing which codes it acts on.
-    Widening the machine means moving members INTO this marker deliberately, with
-    the ladder that any new auto-recovery surface needs.
-    """
-    return _LEGACY_SWAP_SHORTS
 
 
 # The single origin of the unrescued-runout vocabulary, consumed by the runout
@@ -1527,6 +1510,41 @@ def classify_short_code(short: str) -> ClassifiedAmsFault | None:
     if row is None:
         return None
     return ClassifiedAmsFault(fault_class=row.fault_class, extruder_side=row.extruder_side, slot=None)
+
+
+def classify_hms_entry(e) -> ClassifiedAmsFault | None:
+    """Classify ONE live ``state.hms_errors`` entry, whichever lane it arrived on.
+
+    ``state.hms_errors`` is a MIXED list — the MQTT parser appends entries from two
+    wire shapes and they carry their identity differently:
+
+    * the ``hms[]`` array lane — ``attr`` is the full 32-bit attribute (module byte,
+      submodule byte, slot byte) and ``code`` is the 32-bit code WORD, so
+      :func:`classify_ams_fault` applies and can name the slot;
+    * the ``print_error`` lane — one 32-bit integer split into module/error, stored
+      as ``attr`` = the whole value and ``code`` = the low 16 bits. Its code word is
+      not a code word at all, so only :func:`classify_short_code` applies and the
+      verdict can never carry a slot.
+
+    Trying the attr-aware lane FIRST is what makes this safe: every code word whose
+    meaning is submodule-scoped (the runout demand, the auto-switch spent evidence,
+    the empty-slot ask) is decided there — including the deliberate ``None``s — and
+    the short lane is only reached for entries the code-word table does not claim.
+    That ordering is why no ``print_error``-shaped fallback can smuggle a runout
+    demand into the swap machine (doctrine rule 9): the short table has no
+    ``0700_0001`` row at all.
+
+    Malformed entries classify ``None`` rather than raising — this runs inside the
+    MQTT status callback (invariant 10).
+    """
+    try:
+        attr = int(getattr(e, "attr", 0) or 0)
+        verdict = classify_ams_fault(attr, _code_word(getattr(e, "code", 0)))
+        if verdict is not None:
+            return verdict
+        return classify_short_code(hms_short_code(attr, getattr(e, "code", 0)))
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def _code_word(code: int | str) -> int:

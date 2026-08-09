@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: 'Filament ist leer — neue Spule in das markierte AMS-Fach einlegen und fortsetzen',
+        spoolPhysicalFault: 'Physischer Fehler — Eingriff nötig, kein automatischer Wechsel',
         printerOfflineStalled: 'Drucker mitten im Druck offline — Ergebnis unbekannt, bis er sich wieder verbindet',
         printPausedStalled: 'Am Drucker pausiert — Eingriff nötig (keine automatische Behebung)',
         visionHold: 'Druckererkennung: Platte nicht leer — Bett freiräumen, dann am Drucker fortsetzen',
@@ -1147,6 +1148,12 @@ export default {
     },
     noUsb: 'Kein USB-Stick',
     noUsbHint: 'Druckauftrag schlägt fehl — USB-A-Stick (FAT32/exFAT) einstecken',
+    incident: {
+      jam: 'AMS-Stau',
+      runout: 'Filament leer',
+      physical: 'Filamentfehler',
+      recovering: 'Wiederherstellung',
+    },
     // Fans
     fans: {
       partCooling: 'Bauteilkühlung',

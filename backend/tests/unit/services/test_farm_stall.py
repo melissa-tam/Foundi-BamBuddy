@@ -377,6 +377,34 @@ async def _add_paused_held(db, printer_id, reason, pos=1):
     return it
 
 
+async def _add_incident_held(db, printer_id, kind, *, pos=1, slot_global_tray=None, item=True, code=None):
+    """A printer held by an ESCALATED AMS incident (WS2b).
+
+    The AMS holds (jam / runout / physical) are reminded from their INCIDENT, not
+    from a queue token: an incident is a fact about the PRINTER, so a FOREIGN print's
+    hold nags exactly like a farm one. ``item=False`` seeds the foreign case (no
+    queue unit at all).
+    """
+    from backend.app.models.printer_incident import STATUS_ESCALATED
+    from backend.app.services import printer_incidents
+
+    row = None
+    if item:
+        row = await _add_paused_held(db, printer_id, f"spool_{kind}_hold", pos=pos)
+    await printer_incidents.open_new(
+        db,
+        printer_id=printer_id,
+        job_id="task-1",
+        item_id=row.id if row is not None else None,
+        kind=kind,
+        code=code or ("0700_8010" if kind == "jam" else "0700_8011"),
+        codes=f"{kind}:seeded",
+        slot_global_tray=slot_global_tray,
+        status=STATUS_ESCALATED,
+    )
+    return row
+
+
 class TestAttentionReminders:
     """W3: an unresolved escalated hold on a still-PAUSEd printer re-fires its OWN
     notification once per window until a human clears it (the 2026-07-20 5-hour
@@ -447,30 +475,61 @@ class TestAttentionReminders:
             mock_n.assert_not_awaited()
 
     async def test_offline_printer_never_reminds(self, db_session):
-        await _add_paused_held(db_session, 7, "spool_jam_recovery_failed")
+        await _add_incident_held(db_session, 7, "jam")
         mgr = _FakeManager({7: False}, {7: _FakeState("PAUSE")})  # PAUSE but OFFLINE
         with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
             mock_n.assert_not_awaited()
 
-    async def test_jam_reason_refires_spool_recovery_failed(self, db_session):
-        await _add_paused_held(db_session, 7, "spool_jam_recovery_failed")
+    async def test_jam_incident_refires_spool_recovery_failed(self, db_session):
+        await _add_incident_held(db_session, 7, "jam")
         mgr = _FakeManager({7: True}, {7: _FakeState("PAUSE")})
         with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
             mock_n.assert_awaited_once()
-            assert mock_n.await_args.kwargs["is_feed_fault"] is True
+            assert mock_n.await_args.kwargs["kind"] == "jam"
 
-    async def test_runout_reason_refires_with_is_feed_fault_false(self, db_session):
-        await _add_paused_held(db_session, 8, "filament_runout_recovery_failed")
+    async def test_runout_incident_refires_with_the_runout_kind(self, db_session):
+        await _add_incident_held(db_session, 8, "runout")
         mgr = _FakeManager({8: True}, {8: _FakeState("PAUSE")})
         with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
             mock_n.assert_awaited_once()
-            assert mock_n.await_args.kwargs["is_feed_fault"] is False
+            assert mock_n.await_args.kwargs["kind"] == "runout"
+
+    async def test_a_foreign_print_hold_reminds_too(self, db_session):
+        """The WS2b reason the reminder moved off queue tokens: a print the farm did
+        not dispatch has NO unit to carry one, so a foreign hold nagged nobody."""
+        await _add_incident_held(db_session, 11, "runout", item=False)
+        mgr = _FakeManager({11: True}, {11: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_awaited_once()
+            assert mock_n.await_args.kwargs["foreign"] is True
+
+    async def test_a_recovering_incident_is_not_nagged(self, db_session):
+        """'recovering' is the machine still acting — not a hold to nag a human about."""
+        from backend.app.services import printer_incidents
+
+        await printer_incidents.open_new(
+            db_session,
+            printer_id=12,
+            job_id="task-1",
+            item_id=None,
+            kind="jam",
+            code="0700_8010",
+            codes="jam:seeded",
+            slot_global_tray=None,
+        )
+        mgr = _FakeManager({12: True}, {12: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_not_awaited()
 
     async def test_plate_vision_reason_refires_plate_not_empty(self, db_session):
         await _add_paused_held(db_session, 9, "plate_not_empty_printer_detected")
@@ -498,15 +557,20 @@ class TestAttentionReminders:
 
     async def test_reason_set_membership_pinned(self):
         # async only to satisfy the module-level asyncio mark; no awaits needed.
+        # WS2b: the AMS holds moved OUT of the token lane and are reminded from
+        # their open escalated incident instead (a foreign print has no token).
         expected = {
-            "spool_jam_recovery_failed",
             "print_paused_stalled",
-            "filament_runout_recovery_failed",
             "plate_not_empty_printer_detected",
         }
         assert set(farm_stall._ATTENTION_REASONS) == expected
         # The dispatch dict IS the reason set — they cannot drift.
         assert set(farm_stall._ATTENTION_DISPATCH) == farm_stall._ATTENTION_REASONS
+        # ...and every incident kind has reminder copy, so a new kind cannot land
+        # silently.
+        from backend.app.models.printer_incident import KIND_JAM, KIND_PHYSICAL, KIND_RUNOUT
+
+        assert set(farm_stall._INCIDENT_REMINDER_DETAIL) == {KIND_JAM, KIND_RUNOUT, KIND_PHYSICAL}
 
 
 class TestSchedulerHookGuard:
@@ -591,7 +655,7 @@ class TestRunoutReminderNamesTheLiveSlot:
     CURRENT demand from the live state the tick already read."""
 
     async def test_reminder_carries_the_demanded_slot(self, db_session):
-        await _add_paused_held(db_session, 8, "filament_runout_recovery_failed")
+        await _add_incident_held(db_session, 8, "runout")
         # Firmware demands AMS A slot 2 (0-indexed tray 1).
         mgr = _FakeManager({8: True}, {8: _FakeState("PAUSE", [_runout_demand(0, 1)])})
         with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
@@ -602,7 +666,7 @@ class TestRunoutReminderNamesTheLiveSlot:
 
     async def test_reminder_self_updates_when_the_demand_moves(self, db_session):
         """The whole point: a demand that MOVES between windows must move the nag."""
-        await _add_paused_held(db_session, 8, "filament_runout_recovery_failed")
+        await _add_incident_held(db_session, 8, "runout")
         state = _FakeState("PAUSE", [_runout_demand(0, 2)])  # AMS A slot 3
         mgr = _FakeManager({8: True}, {8: state})
         with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
@@ -618,7 +682,7 @@ class TestRunoutReminderNamesTheLiveSlot:
     async def test_slot_agnostic_runout_degrades_honestly_to_none(self, db_session):
         """The bare 07xx_8011 names no slot, so ``None`` (the copy falls back to "the
         SAME slot") is the honest answer — not a guess."""
-        await _add_paused_held(db_session, 8, "filament_runout_recovery_failed")
+        await _add_incident_held(db_session, 8, "runout")
         bare = SimpleNamespace(attr=0x07000000, code="0x8011", full_code="0700000000008011")
         mgr = _FakeManager({8: True}, {8: _FakeState("PAUSE", [bare])})
         with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
@@ -627,13 +691,97 @@ class TestRunoutReminderNamesTheLiveSlot:
             mock_n.assert_awaited_once()
             assert mock_n.await_args.kwargs["runout_slot"] is None
 
-    async def test_jam_reminder_is_unaffected_by_the_state_passthrough(self, db_session):
-        """The jam reminder takes the same ``state`` kwarg and must ignore it."""
-        await _add_paused_held(db_session, 7, "spool_jam_recovery_failed")
+    async def test_jam_reminder_never_borrows_a_runout_demand_slot(self, db_session):
+        """A live runout demand on the wire must not leak into a JAM's copy — the
+        8010 family carries no slot attribution, so naming one would be a guess."""
+        await _add_incident_held(db_session, 7, "jam")
         mgr = _FakeManager({7: True}, {7: _FakeState("PAUSE", [_runout_demand(0, 1)])})
         with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
             mock_n.assert_awaited_once()
-            assert mock_n.await_args.kwargs["is_feed_fault"] is True
-            assert "runout_slot" not in mock_n.await_args.kwargs
+            assert mock_n.await_args.kwargs["kind"] == "jam"
+            assert mock_n.await_args.kwargs["runout_slot"] is None
+
+
+class TestForeignPausedPrinters:
+    """WS2b: the R1 minimum for a print the farm did NOT dispatch.
+
+    Every other watch in this module starts from a ``printing`` farm queue item, so a
+    LAN print, a screen restart or a USB re-run that PAUSEs — a vision trip, a
+    door-open, an HMS outside the AMS-actionable classes — was visible to nothing at
+    all and sat until a human happened to look.
+    """
+
+    async def test_a_foreign_pause_past_grace_alerts_once(self, db_session, printer_factory):
+        printer = await printer_factory()
+        mgr = _FakeManager({printer.id: True}, {printer.id: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_foreign_print_paused", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=0.0)  # edge
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=60.0)  # inside grace
+            mock_n.assert_not_awaited()
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=16 * 60.0)
+            mock_n.assert_awaited_once()
+            # ONE alert per episode, however many ticks the pause survives.
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=40 * 60.0)
+            assert mock_n.await_count == 1
+
+    async def test_leaving_pause_resets_the_episode(self, db_session, printer_factory):
+        printer = await printer_factory()
+        paused = _FakeManager({printer.id: True}, {printer.id: _FakeState("PAUSE")})
+        running = _FakeManager({printer.id: True}, {printer.id: _FakeState("RUNNING")})
+        with patch.object(notification_service, "on_foreign_print_paused", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_foreign_paused_printers(db_session, manager=paused, now=0.0)
+            await farm_stall.check_foreign_paused_printers(db_session, manager=paused, now=16 * 60.0)
+            assert mock_n.await_count == 1
+            # The operator clears it; the episode ends.
+            await farm_stall.check_foreign_paused_printers(db_session, manager=running, now=17 * 60.0)
+            assert printer.id not in farm_stall._foreign_paused_at
+            # A NEW pause episode alerts again.
+            await farm_stall.check_foreign_paused_printers(db_session, manager=paused, now=18 * 60.0)
+            await farm_stall.check_foreign_paused_printers(db_session, manager=paused, now=40 * 60.0)
+            assert mock_n.await_count == 2
+
+    async def test_a_farm_print_is_not_this_watch_s_business(self, db_session, printer_factory):
+        """The farm-unit pause-stall watch owns that one — double-alerting a hold a
+        human already knows about is exactly what the ownership checks prevent."""
+        printer = await printer_factory()
+        await _add_printing(db_session, printer.id)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_foreign_print_paused", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=60 * 60.0)
+            mock_n.assert_not_awaited()
+
+    async def test_an_open_incident_owns_the_pause(self, db_session, printer_factory):
+        """An AMS hold has its own alert AND its own hourly nag — this watch is the
+        catch-all behind everything the taxonomy could not explain."""
+        printer = await printer_factory()
+        await _add_incident_held(db_session, printer.id, "runout", item=False)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_foreign_print_paused", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=60 * 60.0)
+            mock_n.assert_not_awaited()
+
+    async def test_an_offline_printer_is_not_alerted(self, db_session, printer_factory):
+        printer = await printer_factory()
+        mgr = _FakeManager({printer.id: False}, {printer.id: _FakeState("PAUSE")})
+        with patch.object(notification_service, "on_foreign_print_paused", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=60 * 60.0)
+            mock_n.assert_not_awaited()
+
+    async def test_a_notify_failure_does_not_abort_the_watch(self, db_session, printer_factory):
+        a = await printer_factory()
+        b = await printer_factory()
+        mgr = _FakeManager({a.id: True, b.id: True}, {a.id: _FakeState("PAUSE"), b.id: _FakeState("PAUSE")})
+
+        async def _boom(printer_id, *args, **kwargs):
+            if printer_id == a.id:
+                raise RuntimeError("boom")
+
+        with patch.object(notification_service, "on_foreign_print_paused", new=AsyncMock(side_effect=_boom)) as mock_n:
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_foreign_paused_printers(db_session, manager=mgr, now=60 * 60.0)
+            assert mock_n.await_count == 2  # both attempted; the tick survived

@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: '耗材已用完——請在標記的 AMS 插槽插入新料卷並繼續',
+        spoolPhysicalFault: '實體故障 — 需要人工處理，不會自動換料',
         printerOfflineStalled: '列印過程中印表機離線 — 重新連線前結果未知',
         printPausedStalled: '印表機上已暫停 — 需要人工處理（無法自動復原）',
         visionHold: '印表機視覺偵測：列印板不為空 — 清理熱床後在印表機上繼續',
@@ -1147,6 +1148,12 @@ export default {
     },
     noUsb: '無 USB 隨身碟',
     noUsbHint: '派送將失敗 — 請插入 USB-A 隨身碟（FAT32/exFAT）',
+    incident: {
+      jam: 'AMS 卡料',
+      runout: '耗材用盡',
+      physical: '耗材故障',
+      recovering: '恢復中',
+    },
     // Fans
     fans: {
       partCooling: '零件冷卻風扇',

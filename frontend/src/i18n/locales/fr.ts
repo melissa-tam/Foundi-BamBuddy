@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: 'Le filament est épuisé — insérez une nouvelle bobine dans l\'emplacement AMS indiqué et reprenez',
+        spoolPhysicalFault: 'Panne physique — intervention requise, aucun échange automatique',
         printerOfflineStalled: 'Imprimante hors ligne en cours d\'impression — résultat inconnu jusqu\'à sa reconnexion',
         printPausedStalled: 'En pause sur l\'imprimante — intervention requise (pas de récupération automatique)',
         visionHold: 'Vision de l\'imprimante : plateau non vide — dégagez le plateau, puis reprenez sur l\'imprimante',
@@ -1147,6 +1148,12 @@ export default {
     },
     noUsb: 'Pas de clé USB',
     noUsbHint: 'L\'envoi échouera — insérez une clé USB-A (FAT32/exFAT)',
+    incident: {
+      jam: 'Bourrage AMS',
+      runout: 'Filament épuisé',
+      physical: 'Panne de filament',
+      recovering: 'Récupération',
+    },
     // Fans
     fans: {
       partCooling: 'Ventilateur pièce',

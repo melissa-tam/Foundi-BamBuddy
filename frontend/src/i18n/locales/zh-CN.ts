@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: '耗材已用完——请在标记的 AMS 槽位插入新料卷并继续',
+        spoolPhysicalFault: '物理故障 — 需要人工处理，不会自动换料',
         printerOfflineStalled: '打印过程中打印机离线 — 重新连接前结果未知',
         printPausedStalled: '打印机上已暂停 — 需要人工处理（无法自动恢复）',
         visionHold: '打印机视觉检测：打印板不为空 — 清理热床后在打印机上继续',
@@ -1147,6 +1148,12 @@ export default {
     },
     noUsb: '无 USB 驱动器',
     noUsbHint: '派发将失败 — 请插入 USB-A 驱动器（FAT32/exFAT）',
+    incident: {
+      jam: 'AMS 堵料',
+      runout: '耗材用尽',
+      physical: '耗材故障',
+      recovering: '恢复中',
+    },
     // Fans
     fans: {
       partCooling: '零件冷却风扇',

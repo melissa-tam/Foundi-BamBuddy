@@ -35,12 +35,14 @@ from sqlalchemy import select
 
 from backend.app.core.websocket import broadcast_production_run_changed
 from backend.app.models.print_queue import PrintQueueItem
+from backend.app.models.printer_incident import KIND_JAM, KIND_PHYSICAL, KIND_RUNOUT, STATUS_ESCALATED
 from backend.app.services import notify_dedup
 from backend.app.services.farm_correlation import WAITING_REASON_PLATE_VISION
 from backend.app.services.hms_errors import current_runout_demand
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_recovery import (
     WAITING_REASON_FAILED,
+    WAITING_REASON_PHYSICAL,
     WAITING_REASON_RECOVERING,
     WAITING_REASON_RUNOUT,
     runout_slot_desc,
@@ -80,13 +82,14 @@ WAITING_REASON_PAUSED = "print_paused_stalled"
 # as ownership would leave the printer PAUSEd forever with the watchdog silenced.
 # The orphan is instead reclaimed below.
 #
-# WAITING_REASON_FAILED / WAITING_REASON_RUNOUT STAY: escalation already fired its
-# one-shot operator notification and deliberately left the printer PAUSED for a human
-# (a jam that couldn't be recovered, or a filament runout that needs a same-slot
-# refill). Re-notifying either through the pause-stall watch would just double up on a
-# hold a human already owns.
+# The escalated AMS tokens STAY: the escalation already fired its one-shot operator
+# notification and deliberately left the printer PAUSED for a human (a jam that
+# couldn't be recovered, a runout needing a same-slot refill, a physical fault needing
+# hands). Re-notifying any of them through the pause-stall watch would just double up
+# on a hold a human already owns — and since WS2b the OPEN INCIDENT is the primary
+# ownership signal (it covers a foreign print, which has no token to read).
 _ATTENDED_PAUSE_REASONS: frozenset[str] = frozenset(
-    {WAITING_REASON_PLATE_VISION, WAITING_REASON_FAILED, WAITING_REASON_RUNOUT}
+    {WAITING_REASON_PLATE_VISION, WAITING_REASON_FAILED, WAITING_REASON_RUNOUT, WAITING_REASON_PHYSICAL}
 )
 
 _DEFAULT_GRACE_MINUTES = 30
@@ -115,6 +118,8 @@ def _reset_state() -> None:
     _first_paused_at.clear()
     _paused_notified.clear()
     _attention_first_seen.clear()
+    _foreign_paused_at.clear()
+    _foreign_notified.clear()
 
 
 async def _grace_seconds(db: AsyncSession, key: str, default: int) -> float:
@@ -273,7 +278,12 @@ async def check_paused_prints(db: AsyncSession, *, manager=printer_manager, now:
     grace_s = await _grace_seconds(db, "farm_pause_stall_minutes", _DEFAULT_PAUSE_GRACE_MINUTES)
     # Local import (matches the fork's cycle-avoidance convention here) — the sole
     # ownership signal for a spool-recovery pause is a LIVE task, not the token.
-    from backend.app.services import spool_recovery
+    from backend.app.services import printer_incidents, spool_recovery
+
+    # Printers whose pause an AMS incident already owns. Read ONCE per tick (the
+    # durable successor of "the item carries an escalated token": it also covers a
+    # foreign print, which has no queue row to carry one).
+    incident_printers = {inc.printer_id for inc in await printer_incidents.all_open(db)}
 
     result = await db.execute(
         select(PrintQueueItem).where(PrintQueueItem.status == "printing").where(PrintQueueItem.printer_id.is_not(None))
@@ -328,7 +338,11 @@ async def check_paused_prints(db: AsyncSession, *, manager=printer_manager, now:
         # this pause). ONE definition: a muted token (plate-vision / already-escalated
         # FAILED) OR a LIVE recovery task. RECOVERING is proven only by the live task,
         # never the token (an orphaned token was already reclaimed above).
-        owned = item.waiting_reason in _ATTENDED_PAUSE_REASONS or spool_recovery.has_live_recovery(pid)
+        owned = (
+            item.waiting_reason in _ATTENDED_PAUSE_REASONS
+            or spool_recovery.has_live_recovery(pid)
+            or pid in incident_printers
+        )
         if owned:
             _first_paused_at.pop(pid, None)
             _paused_notified.discard(pid)
@@ -376,6 +390,97 @@ async def check_paused_prints(db: AsyncSession, *, manager=printer_manager, now:
 
 
 # --------------------------------------------------------------------------- #
+# WS2b: the foreign-print pause watch
+# --------------------------------------------------------------------------- #
+# printer_id -> the ts a FOREIGN print was first seen PAUSEd (episode start), and
+# the printers already notified for the current episode. An episode is one
+# continuous PAUSE: leaving PAUSE clears both, so the next pause nags afresh.
+_foreign_paused_at: dict[int, float] = {}
+_foreign_notified: set[int] = set()
+
+
+async def check_foreign_paused_printers(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
+    """One-shot alert for a print the farm did NOT dispatch, left PAUSEd past grace.
+
+    Every other watch in this module starts from a ``printing`` farm queue item, so
+    the whole of the fleet's foreign work — a Bambu Studio LAN print, a screen
+    restart, a re-run off the USB — was invisible to all of them: a vision trip or a
+    door-open on a foreign print sat until a human happened to look. The AMS-incident
+    lane covers the faults it can classify; this is the catch-all behind everything
+    else, and it deliberately says only what is true (something stopped, nothing is
+    recovering it) rather than promising a farm reaction.
+
+    Fires when ALL hold: the printer is CONNECTED and in live PAUSE, NO farm unit is
+    printing on it, NO AMS incident is open for it (that hold has its own alert and
+    its own hourly nag), and the pause has lasted past ``farm_pause_stall_minutes``.
+    One notification per pause EPISODE. Mutates nothing.
+    """
+    now = time.time() if now is None else now
+    grace_s = await _grace_seconds(db, "farm_pause_stall_minutes", _DEFAULT_PAUSE_GRACE_MINUTES)
+    from backend.app.models.printer import Printer
+    from backend.app.services import printer_incidents
+
+    incident_printers = {inc.printer_id for inc in await printer_incidents.all_open(db)}
+    farm_busy = {
+        pid
+        for (pid,) in (
+            await db.execute(
+                select(PrintQueueItem.printer_id)
+                .where(PrintQueueItem.status == "printing")
+                .where(PrintQueueItem.printer_id.is_not(None))
+            )
+        ).all()
+    }
+
+    printers = list((await db.execute(select(Printer))).scalars().all())
+    seen: set[int] = set()
+    for printer in printers:
+        pid = printer.id
+        try:
+            if not manager.is_connected(pid):
+                continue
+            st = manager.get_status(pid)
+            if getattr(st, "state", None) != "PAUSE":
+                continue
+            seen.add(pid)
+            if pid in farm_busy or pid in incident_printers:
+                # Owned elsewhere: restart the episode clock so this watch only ever
+                # counts time the pause was genuinely unowned.
+                _foreign_paused_at.pop(pid, None)
+                _foreign_notified.discard(pid)
+                seen.discard(pid)
+                continue
+
+            first = _foreign_paused_at.get(pid)
+            if first is None:
+                _foreign_paused_at[pid] = now
+                continue
+            if now - first < grace_s or pid in _foreign_notified:
+                continue
+
+            _foreign_notified.add(pid)
+            minutes = int((now - first) // 60)
+            job_name = (getattr(st, "subtask_name", None) or "").strip() or "an unknown print"
+            from backend.app.services.notification_service import notification_service
+
+            await notification_service.on_foreign_print_paused(pid, printer.name, job_name, minutes, db)
+            logger.warning(
+                "farm_stall: printer %s PAUSEd %d min on FOREIGN print '%s' with nothing owning it — operator alerted",
+                pid,
+                minutes,
+                job_name,
+            )
+        except Exception:  # noqa: BLE001 — one bad printer must not abort the watch
+            logger.exception("farm_stall: foreign-pause watch failed for printer %s", pid)
+
+    # Episode reset: any printer no longer in an unowned PAUSE starts over.
+    for pid in list(_foreign_paused_at.keys()):
+        if pid not in seen:
+            _foreign_paused_at.pop(pid, None)
+            _foreign_notified.discard(pid)
+
+
+# --------------------------------------------------------------------------- #
 # W3: hourly attention reminders for a printer left down needing a human
 # --------------------------------------------------------------------------- #
 # Reminder copy — a re-fire is the SAME notification EVENT the original escalation
@@ -396,37 +501,17 @@ async def _remind_paused(db, notif, printer_id, printer_name, job_name, minutes,
     await notif.on_print_paused_stalled(printer_id, printer_name, job_name, minutes, db)
 
 
-async def _remind_jam(db, notif, printer_id, printer_name, job_name, minutes, *, state=None) -> None:
-    """Re-fire the spool-recovery escalation's own event (WAITING_REASON_FAILED)."""
-    await notif.on_spool_recovery_failed(
-        printer_id=printer_id,
-        printer_name=printer_name,
-        job_name=job_name,
-        detail=_JAM_REMINDER_DETAIL,
-        db=db,
-        is_feed_fault=True,
-    )
+_PHYSICAL_REMINDER_DETAIL = (
+    "A physical filament fault is STILL unresolved — the printer is still PAUSED and no swap can clear it."
+)
 
-
-async def _remind_runout(db, notif, printer_id, printer_name, job_name, minutes, *, state=None) -> None:
-    """Re-fire the runout escalation's own event (WAITING_REASON_RUNOUT) — same
-    ``on_spool_recovery_failed`` method, runout-framed copy (``is_feed_fault=False``).
-
-    The slot is decoded LIVE from the printer state the tick already fetched (006-H2S
-    2026-07-26): the reminder used to hardcode ``runout_slot=None``, so every hourly
-    nag degraded to "the SAME slot" and told an operator who had been given the WRONG
-    slot nothing new for 12 h. Reading the firmware's current demand each time also
-    means the reminder SELF-CORRECTS when the demand moves. ``None`` only when the
-    firmware names no slot (the bare ``07xx_8011``), which is the honest fallback."""
-    await notif.on_spool_recovery_failed(
-        printer_id=printer_id,
-        printer_name=printer_name,
-        job_name=job_name,
-        detail=_RUNOUT_REMINDER_DETAIL,
-        db=db,
-        is_feed_fault=False,
-        runout_slot=_live_runout_slot(state),
-    )
+# incident kind -> the reminder's detail copy. One line per kind, so the nag reads
+# like the alert it repeats.
+_INCIDENT_REMINDER_DETAIL: dict[str, str] = {
+    KIND_JAM: _JAM_REMINDER_DETAIL,
+    KIND_RUNOUT: _RUNOUT_REMINDER_DETAIL,
+    KIND_PHYSICAL: _PHYSICAL_REMINDER_DETAIL,
+}
 
 
 def _live_runout_slot(state) -> str | None:
@@ -447,9 +532,13 @@ async def _remind_plate_vision(db, notif, printer_id, printer_name, job_name, mi
 # reason -> the callable that RE-FIRES that reason's original notification event.
 # This dict IS the single source of the remindable reason set (_ATTENTION_REASONS
 # below), so adding a reason is a one-line edit that cannot drift from the pin.
+#
+# The AMS holds (jam / runout / physical) are deliberately ABSENT: since WS2b they
+# are reminded from their OPEN ESCALATED INCIDENT (:func:`_remind_open_incidents`),
+# not from a queue item's token. A token can only exist for a farm print, so the
+# token lane could never nag about a foreign print left holding — which is exactly
+# the class of hold that sat silent for hours.
 _ATTENTION_DISPATCH: dict[str, Callable[..., Awaitable[None]]] = {
-    WAITING_REASON_FAILED: _remind_jam,
-    WAITING_REASON_RUNOUT: _remind_runout,
     WAITING_REASON_PAUSED: _remind_paused,
     WAITING_REASON_PLATE_VISION: _remind_plate_vision,
 }
@@ -459,17 +548,102 @@ _ATTENTION_DISPATCH: dict[str, Callable[..., Awaitable[None]]] = {
 _ATTENTION_REASONS: frozenset[str] = frozenset(_ATTENTION_DISPATCH)
 
 
+async def _remind_open_incidents(
+    db: AsyncSession,
+    notif,
+    *,
+    manager,
+    now: float,
+    held_keys: set[tuple[int, str]],
+) -> None:
+    """Hourly nag for every OPEN ESCALATED AMS incident still holding its printer.
+
+    Printer-scoped by design (WS2b): an incident is a fact about the PRINTER, so this
+    arm reminds identically whether the held print is a farm unit or a foreign one —
+    the token-driven arm it replaces could only ever see farm units, and a foreign
+    hold nagged nobody. Re-fires the escalation's OWN event with kind-aware copy; no
+    new event types.
+
+    The runout slot is re-decoded LIVE each tick (006-H2S 2026-07-26) so the nag
+    SELF-CORRECTS when the firmware's demand moves, rather than repeating the slot
+    that was right an hour ago.
+    """
+    from backend.app.models.printer import Printer
+    from backend.app.services import printer_incidents
+
+    for incident in await printer_incidents.all_open(db):
+        if incident.status != STATUS_ESCALATED:
+            continue  # 'recovering' is the machine acting — not a hold to nag about
+        pid = incident.printer_id
+        key = (pid, f"incident:{incident.id}")
+        try:
+            if not manager.is_connected(pid):
+                continue
+            st = manager.get_status(pid)
+            if getattr(st, "state", None) != "PAUSE":
+                continue
+            held_keys.add(key)
+
+            akey = f"{pid}:incident:{incident.id}"
+            first = _attention_first_seen.get(key)
+            if first is None:
+                # First remindable sighting: seed the window so the first reminder
+                # lands one full window later (the escalation delivered the first).
+                _attention_first_seen[key] = now
+                notify_dedup.allow("attention", akey, now, _ATTENTION_REMINDER_S)
+                continue
+            if not notify_dedup.allow("attention", akey, now, _ATTENTION_REMINDER_S):
+                continue
+
+            minutes = int((now - first) // 60)
+            printer = await db.get(Printer, pid)
+            printer_name = printer.name if printer is not None else f"printer {pid}"
+            job_name = (getattr(st, "subtask_name", None) or "").strip() or "print"
+            slot = None
+            if incident.kind == KIND_RUNOUT:
+                slot = _live_runout_slot(st) or runout_slot_desc(incident.slot_global_tray)
+            elif incident.slot_global_tray is not None:
+                slot = runout_slot_desc(incident.slot_global_tray)
+            await notif.on_spool_recovery_failed(
+                printer_id=pid,
+                printer_name=printer_name,
+                job_name=job_name,
+                detail=_INCIDENT_REMINDER_DETAIL.get(incident.kind, _JAM_REMINDER_DETAIL),
+                db=db,
+                kind=incident.kind,
+                runout_slot=slot,
+                foreign=incident.item_id is None,
+            )
+            logger.warning(
+                "farm_stall: printer %s STILL held by %s incident %s (%d min%s) — attention reminder re-fired",
+                pid,
+                incident.kind,
+                incident.id,
+                minutes,
+                "" if incident.item_id is not None else ", foreign print",
+            )
+        except Exception:  # noqa: BLE001 — one bad printer must not abort the watch
+            logger.exception("farm_stall: incident attention reminder failed for printer %s", pid)
+
+
 async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
     """Re-fire the ORIGINAL escalation notification for a printer left down (W3).
 
     The offline / pause-stall / spool-recovery / runout escalations each alert
     EXACTLY ONCE per incident and then leave the printer PAUSED for a human, so a
     hold that a human doesn't clear for hours produced a single Discord message —
-    the 2026-07-20 incident sat 5+ h that way on two printers. This watch nags: for
-    every CONNECTED printer in live gcode_state PAUSE whose still-``printing`` unit
-    carries one of the ESCALATED tokens in :data:`_ATTENTION_REASONS`, it re-fires
-    THAT reason's own notification event (via :data:`_ATTENTION_DISPATCH` — no new
-    event types) once per :data:`_ATTENTION_REMINDER_S` window until the hold lifts.
+    the 2026-07-20 incident sat 5+ h that way on two printers. This watch nags,
+    through TWO arms that never overlap:
+
+    * every OPEN ESCALATED AMS incident (:func:`_remind_open_incidents`) — printer
+      scoped, so a FOREIGN print's hold nags exactly like a farm one. Before WS2b
+      this arm read farm queue tokens, and a foreign hold had none to read;
+    * every still-``printing`` farm unit carrying one of the remaining non-AMS
+      ESCALATED tokens in :data:`_ATTENTION_REASONS` (plate-vision, pause-stall),
+      re-firing THAT reason's own notification event via :data:`_ATTENTION_DISPATCH`
+      — no new event types.
+
+    Each nags once per :data:`_ATTENTION_REMINDER_S` window until the hold lifts.
 
     Cadence: the first alert stays owned by the original escalation path, which
     never touches the ``"attention"`` :func:`notify_dedup.allow` scope. So the loop
@@ -490,8 +664,10 @@ async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager
         select(PrintQueueItem).where(PrintQueueItem.status == "printing").where(PrintQueueItem.printer_id.is_not(None))
     )
     # (printer_id, reason) pairs still in the remindable condition THIS tick. Only
-    # these are retained below; every other tracked key is reset.
+    # these are retained below; every other tracked key is reset. The incident arm
+    # shares the ledger, keyed ``incident:{id}`` — one reset pass, one contract.
     held_keys: set[tuple[int, str]] = set()
+    await _remind_open_incidents(db, notification_service, manager=manager, now=now, held_keys=held_keys)
 
     for item in list(result.scalars().all()):
         pid = item.printer_id

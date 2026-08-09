@@ -562,12 +562,13 @@ _SWAP_8010_MODULES = (
     "12FF",
 )
 
-# The trigger vocabulary the jam-swap machine has always acted on. WS2a keeps it
-# byte-identical while the taxonomy already classifies a wider mechanical family.
-_EXPECTED_LEGACY_SWAP = _family(_SWAP_8010_MODULES, "8010") | {"0300_801E"}
-
+# The mechanical-feed class. Since the 2026-08-09 operator-ratified partition (WS2b)
+# this IS the jam-swap machine's trigger vocabulary — the WS2a ``legacy_swap`` marker
+# that held the machine at the 8010/801E subset was scaffolding for a
+# behavior-neutral relocation and was deleted by the consumer wave that widened it.
 _EXPECTED_MECHANICAL = (
-    _EXPECTED_LEGACY_SWAP
+    _family(_SWAP_8010_MODULES, "8010")
+    | {"0300_801E"}
     | _family((*_AMS_UNIT_MODULES, "07FF"), "8005")
     | _family((*_AMS_UNIT_MODULES, "07FF"), "8006")
     | {"0700_8028", "07FF_8028"}
@@ -696,11 +697,7 @@ class TestAmsFaultTaxonomyShortLane:
 
     @pytest.mark.parametrize(
         ("short", "expected_class"),
-        sorted(
-            (short, class_value)
-            for class_value, shorts in _EXPECTED_SHORT_CLASSES.items()
-            for short in shorts
-        ),
+        sorted((short, class_value) for class_value, shorts in _EXPECTED_SHORT_CLASSES.items() for short in shorts),
     )
     def test_each_short_code_classifies(self, short, expected_class):
         from backend.app.services.hms_errors import classify_short_code
@@ -721,7 +718,6 @@ class TestAmsFaultTaxonomyShortLane:
     def test_the_derived_consumer_sets_match(self):
         from backend.app.services.hms_errors import (
             extruder_side_short_codes,
-            legacy_swap_short_codes,
             mechanical_feed_short_codes,
             runout_short_codes,
         )
@@ -729,19 +725,21 @@ class TestAmsFaultTaxonomyShortLane:
         assert mechanical_feed_short_codes() == _EXPECTED_MECHANICAL
         assert runout_short_codes() == _EXPECTED_RUNOUT
         assert extruder_side_short_codes() == _EXPECTED_EXTRUDER_SIDE
-        assert legacy_swap_short_codes() == _EXPECTED_LEGACY_SWAP
 
-    def test_the_send_out_families_are_classified_but_not_swap_triggers(self):
-        from backend.app.services.hms_errors import (
-            classify_short_code,
-            legacy_swap_short_codes,
-        )
+    def test_the_send_out_families_are_swap_triggers(self):
+        """The 2026-08-09 operator-ratified widening: these classify mechanical_feed
+        AND the swap machine acts on them. The ``legacy_swap`` marker that held them
+        out during WS2a is deleted — a "do not act on this classification yet" flag
+        must not outlive the wave that acts on it."""
+        from backend.app.services import hms_errors
+        from backend.app.services.hms_errors import classify_short_code, mechanical_feed_short_codes
+        from backend.app.services.spool_recovery import FEED_FAULT_HMS_CODES
 
-        # WS2a behavior neutrality: the taxonomy carries the wider classification,
-        # the swap machine's trigger marker does not — the consumer wave widens it.
         for short in ("0700_8005", "0700_8006", "0700_8028"):
             assert classify_short_code(short).fault_class.value == "mechanical_feed"
-            assert short not in legacy_swap_short_codes()
+            assert short in FEED_FAULT_HMS_CODES
+        assert mechanical_feed_short_codes() == FEED_FAULT_HMS_CODES
+        assert not hasattr(hms_errors, "legacy_swap_short_codes")
 
     def test_an_unclassified_short_code_is_none(self):
         from backend.app.services.hms_errors import classify_short_code
@@ -763,9 +761,7 @@ class TestAmsFaultTaxonomyCodeWordLane:
         ("code_word", "expected_class", "expected_extruder_side"),
         sorted((cw, cls, ext) for cw, (cls, ext) in _EXPECTED_TRAY_CODE_WORDS.items()),
     )
-    def test_each_tray_attributed_code_word_classifies(
-        self, code_word, expected_class, expected_extruder_side
-    ):
+    def test_each_tray_attributed_code_word_classifies(self, code_word, expected_class, expected_extruder_side):
         from backend.app.services.hms_errors import classify_ams_fault
 
         verdict = classify_ams_fault(_tray_attr(ams_id=1, tray=2), code_word)
@@ -909,10 +905,7 @@ class TestHmsErrorsImportGraph:
         # A fresh interpreter: importing hms_errors alone must not drag in the spool
         # stack transitively either (which would mean the cycle is merely deferred).
         repo_root = Path(inspect.getfile(hms_errors_module)).parents[3]
-        probe = (
-            "import sys; import backend.app.services.hms_errors; "
-            "print([m for m in sys.modules if 'spool' in m])"
-        )
+        probe = "import sys; import backend.app.services.hms_errors; print([m for m in sys.modules if 'spool' in m])"
         result = subprocess.run(
             [sys.executable, "-c", probe],
             capture_output=True,

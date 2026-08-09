@@ -114,6 +114,9 @@ class NotificationProvider(Base):
     on_print_paused_stalled = Column(
         Boolean, default=True
     )  # Printing unit's CONNECTED printer sat unattended-PAUSEd past the pause-stall grace window
+    on_foreign_print_paused = Column(
+        Boolean, default=True
+    )  # A print the farm did NOT dispatch sat PAUSEd past the grace window with no AMS incident owning it
     on_storage_low = Column(
         Boolean, default=True
     )  # Printer USB storage FAILURE — auto-cleanup could not free space, FTPS/USB unreachable, or the drive dropped mid-print (successful cleanups are silent)

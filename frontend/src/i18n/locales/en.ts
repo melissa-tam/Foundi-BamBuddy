@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: 'Filament ran out — insert a new spool into the marked AMS slot and resume',
+        spoolPhysicalFault: 'Physical fault — hands needed, no auto-swap',
         printerOfflineStalled: 'Printer offline mid-print — outcome unknown until it reconnects',
         printPausedStalled: 'Paused on the printer — needs attention (no auto-recovery)',
         visionHold: 'Printer vision: plate not empty — clear the bed, then resume on the printer',
@@ -1153,6 +1154,12 @@ export default {
     },
     noUsb: 'No USB drive',
     noUsbHint: 'Dispatch will fail — insert a USB-A drive (FAT32/exFAT)',
+    incident: {
+      jam: 'AMS jam',
+      runout: 'Filament out',
+      physical: 'Filament fault',
+      recovering: 'Recovering',
+    },
     // Fans
     fans: {
       partCooling: 'Part Cooling Fan',

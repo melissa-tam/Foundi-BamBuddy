@@ -383,7 +383,7 @@ class TestRecoveryOwnedSuppression:
         with (
             _Harness() as h,
             patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=True)) as will_own,
-            patch("backend.app.services.spool_recovery.on_feed_fault_hms", new=AsyncMock()),
+            patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()),
         ):
             await main_module.on_printer_status_change(5, _state([_FEED_FAULT, _RUNOUT_COMPANION, _UNRELATED]))
 
@@ -403,7 +403,7 @@ class TestRecoveryOwnedSuppression:
         with (
             _Harness() as h,
             patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=False)),
-            patch("backend.app.services.spool_recovery.on_feed_fault_hms", new=AsyncMock()),
+            patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()),
         ):
             await main_module.on_printer_status_change(5, _state([_FEED_FAULT, _RUNOUT_COMPANION, _UNRELATED]))
 
@@ -419,7 +419,7 @@ class TestRecoveryOwnedSuppression:
         with (
             _Harness() as h,
             patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(side_effect=RuntimeError("boom"))),
-            patch("backend.app.services.spool_recovery.on_feed_fault_hms", new=AsyncMock()),
+            patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()),
         ):
             await main_module.on_printer_status_change(5, _state([_FEED_FAULT, _RUNOUT_COMPANION, _UNRELATED]))
 
@@ -561,3 +561,88 @@ class TestSlotRunoutSpentHook:
         # The push completed: the ordinary code still notified and still stamped.
         assert h.notify.on_printer_error.await_count == 1
         assert "0700_4025" in h.sent_bodies[0]
+
+
+@pytest.mark.asyncio
+class TestStandingCodesStillReachTheIncidentMachine:
+    """THE silent-class reproduction (WS2b finding (b)).
+
+    The recovery spawn used to be nested inside ``if new_error_codes:`` — the
+    NOTIFICATION dedup's edge. Two everyday shapes therefore never reached it, and
+    produced no incident, no alert and not even a log line (9 runout episodes):
+
+      * a code STANDING at restart — ``notify_dedup.seed_standing`` pre-marks every
+        live code as already-seen so a deploy does not re-blast, which also emptied
+        ``new_error_codes`` on the first push;
+      * a code FLAPPING inside the 600 s re-notify window — one continuing incident
+        for notification purposes, but a fresh physical fault for the machine.
+
+    The spawn is now derived from the LIVE hms list and fires per push. Running these
+    cases against the pre-WS2b pipeline produced zero calls (reference only — the old
+    code is deleted, so the contrast is documented rather than executed).
+    """
+
+    async def test_a_code_standing_since_restart_still_spawns(self):
+        import asyncio
+
+        runout = SimpleNamespace(code="0x8011", attr=0x07000000, module=0x07, severity=2, full_code="0700000000008011")
+        with (
+            _Harness() as h,
+            patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=True)),
+            patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()) as spawn,
+        ):
+            # Exactly what startup does: the live code is pre-marked as already
+            # alerted, so it is NOT new on this push.
+            h.seed_standing.return_value = {runout.full_code}
+            notify_dedup.new_codes(5, {runout.full_code}, 1000.0)
+
+            await main_module.on_printer_status_change(5, _state([_hms(runout)], layer_num=3))
+            await asyncio.sleep(0)  # let the fire-and-forget task run
+
+        assert spawn.await_count == 1  # the incident machine was reached
+        assert h.notify.on_printer_error.await_count == 0  # ...and nothing re-blasted
+
+    async def test_a_code_flapping_inside_the_renotify_window_still_spawns(self):
+        import asyncio
+
+        runout = SimpleNamespace(code="0x8011", attr=0x07000000, module=0x07, severity=2, full_code="0700000000008011")
+        with (
+            _Harness(),
+            patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=True)),
+            patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()) as spawn,
+        ):
+            await main_module.on_printer_status_change(5, _state([_hms(runout)], layer_num=1))
+            await asyncio.sleep(0)
+            # It clears and comes back well inside the 600 s window: one incident for
+            # notification, a live fault for the machine on EVERY push.
+            await main_module.on_printer_status_change(5, _state([], layer_num=2))
+            await main_module.on_printer_status_change(5, _state([_hms(runout)], layer_num=3))
+            await asyncio.sleep(0)
+
+        assert spawn.await_count == 2
+
+    async def test_no_actionable_code_never_spawns(self):
+        """The gate is the TAXONOMY, not "any HMS": an RFID-read failure is not an
+        incident and must not open a hold nobody can clear."""
+        import asyncio
+
+        with (
+            _Harness(),
+            patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()) as spawn,
+        ):
+            await main_module.on_printer_status_change(5, _state([_hms(_READ_FAIL), _hms(_MAIN_BOARD)]))
+            await asyncio.sleep(0)
+
+        spawn.assert_not_awaited()
+
+    async def test_the_wire_sampler_runs_on_every_push_even_with_no_hms(self):
+        """The sampler owns the "printer is running again" close and the demand-clear
+        resume — both are edges where hms is EMPTY, so it must not sit inside the
+        HMS branch."""
+        with (
+            _Harness(),
+            patch("backend.app.services.spool_recovery.note_demand_watch") as sampler,
+        ):
+            await main_module.on_printer_status_change(5, _state([], layer_num=7))
+
+        sampler.assert_called_once()

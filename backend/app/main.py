@@ -1313,6 +1313,23 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     except Exception as _bse:  # noqa: BLE001 — sampling must never crash the status flow
         logging.getLogger(__name__).warning("[RESPOOL] backup-swap sampler failed for printer %s: %s", printer_id, _bse)
 
+    # AMS-incident wire sampler (WS2b). Sync, in-memory and session-free like the
+    # backup-swap sampler above, and OUTSIDE the "HMS present" branch on purpose: the
+    # two edges it watches are the DISAPPEARANCE of a fault (the firmware stopped
+    # demanding filament) and the printer running again — both of which are pushes
+    # where hms may be empty. It owns the refill auto-resume's second spawn source
+    # and the close that ends a hold whoever resumed the printer, which before WS2b
+    # only the farm's own auto-resume could do (a screen resume left the unit holding
+    # "filament_runout_recovery_failed" forever).
+    try:
+        from backend.app.services.spool_recovery import note_demand_watch
+
+        note_demand_watch(printer_id, state)
+    except Exception as _dwe:  # noqa: BLE001 — sampling must never crash the status flow
+        logging.getLogger(__name__).warning(
+            "[SPOOL-RECOVERY] incident wire sampler failed for printer %s: %s", printer_id, _dwe
+        )
+
     # Restart-replay HMS suppression (Phase D). Same one-shot shape as the runout
     # seed above and gated on the same "real report" rule: on the FIRST status push
     # per printer per process, every live code we have PROVABLY alerted on before
@@ -1438,11 +1455,16 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             hms_short_code,
             runout_slot_from_hms,
         )
-        from backend.app.services.spool_recovery import RECOVERABLE_HMS_CODES
+        from backend.app.services.spool_recovery import on_ams_fault, owned_short_codes
 
-        _new_recoverable = {
-            hms_short_code(e.attr, e.code) for e in current_hms_errors if e.full_code in new_error_codes
-        } & RECOVERABLE_HMS_CODES
+        # Codes an AMS INCIDENT speaks for, derived from ALL live HMS entries through
+        # the WS2a taxonomy — not from ``new_error_codes``. That decoupling is the WS2b
+        # fix for the silent class: a code standing at restart (seed_standing marks it
+        # already-seen) or flapping inside the 600 s re-notify window never entered
+        # ``new_error_codes``, so the old spawn never fired and never logged — 9 runout
+        # episodes passed with no incident, no alert and no trace. Computed once here
+        # so the notify suppression and the spawn below read the SAME set.
+        _incident_codes = owned_short_codes(state)
 
         if new_error_codes:
             # Get the actual new errors for the notification.
@@ -1490,7 +1512,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                     # already fails closed; the guard is belt-and-braces so a predicate
                     # error can never silence the raw alerts.
                     owned = False
-                    if _new_recoverable:
+                    if _incident_codes:
                         try:
                             owned = await spool_recovery.will_own(db, printer_id, state)
                         except Exception:  # noqa: BLE001 — never suppress on a crashed predicate
@@ -1550,7 +1572,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         # never match the bare short string "0700_0001" — it collides with
                         # the slot-attributed runout family.
                         if owned and (
-                            short_code in RECOVERABLE_HMS_CODES
+                            short_code in _incident_codes
                             or runout_slot_from_hms(error.attr, _code_word(error.code)) is not None
                         ):
                             await notify_dedup.record_sent(
@@ -1745,22 +1767,25 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                     "[SPOOL-RECOVERY] runout guidance refresh failed for printer %s: %s", printer_id, _ge
                 )
 
-            # Automatic mid-print spool-jam recovery: a NEW feed-fault HMS (AMS
-            # tangle / assist-motor overload) — or a runout the firmware backup
-            # failed to rescue — PAUSEs a farm print with no self-recovery. Spawn
-            # the recovery state machine (unload → out-of-rotation → swap →
-            # resume). All gating + orchestration lives in spool_recovery; this is a
-            # guarded fire-and-forget hook only. Reuses the _new_recoverable set computed
-            # once above (which also drives the notify recovery-owned suppression).
-            if _new_recoverable:
-                try:
-                    from backend.app.services.spool_recovery import on_feed_fault_hms
-
-                    asyncio.create_task(on_feed_fault_hms(printer_id, _new_recoverable, state))
-                except Exception as _fe:  # noqa: BLE001 — hook must never crash the status flow
-                    logging.getLogger(__name__).warning(
-                        "[SPOOL-RECOVERY] feed-fault hook failed for printer %s: %s", printer_id, _fe
-                    )
+        # Automatic AMS incident ownership: a mechanical feed fault (tangle /
+        # assist-motor overload / failed send-out) PAUSEs a farm print with no
+        # self-recovery; a runout holds for a same-slot refill; a physical fault needs
+        # hands. Spawn the incident machine — it opens the durable incident, routes by
+        # fault class and print origin (farm or foreign), and owns every notification.
+        #
+        # DELIBERATELY OUTSIDE the ``if new_error_codes:`` branch above and fired per
+        # push: gating the spawn on the notification dedup's new-code edge is what made
+        # 9 runout episodes silent (a code standing at restart, or flapping inside the
+        # 600 s window, is never "new"). The service's own entry throttle keeps a
+        # standing fault from re-querying every second; all other gating lives there
+        # too. Guarded fire-and-forget hook only.
+        if _incident_codes:
+            try:
+                asyncio.create_task(on_ams_fault(printer_id, state))
+            except Exception as _fe:  # noqa: BLE001 — hook must never crash the status flow
+                logging.getLogger(__name__).warning(
+                    "[SPOOL-RECOVERY] AMS fault hook failed for printer %s: %s", printer_id, _fe
+                )
 
     # An empty hms list needs no bookkeeping: notify_dedup ages each code out by
     # its own last-seen timestamp, so a flapping code that briefly clears is still
@@ -4068,6 +4093,18 @@ async def on_print_complete(printer_id: int, data: dict):
         reset_swap_edge_state(printer_id)
     except Exception as _rse:  # noqa: BLE001 — edge-state reset must never crash the completion callback
         logger.warning("[RESPOOL] backup-swap edge reset failed on print complete for printer %s: %s", printer_id, _rse)
+
+    # Close any AMS incident this print was holding (WS2b). A fault cannot outlive the
+    # job it interrupted — whatever the outcome, the hold is over and the next print
+    # must not inherit a printer that reads "already owned". Unconditional and
+    # symmetric to the reset above; the farm unit's own waiting_reason hygiene stays
+    # farm_policy.on_terminal's job (W4b), so the two never fight over one row.
+    try:
+        from backend.app.services.spool_recovery import on_job_terminal
+
+        await on_job_terminal(printer_id)
+    except Exception as _ite:  # noqa: BLE001 — incident close must never crash the completion callback
+        logger.warning("[SPOOL-RECOVERY] incident close failed on print complete for printer %s: %s", printer_id, _ite)
 
     # Drop the 3MF download cache for this printer (#972). The print is over,
     # nothing else legitimately needs the bytes; keeping them would only risk
@@ -6593,6 +6630,14 @@ async def lifespan(app: FastAPI):
         await hydrate_pending_ejects_from_db()
     except Exception as _hydr_e:  # noqa: BLE001 — hydration must never block startup
         logging.getLogger(__name__).warning("Pending-eject hydration failed: %s", _hydr_e)
+
+    # AMS incidents (WS2b): reconcile holds left open by the restart, then rehydrate
+    # the printer-card projection. A printer now running was resumed while we were
+    # down (close it — a stale open row would block every future incident there); one
+    # still PAUSEd keeps its hold and its hourly reminder. Fully self-guarded.
+    from backend.app.services.spool_recovery import rearm_incidents_on_startup
+
+    await rearm_incidents_on_startup()
 
     # Farm auto-eject: re-arm cooldown watches lost to the restart (a gate left
     # set by a successful eject job would otherwise stall the queue forever).

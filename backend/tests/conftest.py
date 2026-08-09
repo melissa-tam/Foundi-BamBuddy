@@ -133,6 +133,7 @@ async def test_engine():
         print_log,
         print_queue,
         printer,
+        printer_incident,  # noqa: F401 — WS2b durable AMS incidents
         project,
         project_bom,
         settings,

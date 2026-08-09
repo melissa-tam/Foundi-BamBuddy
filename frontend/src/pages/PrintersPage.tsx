@@ -3763,6 +3763,32 @@ function PrinterCard({
                   {t('printers.noUsb')}
                 </span>
               )}
+
+              {/* Open AMS incident (WS2b): a jam / runout / physical fault holding
+                  this printer. Rendered from the printer's OWN state, not from a
+                  queue unit — a foreign print's hold has no queue row, so without
+                  this chip it is invisible in the UI entirely (12 foreign runouts
+                  held printers with nothing on screen to say so). Amber while the
+                  machine is still acting, red once it escalated to a human. */}
+              {status?.open_incident && (
+                <span
+                  className={`flex items-center gap-1 px-2 py-1 rounded-full text-xs ${
+                    status.open_incident.status === 'escalated'
+                      ? 'bg-status-error/20 text-status-error'
+                      : 'bg-yellow-500/20 text-yellow-400'
+                  }`}
+                  title={
+                    status.open_incident.slot_desc
+                      ? `${t(`printers.incident.${status.open_incident.kind}`)} — ${status.open_incident.slot_desc}`
+                      : t(`printers.incident.${status.open_incident.kind}`)
+                  }
+                >
+                  <AlertTriangle className="w-3 h-3" />
+                  {status.open_incident.status === 'escalated'
+                    ? t(`printers.incident.${status.open_incident.kind}`)
+                    : t('printers.incident.recovering')}
+                </span>
+              )}
               </div>
               {/* One-line HMS summary under the badge row — names the fault (incl.
                   unknown codes) without opening the modal (H1/F3). Self-hides when

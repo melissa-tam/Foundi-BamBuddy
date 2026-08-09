@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: 'El filamento se agotó — inserta una bobina nueva en la ranura AMS marcada y reanuda',
+        spoolPhysicalFault: 'Fallo físico: se requiere intervención, sin cambio automático',
         printerOfflineStalled: 'Impresora sin conexión a mitad de impresión — resultado desconocido hasta que se reconecte',
         printPausedStalled: 'En pausa en la impresora — requiere atención (sin recuperación automática)',
         visionHold: 'Visión de la impresora: cama no vacía — despeje la cama y reanude en la impresora',
@@ -1147,6 +1148,12 @@ export default {
     },
     noUsb: 'Sin unidad USB',
     noUsbHint: 'El envío fallará — inserte una unidad USB-A (FAT32/exFAT)',
+    incident: {
+      jam: 'Atasco del AMS',
+      runout: 'Sin filamento',
+      physical: 'Fallo de filamento',
+      recovering: 'Recuperando',
+    },
     // Fans
     fans: {
       partCooling: 'Ventilador de refrigeración de piezas',

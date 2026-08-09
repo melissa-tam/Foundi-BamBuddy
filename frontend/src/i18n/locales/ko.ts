@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: '필라멘트가 떨어졌습니다 — 표시된 AMS 슬롯에 새 스풀을 넣고 재개하세요',
+        spoolPhysicalFault: '물리적 고장 — 직접 조치가 필요하며 자동 교체는 하지 않습니다',
         printerOfflineStalled: '인쇄 중 프린터가 오프라인이 되었습니다 — 다시 연결될 때까지 결과를 알 수 없습니다',
         printPausedStalled: '프린터에서 일시정지됨 — 조치 필요 (자동 복구 미적용)',
         visionHold: '프린터 비전: 플레이트가 비어 있지 않습니다 — 베드를 비운 뒤 프린터에서 재개하세요',
@@ -1105,6 +1106,12 @@ export default {
     },
     noUsb: 'USB 드라이브 없음',
     noUsbHint: '전송이 실패합니다 — USB-A 드라이브(FAT32/exFAT)를 삽입하세요',
+    incident: {
+      jam: 'AMS 걸림',
+      runout: '필라멘트 소진',
+      physical: '필라멘트 고장',
+      recovering: '복구 중',
+    },
     fans: {
       partCooling: '파트 냉각 팬',
       auxiliary: '보조 팬',

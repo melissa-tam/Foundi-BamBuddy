@@ -2208,6 +2208,50 @@ class NotificationService:
             variables=variables,
         )
 
+    async def on_foreign_print_paused(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        job_name: str,
+        minutes: int,
+        db: AsyncSession,
+    ):
+        """Fire when a print the farm did NOT dispatch has sat PAUSEd past grace.
+
+        The sibling of :meth:`on_print_paused_stalled` for the half of the fleet's work
+        that has no queue unit: a Bambu Studio LAN print, a screen-started job, a
+        re-run off the USB. Those pause for exactly the same reasons (a vision trip, a
+        door-open, an HMS outside the AMS-actionable classes) and used to be visible to
+        nothing at all — every farm watchdog keys on a ``printing`` queue item, and the
+        AMS-incident lane deliberately does not own a pause it cannot explain.
+
+        Its own event rather than a reuse: the pause-stall copy names a unit and a run
+        the operator cannot look up, and promises a farm reaction that cannot happen
+        here. One-shot per pause EPISODE — the caller (``farm_stall``) owns the dedup.
+        """
+        providers = await self._get_providers_for_event(db, "on_foreign_print_paused", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "job_name": job_name,
+            "minutes": str(minutes),
+        }
+
+        title, message = await self._build_message_from_template(db, "foreign_print_paused", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "foreign_print_paused",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
     async def on_storage_low(
         self,
         printer_id: int | None,
@@ -2434,7 +2478,7 @@ class NotificationService:
         backend English rather than from the swap-framed
         ``spool_recovery_succeeded`` template (which would falsely claim a donor and
         a replacement spool) — the same one-event-two-copies precedent
-        :meth:`on_spool_recovery_failed` sets with ``is_feed_fault=False``. The
+        :meth:`on_spool_recovery_failed` sets with its runout ``kind``. The
         LOGGED/webhook ``event_type`` stays the truthful ``runout_auto_resumed``."""
         providers = await self._get_providers_for_event(db, "on_spool_recovery_succeeded", printer_id)
         if not providers:
@@ -2469,22 +2513,31 @@ class NotificationService:
         detail: str,
         db: AsyncSession,
         *,
-        is_feed_fault: bool = True,
+        kind: str = "jam",
         runout_slot: str | None = None,
+        foreign: bool = False,
     ):
-        """Fire when a mid-print feed fault / runout could NOT be auto-recovered.
+        """Fire when a mid-print AMS fault could NOT be auto-recovered.
 
-        Recovery escalated and the print is left PAUSED for a human — no other
-        loaded spool satisfied the requirement, or the swap/resume itself failed.
-        ``detail`` carries the human-facing reason. A printer alarm — defaults ON,
-        ``force_immediate`` — mirroring ``on_run_unit_stopped``/``on_storage_low``.
+        Recovery escalated (or never had a lane) and the print is left PAUSED for a
+        human. ``detail`` carries the human-facing reason. A printer alarm — defaults
+        ON, ``force_immediate`` — mirroring ``on_run_unit_stopped``/``on_storage_low``.
 
-        ``is_feed_fault`` selects the copy: a feed fault (jam / tangle) keeps the
-        seeded jam template; a filament RUNOUT (``is_feed_fault=False``) gets
-        runout-framed copy built in backend English here — there is no runout
-        template seeded and the jam wording ("Spool jam NOT recovered") is wrong
-        for an empty spool. ``runout_slot`` (e.g. "AMS A slot 3") names the slot to
-        refill when the firmware attributed it."""
+        ``kind`` selects the copy, one incident kind per branch (WS2b replaced the
+        ``is_feed_fault`` boolean: a third kind arrived and a bool cannot carry it):
+
+        * ``"jam"`` — the seeded ``spool_recovery_failed`` template (swap-framed).
+        * ``"runout"`` — runout-framed backend English; there is no runout template
+          and the jam wording ("Spool jam NOT recovered") is wrong for an empty spool.
+          ``runout_slot`` (e.g. "AMS A slot 3") names the slot to refill when the
+          firmware attributed one.
+        * ``"physical"`` — a breakage/clog/hardware fault. The farm never swaps on
+          these (a fresh roll cannot clear a broken filament or a clogged extruder),
+          so the copy must NOT imply an attempt was made or that one will follow.
+
+        ``foreign`` marks a print the farm did not dispatch: the job is named but no
+        unit/run is, and the operator is told the farm cannot act on it.
+        """
         providers = await self._get_providers_for_event(db, "on_spool_recovery_failed", printer_id)
         if not providers:
             return
@@ -2494,16 +2547,32 @@ class NotificationService:
             "job_name": job_name,
             "detail": detail,
         }
+        foreign_txt = " (a print Bambuddy did not dispatch)" if foreign else ""
 
-        if is_feed_fault:
-            title, message = await self._build_message_from_template(db, "spool_recovery_failed", variables)
-        else:
+        if kind == "runout":
             slot_txt = f" into {runout_slot}" if runout_slot else ""
             title = f"Filament runout NOT recovered — {printer_name}"
             message = (
-                f"{printer_name}: '{job_name}' is left PAUSED. Filament ran out and the printer only "
+                f"{printer_name}: '{job_name}'{foreign_txt} is left PAUSED. Filament ran out and the printer only "
                 f"accepts new filament in the SAME slot — insert filament{slot_txt} and resume on the printer."
             )
+        elif kind == "physical":
+            slot_txt = f" ({runout_slot})" if runout_slot else ""
+            title = f"Filament hardware fault — {printer_name}"
+            message = (
+                f"{printer_name}: '{job_name}'{foreign_txt} is left PAUSED by a physical filament fault{slot_txt}. "
+                f"{detail} The farm will NOT attempt a spool swap — this needs hands at the printer."
+            )
+        elif foreign:
+            # A jam on a foreign print: the swap machine needs the dispatch mapping to
+            # know which feeder jammed, and a foreign print has none.
+            title = f"Spool jam NOT recovered — {printer_name}"
+            message = (
+                f"{printer_name}: '{job_name}'{foreign_txt} is left PAUSED. {detail} "
+                "Bambuddy cannot auto-swap on a print it did not dispatch."
+            )
+        else:
+            title, message = await self._build_message_from_template(db, "spool_recovery_failed", variables)
         await self._send_to_providers(
             providers,
             title,

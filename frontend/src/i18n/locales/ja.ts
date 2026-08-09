@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: 'フィラメントが切れました — 表示された AMS スロットに新しいスプールを入れて再開してください',
+        spoolPhysicalFault: '物理的な故障 — 手動対応が必要です。自動交換は行いません',
         printerOfflineStalled: '印刷中にプリンターがオフラインになりました — 再接続まで結果は不明です',
         printPausedStalled: 'プリンターで一時停止中 — 対応が必要です（自動復旧は適用外）',
         visionHold: 'プリンターの検知: プレートが空ではありません — ベッドを片付けてからプリンター側で再開してください',
@@ -1146,6 +1147,12 @@ export default {
     },
     noUsb: 'USBドライブなし',
     noUsbHint: '送信に失敗します — USB-Aドライブ（FAT32/exFAT）を挿入してください',
+    incident: {
+      jam: 'AMS詰まり',
+      runout: 'フィラメント切れ',
+      physical: 'フィラメント故障',
+      recovering: '復旧中',
+    },
     // Fans
     fans: {
       partCooling: 'パーツ冷却ファン',

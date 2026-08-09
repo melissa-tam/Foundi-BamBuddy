@@ -36,6 +36,9 @@ describe('waitingReasonText', () => {
     expect(waitingReasonText('spool_jam_recovery_failed', t)).toBe(
       'productionRuns.detail.waiting.spoolJamRecoveryFailed',
     );
+    expect(waitingReasonText('spool_physical_fault', t)).toBe(
+      'productionRuns.detail.waiting.spoolPhysicalFault',
+    );
     expect(waitingReasonText('filament_runout_recovery_failed', t)).toBe(
       'productionRuns.detail.waiting.filamentRunoutRecoveryFailed',
     );

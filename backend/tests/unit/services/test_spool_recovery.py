@@ -23,6 +23,7 @@ from backend.app.models.print_queue import PrintQueueItem
 
 # Imported at module level so the test-engine's create_all registers this new table
 # (conftest builds the schema from Base.metadata, not the models/__init__ list).
+from backend.app.models.printer_incident import PrinterIncident
 from backend.app.models.recovery_escalation import RecoveryEscalation
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
@@ -33,7 +34,7 @@ from backend.app.services.spool_recovery import (
     WAITING_REASON_RECOVERING,
     WAITING_REASON_RUNOUT,
     clear_on_reinsert,
-    on_feed_fault_hms,
+    on_ams_fault,
 )
 
 _NONE_TAG = "0000000000000000"
@@ -59,6 +60,10 @@ def _fast_timing(monkeypatch):
     # resolves on the first idle+empty poll. The dwell itself is pinned with a fake
     # clock in TestUnloadGraceDwell.
     monkeypatch.setattr(spool_recovery, "_UNLOAD_GRACE_S", 0.0)
+    # The entry-gate throttle is a per-push cost bound, not a decision: zero it so
+    # every case exercises the DURABLE gates. Its own behaviour is pinned in
+    # TestEntryThrottle.
+    monkeypatch.setattr(spool_recovery, "_EVAL_THROTTLE_S", 0.0)
 
 
 @pytest.fixture(autouse=True)
@@ -387,7 +392,7 @@ async def test_happy_path(db_session, printer_factory, install_settings, monkeyp
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is not None
     await task
 
@@ -413,7 +418,7 @@ async def test_load_needs_resend(db_session, printer_factory, install_settings, 
     client = FakeClient(state, load_after=2)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert client.calls.count(("load", 1)) == 2  # needed a second send
@@ -429,7 +434,7 @@ async def test_resume_needs_second_cycle(db_session, printer_factory, install_se
     client = FakeClient(state, resume_repauses=1)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert client.calls.count(("resume",)) == 2
@@ -454,7 +459,7 @@ async def test_replacement_rejams_tries_next_candidate(db_session, printer_facto
     client = FakeClient(state, resume_repauses=2)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert ("load", 1) in client.calls and ("load", 2) in client.calls
@@ -477,7 +482,7 @@ async def test_candidates_exhausted_escalates(db_session, printer_factory, insta
     client = FakeClient(state, resume_repauses=99)  # every replacement re-jams
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     succeeded.assert_not_awaited()
@@ -501,7 +506,7 @@ async def test_external_resume_aborts(db_session, printer_factory, install_setti
     client = FakeClient(state, external_resume_on_unload=True)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     succeeded.assert_not_awaited()
@@ -519,7 +524,7 @@ async def test_pending_tray_target_hijack_aborts(db_session, printer_factory, in
     client = FakeClient(state, hijack_on_load=True)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     succeeded.assert_not_awaited()
@@ -544,7 +549,7 @@ async def test_disabled_setting_noop(db_session, printer_factory, monkeypatch):
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is None
     assert client.calls == []
 
@@ -558,7 +563,7 @@ async def test_foreign_subtask_noop(db_session, printer_factory, install_setting
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is None
     assert client.calls == []
 
@@ -570,7 +575,7 @@ async def test_non_farm_no_item_noop(db_session, printer_factory, install_settin
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is None
     assert client.calls == []
 
@@ -584,7 +589,7 @@ async def test_multi_feeder_escalates_immediately(db_session, printer_factory, i
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is None  # no driver spawned — escalated inline
     assert client.calls == []  # no unload/load/resume on a multi-feeder job
     failed.assert_awaited_once()
@@ -604,9 +609,9 @@ async def test_dedup_blocks_while_incident_active(db_session, printer_factory, i
     client = FakeClient(state, unload_after=9999)
     _wire(monkeypatch, state, client)
 
-    task1 = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task1 = await on_ams_fault(printer.id, state)
     assert task1 is not None
-    task2 = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task2 = await on_ams_fault(printer.id, state)
     assert task2 is None  # dedup: same incident still live
     task1.cancel()
     try:
@@ -627,7 +632,7 @@ async def test_success_rearms_same_code(db_session, printer_factory, install_set
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task1 = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task1 = await on_ams_fault(printer.id, state)
     assert task1 is not None
     await task1
     assert state.state == "RUNNING"
@@ -635,7 +640,7 @@ async def test_success_rearms_same_code(db_session, printer_factory, install_set
     # Fresh pause on the same job + same code -> NEW task (dedup re-armed on success).
     state.state = "PAUSE"
     state.tray_now = 1  # currently on the replacement chosen in round 1
-    task2 = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task2 = await on_ams_fault(printer.id, state)
     assert task2 is not None
     await task2
     assert state.state == "RUNNING"
@@ -652,13 +657,17 @@ async def test_transient_close_rearms(db_session, printer_factory, install_setti
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task1 = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task1 = await on_ams_fault(printer.id, state)
     assert task1 is not None
     await task1
     assert client.calls == []  # closed as transient, never acted
 
     state.state = "PAUSE"  # a real jam this time
-    task2 = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    # Production drives the wire sampler on EVERY push, and the RUNNING→PAUSE edge
+    # is what re-arms a transient close: "it never held the printer" is exactly the
+    # answer a pause invalidates.
+    spool_recovery.note_demand_watch(printer.id, state)
+    task2 = await on_ams_fault(printer.id, state)
     assert task2 is not None
     await task2
     assert state.state == "RUNNING"
@@ -679,7 +688,7 @@ async def test_extruder_overload_triggers_recovery(db_session, printer_factory, 
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0300_801E"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is not None
     await task
 
@@ -708,7 +717,7 @@ async def test_extruder_side_rejam_keeps_replacement_in_rotation(
     client = FakeClient(state, resume_repauses=2)  # tray1 re-jams both cycles; tray2 succeeds
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0300_801E"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert ("load", 1) in client.calls and ("load", 2) in client.calls
@@ -738,13 +747,13 @@ async def test_escalation_latch_blocks_sibling_code(db_session, printer_factory,
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task1 = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task1 = await on_ams_fault(printer.id, state)
     assert task1 is not None
     await task1
     assert state.state == "PAUSE"  # escalated, left paused
     calls_after = len(client.calls)
 
-    task2 = await on_feed_fault_hms(printer.id, {"0300_801E"}, state)
+    task2 = await on_ams_fault(printer.id, state)
     assert task2 is None  # latched
     assert len(client.calls) == calls_after  # no new interaction
 
@@ -759,20 +768,24 @@ async def test_abort_latch_blocks_sibling_code(db_session, printer_factory, inst
     client = FakeClient(state, external_resume_on_unload=True)  # external actor resumes mid-recovery
     _wire(monkeypatch, state, client)
 
-    task1 = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task1 = await on_ams_fault(printer.id, state)
     assert task1 is not None
     await task1
     assert state.state == "RUNNING"  # the external actor's resume stands
     calls_after = len(client.calls)
 
-    task2 = await on_feed_fault_hms(printer.id, {"0300_801E"}, state)
+    task2 = await on_ams_fault(printer.id, state)
     assert task2 is None  # latched
     assert len(client.calls) == calls_after
 
 
-async def test_escalation_latch_scoped_to_job(db_session, printer_factory, install_settings, monkeypatch):
-    """The latch is per (printer, job): a NEW job on the same printer recovers
-    normally after a prior job escalated."""
+async def test_escalation_hold_does_not_outlive_its_job(db_session, printer_factory, install_settings, monkeypatch):
+    """An escalated hold is scoped to its job: once that job reaches a terminal the
+    incident CLOSES, and the next job on the same printer recovers normally.
+
+    Pre-WS2b this was a process-lifetime ``_escalated`` latch keyed (printer, job),
+    which never expired — finding (c): a later, different fault on the SAME job could
+    never be recovered. Now the hold is an open incident and the lifecycle ends it."""
     install_settings()
     printer = await printer_factory()
     _spy(monkeypatch, "on_spool_recovery_failed")
@@ -782,9 +795,14 @@ async def test_escalation_latch_scoped_to_job(db_session, printer_factory, insta
     state1 = _make_state(subtask="task-1", trays=[_ams_tray(0)])
     client1 = FakeClient(state1)
     _wire(monkeypatch, state1, client1)
-    task1 = await on_feed_fault_hms(printer.id, {"0700_8010"}, state1)
+    task1 = await on_ams_fault(printer.id, state1)
     await task1
     assert state1.state == "PAUSE"
+
+    # Job 1 reaches its terminal — the hold closes with it (in production this is
+    # main.on_print_complete's per-print reset; the printer's RUNNING edge closes it
+    # too).
+    assert await spool_recovery.on_job_terminal(printer.id) is True
 
     # Job 2 on the same printer is a fresh incident — recovers normally.
     await _farm_item(db_session, printer.id, subtask="task-2")
@@ -792,7 +810,7 @@ async def test_escalation_latch_scoped_to_job(db_session, printer_factory, insta
     state2 = _make_state(subtask="task-2")
     client2 = FakeClient(state2)
     _wire(monkeypatch, state2, client2)
-    task2 = await on_feed_fault_hms(printer.id, {"0700_8010"}, state2)
+    task2 = await on_ams_fault(printer.id, state2)
     assert task2 is not None
     await task2
     assert state2.state == "RUNNING"
@@ -810,13 +828,21 @@ async def test_success_cap_escalates(db_session, printer_factory, install_settin
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id, subtask="task-1")
     failed = _spy(monkeypatch, "on_spool_recovery_failed")
-    # Simulate the flap cap already reached this job.
-    spool_recovery._success_counts[(printer.id, "task-1")] = spool_recovery._MAX_SUCCESSES_PER_JOB
+    # Simulate the flap cap already reached this job: the durable ledger counts
+    # RESOLVED jam incidents, so a restart no longer hands a sick printer a fresh
+    # budget the way the in-memory counter did.
+    from backend.app.services import printer_incidents
+
+    for n in range(spool_recovery._MAX_SUCCESSES_PER_JOB):
+        seeded = await _seed_incident(
+            db_session, printer.id, kind="jam", code="0700_8010", codes=f"seeded-{n}", status="recovering"
+        )
+        await printer_incidents.close(db_session, seeded.id, status="resolved", source="observed_running")
     state = _make_state(subtask="task-1")
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is None  # escalated inline, no driver spawned
     assert client.calls == []  # never touched the printer
     failed.assert_awaited_once()
@@ -840,9 +866,12 @@ async def test_gate_out_logging(db_session, printer_factory, install_settings, m
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
-        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+        task = await on_ams_fault(printer.id, state)
     assert task is None
-    assert any("0700_8010" in r.getMessage() and "NOT recovered" in r.getMessage() for r in caplog.records)
+    # One line per OUTCOME CHANGE per (printer, job) — naming the fault fingerprint
+    # and why nothing owned it (the entry gate is per-push now, so a line per push
+    # would be a log storm).
+    assert any("0700_8010" in r.getMessage() and "not owned" in r.getMessage() for r in caplog.records)
 
 
 # ===========================================================================
@@ -859,7 +888,7 @@ async def test_runout_rescued_by_firmware_transient_close(db_session, printer_fa
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0300_8004"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is not None
     await task
 
@@ -884,14 +913,14 @@ async def test_runout_escalates_immediately_zero_loads(db_session, printer_facto
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0300_8004"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert state.state == "PAUSE"  # never resumed — left for a same-slot refill
     assert not any(c[0] == "load" for c in client.calls)  # ZERO cross-slot load commands
     assert ("unload",) not in client.calls  # the whole swap machine was skipped
     failed.assert_awaited_once()
-    assert failed.call_args.kwargs["is_feed_fault"] is False  # runout copy branch
+    assert failed.call_args.kwargs["kind"] == "runout"  # runout copy branch
     oor.assert_not_awaited()  # runout spool is SPENT — never marked out-of-rotation
     db_session.expunge_all()
     jammed_after = await db_session.get(Spool, jammed.id)
@@ -910,7 +939,7 @@ async def test_runout_escalation_detail_names_slot_refill(db_session, printer_fa
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0300_8004"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     failed.assert_awaited_once()
@@ -932,7 +961,7 @@ async def test_low_spool_in_protected_layers_escalates(db_session, printer_facto
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     failed.assert_awaited_once()
@@ -950,7 +979,7 @@ async def test_low_spool_after_protected_layers_selected(db_session, printer_fac
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert ("load", 1) in client.calls
@@ -974,7 +1003,7 @@ async def test_near_empty_spool_after_protected_layers_escalates_near_empty(
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert not any(c[0] == "load" for c in client.calls)  # never loaded the empty spool
@@ -999,7 +1028,7 @@ async def test_below_protected_layers_uses_protected_layer_reason(
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     failed.assert_awaited_once()
@@ -1024,7 +1053,7 @@ async def test_state9_candidate_excluded(db_session, printer_factory, install_se
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert not any(c == ("load", 1) for c in client.calls)  # state-9 tray never loaded
@@ -1044,7 +1073,7 @@ async def test_state_none_candidate_kept(db_session, printer_factory, install_se
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert ("load", 1) in client.calls  # kept and loaded despite unknown state
@@ -1073,7 +1102,7 @@ async def test_load_step_notes_commanded_load(db_session, printer_factory, insta
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert (printer.id, 1) in noted  # the replacement load was marked as ours
@@ -1093,12 +1122,14 @@ async def test_restart_clean_state_skips_unload(db_session, printer_factory, ins
     install_settings()
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
+    # No feed-fault code STANDING — which is the whole premise, and since WS2b the
+    # entry gate derives its candidates from the live wire, so this state can only be
+    # reached by an incident already in flight. Driven through the driver directly.
     state = _make_state(tray_now=255, ams_status_main=0, hms=[])
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
-    await task
+    await spool_recovery._run_recovery(_incident(printer.id, step_timeout_s=0.05, item_id=item.id))
 
     assert ("unload",) not in client.calls  # short-circuited
     assert ("load", 1) in client.calls
@@ -1115,7 +1146,7 @@ async def test_unbound_jammed_slot_proceeds(db_session, printer_factory, install
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     # Marking is a no-op with no bound spool, but recovery proceeds and succeeds.
@@ -1233,7 +1264,7 @@ async def test_bare_candidate_forced_autoconfig_then_loads(db_session, printer_f
 
     monkeypatch.setattr(spool_tagless, "maybe_autoconfigure_bare_tray", _fake_autoconfig)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert seen.get("force") is True  # forced sweep bypassed the retry window
@@ -1256,7 +1287,7 @@ async def test_bare_jammed_tray_requirement_from_db_assignment(
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert ("load", 1) in client.calls  # scan proceeded off the DB-derived requirement
@@ -1284,12 +1315,12 @@ async def test_still_bare_after_forced_sweep_escalates(db_session, printer_facto
 
     monkeypatch.setattr(spool_tagless, "maybe_autoconfigure_bare_tray", _fake_autoconfig)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert seen.get("force") is True
     failed.assert_awaited_once()
-    assert failed.call_args.kwargs["is_feed_fault"] is True  # feed-fault chooses jam copy
+    assert failed.call_args.kwargs["kind"] == "jam"  # feed fault chooses the jam copy
     assert state.state == "PAUSE"  # never resumed blind
     db_session.expunge_all()
     assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_FAILED
@@ -1311,7 +1342,7 @@ async def test_escalation_emits_tray_snapshot(db_session, printer_factory, insta
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
-        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+        task = await on_ams_fault(printer.id, state)
         await task
 
     snapshots = [r for r in caplog.records if "[spool_recovery] tray snapshot" in r.getMessage()]
@@ -1348,7 +1379,7 @@ async def test_runout_escalation_uses_runout_copy(db_session, printer_factory, i
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0300_8004"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert state.state == "PAUSE"
@@ -1367,7 +1398,7 @@ async def test_feed_fault_escalation_uses_jam_copy(db_session, printer_factory, 
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert state.state == "PAUSE"
@@ -1400,7 +1431,7 @@ async def test_abort_clears_oor_when_resumed_on_jammed_feeder(
     client = FakeClient(state, external_resume_on_unload=True)  # resume mid-recovery, same feeder
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert state.state == "RUNNING"  # the external actor's resume stands
@@ -1428,7 +1459,7 @@ async def test_abort_retains_oor_when_resumed_on_other_feeder(
     client = FakeClient(state, external_resume_on_unload=True, external_resume_tray=1)  # resumed on tray1
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert state.state == "RUNNING"
@@ -1461,7 +1492,7 @@ async def test_offline_unload_escalates_without_confirm_waits(
     client = FakeClient(state, unload_ret=False, load_ret=False, resume_ret=False, pause_ret=False)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert client.calls.count(("unload",)) == 2  # both attempts consumed
@@ -1487,7 +1518,7 @@ async def test_offline_load_advances_without_confirm_wait(db_session, printer_fa
     client = FakeClient(state, load_ret=False)  # unload OK, load always a no-op
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert client.calls.count(("load", 1)) == 2  # both load attempts consumed, then advanced
@@ -1512,7 +1543,7 @@ async def test_offline_resume_advances_without_confirm_wait(db_session, printer_
     client = FakeClient(state, resume_ret=False, pause_ret=False)  # unload+load OK, resume/pause no-op
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert ("load", 1) in client.calls  # load reached and confirmed
@@ -1589,7 +1620,7 @@ async def test_incident_pin_unloads_before_first_load_when_ams_stuck_mid_change(
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     motion = [c for c in client.calls if c[0] in ("unload", "load")]
@@ -1613,7 +1644,7 @@ async def test_every_candidate_round_unloads_again_after_a_failed_load(
     client = FakeClient(state, load_after=9999)  # no load ever confirms
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     # Three rounds ran (two candidates + the exhausted round) — each one unloaded.
@@ -1647,7 +1678,7 @@ async def test_unload_confirms_only_after_the_ams_returns_to_idle(
 
     _wire(monkeypatch, state, client, on_poll=_on_poll)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert busy_polls["n"] >= 1  # the busy window was actually observed
@@ -1671,7 +1702,7 @@ async def test_unload_stuck_non_idle_never_confirms_and_never_loads(
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
-        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+        task = await on_ams_fault(printer.id, state)
         await task
 
     assert client.calls.count(("unload",)) == 2  # both attempts resent
@@ -1689,17 +1720,29 @@ async def test_unload_stuck_non_idle_never_confirms_and_never_loads(
 # ===========================================================================
 
 
-def _incident(printer_id: int, *, step_timeout_s: float, max_attempts: int = 2):
+def _incident(
+    printer_id: int, *, step_timeout_s: float, max_attempts: int = 2, incident_id: int = 0, item_id: int | None = 1
+):
+    """A driver context for the step-helper tests.
+
+    ``incident_id=0`` names no durable row on purpose: these cases drive the unload /
+    load / resume helpers, and the incident-store calls those helpers' terminal steps
+    make are no-ops for a missing row (``close``/``mark_escalated`` return None). The
+    lifecycle itself is pinned through the real entry point elsewhere.
+    """
     return spool_recovery.RecoveryIncident(
+        incident_id=incident_id,
         printer_id=printer_id,
         job_id="task-1",
         codes=frozenset({"0700_8010"}),
-        item_id=1,
+        fingerprint="mechanical_feed:0700_8010",
+        item_id=item_id,
         settings=spool_recovery.RecoverySettings(
             enabled=True, max_attempts=max_attempts, step_timeout_s=step_timeout_s, protect_layers=7
         ),
         jammed_global_tray=0,
-        is_feed_fault=True,
+        kind=spool_recovery.KIND_JAM,
+        external=False,
         extruder_side_only=False,
         layer_at_fault=50,
         code="0700_8010",
@@ -1790,7 +1833,7 @@ async def test_zero_loads_attempted_escalates_no_eligible_spool(
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
-        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+        task = await on_ams_fault(printer.id, state)
         await task
 
     assert not any(c[0] == "load" for c in client.calls)
@@ -1804,15 +1847,16 @@ async def test_loads_failed_without_a_confirmed_unload_escalates_candidate_loads
     replacement would load → the candidate set, not the feed path, is the story."""
     install_settings()
     printer = await printer_factory()
-    await _farm_item(db_session, printer.id)
+    item = await _farm_item(db_session, printer.id)
     _spy(monkeypatch, "on_spool_recovery_failed")
+    # Clean state with NO code standing (see test_restart_clean_state_skips_unload):
+    # unreachable through the wire-derived entry gate, so driven through the driver.
     state = _make_state(tray_now=255, ams_status_main=0, hms=[], trays=[_ams_tray(0), _ams_tray(1)])
     client = FakeClient(state, load_after=9999)
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
-        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
-        await task
+        await spool_recovery._run_recovery(_incident(printer.id, step_timeout_s=0.05, item_id=item.id))
 
     assert ("unload",) not in client.calls  # genuinely clean state → skipped
     assert ("load", 1) in client.calls
@@ -1834,7 +1878,7 @@ async def test_confirmed_unloads_with_every_load_failing_escalates_feed_path_blo
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
-        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+        task = await on_ams_fault(printer.id, state)
         await task
 
     assert client.calls.count(("unload",)) == 3  # every round confirmed an unload
@@ -1853,7 +1897,7 @@ async def test_drying_refusal_escalates_ams_drying_without_burning_attempts(
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
-        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+        task = await on_ams_fault(printer.id, state)
         await task
 
     assert ("unload",) not in client.calls  # a doomed lane is never written to
@@ -1876,7 +1920,7 @@ async def test_identify_refusal_is_absorbed_by_the_settle_wait(
     client = FakeClient(state, write_refusal="identify_in_flight", refusal_clears_on_settle=True)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert ("settle",) in client.calls
@@ -1919,7 +1963,7 @@ async def test_jam_attributed_to_live_tray_when_attr_carries_no_slot(
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     db_session.expunge_all()
@@ -1980,7 +2024,7 @@ async def test_incident_pin_resume_first_then_hung_self_pause_then_swap(
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is not None
     await task
 
@@ -2039,14 +2083,17 @@ async def test_reset_recovered_self_heals_without_swap(db_session, printer_facto
     client = _SelfHealClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is not None
     await task
 
     assert not any(c[0] in ("unload", "load") for c in client.calls)  # NO swap performed
     assert client.calls.count(("resume",)) == 1  # only the reset resume
     assert state.state == "RUNNING"
-    assert spool_recovery._success_counts[(printer.id, "task-1")] == 1  # counted toward the flap cap
+    from backend.app.services import printer_incidents
+
+    # Counted toward the flap cap — the durable ledger IS the counter now.
+    assert await printer_incidents.count_resolved(db_session, printer.id, "task-1", "jam") == 1
     succeeded.assert_not_awaited()  # a no-swap self-heal never sends the swap-framed alert
     oor.assert_not_awaited()  # nothing taken out of rotation — the commit boundary was never reached
 
@@ -2087,7 +2134,7 @@ async def test_reset_never_moves_escalates_stuck_reset_failed(
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
-        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+        task = await on_ams_fault(printer.id, state)
         await task
 
     assert ("resume",) in client.calls  # the reset was attempted
@@ -2155,7 +2202,7 @@ async def test_incident_pin_engaged_feeder_assist_fault_skips_reset_and_swaps(
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0300_801E"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is not None
     await task
 
@@ -2337,7 +2384,7 @@ async def test_oor_stamped_once_at_swap_commit(db_session, printer_factory, inst
     oor.side_effect = _record
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert state.state == "RUNNING"  # the swap landed after the extra round
@@ -2374,7 +2421,7 @@ async def test_pre_commit_abort_leaves_no_stamp(db_session, printer_factory, ins
     monkeypatch.setattr(spool_recovery.printer_manager, "get_status", _status)
     monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert ("unload",) not in client.calls  # aborted before the swap round
@@ -2398,7 +2445,7 @@ async def test_extruder_side_stamps_feeding_spool_at_commit(db_session, printer_
     client = FakeClient(state, resume_repauses=2)  # tray1 re-jams both cycles; tray2 succeeds
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0300_801E"}, state)
+    task = await on_ams_fault(printer.id, state)
     await task
 
     assert state.state == "RUNNING"
@@ -2428,7 +2475,7 @@ async def test_ams_drying_escalation_keeps_commit_stamp(
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
-        task = await on_feed_fault_hms(printer.id, {"0700_8010"}, state)
+        task = await on_ams_fault(printer.id, state)
         await task
 
     assert ("unload",) not in client.calls  # a drying lane is never written to
@@ -2469,21 +2516,36 @@ async def test_will_own_false_when_setting_disabled(db_session, printer_factory,
     assert await spool_recovery.will_own(db_session, printer.id, state) is False
 
 
-async def test_will_own_false_when_escalation_latched(db_session, printer_factory):
+async def test_will_own_false_when_the_fault_was_already_closed_as_aborted(db_session, printer_factory):
+    """A fault an ABORTED close barred will never be owned again — so the raw alert
+    must be let through rather than suppressed into silence."""
     printer = await printer_factory()
     await _farm_item(db_session, printer.id, subtask="task-1")
     state = _make_state(subtask="task-1")
-    spool_recovery._escalated.add((printer.id, "task-1"))  # already given up on this (printer, job)
+    fingerprint = spool_recovery.candidate_fingerprint(spool_recovery.live_candidates(state))
+    incident = await _seed_incident(
+        db_session, printer.id, kind="jam", code="0700_8010", codes=fingerprint, status="recovering"
+    )
+    from backend.app.services import printer_incidents
+
+    await printer_incidents.close(db_session, incident.id, status="aborted", source="operator")
+    spool_recovery._blocked[(printer.id, "task-1")] = {fingerprint}
 
     assert await spool_recovery.will_own(db_session, printer.id, state) is False
 
 
-async def test_will_own_false_when_no_farm_item(db_session, printer_factory):
+async def test_will_own_true_for_a_foreign_print(db_session, printer_factory):
+    """WS2b: an incident owns a foreign print's AMS fault too, so its raw per-code
+    alert is the duplicate and must still be suppressed.
+
+    This assertion is INVERTED from the pre-WS2b pin, deliberately: requiring a farm
+    queue item here is exactly what left 12 foreign-print runouts spent-stamped with
+    no alert, no hold and no resume."""
     printer = await printer_factory()
     # No farm item dispatched for this subtask → a foreign / non-farm job.
     state = _make_state(subtask="foreign-task")
 
-    assert await spool_recovery.will_own(db_session, printer.id, state) is False
+    assert await spool_recovery.will_own(db_session, printer.id, state) is True
 
 
 async def test_will_own_false_when_db_read_raises(db_session, printer_factory, monkeypatch):
@@ -2495,7 +2557,7 @@ async def test_will_own_false_when_db_read_raises(db_session, printer_factory, m
     async def _boom(*_a, **_k):
         raise RuntimeError("db down")
 
-    monkeypatch.setattr(spool_recovery, "_resolve_farm_item", _boom)
+    monkeypatch.setattr(spool_recovery.printer_incidents, "get_open", _boom)
 
     assert await spool_recovery.will_own(db_session, printer.id, state) is False
 
@@ -2523,13 +2585,13 @@ async def test_runout_escalation_names_the_firmware_demanded_slot(
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_feed_fault_hms(printer.id, {"0700_8011"}, state)
+    task = await on_ams_fault(printer.id, state)
     assert task is not None
     await task
 
     failed.assert_awaited_once()
     assert failed.call_args.kwargs["runout_slot"] == "AMS A slot 3"
-    assert failed.call_args.kwargs["is_feed_fault"] is False
+    assert failed.call_args.kwargs["kind"] == "runout"
 
 
 def test_resolve_jammed_tray_prefers_the_demand_over_mapping_and_tray_now():
@@ -2576,7 +2638,40 @@ async def _runout_held_item(db, printer_id, *, subtask="task-1"):
     item = await _farm_item(db, printer_id, subtask=subtask)
     item.waiting_reason = WAITING_REASON_RUNOUT
     await db.commit()
+    # The hold itself is the durable INCIDENT since WS2b; the token on the unit is
+    # only its projection. Both guidance lanes and the auto-resume gate on the
+    # incident, which is what lets them work for a foreign print too.
+    await _seed_incident(db, printer_id, job_id=subtask, item_id=item.id)
     return item
+
+
+async def _seed_incident(
+    db,
+    printer_id,
+    *,
+    job_id="task-1",
+    kind=None,
+    status=None,
+    item_id=None,
+    code="0700_8011",
+    codes=None,
+    slot_global_tray=None,
+):
+    """Open a durable incident the way the entry gate would."""
+    from backend.app.models.printer_incident import KIND_RUNOUT, STATUS_ESCALATED
+    from backend.app.services import printer_incidents
+
+    return await printer_incidents.open_new(
+        db,
+        printer_id=printer_id,
+        job_id=job_id,
+        item_id=item_id,
+        kind=kind or KIND_RUNOUT,
+        code=code,
+        codes=codes or f"runout:{code}",
+        slot_global_tray=slot_global_tray,
+        status=status or STATUS_ESCALATED,
+    )
 
 
 async def test_demand_move_refreshes_guidance_once(db_session, printer_factory, monkeypatch):
@@ -2593,7 +2688,7 @@ async def test_demand_move_refreshes_guidance_once(db_session, printer_factory, 
     assert fired is True
     failed.assert_awaited_once()
     assert failed.call_args.kwargs["runout_slot"] == "AMS A slot 2"
-    assert failed.call_args.kwargs["is_feed_fault"] is False
+    assert failed.call_args.kwargs["kind"] == "runout"
     assert "NOW asking" in failed.call_args.kwargs["detail"]
 
 
@@ -2618,13 +2713,15 @@ async def test_refresh_leaves_the_escalation_latch_untouched(db_session, printer
     printer = await printer_factory()
     item = await _runout_held_item(db_session, printer.id)
     _spy(monkeypatch, "on_spool_recovery_failed")
-    spool_recovery._escalated.add((printer.id, "task-1"))
     moved = _runout_demand_hms(0, 1)
     state = _make_state(hms=[moved])
 
     assert await spool_recovery.maybe_refresh_runout_guidance(printer.id, {moved.full_code}, state) is True
 
-    assert (printer.id, "task-1") in spool_recovery._escalated  # latch intact
+    from backend.app.services import printer_incidents
+
+    held = await printer_incidents.get_open(db_session, printer.id)
+    assert held is not None and held.status == "escalated"  # the hold stands
     assert printer.id not in spool_recovery._active_tasks  # no recovery re-entry
     db_session.expunge_all()
     assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_RUNOUT
@@ -2812,13 +2909,30 @@ async def test_assist_never_raises_on_a_broken_client(db_session, printer_factor
 
 
 # --- Trigger-set derivation -------------------------------------------------
-# The four trigger sets are now VIEWS of the hms_errors AMS fault taxonomy rather
-# than literals in spool_recovery. The pins below spell out the pre-derivation
-# membership so a taxonomy edit that would change what this machine ACTS on fails
-# here — the taxonomy may widen freely, the machine's reach may not drift.
+# The trigger sets are VIEWS of the hms_errors AMS fault taxonomy rather than
+# literals in spool_recovery. The pins below spell out the RATIFIED membership
+# independently of the module's own data, so a taxonomy edit that would change what
+# this machine ACTS on fails here rather than moving with it.
+#
+# WIDENED 2026-08-09 (WS2b, operator-ratified partition): the swap machine's trigger
+# vocabulary is now the WHOLE mechanical-feed class. WS2a had pinned it to the
+# ``legacy_swap`` subset (8010 family + 0300_801E) purely to stay behavior-neutral
+# while the taxonomy landed; this wave spends that marker, so the send-out (8005),
+# feed-into-extruder (8006) and feed-to-extruder (8028) families — the same physical
+# obstruction one step further along the path, and all PAUSE-raising — join it.
 
-_PRE_DERIVATION_AMS_FEED = frozenset(
-    {
+_AMS_UNIT_MODULES = ("0700", "0701", "0702", "0703", "0704", "0705", "0706", "0707")
+
+
+def _fam(modules, suffix):
+    return {f"{m}_{suffix}" for m in modules}
+
+
+_RATIFIED_AMS_FEED = frozenset(
+    _fam(_AMS_UNIT_MODULES, "8005")
+    | _fam(_AMS_UNIT_MODULES, "8006")
+    | {"07FF_8005", "07FF_8006", "0700_8028", "07FF_8028"}
+    | {
         "0700_8010",
         "0701_8010",
         "0702_8010",
@@ -2837,8 +2951,8 @@ _PRE_DERIVATION_AMS_FEED = frozenset(
         "12FF_8010",
     }
 )
-_PRE_DERIVATION_EXTRUDER = frozenset({"0300_801E"})
-_PRE_DERIVATION_RUNOUT = frozenset(
+_RATIFIED_EXTRUDER = frozenset({"0300_801E"})
+_RATIFIED_RUNOUT = frozenset(
     {
         "0300_8004",
         "0700_8011",
@@ -2853,33 +2967,38 @@ _PRE_DERIVATION_RUNOUT = frozenset(
 )
 
 
-def test_ams_feed_fault_set_is_unchanged_by_the_derivation():
-    assert spool_recovery.AMS_FEED_FAULT_HMS_CODES == _PRE_DERIVATION_AMS_FEED
+def test_ams_feed_fault_set_matches_the_ratified_partition():
+    assert spool_recovery.AMS_FEED_FAULT_HMS_CODES == _RATIFIED_AMS_FEED
 
 
-def test_extruder_feed_fault_set_is_unchanged_by_the_derivation():
-    assert spool_recovery.EXTRUDER_FEED_FAULT_HMS_CODES == _PRE_DERIVATION_EXTRUDER
+def test_extruder_feed_fault_set_matches_the_ratified_partition():
+    assert spool_recovery.EXTRUDER_FEED_FAULT_HMS_CODES == _RATIFIED_EXTRUDER
 
 
-def test_feed_fault_union_is_unchanged_by_the_derivation():
-    assert spool_recovery.FEED_FAULT_HMS_CODES == _PRE_DERIVATION_AMS_FEED | _PRE_DERIVATION_EXTRUDER
+def test_feed_fault_union_matches_the_ratified_partition():
+    assert spool_recovery.FEED_FAULT_HMS_CODES == _RATIFIED_AMS_FEED | _RATIFIED_EXTRUDER
 
 
-def test_recoverable_set_is_unchanged_by_the_derivation():
-    assert spool_recovery.RECOVERABLE_HMS_CODES == (
-        _PRE_DERIVATION_AMS_FEED | _PRE_DERIVATION_EXTRUDER | _PRE_DERIVATION_RUNOUT
-    )
+def test_recoverable_set_matches_the_ratified_partition():
+    assert spool_recovery.RECOVERABLE_HMS_CODES == (_RATIFIED_AMS_FEED | _RATIFIED_EXTRUDER | _RATIFIED_RUNOUT)
 
 
-def test_the_wider_taxonomy_families_stay_out_of_the_trigger_sets():
-    """WS2a is behavior-neutral: classified-but-not-yet-consumed stays out."""
+def test_the_swap_set_is_exactly_the_mechanical_feed_class():
+    """The widening's real contract: no marker sits between the taxonomy and the
+    machine any more, so a code classified mechanical_feed IS a swap trigger."""
     from backend.app.services.hms_errors import mechanical_feed_short_codes
 
-    # The taxonomy knows these are mechanical feed faults; the machine must not act
-    # on them until a consumer wave gives each one its hardware ladder.
+    assert mechanical_feed_short_codes() == spool_recovery.FEED_FAULT_HMS_CODES
     for short in ("0700_8005", "0700_8006", "0700_8028", "07FF_8005"):
-        assert short in mechanical_feed_short_codes()
-        assert short not in spool_recovery.RECOVERABLE_HMS_CODES
+        assert short in spool_recovery.RECOVERABLE_HMS_CODES
+
+
+def test_the_legacy_swap_marker_is_gone():
+    """Hard cutover: the WS2a behavior pin must not survive its consumer wave."""
+    import backend.app.services.hms_errors as hms_errors
+
+    assert not hasattr(hms_errors, "legacy_swap_short_codes")
+    assert not hasattr(hms_errors, "_LEGACY_SWAP_SHORTS")
 
 
 def test_external_spool_runouts_are_not_recoverable():
@@ -2887,3 +3006,634 @@ def test_external_spool_runouts_are_not_recoverable():
     from backend.app.services.hms_errors import runout_external_short_codes
 
     assert not (runout_external_short_codes() & spool_recovery.RECOVERABLE_HMS_CODES)
+
+
+# ===========================================================================
+# WS2b — the incident lanes: foreign prints, physical faults, hold lifecycle,
+# the widened swap set, and the two-source refill auto-resume.
+#
+# Everything below exists because the pre-WS2b machine could only be reached
+# through a matching FARM queue item and only ever spawned on the NOTIFICATION
+# dedup's new-code edge. In production that meant: 12 foreign-print runouts
+# spent-stamped with no alert / no hold / no resume, 9 runout episodes that never
+# even logged, an escalation latch that outlived its fault, and a hold only the
+# farm's own auto-resume could clear.
+# ===========================================================================
+
+
+def _physical_wire_hms(ams_id=0, tray_id=2):
+    """hms[] lane: "AMS A Slot 3's filament may be broken in AMS." (0x00020003)."""
+    attr = 0x07000000 | (ams_id << 16) | ((0x20 + tray_id) << 8)
+    return HMSError(code="0x20003", attr=attr, module=7, severity=2, full_code=f"{attr:08X}00020003")
+
+
+def _physical_short_hms():
+    """print_error lane: 0700_8003 "Failed to pull out the filament from the extruder"."""
+    return HMSError(code="8003", attr=0x07008003, module=7, severity=3, full_code="07008003")
+
+
+def _sendout_hms():
+    """0700_8005 "The AMS failed to send out filament" — mechanical_feed, and a swap
+    trigger since the 2026-08-09 ratified widening (it was classified-but-unowned)."""
+    return HMSError(code="8005", attr=0x07000000, module=7, severity=2, full_code="0700000000008005")
+
+
+def _external_runout_hms():
+    """07FF_8011 — the EXTERNAL spool holder ran dry. No AMS slot, no sibling tray."""
+    return HMSError(code="8011", attr=0x07FF0000, module=7, severity=2, full_code="07FF000000008011")
+
+
+async def _incident_row(db, printer_id):
+    from backend.app.services import printer_incidents
+
+    return await printer_incidents.get_open(db, printer_id)
+
+
+def _capture_spawns(monkeypatch):
+    """Capture what the sync wire sampler fires and forgets, so a test can await it."""
+    import backend.app.core.tasks as core_tasks
+
+    spawned = []
+
+    def _spawn(coro, name=None):
+        spawned.append(coro)
+        return None
+
+    monkeypatch.setattr(core_tasks, "spawn_background_task", _spawn)
+    return spawned
+
+
+# --- FOREIGN prints ---------------------------------------------------------
+
+
+async def test_foreign_runout_opens_an_incident_and_alerts(db_session, printer_factory, install_settings, monkeypatch):
+    """A runout on a print the farm did NOT dispatch: incident + hold + guidance,
+    and NOT ONE queue row touched.
+
+    The production shape this closes: 12 foreign-print runouts got spent stamps but
+    no alert, no hold and no resume, because the entry gate required a matching farm
+    unit and returned before anything else could happen."""
+    install_settings()
+    printer = await printer_factory()
+    # A farm unit exists on this printer but for a DIFFERENT job — the live print is
+    # foreign, which is exactly how a screen-started job looks.
+    other = await _farm_item(db_session, printer.id, subtask="task-other")
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(subtask="foreign-job", hms=[_runout_same_slot_hms()])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_ams_fault(printer.id, state)
+    assert task is not None
+    await task
+
+    row = await _incident_row(db_session, printer.id)
+    assert row is not None
+    assert row.item_id is None  # FOREIGN — no queue unit owns it
+    assert row.kind == "runout"
+    assert row.status == "escalated"  # held for a same-slot refill
+    failed.assert_awaited_once()
+    assert failed.call_args.kwargs["kind"] == "runout"
+    assert failed.call_args.kwargs["foreign"] is True
+    # The swap machine is never entered for a runout (doctrine invariant 9).
+    assert not any(c[0] in ("unload", "load") for c in client.calls)
+    # And no farm row was mutated — a foreign incident owns nothing in the queue.
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, other.id)).waiting_reason is None
+
+
+async def test_foreign_feed_fault_escalates_without_entering_the_swap_loop(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """A jam on a foreign print is ALERTED but never auto-swapped: the single-feeder
+    verdict the swap machine needs comes from the dispatch mapping, which a foreign
+    print has none of."""
+    install_settings()
+    printer = await printer_factory()
+    await _bind_spool(db_session, printer.id, 0, 0)
+    await _bind_spool(db_session, printer.id, 0, 1)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(subtask="foreign-job")  # default hms = 0700_8010
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    assert await on_ams_fault(printer.id, state) is None  # escalated at entry
+
+    row = await _incident_row(db_session, printer.id)
+    assert row.kind == "jam" and row.status == "escalated" and row.item_id is None
+    assert client.calls == []  # ZERO AMS commands published
+    failed.assert_awaited_once()
+    assert failed.call_args.kwargs["foreign"] is True
+    assert "did not dispatch" in failed.call_args.kwargs["detail"]
+
+
+async def test_a_foreign_incident_still_records_the_escalation_ledger(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """Hardware suspicion is printer-scoped by nature, so the quarantine ledger
+    counts a foreign escalation exactly like a farm one."""
+    install_settings()
+    printer = await printer_factory()
+    _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(subtask="foreign-job")
+    _wire(monkeypatch, state, FakeClient(state))
+
+    await on_ams_fault(printer.id, state)
+
+    rows = (await db_session.execute(select(RecoveryEscalation))).scalars().all()
+    assert [r.printer_id for r in rows] == [printer.id]
+
+
+# --- PHYSICAL faults (the class nothing used to consume) --------------------
+
+
+@pytest.mark.parametrize(
+    "hms_factory,expected_slot",
+    [
+        (_physical_wire_hms, 2),  # hms[] lane: the attr names the tray
+        (_physical_short_hms, None),  # print_error lane: the short form has no slot
+    ],
+)
+async def test_physical_fault_escalates_immediately_and_never_swaps(
+    db_session, printer_factory, install_settings, monkeypatch, hms_factory, expected_slot
+):
+    """Broken filament / a clog / a failed pull-back needs hands: no swap is
+    attempted, the unit takes its own token, and the alert says so.
+
+    Before WS2b this whole class was consumed by NOTHING — those faults waited on
+    the generic pause-stall watchdog."""
+    install_settings()
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    await _bind_spool(db_session, printer.id, 0, 1)  # a healthy replacement IS available
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(hms=[hms_factory()])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    assert await on_ams_fault(printer.id, state) is None  # escalated at entry, no driver
+
+    row = await _incident_row(db_session, printer.id)
+    assert row.kind == "physical"
+    assert row.status == "escalated"
+    assert row.slot_global_tray == expected_slot
+    assert client.calls == []  # the swap loop is never entered
+    failed.assert_awaited_once()
+    assert failed.call_args.kwargs["kind"] == "physical"
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == spool_recovery.WAITING_REASON_PHYSICAL
+
+
+async def test_physical_outranks_a_mechanical_sibling(db_session, printer_factory, install_settings, monkeypatch):
+    """A breakage standing beside a feed fault means hands are needed whatever else
+    is true — acting on the milder classification would send the swap machine at a
+    fault it cannot fix."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    await _bind_spool(db_session, printer.id, 0, 1)
+    _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(hms=[_feed_fault_hms(), _physical_wire_hms()])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    await on_ams_fault(printer.id, state)
+
+    assert (await _incident_row(db_session, printer.id)).kind == "physical"
+    assert client.calls == []
+
+
+# --- the ratified swap-set widening -----------------------------------------
+
+
+async def test_a_send_out_fault_now_enters_the_swap_loop(db_session, printer_factory, install_settings, monkeypatch):
+    """0700_8005 was classified mechanical_feed by WS2a and owned by NOTHING. Since
+    the 2026-08-09 operator-ratified partition it is a swap trigger like the 8010
+    family — same physical obstruction, one step further along the path."""
+    install_settings()
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    await _bind_spool(db_session, printer.id, 0, 0)
+    state = _make_state(hms=[_sendout_hms()])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_ams_fault(printer.id, state)
+    assert task is not None
+    await task
+
+    assert ("unload",) in client.calls
+    assert ("load", 1) in client.calls
+    assert state.state == "RUNNING"
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+
+# --- hold lifecycle ---------------------------------------------------------
+
+
+async def test_a_screen_resume_closes_the_hold_and_clears_the_token(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """THE (d) pin: any resume source ends the hold.
+
+    An operator who walked to the printer and pressed Resume used to leave
+    ``filament_runout_recovery_failed`` on the unit forever — only the farm's own
+    auto-resume cleared it — so the run page showed a phantom hold and the hourly
+    reminder kept nagging about a print that had been running for hours."""
+    printer = await printer_factory()
+    item = await _runout_held_item(db_session, printer.id)
+    state = _make_state(gcode_state="RUNNING", hms=[])
+    _wire(monkeypatch, state, FakeClient(state))
+
+    assert await spool_recovery.on_observed_running(printer.id) is True
+
+    assert await _incident_row(db_session, printer.id) is None
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+
+async def test_the_running_edge_is_what_calls_it(db_session, printer_factory, monkeypatch):
+    """The sampler turns a PAUSE→RUNNING transition into the close — this is the
+    production path, since nothing else observes a screen resume."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    spawned = _capture_spawns(monkeypatch)
+    state = _make_state(hms=[_runout_same_slot_hms()])
+    _wire(monkeypatch, state, FakeClient(state))
+
+    spool_recovery.note_demand_watch(printer.id, state)  # seed the sample
+    state.state, state.hms_errors = "RUNNING", []  # the operator pressed Resume
+    spool_recovery.note_demand_watch(printer.id, state)
+
+    assert len(spawned) == 1
+    assert await spawned[0] is True
+    assert await _incident_row(db_session, printer.id) is None
+
+
+async def test_a_hold_never_survives_a_non_recovery_token(db_session, printer_factory, monkeypatch):
+    """Only the tokens this module owns are cleared: a unit holding for a plate-vision
+    trip keeps its own reason, because a resume says nothing about that hold."""
+    printer = await printer_factory()
+    item = await _runout_held_item(db_session, printer.id)
+    item.waiting_reason = "plate_not_empty_printer_detected"
+    await db_session.commit()
+    state = _make_state(gcode_state="RUNNING", hms=[])
+    _wire(monkeypatch, state, FakeClient(state))
+
+    await spool_recovery.on_observed_running(printer.id)
+
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == "plate_not_empty_printer_detected"
+
+
+async def test_startup_closes_a_stale_hold_on_a_running_printer(db_session, printer_factory, monkeypatch):
+    """A restart proves nothing about a physical hold, so the sweep is evidence-led:
+    a printer now RUNNING was resumed while we were down."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    state = _make_state(gcode_state="RUNNING", hms=[])
+    _wire(monkeypatch, state, FakeClient(state))
+
+    assert await spool_recovery.rearm_incidents_on_startup() == 1
+
+    assert await _incident_row(db_session, printer.id) is None
+
+
+async def test_startup_keeps_a_hold_on_a_still_paused_printer(db_session, printer_factory, monkeypatch):
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    state = _make_state(gcode_state="PAUSE", hms=[_runout_same_slot_hms()])
+    _wire(monkeypatch, state, FakeClient(state))
+
+    assert await spool_recovery.rearm_incidents_on_startup() == 0
+
+    row = await _incident_row(db_session, printer.id)
+    assert row is not None and row.status == "escalated"
+    # ...and the chip projection is rebuilt, so the hold is visible again.
+    from backend.app.services import printer_incidents
+
+    assert printer_incidents.snapshot(printer.id)["kind"] == "runout"
+
+
+async def test_startup_leaves_a_hold_alone_when_the_printer_has_not_reported(db_session, printer_factory, monkeypatch):
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_status", lambda _pid: None)
+
+    assert await spool_recovery.rearm_incidents_on_startup() == 0
+    assert await _incident_row(db_session, printer.id) is not None
+
+
+async def test_a_later_different_fault_on_the_same_job_is_recovered(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """THE (c) pin — the latch death.
+
+    ``_escalated`` was a per-(printer, job) set that never expired inside a process,
+    so once ANY fault on a job gave up, a LATER, DIFFERENT fault on that same job
+    could never be recovered. The hold is now scoped to the incident."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    _spy(monkeypatch, "on_spool_recovery_failed")
+
+    # Fault 1: a physical fault escalates and holds.
+    state = _make_state(hms=[_physical_wire_hms()])
+    _wire(monkeypatch, state, FakeClient(state))
+    await on_ams_fault(printer.id, state)
+    assert (await _incident_row(db_session, printer.id)).kind == "physical"
+
+    # The operator clears it and the print runs again — the hold ends with it.
+    running = _make_state(gcode_state="RUNNING", hms=[])
+    _wire(monkeypatch, running, FakeClient(running))
+    await spool_recovery.on_observed_running(printer.id)
+
+    # Fault 2 on the SAME job: a jam, which must be recovered normally.
+    await _bind_spool(db_session, printer.id, 0, 0)
+    state2 = _make_state()
+    client2 = FakeClient(state2)
+    _wire(monkeypatch, state2, client2)
+    task = await on_ams_fault(printer.id, state2)
+    assert task is not None
+    await task
+    assert ("unload",) in client2.calls
+
+
+async def test_the_same_fault_after_an_abort_is_not_re_entered(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """An external actor took over: re-entering would fight the operator. The bar
+    lifts only when the wire says this is no longer the same standing fault."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    await _bind_spool(db_session, printer.id, 0, 0)
+    state = _make_state()
+    client = FakeClient(state, external_resume_on_unload=True)  # someone resumed mid-recovery
+    _wire(monkeypatch, state, client)
+
+    task = await on_ams_fault(printer.id, state)
+    await task
+    row = (await db_session.execute(select(PrinterIncident))).scalars().all()[-1]
+    assert row.status == "aborted"
+
+    # The same fault, still standing, must NOT re-open an incident.
+    state.state = "PAUSE"
+    assert await on_ams_fault(printer.id, state) is None
+    assert await _incident_row(db_session, printer.id) is None
+
+
+async def test_the_wire_re_arms_a_barred_fault_when_it_clears(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """The bar is an EDGE ledger, not a latch: once the codes stop standing, the next
+    occurrence is a new fault and is owned again."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    await _bind_spool(db_session, printer.id, 0, 0)
+    state = _make_state()
+    client = FakeClient(state, external_resume_on_unload=True)
+    _wire(monkeypatch, state, client)
+    await (await on_ams_fault(printer.id, state))
+
+    # The fault clears from the wire...
+    cleared = _make_state(gcode_state="RUNNING", hms=[])
+    spool_recovery.note_demand_watch(printer.id, cleared)
+    # ...and comes back later in the same job.
+    state2 = _make_state()
+    client2 = FakeClient(state2)
+    _wire(monkeypatch, state2, client2)
+
+    task = await on_ams_fault(printer.id, state2)
+    assert task is not None
+    await task
+    assert ("unload",) in client2.calls
+
+
+async def test_a_terminal_closes_the_hold(db_session, printer_factory, monkeypatch):
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    state = _make_state(gcode_state="FINISH", hms=[])
+    _wire(monkeypatch, state, FakeClient(state))
+
+    assert await spool_recovery.on_job_terminal(printer.id) is True
+
+    assert await _incident_row(db_session, printer.id) is None
+    assert await spool_recovery.on_job_terminal(printer.id) is False  # nothing left to close
+
+
+# --- refill auto-resume: two spawn sources, one body ------------------------
+
+
+async def test_demand_clearing_while_paused_resumes(db_session, printer_factory, monkeypatch, _fast_resume):
+    """Spawn source 2 (NEW): the firmware stops asking for filament.
+
+    Nothing watched for this before WS2b — auto-resume rode the presence-GAIN edge
+    alone, and in production it had never fired."""
+    printer = await printer_factory()
+    item = await _runout_held_item(db_session, printer.id)
+    resumed = _spy(monkeypatch, "on_runout_auto_resumed")
+    spawned = _capture_spawns(monkeypatch)
+    # ONE state object, mutated in place — a live PrinterState is updated by each
+    # push, and the resume must land on the same object the client drives.
+    state = _runout_paused_state(tray_id=2)
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    spool_recovery.note_demand_watch(printer.id, state)  # seed: demand standing
+    state.hms_errors = []  # the firmware answered: nothing to fill
+    spool_recovery.note_demand_watch(printer.id, state)
+
+    assert len(spawned) == 1
+    assert await spawned[0] is True
+
+    assert client.calls.count(("resume",)) == 1
+    row = (await db_session.execute(select(PrinterIncident))).scalars().all()[-1]
+    assert row.status == "resolved" and row.resolve_source == "auto_resume"
+    resumed.assert_awaited_once()
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+
+async def test_a_still_standing_demand_on_a_loaded_slot_resumes(db_session, printer_factory, monkeypatch, _fast_resume):
+    """THE 006-H2S pin: the firmware LATCHES a bogus demand for a slot that never ran
+    dry, so "wait for the demand to clear" can wait forever. A demanded slot that
+    physically READS LOADED is the second admissible evidence of the same fact."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    state = _make_state(
+        gcode_state="PAUSE",
+        tray_now=255,
+        hms=[_runout_demand_hms(0, 1), _runout_same_slot_hms()],
+        trays=[_ams_tray(0), _ams_tray(1)],  # the demanded slot 1 IS seated
+    )
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    # The operator refilled a DIFFERENT slot; the gain edge fires there.
+    assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 0) is True
+
+    assert client.calls.count(("resume",)) == 1
+
+
+async def test_no_evidence_stands_down(db_session, printer_factory, monkeypatch, _fast_resume):
+    """Neither witness: the demand still stands and the slot it names is EMPTY."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    state = _make_state(
+        gcode_state="PAUSE",
+        tray_now=255,
+        hms=[_runout_demand_hms(0, 3), _runout_same_slot_hms()],  # slot 3 — not in the tray list
+        trays=[_ams_tray(0), _ams_tray(1)],
+    )
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 1) is False
+
+    assert client.calls == []
+
+
+async def test_an_external_runout_resumes_when_its_code_clears(db_session, printer_factory, monkeypatch, _fast_resume):
+    """The demand decoder covers AMS slots only, so the external lane watches its own
+    code: no code, no runout."""
+    printer = await printer_factory()
+    item = await _runout_held_item(db_session, printer.id)
+    spawned = _capture_spawns(monkeypatch)
+    state = _make_state(gcode_state="PAUSE", tray_now=255, hms=[_external_runout_hms()])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    spool_recovery.note_demand_watch(printer.id, state)
+    state.hms_errors = []  # the operator loaded the spool holder
+    spool_recovery.note_demand_watch(printer.id, state)
+
+    assert len(spawned) == 1
+    assert await spawned[0] is True
+    assert client.calls.count(("resume",)) == 1
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+
+async def test_auto_resume_needs_an_open_runout_incident(db_session, printer_factory, monkeypatch, _fast_resume):
+    """No hold, nothing to resume — a PAUSE the farm does not own is not ours to end."""
+    printer = await printer_factory()
+    state = _runout_paused_state(tray_id=2)
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is False
+    assert client.calls == []
+
+
+# --- liveness: the whole journey, end to end --------------------------------
+
+
+async def test_liveness_runout_hold_to_confirmed_running(
+    db_session, printer_factory, install_settings, monkeypatch, _fast_resume
+):
+    """The paired LIVENESS probe (memory: a cured storm and a starved deadlock look
+    identical on absence metrics). Scripted wire sequence, asserting the EVENT
+    HAPPENS rather than "no error":
+
+        8011 arrives while PAUSE → incident + hold + alert
+        → the firmware demands a slot → guidance names it
+        → the operator refills; the demand clears → auto-resume publishes one resume
+        → RUNNING is confirmed → the incident closes and the hold token goes.
+    """
+    install_settings()
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    resumed = _spy(monkeypatch, "on_runout_auto_resumed")
+    spawned = _capture_spawns(monkeypatch)
+
+    # 1. The unrescued runout lands on a PAUSEd printer.
+    state = _make_state(gcode_state="PAUSE", tray_now=255, hms=[_runout_same_slot_hms()])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+    spool_recovery.note_demand_watch(printer.id, state)
+    task = await on_ams_fault(printer.id, state)
+    assert task is not None
+    await task
+
+    row = await _incident_row(db_session, printer.id)
+    assert row is not None and row.kind == "runout" and row.status == "escalated"
+    failed.assert_awaited_once()
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_RUNOUT
+
+    # 2. The firmware names the slot it wants filled; the guidance re-announces it.
+    demand = _runout_demand_hms(0, 2)
+    state.hms_errors = [_runout_same_slot_hms(), demand]
+    spool_recovery.note_demand_watch(printer.id, state)
+    assert await spool_recovery.maybe_refresh_runout_guidance(printer.id, {demand.full_code}, state) is True
+    assert failed.await_args.kwargs["runout_slot"] == "AMS A slot 3"
+
+    # 3. The operator refills — the demand disappears from the wire.
+    state.hms_errors = []
+    spool_recovery.note_demand_watch(printer.id, state)
+    assert len(spawned) == 1  # the sampler fired the resume lane
+    assert await spawned[0] is True
+
+    # 4. One resume, RUNNING confirmed, hold gone — the event HAPPENED.
+    assert client.calls.count(("resume",)) == 1
+    assert state.state == "RUNNING"
+    resumed.assert_awaited_once()
+    assert await _incident_row(db_session, printer.id) is None
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+
+# --- the per-push entry throttle -------------------------------------------
+
+
+class TestEntryThrottle:
+    """The entry gate runs on EVERY push now (that decoupling is the silent-class
+    fix), so a standing fault must not re-query the durable gates every second —
+    while a CHANGED fault is never delayed."""
+
+    async def test_an_unchanged_fault_is_throttled(self, db_session, printer_factory, install_settings, monkeypatch):
+        install_settings()
+        monkeypatch.setattr(spool_recovery, "_EVAL_THROTTLE_S", 60.0)
+        printer = await printer_factory()
+        state = _make_state(subtask="foreign-job")
+        _wire(monkeypatch, state, FakeClient(state))
+        _spy(monkeypatch, "on_spool_recovery_failed")
+        calls = {"n": 0}
+        real = spool_recovery.printer_incidents.get_open
+
+        async def _counting(db, pid):
+            calls["n"] += 1
+            return await real(db, pid)
+
+        monkeypatch.setattr(spool_recovery.printer_incidents, "get_open", _counting)
+
+        await on_ams_fault(printer.id, state)  # opens the incident
+        before = calls["n"]
+        for _ in range(5):
+            await on_ams_fault(printer.id, state)
+
+        assert calls["n"] == before  # not one extra durable read
+
+    async def test_a_changed_fault_is_never_throttled(self, db_session, printer_factory, install_settings, monkeypatch):
+        install_settings()
+        monkeypatch.setattr(spool_recovery, "_EVAL_THROTTLE_S", 60.0)
+        printer = await printer_factory()
+        _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _make_state(subtask="foreign-job", hms=[_runout_same_slot_hms()])
+        _wire(monkeypatch, state, FakeClient(state))
+        task = await on_ams_fault(printer.id, state)
+        if task is not None:
+            await task  # settle the driver before the next session touches the row
+        await spool_recovery.on_job_terminal(printer.id)  # the hold ends
+
+        # A DIFFERENT fault on the next push must be evaluated immediately.
+        state2 = _make_state(subtask="foreign-job", hms=[_physical_wire_hms()])
+        _wire(monkeypatch, state2, FakeClient(state2))
+        await on_ams_fault(printer.id, state2)
+
+        row = await _incident_row(db_session, printer.id)
+        assert row is not None and row.kind == "physical"

@@ -185,6 +185,7 @@ export default {
       },
       waiting: {
         filamentRunoutRecoveryFailed: 'Filament bitti — işaretli AMS yuvasına yeni bir makara takın ve sürdürün',
+        spoolPhysicalFault: 'Fiziksel arıza — elle müdahale gerekiyor, otomatik değişim yok',
         printerOfflineStalled: 'Yazıcı baskı sırasında çevrimdışı oldu — yeniden bağlanana kadar sonuç bilinmiyor',
         printPausedStalled: 'Yazıcıda duraklatıldı — müdahale gerekiyor (otomatik kurtarma yok)',
         visionHold: 'Yazıcı görüşü: plaka boş değil — yatağı temizleyin, sonra yazıcıdan sürdürün',
@@ -1147,6 +1148,12 @@ export default {
     },
     noUsb: 'USB sürücü yok',
     noUsbHint: 'Gönderim başarısız olacak — bir USB-A sürücü (FAT32/exFAT) takın',
+    incident: {
+      jam: 'AMS sıkışması',
+      runout: 'Filament bitti',
+      physical: 'Filament arızası',
+      recovering: 'Kurtarılıyor',
+    },
     // Fanlar
     fans: {
       partCooling: 'Parça Soğutma Fanı',

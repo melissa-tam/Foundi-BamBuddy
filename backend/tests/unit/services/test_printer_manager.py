@@ -1939,3 +1939,60 @@ class TestRunSlotPipelinePass:
 
         assert lanes == ["presence", "pipeline"]  # the pipeline still ran
         assert "AMS presence pass failed for printer 1" in caplog.text
+
+
+class TestOpenIncidentProjection:
+    """WS2b: the printer card's AMS-incident chip.
+
+    A FOREIGN print's hold has no queue row and therefore no ``waiting_reason``
+    anywhere in the UI — this projection is the only place it can be seen. It is
+    read from the incident store's in-memory cache because this serializer runs on
+    every status broadcast, so a cache miss must render NO chip rather than block or
+    invent one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from backend.app.services import printer_incidents
+
+        printer_incidents._reset_state()
+        yield
+        printer_incidents._reset_state()
+
+    def _state(self):
+        state = MagicMock()
+        state.connected = True
+        state.state = "PAUSE"
+        state.temperatures = {}
+        state.hms_errors = []
+        state.raw_data = {}
+        state.stg_cur = -1
+        state.firmware_version = None
+        state.gcode_file = ""
+        state.subtask_name = ""
+        return state
+
+    def test_no_open_incident_renders_null(self):
+        assert printer_state_to_dict(self._state(), printer_id=7)["open_incident"] is None
+
+    def test_no_printer_id_renders_null(self):
+        assert printer_state_to_dict(self._state())["open_incident"] is None
+
+    def test_an_open_incident_is_projected(self):
+        from backend.app.services import printer_incidents
+
+        printer_incidents._open_cache[7] = {
+            "kind": "runout",
+            "status": "escalated",
+            "slot_desc": "AMS A slot 3",
+            "created_at": "2026-08-09T12:00:00",
+        }
+
+        payload = printer_state_to_dict(self._state(), printer_id=7)["open_incident"]
+
+        assert payload == {
+            "kind": "runout",
+            "status": "escalated",
+            "slot_desc": "AMS A slot 3",
+            "created_at": "2026-08-09T12:00:00",
+        }

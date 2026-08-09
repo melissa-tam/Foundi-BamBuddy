@@ -235,6 +235,15 @@ DEFAULT_TEMPLATES = [
         "title_template": "Print paused — {printer_name}",
         "body_template": "{printer_name} has been PAUSEd {minutes} min with '{job_name}' still printing, and nothing is recovering it. Check the printer — it will not resolve on its own.",
     },
+    # WS2b: the same hold on a print the farm did NOT dispatch. A separate event from
+    # print_paused_stalled because there is no queue unit to name and no run to hold —
+    # the copy must not promise a farm reaction that cannot happen.
+    {
+        "event_type": "foreign_print_paused",
+        "name": "Foreign Print Paused",
+        "title_template": "Foreign print paused — {printer_name}",
+        "body_template": "{printer_name} has been PAUSEd {minutes} min on '{job_name}', a print Bambuddy did not dispatch. Nothing is recovering it — check the printer.",
+    },
     {
         "event_type": "storage_low",
         "name": "USB Storage Low (auto-cleanup)",
