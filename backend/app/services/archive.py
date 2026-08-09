@@ -6,8 +6,10 @@ import os
 import re
 import shutil
 import zipfile
+from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from pathlib import Path
+from typing import Any
 
 from defusedxml import ElementTree as ET
 from sqlalchemy import and_, or_, select, text
@@ -1186,6 +1188,23 @@ async def _count_related_queue_items(db: AsyncSession, archive_id: int) -> tuple
     return int(total or 0), int(printing or 0)
 
 
+@dataclass(frozen=True)
+class IngestedThreeMF:
+    """A 3MF copied into the archive tree, together with everything parsed out of it.
+
+    ``columns`` carries exactly the :class:`PrintArchive` column values the FILE
+    determines (stored copy, hash, thumbnail, slice metadata, cost, quantity).
+    Row identity — filename, print name, status, timestamps, ownership — is the
+    caller's and is deliberately absent, so the same ingest serves both archive
+    creation and a late attach onto a row that already exists.
+    """
+
+    dest_file: Path
+    display_stem: str
+    metadata: dict
+    columns: dict[str, Any]
+
+
 class ArchiveService:
     """Service for archiving print jobs."""
 
@@ -1331,45 +1350,23 @@ class ArchiveService:
 
         return duplicates
 
-    async def archive_print(
+    async def _ingest_3mf(
         self,
         printer_id: int | None,
         source_file: Path,
-        print_data: dict | None = None,
-        created_by_id: int | None = None,
-        original_filename: str | None = None,
-        project_id: int | None = None,
-        subtask_id: str | None = None,
-        prefer_filename_for_name: bool = False,
-        plate_id: int | None = None,
-    ) -> PrintArchive | None:
-        """Archive a 3MF file with metadata.
+        print_data: dict | None,
+        original_filename: str | None,
+        plate_id: int | None,
+    ) -> IngestedThreeMF | None:
+        """Copy a 3MF into a fresh archive directory and parse it into column values.
 
-        Args:
-            printer_id: ID of the printer (optional)
-            source_file: Path to the 3MF file
-            print_data: Print data from MQTT (optional)
-            created_by_id: User ID who created this archive (optional, for user tracking)
-            original_filename: Original human-readable filename (optional, for library files
-                stored with UUID names)
-            project_id: Project to associate this archive with (optional, set when triggered
-                from the project view)
-            subtask_id: MQTT-provided task identifier (optional). Used to match an
-                existing archive across a backend restart mid-print so the
-                original row can be resumed instead of cancelled (#972).
-            prefer_filename_for_name: When True, use the uploaded filename stem as the
-                archive's display name even if the 3MF embeds a `print_name` in its
-                metadata. Used by virtual-printer flows so users who rename a job in
-                BambuStudio's "send to printer" dialog see that name instead of the
-                creator-baked title (#1152).
+        The one origin for turning a 3MF into archive columns: :meth:`archive_print`
+        builds a new row from the result, :meth:`attach_3mf_to_archive` writes it
+        onto a row that was created without a file.
+
+        Returns None when the copy did not survive verification (#1032) — the
+        caller must not point a row at a corrupt file.
         """
-        # Verify printer exists if specified
-        if printer_id is not None:
-            result = await self.db.execute(select(Printer).where(Printer.id == printer_id))
-            printer = result.scalar_one_or_none()
-            if not printer:
-                return None
-
         # Create archive directory structure
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         display_stem = resolve_display_stem(original_filename if original_filename else source_file.name)
@@ -1456,11 +1453,6 @@ class ArchiveService:
         if print_data:
             metadata["_print_data"] = print_data
 
-        # Determine status and timestamps
-        status = print_data.get("status", "completed") if print_data else "archived"
-        started_at = datetime.now(timezone.utc) if status == "printing" else None
-        completed_at = datetime.now(timezone.utc) if status in ("completed", "failed", "archived") else None
-
         # Calculate cost based on filament usage and type
         cost = None
         filament_grams = metadata.get("filament_used_grams")
@@ -1489,37 +1481,142 @@ class ArchiveService:
             quantity = len(printable_objects)
             logger.debug("Auto-detected %s parts from 3MF printable objects", quantity)
 
-        # Create archive record
+        return IngestedThreeMF(
+            dest_file=dest_file,
+            display_stem=display_stem,
+            metadata=metadata,
+            columns={
+                "file_path": str(dest_file.relative_to(settings.base_dir)),
+                "file_size": dest_file.stat().st_size,
+                "content_hash": content_hash,
+                "thumbnail_path": thumbnail_path,
+                "print_time_seconds": metadata.get("print_time_seconds"),
+                "filament_used_grams": metadata.get("filament_used_grams"),
+                "filament_type": metadata.get("filament_type"),
+                "filament_color": metadata.get("filament_color"),
+                "layer_height": metadata.get("layer_height"),
+                "total_layers": metadata.get("total_layers"),
+                "nozzle_diameter": metadata.get("nozzle_diameter"),
+                "bed_temperature": metadata.get("bed_temperature"),
+                "bed_type": metadata.get("bed_type"),
+                "nozzle_temperature": metadata.get("nozzle_temperature"),
+                "sliced_for_model": metadata.get("sliced_for_model"),
+                "makerworld_url": metadata.get("makerworld_url"),
+                "designer": metadata.get("designer"),
+                "cost": cost,
+                "quantity": quantity,
+            },
+        )
+
+    async def attach_3mf_to_archive(
+        self,
+        archive: PrintArchive,
+        source_file: Path,
+        plate_id: int | None = None,
+    ) -> bool:
+        """Attach a late-captured 3MF to an archive row created without one.
+
+        Writes exactly what the file determines (see :class:`IngestedThreeMF`) and
+        drops the ``no_3mf_available`` marker. Row identity — filename, print name,
+        status, timestamps — is left as created: the running print's bookkeeping and
+        the UI already reference it. A row that already has a file is never
+        overwritten, so this is safe to call against a print the terminal path may
+        have resolved in the meantime.
+
+        Returns True when the file was attached.
+        """
+        if archive.file_path:
+            return False
+
+        ingested = await self._ingest_3mf(archive.printer_id, source_file, None, None, plate_id)
+        if ingested is None:
+            return False
+
+        for column, value in ingested.columns.items():
+            setattr(archive, column, value)
+        # JSON column — SQLAlchemy only sees a whole-value assignment. Parsed
+        # metadata wins on collisions; keys the row already owns (original_subtask,
+        # the start payload under _print_data) survive.
+        merged = {**(archive.extra_data or {}), **ingested.metadata}
+        merged.pop("no_3mf_available", None)
+        archive.extra_data = merged
+        await self.db.commit()
+
+        logger.info(
+            "Attached late-captured 3MF %s to archive %s (%s bytes)",
+            ingested.dest_file.name,
+            archive.id,
+            ingested.columns["file_size"],
+        )
+        return True
+
+    async def archive_print(
+        self,
+        printer_id: int | None,
+        source_file: Path,
+        print_data: dict | None = None,
+        created_by_id: int | None = None,
+        original_filename: str | None = None,
+        project_id: int | None = None,
+        subtask_id: str | None = None,
+        prefer_filename_for_name: bool = False,
+        plate_id: int | None = None,
+    ) -> PrintArchive | None:
+        """Archive a 3MF file with metadata.
+
+        Args:
+            printer_id: ID of the printer (optional)
+            source_file: Path to the 3MF file
+            print_data: Print data from MQTT (optional)
+            created_by_id: User ID who created this archive (optional, for user tracking)
+            original_filename: Original human-readable filename (optional, for library files
+                stored with UUID names)
+            project_id: Project to associate this archive with (optional, set when triggered
+                from the project view)
+            subtask_id: MQTT-provided task identifier (optional). Used to match an
+                existing archive across a backend restart mid-print so the
+                original row can be resumed instead of cancelled (#972).
+            prefer_filename_for_name: When True, use the uploaded filename stem as the
+                archive's display name even if the 3MF embeds a `print_name` in its
+                metadata. Used by virtual-printer flows so users who rename a job in
+                BambuStudio's "send to printer" dialog see that name instead of the
+                creator-baked title (#1152).
+        """
+        # Verify printer exists if specified
+        if printer_id is not None:
+            result = await self.db.execute(select(Printer).where(Printer.id == printer_id))
+            printer = result.scalar_one_or_none()
+            if not printer:
+                return None
+
+        ingested = await self._ingest_3mf(printer_id, source_file, print_data, original_filename, plate_id)
+        if ingested is None:
+            return None
+        metadata = ingested.metadata
+
+        # Determine status and timestamps
+        status = print_data.get("status", "completed") if print_data else "archived"
+        started_at = datetime.now(timezone.utc) if status == "printing" else None
+        completed_at = datetime.now(timezone.utc) if status in ("completed", "failed", "archived") else None
+
+        # Create archive record — identity fields here, everything the file
+        # determines from the ingest.
         archive = PrintArchive(
             printer_id=printer_id,
             filename=original_filename or source_file.name,
-            file_path=str(dest_file.relative_to(settings.base_dir)),
-            file_size=dest_file.stat().st_size,
-            content_hash=content_hash,
-            thumbnail_path=thumbnail_path,
-            print_name=display_stem if prefer_filename_for_name else (metadata.get("print_name") or display_stem),
-            print_time_seconds=metadata.get("print_time_seconds"),
-            filament_used_grams=metadata.get("filament_used_grams"),
-            filament_type=metadata.get("filament_type"),
-            filament_color=metadata.get("filament_color"),
-            layer_height=metadata.get("layer_height"),
-            total_layers=metadata.get("total_layers"),
-            nozzle_diameter=metadata.get("nozzle_diameter"),
-            bed_temperature=metadata.get("bed_temperature"),
-            bed_type=metadata.get("bed_type"),
-            nozzle_temperature=metadata.get("nozzle_temperature"),
-            sliced_for_model=metadata.get("sliced_for_model"),
-            makerworld_url=metadata.get("makerworld_url"),
-            designer=metadata.get("designer"),
+            print_name=(
+                ingested.display_stem
+                if prefer_filename_for_name
+                else (metadata.get("print_name") or ingested.display_stem)
+            ),
             status=status,
             started_at=started_at,
             completed_at=completed_at,
-            cost=cost,
-            quantity=quantity,
             extra_data=metadata,
             created_by_id=created_by_id,
             project_id=project_id,
             subtask_id=subtask_id,
+            **ingested.columns,
         )
 
         self.db.add(archive)
