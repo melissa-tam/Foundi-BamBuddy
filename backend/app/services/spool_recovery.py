@@ -98,9 +98,15 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services import tray_fields
 from backend.app.services.bambu_mqtt import AMS_STATUS_FILAMENT_CHANGE, AMS_STATUS_IDLE
-from backend.app.services.hms_errors import current_runout_demand, hms_short_code
+from backend.app.services.hms_errors import (
+    RUNOUT_HMS_CODES,
+    current_runout_demand,
+    extruder_side_short_codes,
+    hms_short_code,
+    legacy_swap_short_codes,
+)
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.spool_respool import RUNOUT_HMS_CODES, _decode_global_tray
+from backend.app.services.spool_respool import _decode_global_tray
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -110,72 +116,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # --- Trigger code sets ------------------------------------------------------
-# Feed-fault HMS short codes ("MMMM_CCCC", uppercase hex — matches hms_short_code
-# output), split by WHERE the fault sits so recovery can reason about the common
-# factor on a re-jam (see extruder_side_only below).
+# DERIVED from the AMS fault taxonomy (``hms_errors``), never re-listed here: the
+# classification of a firmware code is that module's job, and a second literal copy
+# is exactly how two modules come to disagree about one code (doctrine invariant 1).
+# Each name below keeps its historical membership and its historical meaning —
+# these are the machine's trigger sets, split by WHERE the fault sits so recovery
+# can reason about the common factor on a re-jam (see extruder_side_only below).
 #
-# AMS-side (assist-motor / feed-path) faults — a fresh spool on a healthy feed
-# path usually clears them: the 07xx family is "AMS assist motor overloaded /
-# entangled filament / stuck spool"; the 18xx family is the AMS-HT equivalent;
-# the 12xx family is "Filament or spool may be stuck" (hms_errors.py). All carry
-# stuck-spool semantics and all PAUSE the print, so a false positive cannot fire
-# on a healthy print (acting requires a PAUSE anyway). The pull-out/pull-back
-# siblings (07xx_8003/8004/8006) stay OUT — those can need physical extruder work
-# an auto-load could grind.
+# The scope pin is ``legacy_swap_short_codes()``: the taxonomy classifies MORE
+# codes as mechanical-feed faults than this machine acts on (the send-out 8005,
+# feed-into-extruder 8006 and feed-to-extruder 8028 families), and every one of
+# those is a NEW auto-recovery surface that owes a hardware ladder before it may
+# drive an unattended swap. Widening the machine means moving members into that
+# marker deliberately — not widening the intersection here.
 #
-# F9 — two deliberate EXCLUSIONS, recorded so a future widening does not regress:
-#   * ``0700_0025`` is NOT a trigger. It was observed live 2026-07-20 07:48 on
-#     009-H2S, ~5 min BEFORE the 8010 that actually wedged the change, but its
-#     semantics are unknown / uncatalogued. The 8010 always follows and is the
-#     real trigger, so adding 0025 would only widen the surface with no signal.
-#   * ``0700_0001`` must NEVER be added as a short code. The same low-16 code word
-#     (``0001``) also appears under the SLOT-ATTRIBUTED runout attr family
-#     ``0700_2X00_0002_0001`` (see hms_errors._RUNOUT_SLOT_CODE32, which carries
-#     0x00020001). A short-code match here would route those runouts into the
-#     jam-swap machine, regressing the 2026-07-19 runout-honest design (runouts
-#     must escalate for a SAME-slot refill, never swap). Distinguishing the two
-#     would require attr-aware FULL-code matching first — short codes alone cannot.
-AMS_FEED_FAULT_HMS_CODES: frozenset[str] = frozenset(
-    {
-        "0700_8010",
-        "0701_8010",
-        "0702_8010",
-        "0703_8010",
-        "0704_8010",
-        "0705_8010",
-        "0706_8010",
-        "0707_8010",
-        "1800_8010",
-        "1801_8010",
-        "1802_8010",
-        "1200_8010",
-        "1201_8010",
-        "1202_8010",
-        "1203_8010",
-        "12FF_8010",
-    }
-)
+# The deliberate EXCLUSIONS that used to be recorded in this block now live with
+# the classification they qualify, in the ``hms_errors`` taxonomy tables: the
+# ``0700_0001`` ban (short-code header), the ``0700_0025`` precursor
+# (INFORMATIONAL, code word 0x00020025), the pull-out/pull-back families
+# (PHYSICAL_FAULT, 8003/8004) and the clog family (PHYSICAL_FAULT,
+# 0300_801A/801C/8016 + 0300_4006) — the last of which the pause-stall watchdog
+# escalates instead, because a swap cannot fix a clog.
+AMS_FEED_FAULT_HMS_CODES: frozenset[str] = legacy_swap_short_codes() - extruder_side_short_codes()
 
-# Extruder-side (main extruder motor overloaded) — the H2S code a tangle/stuck
-# spool emits when it overloads the MAIN extruder instead of the AMS assist motor
-# (production incident 2026-07-17: 004-H2S sat PAUSEd ~2h40m with no reaction
-# because this code was outside the trigger set). A swap still helps (fresh
+# Extruder-side (the MAIN extruder motor overloaded, not the AMS assist motor).
+# Production incident 2026-07-17: 004-H2S sat PAUSEd ~2h40m with no reaction
+# because this code was outside the trigger set. A swap still helps (fresh
 # filament often clears the immediate overload), but the extruder — not the
 # spool — is the common factor, so a re-jam after the swap must NOT penalize the
-# healthy replacement (extruder_side_only). Clog-leaning siblings
-# (0300_801A/801C/8016, 0300_4006) stay OUT — a swap cannot fix a clog; the
-# pause-stall watchdog escalates those instead.
-EXTRUDER_FEED_FAULT_HMS_CODES: frozenset[str] = frozenset({"0300_801E"})
+# healthy replacement (extruder_side_only).
+EXTRUDER_FEED_FAULT_HMS_CODES: frozenset[str] = legacy_swap_short_codes() & extruder_side_short_codes()
 
 # Public union — kept as the single name the rest of the module (and main.py's
 # import) reads, so RECOVERABLE_HMS_CODES / _primary_code / is_feed_fault are
-# unchanged. Widening either family later is a one-line frozenset edit.
+# unchanged.
 FEED_FAULT_HMS_CODES: frozenset[str] = AMS_FEED_FAULT_HMS_CODES | EXTRUDER_FEED_FAULT_HMS_CODES
 
-# Codes that trigger a recovery attempt: feed faults PLUS the reused-tag runout
-# family (import — do NOT duplicate the runout set). A runout that the firmware
-# backup already rescued never PAUSEs, so the state machine closes it as
-# transient; a stuck runout runs recovery WITHOUT the out-of-rotation marking.
+# Codes that trigger a recovery attempt: feed faults PLUS the unrescued runout
+# family. A runout that the firmware backup already rescued never PAUSEs, so the
+# state machine closes it as transient; a stuck runout runs recovery WITHOUT the
+# out-of-rotation marking. The EXTERNAL-spool runouts are deliberately absent —
+# they name no AMS slot and there is no sibling tray to swap to.
 RECOVERABLE_HMS_CODES: frozenset[str] = FEED_FAULT_HMS_CODES | RUNOUT_HMS_CODES
 
 # --- waiting_reason tokens (rendered by the queue UI, mapped in waitingReason.ts)

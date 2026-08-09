@@ -2809,3 +2809,81 @@ async def test_assist_never_raises_on_a_broken_client(db_session, printer_factor
     monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: _Boom())
 
     assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is False
+
+
+# --- Trigger-set derivation -------------------------------------------------
+# The four trigger sets are now VIEWS of the hms_errors AMS fault taxonomy rather
+# than literals in spool_recovery. The pins below spell out the pre-derivation
+# membership so a taxonomy edit that would change what this machine ACTS on fails
+# here — the taxonomy may widen freely, the machine's reach may not drift.
+
+_PRE_DERIVATION_AMS_FEED = frozenset(
+    {
+        "0700_8010",
+        "0701_8010",
+        "0702_8010",
+        "0703_8010",
+        "0704_8010",
+        "0705_8010",
+        "0706_8010",
+        "0707_8010",
+        "1800_8010",
+        "1801_8010",
+        "1802_8010",
+        "1200_8010",
+        "1201_8010",
+        "1202_8010",
+        "1203_8010",
+        "12FF_8010",
+    }
+)
+_PRE_DERIVATION_EXTRUDER = frozenset({"0300_801E"})
+_PRE_DERIVATION_RUNOUT = frozenset(
+    {
+        "0300_8004",
+        "0700_8011",
+        "0701_8011",
+        "0702_8011",
+        "0703_8011",
+        "0704_8011",
+        "0705_8011",
+        "0706_8011",
+        "0707_8011",
+    }
+)
+
+
+def test_ams_feed_fault_set_is_unchanged_by_the_derivation():
+    assert spool_recovery.AMS_FEED_FAULT_HMS_CODES == _PRE_DERIVATION_AMS_FEED
+
+
+def test_extruder_feed_fault_set_is_unchanged_by_the_derivation():
+    assert spool_recovery.EXTRUDER_FEED_FAULT_HMS_CODES == _PRE_DERIVATION_EXTRUDER
+
+
+def test_feed_fault_union_is_unchanged_by_the_derivation():
+    assert spool_recovery.FEED_FAULT_HMS_CODES == _PRE_DERIVATION_AMS_FEED | _PRE_DERIVATION_EXTRUDER
+
+
+def test_recoverable_set_is_unchanged_by_the_derivation():
+    assert spool_recovery.RECOVERABLE_HMS_CODES == (
+        _PRE_DERIVATION_AMS_FEED | _PRE_DERIVATION_EXTRUDER | _PRE_DERIVATION_RUNOUT
+    )
+
+
+def test_the_wider_taxonomy_families_stay_out_of_the_trigger_sets():
+    """WS2a is behavior-neutral: classified-but-not-yet-consumed stays out."""
+    from backend.app.services.hms_errors import mechanical_feed_short_codes
+
+    # The taxonomy knows these are mechanical feed faults; the machine must not act
+    # on them until a consumer wave gives each one its hardware ladder.
+    for short in ("0700_8005", "0700_8006", "0700_8028", "07FF_8005"):
+        assert short in mechanical_feed_short_codes()
+        assert short not in spool_recovery.RECOVERABLE_HMS_CODES
+
+
+def test_external_spool_runouts_are_not_recoverable():
+    """No AMS slot means no sibling tray — the swap machine has nothing to swap to."""
+    from backend.app.services.hms_errors import runout_external_short_codes
+
+    assert not (runout_external_short_codes() & spool_recovery.RECOVERABLE_HMS_CODES)

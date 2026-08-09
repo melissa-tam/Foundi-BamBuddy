@@ -4,6 +4,10 @@ Auto-generated from frontend/src/components/HMSErrorModal.tsx
 Source: https://github.com/greghesp/ha-bambulab
 """
 
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
+
 from backend.app.services.hms_catalog import lookup_full_code, lookup_wiki_path
 
 # HMS error code to human-readable description mapping
@@ -1086,6 +1090,445 @@ def runout_slot_from_hms(attr: int, code: int) -> tuple[int, int] | None:
     return ams_slot_from_attr(attr)
 
 
+# ===========================================================================
+# AMS fault taxonomy — ONE classification of the AMS fault vocabulary
+# ===========================================================================
+# Every consumer that needs to know what KIND of AMS fault a code is reads it
+# from here (doctrine invariant 1, one origin per magic value): the swap machine,
+# the runout lane, the read-failure suppression and the spent-evidence gate all
+# describe the same firmware vocabulary and must never disagree about a code.
+#
+# TWO LANES, because the firmware speaks two (see hms_short_code / §"anatomy"):
+#   * :func:`classify_ams_fault` — the ``hms[]`` array lane, 32-bit attr + 32-bit
+#     code word. The code word names the fault; the attr's SUBMODULE byte scopes
+#     what that word means, so a row is only honored under the submodules whose
+#     catalog text it was read from.
+#   * :func:`classify_short_code` — the ``print_error`` lane, whose ``MMMM_CCCC``
+#     short form has already thrown the submodule byte away. Necessarily coarser.
+#
+# EVERY row is backed by the verbatim text of the vendored catalog
+# (``app/data/hms_error_text_en.json.gz``, AMS-unit-A variants quoted; the other
+# units carry the same sentence with the unit letter swapped). A code word with no
+# row under the observed attr classifies ``None`` — meaning "not AMS-fault-
+# actionable, the generic notify lane owns it", never "benign".
+
+
+class AmsFaultClass(str, Enum):
+    """What KIND of AMS fault a code is — the farm's reaction vocabulary.
+
+    ``str`` mixin so the value serializes straight onto the wire / into logs.
+    """
+
+    RUNOUT = "runout"  # an AMS SLOT ran dry and the print is HELD for a same-slot refill
+    RUNOUT_EXTERNAL = "runout_external"  # the EXTERNAL spool holder ran dry — no AMS slot, no swap
+    MECHANICAL_FEED = "mechanical_feed"  # the path is obstructed/slipping — fresh filament can clear it
+    PHYSICAL_FAULT = "physical_fault"  # breakage/clog/hardware — needs physical work, never a swap
+    RFID_READ = "rfid_read"  # the tag could not be read (expected on a tagless slot)
+    INFORMATIONAL = "informational"  # a progress notice or a precursor — no farm action
+
+
+@dataclass(frozen=True)
+class ClassifiedAmsFault:
+    """The taxonomy's verdict for one fault.
+
+    ``extruder_side`` marks a fault whose common factor is the EXTRUDER rather than
+    the spool (a re-fault after a swap must not penalize the replacement).
+    ``slot`` is the ``(ams_id, tray_id)`` the attr names via :func:`ams_slot_from_attr`,
+    and is always ``None`` on the short-code lane — the short form discards the attr
+    low byte that carries it.
+    """
+
+    fault_class: AmsFaultClass
+    extruder_side: bool
+    slot: tuple[int, int] | None
+
+
+# AMS-bearing modules: 0x07 AMS / AMS 2 Pro, 0x12 AMS lite, 0x18 AMS-HT. A code
+# word reused by a non-AMS module (0x03 motion, 0x05 mainboard/camera) is never an
+# AMS fault, so the lane gates on the module first — the same fail-closed shape
+# :func:`is_filament_read_failure` uses.
+_AMS_MODULES: frozenset[int] = frozenset({0x07, 0x12, 0x18})
+
+# The attr SUBMODULE byte (``(attr >> 8) & 0xFF``) that scopes a code word's meaning.
+# 0x00020002 is the proof this scoping is required, not decoration — the ONE code
+# word carries three unrelated faults under three submodules (rows below).
+_TRAY_ATTR_BYTES: frozenset[int] = frozenset({0x20, 0x21, 0x22, 0x23})  # per-slot faults
+_MOTOR_ATTR_BYTES: frozenset[int] = frozenset({0x01, 0x10, 0x11, 0x12, 0x13})  # assist + feeder motors
+_RFID_ATTR_BYTES: frozenset[int] = frozenset({0x30, 0x31, 0x32, 0x33})  # per-slot RFID reader
+
+
+@dataclass(frozen=True)
+class _CodeWordRow:
+    """One (code word × submodule) classification in the ``hms[]`` lane."""
+
+    attr_bytes: frozenset[int]
+    fault_class: AmsFaultClass
+    extruder_side: bool = False
+
+
+_MECHANICAL = AmsFaultClass.MECHANICAL_FEED
+_PHYSICAL = AmsFaultClass.PHYSICAL_FAULT
+_RFID = AmsFaultClass.RFID_READ
+_INFO = AmsFaultClass.INFORMATIONAL
+
+# --- The hms[] code-word table ---------------------------------------------
+# Scoped to the submodules whose text was read; catalog sentence quoted per row.
+#
+# THREE code words are deliberately ABSENT so they classify None — each is owned by
+# a dedicated decoder and routing it through the generic taxonomy would regress a
+# ratified design:
+#   * 0x00020001 (tray attrs) — "AMS A Slot 3 filament has run out. Please insert a
+#     new filament." The DEMAND, owned by :func:`current_runout_demand`. Doctrine
+#     rule 9: runouts escalate for a SAME-slot refill, jams swap — a demand that
+#     reached a fault classifier could route a runout into the swap machine. It is
+#     also NOT spent evidence: 006-H2S 2026-07-26 proved the firmware latches a
+#     BOGUS demand for a slot that never ran dry.
+#   * 0x00030002 (tray attrs) — "…has run out and automatically switched to the slot
+#     with the same filament." THE spent evidence, owned by
+#     :data:`_RUNOUT_AUTO_SWITCH_SPENT_CODE32` / ``spool_respool``. A second consumer
+#     reading it as a generic fault would double-stamp the operator's ledger.
+#   * 0x00020002 under TRAY attrs — "AMS A Slot 1 is empty; please insert a new
+#     filament." An empty-slot ASK, hazard-identical to the 0x00020001 demand: an
+#     empty slot is not evidence a roll ran dry and not a fault a swap can fix. The
+#     generic notify lane tells the operator; no farm machine consumes it. (The SAME
+#     code word under the motor and RFID submodules IS classified — see below.)
+_CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
+    # -- 0x00020002, the three-meaning code word -----------------------------
+    # tray attrs: "AMS A Slot 1 is empty; please insert a new filament." -> None (above)
+    0x00020002: (
+        # "The AMS A assist motor is overloaded. The filament may be tangled or
+        # stuck." / "The AMS A slot 1 motor is overloaded. The filament may be
+        # tangled or stuck." — the 16-hex twin of the 8010 swap trigger.
+        _CodeWordRow(_MOTOR_ATTR_BYTES, _MECHANICAL),
+        # "The RFID-tag on AMS A Slot1 is damaged, or its content cannot be identified."
+        _CodeWordRow(_RFID_ATTR_BYTES, _RFID),
+    ),
+    # -- MECHANICAL_FEED: the path is obstructed or slipping ------------------
+    # "Failed to adjust the buffer position. The AMS A Slot 1 filament or the
+    # buffer itself may be jammed."
+    0x0002000A: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    # "AMS A slot 1 feeds filament out of AMS timeout."
+    0x00020010: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    # "AMS A slot 1 feeder unit motor is stalled, cannot rotate the spool."
+    0x00020012: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    # "AMS A slot 1 assist motor has slipped. Please pull out the filament, cut
+    # off the worn part, and then try again."
+    0x00020016: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    # The tube-resistance ladder — one code word per tube segment, AMS side:
+    # "…assist motor is stalled，due to excessive resistance in the tube
+    # between AMS and the printer / near AMS / between AMS and the filament
+    # buffer / near the filament buffer."
+    0x00020017: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    0x00020018: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    0x00020019: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    0x00020020: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    # …and the two toolhead-side segments of the same ladder: "…in the tube
+    # between the filament buffer and the toolhead" / "…in the tube near the
+    # toolhead". Past the buffer the EXTRUDER is the common factor, not the spool.
+    0x00020021: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL, extruder_side=True),),
+    0x00020022: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL, extruder_side=True),),
+    # "AMS A slot 1 assist motor overloaded. Excessive resistance in the filament
+    # tube between the AMS and the filament track switch / between the filament
+    # track switch and the filament buffer." (FTS-equipped models.)
+    0x00020026: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    0x00020027: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    # -- PHYSICAL_FAULT: breakage / clog / hardware — a swap cannot fix it -----
+    # "AMS A Slot 1's filament may be broken in AMS."
+    0x00020003: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "AMS A Slot 1 filament may be broken in the tool head."
+    0x00020004: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "AMS A Slot 1 filament has run out, and purging the old filament went
+    # abnormally; please check whether the filament is stuck in the tool head."
+    # A runout ENTANGLED with a tool-head fault: the ask is an inspection, which is
+    # why it is neither RUNOUT nor spent evidence (see _RUNOUT_AUTO_SWITCH_SPENT_CODE32).
+    0x00020005: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "AMS A has detected a breakage of the PTFE tube during filament loading…"
+    0x00020006: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "Failed to extrude AMS A Slot 1 filament; the extruder may be clogged or the
+    # filament may be too thin, causing the extruder to slip."
+    0x00020009: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "AMS A slot 1 pulls filament back to AMS timeout." Pull-BACK, the family an
+    # auto-load can grind (see the swap set's exclusion note).
+    0x00020011: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "AMS A slot 1 feeder unit motor has no signal, which may be due to poor
+    # contact in the motor connector or a motor fault." Wiring/motor hardware —
+    # NOT a feed obstruction, so fresh filament cannot clear it.
+    0x00020013: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "AMS A slot 1 filament status is abnormal, which may be due to a filament
+    # breakage inside the AMS."
+    0x00020015: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "AMS A slot 1 the tube inside the AMS is broken, or feed-out hall sensor is
+    # faulty and cannot detect the filament."
+    0x00020023: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "AMS A slot 1 failed to rotate the filament spool when pulling filament back to AMS."
+    0x00020024: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # -- RFID_READ: the tag could not be read ---------------------------------
+    # "Failed to read the filament information from AMS A slot 1. …" — one code
+    # word per cause: AMS main board malfunction (0081, the code a commanded read
+    # on a tagless slot mints and that can never self-clear), third-party tag
+    # (0082), damaged tag (0083), tag at the edge of the reader (0084), tag
+    # verification failed (0085), tag cannot rotate due to a jam (0086).
+    0x00010081: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
+    0x00010082: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
+    0x00010083: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
+    0x00010084: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
+    0x00010085: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
+    0x00010086: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
+    # "The RFID-tag on AMS A Slot 1 cannot be identified."
+    0x00020057: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
+    # "RFID cannot be read because of a hardware or structural error." Carried on
+    # the RFID submodule attr, which names no tray — so ``slot`` decodes to None.
+    0x00030003: (_CodeWordRow(_RFID_ATTR_BYTES, _RFID),),
+    # -- INFORMATIONAL: a notice or a precursor, never a trigger --------------
+    # "AMS A slot 1 feed resistance is too high. Please reduce spool rotation
+    # resistance and avoid over-bent or over-long filament tubes." Observed
+    # 2026-07-20 07:48 on 009-H2S ~5 min BEFORE the 8010 that actually wedged the
+    # change — one incident is not a lead-time proof, and the 8010 always follows
+    # and IS the trigger, so acting on this would only widen the surface.
+    0x00020025: (_CodeWordRow(_TRAY_ATTR_BYTES, _INFO),),
+    # "AMS A Slot 1 filament has run out. Please wait while old filament is
+    # purged." An in-progress notice, not an ask — the firmware follows it with the
+    # 0x00020001 demand or the 0x00030002 auto-switch, whichever way the purge lands.
+    0x00030001: (_CodeWordRow(_TRAY_ATTR_BYTES, _INFO),),
+    # "Checking the filament location of all AMS slots, please wait."
+    0x00030007: (_CodeWordRow(_TRAY_ATTR_BYTES, _INFO),),
+}
+
+
+@dataclass(frozen=True)
+class _ShortRow:
+    """One classification in the lossy ``MMMM_CCCC`` short-code lane.
+
+    ``legacy_swap`` marks the members the jam-swap recovery machine has always
+    triggered on. It exists to keep that machine's trigger set BYTE-IDENTICAL while
+    the taxonomy already carries the wider classification: the send-out / feed-to-
+    extruder families below are MECHANICAL_FEED here but are NOT legacy-swap
+    members, so recovery does not act on them until the consumer wave widens the
+    derived sets deliberately.
+    """
+
+    fault_class: AmsFaultClass
+    extruder_side: bool = False
+    legacy_swap: bool = False
+
+
+_AMS_UNITS: tuple[str, ...] = ("0700", "0701", "0702", "0703", "0704", "0705", "0706", "0707")
+_AMS_HT_UNITS: tuple[str, ...] = ("1800", "1801", "1802")
+_AMS_LITE_UNITS: tuple[str, ...] = ("1200", "1201", "1202", "1203")
+_EXTERNAL_SPOOL: tuple[str, ...] = ("07FF",)
+
+# --- The print_error short-code table --------------------------------------
+# ``0700_0001`` is deliberately ABSENT and must never be added: the same low-16
+# word appears under the slot-attributed runout attr family 0700_2X00_0002_0001,
+# so a short-code match would route runouts into the jam-swap machine (doctrine
+# rule 9). Telling the two apart needs the attr-aware code-word lane above, which
+# is exactly where that decision lives. On H2C the same short code means "A new AMS
+# detected" — a second reason a bare match is meaningless.
+_SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
+    # -- MECHANICAL_FEED, legacy swap triggers --------------------------------
+    # "The AMS assist motor is overloaded. This could be due to entangled filament
+    # or a stuck spool." / AMS-HT + AMS lite equivalents ("spool or filament may be
+    # stuck"). All carry stuck-spool semantics and all PAUSE the print, so a false
+    # positive cannot fire on a healthy print (acting requires a PAUSE anyway).
+    (
+        (*_AMS_UNITS, *_AMS_HT_UNITS, *_AMS_LITE_UNITS, "12FF"),
+        "8010",
+        _ShortRow(_MECHANICAL, legacy_swap=True),
+    ),
+    # "The extrusion motor is overloaded, please check the Assistant for details."
+    # The MAIN extruder, not the AMS assist motor (004-H2S 2026-07-17 sat PAUSEd
+    # ~2h40m because this code was outside the trigger set). A swap still helps,
+    # but the extruder is the common factor on a re-fault.
+    (("0300",), "801E", _ShortRow(_MECHANICAL, extruder_side=True, legacy_swap=True)),
+    # -- MECHANICAL_FEED, taxonomy-only (NOT legacy swap triggers) ------------
+    # "The AMS failed to send out filament. You can clip the end of your filament
+    # flat, and reinsert…" / external: "Failed to feed the filament outside the AMS…"
+    ((*_AMS_UNITS, *_EXTERNAL_SPOOL), "8005", _ShortRow(_MECHANICAL)),
+    # "Unable to feed filament into the extruder. This could be due to an entangled
+    # filament or a stuck spool…" / external: "Please feed filament into the PTFE
+    # tube until it can not be pushed any farther."
+    ((*_AMS_UNITS, *_EXTERNAL_SPOOL), "8006", _ShortRow(_MECHANICAL)),
+    # "Failed to feed filament to the extruder. Check the Assistant for troubleshooting."
+    (("0700", *_EXTERNAL_SPOOL), "8028", _ShortRow(_MECHANICAL)),
+    # -- RUNOUT: an AMS slot ran dry and the print is HELD --------------------
+    # "AMS filament ran out. Please insert a new filament into the same AMS slot."
+    # / printer-side "Filament ran out. Please load new filament."
+    ((*_AMS_UNITS,), "8011", _ShortRow(AmsFaultClass.RUNOUT)),
+    (("0300",), "8004", _ShortRow(AmsFaultClass.RUNOUT)),
+    # -- RUNOUT_EXTERNAL: the spool holder ran dry — no slot, no swap ---------
+    # "External filament has run out; please load a new filament." / per-side on
+    # dual-nozzle H2 ("connected to the left / right extruder") / "The filament on
+    # external spool has run out…". Never spent-stamps (no AMS slot to attribute)
+    # and never swaps (there is no sibling tray to swap to).
+    ((*_EXTERNAL_SPOOL, "18FE", "18FF"), "8011", _ShortRow(AmsFaultClass.RUNOUT_EXTERNAL)),
+    (("0300",), "8015", _ShortRow(AmsFaultClass.RUNOUT_EXTERNAL)),
+    # -- PHYSICAL_FAULT: needs physical work — never auto-recovered -----------
+    # "Failed to pull out the filament from the extruder. This might be caused by
+    # clogged extruder or filament broken inside the extruder."
+    ((*_AMS_UNITS, *_EXTERNAL_SPOOL), "8003", _ShortRow(_PHYSICAL)),
+    # "AMS failed to pull back filament. This could be due to a stuck spool or the
+    # end of the filament being stuck in the path."
+    ((*_AMS_UNITS, *_EXTERNAL_SPOOL), "8004", _ShortRow(_PHYSICAL)),
+    # "Extruding filament failed. The extruder might be clogged."
+    ((*_AMS_UNITS,), "8007", _ShortRow(_PHYSICAL)),
+    # "Timeout purging old filament: Please check if the filament is stuck or the
+    # extruder is clogged."
+    (("0700",), "8013", _ShortRow(_PHYSICAL)),
+    # "The extruder is not extruding normally; please refer to the Assistant…"
+    (("0700",), "8016", _ShortRow(_PHYSICAL)),
+    # The clog family. A swap cannot fix a clog — the pause-stall watchdog
+    # escalates these instead. "Filament extrusion error…" / "The extrusion
+    # resistance is abnormal. The extruder may be clogged…" / "The nozzle is
+    # clogged with filament…" / "The nozzle is clogged."
+    (("0300",), "801A", _ShortRow(_PHYSICAL)),
+    (("0300",), "801C", _ShortRow(_PHYSICAL)),
+    (("0300",), "8016", _ShortRow(_PHYSICAL)),
+    (("0300",), "4006", _ShortRow(_PHYSICAL)),
+    # The manual-clearing asks the firmware raises for the external spool path:
+    # "Please manually and slowly pull out the filament from the extruder…" /
+    # "Press the black PTFE tube coupler and unplug the PTFE tube…"
+    (("07FF", "07FE"), "C011", _ShortRow(_PHYSICAL)),
+    (("07FF", "07FE"), "C012", _ShortRow(_PHYSICAL)),
+    # -- RFID_READ ------------------------------------------------------------
+    # "Failed to read the filament information." Names the AMS unit but NO slot.
+    ((*_AMS_UNITS,), "4025", _ShortRow(_RFID)),
+    # -- INFORMATIONAL --------------------------------------------------------
+    # The short form of the 0x00020025 feed-resistance precursor (no device_error
+    # entry of its own — it reaches consumers only as the lossy short of
+    # 07xx_2X00_0002_0025). Classified so the precursor can never be mistaken for
+    # a swap trigger; see the code-word row for the evidence.
+    ((*_AMS_UNITS,), "0025", _ShortRow(_INFO)),
+)
+
+
+def _build_short_taxonomy() -> dict[str, _ShortRow]:
+    """Expand the family rows into the flat short-code table.
+
+    Raises on a duplicate key: two rows claiming one short code would mean the
+    taxonomy silently holds two opinions about the same fault.
+    """
+    table: dict[str, _ShortRow] = {}
+    for modules, suffix, row in _SHORT_TAXONOMY_ROWS:
+        for module in modules:
+            short = f"{module}_{suffix}"
+            if short in table:
+                raise ValueError(f"duplicate short code in the AMS fault taxonomy: {short}")
+            table[short] = row
+    return table
+
+
+_SHORT_CODE_TAXONOMY: dict[str, _ShortRow] = _build_short_taxonomy()
+
+
+def _shorts_where(predicate: Callable[[_ShortRow], bool]) -> frozenset[str]:
+    """The short codes whose taxonomy row satisfies ``predicate``."""
+    return frozenset(short for short, row in _SHORT_CODE_TAXONOMY.items() if predicate(row))
+
+
+# Derived once at import — the consumer-facing sets. Each is a VIEW of the table
+# above, never a second literal (doctrine invariant 1).
+_RUNOUT_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFaultClass.RUNOUT)
+_RUNOUT_EXTERNAL_SHORTS: frozenset[str] = _shorts_where(
+    lambda r: r.fault_class is AmsFaultClass.RUNOUT_EXTERNAL
+)
+_MECHANICAL_FEED_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is _MECHANICAL)
+_EXTRUDER_SIDE_SHORTS: frozenset[str] = _shorts_where(lambda r: r.extruder_side)
+_LEGACY_SWAP_SHORTS: frozenset[str] = _shorts_where(lambda r: r.legacy_swap)
+
+
+def runout_short_codes() -> frozenset[str]:
+    """AMS-slot UNRESCUED runout short codes — "the slot ran dry and the print is HELD".
+
+    A runout the AMS backup rescued raises NONE of these (it raises the
+    slot-attributed auto-switch instead, :data:`_RUNOUT_AUTO_SWITCH_SPENT_CODE32`),
+    which is why this set is the unrescued vocabulary only. The external-spool
+    runouts are a SEPARATE set (:func:`runout_external_short_codes`) — they name no
+    AMS slot, so nothing that resolves a tray may consume them.
+    """
+    return _RUNOUT_SHORTS
+
+
+def runout_external_short_codes() -> frozenset[str]:
+    """EXTERNAL spool-holder runout short codes — no AMS slot, no sibling to swap to."""
+    return _RUNOUT_EXTERNAL_SHORTS
+
+
+def mechanical_feed_short_codes() -> frozenset[str]:
+    """Feed faults an obstruction or a slipping path causes — fresh filament can clear them.
+
+    WIDER than the jam-swap machine's live trigger set: the send-out (8005),
+    feed-into-extruder (8006) and feed-to-extruder (8028) families are classified
+    here but are not :data:`_LEGACY_SWAP_SHORTS` members, so recovery keeps its
+    historical scope until a consumer wave widens it deliberately.
+    """
+    return _MECHANICAL_FEED_SHORTS
+
+
+def extruder_side_short_codes() -> frozenset[str]:
+    """Faults whose common factor is the EXTRUDER, not the spool.
+
+    A re-fault after a swap must not penalize the replacement roll — the extruder
+    is what both faults share.
+    """
+    return _EXTRUDER_SIDE_SHORTS
+
+
+def legacy_swap_short_codes() -> frozenset[str]:
+    """The jam-swap machine's historical trigger vocabulary.
+
+    A behavior pin, not a classification: it exists so ``spool_recovery`` can derive
+    its trigger sets from this taxonomy without changing which codes it acts on.
+    Widening the machine means moving members INTO this marker deliberately, with
+    the ladder that any new auto-recovery surface needs.
+    """
+    return _LEGACY_SWAP_SHORTS
+
+
+# The single origin of the unrescued-runout vocabulary, consumed by the runout
+# hook, the recovery trigger set and the hold predicate below. Defined AS the
+# taxonomy's own view so the constant and the classifier can never drift.
+RUNOUT_HMS_CODES: frozenset[str] = runout_short_codes()
+
+
+def classify_ams_fault(attr: int, code: int) -> ClassifiedAmsFault | None:
+    """Classify an ``hms[]`` fault from its raw ``attr`` + 32-bit ``code`` word.
+
+    Returns ``None`` when the fault is not AMS-fault-actionable — a non-AMS module,
+    an unclassified code word, or a code word whose meaning under THIS attr's
+    submodule is owned by a dedicated decoder (the runout demand and the auto-switch
+    spent evidence; see the table's header). ``None`` routes the fault to the generic
+    notify lane; it never means "benign".
+    """
+    if (attr >> 24) & 0xFF not in _AMS_MODULES:
+        return None
+    rows = _CODE_WORD_TAXONOMY.get(code)
+    if not rows:
+        return None
+    attr_byte = (attr >> 8) & 0xFF
+    for row in rows:
+        if attr_byte in row.attr_bytes:
+            return ClassifiedAmsFault(
+                fault_class=row.fault_class,
+                extruder_side=row.extruder_side,
+                slot=ams_slot_from_attr(attr),
+            )
+    return None
+
+
+def classify_short_code(short: str) -> ClassifiedAmsFault | None:
+    """Classify a ``MMMM_CCCC`` short code (the ``print_error`` lane).
+
+    Necessarily coarser than :func:`classify_ams_fault`: the short form has already
+    discarded the attr low byte, so ``slot`` is always ``None`` and any code word
+    whose meaning depends on its submodule is unclassifiable here (which is why
+    ``0700_0001`` has no row — see the table's header).
+    """
+    row = _SHORT_CODE_TAXONOMY.get(short.upper())
+    if row is None:
+        return None
+    return ClassifiedAmsFault(fault_class=row.fault_class, extruder_side=row.extruder_side, slot=None)
+
+
 def _code_word(code: int | str) -> int:
     """Parse an HMSError ``code`` (int or hex string like ``"0x20001"``) to its full
     32-bit int — the form :func:`runout_slot_from_hms` expects."""
@@ -1152,9 +1595,6 @@ def runout_hold_active(state) -> bool:
     and resurfaces at the operator's eventual resume as a bogus demand for the
     latched slot — 12 h later in the incident.
 
-    ``RUNOUT_HMS_CODES`` is imported at CALL time on purpose: ``spool_respool`` owns
-    that constant (doctrine invariant 1, one origin per magic value) and imports
-    THIS module at module scope, so a module-level import here would be circular.
     Fails closed (False) on a malformed/absent state — a predicate that errors must
     never block an operator's load.
     """
@@ -1164,8 +1604,6 @@ def runout_hold_active(state) -> bool:
         hms_list = getattr(state, "hms_errors", None) or []
         if current_runout_demand(hms_list) is not None:
             return True
-
-        from backend.app.services.spool_respool import RUNOUT_HMS_CODES
 
         for e in hms_list:
             try:

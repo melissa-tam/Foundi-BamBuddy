@@ -1,6 +1,11 @@
 """Tests for HMS error code translations."""
 
+import ast
+import inspect
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from backend.app.services.hms_errors import (
     HMS_ERROR_DESCRIPTIONS,
@@ -528,3 +533,391 @@ class TestRunoutHoldActive:
 
         assert runout_hold_active(None) is False
         assert runout_hold_active(SimpleNamespace()) is False
+
+
+# ===========================================================================
+# AMS fault taxonomy
+# ===========================================================================
+# The expected tables are written out HERE, independently of the module's own
+# data, so a silent edit to the taxonomy fails these pins instead of moving with
+# them. Family membership is spelled out the same way the catalog publishes it.
+
+_AMS_UNIT_MODULES = ("0700", "0701", "0702", "0703", "0704", "0705", "0706", "0707")
+
+
+def _family(modules, suffix):
+    """The short codes one fault family spans, as ``{MMMM_CCCC}``."""
+    return {f"{module}_{suffix}" for module in modules}
+
+
+_SWAP_8010_MODULES = (
+    *_AMS_UNIT_MODULES,
+    "1800",
+    "1801",
+    "1802",
+    "1200",
+    "1201",
+    "1202",
+    "1203",
+    "12FF",
+)
+
+# The trigger vocabulary the jam-swap machine has always acted on. WS2a keeps it
+# byte-identical while the taxonomy already classifies a wider mechanical family.
+_EXPECTED_LEGACY_SWAP = _family(_SWAP_8010_MODULES, "8010") | {"0300_801E"}
+
+_EXPECTED_MECHANICAL = (
+    _EXPECTED_LEGACY_SWAP
+    | _family((*_AMS_UNIT_MODULES, "07FF"), "8005")
+    | _family((*_AMS_UNIT_MODULES, "07FF"), "8006")
+    | {"0700_8028", "07FF_8028"}
+)
+_EXPECTED_RUNOUT = _family(_AMS_UNIT_MODULES, "8011") | {"0300_8004"}
+_EXPECTED_RUNOUT_EXTERNAL = {"07FF_8011", "18FE_8011", "18FF_8011", "0300_8015"}
+_EXPECTED_PHYSICAL = (
+    _family((*_AMS_UNIT_MODULES, "07FF"), "8003")
+    | _family((*_AMS_UNIT_MODULES, "07FF"), "8004")
+    | _family(_AMS_UNIT_MODULES, "8007")
+    | {"0700_8013", "0700_8016", "0300_801A", "0300_801C", "0300_8016", "0300_4006"}
+    | {"07FF_C011", "07FE_C011", "07FF_C012", "07FE_C012"}
+)
+_EXPECTED_RFID = _family(_AMS_UNIT_MODULES, "4025")
+_EXPECTED_INFORMATIONAL = _family(_AMS_UNIT_MODULES, "0025")
+_EXPECTED_EXTRUDER_SIDE = {"0300_801E"}
+
+_EXPECTED_SHORT_CLASSES = {
+    "mechanical_feed": _EXPECTED_MECHANICAL,
+    "runout": _EXPECTED_RUNOUT,
+    "runout_external": _EXPECTED_RUNOUT_EXTERNAL,
+    "physical_fault": _EXPECTED_PHYSICAL,
+    "rfid_read": _EXPECTED_RFID,
+    "informational": _EXPECTED_INFORMATIONAL,
+}
+
+# The pre-relocation literal from spool_respool.py, copied verbatim. RUNOUT_HMS_CODES
+# must still be exactly this after moving into hms_errors — a relocation that also
+# widened the runout vocabulary would silently change what stamps spent_at.
+_OLD_RUNOUT_HMS_CODES_LITERAL = frozenset(
+    {
+        "0300_8004",
+        "0700_8011",
+        "0701_8011",
+        "0702_8011",
+        "0703_8011",
+        "0704_8011",
+        "0705_8011",
+        "0706_8011",
+        "0707_8011",
+    }
+)
+
+
+def _tray_attr(ams_id: int = 0, tray: int = 0) -> int:
+    """A slot-attributed AMS attr — the shape ``ams_slot_from_attr`` decodes."""
+    return (0x07 << 24) | (ams_id << 16) | ((0x20 + tray) << 8)
+
+
+def _submodule_attr(submodule_byte: int, ams_id: int = 0) -> int:
+    """An AMS attr naming a submodule rather than a tray (motor, RFID reader)."""
+    return (0x07 << 24) | (ams_id << 16) | (submodule_byte << 8)
+
+
+# code word -> (class value, extruder_side), all under TRAY-attributed attrs.
+_EXPECTED_TRAY_CODE_WORDS = {
+    0x0002000A: ("mechanical_feed", False),
+    0x00020010: ("mechanical_feed", False),
+    0x00020012: ("mechanical_feed", False),
+    0x00020016: ("mechanical_feed", False),
+    0x00020017: ("mechanical_feed", False),
+    0x00020018: ("mechanical_feed", False),
+    0x00020019: ("mechanical_feed", False),
+    0x00020020: ("mechanical_feed", False),
+    0x00020021: ("mechanical_feed", True),
+    0x00020022: ("mechanical_feed", True),
+    0x00020026: ("mechanical_feed", False),
+    0x00020027: ("mechanical_feed", False),
+    0x00020003: ("physical_fault", False),
+    0x00020004: ("physical_fault", False),
+    0x00020005: ("physical_fault", False),
+    0x00020006: ("physical_fault", False),
+    0x00020009: ("physical_fault", False),
+    0x00020011: ("physical_fault", False),
+    0x00020013: ("physical_fault", False),
+    0x00020015: ("physical_fault", False),
+    0x00020023: ("physical_fault", False),
+    0x00020024: ("physical_fault", False),
+    0x00010081: ("rfid_read", False),
+    0x00010082: ("rfid_read", False),
+    0x00010083: ("rfid_read", False),
+    0x00010084: ("rfid_read", False),
+    0x00010085: ("rfid_read", False),
+    0x00010086: ("rfid_read", False),
+    0x00020057: ("rfid_read", False),
+    0x00020025: ("informational", False),
+    0x00030001: ("informational", False),
+    0x00030007: ("informational", False),
+}
+
+
+class TestRunoutCodeRelocation:
+    """RUNOUT_HMS_CODES moved to hms_errors — one origin, identical membership."""
+
+    def test_membership_is_byte_identical_to_the_pre_move_literal(self):
+        from backend.app.services.hms_errors import RUNOUT_HMS_CODES
+
+        assert RUNOUT_HMS_CODES == _OLD_RUNOUT_HMS_CODES_LITERAL
+
+    def test_it_is_the_taxonomy_view_not_a_second_literal(self):
+        from backend.app.services.hms_errors import RUNOUT_HMS_CODES, runout_short_codes
+
+        assert RUNOUT_HMS_CODES is runout_short_codes()
+
+    def test_the_external_spool_family_never_leaks_in(self):
+        from backend.app.services.hms_errors import (
+            RUNOUT_HMS_CODES,
+            runout_external_short_codes,
+        )
+
+        # An external-spool runout names no AMS slot and has no sibling tray to
+        # swap to, so it must never reach a consumer that resolves one.
+        assert runout_external_short_codes() == _EXPECTED_RUNOUT_EXTERNAL
+        assert not (RUNOUT_HMS_CODES & runout_external_short_codes())
+
+    def test_the_consumers_read_the_relocated_constant(self):
+        from backend.app.services import spool_recovery, spool_respool
+        from backend.app.services.hms_errors import RUNOUT_HMS_CODES
+
+        assert spool_respool.RUNOUT_HMS_CODES is RUNOUT_HMS_CODES
+        assert spool_recovery.RUNOUT_HMS_CODES is RUNOUT_HMS_CODES
+
+
+class TestAmsFaultTaxonomyShortLane:
+    """The print_error lane: every classified short code, and nothing else."""
+
+    @pytest.mark.parametrize(
+        ("short", "expected_class"),
+        sorted(
+            (short, class_value)
+            for class_value, shorts in _EXPECTED_SHORT_CLASSES.items()
+            for short in shorts
+        ),
+    )
+    def test_each_short_code_classifies(self, short, expected_class):
+        from backend.app.services.hms_errors import classify_short_code
+
+        verdict = classify_short_code(short)
+        assert verdict is not None, short
+        assert verdict.fault_class.value == expected_class
+        assert verdict.extruder_side is (short in _EXPECTED_EXTRUDER_SIDE)
+        # The short form discarded the attr low byte, so it can never name a slot.
+        assert verdict.slot is None
+
+    def test_the_table_holds_no_unpinned_row(self):
+        from backend.app.services.hms_errors import _SHORT_CODE_TAXONOMY
+
+        expected = set().union(*_EXPECTED_SHORT_CLASSES.values())
+        assert set(_SHORT_CODE_TAXONOMY) == expected
+
+    def test_the_derived_consumer_sets_match(self):
+        from backend.app.services.hms_errors import (
+            extruder_side_short_codes,
+            legacy_swap_short_codes,
+            mechanical_feed_short_codes,
+            runout_short_codes,
+        )
+
+        assert mechanical_feed_short_codes() == _EXPECTED_MECHANICAL
+        assert runout_short_codes() == _EXPECTED_RUNOUT
+        assert extruder_side_short_codes() == _EXPECTED_EXTRUDER_SIDE
+        assert legacy_swap_short_codes() == _EXPECTED_LEGACY_SWAP
+
+    def test_the_send_out_families_are_classified_but_not_swap_triggers(self):
+        from backend.app.services.hms_errors import (
+            classify_short_code,
+            legacy_swap_short_codes,
+        )
+
+        # WS2a behavior neutrality: the taxonomy carries the wider classification,
+        # the swap machine's trigger marker does not — the consumer wave widens it.
+        for short in ("0700_8005", "0700_8006", "0700_8028"):
+            assert classify_short_code(short).fault_class.value == "mechanical_feed"
+            assert short not in legacy_swap_short_codes()
+
+    def test_an_unclassified_short_code_is_none(self):
+        from backend.app.services.hms_errors import classify_short_code
+
+        assert classify_short_code("0500_808C") is None
+        assert classify_short_code("0300_400C") is None
+
+    def test_lookup_is_case_insensitive(self):
+        from backend.app.services.hms_errors import classify_short_code
+
+        assert classify_short_code("0700_8011").fault_class.value == "runout"
+        assert classify_short_code("0700_8011") == classify_short_code("0700_8011".lower())
+
+
+class TestAmsFaultTaxonomyCodeWordLane:
+    """The hms[] lane: attr-scoped code words, with the slot the attr names."""
+
+    @pytest.mark.parametrize(
+        ("code_word", "expected_class", "expected_extruder_side"),
+        sorted((cw, cls, ext) for cw, (cls, ext) in _EXPECTED_TRAY_CODE_WORDS.items()),
+    )
+    def test_each_tray_attributed_code_word_classifies(
+        self, code_word, expected_class, expected_extruder_side
+    ):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        verdict = classify_ams_fault(_tray_attr(ams_id=1, tray=2), code_word)
+        assert verdict is not None, hex(code_word)
+        assert verdict.fault_class.value == expected_class
+        assert verdict.extruder_side is expected_extruder_side
+        assert verdict.slot == (1, 2)
+
+    @pytest.mark.parametrize("tray", [0, 1, 2, 3])
+    def test_the_slot_comes_from_the_attr(self, tray):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        verdict = classify_ams_fault(_tray_attr(ams_id=0, tray=tray), 0x00020010)
+        assert verdict.slot == (0, tray)
+
+    def test_the_table_holds_no_unpinned_code_word(self):
+        from backend.app.services.hms_errors import _CODE_WORD_TAXONOMY
+
+        # The tray rows plus the two attr-scoped code words classified only under a
+        # submodule attr (0x00020002's motor/RFID meanings, 0x00030003).
+        assert set(_CODE_WORD_TAXONOMY) == set(_EXPECTED_TRAY_CODE_WORDS) | {
+            0x00020002,
+            0x00030003,
+        }
+
+    def test_a_non_ams_module_is_never_an_ams_fault(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        # 0x00020010 under the motion module is a different fault entirely.
+        assert classify_ams_fault(0x03000900, 0x00020010) is None
+
+    def test_an_ams_attr_outside_the_rows_submodule_is_none(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        # 0x00020010 was read under TRAY attrs; under the assist-motor submodule the
+        # catalog says something else ("assist motor resistance is abnormal").
+        assert classify_ams_fault(_submodule_attr(0x01), 0x00020010) is None
+
+    def test_an_unclassified_code_word_is_none(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        assert classify_ams_fault(_tray_attr(), 0x00025000) is None
+
+    def test_the_rfid_submodule_row_names_no_slot(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        verdict = classify_ams_fault(_submodule_attr(0x30), 0x00030003)
+        assert verdict.fault_class.value == "rfid_read"
+        assert verdict.slot is None
+
+
+class TestAmsFaultTaxonomyCollisionPins:
+    """The code words a dedicated decoder owns must never classify generically."""
+
+    def test_the_runout_demand_is_not_classified(self):
+        from backend.app.services.hms_errors import (
+            _RUNOUT_DEMAND_CODE32,
+            classify_ams_fault,
+            runout_slot_from_hms,
+        )
+
+        # Doctrine rule 9: runouts escalate for a same-slot refill, jams swap. The
+        # demand stays with current_runout_demand; it is also NOT spent evidence
+        # (006-H2S 2026-07-26 latched a bogus demand for a slot that never ran dry).
+        assert classify_ams_fault(_tray_attr(tray=2), 0x00020001) is None
+        assert 0x00020001 in _RUNOUT_DEMAND_CODE32
+        assert runout_slot_from_hms(_tray_attr(tray=2), 0x00020001) == (0, 2)
+
+    def test_the_auto_switch_spent_evidence_is_not_classified(self):
+        from backend.app.services.hms_errors import (
+            _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
+            classify_ams_fault,
+        )
+
+        assert classify_ams_fault(_tray_attr(), 0x00030002) is None
+        assert 0x00030002 in _RUNOUT_AUTO_SWITCH_SPENT_CODE32
+
+    def test_short_0700_0001_is_banned(self):
+        from backend.app.services.hms_errors import classify_short_code
+
+        # The same low-16 word rides the slot-attributed runout attr family, so a
+        # short-code match would route runouts into the jam-swap machine.
+        for unit in _AMS_UNIT_MODULES:
+            assert classify_short_code(f"{unit}_0001") is None
+
+    def test_0x00020002_splits_three_ways_by_submodule(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        # Tray attr: "AMS A Slot 1 is empty; please insert a new filament." An
+        # empty-slot ASK — hazard-identical to the banned demand, so it stays with
+        # the generic notify lane.
+        assert classify_ams_fault(_tray_attr(), 0x00020002) is None
+        # Motor attrs: "The AMS A slot 1 motor is overloaded…" — the 16-hex twin of
+        # the 8010 swap trigger.
+        for submodule in (0x01, 0x10, 0x11, 0x12, 0x13):
+            verdict = classify_ams_fault(_submodule_attr(submodule), 0x00020002)
+            assert verdict.fault_class.value == "mechanical_feed"
+        # RFID attrs: "The RFID-tag on AMS A Slot1 is damaged…"
+        verdict = classify_ams_fault(_submodule_attr(0x30), 0x00020002)
+        assert verdict.fault_class.value == "rfid_read"
+
+    def test_the_feed_resistance_precursor_stays_informational(self):
+        from backend.app.services.hms_errors import (
+            classify_ams_fault,
+            classify_short_code,
+            mechanical_feed_short_codes,
+        )
+
+        # Observed ~5 min before an 8010 once; one incident is not a lead-time proof
+        # and the 8010 always follows, so acting on it only widens the surface.
+        assert classify_ams_fault(_tray_attr(), 0x00020025).fault_class.value == "informational"
+        assert classify_short_code("0700_0025").fault_class.value == "informational"
+        assert "0700_0025" not in mechanical_feed_short_codes()
+
+
+class TestHmsErrorsImportGraph:
+    """hms_errors is a leaf of the spool stack — the cycle that forced the old
+    call-time import is gone with the constant it worked around."""
+
+    def test_it_imports_nothing_from_the_spool_services(self):
+        import backend.app.services.hms_errors as hms_errors_module
+
+        source = Path(inspect.getfile(hms_errors_module)).read_text(encoding="utf-8")
+        imported: list[str] = []
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported.append(node.module)
+            elif isinstance(node, ast.Import):
+                imported.extend(alias.name for alias in node.names)
+
+        # ast.walk reaches function bodies too, so a re-introduced call-time import
+        # fails this just as a module-level one would.
+        assert not [m for m in imported if "spool" in m], imported
+
+    def test_it_imports_cleanly_before_any_spool_module(self):
+        import subprocess
+        import sys
+
+        import backend.app.services.hms_errors as hms_errors_module
+
+        # A fresh interpreter: importing hms_errors alone must not drag in the spool
+        # stack transitively either (which would mean the cycle is merely deferred).
+        repo_root = Path(inspect.getfile(hms_errors_module)).parents[3]
+        probe = (
+            "import sys; import backend.app.services.hms_errors; "
+            "print([m for m in sys.modules if 'spool' in m])"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=repo_root,
+        )
+        assert result.stdout.strip() == "[]", result.stdout

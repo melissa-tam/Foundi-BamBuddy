@@ -57,7 +57,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.models.spool_usage_history import SpoolUsageHistory
-from backend.app.services.hms_errors import hms_short_code
+from backend.app.services.hms_errors import RUNOUT_HMS_CODES, hms_short_code
 from backend.app.services.spool_tag_matcher import (
     ZERO_TAG_UID,
     ZERO_TRAY_UUID,
@@ -78,25 +78,6 @@ logger = logging.getLogger(__name__)
 # Tag vendor marker written on every re-spooled row. Single origin of truth so
 # the sibling-tag guard and the observability hook agree on the classification.
 RESPOOL_TAG_TYPE = "bambulab_reused"
-
-# Hardware runout HMS short codes that mean "the AMS physically saw the filament
-# end" — printer-side (0300_8004) and per-AMS-slot (07xx_8011). Curated to the
-# same family already in main._HMS_FAILURE_REASONS; the slot-from-attr decode is
-# hardware-probe-pinned, so we resolve WHICH tray ran out via the dispatched farm
-# ams_mapping / live tray_now instead of the HMS attr.
-RUNOUT_HMS_CODES: frozenset[str] = frozenset(
-    {
-        "0300_8004",
-        "0700_8011",
-        "0701_8011",
-        "0702_8011",
-        "0703_8011",
-        "0704_8011",
-        "0705_8011",
-        "0706_8011",
-        "0707_8011",
-    }
-)
 
 # Per-printer last-seen loaded tray (global id) for the backup-swap detector.
 # Module-level edge state matching the fork's other event-edge bookkeeping

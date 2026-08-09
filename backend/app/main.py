@@ -1567,7 +1567,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             # farm ams_mapping / live tray_now) so the reused tag re-spools
             # automatically on refill instead of mapping to the spent donor.
             # Orchestration lives in spool_respool; this is a guarded hook only.
-            from backend.app.services.spool_respool import (
+            from backend.app.services.hms_errors import (
                 RUNOUT_HMS_CODES as _RUNOUT_HMS_CODES,
             )
 
