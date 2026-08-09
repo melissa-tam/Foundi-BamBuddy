@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from backend.app.services.slot_state import (
+    IDENTITY_BACKED_REASONS,
     RESOLUTION_REASONS,
     BindingView,
     Decision,
@@ -43,6 +44,7 @@ from backend.app.services.slot_state import (
     derive_state,
     format_slot_event,
     identity_relation,
+    post_state,
     resolve,
 )
 from backend.app.services.tray_observation import TrayObservation, observe_ams_push, observe_tray
@@ -1336,6 +1338,89 @@ class TestFlipFlopReplay007C194:
         other = resolve(obs[1], derive_state(obs[1], None), ResolutionContext(identity_candidate=self.SPOOL_194))
         assert held.kind is DecisionKind.KEEP
         assert other.kind is DecisionKind.BIND
+
+
+# --- post-application state -------------------------------------------------
+
+
+class TestPostState:
+    """``post_state`` is the RIGHT side of the audit line.
+
+    ``derive_state`` is computed against the PRE-transition binding, so using it as the
+    right side printed tautologies in production — ``SPENT_AWAITING_SWAP→
+    SPENT_AWAITING_SWAP replace_spent`` on the very line an operator reads to see what
+    changed.
+    """
+
+    @pytest.mark.parametrize("kind", list(DecisionKind))
+    def test_every_decision_kind_is_mapped(self, kind):
+        """Totality pin: a NEW kind with no mapping raises here instead of silently
+        reviving the tautology."""
+        assert isinstance(post_state(Decision(kind, reason="x"), SlotState.OCCUPIED_UNRESOLVED), SlotState)
+
+    def test_an_unmapped_kind_fails_loudly(self):
+        with pytest.raises(ValueError, match="no mapping"):
+            post_state(Decision("not_a_kind"), SlotState.EMPTY)  # type: ignore[arg-type]
+
+    def test_release_lands_empty(self):
+        decision = Decision(DecisionKind.RELEASE, spool_id=140, reason="cleared_tray")
+        assert post_state(decision, SlotState.OCCUPIED_ASSUMED) is SlotState.EMPTY
+
+    @pytest.mark.parametrize("reason", sorted(IDENTITY_BACKED_REASONS))
+    def test_an_identity_backed_decision_lands_identified(self, reason):
+        kind = DecisionKind.MINT if reason == "unknown_identity_auto_add" else DecisionKind.BIND
+        assert post_state(Decision(kind, spool_id=1, reason=reason), SlotState.EMPTY) is SlotState.OCCUPIED_IDENTIFIED
+
+    @pytest.mark.parametrize(
+        ("kind", "reason"),
+        [
+            # The tagless lane: a fingerprint, an operator's intent or a last-location
+            # guess — good evidence, but nothing READ the roll in this slot.
+            (DecisionKind.BIND, "pre_configured_apply"),
+            (DecisionKind.MINT, "tagless_mint"),
+            (DecisionKind.MINT, "different_filament"),
+            (DecisionKind.MINT, "archived_bound_replaced"),
+            (DecisionKind.RECLAIM, "last_location_reclaim"),
+            (DecisionKind.REPLACE_SPENT, "spent_swap_confirmed"),
+            (DecisionKind.REPLACE_SPENT, "spent_swap_no_tag_read"),
+        ],
+    )
+    def test_an_assumption_tier_decision_lands_assumed(self, kind, reason):
+        assert post_state(Decision(kind, spool_id=1, reason=reason), SlotState.EMPTY) is SlotState.OCCUPIED_ASSUMED
+
+    @pytest.mark.parametrize("kind", [DecisionKind.KEEP, DecisionKind.DEFER, DecisionKind.NONE])
+    @pytest.mark.parametrize("derived", list(SlotState))
+    def test_a_non_writing_decision_returns_the_derived_state(self, kind, derived):
+        assert post_state(Decision(kind, reason="x"), derived) is derived
+
+    def test_the_production_tautology_is_gone(self):
+        """The exact prod line: a spent latch replaced by a fresh roll now reads as a
+        transition, not as a state repeating itself."""
+        decision = Decision(DecisionKind.REPLACE_SPENT, spool_id=212, reason="spent_swap_confirmed")
+        derived = SlotState.SPENT_AWAITING_SWAP
+        assert post_state(decision, derived) is not derived
+        assert post_state(decision, derived) is SlotState.OCCUPIED_ASSUMED
+
+
+class TestIdentityBackedReasons:
+    def test_they_are_all_declared_resolution_reasons(self):
+        """A renamed reason must break here, not degrade a slot to ASSUMED in silence."""
+        assert IDENTITY_BACKED_REASONS <= RESOLUTION_REASONS
+
+    def test_the_identity_mint_is_exactly_the_one_carrying_a_read_pair(self):
+        """The reason set and the mint spec are two views of ONE fact ("the wire
+        asserted an identity"); this pins them together so they cannot drift."""
+        tagged = _obs(tag_uid="3CF1F3E700000100", tray_uuid="8AC9EC0847FD41D0890870319F2E1975")
+        identity_mint = resolve(tagged, derive_state(tagged, None), ResolutionContext(auto_add_unknown=True))
+        bare = _obs()
+        tagless_mint = resolve(bare, derive_state(bare, None), ResolutionContext())
+
+        assert identity_mint.kind is tagless_mint.kind is DecisionKind.MINT
+        assert identity_mint.reason in IDENTITY_BACKED_REASONS
+        assert identity_mint.mint_spec["tag_uid"] and identity_mint.mint_spec["tray_uuid"]
+        assert tagless_mint.reason not in IDENTITY_BACKED_REASONS
+        assert not tagless_mint.mint_spec.get("tag_uid")
+        assert not tagless_mint.mint_spec.get("tray_uuid")
 
 
 # --- log grammar ------------------------------------------------------------

@@ -8,6 +8,7 @@ from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.filament import Filament
 from backend.app.models.github_backup import GitHubBackupConfig, GitHubBackupLog
 from backend.app.models.group import Group, user_groups
+from backend.app.models.hms_event import HMSEvent
 from backend.app.models.kprofile_note import KProfileNote
 from backend.app.models.library import LibraryFile, LibraryFolder
 from backend.app.models.local_preset import LocalPreset
@@ -61,6 +62,7 @@ __all__ = [
     "AMSSensorHistory",
     "PrinterSensorHistory",
     "AmsLabel",
+    "HMSEvent",
     "PendingUpload",
     "PrintBatch",
     "PrinterModelGeometry",

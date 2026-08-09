@@ -179,6 +179,7 @@ async def init_db():
         filament_sku_settings,
         github_backup,
         group,
+        hms_event,
         kprofile_note,
         library,
         local_preset,
@@ -3930,6 +3931,56 @@ async def run_migrations(conn):
         )
         async with conn.begin_nested():
             await conn.execute(text("DELETE FROM spool_assignment WHERE printer_id NOT IN (SELECT id FROM printers)"))
+
+    # Migration (WS6, 2026-08-09): the durable HMS vocabulary. HMS codes were persisted
+    # NOWHERE — the notification ledger records only that an ALERT was sent, and a code
+    # with no catalog description never notifies, so it left one DEBUG line that prod
+    # logging does not write (printer 2's live 0500_0051 / 0500_0005: zero occurrences in
+    # 914k lines). ``hms_event`` is a per-(printer, full_code) COUNTER, written by main's
+    # HMS block under a per-code throttle. On a fresh DB Base.metadata.create_all already
+    # made this table (dialect-correct); this IF NOT EXISTS is the fallback for
+    # pre-existing DBs, dialect-branched on the autoincrement PK spelling exactly like
+    # recovery_escalation above. attr/code are BIGINT because both wire words reach
+    # 0xFFFFFFFF and Postgres INTEGER is signed 32-bit; VARCHAR/TIMESTAMP/BIGINT and the
+    # inline REFERENCES clause are valid on SQLite and PostgreSQL alike.
+    await _safe_execute(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS hms_event (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            printer_id INTEGER NOT NULL REFERENCES printers(id) ON DELETE CASCADE,
+            full_code VARCHAR(16) NOT NULL,
+            attr BIGINT NOT NULL,
+            code BIGINT NOT NULL,
+            severity INTEGER,
+            first_seen TIMESTAMP NOT NULL,
+            last_seen TIMESTAMP NOT NULL,
+            count INTEGER NOT NULL DEFAULT 1
+        )
+        """
+        if is_sqlite()
+        else """
+        CREATE TABLE IF NOT EXISTS hms_event (
+            id SERIAL PRIMARY KEY,
+            printer_id INTEGER NOT NULL REFERENCES printers(id) ON DELETE CASCADE,
+            full_code VARCHAR(16) NOT NULL,
+            attr BIGINT NOT NULL,
+            code BIGINT NOT NULL,
+            severity INTEGER,
+            first_seen TIMESTAMP NOT NULL,
+            last_seen TIMESTAMP NOT NULL,
+            count INTEGER NOT NULL DEFAULT 1
+        )
+        """,
+    )
+    # The natural key — UNIQUE so the writer's upsert can never race two rows for one
+    # code, and the read path's index too (``WHERE printer_id = ? ORDER BY last_seen
+    # DESC`` uses the leftmost column). Same name the model declares, so create_all and
+    # this DDL converge on ONE index object.
+    await _safe_execute(
+        conn,
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_hms_event_printer_code ON hms_event (printer_id, full_code)",
+    )
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (

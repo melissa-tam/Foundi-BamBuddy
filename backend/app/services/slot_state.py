@@ -1,6 +1,6 @@
 """Derived AMS slot state + the ONE identity-resolution decision table (W1).
 
-Two pure functions and their vocabulary:
+Three pure functions and their vocabulary:
 
 * :func:`derive_state` — ``state = f(observation, binding)``. NOTHING is persisted:
   a stored copy would be a second source of truth that can drift from the wire,
@@ -9,6 +9,9 @@ Two pure functions and their vocabulary:
   ``spool.spent_at`` (the W1 runout latch), ``spool_assignment.pre_configured_at``.
 * :func:`resolve` — the decision table. Flat, exhaustively commented, one row per
   situation. It returns a :class:`Decision`; it never performs it.
+* :func:`post_state` — the state an APPLIED decision leaves behind. ``derive_state``
+  is computed against the PRE-transition binding, so it is the LEFT side of the audit
+  line and can never be its right side without printing a tautology.
 
 **I/O-free by contract.** No session, no DB models, no awaits, and no imports of
 modules that pull either. The orchestrator (W2/W3) fetches candidates, calls these,
@@ -148,6 +151,28 @@ RESOLUTION_REASONS = frozenset(
         # binding: hardware-certain different roll — swap to the tagless default.
         "spent_swap_no_tag_read",
         "no_signal",
+    }
+)
+
+#: The subset of :data:`RESOLUTION_REASONS` whose APPLIED decision leaves the slot
+#: positively identified — row 2, the RFID lane, where the wire asserted an identity and
+#: the decision resolves it onto a row. Every other binding decision is an assumption,
+#: however good: the tagless pre-config apply, a fingerprint mint, a last-location
+#: reclaim and a spent replacement all bind a row nothing has READ in that slot.
+#:
+#: Keyed on the reason rather than a new :class:`Decision` field because the reason set
+#: is ALREADY this module's public contract with the orchestrator, which distinguishes
+#: this very lane the same way (``slot_pipeline._IDENTITY_CLAIM_REASONS``,
+#: ``_IDENTIFY_VERDICT``). The one MINT listed here, ``unknown_identity_auto_add``, is
+#: exactly the mint whose ``mint_spec`` carries the full read pair — the equivalence is
+#: pinned in the tests so the two views cannot drift. Consumed only by
+#: :func:`post_state`; extend it in the same commit that adds an identity-lane reason.
+IDENTITY_BACKED_REASONS: frozenset[str] = frozenset(
+    {
+        "identity_resolved_candidate",
+        "pre_configured_apply_identity",
+        "identity_claims_untagged_row",
+        "unknown_identity_auto_add",
     }
 )
 
@@ -298,6 +323,52 @@ def derive_state(obs: TrayObservation, binding: BindingView | None) -> SlotState
     if obs.occupancy_signal or binding is not None:
         return SlotState.OCCUPIED_UNRESOLVED
     return SlotState.EMPTY
+
+
+def post_state(decision: Decision, derived: SlotState) -> SlotState:
+    """The state the slot is in AFTER ``decision`` has been APPLIED.
+
+    :func:`derive_state` answers "what do this push and the binding as it stood BEFORE
+    the decision imply?" — the LEFT side of a transition. Using it as the right side too
+    printed tautologies in production (``SPENT_AWAITING_SWAP→SPENT_AWAITING_SWAP
+    replace_spent``, ``OCCUPIED_ASSUMED→OCCUPIED_ASSUMED bind``): the one line an
+    operator reads to see what changed was hiding the change.
+
+    ``derived`` is that pre-transition classification, returned unchanged for the kinds
+    that write no binding. Total over :class:`DecisionKind` by construction — an
+    unmapped kind RAISES rather than quietly reporting the pre-transition state, so a
+    new kind fails loudly in the tests instead of silently reviving the tautology.
+    """
+    kind = decision.kind
+
+    if kind is DecisionKind.RELEASE:
+        # The binding is gone, and the only row that releases (row 3) requires a
+        # wire-asserted empty tray — the orchestrator's orphan release says the same.
+        return SlotState.EMPTY
+
+    if kind is DecisionKind.BIND or kind is DecisionKind.MINT:
+        # Identified only when an RFID identity was asserted and resolved onto the row
+        # (see :data:`IDENTITY_BACKED_REASONS`); the tagless lane's binds and mints rest
+        # on a fingerprint or an operator's intent, which is an assumption.
+        if decision.reason in IDENTITY_BACKED_REASONS:
+            return SlotState.OCCUPIED_IDENTIFIED
+        return SlotState.OCCUPIED_ASSUMED
+
+    if kind is DecisionKind.RECLAIM:
+        # Doctrine rule 7's donor is chosen by last location + fingerprint. Nothing read
+        # the roll, so the rebind is an assumption tier however confident the match.
+        return SlotState.OCCUPIED_ASSUMED
+
+    if kind is DecisionKind.REPLACE_SPENT:
+        # The replacement is minted from the tagless default or the tray's own config —
+        # assumed until something actually reads what now sits there.
+        return SlotState.OCCUPIED_ASSUMED
+
+    if kind is DecisionKind.KEEP or kind is DecisionKind.DEFER or kind is DecisionKind.NONE:
+        # No binding was written, so the derived classification IS the after-state.
+        return derived
+
+    raise ValueError(f"post_state has no mapping for DecisionKind {kind!r}")
 
 
 # --- decision table ---------------------------------------------------------

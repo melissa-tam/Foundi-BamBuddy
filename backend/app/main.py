@@ -32,6 +32,7 @@ from backend.app.api.routes import (
     firmware,
     github_backup,
     groups,
+    hms,
     inventory,
     kprofiles,
     labels,
@@ -406,6 +407,40 @@ _first_layer_notified: dict[int, bool] = {}
 # notification_ledger that keeps a STANDING code from re-blasting at every deploy).
 # The old per-printer set-replace + empty-list grace clear re-notified on every
 # reappearance of a code that flapped while another stayed present (0700_0002 storm).
+
+# Write throttle for the durable HMS vocabulary (models/hms_event): (printer_id,
+# full_code) -> time.monotonic() of the last row write. A standing code rides EVERY
+# ~1 Hz status push, so an unthrottled upsert would be a DB write per second per code;
+# a code is written on its first sighting this process and then at most once per
+# _HMS_EVENT_WRITE_INTERVAL_S. Monotonic (never wall clock) so a clock step cannot
+# stall the writer for hours. Process-lifetime, like the other event-edge maps here.
+_hms_event_written_at: dict[tuple[int, str], float] = {}
+_HMS_EVENT_WRITE_INTERVAL_S = 600.0
+
+# Retention for hms_event rows, pruned in the lifespan hygiene pass beside
+# notify_dedup.prune_ledger. Deliberately a code constant and NOT a setting (unlike
+# ams_history_retention_days): this table is a forensic reference an operator never
+# tunes, and 30 days matches notify_dedup.LEDGER_PRUNE_DAYS — the two describe the same
+# incident horizon and must not drift apart by accident.
+_HMS_EVENT_RETENTION_DAYS = 30
+
+
+async def _prune_hms_events(db, older_than_days: int = _HMS_EVENT_RETENTION_DAYS) -> int:
+    """Delete hms_event rows not seen for ``older_than_days``; return the row count.
+
+    The vocabulary table's twin of ``notify_dedup.prune_ledger`` — same startup-hygiene
+    contract, same 30-day horizon. A code a printer has not emitted in a month is
+    history, not state: the table answers "what does this printer say" for the incident
+    window an audit actually reaches back through, and pruning bounds it without a
+    dedicated scheduler.
+    """
+    from backend.app.models.hms_event import HMSEvent
+
+    cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+    result = await db.execute(delete(HMSEvent).where(HMSEvent.last_seen < cutoff))
+    await db.commit()
+    return int(result.rowcount or 0)
+
 
 # Track timelapse file baselines at print start: {printer_id: set of video filenames}
 # Used for snapshot-diff detection at print completion
@@ -1307,6 +1342,82 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # durable ledger row unambiguously.
         current_error_codes = {e.full_code for e in current_hms_errors}
 
+        # Durable HMS vocabulary (models/hms_event). EVERY code live on this printer is
+        # recorded, not just the ones that notify: main only alerts on codes carrying a
+        # catalog description, so an UNDESCRIBED code left no trace anywhere — printer 2
+        # stood on 0500_0051 / 0500_0005 with zero occurrences across 914k log lines, and
+        # every incident audit had to reconstruct the fleet's vocabulary from
+        # notification side effects.
+        #
+        # Throttled per (printer, full_code): written on its first sighting this process,
+        # then at most once per _HMS_EVENT_WRITE_INTERVAL_S. A standing code rides every
+        # ~1 Hz status push and this is a REFERENCE table (a counter of writes), not an
+        # event log — so the session opens only when a code is actually due, and never at
+        # all on the overwhelmingly common "nothing new" push. Guarded like the seeding
+        # hooks above: a forensic write must never break the status callback.
+        _hms_write_at = time.monotonic()
+        _due_hms_events = []
+        for _live in current_hms_errors:
+            _live_code = getattr(_live, "full_code", "") or ""
+            if not _live_code:
+                continue
+            _last_write = _hms_event_written_at.get((printer_id, _live_code))
+            if _last_write is None or (_hms_write_at - _last_write) >= _HMS_EVENT_WRITE_INTERVAL_S:
+                _due_hms_events.append(_live)
+        if _due_hms_events:
+            # Stamped at ATTEMPT time, not on success: a sick DB must not turn this into
+            # a per-push retry storm, and a still-standing code is re-recorded at the
+            # next window anyway.
+            for _live in _due_hms_events:
+                _hms_event_written_at[(printer_id, _live.full_code)] = _hms_write_at
+            try:
+                from backend.app.models.hms_event import HMSEvent
+                from backend.app.services.hms_errors import _code_word as _hms_code_word
+
+                _hms_stamp = datetime.utcnow()
+                async with async_session() as _ev_db:
+                    for _live in _due_hms_events:
+                        _row = (
+                            await _ev_db.execute(
+                                select(HMSEvent).where(
+                                    HMSEvent.printer_id == printer_id,
+                                    HMSEvent.full_code == _live.full_code,
+                                )
+                            )
+                        ).scalar_one_or_none()
+                        # Severity as the PARSER decoded it — bambu_mqtt runs
+                        # hms_errors.hms_severity for the hms[] path and deliberately
+                        # assigns 3 to print_error faults, whose 32-bit word carries a
+                        # MODULE in the bits hms_severity reads. Re-decoding here would
+                        # be a second interpretation that disagrees with the notify
+                        # filter on exactly those codes. Refreshed on every write: the
+                        # firmware can re-raise one fault at a new severity, and the
+                        # newest statement wins.
+                        _severity = getattr(_live, "severity", None)
+                        _severity = int(_severity) if isinstance(_severity, int) else None
+                        if _row is None:
+                            _ev_db.add(
+                                HMSEvent(
+                                    printer_id=printer_id,
+                                    full_code=_live.full_code,
+                                    attr=int(getattr(_live, "attr", 0) or 0),
+                                    code=_hms_code_word(_live.code),
+                                    severity=_severity,
+                                    first_seen=_hms_stamp,
+                                    last_seen=_hms_stamp,
+                                    count=1,
+                                )
+                            )
+                        else:
+                            _row.count += 1
+                            _row.last_seen = _hms_stamp
+                            _row.severity = _severity
+                    await _ev_db.commit()
+            except Exception as _hve:  # noqa: BLE001 — forensics must never break status
+                logging.getLogger(__name__).warning(
+                    "[HMS] vocabulary write failed for printer %s: %s", printer_id, _hve
+                )
+
         # Per-code re-notify dedup (services/notify_dedup): a code counts as
         # "new" only on first appearance or after it has been ABSENT past the
         # re-notify window. A code flapping out-then-back within the window is one
@@ -1387,7 +1498,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
 
                     entries: list[dict] = []
                     suppressed_owned: list[str] = []
-                    all_new_short_codes: list[str] = []
+                    all_new_code_tokens: list[str] = []
                     for error in new_errors:
                         module_name = module_names.get(error.module, f"Module 0x{error.module:02X}")
                         # Build short code like "0700_8010"
@@ -1395,13 +1506,19 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         error_code_int = int(error.code.replace("0x", ""), 16) if error.code else 0
                         error_code_masked = error_code_int & 0xFFFF
                         short_code = f"{(error.attr >> 16) & 0xFFFF:04X}_{error_code_masked:04X}"
-                        all_new_short_codes.append(short_code)
 
                         # Only notify for errors with known descriptions — printers
                         # send many undocumented/phantom codes that aren't real errors.
                         # Prefer the lossless full_code against the vendored catalog,
                         # then fall back to the legacy 2-group table.
                         description = lookup_full_code(error.full_code) or get_error_description(short_code)
+                        # Forensic token for the cycle line below. A code the catalog
+                        # MISSES carries its lossless full_code in parens: the short form
+                        # drops the attr low word and the code high word, so an
+                        # undescribed code named only by its short form cannot be looked
+                        # up, decoded or matched later — which is exactly how printer 2's
+                        # 0500_0051 / 0500_0005 stayed invisible.
+                        all_new_code_tokens.append(short_code if description else f"{short_code}({error.full_code})")
                         if not description or short_code in _HMS_NOTIFICATION_SUPPRESS:
                             continue
                         # A "failed to read the filament information" fault that
@@ -1467,15 +1584,19 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                             {"short_code": short_code, "description": description, "module_name": module_name}
                         )
 
-                    # Full forensic trail: every NEW short code this cycle, INCLUDING
-                    # the description-less ones dropped above (they otherwise leave no
-                    # trace) — makes "what did the printer actually emit" answerable
-                    # when auto-recovery / watchdogs did or didn't fire.
-                    if all_new_short_codes:
-                        logging.getLogger(__name__).debug(
+                    # Full forensic trail: every NEW code this cycle, INCLUDING the
+                    # description-less ones dropped above — makes "what did the printer
+                    # actually emit" answerable when auto-recovery / watchdogs did or
+                    # didn't fire. INFO, not DEBUG: DEBUG is off in production, which is
+                    # precisely where the question gets asked, and an undescribed code
+                    # notifies nowhere else. Still ONE line per cycle per printer, and
+                    # a cycle is a NEW-code edge (notify_dedup), not a push — a standing
+                    # code does not re-log.
+                    if all_new_code_tokens:
+                        logging.getLogger(__name__).info(
                             "[HMS] printer %s new codes this cycle: %s",
                             printer_id,
-                            ", ".join(all_new_short_codes),
+                            ", ".join(all_new_code_tokens),
                         )
 
                     # ONE aggregated message per printer per push: a single physical
@@ -6447,6 +6568,20 @@ async def lifespan(app: FastAPI):
     except Exception as _ple:  # noqa: BLE001 — hygiene must never block startup
         logging.getLogger(__name__).warning("Notification-ledger prune failed: %s", _ple)
 
+    # HMS-vocabulary hygiene: the same startup pass for models/hms_event (see
+    # _prune_hms_events). Mirrors the ledger prune above exactly, down to the guard.
+    try:
+        async with async_session() as _hv_db:
+            _hms_pruned = await _prune_hms_events(_hv_db)
+            if _hms_pruned:
+                logging.getLogger(__name__).info(
+                    "Startup hygiene: pruned %d HMS vocabulary row(s) older than %d days",
+                    _hms_pruned,
+                    _HMS_EVENT_RETENTION_DAYS,
+                )
+    except Exception as _hpe:  # noqa: BLE001 — hygiene must never block startup
+        logging.getLogger(__name__).warning("HMS vocabulary prune failed: %s", _hpe)
+
     # Restart-safe eject terminal handling (W1): hydrate the in-memory pending-eject
     # registry from durable per-unit stamps BEFORE re-arming cooldown watches, so
     # rearm_on_startup skips any printer with an eject still in flight (no double
@@ -7168,6 +7303,9 @@ app.include_router(users.router, prefix=app_settings.api_prefix)
 app.include_router(groups.router, prefix=app_settings.api_prefix)
 app.include_router(printers.router, prefix=app_settings.api_prefix)
 app.include_router(printer_eject.router, prefix=app_settings.api_prefix)
+# Printer-scoped HMS vocabulary read; its own module, registered after printers.router
+# like the other /printers satellites.
+app.include_router(hms.router, prefix=app_settings.api_prefix)
 app.include_router(archives.router, prefix=app_settings.api_prefix)
 app.include_router(filaments.router, prefix=app_settings.api_prefix)
 app.include_router(inventory.router, prefix=app_settings.api_prefix)

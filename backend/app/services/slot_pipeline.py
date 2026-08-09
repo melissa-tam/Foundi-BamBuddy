@@ -86,6 +86,7 @@ from backend.app.services.slot_state import (
     SpoolView,
     derive_state,
     format_slot_event,
+    post_state,
     resolve,
 )
 from backend.app.services.spool_binding import NEVER_FED_MAX_G, bind_spool_to_slot, release_spool_from_slot
@@ -351,7 +352,9 @@ class AppliedTransition:
 
     ``to_state`` rides alongside ``from_state`` because the audit line needs both ends
     of the transition; ``from_state`` is the state the DURABLE facts implied before this
-    push (:func:`_believed_state`) and ``to_state`` is what this push establishes.
+    push (:func:`_believed_state`) and ``to_state`` is what the slot is in AFTER the
+    decision was applied (:func:`slot_state.post_state`) — or, when nothing was applied,
+    the state this push derives.
     """
 
     slot: tuple[int, int, int]
@@ -475,9 +478,18 @@ async def _process_observation(
 
     decision, applied = await _apply(obs, deps, assignment, decision, seen, tray_counts or {})
 
+    # The RIGHT side of the transition is what the APPLIED decision leaves behind, not
+    # ``state`` — that is ``derive_state`` against the PRE-transition binding, so logging
+    # it printed tautologies (prod: ``SPENT_AWAITING_SWAP→SPENT_AWAITING_SWAP
+    # replace_spent``). When nothing was applied — a KEEP, a DEFER, a damped bind — the
+    # binding did not move and the derived classification is still the honest after-state.
+    to_state = post_state(decision, state) if applied else state
+
     if applied:
-        logger.info("%s", format_slot_event(printer_id, ams_id, tray_id, from_state, state, decision))
-    return AppliedTransition(slot=obs.slot, from_state=from_state, to_state=state, decision=decision, applied=applied)
+        logger.info("%s", format_slot_event(printer_id, ams_id, tray_id, from_state, to_state, decision))
+    return AppliedTransition(
+        slot=obs.slot, from_state=from_state, to_state=to_state, decision=decision, applied=applied
+    )
 
 
 async def _load_assignment(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> SpoolAssignment | None:

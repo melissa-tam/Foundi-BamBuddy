@@ -85,9 +85,20 @@ def _reset_state():
 
 
 class _Harness:
-    """Patches every side effect around the HMS pipeline and records its calls."""
+    """Patches every side effect around the HMS pipeline and records its calls.
 
-    def __init__(self):
+    ``session_factory`` swaps the mocked ``async_session`` for a real one (an
+    ``async_sessionmaker`` bound to a test engine) so a case can assert on rows the
+    pipeline actually wrote — used by ``test_hms_event.py`` for the durable HMS
+    vocabulary. ``catalog`` maps ``full_code -> description``; the default (None) keeps
+    the blanket "the vendored catalog knows every code" stub the older cases were
+    written against, while a dict lets a case model an UNDESCRIBED code (the shape the
+    vocabulary table exists for).
+    """
+
+    def __init__(self, *, session_factory=None, catalog: dict[str, str] | None = None):
+        self.session_factory = session_factory
+        self.catalog = catalog
         self.notify = MagicMock()
         self.notify.on_printer_error = AsyncMock()
         self.record_sent = AsyncMock()
@@ -116,16 +127,31 @@ class _Harness:
         pm.get_printer.return_value = None
         pm.get_model.return_value = ""
 
+        if self.session_factory is not None:
+            session_patch = patch("backend.app.main.async_session", self.session_factory)
+        else:
+            session_patch = patch("backend.app.main.async_session", return_value=session_cm)
+        if self.catalog is not None:
+            catalog = dict(self.catalog)
+            catalog_patch = patch(
+                "backend.app.services.hms_catalog.lookup_full_code",
+                side_effect=lambda full_code: catalog.get(full_code),
+            )
+        else:
+            catalog_patch = patch(
+                "backend.app.services.hms_catalog.lookup_full_code", return_value="Failed to read the filament"
+            )
+
         self._patches = [
             patch("backend.app.main.ws_manager", ws),
             patch("backend.app.main.mqtt_relay", relay),
             patch("backend.app.main.printer_manager", pm),
             patch("backend.app.main.spawn_background_task"),
             patch("backend.app.main.printer_state_to_dict", return_value={}),
-            patch("backend.app.main.async_session", return_value=session_cm),
+            session_patch,
             patch("backend.app.main.notification_service", self.notify),
             patch("backend.app.main._capture_snapshot_for_notification", new=AsyncMock(return_value=None)),
-            patch("backend.app.services.hms_catalog.lookup_full_code", return_value="Failed to read the filament"),
+            catalog_patch,
             patch(
                 "backend.app.services.ams_presence.is_expected_read_failure",
                 side_effect=self._is_expected_read_failure,

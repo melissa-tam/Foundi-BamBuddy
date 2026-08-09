@@ -1963,3 +1963,120 @@ class TestStaleEmptyReplay003T2:
             f"[slot-state] printer={printer.id} A0T2 OCCUPIED_ASSUMED→EMPTY release "
             f"spool={spool.id} reason=cleared_tray"
         )
+
+
+# --- the applied audit line is a TRANSITION, not a tautology -----------------
+
+
+def _transition(caplog) -> tuple[str, str]:
+    """The ``FROM→TO`` pair from the pass's audit line.
+
+    Matched on the ARROW, not merely the ``[slot-state]`` prefix: the module logs
+    other INFO lines under that prefix (a disposal, a sibling KEEP) and only the
+    audit line carries a transition.
+    """
+    line = next(m for m in _records(caplog, logging.INFO) if m.startswith("[slot-state]") and "→" in m)
+    left, right = line.split()[3].split("→")
+    return left, right
+
+
+class TestAppliedLineShowsTheChange:
+    """The right-hand state used to be ``derive_state`` against the PRE-transition
+    binding, so the one line an operator reads to see what changed printed things like
+    ``SPENT_AWAITING_SWAP→SPENT_AWAITING_SWAP replace_spent`` (observed in prod). Every
+    state-CHANGING kind must now show two different states.
+    """
+
+    @pytest.mark.asyncio
+    async def test_replace_spent_reads_spent_to_assumed(self, db_session, printer_factory, env, caplog):
+        """The exact prod tautology, now a transition: the latch is gone and the
+        replacement row is ASSUMED (nothing has read the fresh roll yet)."""
+        printer = await printer_factory()
+        env.settings["tagless_default_filament"] = _tagless_default_json()
+        await _spent_slot(db_session, printer.id)
+
+        tray = {"id": 0, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"}
+        with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
+            transitions = await run_slot_pipeline(printer.id, [_obs(printer.id, tray)], _deps(db_session, env))
+
+        assert transitions[0].applied is True
+        assert transitions[0].decision.kind is DecisionKind.REPLACE_SPENT
+        assert _transition(caplog) == ("SPENT_AWAITING_SWAP", "OCCUPIED_ASSUMED")
+        assert transitions[0].from_state is SlotState.SPENT_AWAITING_SWAP
+        assert transitions[0].to_state is SlotState.OCCUPIED_ASSUMED
+
+    @pytest.mark.asyncio
+    async def test_release_reads_to_empty(self, db_session, printer_factory, env, caplog):
+        printer = await printer_factory()
+        spool = await _spool(db_session, material="PETG", rgba="000000FF", weight_used=932)
+        await _bind_row(db_session, spool, printer.id, 0, 2)
+
+        with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
+            transitions = await run_slot_pipeline(
+                printer.id, [_obs(printer.id, {"id": 2, "state": 9, "tray_type": ""})], _deps(db_session, env)
+            )
+
+        assert transitions[0].applied is True
+        from_state, to_state = _transition(caplog)
+        assert to_state == "EMPTY"
+        assert from_state != to_state
+
+    @pytest.mark.asyncio
+    async def test_an_identity_bind_reads_to_identified(self, db_session, printer_factory, env, caplog):
+        """A tag was READ and resolved onto a row — the slot is identified, not assumed,
+        and ``derive_state`` could not have said so from the pre-transition binding
+        (there was none)."""
+        printer = await printer_factory()
+        roll = await _spool(db_session, tag_uid=TAG_A, tray_uuid=UUID_1, material="PETG", rgba="000000FF")
+
+        arrived = _obs(
+            printer.id,
+            {
+                "id": 1,
+                "state": 11,
+                "tag_uid": TAG_A,
+                "tray_uuid": UUID_1,
+                "tray_type": "PETG",
+                "tray_color": "000000FF",
+            },
+        )
+        with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
+            transitions = await run_slot_pipeline(printer.id, [arrived], _deps(db_session, env))
+
+        assert transitions[0].decision == Decision(
+            DecisionKind.BIND, spool_id=roll.id, reason="identity_resolved_candidate"
+        )
+        assert _transition(caplog) == ("EMPTY", "OCCUPIED_IDENTIFIED")
+
+    @pytest.mark.asyncio
+    async def test_a_tagless_mint_reads_to_assumed(self, db_session, printer_factory, env, caplog):
+        """No tag was read: a fingerprint mint is an assumption, however confident."""
+        printer = await printer_factory()
+
+        with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
+            transitions = await run_slot_pipeline(
+                printer.id,
+                [_obs(printer.id, {"id": 0, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"})],
+                _deps(db_session, env),
+            )
+
+        assert transitions[0].decision.reason == "tagless_mint"
+        assert _transition(caplog) == ("EMPTY", "OCCUPIED_ASSUMED")
+
+    @pytest.mark.asyncio
+    async def test_a_non_applied_pass_keeps_the_derived_state(self, db_session, printer_factory, env):
+        """Nothing was written, so the derived classification stands — and no audit
+        line is emitted at all (the line means "the ledger changed")."""
+        printer = await printer_factory()
+        spool = await _spool(db_session, material="PETG", rgba="000000FF")
+        await _bind_row(db_session, spool, printer.id, 0, 0, fingerprint_color="000000FF", fingerprint_type="PETG")
+
+        transitions = await run_slot_pipeline(
+            printer.id,
+            [_obs(printer.id, {"id": 0, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"})],
+            _deps(db_session, env),
+        )
+
+        assert transitions[0].applied is False
+        assert transitions[0].decision.kind is DecisionKind.KEEP
+        assert transitions[0].to_state is SlotState.OCCUPIED_ASSUMED  # == derive_state
