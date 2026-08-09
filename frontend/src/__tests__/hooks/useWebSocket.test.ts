@@ -474,6 +474,70 @@ describe('useWebSocket hook', () => {
       vi.unstubAllGlobals();
     });
 
+    it('forwards the respool_prompt trigger and provenance fields, not just the tray data', async () => {
+      // LIVENESS PIN. The bridge re-states the payload field by field, and the trigger
+      // + provenance fields were never added when the backend grew them — so the toast
+      // saw `trigger: undefined` and rendered the "reused tag" copy for EVERY prompt,
+      // including the near-empty and spent cases written specifically to stop claiming
+      // a reused tag. A backend field that the UI branches on is not delivered until
+      // this bridge carries it.
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      const received: Array<Record<string, unknown>> = [];
+      const handler = (e: Event) => received.push((e as CustomEvent).detail);
+      window.addEventListener('respool-prompt', handler);
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'respool_prompt',
+          printer_id: 3,
+          ams_id: 1,
+          tray_id: 2,
+          tag_uid: 'ABCD1234',
+          tray_uuid: null,
+          tray_type: 'PETG',
+          tray_color: 'FF8800FF',
+          tray_sub_brands: 'PETG HF',
+          tray_count: 4,
+          donor_spool_id: 12,
+          donor_remaining_g: -792.9,
+          brand_prefill: 'Overture',
+          label_weight_prefill: 1000,
+          trigger: 'spent',
+          spent_at: '2026-07-31T10:00:00',
+          spent_age_s: 7200,
+          ams_remain_pct: 100,
+          ledger_remain_pct: 0,
+          bound_since: '2026-07-01T10:00:00',
+          ledger_unreliable: true,
+        });
+      });
+
+      window.removeEventListener('respool-prompt', handler);
+      expect(received).toHaveLength(1);
+      expect(received[0]).toMatchObject({
+        printer_id: 3,
+        trigger: 'spent',
+        spent_age_s: 7200,
+        ams_remain_pct: 100,
+        ledger_remain_pct: 0,
+        bound_since: '2026-07-01T10:00:00',
+        ledger_unreliable: true,
+      });
+
+      vi.unstubAllGlobals();
+    });
+
     it('bridges respool_prompt_dismissed to a respool-prompt-dismissed window event', async () => {
       vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
         cb(0);

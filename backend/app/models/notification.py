@@ -117,6 +117,9 @@ class NotificationProvider(Base):
     on_foreign_print_paused = Column(
         Boolean, default=True
     )  # A print the farm did NOT dispatch sat PAUSEd past the grace window with no AMS incident owning it
+    on_spent_contradiction = Column(
+        Boolean, default=True
+    )  # A spool the ledger calls SPENT is still seated in its slot reading substantially full on the wire
     on_storage_low = Column(
         Boolean, default=True
     )  # Printer USB storage FAILURE — auto-cleanup could not free space, FTPS/USB unreachable, or the drive dropped mid-print (successful cleanups are silent)

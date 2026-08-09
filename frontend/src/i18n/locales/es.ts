@@ -4597,6 +4597,7 @@ export default {
       nearEmptyToast: 'Bobina casi vacía en {{printer}} ranura {{slot}} — ¿estás sustituyendo este rollo?',
       spentToast: '{{printer}} ranura {{slot}}: esta bobina se marcó como vacía hace {{age}} por una señal de agotamiento, pero sigue cargada.',
       spentToastNumbers: 'El AMS indica ~{{ams}}% restante; los registros dicen {{ledger}}%.',
+      ledgerUnreliable: 'El registro de uso de esta bobina es imposible (más usado que la etiqueta), por lo que ninguna cifra restante es fiable.',
       nearEmptyToastRemaining: 'Quedan {{remaining}} g.',
       nearEmptyTitle: '¿Estás sustituyendo este rollo?',
       nearEmptyMessage: 'La bobina en {{location}} está casi vacía. Si acabas de poner un rollo nuevo en ella, regístralo aquí para que el seguimiento de filamento siga siendo preciso.',

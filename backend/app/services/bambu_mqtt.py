@@ -875,6 +875,32 @@ class BambuMQTTClient:
         """
         return self._report_messages_since_connect
 
+    @property
+    def is_dual_nozzle(self) -> bool:
+        """Is this printer a dual-nozzle (Vortek) machine — H2C / H2D / X2D?
+
+        The public, read-only view of the private ``_is_dual_nozzle`` runtime flag,
+        composed with the model-name fallback exactly as the three existing internal
+        callers do (``_build_print_payload``, the external-spool routing, and
+        :meth:`home_all_axes`): runtime ``device.extruder.info`` first — it only ever
+        flips False→True, so it is safe as the primary signal — falling back to the
+        registered model for the window after connect before push data arrives, and
+        for a printer whose firmware never sends the extruder block.
+
+        Exposed because the nozzle TOPOLOGY changes what a wire field is allowed to
+        mean, not just how the farm drives the machine. ``tray_now`` is the case that
+        forced it out: on a dual-nozzle printer the value is a bare SLOT number and
+        :meth:`_handle_ams_data` must guess which AMS unit owns it — a guess with
+        explicit may-be-wrong fallbacks ("no AMS on extruder N, using slot M"). So a
+        consumer that would infer a physical roll from ``tray_now``
+        (``spool_respool._resolve_exhausted_tray``) has to know it is standing on an
+        inference, and this is how it asks. Read-only by design: the flag is wire
+        state, and nothing outside the client's own status handling may set it.
+        """
+        from backend.app.utils.printer_models import is_dual_nozzle_model
+
+        return self._is_dual_nozzle or is_dual_nozzle_model(self.model)
+
     # Maximum time (seconds) without a message before considering connection stale
     STALE_TIMEOUT = 60.0
 
@@ -1922,11 +1948,13 @@ class BambuMQTTClient:
 
         Injection requires ALL of:
 
-        * ``state`` parses to STRICTLY 9, firmware's "no spool" code. Never 0 (the
-          H2C long-idle "detail not reported" dialect), 3 (the A1/P1S constant),
-          25/27 (H2C dialect values observed on visibly-loaded trays) or 8/26
-          (transitional) — asserting empty for those would authorize a destructive
-          release on a possibly-loaded tray.
+        * ``state`` parses to STRICTLY ``tray_fields.TRAY_STATE_EMPTY``, firmware's
+          "no spool" code. Never ``TRAY_STATE_UNREPORTED`` (the H2C long-idle
+          "detail not reported" dialect), never a ``TRAY_STATE_DIALECT`` value (the
+          A1/P1S constant and the H2C codes observed on visibly-loaded trays) and
+          never a ``TRAY_STATE_TRANSITIONAL`` one (load/unload transit) — asserting
+          empty for those would authorize a destructive release on a possibly-loaded
+          tray. The vocabulary table lives beside the constants in ``tray_fields``.
         * no ``tray_type`` key: the push must say NOTHING about content. A push
           that asserts its own type is never overwritten, which is what makes the
           004-H2S state-9-while-feeding dialect (state 9 + ``tray_type: "PETG"``)

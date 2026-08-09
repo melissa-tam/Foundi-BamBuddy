@@ -4582,6 +4582,7 @@ export default {
       nearEmptyToast: 'Bobina quasi vuota su {{printer}} slot {{slot}} — stai sostituendo questa bobina?',
       spentToast: '{{printer}} slot {{slot}}: questa bobina è stata segnata come vuota {{age}} fa da un segnale di esaurimento, ma è ancora inserita.',
       spentToastNumbers: 'L’AMS segnala ~{{ams}}% rimanente; i registri indicano {{ledger}}%.',
+      ledgerUnreliable: 'Il registro d’uso di questa bobina è impossibile (consumo superiore all’etichetta), quindi nessun dato sul rimanente è affidabile.',
       nearEmptyToastRemaining: 'Rimangono {{remaining}} g.',
       nearEmptyTitle: 'Stai sostituendo questa bobina?',
       nearEmptyMessage: 'La bobina in {{location}} è quasi vuota. Se hai appena montato una bobina nuova, registrala qui così il tracciamento del filamento resta preciso.',

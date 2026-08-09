@@ -3428,6 +3428,11 @@ async def run_migrations(conn):
         # the same grace with no AMS incident owning it (a vision trip on a LAN print
         # is the common case) — the farm-item watch above can never see those.
         ("on_foreign_print_paused", "1", "TRUE"),
+        # WS3 spent-contradiction detector: a spool stamped SPENT is still seated in
+        # its slot reading substantially full on the wire — a false spent stamp, which
+        # is permanent (there is no un-spend lane) and silently removes the roll from
+        # selection. Spools 185/205 sat like that for nine days before anyone noticed.
+        ("on_spent_contradiction", "1", "TRUE"),
         # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
         ("on_storage_low", "1", "TRUE"),
         # Cooldown escalation: post-print eject cooldown is running long (bed still

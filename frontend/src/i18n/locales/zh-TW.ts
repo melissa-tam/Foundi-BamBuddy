@@ -4582,6 +4582,7 @@ export default {
       nearEmptyToast: '{{printer}} 插槽 {{slot}} 的線軸快用完了——是否要更換此卷？',
       spentToast: '{{printer}} 插槽 {{slot}}：此線軸在 {{age}} 前因斷料訊號被標記為空，但仍處於裝載狀態。',
       spentToastNumbers: 'AMS 回報約剩 {{ams}}%，但記錄顯示為 {{ledger}}%。',
+      ledgerUnreliable: '此料盤的用量紀錄不可能成立（用量超過標示重量），因此任何剩餘量數值都不可信。',
       nearEmptyToastRemaining: '還剩 {{remaining}} 克。',
       nearEmptyTitle: '是否要更換此卷？',
       nearEmptyMessage: '{{location}} 的線軸快用完了。如果剛換上新卷，請在此記錄以保持耗材追蹤準確。',

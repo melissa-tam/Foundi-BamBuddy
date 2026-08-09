@@ -122,6 +122,31 @@ describe('useRespoolPrompt', () => {
     expect(message).toBe('inventory.respool.spentToast inventory.respool.spentToastNumbers');
   });
 
+  it('withdraws the numbers — but not the prompt — when the donor ledger is impossible', () => {
+    renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
+    act(() =>
+      dispatchPrompt(
+        makePrompt({
+          trigger: 'spent',
+          spent_age_s: 7200,
+          ams_remain_pct: 100,
+          // weight_used past the label: every derived "remaining" is meaningless, and
+          // prod prompts were announcing "remaining -792.9 g" as if it were a fact.
+          ledger_remain_pct: 0,
+          donor_remaining_g: -792.9,
+          ledger_unreliable: true,
+        }),
+      ),
+    );
+
+    const [, message] = showPersistentToast.mock.calls[0];
+    // The question still stands (spent + loaded deserves the ask); only the asserted
+    // numbers are replaced by the honest "this record cannot be trusted" clause.
+    expect(message).toBe('inventory.respool.spentToast inventory.respool.ledgerUnreliable');
+    expect(message).not.toContain('spentToastNumbers');
+    expect(showPersistentToast).toHaveBeenCalledTimes(1);
+  });
+
   it('falls back to the reused-tag wording for a spent prompt with no age', () => {
     renderHook(() => useRespoolPrompt(), { wrapper: createWrapper() });
     act(() => dispatchPrompt(makePrompt({ trigger: 'spent' }))); // spent_age_s absent

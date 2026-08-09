@@ -22,6 +22,43 @@ from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tra
 ZERO_TAG_UID = "0000000000000000"
 ZERO_TRAY_UUID = "00000000000000000000000000000000"
 
+# --- tray `state` vocabulary -------------------------------------------------
+#
+# Every per-tray ``state`` value the fleet emits, named once so no consumer spells
+# a bare number again (doctrine invariant 1 — one origin per magic value). The
+# table below IS the contract; :func:`tray_presence` implements it and nothing
+# else may re-derive it:
+#
+# | constant                  | value(s) | what the firmware means            | tray_presence |
+# |---------------------------|----------|------------------------------------|---------------|
+# | ``TRAY_STATE_EMPTY``      | 9        | "no spool" — the ONLY empty code   | ``False``*    |
+# | ``TRAY_STATE_SEATED``     | 10       | spool seated, filament not fed     | ``True``      |
+# | ``TRAY_STATE_FED``        | 11       | loaded / feeding                   | ``True``      |
+# | ``TRAY_STATE_UNREPORTED`` | 0        | "tray detail not being reported"   | ``None``      |
+# | ``TRAY_STATE_TRANSITIONAL`` | 8, 26  | load / unload transit              | ``None``      |
+# | ``TRAY_STATE_DIALECT``    | 3, 25, 27| A1/P1S constant + H2C loaded-tray  | ``None``      |
+#
+# \* 9 alone is NOT enough: presence answers ``False`` only when ``tray_type`` is
+# ASSERTED empty beside it (:func:`asserted_str_field`), because "empty" is what
+# authorizes a destructive release and 004-H2S feeds whole prints at state 9.
+#
+# The last three rows are the reason presence is TRI-state. ``0`` is the H2C
+# long-idle dialect (the tray is not being described, which is not a claim that it
+# is bare); ``8``/``26`` are seen mid-load and mid-unload (state 8 observed live on
+# a mid-unload H2S slot); ``3`` is the A1-family/P1S constant that never varies and
+# ``25``/``27`` are H2C values observed on visibly LOADED trays. Reading any of them
+# as empty would release a live binding out from under a seated roll, so they all
+# answer UNKNOWN — and unknown fails OPEN at every consumer. Naming them changes no
+# behavior (every non-9/10/11 value already fell through to ``None``); it makes the
+# vocabulary auditable and gives ``bambu_mqtt._normalize_cleared_trays`` something to
+# cite instead of re-listing the codes in prose.
+TRAY_STATE_EMPTY = 9
+TRAY_STATE_SEATED = 10
+TRAY_STATE_FED = 11
+TRAY_STATE_UNREPORTED = 0
+TRAY_STATE_TRANSITIONAL: tuple[int, int] = (8, 26)
+TRAY_STATE_DIALECT: tuple[int, int, int] = (3, 25, 27)
+
 # Tray `state` codes that mean a spool is physically PRESENT: 11 = loaded, 10 =
 # "spool present, filament not in feeder" (see the merge comment in
 # ``bambu_mqtt._handle_ams_data``). Wiping tray identity for a present spool is the
@@ -32,7 +69,7 @@ ZERO_TRAY_UUID = "00000000000000000000000000000000"
 # consumer gates on — needs it and ``bambu_mqtt`` already imports this module (the
 # reverse import would be a cycle). ``bambu_mqtt`` re-exports the same tuple object,
 # so ``ams_presence``/``tray_observation``/``spool_recovery`` keep their one origin.
-TRAY_PRESENT_STATES = (10, 11)
+TRAY_PRESENT_STATES = (TRAY_STATE_SEATED, TRAY_STATE_FED)
 
 
 def parse_int_field(raw: object) -> int | None:
@@ -101,6 +138,50 @@ def slot_exist_bit_set(bits: int | None, ams_id: object, tray_id: object) -> boo
     if a < 0 or a >= 128 or t < 0:
         return False
     return bool((bits >> (a * 4 + t)) & 1)
+
+
+def parse_filam_bak(source: object) -> list[int] | None:
+    """Parse a firmware ``filam_bak`` array — the trays enrolled in AUTO-REFILL BACKUP.
+
+    ``filam_bak`` is the firmware's own statement of which trays it will switch between
+    when one runs dry. Do NOT confuse it with ``ams_filament_backup``
+    (``bambu_mqtt.parse_ams_filament_backup_from_cfg``, bit 18 of ``print.cfg``): that is
+    the CAPABILITY boolean "is the feature on", this is the live MEMBERSHIP list.
+
+    **The field is not per-AMS-unit** (verified 2026-08-09 against the OpenBambuAPI
+    ``pushall`` reference, BambuStudio/OrcaSlicer ``DeviceManager.cpp`` +
+    ``DevExtruderSystem.cpp``, and a live production status pull — no AMS unit or tray
+    block carries it). Two wire shapes exist, and this parser is deliberately agnostic
+    to both because it reads ONE key off whatever dict the caller hands it:
+
+    * ``print.filam_bak`` — flat, machine-level (legacy / general);
+    * ``print.device.extruder.info[i].filam_bak`` — per EXTRUDER, the newer
+      substructure that a dual-nozzle machine reports.
+
+    Returns the parsed ints, or ``None`` when the source asserts no array at all (not a
+    dict, key absent, or the value is not a list). An EMPTY list is preserved as ``[]``,
+    a real answer distinct from ``None``: firmware clears and refills this field on
+    every report, so ``[]`` means "nothing is enrolled right now". Elements that are not
+    parseable ints are dropped rather than poisoning the list.
+
+    **Element encoding is UNCONFIRMED** — no source states whether the ints are global
+    tray ids (``ams_id * 4 + tray_id``) or per-unit slot ids, and both clients parse them
+    as bare ints with no bit-extraction. Consumers must therefore be written so that the
+    global-id reading can only UNDER-match: for any tray outside AMS 0 the two encodings
+    occupy disjoint value ranges, so a global-id comparison silently fails to corroborate
+    rather than corroborating something false.
+    """
+    if not isinstance(source, dict):
+        return None
+    raw = source.get("filam_bak")
+    if not isinstance(raw, list):
+        return None
+    out: list[int] = []
+    for item in raw:
+        value = parse_int_field(item)
+        if value is not None:
+            out.append(value)
+    return out
 
 
 def asserted_str_field(tray: dict, key: str) -> str | None:

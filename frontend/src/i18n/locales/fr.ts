@@ -4583,6 +4583,7 @@ export default {
       nearEmptyToast: 'Bobine presque vide sur {{printer}} emplacement {{slot}} — remplacez-vous ce rouleau ?',
       spentToast: '{{printer}} emplacement {{slot}} : cette bobine a été marquée vide il y a {{age}} par un signal de fin de filament, mais elle est toujours en place.',
       spentToastNumbers: 'L’AMS indique ~{{ams}}% restant ; les enregistrements indiquent {{ledger}}%.',
+      ledgerUnreliable: 'L’historique d’utilisation de cette bobine est impossible (plus consommé que l’étiquette) : aucun reste affiché n’est fiable.',
       nearEmptyToastRemaining: 'Il reste {{remaining}} g.',
       nearEmptyTitle: 'Remplacez-vous ce rouleau ?',
       nearEmptyMessage: 'La bobine à {{location}} est presque vide. Si vous venez d\'y placer un rouleau neuf, enregistrez-le ici pour que le suivi du filament reste exact.',

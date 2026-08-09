@@ -4594,6 +4594,7 @@ export default {
       nearEmptyToast: 'Spule fast leer an {{printer}} Slot {{slot}} — wird diese Rolle ersetzt?',
       spentToast: '{{printer}} Slot {{slot}}: Diese Spule wurde vor {{age}} durch ein Leersignal als leer markiert, sitzt aber noch.',
       spentToastNumbers: 'Das AMS meldet noch ~{{ams}}%; laut Aufzeichnung {{ledger}}%.',
+      ledgerUnreliable: 'Der Verbrauchsdatensatz dieser Spule ist unmöglich (mehr verbraucht als das Etikett), daher ist keine Restangabe verlässlich.',
       nearEmptyToastRemaining: 'Noch {{remaining}} g.',
       nearEmptyTitle: 'Wird diese Rolle ersetzt?',
       nearEmptyMessage: 'Die Spule bei {{location}} ist fast leer. Wenn du gerade eine frische Rolle aufgesetzt hast, erfasse sie hier, damit die Filamentverfolgung korrekt bleibt.',

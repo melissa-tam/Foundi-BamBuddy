@@ -98,7 +98,13 @@ export function useRespoolPrompt() {
       // Provenance clause shared by the spent and remain_jump copies: only when
       // BOTH the live AMS % and the ledger % are known does it say the numbers the
       // operator needs to judge a stale question ("AMS reports ~X%; records say Y%").
+      // An IMPOSSIBLE donor ledger (weight_used past the label) makes every derived
+      // "remaining" meaningless — prod prompts announced "remaining −792.9 g". The
+      // question still stands (a spent+loaded spool deserves it), so the prompt is not
+      // suppressed; only the numbers are, replaced by a clause that says the record is
+      // untrustworthy. That is the honest thing to show and it points at the real fix.
       const numbersClause = (): string | null => {
+        if (prompt.ledger_unreliable) return t('inventory.respool.ledgerUnreliable');
         const ams = prompt.ams_remain_pct;
         const ledger = prompt.ledger_remain_pct;
         if (ams == null || ledger == null) return null;

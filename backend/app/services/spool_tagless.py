@@ -61,7 +61,7 @@ from sqlalchemy.orm import selectinload
 from backend.app.core.websocket import ws_manager
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import ams_presence
+from backend.app.services import ams_presence, spool_respool
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_binding import bind_spool_to_slot
 from backend.app.services.spool_tag_matcher import (
@@ -1546,6 +1546,17 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
                         ams_id,
                         tray_id,
                     )
+
+    # SPENT-CONTRADICTION sweep — this walk's fifth duty, and the only one that checks a
+    # DURABLE claim against the wire rather than re-driving a write. A spool stamped
+    # spent is hard-excluded from every print, so a false stamp silently retires a
+    # healthy roll; spools 185/205 sat spent-and-loaded-and-full for nine days because
+    # nothing compared the two. It rides HERE because this is already the lane that
+    # holds live merged AMS state beside the DB every tick. No guard at this call site
+    # by design: the detector is an entry hook that owns its own throttle (its own
+    # 15-minute floor, far slower than this pass) and its own guard, and it never
+    # mutates a spool row.
+    await spool_respool.detect_spent_contradictions(db, manager)
     return pushed
 
 

@@ -2993,6 +2993,11 @@ export interface RespoolPromptMessage {
   ams_remain_pct?: number | null;
   ledger_remain_pct?: number | null;
   bound_since?: string | null;
+  /** The donor row's gram ledger is physically impossible (weight_used past the
+   *  label), so every "remaining" figure derived from it is meaningless. The prompt
+   *  still shows — a spent+loaded spool deserves the question — but the copy must not
+   *  assert numbers (prod prompts quoted "remaining −792.9 g"). */
+  ledger_unreliable?: boolean | null;
 }
 
 /** WS `spool_auto_assigned` payload — a spool was auto-bound to an AMS slot.

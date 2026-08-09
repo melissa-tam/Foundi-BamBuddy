@@ -244,6 +244,17 @@ DEFAULT_TEMPLATES = [
         "title_template": "Foreign print paused — {printer_name}",
         "body_template": "{printer_name} has been PAUSEd {minutes} min on '{job_name}', a print Bambuddy did not dispatch. Nothing is recovering it — check the printer.",
     },
+    # WS3: the ledger says this roll is exhausted; the wire says it is still in the
+    # slot and substantially full. Both cannot be true, and the ledger is the one the
+    # farm ACTS on (a spent row is hard-excluded from selection). Deliberately no
+    # instruction to un-spend — there is no such lane by operator ruling; the message
+    # names the contradiction so the root cause gets fixed.
+    {
+        "event_type": "spent_contradiction",
+        "name": "Spent Spool Still Loaded",
+        "title_template": "Spool marked spent is still loaded — {printer_name}",
+        "body_template": "Spool #{spool_id} ({spool_label}) is marked SPENT but is still seated in {slot} on {printer_name}, and the AMS reports it {remain}% full. A spent spool is excluded from every print, so this roll is out of service. Check whether the spent stamp was correct.",
+    },
     {
         "event_type": "storage_low",
         "name": "USB Storage Low (auto-cleanup)",

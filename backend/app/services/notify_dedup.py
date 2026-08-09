@@ -213,6 +213,27 @@ async def load_keys(db: AsyncSession, scope: str, prefix: str = "") -> set[str]:
     return set(result.scalars().all())
 
 
+async def last_sent_at(db: AsyncSession, scope: str, key: str) -> datetime | None:
+    """When ``(scope, key)`` was last delivered, or ``None`` if never.
+
+    The timestamped read :func:`load_keys` cannot give: that one answers "was this ever
+    sent" for the HMS seeding pass, which needs a whole prefix and no times. A caller
+    whose re-notify window is measured in DAYS (a standing condition that re-derives on
+    every scheduler tick, rather than an edge) needs the stamp itself.
+
+    Lives here because :class:`NotificationLedger` has ONE owner — every read and write
+    of the durable table goes through this module, so a second reader cannot drift from
+    :func:`record_sent`'s write. Never raises: an unreadable ledger returns ``None``,
+    which fails towards NOTIFYING, the same direction :func:`seed_standing` fails.
+    """
+    try:
+        row = await db.get(NotificationLedger, {"scope": scope, "dedup_key": key})
+    except SQLAlchemyError as exc:
+        logger.warning("[NOTIFY-DEDUP] ledger read failed for %s/%s: %s", scope, key, exc)
+        return None
+    return None if row is None else row.last_sent_at
+
+
 async def record_sent(db: AsyncSession, scope: str, key: str, now: float | None = None) -> None:
     """Upsert "an alert for ``(scope, key)`` was just delivered".
 

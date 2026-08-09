@@ -4385,6 +4385,7 @@ export default {
       nearEmptyToast: '{{printer}} 슬롯 {{slot}}의 스풀이 거의 비었습니다 — 이 롤을 교체하시겠습니까?',
       spentToast: '{{printer}} 슬롯 {{slot}}: 이 스풀은 {{age}} 전 소진 신호로 비어 있음으로 표시되었지만 여전히 장착되어 있습니다.',
       spentToastNumbers: 'AMS는 약 {{ams}}% 남음으로 보고하지만 기록상으로는 {{ledger}}%입니다.',
+      ledgerUnreliable: '이 스풀의 사용 기록이 불가능한 값입니다(라벨보다 많이 사용). 남은 양 수치를 신뢰할 수 없습니다.',
       nearEmptyToastRemaining: '{{remaining}} g 남음.',
       nearEmptyTitle: '이 롤을 교체하시겠습니까?',
       nearEmptyMessage: '{{location}}의 스풀이 거의 비었습니다. 방금 새 롤로 교체했다면 필라멘트 추적이 정확하도록 여기에 기록하세요.',

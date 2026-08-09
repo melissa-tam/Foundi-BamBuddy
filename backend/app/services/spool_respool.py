@@ -53,6 +53,7 @@ from sqlalchemy.orm import selectinload
 from backend.app.core.websocket import ws_manager
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
+from backend.app.models.printer import Printer
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
@@ -65,6 +66,12 @@ from backend.app.services.spool_tag_matcher import (
     get_spool_by_tag,
     is_valid_tag,
     parse_tray_fields,
+)
+from backend.app.services.tray_fields import (
+    normalized_tag_uid,
+    normalized_tray_uuid,
+    parse_filam_bak,
+    tray_presence_from_dict,
 )
 from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid
 
@@ -193,6 +200,8 @@ _seeded_slot_runout_full: dict[int, set[str]] = {}
 
 def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
+    global _last_contradiction_scan_at
+
     _last_tray_now.clear()
     _stable_feeder.clear()
     _feeder_since.clear()
@@ -205,6 +214,8 @@ def _reset_state() -> None:
     _runout_seeded.clear()
     _seeded_runout_codes.clear()
     _seeded_slot_runout_full.clear()
+    _filam_bak_groups.clear()
+    _last_contradiction_scan_at = None
 
 
 def _monotonic() -> float:
@@ -471,7 +482,138 @@ def _runout_slot_global_tray(state) -> int | None:
     return None
 
 
-async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> int | None:
+def _ams_hint_from_short_codes(short_codes) -> int | None:
+    """The AMS unit the triggering runout short codes name, when they agree on ONE.
+
+    ``07XX_8011`` — the slot-agnostic "insert filament into the SAME AMS slot" runout —
+    names no slot, which is why it falls through to inference at all. It DOES name its
+    unit: a short code's ``MMMM`` half is exactly ``(attr >> 16) & 0xFFFF``
+    (:func:`hms_errors.hms_short_code`), so re-widening it recovers the two bytes
+    :func:`hms_errors.ams_unit_from_attr` reads — the module class and the unit id.
+    One decoder for "which AMS does this attr name"; this never re-implements the
+    layout, it only undoes the string formatting.
+
+    ``None`` when the codes name no AMS unit (``0300_8004`` is the extruder-module
+    runout — module ``0x03``, not ``0x07``) or when several DISAGREE. Disagreement is
+    genuinely unknown, not a tie to break: two units reporting runouts in one push is
+    the chained case, and picking either would be the same guess this hint exists to
+    stop. Pure; never raises (it runs on the HMS callback path, invariant 10).
+    """
+    from backend.app.services.hms_errors import ams_unit_from_attr
+
+    units: set[int] = set()
+    for short in short_codes or []:
+        try:
+            module_half = str(short).split("_", 1)[0]
+            unit = ams_unit_from_attr(int(module_half, 16) << 16)
+        except (TypeError, ValueError):  # noqa: PERF203 — a malformed code must not break the hint
+            continue
+        if unit is not None:
+            units.add(unit)
+    return units.pop() if len(units) == 1 else None
+
+
+def _topology_is_ambiguous(state, client) -> bool:
+    """Can this printer's ``tray_now`` be trusted to name a GLOBAL tray by itself?
+
+    ``False`` (unambiguous) only for the one shape where the wire value can mean
+    nothing else: a SINGLE AMS unit on a SINGLE-nozzle printer. There ``tray_now`` is
+    the global id, ``global == ams_id * 4 + slot`` collapses to ``slot``, and the
+    inference tier below is reading firmware truth.
+
+    ``True`` in both other shapes, for the same underlying reason — the firmware sends
+    a bare SLOT number and somebody has to decide which unit owns it:
+
+    * **dual nozzle** — ``bambu_mqtt._handle_ams_data`` runs the H2D disambiguation,
+      whose fallbacks are explicitly labelled as possibly wrong ("no AMS on extruder
+      N, using slot M"; "multiple AMS …, no snow field, using slot M (may be
+      incorrect)"). Those two WARNINGs were observed 15+ times on H2C serials.
+    * **several AMS units** — even single-nozzle firmwares report a local slot id
+      (#420), and a two-unit printer has two candidate global trays per slot.
+
+    A missing client cannot ASSERT dual-nozzle, so it does not make the topology
+    ambiguous on its own: in production a live status push and a live client come from
+    the same registry, so a state to reason about implies a client to ask, and the
+    unit-count half of the test still stands for every printer. Pure; never raises.
+    """
+    if len(_iter_ams_units(state)) > 1:
+        return True
+    try:
+        return bool(client is not None and client.is_dual_nozzle)
+    except Exception:  # noqa: BLE001 — a client probe must never break the HMS callback chain
+        return False
+
+
+def _owe_attribution_evidence(printer_id: int, state, ams_hint: int | None) -> None:
+    """Ask the printer (and the identify lane) to settle an attribution we refused.
+
+    Called from the one place that declines to stamp on an ambiguous topology. It buys
+    no certainty now; it makes the NEXT runout resolvable, which is the whole shape of
+    the fix — a missed stamp self-heals forward, a false one never does.
+
+    Two acts, both fire-and-forget and both bounded:
+
+    * a fresh full report (``request_evidence_pushall``) — the client owns the
+      connected check and the pacing floor, and ``False`` just means "not now";
+    * a READ OCCASION on each PRESENT slot of the hinted unit. The runout named that
+      unit, so the farm's identity ledger for it is what is in doubt; an occasion is
+      permission for ONE commanded read, not a read, and ``identify_needed`` still
+      decides whether any is warranted (an untagged, unbound slot is never read —
+      invariant 4). Paced BY CAUSE (a runout the farm could not attribute), never by a
+      timer over a standing verdict, per doctrine rule 6/7.
+
+    Never raises: this runs inside the HMS status callback (invariant 10).
+    """
+    try:
+        from backend.app.services.printer_manager import printer_manager
+
+        printer_manager.request_evidence_pushall(printer_id, "spent_attribution")
+    except Exception:  # noqa: BLE001 — evidence is best-effort; the refusal to stamp already stands
+        logger.debug("[RESPOOL] evidence pushall failed for printer %s", printer_id, exc_info=True)
+    if ams_hint is None:
+        return
+    try:
+        from backend.app.services import ams_presence
+
+        for unit in _iter_ams_units(state):
+            if not isinstance(unit, dict) or int(unit.get("id", -1)) != ams_hint:
+                continue
+            for tray in unit.get("tray", []) or []:
+                if not isinstance(tray, dict):
+                    continue
+                tray_id = tray.get("id")
+                if tray_id is None or tray_presence_from_dict(tray) is not True:
+                    continue
+                ams_presence.open_read_occasion(printer_id, ams_hint, int(tray_id))
+    except Exception:  # noqa: BLE001 — same contract
+        logger.debug("[RESPOOL] read-occasion owing failed for printer %s", printer_id, exc_info=True)
+
+
+def _warn_hint_mismatch(printer_id: int, ams_hint: int | None, resolved_unit: int, source: str) -> None:
+    """Log a disagreement between the trigger's unit hint and the slot-attributed answer.
+
+    Telemetry ONLY — the attr answer stands unconditionally. Slot-attributed wire truth
+    is the firmware naming the exact slot; the hint is a coarser read of a different
+    code's module byte, so when they disagree the hint is what is wrong (or the push
+    carries runouts from two units at once, which is the chained case). Surfacing it is
+    how a systematic misattribution becomes visible instead of silently outvoting
+    nothing. Never raises.
+    """
+    if ams_hint is None or ams_hint == resolved_unit:
+        return
+    logger.warning(
+        "[RESPOOL] runout unit hint disagrees with the firmware's slot attribution on printer %d: "
+        "hint names AMS %d, %s names AMS %d — using the slot attribution (misattribution telemetry)",
+        printer_id,
+        ams_hint,
+        source,
+        resolved_unit,
+    )
+
+
+async def _resolve_exhausted_tray(
+    db: AsyncSession, printer_id: int, state, *, ams_hint: int | None = None
+) -> int | None:
     """Which tray ran out.
 
     Firmware slot attribution is PRIMARY, and within it the CURRENT DEMAND outranks the
@@ -487,6 +629,7 @@ async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> i
        backup-switch / operator reload), falling back to the mapping when ``tray_now``
        is unloaded/unknown (255/None). ``last_loaded_tray`` remains un-consulted (the
        firmware-named slot supersedes it); the multi-feeder fail-safe is unchanged.
+       **Permitted only on an unambiguous topology** — see below.
 
     Step 1 is load-bearing for the CHAINED case. The firmware APPENDS newer faults, so
     the first-hit decode returns the OLDEST slot-attributed entry — after a rescue-then-
@@ -494,6 +637,28 @@ async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> i
     whereupon ``_spent_dedup`` swallows this stamp and the actually-unrescued roll is
     never marked. 006-H2S 2026-07-26 carried exactly that list shape (an older
     auto-switched slot-1 entry ahead of the standing slot-3 demand).
+
+    **``ams_hint`` — the unit the trigger named** (:func:`_ams_hint_from_short_codes`),
+    and the gate on step 3 (spools 185 & 205, printer 12 / H2C, 2026-07-31). That
+    printer runs THREE AMS units behind a dual nozzle, so ``tray_now`` is a bare slot
+    number the client disambiguates with explicitly may-be-wrong fallbacks. Step 3
+    trusted it anyway and stamped two LOADED rolls reading ``remain = 100 %`` as spent
+    with ``weight_used = 0``; they stayed excluded from selection for NINE DAYS. So:
+
+    * steps 1-2 are UNCHANGED — slot-attributed wire truth outranks the hint, which is
+      only a unit. A hint that disagrees with the decoded unit is logged as
+      misattribution telemetry and the attr answer stands;
+    * step 3 runs only when the topology cannot mislead (:func:`_topology_is_ambiguous`:
+      exactly one AMS unit, single nozzle). Otherwise a hinted ``tray_now`` is accepted
+      only when it decodes INTO the hinted unit, and anything else stamps NOTHING —
+      the farm owes evidence instead (:func:`_owe_attribution_evidence`).
+
+    Not stamping is the safe failure and that asymmetry is the entire design: a MISSED
+    stamp self-heals forward (the next runout re-fires, the tagless fresh-roll prompt is
+    the backstop, and the operator's physical swap surfaces it), while a FALSE stamp is
+    permanent — the grams-reconcile deliberately preserves the latch, there is no
+    un-spend lane by operator ruling, and the row is hard-excluded from selection until
+    somebody notices. Never widen step 3 to "guess something rather than nothing".
 
     The ``isinstance`` guard keeps the decode fail-closed on an absent / non-list
     ``hms_errors`` (MagicMock states in tests, a degenerate push in production), so
@@ -504,10 +669,17 @@ async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> i
 
         demanded = current_runout_demand(hms_list)
         if demanded is not None:
+            _warn_hint_mismatch(printer_id, ams_hint, demanded[0], "demand")
             return demanded[0] * 4 + demanded[1]
     decoded = _runout_slot_global_tray(state)
     if decoded is not None:
+        _warn_hint_mismatch(printer_id, ams_hint, decoded // 4, "attr decode")
         return decoded
+
+    # --- step 3: inference, and the topology gate on it ---------------------
+    from backend.app.services.printer_manager import printer_manager
+
+    ambiguous = _topology_is_ambiguous(state, printer_manager.get_client(printer_id))
     result = await db.execute(
         select(PrintQueueItem)
         .join(PrintBatch, PrintQueueItem.batch_id == PrintBatch.id)
@@ -523,6 +695,11 @@ async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> i
     item = result.scalar_one_or_none()
     tray_now = getattr(state, "tray_now", None)
     live_ok = tray_now is not None and 0 <= tray_now <= 254
+
+    # The inference itself is UNCHANGED — it is computed once here so the topology
+    # gate below applies to every one of its outcomes rather than to some of them.
+    candidate: int | None = None
+    mapped = False
     if item and item.ams_mapping:
         try:
             mapping = json.loads(item.ams_mapping)
@@ -532,17 +709,44 @@ async def _resolve_exhausted_tray(db: AsyncSession, printer_id: int, state) -> i
         if len(feeders) == 1:
             # Single-feeder farm job: the live feeding tray is authoritative; the
             # mapping is only a fallback for an unloaded/unknown tray_now.
-            return tray_now if live_ok else feeders[0]
-        if feeders:
+            candidate, mapped = (tray_now if live_ok else feeders[0]), True
+        elif feeders:
             # Multi-filament job: the mapping alone can't say WHICH feeder ran
             # out. Trust the live tray_now only when it is one of the job's
             # feeders; otherwise mark nothing (fail-safe — a wrong spent stamp
             # would auto-reset a half-full spool to fresh on its next arrival).
-            if tray_now is not None and tray_now in feeders:
-                return tray_now
-            return None
-    if tray_now is not None and 0 <= tray_now <= 254:
-        return tray_now
+            candidate, mapped = (tray_now if tray_now is not None and tray_now in feeders else None), True
+    if not mapped and live_ok:
+        candidate = tray_now
+
+    if candidate is None:
+        return None
+    if not ambiguous:
+        return candidate
+    # AMBIGUOUS topology: `tray_now` is a bare slot the client had to guess a unit
+    # for, so the inference is admissible only where the firmware's own unit hint
+    # corroborates it. `candidate // 4` is the decoded unit for a regular AMS global
+    # id; AMS-HT (>=128) and the external sentinels carry no unit to corroborate and
+    # so can never clear this gate.
+    if ams_hint is not None and 0 <= candidate <= 127 and candidate // 4 == ams_hint:
+        logger.info(
+            "[RESPOOL] runout attribution on printer %d: tray_now-derived tray %d decodes into the "
+            "firmware-hinted AMS %d — accepting on an ambiguous topology",
+            printer_id,
+            candidate,
+            ams_hint,
+        )
+        return candidate
+    logger.warning(
+        "[RESPOOL] runout attribution ambiguous (multi-AMS/dual-nozzle) — not stamping; owe evidence "
+        "(printer %d, inferred tray %s, firmware AMS hint %s). tray_now is a bare slot on this "
+        "topology and the firmware named no slot, so a stamp here would be a guess — and a false "
+        "spent stamp is permanent (spools 185/205, 2026-07-31), while a missed one self-heals.",
+        printer_id,
+        candidate,
+        "none" if ams_hint is None else ams_hint,
+    )
+    _owe_attribution_evidence(printer_id, state, ams_hint)
     return None
 
 
@@ -639,11 +843,18 @@ def note_status_push(printer_id: int, state) -> None:
 async def mark_spent_on_runout(db: AsyncSession, printer_id: int, new_short_codes, state) -> Spool | None:
     """Tier 1: a NEW runout HMS code stamps spent_at on the exhausted tray's spool.
 
-    Resolves the exhausted tray via the dispatched farm ``ams_mapping`` (the
-    deterministic feeding tray) falling back to the live ``tray_now``. Idempotent:
-    re-observing the code is a no-op once spent_at is set. No-op in Spoolman mode.
-    Skips a restart-replayed runout (a code seeded live at the first push — see
-    :func:`note_status_push`) so a swapped-in fresh spool is never mis-stamped.
+    Resolves the exhausted tray via :func:`_resolve_exhausted_tray` — firmware slot
+    attribution first, the dispatched farm ``ams_mapping`` / live ``tray_now`` only as
+    inference. Idempotent: re-observing the code is a no-op once spent_at is set. No-op
+    in Spoolman mode. Skips a restart-replayed runout (a code seeded live at the first
+    push — see :func:`note_status_push`) so a swapped-in fresh spool is never
+    mis-stamped.
+
+    The TRIGGERING codes carry one more fact than the vocabulary check consumes: their
+    module half names the AMS unit (``07XX_8011`` → unit XX; the extruder-module
+    ``0300_8004`` names none). That unit is passed down as ``ams_hint`` and is what
+    gates the inference tier on a printer whose ``tray_now`` is a bare slot number —
+    the 185/205 misattribution class. See :func:`_resolve_exhausted_tray`.
     """
     if await _spoolman_enabled(db):
         return None
@@ -662,7 +873,7 @@ async def mark_spent_on_runout(db: AsyncSession, printer_id: int, new_short_code
             sorted(triggering & seeded),
         )
         return None
-    global_tray = await _resolve_exhausted_tray(db, printer_id, state)
+    global_tray = await _resolve_exhausted_tray(db, printer_id, state, ams_hint=_ams_hint_from_short_codes(triggering))
     if global_tray is None:
         return None
     # Incident dedup: one spent stamp per (printer, job, tray). A re-raised runout
@@ -702,6 +913,12 @@ async def mark_spent_on_slot_runout(db: AsyncSession, printer_id: int, events, s
     constant for why the bare demand (0x00020001) is NOT spent evidence: 006-H2S proved
     firmware can latch a bogus demand for a slot that never ran dry, and a demand-driven
     stamp would have archived a healthy roll.
+
+    **This trigger needs no topology gate.** Attribution is `runout_slot_from_hms(attr,
+    code_word)` and NOTHING else: an entry whose attr does not decode to a real slot is
+    skipped outright, so there is no path from here into ``_resolve_exhausted_tray``'s
+    ``tray_now`` inference and none into the 185/205 misattribution class. Keep it that
+    way — the moment this loop gains a fallback it inherits the same gate.
 
     Returns the spools stamped by THIS call (empty when nothing qualified). No-op in
     Spoolman mode; skips S1 restart replays; delegates the stamp itself to the shared
@@ -780,9 +997,122 @@ def _update_stable_feeder(printer_id: int, current: int) -> None:
         _stable_feeder[printer_id] = current
 
 
-def _resolve_pending_swap(printer_id: int, current: int, running: bool) -> int | None:
-    """Resolve an open pending backup swap against the current push; returns the
-    DEPARTED global tray when it confirms, else ``None``.
+# Last-seen firmware auto-refill BACKUP GROUPS per printer, as membership lists.
+# Refreshed by the per-push sampler whenever a push carries the field and left standing
+# when it does not: firmware clears and refills `filam_bak` on every report it appears
+# in, but `bambu_mqtt` preserves only ams / vt_tray / ams_extruder_map / mapping across
+# raw_data replacement, so an incremental push that omits it would otherwise read as
+# "no groups". Machine-scoped, NOT AMS-scoped — the field is top-level or per-EXTRUDER
+# on the wire, never per AMS unit (see `tray_fields.parse_filam_bak`). Process-lifetime
+# like the other edge dicts; a restart simply re-learns it from the next push carrying
+# one, and until then the corroboration below fails safe.
+_filam_bak_groups: dict[int, list[list[int]]] = {}
+
+
+def _note_filam_bak(printer_id: int, state) -> None:
+    """Refresh the cached backup groups from this push, if it carries any.
+
+    Sync, pure in-memory, no DB and no awaits — it rides :func:`sample_status_push` on
+    the ~1 Hz status callback. Reads BOTH wire shapes and keeps each as its OWN group,
+    because "same group" is the question the corroboration asks: the flat machine-level
+    ``print.filam_bak`` is one group, and each entry of
+    ``print.device.extruder.info[]`` is a separate one (a dual-nozzle machine's two
+    nozzles do not back each other up). A push carrying neither leaves the cache alone.
+    """
+    raw = getattr(state, "raw_data", None)
+    if not isinstance(raw, dict):
+        return
+    groups: list[list[int]] = []
+    flat = parse_filam_bak(raw)
+    if flat is not None:
+        groups.append(flat)
+    device = raw.get("device")
+    extruder = device.get("extruder") if isinstance(device, dict) else None
+    info = extruder.get("info") if isinstance(extruder, dict) else None
+    if isinstance(info, list):
+        for entry in info:
+            per_extruder = parse_filam_bak(entry)
+            if per_extruder is not None:
+                groups.append(per_extruder)
+    if groups:
+        _filam_bak_groups[printer_id] = groups
+
+
+def _backup_swap_corroborated(printer_id: int, departed: int, arrived: int) -> bool | None:
+    """Do the departed feeder and its replacement sit in ONE firmware backup group?
+
+    ``True`` / ``False`` when grouping evidence exists, ``None`` when it does not (no
+    push has ever carried ``filam_bak`` for this printer). The caller treats ``None``
+    and ``False`` alike — no stamp — but they are different facts and the log says which.
+
+    Both trays must appear in the SAME list. That is the literal meaning of a backup
+    group: the firmware switched from one enrolled tray to another enrolled tray, which
+    is the auto-refill it performs precisely because the first ran dry. A feeder change
+    ACROSS groups is something else (a tool change, a dispatch remap) and must never
+    spend a spool.
+
+    Encoding safety: ``departed``/``arrived`` are global tray ids, and `filam_bak`'s own
+    encoding is unconfirmed. If it turns out to be per-unit slot ids, every tray outside
+    AMS 0 has a global id ≥ 4 that no slot id can equal, so this returns ``False`` and we
+    decline to stamp. The unconfirmed reading can therefore only cost a stamp, never
+    fabricate one — which is the direction this whole workstream fails in.
+    """
+    groups = _filam_bak_groups.get(printer_id)
+    if not groups:
+        return None
+    return any(departed in group and arrived in group for group in groups)
+
+
+def _swap_stamp_permitted(printer_id: int, state, departed: int, arrived: int) -> bool:
+    """May a confirmed feeder departure stamp the departed spool spent?
+
+    On an UNAMBIGUOUS topology (one AMS unit, single nozzle) — yes, unchanged: the
+    stable-feeder machinery above is the whole gate and ``tray_now`` means exactly what
+    it says.
+
+    On an ambiguous one (several AMS units, or a dual nozzle) ``tray_now`` is a bare slot
+    the client had to guess a unit for, so a "departure" can be an artefact of that guess
+    rather than a roll running dry — the same inference that stamped spools 185 and 205
+    spent while they sat loaded and full. There the firmware's OWN backup grouping has to
+    corroborate it: if it did not have both trays enrolled together, it did not perform an
+    auto-refill between them, and there is no run-dry to record.
+
+    Declining costs one stamp and keeps two backstops (the fat-remainder WARNING in
+    :func:`_mark_tray_spent` and the tagless fresh-roll prompt at the operator's physical
+    swap). Stamping wrongly costs a healthy roll, permanently. Sync and never raises —
+    it runs inside the status callback (invariant 10).
+    """
+    try:
+        from backend.app.services.printer_manager import printer_manager
+
+        if not _topology_is_ambiguous(state, printer_manager.get_client(printer_id)):
+            return True
+    except Exception:  # noqa: BLE001 — an unreadable topology is an ambiguous one
+        logger.debug("[RESPOOL] topology probe failed for printer %s", printer_id, exc_info=True)
+    corroborated = _backup_swap_corroborated(printer_id, departed, arrived)
+    if corroborated:
+        return True
+    logger.warning(
+        "[RESPOOL] backup-swap spent stamp declined on printer %d (tray %d -> %d): ambiguous topology "
+        "(multi-AMS/dual-nozzle) and the firmware's backup grouping %s. tray_now is a bare slot here, so "
+        "the departure alone is not evidence a roll ran dry — the fat-remainder warning and the "
+        "fresh-roll prompt remain the backstops.",
+        printer_id,
+        departed,
+        arrived,
+        "does not pair these trays" if corroborated is False else "was never reported",
+    )
+    return False
+
+
+def _resolve_pending_swap(printer_id: int, current: int, running: bool) -> tuple[int, int] | None:
+    """Resolve an open pending backup swap against the current push; returns
+    ``(departed, arrived)`` global trays when it confirms, else ``None``.
+
+    The ARRIVED tray is carried out alongside the departed one because the corroboration
+    gate (:func:`_swap_stamp_permitted`) asks about the PAIR — "did the firmware switch
+    between two trays it had grouped?" — and this is the only place both halves of the
+    edge are known.
 
     CONFIRM the departed tray as run-dry when the new tray has fed stably for
     ``_SWAP_CONFIRM_S`` with the print still RUNNING and tray_now not returned to the
@@ -814,7 +1144,7 @@ def _resolve_pending_swap(printer_id: int, current: int, running: bool) -> int |
         return None
     if _monotonic() - opened_ts >= _SWAP_CONFIRM_S:
         _pending_swaps.pop(printer_id, None)
-        return prev
+        return (prev, cur)
     if current != cur:
         _pending_swaps.pop(printer_id, None)  # moved off `cur` before confirming → transient
         return None
@@ -847,6 +1177,11 @@ def sample_status_push(printer_id: int, state) -> list[int]:
     current = getattr(state, "tray_now", 255)
     running = getattr(state, "state", None) == "RUNNING"
 
+    # Learn the firmware's backup grouping from this push while we are here — it is the
+    # corroboration the ambiguous-topology gate below needs, and this is the only lane
+    # that sees every push. Cheap and unconditional: a push without the field is a no-op.
+    _note_filam_bak(printer_id, state)
+
     # Belt-and-braces cross-job discard (2026-07-20). The primary guard is the
     # job-boundary reset hooked into main.on_print_start / on_print_complete; this
     # covers a missed or lagging hook. Edge state sampled under a DIFFERENT subtask_id
@@ -865,8 +1200,15 @@ def sample_status_push(printer_id: int, state) -> list[int]:
     # list because the caller's contract is uniform, never because one push can carry
     # two: a swap opened on this push can only confirm on a LATER one (the window is
     # checked against ``opened_ts``), so at most one tray departs per call.
-    departed = _resolve_pending_swap(printer_id, current, running)
-    confirmed: list[int] = [] if departed is None else [departed]
+    #
+    # A confirmed edge still has to clear the topology gate: on a printer where
+    # ``tray_now`` is a bare slot number the edge may be an artefact of the client's
+    # unit guess rather than a roll running dry, and only the firmware's own backup
+    # grouping can tell the two apart (:func:`_swap_stamp_permitted`).
+    resolved = _resolve_pending_swap(printer_id, current, running)
+    confirmed: list[int] = []
+    if resolved is not None and _swap_stamp_permitted(printer_id, state, resolved[0], resolved[1]):
+        confirmed.append(resolved[0])
 
     prev = _last_tray_now.get(printer_id)
     _last_tray_now[printer_id] = current
@@ -925,6 +1267,12 @@ async def confirm_backup_swaps(
     ``session_factory`` exists so a caller can supply the session maker; ``None`` means
     the application's :data:`core.database.async_session` (imported lazily, matching the
     other own-session services).
+
+    Every DECISION about whether a departure deserves a stamp — the commanded-load
+    suppression, the stable-feeder requirement, the job boundary, and since 2026-08-09
+    the ambiguous-topology corroboration (:func:`_swap_stamp_permitted`) — belongs to
+    the sampler, which is the only half that sees both ends of the edge and the live
+    push. This half stamps what it is handed.
     """
     if not departed_trays:
         return []
@@ -969,6 +1317,227 @@ async def capture_backup_swap(db: AsyncSession, printer_id: int, state) -> Spool
         if spool is not None:
             return spool
     return None
+
+
+# --- the spent-contradiction detector ---------------------------------------
+#
+# A spent stamp is a one-way door. `_mark_tray_spent` deliberately leaves the gram
+# ledger intact so a false stamp is losslessly reversible IN PRINCIPLE, but by operator
+# ruling there is no un-spend LANE: the fix for a false stamp is to stop producing them
+# (D1 above), never to build machinery that clears them. Meanwhile a spent row is
+# hard-excluded from selection (`spool_selection.SlotInventory.spent`) and dropped by
+# `filament_deficit`, so the roll silently leaves service.
+#
+# Nothing compared the stamp against the wire. Spools 185 and 205 (printer 12, an H2C
+# with three AMS units behind a dual nozzle) were stamped spent on 2026-07-31 with
+# `weight_used = 0` while their trays kept reporting LOADED at `remain = 100 %`. Nine
+# days. This detector is what makes that class LOUD within minutes: it reads both facts
+# every reconcile pass and reports the disagreement.
+#
+# It NEVER writes a spool row — not the stamp, not the grams, not the archive flag. Its
+# entire output is a WARNING plus one notification. That restraint is the design: an
+# automatic correction here would be a second guess layered on the first, and the roll
+# the ledger describes may genuinely be gone (an operator can seat a DIFFERENT roll of
+# the same colour in the same slot). A human settles it.
+
+# Durable notify scope. Its own key space, deliberately not the printer-HMS one: an HMS
+# key is `{printer_id}:{full_code}` and records "we alerted on this fault", while these
+# are keyed by SPOOL and record "we reported this row's stamp as contradicted". Sharing
+# a scope would let an HMS prune or an HMS window silently govern this lane.
+_SPENT_CONTRADICTION_SCOPE = "spent_contradiction"
+
+# Wire remain% at or above which a still-seated spent roll is a CONTRADICTION rather
+# than ordinary end-of-roll drift. 30 points of label is the margin the respool
+# remain-jump already treats as far above AMS quantization noise
+# (:data:`_RESPOOL_REMAIN_JUMP_PCT`) — a roll that truly ran dry does not read a third
+# full, whatever the ledger says.
+_SPENT_CONTRADICTION_MIN_REMAIN_PCT = 30
+
+# The contradiction is a STANDING state: it re-derives identically on every pass until
+# a human resolves it, so the re-notify window is long. Seven days keeps a genuinely
+# ignored contradiction from going silent forever while never becoming a nag.
+_SPENT_CONTRADICTION_RENOTIFY_S = 7 * 24 * 3600.0
+
+# Floor between detector passes. The reconcile tick that hosts it runs every ~20 s and
+# this lane walks every spent binding in the fleet plus a durable ledger read per hit —
+# far too expensive for that cadence, and pointless at it (a contradiction that has
+# stood for nine days does not need sub-minute detection). Mirrors
+# ``spool_tagless._last_reconcile_at``: one module-level stamp, no other memory, so the
+# pass stays restart-safe and re-derived.
+_SPENT_CONTRADICTION_MIN_INTERVAL_S = 900.0
+_last_contradiction_scan_at: float | None = None
+
+
+def _wire_remain_pct(tray: dict) -> int | None:
+    """The tray's AMS ``remain`` as a usable percentage, or ``None``.
+
+    ONE parse discipline for the whole module: an integer 1..100 is a reading, and
+    everything else is "no reading" — ``0`` and ``-1`` are firmware's own no-value
+    sentinels (a tagless tray always reports ``-1``, doctrine rule 8), an absent key
+    says nothing, and garbage is not a number. Consumed by the respool prompt payload,
+    the remain-jump margin and the spent-contradiction detector, which must never
+    disagree about whether the wire said anything at all.
+    """
+    try:
+        remain = int(tray.get("remain"))
+    except (TypeError, ValueError):
+        return None
+    return remain if 1 <= remain <= 100 else None
+
+
+def _binding_identity_holds(spool: Spool, tray: dict) -> bool:
+    """Is the roll in this tray the SAME one the binding claims — as far as it can tell?
+
+    TAGGED binding (the row carries a tag or a uuid): identity is RFID, read under the
+    sibling-tag law. ``tray_uuid`` IS the spool identity and ``tag_uid`` is a read of
+    one of the roll's two chips, so uuid agreement settles it even across an apparent
+    tag change (doctrine rule 10, false-alarm shape 20), and a tag match is equally
+    conclusive when the push carried no uuid. Disagreement on both = a different roll,
+    which is not a contradiction at all — it is an ordinary swap the binding has not
+    caught up with.
+
+    UNTAGGED binding: no RFID to compare, so the codebase's existing fingerprint idiom
+    (``spool_tagless.fingerprint_matches`` — canonical material plus colour within
+    tolerance) is the only available test. It is deliberately weak evidence: a different
+    roll of the same filament passes it. That is tolerable here and ONLY here, because
+    this detector's whole output is a warning a human reads — the same-core ambiguity
+    that bars a tagless no-tag read from CONCLUDING anything in ``slot_state`` would bar
+    this too if it mutated a row. It does not.
+    """
+    spool_uuid = normalized_tray_uuid(spool.tray_uuid)
+    spool_tag = normalized_tag_uid(spool.tag_uid)
+    if spool_uuid is not None or spool_tag is not None:
+        tray_uuid = normalized_tray_uuid(tray.get("tray_uuid"))
+        tray_tag = normalized_tag_uid(tray.get("tag_uid"))
+        return (spool_uuid is not None and spool_uuid == tray_uuid) or (spool_tag is not None and spool_tag == tray_tag)
+    from backend.app.services.spool_tagless import fingerprint_matches
+
+    return fingerprint_matches(spool, tray)
+
+
+async def detect_spent_contradictions(db: AsyncSession, manager=None, *, now: float | None = None) -> int:
+    """Report every spool whose SPENT stamp the wire currently contradicts.
+
+    A contradiction is all four of: the row is spent and not archived; it still holds a
+    live :class:`SpoolAssignment`; that slot's live tray reads PRESENT with the SAME
+    bound identity (:func:`_binding_identity_holds`); and the wire reports it at least
+    :data:`_SPENT_CONTRADICTION_MIN_REMAIN_PCT` full. Returns how many were found.
+
+    **It never writes a spool row.** See the section comment above for why an automatic
+    correction is the wrong answer. The only durable write on this path is the notify
+    dedup ledger entry, so that a standing contradiction alerts once per
+    :data:`_SPENT_CONTRADICTION_RENOTIFY_S` instead of on every pass — the state
+    re-derives identically forever, which is exactly what a durable window is for (the
+    in-memory :func:`notify_dedup.allow` gate would re-blast the fleet at every deploy,
+    the failure that made the HMS lane durable in the first place).
+
+    Throttled to :data:`_SPENT_CONTRADICTION_MIN_INTERVAL_S` because its host tick runs
+    ~45× faster than this walk is worth. ``manager``/``now`` are injectable for tests.
+
+    FULLY self-guarding (invariant 10), at two levels: per row, so one unreadable
+    printer cannot abort the sweep, and around the whole sweep, so nothing here can kill
+    the scheduler-tick lane it hangs off. That is what lets the call site be a bare line
+    with no try/except of its own — this is an entry hook, and an entry hook owns its
+    own guard.
+    """
+    global _last_contradiction_scan_at
+
+    now = _monotonic() if now is None else now
+    if _last_contradiction_scan_at is not None and (now - _last_contradiction_scan_at) < (
+        _SPENT_CONTRADICTION_MIN_INTERVAL_S
+    ):
+        return 0
+    _last_contradiction_scan_at = now
+
+    if await _spoolman_enabled(db):
+        return 0  # Spoolman owns the spool lifecycle; the farm's spent stamp is not the truth there
+
+    if manager is None:
+        from backend.app.services.printer_manager import printer_manager
+
+        manager = printer_manager
+
+    try:
+        return await _scan_spent_contradictions(db, manager)
+    except Exception:  # noqa: BLE001 — an entry hook owns its guard; the tick must survive
+        logger.exception("Spent-contradiction sweep failed (non-fatal)")
+        return 0
+
+
+async def _scan_spent_contradictions(db: AsyncSession, manager) -> int:
+    """The sweep :func:`detect_spent_contradictions` throttles and guards. See it."""
+    from backend.app.services import notify_dedup
+    from backend.app.services.notification_service import notification_service
+    from backend.app.services.spool_recovery import runout_slot_desc
+
+    result = await db.execute(
+        select(SpoolAssignment)
+        .options(selectinload(SpoolAssignment.spool))
+        .join(Spool, SpoolAssignment.spool_id == Spool.id)
+        .where(Spool.spent_at.is_not(None), Spool.archived_at.is_(None))
+    )
+    found = 0
+    for assignment in result.scalars().all():
+        spool = assignment.spool
+        if spool is None:
+            continue
+        try:
+            state = manager.get_status(assignment.printer_id)
+            tray = _resolve_live_tray(state, assignment.ams_id, assignment.tray_id)
+            if not tray or tray_presence_from_dict(tray) is not True:
+                continue  # gone or unknown — a binding whose roll left is a RELEASE question, not this one
+            remain = _wire_remain_pct(tray)
+            if remain is None or remain < _SPENT_CONTRADICTION_MIN_REMAIN_PCT:
+                continue
+            if not _binding_identity_holds(spool, tray):
+                continue  # a DIFFERENT roll is in the slot — ordinary swap, nothing contradicted
+            found += 1
+            ledger_remaining = float(spool.label_weight or 0) - float(spool.weight_used or 0)
+            logger.warning(
+                "[RESPOOL] SPENT-CONTRADICTION: spool %d is stamped spent (%s) but is still seated on "
+                "printer %d AMS%d-T%d reading %d%% full on the wire, while the ledger claims %.0f g of "
+                "%.0f g left. A spent row is excluded from every print, so this roll is out of service. "
+                "Nothing was changed — spent stamps are never cleared automatically.",
+                spool.id,
+                spool.spent_at.isoformat() if spool.spent_at else "?",
+                assignment.printer_id,
+                assignment.ams_id,
+                assignment.tray_id,
+                remain,
+                ledger_remaining,
+                float(spool.label_weight or 0),
+            )
+            key = f"spool:{spool.id}"
+            last = await notify_dedup.last_sent_at(db, _SPENT_CONTRADICTION_SCOPE, key)
+            if last is not None and (datetime.utcnow() - last).total_seconds() < _SPENT_CONTRADICTION_RENOTIFY_S:
+                continue
+            printer = await db.get(Printer, assignment.printer_id)
+            global_tray = assignment.ams_id * 4 + assignment.tray_id
+            await notification_service.on_spent_contradiction(
+                assignment.printer_id,
+                (printer.name if printer is not None else None) or f"Printer {assignment.printer_id}",
+                spool.id,
+                _spool_label(spool),
+                runout_slot_desc(global_tray) or f"AMS{assignment.ams_id}-T{assignment.tray_id}",
+                remain,
+                db,
+            )
+            await notify_dedup.record_sent(db, _SPENT_CONTRADICTION_SCOPE, key)
+        except Exception:  # noqa: BLE001 — one bad row must not abort the sweep
+            logger.exception(
+                "Spent-contradiction check failed for spool %s on printer %s AMS%s-T%s",
+                spool.id,
+                assignment.printer_id,
+                assignment.ams_id,
+                assignment.tray_id,
+            )
+    return found
+
+
+def _spool_label(spool: Spool) -> str:
+    """Short human name for a spool in operator copy ("Bambu Lab PETG Green")."""
+    parts = [(spool.brand or "").strip(), (spool.material or "").strip(), (spool.color_name or "").strip()]
+    return " ".join(p for p in parts if p) or f"spool #{spool.id}"
 
 
 # --- Tier 2 / 3: automatic re-spool or prompt ------------------------------
@@ -1071,15 +1640,9 @@ async def _build_respool_prompt_payload(
     spent_at_iso = spent_at.isoformat() if spent_at is not None else None
     spent_age_s = max(0.0, (datetime.utcnow() - spent_at).total_seconds()) if spent_at is not None else None
 
-    # AMS live tray remain %, 1..100 or None — the same parse discipline
-    # :func:`_remain_jump_reading` uses (integer %, out-of-range / garbage → None).
-    ams_remain_pct: int | None = None
-    try:
-        remain_val = int(tray.get("remain"))
-    except (TypeError, ValueError):
-        remain_val = None
-    if remain_val is not None and 1 <= remain_val <= 100:
-        ams_remain_pct = remain_val
+    # AMS live tray remain %, 1..100 or None — through the module's ONE parse
+    # discipline, shared with the remain-jump margin and the contradiction detector.
+    ams_remain_pct = _wire_remain_pct(tray)
 
     # Ledger-implied remaining %, clamped at 0 like _remain_jump_reading's ledger_pct.
     label_weight = donor.label_weight or 0
@@ -1111,6 +1674,16 @@ async def _build_respool_prompt_payload(
         "ams_remain_pct": ams_remain_pct,
         "ledger_remain_pct": ledger_remain_pct,
         "bound_since": bound_since,
+        # Is this row's gram ledger PHYSICALLY IMPOSSIBLE (weight_used past the label)?
+        # The Tier-3 branch already refuses to prompt on such a row, but the SPENT branch
+        # must still ask — a spent+loaded spool deserves the question whatever the ledger
+        # says — and it was asking it while quoting the garbage: prod prompts announced
+        # "remaining −792.9 g". So the prompt stands and the NUMBERS are withdrawn. The
+        # flag rides the payload rather than a pre-formatted string because the copy is
+        # composed frontend-side and i18n'd there; `donor_remaining_g` and
+        # `ledger_remain_pct` stay in the payload unchanged (the modal clamps them, and
+        # dropping fields from a frozen contract would break the replay path).
+        "ledger_unreliable": _ledger_corrupt(donor),
     }
 
 
@@ -1137,13 +1710,23 @@ async def _broadcast_respool_prompt(
     # slot_pipeline.broadcast_unknown_tag so a failed push retries on the next tick).
     await ws_manager.broadcast(payload)
     per_printer[slot_key] = tag_key
+    # An impossible ledger row must not have its "remaining" ASSERTED, here or in the
+    # operator copy: a negative remaining is not a small number, it is a broken record,
+    # and quoting it as fact is how the log stopped being triage evidence. State the
+    # inputs instead, so the row can be found and repaired.
+    remaining_desc = (
+        f"remaining={payload['donor_remaining_g']:.1f}g"
+        if not payload["ledger_unreliable"]
+        else f"remaining=UNRELIABLE (used {float(donor.weight_used or 0):.1f}g of a "
+        f"{float(donor.label_weight or 0):.1f}g label)"
+    )
     logger.info(
-        "respool_prompt broadcast: printer=%d AMS=%d slot=%d donor=%d remaining=%.1fg trigger=%s",
+        "respool_prompt broadcast: printer=%d AMS=%d slot=%d donor=%d %s trigger=%s",
         printer_id,
         ams_id,
         tray_id,
         donor.id,
-        payload["donor_remaining_g"],
+        remaining_desc,
         payload["trigger"],
     )
 
@@ -1413,11 +1996,8 @@ def remain_jump_margin(spool: Spool, tray: dict) -> float | None:
     label_weight = spool.label_weight or 0
     if label_weight <= 0:
         return None
-    try:
-        remain = int(tray.get("remain"))
-    except (TypeError, ValueError):
-        return None
-    if not (1 <= remain <= 100):
+    remain = _wire_remain_pct(tray)
+    if remain is None:
         return None
     ledger_pct = max(0, label_weight - (spool.weight_used or 0)) / label_weight * 100
     return remain - ledger_pct

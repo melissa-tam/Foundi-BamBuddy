@@ -525,6 +525,19 @@ export function useWebSocket() {
             donor_remaining_g: m.donor_remaining_g,
             brand_prefill: m.brand_prefill,
             label_weight_prefill: m.label_weight_prefill,
+            // Trigger + provenance. These were enumerated out of the bridge when the
+            // backend gained them, so the toast never saw a `trigger` and fell to the
+            // "reused tag" copy for EVERY prompt — including the near-empty and spent
+            // cases whose whole point was to stop claiming a reused tag. Forwarded
+            // explicitly rather than by spread: the bridge deliberately re-states the
+            // contract so a backend field cannot leak into the UI unreviewed.
+            trigger: m.trigger,
+            spent_at: m.spent_at,
+            spent_age_s: m.spent_age_s,
+            ams_remain_pct: m.ams_remain_pct,
+            ledger_remain_pct: m.ledger_remain_pct,
+            bound_since: m.bound_since,
+            ledger_unreliable: m.ledger_unreliable,
           },
         }));
         break;

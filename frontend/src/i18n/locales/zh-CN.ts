@@ -4582,6 +4582,7 @@ export default {
       nearEmptyToast: '{{printer}} 槽位 {{slot}} 的料卷快用完了——是否要更换此卷？',
       spentToast: '{{printer}} 槽位 {{slot}}：此料卷在 {{age}} 前被断料信号标记为空，但仍处于装载状态。',
       spentToastNumbers: 'AMS 报告约剩 {{ams}}%，但记录显示为 {{ledger}}%。',
+      ledgerUnreliable: '该料盘的用量记录不可能成立（用量超过标称重量），因此任何剩余量数值都不可信。',
       nearEmptyToastRemaining: '还剩 {{remaining}} 克。',
       nearEmptyTitle: '是否要更换此卷？',
       nearEmptyMessage: '{{location}} 的料卷快用完了。如果刚换上新卷，请在此记录以保持耗材跟踪准确。',

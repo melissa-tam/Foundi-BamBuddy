@@ -4584,6 +4584,7 @@ export default {
       nearEmptyToast: '{{printer}} yuva {{slot}} makarası neredeyse boş — bu rulo değiştiriliyor mu?',
       spentToast: '{{printer}} yuva {{slot}}: bu makara {{age}} önce filament bitti sinyaliyle boş olarak işaretlendi, ancak hâlâ takılı.',
       spentToastNumbers: 'AMS ~{{ams}}% kaldığını bildiriyor; kayıtlar {{ledger}}% diyor.',
+      ledgerUnreliable: 'Bu makaranın kullanım kaydı imkânsız (etiketten fazla kullanılmış), bu yüzden kalan miktar değeri güvenilir değil.',
       nearEmptyToastRemaining: '{{remaining}} g kaldı.',
       nearEmptyTitle: 'Bu rulo değiştiriliyor mu?',
       nearEmptyMessage: '{{location}} konumundaki makara neredeyse boş. Az önce üzerine yeni bir rulo taktıysanız, filament takibinin doğru kalması için burada kaydedin.',

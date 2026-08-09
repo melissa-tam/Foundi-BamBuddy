@@ -2252,6 +2252,60 @@ class NotificationService:
             variables=variables,
         )
 
+    async def on_spent_contradiction(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        spool_id: int,
+        spool_label: str,
+        slot: str,
+        remain: int,
+        db: AsyncSession,
+    ):
+        """Fire when a spool the ledger calls SPENT is still seated and reads full.
+
+        The two facts cannot both be true, and the farm ACTS on the ledger: a spent row
+        is hard-excluded from selection (``spool_selection.SlotInventory.spent``), so a
+        false spent stamp silently retires a healthy roll. Spools 185 and 205 sat that
+        way for nine days on printer 12 — stamped spent with ``weight_used = 0`` while
+        their trays read LOADED at ``remain = 100 %`` — because nothing in the farm ever
+        compared the stamp against the wire.
+
+        Its own event rather than a reuse of the respool prompt: that prompt asks the
+        operator to DO something (move a tag onto a fresh roll), while this one reports
+        a data contradiction with no safe automatic answer. The detector never mutates
+        the row — there is no un-spend lane by operator ruling, and inventing one here
+        would replace a visible wrong stamp with an invisible one.
+
+        One-shot per re-notify window — the caller (``spool_respool``) owns the durable
+        dedup, because the contradiction is a STANDING state that re-derives on every
+        reconcile pass.
+        """
+        providers = await self._get_providers_for_event(db, "on_spent_contradiction", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "spool_id": str(spool_id),
+            "spool_label": spool_label,
+            "slot": slot,
+            "remain": str(remain),
+        }
+
+        title, message = await self._build_message_from_template(db, "spent_contradiction", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "spent_contradiction",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
     async def on_storage_low(
         self,
         printer_id: int | None,

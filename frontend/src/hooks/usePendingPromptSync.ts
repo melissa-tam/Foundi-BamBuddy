@@ -70,6 +70,16 @@ export function usePendingPromptSync(): void {
               donor_remaining_g: m.donor_remaining_g,
               brand_prefill: m.brand_prefill,
               label_weight_prefill: m.label_weight_prefill,
+              // Same field set the live WS bridge forwards — the REST replay must
+              // produce a byte-identical prompt or a reconnect would silently change
+              // the copy the operator sees.
+              trigger: m.trigger,
+              spent_at: m.spent_at,
+              spent_age_s: m.spent_age_s,
+              ams_remain_pct: m.ams_remain_pct,
+              ledger_remain_pct: m.ledger_remain_pct,
+              bound_since: m.bound_since,
+              ledger_unreliable: m.ledger_unreliable,
             },
           }),
         );

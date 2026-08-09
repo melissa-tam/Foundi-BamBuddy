@@ -4611,6 +4611,7 @@ export default {
       nearEmptyToast: 'Spool almost empty on {{printer}} slot {{slot}} — replacing this roll?',
       spentToast: '{{printer}} slot {{slot}}: this spool was marked empty {{age}} ago by a runout signal, but it is still seated.',
       spentToastNumbers: 'AMS reports ~{{ams}}% left; records say {{ledger}}%.',
+      ledgerUnreliable: "This spool's usage record is impossible (more used than the label), so no remaining figure can be trusted.",
       nearEmptyToastRemaining: '{{remaining}} g left.',
       nearEmptyTitle: 'Replacing this roll?',
       nearEmptyMessage: 'The spool at {{location}} is almost empty. If you have just put a fresh roll on it, record it here so filament tracking stays accurate.',

@@ -4594,6 +4594,7 @@ export default {
       nearEmptyToast: '{{printer}} スロット {{slot}} のスプールがほぼ空です — このロールを交換しますか？',
       spentToast: '{{printer}} スロット {{slot}}：このスプールは{{age}}前にフィラメント切れ信号で空とマークされましたが、まだ装填されています。',
       spentToastNumbers: 'AMS は残り約 {{ams}}% と報告していますが、記録では {{ledger}}% です。',
+      ledgerUnreliable: 'このスプールの使用記録は不整合です（ラベル重量を超える使用量）。残量の数値は信頼できません。',
       nearEmptyToastRemaining: '残り {{remaining}} g。',
       nearEmptyTitle: 'このロールを交換しますか？',
       nearEmptyMessage: '{{location}} のスプールはほぼ空です。新しいロールに付け替えたばかりの場合は、フィラメント追跡を正確に保つためにここに記録してください。',
