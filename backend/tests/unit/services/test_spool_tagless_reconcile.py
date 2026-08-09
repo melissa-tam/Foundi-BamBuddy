@@ -87,15 +87,23 @@ class _FakeClient:
 
 
 class _FakeManager:
-    """Injectable ``printer_manager`` stand-in — the reconcile reads ``get_status`` only."""
+    """Injectable ``printer_manager`` stand-in — ``get_status`` plus the report request
+    the bound-presence arm makes (paced + connected-gated in the real client, so the
+    lane only ever asks)."""
 
-    def __init__(self, states: dict[int, object]):
+    def __init__(self, states: dict[int, object], *, pushall_ok: bool = True):
         self._states = states
+        self._pushall_ok = pushall_ok
         self.status_calls: list[int] = []
+        self.pushall_calls: list[tuple[int, str]] = []
 
     def get_status(self, printer_id: int):
         self.status_calls.append(printer_id)
         return self._states.get(printer_id)
+
+    def request_evidence_pushall(self, printer_id: int, reason: str) -> bool:
+        self.pushall_calls.append((printer_id, reason))
+        return self._pushall_ok
 
 
 def _bare_tray(tray_id=0, *, state=10):
@@ -107,6 +115,41 @@ def _bare_tray(tray_id=0, *, state=10):
         "tray_sub_brands": "",
         "tray_color": "",
         "tray_info_idx": "",
+        "tag_uid": _ZERO_TAG,
+        "tray_uuid": _ZERO_UUID,
+    }
+
+
+def _unknown_tray(tray_id=0):
+    """A merged tray that asserts NOTHING about content — the boot-forgotten / reduced
+    mid-print shape. Tri-state presence is None (unknown), which fails OPEN everywhere:
+    no consumer skips it, no release fires, and nothing says a word."""
+    return {"id": tray_id, "state": 9}
+
+
+def _cleared_tray(tray_id=0):
+    """The wire's asserted-empty shape — presence resolves False. Under a LIVE binding
+    that is the printer-1 shape (2026-08-09): the merged lane holds the release evidence
+    and the binding still stands, so the deciding RAW lane never saw it."""
+    return {"id": tray_id, "state": 9, "tray_type": ""}
+
+
+def _a1_tray(tray_id=0):
+    """The A1/P1S dialect: ``state`` is the constant 3, so presence is PERMANENTLY
+    unknown for a configured slot. No report will ever settle it."""
+    return {"id": tray_id, "state": 3, "tray_type": "PLA", "tray_color": "112233FF"}
+
+
+def _present_tray(tray_id=0):
+    """A seated, configured tray — presence True. Non-empty ``tray_type`` keeps the
+    bare-tray arm out, and the absent Bambu tag keeps the K-drift arm out, so this
+    isolates the presence arm."""
+    return {
+        "id": tray_id,
+        "state": 11,
+        "tray_type": "PETG",
+        "tray_color": "112233FF",
+        "tray_info_idx": "GFG02",
         "tag_uid": _ZERO_TAG,
         "tray_uuid": _ZERO_UUID,
     }
@@ -590,6 +633,203 @@ class TestOwedIdentifyArm:
         await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
 
         assert client.reads == []
+
+
+# --- L: the bound-but-presence-stale arm ------------------------------------
+
+
+class TestBoundPresenceStaleArm:
+    """A binding claims WHERE a roll is (doctrine rule 9), so it is only as good as the
+    presence signal that can contradict it. TWO readings leave the claim unchecked and
+    both are stale: UNKNOWN (nothing asserts anything, so every consumer fails open) and
+    ASSERTED-EMPTY UNDER A LIVE BINDING (the merged lane has the release evidence and the
+    binding still stands — printer 1, 2026-08-09: four bound slots merged at state 9, two
+    asserting ``tray_type: ""``, zero releases in two days, because H2S omits a stable-
+    empty tray from its incrementals and nothing ever asked for a full report).
+
+    The arm asks ONCE PER EPISODE, where an episode is one continuous run of the same
+    reading on the same binding. It ends on a presence VALUE change or a binding change,
+    never on a timer."""
+
+    _PAST = _T0 + spool_tagless._BOUND_PRESENCE_STALE_AFTER_S + 1.0
+
+    @pytest.mark.parametrize(
+        ("shape", "tray"),
+        [("unknown", _unknown_tray(1)), ("asserted_empty", _cleared_tray(1))],
+    )
+    async def test_a_persistent_stale_reading_flags_the_slot_and_asks_the_printer(
+        self, db_session, printer_factory, env, shape, tray
+    ):
+        printer = await printer_factory(name="003-H2S")
+        await _seed_assignment(db_session, printer.id, 0, 1)
+        manager = _FakeManager({printer.id: _state([tray])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        assert manager.pushall_calls == [], "first sighting only opens the episode"
+        env.ws.assert_not_awaited()
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+
+        assert manager.pushall_calls == [(printer.id, "bound_presence_unknown")]
+        payload = env.ws.await_args.args[0]
+        assert payload["type"] == "slot_standing_unknown"
+        assert payload["case"] == "bound_presence_unknown"
+        assert (payload["printer_id"], payload["ams_id"], payload["tray_id"]) == (printer.id, 0, 1)
+        assert payload["printer_name"] == "003-H2S"
+
+    async def test_an_open_episode_fires_exactly_once_however_long_it_stands(self, db_session, printer_factory, env):
+        """The wire has answered: if the requested report arrived and the reading still
+        stands, that IS the printer's answer. Asking again says nothing new."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 1)
+        manager = _FakeManager({printer.id: _state([_cleared_tray(1)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        for tick in range(1, 8):
+            when = self._PAST + tick * spool_tagless._BOUND_PRESENCE_STALE_AFTER_S
+            await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=when)
+
+        assert manager.pushall_calls == [(printer.id, "bound_presence_unknown")]
+        assert env.ws.await_count == 1
+
+    async def test_the_a1_family_constant_state_costs_one_signal_per_slot_ever(self, db_session, printer_factory, env):
+        """A1/P1S report a constant ``state=3``, so presence there is unknowable BY
+        DIALECT and no report can ever settle it. Episode semantics are what stop that
+        from becoming an hourly toast forever — one signal, then silence."""
+        printer = await printer_factory(model="A1")
+        await _seed_assignment(db_session, printer.id, 0, 1)
+        manager = _FakeManager({printer.id: _state([_a1_tray(1)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        for tick in range(1, 25):  # a day of passes on a printer that can never answer
+            await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST + tick * 3600.0)
+
+        assert manager.pushall_calls == [(printer.id, "bound_presence_unknown")]
+        assert env.ws.await_count == 1
+
+    async def test_a_presence_value_change_closes_the_episode_and_re_arms(self, db_session, printer_factory, env):
+        """PRESENT ends the episode outright; the next stale reading is a NEW situation,
+        timed from when it started and entitled to its own single ask."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 1)
+        key = (printer.id, 0, 1)
+        stale = _FakeManager({printer.id: _state([_cleared_tray(1)])})
+        present = _FakeManager({printer.id: _state([_present_tray(1)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=stale, now=_T0)
+        await spool_tagless.reconcile_slot_config(db_session, manager=stale, now=self._PAST)
+        assert len(stale.pushall_calls) == 1
+        assert spool_tagless._presence_stale_episodes[key].fired is True
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=present, now=self._PAST + 60)
+        assert key not in spool_tagless._presence_stale_episodes, "PRESENT closes the episode"
+
+        # Stale again — a fresh episode, so the age restarts and one more ask is earned.
+        restart = self._PAST + 120
+        await spool_tagless.reconcile_slot_config(db_session, manager=stale, now=restart)
+        assert len(stale.pushall_calls) == 1, "the new episode has not aged yet"
+        await spool_tagless.reconcile_slot_config(
+            db_session, manager=stale, now=restart + spool_tagless._BOUND_PRESENCE_STALE_AFTER_S + 1
+        )
+        assert len(stale.pushall_calls) == 2
+
+    async def test_a_reading_that_changes_value_restarts_the_clock(self, db_session, printer_factory, env):
+        """None→False is a different situation, not a continuation: the new reading is
+        timed from when IT started, so an old age cannot fire it instantly."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 1)
+        key = (printer.id, 0, 1)
+        unknown = _FakeManager({printer.id: _state([_unknown_tray(1)])})
+        empty = _FakeManager({printer.id: _state([_cleared_tray(1)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=unknown, now=_T0)
+        flip = _T0 + spool_tagless._BOUND_PRESENCE_STALE_AFTER_S - 1
+        await spool_tagless.reconcile_slot_config(db_session, manager=empty, now=flip)
+
+        episode = spool_tagless._presence_stale_episodes[key]
+        assert (episode.presence, episode.first_seen, episode.fired) == (False, flip, False)
+        assert empty.pushall_calls == []
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=empty, now=flip + 60)
+        assert empty.pushall_calls == [], "the old age belonged to the old reading"
+
+    @pytest.mark.parametrize("exempt", ["pre_configured", "spent"])
+    @pytest.mark.parametrize("shape", ["unknown", "asserted_empty"])
+    async def test_exempt_bindings_are_never_flagged(self, db_session, printer_factory, env, exempt, shape):
+        """The same two rule 9 exempts from release: a PRE-CONFIGURED binding is an
+        intent over a deliberately empty slot, and a SPENT one is the ran-dry latch.
+        Neither is a location claim presence could contradict."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 1, spent=(exempt == "spent"))
+        if exempt == "pre_configured":
+            row = await _assignment(db_session, printer.id, 0, 1)
+            row.pre_configured_at = datetime.utcnow()
+            await db_session.commit()
+        tray = _unknown_tray(1) if shape == "unknown" else _cleared_tray(1)
+        manager = _FakeManager({printer.id: _state([tray])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+
+        assert manager.pushall_calls == []
+        env.ws.assert_not_awaited()
+        assert (printer.id, 0, 1) not in spool_tagless._presence_stale_episodes
+
+    @pytest.mark.parametrize("shape", ["unknown", "asserted_empty"])
+    async def test_an_unbound_slot_is_never_flagged(self, db_session, printer_factory, env, shape):
+        """Nothing claims the slot, so a stale reading contradicts nothing."""
+        printer = await printer_factory()
+        tray = _unknown_tray(1) if shape == "unknown" else _cleared_tray(1)
+        manager = _FakeManager({printer.id: _state([tray])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+
+        assert manager.pushall_calls == []
+        env.ws.assert_not_awaited()
+
+    async def test_a_refused_report_request_still_spends_the_episode(self, db_session, printer_factory, env):
+        """A refusal (disconnected / inside the client's pacing floor) is NOT retried
+        within the episode: a reconnect re-pushes a full report by itself, which moves
+        the reading and opens a fresh episode. Retrying here would only re-ask a printer
+        that cannot answer."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 1)
+        manager = _FakeManager({printer.id: _state([_cleared_tray(1)])}, pushall_ok=False)
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST + 3600)
+
+        assert manager.pushall_calls == [(printer.id, "bound_presence_unknown")]
+        assert env.ws.await_count == 1
+
+    async def test_a_rebind_opens_a_new_episode(self, db_session, printer_factory, env):
+        """Episode identity includes the SPOOL: a different roll bound to the same stale
+        slot is a new claim, and it earns its own single ask."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 1)
+        key = (printer.id, 0, 1)
+        manager = _FakeManager({printer.id: _state([_cleared_tray(1)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+        assert len(manager.pushall_calls) == 1
+
+        row = await _assignment(db_session, printer.id, 0, 1)
+        await db_session.delete(row)
+        await db_session.commit()
+        replacement = await _seed_assignment(db_session, printer.id, 0, 1)
+
+        rebound = self._PAST + 60
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=rebound)
+        assert spool_tagless._presence_stale_episodes[key].spool_id == replacement.id
+        assert len(manager.pushall_calls) == 1, "the new episode starts its own clock"
+
+        await spool_tagless.reconcile_slot_config(
+            db_session, manager=manager, now=rebound + spool_tagless._BOUND_PRESENCE_STALE_AFTER_S + 1
+        )
+        assert len(manager.pushall_calls) == 2
 
 
 # --- B: scheduler registration ---------------------------------------------

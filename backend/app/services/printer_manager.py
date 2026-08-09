@@ -930,6 +930,17 @@ class PrinterManager:
             return self._clients[printer_id].request_status_update()
         return False
 
+    def request_evidence_pushall(self, printer_id: int, reason: str) -> bool:
+        """Ask a printer to re-report so stale presence evidence can be settled.
+
+        Transport for :meth:`BambuMQTTClient.request_evidence_pushall`, which owns the
+        connected check and the pacing floor. False means "not now" (disconnected, no
+        such client, or inside the floor) — a caller defers, it never loops.
+        """
+        if printer_id in self._clients:
+            return self._clients[printer_id].request_evidence_pushall(reason)
+        return False
+
     # Probe budget for test_connection (#1445). Was a fixed 2s sleep, which was
     # too short for P1S firmware whose broker / TLS handshake routinely takes
     # 3–5s to surface a CONNACK on a cold MQTT session. We now poll up to

@@ -2240,6 +2240,10 @@ class TestStandingUnknownBroadcast:
             "printer_name": "007-H2C",
             "ams_id": 0,
             "tray_id": 0,
+            # WHAT is unresolved: this lane's owed identity read. The bound-presence
+            # lane sends "bound_presence_unknown" on the same event and the same
+            # per-slot dedup, so the toast can word itself for either.
+            "case": "standing_unknown",
         }
 
         # Same slot again inside the re-warn window → still deferred, still silent.

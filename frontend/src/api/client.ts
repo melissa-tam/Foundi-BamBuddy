@@ -3036,6 +3036,12 @@ export interface SlotStandingUnknownMessage {
   printer_name?: string | null;
   ams_id: number;
   tray_id: number;
+  /** WHICH standing condition raised it: `standing_unknown` = an owed identity read the
+   *  wire keeps refusing; `bound_presence_unknown` = a binding whose slot presence has
+   *  stopped being checkable (unknown, or asserted-empty with the binding still live).
+   *  Optional because the toast is deliberately case-agnostic today — one nudge to go
+   *  look at the printer either way. */
+  case?: 'standing_unknown' | 'bound_presence_unknown';
 }
 
 /** `GET /inventory/prompts/pending` — every operator question that is still

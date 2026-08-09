@@ -290,6 +290,14 @@ _OWED_READ_WARN_AFTER_S = 600.0
 # hours; one line an hour keeps it visible without becoming the log's own noise.
 _OWED_READ_REWARN_S = 3600.0
 
+# (printer_id, ams_id, tray_id) -> time.monotonic() of the last standing-unknown
+# BROADCAST, whatever raised it. Shared across cases on purpose: an owed identity read
+# and a binding whose presence never resolves are two views of one unresolved slot, and
+# the operator has one action for it — so the toast is one per slot per
+# _OWED_READ_REWARN_S however many lanes notice. Separate from _owed_read_warned_at
+# because the WARN log must keep firing on its own schedule.
+_standing_unknown_broadcast_at: dict[tuple[int, int, int], float] = {}
+
 
 def _reset_state() -> None:
     """Test hook: clear all module-level edge state between cases."""
@@ -304,6 +312,7 @@ def _reset_state() -> None:
     _slot_read_at.clear()
     _discovery_read_at.clear()
     _owed_read_warned_at.clear()
+    _standing_unknown_broadcast_at.clear()
     _read_occasion_at.clear()
     _spent_occupied_occasion_epoch.clear()
     _commanded_read_at.clear()
@@ -968,14 +977,32 @@ async def command_identify(
     return ok, msg
 
 
-async def _broadcast_standing_unknown(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> None:
+async def _broadcast_standing_unknown(
+    db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, *, case: str = "standing_unknown"
+) -> None:
     """Push the standing-unknown slot to the operator UI (same bus as ``tagless_fresh_prompt``).
 
     A log WARNING is invisible to the person who can actually fix the slot, which is why
     the 2026-07-25 six-hour unknown produced no operator signal at all. Rides the shared
     ``ws_manager.broadcast`` helper — one bus, one payload shape, frontend consumer ships
     separately. Never raises: an unreachable websocket layer must not abort the drain.
+
+    ``case`` names WHAT is unresolved (``standing_unknown`` = an owed identity read the
+    wire keeps refusing; ``bound_presence_unknown`` = a binding whose slot presence has
+    not resolved either way), so the toast can word itself. The dedup below is per SLOT
+    and shared across cases: whichever lane notices first, the operator gets one signal
+    per :data:`_OWED_READ_REWARN_S`, because both cases point at the same physical slot
+    and the same human action. The WARN log keeps its own gate — a suppressed toast must
+    never suppress the record.
     """
+    key = (printer_id, ams_id, tray_id)
+    now = time.monotonic()
+    last = _standing_unknown_broadcast_at.get(key)
+    if last is not None and now - last < _OWED_READ_REWARN_S:
+        return
+    # Stamped before the send: a websocket layer that is failing must not turn into an
+    # every-pass retry — the exception log below is the record that it failed.
+    _standing_unknown_broadcast_at[key] = now
     try:
         from backend.app.models.printer import Printer
 
@@ -987,12 +1014,30 @@ async def _broadcast_standing_unknown(db: AsyncSession, printer_id: int, ams_id:
                 "printer_name": name or f"Printer {printer_id}",
                 "ams_id": ams_id,
                 "tray_id": tray_id,
+                "case": case,
             }
         )
     except Exception:  # noqa: BLE001 — observability must never break the drain
         logger.exception(
-            "AMS presence: standing-unknown broadcast failed for printer %s AMS%d-T%d", printer_id, ams_id, tray_id
+            "AMS presence: standing-unknown broadcast failed for printer %s AMS%d-T%d (case=%s)",
+            printer_id,
+            ams_id,
+            tray_id,
+            case,
         )
+
+
+async def broadcast_standing_unknown(
+    db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, *, case: str
+) -> None:
+    """Public entry to the standing-unknown toast for lanes outside this module.
+
+    Same one implementation as the owed-read path uses
+    (:func:`_broadcast_standing_unknown`), including the shared per-slot dedup — the
+    only difference is that ``case`` is REQUIRED here: a caller from another module is
+    reporting a different kind of unresolved slot and must say which. Never raises.
+    """
+    await _broadcast_standing_unknown(db, printer_id, ams_id, tray_id, case=case)
 
 
 async def _warn_owed_read_blocked(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, blocker: str) -> None:
@@ -1004,8 +1049,11 @@ async def _warn_owed_read_blocked(db: AsyncSession, printer_id: int, ams_id: int
     the whole window — the 2026-07-25 shape, where the read stayed owed for six hours
     behind a permanently-engaged extruder and said nothing.
 
-    The WS event rides the SAME dedup as the log line (one per slot per re-warn window),
-    so a permanently-blocked slot is one hourly signal, not a per-pass toast storm.
+    The WS event rides the same re-warn WINDOW as the log line, so a permanently-blocked
+    slot is one hourly signal, not a per-pass toast storm — but it is gated by the
+    broadcast's own per-slot stamp, which every standing-unknown CASE shares. A slot the
+    bound-presence lane already toasted this hour therefore logs here without re-toasting
+    (the toast is about the slot, the WARN is about this lane).
     """
     key = (printer_id, ams_id, tray_id)
     age = last_physical_cycle_age(printer_id, ams_id, tray_id)

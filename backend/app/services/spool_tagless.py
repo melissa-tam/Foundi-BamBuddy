@@ -53,7 +53,7 @@ import json
 import logging
 from datetime import datetime
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
@@ -71,6 +71,7 @@ from backend.app.services.spool_tag_matcher import (
     parse_tray_fields,
     reapply_k_profile_if_drifted,
 )
+from backend.app.services.tray_fields import tray_presence_from_dict
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_ids import GENERIC_FILAMENT_IDS
 from backend.app.utils.filament_types import canonical_filament_type
@@ -151,6 +152,35 @@ _CONFIG_PUSH_BUSY_STATES = ("RUNNING", "PAUSE")
 # keeps (everything else it acts on is derived from live state + DB each pass).
 _last_reconcile_at: float | None = None
 
+
+class _PresenceStaleEpisode(NamedTuple):
+    """One continuous run of the SAME presence-stale reading on one bound slot.
+
+    ``presence`` + ``spool_id`` are the episode's IDENTITY: while both hold, the farm is
+    looking at one unchanging situation and may act on it exactly once (``fired``).
+    ``first_seen`` is when that situation started, i.e. what :data:`_BOUND_PRESENCE_STALE_AFTER_S`
+    is measured against.
+    """
+
+    first_seen: float
+    presence: bool | None
+    spool_id: int
+    fired: bool
+
+
+# (printer_id, ams_id, tray_id) -> the open episode for that slot, or absent when the
+# slot is healthy/ineligible. Session state by design — a restart re-derives everything
+# from the next pass's live state and the DB.
+_presence_stale_episodes: dict[tuple[int, int, int], _PresenceStaleEpisode] = {}
+
+# How long ONE presence-stale reading must stand before the farm stops waiting for the
+# wire to volunteer an answer. Deliberately well past every ORDINARY stale window: mid-
+# print the H2S reduces its tray blocks to presence-unknown partials for the whole job,
+# and eject/settle gaps are minutes at most. Past 15 minutes the reports have simply
+# stopped carrying what the binding needs, and the two parties who can supply it — the
+# printer (a fresh full report) and the operator (a standing-unknown toast) — are asked.
+_BOUND_PRESENCE_STALE_AFTER_S: float = 900.0
+
 # Settle delay before the farm may publish a filament IDENTITY into a slot. A spool
 # inserted into a slot that still carries a surviving tagless binding looks BARE for
 # ~1 s while the firmware runs its own RFID read; an ``ams_filament_setting`` write
@@ -173,6 +203,7 @@ def _reset_state() -> None:
     global _last_reconcile_at
     _autoconfig_window.reset()
     _pending_physical_cycles.clear()
+    _presence_stale_episodes.clear()
     _last_reconcile_at = None
 
 
@@ -1264,6 +1295,89 @@ async def maybe_autoconfigure_bare_tray(
 # --- durable slot-config reconcile (scheduler tick) ------------------------
 
 
+async def _age_bound_presence_stale(
+    db: AsyncSession,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    tray: dict,
+    assignment: SpoolAssignment | None,
+    now: float,
+    manager,
+) -> None:
+    """Age a BOUND slot whose merged presence has gone stale, and ask ONCE per episode.
+
+    A binding claims WHERE a roll is (doctrine rule 9), so it is only as good as the
+    presence signal that can contradict it. Two readings leave that claim unchecked, and
+    BOTH are stale — the arm treats them identically:
+
+    * **None (unknown)** — nothing in the merged view asserts anything, so every consumer
+      fails OPEN. The A1/P1S constant ``state=3`` and the H2C long-idle ``state=0``
+      dialects sit here permanently.
+    * **False (asserted empty) under a LIVE binding** — the merged lane HAS the release
+      evidence and the binding is still standing, which can only mean the deciding RAW
+      lane never saw it. Measured on printer 1 (2026-08-09): four bound slots merged at
+      state 9, two of them asserting ``tray_type: ""``, zero releases in two days,
+      because H2S omits a stable-empty tray from its incrementals entirely — the cleared
+      shape's only carrier is a full report, and nothing asked for one. Requesting that
+      report IS the cure: its raw observations reach the pipeline, which releases.
+
+    Exempt, because their presence is not a claim this can check: a PRE-CONFIGURED
+    binding (a deliberate weigh-then-assign intent over an empty slot) and a SPENT one
+    (the durable ran-dry latch) — the same two rule 9 exempts from release.
+
+    **EPISODE SEMANTICS.** An episode is one continuous run of the same reading on the
+    same binding, and the farm acts on it exactly ONCE, past
+    :data:`_BOUND_PRESENCE_STALE_AFTER_S`. It closes only when the presence VALUE changes
+    (including None↔False) or the binding does — never on a timer. The reason is that a
+    repeat ask answers nothing: if the requested report arrived and the reading still
+    stands, the wire has said "this IS my answer", and asking again is noise against a
+    printer that is already telling the truth. It is also what keeps a permanently
+    unknowable dialect (A1/P1S state 3) to a single lifetime signal per slot instead of
+    an hourly toast forever. A refused request is likewise not retried within the
+    episode — a disconnected printer re-pushes a full report on reconnect anyway, which
+    moves the reading and opens a fresh episode on its own.
+    """
+    key = (printer_id, ams_id, tray_id)
+    if (
+        assignment is None
+        or assignment.pre_configured_at is not None
+        or (assignment.spool is not None and assignment.spool.spent_at is not None)
+    ):
+        _presence_stale_episodes.pop(key, None)
+        return
+    # The canonical tri-state rule, never a re-derivation from tray_type emptiness.
+    presence = tray_presence_from_dict(tray)
+    if presence is True:
+        # The slot answered PRESENT: the claim is checkable again and whatever episode
+        # was open is over (a later stale reading is a new situation, timed from then).
+        _presence_stale_episodes.pop(key, None)
+        return
+
+    episode = _presence_stale_episodes.get(key)
+    if episode is None or episode.presence != presence or episode.spool_id != assignment.spool_id:
+        episode = _PresenceStaleEpisode(now, presence, assignment.spool_id, False)
+        _presence_stale_episodes[key] = episode
+    if episode.fired or now - episode.first_seen < _BOUND_PRESENCE_STALE_AFTER_S:
+        return
+
+    # Spend the episode BEFORE the escalations: neither of them raising (nor a refused
+    # request) may turn a one-shot ask into a per-pass one.
+    _presence_stale_episodes[key] = episode._replace(fired=True)
+    logger.warning(
+        "Bound slot presence stale (%s) for %.0fs: printer %d AMS%d-T%d (spool %s) — "
+        "requesting a fresh report and flagging the slot",
+        "unknown" if presence is None else "asserted-empty",
+        now - episode.first_seen,
+        printer_id,
+        ams_id,
+        tray_id,
+        assignment.spool_id,
+    )
+    await ams_presence.broadcast_standing_unknown(db, printer_id, ams_id, tray_id, case="bound_presence_unknown")
+    manager.request_evidence_pushall(printer_id, "bound_presence_unknown")
+
+
 async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> int:
     """Re-drive slot config the firmware never applied — the DURABLE retry lane.
 
@@ -1283,7 +1397,10 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
     ``spool_tag_matcher.reapply_k_profile_if_drifted`` for a Bambu-tagged bound one,
     and ``ams_presence.maybe_command_owed_identify`` for a slot whose owed DISCOVERY
     read the event-driven identify lanes never got to (2026-07-25: six hours behind a
-    permanently-engaged extruder). All three keep every guard they carry (RFID
+    permanently-engaged extruder). A fourth arm watches PRESENCE rather than identity —
+    :func:`_age_bound_presence_stale` ages a bound slot whose merged presence has stopped
+    being a checkable claim and, once per episode, asks the printer and the operator to
+    settle it. All of them keep every guard they carry (RFID
     early-exit, spent latch, identify/drying defer, mint settle, config settle,
     operator/RFID-bound never-overwrite, wire-safety refusals, their own retry
     windows) — this lane supplies the missing OCCASION to retry, never a new
@@ -1416,6 +1533,12 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
                         db, printer_id, ams_id, tray_id, tray, state
                     ):
                         identify_spent = True
+
+                    # BOUND-BUT-PRESENCE-STALE — the release lane's liveness probe, and
+                    # the fourth thing this walk is durable for. The arms above chase an
+                    # unknown IDENTITY; this one chases a stale PRESENCE, which is what a
+                    # binding is actually a claim about (doctrine rule 9).
+                    await _age_bound_presence_stale(db, printer_id, ams_id, tray_id, tray, assignment, now, manager)
                 except Exception:  # noqa: BLE001 — one bad slot must not abort the pass
                     logger.exception(
                         "Slot-config reconcile failed for printer %d AMS%d-T%d",

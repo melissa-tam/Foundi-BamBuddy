@@ -7640,3 +7640,152 @@ class TestClearedTrayNormalization:
 
         assert self._merged(client, 0, 2)["tray_type"] == ""
         assert self._clear_logs(caplog) == [], "never-configured slot is not a clearing edge"
+
+
+class TestEvidencePushall:
+    """A veto standing on a CACHED exist bit owes the wire one pushall.
+
+    H2S sends ``tray_exist_bits`` in PUSHALLS ONLY, so the cached mask goes stale the
+    moment a roll leaves between two of them. The veto in ``_normalize_cleared_trays``
+    then blocks the asserted-cleared shape on every ~1 Hz partial forever: presence
+    stays UNKNOWN and release-on-empty (doctrine rule 9) can never fire — measured in
+    prod as 13 bound-but-empty slots and ZERO releases ever. The farm now asks the
+    printer to re-report instead of guessing. The veto itself is untouched: a bit
+    carried by THIS push is the 003-H2S mid-print insert and settles the question.
+    """
+
+    @pytest.fixture
+    def client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        client = BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST_H2S",
+            access_code="12345678",
+        )
+        client.on_ams_push_raw = _RawCapture()
+        client._client = MagicMock()
+        client.state.connected = True
+        return client
+
+    @staticmethod
+    def _pushalls(client):
+        """Every pushall REQUEST published — the message a full report answers."""
+        return [
+            json.loads(call[0][1])
+            for call in client._client.publish.call_args_list
+            if json.loads(call[0][1]).get("pushing", {}).get("command") == "pushall"
+        ]
+
+    @staticmethod
+    def _evidence_logs(caplog, needle):
+        return [r for r in caplog.records if "[EVIDENCE]" in r.getMessage() and needle in r.getMessage()]
+
+    @staticmethod
+    def _seat_with_bits(client, bits="1"):
+        """A pushall from while the roll was seated: the slot's bit is SET and cached."""
+        client._handle_ams_data(
+            {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [{"id": 0, "tray_type": "PETG", "tray_color": "00FF00FF", "remain": 42, "state": 11}],
+                    }
+                ],
+                "tray_exist_bits": bits,
+                "power_on_flag": True,
+            }
+        )
+
+    @staticmethod
+    def _minimal_partial(client, times=1):
+        """The bitless ~1 Hz partial the H2S sends for a slot it reports nothing about."""
+        for _ in range(times):
+            client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}]})
+
+    def test_stale_bit_partials_request_exactly_one_pushall(self, client, caplog):
+        """The incident's own cadence: five contradicting partials, ONE request."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+        self._seat_with_bits(client)
+        assert client._last_tray_exist_bits == 1
+        assert self._pushalls(client) == [], "a healthy report asks for nothing"
+
+        self._minimal_partial(client, times=5)
+
+        assert len(self._pushalls(client)) == 1, "paced: one request, never one per partial"
+        assert len(self._evidence_logs(caplog, "pushall owed")) == 1, "one owed INFO per epoch, not per push"
+        assert len(self._evidence_logs(caplog, "slot(s) owed")) == 1
+        assert client.on_ams_push_raw.last(0, 0).present is None, "the veto still holds — presence stays UNKNOWN"
+
+    def test_a_bits_carrying_push_answers_every_owed_slot(self, client):
+        """The report the request asked for closes the epoch: nothing stays owed, and
+        the un-vetoed partials that follow assert EMPTY instead of owing again."""
+        self._seat_with_bits(client)
+        self._minimal_partial(client, times=2)
+        assert client._evidence_owed, "precondition: the slot is owed a report"
+
+        client._handle_ams_data(
+            {
+                "ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}],
+                "tray_exist_bits": "0",
+                "power_on_flag": True,
+            }
+        )
+        assert client._evidence_owed == {}, "the answering report clears the whole epoch"
+        assert client.on_ams_push_raw.last(0, 0).present is False, "bit clear → the clear is injected"
+
+        self._minimal_partial(client, times=3)
+        assert client._evidence_owed == {}, "no veto left to contradict — nothing re-owed"
+        assert client.on_ams_push_raw.last(0, 0).present is False
+
+    def test_bits_carried_by_this_push_owe_nothing(self, client, caplog):
+        """003-H2S PROTECTION: a mid-print insert sits at state 9 with its bit SET in
+        the SAME push. That veto is the firmware's current answer — the slot is not
+        owed a report and no pushall goes out."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+        client._handle_ams_data(
+            {
+                "ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}],
+                "tray_exist_bits": "1",
+                "power_on_flag": True,
+            }
+        )
+
+        assert client._evidence_owed == {}
+        assert self._pushalls(client) == []
+        assert self._evidence_logs(caplog, "[EVIDENCE]") == []
+        assert client.on_ams_push_raw.last(0, 0).present is None, "veto held: presence stays UNKNOWN"
+
+    def test_request_evidence_pushall_is_paced(self, client, caplog):
+        """The service-side lane: one request, then defer — never a loop."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+        assert client.request_evidence_pushall("bound_presence_unknown") is True
+        assert len(self._pushalls(client)) == 1
+        assert len(self._evidence_logs(caplog, "bound_presence_unknown")) == 1
+
+        assert client.request_evidence_pushall("bound_presence_unknown") is False
+        assert len(self._pushalls(client)) == 1, "inside the floor: nothing published"
+
+    def test_request_evidence_pushall_needs_a_connection(self, client):
+        """A disconnected printer answers nothing; the caller defers."""
+        client.state.connected = False
+        assert client.request_evidence_pushall("bound_presence_unknown") is False
+        assert self._pushalls(client) == []
+
+    def test_both_evidence_lanes_share_one_pacing_floor(self, client):
+        """One origin: the wire-side drain and the service-side request cannot add up
+        to two reports inside the window."""
+        self._seat_with_bits(client)
+        self._minimal_partial(client, times=2)
+        assert len(self._pushalls(client)) == 1
+
+        assert client.request_evidence_pushall("bound_presence_unknown") is False
+        assert len(self._pushalls(client)) == 1

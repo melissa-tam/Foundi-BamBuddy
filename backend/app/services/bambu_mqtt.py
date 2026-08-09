@@ -27,6 +27,7 @@ from backend.app.services.tray_fields import (
     TRAY_PRESENT_STATES,
     ZERO_TAG_UID,
     ZERO_TRAY_UUID,
+    parse_int_field,
     parse_tray_exist_bits,
     parse_tray_state,
     slot_exist_bit_set,
@@ -86,6 +87,14 @@ CLEARED_TRAY_FIELDS = {
     "k": None,
     "cali_idx": None,
 }
+
+# Pacing floor between two EVIDENCE pushall requests on one printer. A pushall asks the
+# printer to re-send its full report: it moves nothing, reads no tag and writes no
+# config, so the only cost it can carry is wire chatter (one ~8.7 KB report). The floor
+# bounds that worst case to one extra report every two minutes per printer, which is why
+# the drain below may fire from a ~1 Hz push handler at all. CODE CONSTANT, not a
+# setting: it protects the wire, and the wire's limits are not an operator preference.
+_EVIDENCE_PUSHALL_MIN_S: float = 120.0
 
 # AMS drying latch. `dry_time` (minutes remaining) is the primary "unit is drying"
 # signal, but the firmware only reports it once a cycle is under way. A monotonic
@@ -765,6 +774,20 @@ class BambuMQTTClient:
         # that carries fresh bits overwrites it; one that does not keeps the last
         # truth, matching the merged trays it guards). None = never seen.
         self._last_tray_exist_bits: int | None = None
+        # (ams_id, tray_id) -> monotonic() of the first push whose state-9 partial
+        # CONTRADICTED the CACHED exist bit above. On the H2S dialect the mask rides
+        # pushalls only, so the cache goes stale the moment a roll leaves between them:
+        # the veto in _normalize_cleared_trays then blocks the asserted-cleared shape on
+        # every ~1 Hz partial, tray_presence stays UNKNOWN and release-on-empty (doctrine
+        # rule 9) can never fire for the slot. The farm cannot settle that contradiction
+        # from cache — only the wire can — so an entry here means A PUSHALL IS OWED,
+        # drained at the tail of _handle_ams_data. Cleared wholesale by any push that
+        # carries bits: that report answers every owed slot at once.
+        self._evidence_owed: dict[tuple[int, int], float] = {}
+        # monotonic() of the last evidence pushall published for this printer, or None
+        # when we have never asked. Paces BOTH evidence lanes (the drain and the public
+        # request_evidence_pushall) through one stamp — see _EVIDENCE_PUSHALL_MIN_S.
+        self._last_evidence_pushall_at: float | None = None
 
         # Cache AMS firmware/SN from get_version in case it arrives before AMS status
         # Key: ams_id (int). Value: {'sw_ver': str, 'sn': str}
@@ -1852,7 +1875,39 @@ class BambuMQTTClient:
         """
         return slot_exist_bit_set(self._last_tray_exist_bits, ams_id, tray_id)
 
-    def _normalize_cleared_trays(self, ams_data) -> None:
+    def _note_evidence_owed(self, ams_id, tray_id, *, cause: str) -> None:
+        """Record that only a fresh report can settle this slot's presence.
+
+        Called when the exist-bit veto below fired from the CACHED bitmask rather than
+        from bits the push carried — a contradiction the farm has no way to resolve on
+        its own, because on the H2S dialect the cache is refreshed by a pushall and
+        nothing else. The entry is the owed marker :meth:`_maybe_drain_evidence_pushall`
+        acts on; the INFO fires once per owed epoch per slot, because the contradicting
+        partial recurs at ~1 Hz for as long as the stale bit stands.
+
+        ``cause`` names the contradiction the message describes; it is the discriminator
+        for any future evidence cause that would owe the same report.
+
+        Ids arrive raw from the wire (int or str), so they are parsed to the addressing
+        the drain and the bit arithmetic use. An unparseable slot is dropped: an owed
+        entry the drain cannot name is noise.
+        """
+        a = parse_int_field(ams_id)
+        t = parse_int_field(tray_id)
+        if a is None or t is None:
+            return
+        key = (a, t)
+        if key in self._evidence_owed:
+            return
+        self._evidence_owed[key] = time.monotonic()
+        logger.info(
+            "[%s] [EVIDENCE] AMS%s-T%s state-9 partial contradicts cached exist bit — pushall owed",
+            self.serial_number,
+            a,
+            t,
+        )
+
+    def _normalize_cleared_trays(self, ams_data, *, push_carried_bits: bool) -> None:
         """Give minimal state-9 tray partials the asserted-cleared shape, IN PLACE.
 
         Runs immediately BEFORE the raw pre-merge hand-off so the spool pipeline
@@ -1877,9 +1932,13 @@ class BambuMQTTClient:
           004-H2S state-9-while-feeding dialect (state 9 + ``tray_type: "PETG"``)
           safe here.
         * no exist bit for the slot (003-H2S veto): a mid-print insert sits at
-          state 9 with its bitmask bit set. H2S sends no bitmask at all, so the
-          cache is empty and the veto is inert there — correct, because on that
-          fleet a minimal partial means boot-forgotten-empty.
+          state 9 with its bitmask bit set. The veto stands either way, but its
+          EVIDENCE does not: a bit carried by THIS push is the mid-print insert and
+          is final, while a bit read from the CACHE is a contradiction only the
+          printer can settle (H2S sends the mask in pushalls only, so a roll that
+          left between two pushalls keeps a stale set bit and its slot never becomes
+          releasable). The cached case therefore records a pushall as OWED
+          (:meth:`_note_evidence_owed`) instead of silently standing forever.
 
         The merged display copy decides only whether the injection is LOGGED, never
         whether it happens: a copy still holding content makes this the clearing
@@ -1928,6 +1987,14 @@ class BambuMQTTClient:
                     continue
                 tray_id = tray.get("id")
                 if self._slot_exist_bit_known_set(ams_id, tray_id):
+                    # Vetoed — but by WHOSE evidence? Bits this push carried are the
+                    # firmware's current answer (003-H2S mid-print insert) and close the
+                    # question. A CACHED bit answers for whenever the last pushall ran,
+                    # which on this dialect can be arbitrarily long ago, so the veto is
+                    # standing on evidence that may no longer exist. Owe a pushall and
+                    # let the printer settle it.
+                    if not push_carried_bits:
+                        self._note_evidence_owed(ams_id, tray_id, cause="stale_exist_bit")
                     continue
                 merged_tray = merged_trays.get(tray_id)
                 if isinstance(merged_tray, dict) and merged_tray.get("tray_type"):
@@ -1951,6 +2018,11 @@ class BambuMQTTClient:
         # Handle nested ams structure: {"ams": {"ams": [...]}} or {"ams": [...]}
         # Also handle P1S partial updates: {"tray_now": ..., "tray_tar": ...} without "ams" key
         ams_list = None
+        # Did THIS push carry tray_exist_bits? Only the dict payload has a field to carry
+        # it in — a bare unit list (the H2S shape) structurally cannot — so the answer is
+        # False for every other shape. It is what separates a veto backed by the
+        # firmware's current mask from one backed by the cache (see _note_evidence_owed).
+        push_carried_bits = False
         if isinstance(ams_data, dict):
             if "ams" in ams_data:
                 ams_list = ams_data["ams"]
@@ -1968,6 +2040,11 @@ class BambuMQTTClient:
             _exist_bits = parse_tray_exist_bits(ams_data.get("tray_exist_bits"))
             if _exist_bits is not None:
                 self._last_tray_exist_bits = _exist_bits
+                push_carried_bits = True
+                # This report ANSWERS every owed slot, whatever it says: a bit now clear
+                # lets the next partial normalize (→ release), a bit still set resolves
+                # presence through the 9→10 promotion further down. Nothing stays owed.
+                self._evidence_owed.clear()
 
             # IMPORTANT: Parse ams_status FIRST before tray_now, so we have fresh status
             # when checking if we're in filament change mode for tray_now disambiguation
@@ -2238,7 +2315,7 @@ class BambuMQTTClient:
         # was) left boot-forgotten slots asserting nothing forever, so their presence
         # read UNKNOWN and release-on-empty never fired. Strictness and the 003-H2S
         # exist-bit veto live in the method's docstring.
-        self._normalize_cleared_trays(ams_data)
+        self._normalize_cleared_trays(ams_data, push_carried_bits=push_carried_bits)
 
         # RAW pre-merge hand-off — the LAST point at which the wire dicts still say only
         # what this push said (plus the normalization above). Everything below merges
@@ -2556,6 +2633,70 @@ class BambuMQTTClient:
                 # Pass merged AMS data (not raw ams_list) — partial MQTT updates
                 # may lack fields like 'remain' that the merged state preserves
                 self.on_ams_change(merged_ams)
+
+        # EVIDENCE DRAIN — last, so it acts on everything this push recorded. Strictly
+        # synchronous: this runs on the paho network thread, so it touches no DB, no
+        # event loop and no awaitable, only the same qos=1 publish every command here
+        # uses (thread-safe by paho's contract).
+        self._maybe_drain_evidence_pushall()
+
+    def _publish_evidence_pushall(self) -> bool:
+        """Publish ONE paced pushall request. True when it actually went out.
+
+        The single gate every evidence-driven report request passes: connected, and
+        outside :data:`_EVIDENCE_PUSHALL_MIN_S` since the last one. Callers own only
+        their own log line, so the wire-side drain and the service-side
+        :meth:`request_evidence_pushall` together can never cost more than one report
+        request per printer per window. The message shape itself stays where it has
+        always been (:meth:`_request_push_all`) — one origin.
+        """
+        if not self._client or not self.state.connected:
+            return False
+        now = time.monotonic()
+        last = self._last_evidence_pushall_at
+        if last is not None and now - last < _EVIDENCE_PUSHALL_MIN_S:
+            return False
+        self._last_evidence_pushall_at = now
+        self._request_push_all()
+        return True
+
+    def _maybe_drain_evidence_pushall(self) -> None:
+        """Ask the printer to re-report when a cached exist bit is vetoing a clear.
+
+        The wire-side half of the evidence lane: slots recorded by
+        :meth:`_note_evidence_owed` are ones whose presence NOTHING in the farm can
+        settle, because the only evidence against the state-9 partial is a cached
+        bitmask this dialect refreshes on pushall alone. Asking is the whole fix —
+        the answering report either clears the bit (the next partial normalizes and
+        release-on-empty fires) or confirms it (the 9→10 promotion resolves presence).
+
+        Deliberately NOT retried on a paced/disconnected skip: the contradicting
+        partial recurs at ~1 Hz, so the next push re-enters this drain for free.
+        """
+        if not self._evidence_owed:
+            return
+        owed = len(self._evidence_owed)
+        if not self._publish_evidence_pushall():
+            return
+        logger.info("[%s] [EVIDENCE] requesting pushall (%d slot(s) owed)", self.serial_number, owed)
+
+    def request_evidence_pushall(self, reason: str) -> bool:
+        """Request a full status report to settle stale presence evidence (public API).
+
+        For service-side callers holding STATE-DERIVED evidence that a fresh report
+        would refresh — a binding whose slot presence has read unknown far too long,
+        say. Shares the drain's pacing floor and connected check, so this lane cannot
+        double the wire cost of the one above it.
+
+        Returns False when the printer is disconnected or the floor has not elapsed.
+        The caller DEFERS on False and never loops: state-derived evidence is
+        re-derived for free on its own next pass (invariant 2's "callers may defer,
+        never pre-approve", applied to asking for a report).
+        """
+        if not self._publish_evidence_pushall():
+            return False
+        logger.info("[%s] [EVIDENCE] requesting pushall: %s", self.serial_number, reason)
+        return True
 
     def _update_state(self, data: dict):
         """Update printer state from message data."""
