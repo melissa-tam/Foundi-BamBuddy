@@ -66,6 +66,24 @@ class Spool(Base):
     last_used: Mapped[datetime | None] = mapped_column(DateTime)  # Last time this spool was used in a print
     encode_time: Mapped[datetime | None] = mapped_column(DateTime)  # When spool was encoded/written to tag
     tag_uid: Mapped[str | None] = mapped_column(String(32))  # RFID tag UID (up to 32 hex chars)
+    # The roll's SECOND RFID chip, once the AMS has read it. A Bambu roll physically
+    # carries exactly TWO tags — one per flange side — sharing one ``tray_uuid``, and the
+    # AMS reads whichever side faces its antenna, so the wire ``tag_uid`` for one roll
+    # legitimately alternates between two values (live-proven 4/4 fleet slots 2026-08-01).
+    #
+    # 3NF note: this is a COLUMN, not a child table, because the hardware cardinality is
+    # a fixed 2 — not "zero or more tags per roll" but "exactly two chips on one physical
+    # object", the same way a person's row carries first and last name rather than a
+    # names table. A tag_uid/sibling_tag_uid pair is a single-valued fact about the roll
+    # (which two chips it carries), fully dependent on the spool key and on nothing else.
+    #
+    # NULL = only one side has ever been read (the normal state — a roll seated the same
+    # way up every time never shows its other chip). Written ONCE, on first sighting, by
+    # the slot pipeline's sibling-read path; a THIRD distinct tag is physically impossible
+    # for a genuine roll and is refused + WARNed rather than overwriting the pair.
+    # Compare through ``utils.tag_normalization.tag_matches_row`` — never against
+    # ``tag_uid`` alone.
+    sibling_tag_uid: Mapped[str | None] = mapped_column(String(32))
     tray_uuid: Mapped[str | None] = mapped_column(String(32))  # Bambu Lab spool UUID (32 hex chars)
     data_origin: Mapped[str | None] = mapped_column(String(20))  # How data was populated: manual, rfid_auto, nfc_link
     tag_type: Mapped[str | None] = mapped_column(String(20))  # Tag vendor: bambulab, generic, bambulab_reused, etc.

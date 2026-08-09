@@ -70,7 +70,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import ws_manager
@@ -184,10 +184,12 @@ _RECLAIM_SCAN_LIMIT = 25
 # passes for DIFFERENT printers stay fully concurrent.
 _pipeline_locks: dict[int, asyncio.Lock] = {}
 
-# (slot, scanned tag) pairs whose sibling-tag KEEP has already been announced. A sibling
-# read repeats on every push for as long as the roll faces that way, and the operator
-# needs the fact once, not 3600 times an hour.
-_sibling_logged: set[tuple[tuple[int, int, int], str]] = set()
+# (spool_id, scanned tag) pairs already WARNed about as a third chip. Not the sibling
+# dedup — that is the ``spool.sibling_tag_uid`` column now (see :func:`_record_sibling_tag`);
+# this holds only physically-impossible reads, of which a healthy fleet has none. It
+# exists because the condition STANDS and re-derives on every push, and a 1 Hz warning
+# buries the fact it is reporting.
+_chimera_warned: set[tuple[int, str]] = set()
 
 # Per-printer dedup for ``unknown_tag`` prompts: {printer_id: {(ams, tray): (tag, uuid)}}.
 # Re-broadcast only when the tag tuple CHANGES for a slot; cleared when the slot reports
@@ -203,7 +205,7 @@ _unknown_tag_last_broadcast: dict[int, dict[tuple[int, int], tuple[str, str]]] =
 def _reset_state() -> None:
     """Test hook: clear module-level locks + dedup state between cases."""
     _pipeline_locks.clear()
-    _sibling_logged.clear()
+    _chimera_warned.clear()
     _unknown_tag_last_broadcast.clear()
 
 
@@ -545,6 +547,7 @@ def _binding_view(assignment: SpoolAssignment | None) -> BindingView | None:
         spool_id=spool.id,
         is_tagless=_is_tagless(spool),
         tag_uid=spool.tag_uid,
+        sibling_tag_uid=spool.sibling_tag_uid,
         tray_uuid=spool.tray_uuid,
         spent=spool.spent_at is not None,
         archived=spool.archived_at is not None,
@@ -561,6 +564,7 @@ def _spool_view(spool: Spool) -> SpoolView:
         spool_id=spool.id,
         is_tagless=_is_tagless(spool),
         tag_uid=spool.tag_uid,
+        sibling_tag_uid=spool.sibling_tag_uid,
         tray_uuid=spool.tray_uuid,
         spent=spool.spent_at is not None,
         archived=spool.archived_at is not None,
@@ -597,22 +601,31 @@ async def _identity_candidate(db: AsyncSession, obs: TrayObservation) -> Spool |
     """The row that OWNS this push's identity — uuid-primary, EXACT matches only.
 
     ``tray_uuid`` names the roll (two chips, one uuid — 4/4 prod slots 2026-08-01), so
-    the uuid owner answers first; a bare tag falls back to strict equality. Deliberately
-    NOT ``get_spool_by_tag``: its suffix/first-char variance lanes exist for legacy
-    callers, and a widened row handed to the table as a certainty is the false-merge
-    hazard (plan §"Root causes confirmed"). The table re-checks whatever arrives against
-    the observation anyway, so a widened row could not be smuggled in — this just never
-    produces one.
+    the uuid owner answers first; a bare tag falls back to strict equality against
+    EITHER chip the row carries. Deliberately NOT ``get_spool_by_tag``: its
+    suffix/first-char variance lanes exist for legacy callers, and a widened row handed
+    to the table as a certainty is the false-merge hazard (plan §"Root causes
+    confirmed"). The table re-checks whatever arrives against the observation anyway, so
+    a widened row could not be smuggled in — this just never produces one.
+
+    Matching ``sibling_tag_uid`` is exactness, not widening: the pair is the roll's
+    recorded identity, both members written from real reads of that physical roll.
+    Without it a push carrying only the far-side chip (no uuid — the incremental-push
+    shape) finds NO owner, and the roll's own row cannot answer for it.
     """
     if obs.tray_uuid:
         spool = await find_spool_sharing_tray_uuid(db, obs.tray_uuid)
         if spool is not None:
             return spool
     if obs.tag_uid:
+        scanned = obs.tag_uid.upper()
         res = await db.execute(
             select(Spool)
             .options(selectinload(Spool.k_profiles), selectinload(Spool.assignments))
-            .where(func.upper(Spool.tag_uid) == obs.tag_uid.upper(), Spool.archived_at.is_(None))
+            .where(
+                or_(func.upper(Spool.tag_uid) == scanned, func.upper(Spool.sibling_tag_uid) == scanned),
+                Spool.archived_at.is_(None),
+            )
             .limit(1)
         )
         return res.scalar_one_or_none()
@@ -925,7 +938,7 @@ async def _apply_keep(
 ) -> None:
     """KEEP: the binding is correct. Two side-effects only, neither a binding change."""
     if decision.reason == "sibling_tag_read":
-        _log_sibling_read(obs, decision)
+        await _record_sibling_tag(obs, deps, assignment, decision)
     if assignment is None or not obs.config_nonempty:
         return
     # Fingerprint refresh: the snapshot tracks what the slot currently reports, so a
@@ -952,26 +965,67 @@ async def _apply_keep(
     )
 
 
-def _log_sibling_read(obs: TrayObservation, decision: Decision) -> None:
-    """Announce a sibling-tag KEEP ONCE per (slot, scanned tag).
+async def _record_sibling_tag(
+    obs: TrayObservation, deps: PipelineDeps, assignment: SpoolAssignment | None, decision: Decision
+) -> None:
+    """Persist the roll's SECOND RFID chip onto its row, and announce it — ONCE, EVER.
 
-    This is the one KEEP where the stored identity visibly disagrees with the wire, so
-    an operator reading the log must be able to see WHY it was still the same roll (the
-    uuid matched). Repeating it every push would bury that.
+    This is the one KEEP where the stored identity visibly disagrees with the wire (the
+    uuid matched, the tag did not), so it is both the moment an operator needs the fact
+    explained AND the moment we learn the other half of the roll's identity. Recording
+    it is what makes the explanation a one-time event: with the pair on the row, every
+    later read of that chip matches (:func:`tag_matches_row`) and resolves as a plain
+    silent ``identity_matches_bound`` KEEP.
+
+    The dedup this replaces was a process-lifetime set, so the six prod spools whose
+    rolls sit facing their far side re-announced on every push after every restart,
+    forever. A column cannot forget.
+
+    THIRD distinct chip: refused, never overwritten. A genuine roll carries exactly two
+    tags, so a third read over a uuid-matching binding is a misread or a chimera row —
+    evidence to surface, never to absorb into the pair. The WARN is deduped only because
+    the condition STANDS (it re-derives on every push until a human settles it) and a
+    1 Hz warning buries the very fact it reports; the ledger holds an entry only for a
+    physically-impossible read, i.e. nothing at all in a healthy fleet.
+
+    Rides the pass's session — the same session and commit discipline as the fingerprint
+    refresh below it.
     """
-    scanned = (obs.tag_uid or "").upper()
-    key = (obs.slot, scanned)
-    if key in _sibling_logged:
+    spool = assignment.spool if assignment is not None else None
+    scanned = (obs.tag_uid or "").strip().upper()
+    if spool is None or not scanned:
         return
-    _sibling_logged.add(key)
+
+    if spool.sibling_tag_uid:
+        key = (spool.id, scanned)
+        if key not in _chimera_warned:
+            _chimera_warned.add(key)
+            logger.warning(
+                "[sibling-tag] printer=%d A%dT%d spool=%s read a THIRD tag %s over the recorded pair "
+                "(%s / %s) on a matching tray_uuid — a roll carries only two chips, so this is a "
+                "misread or a chimera row; pair left untouched",
+                obs.printer_id,
+                obs.ams_id,
+                obs.tray_id,
+                spool.id,
+                scanned,
+                spool.tag_uid or "-",
+                spool.sibling_tag_uid,
+            )
+        return
+
+    spool.sibling_tag_uid = scanned
+    await deps.db.commit()
     logger.info(
-        "[sibling-tag] printer=%d A%dT%d spool=%s read its second tag %s (stored %s)",
+        "[sibling-tag] printer=%d A%dT%d spool=%s read its second tag %s (stored %s, tray_uuid %s) — "
+        "pair recorded; further reads of either chip resolve silently",
         obs.printer_id,
         obs.ams_id,
         obs.tray_id,
         decision.spool_id,
-        scanned or "-",
-        (obs.tray_uuid or "-"),
+        scanned,
+        spool.tag_uid or "-",
+        obs.tray_uuid or "-",
     )
 
 

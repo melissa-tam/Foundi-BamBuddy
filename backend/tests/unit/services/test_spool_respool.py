@@ -29,7 +29,6 @@ from backend.app.services.spool_respool import (
     RespoolSiblingConflict,
     _remain_jump,
     _remain_jump_reading,
-    capture_backup_swap,
     mark_spent_on_runout,
     mark_spent_on_slot_runout,
     maybe_auto_or_prompt_respool,
@@ -607,69 +606,103 @@ async def _bind_at(db, printer_id, ams_id, tray_id, *, weight_used=500.0):
     return spool
 
 
-async def _establish_stable_feeder(db, printer_id, tray, clock, *, present=(0, 1, 2), subtask_id="job-A"):
+def _establish_stable_feeder(printer_id, tray, clock, *, present=(0, 1, 2), subtask_id="job-A"):
     """Make ``tray`` the confirmed stable feeder under one job identity.
 
     The first push seeds the job/edge state (a boundary that opens nothing); two
     further pushes ≥ _SWAP_CONFIRM_S apart under the SAME subtask confirm the feeder.
+
+    Sync and DB-less because the SAMPLER is: nothing confirms here, so the session-owning
+    half never runs. That is the production shape — the sampler carries every push at
+    ~1 Hz, the confirmer only a confirmation.
     """
-    await capture_backup_swap(db, printer_id, _running(tray, present=present, subtask_id=subtask_id))
-    await capture_backup_swap(db, printer_id, _running(tray, present=present, subtask_id=subtask_id))
+    for _ in range(2):
+        assert _sample(printer_id, _running(tray, present=present, subtask_id=subtask_id)) == []
     clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    await capture_backup_swap(db, printer_id, _running(tray, present=present, subtask_id=subtask_id))
+    assert _sample(printer_id, _running(tray, present=present, subtask_id=subtask_id)) == []
     assert spool_respool._stable_feeder.get(printer_id) == tray
 
 
+def _sample(printer_id, state) -> list[int]:
+    """One status push through the REAL sampler — the sync, DB-less half that
+    ``main.on_printer_status_change`` calls on every push. Returns the departed global
+    trays whose pending swap CONFIRMED on this push."""
+    return spool_respool.sample_status_push(printer_id, state)
+
+
+async def _drive_swap(session_factory, printer_id, state) -> Spool | None:
+    """One status push through BOTH production halves, wired as ``main`` wires them.
+
+    The sync sampler owns every decision (commanded-load suppression, the stable-feeder
+    requirement, the job boundary, the ambiguous-topology corroboration); the async
+    confirmer stamps what it is handed, on its OWN session. Returns the first spool
+    stamped by this push, else None.
+
+    Because the stamp is committed by a DIFFERENT session, a caller inspecting the row
+    through ``db_session`` must ``refresh()`` it — the returned instance is the
+    confirmer's own and is always current.
+    """
+    departed = _sample(printer_id, state)
+    if not departed:
+        return None
+    stamped = await spool_respool.confirm_backup_swaps(printer_id, departed, session_factory=session_factory)
+    return stamped[0] if stamped else None
+
+
 @pytest.mark.asyncio
-async def test_backup_swap_genuine_switch_stamps_after_confirm(db_session, printer_factory, fake_clock):
+async def test_backup_swap_genuine_switch_stamps_after_confirm(
+    db_session, printer_factory, fake_clock, own_session_factory
+):
     """A genuine firmware backup switch (the stable feeder ran dry, a sibling feeds
     on for ≥ 60 s, the departed still present) STILL marks the departed spool spent —
     and preserves its true grams (the label floor is gone)."""
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=500.0)
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+    _establish_stable_feeder(printer.id, 0, fake_clock)
 
     # Edge off the stable feeder (0 → 1) opens a pending swap; not yet confirmed.
-    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running(1)) is None
 
     # The new tray feeds stably past the confirm window with tray 0 still present.
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    marked = await capture_backup_swap(db_session, printer.id, _running(1))
+    marked = await _drive_swap(own_session_factory, printer.id, _running(1))
     assert marked is not None and marked.id == spool.id
     assert marked.spent_at is not None
     assert marked.weight_used == 500.0  # true ledger preserved
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_no_stamp_before_confirm_window(db_session, printer_factory, fake_clock):
+async def test_backup_swap_no_stamp_before_confirm_window(db_session, printer_factory, fake_clock, own_session_factory):
     """Within the confirm window the pending swap has NOT stamped yet."""
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 0)
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+    _establish_stable_feeder(printer.id, 0, fake_clock)
 
-    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None  # opens pending
+    assert await _drive_swap(own_session_factory, printer.id, _running(1)) is None  # opens pending
     fake_clock["t"] += 10  # still < 60 s
-    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running(1)) is None
     assert (await db_session.get(Spool, spool.id)).spent_at is None
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_drops_on_flap_back_to_departed(db_session, printer_factory, fake_clock):
+async def test_backup_swap_drops_on_flap_back_to_departed(db_session, printer_factory, fake_clock, own_session_factory):
     """tray_now returning to the departed feeder = it's feeding again → drop, no stamp."""
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 0)
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+    _establish_stable_feeder(printer.id, 0, fake_clock)
 
-    await capture_backup_swap(db_session, printer.id, _running(1))  # pending 0→1
+    await _drive_swap(own_session_factory, printer.id, _running(1))  # pending 0→1
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    marked = await capture_backup_swap(db_session, printer.id, _running(0))  # flapped back to 0
+    marked = await _drive_swap(own_session_factory, printer.id, _running(0))  # flapped back to 0
     assert marked is None
     assert (await db_session.get(Spool, spool.id)).spent_at is None
     assert printer.id not in spool_respool._pending_swaps  # dropped
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_run_to_empty_departed_absent_stamps_incident_pin(db_session, printer_factory, fake_clock):
+async def test_backup_swap_run_to_empty_departed_absent_stamps_incident_pin(
+    db_session, printer_factory, fake_clock, own_session_factory
+):
     """INCIDENT PIN (2026-07-21 12:54:55, 003-H2S). A tagless roll on the stable feeder
     (tray 1) runs FULLY dry mid-print: the firmware backup-switches to tray 0, then the
     exist-bits wipe forces tray 1 to state 9 / blank tray_type WITHIN the confirm window
@@ -686,25 +719,27 @@ async def test_backup_swap_run_to_empty_departed_absent_stamps_incident_pin(db_s
     """
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 1, weight_used=500.0)  # the run-dry feeder
-    await _establish_stable_feeder(db_session, printer.id, 1, fake_clock, present=(0, 1))
+    _establish_stable_feeder(printer.id, 1, fake_clock, present=(0, 1))
 
     # Edge 1→0 opens the pending swap; tray 1 still seated at the edge (the wipe lags).
-    assert await capture_backup_swap(db_session, printer.id, _running(0, present=(0, 1))) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running(0, present=(0, 1))) is None
 
     # Within the window tray 1's exist bit clears → state 9 / blank tray_type (absent).
     fake_clock["t"] += 10
-    assert await capture_backup_swap(db_session, printer.id, _running_wiped(0, seated=(0,), wiped=(1,))) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running_wiped(0, seated=(0,), wiped=(1,))) is None
 
     # Tray 0 keeps feeding past the confirm window with tray 1 still absent → STAMP.
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    marked = await capture_backup_swap(db_session, printer.id, _running_wiped(0, seated=(0,), wiped=(1,)))
+    marked = await _drive_swap(own_session_factory, printer.id, _running_wiped(0, seated=(0,), wiped=(1,)))
     assert marked is not None and marked.id == spool.id  # departed run-dry spool stamped though absent
     assert marked.spent_at is not None
     assert marked.weight_used == 500.0  # true ledger preserved (the label floor is gone)
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_chained_double_switch_stamps_both(db_session, printer_factory, fake_clock):
+async def test_backup_swap_chained_double_switch_stamps_both(
+    db_session, printer_factory, fake_clock, own_session_factory
+):
     """The full 003-H2S sequence: tray 1 runs dry (→ tray 0), then ~151 s later tray 0
     runs dry (→ tray 3). Each switch opens and confirms its OWN pending swap (the gap
     exceeds _SWAP_CONFIRM_S), and each departed tray goes absent via the exist-bits wipe
@@ -713,28 +748,35 @@ async def test_backup_swap_chained_double_switch_stamps_both(db_session, printer
     printer = await printer_factory()
     spool1 = await _bind_at(db_session, printer.id, 0, 1, weight_used=400.0)  # first to run dry
     spool0 = await _bind_at(db_session, printer.id, 0, 0, weight_used=600.0)  # second to run dry
-    await _establish_stable_feeder(db_session, printer.id, 1, fake_clock, present=(0, 1, 3))
+    _establish_stable_feeder(printer.id, 1, fake_clock, present=(0, 1, 3))
 
     # Switch 1: 1→0. Tray 1 seated at the edge, then wiped within its window.
-    assert await capture_backup_swap(db_session, printer.id, _running(0, present=(0, 1, 3))) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running(0, present=(0, 1, 3))) is None
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    marked1 = await capture_backup_swap(db_session, printer.id, _running_wiped(0, seated=(0, 3), wiped=(1,)))
+    marked1 = await _drive_swap(own_session_factory, printer.id, _running_wiped(0, seated=(0, 3), wiped=(1,)))
     assert marked1 is not None and marked1.id == spool1.id  # tray 1 stamped though absent
     assert spool_respool._stable_feeder.get(printer.id) == 0  # tray 0 is now the confirmed feeder
 
     # Switch 2: 0→3. Tray 0 seated at the edge, then wiped within its window.
-    assert await capture_backup_swap(db_session, printer.id, _running_wiped(3, seated=(0, 3), wiped=(1,))) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running_wiped(3, seated=(0, 3), wiped=(1,))) is None
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    marked0 = await capture_backup_swap(db_session, printer.id, _running_wiped(3, seated=(3,), wiped=(0, 1)))
+    marked0 = await _drive_swap(own_session_factory, printer.id, _running_wiped(3, seated=(3,), wiped=(0, 1)))
     assert marked0 is not None and marked0.id == spool0.id  # tray 0 stamped though absent
 
-    assert (await db_session.get(Spool, spool1.id)).spent_at is not None
-    assert (await db_session.get(Spool, spool0.id)).spent_at is not None
+    # Re-read, not identity-map: the confirmer committed on its OWN session, so this
+    # session's cached instances are stale until refreshed.
+    await db_session.refresh(spool1)
+    await db_session.refresh(spool0)
+    assert spool1.spent_at is not None
+    assert spool0.spent_at is not None
 
 
 @pytest.mark.asyncio
 async def test_backup_swap_transient_walk_within_window_departed_present_no_stamp(
-    db_session, printer_factory, fake_clock
+    db_session,
+    printer_factory,
+    fake_clock,
+    own_session_factory,
 ):
     """Keep-drop pin: a pending swap whose tray_now moves off ``cur`` to a THIRD tray
     BEFORE the confirm window elapses is a transient walk, not a settled backup switch —
@@ -743,66 +785,68 @@ async def test_backup_swap_transient_walk_within_window_departed_present_no_stam
     the fix intact."""
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=500.0)
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock, present=(0, 1, 2))
+    _establish_stable_feeder(printer.id, 0, fake_clock, present=(0, 1, 2))
 
-    await capture_backup_swap(db_session, printer.id, _running(1, present=(0, 1, 2)))  # pending 0→1
+    await _drive_swap(own_session_factory, printer.id, _running(1, present=(0, 1, 2)))  # pending 0→1
     fake_clock["t"] += 10  # still within the window
-    marked = await capture_backup_swap(db_session, printer.id, _running(2, present=(0, 1, 2)))  # walked to tray 2
+    marked = await _drive_swap(own_session_factory, printer.id, _running(2, present=(0, 1, 2)))  # walked to tray 2
     assert marked is None
     assert printer.id not in spool_respool._pending_swaps  # dropped as a transient walk
     assert (await db_session.get(Spool, spool.id)).spent_at is None
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_drops_on_state_change(db_session, printer_factory, fake_clock):
+async def test_backup_swap_drops_on_state_change(db_session, printer_factory, fake_clock, own_session_factory):
     """Leaving RUNNING before the window elapses drops the pending swap."""
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 0)
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+    _establish_stable_feeder(printer.id, 0, fake_clock)
 
-    await capture_backup_swap(db_session, printer.id, _running(1))  # pending 0→1
+    await _drive_swap(own_session_factory, printer.id, _running(1))  # pending 0→1
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
     paused = _running(1)
     paused.state = "PAUSE"
-    assert await capture_backup_swap(db_session, printer.id, paused) is None
+    assert await _drive_swap(own_session_factory, printer.id, paused) is None
     assert (await db_session.get(Spool, spool.id)).spent_at is None
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_transient_walk_no_false_stamp(db_session, printer_factory, fake_clock):
+async def test_backup_swap_transient_walk_no_false_stamp(db_session, printer_factory, fake_clock, own_session_factory):
     """The 011 pattern: stable feeder 2, then tray_now WALKS 2→1→0 during the
     firmware's runout handling. The 1→0 edge departs a NON-stable value (1) so it
     never opens a pending, and the 2→1 pending drops when tray_now moves on — so
     tray 1's still-full spool is NOT falsely stamped."""
     printer = await printer_factory()
     tray1_spool = await _bind_at(db_session, printer.id, 0, 1, weight_used=200.0)  # must NOT be stamped
-    await _establish_stable_feeder(db_session, printer.id, 2, fake_clock)
+    _establish_stable_feeder(printer.id, 2, fake_clock)
 
     # Walk 2→1 (opens pending 2→1) then 1→0 (prev 1 is not the stable feeder → nothing).
-    await capture_backup_swap(db_session, printer.id, _running(1))
-    marked = await capture_backup_swap(db_session, printer.id, _running(0))
+    await _drive_swap(own_session_factory, printer.id, _running(1))
+    marked = await _drive_swap(own_session_factory, printer.id, _running(0))
     assert marked is None
     assert (await db_session.get(Spool, tray1_spool.id)).spent_at is None  # tray 1 untouched
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_commanded_load_suppressed(db_session, printer_factory, fake_clock):
+async def test_backup_swap_commanded_load_suppressed(db_session, printer_factory, fake_clock, own_session_factory):
     """Our own commanded load to the new tray consumes the marker and never opens a
     pending swap — the departed spool is never stamped (the 006 false-stamp mode)."""
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 0)
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+    _establish_stable_feeder(printer.id, 0, fake_clock)
 
     note_commanded_load(printer.id, 1)  # WE issued the load to tray 1
-    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None  # edge 0→1 suppressed
+    assert await _drive_swap(own_session_factory, printer.id, _running(1)) is None  # edge 0→1 suppressed
     assert printer.id not in spool_respool._pending_swaps  # no pending opened
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running(1)) is None
     assert (await db_session.get(Spool, spool.id)).spent_at is None
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_commanded_load_ttl_expiry_rearms(db_session, printer_factory, fake_clock):
+async def test_backup_swap_commanded_load_ttl_expiry_rearms(
+    db_session, printer_factory, fake_clock, own_session_factory
+):
     """A commanded-load marker older than _COMMANDED_LOAD_TTL_S no longer suppresses:
     a later genuine switch to that same tray stamps normally."""
     printer = await printer_factory()
@@ -810,30 +854,32 @@ async def test_backup_swap_commanded_load_ttl_expiry_rearms(db_session, printer_
 
     note_commanded_load(printer.id, 1)  # stale marker at t0
     fake_clock["t"] += spool_respool._COMMANDED_LOAD_TTL_S + 1  # let it expire
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)
+    _establish_stable_feeder(printer.id, 0, fake_clock)
 
-    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None  # opens pending (marker expired)
+    assert await _drive_swap(own_session_factory, printer.id, _running(1)) is None  # opens pending (marker expired)
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    marked = await capture_backup_swap(db_session, printer.id, _running(1))
+    marked = await _drive_swap(own_session_factory, printer.id, _running(1))
     assert marked is not None and marked.id == spool.id  # stamped — TTL expiry re-armed detection
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_noop_when_not_running(db_session, printer_factory):
+async def test_backup_swap_noop_when_not_running(db_session, printer_factory, own_session_factory):
     """Not mid-print: the edge tracker updates but nothing stamps (baseline)."""
     printer = await printer_factory()
     idle = MagicMock()
     idle.state = "IDLE"
     idle.tray_now = 1
     idle.raw_data = {"ams": [{"id": 0, "tray": [{"id": 0, **_tray()}]}]}
-    assert await capture_backup_swap(db_session, printer.id, idle) is None
+    assert await _drive_swap(own_session_factory, printer.id, idle) is None
 
 
 # -- Tier 1: job-boundary edge reset (2026-07-20 spool-106 false-stamp) ---------
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_no_stamp_across_job_boundary_incident_pin(db_session, printer_factory, fake_clock):
+async def test_backup_swap_no_stamp_across_job_boundary_incident_pin(
+    db_session, printer_factory, fake_clock, own_session_factory
+):
     """INCIDENT PIN (2026-07-20 02:40, spool 106 falsely stamped spent).
 
     Job A feeds tray 0 for > 60 s (stable feeder 0). The next job B is dispatch-mapped
@@ -848,12 +894,12 @@ async def test_backup_swap_no_stamp_across_job_boundary_incident_pin(db_session,
     """
     printer = await printer_factory()
     tray0_spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=250.0)  # must NOT be stamped
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock, subtask_id="A")
+    _establish_stable_feeder(printer.id, 0, fake_clock, subtask_id="A")
 
     # Job B (new subtask) is dispatch-mapped to tray 2; tray 0 is still seated.
-    assert await capture_backup_swap(db_session, printer.id, _running(2, subtask_id="B")) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running(2, subtask_id="B")) is None
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    marked = await capture_backup_swap(db_session, printer.id, _running(2, subtask_id="B"))
+    marked = await _drive_swap(own_session_factory, printer.id, _running(2, subtask_id="B"))
 
     assert marked is None
     assert (await db_session.get(Spool, tray0_spool.id)).spent_at is None
@@ -861,7 +907,9 @@ async def test_backup_swap_no_stamp_across_job_boundary_incident_pin(db_session,
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_eject_interlude_between_jobs_no_false_stamp(db_session, printer_factory, fake_clock):
+async def test_backup_swap_eject_interlude_between_jobs_no_false_stamp(
+    db_session, printer_factory, fake_clock, own_session_factory
+):
     """Eject-shaped interlude: job A feeds tray 0 (stable), then a server-dispatched
     eject job runs RUNNING with tray_now=255 (no filament) under its own subtask, then
     job B is dispatch-mapped to tray 2. The RUNNING eject pushes never fire the
@@ -870,31 +918,33 @@ async def test_backup_swap_eject_interlude_between_jobs_no_false_stamp(db_sessio
     """
     printer = await printer_factory()
     tray0_spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=250.0)
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock, subtask_id="A")
+    _establish_stable_feeder(printer.id, 0, fake_clock, subtask_id="A")
 
     # Eject job: RUNNING, tray_now=255 (no filament), distinct subtask → no cleanup.
-    await capture_backup_swap(db_session, printer.id, _running(255, subtask_id="eject"))
+    await _drive_swap(own_session_factory, printer.id, _running(255, subtask_id="eject"))
     fake_clock["t"] += 5
-    await capture_backup_swap(db_session, printer.id, _running(255, subtask_id="eject"))
+    await _drive_swap(own_session_factory, printer.id, _running(255, subtask_id="eject"))
     assert printer.id not in spool_respool._stable_feeder  # the boundary reset cleared it
 
     # Job B mapped to tray 2, tray 0 still seated, past the confirm window.
-    assert await capture_backup_swap(db_session, printer.id, _running(2, subtask_id="B")) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running(2, subtask_id="B")) is None
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    marked = await capture_backup_swap(db_session, printer.id, _running(2, subtask_id="B"))
+    marked = await _drive_swap(own_session_factory, printer.id, _running(2, subtask_id="B"))
 
     assert marked is None
     assert (await db_session.get(Spool, tray0_spool.id)).spent_at is None
 
 
 @pytest.mark.asyncio
-async def test_reset_swap_edge_state_clears_printer_and_opens_no_swap(db_session, printer_factory, fake_clock):
+async def test_reset_swap_edge_state_clears_printer_and_opens_no_swap(
+    db_session, printer_factory, fake_clock, own_session_factory
+):
     """The job-boundary reset hook (called from main.on_print_start / on_print_complete)
     drops that printer's edge trackers; the next push re-seeds ``_last_tray_now`` with
     prev ``None`` and opens no pending swap (no confirmed stable feeder survives)."""
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 0)
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock)  # stable feeder 0 armed
+    _establish_stable_feeder(printer.id, 0, fake_clock)  # stable feeder 0 armed
 
     reset_swap_edge_state(printer.id)
 
@@ -905,26 +955,28 @@ async def test_reset_swap_edge_state_clears_printer_and_opens_no_swap(db_session
 
     # The next push (still subtask job-A) merely re-seeds; the immediate 0→1 edge cannot
     # open a pending because there is no confirmed stable feeder after the reset.
-    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running(1)) is None
     assert printer.id not in spool_respool._pending_swaps
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    assert await capture_backup_swap(db_session, printer.id, _running(1)) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running(1)) is None
     assert (await db_session.get(Spool, spool.id)).spent_at is None
 
 
 @pytest.mark.asyncio
-async def test_backup_swap_same_subtask_genuine_switch_still_stamps(db_session, printer_factory, fake_clock):
+async def test_backup_swap_same_subtask_genuine_switch_still_stamps(
+    db_session, printer_factory, fake_clock, own_session_factory
+):
     """Regression guard for the job-boundary fix: a genuine mid-job firmware backup
     switch happens under an UNCHANGED subtask_id and must STILL stamp. Same subtask 'J'
     throughout: stable feeder 0, edge 0→1, tray 0 still seated, 60 s confirm → stamped.
     """
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=500.0)
-    await _establish_stable_feeder(db_session, printer.id, 0, fake_clock, subtask_id="J")
+    _establish_stable_feeder(printer.id, 0, fake_clock, subtask_id="J")
 
-    assert await capture_backup_swap(db_session, printer.id, _running(1, subtask_id="J")) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running(1, subtask_id="J")) is None
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    marked = await capture_backup_swap(db_session, printer.id, _running(1, subtask_id="J"))
+    marked = await _drive_swap(own_session_factory, printer.id, _running(1, subtask_id="J"))
 
     assert marked is not None and marked.id == spool.id
     assert marked.spent_at is not None
@@ -1305,7 +1357,7 @@ async def test_gate_tier2_both_empty_falls_back_to_prompt(db_session, printer_fa
 
 
 @pytest.mark.asyncio
-async def test_hooks_noop_in_spoolman_mode(db_session, printer_factory, monkeypatch):
+async def test_hooks_noop_in_spoolman_mode(db_session, printer_factory, monkeypatch, own_session_factory):
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=True, weight_used=990.0)
     await _assign(db_session, printer.id, 0, 0, donor.id)
@@ -1318,7 +1370,7 @@ async def test_hooks_noop_in_spoolman_mode(db_session, printer_factory, monkeypa
     state = _make_state(0, 0, _tray(), tray_now=0)
 
     assert await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, state) is None
-    assert await capture_backup_swap(db_session, printer.id, state) is None
+    assert await _drive_swap(own_session_factory, printer.id, state) is None
     assert await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor) is None
     assert broadcasts == []
 
@@ -2520,32 +2572,10 @@ async def test_slot_runout_ams_ht_attr_fails_closed(db_session, printer_factory)
 # stamps. The detector is now a per-push sampler (no DB) + a confirm task (own session).
 
 
-def _sampler_stable_feeder(printer_id, tray, clock, *, present=(0, 1, 2), subtask_id="job-A"):
-    """Confirm ``tray`` as the stable feeder driving :func:`sample_status_push` DIRECTLY
-    — the production path, where the samples arrive ~1 Hz instead of only on AMS-hash
-    changes. Same three-push shape as ``_establish_stable_feeder``: a seeding boundary
-    push, then two same-value samples ≥ _SWAP_CONFIRM_S apart. Nothing confirms."""
-    for _ in range(2):
-        assert (
-            spool_respool.sample_status_push(printer_id, _running(tray, present=present, subtask_id=subtask_id)) == []
-        )
-    clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    assert spool_respool.sample_status_push(printer_id, _running(tray, present=present, subtask_id=subtask_id)) == []
-    assert spool_respool._stable_feeder.get(printer_id) == tray
-
-
-def _own_session_factory(test_engine):
-    """An independent session maker on the test engine — the shape
-    :func:`confirm_backup_swaps` takes in production (``core.database.async_session``),
-    so the confirm half is exercised opening and committing its OWN session rather than
-    borrowing the test's."""
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-    return async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-
-
 @pytest.mark.asyncio
-async def test_backup_swap_open_time_absent_departed_still_stamps(db_session, printer_factory, fake_clock):
+async def test_backup_swap_open_time_absent_departed_still_stamps(
+    db_session, printer_factory, fake_clock, own_session_factory
+):
     """INCIDENT PIN (2026-07-30 08:32, 009-H2S / printer 7). The stable feeder (tray 1)
     runs dry and the firmware auto-switches to tray 0. The exist-bit wipe lands WITH the
     push that first reveals the edge, so the departed tray already reads absent (state 9
@@ -2560,14 +2590,14 @@ async def test_backup_swap_open_time_absent_departed_still_stamps(db_session, pr
     """
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 1, weight_used=500.0)  # the run-dry feeder
-    await _establish_stable_feeder(db_session, printer.id, 1, fake_clock, present=(0, 1))
+    _establish_stable_feeder(printer.id, 1, fake_clock, present=(0, 1))
 
     # The edge push itself already carries the wipe: tray_now 1→0 AND tray 1 absent.
-    assert await capture_backup_swap(db_session, printer.id, _running_wiped(0, seated=(0,), wiped=(1,))) is None
+    assert await _drive_swap(own_session_factory, printer.id, _running_wiped(0, seated=(0,), wiped=(1,))) is None
     assert spool_respool._pending_swaps.get(printer.id) == (1, 0, fake_clock["t"])  # opened despite absence
 
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    marked = await capture_backup_swap(db_session, printer.id, _running_wiped(0, seated=(0,), wiped=(1,)))
+    marked = await _drive_swap(own_session_factory, printer.id, _running_wiped(0, seated=(0,), wiped=(1,)))
 
     assert marked is not None and marked.id == spool.id
     assert marked.spent_at is not None
@@ -2576,7 +2606,11 @@ async def test_backup_swap_open_time_absent_departed_still_stamps(db_session, pr
 
 @pytest.mark.asyncio
 async def test_sample_status_push_confirms_and_confirm_task_stamps(
-    db_session, test_engine, printer_factory, fake_clock
+    db_session,
+    test_engine,
+    printer_factory,
+    fake_clock,
+    own_session_factory,
 ):
     """The production wiring end to end: the sync sampler carries every push, reports the
     departed tray on the push that confirms, and the async confirmer — on its OWN session,
@@ -2584,7 +2618,7 @@ async def test_sample_status_push_confirms_and_confirm_task_stamps(
     printer = await printer_factory()
     spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    _sampler_stable_feeder(printer.id, 0, fake_clock)
+    _establish_stable_feeder(printer.id, 0, fake_clock)
 
     # Edge 0→1 opens the pending swap; the sampler reports nothing yet.
     assert spool_respool.sample_status_push(printer.id, _running(1)) == []
@@ -2592,9 +2626,7 @@ async def test_sample_status_push_confirms_and_confirm_task_stamps(
     departed = spool_respool.sample_status_push(printer.id, _running(1))
     assert departed == [0]  # the departed GLOBAL tray, not the new feeder
 
-    stamped = await spool_respool.confirm_backup_swaps(
-        printer.id, departed, session_factory=_own_session_factory(test_engine)
-    )
+    stamped = await spool_respool.confirm_backup_swaps(printer.id, departed, session_factory=own_session_factory)
 
     assert [s.id for s in stamped] == [spool.id]
     await db_session.refresh(spool)  # the stamp was committed by the confirmer's session
@@ -2603,7 +2635,7 @@ async def test_sample_status_push_confirms_and_confirm_task_stamps(
 
 
 @pytest.mark.asyncio
-async def test_confirm_backup_swaps_spoolman_noop(db_session, test_engine, printer_factory):
+async def test_confirm_backup_swaps_spoolman_noop(db_session, test_engine, printer_factory, own_session_factory):
     """Spoolman owns the spool lifecycle → the confirmer stamps nothing even with a
     confirmed departure. The gate lives HERE and not in the sampler: it is a settings
     read, and the sampler runs on every status push."""
@@ -2614,9 +2646,7 @@ async def test_confirm_backup_swaps_spoolman_noop(db_session, test_engine, print
     await set_setting(db_session, "spoolman_enabled", "true")
     await db_session.commit()
 
-    stamped = await spool_respool.confirm_backup_swaps(
-        printer.id, [0], session_factory=_own_session_factory(test_engine)
-    )
+    stamped = await spool_respool.confirm_backup_swaps(printer.id, [0], session_factory=own_session_factory)
 
     assert stamped == []
     await db_session.refresh(spool)
@@ -2632,7 +2662,7 @@ async def test_sample_status_push_job_boundary_discards(db_session, printer_fact
     printer = await printer_factory()
     tray0_spool = await _bind_at(db_session, printer.id, 0, 0, weight_used=250.0)  # must NOT be stamped
 
-    _sampler_stable_feeder(printer.id, 0, fake_clock, subtask_id="A")
+    _establish_stable_feeder(printer.id, 0, fake_clock, subtask_id="A")
 
     # Job B: the boundary resets the edge trackers and re-seeds tray_now — no pending.
     assert spool_respool.sample_status_push(printer.id, _running(2, subtask_id="B")) == []

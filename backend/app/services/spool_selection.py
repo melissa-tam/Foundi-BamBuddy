@@ -506,8 +506,9 @@ def _trace_rows(rows: list[dict], inv: dict[int, SlotInventory] | None) -> list[
 
 
 # ---------------------------------------------------------------------------
-# Slot-inventory construction (extends the legacy _build_inventory_remain_overrides
-# with the first-loaded ordinal, in one query per mode).
+# Slot-inventory construction: remaining grams + the first-loaded ordinal, in one query
+# per mode. THE owner — the scheduler's remaining-grams-only delegate had no production
+# caller and was deleted (2026-08-09).
 # ---------------------------------------------------------------------------
 def _dt_to_epoch(dt: datetime | None) -> float | None:
     """Epoch seconds for a datetime, treating a naive value as UTC.

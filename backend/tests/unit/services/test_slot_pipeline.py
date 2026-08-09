@@ -184,6 +184,7 @@ def _records(caplog, level):
 
 TAG_A = "AABBCCDD11223344"
 TAG_B = "1122334455667788"
+TAG_C = "99887766554433221"[:16]  # a THIRD chip — physically impossible on a genuine roll
 UUID_1 = "8AC9EC0847FD41D0890870319F2E1975"
 UUID_2 = "3C78FA47DFCC4F0C8C95566C77A73DCE"
 
@@ -215,9 +216,12 @@ async def test_keep_refreshes_a_drifted_fingerprint(db_session, printer_factory,
 
 
 @pytest.mark.asyncio
-async def test_sibling_keep_logs_once_per_slot_and_tag(db_session, printer_factory, env, caplog):
-    """The one KEEP where stored identity visibly disagrees with the wire gets ONE
-    INFO line — repeated every push it would bury the fact it exists to surface."""
+async def test_sibling_read_persists_the_pair_and_announces_once(db_session, printer_factory, env, caplog):
+    """First sighting of the roll's far chip: KEEP, one INFO, and the tag lands on the row.
+
+    The announcement is the moment we LEARN the second half of the roll's identity, so
+    it is also the moment we record it — that is what turns a recurring surprise into a
+    one-time event."""
     printer = await printer_factory()
     spool = await _spool(db_session, tag_uid=TAG_A, tray_uuid=UUID_1)
     await _bind_row(db_session, spool, printer.id, 0, 3)
@@ -231,10 +235,99 @@ async def test_sibling_keep_logs_once_per_slot_and_tag(db_session, printer_facto
         second = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
 
     assert first[0].decision.reason == "sibling_tag_read"
-    assert second[0].decision.reason == "sibling_tag_read"
+    # The pair is recorded, so the SAME push is now an ordinary exact match — silent.
+    assert second[0].decision.reason == "identity_matches_bound"
+    await db_session.refresh(spool)
+    assert spool.sibling_tag_uid == TAG_B
+    assert spool.tag_uid == TAG_A, "the near chip is never overwritten — the row gains a pair"
+
     sibling_lines = [m for m in _records(caplog, logging.INFO) if m.startswith("[sibling-tag]")]
     assert len(sibling_lines) == 1
     assert f"spool={spool.id}" in sibling_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_sibling_reread_after_restart_is_silent(db_session, printer_factory, env, caplog):
+    """PROD-SIGNATURE PIN (2026-08-09). Six spools replayed "read its second tag" on
+    every push after every restart, forever, because the dedup was a process-lifetime
+    set. ``_reset_state()`` is that restart: with the pair on the ROW, the re-read is a
+    plain exact match and nothing is announced at all.
+
+    Mutation-verified against the old shape: a process-memory dedup cannot survive this.
+    """
+    printer = await printer_factory()
+    spool = await _spool(db_session, tag_uid=TAG_A, tray_uuid=UUID_1)
+    await _bind_row(db_session, spool, printer.id, 0, 3)
+    obs = _obs(
+        printer.id,
+        {"id": 3, "state": 11, "tag_uid": TAG_B, "tray_uuid": UUID_1, "tray_type": "PETG", "tray_color": "000000FF"},
+    )
+    await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))  # first sighting: persists
+
+    slot_pipeline._reset_state()  # a restart: every in-process ledger is gone
+
+    # Drop the first sighting's (expected) announcement: caplog accumulates across the
+    # whole test, so without this the assertion below depends on whatever level another
+    # test left the logger at.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
+        after_restart = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert after_restart[0].decision.kind is DecisionKind.KEEP
+    assert after_restart[0].decision.reason == "identity_matches_bound"
+    assert [m for m in _records(caplog, logging.INFO) if m.startswith("[sibling-tag]")] == []
+
+
+@pytest.mark.asyncio
+async def test_sibling_pair_resolves_the_slot_when_only_the_far_chip_is_on_the_wire(
+    db_session, printer_factory, env, caplog
+):
+    """The identity pair must also ANSWER, not merely stay quiet. A push carrying only
+    the far chip and NO uuid (the incremental-push shape) previously found no owning row
+    at all; with the pair recorded it resolves to this roll — no defer, no mint."""
+    printer = await printer_factory()
+    spool = await _spool(db_session, tag_uid=TAG_A, tray_uuid=UUID_1, sibling_tag_uid=TAG_B)
+    await _bind_row(db_session, spool, printer.id, 0, 3)
+    before = await _spool_count(db_session)
+
+    obs = _obs(  # tag only — the atomic-pair rule means no uuid is asserted
+        printer.id,
+        {"id": 3, "state": 11, "tag_uid": TAG_B, "tray_type": "PETG", "tray_color": "000000FF"},
+    )
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision.kind is DecisionKind.KEEP
+    assert transitions[0].decision.reason == "identity_matches_bound"
+    assert await _spool_count(db_session) == before, "the roll's own row answered — nothing minted"
+
+
+@pytest.mark.asyncio
+async def test_a_third_tag_is_refused_and_warned_not_absorbed(db_session, printer_factory, env, caplog):
+    """A roll carries exactly TWO chips, so a third read over a uuid-matching binding is
+    a misread or a chimera row. Surface it; never absorb it into the pair (overwriting
+    would launder the anomaly into a legitimate-looking identity). The WARN is deduped
+    because the condition STANDS — it re-derives on every push until a human settles it."""
+    printer = await printer_factory()
+    spool = await _spool(db_session, tag_uid=TAG_A, tray_uuid=UUID_1, sibling_tag_uid=TAG_B)
+    await _bind_row(db_session, spool, printer.id, 0, 3)
+
+    obs = _obs(
+        printer.id,
+        {"id": 3, "state": 11, "tag_uid": TAG_C, "tray_uuid": UUID_1, "tray_type": "PETG", "tray_color": "000000FF"},
+    )
+    with caplog.at_level(logging.WARNING, logger=_PIPELINE_LOGGER):
+        first = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+        second = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert first[0].decision.kind is DecisionKind.KEEP, "the uuid matched — the binding is still right"
+    assert first[0].decision.reason == "sibling_tag_read"
+    assert second[0].decision.reason == "sibling_tag_read", "unrecorded, so it stays anomalous"
+    await db_session.refresh(spool)
+    assert (spool.tag_uid, spool.sibling_tag_uid) == (TAG_A, TAG_B), "pair untouched"
+
+    third_lines = [m for m in _records(caplog, logging.WARNING) if "THIRD tag" in m]
+    assert len(third_lines) == 1, "loud once, not at 1 Hz"
+    assert TAG_C in third_lines[0]
 
 
 # --- BIND -------------------------------------------------------------------

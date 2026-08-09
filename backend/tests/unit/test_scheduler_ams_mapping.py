@@ -11,6 +11,19 @@ from backend.app.services.spool_selection import SlotInventory, match_filaments_
 from backend.app.utils.threemf_tools import extract_nozzle_mapping_from_3mf
 
 
+def _slot_order(required, loaded):
+    """Drive the canonical matcher under the DEFAULT case — ``slot_order`` policy, no
+    inventory, no minimum-start floor. Returns the mapping array.
+
+    The sibling of :func:`_lowest_remaining`: policy selection and the start floor are
+    the dispatcher's job (``_compute_ams_mapping_for_printer``), so a bucket-precedence
+    test states the policy it means rather than inheriting one.
+    """
+    return match_filaments_to_slots(
+        required, loaded, policy="slot_order", inv={}, backup_on=True, min_start_g=0
+    ).mapping
+
+
 def _lowest_remaining(required, loaded, overrides=None):
     """Drive the canonical matcher under the ``lowest_remaining`` policy, building
     the slot inventory from a ``{global_tray_id: grams}`` override map (as the
@@ -245,7 +258,7 @@ class TestPresentCandidates:
 
 
 class TestMatchFilamentsToSlots:
-    """Test the _match_filaments_to_slots method."""
+    """Bucket precedence in ``spool_selection.match_filaments_to_slots`` (slot_order)."""
 
     @pytest.fixture
     def scheduler(self):
@@ -253,7 +266,7 @@ class TestMatchFilamentsToSlots:
 
     def test_match_empty_required(self, scheduler):
         """Empty required list should return None."""
-        result = scheduler._match_filaments_to_slots([], [])
+        result = _slot_order([], [])
         assert result is None
 
     def test_match_exact_color(self, scheduler):
@@ -264,7 +277,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 1},  # Exact match
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [1]  # Should pick tray 1 (exact color match)
 
     def test_match_similar_color(self, scheduler):
@@ -274,7 +287,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PLA", "color": "#FF5510", "global_tray_id": 0},  # Similar
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [0]
 
     def test_match_type_only(self, scheduler):
@@ -284,7 +297,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PLA", "color": "#0000FF", "global_tray_id": 5},  # Type match, color way off
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [5]
 
     def test_match_no_match_returns_minus_one(self, scheduler):
@@ -294,7 +307,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PETG", "color": "#FF0000", "global_tray_id": 0},  # Wrong type
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [-1]
 
     def test_match_multiple_filaments(self, scheduler):
@@ -308,7 +321,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PETG", "color": "#00FF00", "global_tray_id": 1},
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [0, 1]
 
     def test_match_avoids_duplicate_assignment(self, scheduler):
@@ -321,7 +334,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 0},  # Only one PLA
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         # First slot gets the match, second slot gets -1
         assert result == [0, -1]
 
@@ -332,7 +345,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 512},  # AMS 128, slot 0
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [512]
 
     def test_match_external_spool(self, scheduler):
@@ -342,7 +355,7 @@ class TestMatchFilamentsToSlots:
             {"type": "TPU", "color": "#0000FF", "global_tray_id": 254, "is_external": True},
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [254]
 
     def test_match_by_tray_info_idx_priority(self, scheduler):
@@ -369,7 +382,7 @@ class TestMatchFilamentsToSlots:
             },  # Same color, different spool
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [1]  # Should pick tray 1 (exact tray_info_idx match)
 
     def test_match_by_tray_info_idx_with_different_colors(self, scheduler):
@@ -385,7 +398,7 @@ class TestMatchFilamentsToSlots:
             },  # Exact spool (slightly different color reported)
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [3]  # Should pick tray 3 (exact tray_info_idx match)
 
     def test_match_fallback_to_color_when_no_tray_info_idx(self, scheduler):
@@ -396,7 +409,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 1, "tray_info_idx": "GFB00"},  # Color match
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [1]  # Should pick tray 1 (color match)
 
     def test_match_fallback_to_color_when_no_matching_tray_info_idx(self, scheduler):
@@ -411,7 +424,7 @@ class TestMatchFilamentsToSlots:
             },  # Different idx but same color
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [0]  # Should fall back to color match
 
     def test_match_multiple_same_color_with_tray_info_idx(self, scheduler):
@@ -432,7 +445,7 @@ class TestMatchFilamentsToSlots:
             },  # Tray 3 - the one we want
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [3]  # Should pick tray 3, not tray 0
 
     def test_match_tray_info_idx_not_reused(self, scheduler):
@@ -446,7 +459,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PLA", "color": "#000000", "global_tray_id": 1, "tray_info_idx": "GFA01"},
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [0, 1]  # Each slot gets its specific tray
 
     def test_match_non_unique_tray_info_idx_uses_color(self, scheduler):
@@ -467,7 +480,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PLA", "color": "#00FF00", "global_tray_id": 4, "tray_info_idx": "GFA00"},  # Green PLA
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [-1, 4]  # Should pick tray 4 (color match), not tray 3 (first match)
 
     def test_match_non_unique_tray_info_idx_same_color(self, scheduler):
@@ -484,7 +497,7 @@ class TestMatchFilamentsToSlots:
             {"type": "PLA", "color": "#FFFFFF", "global_tray_id": 4, "tray_info_idx": "GFA00"},
         ]
 
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         # Both have same color, so first is used
         assert result == [-1, 3]
 
@@ -510,9 +523,7 @@ class TestLowestRemainingPolicy:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 0, "remain": 80},
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 1, "remain": 30},
         ]
-        result = match_filaments_to_slots(
-            required, loaded, policy="slot_order", inv={}, backup_on=True, min_start_g=0
-        ).mapping
+        result = _slot_order(required, loaded)
         assert result == [0]  # first match
 
     def test_unknown_remain_sorted_last(self):
@@ -949,7 +960,7 @@ class TestNozzleAwareMapping:
         # Without nozzle filtering, slot 1 (red, right) would match tray 4 (red, left) by color.
         # With nozzle filtering, slot 1 (right nozzle) can only use tray 0 (right extruder),
         # and slot 2 (left nozzle) can only use tray 4 (left extruder).
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [0, 4]
 
     def test_nozzle_hard_filter_no_fallback(self, scheduler):
@@ -962,7 +973,7 @@ class TestNozzleAwareMapping:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 4, "extruder_id": 1},
         ]
         # No trays on extruder 0 — hard filter returns -1, no cross-nozzle fallback
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [-1]
 
     def test_no_nozzle_id_skips_filtering(self, scheduler):
@@ -975,7 +986,7 @@ class TestNozzleAwareMapping:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 4, "extruder_id": 1},
         ]
         # Should match first available (tray 0) regardless of extruder
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [0]
 
     def test_extruder_id_in_loaded_filaments(self, scheduler):
@@ -1044,7 +1055,7 @@ class TestNozzleAwareMapping:
             {"type": "PLA", "color": "#000000", "global_tray_id": 0, "tray_info_idx": "GFA00", "extruder_id": 0},
             {"type": "PLA", "color": "#000000", "global_tray_id": 4, "tray_info_idx": "GFA01", "extruder_id": 1},
         ]
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [0, 4]
 
 
@@ -1205,7 +1216,7 @@ class TestH2DModel:
         required = [
             {"slot_id": 1, "type": "PLA", "color": "#000000", "nozzle_id": 1},  # LEFT
         ]
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         # Black PLA on LEFT: AMS 0 T4 (global 3)
         assert result == [3]
 
@@ -1219,7 +1230,7 @@ class TestH2DModel:
         required = [
             {"slot_id": 1, "type": "PLA", "color": "#FFFFFF", "nozzle_id": 0},  # RIGHT
         ]
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         # White PLA on RIGHT: AMS 1 T1 (global 4)
         assert result == [4]
 
@@ -1234,7 +1245,7 @@ class TestH2DModel:
         required = [
             {"slot_id": 1, "type": "PLA-S", "color": "#FFFFFF", "nozzle_id": 0},
         ]
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [-1]  # No fallback to wrong nozzle
 
     def test_dual_nozzle_multi_filament(self, scheduler):
@@ -1248,7 +1259,7 @@ class TestH2DModel:
             {"slot_id": 1, "type": "PETG", "color": "#FFFFFF", "nozzle_id": 1, "tray_info_idx": "GFG02"},
             {"slot_id": 2, "type": "PLA", "color": "#FFFFFF", "nozzle_id": 0, "tray_info_idx": "GFA00"},
         ]
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         # PETG white on LEFT: AMS 0 T1 (global 0)
         # PLA white on RIGHT: AMS 1 T1 (global 4)
         assert result == [0, 4]
@@ -1263,7 +1274,7 @@ class TestH2DModel:
         required = [
             {"slot_id": 1, "type": "PLA", "color": "#000000", "nozzle_id": 1, "tray_info_idx": "P4d64437"},
         ]
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [254]  # External spool on left nozzle
 
 
@@ -1299,7 +1310,7 @@ class TestX1CModel:
         required = [
             {"slot_id": 1, "type": "PLA", "color": "#0066FF"},  # No nozzle_id
         ]
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         # Blue PLA → AMS 1 T4 (global 7)
         assert result == [7]
 
@@ -1313,7 +1324,7 @@ class TestX1CModel:
         required = [
             {"slot_id": 1, "type": "PLA", "color": "#EBCFA6", "tray_info_idx": "PFUS22b2"},
         ]
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         # Unique tray_info_idx → AMS 1 T2 (global 5)
         assert result == [5]
 
@@ -1328,7 +1339,7 @@ class TestX1CModel:
         required = [
             {"slot_id": 1, "type": "PLA", "color": "#FCECD6", "tray_info_idx": "P4d64437"},
         ]
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         # Should pick AMS 1 T3 (global 6, color FCECD6) over T4 (0066FF)
         assert result == [6]
 
@@ -1343,5 +1354,5 @@ class TestX1CModel:
             {"slot_id": 1, "type": "PLA", "color": "#EBCFA6"},
             {"slot_id": 2, "type": "PLA", "color": "#0066FF"},
         ]
-        result = scheduler._match_filaments_to_slots(required, loaded)
+        result = _slot_order(required, loaded)
         assert result == [5, 7]

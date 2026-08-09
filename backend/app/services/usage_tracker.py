@@ -20,6 +20,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services.tray_fields import normalized_tag_uid, normalized_tray_uuid
+from backend.app.utils.tag_normalization import tag_matches_row
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,11 @@ def _wire_identity_is_the_bound_row(spool: Spool, tray: dict) -> bool:
     the corrected 2026-08-01 identity law: a Bambu roll carries TWO RFID tags
     sharing one ``tray_uuid``, so a differing ``tag_uid`` beside an agreeing uuid is
     a sibling read of the same roll — not a swap. Only when neither side asserts a
-    uuid does the tag decide.
+    uuid does the tag decide, and then it decides against the row's PAIR of chips
+    (:func:`tag_matches_row`): a push carrying only the far chip is still this roll
+    identifying itself. Comparing the near chip alone silently gated the weight-sync
+    and decrease-reconcile lanes OFF for a roll that WAS the bound roll, for as long
+    as it sat facing that way.
 
     Refuses (False) whenever nothing is comparable: a tagless row, an untagged
     tray, or a partial push asserting neither member. Silence is never agreement —
@@ -134,8 +139,9 @@ def _wire_identity_is_the_bound_row(spool: Spool, tray: dict) -> bool:
 
     wire_tag = normalized_tag_uid(tray.get("tag_uid"))
     row_tag = normalized_tag_uid(spool.tag_uid)
-    if wire_tag is not None and row_tag is not None:
-        return wire_tag == row_tag
+    row_sibling = normalized_tag_uid(spool.sibling_tag_uid)
+    if wire_tag is not None and (row_tag is not None or row_sibling is not None):
+        return tag_matches_row(wire_tag, row_tag, row_sibling)
 
     return False
 

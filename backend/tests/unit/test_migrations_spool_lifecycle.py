@@ -759,3 +759,129 @@ async def test_orphan_purge_is_silent_and_idempotent_on_a_clean_table(engine, se
 
     assert count == 1
     assert [r.getMessage() for r in caplog.records if "orphaned spool binding" in r.getMessage()] == []
+
+
+# ---------------------------------------------------------------------------
+# WS7: sibling_tag_uid column + the false-spent repair
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migration_readds_sibling_tag_uid_column(engine):
+    """Dropping the column simulates a pre-migration schema; run_migrations re-adds it."""
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE spool DROP COLUMN sibling_tag_uid"))
+        assert "sibling_tag_uid" not in await _spool_columns(conn)
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        assert "sibling_tag_uid" in await _spool_columns(conn)
+
+
+async def _seed_false_spent_fixtures(session_maker):
+    """The three shapes the repair must tell apart. Returns their ids.
+
+    * ``false_spent`` — the prod 185/205 shape: stamped spent, never fed
+      (``last_used`` NULL, 0 g used), still BOUND, not archived. Functionality-blocking.
+    * ``genuine`` — stamped spent WITH feed evidence. Must never be cleared: doctrine
+      rule 8 makes ``last_used`` the evidence field that survives repairs.
+    * ``unbound`` — false-spent but bound to nothing. Cosmetic history, deliberately
+      out of scope: it blocks no slot.
+    """
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    stamped = datetime(2026, 7, 31, 12, 0, 0)
+    async with session_maker() as session:
+        await _make_printer(session)
+        false_spent = await _make_spool(session, spent_at=stamped, last_used=None, weight_used=0.0)
+        genuine = await _make_spool(
+            session, spent_at=stamped, last_used=datetime(2026, 7, 30, 9, 0, 0), weight_used=900.0
+        )
+        unbound = await _make_spool(session, spent_at=stamped, last_used=None, weight_used=0.0)
+        session.add(SpoolAssignment(spool_id=false_spent.id, printer_id=1, ams_id=0, tray_id=0))
+        session.add(SpoolAssignment(spool_id=genuine.id, printer_id=1, ams_id=0, tray_id=1))
+        await session.commit()
+        return {"false_spent": false_spent.id, "genuine": genuine.id, "unbound": unbound.id}
+
+
+async def _spent_map(conn) -> dict[int, object]:
+    rows = (await conn.execute(text("SELECT id, spent_at FROM spool"))).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+@pytest.mark.asyncio
+async def test_repair_clears_only_the_bound_never_fed_false_spent_row(engine, session_maker, caplog):
+    """A spool that 'ran out' but never fed is self-contradictory — and while it is
+    BOUND it blocks its slot forever (a same-roll discovery read concludes KEEP on the
+    spent latch, and selection hard-excludes spent rows). Exactly that row is cleared."""
+    ids = await _seed_false_spent_fixtures(session_maker)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_DB_LOGGER):
+        async with engine.begin() as conn:
+            await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        spent = await _spent_map(conn)
+
+    assert spent[ids["false_spent"]] is None, "the 185/205 shape is cleared"
+    assert spent[ids["genuine"]] is not None, "feed evidence (rule 8) protects a real stamp"
+    assert spent[ids["unbound"]] is not None, "unbound false-spent is cosmetic and stays"
+
+    repair_lines = [r.getMessage() for r in caplog.records if "[REPAIR] clearing false spent stamps" in r.getMessage()]
+    assert len(repair_lines) == 1
+    assert str(ids["false_spent"]) in repair_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_repair_is_idempotent_and_silent_on_a_second_run(engine, session_maker, caplog):
+    """Second run matches nothing (its own predicate requires a standing stamp), and an
+    empty result logs nothing at all."""
+    ids = await _seed_false_spent_fixtures(session_maker)
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        first_pass = await _spent_map(conn)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_DB_LOGGER):
+        async with engine.begin() as conn:
+            await run_migrations(conn)
+    async with engine.connect() as conn:
+        second_pass = await _spent_map(conn)
+
+    assert first_pass == second_pass
+    assert first_pass[ids["genuine"]] is not None
+    assert [r.getMessage() for r in caplog.records if "[REPAIR]" in r.getMessage()] == []
+
+
+@pytest.mark.asyncio
+async def test_repair_unblocks_the_slot_for_selection(engine, session_maker):
+    """LIVENESS PIN. Clearing the stamp is only the mechanism; the CONSEQUENCE is that
+    the slot becomes selectable again. Asserted through the real consumer
+    (``spool_selection.build_slot_inventory``), because a suppression/repair fix that is
+    verified only by absence cannot tell a cure from a deeper deadlock."""
+    from unittest.mock import AsyncMock, patch
+
+    from backend.app.services.spool_selection import build_slot_inventory
+
+    ids = await _seed_false_spent_fixtures(session_maker)
+    loaded = [{"ams_id": 0, "tray_id": 0, "global_tray_id": 0, "is_external": False}]
+
+    async with session_maker() as session:
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            before = await build_slot_inventory(session, printer_id=1, loaded=loaded)
+    assert before[0].spent is True, "pre-repair the slot is hard-excluded from selection"
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+
+    async with session_maker() as session:
+        with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
+            after = await build_slot_inventory(session, printer_id=1, loaded=loaded)
+    assert after[0].spent is False, "post-repair the roll is eligible again"
+    # Still the SAME binding, with its ledger intact — the repair clears one stamp, it
+    # does not rebind the slot or touch grams.
+    assert after[0].remaining_g == before[0].remaining_g
+    assert ids["false_spent"] is not None

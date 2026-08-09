@@ -581,6 +581,62 @@ async def test_exact_uuid_match_accepts_a_differing_stored_tag_as_a_sibling_read
 
 
 @pytest.mark.asyncio
+async def test_a_recorded_sibling_tag_resolves_the_row_on_a_bare_tag_scan(db_session, caplog):
+    """Once the pair is on the row, the far chip is a FIRST-CLASS identifier.
+
+    A scan carrying only that chip and no uuid — the incremental-push shape, and every
+    SpoolBuddy/NFC bare-tag lookup — used to find no owner at all, because the exact
+    lane only ever queried ``tag_uid``. Matching ``sibling_tag_uid`` is exactness, not
+    widening: it was written from a real read of this same roll."""
+    roll = Spool(
+        material="PETG",
+        tag_uid="EC96F1E700000100",
+        sibling_tag_uid="3CF1F3E700000100",
+        tray_uuid="8AC9EC0847FD41D0890870319F2E1975",
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    roll.k_profiles = []
+    roll.assignments = []
+    db_session.add(roll)
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger=_MATCHER_LOGGER):
+        found = await get_spool_by_tag(db_session, "3CF1F3E700000100", "")
+
+    assert found is not None and found.id == roll.id, "the far chip names this roll"
+    # Nothing to explain any more: a recorded chip is an ordinary exact match, so the
+    # sibling INFO fires only for a side never seen before.
+    assert not any("[sibling-tag]" in m for m in _matcher_infos(caplog))
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_sibling_silences_the_uuid_path_announcement(db_session, caplog):
+    """Same roll, same far-side scan, but WITH the uuid on the wire: still the same row,
+    and now silent — the disagreement the INFO existed to explain is recorded fact."""
+    roll = Spool(
+        material="PETG",
+        tag_uid="EC96F1E700000100",
+        sibling_tag_uid="3CF1F3E700000100",
+        tray_uuid="8AC9EC0847FD41D0890870319F2E1975",
+        tag_type="bambulab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    roll.k_profiles = []
+    roll.assignments = []
+    db_session.add(roll)
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger=_MATCHER_LOGGER):
+        found = await get_spool_by_tag(db_session, "3CF1F3E700000100", "8AC9EC0847FD41D0890870319F2E1975")
+
+    assert found is not None and found.id == roll.id
+    assert not any("[sibling-tag]" in m for m in _matcher_infos(caplog))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("spool_id_label", "stored_tag", "wire_tag", "tray_uuid"),
     [

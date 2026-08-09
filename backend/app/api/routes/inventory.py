@@ -5,7 +5,7 @@ import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -2207,27 +2207,41 @@ async def link_tag_to_spool(
     _validate_tag_input(data.tag_uid, normalized_tag_uid, "tag_uid")
     _validate_tag_input(data.tray_uuid, normalized_tray_uuid, "tray_uuid", exact_len=32)
 
-    # Check for conflicts: tag already linked to another active spool
+    # Check for conflicts: tag already linked to another active spool.
+    #
+    # The uniqueness span covers BOTH chips. A Bambu roll carries two RFID tags sharing
+    # one tray_uuid, so a tag that is some other row's recorded ``sibling_tag_uid`` is
+    # already spoken for just as firmly as its primary — linking it here would put one
+    # physical roll's identity on two ledger rows, the exact duplicate-identity error
+    # this 409 exists to prevent.
     if normalized_tag_uid:
+        _tag_on_either_chip = or_(
+            func.upper(Spool.tag_uid) == normalized_tag_uid,
+            func.upper(Spool.sibling_tag_uid) == normalized_tag_uid,
+        )
         conflict = await db.execute(
             select(Spool).where(
-                func.upper(Spool.tag_uid) == normalized_tag_uid,
+                _tag_on_either_chip,
                 Spool.id != spool_id,
                 Spool.archived_at.is_(None),
             )
         )
         if conflict.scalar_one_or_none():
             raise HTTPException(409, "Tag UID already linked to another active spool")
-        # Auto-clear from archived spools (tag recycling)
+        # Auto-clear from archived spools (tag recycling) — whichever chip held it, so a
+        # recycled tag cannot stay pinned by an archived row's sibling.
         archived_with_tag = await db.execute(
             select(Spool).where(
-                func.upper(Spool.tag_uid) == normalized_tag_uid,
+                _tag_on_either_chip,
                 Spool.id != spool_id,
                 Spool.archived_at.is_not(None),
             )
         )
         for old_spool in archived_with_tag.scalars().all():
-            old_spool.tag_uid = None
+            if (old_spool.tag_uid or "").upper() == normalized_tag_uid:
+                old_spool.tag_uid = None
+            if (old_spool.sibling_tag_uid or "").upper() == normalized_tag_uid:
+                old_spool.sibling_tag_uid = None
 
     if normalized_tray_uuid:
         conflict = await db.execute(

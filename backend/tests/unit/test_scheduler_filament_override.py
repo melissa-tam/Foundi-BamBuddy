@@ -5,6 +5,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from backend.app.services.print_scheduler import PrintScheduler
+from backend.app.services.spool_selection import match_filaments_to_slots
+
+
+def _slot_order(required, loaded):
+    """Drive the canonical matcher under the DEFAULT case — ``slot_order`` policy, no
+    inventory, no minimum-start floor. Returns the mapping array. Policy selection and
+    the start floor belong to the dispatcher, not to an override test."""
+    return match_filaments_to_slots(
+        required, loaded, policy="slot_order", inv={}, backup_on=True, min_start_g=0
+    ).mapping
 
 
 class TestCountOverrideColorMatches:
@@ -115,7 +125,7 @@ class TestFilamentOverrideInMatching:
         ]
 
         # Without override: type-only match (colors differ)
-        result_without = scheduler._match_filaments_to_slots(filament_reqs, loaded)
+        result_without = _slot_order(filament_reqs, loaded)
         assert result_without == [0]  # Matches by type only
 
         # Now apply override changing color to match loaded
@@ -123,7 +133,7 @@ class TestFilamentOverrideInMatching:
         filament_reqs_overridden = [{"slot_id": 1, "type": "PLA", "color": "#000000", "tray_info_idx": ""}]
         self._apply_overrides(filament_reqs_overridden, overrides)
 
-        result_with = scheduler._match_filaments_to_slots(filament_reqs_overridden, loaded)
+        result_with = _slot_order(filament_reqs_overridden, loaded)
         assert result_with == [0]  # Exact color match now
         # Verify the override actually changed the color in the requirement
         assert filament_reqs_overridden[0]["color"] == "#FF0000"
@@ -137,7 +147,7 @@ class TestFilamentOverrideInMatching:
 
         # Without override: tray_info_idx "GFA00" matches tray 0 (red)
         filament_reqs_original = [{"slot_id": 1, "type": "PLA", "color": "#FF0000", "tray_info_idx": "GFA00"}]
-        result_original = scheduler._match_filaments_to_slots(filament_reqs_original, loaded)
+        result_original = _slot_order(filament_reqs_original, loaded)
         assert result_original == [0]  # Matched by tray_info_idx
 
         # With override: tray_info_idx is cleared, color changed to green -> matches tray 1
@@ -146,7 +156,7 @@ class TestFilamentOverrideInMatching:
         self._apply_overrides(filament_reqs_overridden, overrides)
 
         assert filament_reqs_overridden[0]["tray_info_idx"] == ""  # Cleared
-        result_overridden = scheduler._match_filaments_to_slots(filament_reqs_overridden, loaded)
+        result_overridden = _slot_order(filament_reqs_overridden, loaded)
         assert result_overridden == [1]  # Now matches tray 1 by color
 
     def test_override_type_change(self, scheduler):
@@ -157,7 +167,7 @@ class TestFilamentOverrideInMatching:
 
         # Without override: PLA requirement, PETG loaded -> no match
         filament_reqs_original = [{"slot_id": 1, "type": "PLA", "color": "#FF0000", "tray_info_idx": ""}]
-        result_original = scheduler._match_filaments_to_slots(filament_reqs_original, loaded)
+        result_original = _slot_order(filament_reqs_original, loaded)
         assert result_original == [-1]  # Type mismatch
 
         # With override: type changed to PETG -> matches
@@ -165,7 +175,7 @@ class TestFilamentOverrideInMatching:
         overrides = [{"slot_id": 1, "type": "PETG", "color": "#FF0000"}]
         self._apply_overrides(filament_reqs_overridden, overrides)
 
-        result_overridden = scheduler._match_filaments_to_slots(filament_reqs_overridden, loaded)
+        result_overridden = _slot_order(filament_reqs_overridden, loaded)
         assert result_overridden == [0]  # Exact match now
 
     def test_partial_override(self, scheduler):
@@ -192,7 +202,7 @@ class TestFilamentOverrideInMatching:
         assert filament_reqs[1]["color"] == "#00FF00"
         assert filament_reqs[1]["tray_info_idx"] == "GFG02"
 
-        result = scheduler._match_filaments_to_slots(filament_reqs, loaded)
+        result = _slot_order(filament_reqs, loaded)
         assert result == [0, 1]  # Slot 1 -> tray 0 (red PLA), slot 2 -> tray 1 (green PETG)
 
     def test_nozzle_filtering_with_override(self, scheduler):
@@ -209,7 +219,7 @@ class TestFilamentOverrideInMatching:
         overrides = [{"slot_id": 1, "type": "PETG", "color": "#FF0000"}]
         self._apply_overrides(filament_reqs, overrides)
 
-        result = scheduler._match_filaments_to_slots(filament_reqs, loaded)
+        result = _slot_order(filament_reqs, loaded)
         # Nozzle filter limits to extruder 1 (LEFT) which only has PLA.
         # Override changed type to PETG, so no type match on LEFT nozzle -> -1
         assert result == [-1]

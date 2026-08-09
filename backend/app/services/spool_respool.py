@@ -73,7 +73,7 @@ from backend.app.services.tray_fields import (
     parse_filam_bak,
     tray_presence_from_dict,
 )
-from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid
+from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid, tag_matches_row
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1294,31 +1294,6 @@ async def confirm_backup_swaps(
     return stamped
 
 
-async def capture_backup_swap(db: AsyncSession, printer_id: int, state) -> Spool | None:
-    """Sample + confirm in one call against the CALLER's session — tests-only entry point.
-
-    Production drives the two halves separately (:func:`sample_status_push` per status
-    push, :func:`confirm_backup_swaps` as a fire-and-forget task) because the sampling
-    cadence and the session-bearing work have different homes. This facade keeps the
-    single-call shape the incident-pin suite exercises: it runs the same sampler and
-    stamps through the same :func:`_mark_tray_spent`, so there is one implementation of
-    the decision logic and the pins keep testing what production runs.
-
-    Returns the first spool stamped by this call (or ``None``), matching the pre-split
-    signature. No-op in Spoolman mode.
-    """
-    departed = sample_status_push(printer_id, state)
-    if not departed:
-        return None
-    if await _spoolman_enabled(db):
-        return None
-    for global_tray in departed:
-        spool = await _mark_tray_spent(db, printer_id, global_tray)
-        if spool is not None:
-            return spool
-    return None
-
-
 # --- the spent-contradiction detector ---------------------------------------
 #
 # A spent stamp is a one-way door. `_mark_tray_spent` deliberately leaves the gram
@@ -1391,10 +1366,14 @@ def _binding_identity_holds(spool: Spool, tray: dict) -> bool:
     TAGGED binding (the row carries a tag or a uuid): identity is RFID, read under the
     sibling-tag law. ``tray_uuid`` IS the spool identity and ``tag_uid`` is a read of
     one of the roll's two chips, so uuid agreement settles it even across an apparent
-    tag change (doctrine rule 10, false-alarm shape 20), and a tag match is equally
-    conclusive when the push carried no uuid. Disagreement on both = a different roll,
-    which is not a contradiction at all — it is an ordinary swap the binding has not
-    caught up with.
+    tag change (doctrine rule 10, false-alarm shape 20), and a tag match against EITHER
+    recorded chip (:func:`tag_matches_row`) is equally conclusive when the push carried
+    no uuid. Matching the near chip alone made the spent-contradiction detector skip a
+    genuine contradiction whenever the tray happened to be showing its far side — the
+    detector's whole job is to be loud, so a silent miss on a coin-flip of roll
+    orientation is the worst possible failure for it. Disagreement on both = a different
+    roll, which is not a contradiction at all — it is an ordinary swap the binding has
+    not caught up with.
 
     UNTAGGED binding: no RFID to compare, so the codebase's existing fingerprint idiom
     (``spool_tagless.fingerprint_matches`` — canonical material plus colour within
@@ -1406,10 +1385,13 @@ def _binding_identity_holds(spool: Spool, tray: dict) -> bool:
     """
     spool_uuid = normalized_tray_uuid(spool.tray_uuid)
     spool_tag = normalized_tag_uid(spool.tag_uid)
-    if spool_uuid is not None or spool_tag is not None:
+    spool_sibling = normalized_tag_uid(spool.sibling_tag_uid)
+    if spool_uuid is not None or spool_tag is not None or spool_sibling is not None:
         tray_uuid = normalized_tray_uuid(tray.get("tray_uuid"))
         tray_tag = normalized_tag_uid(tray.get("tag_uid"))
-        return (spool_uuid is not None and spool_uuid == tray_uuid) or (spool_tag is not None and spool_tag == tray_tag)
+        return (spool_uuid is not None and spool_uuid == tray_uuid) or tag_matches_row(
+            tray_tag, spool_tag, spool_sibling
+        )
     from backend.app.services.spool_tagless import fingerprint_matches
 
     return fingerprint_matches(spool, tray)
@@ -2275,6 +2257,14 @@ async def respool_tag(
     # 2. Sibling-tag guard + donor resolution. get_spool_by_tag prefers tray_uuid,
     # so a tray_uuid match that is itself a reused-type row with a DIFFERENT
     # tag_uid is the donor's sibling already living on another spool → refuse.
+    #
+    # DELIBERATELY compares ``tag_uid`` ALONE — do NOT "unify" this onto
+    # ``tag_matches_row``. Every other tag comparison in the fork asks "is this the same
+    # roll?" and wants the sibling folded in; this one asks the opposite question, "did
+    # the donor's OTHER chip just arrive?", and the tag DISAGREEMENT is precisely the
+    # signal it fires on. Routing it through the pair comparer would make a recorded
+    # sibling match, the disagreement vanish, and this 409 silently stop existing —
+    # letting one donor roll's two chips each spawn a re-spooled row (one tag per donor).
     donor = await get_spool_by_tag(db, scan_tag_uid, scan_tray_uuid)
     if (
         donor is not None
@@ -2287,16 +2277,25 @@ async def respool_tag(
             raise RespoolSiblingConflict(donor.id)
 
     # Idempotency: the resolved row is ALREADY the fresh re-spooled record for
-    # this very tag (double-submit, or the auto path racing a manual confirm) —
+    # this very ROLL (double-submit, or the auto path racing a manual confirm) —
     # disposing it and minting another would churn a duplicate. Return it
     # unchanged; a brand correction goes through the normal spool edit.
+    #
+    # Unlike the sibling GUARD above, this asks the ordinary "same roll?" question, so
+    # it matches EITHER recorded chip: a re-submit that happens to scan the fresh row's
+    # far side is the same double-submit, and comparing the near chip alone let it fall
+    # through to a second full re-spool of a row already re-spooled.
     if (
         donor is not None
         and donor.tag_type == RESPOOL_TAG_TYPE
         and donor.spent_at is None
         and not (donor.weight_used or 0)
         and norm_uid
-        and normalize_tag_uid(donor.tag_uid or "") == norm_uid
+        and tag_matches_row(
+            norm_uid,
+            normalize_tag_uid(donor.tag_uid or ""),
+            normalize_tag_uid(donor.sibling_tag_uid or ""),
+        )
     ):
         logger.info("Re-spool no-op: spool %d is already the fresh record for tag %s", donor.id, norm_uid)
         return donor

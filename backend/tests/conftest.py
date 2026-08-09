@@ -179,6 +179,20 @@ async def db_session(test_engine) -> AsyncGenerator[AsyncSession, None]:
 
 
 @pytest.fixture
+def own_session_factory(test_engine):
+    """An INDEPENDENT session maker on the test engine.
+
+    The shape a service that opens its own session takes in production
+    (``core.database.async_session``) — e.g. ``spool_respool.confirm_backup_swaps``,
+    which ``main`` fires as a bare task with no session to borrow. Using this instead of
+    ``db_session`` is what makes such a service run its real commit boundary: work it
+    lands is committed by ANOTHER session, so a test observing it through ``db_session``
+    must ``refresh()`` rather than read a stale identity-mapped instance.
+    """
+    return async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+@pytest.fixture
 async def async_client(test_engine, db_session) -> AsyncGenerator[AsyncClient, None]:
     """Create an async test client."""
     from backend.app.core.database import async_session, get_db

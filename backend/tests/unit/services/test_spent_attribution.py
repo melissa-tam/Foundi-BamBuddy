@@ -28,7 +28,6 @@ from backend.app.services.bambu_mqtt import BambuMQTTClient, HMSError
 from backend.app.services.notification_service import notification_service
 from backend.app.services.spool_respool import (
     _ams_hint_from_short_codes,
-    capture_backup_swap,
     detect_spent_contradictions,
     mark_spent_on_runout,
     mark_spent_on_slot_runout,
@@ -331,17 +330,36 @@ def _swap_push(tray_now, *, units=(0, 1, 2), filam_bak=None, device_bak=None, su
     return state
 
 
-async def _stable_feeder(db, printer_id, tray, clock, **kw):
-    await capture_backup_swap(db, printer_id, _swap_push(tray, **kw))
-    await capture_backup_swap(db, printer_id, _swap_push(tray, **kw))
+def _sample(printer_id, tray, **kw) -> list[int]:
+    """One status push through the REAL sampler — sync and DB-less, exactly as
+    ``main.on_printer_status_change`` drives it ~1 Hz per printer."""
+    return spool_respool.sample_status_push(printer_id, _swap_push(tray, **kw))
+
+
+def _stable_feeder(printer_id, tray, clock, **kw):
+    """Confirm ``tray`` as the stable feeder: two same-value samples ≥ _SWAP_CONFIRM_S
+    apart after a seeding push. Nothing confirms, so no session is involved at all."""
+    assert _sample(printer_id, tray, **kw) == []
+    assert _sample(printer_id, tray, **kw) == []
     clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    await capture_backup_swap(db, printer_id, _swap_push(tray, **kw))
+    assert _sample(printer_id, tray, **kw) == []
     assert spool_respool._stable_feeder.get(printer_id) == tray
+
+
+async def _drive_swap(session_factory, printer_id, tray, **kw) -> Spool | None:
+    """One status push through BOTH production halves, wired as ``main`` wires them:
+    the sync sampler decides, and — only on a confirmation — the async confirmer stamps
+    on its OWN session. Returns the first spool stamped by this push, else None."""
+    departed = _sample(printer_id, tray, **kw)
+    if not departed:
+        return None
+    stamped = await spool_respool.confirm_backup_swaps(printer_id, departed, session_factory=session_factory)
+    return stamped[0] if stamped else None
 
 
 @pytest.mark.asyncio
 async def test_ambiguous_swap_without_filam_bak_declines_and_warns(
-    db_session, printer_factory, wire, fake_clock, caplog
+    db_session, printer_factory, wire, fake_clock, caplog, own_session_factory
 ):
     """No grouping evidence at all → no stamp. On a bare-slot topology a feeder change
     is not by itself proof a roll ran dry, and the fat-remainder WARNING plus the
@@ -350,11 +368,11 @@ async def test_ambiguous_swap_without_filam_bak_declines_and_warns(
     wire["client"] = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    await _stable_feeder(db_session, printer.id, 0, fake_clock)
-    await capture_backup_swap(db_session, printer.id, _swap_push(1))  # open the pending swap
+    _stable_feeder(printer.id, 0, fake_clock)
+    assert _sample(printer.id, 1) == []  # open the pending swap
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_respool"):
-        stamped = await capture_backup_swap(db_session, printer.id, _swap_push(1))
+        stamped = await _drive_swap(own_session_factory, printer.id, 1)
 
     assert stamped is None
     await db_session.refresh(departed)
@@ -364,17 +382,19 @@ async def test_ambiguous_swap_without_filam_bak_declines_and_warns(
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_swap_with_filam_bak_group_stamps(db_session, printer_factory, wire, fake_clock):
+async def test_ambiguous_swap_with_filam_bak_group_stamps(
+    db_session, printer_factory, wire, fake_clock, own_session_factory
+):
     """The firmware's OWN grouping pairs the two trays → the switch it performed between
     them IS an auto-refill, and the departed roll ran dry. Stamp."""
     printer = await printer_factory(model="H2C")
     wire["client"] = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    await _stable_feeder(db_session, printer.id, 0, fake_clock, filam_bak=[0, 1])
-    await capture_backup_swap(db_session, printer.id, _swap_push(1, filam_bak=[0, 1]))
+    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[0, 1])
+    assert _sample(printer.id, 1, filam_bak=[0, 1]) == []
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    stamped = await capture_backup_swap(db_session, printer.id, _swap_push(1, filam_bak=[0, 1]))
+    stamped = await _drive_swap(own_session_factory, printer.id, 1, filam_bak=[0, 1])
 
     assert stamped is not None and stamped.id == departed.id
     assert stamped.spent_at is not None
@@ -383,7 +403,7 @@ async def test_ambiguous_swap_with_filam_bak_group_stamps(db_session, printer_fa
 
 @pytest.mark.asyncio
 async def test_ambiguous_swap_with_group_not_pairing_the_trays_declines(
-    db_session, printer_factory, wire, fake_clock, caplog
+    db_session, printer_factory, wire, fake_clock, caplog, own_session_factory
 ):
     """A group exists but does NOT contain both trays — the feeder change crossed
     groups, so it is a tool change or a remap, never an auto-refill."""
@@ -391,11 +411,11 @@ async def test_ambiguous_swap_with_group_not_pairing_the_trays_declines(
     wire["client"] = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    await _stable_feeder(db_session, printer.id, 0, fake_clock, filam_bak=[0, 3])
-    await capture_backup_swap(db_session, printer.id, _swap_push(1, filam_bak=[0, 3]))
+    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[0, 3])
+    assert _sample(printer.id, 1, filam_bak=[0, 3]) == []
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_respool"):
-        stamped = await capture_backup_swap(db_session, printer.id, _swap_push(1, filam_bak=[0, 3]))
+        stamped = await _drive_swap(own_session_factory, printer.id, 1, filam_bak=[0, 3])
 
     assert stamped is None
     await db_session.refresh(departed)
@@ -404,7 +424,7 @@ async def test_ambiguous_swap_with_group_not_pairing_the_trays_declines(
 
 
 @pytest.mark.asyncio
-async def test_per_extruder_filam_bak_shape_is_read(db_session, printer_factory, wire, fake_clock):
+async def test_per_extruder_filam_bak_shape_is_read(db_session, printer_factory, wire, fake_clock, own_session_factory):
     """Shape B: ``print.device.extruder.info[i].filam_bak``. A dual-nozzle machine
     reports groups per EXTRUDER, and each extruder is its own group — two nozzles do not
     back each other up."""
@@ -413,16 +433,18 @@ async def test_per_extruder_filam_bak_shape_is_read(db_session, printer_factory,
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
     groups = [[0, 1], [8, 9]]  # right nozzle pairs 0/1; left nozzle pairs 8/9
 
-    await _stable_feeder(db_session, printer.id, 0, fake_clock, device_bak=groups)
-    await capture_backup_swap(db_session, printer.id, _swap_push(1, device_bak=groups))
+    _stable_feeder(printer.id, 0, fake_clock, device_bak=groups)
+    assert _sample(printer.id, 1, device_bak=groups) == []
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    stamped = await capture_backup_swap(db_session, printer.id, _swap_push(1, device_bak=groups))
+    stamped = await _drive_swap(own_session_factory, printer.id, 1, device_bak=groups)
 
     assert stamped is not None and stamped.id == departed.id
 
 
 @pytest.mark.asyncio
-async def test_filam_bak_cache_survives_pushes_that_omit_it(db_session, printer_factory, wire, fake_clock):
+async def test_filam_bak_cache_survives_pushes_that_omit_it(
+    db_session, printer_factory, wire, fake_clock, own_session_factory
+):
     """``bambu_mqtt`` replaces ``raw_data`` wholesale and preserves only ams / vt_tray /
     ams_extruder_map / mapping, so an incremental push drops ``filam_bak`` entirely. The
     LAST-SEEN grouping must stand, or corroboration would be a coin flip on push timing."""
@@ -430,27 +452,29 @@ async def test_filam_bak_cache_survives_pushes_that_omit_it(db_session, printer_
     wire["client"] = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    await _stable_feeder(db_session, printer.id, 0, fake_clock, filam_bak=[0, 1])
+    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[0, 1])
     # Every push from here on omits the field.
-    await capture_backup_swap(db_session, printer.id, _swap_push(1))
+    assert _sample(printer.id, 1) == []
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    stamped = await capture_backup_swap(db_session, printer.id, _swap_push(1))
+    stamped = await _drive_swap(own_session_factory, printer.id, 1)
 
     assert stamped is not None and stamped.id == departed.id
 
 
 @pytest.mark.asyncio
-async def test_unambiguous_topology_swap_needs_no_corroboration(db_session, printer_factory, wire, fake_clock):
+async def test_unambiguous_topology_swap_needs_no_corroboration(
+    db_session, printer_factory, wire, fake_clock, own_session_factory
+):
     """Single AMS, single nozzle: unchanged behavior, no ``filam_bak`` required. The
     corroboration is a narrowing of the ambiguous case ONLY."""
     printer = await printer_factory(model="H2S")
     wire["client"] = _client(model="H2S")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    await _stable_feeder(db_session, printer.id, 0, fake_clock, units=(0,))
-    await capture_backup_swap(db_session, printer.id, _swap_push(1, units=(0,)))
+    _stable_feeder(printer.id, 0, fake_clock, units=(0,))
+    assert _sample(printer.id, 1, units=(0,)) == []
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    stamped = await capture_backup_swap(db_session, printer.id, _swap_push(1, units=(0,)))
+    stamped = await _drive_swap(own_session_factory, printer.id, 1, units=(0,))
 
     assert stamped is not None and stamped.id == departed.id
 
@@ -495,6 +519,67 @@ async def test_detector_reports_contradiction_and_never_mutates_the_row(db_sessi
     assert spool.spent_at == spent_before, "the detector must NEVER clear or move a spent stamp"
     assert spool.weight_used == 0.0
     assert spool.archived_at is None
+
+
+SIBLING_TAG_UID = "3CF1F3E700000100"
+
+
+@pytest.mark.asyncio
+async def test_detector_still_fires_when_the_tray_shows_the_sibling_chip(db_session, printer_factory):
+    """A Bambu roll carries two chips, and which one the AMS reads is a coin flip on how
+    the roll was seated. The identity check therefore has to accept EITHER, or the
+    detector silently skips a genuine contradiction for as long as the roll faces its far
+    side — a loud-by-design lane going quiet on roll orientation.
+
+    Same 185/205 fixture as above; only the chip on the wire differs.
+    """
+    printer = await printer_factory(model="H2C")
+    spool = await _bind(
+        db_session,
+        printer.id,
+        1,
+        0,
+        weight_used=0.0,
+        tag_uid=TAG_UID,
+        sibling_tag_uid=SIBLING_TAG_UID,
+        tray_uuid=TRAY_UUID,
+        spent_at=datetime.utcnow(),
+    )
+    # The push carries the FAR chip and no uuid — the incremental-push shape.
+    manager = _live(printer.id, 1, 0, _tray(remain=100, tag_uid=SIBLING_TAG_UID, tray_uuid=None))
+
+    with patch.object(notification_service, "on_spent_contradiction", new_callable=AsyncMock) as notify:
+        found = await detect_spent_contradictions(db_session, manager)
+
+    assert found == 1, "the far chip identifies the bound roll just as the near one does"
+    notify.assert_awaited_once()
+    assert notify.await_args.args[2] == spool.id
+
+
+@pytest.mark.asyncio
+async def test_detector_still_ignores_a_genuinely_different_roll(db_session, printer_factory):
+    """The widening must not become "any tag counts". A chip belonging to neither
+    recorded side is an ordinary swap the binding has not caught up with — not a
+    contradiction."""
+    printer = await printer_factory(model="H2C")
+    await _bind(
+        db_session,
+        printer.id,
+        1,
+        0,
+        weight_used=0.0,
+        tag_uid=TAG_UID,
+        sibling_tag_uid=SIBLING_TAG_UID,
+        tray_uuid=TRAY_UUID,
+        spent_at=datetime.utcnow(),
+    )
+    manager = _live(printer.id, 1, 0, _tray(remain=100, tag_uid="A5E7210D00000100", tray_uuid=None))
+
+    with patch.object(notification_service, "on_spent_contradiction", new_callable=AsyncMock) as notify:
+        found = await detect_spent_contradictions(db_session, manager)
+
+    assert found == 0
+    notify.assert_not_awaited()
 
 
 @pytest.mark.asyncio

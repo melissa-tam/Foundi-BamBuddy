@@ -1551,28 +1551,6 @@ class PrintScheduler:
         to the canonical ``spool_selection`` implementation."""
         return colors_are_similar(color1, color2, threshold)
 
-    async def _build_inventory_remain_overrides(
-        self, db: AsyncSession, printer_id: int, loaded: list[dict]
-    ) -> dict[int, float]:
-        """Thin delegate: ``{global_tray_id: remaining_grams}`` for inventory-bound
-        AMS slots, sourced from ``spool_selection.build_slot_inventory`` (single
-        source with the dispatcher). Kept for external callers that only need the
-        remaining-grams map; slots without a known remaining are omitted.
-        """
-        inv = await build_slot_inventory(db, printer_id, loaded)
-        return {gtid: si.remaining_g for gtid, si in inv.items() if si.remaining_g is not None}
-
-    def _match_filaments_to_slots(self, required: list[dict], loaded: list[dict]) -> list[int] | None:
-        """Thin delegate to ``spool_selection.match_filaments_to_slots`` for the
-        default (slot-order, no floor) case — bucket precedence unchanged. Policy
-        selection and the minimum-start floor live in
-        ``_compute_ams_mapping_for_printer``; this preserves the simple
-        two-argument entry point external callers use. Returns the mapping array.
-        """
-        return match_filaments_to_slots(
-            required, loaded, policy="slot_order", inv={}, backup_on=True, min_start_g=0
-        ).mapping
-
     def _mark_printer_dispatched(
         self,
         printer_id: int,

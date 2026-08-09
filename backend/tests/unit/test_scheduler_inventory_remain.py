@@ -9,9 +9,9 @@ the authoritative remaining-weight signal, and ``COALESCE(first_loaded_at,
 created_at)`` (Spoolman: ``first_used``) is the FIFO ordinal. These tests
 verify ``build_slot_inventory`` surfaces both, keyed by ``global_tray_id``.
 
-``PrintScheduler._build_inventory_remain_overrides`` is now a thin delegate
-that projects the remaining-grams side of this map; a couple of cases pin
-that delegate to guard the external key/shape it still returns.
+``build_slot_inventory`` is the ONE owner: the scheduler's
+``_build_inventory_remain_overrides`` delegate that used to project the
+remaining-grams side had no production caller and has been deleted.
 """
 
 from datetime import datetime, timezone
@@ -270,9 +270,11 @@ class TestInternalInventoryOverrides:
         assert 1 not in out
 
     @pytest.mark.asyncio
-    async def test_delegate_projects_remaining_grams(self, scheduler):
-        """The retained ``_build_inventory_remain_overrides`` delegate projects
-        the remaining-grams side, preserving its external ``{gtid: grams}`` shape."""
+    async def test_remaining_grams_per_bound_slot(self):
+        """Remaining grams are ``label_weight - weight_used`` per bound slot, keyed by
+        global tray id. Previously asserted through a scheduler delegate that projected
+        ``{gtid: grams}``; that delegate had no production caller and is gone, so the
+        property is asserted on its one owner."""
         rows = [
             SimpleNamespace(ams_id=0, tray_id=0, spool=_spool(label_weight=1000, weight_used=50)),
             SimpleNamespace(ams_id=0, tray_id=3, spool=_spool(label_weight=1000, weight_used=950)),
@@ -283,8 +285,8 @@ class TestInternalInventoryOverrides:
         ]
         db = _make_async_session_returning(rows)
         with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
-            out = await scheduler._build_inventory_remain_overrides(db, printer_id=1, loaded=loaded)
-        assert out == {0: 950.0, 3: 50.0}
+            out = await build_slot_inventory(db, printer_id=1, loaded=loaded)
+        assert {gtid: si.remaining_g for gtid, si in out.items()} == {0: 950.0, 3: 50.0}
 
 
 class TestSpoolmanModeOverrides:

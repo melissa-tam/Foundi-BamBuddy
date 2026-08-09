@@ -17,6 +17,7 @@ from backend.app.utils.retry_window import RetryWindow
 from backend.app.utils.tag_normalization import (
     normalize_tag_uid as _normalize_tag_uid,
     normalize_tray_uuid as _normalize_tray_uuid,
+    tag_matches_row,
 )
 
 logger = logging.getLogger(__name__)
@@ -495,14 +496,19 @@ async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str, *, co
             return False
         return stored != tray_uuid_norm
 
-    def _tag_conflicts(stored_tag: str | None) -> bool:
-        """True when the scan and ``stored_tag`` are BOTH valid and DIFFER."""
+    def _tag_conflicts(stored_tag: str | None, sibling_tag: str | None = None) -> bool:
+        """True when the scan is valid, the row asserts a chip, and it matches NEITHER.
+
+        A row's tag identity is the PAIR of chips the roll carries, so the far-side chip
+        counts as an exact identification once it has been sighted — see
+        :func:`tag_matches_row`.
+        """
         if not tag_uid_valid:
             return False
         stored = _normalize_tag_uid(stored_tag or "")
         if not stored or stored == ZERO_TAG_UID or stored == "0" * len(stored):
             return False
-        return stored != tag_uid_norm
+        return not tag_matches_row(tag_uid_norm, stored, _normalize_tag_uid(sibling_tag or "") or None)
 
     async def _accept_variance(candidate: Spool, kind: str) -> Spool | None:
         """Different-roll guard + one-time convergence for a variance match.
@@ -582,13 +588,15 @@ async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str, *, co
             .limit(1)
         )
         spool = result.scalar_one_or_none()
-        if spool is not None and _tag_conflicts(spool.tag_uid):
+        if spool is not None and _tag_conflicts(spool.tag_uid, spool.sibling_tag_uid):
             # SIBLING TAG, not a different roll (2026-08-01, 4/4 prod slots — see the
             # docstring). The uuid is the roll's identity; the two chips on its flanges
             # share it, so a scan from the far side legitimately disagrees with the one
             # tag this row happens to store. Return the row and log it — deliberately
             # WITHOUT converging the stored tag: whichever side faces the antenna is a
             # property of how the roll was seated, not a reader defect to correct.
+            # Silent once the pair is recorded: a scan matching ``sibling_tag_uid`` is an
+            # exact identification, so this fires only for a chip never seen before.
             logger.info(
                 "[sibling-tag] tray_uuid match on spool %d: scanned tag %s differs from stored %s — "
                 "second RFID tag of the same roll (Bambu rolls carry two tags per tray_uuid); same spool",
@@ -599,12 +607,20 @@ async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str, *, co
         if spool:
             return spool
 
-    # Fall back to tag_uid
+    # Fall back to tag_uid — EITHER chip. A recorded ``sibling_tag_uid`` was written from
+    # a real read of this same roll, so matching it is exactness, not widening: without
+    # it a scan of the far side finds no owner and the roll's own row cannot answer.
     if tag_uid_valid:
         result = await db.execute(
             select(Spool)
             .options(selectinload(Spool.k_profiles), selectinload(Spool.assignments))
-            .where(func.upper(Spool.tag_uid) == tag_uid_norm, Spool.archived_at.is_(None))
+            .where(
+                or_(
+                    func.upper(Spool.tag_uid) == tag_uid_norm,
+                    func.upper(Spool.sibling_tag_uid) == tag_uid_norm,
+                ),
+                Spool.archived_at.is_(None),
+            )
             .limit(1)
         )
         spool = result.scalar_one_or_none()

@@ -58,6 +58,7 @@ from enum import Enum
 from backend.app.services.tray_observation import TrayObservation
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_types import canonical_filament_type
+from backend.app.utils.tag_normalization import tag_matches_row
 
 
 class SlotState(str, Enum):
@@ -195,6 +196,10 @@ class BindingView:
     spool_id: int
     is_tagless: bool
     tag_uid: str | None
+    # The roll's OTHER RFID chip, once sighted (``spool.sibling_tag_uid``). A row's tag
+    # identity is a PAIR — never compare against ``tag_uid`` alone; go through
+    # :func:`tag_matches_row`.
+    sibling_tag_uid: str | None
     tray_uuid: str | None
     spent: bool
     archived: bool
@@ -693,11 +698,13 @@ def identity_relation(view: BindingView, obs: TrayObservation) -> str:
       decides outright: equal → ``"same"`` EVEN when the tags differ (a sibling read of
       the roll's other chip — 4/4 prod slots, 2026-08-01); unequal → ``"different"``,
       positive proof of another roll.
-    * **Otherwise, both sides assert a ``tag_uid``.** Equal → ``"same"``: one chip is
-      only ever fitted to one roll, so a tag agreement is a real identification.
-      Unequal → ``"ambiguous"``, NOT a difference: the scanned chip may be the far side
-      of the very roll this row stands for, and no evidence in this push separates that
-      from a swap. Only a full read (both members) can.
+    * **Otherwise, both sides assert a ``tag_uid``.** Matching EITHER of the row's two
+      chips → ``"same"``: one chip is only ever fitted to one roll, so a tag agreement
+      is a real identification — and once the sibling has been sighted and persisted,
+      the roll's far side is just as much an identification as its near side.
+      Matching neither → ``"ambiguous"``, NOT a difference: the scanned chip may still
+      be a side of this roll we have never read, and no evidence in this push separates
+      that from a swap. Only a full read (both members) can.
     * **Nothing comparable** — one side asserts a member the other does not, or a
       tagless row asserts neither → ``"ambiguous"``: the honest answer is "no verdict".
 
@@ -710,22 +717,26 @@ def identity_relation(view: BindingView, obs: TrayObservation) -> str:
     if view_uuid and obs_uuid:
         return "same" if view_uuid == obs_uuid else "different"
 
-    view_tag = (view.tag_uid or "").upper()
-    obs_tag = (obs.tag_uid or "").upper()
-    if view_tag and obs_tag:
-        return "same" if view_tag == obs_tag else "ambiguous"
+    if (view.tag_uid or view.sibling_tag_uid) and obs.tag_uid:
+        return "same" if tag_matches_row(obs.tag_uid, view.tag_uid, view.sibling_tag_uid) else "ambiguous"
 
     return "ambiguous"
 
 
 def _keep_reason(view: BindingView, obs: TrayObservation) -> str:
-    """``"sibling_tag_read"`` when a KEEP spans a tag change, else the plain reason.
+    """``"sibling_tag_read"`` when a KEEP spans an UNRECORDED tag, else the plain reason.
 
-    The orchestrator INFO-logs the sibling case: it is the one KEEP where the stored
-    identity visibly disagrees with the wire, so an operator reading the log must be
-    able to see WHY it was still the same roll (the uuid matched).
+    The orchestrator INFO-logs the sibling case and PERSISTS the scanned chip onto the
+    row: it is the one KEEP where the stored identity visibly disagrees with the wire,
+    so an operator reading the log must be able to see WHY it was still the same roll
+    (the uuid matched).
+
+    Once that second chip is on the row, a re-read of it matches the PAIR
+    (:func:`tag_matches_row`) and this returns the plain reason — which is what makes
+    the announcement fire once per roll ever instead of on every push of every restart
+    (six prod spools replayed it forever before the pair was persisted).
     """
-    if obs.tag_uid and view.tag_uid and obs.tag_uid.upper() != view.tag_uid.upper():
+    if obs.tag_uid and view.tag_uid and not tag_matches_row(obs.tag_uid, view.tag_uid, view.sibling_tag_uid):
         return "sibling_tag_read"
     return "identity_matches_bound"
 

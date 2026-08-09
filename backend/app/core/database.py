@@ -4056,6 +4056,54 @@ async def run_migrations(conn):
         "CREATE INDEX IF NOT EXISTS ix_printer_incident_item_id ON printer_incident (item_id)",
     )
 
+    # Migration (WS7, 2026-08-09): the roll's SECOND RFID chip. A Bambu roll physically
+    # carries TWO tags — one per flange side — sharing one tray_uuid, and the AMS reads
+    # whichever side faces its antenna. Only one of the two was ever stored, so the other
+    # was re-discovered as a surprise on every push: six prod spools replayed the
+    # "[sibling-tag] … read its second tag" INFO forever, across every restart, because
+    # the dedup was process memory. Persisting the pair makes a far-side read a plain
+    # exact match. Idempotent ADD COLUMN (_safe_execute swallows "duplicate column name" /
+    # "already exists"); NULL = only one side has ever been read.
+    await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN sibling_tag_uid VARCHAR(32)")
+
+    # Repair (WS7, 2026-08-09): clear FALSE spent stamps — the one thing running code
+    # cannot fix for itself.
+    #
+    # A spool that "ran out" but never fed is self-contradictory. Doctrine rule 8 makes
+    # ``last_used`` the feed-evidence field that SURVIVES repairs (historical grams do
+    # not — a full-weight reset makes 0 g used ≠ never used), and rule 10 rules out every
+    # reuse story on this fleet, so "spent, never fed, still bound" has exactly one
+    # explanation: the stamp was wrong. Prod rows 185 and 205 were stamped by the
+    # pre-WS3 multi-AMS misattribution while their trays read LOADED at 100 %.
+    #
+    # Why it must be a migration rather than self-healing: a spent row is hard-excluded
+    # from selection and a same-roll discovery read concludes KEEP on the spent latch, so
+    # the stamp is a closed loop — the slot is blocked FOREVER and no amount of correct
+    # code reopens it. WS3 stopped producing these; only a repair clears the ones already
+    # written. There is no un-spend lane by operator ruling, which is precisely why this
+    # is a one-shot bounded repair and not a runtime path.
+    #
+    # BOUND-AND-LOADED is what makes a row functionality-blocking, hence the
+    # spool_assignment predicate: an unbound false-spent row is cosmetic history and is
+    # deliberately left alone. The <= 5 g tolerance is the never-fed floor used elsewhere
+    # in the binding layer, not a guess at "barely used".
+    #
+    # Idempotent: a second run matches nothing (the stamps it clears are its own
+    # predicate). Plain SQL, valid on SQLite and PostgreSQL alike. DML → conn.execute
+    # inside begin_nested (never swallowed), per this module's convention.
+    _false_spent_predicate = (
+        "spent_at IS NOT NULL AND last_used IS NULL AND COALESCE(weight_used, 0) <= 5 "
+        "AND archived_at IS NULL AND id IN (SELECT spool_id FROM spool_assignment)"
+    )
+    _false_spent = (await conn.execute(text(f"SELECT id FROM spool WHERE {_false_spent_predicate}"))).fetchall()
+    if _false_spent:
+        logger.info(
+            "[REPAIR] clearing false spent stamps: ids=%s",
+            [r[0] for r in _false_spent],
+        )
+        async with conn.begin_nested():
+            await conn.execute(text(f"UPDATE spool SET spent_at = NULL WHERE {_false_spent_predicate}"))
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),
