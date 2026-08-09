@@ -191,6 +191,7 @@ export default {
         previousPrintFailed: 'Held: previous print failed',
         filamentShort: 'Low filament',
         startSpoolBelowMinimum: 'Assigned spool is below the minimum start weight',
+        filamentUnreadPending: 'Filament unread — reading the seated roll',
         no_usb_drive: 'No USB drive in the printer — insert a USB-A drive (FAT32/exFAT)',
         staggerHold: 'Waiting for the power-stagger window — starts shortly',
         spoolJamRecovering: 'Spool jam — swapping to another spool and resuming',

@@ -84,7 +84,7 @@ from backend.app.services import hms_errors
 from backend.app.services.bambu_mqtt import AMS_STATUS_IDENTIFYING, TRAY_PRESENT_STATES
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_tag_matcher import is_valid_tag
-from backend.app.services.tray_fields import parse_int_field
+from backend.app.services.tray_fields import parse_int_field, tray_identity_asserted
 from backend.app.services.tray_observation import TrayObservation, observation_tray_dict
 
 if TYPE_CHECKING:
@@ -653,6 +653,25 @@ def identity_unanswered(printer_id: int, ams_id: int, tray_id: int) -> bool:
     return _unanswered_cycle(printer_id, ams_id, tray_id)
 
 
+def read_answered_since_seating(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Has this slot's identity question already been PUT since its current seating?
+
+    True when a read was commanded (or the firmware published a tag) for the slot AND no
+    qualified physical cycle has happened since — i.e. the answer on file, whatever it
+    was, still describes the roll that is in the tray now. A slot nobody has ever read
+    answers False, so a first ask is never blocked.
+
+    Non-consuming public accessor over the same ``_slot_read_at`` / ``_physical_cycle_at``
+    pair the discovery lane uses (:func:`_unanswered_cycle`), for the ONE consumer that
+    needs the complementary question: ``filament_deficit.request_unread_reads``, whose
+    per-episode ask must not re-put a question the identify lane already put. It cannot
+    use ``not identity_unanswered(...)`` — that reads True for a slot with no cycle on
+    record at all, which is precisely the never-asked slot the ask exists for.
+    """
+    key = (printer_id, ams_id, tray_id)
+    return _slot_read_at.get(key) is not None and not _unanswered_cycle(printer_id, ams_id, tray_id)
+
+
 def last_physical_cycle_age(printer_id: int, ams_id: int, tray_id: int) -> float | None:
     """Seconds since the slot's last QUALIFIED physical cycle, or None if never seen.
 
@@ -801,10 +820,11 @@ async def identify_needed(
       whose bound tagged spool has been pulled would fail exactly like a tagless read and
       raise a never-clearing ``0700_2X00_0001_0081``. A DB binding that outlives its roll
       is a RELEASE problem (doctrine rule 9), never a read reason.
-    * ``"discovery"`` — either a qualified physical cycle is unanswered since the slot's
-      identity was last learned and the tray is still unidentified, or the binding is
-      spent-latched under an unidentified replacement roll (see below). One read settles
-      it; a failure is the answer "no tag ⇒ tagless" and is suppressed farm-side.
+    * ``"discovery"`` — any of: a qualified physical cycle is unanswered since the slot's
+      identity was last learned and the tray is still unidentified; the binding is
+      spent-latched under an unidentified replacement roll; or the slot is UNBOUND and
+      the seated roll asserts no identity at all (see below). One read settles it; a
+      failure is the answer "no tag ⇒ tagless" and is suppressed farm-side.
       The cycle arm is checked BEFORE the DB rules on an untagged tray on purpose: once
       something physically changed in the slot, the DB's idea of what is in it is a
       hypothesis, and the read must be treated as one that may legitimately fail.
@@ -813,8 +833,9 @@ async def identify_needed(
       so does every re-derivation of standing evidence whose occasion is already spent.
 
     OCCASION PACING (2026-08-07). Every arm that rests on STANDING evidence — the two
-    ``rfid_refresh`` arms and the spent-occupied arm — is gated on an open read occasion
-    (:data:`_read_occasion_at`), which a commanded read consumes. The unanswered-cycle
+    ``rfid_refresh`` arms, the spent-occupied arm and the unbound-unread arm — is gated on
+    an open read occasion (:data:`_read_occasion_at`), which a commanded read consumes.
+    The unanswered-cycle
     arm needs no separate gate: it already carries its own one-read-per-change pacing
     through ``_slot_read_at``. Without this, a standing condition re-derived on every
     reconcile / pipeline pass re-owed the same read forever, and the resulting per-printer
@@ -838,7 +859,7 @@ async def identify_needed(
         return "discovery"
 
     if present and occasion:
-        _has_assignment, bound_tagged, bound_spent = await _slot_assignment_context(
+        has_assignment, bound_tagged, bound_spent = await _slot_assignment_context(
             db, printer_id, ams_id, tray_id, spoolman_active
         )
         # Spent-occupied FIRST: a spent-latched binding under a seated roll the wire
@@ -856,6 +877,33 @@ async def identify_needed(
             return "discovery"
         if bound_tagged:
             return "rfid_refresh"
+        # UNBOUND + UNREAD: a roll sits in a slot the farm has no binding for and the
+        # wire asserts no identity at all — no filament type, no preset id, no tag. The
+        # DB knows nothing, the wire says nothing, so ONE read is the only way the slot
+        # can ever be priced; until then the dispatch layers treat it as unknown
+        # material (``filament_deficit.live_unread_slots``) and hold work behind it.
+        # Classified ``discovery`` because the answer may legitimately be "no tag",
+        # which the farm-side suppression then recognizes as OURS (rule 5 / invariant 4:
+        # the deficit block IS the reason to read, so this is not a read of an untouched
+        # tagless slot).
+        #
+        # STORM SAFETY, in three independent brakes:
+        #   1. it fires only with an OPEN occasion, and ``command_identify`` consumes the
+        #      occasion — so a re-derivation of the same standing evidence buys nothing;
+        #   2. the only NEW opener is the deficit lane's ask, which is once per unread
+        #      EPISODE per slot and additionally checks
+        #      :func:`read_answered_since_seating` before spending one;
+        #   3. state 10 specifically (mirroring the spent-occupied arm): state 11 is the
+        #      same roll threaded on to the hub, the shape a read cannot answer without
+        #      unloading first.
+        # A genuinely tagless roll therefore costs exactly ONE read per seating, whose
+        # expected failure is suppressed farm-side and never reaches the operator.
+        #
+        # ``tray_identity_asserted`` is the whole identity test (type / preset id / tag),
+        # so it subsumes ``live_tagged`` here — a live-tagged tray already took the
+        # ``rfid_refresh`` arm above and could not reach this line unbound anyway.
+        if not has_assignment and state == _TRAY_SEATED_STATE and not tray_identity_asserted(tray):
+            return "discovery"
 
     return None
 

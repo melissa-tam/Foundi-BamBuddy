@@ -37,6 +37,16 @@ set before any eligibility split, so it can never start a print, be staged, or s
 in ``start_blocked_slots`` — it is simply invisible to selection until the condition
 clears. This exclusion is unconditional: a jammed, spent or retired spool never starts
 a print regardless of the selection policy or the minimum-start floor.
+
+A fourth exclusion is a WIRE fact rather than a ledger one: a SEATED-but-UNIDENTIFIED
+tray (:attr:`SlotInventory.unread` / the ``unread`` key the scheduler's loaded-filament
+extraction now stamps). Such a slot physically holds a roll the farm cannot name, so it
+can neither be matched (no material to match on) nor priced (its binding, if any, is a
+hypothesis). It is excluded BY NAME rather than by the accident of carrying an empty
+filament type, so the reason a phantom "no match" happened is visible in the decision
+trace and a future builder change cannot silently make unidentified rolls selectable.
+The dispatch answer for such a slot is not "stage the job" but "read the slot" —
+``waiting_reason`` :data:`WAITING_REASON_UNREAD_PENDING`, driven by the scheduler.
 """
 
 from __future__ import annotations
@@ -68,6 +78,13 @@ DEFAULT_MIN_START_SPOOL_G = 150
 # Machine waiting_reason token for a job held because its starting spool is below
 # the minimum-start floor. Rendered by QueuePage; released by farm_staging.
 WAITING_REASON_START_MIN = "start_spool_below_minimum"
+# Machine waiting_reason token for a job whose filament requirement is uncovered by the
+# IDENTIFIED slots while the candidate printer still has ≥1 seated-but-unidentified tray
+# (:attr:`SlotInventory.unread`). NOT a staging reason: the item stays pending and
+# un-promoted, the deficit lane asks the printer to read the slot, and the next tick
+# re-decides on real evidence. Self-clearing exactly like ``stagger_hold`` /
+# ``no_usb_drive`` — dispatch clears it, and a genuine deficit overwrites it.
+WAITING_REASON_UNREAD_PENDING = "filament_unread_pending"
 
 
 @dataclass
@@ -97,6 +114,13 @@ class SlotInventory:
     differ) and all three hard-exclude the slot. Only the internal inventory mode
     can set them (``Spool.feed_fault_at`` / ``spent_at`` / ``archived_at``);
     Spoolman has no such concept, so they stay ``False`` there.
+
+    ``unread`` is the SEATED-but-UNIDENTIFIED flag (``tray_fields.tray_unread`` applied
+    to the live tray by the scheduler's loaded-filament extraction, carried here on the
+    loaded entry). It is a WIRE fact, not a ledger one, and it means the slot holds a
+    roll the farm cannot name — so the binding's grams are a hypothesis and
+    ``remaining_g`` is forced to ``None`` (undetermined) for such a row rather than
+    quoting a ledger figure nothing has verified. Both modes can set it.
     """
 
     remaining_g: float | None
@@ -105,6 +129,7 @@ class SlotInventory:
     out_of_rotation: bool = False
     spent: bool = False
     archived: bool = False
+    unread: bool = False
 
 
 @dataclass
@@ -306,6 +331,9 @@ def match_filaments_to_slots(
        (``SlotInventory.out_of_rotation`` — a jammed / feed-fault spool) and spent
        (``SlotInventory.spent`` — a run-dry spool). They enter neither ``eligible``
        nor ``dropped``, so they can never match nor appear in ``start_blocked_slots``.
+       An UNREAD candidate (``loaded`` entry stamped ``unread`` — a seated tray with no
+       identity at all) is excluded FIRST and independently of ``inv``, because that
+       exclusion is a wire fact that holds whether or not the slot carries a binding.
     1. ``min_start_g > 0`` drops candidates whose *known* remaining is below the
        floor into a ``dropped`` reserve (unknown/unbound stay eligible).
     2. Eligible candidates are sorted by the policy key (``slot_order`` = none).
@@ -334,6 +362,17 @@ def match_filaments_to_slots(
         # of the policy or the minimum-start floor. The three reasons are kept
         # SEPARATE so the trace names why a slot vanished (jam vs run-dry vs
         # retired-row differ operationally).
+        # Seated-but-UNIDENTIFIED trays leave first, and WITHOUT consulting ``inv``: an
+        # unread slot may be unbound entirely (the 12-tray fleet reality), so keying the
+        # exclusion off an inventory row would miss exactly the slots that need it. The
+        # candidate carries the wire verdict on itself (``tray_fields.tray_unread``,
+        # stamped by the scheduler's loaded-filament extraction). Excluding by NAME
+        # rather than relying on the empty filament type to fail every bucket keeps the
+        # reason visible in the trace and survives a future builder change.
+        excluded_unread: list[int] = [f["global_tray_id"] for f in available if f.get("unread")]
+        if excluded_unread:
+            available = [f for f in available if not f.get("unread")]
+
         excluded_oor: list[int] = []
         excluded_spent: list[int] = []
         excluded_archived: list[int] = []
@@ -383,7 +422,8 @@ def match_filaments_to_slots(
         if trace:
             logger.info(
                 "[spool-select] slot=%s type=%r color=%r tii=%r nozzle=%s policy=%s min_start=%s; "
-                "eligible=%s dropped=%s excluded_oor=%s excluded_spent=%s excluded_archived=%s",
+                "eligible=%s dropped=%s excluded_oor=%s excluded_spent=%s excluded_archived=%s "
+                "excluded_unread=%s",
                 slot_id,
                 req_type_repr(req),
                 req.get("color", ""),
@@ -396,6 +436,7 @@ def match_filaments_to_slots(
                 excluded_oor,
                 excluded_spent,
                 excluded_archived,
+                excluded_unread,
             )
 
         # (4) bucket scan on eligible; dropped-only match ⇒ start-blocked.
@@ -458,6 +499,7 @@ def _trace_rows(rows: list[dict], inv: dict[int, SlotInventory] | None) -> list[
                 "inv_g": si.remaining_g if si else None,
                 "first_ord": si.first_loaded_ord if si else None,
                 "ord_src": si.ord_src if si else None,
+                "unread": bool(f.get("unread")),
             }
         )
     return out
@@ -522,10 +564,20 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
     are skipped (tracked separately). Slots without a binding are absent from the
     map — the caller falls back to MQTT ``remain`` for those. Best-effort: an
     empty map on any failure.
+
+    A loaded entry stamped ``unread`` (seated, no identity — see
+    :attr:`SlotInventory.unread`) keeps its row so the flag reaches the trace and the
+    ``/inventory-remain`` mirror, but its ``remaining_g`` is forced to ``None``: the
+    binding names a roll the wire cannot confirm is the one in the tray, and quoting an
+    unverifiable ledger figure is how a stale claim gets treated as available material.
     """
     if not loaded:
         return {}
-    tracked_slots = [(f["ams_id"], f["tray_id"], f["global_tray_id"]) for f in loaded if not f.get("is_external")]
+    tracked_slots = [
+        (f["ams_id"], f["tray_id"], f["global_tray_id"], bool(f.get("unread")))
+        for f in loaded
+        if not f.get("is_external")
+    ]
     if not tracked_slots:
         return {}
 
@@ -534,7 +586,7 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
     if await _is_spoolman_mode(db):
         result = await db.execute(select(SpoolmanSlotAssignment).where(SpoolmanSlotAssignment.printer_id == printer_id))
         by_slot = {(a.ams_id, a.tray_id): a.spoolman_spool_id for a in result.scalars().all()}
-        for ams_id, tray_id, gtid in tracked_slots:
+        for ams_id, tray_id, gtid, unread in tracked_slots:
             spoolman_id = by_slot.get((ams_id, tray_id))
             if spoolman_id is None:
                 continue
@@ -542,9 +594,10 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
             if remaining_g is None and first_ord is None:
                 continue
             out[gtid] = SlotInventory(
-                remaining_g=remaining_g,
+                remaining_g=None if unread else remaining_g,
                 first_loaded_ord=first_ord,
                 ord_src="first_used" if first_ord is not None else None,
+                unread=unread,
             )
         return out
 
@@ -555,7 +608,7 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
         .where(SpoolAssignment.printer_id == printer_id)
     )
     by_slot = {(a.ams_id, a.tray_id): a.spool for a in result.scalars().all()}
-    for ams_id, tray_id, gtid in tracked_slots:
+    for ams_id, tray_id, gtid, unread in tracked_slots:
         spool = by_slot.get((ams_id, tray_id))
         if spool is None:
             continue
@@ -574,12 +627,13 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
             ord_src = "created_at"
         first_ord = _dt_to_epoch(spool.loaded_at or spool.first_loaded_at or spool.created_at)
         out[gtid] = SlotInventory(
-            remaining_g=remaining_g,
+            remaining_g=None if unread else remaining_g,
             first_loaded_ord=first_ord,
             ord_src=ord_src,
             out_of_rotation=spool.feed_fault_at is not None,
             spent=spool.spent_at is not None,
             archived=spool.archived_at is not None,
+            unread=unread,
         )
     return out
 

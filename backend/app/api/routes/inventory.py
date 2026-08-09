@@ -2072,7 +2072,10 @@ async def assign_spool(
     )
     resp = result.scalar_one()
     response = SpoolAssignmentResponse.model_validate(resp)
-    response.configured = configured
+    # ``configured`` is NOT echoed: it was a response-only field no GET could ever
+    # reproduce (nothing persisted it), so it told every later reader "False". The
+    # durable answer is ``pending_config`` below, derived from ``pre_configured_at`` —
+    # and the local ``configured`` flag keeps its real job of DECIDING that stamp.
     response.pending_config = pending_config
 
     if pending_config:

@@ -191,6 +191,7 @@ export default {
         previousPrintFailed: '보류됨: 이전 인쇄가 실패했습니다',
         filamentShort: '필라멘트 부족',
         startSpoolBelowMinimum: '할당된 스풀이 최소 시작 중량 미만입니다',
+        filamentUnreadPending: '필라멘트 미판독 — 장착된 롤을 읽는 중',
         no_usb_drive: '프린터에 USB 드라이브가 없습니다 — USB-A 드라이브(FAT32/exFAT)를 삽입하세요',
         staggerHold: '전력 분산 시작 시간을 기다리는 중 — 곧 시작됩니다',
         spoolJamRecovering: '스풀 걸림 — 다른 스풀로 교체하고 재개 중',

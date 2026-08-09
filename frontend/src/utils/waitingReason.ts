@@ -47,6 +47,8 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
       return t('productionRuns.detail.waiting.filamentShort');
     case 'start_spool_below_minimum':
       return t('productionRuns.detail.waiting.startSpoolBelowMinimum');
+    case 'filament_unread_pending':
+      return t('productionRuns.detail.waiting.filamentUnreadPending');
     case 'no_usb_drive':
       return t('productionRuns.detail.waiting.no_usb_drive');
     case 'stagger_hold':

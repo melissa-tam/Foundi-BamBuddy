@@ -787,3 +787,232 @@ async def test_every_send_carries_the_item_dedup_key(scheduler, db_session, queu
         await scheduler._block_on_filament_deficit(db_session, item)
 
     assert waiting_notifier.await_args.kwargs["dedup_key"] == str(item.id)
+
+
+class TestUnreadHoldDispatchOutcome:
+    """WS4-D2: an uncovered requirement + a seated-but-UNIDENTIFIED tray is a
+    "read the slot" outcome, not a "stage the job" one.
+
+    The verified production shape: 12 fleet trays held rolls in state 10/11 with no
+    filament type, no preset id and no tag. Selection could not match them, the pricer
+    quoted the bound ledger against material it could not see, and the #1496 guard
+    promoted real work to ``manual_start`` behind a phantom "Low filament" banner — a
+    farm-stopping outcome caused entirely by not knowing.
+
+    Driven through the REAL ``check_queue`` against a real in-memory DB, with the live
+    AMS payload scripted: everything from ``_build_loaded_filaments`` through the matcher,
+    ``_mapping_uncovered`` and ``_hold_for_unread`` runs for real.
+    """
+
+    REQUIREMENTS = [{"slot_id": 1, "type": "PLA", "color": "#FFFFFF", "tray_info_idx": "", "used_grams": 100.0}]
+    UNREAD_TRAY = {"id": 0, "state": 10, "tray_type": "", "tray_info_idx": "", "remain": -1}
+    IDENTIFIED_TRAY = {"id": 0, "state": 10, "tray_type": "PLA", "tray_color": "FFFFFFFF", "remain": 90}
+
+    @staticmethod
+    def _status(trays):
+        from unittest.mock import MagicMock
+
+        state = MagicMock()
+        state.state = "IDLE"
+        state.ams_filament_backup = False
+        state.ams_extruder_map = {}
+        state.sdcard = True
+        state.raw_data = {"ams": [{"id": 0, "tray": trays}], "ams_extruder_map": {}, "vt_tray": []}
+        return state
+
+    async def _harness(self):
+        """Real DB + one pending item pinned to printer 1."""
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+        import backend.app.models  # noqa: F401
+        from backend.app.core.database import Base
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with maker() as db:
+            db.add(PrintQueueItem(printer_id=1, status="pending", position=1, archive_id=84))
+            await db.commit()
+        return engine, maker
+
+    async def _pass(self, scheduler, maker, trays, *, mock_pm, start_mock):
+        """One full check_queue tick against the given live AMS trays."""
+        from unittest.mock import AsyncMock, patch
+
+        mock_pm.get_status.return_value = self._status(trays)
+        with (
+            patch("backend.app.services.print_scheduler.async_session", maker),
+            patch("backend.app.services.print_scheduler.printer_manager", mock_pm),
+            patch("backend.app.services.printer_manager.printer_manager", mock_pm),
+            patch.object(scheduler, "_check_auto_drying", AsyncMock()),
+            patch.object(scheduler, "_get_filament_requirements", AsyncMock(return_value=self.REQUIREMENTS)),
+            patch("backend.app.services.print_scheduler.stagger_policy.budget", AsyncMock(return_value=99)),
+            patch.object(scheduler, "_start_print_by_id", start_mock),
+        ):
+            await scheduler.check_queue()
+
+    async def _item(self, maker):
+        from sqlalchemy import select as _select
+
+        async with maker() as db:
+            return (await db.execute(_select(PrintQueueItem))).scalars().one()
+
+    @pytest.mark.asyncio
+    async def test_unread_slot_holds_the_item_asks_once_then_dispatches_when_identity_lands(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from backend.app.services import ams_presence, filament_deficit
+        from backend.app.services.spool_selection import WAITING_REASON_UNREAD_PENDING
+
+        filament_deficit._reset_state()
+        ams_presence._reset_state()
+
+        engine, maker = await self._harness()
+        scheduler = PrintScheduler()
+        start_mock = AsyncMock()
+        mock_pm = MagicMock()
+        mock_pm.is_connected.return_value = True
+        mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
+        mock_pm.is_awaiting_plate_clear.return_value = False
+        mock_pm.request_evidence_pushall.return_value = True
+
+        try:
+            # --- pass 1: the tray is seated and unidentified -------------------
+            await self._pass(scheduler, maker, [dict(self.UNREAD_TRAY)], mock_pm=mock_pm, start_mock=start_mock)
+            item = await self._item(maker)
+
+            assert item.waiting_reason == WAITING_REASON_UNREAD_PENDING
+            assert item.manual_start is False, "the #1496 guard must not swallow an unknown slot"
+            assert item.filament_short is False, "not a shortage — nothing was measured"
+            assert item.ams_mapping is None, "an all -1 mapping would outlive the read that fixes it"
+            assert item.status == "pending"
+            start_mock.assert_not_awaited()
+            # The ask went out: an occasion for the slot plus one evidence report.
+            assert ams_presence._read_occasion_open(1, 0, 0) is True
+            assert mock_pm.request_evidence_pushall.call_args_list == [(((1, "unread_inventory")), {})]
+
+            # --- pass 2: nothing changed — the episode is already spent --------
+            await self._pass(scheduler, maker, [dict(self.UNREAD_TRAY)], mock_pm=mock_pm, start_mock=start_mock)
+            item = await self._item(maker)
+
+            assert item.waiting_reason == WAITING_REASON_UNREAD_PENDING
+            assert item.manual_start is False
+            start_mock.assert_not_awaited()
+            assert mock_pm.request_evidence_pushall.call_count == 1, "one ask per unread episode, never per tick"
+
+            # --- pass 3: the read landed, the tray now names its filament ------
+            # STAGING-LIVENESS pin: the hold must be a passing state, not a new park.
+            await self._pass(scheduler, maker, [dict(self.IDENTIFIED_TRAY)], mock_pm=mock_pm, start_mock=start_mock)
+            item = await self._item(maker)
+
+            assert item.ams_mapping == "[0]", "the identified tray is matched normally"
+            assert item.manual_start is False
+            start_mock.assert_awaited_once()
+            assert start_mock.await_args.args[:2] == (item.id, 1)
+        finally:
+            filament_deficit._reset_state()
+            ams_presence._reset_state()
+            await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_no_unread_slot_still_stages_a_genuine_shortage(self):
+        """The guard is narrow: with every tray identified, a requirement nothing can
+        satisfy takes the ORIGINAL path (mapping persisted, dispatch attempted) — the
+        unread hold never becomes a blanket excuse to stop deciding."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from backend.app.services import ams_presence, filament_deficit
+        from backend.app.services.spool_selection import WAITING_REASON_UNREAD_PENDING
+
+        filament_deficit._reset_state()
+        ams_presence._reset_state()
+
+        engine, maker = await self._harness()
+        scheduler = PrintScheduler()
+        start_mock = AsyncMock()
+        mock_pm = MagicMock()
+        mock_pm.is_connected.return_value = True
+        mock_pm.is_quarantined.return_value = False
+        mock_pm.is_model_mismatch.return_value = False
+        mock_pm.is_awaiting_plate_clear.return_value = False
+        mock_pm.request_evidence_pushall.return_value = True
+
+        try:
+            # A tray loaded with the WRONG material: identified, so nothing is unknown.
+            wrong = {"id": 0, "state": 10, "tray_type": "ABS", "tray_color": "000000FF", "remain": 90}
+            await self._pass(scheduler, maker, [wrong], mock_pm=mock_pm, start_mock=start_mock)
+            item = await self._item(maker)
+
+            assert item.waiting_reason != WAITING_REASON_UNREAD_PENDING
+            assert item.ams_mapping == "[-1]", "unchanged behaviour when the slot IS known"
+            mock_pm.request_evidence_pushall.assert_not_called()
+        finally:
+            filament_deficit._reset_state()
+            ams_presence._reset_state()
+            await engine.dispose()
+
+
+class TestHoldForUnreadUnit:
+    """The hold helper itself: what it writes, what it refuses to write."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from backend.app.services import ams_presence, filament_deficit
+
+        filament_deficit._reset_state()
+        ams_presence._reset_state()
+        yield
+        filament_deficit._reset_state()
+        ams_presence._reset_state()
+
+    @staticmethod
+    def _pm_with(trays):
+        from unittest.mock import MagicMock, patch as _patch
+
+        state = MagicMock()
+        state.raw_data = {"ams": [{"id": 0, "tray": trays}]}
+        pm = MagicMock()
+        pm.get_status.return_value = state
+        pm.request_evidence_pushall.return_value = True
+        return pm, _patch("backend.app.services.printer_manager.printer_manager", pm)
+
+    @pytest.mark.asyncio
+    async def test_no_unread_slots_means_no_hold(self, scheduler, db_session, queue_item):
+        item = await queue_item()
+        pm, patched = self._pm_with([{"id": 0, "state": 10, "tray_type": "PLA"}])
+        with patched:
+            assert await scheduler._hold_for_unread(db_session, item, [item.printer_id]) is False
+        assert item.waiting_reason is None
+
+    @pytest.mark.asyncio
+    async def test_print_anyway_bypasses_the_hold(self, scheduler, db_session, queue_item):
+        """The operator already accepted dispatching on unverified filament (#1698) —
+        re-holding them would reopen the acknowledge/re-block bounce."""
+        item = await queue_item(skip_filament_check=True)
+        pm, patched = self._pm_with([{"id": 0, "state": 10, "tray_type": "", "tray_info_idx": ""}])
+        with patched:
+            assert await scheduler._hold_for_unread(db_session, item, [item.printer_id]) is False
+        pm.request_evidence_pushall.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deficit_site_holds_instead_of_promoting_to_manual_start(self, scheduler, db_session, queue_item):
+        """The #1496 guard's phantom-deficit branch: a computed shortfall beside an
+        unread tray blocks dispatch WITHOUT staging."""
+        item = await queue_item()
+        pm, patched = self._pm_with([{"id": 0, "state": 10, "tray_type": "", "tray_info_idx": ""}])
+        with (
+            patched,
+            patch(
+                "backend.app.services.print_scheduler.compute_deficit_for_queue_item",
+                AsyncMock(return_value=_deficit()),
+            ),
+        ):
+            blocked = await scheduler._block_on_filament_deficit(db_session, item)
+
+        assert blocked is True
+        await db_session.refresh(item)
+        assert item.manual_start is False
+        assert item.filament_short is False
+        assert item.waiting_reason == "filament_unread_pending"

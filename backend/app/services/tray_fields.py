@@ -184,6 +184,54 @@ def tray_presence_from_dict(tray: object) -> bool | None:
     return tray_presence(parse_tray_state(tray.get("state")), asserted_str_field(tray, "tray_type"))
 
 
+def tray_identity_asserted(tray: object) -> bool:
+    """Does this tray dict assert ANY identity for what is in it?
+
+    Identity is the OTHER half of invariant 3 (presence ≠ identity), and it has three
+    carriers, any one of which is enough:
+
+    * an asserted, non-empty ``tray_type`` (the configured filament — an RFID read or a
+      tagless autoconfig put it there);
+    * a non-empty ``tray_info_idx`` (the Bambu preset id);
+    * a valid RFID pair (``tag_uid`` / ``tray_uuid``), normalized through
+      :func:`normalized_tag_uid` / :func:`normalized_tray_uuid` so every "no tag"
+      spelling — absent, empty, all-zero — collapses to "no identity".
+
+    ``False`` therefore means the wire says NOTHING about what is in the slot. Paired
+    with :func:`tray_presence` it yields the seated-but-unidentified class
+    (:func:`tray_unread`). Pure, never raises: a non-dict reads as no identity.
+    """
+    if not isinstance(tray, dict):
+        return False
+    if asserted_str_field(tray, "tray_type"):
+        return True
+    if asserted_str_field(tray, "tray_info_idx"):
+        return True
+    return (
+        normalized_tag_uid(tray.get("tag_uid")) is not None or normalized_tray_uuid(tray.get("tray_uuid")) is not None
+    )
+
+
+def tray_unread(tray: object) -> bool:
+    """SEATED but UNIDENTIFIED — a roll is physically in the tray and the farm has no
+    idea which one.
+
+    ``tray_presence_from_dict(tray) is True`` AND :func:`tray_identity_asserted` is
+    False. This is the class 12 fleet trays sat in for days while the selection,
+    deficit and staging layers priced them as EMPTY (remain 0, no material) and staged
+    work behind phantom "Low filament" deficits — a slot that physically holds filament
+    is not an empty slot, it is an UNKNOWN one, and the only cure is to read it.
+
+    Deliberately gated on the canonical tri-state presence rule, never on
+    ``tray_type`` emptiness: an asserted-empty ``tray_type`` beside a non-present state
+    is the CLEARED shape (presence ``False``), which is a different fact with a
+    different consequence (release, doctrine rule 9). Unknown presence is likewise NOT
+    unread — nothing is known about the slot at all, and WS1's presence-stale machinery
+    owns that case.
+    """
+    return tray_presence_from_dict(tray) is True and not tray_identity_asserted(tray)
+
+
 def tray_presence_map(ams_payload: object) -> dict[tuple[int, int], bool | None]:
     """``{(ams_id, tray_id): present}`` for every tray in a live/merged AMS payload.
 

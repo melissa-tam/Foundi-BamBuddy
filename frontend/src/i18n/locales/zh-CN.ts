@@ -191,6 +191,7 @@ export default {
         previousPrintFailed: '已搁置：上一次打印失败',
         filamentShort: '耗材不足',
         startSpoolBelowMinimum: '分配的料卷低于最低起始重量',
+        filamentUnreadPending: '耗材未识别 — 正在读取已装入的料卷',
         no_usb_drive: '打印机中没有 USB 驱动器 — 请插入 USB-A 驱动器（FAT32/exFAT）',
         staggerHold: '正在等待电源错峰启动窗口 — 即将开始',
         spoolJamRecovering: '料卷卡料 — 正在切换到其他料卷并恢复',

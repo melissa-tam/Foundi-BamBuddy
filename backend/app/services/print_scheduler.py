@@ -29,7 +29,11 @@ from backend.app.services.bambu_ftp import (
 from backend.app.services.dispatch_kick import DispatchKick, dispatch_kick
 from backend.app.services.eject import progress as dispatch_progress
 from backend.app.services.farm_staging import build_staged_reason, maybe_release_periodic
-from backend.app.services.filament_deficit import compute_deficit_for_queue_item
+from backend.app.services.filament_deficit import (
+    compute_deficit_for_queue_item,
+    live_unread_slots,
+    request_unread_reads,
+)
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import (
     printer_manager,
@@ -41,6 +45,7 @@ from backend.app.services.spool_selection import (
     DEFAULT_MIN_START_SPOOL_G,
     DEFAULT_SELECTION_POLICY,
     SELECTION_POLICIES,
+    WAITING_REASON_UNREAD_PENDING,
     MatchOutcome,
     SlotInventory,
     build_slot_inventory,
@@ -50,7 +55,7 @@ from backend.app.services.spool_selection import (
     normalize_color_for_compare,
 )
 from backend.app.services.stagger import stagger_policy
-from backend.app.services.tray_fields import parse_tray_state, tray_presence
+from backend.app.services.tray_fields import parse_tray_state, tray_presence, tray_unread
 from backend.app.services.usb_storage import upload_in_flight
 from backend.app.utils.filament_types import canonical_filament_type as _canonical_filament_type
 from backend.app.utils.filename import derive_remote_filename
@@ -120,6 +125,17 @@ def _present_candidates(loaded: list[dict]) -> list[dict]:
     so a future builder change cannot silently make stale trays dispatchable.
     """
     return [f for f in loaded if tray_presence(parse_tray_state(f.get("state")), f.get("type")) is not False]
+
+
+def _mapping_uncovered(mapping: list[int] | None) -> bool:
+    """True when a COMPUTED AMS mapping leaves at least one required slot unfilled.
+
+    ``-1`` is the matcher's "no candidate for this requirement" value. ``None`` / an
+    empty mapping is NOT uncovered: those mean "nothing to map" (no filament
+    requirements in the 3MF, or no status), which is a legitimate mapping-free dispatch
+    and must never be confused with an unsatisfied requirement.
+    """
+    return bool(mapping) and any(v is None or v < 0 for v in mapping)
 
 
 class PrintScheduler:
@@ -485,6 +501,17 @@ class PrintScheduler:
                     # Compute AMS mapping if not already set
                     if not item.ams_mapping:
                         outcome = await self._compute_ams_mapping_for_printer(db, item.printer_id, item)
+                        if (
+                            outcome.start_blocked_slots or _mapping_uncovered(outcome.mapping)
+                        ) and await self._hold_for_unread(db, item, [item.printer_id]):
+                            # A requirement went unmatched (or matched only a
+                            # below-floor donor) while the printer still holds a
+                            # seated-but-unidentified roll — the material may be right
+                            # there. Hold for the read and persist NO mapping: an
+                            # all-``-1`` mapping written now would be reused verbatim by
+                            # every later tick (``if not item.ams_mapping``) and outlive
+                            # the read that was supposed to fix it.
+                            continue
                         if outcome.start_blocked_slots:
                             # The only matching spool(s) sit below the minimum-start
                             # floor — hold the job with a distinct reason (they stay
@@ -817,13 +844,19 @@ class PrintScheduler:
                         # persistent) so the queue banner tells the operator which
                         # printer to top up. Purely start-floor blocks read "below
                         # minimum"; a mix stays generic ("needs more filament").
-                        start_min_only = candidates_deficit_blocked == 0 and candidates_start_blocked > 0
-                        blocked_names = await self._resolve_printer_names(db, blocked_candidate_ids)
-                        who = ", ".join(blocked_names) if blocked_names else f"{item.target_model} printers"
-                        stage_reason = build_staged_reason(who, start_min=start_min_only)
-                        await self._stage_model_item_filament_short(
-                            db, item, notified_short_groups, reason=stage_reason
-                        )
+                        # Same phantom-deficit guard as the pinned path, applied to the
+                        # candidates that were actually blocked: if any of them holds a
+                        # seated-but-unidentified roll, the run is not short — the farm
+                        # just cannot see the material yet. Hold un-staged and un-pinned
+                        # (the item was never pinned on this branch) for the read.
+                        if not await self._hold_for_unread(db, item, list(blocked_candidate_ids)):
+                            start_min_only = candidates_deficit_blocked == 0 and candidates_start_blocked > 0
+                            blocked_names = await self._resolve_printer_names(db, blocked_candidate_ids)
+                            who = ", ".join(blocked_names) if blocked_names else f"{item.target_model} printers"
+                            stage_reason = build_staged_reason(who, start_min=start_min_only)
+                            await self._stage_model_item_filament_short(
+                                db, item, notified_short_groups, reason=stage_reason
+                            )
 
                     else:
                         # No eligible printer for a non-filament reason (all busy /
@@ -1386,11 +1419,28 @@ class PrintScheduler:
     def _build_loaded_filaments(self, status) -> list[dict]:
         """Build list of loaded filaments from printer status.
 
+        Emits one entry per AMS tray that either carries a filament type OR reads
+        SEATED-but-UNIDENTIFIED (``tray_fields.tray_unread`` — a roll is in the tray and
+        the wire asserts no type, no preset id and no tag). The unread entry carries an
+        empty ``type`` and ``unread: True``.
+
+        Emitting the unread ones is the point: dropping them made every downstream layer
+        price a physically-loaded slot as EMPTY (the 12-tray fleet incident). They can
+        never be selected — ``spool_selection.match_filaments_to_slots`` hard-excludes
+        ``unread`` by name — but they are now VISIBLE, so the inventory layer can refuse
+        to quote their ledger grams and the scheduler can hold the job for a read
+        instead of staging it behind a phantom "Low filament".
+
+        A cleared tray (asserted-empty type beside a non-present state) is still NOT
+        emitted: that shape reads presence ``False``, which is a release fact, not an
+        unknown one.
+
         Args:
             status: PrinterState from printer_manager
 
         Returns:
-            List of loaded filament dicts with type, color, ams_id, tray_id, global_tray_id
+            List of loaded filament dicts with type, color, ams_id, tray_id,
+            global_tray_id and the ``unread`` wire verdict.
         """
         filaments = []
 
@@ -1406,7 +1456,11 @@ class PrintScheduler:
 
             for tray in trays:
                 tray_type = tray.get("tray_type")
-                if tray_type:
+                # Seated with no identity of ANY kind (canonical rule, never a
+                # re-derivation from tray_type emptiness). Only asked when the tray
+                # carries no type, so an identified tray never pays for the check.
+                unread = not tray_type and tray_unread(tray)
+                if tray_type or unread:
                     tray_id = int(tray.get("id", 0))
                     tray_color = tray.get("tray_color", "")
                     # tray_info_idx identifies the specific spool (e.g., "GFA00", "P4d64437")
@@ -1419,7 +1473,7 @@ class PrintScheduler:
 
                     filaments.append(
                         {
-                            "type": tray_type,
+                            "type": tray_type or "",
                             "color": color,
                             "tray_info_idx": tray_info_idx,
                             "ams_id": ams_id,
@@ -1434,6 +1488,10 @@ class PrintScheduler:
                             # seated-but-unsensed candidate. Additive key; no existing
                             # consumer reads it.
                             "state": tray.get("state"),
+                            # Wire verdict: this tray holds a roll nobody has identified.
+                            # Hard-excluded from selection, and the signal the deficit
+                            # lane holds a job on instead of staging it.
+                            "unread": unread,
                         }
                     )
 
@@ -1455,6 +1513,10 @@ class PrintScheduler:
                         "extruder_id": (255 - tray_id) if ams_extruder_map else None,
                         "remain": vt.get("remain", -1),
                         "state": vt.get("state"),
+                        # The external holder is only emitted when it declares a type,
+                        # so it is never the unknown-roll case (and AMS backup never
+                        # spans it) — the key stays for a uniform candidate shape.
+                        "unread": False,
                     }
                 )
 
@@ -2246,6 +2308,74 @@ class PrintScheduler:
             logger.warning("Filament deficit check failed for item %s: %s", item.id, e)
             return []
 
+    async def _hold_for_unread(
+        self,
+        db: AsyncSession,
+        item: PrintQueueItem,
+        printer_ids: list[int | None],
+    ) -> bool:
+        """Hold a filament-blocked item for EVIDENCE instead of staging it (D2).
+
+        Returns True when the item was held — the caller must then skip its staging
+        branch and move on; the next tick re-decides.
+
+        The trigger is "this item's requirement is uncovered by the IDENTIFIED slots
+        while ``printer_ids`` still hold ≥1 SEATED-but-UNIDENTIFIED tray". Such a tray
+        physically contains filament, so neither of the two answers the scheduler used
+        to give is true: it is not a shortage ("Low filament" staging, which promotes to
+        ``manual_start`` and needs a human press per row — #1496's guard, the one that
+        swallowed 12 fleet trays' worth of work) and it is not clear-to-dispatch. The
+        honest answer is "unknown — read the slot", so the item stays PENDING and
+        un-promoted with ``waiting_reason = filament_unread_pending`` and the deficit
+        lane asks the printer for the read.
+
+        ONE canonical path: no shadow mode, no timer, no retry counter. The hold is
+        re-derived from live state on every pass and simply stops happening the moment
+        the read lands — after which normal dispatch or a GENUINE deficit takes over.
+        The token self-clears exactly like ``stagger_hold`` / the capability tokens
+        (``_start_print`` drops any waiting reason once the item is cleared to
+        dispatch; a real deficit overwrites it via ``_stage_filament_short``).
+
+        Print-Anyway (``skip_filament_check``) bypasses the hold: the operator has
+        already accepted dispatching on unverified filament, and re-holding them would
+        reopen the #1698 bounce.
+
+        Deliberately does NOT notify. The hold is an evidence round-trip measured in one
+        tick, not an operator action — paging for it would be the 2026-07-20 alert-spam
+        shape. A slot that STAYS unread is escalated by the AMS side's own
+        standing-unknown broadcast, which is where that signal belongs.
+        """
+        if item.skip_filament_check:
+            return False
+
+        unread_by_printer: dict[int, set[tuple[int, int]]] = {}
+        for pid in dict.fromkeys(p for p in printer_ids if p is not None):
+            slots = live_unread_slots(pid)
+            if slots:
+                unread_by_printer[pid] = slots
+        if not unread_by_printer:
+            return False
+
+        newly_held = item.waiting_reason != WAITING_REASON_UNREAD_PENDING
+        if newly_held:
+            item.waiting_reason = WAITING_REASON_UNREAD_PENDING
+            await db.commit()
+        log = logger.info if newly_held else logger.debug
+        log(
+            "Queue item %s: held for unidentified filament — %s (not staged; awaiting an AMS read)",
+            item.id,
+            ", ".join(f"printer {pid} slots {sorted(slots)}" for pid, slots in unread_by_printer.items()),
+        )
+
+        # Ask each printer to resolve its unread slots. Episode-paced inside, and
+        # guarded here because an evidence request must never break a dispatch tick.
+        for pid, slots in unread_by_printer.items():
+            try:
+                request_unread_reads(pid, slots)
+            except Exception:  # noqa: BLE001 — asking is best-effort; the hold stands
+                logger.debug("unread-read request failed for printer %s (non-fatal)", pid, exc_info=True)
+        return True
+
     async def _stage_filament_short(
         self, db: AsyncSession, item: PrintQueueItem, *, unpin: bool, reason: str = "filament_short"
     ) -> None:
@@ -2338,6 +2468,14 @@ class PrintScheduler:
             return False
 
         deficit = await self._compute_deficit_safe(db, item)
+
+        if deficit and await self._hold_for_unread(db, item, [item.printer_id]):
+            # PHANTOM-DEFICIT GUARD: the printer holds a seated-but-unidentified roll,
+            # so this shortfall is computed against material the farm simply cannot see
+            # yet. Hold for the read instead of promoting to manual_start — a phantom
+            # "Low filament" here is what parked real work behind physically loaded
+            # trays. Blocked (return True), but NOT staged.
+            return True
 
         if deficit:
             # The deficit re-evaluates on EVERY tick, so notifying unconditionally

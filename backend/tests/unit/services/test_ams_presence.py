@@ -2474,3 +2474,99 @@ class TestStandingOccasionDrain:
         assert ok is False
         client.ams_refresh_tray.assert_not_called()
         assert ams_presence._read_occasion_open(1, 0, 0) is True  # untouched for the sweep
+
+
+class TestUnboundUnreadDiscoveryArm:
+    """WS4-D3: an UNBOUND, seated, identity-less slot may buy ONE discovery read.
+
+    The gap this closes: ``identify_needed`` answered None for a slot with no DB binding
+    and no live identity even with an occasion open — the unanswered-cycle arm was the
+    only unbound path, and it needs a presence EDGE the farm may never have seen (a roll
+    inserted while the server was down, or during a print). Meanwhile the dispatch layers
+    could not price the slot at all, so work parked behind a tray that physically held
+    filament. The read IS the way out, so the constellation gets an arm.
+
+    Storm safety is by CAUSE, not by timer: the arm needs an OPEN occasion, a commanded
+    read CONSUMES it, and the only new opener is the deficit lane's once-per-episode ask.
+    State 10 specifically — state 11 is the same roll threaded on to the hub, which a
+    read cannot answer without unloading first.
+    """
+
+    async def _assign(self, db_session, *, tag=_VALID_TAG, tray_id=0):
+        spool = Spool(material="PETG", data_origin="rfid_auto" if tag else "ams_auto", tag_uid=tag)
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=tray_id))
+        await db_session.commit()
+
+    async def test_unbound_seated_identityless_with_an_occasion_owes_discovery(self, db_session):
+        _arm_occasion()
+        reason = await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False)
+        assert reason == "discovery"
+
+    async def test_without_an_occasion_it_owes_nothing(self, db_session):
+        # The whole storm defence: the constellation is STANDING (true on every pass),
+        # so re-derivation must buy nothing. Only a fresh cause opens an occasion.
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False) is None
+
+    async def test_state_eleven_owes_nothing(self, db_session):
+        # Feeding: the read cannot answer without unloading first, so asking would only
+        # mint a printer-side 0700_0081 nothing can clear.
+        _arm_occasion()
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=11), False) is None
+
+    async def test_a_configured_tagless_tray_owes_nothing(self, db_session):
+        # Doctrine rule 4 / invariant 4: an asserted filament type IS identity. Reading
+        # it can only fail, and that failure never self-clears. Not unread, not read.
+        _arm_occasion()
+        tray = _tray(0, state=10, tray_type="PETG")
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, tray, False) is None
+
+    async def test_a_preset_id_alone_is_identity(self, db_session):
+        _arm_occasion()
+        tray = _tray(0, state=10)
+        tray["tray_info_idx"] = "GFG02"
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, tray, False) is None
+
+    async def test_a_bound_slot_does_not_take_this_arm(self, db_session):
+        # The arm is for the UNBOUND constellation only; a bound slot is adjudicated by
+        # the spent-occupied / rfid_refresh arms, which know what the DB claims.
+        await self._assign(db_session, tag=None)
+        _arm_occasion()
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False) is None
+
+    async def test_one_read_per_occasion_then_the_deficit_lane_blocks_the_re_ask(self, db_session, monkeypatch):
+        """End to end for the tagless roll: the arm fires once, the commanded read
+        consumes the occasion, and the D4 predicate then refuses to open another —
+        so a genuinely tagless roll costs exactly ONE read per seating."""
+        from unittest.mock import MagicMock, patch as _patch
+
+        from backend.app.services import filament_deficit
+
+        filament_deficit._reset_state()
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=10)]), client=client)
+
+        manager = MagicMock()
+        manager.request_evidence_pushall.return_value = True
+        try:
+            with _patch("backend.app.services.printer_manager.printer_manager", manager):
+                assert filament_deficit.request_unread_reads(1, {(0, 0)}) == 1
+
+            reason = await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False)
+            assert reason == "discovery"
+            await ams_presence.command_identify(1, 0, 0, source="reconcile", reason=reason)
+            assert client.ams_refresh_tray.call_count == 1
+
+            # The read answered "no tag" (nothing re-stamped identity beyond our own
+            # command), the tray is still unread — and the lane asks for nothing more.
+            assert ams_presence.read_answered_since_seating(1, 0, 0) is True
+            manager.reset_mock()
+            filament_deficit._reset_state()  # even a FRESH episode is refused…
+            with _patch("backend.app.services.printer_manager.printer_manager", manager):
+                assert filament_deficit.request_unread_reads(1, {(0, 0)}) == 0
+            manager.request_evidence_pushall.assert_not_called()
+            assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False) is None
+        finally:
+            filament_deficit._reset_state()

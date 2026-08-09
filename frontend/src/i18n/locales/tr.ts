@@ -191,6 +191,7 @@ export default {
         previousPrintFailed: 'Bekletildi: önceki baskı başarısız oldu',
         filamentShort: 'Filament az',
         startSpoolBelowMinimum: 'Atanan makara minimum başlangıç ağırlığının altında',
+        filamentUnreadPending: 'Filament okunmadı — takılı makara okunuyor',
         no_usb_drive: 'Yazıcıda USB sürücü yok — bir USB-A sürücü (FAT32/exFAT) takın',
         staggerHold: 'Güç kademelendirme penceresi bekleniyor — birazdan başlıyor',
         spoolJamRecovering: 'Makara sıkışması — başka bir makaraya geçiliyor ve devam ediliyor',

@@ -265,7 +265,12 @@ class SpoolAssignmentResponse(BaseModel):
     fingerprint_type: str | None = None
     created_at: datetime
     spool: SpoolResponse | None = None
-    configured: bool = False
+    # NOTE: there is deliberately no ``configured`` field. It was a response-only
+    # residue: default False, set True on the POST /assignments response alone, never
+    # persisted — so every GET reported False for every live assignment and any consumer
+    # reading it was reading a lie. ``pending_config`` (from the durable
+    # ``pre_configured_at`` stamp) is the real "config has not landed yet" fact, and
+    # ``present`` below is the real live-slot fact.
     pending_config: bool = False  # True when slot was empty at assign time; will configure on insert
     ams_label: str | None = None  # User-defined friendly name for the AMS unit
     # Tri-state LIVE presence of the bound tray (``tray_fields.tray_presence``):

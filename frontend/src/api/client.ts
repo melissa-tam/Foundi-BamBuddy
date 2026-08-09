@@ -3237,7 +3237,10 @@ export interface SpoolAssignment {
   fingerprint_color: string | null;
   fingerprint_type: string | null;
   spool?: InventorySpool | null;
-  configured: boolean;
+  /* No `configured` field: it was a response-only backend residue (default false, set
+   * only on the POST /assignments response, never persisted) so every GET reported
+   * false for every assignment. Use `pending_config` for "config has not landed yet"
+   * and `present` for the live slot state. */
   pending_config?: boolean;  // Slot was empty at assign time; will configure on insert
   created_at: string;
   ams_label?: string | null;  // User-defined friendly name for the AMS unit

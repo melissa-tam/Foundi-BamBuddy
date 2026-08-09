@@ -752,3 +752,275 @@ class TestFilamentDeficitPresenceGate:
 
         assert len(deficit) == 1
         assert deficit[0].remaining_grams == 30.0
+
+
+class TestFilamentDeficitUnreadSlots:
+    """WS4-D1: a SEATED-but-UNIDENTIFIED tray prices as UNDETERMINED, never as empty.
+
+    Twelve fleet trays sat in state 10/11 with no ``tray_type``, no ``tray_info_idx``
+    and no tag. Every backend layer read them as empty slots, so the pricer quoted a
+    binding's grams against material it could not see and the scheduler staged real work
+    behind phantom "Low filament" deficits. The rule: presence True + no identity of any
+    kind means we do not know, so the slot contributes NO deficit grams. The
+    asserted-empty (cleared) shape keeps its 0.0 — that one IS knowledge — and unknown
+    PRESENCE keeps today's ratified fail-open pricing.
+    """
+
+    @staticmethod
+    def _status(printer_id: int, trays: list[dict], *, ams_id: int = 0, backup_on: bool = False):
+        from types import SimpleNamespace
+        from unittest.mock import patch as _patch
+
+        fake_state = SimpleNamespace(
+            ams_filament_backup=backup_on,
+            ams_extruder_map={},
+            raw_data={"ams": [{"id": ams_id, "tray": trays}]},
+        )
+        return _patch(
+            "backend.app.services.printer_manager.printer_manager.get_status",
+            lambda pid: fake_state if pid == printer_id else None,
+        )
+
+    async def _fixture(self, db_session, printer_factory, tmp_path, *, weight_used: float = 970.0):
+        """A binding whose ledger says 30 g left against a 100 g print — i.e. a slot that
+        WOULD produce a deficit if its grams were priced at all."""
+        printer = await printer_factory()
+        archive = await _setup_archive_3mf(
+            db_session,
+            tmp_path,
+            [{"id": "1", "type": "PLA", "color": "#FFFFFF", "used_g": "100.0"}],
+        )
+        spool = await _spool(db_session, label_weight=1000, weight_used=weight_used)
+        await _assign(db_session, printer_id=printer.id, spool_id=spool.id, ams_id=0, tray_id=0)
+        item = await _queue_item(db_session, printer_id=printer.id, archive=archive, ams_mapping=[0])
+        return printer, item
+
+    async def _run(self, db_session, item, printer_id, trays, *, backup_on: bool = False):
+        with (
+            patch("backend.app.services.filament_deficit.app_settings.base_dir", Path("/")),
+            self._status(printer_id, trays, backup_on=backup_on),
+        ):
+            return await compute_deficit_for_queue_item(db_session, item)
+
+    @pytest.mark.parametrize("state", [10, 11])
+    @pytest.mark.asyncio
+    async def test_seated_unread_tray_emits_no_phantom_deficit(self, db_session, printer_factory, tmp_path, state):
+        """The incident shape: a roll IS in the tray, nobody has read it, and the ledger
+        row bound to the slot is nearly spent. No deficit — the answer is undetermined."""
+        printer, item = await self._fixture(db_session, printer_factory, tmp_path)
+
+        deficit = await self._run(
+            db_session,
+            item,
+            printer.id,
+            [{"id": 0, "state": state, "tray_type": "", "tray_info_idx": "", "remain": -1}],
+        )
+
+        assert deficit == []
+
+    @pytest.mark.asyncio
+    async def test_seated_unread_tray_emits_no_material_mismatch_under_backup(
+        self, db_session, printer_factory, tmp_path
+    ):
+        """Backup-ON pools by live identity, and an unread tray joins no pool. It must
+        still not manufacture a shortfall: the requirement's own slot is unread, so it
+        never enters the pool accounting at all."""
+        printer, item = await self._fixture(db_session, printer_factory, tmp_path)
+
+        deficit = await self._run(
+            db_session,
+            item,
+            printer.id,
+            [{"id": 0, "state": 10, "tray_type": "", "tray_info_idx": "", "remain": -1}],
+            backup_on=True,
+        )
+
+        assert deficit == []
+
+    @pytest.mark.asyncio
+    async def test_identity_bearing_seated_tray_still_prices_and_blocks(self, db_session, printer_factory, tmp_path):
+        """Guard against over-reach: a tray that DOES assert a filament type is not
+        unread, so the genuine 30 g-vs-100 g shortfall still surfaces."""
+        printer, item = await self._fixture(db_session, printer_factory, tmp_path)
+
+        deficit = await self._run(
+            db_session, item, printer.id, [{"id": 0, "state": 10, "tray_type": "PLA", "remain": 3}]
+        )
+
+        assert len(deficit) == 1
+        assert deficit[0].remaining_grams == 30.0
+
+    @pytest.mark.asyncio
+    async def test_tag_alone_disqualifies_unread(self, db_session, printer_factory, tmp_path):
+        """A valid RFID pair IS identity even with a blank type — the farm knows which
+        roll that is, so the slot prices normally and the real shortfall stands."""
+        printer, item = await self._fixture(db_session, printer_factory, tmp_path)
+
+        deficit = await self._run(
+            db_session,
+            item,
+            printer.id,
+            [
+                {
+                    "id": 0,
+                    "state": 10,
+                    "tray_type": "",
+                    "tray_info_idx": "",
+                    "tag_uid": "A1B2C3D4E5F60718",
+                    "remain": 3,
+                }
+            ],
+        )
+
+        assert len(deficit) == 1
+        assert deficit[0].remaining_grams == 30.0
+
+    @pytest.mark.asyncio
+    async def test_cleared_tray_still_prices_zero(self, db_session, printer_factory, tmp_path):
+        """The 0.0 branch is unchanged and stays reserved for the ASSERTED-empty shape:
+        state 9 + an asserted-empty tray_type is a release fact, not an unknown one."""
+        printer, item = await self._fixture(db_session, printer_factory, tmp_path, weight_used=100.0)
+
+        deficit = await self._run(db_session, item, printer.id, [{"id": 0, "state": 9, "tray_type": "", "remain": 0}])
+
+        assert len(deficit) == 1
+        assert deficit[0].remaining_grams == 0.0
+
+    @pytest.mark.asyncio
+    async def test_unknown_presence_is_never_coerced_to_zero(self, db_session, printer_factory, tmp_path):
+        """Boundary pin for the 0.0 branch: the A1-family always-state-3 dialect reads
+        presence UNKNOWN, which must never be widened into empty. It keeps the ratified
+        fail-open pricing (ledger decides), so a 900 g roll still covers a 100 g print."""
+        printer, item = await self._fixture(db_session, printer_factory, tmp_path, weight_used=100.0)
+
+        deficit = await self._run(
+            db_session, item, printer.id, [{"id": 0, "state": 3, "tray_type": "PLA", "remain": 90}]
+        )
+
+        assert deficit == []
+
+    @pytest.mark.asyncio
+    async def test_live_unread_slots_classifies_the_printer(self, db_session, printer_factory, tmp_path):
+        """The public classifier the dispatch layer consumes: seated + identity-less in,
+        everything else out (cleared, identified)."""
+        from backend.app.services.filament_deficit import live_unread_slots
+
+        printer = await printer_factory()
+        trays = [
+            {"id": 0, "state": 10, "tray_type": "", "tray_info_idx": ""},  # unread
+            {"id": 1, "state": 11, "tray_type": "", "tray_info_idx": ""},  # unread (feeding)
+            {"id": 2, "state": 9, "tray_type": ""},  # cleared
+            {"id": 3, "state": 10, "tray_type": "PETG"},  # identified
+        ]
+        with self._status(printer.id, trays):
+            assert live_unread_slots(printer.id) == {(0, 0), (0, 1)}
+
+    @pytest.mark.asyncio
+    async def test_live_unread_slots_is_empty_when_offline(self, db_session, printer_factory):
+        from unittest.mock import patch as _patch
+
+        from backend.app.services.filament_deficit import live_unread_slots
+
+        printer = await printer_factory()
+        with _patch("backend.app.services.printer_manager.printer_manager.get_status", lambda pid: None):
+            assert live_unread_slots(printer.id) == set()
+
+
+class TestUnreadReadRequest:
+    """WS4-D4: the ask that resolves an unread slot, paced ONCE PER EPISODE.
+
+    Pricing the slot as undetermined removes the phantom deficit but leaves it unknown
+    forever unless something asks. Asking every tick is the 2026-08-02 read-storm shape
+    (and every failed read on a tagless roll leaves a printer-side 0700_0081 no software
+    can clear), so the ask is spent once per continuous run of the slot reading unread.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from backend.app.services import ams_presence, filament_deficit
+
+        filament_deficit._reset_state()
+        ams_presence._reset_state()
+        yield
+        filament_deficit._reset_state()
+        ams_presence._reset_state()
+
+    @staticmethod
+    def _patched():
+        from unittest.mock import MagicMock, patch as _patch
+
+        manager = MagicMock()
+        manager.request_evidence_pushall.return_value = True
+        return manager, _patch("backend.app.services.printer_manager.printer_manager", manager)
+
+    def test_first_pass_opens_an_occasion_and_asks_for_a_report(self):
+        from backend.app.services import ams_presence
+        from backend.app.services.filament_deficit import request_unread_reads
+
+        manager, patched = self._patched()
+        with patched:
+            asked = request_unread_reads(7, {(0, 1), (0, 2)})
+
+        assert asked == 2
+        assert ams_presence._read_occasion_open(7, 0, 1)
+        assert ams_presence._read_occasion_open(7, 0, 2)
+        manager.request_evidence_pushall.assert_called_once_with(7, "unread_inventory")
+
+    def test_second_pass_in_the_same_episode_asks_nothing(self):
+        from backend.app.services.filament_deficit import request_unread_reads
+
+        manager, patched = self._patched()
+        with patched:
+            request_unread_reads(7, {(0, 1)})
+            manager.reset_mock()
+            asked = request_unread_reads(7, {(0, 1)})
+
+        assert asked == 0
+        manager.request_evidence_pushall.assert_not_called()
+
+    def test_episode_closes_when_the_slot_stops_being_unread(self):
+        from backend.app.services.filament_deficit import request_unread_reads
+
+        manager, patched = self._patched()
+        with patched:
+            request_unread_reads(7, {(0, 1)})
+            request_unread_reads(7, set())  # identity appeared / tray left
+            manager.reset_mock()
+            asked = request_unread_reads(7, {(0, 1)})  # it went unread again — a NEW episode
+
+        assert asked == 1
+        manager.request_evidence_pushall.assert_called_once_with(7, "unread_inventory")
+
+    def test_already_answered_since_seating_spends_the_episode_without_asking(self):
+        """A tagless roll answers no-tag once; the identify lane's own bookkeeping says
+        the question was already put, so the deficit lane must not put it again."""
+        from backend.app.services import ams_presence
+        from backend.app.services.filament_deficit import request_unread_reads
+
+        ams_presence.note_identity_learned(7, 0, 1)  # a read was commanded for this slot
+
+        manager, patched = self._patched()
+        with patched:
+            asked = request_unread_reads(7, {(0, 1)})
+
+        assert asked == 0
+        assert not ams_presence._read_occasion_open(7, 0, 1)
+        manager.request_evidence_pushall.assert_not_called()
+
+    def test_a_physical_cycle_after_the_read_reopens_the_question(self):
+        """``read_answered_since_seating`` is about the CURRENT seating: a qualified cycle
+        after the read means the answer on file describes a roll that has since moved."""
+        from backend.app.services import ams_presence
+
+        ams_presence.note_identity_learned(7, 0, 1)
+        assert ams_presence.read_answered_since_seating(7, 0, 1)
+
+        ams_presence._note_gain(7, 0, 1, qualified=True)
+        assert not ams_presence.read_answered_since_seating(7, 0, 1)
+
+    def test_never_read_slot_is_not_treated_as_answered(self):
+        """The first ask must never be blocked — a slot with no read on record at all
+        answers False (this is why ``not identity_unanswered()`` cannot be used)."""
+        from backend.app.services import ams_presence
+
+        assert not ams_presence.read_answered_since_seating(7, 0, 1)

@@ -191,6 +191,7 @@ export default {
         previousPrintFailed: 'Angehalten: vorheriger Druck fehlgeschlagen',
         filamentShort: 'Filament knapp',
         startSpoolBelowMinimum: 'Zugewiesene Spule liegt unter dem Mindest-Startgewicht',
+        filamentUnreadPending: 'Filament nicht gelesen — die eingesetzte Rolle wird ausgelesen',
         no_usb_drive: 'Kein USB-Stick im Drucker — USB-A-Laufwerk (FAT32/exFAT) einstecken',
         staggerHold: 'Warten auf das Strom-Staffelungsfenster — startet in Kürze',
         spoolJamRecovering: 'Spulenstau — Wechsel auf eine andere Spule und Fortsetzen',

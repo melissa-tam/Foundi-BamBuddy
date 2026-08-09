@@ -191,6 +191,7 @@ export default {
         previousPrintFailed: 'Retida: a impressão anterior falhou',
         filamentShort: 'Filamento insuficiente',
         startSpoolBelowMinimum: 'A bobina atribuída está abaixo do peso mínimo de início',
+        filamentUnreadPending: 'Filamento não lido — lendo a bobina inserida',
         no_usb_drive: 'Nenhuma unidade USB na impressora — insira uma unidade USB-A (FAT32/exFAT)',
         staggerHold: 'Aguardando a janela de escalonamento de energia — começa em breve',
         spoolJamRecovering: 'Travamento de bobina — trocando para outra bobina e retomando',

@@ -1313,7 +1313,15 @@ async def _build_requirement(incident: RecoveryIncident, status) -> dict | None:
     from backend.app.services.print_scheduler import scheduler
 
     loaded_all = scheduler._build_loaded_filaments(status)
-    jammed = next((f for f in loaded_all if f.get("global_tray_id") == incident.jammed_global_tray), None)
+    # An UNREAD entry is telemetry about PRESENCE, not about material: the builder now
+    # emits seated-but-unidentified trays so the dispatch layers stop pricing them as
+    # empty, and such an entry carries no type / colour / preset id. Reading a
+    # requirement out of it would silently ask the matcher for "" filament and skip the
+    # DB fallback that exists for exactly this bare-jammed-tray case.
+    jammed = next(
+        (f for f in loaded_all if f.get("global_tray_id") == incident.jammed_global_tray and not f.get("unread")),
+        None,
+    )
     if jammed is not None:
         return _requirement_from_loaded(jammed)
 

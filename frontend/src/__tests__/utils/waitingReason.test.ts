@@ -41,6 +41,16 @@ describe('waitingReasonText', () => {
     );
   });
 
+  it('maps the unread-filament hold to operator copy, not a humanized token', () => {
+    // WS4-D2: a seated-but-unidentified AMS tray is neither a shortage nor a
+    // dispatchable slot. Without the case the humanizer would render it as
+    // "Filament unread pending", which reads like a shortage and hides the fact
+    // that the farm is actively reading the roll.
+    expect(waitingReasonText('filament_unread_pending', t)).toBe(
+      'productionRuns.detail.waiting.filamentUnreadPending',
+    );
+  });
+
   it('humanizes an unmapped bare token instead of returning it raw', () => {
     // Not in the tier-1 map → falls through to the humanizer.
     expect(waitingReasonText('some_new_hold', t)).toBe('Some new hold');

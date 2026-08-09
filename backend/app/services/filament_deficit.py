@@ -24,6 +24,12 @@ Design notes:
   than wedge the queue on a flaky network call.
 * The ``disable_filament_warnings`` user setting is respected at the
   service boundary — callers do not have to know about it.
+* A SEATED-but-UNIDENTIFIED tray (``tray_fields.tray_unread``) is priced as
+  UNDETERMINED, never as empty. The slot physically holds a roll nobody has
+  named, so neither its binding's ledger grams nor a zero is an honest answer —
+  and a zero is what produced phantom "Low filament" deficits against 12 loaded
+  fleet trays. This module also owns the ASK that resolves them
+  (:func:`request_unread_reads`), once per unread episode per slot.
 """
 
 from __future__ import annotations
@@ -43,7 +49,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.services.filament_requirements import extract_filament_requirements
-from backend.app.services.tray_fields import tray_presence_map
+from backend.app.services.tray_fields import tray_presence_map, tray_unread
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +189,52 @@ def _live_tray_presence(printer_id: int) -> dict[tuple[int, int], bool | None]:
     return tray_presence_map(getattr(state, "raw_data", None))
 
 
+def live_unread_slots(printer_id: int) -> set[tuple[int, int]]:
+    """``{(ams_id, tray_id)}`` for every SEATED-but-UNIDENTIFIED tray on the printer.
+
+    The third sibling of :func:`_live_tray_presence` / :func:`_live_tray_identities`,
+    reading the same live merged status through the same canonical rule
+    (``tray_fields.tray_unread`` — presence ``True`` and no asserted identity of any
+    kind). It exists because the identity map DROPS these trays: that drop is correct
+    for pooling (they contribute no material to any identity) but it made them
+    indistinguishable from empty slots everywhere else, which is the phantom-deficit
+    root cause. Classified here instead of silently lost.
+
+    The external ``vt_tray`` holder is excluded, mirroring the identity map. Public
+    because the dispatch decision (``print_scheduler``) needs it: an uncovered
+    requirement beside an unread slot is a "read the slot" answer, not a "stage the
+    job" one. ``set()`` when no live state is available, so an offline printer decides
+    exactly as it does today.
+    """
+    try:
+        from backend.app.services.printer_manager import printer_manager
+    except ImportError:
+        return set()
+
+    state = printer_manager.get_status(printer_id)
+    raw = getattr(state, "raw_data", None)
+    if not isinstance(raw, dict):
+        return set()
+
+    out: set[tuple[int, int]] = set()
+    for unit in raw.get("ams") or []:
+        if not isinstance(unit, dict):
+            continue
+        try:
+            ams_id = int(unit["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        for tray in unit.get("tray") or []:
+            if not isinstance(tray, dict) or not tray_unread(tray):
+                continue
+            try:
+                tray_id = int(tray["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            out.add((ams_id, tray_id))
+    return out
+
+
 def _live_tray_identities(printer_id: int) -> dict[tuple[int, int], str]:
     """Map ``(ams_id, tray_id) → material identity`` from the printer's LIVE trays.
 
@@ -199,6 +251,11 @@ def _live_tray_identities(printer_id: int) -> dict[tuple[int, int], str]:
     spans it). Empty/blank trays (no ``tray_type``/``filament_type``) produce no
     identity. Every access is guarded; returns ``{}`` when the state or its AMS
     structure is missing.
+
+    A tray absent from this map is NOT thereby empty: a seated tray with no identity is
+    classified by :func:`live_unread_slots` instead, and the two readers together are
+    the full picture of a printer's trays. Absence from BOTH means the tray declared
+    itself cleared (or the printer is offline).
     """
     try:
         from backend.app.services.printer_manager import printer_manager
@@ -379,6 +436,11 @@ async def compute_deficit_for_queue_item(
     # ledger grams as "available" is how a stale spool HIDES a real deficit and lets
     # dispatch start a print with nothing in the slot.
     live_presence = _live_tray_presence(printer_id)
+    # Seated-but-unidentified trays. Read unconditionally (not only under backup) —
+    # the per-slot path needs it just as much: a mapped tray whose roll nobody has
+    # named cannot be priced from its binding, because the binding names a roll the
+    # wire never confirmed.
+    unread_slots = live_unread_slots(printer_id)
 
     # ------------------------------------------------------------------ phase 1
     # Resolve each requirement to (ams_id, tray_id, identity, remaining_grams).
@@ -477,6 +539,16 @@ async def compute_deficit_for_queue_item(
             # not undetermined — undetermined would `continue` below and silently
             # pass the check. Unknown presence is left untouched (fail open).
             remaining = 0.0
+        elif (ams_id, tray_id) in unread_slots:
+            # The mapped tray is SEATED but carries no identity: a roll is physically
+            # there and the farm cannot say which. UNDETERMINED (None), which is the
+            # opposite end from the cleared-tray branch above and deliberately so —
+            # 0.0 would invent a shortfall against loaded material (the phantom "Low
+            # filament" this wave removes) while the ledger figure would quote a
+            # binding the wire never confirmed. Neither is knowledge, so this slot
+            # contributes no deficit grams; ``print_scheduler`` holds the job on
+            # ``filament_unread_pending`` and asks the printer to read the slot.
+            remaining = None
 
         if remaining is None:
             # Unable to determine remaining grams — preserve pre-#1762 behaviour
@@ -587,6 +659,11 @@ async def compute_deficit_for_queue_item(
     # Same presence rule as phase 1, applied to the POOL: a binding whose tray reads
     # EMPTY contributes 0.0, never its ledger grams and never "undetermined" (which
     # would make the whole identity open-ended and unblockable).
+    #
+    # Unread slots need no rule here: the pool is keyed by LIVE TRAY IDENTITY and an
+    # unread tray has none, so it never joins a pool and its ``grams_by_slot`` entry is
+    # never read. That is also why the pool alone cannot see them — the phantom deficit
+    # is decided one layer up, where ``live_unread_slots`` is consulted.
     for slot_key, present in live_presence.items():
         if present is False and slot_key in grams_by_slot:
             grams_by_slot[slot_key] = 0.0
@@ -643,8 +720,88 @@ async def compute_deficit_for_queue_item(
     return deficits
 
 
+# ---------------------------------------------------------------------------
+# The unread-slot ASK (D4). Pricing a seated-unidentified slot as UNDETERMINED
+# removes the phantom deficit but leaves the slot unknown forever unless something
+# asks the printer to read it. This is that ask, and it is deliberately paced BY
+# EPISODE rather than by a timer (doctrine rule 6/7, the 2026-08-02 read-storm shape).
+# ---------------------------------------------------------------------------
+
+# (printer_id, ams_id, tray_id) for every slot whose CURRENT unread episode has already
+# been asked about. An episode is one continuous run of the slot reading unread; it ends
+# the moment the slot stops being unread (identity appeared, the tray left, presence
+# changed), which is exactly when the slot drops out of ``live_unread_slots`` and this
+# set is pruned below. Module-level edge state like ``farm_staging._tray_signatures`` —
+# lost on restart, worst case one extra ask per slot after a restart.
+_unread_ask_episodes: set[tuple[int, int, int]] = set()
+
+
+def _reset_state() -> None:
+    """Test hook: clear the module-level unread-episode ledger between cases."""
+    _unread_ask_episodes.clear()
+
+
+def request_unread_reads(printer_id: int, slots: set[tuple[int, int]]) -> int:
+    """Ask the printer to resolve its seated-but-unidentified slots. Returns asks made.
+
+    For each slot in ``slots`` that has not already spent this episode's ask: open a
+    read occasion (``ams_presence.open_read_occasion`` — the farm's permission to spend
+    ONE commanded read on standing evidence, which ``command_identify`` consumes) and,
+    once per pass, request a fresh full report so the identify lanes act on current
+    wire facts.
+
+    WHY ONCE PER EPISODE. A truly tagless roll answers the read with "no tag" exactly
+    once; after that the bare-tray autoconfig lane owns the slot (doctrine rule 2 — the
+    Bambu Black PETG default assumption stands) and re-asking can only re-fail. Every
+    failed read also leaves a printer-side ``0700_0081`` that no software can clear, so
+    a per-tick ask is the 2026-08-02 storm shape with a new caller's name on it. Two
+    independent brakes enforce it: this per-slot episode ledger, and
+    ``ams_presence.read_answered_since_seating`` — if the identify lane already put the
+    question since the slot's current seating, the episode is spent WITHOUT an ask.
+
+    Failures are swallowed by design: a refused pushall (disconnected printer, pacing
+    floor) is a defer, never a retry loop — the slot is still unread on the next pass
+    and the printer re-reports on reconnect anyway (invariant 2's "callers may defer").
+    """
+    from backend.app.services import ams_presence
+    from backend.app.services.printer_manager import printer_manager
+
+    current = {(printer_id, ams_id, tray_id) for ams_id, tray_id in slots}
+    # Close the episodes of this printer's slots that are no longer unread.
+    for stale in [k for k in _unread_ask_episodes if k[0] == printer_id and k not in current]:
+        _unread_ask_episodes.discard(stale)
+
+    asked = 0
+    for key in sorted(current - _unread_ask_episodes):
+        _, ams_id, tray_id = key
+        # Spend the episode BEFORE anything can raise, so a failure downstream can never
+        # turn a one-shot ask into a per-pass one.
+        _unread_ask_episodes.add(key)
+        if ams_presence.read_answered_since_seating(printer_id, ams_id, tray_id):
+            logger.debug(
+                "filament_deficit: unread slot printer %s AMS%d-T%d already answered since seating — no ask",
+                printer_id,
+                ams_id,
+                tray_id,
+            )
+            continue
+        ams_presence.open_read_occasion(printer_id, ams_id, tray_id)
+        asked += 1
+        logger.info(
+            "filament_deficit: unread slot printer %s AMS%d-T%d blocks dispatch — read occasion opened",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+    if asked:
+        printer_manager.request_evidence_pushall(printer_id, "unread_inventory")
+    return asked
+
+
 # Re-export the most useful pieces for callers that just want the data.
 __all__ = [
     "FilamentDeficit",
     "compute_deficit_for_queue_item",
+    "live_unread_slots",
+    "request_unread_reads",
 ]

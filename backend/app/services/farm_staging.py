@@ -195,9 +195,20 @@ async def release_filament_staged(db: AsyncSession, printer_id: int | None = Non
         # (STAGING_REASON_PREFIX) or a legacy bare token from a pre-D9 build — so a
         # released item never keeps a stale hold reason. An UNRELATED reason (never
         # set on a staged item today, but defensive) is left intact.
+        # ``WAITING_REASON_UNREAD_PENDING`` is in the list even though the scheduler
+        # never STAGES an item under it (that is the whole point of D2): a build that
+        # staged an item on a phantom deficit and then held the same item for a read
+        # could leave the token behind, and a released item must never keep a stale hold
+        # reason. Cheap, and it keeps every filament-lane token clearing in ONE place.
         wr = item.waiting_reason
         if wr and (
-            wr.startswith(STAGING_REASON_PREFIX) or wr in ("filament_short", spool_selection.WAITING_REASON_START_MIN)
+            wr.startswith(STAGING_REASON_PREFIX)
+            or wr
+            in (
+                "filament_short",
+                spool_selection.WAITING_REASON_START_MIN,
+                spool_selection.WAITING_REASON_UNREAD_PENDING,
+            )
         ):
             item.waiting_reason = None
         released += 1

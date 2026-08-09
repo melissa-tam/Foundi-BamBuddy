@@ -191,6 +191,7 @@ export default {
         previousPrintFailed: 'Retenue : l\'impression précédente a échoué',
         filamentShort: 'Filament insuffisant',
         startSpoolBelowMinimum: 'La bobine affectée est en dessous du poids minimal de démarrage',
+        filamentUnreadPending: 'Filament non lu — lecture de la bobine en place',
         no_usb_drive: 'Aucune clé USB dans l\'imprimante — insérez une clé USB-A (FAT32/exFAT)',
         staggerHold: 'En attente de la fenêtre d\'échelonnement de l\'alimentation — démarre sous peu',
         spoolJamRecovering: 'Bourrage de bobine — bascule vers une autre bobine et reprise',

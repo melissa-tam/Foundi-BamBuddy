@@ -191,6 +191,7 @@ export default {
         previousPrintFailed: '保留中: 前の印刷が失敗しました',
         filamentShort: 'フィラメント不足',
         startSpoolBelowMinimum: '割り当てられたスプールが最小開始重量を下回っています',
+        filamentUnreadPending: 'フィラメント未読取 — セット済みのロールを読み取り中',
         no_usb_drive: 'プリンターにUSBドライブがありません — USB-Aドライブ（FAT32/exFAT）を挿入してください',
         staggerHold: '電力スタッガー枠を待機中 — まもなく開始します',
         spoolJamRecovering: 'スプール詰まり — 別のスプールに切り替えて再開中',

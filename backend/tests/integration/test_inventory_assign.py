@@ -669,7 +669,7 @@ class TestAssignSpoolEmptySlotPreConfig:
         mock_client.ams_set_filament_setting.assert_called_once()
         body = response.json()
         assert body["pending_config"] is False
-        assert body["configured"] is True
+        assert "configured" not in body  # response-only residue, deleted
         # The config landed → no "awaiting insert" marker is written.
         assert await _pre_configured_at(db_session, printer.id, 2, 3) is None
 
@@ -699,7 +699,7 @@ class TestAssignSpoolEmptySlotPreConfig:
         assert response.status_code == 200
         body = response.json()
         assert body["pending_config"] is True
-        assert body["configured"] is False
+        assert "configured" not in body  # response-only residue, deleted
         # ...and pending_config is READ OFF the explicit column, not inferred from a
         # blank fingerprint. This stamp is what the pipeline's one-shot apply consumes.
         assert await _pre_configured_at(db_session, printer.id, 0, 0) is not None
@@ -733,7 +733,7 @@ class TestAssignSpoolEmptySlotPreConfig:
         assert response.status_code == 200
         body = response.json()
         assert body["pending_config"] is False
-        assert body["configured"] is True
+        assert "configured" not in body  # response-only residue, deleted
         mock_client.ams_set_filament_setting.assert_called_once()
         assert await _pre_configured_at(db_session, printer.id, 0, 0) is None
 
@@ -955,7 +955,7 @@ class TestAssignSpoolEmptyDetection:
         # slot is loaded, just had stale metadata cleared.
         body = response.json()
         assert body["pending_config"] is False
-        assert body["configured"] is True
+        assert "configured" not in body  # response-only residue, deleted
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -987,7 +987,7 @@ class TestAssignSpoolEmptyDetection:
         mock_client.ams_set_filament_setting.assert_not_called()
         body = response.json()
         assert body["pending_config"] is True
-        assert body["configured"] is False
+        assert "configured" not in body  # response-only residue, deleted
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1056,7 +1056,7 @@ class TestAssignSpoolEmptyDetection:
         mock_client.ams_set_filament_setting.assert_called_once()
         body = response.json()
         assert body["pending_config"] is False
-        assert body["configured"] is True
+        assert "configured" not in body  # response-only residue, deleted
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1091,7 +1091,7 @@ class TestAssignSpoolEmptyDetection:
         mock_client.ams_set_filament_setting.assert_called_once()
         body = response.json()
         assert body["pending_config"] is False
-        assert body["configured"] is True
+        assert "configured" not in body  # response-only residue, deleted
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1132,7 +1132,7 @@ class TestAssignSpoolEmptyDetection:
         mock_client.ams_set_filament_setting.assert_called_once()
         body = response.json()
         assert body["pending_config"] is False
-        assert body["configured"] is True
+        assert "configured" not in body  # response-only residue, deleted
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1164,7 +1164,7 @@ class TestAssignSpoolEmptyDetection:
         mock_client.ams_set_filament_setting.assert_called_once()
         body = response.json()
         assert body["pending_config"] is False
-        assert body["configured"] is True
+        assert "configured" not in body  # response-only residue, deleted
 
 
 class TestAssignSpoolPfcnCloudPreset:
@@ -1472,3 +1472,52 @@ class TestUnassignDismissesAStaleFreshRollPrompt:
 
         assert response.status_code == 200
         dismissed.assert_not_awaited()
+
+
+class TestAssignmentResponseShape:
+    """The ``configured`` field is GONE from every assignment response (hard cutover).
+
+    It was a response-only residue: defaulted False on the schema, written on the POST
+    response alone, never persisted — so every GET reported ``configured: false`` for
+    every live assignment. A field that is wrong on all but one response is worse than
+    no field, and the two facts it was mistaken for are already there and durable:
+    ``pending_config`` (from ``pre_configured_at``) and the live tri-state ``present``.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_post_and_get_carry_no_configured_field(
+        self, async_client: AsyncClient, printer_factory, spool_factory
+    ):
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(slicer_filament="GFL05", material="PLA")
+
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+        mock_client.extrusion_cali_sel.return_value = True
+        status = _make_mock_status(
+            ams_data=[{"id": 0, "tray": [{"id": 0, "tray_type": "PLA", "tray_info_idx": "GFL05"}]}]
+        )
+
+        with patch("backend.app.services.printer_manager.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = status
+
+            created = await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 0, "tray_id": 0},
+            )
+            listed = await async_client.get("/api/v1/inventory/assignments")
+
+        assert created.status_code == 200
+        assert "configured" not in created.json()
+        # The durable replacements are still there on the same payload.
+        assert "pending_config" in created.json()
+
+        assert listed.status_code == 200
+        rows = listed.json()
+        assert rows, "the assignment just created must be listed"
+        for row in rows:
+            assert "configured" not in row
+            assert "pending_config" in row
+            assert "present" in row
