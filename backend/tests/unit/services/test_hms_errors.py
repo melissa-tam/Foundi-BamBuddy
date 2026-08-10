@@ -914,3 +914,53 @@ class TestHmsErrorsImportGraph:
             cwd=repo_root,
         )
         assert result.stdout.strip() == "[]", result.stdout
+
+
+class TestNotifySuppression:
+    """C5: the runout auto-switch is a rescue REPORT, so it stops paging the operator.
+
+    Suppression is a notification decision, deliberately kept OUT of the fault
+    taxonomy: ``0x00030002`` is THE spent evidence, and classifying it would give it a
+    second consumer that double-stamps the operator's ledger.
+    """
+
+    def test_the_auto_switch_is_suppressed(self):
+        from backend.app.services.hms_errors import is_notify_suppressed
+
+        # attr 0x07002200 = AMS unit 0, tray 3; code word 0x00030002.
+        assert is_notify_suppressed(0x07002200, "0x30002") is True
+        assert is_notify_suppressed(0x07002200, 0x00030002) is True
+
+    def test_the_colliding_short_form_is_not_suppressed(self):
+        """0x00020002 (assist motor overloaded) masks to the SAME short code and must
+        keep alerting — which is why the predicate reads the full code word."""
+        from backend.app.services.hms_errors import hms_short_code, is_notify_suppressed
+
+        assert hms_short_code(0x07001000, "0x20002") == hms_short_code(0x07002200, "0x30002")
+        assert is_notify_suppressed(0x07001000, "0x20002") is False
+
+    def test_a_non_ams_attr_is_not_suppressed(self):
+        """Scoped to the shape the spent lane consumes — an AMS attr naming a slot."""
+        from backend.app.services.hms_errors import is_notify_suppressed
+
+        assert is_notify_suppressed(0x03000000, 0x00030002) is False
+        assert is_notify_suppressed(0x07000000, 0x00030002) is False  # AMS, but names no slot
+
+    def test_it_is_malformed_safe_and_fails_toward_notifying(self):
+        from backend.app.services.hms_errors import is_notify_suppressed
+
+        assert is_notify_suppressed(0x07002200, "not-a-code") is False
+        assert is_notify_suppressed(None, None) is False
+
+    def test_the_suppressed_code_stays_out_of_the_fault_taxonomy(self):
+        """The set and the taxonomy are separate on purpose: suppressing an alert is
+        not classifying a fault, and this code word's ONE consumer is the spent lane."""
+        from backend.app.services.hms_errors import (
+            _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
+            NOTIFY_SUPPRESSED_CODE32,
+            classify_ams_fault,
+        )
+
+        assert NOTIFY_SUPPRESSED_CODE32 == _RUNOUT_AUTO_SWITCH_SPENT_CODE32
+        for code in NOTIFY_SUPPRESSED_CODE32:
+            assert classify_ams_fault(0x07002200, code) is None

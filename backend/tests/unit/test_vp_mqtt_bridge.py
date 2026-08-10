@@ -780,13 +780,21 @@ class TestPushStatusCache:
         await bridge.stop()
 
     @pytest.mark.asyncio
-    async def test_tray_exist_bits_shutdown_guard_preserves_cache(self):
-        """#765 shutdown guard mirrored at the bridge: when the printer
-        powers off it sends all-zero `tray_exist_bits` paired with
-        `power_on_flag=False`. Wiping the cache on that pattern would
-        propagate phantom empties to every slicer reconnect until the
-        printer powers back on and pushes a real state. Skip cleanup
-        on the shutdown-shaped payload."""
+    async def test_tray_exist_bits_all_zero_mask_empties_the_cache(self):
+        """The #765 `power_on_flag` guard is gone here too, and must be.
+
+        It skipped an all-zero mask whenever `power_on_flag` was False, on the
+        premise that the pattern means "printer powering off". A live fleet survey
+        (2026-08-10) disproves it: that flag reads False as the ORDINARY steady state
+        on printers whose AMS is awake and reporting truthfully, so the guard was
+        pinning stale loaded slots into the slicer-facing cache indefinitely. Keeping
+        it alive in this one caller after deleting it in the other would be exactly the
+        dual path the fork forbids.
+
+        The bridge cache is a DISPLAY mirror — no binding, ledger or dispatch decision
+        reads it — and the printer's next report repopulates it, so applying the mask
+        as reported is both correct and self-healing here. Trust in a repeated zero is
+        the real client's job, where the consequences are destructive."""
         server = _make_server()
         bridge = _make_bridge(server)
         await bridge.start()
@@ -817,7 +825,7 @@ class TestPushStatusCache:
         )
         await asyncio.sleep(0.01)
 
-        # 2. Shutdown-shaped push: tray_exist_bits=0 + power_on_flag=False.
+        # 2. All-zero mask beside power_on_flag=False — the "shutdown" shape.
         bridge._on_printer_raw(
             f"device/{H2D_SERIAL}/report",
             json.dumps(
@@ -836,7 +844,9 @@ class TestPushStatusCache:
 
         cached = bridge.get_latest_print_state()
         for i in range(4):
-            assert cached["ams"]["ams"][0]["tray"][i]["tray_type"] == "PLA", f"slot {i} must survive the shutdown push"
+            assert cached["ams"]["ams"][0]["tray"][i]["tray_type"] == "", (
+                f"slot {i} must follow the reported mask, not a flag that means nothing"
+            )
 
         await bridge.stop()
 

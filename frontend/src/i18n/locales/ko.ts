@@ -191,6 +191,7 @@ export default {
         visionHold: '프린터 비전: 플레이트가 비어 있지 않습니다 — 베드를 비운 뒤 프린터에서 재개하세요',
         previousPrintFailed: '보류됨: 이전 인쇄가 실패했습니다',
         filamentShort: '필라멘트 부족',
+        externalSpoolRunout: '외부 스풀이 소진되었습니다 — AMS 슬롯이 아니라 외부 홀더를 채우세요',
         startSpoolBelowMinimum: '할당된 스풀이 최소 시작 중량 미만입니다',
         filamentUnreadPending: '필라멘트 미판독 — 장착된 롤을 읽는 중',
         no_usb_drive: '프린터에 USB 드라이브가 없습니다 — USB-A 드라이브(FAT32/exFAT)를 삽입하세요',
@@ -762,7 +763,6 @@ export default {
     addFromCloud: '클라우드에서 추가',
     toast: {
       printerDeleted: '프린터가 삭제되었습니다',
-      missingSpoolAssignment: '{{printer}}에서 인쇄가 시작되었습니다. 슬롯 할당 누락: {{slots}}',
       printerAdded: '프린터가 추가되었습니다',
       printerUpdated: '프린터가 업데이트되었습니다',
       failedToDelete: '프린터 삭제 실패',
@@ -878,6 +878,8 @@ export default {
     },
     controls: '제어',
     rfid: {
+      disabledFilamentEngaged: '먼저 필라멘트를 언로드하세요 — 필라멘트가 공급되는 동안에는 AMS가 태그를 읽을 수 없습니다',
+      disabledWhileDrying: 'AMS가 건조하는 동안에는 사용할 수 없습니다',
       reread: 'RFID 재읽기'
     },
     ams: {
@@ -1767,6 +1769,8 @@ export default {
       confirmTitle: '적은 스풀로 시작하시겠습니까?',
       confirmIntro: '할당된 스풀로 이 인쇄를 완료할 수 있지만 최소 시작 중량 미만입니다. 그래도 시작하시겠습니까?',
       slots: '해당 슬롯: {{slots}}',
+      unknownGramsTitle: '무게를 모르는 스풀로 시작할까요?',
+      unknownGramsIntro: '해당 스풀의 무게가 기록되어 있지 않아 인쇄를 끝까지 마칠 수 있는지 확인할 수 없습니다. 스풀 무게를 재거나 할당하거나, 그래도 시작하세요.',
       printAnyway: '그래도 시작'
     },
     farm: {
@@ -2235,8 +2239,6 @@ export default {
     spoolRecoveryStepTimeoutDesc: '각 복구 단계가 실패로 간주되기까지 실행될 수 있는 시간(15~600초).',
     spoolRecoveryProtectLayers: '초기 레이어 보호',
     spoolRecoveryProtectLayersDesc: '처음 N개 레이어 동안에는 최소 시작 무게 미만의 스풀을 교체용으로 사용할 수 없으며, 그 이후에는 사용할 수 있습니다. 0이면 잔량이 적은 스풀도 항상 사용할 수 있습니다.',
-    autoAddUntagged: '태그 없는 트레이 자동 추가',
-    autoAddUntaggedDesc: 'RFID 태그가 없는 AMS 트레이에 대해 재고 스풀을 자동으로 생성합니다. 중복을 피하기 위해 스풀을 수동으로 미리 등록하는 경우 끄십시오. RFID 태그가 있는 스풀은 Spoolman 설정에 별도의 자동 추가 토글이 있습니다.',
     taglessDefaultFilament: '태그 없는 빈 트레이용 기본 필라멘트',
     taglessDefaultFilamentDesc: '설정되지 않은 태그 없는 AMS 트레이를 이 필라멘트로 자동 구성하여 수동 설정 없이 인쇄할 수 있도록 합니다.',
     taglessBrand: '브랜드',
@@ -4344,7 +4346,6 @@ export default {
     addToInventoryFailed: '스풀을 인벤토리에 추가하지 못함',
     unknownSpoolToast: '{{printer}} 슬롯 {{slot}}에 알 수 없는 필라멘트 {{material}} — 인벤토리에 추가하시겠습니까?',
     unknownSpoolSlot: '슬롯',
-    taglessMintToast: '{{printer}} 슬롯 {{slot}}에서 태그 없는 새 스풀 추적을 시작했습니다',
     freshRoll: {
       promptToast: '{{printer}} 슬롯 {{slot}}에 새 롤인가요?',
       sameRoll: '같은 롤',
@@ -4799,17 +4800,19 @@ export default {
     used: '사용됨',
     remainingUnit: '남음',
     slotEmpty: '비어 있음',
-    slotUnconfigured: '?',
+    slotStateUnknown: '슬롯 상태 알 수 없음 — 프린터가 스풀이 들어 있는지 보고하지 않았습니다',
+    slotStateUnknownShort: '알 수 없음',
     slotPresentUnread: '스풀 있음 — 인식되지 않음',
     slotStandingUnknown: '{{printer}}: 슬롯 {{slot}}에 AMS가 읽을 수 없는 스풀이 있습니다 — 확인하세요',
     outOfRotation: '로테이션 제외 — 스풀 걸림 감지됨. 스풀을 다시 삽입하거나 플래그를 해제하면 다시 사용할 수 있습니다',
     outOfRotationShort: '로테이션 제외',
-    emptySlotReset: '필라멘트가 할당되지 않음',
     emptySlotBinding: {
       title: '여전히 할당됨',
       used: '{{grams}} g 사용',
       ranOut: '소진됨 — 새 롤 대기 중',
       awaitingInsert: '삽입 대기 중(사전 구성됨)',
+      seatedUnread: '장착됨 — 식별 대기 중',
+      presenceUnknown: '슬롯에서 확인되지 않음',
       notInserted: '삽입되지 않음',
       elsewhereHint: '(삽입되지 않음 — {{location}}에 할당됨)',
       clear: '슬롯 해제',

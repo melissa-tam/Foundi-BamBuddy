@@ -191,6 +191,7 @@ export default {
         visionHold: 'プリンターの検知: プレートが空ではありません — ベッドを片付けてからプリンター側で再開してください',
         previousPrintFailed: '保留中: 前の印刷が失敗しました',
         filamentShort: 'フィラメント不足',
+        externalSpoolRunout: '外部スプールが切れました — AMS スロットではなく外部ホルダーを補充してください',
         startSpoolBelowMinimum: '割り当てられたスプールが最小開始重量を下回っています',
         filamentUnreadPending: 'フィラメント未読取 — セット済みのロールを読み取り中',
         no_usb_drive: 'プリンターにUSBドライブがありません — USB-Aドライブ（FAT32/exFAT）を挿入してください',
@@ -786,7 +787,6 @@ export default {
     // Toast messages
     toast: {
       printerDeleted: 'プリンターを削除しました',
-      missingSpoolAssignment: '{{printer}}で印刷を開始しました。以下のスプール割り当てがありません: {{slots}}',
       printerAdded: 'プリンターを追加しました',
       printerUpdated: 'プリンターを更新しました',
       failedToDelete: 'プリンターの削除に失敗しました',
@@ -906,6 +906,8 @@ export default {
     controls: 'コントロール',
     // RFID
     rfid: {
+      disabledFilamentEngaged: '先にフィラメントをアンロードしてください — フィラメントが送られている間、AMS はタグを読み取れません',
+      disabledWhileDrying: 'AMS の乾燥中は使用できません',
       reread: 'RFID再読み取り',
     },
     // AMS load/unload (#891)
@@ -1551,6 +1553,8 @@ export default {
       confirmTitle: '残量の少ないスプールで開始しますか？',
       confirmIntro: '割り当てられたスプールはこの印刷をまかなえますが、最小開始重量を下回っています。それでも開始しますか？',
       slots: '対象スロット: {{slots}}',
+      unknownGramsTitle: '重量不明のスプールで開始しますか?',
+      unknownGramsIntro: '該当するスプールの重量が記録されていないため、印刷を完走できるか確認できません。スプールを計量するか割り当てるか、それでも開始してください。',
       printAnyway: 'それでも開始',
     },
     farm: {
@@ -2326,8 +2330,6 @@ export default {
     spoolRecoveryStepTimeoutDesc: '各復旧ステップが失敗と見なされるまでに実行できる時間（15〜600秒）。',
     spoolRecoveryProtectLayers: '最初のレイヤーを保護',
     spoolRecoveryProtectLayersDesc: '最初のNレイヤーの間は、最小開始重量を下回るスプールは交換用として使用できません。それ以降は使用できます。0の場合、残量の少ないスプールは常に使用できます。',
-    autoAddUntagged: 'タグなしトレイを自動追加',
-    autoAddUntaggedDesc: 'RFID タグのない AMS トレイに対して在庫スプールを自動作成します。重複を避けるためにスプールを手動で事前登録する場合はオフにしてください。RFID タグ付きのスプールは、Spoolman 設定に独自の自動追加トグルがあります。',
     taglessDefaultFilament: 'タグなしの空トレイ用のデフォルトフィラメント',
     taglessDefaultFilamentDesc: '未設定のタグなし AMS トレイをこのフィラメントで自動設定し、手動設定なしで印刷できるようにします。',
     taglessBrand: 'ブランド',
@@ -4553,7 +4555,6 @@ export default {
     addToInventoryFailed: 'スプールの在庫追加に失敗しました',
     unknownSpoolToast: '{{printer}} スロット {{slot}} で不明なフィラメント {{material}} を検出しました。在庫に追加しますか？',
     unknownSpoolSlot: 'スロット',
-    taglessMintToast: '{{printer}} のスロット {{slot}} で新しいタグなしスプールの追跡を開始しました',
     freshRoll: {
       promptToast: '{{printer}} スロット {{slot}} に新しいロールですか？',
       sameRoll: '同じロール',
@@ -5007,17 +5008,19 @@ export default {
     empty: '<空>',
     emptySlot: '空のスロット',
     slotEmpty: '空',
-    slotUnconfigured: '?',
+    slotStateUnknown: 'スロットの状態は不明です — スプールが入っているかどうかプリンターから報告がありません',
+    slotStateUnknownShort: '不明',
     slotPresentUnread: 'スプールあり — 認識できません',
     slotStandingUnknown: '{{printer}}: スロット {{slot}} に AMS が読み取れないスプールがあります — 確認してください',
     outOfRotation: 'ローテーション外 — スプール詰まりを検出。スプールを再挿入するかフラグを解除すると再利用できます',
     outOfRotationShort: 'ローテーション外',
-    emptySlotReset: 'スプール未割当',
     emptySlotBinding: {
       title: '割り当ては継続中',
       used: '使用量 {{grams}} g',
       ranOut: '使い切り — 新しいロール待ち',
       awaitingInsert: '挿入待ち（事前設定済み）',
+      seatedUnread: '装着済み — 識別待ち',
+      presenceUnknown: 'スロット内で未確認',
       notInserted: '未挿入',
       elsewhereHint: '（未挿入 — {{location}} に割り当て済み）',
       clear: 'スロットを解除',

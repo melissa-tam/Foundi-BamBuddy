@@ -750,6 +750,12 @@ async def get_printer_status(
         hms_errors=hms_errors,
         ams=ams_units,
         ams_exists=ams_exists,
+        # Exist-bit triage surface: what the last bits-carrying push SAID, and what the
+        # farm decided about it. Additive and read-only — presence itself is settled on
+        # the wire lane long before this route runs.
+        ams_tray_exist_bits=state.ams_tray_exist_bits,
+        ams_power_on_flag=state.ams_power_on_flag,
+        ams_bits_trusted=state.ams_bits_trusted,
         vt_tray=vt_tray,
         sdcard=state.sdcard,
         store_to_sdcard=state.store_to_sdcard,

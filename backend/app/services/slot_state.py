@@ -622,11 +622,17 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
             # tray 2, 2026-08-07). Owe the read instead; the binding is still untouched
             # here, exactly as row 5's unresolved arm leaves it.
             #
-            # Presence must be the TRI-STATE True, not an exist bit: this arm exists to
-            # earn a discovery read, and ``ams_presence.identify_needed``'s spent-occupied
-            # arm gates on the same seated-state test. A verdict this table emits on
-            # weaker evidence than the need authority accepts is a read that is never
-            # spent — and a reason that never resolves anything.
+            # Presence must be the TRI-STATE True: this arm exists to earn a discovery
+            # read, and ``ams_presence.identify_needed``'s spent-occupied arm now grants
+            # one on exactly that — either present state, the same rule
+            # ``tray_fields.tray_presence`` applies here. The two were misaligned (the
+            # need authority demanded state 10 specifically), so this table emitted a
+            # reason for every state-11 spent-occupied slot that the authority could
+            # never grant: a request standing forever, resolving nothing. A verdict
+            # emitted on evidence the need authority does not accept is not a read, it is
+            # a loop with no exit. Wire safety for a threaded-on tray is enforced where
+            # the rest of it lives — ``command_identify`` defers on engaged filament and
+            # spends nothing, so the entitlement waits for the idle edge.
 
             # 5a — the ANSWER to that discovery read, when it came back NO TAG. The arm
             # above only ever handled the tag-FOUND outcome (a tag lands, row 2 decides);

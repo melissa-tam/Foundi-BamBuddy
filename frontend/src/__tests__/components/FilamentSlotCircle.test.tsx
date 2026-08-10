@@ -117,8 +117,8 @@ describe('FilamentSlotCircle', () => {
       expect(circle.className).toContain('dark:border-amber-400');
     });
 
-    it('keeps the dashed empty look for physical and reset slots', () => {
-      for (const kind of ['physical', 'reset'] as const) {
+    it('keeps the dashed empty look for physical and unknown slots', () => {
+      for (const kind of ['physical', 'unknown'] as const) {
         const { container, unmount } = render(
           <FilamentSlotCircle isEmpty={true} emptyKind={kind} slotNumber={2} />
         );
@@ -129,6 +129,30 @@ describe('FilamentSlotCircle', () => {
         expect(screen.queryByRole('img')).not.toBeInTheDocument();
         unmount();
       }
+    });
+
+    it('gives an unknown-presence slot a dimmer ring and its own stated reason', () => {
+      // Quiet, but never silent: "we do not know" must be readable, and it must
+      // not look identical to the positive claim "nothing is in there".
+      const { container: unknownC, unmount } = render(
+        <FilamentSlotCircle isEmpty={true} emptyKind="unknown" slotNumber={2} />
+      );
+      const unknownCircle = unknownC.firstChild as HTMLElement;
+      const title = unknownCircle.getAttribute('title');
+      expect(title).toBeTruthy();
+      // A raw key here would mean a missing locale entry.
+      expect(title).not.toBe('ams.slotStateUnknown');
+      // Carried for screen readers too, not by the border tone alone.
+      expect(screen.getByText(title as string)).toBeInTheDocument();
+      const dimmed = unknownCircle.style.borderColor;
+      unmount();
+
+      const { container: physicalC } = render(
+        <FilamentSlotCircle isEmpty={true} emptyKind="physical" slotNumber={2} />
+      );
+      const physicalCircle = physicalC.firstChild as HTMLElement;
+      expect(physicalCircle.getAttribute('title')).toBeNull();
+      expect(physicalCircle.style.borderColor).not.toBe(dimmed);
     });
 
     it('ignores emptyKind "present" when the slot is loaded', () => {

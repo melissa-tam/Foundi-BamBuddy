@@ -1906,14 +1906,18 @@ class TestReadOccasionPacing:
         ams_presence.note_identity_learned(1, 0, 0)  # cycle answered; the spent latch is not
         assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False) == "discovery"
 
-    async def test_spent_occupied_state11_owes_nothing(self, db_session):
-        # State 11 is the same roll threaded on to the hub — the documented shape a read
-        # cannot answer without unloading first. (A spent row that ALSO carries a tag can
-        # still take the answerable ``rfid_refresh`` arm at 11; this arm is for the
-        # unidentified newcomer, which is the tagless-latch shape.)
+    async def test_spent_occupied_state11_earns_its_read(self, db_session):
+        """State 11 is the same roll threaded on to the hub, so the read must WAIT for the
+        idle edge — but waiting is wire safety, and wire safety is enforced in
+        ``command_identify``, which defers on engaged filament and spends nothing.
+
+        Refusing the VERDICT here instead is what created the gap: ``slot_state`` row 5
+        emits ``spent_occupied_owed_identify`` on ``present is True`` (10 or 11), so a
+        state-11 spent-occupied slot asked for a read the need authority could never
+        grant — a request standing forever, resolving nothing."""
         await self._bind(db_session, tag=None, spent=datetime.utcnow())
         _arm_occasion()
-        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=11), False) is None
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=11), False) == "discovery"
 
     async def test_spent_occupied_with_a_live_tag_is_not_discovery(self, db_session):
         # The wire named the roll: there is nothing to discover, and the read (if the
@@ -2366,6 +2370,134 @@ class TestReadAnsweredNoTag:
         assert (1, 0, 0) in ams_presence._discovery_read_at
 
 
+class TestTheAnsweredReadClosesItsEntitlement:
+    """A read that answered NO TAG stops being a reason to read — in EVERY binding state.
+
+    "No tag" is an answer, not a failure to answer; for a tagless roll it is the only
+    answer there is. Exactly one consumer used to conclude on it (``slot_state`` row 5a,
+    spent + TAGGED bindings) and every other constellation went on re-earning reads from
+    the same evidence. The loop is self-feeding, which is what made it expensive: an
+    identify cycle flaps the tray present→9→present, and any flap the echo-swallow and the
+    identify-explains suppression do not catch is banked as a fresh qualified gain — a new
+    cycle AND a new occasion, manufactured by the read itself. Production measured 419
+    identifies on one slot and 1000 on one printer in a day, each holding that printer's
+    30 s identify gate so every slot decision on it deferred.
+    """
+
+    async def _answered_read(self, monkeypatch, *, state=10):
+        await _commanded_discovery_read(monkeypatch, state=state)
+        _age_slot_stamps(by=ams_presence._IDENTIFY_ACTIVE_S + 5)
+
+    @pytest.mark.parametrize(
+        "binding",
+        ["unbound", "bound_tagged", "bound_tagless", "spent_tagged", "spent_tagless"],
+        ids=lambda b: f"binding={b}",
+    )
+    async def test_the_answer_closes_both_read_entitlements_whatever_is_bound(self, db_session, monkeypatch, binding):
+        """The closure reads no binding at all — it touches only the read ledgers — so the
+        parametrization is the assertion: the same answer, the same closure, five states."""
+        if binding != "unbound":
+            tag = None if "tagless" in binding else _VALID_TAG
+            spool = Spool(
+                material="PETG",
+                data_origin="rfid_auto" if tag else "ams_auto",
+                tag_uid=tag,
+                spent_at=datetime.utcnow() if binding.startswith("spent") else None,
+            )
+            db_session.add(spool)
+            await db_session.flush()
+            db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
+            await db_session.commit()
+
+        await self._answered_read(monkeypatch)
+        # A physical cycle and an occasion, both live: exactly what a further read needs.
+        ams_presence._physical_cycle_at[(1, 0, 0)] = ams_presence.time.monotonic()
+        ams_presence.open_read_occasion(1, 0, 0)
+        assert ams_presence.identity_unanswered(1, 0, 0) is True
+        assert ams_presence._read_occasion_open(1, 0, 0) is True
+
+        assert ams_presence.close_answered_read(1, 0, 0, tray_seated=True, tray_bare=True) is True
+
+        assert ams_presence.identity_unanswered(1, 0, 0) is False
+        assert ams_presence._read_occasion_open(1, 0, 0) is False
+
+    async def test_the_closure_is_idempotent_per_answer(self, monkeypatch):
+        """It runs on every observation at ~1 Hz. The ledger pops make repeats harmless;
+        the ONE-per-answer marker is what keeps the record honest."""
+        await self._answered_read(monkeypatch)
+        assert ams_presence.close_answered_read(1, 0, 0, tray_seated=True, tray_bare=True) is True
+        for _ in range(5):
+            assert ams_presence.close_answered_read(1, 0, 0, tray_seated=True, tray_bare=True) is False
+
+    async def test_a_new_cause_still_earns_a_new_read(self, monkeypatch):
+        """The entitlement is spent, not revoked: a fresh physical cycle is a NEW question
+        about a slot somebody has physically touched, and it must still be asked."""
+        await self._answered_read(monkeypatch)
+        ams_presence.close_answered_read(1, 0, 0, tray_seated=True, tray_bare=True)
+
+        ams_presence._note_gain(1, 0, 0, qualified=True)
+        assert ams_presence.identity_unanswered(1, 0, 0) is True
+        assert ams_presence._read_occasion_open(1, 0, 0) is True
+
+    async def test_an_unanswered_read_closes_nothing(self, monkeypatch):
+        """Inside the settle window the read may still be running — silence is the cycle,
+        not the answer."""
+        await _commanded_discovery_read(monkeypatch)
+        ams_presence._physical_cycle_at[(1, 0, 0)] = ams_presence.time.monotonic()
+        ams_presence.open_read_occasion(1, 0, 0)
+
+        assert ams_presence.close_answered_read(1, 0, 0, tray_seated=True, tray_bare=True) is False
+        assert ams_presence._read_occasion_open(1, 0, 0) is True
+
+    async def test_the_row_5a_conclusion_survives_the_closure(self, monkeypatch):
+        """The pipeline resolves the SAME push one step after the presence pass, and its
+        spent-swap row rests on this very fact. Closing the entitlement must not destroy
+        the evidence — which is why ``_slot_read_at`` is deliberately not re-stamped."""
+        await self._answered_read(monkeypatch)
+        assert ams_presence.close_answered_read(1, 0, 0, tray_seated=True, tray_bare=True) is True
+        assert ams_presence.read_answered_no_tag(1, 0, 0, tray_seated=True, tray_bare=True) is True
+
+    async def test_the_observation_pass_is_what_closes_it_in_production(self, db_session, monkeypatch):
+        """Wired where every push already goes. The answer lands ~15 s after the command,
+        by which time the slot is emitting steady-state pushes and no longer edges, so the
+        closure runs per OBSERVATION rather than per gain."""
+        await self._answered_read(monkeypatch)
+        ams_presence._physical_cycle_at[(1, 0, 0)] = ams_presence.time.monotonic()
+        ams_presence.open_read_occasion(1, 0, 0)
+        ams_presence._primed.add(1)  # steady state, not the first batch
+
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=10)]}], db_session)
+
+        assert ams_presence.identity_unanswered(1, 0, 0) is False
+        assert ams_presence._read_occasion_open(1, 0, 0) is False
+
+    @pytest.mark.parametrize(("seated", "bare"), [(True, False), (False, True)], ids=["named_tray", "empty_tray"])
+    async def test_it_spends_nothing_on_a_slot_whose_answer_belongs_elsewhere(self, monkeypatch, seated, bare):
+        """A tray that NAMES itself was answered by the identity/tagless lanes, and an
+        UNSEATED one never had a question this read could answer. Neither is a no-tag
+        answer, so neither may spend an entitlement."""
+        await self._answered_read(monkeypatch)
+        ams_presence._physical_cycle_at[(1, 0, 0)] = ams_presence.time.monotonic()
+        ams_presence.open_read_occasion(1, 0, 0)
+
+        assert ams_presence.close_answered_read(1, 0, 0, tray_seated=seated, tray_bare=bare) is False
+        assert ams_presence.identity_unanswered(1, 0, 0) is True
+        assert ams_presence._read_occasion_open(1, 0, 0) is True
+
+    async def test_the_swap_evidence_is_a_different_currency_and_is_untouched(self, monkeypatch):
+        """``spool_tagless``'s pending physical cycle is the SWAP entitlement a bare tray's
+        auto-configure and the table's spent-swap arms live on. Spending it here would
+        starve the very transitions the answer enables."""
+        from backend.app.services import spool_tagless
+
+        await self._answered_read(monkeypatch)
+        spool_tagless._pending_physical_cycles.add((1, 0, 0))
+
+        ams_presence.close_answered_read(1, 0, 0, tray_seated=True, tray_bare=True)
+
+        assert spool_tagless.qualified_cycle_pending(1, 0, 0) is True
+
+
 class TestSpentOccupiedOccasion:
     """The spent-occupied constellation buys its OWN read occasion, once per binding epoch.
 
@@ -2378,7 +2510,7 @@ class TestSpentOccupiedOccasion:
     async def test_the_first_call_buys_one_read(self):
         ams_presence.open_spent_occupied_occasion(1, 0, 0, 226)
         assert ams_presence._read_occasion_open(1, 0, 0) is True
-        assert ams_presence._spent_occupied_occasion_epoch[(1, 0, 0)] == 226
+        assert ams_presence._episode_occasion_epoch[(1, 0, 0, "spent_occupied")] == 226
 
     async def test_the_same_epoch_never_re_opens_after_the_read_is_spent(self, monkeypatch):
         client = MagicMock()
@@ -2405,7 +2537,35 @@ class TestSpentOccupiedOccasion:
     async def test_the_epoch_ledger_is_reset_state_covered(self):
         ams_presence.open_spent_occupied_occasion(1, 0, 0, 226)
         ams_presence._reset_state()
-        assert ams_presence._spent_occupied_occasion_epoch == {}
+        assert ams_presence._episode_occasion_epoch == {}
+
+    async def test_the_ambiguity_episode_buys_one_read_per_disagreement(self, monkeypatch):
+        """The other episode-scoped cause, sharing the one ledger. Episode = (bound row,
+        disagreeing tag): the wire re-asserts that tag at ~1 Hz, so without an epoch the
+        "buy the answer" defer would re-buy the read every second."""
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=10, tag=_VALID_TAG)]), client=client)
+
+        ams_presence.open_ambiguity_occasion(1, 0, 0, 226, "AAAA000000000001")
+        assert ams_presence._read_occasion_open(1, 0, 0) is True
+        await ams_presence.command_identify(1, 0, 0, source="reconcile", reason="rfid_refresh")
+        assert ams_presence._read_occasion_open(1, 0, 0) is False
+
+        for _ in range(5):  # the same disagreement, re-derived every push
+            ams_presence.open_ambiguity_occasion(1, 0, 0, 226, "AAAA000000000001")
+        assert ams_presence._read_occasion_open(1, 0, 0) is False
+
+        # A genuinely DIFFERENT disagreement is a new episode and earns its own read.
+        ams_presence.open_ambiguity_occasion(1, 0, 0, 226, "BBBB000000000002")
+        assert ams_presence._read_occasion_open(1, 0, 0) is True
+
+    async def test_the_two_causes_do_not_share_an_episode(self):
+        """Distinct causes on one slot are distinct episodes — the ledger is keyed by both."""
+        ams_presence.open_spent_occupied_occasion(1, 0, 0, 226)
+        ams_presence._consume_read_occasion(1, 0, 0)
+        ams_presence.open_ambiguity_occasion(1, 0, 0, 226, "AAAA000000000001")
+        assert ams_presence._read_occasion_open(1, 0, 0) is True
 
 
 class TestStandingOccasionDrain:
@@ -2509,11 +2669,14 @@ class TestUnboundUnreadDiscoveryArm:
         # so re-derivation must buy nothing. Only a fresh cause opens an occasion.
         assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False) is None
 
-    async def test_state_eleven_owes_nothing(self, db_session):
-        # Feeding: the read cannot answer without unloading first, so asking would only
-        # mint a printer-side 0700_0081 nothing can clear.
+    async def test_state_eleven_earns_its_read_and_waits_for_the_idle_edge(self, db_session):
+        # Feeding: the read cannot answer until the filament is unloaded, which is a
+        # WIRE-SAFETY fact and is enforced by ``command_identify``'s engaged-filament
+        # defer (which spends nothing, so the entitlement survives). The verdict itself
+        # must match the presence the decision lanes act on — mirroring the
+        # spent-occupied arm above.
         _arm_occasion()
-        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=11), False) is None
+        assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=11), False) == "discovery"
 
     async def test_a_configured_tagless_tray_owes_nothing(self, db_session):
         # Doctrine rule 4 / invariant 4: an asserted filament type IS identity. Reading

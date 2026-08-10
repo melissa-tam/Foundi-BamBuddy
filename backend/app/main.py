@@ -1453,6 +1453,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
             _code_word,
             hms_short_code,
+            is_notify_suppressed,
             runout_slot_from_hms,
         )
         from backend.app.services.spool_recovery import on_ams_fault, owned_short_codes
@@ -1542,6 +1543,15 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         # 0500_0051 / 0500_0005 stayed invisible.
                         all_new_code_tokens.append(short_code if description else f"{short_code}({error.full_code})")
                         if not description or short_code in _HMS_NOTIFICATION_SUPPRESS:
+                            continue
+                        # A firmware statement about a rescue it already completed
+                        # (the runout auto-switch) needs no human: the print never
+                        # stopped. Suppressed by CODE WORD through the taxonomy's own
+                        # predicate — the short form collides with the assist-motor
+                        # overload, which must keep alerting. Not ledger-stamped, the
+                        # same as the two suppressions above: an alert nobody sent is
+                        # not an operator who was told.
+                        if is_notify_suppressed(error.attr, error.code):
                             continue
                         # A "failed to read the filament information" fault that
                         # answers a discovery read WE commanded on a possibly-tagless

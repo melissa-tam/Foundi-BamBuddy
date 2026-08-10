@@ -152,6 +152,14 @@ _COMMANDED_LOAD_TTL_S = 600
 # slot goes empty so remove + reinsert re-prompts.
 _respool_prompt_dedup: dict[int, dict[tuple[int, int], tuple[str, str]]] = {}
 
+# Tier-3 OBSERVATION dedup (2026-08-10 demotion), keyed identically. Kept separate
+# from `_respool_prompt_dedup` on purpose: that one is the record of what the
+# operator was ASKED — `pending_respool_prompts` replays it to reconnecting clients
+# and `respool_prompt_open_for_slot` reads it — while a tier-3 observation asks
+# nobody anything. Same lifetime rules (cleared on the slot-empty edge and by
+# `_reset_state`), so a genuine roll swap re-arms the line.
+_respool_observation_logged: dict[int, dict[tuple[int, int], tuple[str, str]]] = {}
+
 # Remain-jump corroboration ledger, keyed (printer_id, ams_id, tray_id) ->
 # (first_seen_monotonic, observation_count). A single AMS push showing a remain
 # jump is not evidence — the reading can be mid-identify garbage or a one-off
@@ -209,6 +217,7 @@ def _reset_state() -> None:
     _commanded_loads.clear()
     _last_sample_job.clear()
     _respool_prompt_dedup.clear()
+    _respool_observation_logged.clear()
     _jump_seen.clear()
     _spent_dedup.clear()
     _runout_seeded.clear()
@@ -1528,16 +1537,19 @@ def _spool_label(spool: Spool) -> str:
 def clear_respool_prompt_dedup(printer_id: int, ams_id: int, tray_id: int) -> None:
     """Drop the cached per-slot prompt state (called when the slot reports empty).
 
-    Clears BOTH per-slot memories in one place — the broadcast dedup tag and the
+    Clears ALL THREE per-slot memories in one place — the broadcast dedup tag, the
+    tier-3 observation dedup (:data:`_respool_observation_logged`) and the
     remain-jump corroboration ledger (:data:`_jump_seen`). They share one lifetime:
     an emptied slot invalidates everything learned about the roll that was in it, so
-    the next roll re-prompts and re-corroborates from scratch. Keeping the pair here
-    means every caller of the empty edge (``main.on_ams_change``) and of a completed
-    re-spool (:func:`respool_tag`) gets both without repeating itself.
+    the next roll re-prompts, re-logs and re-corroborates from scratch. Keeping the
+    set here means every caller of the empty edge (``main.on_ams_change``) and of a
+    completed re-spool (:func:`respool_tag`) gets all of them without repeating
+    itself.
     """
-    per_printer = _respool_prompt_dedup.get(printer_id)
-    if per_printer is not None:
-        per_printer.pop((ams_id, tray_id), None)
+    for _dedup in (_respool_prompt_dedup, _respool_observation_logged):
+        per_printer = _dedup.get(printer_id)
+        if per_printer is not None:
+            per_printer.pop((ams_id, tray_id), None)
     _jump_seen.pop((printer_id, ams_id, tray_id), None)
 
 
@@ -2185,20 +2197,38 @@ async def maybe_auto_or_prompt_respool(
     # exhaustion must still surface.
     if spool.respool_dismissed_at is not None:
         return None
-    # (2) A prompt needs a REASON and EVIDENCE. The reason is the ledger reading
+    # (2) The heuristic needs a REASON and EVIDENCE. The reason is the ledger reading
     # near-empty or a corroborated remain-jump (a reused core carried the tag onto a
     # fresh roll and the gram ledger never noticed). The evidence is physical: unless
     # somebody actually cycled a roll through this slot recently, the spool in it is
-    # the same one the ledger already describes and there is nothing to ask about.
+    # the same one the ledger already describes and there is nothing to observe.
     # This is what silences the standing near-empty rows — they are near-empty
     # because they were printed down, not because a roll was swapped.
+    #
+    # DEMOTED to an INFO line (autonomy ruling 2026-08-10). Tier 3 is a GUESS: it
+    # has no hardware statement behind it, only grams and a timing window. Doctrine
+    # rule 10 is now backed by the full-history audit — every respool prompt this
+    # farm has ever raised was a false positive — so a tier-3 modal is, on this
+    # fleet's evidence, always an interruption asking a human to adjudicate a
+    # question the machine invented. Tier 2 (spent ∧ loaded — the firmware's own
+    # exhaustion statement) is hardware-certain and still prompts, UNCHANGED.
+    # Nothing is lost by logging instead: if the guess is ever right, the roll is a
+    # fresh one on a reused tag and the operator's own re-spool action (tray menu)
+    # is available whenever they see it — with this line in the log as the evidence
+    # that the heuristic did fire, so a future re-promotion has real data to argue
+    # from rather than an absence.
     remaining = (spool.label_weight or 0) - (spool.weight_used or 0)
     threshold = await _respool_prompt_threshold_g(db)
-    if not (remaining <= threshold or _remain_jump(spool, tray, printer_id, ams_id, tray_id)):
+    near_empty = remaining <= threshold
+    # `_remain_jump` mutates the cross-push corroboration ledger, so preserve the
+    # original short-circuit exactly: it is consulted ONLY when near-empty did not
+    # already answer, or its state machine would advance on pushes it never saw.
+    jumped = False if near_empty else _remain_jump(spool, tray, printer_id, ams_id, tray_id)
+    if not (near_empty or jumped):
         return None
     if not _swap_evidence(printer_id, ams_id, tray_id):
         logger.debug(
-            "Re-spool prompt withheld for spool %d (printer %d AMS%d-T%d): no physical roll cycle "
+            "Re-spool heuristic withheld for spool %d (printer %d AMS%d-T%d): no physical roll cycle "
             "on the slot within %.0fs — an untouched spool cannot have become a fresh roll",
             spool.id,
             printer_id,
@@ -2207,7 +2237,34 @@ async def maybe_auto_or_prompt_respool(
             _RESPOOL_SWAP_EVIDENCE_S,
         )
         return None
-    await _broadcast_respool_prompt(db, printer_id, ams_id, tray_id, tray, spool)
+    # One line per (slot, tag), not one per push: the gate above can hold for the
+    # whole swap-evidence window and this runs on the ~1 Hz status stream. Its own
+    # dedup, deliberately NOT `_respool_prompt_dedup` — that dict is the record of
+    # what the operator was ASKED, replayed to reconnecting clients by
+    # `pending_respool_prompts`, and an entry there would resurrect as a prompt the
+    # exact modal this demotion removes.
+    slot_key = (ams_id, tray_id)
+    tag_key = (tray.get("tag_uid") or "", tray.get("tray_uuid") or "")
+    per_printer = _respool_observation_logged.setdefault(printer_id, {})
+    if per_printer.get(slot_key) == tag_key:
+        return None
+    per_printer[slot_key] = tag_key
+    logger.info(
+        "Re-spool heuristic fired (observation only, no prompt): spool %d on printer %d AMS%d-T%d — "
+        "reason=%s remaining=%.1fg of a %.1fg label (threshold %.1fg), AMS remain=%s%%, physical roll "
+        "cycle seen within %.0fs. Tier 3 is a guess; if this roll really is a fresh one on a reused "
+        "tag, re-spool it from the slot's tray menu.",
+        spool.id,
+        printer_id,
+        ams_id,
+        tray_id,
+        "near_empty" if near_empty else "remain_jump",
+        float(remaining),
+        float(spool.label_weight or 0),
+        float(threshold),
+        tray.get("remain"),
+        _RESPOOL_SWAP_EVIDENCE_S,
+    )
     return None
 
 

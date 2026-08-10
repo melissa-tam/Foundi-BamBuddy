@@ -191,6 +191,7 @@ export default {
         visionHold: 'Vision de l\'imprimante : plateau non vide — dégagez le plateau, puis reprenez sur l\'imprimante',
         previousPrintFailed: 'Retenue : l\'impression précédente a échoué',
         filamentShort: 'Filament insuffisant',
+        externalSpoolRunout: 'La bobine externe est vide — rechargez le support externe, pas un emplacement AMS',
         startSpoolBelowMinimum: 'La bobine affectée est en dessous du poids minimal de démarrage',
         filamentUnreadPending: 'Filament non lu — lecture de la bobine en place',
         no_usb_drive: 'Aucune clé USB dans l\'imprimante — insérez une clé USB-A (FAT32/exFAT)',
@@ -787,7 +788,6 @@ export default {
     // Toast messages
     toast: {
       printerDeleted: 'Imprimante supprimée',
-      missingSpoolAssignment: 'Impression démarrée sur {{printer}}. Attribution de bobine manquante pour : {{slots}}',
       printerAdded: 'Imprimante ajoutée',
       printerUpdated: 'Imprimante mise à jour',
       failedToDelete: 'Échec de la suppression',
@@ -907,6 +907,8 @@ export default {
     controls: 'Contrôles',
     // RFID
     rfid: {
+      disabledFilamentEngaged: 'Déchargez d’abord le filament — l’AMS ne peut pas lire une étiquette tant que du filament est engagé',
+      disabledWhileDrying: 'Indisponible pendant le séchage de l’AMS',
       reread: 'Relire RFID',
     },
     // AMS load/unload (#891)
@@ -1552,6 +1554,8 @@ export default {
       confirmTitle: 'Démarrer avec une bobine faible ?',
       confirmIntro: 'La bobine affectée peut couvrir cette impression mais est en dessous du poids minimal de démarrage. Démarrer quand même ?',
       slots: 'Emplacements concernés : {{slots}}',
+      unknownGramsTitle: 'Démarrer avec une bobine non pesée ?',
+      unknownGramsIntro: 'Aucun poids n’est enregistré pour la bobine correspondante : impossible de garantir que l’impression ira au bout. Pesez ou affectez la bobine, ou démarrez quand même.',
       printAnyway: 'Démarrer quand même',
     },
     farm: {
@@ -2283,8 +2287,6 @@ export default {
     spoolRecoveryStepTimeoutDesc: 'Durée maximale de chaque étape de récupération avant qu\'elle soit considérée comme échouée (15-600 s).',
     spoolRecoveryProtectLayers: 'Protéger les premières couches',
     spoolRecoveryProtectLayersDesc: 'Pendant les N premières couches, les bobines sous le poids de démarrage minimal ne peuvent pas servir de remplacement ; ensuite, elles le peuvent. 0 = les bobines presque vides sont toujours utilisables.',
-    autoAddUntagged: 'Ajouter automatiquement les bacs sans étiquette',
-    autoAddUntaggedDesc: "Créer silencieusement une bobine d'inventaire pour les bacs AMS sans étiquette RFID. Désactivez si vous préenregistrez les bobines manuellement pour éviter les doublons. Les bobines à étiquette RFID ont leur propre interrupteur d'ajout automatique dans les paramètres Spoolman.",
     taglessDefaultFilament: 'Filament par défaut pour les bacs nus sans étiquette',
     taglessDefaultFilamentDesc: "Configurer automatiquement les bacs AMS sans étiquette et non configurés avec ce filament afin qu'ils puissent imprimer sans réglage manuel.",
     taglessBrand: 'Marque',
@@ -4542,7 +4544,6 @@ export default {
     addToInventoryFailed: 'Échec de l\'ajout de la bobine à l\'inventaire',
     unknownSpoolToast: 'Filament inconnu {{material}} sur {{printer}} emplacement {{slot}} — l\'ajouter à l\'inventaire ?',
     unknownSpoolSlot: 'Emplacement',
-    taglessMintToast: 'Suivi d’une nouvelle bobine sans étiquette sur {{printer}} emplacement {{slot}}',
     freshRoll: {
       promptToast: 'Nouvelle bobine sur {{printer}} emplacement {{slot}} ?',
       sameRoll: 'Même bobine',
@@ -4996,17 +4997,19 @@ export default {
     empty: 'Vide',
     emptySlot: 'Slot vide',
     slotEmpty: 'Vide',
-    slotUnconfigured: '?',
+    slotStateUnknown: 'État de l’emplacement inconnu — l’imprimante n’a pas indiqué si une bobine s’y trouve',
+    slotStateUnknownShort: 'Inconnu',
     slotPresentUnread: 'Bobine présente — non reconnue',
     slotStandingUnknown: "{{printer}} : l'emplacement {{slot}} contient une bobine que l'AMS ne peut pas lire — à vérifier",
     outOfRotation: 'Hors rotation — bourrage de bobine détecté ; réinsérez la bobine ou effacez l\'indicateur pour la réutiliser',
     outOfRotationShort: 'Hors rotation',
-    emptySlotReset: 'Aucune bobine assignée',
     emptySlotBinding: {
       title: 'Toujours assignée',
       used: '{{grams}} g consommés',
       ranOut: 'épuisée — en attente d’une nouvelle bobine',
       awaitingInsert: 'en attente d’insertion (préconfigurée)',
+      seatedUnread: 'en place — en attente d’identification',
+      presenceUnknown: 'non confirmée dans l’emplacement',
       notInserted: 'non insérée',
       elsewhereHint: '(non insérée — affectée à {{location}})',
       clear: 'Libérer l’emplacement',

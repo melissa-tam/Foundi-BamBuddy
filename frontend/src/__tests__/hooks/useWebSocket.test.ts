@@ -18,11 +18,12 @@ let originalWebSocket: typeof WebSocket;
 // Mock react-i18next BEFORE any modules that use it are imported
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
+    // Returns the KEY verbatim unless a test needs interpolation pinned. Keep it
+    // that way for keys a test asserts the ABSENCE of: a friendly-looking
+    // interpolation here would make `not.toContain(key)` pass even when the toast
+    // did fire (`printers.toast.missingSpoolAssignment` had exactly such a branch
+    // until its toast was retired).
     t: (key: string, options?: Record<string, unknown>) => {
-      if (key === 'printers.toast.missingSpoolAssignment' && options) {
-        const { printer, slots } = options as { printer: string; slots: string };
-        return `Missing assignments for ${printer}: ${slots}`;
-      }
       if (key === 'ams.slotStandingUnknown' && options) {
         // Interpolated so the test can pin the 1-based slot rendering.
         const { printer, slot } = options as { printer: string; slot: number };
@@ -683,15 +684,23 @@ describe('useWebSocket hook', () => {
       vi.unstubAllGlobals();
     });
 
-    it('toasts on a tagless spool_auto_assigned (origin: tagless)', async () => {
+    it('stays silent on a tagless spool_auto_assigned but still refreshes the caches', async () => {
+      // Autonomy ruling 2026-08-10: the tagless mint asks the operator for
+      // nothing — the new row appears in inventory and on the slot by itself —
+      // so it is a backend log line, not an interruption. The event still has to
+      // refresh state, which is the half that must not regress.
+      vi.useFakeTimers();
       vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
         cb(0);
         return 0;
       });
       const { useWebSocket } = await import('../../hooks/useWebSocket');
 
+      const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
       renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
-      const ws = await waitForWs();
+      await vi.advanceTimersByTimeAsync(0);
+      const ws = wsInstances[wsInstances.length - 1]!;
       act(() => {
         ws.open();
       });
@@ -707,12 +716,52 @@ describe('useWebSocket hook', () => {
         });
       });
 
-      // The mocked t() returns the key verbatim, so the rendered toast carries
-      // the i18n key — proof the tagless branch fired showToast.
-      await waitFor(() => {
-        expect(document.body.textContent).toContain('inventory.taglessMintToast');
+      await act(async () => {
+        vi.advanceTimersByTime(5000);
       });
 
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['inventory-spools'] });
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['spool-assignments'] });
+      // The mocked t() returns the key verbatim, so any toast would show it.
+      expect(document.body.textContent).not.toContain('inventory.taglessMintToast');
+
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    });
+
+    it('stays silent on missing_spool_assignment — the slot ring is the ambient surface', async () => {
+      // Nothing to do: the pipeline binds the trays from the wire. Operators who
+      // do want telling have the provider-gated notification (default off).
+      vi.useFakeTimers();
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      await vi.advanceTimersByTimeAsync(0);
+      const ws = wsInstances[wsInstances.length - 1]!;
+      act(() => {
+        ws.open();
+      });
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'missing_spool_assignment',
+          printer_id: 1,
+          printer_name: '004-H2S',
+          missing_slots: [{ slot: 'A1' }, { slot: 'A2' }],
+        });
+      });
+
+      await act(async () => {
+        vi.advanceTimersByTime(5000);
+      });
+
+      expect(document.body.textContent).not.toContain('printers.toast.missingSpoolAssignment');
+
+      vi.useRealTimers();
       vi.unstubAllGlobals();
     });
 

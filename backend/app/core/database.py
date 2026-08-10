@@ -3448,10 +3448,12 @@ async def run_migrations(conn):
         # swap-and-resume succeeded / failed, and a jammed spool was taken out
         # of rotation. self_healed = a firmware retry cleared the fault on the
         # SAME spool (no swap) — a truthful close distinct from the swap copy.
-        ("on_spool_recovery_succeeded", "1", "TRUE"),
+        # The two SUCCESS-class toggles default OFF (autonomy ruling 2026-08-10,
+        # matching the model): a recovery nobody had to act on is a log line.
+        ("on_spool_recovery_succeeded", "0", "FALSE"),
         ("on_spool_recovery_failed", "1", "TRUE"),
         ("on_spool_out_of_rotation", "1", "TRUE"),
-        ("on_spool_recovery_self_healed", "1", "TRUE"),
+        ("on_spool_recovery_self_healed", "0", "FALSE"),
     ):
         _default = _sqlite_default if is_sqlite() else _pg_default
         await _safe_execute(conn, f"ALTER TABLE notification_providers ADD COLUMN {_col} BOOLEAN DEFAULT {_default}")
@@ -4103,6 +4105,126 @@ async def run_migrations(conn):
         )
         async with conn.begin_nested():
             await conn.execute(text(f"UPDATE spool SET spent_at = NULL WHERE {_false_spent_predicate}"))
+
+    # Repair (WS-G, 2026-08-10): archive the UNBOUND phantom-presence spool rows — the
+    # residue that corrected code can never reach.
+    #
+    # 2026-08-09 → 08-10 a firmware presence-bitmask guard discarded correct all-empty
+    # answers, so physically EMPTY slots on printers 3/4/5/6 read as SEATED. The tagless
+    # auto-config lane then did exactly what it exists to do with a seated-but-bare tray:
+    # it minted an inventory spool (``data_origin='ams_auto'``) into the void — at least
+    # prod ids 265-268 and 271-280, every one 0 g used and never fed.
+    #
+    # BOUND phantoms are deliberately EXCLUDED: with the presence fix in place the runtime
+    # handles them end-to-end — presence resolves False, the binding releases, and the
+    # existing disposal lane (``slot_pipeline._dispose_ghost`` → ``spool_tagless``) archives
+    # the never-fed ``ams_auto`` row with full logging. Repairing them here would only
+    # destroy that evidence trail. An UNBOUND phantom — the operator's "clear slot" deleted
+    # the assignment and the loop promptly re-minted a fresh row — has NO runtime path that
+    # will ever touch it again: no slot observes it and no binding owns it, so it is
+    # permanent inventory clutter. That is precisely the R4 test for shipping a repair as a
+    # guarded startup migration rather than waiting for code to self-heal it forward.
+    #
+    # Archiving forfeits nothing that could be wanted later: a never-fed, gram-less,
+    # auto-minted row carries ZERO ledger value, and if its physical roll ever does turn up,
+    # identity/fingerprint resolution mints a fresh row for it. ``archived_at`` is a
+    # soft-hide — the rows are kept, never deleted — so the audit trail survives intact.
+    #
+    # Fences, all of which must hold together: ``spent_at IS NULL`` — operator ruling R2
+    # forbids every spent-adjacent mutation, so a spent row is untouchable however it was
+    # minted; ``last_used IS NULL`` plus the ``<= 5 g`` never-fed floor of the repair above —
+    # feed evidence (doctrine rule 8) protects any row that ever really printed; and
+    # ``created_at >= 2026-08-09`` bounds the blast radius to the MEASURED phantom era, so
+    # older auto-minted inventory is out of reach by construction.
+    #
+    # Idempotent: a second run matches nothing (its own predicate requires
+    # ``archived_at IS NULL``). NOT EXISTS rather than NOT IN, so a NULL ``spool_id`` could
+    # never collapse the whole match set. Plain SQL, valid on SQLite and PostgreSQL alike
+    # (the target table is referenced by name from the correlated subquery in both); the
+    # written value is a bound naive-UTC datetime, matching what the runtime disposal lane
+    # stamps. DML → conn.execute inside begin_nested (never swallowed), per this module's
+    # convention.
+    _phantom_spool_predicate = (
+        "data_origin = 'ams_auto' AND COALESCE(weight_used, 0) <= 5 "
+        "AND last_used IS NULL AND spent_at IS NULL AND archived_at IS NULL "
+        "AND created_at >= '2026-08-09 00:00:00' "
+        "AND NOT EXISTS (SELECT 1 FROM spool_assignment sa WHERE sa.spool_id = spool.id)"
+    )
+    _phantom_spools = (await conn.execute(text(f"SELECT id FROM spool WHERE {_phantom_spool_predicate}"))).fetchall()
+    if _phantom_spools:
+        logger.info(
+            "[REPAIR] archiving unbound phantom-presence ams_auto spools: ids=%s",
+            [r[0] for r in _phantom_spools],
+        )
+        async with conn.begin_nested():
+            await conn.execute(
+                text(f"UPDATE spool SET archived_at = :now WHERE {_phantom_spool_predicate}"),
+                {"now": _dt.utcnow()},
+            )
+
+    # Migration (WS-F, 2026-08-10): retire the success-class farm notifications on
+    # EXISTING provider rows — operator autonomy ruling. A spool recovery that
+    # succeeded (swap-and-resume, or a firmware retry that self-healed the same
+    # roll) demanded nothing of a human; the refill auto-resume notice rides the
+    # ``succeeded`` toggle and goes with it. Those belong in the log. Failures,
+    # escalations and out-of-rotation stamps stay ON — a human has to act on those.
+    # The two model defaults flipped in the same change, so this only carries the
+    # installs that already have the columns.
+    #
+    # ONE-TIME, not idempotent-by-repetition: a plain UPDATE would re-run at every
+    # startup and silently undo an operator who re-enabled the toggle in the UI,
+    # which would turn "the capability remains" into a lie. The durable marker is a
+    # settings row, written in the SAME nested transaction as the flip, so the pair
+    # is all-or-nothing and a second boot is a no-op. Guarded INSERT ... SELECT
+    # rather than ON CONFLICT (dialect-neutral across SQLite + Postgres), matching
+    # the WI-5 policy migration above. Bound Python ``False`` lets the driver pick
+    # the dialect's boolean literal.
+    _posture_marker = "migration_success_notifications_off_20260810"
+    _posture_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _posture_marker})
+    ).scalar()
+    if not _posture_done:
+        async with conn.begin_nested():
+            _flipped = await conn.execute(
+                text(
+                    "UPDATE notification_providers "
+                    "SET on_spool_recovery_succeeded = :off, on_spool_recovery_self_healed = :off"
+                ),
+                {"off": False},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                    "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                ),
+                {"key": _posture_marker},
+            )
+        logger.info(
+            "[MIGRATION] success-class spool-recovery notifications defaulted OFF on %s provider row(s) "
+            "(one-time; re-enable per provider in Settings → Notifications)",
+            _flipped.rowcount,
+        )
+
+    # Migration (WS-F, 2026-08-10): drop the retired ``auto_add_untagged`` setting.
+    # The key was a kill switch for the tagless auto-mint lane, which doctrine rules
+    # 1/2/4 make load-bearing here — with it off, every untagged roll silently stops
+    # being gram-tracked. It is gone from the schema, the route whitelist and the
+    # Settings page, so a stored row could no longer be seen or changed; leaving one
+    # behind would strand an install with the lane permanently off and no control to
+    # turn it back on. Its reader maps a MISSING key to True, so deleting the row
+    # restores the shipped default. Logged when the stored value was disabling, since
+    # that install's behaviour genuinely changes here. Same shape as the WI-5
+    # ``prefer_lowest_filament`` drop above; idempotent (a second run deletes nothing).
+    _aau = (await conn.execute(text("SELECT value FROM settings WHERE key = 'auto_add_untagged'"))).scalar()
+    if _aau is not None:
+        if str(_aau).strip().lower() != "true":
+            logger.warning(
+                "[MIGRATION] retired setting auto_add_untagged was %r (tagless auto-mint DISABLED); the "
+                "control is gone and the lane returns to its shipped default (ON)",
+                _aau,
+            )
+        async with conn.begin_nested():
+            await conn.execute(text("DELETE FROM settings WHERE key = 'auto_add_untagged'"))
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (

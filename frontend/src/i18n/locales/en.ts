@@ -191,6 +191,7 @@ export default {
         visionHold: 'Printer vision: plate not empty — clear the bed, then resume on the printer',
         previousPrintFailed: 'Held: previous print failed',
         filamentShort: 'Low filament',
+        externalSpoolRunout: 'External spool ran out — refill the external holder, not an AMS slot',
         startSpoolBelowMinimum: 'Assigned spool is below the minimum start weight',
         filamentUnreadPending: 'Filament unread — reading the seated roll',
         no_usb_drive: 'No USB drive in the printer — insert a USB-A drive (FAT32/exFAT)',
@@ -792,7 +793,6 @@ export default {
     // Toast messages
     toast: {
       printerDeleted: 'Printer deleted',
-      missingSpoolAssignment: 'Print started on {{printer}}. Missing spool assignment for: {{slots}}',
       printerAdded: 'Printer added',
       printerUpdated: 'Printer updated',
       failedToDelete: 'Failed to delete printer',
@@ -912,6 +912,8 @@ export default {
     controls: 'Controls',
     // RFID
     rfid: {
+      disabledFilamentEngaged: 'Unload the filament first — the AMS cannot read a tag while filament is fed',
+      disabledWhileDrying: 'Not available while the AMS is drying',
       reread: 'Re-read RFID',
     },
     // AMS load/unload (#891)
@@ -1560,6 +1562,8 @@ export default {
       confirmTitle: 'Start with a low spool?',
       confirmIntro: 'The assigned spool can cover this print but is below the minimum start weight. Start anyway?',
       slots: 'Affected slots: {{slots}}',
+      unknownGramsTitle: 'Start with an unweighed spool?',
+      unknownGramsIntro: 'There is no recorded weight for the matching spool, so the print cannot be proven to finish. Weigh or assign the spool, or start anyway.',
       printAnyway: 'Start Anyway',
     },
     farm: {
@@ -2343,8 +2347,6 @@ export default {
     spoolRecoveryStepTimeoutDesc: 'How long each recovery step may run before it is treated as failed (15-600s).',
     spoolRecoveryProtectLayers: 'Protect first layers',
     spoolRecoveryProtectLayersDesc: 'During the first N layers, spools below the minimum start weight are not eligible as replacements; after that they can be used. 0 = low spools are always eligible.',
-    autoAddUntagged: 'Auto-add untagged trays',
-    autoAddUntaggedDesc: 'Silently create an inventory spool for AMS trays that have no RFID tag. Turn off if you pre-register spools manually to avoid duplicates. RFID-tagged spools have their own auto-add toggle under Spoolman settings.',
     taglessDefaultFilament: 'Default filament for bare tagless trays',
     taglessDefaultFilamentDesc: 'Auto-configure unconfigured tagless AMS trays with this filament so they can print without manual setup.',
     taglessBrand: 'Brand',
@@ -4570,7 +4572,6 @@ export default {
     addToInventoryFailed: 'Failed to add spool to inventory',
     unknownSpoolToast: 'Unknown filament {{material}} on {{printer}} slot {{slot}} — add it to inventory?',
     unknownSpoolSlot: 'Slot',
-    taglessMintToast: 'Started tracking a new untagged spool on {{printer}} slot {{slot}}',
     freshRoll: {
       promptToast: 'Fresh roll on {{printer}} slot {{slot}}?',
       sameRoll: 'Same roll',
@@ -5033,17 +5034,19 @@ export default {
     empty: 'Empty',
     emptySlot: 'Empty slot',
     slotEmpty: 'Empty',
-    slotUnconfigured: '?',
+    slotStateUnknown: 'Slot state unknown — the printer has not reported whether a spool is in it',
+    slotStateUnknownShort: 'Unknown',
     slotPresentUnread: 'Spool present — unrecognized',
     slotStandingUnknown: "{{printer}}: slot {{slot}} has a spool the AMS can't read — check it",
     outOfRotation: 'Out of rotation — spool jam detected; re-insert the spool or clear the flag to reuse it',
     outOfRotationShort: 'Out of rotation',
-    emptySlotReset: 'No filament assigned',
     emptySlotBinding: {
       title: 'Still assigned',
       used: '{{grams}} g used',
       ranOut: 'ran out — awaiting new roll',
       awaitingInsert: 'awaiting insert (pre-configured)',
+      seatedUnread: 'seated — awaiting identification',
+      presenceUnknown: 'not confirmed in the slot',
       notInserted: 'not inserted',
       elsewhereHint: '(not inserted — assigned to {{location}})',
       clear: 'Clear slot',

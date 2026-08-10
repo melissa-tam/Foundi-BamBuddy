@@ -139,10 +139,22 @@ _NO_TAG_SWAP_REASON = "spent_swap_no_tag_read"
 ORPHAN_RELEASE_REASON = "orphaned_assignment"
 
 # Decision reason → the identify NEED verdict the discovery lane understands
-# (``ams_presence.identify_needed``). The two ``*_owed_full_read`` defers only ever
-# arise on a push that ASSERTED a tag over a BOUND slot, so the slot is tagged, the read
-# is guaranteed answerable and the need is the push's own evidence — those pass straight
-# through as ``rfid_refresh``.
+# (``ams_presence.identify_needed``). Both ``*_owed_full_read`` defers arise on a push that
+# ASSERTED a tag over a BOUND slot, so the slot is tagged and the read is guaranteed
+# answerable — but "answerable" is not "owed", and the two differ in whether the push is
+# NEW evidence.
+#
+# ``partial_identity_owed_full_read`` is: the push carried one member of the identity pair
+# and not the other, which is a shape a single full read resolves outright.
+#
+# ``identity_ambiguous_owed_full_read`` is NOT. A tag disagreeing with a tag-bearing
+# binding STANDS — the wire re-asserts it at ~1 Hz for as long as the roll sits there — so
+# passing it straight through re-bought the same read on every push, with the client's
+# identify gate as the only brake. It is need-GATED now, and the ambiguity EPISODE buys the
+# occasion the need authority spends (``ams_presence.open_ambiguity_occasion``): one read
+# per (bound row, disagreeing tag) pair, re-armed only by a genuinely different
+# disagreement. While filament is engaged the read defers and the occasion is untouched, so
+# the answer is bought on the idle edge instead of being lost.
 #
 # ``identity_unresolved`` is NOT evidence of anything. It arises with no identity
 # asserted at all, and a slot can sit in it FOREVER (008-H2C AMS2 slot2, 2026-08-02: a
@@ -166,9 +178,17 @@ _IDENTIFY_VERDICT = {
     "spent_occupied_owed_identify": "discovery",
 }
 
-# The one verdict in :data:`_IDENTIFY_VERDICT` that is need-GATED rather than
-# evidence-backed (see the note above).
-_NEED_GATED_VERDICT = "discovery"
+# The reasons in :data:`_IDENTIFY_VERDICT` that rest on STANDING evidence and must clear
+# ``ams_presence.identify_needed`` before anything is spent. Keyed by REASON, not by
+# verdict: ``partial_identity_owed_full_read`` yields the same ``rfid_refresh`` string but
+# is event-shaped (the push itself is the new evidence) and passes straight through.
+_NEED_GATED_REASONS = frozenset(
+    {
+        "identity_unresolved",
+        "spent_occupied_owed_identify",
+        "identity_ambiguous_owed_full_read",
+    }
+)
 
 # How many last-location rows to inspect before giving up on a reclaim donor. The query
 # is already ordered most-recent-first and filtered to ONE slot, so this is a runaway
@@ -290,20 +310,21 @@ class PipelineDeps:
     async def identify_verdict(self, printer_id: int, ams_id: int, tray_id: int, reason: str, tray: dict) -> str | None:
         """The ``ams_presence`` reason this decision has earned, or None to spend nothing.
 
-        Two shapes (see :data:`_IDENTIFY_VERDICT`):
+        Two shapes (see :data:`_IDENTIFY_VERDICT` and :data:`_NEED_GATED_REASONS`):
 
-        * ``rfid_refresh`` — the two full-read defers. A tag WAS asserted over a bound
-          slot this very push, so the read is both owed and answerable; the evidence is
-          the push itself and re-deriving it would only cost a query.
-        * ``discovery`` — a REQUEST, never an entitlement, whether it came from a
-          standing unknown or from a spent latch under a seated unnamed roll.
+        * EVENT-SHAPED — ``partial_identity_owed_full_read``. A half identity WAS
+          asserted over a bound slot this very push, so the read is both owed and
+          answerable; the evidence is the push itself and re-deriving it would only cost
+          a query.
+        * STANDING — a REQUEST, never an entitlement: a standing unknown, a spent latch
+          under a seated unnamed roll, or a tag disagreement the wire keeps re-asserting.
           ``identify_needed`` is the fork's one need authority (it owns the
-          unanswered-qualified-cycle test AND the spent-occupied occasion), so it answers
-          here, and a ``None`` verdict means the condition is merely STANDING — already
-          read, or never a reason to read — which is not a reason to read it again.
-          Whatever reason it DOES return is the one passed on, so a slot that turns out
-          to be live-tagged gets the accurate ``rfid_refresh`` rather than this
-          decision's guess.
+          unanswered-qualified-cycle test AND the episode occasions), so it answers here,
+          and a ``None`` verdict means the condition is merely STANDING — already read,
+          or never a reason to read — which is not a reason to read it again. Whatever
+          reason it DOES return is the one passed on, so a slot that turns out to be
+          live-tagged gets the accurate ``rfid_refresh`` rather than this decision's
+          guess.
 
         ``spoolman_active=False`` is a fact, not an assumption: :func:`run_slot_pipeline`
         stands the whole pass down under Spoolman mode, so no Spoolman binding can reach
@@ -313,7 +334,7 @@ class PipelineDeps:
         reading is a slot whose identity resolves one push later.
         """
         verdict = _IDENTIFY_VERDICT.get(reason)
-        if verdict != _NEED_GATED_VERDICT:
+        if verdict is None or reason not in _NEED_GATED_REASONS:
             return verdict
         need = await ams_presence.identify_needed(self.db, printer_id, ams_id, tray_id, tray, False)
         if need is None:
@@ -786,10 +807,10 @@ def _no_tag_read_answered(obs: TrayObservation, binding: BindingView | None) -> 
     presence and assertion (``ams_presence`` must never re-derive either from the merged
     view, which can be a chimera).
 
-    ``tray_seated`` is state 10 specifically, through ``ams_presence``'s own constant: state
-    11 means filament IS feeding, and a feeding tray must never be mint-swapped.
-    ``tray_bare`` is "this push asserted neither configuration nor identity" — the shape
-    that makes row 4's cycle lane unreachable in the first place.
+    ``tray_seated`` is the observation's own tri-state presence — the canonical rule, which
+    now also answers True on a trusted exist bit the per-tray ``state`` has not caught up
+    with. ``tray_bare`` is "this push asserted neither configuration nor identity" — the
+    shape that makes row 4's cycle lane unreachable in the first place.
     """
     if binding is None or not binding.spent or binding.is_tagless:
         return False
@@ -799,7 +820,7 @@ def _no_tag_read_answered(obs: TrayObservation, binding: BindingView | None) -> 
             printer_id,
             ams_id,
             tray_id,
-            tray_seated=ams_presence.tray_state_seated(obs.state),
+            tray_seated=obs.present is True,
             tray_bare=not obs.config_nonempty and not obs.identity_asserted,
         )
     except Exception:  # noqa: BLE001 — an unreadable ledger is "no evidence", never a crash
@@ -908,15 +929,18 @@ async def _apply(
     # this module decides on.
     if decision.reason in _IDENTIFY_VERDICT:
         printer_id, ams_id, tray_id = obs.slot
+        # A STANDING constellation buys its OWN occasion, before the need gate is
+        # consulted. Read occasions otherwise open only on a qualified physical cycle, a
+        # terminal sweep, or a manual command — so when the insert's presence edges were
+        # missed (2026-08-07, spool 226 on 001-H2S slot 1) such a verdict was a request
+        # nothing could ever grant and the slot parked for a day. One read per EPISODE,
+        # keyed inside ``ams_presence``, so a verdict re-derived at the push cadence
+        # still costs exactly one read.
         if decision.reason == "spent_occupied_owed_identify" and prior_spool_id is not None:
-            # The constellation buys its OWN occasion, before the need gate is consulted.
-            # Read occasions otherwise open only on a qualified physical cycle, a terminal
-            # sweep, or a manual command — so when the insert's presence edges were missed
-            # (2026-08-07, spool 226 on 001-H2S slot 1) this verdict was a standing request
-            # nothing could ever grant and the slot parked for a day. One read per
-            # binding-EPOCH, keyed on the bound spool inside ``ams_presence``, so a verdict
-            # re-derived on every push still costs exactly one read.
             ams_presence.open_spent_occupied_occasion(printer_id, ams_id, tray_id, prior_spool_id)
+        elif decision.reason == "identity_ambiguous_owed_full_read":
+            # Episode = (the row we are disagreeing with, the tag doing the disagreeing).
+            ams_presence.open_ambiguity_occasion(printer_id, ams_id, tray_id, prior_spool_id, obs.tag_uid)
         await deps.identify(printer_id, ams_id, tray_id, decision.reason, observation_tray_dict(obs))
     elif decision.reason == "unknown_tag_prompt_owed":
         # Auto-add is OFF and no row owns this roll: the table refuses to mint, so the
@@ -1449,13 +1473,20 @@ async def _apply_replace_spent(
     # ``spent_swap_no_tag_read`` corroborates differently and more strongly — the table
     # already required observation-asserted presence AND an answered commanded read — and
     # its tray is BARE by construction (that is why the cycle lane cannot reach it), so
-    # ``tray_loaded`` can only ever answer False for it. Accept the SEATED (state-10) shape
-    # the decision was made on; the answered read is what rules out a flap there.
-    tray_ok = (
-        ams_presence.tray_state_seated(obs.state)
-        if no_tag_evidence
-        else spool_tagless.tray_loaded(observation_tray_dict(obs))
-    )
+    # ``tray_loaded`` can only ever answer False for it. Re-assert the very presence the
+    # decision was made on (the canonical tri-state rule, not a second state test that
+    # could disagree with it); the answered read is what rules out a flap there.
+    #
+    # PRESENCE, not the seated state specifically. A no-tag answer read off a FEEDING
+    # tray would prove nothing — the tag faces away from the reader once the filament is
+    # threaded on to the hub — but such an answer cannot be obtained: a read is only ever
+    # commanded when no filament is engaged (``command_identify``'s pre-check, mirroring
+    # the client's own refusal), so every no-tag stamp this arm can see was taken on an
+    # unengaged tray. Demanding state 10 HERE only recreated the emit-versus-grant
+    # mismatch one layer down — the table decides on ``present is True``, so a slot that
+    # was read bare and has since been fed produced a decision this gate silently threw
+    # away, every push, forever.
+    tray_ok = obs.present is True if no_tag_evidence else spool_tagless.tray_loaded(observation_tray_dict(obs))
     if not tray_ok:
         logger.debug(
             "[slot-state] printer=%d A%dT%d spent-replace skipped: tray present but not loaded (reason=%s)",

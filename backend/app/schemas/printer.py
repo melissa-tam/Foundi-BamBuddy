@@ -312,6 +312,14 @@ class PrinterStatus(BaseModel):
     hms_errors: list[HMSErrorResponse] = []
     ams: list[AMSUnit] = []
     ams_exists: bool = False
+    # AMS exist-bit triage, from the last push that carried the mask. `tray_exist_bits`
+    # verbatim as hex; `power_on_flag` as the firmware reported it (RECORDED ONLY — it
+    # does not mean "AMS is powered": False is the normal steady state across most of the
+    # fleet); `ams_bits_trusted` = whether the farm acted on that mask (an all-zero mask
+    # must repeat before it may empty a slot).
+    ams_tray_exist_bits: str | None = None
+    ams_power_on_flag: bool | None = None
+    ams_bits_trusted: bool = False
     vt_tray: list[AMSTray] = []  # Virtual tray / external spool(s)
     sdcard: bool = False  # SD card inserted
     store_to_sdcard: bool = False  # Store sent files on SD card

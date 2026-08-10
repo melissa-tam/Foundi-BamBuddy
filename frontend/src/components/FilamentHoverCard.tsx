@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { Droplets, Copy, Check, Settings2, Package, PackagePlus, Unlink, RefreshCw } from 'lucide-react';
 import { isLightColor } from '../utils/colors';
 import type { EmptySlotKind } from '../utils/amsHelpers';
-import { resolveSpoolBindingStatus } from '../utils/spoolBindingStatus';
+import { resolveSpoolBindingStatus, type SlotPresence } from '../utils/spoolBindingStatus';
 import { Modal } from './ui/Modal';
 import { ConfirmModal } from './ConfirmModal';
 
@@ -563,6 +563,12 @@ export interface EmptySlotBinding {
   spent: boolean;
   /** `assignment.pre_configured_at` is set — awaiting the physical insert. */
   preConfigured: boolean;
+  /** Live presence of the claimed slot, from the wire kind and/or the API
+   *  tri-state (`slotPresence`). Without it the card used to print "not
+   *  inserted" under a header saying a spool was present — the contradiction
+   *  the operator reported. Optional so pre-existing fixtures still compile;
+   *  absent reads as `unknown`, never as empty. */
+  presence?: SlotPresence;
 }
 
 interface EmptySlotHoverCardProps {
@@ -571,11 +577,11 @@ interface EmptySlotHoverCardProps {
   configureSlot?: ConfigureSlotConfig;
   onAssignSpool?: () => void;
   actions?: ReactNode;
-  // #1322 follow-up: distinguish firmware-confirmed empty (state 9) from a user
-  // reset where the firmware still has a spool registered. "reset" surfaces the
-  // user-cleared label; "present" (state 10/11 with no material identity — a
-  // seated spool the AMS could not read) surfaces the unread-spool label;
-  // undefined / "physical" keeps the historical "Empty slot" wording.
+  // #1322 follow-up: distinguish a wire-asserted empty slot from one whose
+  // presence the wire never stated. "unknown" surfaces the state-unknown label;
+  // "present" (state 10/11 with no material identity — a seated spool the AMS
+  // could not read) surfaces the unread-spool label; undefined / "physical"
+  // keeps the historical "Empty slot" wording.
   kind?: EmptySlotKind;
   // W5a: a binding that outlived the filament. Without this the empty-slot card
   // showed NO assignment information at all, so a lingering binding was both
@@ -647,6 +653,16 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
   // LOCATION column so the two surfaces can never drift apart.
   const bindingStatus = binding ? resolveSpoolBindingStatus(binding) : null;
 
+  // "Clear slot" is the manual escape hatch for a STALE LOCATION CLAIM, and it is
+  // offered only where the claim can be stale: a wire-asserted empty slot, or one
+  // whose presence the printer never stated. On a SEATED-but-unread slot it is
+  // semantically void — the pipeline re-derives a binding for the roll that is
+  // physically in there, so clearing removes a row that comes straight back, and
+  // treating clear-slot as the resolution for an unread tray is the defect the
+  // operator ruled against (it also mints the phantom rows the WS-G repair
+  // archives). The honest resolution there is identification, not deletion.
+  const canClearSlot = !!binding && !!onClearSlot && kind !== 'present';
+
   return (
     <div
       ref={triggerRef}
@@ -673,8 +689,8 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
             rounded-md shadow-lg overflow-hidden
           ">
             <div className="px-3 py-1.5 text-xs text-bambu-gray whitespace-nowrap">
-              {kind === 'reset'
-                ? t('ams.emptySlotReset')
+              {kind === 'unknown'
+                ? t('ams.slotStateUnknown')
                 : kind === 'present'
                   ? t('ams.slotPresentUnread')
                   : t('ams.emptySlot')}
@@ -699,9 +715,9 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
               </div>
             )}
             {/* Configure slot button */}
-            {(configureSlot?.enabled || onAssignSpool || actions || (binding && onClearSlot)) && (
+            {(configureSlot?.enabled || onAssignSpool || actions || canClearSlot) && (
               <div className="px-2 pb-2 space-y-1">
-                {binding && onClearSlot && (
+                {canClearSlot && binding && (
                   <button
                     onClick={(e) => { e.stopPropagation(); setShowClearConfirm(true); }}
                     aria-label={t('ams.emptySlotBinding.clearAria', { spool: binding.label })}

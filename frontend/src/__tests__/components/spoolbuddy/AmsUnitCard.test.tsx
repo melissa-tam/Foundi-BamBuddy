@@ -118,10 +118,12 @@ describe('AmsUnitCard', () => {
     expect(screen.queryByText('Empty')).toBeNull();
   });
 
-  it('shows "?" for loaded-but-unconfigured slot (#1694)', () => {
-    // No state reported by firmware + empty tray_type = spool loaded into the
-    // slot but no material assigned. Reporter on a 3-AMS P1S saw these slots
-    // mislabelled as "Empty" because the prior logic only checked tray_type.
+  it('separates an unknown-state slot from a wire-asserted empty one (#1694)', () => {
+    // No state reported by firmware = the printer said nothing about this slot.
+    // Reporter on a 3-AMS P1S saw these mislabelled "Empty" because the prior
+    // logic only checked tray_type; the honest caption is "Unknown", and the
+    // kiosk reads it from the locales like every other surface (it used to
+    // hard-code English here).
     const unit = makeUnit({
       tray: [
         makeTray({ id: 0, tray_type: 'PLA', remain: 80 }),
@@ -131,10 +133,26 @@ describe('AmsUnitCard', () => {
       ],
     });
     render(<AmsUnitCard unit={unit} activeSlot={null} />);
-    expect(screen.getByText('?')).toBeDefined();
-    // The firmware-empty slot still reads "Empty" — the two states are visually
-    // distinct, not collapsed.
+    expect(screen.getByText('Unknown')).toBeDefined();
+    // Only the ASSERTED cleared shape (state 9 + tray_type "") reads "Empty" —
+    // the two states are distinct, not collapsed.
     expect(screen.getByText('Empty')).toBeDefined();
+  });
+
+  it('does not claim "Empty" for a state-9 tray that asserted no material', () => {
+    // The key-less minimal partial a boot-forgotten slot sends. Empty is a claim
+    // about the physical world and this push never made it.
+    const unit = makeUnit({
+      tray: [
+        makeTray({ id: 0, tray_type: 'PLA', remain: 80 }),
+        makeTray({ id: 1, tray_type: 'PLA', remain: 80 }),
+        makeTray({ id: 2, tray_type: 'PLA', remain: 80 }),
+        makeTray({ id: 3, tray_color: null, tray_type: null, remain: -1, state: 9 } as Partial<AMSTray> & { state: number }),
+      ],
+    });
+    render(<AmsUnitCard unit={unit} activeSlot={null} />);
+    expect(screen.getByText('Unknown')).toBeDefined();
+    expect(screen.queryByText('Empty')).toBeNull();
   });
 
   it('renders fill level bars for slots with filament', () => {

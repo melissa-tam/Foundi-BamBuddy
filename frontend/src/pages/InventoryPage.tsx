@@ -29,7 +29,7 @@ import { resolveSpoolColorName } from '../utils/colors';
 import { getCurrencySymbol } from '../utils/currency';
 import { formatDateInput, parseUTCDate, type DateFormat } from '../utils/date';
 import { formatAssignmentSlotLabel } from '../utils/amsHelpers';
-import { resolveSpoolBindingStatus } from '../utils/spoolBindingStatus';
+import { resolveSpoolBindingStatus, slotPresence } from '../utils/spoolBindingStatus';
 import { filterSpoolsByQuery } from '../utils/inventorySearch';
 import {
   inventoryLocationsQueryKey,
@@ -274,6 +274,11 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
       ? resolveSpoolBindingStatus({
           spent: !!spool.spent_at,
           preConfigured: !!assignment.pre_configured_at,
+          // Same tri-state, routed through the shared resolver so this column and
+          // the slot-side hover card can never disagree about what `present`
+          // means. In this branch it is always `empty` — the guard above is what
+          // keeps the qualifier off `true`/`null` rows.
+          presence: slotPresence({ present: assignment.present }),
         })
       : null;
     return (

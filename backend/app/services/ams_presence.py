@@ -314,7 +314,8 @@ def _reset_state() -> None:
     _owed_read_warned_at.clear()
     _standing_unknown_broadcast_at.clear()
     _read_occasion_at.clear()
-    _spent_occupied_occasion_epoch.clear()
+    _episode_occasion_epoch.clear()
+    _no_tag_answer_closed.clear()
     _commanded_read_at.clear()
     _identifying_seen_at.clear()
     _running_edge_at.clear()
@@ -558,42 +559,65 @@ def _consume_read_occasion(printer_id: int, ams_id: int, tray_id: int) -> None:
     _read_occasion_at.pop((printer_id, ams_id, tray_id), None)
 
 
-# (printer_id, ams_id, tray_id) -> the BOUND spool id whose spent-occupied constellation
-# has already bought its one read. The epoch key is the bound spool: a spent-occupied
-# constellation (a spent binding under a seated tray the wire cannot identify) is entitled
-# to exactly ONE commanded read per binding-EPOCH, and resolution (a swap, a displacement)
-# changes the bound spool, so a NEW spent constellation re-opens naturally. Keyed on the
-# spool rather than a timestamp because the read may already have been CONSUMED — an epoch
-# whose read is spent must not re-open, which a "is the occasion still open?" test cannot
-# tell from "was one never opened".
-_spent_occupied_occasion_epoch: dict[tuple[int, int, int], int] = {}
+# (printer_id, ams_id, tray_id, cause) -> the EPOCH token whose occasion has already been
+# bought. Some standing constellations are themselves the cause of a read — the table sees
+# them on every push and nothing else will ever open an occasion for them — so they buy
+# their own, once per EPISODE. The epoch token is whatever identifies "the same situation"
+# for that cause (see the two openers below); when it changes, a new episode has begun and
+# a fresh occasion is due. Keyed on the token rather than a timestamp because the read may
+# already have been CONSUMED — an episode whose read is spent must not re-open, which a
+# "is the occasion still open?" test cannot tell from "was one never opened".
+_episode_occasion_epoch: dict[tuple[int, int, int, str], object] = {}
+
+
+def _open_episode_occasion(printer_id: int, ams_id: int, tray_id: int, *, cause: str, epoch: object) -> None:
+    """Buy the ONE read an EPISODE of ``cause`` is entitled to. Idempotent within it.
+
+    The 2026-08-07 liveness hole (spool 226, 001-H2S slot 1) generalized: read occasions
+    open only on a qualified physical cycle, the terminal sweep's between-prints policy,
+    or a manual command. A verdict the decision table re-derives from STANDING evidence
+    therefore has no entitlement at all when those edges were missed — a request nothing
+    can ever grant, and the slot parks. The cure is that the emitting constellation is
+    itself the cause (doctrine rule 6/7 — pacing BY CAUSE, never a timer over the
+    verdict), and the epoch token is what keeps it to one read per episode rather than
+    one read per push. Sync, in-memory, never raises.
+    """
+    key = (printer_id, ams_id, tray_id, cause)
+    if key in _episode_occasion_epoch and _episode_occasion_epoch[key] == epoch:
+        return
+    _episode_occasion_epoch[key] = epoch
+    open_read_occasion(printer_id, ams_id, tray_id)
 
 
 def open_spent_occupied_occasion(printer_id: int, ams_id: int, tray_id: int, spool_id: int) -> None:
-    """Buy the ONE read a spent-occupied constellation is entitled to, once per epoch.
+    """The spent-occupied constellation's one read: a spent binding under a seated tray
+    the wire cannot identify.
 
-    The 2026-08-07 liveness hole (spool 226, 001-H2S slot 1): the table emitted
-    ``NONE(spent_occupied_owed_identify)`` on every push, but the read it owed had no
-    ENTITLEMENT — read occasions open only on a qualified physical cycle, the terminal
-    sweep's between-prints policy, or a manual command, and the presence edges for that
-    insert were missed. The verdict is a standing request nothing could ever grant, so the
-    slot parked with a spent binding under a fresh roll indefinitely.
-
-    So the constellation buys its own occasion: the emitting decision is itself the cause
-    (doctrine rule 6/7 — pacing BY CAUSE, never a timer over the verdict), and the
-    binding-epoch key is what keeps it to one read. Idempotent within an epoch: a repeat
-    call for the same bound spool is a no-op even after :func:`command_identify` consumed
-    the occasion, which is what stops the re-derived verdict from becoming a read loop.
+    Episode = the BOUND SPOOL. Resolution (a swap, a displacement) changes it, so a new
+    spent constellation re-opens naturally while a re-derived verdict for the same one
+    buys nothing.
 
     An EMPTY slot can never reach this — the emitting verdict requires ``present is True``
-    and ``identify_needed``'s spent-occupied arm additionally requires state 10 — so the
-    008-H2C empty-slot read-loop class stays closed. Sync, in-memory, never raises.
+    and ``identify_needed``'s spent-occupied arm additionally requires a seated state — so
+    the 008-H2C empty-slot read-loop class stays closed.
     """
-    key = (printer_id, ams_id, tray_id)
-    if _spent_occupied_occasion_epoch.get(key) == spool_id:
-        return
-    _spent_occupied_occasion_epoch[key] = spool_id
-    open_read_occasion(printer_id, ams_id, tray_id)
+    _open_episode_occasion(printer_id, ams_id, tray_id, cause="spent_occupied", epoch=spool_id)
+
+
+def open_ambiguity_occasion(printer_id: int, ams_id: int, tray_id: int, spool_id: int | None, tag: str | None) -> None:
+    """The identity-ambiguity constellation's one read: a tag disagreeing with a bound row
+    that also claims an identity (``slot_state`` 2.2).
+
+    Episode = the (bound row, disagreeing tag) PAIR. The push asserts that tag at ~1 Hz for
+    as long as the roll sits there, so without an epoch the "buy the answer" defer would
+    re-buy it every second; with one, a genuinely new disagreement — a different roll, or
+    the same roll over a different binding — still earns its own read.
+
+    The read this buys is answerable by construction (the tray is tagged and present), and
+    the one thing that can stop it is engaged filament: ``command_identify`` defers on that
+    QUIETLY and consumes nothing, so the occasion survives to be spent on the idle edge.
+    """
+    _open_episode_occasion(printer_id, ams_id, tray_id, cause="identity_ambiguous", epoch=(spool_id, tag))
 
 
 # --- Change-evidence ledger -----------------------------------------------
@@ -868,12 +892,19 @@ async def identify_needed(
         # ``discovery`` — that is what suppresses the expected read failure farm-side
         # (rule 5 / invariant 4). Classifying it ``rfid_refresh`` because the SPENT row
         # happens to carry a tag would both mis-name the read and let its expected
-        # failure escape as a fault. State 10 specifically: state 11 is the same roll
-        # threaded on to the hub, the documented shape a read cannot answer without
-        # unloading first. One attempt per occupancy epoch — every failed read leaves a
-        # printer-side 0700_0081 that only a power-cycle clears (rule 1: minimal human
-        # interaction cuts both ways — do not manufacture work for the operator).
-        if bound_spent and not live_tagged and state == _TRAY_SEATED_STATE:
+        # failure escape as a fault. BOTH present states: this arm's job is to grant the
+        # read a decision table asked for on ``present is True``, and refusing it for
+        # state 11 made that verdict ungrantable — the table emitted a reason on evidence
+        # the need authority would not accept, so the request stood forever and resolved
+        # nothing. State 11 IS the shape a read cannot answer while the filament is
+        # threaded on to the hub, but that is a WIRE-SAFETY fact and it is enforced where
+        # every other wire-safety fact is: ``command_identify``'s engaged-filament
+        # pre-check defers it QUIETLY and spends nothing, so the entitlement survives to
+        # the idle edge instead of never existing. One attempt per occupancy epoch —
+        # every failed read leaves a printer-side 0700_0081 that only a power-cycle
+        # clears (rule 1: minimal human interaction cuts both ways — do not manufacture
+        # work for the operator).
+        if bound_spent and not live_tagged and state in TRAY_PRESENT_STATES:
             return "discovery"
         if bound_tagged:
             return "rfid_refresh"
@@ -893,16 +924,18 @@ async def identify_needed(
         #   2. the only NEW opener is the deficit lane's ask, which is once per unread
         #      EPISODE per slot and additionally checks
         #      :func:`read_answered_since_seating` before spending one;
-        #   3. state 10 specifically (mirroring the spent-occupied arm): state 11 is the
-        #      same roll threaded on to the hub, the shape a read cannot answer without
-        #      unloading first.
+        #   3. either present state (mirroring the spent-occupied arm): a state-11 slot is
+        #      threaded on to the hub and its read waits for the idle edge in
+        #      ``command_identify``'s engaged-filament defer, which spends nothing —
+        #      wire safety belongs there, not in the need verdict.
         # A genuinely tagless roll therefore costs exactly ONE read per seating, whose
-        # expected failure is suppressed farm-side and never reaches the operator.
+        # expected failure is suppressed farm-side and never reaches the operator, and
+        # whose NO-TAG answer closes the entitlement outright (:func:`close_answered_read`).
         #
         # ``tray_identity_asserted`` is the whole identity test (type / preset id / tag),
         # so it subsumes ``live_tagged`` here — a live-tagged tray already took the
         # ``rfid_refresh`` arm above and could not reach this line unbound anyway.
-        if not has_assignment and state == _TRAY_SEATED_STATE and not tray_identity_asserted(tray):
+        if not has_assignment and state in TRAY_PRESENT_STATES and not tray_identity_asserted(tray):
             return "discovery"
 
     return None
@@ -1280,16 +1313,64 @@ def read_answered_no_tag(printer_id: int, ams_id: int, tray_id: int, *, tray_sea
     return not (read_at is not None and read_at > stamp)
 
 
-def tray_state_seated(state: int | None) -> bool:
-    """Is this raw tray state the SEATED-not-feeding shape (:data:`_TRAY_SEATED_STATE`)?
+# (printer_id, ams_id, tray_id) -> the ``_discovery_read_at`` stamp whose NO-TAG answer has
+# already been closed out by :func:`close_answered_read`. Not a dedup for politeness: the
+# closure pops ledgers, so repeating it is harmless, but the INFO line that records WHY a
+# slot stopped earning reads must fire once per answer and not at the push cadence.
+_no_tag_answer_closed: dict[tuple[int, int, int], float] = {}
 
-    Public read of the constant this module already owns, for the consumers that hold a
-    parsed state rather than a tray dict (the slot pipeline's no-tag adjudication). State 11
-    is the same roll with its filament threaded on to the hub — feeding, and a feeding tray
-    must never be mint-swapped — so the distinction is load-bearing, not cosmetic. Mirrors
-    the :func:`printer_running` wrapper's role for ``_printer_running``.
+
+def close_answered_read(printer_id: int, ams_id: int, tray_id: int, *, tray_seated: bool, tray_bare: bool) -> bool:
+    """A commanded read that answered NO TAG closes the entitlements that bought it.
+
+    "No tag" is an ANSWER, not a failure to answer — for a tagless roll it is the only
+    answer there is — and an answered question must stop being a reason to ask. Before
+    this, exactly one consumer concluded on it (``slot_state`` row 5a, spent + TAGGED
+    bindings) and every other constellation went on re-earning reads from the same
+    evidence. The loop is self-feeding, which is what made it expensive: an identify
+    cycle flaps the tray present→9→present, and any flap the echo-swallow and the
+    identify-explains suppression do not catch is banked as a fresh qualified gain — a
+    new cycle AND a new occasion, manufactured by the read itself (2026-08-07: 419
+    identifies on one slot, 1000 on one printer in a day, each holding that printer's
+    30 s identify gate so every slot decision on it deferred).
+
+    So the two READ entitlements are spent here, and they are spent for EVERY binding
+    state — bound, spent, tagless, unbound, or none at all, because the ledgers this
+    touches know nothing about bindings:
+
+    * the unanswered-cycle arm, by dropping the slot's physical-cycle stamp — the cycle
+      HAS been answered now;
+    * the open read occasion.
+
+    A new read then needs a NEW cause: a fresh physical cycle, the terminal's
+    between-prints policy, an episode occasion, or an operator.
+
+    Deliberately NOT consumed: ``spool_tagless``'s pending physical cycle. That is a
+    different currency — the SWAP evidence a bare tray's auto-configure and the table's
+    spent-swap arms live on — and spending it here would starve the very transitions the
+    answer enables. Deliberately NOT re-stamped: ``_slot_read_at``, because
+    :func:`read_answered_no_tag` reads it and row 5a must still be able to conclude on
+    this answer in the same pass.
+
+    Returns True on the pass that closes the answer. Pure in-memory, never raises.
     """
-    return state == _TRAY_SEATED_STATE
+    if not read_answered_no_tag(printer_id, ams_id, tray_id, tray_seated=tray_seated, tray_bare=tray_bare):
+        return False
+    key = (printer_id, ams_id, tray_id)
+    stamp = _discovery_read_at.get(key)
+    if _no_tag_answer_closed.get(key) == stamp:
+        return False
+    _no_tag_answer_closed[key] = stamp
+    _physical_cycle_at.pop(key, None)
+    _read_occasion_at.pop(key, None)
+    logger.info(
+        "AMS presence: read answered NO TAG for printer %d AMS%d-T%d — read entitlements spent, "
+        "a further read needs a new cause",
+        printer_id,
+        ams_id,
+        tray_id,
+    )
+    return True
 
 
 def is_expected_read_failure(printer_id: int, attr: int, code: int) -> bool:
@@ -1595,6 +1676,20 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
             # never be read as an answer here.
             if obs.identity_asserted:
                 note_identity_learned(printer_id, ams_id, tray_id)
+
+            # …and the OTHER answer a commanded read can give. A read whose settle window
+            # passed with no identity learned has answered NO TAG, and that answer spends
+            # the entitlements it was bought with, whatever the slot is bound to. Runs on
+            # every observation, not only gains: the answer lands ~15 s after the command,
+            # by which time the slot is emitting steady-state pushes. Non-destructive to
+            # the row-5a conclusion the pipeline draws from the same fact one step later.
+            close_answered_read(
+                printer_id,
+                ams_id,
+                tray_id,
+                tray_seated=obs.present is True,
+                tray_bare=not tray_identity_asserted(observation_tray_dict(obs)),
+            )
 
             # Steady state: act only on a genuine presence GAIN, and only while
             # the printer is idle. Firing ams_get_rfid during a print is unsafe;

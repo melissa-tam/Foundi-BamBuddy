@@ -414,14 +414,19 @@ describe('EmptySlotHoverCard binding block (W5a)', () => {
     label: 'Overture PETG - Black',
     usedGrams: 820,
     spent: false,
+    // The slot is verifiably empty unless a test says otherwise — that is what
+    // makes "not inserted" a statement the card is entitled to make.
     preConfigured: false,
+    presence: 'empty' as const,
   };
 
-  async function openCard(ui: React.ReactElement) {
+  /** `header` is what the card's first line reads once open — it changes with
+   *  the slot kind, so a seated-unread card is awaited on its own wording. */
+  async function openCard(ui: React.ReactElement, header: RegExp = /empty/i) {
     const result = render(ui);
     fireEvent.mouseEnter(result.container.firstElementChild as HTMLElement);
     vi.advanceTimersByTime(100);
-    await waitFor(() => expect(screen.getByText(/empty/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(header)).toBeInTheDocument());
     return result;
   }
 
@@ -447,13 +452,38 @@ describe('EmptySlotHoverCard binding block (W5a)', () => {
     expect(screen.getByText('820 g used')).toBeInTheDocument();
   });
 
-  it('reads "not inserted" for a plain lingering binding', async () => {
+  it('reads "not inserted" for a lingering binding on a verifiably empty slot', async () => {
     await openCard(
       <EmptySlotHoverCard binding={baseBinding}>
         <div>trigger</div>
       </EmptySlotHoverCard>
     );
     expect(screen.getByText(/not inserted/i)).toBeInTheDocument();
+  });
+
+  it('never says "not inserted" beneath a header saying a spool IS present', async () => {
+    // The contradiction the operator photographed: the card header read
+    // "Spool present — unrecognized" while the binding line under it read
+    // "Still assigned … not inserted".
+    await openCard(
+      <EmptySlotHoverCard kind="present" binding={{ ...baseBinding, presence: 'seated' }}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>,
+      /spool present/i,
+    );
+    expect(screen.getByText(/awaiting identification/i)).toBeInTheDocument();
+    expect(screen.queryByText(/not inserted/i)).not.toBeInTheDocument();
+  });
+
+  it('states unconfirmed, not empty, when the slot presence is unknown', async () => {
+    await openCard(
+      <EmptySlotHoverCard kind="unknown" binding={{ ...baseBinding, presence: 'unknown' }}>
+        <div>trigger</div>
+      </EmptySlotHoverCard>,
+      /slot state unknown/i,
+    );
+    expect(screen.getByText(/not confirmed in the slot/i)).toBeInTheDocument();
+    expect(screen.queryByText(/not inserted/i)).not.toBeInTheDocument();
   });
 
   it('reads "awaiting insert (pre-configured)" for a deliberate bind-to-empty', async () => {
@@ -529,6 +559,41 @@ describe('EmptySlotHoverCard binding block (W5a)', () => {
 
     expect(onClearSlot).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByText(/clear this slot\?/i)).not.toBeInTheDocument());
+  });
+
+  it('hides the clear verb on a SEATED slot — clearing a live roll is semantically void', async () => {
+    // The pipeline re-derives a binding for whatever is physically in the slot,
+    // so the row comes straight back (and the round trip mints phantom inventory
+    // rows). The resolution for an unread tray is identification, not deletion.
+    await openCard(
+      <EmptySlotHoverCard
+        kind="present"
+        binding={{ ...baseBinding, presence: 'seated' }}
+        onClearSlot={vi.fn()}
+      >
+        <div>trigger</div>
+      </EmptySlotHoverCard>,
+      /spool present/i,
+    );
+    expect(screen.queryByRole('button', { name: /clear the slot binding/i })).not.toBeInTheDocument();
+  });
+
+  it('keeps the clear verb where the claim CAN be stale (asserted-empty and unknown)', async () => {
+    for (const kind of ['physical', 'unknown'] as const) {
+      const header = kind === 'physical' ? /empty/i : /slot state unknown/i;
+      const { unmount } = await openCard(
+        <EmptySlotHoverCard
+          kind={kind}
+          binding={{ ...baseBinding, presence: kind === 'physical' ? 'empty' : 'unknown' }}
+          onClearSlot={vi.fn()}
+        >
+          <div>trigger</div>
+        </EmptySlotHoverCard>,
+        header,
+      );
+      expect(screen.getByRole('button', { name: /clear the slot binding/i })).toBeInTheDocument();
+      unmount();
+    }
   });
 });
 

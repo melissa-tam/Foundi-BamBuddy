@@ -85,11 +85,31 @@ def test_an_asserted_empty_type_still_clears_a_dialect_state(state):
     assert tray_presence(state, "") is False
 
 
-def test_exist_bit_veto_turns_a_clear_into_unknown():
+def test_a_set_exist_bit_is_seating_whatever_the_state_says():
     """The 003-H2S mid-print insert: the per-tray state sticks at 9 while the push's own
-    bitmask reports the spool. A contradiction resolves to UNKNOWN, never to EMPTY."""
-    assert tray_presence(TRAY_STATE_EMPTY, "", exist_bit=True) is None
+    bitmask reports the spool. The bit is the firmware's answer, so it decides."""
+    assert tray_presence(TRAY_STATE_EMPTY, "", exist_bit=True) is True
+    assert tray_presence(TRAY_STATE_EMPTY, None, exist_bit=True) is True
+    assert tray_presence(None, None, exist_bit=True) is True, "no state at all is still seated"
+
+
+def test_a_clear_exist_bit_empties_a_slot_that_asserts_nothing_else():
+    """The printer-1 shape: a stable-empty tray reduced to ``{"id": N}``. Without the
+    bit nothing in the block asserts emptiness and the slot is UNKNOWN forever."""
+    assert tray_presence(None, None, exist_bit=False) is False
+    assert tray_presence(TRAY_STATE_EMPTY, None, exist_bit=False) is False
     assert tray_presence(TRAY_STATE_EMPTY, "", exist_bit=False) is False
+    assert tray_presence(None, None) is None, "…and with no bit it stays UNKNOWN"
+
+
+def test_an_in_push_contradiction_resolves_to_unknown():
+    """A clear bit beside a tray asserting a PRESENT state is the push disagreeing with
+    itself. A release needs uncontradicted emptiness, so neither side wins."""
+    assert tray_presence(TRAY_STATE_SEATED, "PETG", exist_bit=False) is None
+    assert tray_presence(TRAY_STATE_FED, "PETG", exist_bit=False) is None
+    assert tray_presence(TRAY_STATE_DIALECT[0], "PETG", exist_bit=False) is False, (
+        "a dialect state is not a present state — the bit still answers"
+    )
 
 
 # --- filam_bak ---------------------------------------------------------------

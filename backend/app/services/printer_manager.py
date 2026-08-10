@@ -651,6 +651,14 @@ class PrinterManager:
             needed and nothing downstream can be poisoned by the merge. Only then is the
             pass scheduled, fire-and-forget, onto the event loop.
 
+            ``ams_payload`` is the wire payload with ONE thing already judged for us: an
+            untrusted ``tray_exist_bits`` has been withheld. Downstream the mask is
+            presence evidence in both polarities (a clear bit RELEASES a binding), and
+            whether an all-zero mask may be believed is a question about the push HISTORY
+            — stateful, hence the client's. So a mask that arrives here is one this layer
+            may act on, and a push that carries none is indistinguishable from a dialect
+            that never sends one.
+
             The printer id lives HERE, not in the client: ``BambuMQTTClient`` is keyed by
             serial and knows nothing of the DB, and an observation is addressed by
             ``(printer_id, ams_id, tray_id)``. Keeping the id in this closure is what lets
@@ -664,6 +672,26 @@ class PrinterManager:
             if not observations:
                 return
             self._schedule_async(_run_slot_pipeline_pass(printer_id, observations))
+
+        def on_ams_command_result(echo: dict):
+            """Feed the firmware's verdict on an AMS write to the write-epoch accounting.
+
+            Handled SYNCHRONOUSLY on the MQTT thread, not scheduled: the consumer is
+            process-memory bookkeeping plus (at most) one paced pushall request — no DB,
+            no awaits — and the same tick's bare-tray lane must not be able to publish
+            again between the refusal arriving and being recorded.
+
+            The printer id lives in this closure for the same reason it does on the raw
+            AMS hook: ``BambuMQTTClient`` is keyed by serial and knows nothing of the DB.
+
+            Function-local import — ``spool_tagless`` imports this module to reach the
+            wire, so the dependency may only run one way at module scope. Unguarded here
+            on purpose: the client already wraps this whole call (including the import),
+            and a second identical guard would just log the same failure twice.
+            """
+            from backend.app.services import spool_tagless
+
+            spool_tagless.on_ams_command_result(printer_id, echo)
 
         def on_layer_change(layer_num: int):
             if self._on_layer_change:
@@ -687,6 +715,7 @@ class PrinterManager:
             on_print_complete=on_print_complete,
             on_ams_change=on_ams_change,
             on_ams_push_raw=on_ams_push_raw,
+            on_ams_command_result=on_ams_command_result,
             on_layer_change=on_layer_change,
             on_bed_temp_update=on_bed_temp_update,
             on_drying_complete=on_drying_complete,

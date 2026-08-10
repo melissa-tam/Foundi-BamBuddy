@@ -50,6 +50,7 @@ from backend.app.services.spool_selection import (
     SlotInventory,
     build_slot_inventory,
     colors_are_similar,
+    dominant_start_block,
     effective_policy,
     match_filaments_to_slots,
     normalize_color_for_compare,
@@ -525,11 +526,12 @@ class PrintScheduler:
                             # the read that was supposed to fix it.
                             continue
                         if outcome.start_blocked_slots:
-                            # The only matching spool(s) sit below the minimum-start
-                            # floor — hold the job with a distinct reason (they stay
-                            # loaded as firmware backup donors). Do NOT persist a
-                            # mapping. Notify once per transition, mirroring the
-                            # filament-deficit path.
+                            # No matching spool can be PROVEN to clear the minimum-start
+                            # floor — hold the job with a distinct reason naming which
+                            # proof failed (below the floor: they stay loaded as firmware
+                            # backup donors; unpriced: the farm has no weight for them).
+                            # Do NOT persist a mapping. Notify once per transition,
+                            # mirroring the filament-deficit path.
                             # Already low-spool staged? The durable FLAG is the
                             # transition signal (token-independent now the reason
                             # is a rich string) — dedup the once-per-transition
@@ -537,13 +539,16 @@ class PrintScheduler:
                             was_blocked = bool(item.filament_short)
                             prior_reason = item.waiting_reason
                             printer = await self._get_printer(db, item.printer_id)
-                            stage_reason = build_staged_reason(printer.name if printer else "", start_min=True)
+                            stage_reason = build_staged_reason(
+                                printer.name if printer else "", start_block=outcome.start_block_kind
+                            )
                             await self._stage_filament_short(db, item, unpin=False, reason=stage_reason)
                             logger.info(
-                                "Queue item %s: start spool below minimum on printer %s (slots %s) — staged",
+                                "Queue item %s: no startable spool on printer %s (slots %s, reason %s) — staged",
                                 item.id,
                                 item.printer_id,
                                 outcome.start_blocked_slots,
+                                outcome.start_block_kind,
                             )
                             if self._hold_is_new(was_held=was_blocked, prior_reason=prior_reason, reason=stage_reason):
                                 await self._notify_queue_waiting(
@@ -664,6 +669,9 @@ class PrintScheduler:
                     last_waiting_reason: str | None = None
                     candidates_deficit_blocked = 0
                     candidates_start_blocked = 0
+                    # START_BLOCK_* kinds seen across the candidates this pass —
+                    # collapsed into the ONE kind that words the staged reason.
+                    start_block_kinds: set[str] = set()
                     # Short candidates found THIS item's pass — named in the
                     # staged reason (D9) so the banner tells the operator which
                     # machines to top up.
@@ -685,10 +693,12 @@ class PrintScheduler:
                         if item.ams_mapping:
                             candidate_mapping = item.ams_mapping
                             candidate_start_blocked: list[int] = []
+                            candidate_block_kind: str | None = None
                         else:
                             outcome = await self._compute_ams_mapping_for_printer(db, candidate_id, item)
                             candidate_mapping = json.dumps(outcome.mapping) if outcome.mapping else None
                             candidate_start_blocked = outcome.start_blocked_slots
+                            candidate_block_kind = outcome.start_block_kind
 
                         # Deficit-check against THIS candidate via the override params
                         # (the item is never mutated). Print-Anyway skips the check.
@@ -713,18 +723,23 @@ class PrintScheduler:
                             )
                             continue
 
-                        # Start-spool floor: this candidate's only matching spool(s)
-                        # are below the minimum-start weight. Skip it like a deficit
-                        # (it can still finish other prints / serve as a backup donor).
+                        # Start-spool floor: none of this candidate's matching spool(s)
+                        # can be proven to clear the minimum-start weight. Skip it like a
+                        # deficit (it can still finish other prints / serve as a backup
+                        # donor).
                         if candidate_start_blocked and not item.skip_filament_check:
                             deficit_blocked.add(candidate_id)
                             blocked_candidate_ids.append(candidate_id)
                             candidates_start_blocked += 1
+                            if candidate_block_kind:
+                                start_block_kinds.add(candidate_block_kind)
                             logger.info(
-                                "Queue item %s: candidate printer %s start spool below minimum (slots %s) — trying next",
+                                "Queue item %s: candidate printer %s has no startable spool "
+                                "(slots %s, reason %s) — trying next",
                                 item.id,
                                 candidate_id,
                                 candidate_start_blocked,
+                                candidate_block_kind,
                             )
                             continue
 
@@ -865,7 +880,10 @@ class PrintScheduler:
                             start_min_only = candidates_deficit_blocked == 0 and candidates_start_blocked > 0
                             blocked_names = await self._resolve_printer_names(db, blocked_candidate_ids)
                             who = ", ".join(blocked_names) if blocked_names else f"{item.target_model} printers"
-                            stage_reason = build_staged_reason(who, start_min=start_min_only)
+                            stage_reason = build_staged_reason(
+                                who,
+                                start_block=dominant_start_block(start_block_kinds) if start_min_only else None,
+                            )
                             await self._stage_model_item_filament_short(
                                 db, item, notified_short_groups, reason=stage_reason
                             )
@@ -1346,6 +1364,9 @@ class PrintScheduler:
         # too — same precedent.
         inv: dict[int, SlotInventory] = await build_slot_inventory(db, printer_id, loaded_filaments)
 
+        # ``require_known_grams``: this is the START lane, so a candidate the ledger
+        # cannot price is reserved rather than started (it may hold 5 g). The
+        # mid-print donor lane in ``spool_recovery`` keeps the fail-open reading.
         return match_filaments_to_slots(
             filament_reqs,
             loaded_filaments,
@@ -1353,6 +1374,7 @@ class PrintScheduler:
             inv=inv,
             backup_on=status.ams_filament_backup,
             min_start_g=min_start_g,
+            require_known_grams=True,
         )
 
     async def _build_override_direct_mapping(
@@ -1398,6 +1420,7 @@ class PrintScheduler:
             inv=inv,
             backup_on=getattr(status, "ams_filament_backup", None),
             min_start_g=min_start_g,
+            require_known_grams=True,
         )
 
     async def _get_filament_requirements(self, db: AsyncSession, item: PrintQueueItem) -> list[dict] | None:
@@ -2476,7 +2499,7 @@ class PrintScheduler:
             was_blocked = bool(item.filament_short)
             prior_reason = item.waiting_reason
             printer = await self._get_printer(db, item.printer_id) if item.printer_id else None
-            stage_reason = build_staged_reason(printer.name if printer else "", start_min=False)
+            stage_reason = build_staged_reason(printer.name if printer else "")
             await self._stage_filament_short(db, item, unpin=False, reason=stage_reason)
             logger.info(
                 "Queue item %s blocked on filament deficit (%d slot(s)) — promoted to manual_start",

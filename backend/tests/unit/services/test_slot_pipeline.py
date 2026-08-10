@@ -1396,9 +1396,17 @@ async def test_a_spent_TAGLESS_row_is_never_swapped_on_a_no_tag_read(db_session,
 
 
 @pytest.mark.asyncio
-async def test_a_feeding_tray_is_never_mint_swapped_on_a_no_tag_read(db_session, printer_factory, env):
-    """State 11 means filament IS feeding: whatever the read said, a tray mid-feed must not be
-    replaced under the print pulling from it. Only the SEATED (state-10) shape qualifies."""
+async def test_a_fed_tray_still_takes_the_swap_its_answered_read_earned(db_session, printer_factory, env):
+    """The apply pre-gate re-asserts the PRESENCE the decision was made on, not a second
+    state test that could disagree with it.
+
+    A no-tag answer read off a feeding tray would prove nothing (the tag faces away once
+    the filament is threaded on to the hub) — but such an answer cannot be obtained: a read
+    is only ever commanded when no filament is engaged, so every no-tag stamp reaching this
+    arm was taken on an unengaged tray. Demanding state 10 HERE only re-created the
+    emit-versus-grant mismatch one layer down: the table decides on ``present is True``, so
+    a slot read bare and since fed produced a decision the gate silently discarded, every
+    push, forever."""
     printer = await printer_factory()
     env.settings["tagless_default_filament"] = _tagless_default_json()
     departed = await _spent_tagged_slot(db_session, printer.id, 0, 1)
@@ -1407,9 +1415,9 @@ async def test_a_feeding_tray_is_never_mint_swapped_on_a_no_tag_read(db_session,
     obs = _obs(printer.id, {"id": 1, "state": 11})
     transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
 
-    assert transitions[0].decision.reason != "spent_swap_no_tag_read"
-    assert (await _assignment(db_session, printer.id, 0, 1)).spool_id == departed.id
-    assert await _spool_count(db_session) == 1
+    assert transitions[0].decision.reason == "spent_swap_no_tag_read"
+    assert (await _assignment(db_session, printer.id, 0, 1)).spool_id != departed.id
+    assert await _spool_count(db_session) == 2
 
 
 @pytest.mark.asyncio
@@ -1540,7 +1548,7 @@ async def test_the_spent_occupied_verdict_buys_its_own_read_occasion(db_session,
         transitions = await run_slot_pipeline(printer.id, [obs], deps)
         assert transitions[0].decision.reason == "spent_occupied_owed_identify"
 
-    assert ams_presence._spent_occupied_occasion_epoch[(printer.id, 0, 1)] == spent.id
+    assert ams_presence._episode_occasion_epoch[(printer.id, 0, 1, "spent_occupied")] == spent.id
     assert ams_presence._read_occasion_open(printer.id, 0, 1) is True
 
     # Epoch semantics, through the real opener: the SAME bound spool never re-opens once the
@@ -1658,11 +1666,12 @@ class TestTheProductionIdentifyDefaultIsNeedDriven:
     PROD_EXIST_BITS = 1 << (2 * 4 + 2)
 
     def _prod_obs(self, printer_id: int):
-        """AMS2 slot2 with the stuck exist bit vetoing the state-9 emptiness."""
+        """AMS2 slot2 with the stuck exist bit standing against the state-9 emptiness."""
         obs = observe_tray(printer_id, 2, dict(self.PROD_TRAY), exist_bits=self.PROD_EXIST_BITS)
-        # The exact epistemic shape that makes this slot stand still forever: presence
-        # unknowable, occupancy signalled — so it can never be classified EMPTY either.
-        assert obs.present is None and obs.occupancy_signal is True
+        # The exact epistemic shape that makes this slot stand still forever: the mask
+        # says SEATED while nothing names what is seated, so it can never be classified
+        # EMPTY and never be identified either — a standing condition, not an event.
+        assert obs.present is True and obs.occupancy_signal is True
         return obs
 
     @pytest.mark.asyncio
@@ -1745,24 +1754,50 @@ class TestTheProductionIdentifyDefaultIsNeedDriven:
         assert probe.commanded == [(printer.id, 2, 2, "rfid_refresh")]
 
     @pytest.mark.asyncio
-    async def test_the_full_read_defer_is_not_need_gated(self, db_session, printer_factory, env, identify_probe):
-        """``identity_ambiguous_owed_full_read`` arises ONLY on a tag-asserting push over
-        a bound slot: the push itself is the evidence and the read is guaranteed
-        answerable, so it commands ``rfid_refresh`` without consulting the predicate at
-        all (which here would veto it)."""
+    async def test_the_partial_identity_defer_is_not_need_gated(self, db_session, printer_factory, env, identify_probe):
+        """``partial_identity_owed_full_read`` is EVENT-shaped: the push carried one member
+        of the identity pair and not the other, which a single full read resolves outright.
+        The push itself is the evidence, so it commands ``rfid_refresh`` without consulting
+        the predicate at all (which here would veto it)."""
         printer = await printer_factory()
-        roll = await _spool(db_session, tag_uid=TAG_A, tray_uuid=UUID_1, material="PETG", rgba="000000FF")
-        await _bind_row(db_session, roll, printer.id, 0, 3)
         probe = identify_probe(need=None)
         deps = _prod_identify_deps(db_session, env)
 
-        # Tag-only disagreement against a binding that claims an identity.
+        # Tag with no uuid, on an unbound slot no row owns.
         obs = _obs(printer.id, {"id": 3, "state": 11, "tag_uid": TAG_B, "tray_type": "PETG"})
         transitions = await run_slot_pipeline(printer.id, [obs], deps)
 
-        assert transitions[0].decision == Decision(DecisionKind.DEFER, reason="identity_ambiguous_owed_full_read")
+        assert transitions[0].decision == Decision(DecisionKind.DEFER, reason="partial_identity_owed_full_read")
         assert probe.needs_asked == []
         assert probe.commanded == [(printer.id, 0, 3, "rfid_refresh")]
+
+    @pytest.mark.asyncio
+    async def test_the_ambiguity_defer_is_need_gated_and_buys_one_read_per_episode(
+        self, db_session, printer_factory, env, identify_probe
+    ):
+        """``identity_ambiguous_owed_full_read`` STANDS — the wire re-asserts the
+        disagreeing tag at ~1 Hz for as long as the roll sits there — so passing it
+        straight through re-bought the same read on every push. It is need-gated now, and
+        the ambiguity EPISODE buys the single occasion the predicate spends."""
+        printer = await printer_factory()
+        roll = await _spool(db_session, tag_uid=TAG_A, tray_uuid=UUID_1, material="PETG", rgba="000000FF")
+        await _bind_row(db_session, roll, printer.id, 0, 3)
+        deps = _prod_identify_deps(db_session, env)
+        obs = _obs(printer.id, {"id": 3, "state": 11, "tag_uid": TAG_B, "tray_type": "PETG"})
+
+        refused = identify_probe(need=None)
+        transitions = await run_slot_pipeline(printer.id, [obs], deps)
+        assert transitions[0].decision == Decision(DecisionKind.DEFER, reason="identity_ambiguous_owed_full_read")
+        assert refused.needs_asked[0][:3] == (printer.id, 0, 3), "the predicate is consulted now"
+        assert refused.commanded == []
+
+        # The episode bought exactly one occasion, however many pushes re-derive it.
+        assert ams_presence._read_occasion_open(printer.id, 0, 3) is True
+        assert ams_presence._episode_occasion_epoch[(printer.id, 0, 3, "identity_ambiguous")] == (roll.id, TAG_B)
+
+        granted = identify_probe(need="rfid_refresh")
+        await run_slot_pipeline(printer.id, [obs], deps)
+        assert granted.commanded == [(printer.id, 0, 3, "rfid_refresh")]
 
     @pytest.mark.asyncio
     async def test_the_real_predicate_refuses_the_prod_slot(self, db_session, printer_factory, env, monkeypatch):

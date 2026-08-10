@@ -12,7 +12,11 @@ from backend.app.services.spool_selection import (
     DEFAULT_MIN_START_SPOOL_G,
     DEFAULT_SELECTION_POLICY,
     SELECTION_POLICIES,
+    START_BLOCK_BELOW_FLOOR,
+    START_BLOCK_UNKNOWN_GRAMS,
+    MatchOutcome,
     SlotInventory,
+    dominant_start_block,
     effective_policy,
     match_filaments_to_slots,
 )
@@ -36,9 +40,15 @@ def _req(slot_id=1, *, ftype="PLA", color="#FF0000", tii="", used_grams=0.0):
     return {"slot_id": slot_id, "type": ftype, "color": color, "tray_info_idx": tii, "used_grams": used_grams}
 
 
-def _match(required, loaded, *, policy, inv=None, backup_on=True, min_start_g=0):
+def _match(required, loaded, *, policy, inv=None, backup_on=True, min_start_g=0, require_known_grams=False):
     return match_filaments_to_slots(
-        required, loaded, policy=policy, inv=inv or {}, backup_on=backup_on, min_start_g=min_start_g
+        required,
+        loaded,
+        policy=policy,
+        inv=inv or {},
+        backup_on=backup_on,
+        min_start_g=min_start_g,
+        require_known_grams=require_known_grams,
     )
 
 
@@ -199,8 +209,10 @@ class TestSmartCover:
 
 
 class TestMinStartFloor:
-    def test_drops_known_low_keeps_unknown_eligible(self):
-        """A known below-floor spool is skipped; an unknown/unbound tray is used."""
+    def test_drops_known_low_prefers_priced_over_unknown(self):
+        """A known below-floor spool is skipped. The unbound tray beside it is only
+        usable under the mid-print reading (``require_known_grams`` off); the START
+        lane reserves it too — see TestUnknownGramsFailsClosed."""
         loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1)]
         inv = {0: SlotInventory(remaining_g=50.0, first_loaded_ord=None)}  # gtid 1 unknown
         out = _match([_req()], loaded, policy="slot_order", inv=inv, min_start_g=120)
@@ -250,6 +262,183 @@ class TestStartBlockedSlots:
         out = _match([_req()], loaded, policy="slot_order", inv=inv, min_start_g=0)
         assert out.mapping == [0]
         assert out.start_blocked_slots == []
+
+
+class TestUnknownGramsFailsClosed:
+    """The START reading of the floor (``require_known_grams=True``): a candidate the
+    ledger cannot price is reserved, never started. Prod trace 2026-08-07 23:38:13
+    had exactly such a candidate (``inv_g=None`` beside ``remain=46``) sitting in
+    ``eligible`` — a roll that may hold 5 g was startable.
+
+    Every case here keeps at least one PRICED slot on the printer: the reading is
+    scoped to a ledger that demonstrably speaks (see TestNoLedgerStaysLive)."""
+
+    # A priced roll of another material: it makes the ledger speak without ever
+    # matching the PLA requirement, so each case turns purely on the unpriced roll.
+    PRICED_OTHER = 9
+
+    @staticmethod
+    def _priced_other():
+        return _loaded(TestUnknownGramsFailsClosed.PRICED_OTHER, tray_id=3, ftype="PETG")
+
+    @staticmethod
+    def _priced_other_inv():
+        return {TestUnknownGramsFailsClosed.PRICED_OTHER: SlotInventory(remaining_g=800.0, first_loaded_ord=1.0)}
+
+    def test_unknown_grams_candidate_is_start_blocked(self):
+        loaded = [_loaded(0, tray_id=0, color="#FF0000"), self._priced_other()]
+        out = _match(
+            [_req(color="#FF0000")],
+            loaded,
+            policy="slot_order",
+            inv=self._priced_other_inv(),
+            min_start_g=150,
+            require_known_grams=True,
+        )
+        assert out.mapping == [-1]  # never started
+        assert out.start_blocked_slots == [1]
+        assert out.start_block_kinds == {1: START_BLOCK_UNKNOWN_GRAMS}
+        assert out.start_block_kind == START_BLOCK_UNKNOWN_GRAMS
+
+    def test_bound_row_without_grams_is_start_blocked(self):
+        """Unknown is a property of the GRAMS, not of the binding: a bound slot whose
+        remaining nothing can quote (Spoolman row without a weight) blocks too."""
+        loaded = [_loaded(0, tray_id=0), self._priced_other()]
+        inv = {0: SlotInventory(remaining_g=None, first_loaded_ord=100.0, ord_src="first_used")}
+        inv.update(self._priced_other_inv())
+        out = _match([_req()], loaded, policy="first_loaded", inv=inv, min_start_g=150, require_known_grams=True)
+        assert out.start_block_kinds == {1: START_BLOCK_UNKNOWN_GRAMS}
+
+    def test_known_good_candidate_still_wins(self):
+        """The gate only removes the unpriceable roll — a priced, above-floor sibling
+        starts the print exactly as before, and raises no block."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1)]
+        inv = {1: SlotInventory(remaining_g=500.0, first_loaded_ord=100.0)}  # gtid 0 unpriceable
+        out = _match([_req()], loaded, policy="slot_order", inv=inv, min_start_g=150, require_known_grams=True)
+        assert out.mapping == [1]
+        assert out.start_blocked_slots == []
+
+    def test_mixed_reserves_word_as_below_floor(self):
+        """One reserve of each kind: the hold speaks for the roll the farm HAS priced
+        (``dominant_start_block``), because "below minimum" is true of it."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1)]
+        inv = {0: SlotInventory(remaining_g=50.0, first_loaded_ord=None)}  # gtid 1 unpriceable
+        out = _match([_req()], loaded, policy="slot_order", inv=inv, min_start_g=150, require_known_grams=True)
+        assert out.mapping == [-1]
+        assert out.start_block_kinds == {1: START_BLOCK_BELOW_FLOOR}
+
+    def test_unknown_of_wrong_type_is_a_plain_no_match(self):
+        """The reserve only raises a block when it WOULD have matched — an unpriceable
+        roll of the wrong material is an ordinary no-match, not a start-block."""
+        loaded = [_loaded(0, tray_id=0, ftype="ASA"), self._priced_other()]
+        out = _match(
+            [_req(ftype="PLA")],
+            loaded,
+            policy="slot_order",
+            inv=self._priced_other_inv(),
+            min_start_g=150,
+            require_known_grams=True,
+        )
+        assert out.mapping == [-1]
+        assert out.start_blocked_slots == []
+
+    def test_floor_disabled_disables_the_unknown_gate_too(self):
+        """``min_start_g == 0`` (Print Anyway / floor off) is the one escape hatch, and
+        it must disable BOTH readings — otherwise an acknowledged job can never start."""
+        loaded = [_loaded(0, tray_id=0), self._priced_other()]
+        out = _match(
+            [_req()],
+            loaded,
+            policy="slot_order",
+            inv=self._priced_other_inv(),
+            min_start_g=0,
+            require_known_grams=True,
+        )
+        assert out.mapping == [0]
+        assert out.start_blocked_slots == []
+
+    def test_mid_print_reading_keeps_unknown_eligible(self):
+        """Default OFF is spool_recovery's mid-print donor search: a refill must be able
+        to feed a live print from a roll the ledger cannot price, even on a printer
+        whose ledger speaks for its other slots."""
+        loaded = [_loaded(0, tray_id=0), self._priced_other()]
+        out = _match([_req()], loaded, policy="slot_order", inv=self._priced_other_inv(), min_start_g=5)
+        assert out.mapping == [0]
+        assert out.start_blocked_slots == []
+
+    def test_trace_tells_the_two_reserves_apart(self, caplog):
+        """Triage must distinguish "too light" from "unpriced" in the decision trace —
+        the prod incident was invisible because both would have read ``dropped=``."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1)]
+        inv = {0: SlotInventory(remaining_g=50.0, first_loaded_ord=None)}  # gtid 1 unpriceable
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_selection"):
+            _match([_req()], loaded, policy="slot_order", inv=inv, min_start_g=150, require_known_grams=True)
+        trace = "\n".join(r.message for r in caplog.records)
+        assert "'gtid': 0" in trace.split("dropped_below_floor=")[1].split("dropped_unknown_grams=")[0]
+        assert "'gtid': 1" in trace.split("dropped_unknown_grams=")[1].split("excluded_oor=")[0]
+        assert f"START-BLOCKED reason={START_BLOCK_BELOW_FLOOR}" in trace
+
+    def test_hard_excluded_spool_never_reads_as_unknown(self):
+        """A spent / jammed / archived row leaves before the floor runs, so it can never
+        surface as an unknown-grams block (the exclusions stay tellable apart)."""
+        loaded = [_loaded(0, tray_id=0, color="#FF0000")]
+        inv = {0: SlotInventory(remaining_g=None, first_loaded_ord=None, spent=True)}
+        out = _match(
+            [_req(color="#FF0000")], loaded, policy="slot_order", inv=inv, min_start_g=150, require_known_grams=True
+        )
+        assert out.mapping == [-1]
+        assert out.start_blocked_slots == []
+
+
+class TestNoLedgerStaysLive:
+    """LIVENESS pair for the fail-closed reading. A printer where NOTHING is priced
+    keeps no spool inventory — an install that never enabled it, a freshly onboarded
+    printer, a repair that left every slot unbound. Refusing every roll there is not
+    protection, it is a printer that can never print again, so the unknown reserve
+    stands down and dispatch proceeds exactly as before."""
+
+    def test_unpriced_printer_still_dispatches(self):
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1)]
+        out = _match([_req()], loaded, policy="first_loaded", inv={}, min_start_g=150, require_known_grams=True)
+        assert out.mapping == [0]
+        assert out.start_blocked_slots == []
+
+    def test_unread_only_inventory_is_not_a_speaking_ledger(self):
+        """Rows exist but none can quote grams (every tray seated-unidentified) — still
+        no ledger to fail closed against; the unread exclusion owns that case."""
+        seated_unread = _loaded(0, tray_id=0) | {"unread": True, "type": ""}
+        loaded = [seated_unread, _loaded(1, tray_id=1)]
+        inv = {0: SlotInventory(remaining_g=None, first_loaded_ord=None, unread=True)}
+        out = _match([_req()], loaded, policy="slot_order", inv=inv, min_start_g=150, require_known_grams=True)
+        assert out.mapping == [1]  # the other tray still starts the print
+        assert out.start_blocked_slots == []
+
+    def test_one_priced_slot_arms_the_reading(self):
+        """The threshold is exactly one priced slot: the ledger speaks, so the unpriced
+        roll beside it is reserved (the production shape)."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1)]
+        inv = {1: SlotInventory(remaining_g=800.0, first_loaded_ord=200.0)}
+        out = _match([_req()], loaded, policy="first_loaded", inv=inv, min_start_g=150, require_known_grams=True)
+        assert out.mapping == [1]  # the priced roll starts, the unpriced one never does
+        assert out.start_blocked_slots == []
+
+
+class TestDominantStartBlock:
+    def test_empty_is_no_block(self):
+        assert dominant_start_block([]) is None
+
+    def test_all_unknown_reads_unknown(self):
+        assert dominant_start_block([START_BLOCK_UNKNOWN_GRAMS, START_BLOCK_UNKNOWN_GRAMS]) == START_BLOCK_UNKNOWN_GRAMS
+
+    def test_any_priced_roll_reads_below_floor(self):
+        assert dominant_start_block([START_BLOCK_UNKNOWN_GRAMS, START_BLOCK_BELOW_FLOOR]) == START_BLOCK_BELOW_FLOOR
+
+    def test_outcome_kind_derives_from_its_slots(self):
+        """``start_blocked_slots`` and the kind are two views of ONE record, so they
+        cannot drift apart."""
+        out = MatchOutcome(mapping=None, start_block_kinds={1: START_BLOCK_UNKNOWN_GRAMS, 2: START_BLOCK_BELOW_FLOOR})
+        assert out.start_blocked_slots == [1, 2]
+        assert out.start_block_kind == START_BLOCK_BELOW_FLOOR
 
 
 class TestOutOfRotation:

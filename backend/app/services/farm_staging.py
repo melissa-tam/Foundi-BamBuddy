@@ -76,15 +76,29 @@ _PERIODIC_DEBOUNCE_S = 60.0
 STAGING_REASON_PREFIX = "Low filament"
 
 
-def build_staged_reason(who: str, *, start_min: bool = False) -> str:
+# What each start-block kind says to the operator. The two hold for different
+# reasons and ask for different actions — top the roll up vs. tell the farm what
+# the roll weighs — so a shared "below minimum" sentence would be a lie for half
+# of them. Keys are ``spool_selection.START_BLOCK_*``; anything else (including
+# None) is the generic grams-deficit hold.
+_START_BLOCK_WHAT = {
+    spool_selection.START_BLOCK_BELOW_FLOOR: "starting spool below minimum",
+    spool_selection.START_BLOCK_UNKNOWN_GRAMS: "starting spool weight unknown",
+}
+
+
+def build_staged_reason(who: str, *, start_block: str | None = None) -> str:
     """Build the rich low-spool staging ``waiting_reason`` (see STAGING_REASON_PREFIX).
 
     ``who`` names the blocked machine(s): a pinned printer name, the short
-    candidates of a model run, or a ``"<model> printers"`` fallback. ``start_min``
-    selects the below-minimum-start-weight wording over the generic-deficit one.
+    candidates of a model run, or a ``"<model> printers"`` fallback.
+    ``start_block`` is the ``spool_selection.START_BLOCK_*`` kind when the hold is
+    a minimum-start block (``spool_selection.dominant_start_block`` collapses a
+    multi-slot / multi-printer hold to one kind); ``None`` is the generic
+    "needs more filament" deficit hold.
     """
     who = (who or "").strip() or "assigned printer"
-    what = "starting spool below minimum" if start_min else "needs more filament"
+    what = _START_BLOCK_WHAT.get(start_block or "", "needs more filament")
     return f"{STAGING_REASON_PREFIX}: {who} ({what})"
 
 
@@ -180,9 +194,11 @@ async def release_filament_staged(db: AsyncSession, printer_id: int | None = Non
         if deficit:
             continue  # still short — stays staged
         # A pinned item can have an empty deficit yet still be blocked by the
-        # minimum-start floor (its only matching spool is a below-floor backup
-        # donor). Releasing it here would let the scheduler re-stage it next tick
-        # forever — so keep it staged until the start rule clears too.
+        # minimum-start floor: its grams-needed IS satisfiable, the only matching
+        # spool just cannot be proven startable (a below-floor backup donor, or a
+        # roll the ledger cannot price). Releasing it here would let the scheduler
+        # re-stage it next tick forever — so keep it staged until the start rule
+        # clears too, decided by the SAME predicate the scheduler dispatches on.
         try:
             if await spool_selection.start_rule_blocks_item(db, item):
                 continue

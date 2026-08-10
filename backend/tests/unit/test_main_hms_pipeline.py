@@ -646,3 +646,71 @@ class TestStandingCodesStillReachTheIncidentMachine:
             await main_module.on_printer_status_change(5, _state([], layer_num=7))
 
         sampler.assert_called_once()
+
+
+@pytest.mark.asyncio
+class TestAutoSwitchNotificationSuppression:
+    """C5: the firmware's runout auto-switch statement stops paging the operator.
+
+    ``0x00030002`` is the AMS backup REPORTING a rescue it already completed — the
+    print never stopped and nothing is asked for. The firmware sends it at severity 3
+    (common), which sits inside the notify band, so it produced 87 alerts in 14 days.
+    Everything else it drives is untouched: it is still THE spent evidence, and it is
+    still recorded in the durable HMS vocabulary.
+    """
+
+    async def test_the_auto_switch_never_notifies(self):
+        with _Harness() as h:
+            await main_module.on_printer_status_change(5, _state([_hms(_AUTO_SWITCH)]))
+
+        h.notify.on_printer_error.assert_not_awaited()
+
+    async def test_a_suppressed_alert_is_not_ledger_stamped(self):
+        """An alert nobody sent is not an operator who was told — the same rule the
+        discovery-read suppression follows."""
+        with _Harness() as h:
+            await main_module.on_printer_status_change(5, _state([_hms(_AUTO_SWITCH)]))
+
+        h.record_sent.assert_not_awaited()
+
+    async def test_the_spent_hook_still_receives_it(self):
+        """Suppressing a notification is not un-consuming the evidence."""
+        state = _state([_hms(_AUTO_SWITCH)])
+        with (
+            _Harness(),
+            patch(
+                "backend.app.services.spool_respool.mark_spent_on_slot_runout",
+                new=AsyncMock(return_value=[]),
+            ) as hook,
+        ):
+            await main_module.on_printer_status_change(5, state)
+
+        hook.assert_awaited_once()
+        assert hook.await_args.args[2] == [(_AUTO_SWITCH.full_code, 0x07002200, 0x00030002)]
+
+    async def test_the_durable_vocabulary_still_records_it(self):
+        """The hms_event write is upstream of the notify filter, so the code stays
+        queryable however loudly (or quietly) it is reported."""
+        import backend.app.main as m
+
+        m._hms_event_written_at.clear()
+        with _Harness(), patch("backend.app.models.hms_event.HMSEvent"):
+            await main_module.on_printer_status_change(5, _state([_hms(_AUTO_SWITCH)]))
+
+        assert (5, _AUTO_SWITCH.full_code) in m._hms_event_written_at
+
+    async def test_the_assist_motor_overload_sharing_the_short_form_still_notifies(self):
+        """THE reason suppression is keyed by CODE WORD: 0x00030002 masks to the short
+        form ``0700_0002``, and so does the assist-motor overload 0x00020002 — the
+        swap trigger's own 16-hex twin, which must keep alerting."""
+        # Attr submodule 0x10 = an assist/feeder motor, which is what scopes this code
+        # word to "the AMS A assist motor is overloaded" — a live swap trigger.
+        overload = _err(code="0x20002", attr=0x07001000, module=0x07, full_code="0700100000020002")
+        with (
+            _Harness() as h,
+            patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=False)),
+            patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()),
+        ):
+            await main_module.on_printer_status_change(5, _state([_hms(overload)]))
+
+        assert h.notify.on_printer_error.await_count == 1

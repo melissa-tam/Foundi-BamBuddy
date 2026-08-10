@@ -1022,7 +1022,11 @@ async def test_gate_spent_not_loaded_does_nothing(db_session, printer_factory, m
 
 
 @pytest.mark.asyncio
-async def test_gate_null_spent_under_threshold_prompts_with_dedup(db_session, printer_factory, monkeypatch):
+async def test_gate_tier3_logs_once_and_never_prompts(db_session, printer_factory, monkeypatch, caplog):
+    """Tier 3 is a GUESS (grams + a timing window, no hardware statement), and on
+    this fleet every respool prompt ever raised was a false positive — so since
+    2026-08-10 it OBSERVES instead of interrupting. One INFO per (slot, tag), on
+    the ~1 Hz status stream, and never a broadcast."""
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=False, weight_used=990.0)  # remaining 10 <= 30
     await db_session.commit()
@@ -1030,13 +1034,16 @@ async def test_gate_null_spent_under_threshold_prompts_with_dedup(db_session, pr
 
     broadcasts = _spy_broadcast(monkeypatch)
     tray = _tray()
-    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, tray, donor)
-    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, tray, donor)  # deduped
+    with caplog.at_level("INFO", logger="backend.app.services.spool_respool"):
+        await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, tray, donor)
+        await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, tray, donor)  # deduped
 
-    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
-    assert len(prompts) == 1
-    assert prompts[0]["donor_spool_id"] == donor.id
-    assert prompts[0]["donor_remaining_g"] == pytest.approx(10.0)
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+    observations = [r for r in caplog.records if "Re-spool heuristic fired" in r.getMessage()]
+    assert len(observations) == 1
+    msg = observations[0].getMessage()
+    assert f"spool {donor.id}" in msg
+    assert "reason=near_empty" in msg
 
 
 @pytest.mark.asyncio
@@ -1114,21 +1121,25 @@ async def test_gate_tier3_suppressed_when_dismissed(db_session, printer_factory,
 
 
 @pytest.mark.asyncio
-async def test_gate_tier3_fires_when_not_dismissed(db_session, printer_factory, monkeypatch):
-    """Baseline: the SAME near-empty spool DOES prompt while not dismissed."""
+async def test_gate_tier3_fires_when_not_dismissed(db_session, printer_factory, monkeypatch, caplog):
+    """Baseline for the dismissal test below: the SAME near-empty spool still
+    reaches the tier-3 observation while it is not dismissed (the line is what the
+    dismissal suppresses now that the prompt is gone)."""
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=False, weight_used=990.0)
     await db_session.commit()
     _record_physical_cycle(printer.id)
 
     broadcasts = _spy_broadcast(monkeypatch)
-    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+    with caplog.at_level("INFO", logger="backend.app.services.spool_respool"):
+        await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
 
-    assert [b for b in broadcasts if b["type"] == "respool_prompt"] != []
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+    assert [r for r in caplog.records if "Re-spool heuristic fired" in r.getMessage()]
 
 
 @pytest.mark.asyncio
-async def test_gate_tier3_dismissal_survives_dedup_clear(db_session, printer_factory, monkeypatch):
+async def test_gate_tier3_dismissal_survives_dedup_clear(db_session, printer_factory, monkeypatch, caplog):
     """The persisted dismissal outlives the in-memory dedup: clearing the slot
     dedup (as main.on_ams_change does when a slot reports empty) does NOT re-open
     the prompt for a dismissed spool — the whole point of the new column."""
@@ -1139,12 +1150,16 @@ async def test_gate_tier3_dismissal_survives_dedup_clear(db_session, printer_fac
     _record_physical_cycle(printer.id)  # evidence present on both passes
 
     broadcasts = _spy_broadcast(monkeypatch)
-    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
-    # Simulate the empty-slot dedup clear that used to re-arm the prompt.
-    spool_respool.clear_respool_prompt_dedup(printer.id, 0, 0)
-    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+    with caplog.at_level("INFO", logger="backend.app.services.spool_respool"):
+        await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+        # Simulate the empty-slot dedup clear that used to re-arm the prompt.
+        spool_respool.clear_respool_prompt_dedup(printer.id, 0, 0)
+        await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
 
     assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+    # The dismissal is upstream of the observation too — a dismissed row is silent
+    # on both surfaces, so the demotion did not smuggle the noise into the log.
+    assert [r for r in caplog.records if "Re-spool heuristic fired" in r.getMessage()] == []
 
 
 # -- R4: spent-tier dismissal honored per physical cycle ---------------------
@@ -1279,25 +1294,23 @@ async def test_respool_prompt_payload_carries_provenance(db_session, printer_fac
 
 @pytest.mark.asyncio
 async def test_respool_prompt_payload_nulls_when_absent(db_session, printer_factory, monkeypatch):
-    """The provenance fields degrade to None cleanly: a non-spent near-empty prompt
-    has no spent_at/spent_age_s, and a garbage tray remain yields no ams_remain_pct
-    (the parse discipline of _remain_jump_reading), while the ledger % still computes."""
+    """The provenance fields degrade to None cleanly: a garbage tray remain yields
+    no ams_remain_pct (the parse discipline of _remain_jump_reading) while the
+    ledger % still computes from the durable row."""
     printer = await printer_factory()
-    donor = await _make_donor(db_session, spent=False, weight_used=990.0)  # remaining 10 <= 30 → near_empty
+    donor = await _make_donor(db_session, spent=True, weight_used=990.0)  # ledger 1% of a 1000 g label
     await db_session.commit()
-    _record_physical_cycle(printer.id)  # swap evidence Tier 3 requires
 
-    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
+    garbage = _tray(state=11)
+    garbage["remain"] = "n/a"  # firmware junk — must not be quoted as a percentage
+    _patch_pm(monkeypatch, _make_state(0, 0, garbage))
     broadcasts = _spy_broadcast(monkeypatch)
-    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11, tray_type="PETG"), donor)
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, garbage, donor)
 
     prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
     assert len(prompts) == 1
     p = prompts[0]
-    assert p["trigger"] == "near_empty"
-    assert p["spent_at"] is None
-    assert p["spent_age_s"] is None
-    assert p["ams_remain_pct"] == 100  # a valid remain still parses
+    assert p["ams_remain_pct"] is None
     assert p["ledger_remain_pct"] == pytest.approx(1.0)
 
 
@@ -1836,12 +1849,13 @@ def test_should_evaluate_respool_truth_table(fake_clock):
 
 
 @pytest.mark.asyncio
-async def test_gate_remain_jump_prompts_even_above_threshold(db_session, printer_factory, monkeypatch, fake_clock):
+async def test_gate_remain_jump_logs_even_above_threshold(db_session, printer_factory, monkeypatch, fake_clock, caplog):
     """spent_at NULL and remaining ABOVE the near-empty threshold, but the tray
     reports a CORROBORATED remain-jump on a physically-cycled slot → the Tier-3
-    prompt still fires, labelled ``remain_jump``. Both the bound and the arrival
-    call sites funnel through maybe_auto_or_prompt_respool, so this proves the
-    prompt for both contexts."""
+    OBSERVATION fires, reasoned ``remain_jump``. The corroboration state machine is
+    the part that must not regress: it is stateful, so the demotion kept the
+    original short-circuit (the jump is consulted only when near-empty did not
+    already answer) and the first push still only opens the window."""
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=False, weight_used=958.99)  # remaining 41 > 30
     await db_session.commit()
@@ -1849,18 +1863,19 @@ async def test_gate_remain_jump_prompts_even_above_threshold(db_session, printer
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
     broadcasts = _spy_broadcast(monkeypatch)
-    # First push only opens the corroboration window.
-    assert await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor) is None
+    with caplog.at_level("INFO", logger="backend.app.services.spool_respool"):
+        # First push only opens the corroboration window.
+        assert await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor) is None
+        assert [r for r in caplog.records if "Re-spool heuristic fired" in r.getMessage()] == []
+
+        fake_clock["t"] += spool_respool._JUMP_STABLE_S
+        result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+
+    assert result is None  # neither a prompt nor an auto-respool
     assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
-
-    fake_clock["t"] += spool_respool._JUMP_STABLE_S
-    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
-
-    assert result is None  # a prompt, not an auto-respool
-    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
-    assert len(prompts) == 1
-    assert prompts[0]["donor_spool_id"] == donor.id
-    assert prompts[0]["trigger"] == "remain_jump"
+    observations = [r for r in caplog.records if "Re-spool heuristic fired" in r.getMessage()]
+    assert len(observations) == 1
+    assert "reason=remain_jump" in observations[0].getMessage()
 
 
 @pytest.mark.asyncio
@@ -1909,10 +1924,11 @@ async def test_near_empty_without_swap_evidence_never_prompts(db_session, printe
 
 
 @pytest.mark.asyncio
-async def test_near_empty_with_recent_cycle_prompts_as_near_empty(db_session, printer_factory, monkeypatch):
-    """The same spool DOES prompt once a roll was physically cycled through the
-    slot — and is labelled ``near_empty`` so the UI says "almost empty — replacing
-    this roll?" instead of claiming a reused tag was detected."""
+async def test_near_empty_with_recent_cycle_logs_as_near_empty(db_session, printer_factory, monkeypatch, caplog):
+    """The same spool DOES reach the observation once a roll was physically cycled
+    through the slot, reasoned ``near_empty`` — the evidence line states the grams,
+    the label and the threshold, so a future re-promotion can argue from data
+    instead of from the absence of it."""
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=False, weight_used=990.0)
     await db_session.commit()
@@ -1920,11 +1936,13 @@ async def test_near_empty_with_recent_cycle_prompts_as_near_empty(db_session, pr
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
     broadcasts = _spy_broadcast(monkeypatch)
-    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
+    with caplog.at_level("INFO", logger="backend.app.services.spool_respool"):
+        await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(), donor)
 
-    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
-    assert len(prompts) == 1
-    assert prompts[0]["trigger"] == "near_empty"
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
+    msg = next(r for r in caplog.records if "Re-spool heuristic fired" in r.getMessage()).getMessage()
+    assert "reason=near_empty" in msg
+    assert "remaining=10.0g of a 1000.0g label" in msg
 
 
 @pytest.mark.asyncio
@@ -2035,15 +2053,17 @@ def test_ledger_corrupt_tolerance_boundary():
 # -- F2: fire-once respool_prompt re-broadcast on (re)connect -----------------
 
 
-async def _fire_tier3_prompt(db, printer, monkeypatch, *, weight_used=990.0):
-    """Fire a real Tier-3 prompt so _respool_prompt_dedup is populated exactly as
-    the live gate populates it. Returns (donor, broadcasts_spy)."""
-    donor = await _make_donor(db, spent=False, weight_used=weight_used)  # remaining 10 <= 30
+async def _fire_live_prompt(db, printer, monkeypatch, *, weight_used=990.0):
+    """Fire a real prompt so _respool_prompt_dedup is populated exactly as the live
+    gate populates it. Tier 2 (spent ∧ loaded — the firmware's own exhaustion
+    statement) is the ONLY prompting tier since the 2026-08-10 demotion, so the
+    replay lane is armed through the path that can actually arm it.
+    Returns (donor, broadcasts_spy)."""
+    donor = await _make_donor(db, spent=True, weight_used=weight_used)  # remaining 10
     await db.commit()
-    _record_physical_cycle(printer.id)  # the swap evidence Tier 3 requires
-    _patch_pm(monkeypatch, _make_state(0, 0, _tray()))
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
     broadcasts = _spy_broadcast(monkeypatch)
-    await maybe_auto_or_prompt_respool(db, printer.id, 0, 0, _tray(), donor)
+    await maybe_auto_or_prompt_respool(db, printer.id, 0, 0, _tray(state=11), donor)
     assert [b for b in broadcasts if b["type"] == "respool_prompt"]  # dedup now armed
     return donor, broadcasts
 
@@ -2061,7 +2081,7 @@ def _capture_send():
 async def test_rebroadcast_replays_unresolved_prompt(db_session, printer_factory, monkeypatch):
     """A client that missed the fire-once prompt gets it replayed on (re)connect."""
     printer = await printer_factory()
-    donor, _ = await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    donor, _ = await _fire_live_prompt(db_session, printer, monkeypatch)
 
     sent, send = _capture_send()
     n = await rebroadcast_unresolved_respool_prompts(db_session, send)
@@ -2075,35 +2095,51 @@ async def test_rebroadcast_replays_unresolved_prompt(db_session, printer_factory
 
 @pytest.mark.asyncio
 async def test_rebroadcast_payload_matches_live_prompt(db_session, printer_factory, monkeypatch):
-    """The replayed payload is identical to the live gate's payload (one contract)."""
+    """The replayed payload is identical to the live gate's payload (one contract).
+
+    The ``*_age_s`` fields are excluded by construction, not by convenience: they
+    are now-relative by design (``_build_respool_prompt_payload`` says so), so a
+    replay measured later MUST differ there and nowhere else."""
     printer = await printer_factory()
-    _donor, broadcasts = await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    _donor, broadcasts = await _fire_live_prompt(db_session, printer, monkeypatch)
     live = next(b for b in broadcasts if b["type"] == "respool_prompt")
 
     sent, send = _capture_send()
     await rebroadcast_unresolved_respool_prompts(db_session, send)
-    assert sent[0] == live
+
+    def _frozen(payload):
+        return {k: v for k, v in payload.items() if not k.endswith("_age_s")}
+
+    assert _frozen(sent[0]) == _frozen(live)
+    # The excluded fields still have to BE there, and to have advanced rather than
+    # gone missing or reset.
+    age_keys = [k for k in live if k.endswith("_age_s")]
+    assert age_keys
+    for k in age_keys:
+        assert sent[0][k] >= live[k]
 
 
 @pytest.mark.asyncio
-async def test_rebroadcast_recomputes_trigger_from_durable_state(db_session, printer_factory, monkeypatch):
-    """The replayed prompt is labelled from DURABLE state, so a reconnecting client
-    gets the same copy the live one did — and follows the row if it changed while the
-    client was away (here: the donor was stamped spent in the meantime)."""
+async def test_rebroadcast_recomputes_payload_from_durable_state(db_session, printer_factory, monkeypatch):
+    """The replayed prompt is rebuilt from DURABLE state rather than replayed from a
+    cached copy, so a reconnecting client sees the row as it is NOW — not as it was
+    when the live prompt fired."""
     printer = await printer_factory()
-    donor, broadcasts = await _fire_tier3_prompt(db_session, printer, monkeypatch)
-    assert next(b for b in broadcasts if b["type"] == "respool_prompt")["trigger"] == "near_empty"
+    donor, broadcasts = await _fire_live_prompt(db_session, printer, monkeypatch)
+    assert next(b for b in broadcasts if b["type"] == "respool_prompt")["trigger"] == "spent"
 
     sent, send = _capture_send()
     await rebroadcast_unresolved_respool_prompts(db_session, send)
-    assert sent[0]["trigger"] == "near_empty"
+    assert sent[0]["trigger"] == "spent"
+    assert sent[0]["donor_remaining_g"] == pytest.approx(10.0)
 
-    donor.spent_at = datetime.utcnow()  # hardware runout landed while the client was away
+    donor.weight_used = 950.0  # the ledger moved while the client was away
     await db_session.commit()
 
     sent2, send2 = _capture_send()
     await rebroadcast_unresolved_respool_prompts(db_session, send2)
     assert sent2[0]["trigger"] == "spent"
+    assert sent2[0]["donor_remaining_g"] == pytest.approx(50.0)
 
 
 @pytest.mark.asyncio
@@ -2111,7 +2147,7 @@ async def test_rebroadcast_skips_dismissed_donor(db_session, printer_factory, mo
     """The dismissal route stamps respool_dismissed_at WITHOUT clearing the in-memory
     dedup — the replay must still suppress a dismissed prompt (F2 correctness)."""
     printer = await printer_factory()
-    donor, _ = await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    donor, _ = await _fire_live_prompt(db_session, printer, monkeypatch)
     donor.respool_dismissed_at = datetime.utcnow()
     await db_session.commit()
 
@@ -2124,7 +2160,7 @@ async def test_rebroadcast_skips_dismissed_donor(db_session, printer_factory, mo
 async def test_rebroadcast_skips_archived_donor(db_session, printer_factory, monkeypatch):
     """A re-spooled / archived donor is not replayed."""
     printer = await printer_factory()
-    donor, _ = await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    donor, _ = await _fire_live_prompt(db_session, printer, monkeypatch)
     donor.archived_at = datetime.utcnow()
     await db_session.commit()
 
@@ -2137,7 +2173,7 @@ async def test_rebroadcast_skips_archived_donor(db_session, printer_factory, mon
 async def test_rebroadcast_skips_when_slot_no_longer_holds_tag(db_session, printer_factory, monkeypatch):
     """A slot now empty (or holding a different tag) is stale → no replay."""
     printer = await printer_factory()
-    await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    await _fire_live_prompt(db_session, printer, monkeypatch)
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(tray_type="")))  # slot went empty
 
     sent, send = _capture_send()
@@ -2158,7 +2194,7 @@ async def test_rebroadcast_no_entries_sends_nothing(db_session, printer_factory)
 async def test_rebroadcast_noop_in_spoolman_mode(db_session, printer_factory, monkeypatch):
     """Spoolman owns the lifecycle → the replay hook is a no-op even with a dedup entry."""
     printer = await printer_factory()
-    await _fire_tier3_prompt(db_session, printer, monkeypatch)
+    await _fire_live_prompt(db_session, printer, monkeypatch)
     from backend.app.api.routes.settings import set_setting
 
     await set_setting(db_session, "spoolman_enabled", "true")

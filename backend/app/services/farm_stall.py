@@ -41,10 +41,8 @@ from backend.app.services.farm_correlation import WAITING_REASON_PLATE_VISION
 from backend.app.services.hms_errors import current_runout_demand
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_recovery import (
-    WAITING_REASON_FAILED,
-    WAITING_REASON_PHYSICAL,
+    RECOVERY_WAITING_REASONS,
     WAITING_REASON_RECOVERING,
-    WAITING_REASON_RUNOUT,
     runout_slot_desc,
 )
 
@@ -88,8 +86,12 @@ WAITING_REASON_PAUSED = "print_paused_stalled"
 # hands). Re-notifying any of them through the pause-stall watch would just double up
 # on a hold a human already owns — and since WS2b the OPEN INCIDENT is the primary
 # ownership signal (it covers a foreign print, which has no token to read).
-_ATTENDED_PAUSE_REASONS: frozenset[str] = frozenset(
-    {WAITING_REASON_PLATE_VISION, WAITING_REASON_FAILED, WAITING_REASON_RUNOUT, WAITING_REASON_PHYSICAL}
+#
+# DERIVED from spool_recovery's own token set rather than re-listed, so a new hold
+# token (the external-spool runout was one) cannot be born un-attended and start
+# double-notifying the moment it ships.
+_ATTENDED_PAUSE_REASONS: frozenset[str] = frozenset({WAITING_REASON_PLATE_VISION}) | (
+    RECOVERY_WAITING_REASONS - {WAITING_REASON_RECOVERING}
 )
 
 _DEFAULT_GRACE_MINUTES = 30

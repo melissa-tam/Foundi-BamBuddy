@@ -310,13 +310,22 @@ async def test_printer_1_shape_the_reconcile_probe_asks_and_the_answer_releases(
     assert _pushall_count(wired.client) == 0, "first sighting only opens the episode"
 
     with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
-        await spool_tagless.reconcile_slot_config(db_session, now=_T0 + spool_tagless._BOUND_PRESENCE_STALE_AFTER_S + 1)
+        mature = _T0 + spool_tagless._BOUND_PRESENCE_STALE_AFTER_S + 1
+        await spool_tagless.reconcile_slot_config(db_session, now=mature)
 
-        # The probe asked BOTH parties: the operator, and the printer over the real wire.
+        # The probe asked the PRINTER over the real wire. The operator is told later, once
+        # the machine has had every rung of the ladder (see the arm's ask-until-answered
+        # semantics) — here the very first ask is already what unsticks the slot.
         assert _pushall_count(wired.client) == 1, "the probe must reach the client and publish"
+        assert ws.await_args_list == []
+        assert len(passes) == pushes_before, "asking is not a pipeline pass — nothing has answered yet"
+
+        # An unanswered episode escalates to the operator at the third ask.
+        for gap in spool_tagless._PRESENCE_ASK_GAPS_S:
+            mature += gap
+            await spool_tagless.reconcile_slot_config(db_session, now=mature)
         toasts = [c.args[0] for c in ws.await_args_list if c.args[0].get("type") == "slot_standing_unknown"]
         assert [t["case"] for t in toasts] == ["bound_presence_unknown"]
-        assert len(passes) == pushes_before, "asking is not a pipeline pass — nothing has answered yet"
 
         # The printer answers the request. THAT is what feeds the deciding raw lane.
         await _push(wired, passes, _cleared_pushall())
@@ -328,6 +337,80 @@ async def test_printer_1_shape_the_reconcile_probe_asks_and_the_answer_releases(
         if r.name == _PIPELINE_LOGGER and "release" in r.getMessage() and "reason=cleared_tray" in r.getMessage()
     ]
     assert released and f"spool={spool.id}" in released[0]
+
+
+def _printer_1_pushall(trays, *, bits="0", power_on=True):
+    """The prod all-empty report, sibling fields and all (printer 1, 2026-08-10).
+
+    ``power_on_flag`` is carried and IGNORED: it read True on printer 1 and False on
+    printers 3-6 for the identical physical truth, and the guard built on it is what
+    discarded the second group's correct report forever.
+    """
+    return {
+        "ams": [{"id": 0, "tray": trays}],
+        "ams_exist_bits": "1",
+        "insert_flag": True,
+        "power_on_flag": power_on,
+        "tray_exist_bits": bits,
+        "tray_now": "255",
+        "tray_read_done_bits": bits,
+        "version": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "trays",
+    [
+        pytest.param([{"id": "0"}], id="keyless_stub"),
+        pytest.param([{"id": "0", "state": "9"}], id="minimal_state_9"),
+    ],
+)
+@pytest.mark.parametrize("power_on", [True, False], ids=["printer1", "printer4"])
+async def test_the_prod_all_empty_report_releases_the_binding_end_to_end(
+    db_session, wired, sessions, passes, caplog, trays, power_on
+):
+    """THE outage, through the production wiring, cured by the mask.
+
+    Printer 1 held four bound-but-empty slots for two days while the firmware answered
+    "all empty" every second. Nothing could hear it: a stable-empty tray is reduced to a
+    keyless ``{"id": N}`` stub, so ``tray_presence`` read UNKNOWN forever, unknown fails
+    open, and the binding stood. The mask was correct and present in every push the whole
+    time — it was simply discarded, because it was all-zero beside ``power_on_flag`` False.
+
+    An all-zero mask must repeat before it may empty a slot, so the release lands on the
+    third push and not the first. Two passes is the ceiling the plate-gate class needs;
+    this is well inside it.
+    """
+    spool = await _bind(db_session, wired.printer.id)
+    slot = (wired.printer.id, 0, 0)
+    push = _printer_1_pushall(trays, power_on=power_on)
+
+    with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
+        for _ in range(3):
+            await _push(wired, passes, json.loads(json.dumps(push)))
+
+    assert await _assignment(sessions, *slot) is None, "the firmware's own answer must release the binding"
+    released = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _PIPELINE_LOGGER and "release" in r.getMessage() and "reason=cleared_tray" in r.getMessage()
+    ]
+    assert released and f"spool={spool.id}" in released[0]
+    assert _pushall_count(wired.client) == 0, "the wire already answered — nothing is owed"
+
+
+async def test_a_seated_roll_survives_the_same_report_shape(db_session, wired, sessions, passes):
+    """The liveness fix's own blast radius: the SET bit says the slot is occupied, so the
+    identical keyless stub must NOT release. A cure that also empties live slots is worse
+    than the disease."""
+    await _bind(db_session, wired.printer.id)
+    slot = (wired.printer.id, 0, 0)
+
+    for _ in range(3):
+        await _push(wired, passes, _printer_1_pushall([{"id": "0"}], bits="1", power_on=False))
+
+    assert await _assignment(sessions, *slot) is not None
+    assert _pushall_count(wired.client) == 0
 
 
 async def test_a_mid_print_insert_is_still_protected_end_to_end(db_session, wired, sessions, passes):

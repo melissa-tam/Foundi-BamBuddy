@@ -1231,8 +1231,6 @@ export interface AppSettings {
   // Resume a runout-PAUSEd print automatically when the AMS slot the firmware is
   // demanding gets refilled (006-H2S 2026-07-26). Default true.
   runout_auto_resume_enabled: boolean;
-  // Silently auto-create spool records for AMS trays that have no RFID tag.
-  auto_add_untagged: boolean;
   // JSON string default filament pushed to BARE tagless trays (mirrors
   // gcode_snippets serialization). Empty string / null = feature off.
   tagless_default_filament: string | null;

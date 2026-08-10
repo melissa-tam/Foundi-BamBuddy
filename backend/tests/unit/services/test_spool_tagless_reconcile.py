@@ -647,17 +647,28 @@ class TestBoundPresenceStaleArm:
     asserting ``tray_type: ""``, zero releases in two days, because H2S omits a stable-
     empty tray from its incrementals and nothing ever asked for a full report).
 
-    The arm asks ONCE PER EPISODE, where an episode is one continuous run of the same
-    reading on the same binding. It ends on a presence VALUE change or a binding change,
-    never on a timer."""
+    The arm ASKS UNTIL ANSWERED, on a backoff ladder within one episode — an episode
+    being one continuous run of the same reading on the same binding. It ends on a
+    presence VALUE change or a binding change, never on a timer. The OPERATOR is told
+    once, at the third ask, once the machine has had every chance the ladder allows."""
 
     _PAST = _T0 + spool_tagless._BOUND_PRESENCE_STALE_AFTER_S + 1.0
+
+    @staticmethod
+    def _rungs() -> list[float]:
+        """Ages (from episode open) at which the first four asks are due."""
+        due = spool_tagless._BOUND_PRESENCE_STALE_AFTER_S
+        out = [due]
+        for gap in (*spool_tagless._PRESENCE_ASK_GAPS_S, spool_tagless._PRESENCE_ASK_INTERVAL_S):
+            due += gap
+            out.append(due)
+        return out
 
     @pytest.mark.parametrize(
         ("shape", "tray"),
         [("unknown", _unknown_tray(1)), ("asserted_empty", _cleared_tray(1))],
     )
-    async def test_a_persistent_stale_reading_flags_the_slot_and_asks_the_printer(
+    async def test_a_persistent_stale_reading_asks_the_printer_then_flags_the_slot(
         self, db_session, printer_factory, env, shape, tray
     ):
         printer = await printer_factory(name="003-H2S")
@@ -668,34 +679,49 @@ class TestBoundPresenceStaleArm:
         assert manager.pushall_calls == [], "first sighting only opens the episode"
         env.ws.assert_not_awaited()
 
-        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+        rungs = self._rungs()
+        # Asks 1 and 2 are quiet: the machine may simply not have answered yet.
+        for rung in rungs[:2]:
+            await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0 + rung + 1.0)
+        assert manager.pushall_calls == [(printer.id, "bound_presence_unknown")] * 2
+        env.ws.assert_not_awaited()
 
-        assert manager.pushall_calls == [(printer.id, "bound_presence_unknown")]
+        # Ask 3 escalates to the human, once.
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0 + rungs[2] + 1.0)
+        assert len(manager.pushall_calls) == 3
         payload = env.ws.await_args.args[0]
         assert payload["type"] == "slot_standing_unknown"
         assert payload["case"] == "bound_presence_unknown"
         assert (payload["printer_id"], payload["ams_id"], payload["tray_id"]) == (printer.id, 0, 1)
         assert payload["printer_name"] == "003-H2S"
 
-    async def test_an_open_episode_fires_exactly_once_however_long_it_stands(self, db_session, printer_factory, env):
-        """The wire has answered: if the requested report arrived and the reading still
-        stands, that IS the printer's answer. Asking again says nothing new."""
+    async def test_the_asks_follow_the_backoff_ladder_and_never_the_pass_cadence(
+        self, db_session, printer_factory, env
+    ):
+        """Between rungs the pass runs and asks NOTHING — the ladder paces the requests,
+        not the reconcile tick."""
         printer = await printer_factory()
         await _seed_assignment(db_session, printer.id, 0, 1)
         manager = _FakeManager({printer.id: _state([_cleared_tray(1)])})
 
+        # Passes are spaced past the lane's own _RECONCILE_MIN_INTERVAL_S floor, so what
+        # is being measured here is the ASK ladder and not that floor.
+        gap = spool_tagless._RECONCILE_MIN_INTERVAL_S + 10.0
         await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
-        for tick in range(1, 8):
-            when = self._PAST + tick * spool_tagless._BOUND_PRESENCE_STALE_AFTER_S
-            await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=when)
+        for expected, rung in enumerate(self._rungs(), start=1):
+            # A pass just BEFORE the rung is due changes nothing…
+            await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0 + rung - gap)
+            assert len(manager.pushall_calls) == expected - 1
+            # …and the rung itself buys exactly one request, however often the lane runs.
+            await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0 + rung)
+            await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0 + rung + gap)
+            assert len(manager.pushall_calls) == expected
 
-        assert manager.pushall_calls == [(printer.id, "bound_presence_unknown")]
-        assert env.ws.await_count == 1
-
-    async def test_the_a1_family_constant_state_costs_one_signal_per_slot_ever(self, db_session, printer_factory, env):
+    async def test_the_a1_family_constant_state_costs_one_toast_per_episode(self, db_session, printer_factory, env):
         """A1/P1S report a constant ``state=3``, so presence there is unknowable BY
-        DIALECT and no report can ever settle it. Episode semantics are what stop that
-        from becoming an hourly toast forever — one signal, then silence."""
+        DIALECT and no report can ever settle it. The quiet hourly asks continue (they
+        cost one report each and cannot be distinguished, from inside, from a printer
+        that is about to start answering), but the OPERATOR is told exactly once."""
         printer = await printer_factory(model="A1")
         await _seed_assignment(db_session, printer.id, 0, 1)
         manager = _FakeManager({printer.id: _state([_a1_tray(1)])})
@@ -704,12 +730,13 @@ class TestBoundPresenceStaleArm:
         for tick in range(1, 25):  # a day of passes on a printer that can never answer
             await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST + tick * 3600.0)
 
-        assert manager.pushall_calls == [(printer.id, "bound_presence_unknown")]
-        assert env.ws.await_count == 1
+        assert len(manager.pushall_calls) > 1, "the ladder keeps asking — silence is not an answer"
+        assert all(call == (printer.id, "bound_presence_unknown") for call in manager.pushall_calls)
+        assert env.ws.await_count == 1, "…but the human is told once per episode"
 
     async def test_a_presence_value_change_closes_the_episode_and_re_arms(self, db_session, printer_factory, env):
         """PRESENT ends the episode outright; the next stale reading is a NEW situation,
-        timed from when it started and entitled to its own single ask."""
+        timed from when it started and starting the ladder over."""
         printer = await printer_factory()
         await _seed_assignment(db_session, printer.id, 0, 1)
         key = (printer.id, 0, 1)
@@ -719,7 +746,7 @@ class TestBoundPresenceStaleArm:
         await spool_tagless.reconcile_slot_config(db_session, manager=stale, now=_T0)
         await spool_tagless.reconcile_slot_config(db_session, manager=stale, now=self._PAST)
         assert len(stale.pushall_calls) == 1
-        assert spool_tagless._presence_stale_episodes[key].fired is True
+        assert spool_tagless._presence_stale_episodes[key].asks == 1
 
         await spool_tagless.reconcile_slot_config(db_session, manager=present, now=self._PAST + 60)
         assert key not in spool_tagless._presence_stale_episodes, "PRESENT closes the episode"
@@ -747,7 +774,7 @@ class TestBoundPresenceStaleArm:
         await spool_tagless.reconcile_slot_config(db_session, manager=empty, now=flip)
 
         episode = spool_tagless._presence_stale_episodes[key]
-        assert (episode.presence, episode.first_seen, episode.fired) == (False, flip, False)
+        assert (episode.presence, episode.first_seen, episode.asks) == (False, flip, 0)
         assert empty.pushall_calls == []
 
         await spool_tagless.reconcile_slot_config(db_session, manager=empty, now=flip + 60)
@@ -788,21 +815,26 @@ class TestBoundPresenceStaleArm:
         assert manager.pushall_calls == []
         env.ws.assert_not_awaited()
 
-    async def test_a_refused_report_request_still_spends_the_episode(self, db_session, printer_factory, env):
-        """A refusal (disconnected / inside the client's pacing floor) is NOT retried
-        within the episode: a reconnect re-pushes a full report by itself, which moves
-        the reading and opens a fresh episode. Retrying here would only re-ask a printer
-        that cannot answer."""
+    async def test_a_refused_report_request_spends_its_rung_and_the_ladder_retries(
+        self, db_session, printer_factory, env
+    ):
+        """A refusal (disconnected / inside the client's pacing floor) spends its rung and
+        is NOT re-tried on the next pass — but the LADDER retries it, which is the whole
+        point: pacing and disconnection are exactly the conditions the later rungs exist
+        to outlast, and from inside, a refused ask and an unanswered one look the same."""
         printer = await printer_factory()
         await _seed_assignment(db_session, printer.id, 0, 1)
         manager = _FakeManager({printer.id: _state([_cleared_tray(1)])}, pushall_ok=False)
 
         await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
         await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
-        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST + 3600)
+        assert len(manager.pushall_calls) == 1
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST + 60)
+        assert len(manager.pushall_calls) == 1, "not re-asked at the pass cadence"
 
-        assert manager.pushall_calls == [(printer.id, "bound_presence_unknown")]
-        assert env.ws.await_count == 1
+        rungs = self._rungs()
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0 + rungs[1] + 1.0)
+        assert len(manager.pushall_calls) == 2, "the next rung retries the refused ask"
 
     async def test_a_rebind_opens_a_new_episode(self, db_session, printer_factory, env):
         """Episode identity includes the SPOOL: a different roll bound to the same stale

@@ -255,10 +255,6 @@ class TestBareTray:
             await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(tag=_VALID_TAG))
             is False
         )
-        # auto_add_untagged off → skip.
-        env.settings["auto_add_untagged"] = "false"
-        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is False
-        env.settings["auto_add_untagged"] = "true"
         # setting cleared (feature off) → skip.
         env.settings["tagless_default_filament"] = ""
         assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is False
@@ -416,13 +412,13 @@ class TestForceBareTray:
 
     async def test_force_still_respects_the_other_guards(self, db_session, printer_factory, env):
         printer = await printer_factory()
-        # auto_add off → force does NOT override.
-        env.settings["auto_add_untagged"] = "false"
+        # Cleared default (feature off) → force does NOT override.
+        env.settings["tagless_default_filament"] = ""
         assert (
             await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True)
             is False
         )
-        env.settings["auto_add_untagged"] = "true"
+        env.settings.pop("tagless_default_filament", None)
         # Already-configured (non-bare) tray → force does NOT override.
         assert (
             await spool_tagless.maybe_autoconfigure_bare_tray(

@@ -348,6 +348,24 @@ class TestPromptAccessor:
         spool_respool.clear_respool_prompt_dedup(7, 0, 1)
         assert spool_respool.respool_prompt_open_for_slot(7, 0, 1) is False
 
+    def test_a_tier3_observation_is_not_an_open_prompt(self):
+        """The 2026-08-10 demotion turned tier 3 into a log line, and its dedup is a
+        SEPARATE dict for two reasons that both land here. An entry in the prompt
+        record would resurrect the retired modal through the reconnect replay — and
+        it would make THIS reconcile defer forever, waiting on an answer to a
+        question nobody is being asked. Which matters: a corroborated remain jump is
+        exactly the shape this reconcile exists to correct (rule 10 — on this fleet a
+        wire-vs-ledger contradiction is misattribution, never a refill story), so the
+        deferral must not outlive the prompt that justified it."""
+        spool_respool._respool_observation_logged[7] = {(0, 1): (TAG_UID, TRAY_UUID)}
+        try:
+            assert spool_respool.respool_prompt_open_for_slot(7, 0, 1) is False
+            # ...and the shared empty-slot edge still re-arms it for the next roll.
+            spool_respool.clear_respool_prompt_dedup(7, 0, 1)
+            assert spool_respool._respool_observation_logged[7] == {}
+        finally:
+            spool_respool._respool_observation_logged.pop(7, None)
+
 
 @pytest.mark.asyncio
 class TestSpentRowsAreLeftToTheirOwnMachine:

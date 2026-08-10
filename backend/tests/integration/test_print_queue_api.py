@@ -3,6 +3,8 @@
 import pytest
 from httpx import AsyncClient
 
+from backend.app.services import spool_selection
+
 
 class TestPrintQueueAPI:
     """Integration tests for /api/v1/queue endpoints."""
@@ -592,14 +594,14 @@ class TestQueueStartEndpoint:
             return []
 
         async def _blocked(_db, _item):
-            return [1]
+            return {1: spool_selection.START_BLOCK_BELOW_FLOOR}
 
         monkeypatch.setattr(
             "backend.app.api.routes.print_queue.compute_deficit_for_queue_item",
             _no_deficit,
         )
         monkeypatch.setattr(
-            "backend.app.services.spool_selection.start_rule_blocked_slots",
+            "backend.app.services.spool_selection.start_rule_block_kinds",
             _blocked,
         )
 
@@ -616,6 +618,55 @@ class TestQueueStartEndpoint:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("kinds", "expected_code"),
+        [
+            ({1: "unknown_grams"}, "start_spool_unknown_grams"),
+            # Mixed: at least one roll IS priced below the floor, and "below
+            # minimum" is the true statement about that one — so the whole hold is
+            # worded that way (dominant_start_block owns the rule).
+            ({1: "unknown_grams", 2: "below_floor"}, "start_spool_below_minimum"),
+        ],
+    )
+    async def test_start_409_names_the_right_start_block_kind(
+        self,
+        async_client: AsyncClient,
+        queue_item_factory,
+        monkeypatch,
+        kinds,
+        expected_code,
+    ):
+        """An UNPRICED starting spool gets its own 409 code. The two blocks need
+        different operator actions — top the roll up vs. weigh/assign it — and
+        one dialog claiming "below the minimum start weight" for a spool the farm
+        has no weight for at all is simply false."""
+        item = await queue_item_factory(manual_start=True)
+
+        async def _no_deficit(_db, _item):
+            return []
+
+        async def _blocked(_db, _item):
+            return kinds
+
+        monkeypatch.setattr(
+            "backend.app.api.routes.print_queue.compute_deficit_for_queue_item",
+            _no_deficit,
+        )
+        monkeypatch.setattr(
+            "backend.app.services.spool_selection.start_rule_block_kinds",
+            _blocked,
+        )
+
+        response = await async_client.post(f"/api/v1/queue/{item.id}/start")
+        assert response.status_code == 409
+        body = response.json()
+        assert body["detail"]["code"] == expected_code
+        # The slot list stays the key view of the SAME record, so the code and the
+        # slots can never come from two different computations.
+        assert body["detail"]["slots"] == list(kinds)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_start_skip_flag_bypasses_start_spool_floor(
         self,
         async_client: AsyncClient,
@@ -629,10 +680,10 @@ class TestQueueStartEndpoint:
 
         async def _blocked(_db, _item):
             called["start_rule"] = True
-            return [1]
+            return {1: spool_selection.START_BLOCK_BELOW_FLOOR}
 
         monkeypatch.setattr(
-            "backend.app.services.spool_selection.start_rule_blocked_slots",
+            "backend.app.services.spool_selection.start_rule_block_kinds",
             _blocked,
         )
 
@@ -795,14 +846,14 @@ class TestQueueStartEndpoint:
 
         async def _blocked(_db, _item):
             called["start_rule"] = True
-            return [1]
+            return {1: spool_selection.START_BLOCK_BELOW_FLOOR}
 
         monkeypatch.setattr(
             "backend.app.api.routes.print_queue.compute_deficit_for_queue_item",
             _no_deficit,
         )
         monkeypatch.setattr(
-            "backend.app.services.spool_selection.start_rule_blocked_slots",
+            "backend.app.services.spool_selection.start_rule_block_kinds",
             _blocked,
         )
 

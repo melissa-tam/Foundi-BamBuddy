@@ -665,7 +665,7 @@ class MQTTBridge:
                 apply_tray_exist_bits(
                     units if isinstance(units, list) else [],
                     merged_ams_dict.get("tray_exist_bits"),
-                    power_on_flag=merged_ams_dict.get("power_on_flag", True),
+                    ams_exist_bits=merged_ams_dict.get("ams_exist_bits"),
                     log_label=self.vp_name,
                 )
             self._latest_print_state = new_state

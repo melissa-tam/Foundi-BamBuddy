@@ -24,7 +24,11 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services.filament_deficit import FilamentDeficit, compute_deficit_for_queue_item
 from backend.app.services.print_scheduler import PrintScheduler
-from backend.app.services.spool_selection import MatchOutcome
+from backend.app.services.spool_selection import (
+    START_BLOCK_BELOW_FLOOR,
+    START_BLOCK_UNKNOWN_GRAMS,
+    MatchOutcome,
+)
 
 
 def _deficit(printer_id_override=None, ams_mapping_override=None, slots=1):
@@ -405,7 +409,7 @@ async def test_pinned_start_block_stages_with_reason(cq_scheduler, db_session, p
     monkeypatch.setattr(
         cq_scheduler,
         "_compute_ams_mapping_for_printer",
-        AsyncMock(return_value=MatchOutcome(mapping=None, start_blocked_slots=[1])),
+        AsyncMock(return_value=MatchOutcome(mapping=None, start_block_kinds={1: START_BLOCK_BELOW_FLOOR})),
     )
     monkeypatch.setattr(cq_scheduler, "_is_printer_idle", lambda pid: True)
     monkeypatch.setattr(cq_scheduler, "_get_printer", AsyncMock(return_value=printer))
@@ -436,6 +440,52 @@ async def test_pinned_start_block_stages_with_reason(cq_scheduler, db_session, p
 
 
 @pytest.mark.asyncio
+async def test_pinned_unknown_grams_block_stages_with_its_own_reason(
+    cq_scheduler, db_session, printer_factory, monkeypatch
+):
+    """A printer whose only matching roll is UNPRICEABLE stages too — and says so.
+    Claiming "below minimum" would send the operator to top up a roll that may be
+    full; the honest ask is a weight for it."""
+    printer = await printer_factory(model="H2S")
+    item = PrintQueueItem(
+        printer_id=printer.id, status="pending", manual_start=False, filament_short=False, position=1, plate_id=1
+    )
+    db_session.add(item)
+    await db_session.commit()
+    await db_session.refresh(item)
+    item_id = item.id
+
+    monkeypatch.setattr(
+        cq_scheduler,
+        "_compute_ams_mapping_for_printer",
+        AsyncMock(return_value=MatchOutcome(mapping=None, start_block_kinds={1: START_BLOCK_UNKNOWN_GRAMS})),
+    )
+    monkeypatch.setattr(cq_scheduler, "_is_printer_idle", lambda pid: True)
+    monkeypatch.setattr(cq_scheduler, "_get_printer", AsyncMock(return_value=printer))
+    monkeypatch.setattr(sched_mod.printer_manager, "is_connected", lambda pid: True)
+    start_mock = AsyncMock()
+    monkeypatch.setattr(cq_scheduler, "_start_print", start_mock)
+
+    await cq_scheduler.check_queue()
+
+    start_mock.assert_not_awaited()  # an unpriced roll never starts a print
+    db_session.expire_all()
+    row = (
+        await db_session.execute(
+            select(
+                PrintQueueItem.ams_mapping,
+                PrintQueueItem.manual_start,
+                PrintQueueItem.waiting_reason,
+            ).where(PrintQueueItem.id == item_id)
+        )
+    ).one()
+    assert row.ams_mapping is None
+    assert row.manual_start is True
+    assert "weight unknown" in row.waiting_reason
+    assert "below minimum" not in row.waiting_reason
+
+
+@pytest.mark.asyncio
 async def test_model_loop_skips_start_blocked_candidate(cq_scheduler, db_session, printer_factory, monkeypatch):
     """A start-blocked candidate is skipped like a deficit — the item dispatches
     to the next printer whose starting spool clears the floor."""
@@ -453,7 +503,7 @@ async def test_model_loop_skips_start_blocked_candidate(cq_scheduler, db_session
 
     async def _outcome(db, printer_id, item):
         if printer_id == a.id:
-            return MatchOutcome(mapping=None, start_blocked_slots=[1])  # A below floor
+            return MatchOutcome(mapping=None, start_block_kinds={1: START_BLOCK_BELOW_FLOOR})  # A below floor
         return MatchOutcome(mapping=[0])
 
     monkeypatch.setattr(cq_scheduler, "_compute_ams_mapping_for_printer", AsyncMock(side_effect=_outcome))
@@ -494,7 +544,7 @@ async def test_all_candidates_start_blocked_stages_with_start_min_reason(
     monkeypatch.setattr(
         cq_scheduler,
         "_compute_ams_mapping_for_printer",
-        AsyncMock(return_value=MatchOutcome(mapping=None, start_blocked_slots=[1])),
+        AsyncMock(return_value=MatchOutcome(mapping=None, start_block_kinds={1: START_BLOCK_BELOW_FLOOR})),
     )
     monkeypatch.setattr(cq_scheduler, "_compute_deficit_safe", AsyncMock(return_value=[]))  # no true deficit
     start_mock = AsyncMock()
@@ -540,7 +590,7 @@ async def test_mixed_block_stages_generic_filament_short(cq_scheduler, db_sessio
     async def _outcome(db, printer_id, item):
         # A is start-blocked; B has a mapping (its block will be a true deficit).
         if printer_id == a.id:
-            return MatchOutcome(mapping=None, start_blocked_slots=[1])
+            return MatchOutcome(mapping=None, start_block_kinds={1: START_BLOCK_BELOW_FLOOR})
         return MatchOutcome(mapping=[0])
 
     async def _deficit_for(db, item, *, printer_id_override=None, ams_mapping_override=None):

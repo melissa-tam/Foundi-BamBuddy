@@ -59,6 +59,11 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
       return t('productionRuns.detail.waiting.spoolJamRecoveryFailed');
     case 'filament_runout_recovery_failed':
       return t('productionRuns.detail.waiting.filamentRunoutRecoveryFailed');
+    case 'external_spool_runout':
+      // The EXTERNAL spool holder ran dry, not an AMS slot. The distinction is
+      // the whole point of the token: telling an operator to refill an AMS slot
+      // here sends them to the wrong side of the machine.
+      return t('productionRuns.detail.waiting.externalSpoolRunout');
     case 'spool_physical_fault':
       return t('productionRuns.detail.waiting.spoolPhysicalFault');
     default:

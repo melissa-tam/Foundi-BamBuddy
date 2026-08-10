@@ -191,6 +191,7 @@ export default {
         visionHold: 'Visione della stampante: piatto non vuoto — libera il piatto, poi riprendi sulla stampante',
         previousPrintFailed: 'Trattenuta: la stampa precedente non è riuscita',
         filamentShort: 'Filamento insufficiente',
+        externalSpoolRunout: 'La bobina esterna è esaurita — ricarica il supporto esterno, non uno slot AMS',
         startSpoolBelowMinimum: 'La bobina assegnata è al di sotto del peso minimo di avvio',
         filamentUnreadPending: 'Filamento non letto — lettura della bobina inserita in corso',
         no_usb_drive: 'Nessuna chiavetta USB nella stampante — inserisci un\'unità USB-A (FAT32/exFAT)',
@@ -787,7 +788,6 @@ export default {
     // Toast messages
     toast: {
       printerDeleted: 'Stampante eliminata',
-      missingSpoolAssignment: 'Stampa avviata su {{printer}}. Mancano assegnazioni bobina per: {{slots}}',
       printerAdded: 'Stampante aggiunta',
       printerUpdated: 'Stampante aggiornata',
       failedToDelete: 'Impossibile eliminare stampante',
@@ -907,6 +907,8 @@ export default {
     controls: 'Controlli',
     // RFID
     rfid: {
+      disabledFilamentEngaged: 'Scarica prima il filamento — l’AMS non può leggere un tag mentre il filamento è caricato',
+      disabledWhileDrying: 'Non disponibile mentre l’AMS sta asciugando',
       reread: 'Rileggi RFID',
     },
     // AMS load/unload (#891)
@@ -1552,6 +1554,8 @@ export default {
       confirmTitle: 'Avviare con una bobina quasi esaurita?',
       confirmIntro: 'La bobina assegnata può coprire questa stampa ma è al di sotto del peso minimo di avvio. Avviare comunque?',
       slots: 'Slot interessati: {{slots}}',
+      unknownGramsTitle: 'Avviare con una bobina non pesata?',
+      unknownGramsIntro: 'Non è registrato alcun peso per la bobina corrispondente, quindi non si può dimostrare che la stampa arrivi in fondo. Pesa o assegna la bobina, oppure avvia comunque.',
       printAnyway: 'Avvia comunque',
     },
     farm: {
@@ -2283,8 +2287,6 @@ export default {
     spoolRecoveryStepTimeoutDesc: 'Per quanto tempo può durare ogni passo di recupero prima di essere considerato fallito (15-600 s).',
     spoolRecoveryProtectLayers: 'Proteggi i primi strati',
     spoolRecoveryProtectLayersDesc: 'Durante i primi N strati, le bobine sotto il peso minimo di avvio non sono ammesse come sostituto; dopo di ciò possono essere usate. 0 = le bobine quasi esaurite sono sempre ammesse.',
-    autoAddUntagged: 'Aggiungi automaticamente i vassoi senza tag',
-    autoAddUntaggedDesc: 'Crea automaticamente una bobina di inventario per i vassoi AMS privi di tag RFID. Disattiva se preregistri le bobine manualmente per evitare duplicati. Le bobine con tag RFID hanno un proprio interruttore di aggiunta automatica nelle impostazioni Spoolman.',
     taglessDefaultFilament: 'Filamento predefinito per i vassoi nudi senza tag',
     taglessDefaultFilamentDesc: 'Configura automaticamente i vassoi AMS senza tag e non configurati con questo filamento in modo che possano stampare senza impostazioni manuali.',
     taglessBrand: 'Marca',
@@ -4541,7 +4543,6 @@ export default {
     addToInventoryFailed: 'Aggiunta della bobina all\'inventario non riuscita',
     unknownSpoolToast: 'Filamento sconosciuto {{material}} su {{printer}} slot {{slot}} — aggiungerlo all\'inventario?',
     unknownSpoolSlot: 'Slot',
-    taglessMintToast: 'Avviato il tracciamento di una nuova bobina senza tag su {{printer}} slot {{slot}}',
     freshRoll: {
       promptToast: 'Nuova bobina su {{printer}} slot {{slot}}?',
       sameRoll: 'Stessa bobina',
@@ -4995,17 +4996,19 @@ export default {
     empty: 'Vuoto',
     emptySlot: 'Slot vuoto',
     slotEmpty: 'Vuoto',
-    slotUnconfigured: '?',
+    slotStateUnknown: 'Stato dello slot sconosciuto — la stampante non ha comunicato se contiene una bobina',
+    slotStateUnknownShort: 'Sconosciuto',
     slotPresentUnread: 'Bobina presente — non riconosciuta',
     slotStandingUnknown: "{{printer}}: nello slot {{slot}} c'è una bobina che l'AMS non riesce a leggere — controlla",
     outOfRotation: 'Fuori rotazione — rilevato inceppamento bobina; reinserisci la bobina o azzera il contrassegno per riutilizzarla',
     outOfRotationShort: 'Fuori rotazione',
-    emptySlotReset: 'Nessuna bobina assegnata',
     emptySlotBinding: {
       title: 'Ancora assegnata',
       used: '{{grams}} g consumati',
       ranOut: 'esaurita — in attesa di una bobina nuova',
       awaitingInsert: 'in attesa di inserimento (preconfigurata)',
+      seatedUnread: 'inserita — in attesa di identificazione',
+      presenceUnknown: 'non confermata nello slot',
       notInserted: 'non inserita',
       elsewhereHint: '(non inserita — assegnata a {{location}})',
       clear: 'Libera slot',

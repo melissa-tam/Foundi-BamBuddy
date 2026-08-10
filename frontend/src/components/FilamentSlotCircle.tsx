@@ -9,15 +9,17 @@
  *                fallback background when there is no color but a type is known.
  *   isEmpty    - Whether the slot contains no filament.
  *   emptyKind  - Optional refinement of the empty state used to render the
- *                slot border (#1322 follow-up): "physical" for firmware-
- *                confirmed no spool (state 9), "present" for a spool the
- *                firmware says IS seated (state 10/11) but could not read,
- *                "reset" for slots where the user cleared the assignment but
- *                the firmware hasn't positively confirmed emptiness. Ignored
- *                when isEmpty is false. "present" is the loud one: a solid
+ *                slot border (#1322 follow-up): "physical" for a wire-asserted
+ *                empty slot, "present" for a spool the firmware says IS seated
+ *                (state 10/11) but could not read, "unknown" for a slot whose
+ *                presence the wire has not stated either way. Ignored when
+ *                isEmpty is false. "present" is the loud one: a solid
  *                warning-tone ring plus a centred "?" glyph carrying an
  *                aria-label + title, because an unread-but-seated roll used to
  *                render indistinguishably from an empty slot (004-H2S).
+ *                "unknown" is the quiet one: a DIMMER dashed ring plus its own
+ *                title / screen-reader sentence, so "we don't know" never reads
+ *                as the positive claim "nothing is in there".
  *   slotNumber - 1-based slot number to display inside the circle. Accepts
  *                a string for non-numeric labels (e.g. "L" / "R" for the
  *                dual-nozzle external trays, where carrying a separate
@@ -62,16 +64,17 @@ function isLightFilamentColor(hex: string): boolean {
 
 export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, slotNumber, outOfRotation, ranOut, spentCore }: FilamentSlotCircleProps) {
   const { t } = useTranslation();
-  // Reset slots get a quieter border than physical-empty so they read as
-  // "cleared but possibly still has a spool the firmware hasn't confirmed
-  // gone" rather than "definitely no spool".
-  const emptyBorderColor = emptyKind === 'reset' ? '#3d3d3d' : '#666';
+  // Unknown-presence slots get a quieter border than wire-asserted empty so they
+  // read as "the printer has not said" rather than "definitely no spool".
+  const stateUnknown = isEmpty && emptyKind === 'unknown';
+  const emptyBorderColor = stateUnknown ? '#3d3d3d' : '#666';
   // A spool the firmware reports SEATED but could not read (state 10/11). It is
   // not an empty slot and must not look like one: solid warning-tone ring +
   // a "?" glyph in place of the slot number, both carrying the label so the
   // state is never signalled by colour alone.
   const presentUnread = isEmpty && emptyKind === 'present';
   const presentUnreadLabel = t('ams.slotPresentUnread');
+  const stateUnknownLabel = t('ams.slotStateUnknown');
   const outOfRotationLabel = t('ams.outOfRotation');
   const ranOutLabel = t('printers.slot.ranOut');
   const spentCoreLabel = t('printers.slot.spentCore');
@@ -80,7 +83,7 @@ export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, sl
       className={`relative w-3.5 h-3.5 rounded-full mx-auto mb-0.5 border-2 flex items-center justify-center${
         presentUnread ? ' border-amber-600 dark:border-amber-400' : ''
       }`}
-      title={presentUnread ? presentUnreadLabel : undefined}
+      title={presentUnread ? presentUnreadLabel : stateUnknown ? stateUnknownLabel : undefined}
       style={{
         backgroundColor: trayColor ? `#${trayColor}` : (trayType ? '#333' : 'transparent'),
         // The seated-but-unread ring comes from the theme-paired amber classes
@@ -109,6 +112,10 @@ export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, sl
           {slotNumber}
         </span>
       )}
+      {/* Unknown presence keeps the slot number visible (it is still the slot's
+          identity) and carries the state as a screen-reader sentence beside the
+          title above — never colour/border alone (WCAG 1.4.1). */}
+      {stateUnknown && <span className="sr-only">{stateUnknownLabel}</span>}
       {outOfRotation && (
         // Corner warning badge. Not colour-only: an AlertTriangle glyph carries
         // the meaning; aria-label + title expose the tooltip text to screen

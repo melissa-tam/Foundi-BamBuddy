@@ -191,6 +191,7 @@ export default {
         visionHold: '打印机视觉检测：打印板不为空 — 清理热床后在打印机上继续',
         previousPrintFailed: '已搁置：上一次打印失败',
         filamentShort: '耗材不足',
+        externalSpoolRunout: '外置料卷已用尽 — 请补充外置料架，而不是 AMS 料槽',
         startSpoolBelowMinimum: '分配的料卷低于最低起始重量',
         filamentUnreadPending: '耗材未识别 — 正在读取已装入的料卷',
         no_usb_drive: '打印机中没有 USB 驱动器 — 请插入 USB-A 驱动器（FAT32/exFAT）',
@@ -787,7 +788,6 @@ export default {
     // Toast messages
     toast: {
       printerDeleted: '打印机已删除',
-      missingSpoolAssignment: '已在{{printer}}上开始打印。以下料槽未分配耗材: {{slots}}',
       printerAdded: '打印机已添加',
       printerUpdated: '打印机已更新',
       failedToDelete: '删除打印机失败',
@@ -907,6 +907,8 @@ export default {
     controls: '控制',
     // RFID
     rfid: {
+      disabledFilamentEngaged: '请先卸载耗材 — 有耗材进料时 AMS 无法读取标签',
+      disabledWhileDrying: 'AMS 烘干期间不可用',
       reread: '重新读取 RFID',
     },
     // AMS load/unload (#891)
@@ -1552,6 +1554,8 @@ export default {
       confirmTitle: '使用余量偏低的料卷开始？',
       confirmIntro: '分配的料卷足以完成本次打印，但低于最低起始重量。仍要开始吗？',
       slots: '受影响的槽位：{{slots}}',
+      unknownGramsTitle: '使用未称重的料卷开始吗？',
+      unknownGramsIntro: '匹配料卷没有重量记录，因此无法确认这次打印能否完成。请称重或分配该料卷，或者仍然开始。',
       printAnyway: '仍要开始',
     },
     farm: {
@@ -2328,8 +2332,6 @@ export default {
     spoolRecoveryStepTimeoutDesc: '每个恢复步骤在被视为失败之前可运行的时长（15-600 秒）。',
     spoolRecoveryProtectLayers: '保护起始层',
     spoolRecoveryProtectLayersDesc: '在前 N 层内，低于最小起始重量的料盘不能用作替换；此后即可使用。0 表示余量不足的料盘始终可用。',
-    autoAddUntagged: '自动添加无标签料盘',
-    autoAddUntaggedDesc: '为没有 RFID 标签的 AMS 料盘自动创建库存料卷。如果你手动预先登记料卷以避免重复，请关闭此项。带 RFID 标签的料卷在 Spoolman 设置中有各自的自动添加开关。',
     taglessDefaultFilament: '无标签空料盘的默认耗材',
     taglessDefaultFilamentDesc: '用此耗材自动配置未配置的无标签 AMS 料盘，使其无需手动设置即可打印。',
     taglessBrand: '品牌',
@@ -4541,7 +4543,6 @@ export default {
     addToInventoryFailed: '添加料盘到库存失败',
     unknownSpoolToast: '{{printer}} 槽位 {{slot}} 检测到未知耗材 {{material}} — 是否添加到库存？',
     unknownSpoolSlot: '槽位',
-    taglessMintToast: '已开始跟踪 {{printer}} 插槽 {{slot}} 上的新无标签料卷',
     freshRoll: {
       promptToast: '{{printer}} 槽位 {{slot}} 上是新卷吗？',
       sameRoll: '同一卷',
@@ -4995,17 +4996,19 @@ export default {
     empty: '空',
     emptySlot: '空槽位',
     slotEmpty: '空',
-    slotUnconfigured: '?',
+    slotStateUnknown: '料槽状态未知 — 打印机未报告其中是否有料卷',
+    slotStateUnknownShort: '未知',
     slotPresentUnread: '有料卷 — 无法识别',
     slotStandingUnknown: '{{printer}}: 槽位 {{slot}} 中有 AMS 无法读取的料卷 — 请检查',
     outOfRotation: '已移出轮换 — 检测到料卷卡料；重新插入料卷或清除标记即可再次使用',
     outOfRotationShort: '已移出轮换',
-    emptySlotReset: '未分配料盘',
     emptySlotBinding: {
       title: '仍有绑定',
       used: '已用 {{grams}} g',
       ranOut: '已用尽 — 等待新料卷',
       awaitingInsert: '等待装入（已预先配置）',
+      seatedUnread: '已装入 — 等待识别',
+      presenceUnknown: '未确认在此料槽中',
       notInserted: '未装入',
       elsewhereHint: '（未装入 — 已绑定到 {{location}}）',
       clear: '解除槽位绑定',

@@ -885,3 +885,150 @@ async def test_repair_unblocks_the_slot_for_selection(engine, session_maker):
     # does not rebind the slot or touch grams.
     assert after[0].remaining_g == before[0].remaining_g
     assert ids["false_spent"] is not None
+
+
+# ---------------------------------------------------------------------------
+# WS-G: archive the UNBOUND phantom-presence ams_auto spools (2026-08-09/10)
+# ---------------------------------------------------------------------------
+
+_PHANTOM_ERA = datetime(2026, 8, 9, 14, 30, 0)  # inside the measured phantom window
+_PRE_PHANTOM_ERA = datetime(2026, 8, 8, 23, 59, 59)  # one second before it opens
+_PHANTOM_LOG = "[REPAIR] archiving unbound phantom-presence ams_auto spools"
+
+
+async def _make_dated_spool(session, *, created_at, **kwargs):
+    """``_make_spool`` pins ``created_at`` itself, so the era fence needs it re-stamped."""
+    spool = await _make_spool(session, **kwargs)
+    spool.created_at = created_at
+    await session.flush()
+    return spool
+
+
+async def _seed_phantom_fixtures(session_maker):
+    """The qualifying row plus one row per FENCE, each differing from the qualifying
+    shape in EXACTLY ONE attribute. Isolating them matters: if a sibling row tripped two
+    fences at once, dropping either fence from the predicate would still leave the suite
+    green. Returns the ids.
+
+    * ``unbound`` — the phantom shape: ``ams_auto``, 0 g, never fed, not spent, not
+      archived, minted in the phantom era, bound to NOTHING. No runtime path will ever
+      touch it again, so only a migration can clear it.
+    * ``bound`` — byte-identical but BOUND. Deliberately out of scope: the presence fix
+      makes the runtime release and dispose it with a full log trail.
+    * ``spent`` — stamped spent. Ruling R2 forbids every spent-adjacent mutation.
+    * ``fed`` — carries a ``last_used`` feed stamp (doctrine rule 8's evidence field).
+    * ``charged`` — 42 g on the ledger: real consumption above the never-fed floor.
+    * ``operator`` — an operator-created (``manual``) row awaiting its roll. Auto-minted
+      origin is what identifies a phantom; hand-made inventory is untouchable.
+    * ``pre_era`` — otherwise qualifying but minted BEFORE 2026-08-09.
+    """
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    phantom = {"data_origin": "ams_auto", "weight_used": 0.0, "last_used": None}
+    async with session_maker() as session:
+        await _make_printer(session)
+        unbound = await _make_dated_spool(session, created_at=_PHANTOM_ERA, **phantom)
+        bound = await _make_dated_spool(session, created_at=_PHANTOM_ERA, **phantom)
+        spent = await _make_dated_spool(
+            session, created_at=_PHANTOM_ERA, **{**phantom, "spent_at": datetime(2026, 8, 9, 15, 0, 0)}
+        )
+        fed = await _make_dated_spool(
+            session, created_at=_PHANTOM_ERA, **{**phantom, "last_used": datetime(2026, 8, 9, 16, 0, 0)}
+        )
+        charged = await _make_dated_spool(session, created_at=_PHANTOM_ERA, **{**phantom, "weight_used": 42.0})
+        operator = await _make_dated_spool(session, created_at=_PHANTOM_ERA, **{**phantom, "data_origin": "manual"})
+        pre_era = await _make_dated_spool(session, created_at=_PRE_PHANTOM_ERA, **phantom)
+        session.add(SpoolAssignment(spool_id=bound.id, printer_id=1, ams_id=0, tray_id=0))
+        await session.commit()
+        return {
+            "unbound": unbound.id,
+            "bound": bound.id,
+            "spent": spent.id,
+            "fed": fed.id,
+            "charged": charged.id,
+            "operator": operator.id,
+            "pre_era": pre_era.id,
+        }
+
+
+async def _archived_map(conn) -> dict[int, object]:
+    rows = (await conn.execute(text("SELECT id, archived_at FROM spool"))).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+@pytest.mark.asyncio
+async def test_repair_archives_only_the_unbound_never_fed_phantom_row(engine, session_maker, caplog):
+    """A phantom-presence mint that nothing binds is unreachable clutter — no runtime lane
+    observes it, so corrected code can never self-heal it. Exactly that row is archived,
+    and every fence row survives untouched."""
+    ids = await _seed_phantom_fixtures(session_maker)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_DB_LOGGER):
+        async with engine.begin() as conn:
+            await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        archived = await _archived_map(conn)
+
+    assert archived[ids["unbound"]] is not None, "the unbound phantom is archived"
+    assert archived[ids["bound"]] is None, "a bound phantom belongs to the runtime disposal lane"
+    assert archived[ids["spent"]] is None, "ruling R2: never touch a spent row"
+    assert archived[ids["fed"]] is None, "feed evidence (rule 8) protects a real roll"
+    assert archived[ids["charged"]] is None, "grams on the ledger are real consumption"
+    assert archived[ids["operator"]] is None, "hand-made inventory is not auto-minted clutter"
+    assert archived[ids["pre_era"]] is None, "the blast radius stops at the measured era"
+
+    lines = [r.getMessage() for r in caplog.records if _PHANTOM_LOG in r.getMessage()]
+    assert len(lines) == 1, "the matched ids are logged once, BEFORE the mutation"
+    assert str(ids["unbound"]) in lines[0]
+    assert str(ids["bound"]) not in lines[0]
+
+
+@pytest.mark.asyncio
+async def test_phantom_archive_is_idempotent_and_silent_on_a_second_run(engine, session_maker, caplog):
+    """Second run matches nothing (its own predicate requires ``archived_at IS NULL``), so
+    the stamp is never rewritten and a healthy install logs nothing on every restart."""
+    ids = await _seed_phantom_fixtures(session_maker)
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+    async with engine.connect() as conn:
+        first_pass = await _archived_map(conn)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=_DB_LOGGER):
+        async with engine.begin() as conn:
+            await run_migrations(conn)
+    async with engine.connect() as conn:
+        second_pass = await _archived_map(conn)
+
+    assert second_pass == first_pass, "no row changed, and the original stamp was not rewritten"
+    assert first_pass[ids["unbound"]] is not None
+    assert [r.getMessage() for r in caplog.records if _PHANTOM_LOG in r.getMessage()] == []
+
+
+@pytest.mark.asyncio
+async def test_archived_phantom_leaves_the_operator_inventory_list(engine, session_maker):
+    """LIVENESS PIN. Clearing the column is only the mechanism; the CONSEQUENCE the repair
+    exists for is that the clutter leaves the operator's inventory. Asserted through the
+    real consumer (``inventory.list_spools``), because a repair verified only by its own
+    column read cannot tell a cure from a predicate that matched nothing."""
+    from backend.app.api.routes.inventory import list_spools
+
+    ids = await _seed_phantom_fixtures(session_maker)
+
+    async with session_maker() as session:
+        before = {s.id for s in await list_spools(include_archived=False, db=session, _=None)}
+    assert ids["unbound"] in before, "pre-repair the phantom clutters the active inventory"
+
+    async with engine.begin() as conn:
+        await run_migrations(conn)
+
+    async with session_maker() as session:
+        after = {s.id for s in await list_spools(include_archived=False, db=session, _=None)}
+        with_archived = {s.id for s in await list_spools(include_archived=True, db=session, _=None)}
+
+    assert ids["unbound"] not in after, "post-repair the phantom is gone from the active list"
+    assert before - after == {ids["unbound"]}, "and it is the ONLY row the operator loses"
+    assert ids["unbound"] in with_archived, "archived is a soft-hide — the row is kept, never deleted"

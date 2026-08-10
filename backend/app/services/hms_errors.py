@@ -994,6 +994,38 @@ _RUNOUT_DEMAND_CODE32: frozenset[int] = frozenset({0x00020001})
 # to stamp, never slot RESOLUTION, which must keep consuming the whole parent set.
 _RUNOUT_AUTO_SWITCH_SPENT_CODE32: frozenset[int] = frozenset({0x00030002})
 
+# Code words whose OPERATOR NOTIFICATION is suppressed — a statement the firmware
+# makes about work it already finished, where the farm's only correct reaction is
+# bookkeeping. Notification only: ``hms_event`` recording, the spent stamp and every
+# recovery lane read these codes exactly as before.
+#
+#   * 0x00030002 — "…has run out and automatically switched to the slot with the same
+#     filament." The AMS backup RESCUED the print; nothing stopped and nothing is
+#     asked for. The firmware sends it at severity 3 (common), which sits inside the
+#     notify band, so it paged the operator on every successful rescue — 87 alerts in
+#     14 days for prints that never paused.
+#
+# It is deliberately absent from the fault TAXONOMY and must stay absent: it is THE
+# spent evidence (:data:`_RUNOUT_AUTO_SWITCH_SPENT_CODE32`), and a second consumer
+# reading it as a generic fault would double-stamp the operator's ledger. Suppressing
+# a notification is not classifying a fault, which is why the two live apart.
+NOTIFY_SUPPRESSED_CODE32: frozenset[int] = frozenset({0x00030002})
+
+
+def is_notify_suppressed(attr: int, code: int | str) -> bool:
+    """True when this fault's raw operator alert is suppressed (see the set above).
+
+    Scoped by the SAME shape the spent lane consumes — an AMS-module attr that
+    decodes to a slot — never by the short code: ``0x00030002`` masks to the short
+    form ``07xx_0002``, which the assist-motor overload (``0x00020002``) also masks
+    to, and that one must keep alerting. Fails toward NOTIFYING on anything
+    malformed.
+    """
+    try:
+        return _code_word(code) in NOTIFY_SUPPRESSED_CODE32 and ams_slot_from_attr(int(attr or 0)) is not None
+    except (TypeError, ValueError):
+        return False
+
 
 def ams_slot_from_attr(attr: int) -> tuple[int, int] | None:
     """Decode the AMS unit + slot a slot-attributed HMS ``attr`` names, or ``None``.

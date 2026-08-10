@@ -1428,21 +1428,32 @@ async def start_queue_item(
                     "deficit": [d.to_dict() for d in deficit],
                 },
             )
-        # Minimum-start-weight floor (#spool-selection): the assigned spool can
-        # cover the print but is below the start floor (it may only finish a job
-        # already in progress). Surface a distinct 409 so the UI can offer
-        # "Print Anyway" (retry with skip_filament_check=true) rather than a
-        # generic deficit dialog. Only applies to pinned items.
+        # Minimum-start proof (#spool-selection): the assigned spool can cover the
+        # print but cannot be proven able to START it. Surface a distinct 409 so the
+        # UI can offer "Print Anyway" (retry with skip_filament_check=true) rather
+        # than a generic deficit dialog. Only applies to pinned items.
+        #
+        # TWO codes, because the two block kinds need different operator actions and
+        # a dialog that says "below the minimum start weight" for an UNPRICED roll is
+        # simply false — the farm has no weight for it at all, so there is nothing to
+        # top up; it needs weighing or assigning. The kind comes from the same
+        # outcome the slot list does (`start_rule_block_kinds`), so the code and the
+        # slots can never describe different things.
         if item.printer_id is not None:
             from backend.app.services import spool_selection
 
-            blocked_slots = await spool_selection.start_rule_blocked_slots(db, item)
-            if blocked_slots:
+            block_kinds = await spool_selection.start_rule_block_kinds(db, item)
+            if block_kinds:
+                dominant = spool_selection.dominant_start_block(block_kinds.values())
                 raise HTTPException(
                     status_code=409,
                     detail={
-                        "code": "start_spool_below_minimum",
-                        "slots": blocked_slots,
+                        "code": (
+                            "start_spool_unknown_grams"
+                            if dominant == spool_selection.START_BLOCK_UNKNOWN_GRAMS
+                            else "start_spool_below_minimum"
+                        ),
+                        "slots": list(block_kinds),
                     },
                 )
 

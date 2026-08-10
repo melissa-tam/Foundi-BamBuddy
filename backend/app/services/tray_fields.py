@@ -71,6 +71,13 @@ TRAY_STATE_DIALECT: tuple[int, int, int] = (3, 25, 27)
 # so ``ams_presence``/``tray_observation``/``spool_recovery`` keep their one origin.
 TRAY_PRESENT_STATES = (TRAY_STATE_SEATED, TRAY_STATE_FED)
 
+# Trays per bitmask-addressable AMS unit. The firmware packs `tray_exist_bits` (and
+# every sibling per-tray mask) as one flat integer addressed ``ams_id * 4 + tray_id``,
+# which is why an AMS-HT unit — one tray, ids >= 128 — cannot be addressed in it at all.
+# Named here because both the bit arithmetic below and ``bambu_mqtt``'s merge-side apply
+# need the stride, and two spellings of it would silently address different slots.
+TRAYS_PER_AMS_UNIT = 4
+
 
 def parse_int_field(raw: object) -> int | None:
     """Parse a numeric tray field to ``int``, or ``None`` when it asserts nothing.
@@ -102,14 +109,18 @@ def parse_tray_state(raw: object) -> int | None:
 
 
 def parse_tray_exist_bits(value: str | int | None) -> int | None:
-    """Parse a firmware ``tray_exist_bits`` value (hex string, or int) to an int.
+    """Parse a firmware exist-bit mask (hex string, or int) to an int.
 
-    Firmware sends the bitmask as a hex string; ints are tolerated for defensive
+    THE hex-mask parser for this dialect: ``tray_exist_bits`` (one bit per slot,
+    addressed ``ams_id * TRAYS_PER_AMS_UNIT + tray_id``) and ``ams_exist_bits`` (one
+    bit per AMS unit) share the encoding, so they share this reader — a second parse
+    is a second place for a mask to be mis-read.
+
+    Firmware sends the mask as a hex string; ints are tolerated for defensive
     symmetry. ``None`` / empty / unparseable → ``None`` (the caller reads that as
-    "this push carried no bitmask"). A genuine ``"0"`` parses to ``0`` — all slots
-    empty is a real answer, distinct from "absent". Used by the ``_handle_ams_data``
-    last-seen cache and by the observation layer; ``apply_tray_exist_bits`` keeps
-    its own inline parse so its bit=0 / power-off contract stays byte-identical.
+    "this push carried no mask"). A genuine ``"0"`` parses to ``0`` — all slots empty
+    is a real answer, distinct from "absent", and the two must never collapse: ``0``
+    IS the firmware saying the unit is bare.
     """
     if value is None or value == "":
         return None
@@ -119,25 +130,69 @@ def parse_tray_exist_bits(value: str | int | None) -> int | None:
         return None
 
 
-def slot_exist_bit_set(bits: int | None, ams_id: object, tray_id: object) -> bool:
-    """True when ``bits`` positively marks (ams_id, tray_id) occupied.
+def slot_exist_bit(bits: int | None, ams_id: object, tray_id: object) -> bool | None:
+    """The exist-bit EVIDENCE for one slot: ``True``/``False``, or ``None`` when none.
 
-    The pure core of ``BambuMQTTClient._slot_exist_bit_known_set``. A missing
-    bitmask (``None``), an unparseable/out-of-range address, or a 0 bit all return
-    False, so callers can treat this as "positive evidence only". AMS-HT units
-    (``id >= 128``) use a separate addressing scheme and are never matched here,
-    mirroring ``apply_tray_exist_bits``.
+    ``None`` is returned for every case in which the mask says nothing ABOUT THIS SLOT,
+    and the distinction carries weight now that a clear bit is release-authorizing
+    evidence (:func:`tray_presence`): a 0 read off an address the mask does not cover
+    would be a fabricated "empty".
+
+    Unaddressable, hence ``None``:
+
+    * no mask at all;
+    * an unparseable ``ams_id`` / ``tray_id``;
+    * an AMS-HT unit (``id >= 128``) — a separate addressing scheme, never packed here;
+    * a ``tray_id`` outside ``0 .. TRAYS_PER_AMS_UNIT - 1``, whose "bit" would in fact
+      be a NEIGHBOURING unit's slot.
+    """
+    if bits is None:
+        return None
+    try:
+        a = int(ams_id)  # type: ignore[arg-type]
+        t = int(tray_id)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if a < 0 or a >= 128:
+        return None
+    if t < 0 or t >= TRAYS_PER_AMS_UNIT:
+        return None
+    return bool((bits >> (a * TRAYS_PER_AMS_UNIT + t)) & 1)
+
+
+def slot_exist_bit_set(bits: int | None, ams_id: object, tray_id: object) -> bool:
+    """True when ``bits`` POSITIVELY marks (ams_id, tray_id) occupied.
+
+    The positive-evidence-only view of :func:`slot_exist_bit`, for the callers whose
+    question is "may I treat this slot as occupied?" — ``BambuMQTTClient``'s stale-clear
+    veto and its raw-side normalizer. Absent evidence and a clear bit are the same
+    answer here (False); a caller that needs to tell them apart wants the tri-state.
+    """
+    return slot_exist_bit(bits, ams_id, tray_id) is True
+
+
+def unit_exist_bit_set(bits: int | None, ams_id: object) -> bool:
+    """True when an ``ams_exist_bits`` mask positively marks AMS unit ``ams_id`` present.
+
+    Unit-level twin of :func:`slot_exist_bit_set` (bit index = the unit id, AMS-HT
+    excluded for the same reason). Callers use it to GATE tray-level exist-bit evidence:
+    a unit the firmware does not list is a unit whose slice of ``tray_exist_bits`` is
+    zero for the trivial reason that it is not being reported, and reading those zeros
+    as "four empty trays" invents the one answer that authorizes a release.
+
+    Positive evidence only, and the gating is evidence-REMOVING by construction: an
+    absent/unparseable ``ams_exist_bits`` must be handled by the caller as "no gating"
+    (unknown fails OPEN), never as "no unit exists".
     """
     if bits is None:
         return False
     try:
         a = int(ams_id)  # type: ignore[arg-type]
-        t = int(tray_id)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return False
-    if a < 0 or a >= 128 or t < 0:
+    if a < 0 or a >= 128:
         return False
-    return bool((bits >> (a * 4 + t)) & 1)
+    return bool((bits >> a) & 1)
 
 
 def parse_filam_bak(source: object) -> list[int] | None:
@@ -212,37 +267,45 @@ def tray_presence(state: int | None, tray_type: str | None, exist_bit: bool | No
 
     One origin for every consumer (the observation layer, the assignments API, the
     weight-sync tool, the deficit pricer, the scheduler's candidate filter, the
-    unassigned-tray alert, the K-persist route). Answers:
+    unassigned-tray alert, the K-persist route). Consumers gate on ``is False`` ONLY —
+    unknown always fails OPEN.
 
-    * ``True``  — ``state`` is in :data:`TRAY_PRESENT_STATES` (10 = seated, 11 = fed).
-    * ``False`` — ``state`` parsed, is not a present code, AND ``tray_type`` was
-      asserted EMPTY (``""``). That pair is the verified prod cleared-tray shape
-      (state 9 + ``tray_type: ""``); it is the ONLY shape that may drive a release
-      or a consumer skip. One veto: when the push's own ``tray_exist_bits`` still
-      marks the slot occupied (the 003-H2S mid-print-insert quirk, where the
-      per-tray state sticks at 9 while the bitmask reports the spool), the
-      contradiction resolves to UNKNOWN — never to EMPTY, because "empty" is what
-      authorizes destructive action.
-    * ``None``  — anything else: no parseable state (a partial push), a dialect that
-      never reports presence (the A1-family/P1S always-``state=3`` firmwares), or a
-      state-9 slot that still asserts a filament type (the 004-H2S
-      state-9-while-feeding dialect).
+    ``exist_bit`` is THE firmware's own answer for this slot and outranks the per-tray
+    ``state``/``tray_type`` pair in BOTH directions, because the pair is what the
+    firmware is unreliable about: a mid-print insert leaves ``state`` stuck at 9 with
+    the bit set (003-H2S), and a stable-empty tray is reduced to a keyless ``{"id": N}``
+    stub that asserts nothing at all. It must therefore reach here only when it is
+    TRUSTED — the client is the one authority on that (``bambu_mqtt``: a set bit is
+    positive evidence and trusted at once, an all-zero mask must repeat before it may
+    empty a slot) and strips an untrusted mask before the observation layer ever sees
+    it. ``None`` here means the caller HAS no bit for the slot: no mask in the push, an
+    AMS-HT / out-of-range address, or a unit ``ams_exist_bits`` does not list.
 
-    Consumers gate on ``is False`` ONLY — unknown always fails OPEN.
+    | ``exist_bit`` | ``state``              | answer  | why                                    |
+    |---------------|------------------------|---------|----------------------------------------|
+    | ``True``      | any                    | ``True``  | the bit IS the seating; subsumes the 003-H2S stuck-9 class |
+    | ``False``     | in TRAY_PRESENT_STATES | ``None``  | in-push contradiction — a release needs UNCONTRADICTED emptiness |
+    | ``False``     | anything else          | ``False`` | the firmware says the slot is bare, whatever the tray block omitted |
+    | ``None``      | in TRAY_PRESENT_STATES | ``True``  | 10 = seated, 11 = fed                  |
+    | ``None``      | parsed, ``tray_type == ""`` | ``False`` | the verified prod cleared shape (state 9 + empty type) |
+    | ``None``      | anything else          | ``None``  | a partial push, an always-``state=3`` dialect, or state 9 still asserting a type (004-H2S feeds whole prints there) |
 
     ``tray_type`` must carry assertion (see :func:`asserted_str_field`): ``None``
-    means "not asserted", ``""`` means "asserted empty". The raw stream is
-    normalized BEFORE observation, so a minimal ``{id, state == 9}`` partial that
-    passes the exist-bit veto reaches here with an injected asserted-empty shape
-    (deliberate — ``bambu_mqtt._normalize_cleared_trays``) and answers ``False``
-    instead of ``None``; that is the ONLY way a boot-forgotten slot ever becomes
-    releasable.
+    means "not asserted", ``""`` means "asserted empty". The raw stream is normalized
+    BEFORE observation, so a minimal ``{id, state == 9}`` partial that passes the
+    exist-bit veto reaches here with an injected asserted-empty shape (deliberate —
+    ``bambu_mqtt._normalize_cleared_trays``), which is how a boot-forgotten slot
+    becomes releasable on a dialect that carries no mask at all.
     """
+    if exist_bit is True:
+        return True
+    if exist_bit is False:
+        # A trusted clear bit is the firmware's answer, and the ONLY thing that may
+        # override it is the same push contradicting itself.
+        return None if state in TRAY_PRESENT_STATES else False
     if state in TRAY_PRESENT_STATES:
         return True
     if state is not None and tray_type == "":
-        if exist_bit is True:
-            return None
         return False
     return None
 
@@ -254,11 +317,13 @@ def tray_presence_from_dict(tray: object) -> bool | None:
     a raw pre-merge push: parses ``state`` and ``tray_type`` with THIS module's own
     parsers so a merged-data consumer can never disagree with the observation layer.
 
-    No exist-bit is consulted: the bitmask is a per-PUSH sibling field, and the
-    merged view keeps no honest per-tray copy of it, so passing a stale bit would
-    manufacture a veto. Omitting it can only make the answer *less* decisive
-    (``False`` instead of ``None``) for the one 003-H2S shape — and the merge's own
-    9→10 promotion already resolves that case before a consumer sees it.
+    No exist-bit is consulted: the bitmask is a per-PUSH sibling field, and the merged
+    view keeps no honest per-tray copy of it, so passing a stale bit would manufacture
+    an answer out of an old push. It costs nothing, because the merge applies the mask
+    to the trays themselves (``bambu_mqtt.apply_tray_exist_bits``): a set bit promotes
+    the stuck-9 tray to 10, and a clear bit writes the FULL cleared shape, so both
+    polarities reach this function through ``state``/``tray_type`` and a merged reader
+    can no longer answer UNKNOWN for a slot the firmware called empty.
     """
     if not isinstance(tray, dict):
         return None

@@ -14,7 +14,7 @@ import pytest
 
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
-from backend.app.services import farm_staging
+from backend.app.services import farm_staging, spool_selection
 
 # asyncio_mode = "auto" (pyproject) picks up the async tests; the signature
 # tests below are plain sync functions, so no module-level asyncio mark.
@@ -122,7 +122,9 @@ class TestReleaseFilamentStaged:
         # D9: staged rows now carry a rich "Low filament: <printer> (...)" reason.
         # Release must clear it (STAGING_REASON_PREFIX match), not just the legacy
         # bare token, so a released item keeps no stale hold reason.
-        reason = farm_staging.build_staged_reason("011-H2S, 002-H2S", start_min=True)
+        reason = farm_staging.build_staged_reason(
+            "011-H2S, 002-H2S", start_block=spool_selection.START_BLOCK_BELOW_FLOOR
+        )
         item = await _add_staged(db_session, printer_id=1, waiting_reason=reason)
         _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
         assert await farm_staging.release_filament_staged(db_session) == 1
@@ -187,6 +189,110 @@ class TestReleaseStartRuleGate:
         assert released == 0  # fail-safe: unknown state never releases
         await db_session.refresh(item)
         assert item.manual_start is True
+
+
+def _tray(gtid=0, ftype="PETG", color="#00FF00"):
+    """One loaded-filament candidate in the shape ``_build_loaded_filaments`` emits."""
+    return {
+        "type": ftype,
+        "color": color,
+        "tray_info_idx": "",
+        "ams_id": 0,
+        "tray_id": gtid,
+        "global_tray_id": gtid,
+        "is_external": False,
+        "remain": 46,
+    }
+
+
+def _patch_real_start_rule(monkeypatch, slot_inv):
+    """Answer the scheduler's mapping computation from ``slot_inv`` (the state of the
+    ONE matching tray) through the REAL matcher, in the same fail-closed START reading
+    dispatch uses — so the release path's floor re-check runs for real
+    (``start_rule_blocks_item`` is NOT stubbed).
+
+    A priced PLA roll rides along on every case so the printer's ledger demonstrably
+    speaks; it can never match the PETG requirement, so each case turns purely on the
+    matching tray."""
+    from backend.app.services.print_scheduler import scheduler as real_scheduler
+
+    reqs = [{"slot_id": 1, "type": "PETG", "color": "#00FF00", "tray_info_idx": "", "used_grams": 100.0}]
+    loaded = [_tray(), _tray(gtid=3, ftype="PLA")]
+    inv = {3: spool_selection.SlotInventory(remaining_g=800.0, first_loaded_ord=1.0), **slot_inv}
+
+    async def _outcome(db, printer_id, item):
+        return spool_selection.match_filaments_to_slots(
+            reqs,
+            loaded,
+            policy="first_loaded",
+            inv=inv,
+            backup_on=True,
+            min_start_g=spool_selection.DEFAULT_MIN_START_SPOOL_G,
+            require_known_grams=True,
+        )
+
+    monkeypatch.setattr(real_scheduler, "_compute_ams_mapping_for_printer", AsyncMock(side_effect=_outcome))
+
+
+class TestReleaseAgainstTheRealStartFloor:
+    """The release↔stage oscillation, pinned through the REAL predicate chain
+    (``start_rule_blocks_item`` → ``start_rule_blocked_slots`` → the matcher).
+
+    A start-weight hold has an EMPTY grams deficit BY CONSTRUCTION — the print's
+    grams-needed is satisfiable, the roll just cannot be proven startable — so a
+    release decided on the deficit alone un-stages every pass while the scheduler
+    re-stages every tick. Both sides must read one floor."""
+
+    async def test_below_floor_roll_is_not_released(self, db_session, monkeypatch):
+        item = await _add_staged(
+            db_session, printer_id=1, waiting_reason=farm_staging.spool_selection.WAITING_REASON_START_MIN
+        )
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        _patch_real_start_rule(monkeypatch, {0: spool_selection.SlotInventory(remaining_g=46.0, first_loaded_ord=1.0)})
+        assert await farm_staging.release_filament_staged(db_session) == 0
+        await db_session.refresh(item)
+        assert item.manual_start is True
+        assert item.filament_short is True
+
+    async def test_unpriceable_roll_is_not_released(self, db_session, monkeypatch):
+        """The fail-closed class inherits the same guard: an unbound roll cannot start,
+        so releasing it would hand the scheduler a job it must immediately re-stage."""
+        item = await _add_staged(db_session, printer_id=1)
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        _patch_real_start_rule(monkeypatch, {})  # matching tray has no inventory row → unpriced
+        assert await farm_staging.release_filament_staged(db_session) == 0
+        await db_session.refresh(item)
+        assert item.manual_start is True
+
+    async def test_released_once_the_roll_is_swapped(self, db_session, monkeypatch):
+        item = await _add_staged(
+            db_session, printer_id=1, waiting_reason=farm_staging.spool_selection.WAITING_REASON_START_MIN
+        )
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        _patch_real_start_rule(monkeypatch, {0: spool_selection.SlotInventory(remaining_g=800.0, first_loaded_ord=1.0)})
+        assert await farm_staging.release_filament_staged(db_session) == 1
+        await db_session.refresh(item)
+        assert item.manual_start is False
+        assert item.filament_short is False
+        assert item.waiting_reason is None
+
+    async def test_repeated_passes_converge(self, db_session, monkeypatch):
+        """Three passes on an unchanged below-floor roll release NOTHING (the item is
+        staged, not flapping); the swap releases it exactly once, and a further pass
+        finds nothing left to release."""
+        item = await _add_staged(db_session, printer_id=1)
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        low = {0: spool_selection.SlotInventory(remaining_g=46.0, first_loaded_ord=1.0)}
+        _patch_real_start_rule(monkeypatch, low)
+        assert [await farm_staging.release_filament_staged(db_session) for _ in range(3)] == [0, 0, 0]
+        await db_session.refresh(item)
+        assert item.manual_start is True
+
+        _patch_real_start_rule(monkeypatch, {0: spool_selection.SlotInventory(remaining_g=800.0, first_loaded_ord=1.0)})
+        assert await farm_staging.release_filament_staged(db_session) == 1
+        assert await farm_staging.release_filament_staged(db_session) == 0
+        await db_session.refresh(item)
+        assert item.manual_start is False
 
 
 class TestTraySignature:
@@ -301,10 +407,21 @@ class TestBuildStagedReason:
         # Not a bare machine token (has spaces/punctuation) → humanizer passthrough.
         assert " " in r and ":" in r
 
-    def test_start_min_variant(self):
-        r = farm_staging.build_staged_reason("004-H2S", start_min=True)
+    def test_below_floor_variant(self):
+        r = farm_staging.build_staged_reason("004-H2S", start_block=spool_selection.START_BLOCK_BELOW_FLOOR)
         assert r.startswith(farm_staging.STAGING_REASON_PREFIX)
         assert "starting spool below minimum" in r
+
+    def test_unknown_grams_variant_does_not_claim_below_minimum(self):
+        """An unpriceable roll is not a light roll: telling the operator to top it up
+        would send them to a spool that may be full. The honest ask is a weight."""
+        r = farm_staging.build_staged_reason("004-H2S", start_block=spool_selection.START_BLOCK_UNKNOWN_GRAMS)
+        assert "starting spool weight unknown" in r
+        assert "below minimum" not in r
+
+    def test_unknown_kind_falls_back_to_generic(self):
+        """An unrecognised kind must never invent a claim about the spool."""
+        assert "needs more filament" in farm_staging.build_staged_reason("004-H2S", start_block="future_kind")
 
     def test_empty_who_falls_back(self):
         r = farm_staging.build_staged_reason("")

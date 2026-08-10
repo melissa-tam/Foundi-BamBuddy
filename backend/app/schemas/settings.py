@@ -89,13 +89,14 @@ class AppSettings(BaseModel):
         default=False,
         description="Disable insufficient filament warnings when printing or queueing prints",
     )
-    auto_add_untagged: bool = Field(
-        default=True,
-        description=(
-            "Silently auto-create spool records for AMS trays that have no RFID tag. "
-            "Disable if you pre-create inventory entries manually to avoid duplicates."
-        ),
-    )
+    # NOTE: ``auto_add_untagged`` was deleted end-to-end 2026-08-10 (schema field,
+    # update twin, route whitelist, Settings toggle, stored row). It was a kill
+    # switch for the tagless auto-mint lane — machinery that doctrine rules 1/2/4
+    # make load-bearing on this fleet — and switching it off silently disables
+    # gram tracking for every untagged roll. That is not a preference; a farm that
+    # wants it off wants a different farm.
+    # No reader survives — the tagless auto-mint lane is unconditional.
+    #
     # Spool selection policy for farm dispatch — replaces the legacy boolean
     # ``prefer_lowest_filament``. 'slot_order' keeps the AMS slot ordering,
     # 'lowest_remaining' prefers the most-spent matching spool, 'first_loaded'
@@ -147,7 +148,11 @@ class AppSettings(BaseModel):
         default=7,
         ge=0,
         le=1000,
-        description="Below this layer, spools under min_start_spool_g stay ineligible as mid-print replacements",
+        description=(
+            "Layer threshold for mid-print replacement spools: below it a replacement must clear "
+            "min_start_spool_g; at or after it only a 5 g hard minimum applies, so a nearly-empty "
+            "donor may finish the print"
+        ),
     )
     # A filament RUNOUT escalates for a SAME-slot refill and leaves the print
     # PAUSEd. Default ON (006-H2S 2026-07-26): the refill itself is the operator's
@@ -691,7 +696,6 @@ class AppSettingsUpdate(BaseModel):
     spoolman_report_partial_usage: bool | None = None
     auto_add_unknown_rfid: bool | None = None
     disable_filament_warnings: bool | None = None
-    auto_add_untagged: bool | None = None
     spool_selection_policy: str | None = None
     min_start_spool_g: int | None = Field(default=None, ge=0, le=10000)
     spool_recovery_enabled: bool | None = None

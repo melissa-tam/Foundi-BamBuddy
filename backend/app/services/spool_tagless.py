@@ -18,7 +18,10 @@ everything AROUND that decision, in three groups:
   configuration so the NEXT push carries a filament type and enters the pipeline's
   tagless lane. :func:`reconcile_slot_config` is its durable scheduler-tick retry lane
   (plus K-drift and owed-identify arms), because ``main.on_ams_change`` is
-  change-gated and a settled AMS stops firing it (2026-07-24 incident).
+  change-gated and a settled AMS stops firing it (2026-07-24 incident). The retry is
+  BOUNDED by a per-slot write epoch fed from the firmware's own ACKs
+  (:func:`on_ams_command_result`): the wire refusing, or three attempts it never
+  reflects, stops the lane for that slot until a presence/identity edge re-arms it.
 * **Operator verbs + the prompts behind them** — the W5 fresh-roll prompt
   (:func:`note_physical_cycle` → :func:`_maybe_prompt_fresh_roll`, durable on
   ``Spool.fresh_prompt_pending_at``) and its executor :func:`apply_fresh_roll`, which
@@ -33,10 +36,12 @@ The W1 spent latch itself is unchanged and now lives in the table (``spool.spent
 qualified-physical-cycle signal that releases it
 (:func:`qualified_cycle_pending` / :func:`consume_qualified_cycle`).
 
-Module edge state (``_autoconfig_window``, ``_pending_physical_cycles``) mirrors the
-fork's other event-edge bookkeeping (``spool_respool._last_tray_now``). It is lost on
-restart — worst case a bare-tray config re-push waits one AMS push and a spent slot
-stays latched until a pull/reseat (honest, not silent). The fresh-roll prompt is
+Module edge state (``_autoconfig_window``, ``_autoconfig_epochs``,
+``_pending_physical_cycles``) mirrors the fork's other event-edge bookkeeping
+(``spool_respool._last_tray_now``). It is lost on restart — worst case a bare-tray
+config re-push waits one AMS push, a spent slot stays latched until a pull/reseat, and
+a write epoch starts over with full strikes (one more attempt, never a suppressed one;
+still bounded by the ladder, and the wire re-states its verdict on that attempt). The fresh-roll prompt is
 deliberately NOT in that set: its state is the durable
 ``Spool.fresh_prompt_pending_at`` stamp, because a question nobody was connected to
 hear must survive both an empty websocket list and a restart.
@@ -71,7 +76,7 @@ from backend.app.services.spool_tag_matcher import (
     parse_tray_fields,
     reapply_k_profile_if_drifted,
 )
-from backend.app.services.tray_fields import tray_presence_from_dict
+from backend.app.services.tray_fields import parse_int_field, tray_presence_from_dict
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_ids import GENERIC_FILAMENT_IDS
 from backend.app.utils.filament_types import canonical_filament_type
@@ -100,6 +105,51 @@ _AUTOCONFIG_RETRY_S = 30.0
 # Per-slot gate for that cadence. Cleared when the slot empties
 # (:func:`clear_autoconfig_dedup`).
 _autoconfig_window = RetryWindow(_AUTOCONFIG_RETRY_S)
+
+# Config writes one slot may attempt before the lane concludes the write is not
+# landing and stops. Each attempt is spaced by :data:`_AUTOCONFIG_RETRY_S`, so a
+# strike always spans a full settle window — the firmware had 30 s to reflect the
+# config and did not. Three is the smallest count that outlives the two ways a
+# single attempt legitimately goes unreflected (a status report that crossed the
+# write; one AMS busy window the publish gates did not catch) while bounding the
+# blind-retry class at ~90 s. Unbounded is what this replaces: answered
+# ``result:"fail"`` on every attempt, the lane re-published for hours (~40k writes
+# a day, 2026-08-10) because nothing consumed the wire's answer.
+_AUTOCONFIG_MAX_PUBLISHES = 3
+
+# AMS ids the firmware uses for the EXTERNAL/virtual spool. A command echo for one
+# of these is unaddressable here: :meth:`BambuMQTTClient.ams_set_filament_setting`
+# rewrites the external coordinates on the way out (farm ``ams_id=255, tray_id=N``
+# → wire ``ams_id`` 254/255 with ``tray_id`` 254, echoed back as slot position 0),
+# and that mapping is not invertible from the echo alone. Ignored rather than
+# guessed — the bare-tray lane only ever writes real AMS slots.
+_ECHO_VIRTUAL_AMS_IDS = frozenset({254, 255})
+
+
+class _AutoconfigEpoch(NamedTuple):
+    """One run of config writes at a slot: first attempt → the wire's answer.
+
+    ``publishes`` counts ATTEMPTS the lane committed to (the retry window is stamped
+    and :func:`_push_config` called), which is what :data:`_AUTOCONFIG_MAX_PUBLISHES`
+    bounds; ``acked_ok`` counts the ``result:"success"`` echoes among them, so the
+    closing log can tell "the firmware said yes and did nothing" apart from "the
+    firmware never answered". ``ended`` is the verdict once the lane has STOPPED
+    writing (None while it is still trying) and its presence IS the latch: a slot
+    with an ended epoch publishes nothing until an edge re-arms it.
+    """
+
+    publishes: int = 0
+    acked_ok: int = 0
+    ended: str | None = None
+
+
+# (printer_id, ams_id, tray_id) -> that slot's open write epoch. Process memory by
+# design: a restart drops every epoch, so the next pass starts a FRESH one and the
+# ladder runs again. That is the safe direction (one more attempt, never a suppressed
+# one) and it is bounded — a restart costs at most _AUTOCONFIG_MAX_PUBLISHES writes
+# per bare slot, not the unbounded loop this replaces. Nothing durable is lost: the
+# wire re-states its verdict on the very next attempt.
+_autoconfig_epochs: dict[tuple[int, int, int], _AutoconfigEpoch] = {}
 
 # Settle delay before a FRESH tagless row may be minted for a just-inserted spool.
 # Inserting a roll makes the firmware publish the slot's config ~1 s BEFORE its own
@@ -157,15 +207,16 @@ class _PresenceStaleEpisode(NamedTuple):
     """One continuous run of the SAME presence-stale reading on one bound slot.
 
     ``presence`` + ``spool_id`` are the episode's IDENTITY: while both hold, the farm is
-    looking at one unchanging situation and may act on it exactly once (``fired``).
-    ``first_seen`` is when that situation started, i.e. what :data:`_BOUND_PRESENCE_STALE_AFTER_S`
-    is measured against.
+    looking at one unchanging situation. ``first_seen`` is when that situation started,
+    i.e. what :data:`_BOUND_PRESENCE_STALE_AFTER_S` is measured against; ``asks`` counts
+    the requests made within it and ``next_ask_at`` is when the next one is due.
     """
 
     first_seen: float
     presence: bool | None
     spool_id: int
-    fired: bool
+    asks: int
+    next_ask_at: float
 
 
 # (printer_id, ams_id, tray_id) -> the open episode for that slot, or absent when the
@@ -180,6 +231,30 @@ _presence_stale_episodes: dict[tuple[int, int, int], _PresenceStaleEpisode] = {}
 # stopped carrying what the binding needs, and the two parties who can supply it — the
 # printer (a fresh full report) and the operator (a standing-unknown toast) — are asked.
 _BOUND_PRESENCE_STALE_AFTER_S: float = 900.0
+
+# Gaps between the successive ASKS inside one unresolved episode, measured from the ask
+# before. One ask per episode was the previous rule and its reasoning does not survive
+# contact with the failure it was written for: "a repeat ask answers nothing" holds only
+# if the first ask ARRIVED, and the ways it silently does not — a disconnected printer, the
+# 120 s pacing floor already spent by the wire-side drain, a report that crossed the
+# request — are exactly the states a slot sits in when its presence has stopped resolving.
+# Silence after one unanswered request is indistinguishable from a printer that answered,
+# so the episode keeps asking: +10 min covers the transient blockers, +1 h covers a
+# printer that was busy for a whole job. Backoff, not repetition — a pushall is one ~8.7 KB
+# report and nothing else, so the cost of asking again is wire chatter alone.
+_PRESENCE_ASK_GAPS_S: tuple[float, ...] = (600.0, 3600.0)
+
+# Steady-state spacing once the ladder above is exhausted. An episode that has survived
+# three asks is a genuinely unanswerable slot (the A1/P1S always-``state=3`` dialect is the
+# permanent case), and one quiet request an hour keeps the question live for the day the
+# printer starts answering again without becoming the log's own noise.
+_PRESENCE_ASK_INTERVAL_S: float = 3600.0
+
+# The ask at which the farm stops asking the PRINTER quietly and tells the OPERATOR. The
+# machine has now had every chance the ladder above allows; past this the unresolved slot
+# is a human's problem, and it is raised exactly once per episode (the toast's own per-slot
+# dedup then spaces any repeat).
+_PRESENCE_ASK_ESCALATE_AT: int = len(_PRESENCE_ASK_GAPS_S) + 1
 
 # Settle delay before the farm may publish a filament IDENTITY into a slot. A spool
 # inserted into a slot that still carries a surviving tagless binding looks BARE for
@@ -202,6 +277,7 @@ def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
     global _last_reconcile_at
     _autoconfig_window.reset()
+    _autoconfig_epochs.clear()
     _pending_physical_cycles.clear()
     _presence_stale_episodes.clear()
     _last_reconcile_at = None
@@ -343,13 +419,6 @@ async def override_generic_identity(
 
 
 # --- setting helpers --------------------------------------------------------
-
-
-async def _auto_add_untagged(db: AsyncSession) -> bool:
-    from backend.app.api.routes.settings import get_setting
-
-    raw = await get_setting(db, "auto_add_untagged")
-    return raw is None or raw.lower() == "true"
 
 
 async def _tagless_default(db: AsyncSession) -> dict | None:
@@ -955,6 +1024,12 @@ async def note_physical_cycle(printer_id: int, ams_id: int, tray_id: int) -> Non
     """
     key = (printer_id, ams_id, tray_id)
     _pending_physical_cycles.add(key)
+    # Somebody physically moved a roll here, so a refused/unreflected write epoch is
+    # about a slot that no longer exists as it was — the ONE edge that re-arms the
+    # bare-tray lane on a still-occupied slot (its twin, the slot going empty, re-arms
+    # through :func:`clear_autoconfig_dedup`). Before the prompt await: the cycle and
+    # the re-arm are the same event, and nothing may observe one without the other.
+    _rearm_autoconfig_epoch(printer_id, ams_id, tray_id, cause="a qualified physical cycle")
     try:
         from backend.app.core.database import async_session
 
@@ -1137,6 +1212,157 @@ def _printer_busy(printer_id: int, *, on_error: bool = True) -> bool:
         return on_error
 
 
+# --- D3b: bare-tray write-epoch accounting ---------------------------------
+
+
+def _autoconfig_latched(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Has this slot's write epoch ENDED, i.e. is the lane done writing to it?"""
+    epoch = _autoconfig_epochs.get((printer_id, ams_id, tray_id))
+    return epoch is not None and epoch.ended is not None
+
+
+def _end_autoconfig_epoch(
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    epoch: _AutoconfigEpoch,
+    *,
+    verdict: str,
+    detail: str,
+) -> None:
+    """Latch a slot's write epoch closed: one INFO line, no more writes, ask the wire.
+
+    The single epoch-end for all three failure shapes — a ``fail`` ack, a ``success``
+    ack the tray never reflects, and no ack at all — because they are the same
+    conclusion: this slot is not taking the config, and repeating the write is not what
+    changes that. Only ever called on an OPEN epoch (:func:`_autoconfig_latched` gates
+    every caller), so the line and the report request happen exactly once per epoch.
+
+    The pushall is the honest follow-up to stopping: what the farm believes about the
+    slot is now a hypothesis the wire has contradicted, and a full report is the one
+    thing that can replace it. It self-paces and answers False when the printer is
+    disconnected or the floor has not elapsed — a deferral is fine, the latch does not
+    depend on it (invariant 2: callers may defer, never pre-approve).
+    """
+    _autoconfig_epochs[(printer_id, ams_id, tray_id)] = epoch._replace(ended=verdict)
+    logger.info(
+        "Bare-tray auto-config STOPPED for printer %d AMS%d-T%d: %s (%d attempt(s), %d success ack(s)) "
+        "— no further config writes until a presence/identity edge re-arms the slot",
+        printer_id,
+        ams_id,
+        tray_id,
+        detail,
+        epoch.publishes,
+        epoch.acked_ok,
+    )
+    printer_manager.request_evidence_pushall(printer_id, verdict)
+
+
+def _rearm_autoconfig_epoch(printer_id: int, ams_id: int, tray_id: int, *, cause: str) -> None:
+    """Drop a slot's write epoch — the ONLY way a latched slot ever writes again.
+
+    Called on the three EDGES that make the situation genuinely new rather than the
+    same refused hypothesis restated: a qualified physical roll cycle
+    (:func:`note_physical_cycle`), the slot reading empty
+    (:func:`clear_autoconfig_dedup`), and the firmware reflecting a config
+    (:func:`note_config_adopted`). Deliberately NOT a timer: a latch that expires on
+    its own is the unbounded retry loop again, only slower.
+    """
+    epoch = _autoconfig_epochs.pop((printer_id, ams_id, tray_id), None)
+    if epoch is not None and epoch.ended is not None:
+        logger.info(
+            "Bare-tray auto-config re-armed for printer %d AMS%d-T%d on %s (epoch had ended: %s)",
+            printer_id,
+            ams_id,
+            tray_id,
+            cause,
+            epoch.ended,
+        )
+
+
+def _note_autoconfig_attempt(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """Count one committed config write against the slot's epoch, opening it if new.
+
+    Counted at the COMMIT point — every gate passed, immediately before the publish —
+    for two reasons. The retry window is already stamped by then, so the attempt has
+    spent its slot in the cadence whether or not the transport succeeded (a write that
+    never reached the broker is an attempt that did not land, which is exactly what the
+    ladder counts). And the ack cannot arrive before the publish, so an epoch always
+    exists by the time the wire answers it.
+    """
+    key = (printer_id, ams_id, tray_id)
+    epoch = _autoconfig_epochs.get(key, _AutoconfigEpoch())
+    _autoconfig_epochs[key] = epoch._replace(publishes=epoch.publishes + 1)
+
+
+def note_config_adopted(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """The firmware is reporting a configuration for this slot — the epoch SUCCEEDED.
+
+    Adoption is the lane's only positive success signal: an ack says the write was
+    accepted, a non-empty ``tray_type`` says it was applied, and the incident this
+    accounting closes is precisely the gap between the two. Called from the two places
+    that see a slot's live tray dict — :func:`maybe_autoconfigure_bare_tray`'s
+    already-configured guard and :func:`reconcile_slot_config`'s walk — so an adopted
+    slot cannot carry a stale strike count into a LATER bare episode (a firmware slot
+    reset makes a configured slot bare again with no presence edge anywhere).
+
+    A slot with no open epoch is the ordinary case (every RFID tray reports a type):
+    the drop is then a no-op.
+    """
+    _rearm_autoconfig_epoch(printer_id, ams_id, tray_id, cause="config adopted")
+
+
+def on_ams_command_result(printer_id: int, echo: dict) -> None:
+    """Consume the firmware's ACK of an AMS write — the wire's verdict on our config.
+
+    Entry hook for ``BambuMQTTClient.on_ams_command_result``, wired with the printer id
+    in ``printer_manager.connect_printer``. Runs SYNCHRONOUSLY on the MQTT thread: pure
+    process-memory bookkeeping plus (at most) one paced pushall request, no DB and no
+    awaits, so the bare-tray lane cannot publish again between a refusal arriving and
+    being recorded. Never raises — a farm-side failure must never break the MQTT
+    callback chain.
+
+    Only ``ams_filament_setting`` is judged here. ``extrusion_cali_sel`` echoes on the
+    same lane (routing both is the client's contract) but a K selection is not the
+    filament config: it addresses the tray in the GLOBAL id space, and a refused
+    calibration says nothing about whether the identity write landed.
+
+    Only an OPEN epoch is acted on. An ack for a write this lane never made — an
+    operator assign, the pipeline's pre-config one-shot — has nothing to stop, and a
+    latch minted from it would suppress attempts that were never attempted.
+    """
+    try:
+        if echo.get("command") != "ams_filament_setting":
+            return
+        result = str(echo.get("result") or "").strip().lower()
+        if result not in ("fail", "success"):
+            return
+        ams_id = parse_int_field(echo.get("ams_id"))
+        tray_id = parse_int_field(echo.get("tray_id"))
+        if ams_id is None or tray_id is None or ams_id in _ECHO_VIRTUAL_AMS_IDS:
+            return
+
+        key = (printer_id, ams_id, tray_id)
+        epoch = _autoconfig_epochs.get(key)
+        if epoch is None or epoch.ended is not None:
+            return
+
+        if result == "success":
+            # NOT an epoch end: the firmware accepting a write is not the firmware
+            # applying it, and the whole incident class lives in that gap. Counted only
+            # so the closing line can name which of the two silences was observed.
+            _autoconfig_epochs[key] = epoch._replace(acked_ok=epoch.acked_ok + 1)
+            return
+
+        reason = echo.get("reason")
+        detail = 'the firmware answered result="fail"'
+        if reason not in (None, ""):
+            detail = f"{detail} (reason={reason})"
+        _end_autoconfig_epoch(printer_id, ams_id, tray_id, epoch, verdict="config_refused", detail=detail)
+    except Exception:  # noqa: BLE001 — must never break the MQTT callback chain
+        logger.exception("AMS command-result handling failed for printer %s: %s", printer_id, echo)
+
+
 # --- D3b: bare-tray auto-config --------------------------------------------
 
 
@@ -1150,7 +1376,9 @@ async def maybe_autoconfigure_bare_tray(
     config push was attempted this tick.
 
     Trigger: tray PRESENT (state 10/11) AND tray_type empty AND no valid tag AND
-    ``auto_add_untagged`` AND a non-empty ``tagless_default_filament`` setting.
+    a non-empty ``tagless_default_filament`` setting — clearing that setting is the
+    ONE off switch (the 2026-08-10 wave retired the separate kill-switch setting;
+    tagless gram tracking is load-bearing, not a preference).
     The config push self-heals through TWO service lanes (gated by
     :data:`_AUTOCONFIG_RETRY_S` either way) until the firmware reports a non-empty
     tray_type and the slot leaves this branch: ``main.on_ams_change``'s bare-tray
@@ -1164,15 +1392,24 @@ async def maybe_autoconfigure_bare_tray(
     slot — still applies). ``spool_recovery`` uses it for a one-shot bare-tray
     sweep when a mid-print jam has no configured replacement, so a present-but-bare
     backup spool can be enrolled without waiting out the retry cadence.
+
+    Both self-healing lanes are BOUNDED by the slot's write epoch: a ``result:"fail"``
+    ack (:func:`on_ams_command_result`) or :data:`_AUTOCONFIG_MAX_PUBLISHES` attempts the
+    tray never reflects ends the epoch, and nothing writes to that slot again until a
+    presence/identity edge re-arms it (:func:`_rearm_autoconfig_epoch`). Unbounded,
+    "retry until the firmware reflects it" has no exit when the firmware's answer is no.
     """
     if not tray_present(tray):
         return False
     if (tray.get("tray_type") or "").strip():
+        # ADOPTED: the firmware is reflecting a config for the slot, so any open write
+        # epoch ended in success. Both callers pre-filter on bare-ness, so this guard is
+        # not the reliable observer — ``reconcile_slot_config``'s walk carries the same
+        # observation for the slots that stop reaching here at all.
+        note_config_adopted(printer_id, ams_id, tray_id)
         return False  # already configured — not bare
     if is_valid_tag(tray.get("tag_uid", "") or "", tray.get("tray_uuid", "") or ""):
         return False  # RFID tray — not tagless
-    if not await _auto_add_untagged(db):
-        return False
     default = await _tagless_default(db)
     if default is None:
         return False  # setting cleared → feature off
@@ -1192,6 +1429,16 @@ async def maybe_autoconfigure_bare_tray(
         return False
 
     key = (printer_id, ams_id, tray_id)
+
+    # LATCHED: this slot's write epoch ENDED (refused on the wire, or written three
+    # times and never reflected) and nothing since has made the situation new. Refused
+    # here — above the DB lookup, and above the spent-cycle transition below, which is
+    # unreachable while latched anyway because the qualified cycle that unlocks it
+    # re-arms the epoch in the same call. ``force=`` does not bypass this: it bypasses
+    # only the retry window, and a forced sweep supplies a fresh OCCASION, never new
+    # evidence about a slot the wire is refusing.
+    if _autoconfig_latched(printer_id, ams_id, tray_id):
+        return False
 
     res = await db.execute(
         select(SpoolAssignment)
@@ -1268,6 +1515,25 @@ async def maybe_autoconfigure_bare_tray(
     if not _autoconfig_window.allow(key):
         return False  # config attempt still inside its retry window
 
+    # STRIKE LADDER. The window has just opened for attempt N+1, which means every
+    # earlier attempt has had a FULL settle window to be reflected — and the tray still
+    # reports no configuration, or this branch would not be running. At
+    # :data:`_AUTOCONFIG_MAX_PUBLISHES` that is the same conclusion an explicit refusal
+    # states, reached the slow way (the "success ack, never applied" and "no ack at
+    # all" shapes both land here), so it ends the epoch identically. Above the mint so
+    # a latching pass never creates a spool row for a write it is not going to make.
+    epoch = _autoconfig_epochs.get(key, _AutoconfigEpoch())
+    if epoch.publishes >= _AUTOCONFIG_MAX_PUBLISHES:
+        _end_autoconfig_epoch(
+            printer_id,
+            ams_id,
+            tray_id,
+            epoch,
+            verdict="config_unadopted",
+            detail="the config was written and the tray still reports none applied",
+        )
+        return False
+
     if assignment is None:
         spool = await mint_tagless_spool(db, default_filament=default)
         bound = await _assign_from_setting(db, spool, printer_id, ams_id, tray_id, default)
@@ -1288,6 +1554,7 @@ async def maybe_autoconfigure_bare_tray(
         # (failed / slow push) — re-push, don't re-mint.
         spool = assignment.spool
 
+    _note_autoconfig_attempt(printer_id, ams_id, tray_id)
     await _push_config(db, spool, printer_id, ams_id, tray_id, tray)
     return True
 
@@ -1326,17 +1593,27 @@ async def _age_bound_presence_stale(
     binding (a deliberate weigh-then-assign intent over an empty slot) and a SPENT one
     (the durable ran-dry latch) — the same two rule 9 exempts from release.
 
-    **EPISODE SEMANTICS.** An episode is one continuous run of the same reading on the
-    same binding, and the farm acts on it exactly ONCE, past
-    :data:`_BOUND_PRESENCE_STALE_AFTER_S`. It closes only when the presence VALUE changes
-    (including None↔False) or the binding does — never on a timer. The reason is that a
-    repeat ask answers nothing: if the requested report arrived and the reading still
-    stands, the wire has said "this IS my answer", and asking again is noise against a
-    printer that is already telling the truth. It is also what keeps a permanently
-    unknowable dialect (A1/P1S state 3) to a single lifetime signal per slot instead of
-    an hourly toast forever. A refused request is likewise not retried within the
-    episode — a disconnected printer re-pushes a full report on reconnect anyway, which
-    moves the reading and opens a fresh episode on its own.
+    **EPISODE SEMANTICS: ASK UNTIL ANSWERED.** An episode is one continuous run of the
+    same reading on the same binding. It matures after :data:`_BOUND_PRESENCE_STALE_AFTER_S`
+    and then ASKS on a backoff ladder — at maturity, then :data:`_PRESENCE_ASK_GAPS_S`
+    later each time, then every :data:`_PRESENCE_ASK_INTERVAL_S` — until the reading moves.
+    It closes only when the presence VALUE changes (including None↔False) or the binding
+    does; never on a timer.
+
+    One ask per episode was the previous rule, on the reasoning that a repeat answers
+    nothing. That holds only if the first ask ARRIVED, and the ways it silently does not —
+    a disconnected printer, the 120 s pacing floor already spent by the wire-side drain, a
+    report that crossed the request — are precisely the states a slot is in when its
+    presence has stopped resolving. From inside, "asked and answered" and "never asked"
+    look identical; the ladder makes the farm act on the difference it cannot see.
+
+    The OPERATOR is told once, at :data:`_PRESENCE_ASK_ESCALATE_AT`: the machine has had
+    every chance the ladder allows, so what remains is a human's problem. Before that the
+    asks are quiet, and after it they continue quietly — a permanently unknowable dialect
+    (A1/P1S state 3) still costs one toast per episode, not an hourly one.
+
+    A REFUSED request spends its rung deliberately (pacing and disconnection are the very
+    conditions the next rung exists to outlast); the ladder retries, so nothing is lost.
     """
     key = (printer_id, ams_id, tray_id)
     if (
@@ -1356,25 +1633,44 @@ async def _age_bound_presence_stale(
 
     episode = _presence_stale_episodes.get(key)
     if episode is None or episode.presence != presence or episode.spool_id != assignment.spool_id:
-        episode = _PresenceStaleEpisode(now, presence, assignment.spool_id, False)
+        episode = _PresenceStaleEpisode(
+            now, presence, assignment.spool_id, asks=0, next_ask_at=now + _BOUND_PRESENCE_STALE_AFTER_S
+        )
         _presence_stale_episodes[key] = episode
-    if episode.fired or now - episode.first_seen < _BOUND_PRESENCE_STALE_AFTER_S:
+    if now < episode.next_ask_at:
         return
 
-    # Spend the episode BEFORE the escalations: neither of them raising (nor a refused
-    # request) may turn a one-shot ask into a per-pass one.
-    _presence_stale_episodes[key] = episode._replace(fired=True)
-    logger.warning(
-        "Bound slot presence stale (%s) for %.0fs: printer %d AMS%d-T%d (spool %s) — "
-        "requesting a fresh report and flagging the slot",
-        "unknown" if presence is None else "asserted-empty",
-        now - episode.first_seen,
-        printer_id,
-        ams_id,
-        tray_id,
-        assignment.spool_id,
-    )
-    await ams_presence.broadcast_standing_unknown(db, printer_id, ams_id, tray_id, case="bound_presence_unknown")
+    # Schedule the NEXT rung before doing anything that can raise or be refused: neither
+    # outcome may turn a paced ask into a per-pass one.
+    asks = episode.asks + 1
+    gap = _PRESENCE_ASK_GAPS_S[asks - 1] if asks <= len(_PRESENCE_ASK_GAPS_S) else _PRESENCE_ASK_INTERVAL_S
+    _presence_stale_episodes[key] = episode._replace(asks=asks, next_ask_at=now + gap)
+
+    reading = "unknown" if presence is None else "asserted-empty"
+    if asks == _PRESENCE_ASK_ESCALATE_AT:
+        logger.warning(
+            "Bound slot presence stale (%s) for %.0fs after %d requests: printer %d AMS%d-T%d (spool %s) — "
+            "asking again and flagging the slot for the operator",
+            reading,
+            now - episode.first_seen,
+            asks - 1,
+            printer_id,
+            ams_id,
+            tray_id,
+            assignment.spool_id,
+        )
+        await ams_presence.broadcast_standing_unknown(db, printer_id, ams_id, tray_id, case="bound_presence_unknown")
+    else:
+        logger.info(
+            "Bound slot presence stale (%s) for %.0fs: printer %d AMS%d-T%d (spool %s) — requesting a fresh report (#%d)",
+            reading,
+            now - episode.first_seen,
+            printer_id,
+            ams_id,
+            tray_id,
+            assignment.spool_id,
+            asks,
+        )
     manager.request_evidence_pushall(printer_id, "bound_presence_unknown")
 
 
@@ -1481,11 +1777,16 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
                 # fleet's reconcile for the whole pass (the tick's own guard would
                 # abandon every printer after this one).
                 try:
-                    if (
-                        tray_present(tray)
-                        and not (tray.get("tray_type") or "").strip()
-                        and not is_valid_tag(tag_uid, tray_uuid)
-                    ):
+                    configured = bool((tray.get("tray_type") or "").strip())
+                    if configured:
+                        # ADOPTION — and this walk is its RELIABLE observer: both
+                        # bare-tray call sites pre-filter on an empty tray_type, so a
+                        # slot that has taken the config stops reaching the lane
+                        # entirely and would otherwise carry its strike count into a
+                        # later bare episode.
+                        note_config_adopted(printer_id, ams_id, tray_id)
+
+                    if tray_present(tray) and not configured and not is_valid_tag(tag_uid, tray_uuid):
                         # BARE — the incident shape. The callee owns every guard,
                         # including the operator/RFID-bound never-overwrite: a config
                         # write racing a firmware tag read is the 2026-07-18 HMS
@@ -1564,8 +1865,15 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
 
 
 def clear_autoconfig_dedup(printer_id: int, ams_id: int, tray_id: int) -> None:
-    """Drop the bare-tray retry timestamp for a slot (called when it empties)."""
+    """Drop the bare-tray retry timestamp AND write epoch for a slot (it emptied).
+
+    An empty slot is a presence EDGE: whatever the wire refused to configure has left,
+    so both gates that would hold the next roll's first write back are dropped together
+    — the cadence stamp and the epoch latch. Splitting them would leave a slot re-armed
+    for cadence but still latched, i.e. silently unconfigurable for the next roll.
+    """
     _autoconfig_window.clear((printer_id, ams_id, tray_id))
+    _rearm_autoconfig_epoch(printer_id, ams_id, tray_id, cause="the slot reading empty")
 
 
 # --- provisional disposal on RFID takeover ---------------------------------

@@ -123,11 +123,19 @@ class NotificationProvider(Base):
     on_storage_low = Column(
         Boolean, default=True
     )  # Printer USB storage FAILURE — auto-cleanup could not free space, FTPS/USB unreachable, or the drive dropped mid-print (successful cleanups are silent)
-    on_spool_recovery_succeeded = Column(Boolean, default=True)  # farm: mid-print jam auto-recovered
+    # Autonomy posture (operator ruling 2026-08-10): a recovery that SUCCEEDED asked
+    # nothing of a human, so it is a log line, not a page — both success-class
+    # toggles therefore default OFF (the refill auto-resume notice rides
+    # ``on_spool_recovery_succeeded`` and goes quiet with it). Failure and
+    # escalation stay ON and loud: those are the ones that need somebody. The
+    # capability is untouched — any provider can re-enable either toggle in the UI,
+    # and the migration that flips existing rows runs exactly once so a re-enable
+    # is never re-reverted.
+    on_spool_recovery_succeeded = Column(Boolean, default=False)  # farm: mid-print jam auto-recovered
     on_spool_recovery_failed = Column(Boolean, default=True)  # farm: jam recovery escalated, printer left paused
     on_spool_out_of_rotation = Column(Boolean, default=True)  # farm: spool flagged out of rotation after feed fault
     on_spool_recovery_self_healed = Column(
-        Boolean, default=True
+        Boolean, default=False
     )  # farm: feed fault cleared by a firmware retry on the SAME spool (no swap, no out-of-rotation)
     on_cooldown_escalation = Column(
         Boolean, default=True

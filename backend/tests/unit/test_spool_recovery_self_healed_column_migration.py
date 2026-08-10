@@ -4,7 +4,8 @@ The truth-ordered out-of-rotation remediation introduced a dedicated
 ``spool_recovery_self_healed`` event (truthful "cleared on the same spool" copy,
 distinct from the swap-framed ``spool_recovery_succeeded``). Its provider toggle is
 a boolean column added by ``run_migrations`` via ``_safe_execute`` (ADD COLUMN,
-default TRUE). ``create_all`` would create the column from the current model and
+default FALSE since the 2026-08-10 autonomy ruling — a recovery that SUCCEEDED
+asked nothing of a human, so it is a log line, not a page). ``create_all`` would create the column from the current model and
 mask the migration, so the fixture drops it first to simulate a pre-migration
 schema; the test then proves ``run_migrations`` re-adds it and that a second pass is
 a no-op. Idempotent and SQLite-safe (mirrors the sibling migration regression tests).
@@ -80,8 +81,9 @@ async def test_migration_adds_column(engine):
 
 
 @pytest.mark.asyncio
-async def test_migration_default_is_true(engine):
-    """A row inserted without the toggle gets the DEFAULT 1 (subscribed by default)."""
+async def test_migration_default_is_false(engine):
+    """A row inserted without the toggle gets the DEFAULT 0 — the success-class
+    events are unsubscribed by default (the failure-class ones stay ON)."""
     async with engine.begin() as conn:
         await run_migrations(conn)
     async with engine.begin() as conn:
@@ -94,7 +96,7 @@ async def test_migration_default_is_true(engine):
         row = (
             await conn.execute(text(f"SELECT {_NEW_COLUMN} FROM notification_providers WHERE name = 'migrated'"))
         ).fetchone()
-    assert row[0] == 1
+    assert row[0] == 0
 
 
 @pytest.mark.asyncio

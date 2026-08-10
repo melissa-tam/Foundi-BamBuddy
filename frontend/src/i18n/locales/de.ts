@@ -191,6 +191,7 @@ export default {
         visionHold: 'Druckererkennung: Platte nicht leer — Bett freiräumen, dann am Drucker fortsetzen',
         previousPrintFailed: 'Angehalten: vorheriger Druck fehlgeschlagen',
         filamentShort: 'Filament knapp',
+        externalSpoolRunout: 'Externe Spule ist leer — den externen Halter nachfüllen, nicht ein AMS-Fach',
         startSpoolBelowMinimum: 'Zugewiesene Spule liegt unter dem Mindest-Startgewicht',
         filamentUnreadPending: 'Filament nicht gelesen — die eingesetzte Rolle wird ausgelesen',
         no_usb_drive: 'Kein USB-Stick im Drucker — USB-A-Laufwerk (FAT32/exFAT) einstecken',
@@ -787,7 +788,6 @@ export default {
     // Toast messages
     toast: {
       printerDeleted: 'Drucker gelöscht',
-      missingSpoolAssignment: 'Druck gestartet auf {{printer}}. Fehlende Spulenzuordnung für: {{slots}}',
       printerAdded: 'Drucker hinzugefügt',
       printerUpdated: 'Drucker aktualisiert',
       failedToDelete: 'Drucker konnte nicht gelöscht werden',
@@ -907,6 +907,8 @@ export default {
     controls: 'Steuerung',
     // RFID
     rfid: {
+      disabledFilamentEngaged: 'Zuerst das Filament entladen — das AMS kann keinen Tag lesen, während Filament eingezogen ist',
+      disabledWhileDrying: 'Nicht verfügbar, während das AMS trocknet',
       reread: 'RFID neu lesen',
     },
     // AMS Laden/Entladen (#891)
@@ -1552,6 +1554,8 @@ export default {
       confirmTitle: 'Mit einer fast leeren Spule starten?',
       confirmIntro: 'Die zugewiesene Spule reicht für diesen Druck aus, liegt aber unter dem Mindest-Startgewicht. Trotzdem starten?',
       slots: 'Betroffene Fächer: {{slots}}',
+      unknownGramsTitle: 'Mit ungewogener Spule starten?',
+      unknownGramsIntro: 'Für die passende Spule ist kein Gewicht erfasst, daher lässt sich nicht belegen, dass der Druck durchläuft. Wiege die Spule oder weise sie zu — oder starte trotzdem.',
       printAnyway: 'Trotzdem starten',
     },
     farm: {
@@ -2327,8 +2331,6 @@ export default {
     spoolRecoveryStepTimeoutDesc: 'Wie lange jeder Wiederherstellungsschritt laufen darf, bevor er als fehlgeschlagen gilt (15–600 s).',
     spoolRecoveryProtectLayers: 'Erste Schichten schützen',
     spoolRecoveryProtectLayersDesc: 'Während der ersten N Schichten sind Spulen unter dem Mindeststartgewicht nicht als Ersatz zulässig; danach können sie verwendet werden. 0 = fast leere Spulen sind immer zulässig.',
-    autoAddUntagged: 'Fächer ohne Tag automatisch hinzufügen',
-    autoAddUntaggedDesc: 'Für AMS-Fächer ohne RFID-Tag automatisch eine Bestandsspule anlegen. Deaktivieren, wenn du Spulen manuell vorab registrierst, um Duplikate zu vermeiden. RFID-getaggte Spulen haben ihren eigenen Auto-Hinzufügen-Schalter unter den Spoolman-Einstellungen.',
     taglessDefaultFilament: 'Standard-Filament für leere Fächer ohne Tag',
     taglessDefaultFilamentDesc: 'Nicht konfigurierte AMS-Fächer ohne Tag automatisch mit diesem Filament einrichten, damit sie ohne manuelle Einrichtung drucken können.',
     taglessBrand: 'Marke',
@@ -4553,7 +4555,6 @@ export default {
     addToInventoryFailed: 'Spule konnte nicht zum Inventar hinzugefügt werden',
     unknownSpoolToast: 'Unbekanntes Filament {{material}} auf {{printer}} Slot {{slot}} — zum Inventar hinzufügen?',
     unknownSpoolSlot: 'Slot',
-    taglessMintToast: 'Neue Spule ohne Tag auf {{printer}} Fach {{slot}} wird jetzt erfasst',
     freshRoll: {
       promptToast: 'Neue Rolle auf {{printer}} Slot {{slot}}?',
       sameRoll: 'Gleiche Rolle',
@@ -5007,17 +5008,19 @@ export default {
     empty: 'Leer',
     emptySlot: 'Leerer Slot',
     slotEmpty: 'Leer',
-    slotUnconfigured: '?',
+    slotStateUnknown: 'Fachstatus unbekannt — der Drucker hat nicht gemeldet, ob eine Spule darin liegt',
+    slotStateUnknownShort: 'Unbekannt',
     slotPresentUnread: 'Spule vorhanden — nicht erkannt',
     slotStandingUnknown: '{{printer}}: In Slot {{slot}} liegt eine Spule, die das AMS nicht lesen kann — bitte prüfen',
     outOfRotation: 'Aus der Rotation — Spulenstau erkannt; Spule erneut einlegen oder Markierung löschen, um sie wiederzuverwenden',
     outOfRotationShort: 'Aus der Rotation',
-    emptySlotReset: 'Keine Spule zugewiesen',
     emptySlotBinding: {
       title: 'Weiterhin zugewiesen',
       used: '{{grams}} g verbraucht',
       ranOut: 'aufgebraucht — wartet auf neue Rolle',
       awaitingInsert: 'wartet auf Einlegen (vorkonfiguriert)',
+      seatedUnread: 'eingelegt — wartet auf Erkennung',
+      presenceUnknown: 'im Fach nicht bestätigt',
       notInserted: 'nicht eingelegt',
       elsewhereHint: '(nicht eingelegt — zugewiesen an {{location}})',
       clear: 'Steckplatz leeren',

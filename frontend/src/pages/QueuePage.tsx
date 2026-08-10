@@ -1404,12 +1404,18 @@ export function QueuePage() {
   } | null>(null);
 
   // Distinct 409 (#spool-selection): the assigned spool can COVER the print but
-  // sits below the minimum-start floor. Its own confirm surfaces the slots and
+  // cannot be PROVEN able to start it. Its own confirm surfaces the slots and
   // re-issues the start with skipFilamentCheck=true (which bypasses this floor
   // too, per the backend start route).
+  //
+  // `unknownGrams` splits the two block kinds the backend now words apart: a
+  // roll the farm has priced BELOW the floor ("top it up") versus one the farm
+  // has no weight for at all ("weigh it / assign it"). They need different
+  // operator actions, so one dialog must not speak for both.
   const [startBelowMinConfirm, setStartBelowMinConfirm] = useState<{
     itemId: number;
     slots: number[];
+    unknownGrams: boolean;
   } | null>(null);
 
   const startMutation = useMutation({
@@ -1432,9 +1438,17 @@ export function QueuePage() {
         setFilamentShortConfirm({ itemId: variables.id, deficit: deficitRaw });
         return;
       }
-      if (error instanceof ApiError && error.status === 409 && error.code === 'start_spool_below_minimum') {
+      if (
+        error instanceof ApiError &&
+        error.status === 409 &&
+        (error.code === 'start_spool_below_minimum' || error.code === 'start_spool_unknown_grams')
+      ) {
         const slotsRaw = (error.detail?.slots ?? []) as number[];
-        setStartBelowMinConfirm({ itemId: variables.id, slots: slotsRaw });
+        setStartBelowMinConfirm({
+          itemId: variables.id,
+          slots: slotsRaw,
+          unknownGrams: error.code === 'start_spool_unknown_grams',
+        });
         return;
       }
       showToast(t('queue.toast.startFailed'), 'error');
@@ -2589,9 +2603,17 @@ export function QueuePage() {
       {/* Minimum-start-weight confirmation (#spool-selection) */}
       {startBelowMinConfirm && (
         <ConfirmModal
-          title={t('queue.startBelowMin.confirmTitle')}
+          title={t(
+            startBelowMinConfirm.unknownGrams
+              ? 'queue.startBelowMin.unknownGramsTitle'
+              : 'queue.startBelowMin.confirmTitle',
+          )}
           message={
-            t('queue.startBelowMin.confirmIntro') +
+            t(
+              startBelowMinConfirm.unknownGrams
+                ? 'queue.startBelowMin.unknownGramsIntro'
+                : 'queue.startBelowMin.confirmIntro',
+            ) +
             (startBelowMinConfirm.slots.length > 0
               ? '\n\n' +
                 t('queue.startBelowMin.slots', {

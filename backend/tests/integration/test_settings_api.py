@@ -837,7 +837,7 @@ class TestSettingsAPI:
 
 class TestSpoolSelectionSettings:
     """WI-5: prefer_lowest_filament retired; spool_selection_policy /
-    min_start_spool_g / auto_add_untagged / tagless_default_filament added.
+    min_start_spool_g / tagless_default_filament added.
     Full PUT→GET round-trip through the route whitelist."""
 
     @pytest.mark.asyncio
@@ -848,7 +848,8 @@ class TestSpoolSelectionSettings:
         result = response.json()
         assert result["spool_selection_policy"] == "first_loaded"
         assert result["min_start_spool_g"] == 150
-        assert result["auto_add_untagged"] is True
+        # Retired 2026-08-10: deleted end-to-end, so it is absent from the payload.
+        assert "auto_add_untagged" not in result
         import json as _json
 
         parsed = _json.loads(result["tagless_default_filament"])
@@ -890,13 +891,16 @@ class TestSpoolSelectionSettings:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_auto_add_untagged_round_trips(self, async_client: AsyncClient):
+    async def test_auto_add_untagged_is_gone_and_unsettable(self, async_client: AsyncClient):
+        """The retired kill switch cannot be re-introduced through the API: the
+        schema field, the update twin and the route whitelist all went with it, so
+        a PUT carrying it is ignored rather than silently disabling the tagless
+        auto-mint lane again."""
         response = await async_client.put("/api/v1/settings/", json={"auto_add_untagged": False})
         assert response.status_code == 200
-        assert response.json()["auto_add_untagged"] is False
-        # Read-back coerced to bool through the bool whitelist.
+        assert "auto_add_untagged" not in response.json()
         get_resp = await async_client.get("/api/v1/settings/")
-        assert get_resp.json()["auto_add_untagged"] is False
+        assert "auto_add_untagged" not in get_resp.json()
 
     @pytest.mark.asyncio
     @pytest.mark.integration

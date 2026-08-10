@@ -979,17 +979,17 @@ class TestSpentOccupiedOwesAnIdentify:
         decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
         assert decision == Decision(DecisionKind.KEEP, spool_id=212, reason="spent_latch")
 
-    def test_an_exist_bit_alone_is_not_enough(self):
-        """The read arm gates on the TRI-STATE ``present is True`` — the same seated-state
-        test ``ams_presence.identify_needed``'s spent-occupied arm applies. A verdict
-        emitted on weaker evidence than the need authority accepts is a read that is never
-        spent, and a reason that never resolves anything (008-H2C's stuck exist bit is
-        exactly that shape)."""
+    def test_a_trusted_exist_bit_IS_presence_and_earns_the_read(self):
+        """The read arm gates on the TRI-STATE ``present is True``, which a trusted exist
+        bit now answers on its own — and ``ams_presence.identify_needed``'s spent-occupied
+        arm grants a read on exactly that. The two must agree: a verdict emitted on
+        evidence the need authority does not accept is a read that is never spent, and a
+        reason that never resolves anything."""
         bound = self._spent()
         obs = observe_tray(4, 2, {"id": 2, "state": 9, "tray_type": ""}, exist_bits=1 << (2 * 4 + 2))
-        assert obs.present is None and obs.occupancy_signal is True
+        assert obs.present is True and obs.occupancy_signal is True
         decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
-        assert decision == Decision(DecisionKind.KEEP, spool_id=212, reason="spent_latch")
+        assert decision == Decision(DecisionKind.NONE, reason="spent_occupied_owed_identify")
 
     def test_an_empty_tray_keeps_the_row_3_latch(self):
         """The boundary is unmoved: presence FALSE never reaches rows 5/6 — row 3 owns it,

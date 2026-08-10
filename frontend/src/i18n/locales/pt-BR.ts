@@ -191,6 +191,7 @@ export default {
         visionHold: 'Visão da impressora: placa não vazia — libere a placa e retome na impressora',
         previousPrintFailed: 'Retida: a impressão anterior falhou',
         filamentShort: 'Filamento insuficiente',
+        externalSpoolRunout: 'A bobina externa acabou — reabasteça o suporte externo, não um slot do AMS',
         startSpoolBelowMinimum: 'A bobina atribuída está abaixo do peso mínimo de início',
         filamentUnreadPending: 'Filamento não lido — lendo a bobina inserida',
         no_usb_drive: 'Nenhuma unidade USB na impressora — insira uma unidade USB-A (FAT32/exFAT)',
@@ -787,7 +788,6 @@ export default {
     // Toast messages
     toast: {
       printerDeleted: 'Impressora excluída',
-      missingSpoolAssignment: 'Impressão iniciada em {{printer}}. Atribuição de bobina ausente para: {{slots}}',
       printerAdded: 'Impressora adicionada',
       printerUpdated: 'Impressora atualizada',
       failedToDelete: 'Falha ao excluir impressora',
@@ -907,6 +907,8 @@ export default {
     controls: 'Controles',
     // RFID
     rfid: {
+      disabledFilamentEngaged: 'Descarregue o filamento primeiro — o AMS não consegue ler uma etiqueta enquanto há filamento carregado',
+      disabledWhileDrying: 'Indisponível enquanto o AMS está secando',
       reread: 'Releitura de RFID',
     },
     // AMS load/unload (#891)
@@ -1552,6 +1554,8 @@ export default {
       confirmTitle: 'Iniciar com uma bobina baixa?',
       confirmIntro: 'A bobina atribuída pode cobrir esta impressão, mas está abaixo do peso mínimo de início. Iniciar mesmo assim?',
       slots: 'Slots afetados: {{slots}}',
+      unknownGramsTitle: 'Iniciar com uma bobina sem pesagem?',
+      unknownGramsIntro: 'Não há peso registrado para a bobina correspondente, então não é possível garantir que a impressão termine. Pese ou atribua a bobina, ou inicie mesmo assim.',
       printAnyway: 'Iniciar mesmo assim',
     },
     farm: {
@@ -2283,8 +2287,6 @@ export default {
     spoolRecoveryStepTimeoutDesc: 'Quanto tempo cada etapa de recuperação pode durar antes de ser considerada falha (15-600 s).',
     spoolRecoveryProtectLayers: 'Proteger as primeiras camadas',
     spoolRecoveryProtectLayersDesc: 'Durante as primeiras N camadas, as bobinas abaixo do peso mínimo de início não podem ser usadas como substituição; depois disso, podem. 0 = bobinas com pouco material são sempre elegíveis.',
-    autoAddUntagged: 'Adicionar automaticamente bandejas sem etiqueta',
-    autoAddUntaggedDesc: 'Criar silenciosamente uma bobina de inventário para bandejas AMS que não têm etiqueta RFID. Desative se você registra as bobinas manualmente para evitar duplicatas. Bobinas com etiqueta RFID têm seu próprio botão de adição automática nas configurações do Spoolman.',
     taglessDefaultFilament: 'Filamento padrão para bandejas sem etiqueta',
     taglessDefaultFilamentDesc: 'Configurar automaticamente as bandejas AMS sem etiqueta e não configuradas com este filamento para que possam imprimir sem configuração manual.',
     taglessBrand: 'Marca',
@@ -4541,7 +4543,6 @@ export default {
     addToInventoryFailed: 'Falha ao adicionar carretel ao inventário',
     unknownSpoolToast: 'Filamento desconhecido {{material}} em {{printer}} slot {{slot}} — adicioná-lo ao inventário?',
     unknownSpoolSlot: 'Slot',
-    taglessMintToast: 'Começou a rastrear uma nova bobina sem etiqueta em {{printer}} slot {{slot}}',
     freshRoll: {
       promptToast: 'Rolo novo em {{printer}} slot {{slot}}?',
       sameRoll: 'Mesmo rolo',
@@ -4995,17 +4996,19 @@ export default {
     empty: 'Vazio',
     emptySlot: 'Slot vazio',
     slotEmpty: 'Vazio',
-    slotUnconfigured: '?',
+    slotStateUnknown: 'Estado do slot desconhecido — a impressora não informou se há uma bobina dentro',
+    slotStateUnknownShort: 'Desconhecido',
     slotPresentUnread: 'Bobina presente — não reconhecida',
     slotStandingUnknown: '{{printer}}: o slot {{slot}} tem uma bobina que o AMS não consegue ler — verifique',
     outOfRotation: 'Fora de rotação — travamento de bobina detectado; reinsira a bobina ou limpe a marcação para reutilizá-la',
     outOfRotationShort: 'Fora de rotação',
-    emptySlotReset: 'Nenhum carretel atribuído',
     emptySlotBinding: {
       title: 'Ainda atribuído',
       used: '{{grams}} g usados',
       ranOut: 'acabou — aguardando rolo novo',
       awaitingInsert: 'aguardando inserção (pré-configurado)',
+      seatedUnread: 'inserida — aguardando identificação',
+      presenceUnknown: 'não confirmada no slot',
       notInserted: 'não inserido',
       elsewhereHint: '(não inserido — atribuído a {{location}})',
       clear: 'Liberar slot',

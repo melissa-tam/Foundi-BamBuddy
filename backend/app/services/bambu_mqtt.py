@@ -8,6 +8,7 @@ but with qos=1 they respond instantly.
 """
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -25,12 +26,15 @@ from backend.app.services.hms_actions import HMSAction, get_actions_for_error_co
 from backend.app.services.hms_errors import hms_severity
 from backend.app.services.tray_fields import (
     TRAY_PRESENT_STATES,
+    TRAYS_PER_AMS_UNIT,
     ZERO_TAG_UID,
     ZERO_TRAY_UUID,
     parse_int_field,
     parse_tray_exist_bits,
     parse_tray_state,
+    slot_exist_bit,
     slot_exist_bit_set,
+    unit_exist_bit_set,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +65,22 @@ AMS_STATUS_IDLE = 0
 # (006-H2S 2026-07-21). Exported so spool_recovery keys the stuck-change reset off
 # this one origin.
 AMS_STATUS_FILAMENT_CHANGE = 1
+
+# The AMS write commands the firmware ACKs on the REPORT topic. An echo is the
+# request's own `command` string plus a `result` ("success"/"fail"), and it is the
+# ONLY statement the wire ever makes about whether a config write was accepted —
+# a refused write is otherwise indistinguishable from one still in flight, which
+# is what let the bare-tray retry loop re-publish into a slot answering `fail`
+# ~40k times a day (2026-08-10). One origin for the detection set; the routing
+# contract is documented at `on_ams_command_result`.
+_AMS_COMMAND_RESULT_COMMANDS = frozenset({"ams_filament_setting", "extrusion_cali_sel"})
+
+# The scalar fields lifted out of a command echo and handed to the consumer. The
+# echo also carries a full `ams` section — deliberately NOT forwarded here: that
+# section is status, it has already gone through `_handle_ams_data` (one origin for
+# AMS state), and re-serving it on the ack lane would give the farm a second,
+# copy-shaped path to the same wire data.
+_AMS_COMMAND_RESULT_FIELDS = ("command", "result", "ams_id", "tray_id", "sequence_id", "reason")
 
 # Tray `state` codes that mean a spool is physically PRESENT — DEFINED in
 # ``tray_fields`` (beside the parser that reads the field and the ``tray_presence``
@@ -95,6 +115,17 @@ CLEARED_TRAY_FIELDS = {
 # the drain below may fire from a ~1 Hz push handler at all. CODE CONSTANT, not a
 # setting: it protects the wire, and the wire's limits are not an operator preference.
 _EVIDENCE_PUSHALL_MIN_S: float = 120.0
+
+# How many CONSECUTIVE bits-carrying pushes must repeat the same ALL-ZERO
+# ``tray_exist_bits`` before the farm may act on it. The asymmetry is the whole point:
+# a SET bit is positive evidence and is believed at once (nothing is destroyed by
+# believing a spool is there), while an all-zero mask is the one value that authorizes
+# emptying every slot on the printer, and it is also the value a boot frame, a
+# reconnect or a dropped report degrades to. Three at the fleet's ~1 Hz report cadence
+# is ~3 s of latency on a genuine removal — below one scheduler tick, invisible to the
+# operator — in exchange for making a single anomalous frame unable to release a
+# binding. CODE CONSTANT, not a setting: it is a property of the wire, not a preference.
+_ZERO_EXIST_BITS_TRUST_PUSHES = 3
 
 # AMS drying latch. `dry_time` (minutes remaining) is the primary "unit is drying"
 # signal, but the firmware only reports it once a cycle is under way. A monotonic
@@ -152,7 +183,7 @@ def apply_tray_exist_bits(
     units: list,
     tray_exist_bits_str: str | int | None,
     *,
-    power_on_flag: bool = True,
+    ams_exist_bits: str | int | None = None,
     log_label: str | None = None,
     allow_demote: bool = True,
 ) -> int:
@@ -163,9 +194,13 @@ def apply_tray_exist_bits(
     it so downstream readers keyed on `state` see one signal instead of guessing
     from payload shape (#1322, #147):
 
-    * bit clear (empty): promote the tray `state` to 9 (firmware's "no spool"
-      code) and clear `tray_type` / `tray_color` / `tray_info_idx` / `tag_uid` /
-      `tray_uuid` / `remain` etc.
+    * bit clear (empty): force the tray `state` to 9 (firmware's "no spool" code) AND
+      write the full cleared shape (:data:`CLEARED_TRAY_FIELDS`). Unconditionally: a
+      tray that already carried no ``tray_type`` used to keep its KEYS ABSENT, so the
+      merged copy asserted nothing and ``tray_fields.tray_presence_from_dict`` read
+      UNKNOWN for a slot the firmware had called empty — while the frontend, which
+      reads ``state === 9``, painted it empty. Display and decision must not be able
+      to disagree about the same slot.
     * bit set (occupied) with a stuck `state == 9`: promote it to 10 ("spool
       present, filament not in feeder"). A spool inserted mid-print gets no
       auto-read and the per-tray `state` stays 9 while the bitmask already reports
@@ -184,17 +219,28 @@ def apply_tray_exist_bits(
        per-tray fields for empty slots, and BambuStudio's Sync would render
        phantom loaded slots).
 
-    Skipped only on the printer-shutdown pattern: all-zero bits paired with
-    ``power_on_flag=False`` (#765). Non-zero bits with ``power_on_flag=False``
-    is valid idle-printer state (#1365 — X1C between prints) and MUST be applied
-    so spool removal is detected without requiring a manual reconnect.
+    **TRUST IS THE CALLER'S JOB, and ``power_on_flag`` was never it.** This helper used
+    to no-op on the "printer shutdown" pattern — an all-zero mask beside
+    ``power_on_flag=False`` (#765). A live wire survey of the fleet (2026-08-10)
+    disproves the premise: ``power_on_flag`` reads ``False`` as the NORMAL steady state
+    on four of six sampled printers whose AMS was demonstrably alive and answering
+    truthfully, and ``True`` on another. It is not a statement about AMS power, so a
+    guard built on it discarded correct all-empty masks forever — which is how four
+    printers kept stale state-10 trays, the tagless lane minted phantom spools into
+    physically empty slots, and release-on-empty never fired. The trust question that
+    DOES exist (may a transient all-zero mask empty a slot?) is stateful — it needs the
+    push history — so it belongs to the client that has one, and this helper is called
+    only with a mask its caller already believes.
 
     AMS-HT units (``id >= 128``) use a separate addressing scheme and are
-    skipped here.
+    skipped here. ``ams_exist_bits`` — the unit-level mask, same hex encoding —
+    additionally GATES which units may take evidence at all: a unit the firmware does
+    not list has an all-zero slice of the tray mask because it is not being described,
+    not because its trays are bare. Absent ``ams_exist_bits`` gates nothing.
 
     `tray_exist_bits_str` is expected as a hex string (firmware sends it that
-    way). Ints are tolerated for defensive symmetry but typically not seen
-    on the wire. ``None`` / empty / unparseable → no-op.
+    way). Ints are tolerated for defensive symmetry. ``None`` / empty / unparseable →
+    no-op; a parsed ``0`` is a real answer and IS applied.
 
     ``allow_demote`` expresses the EVIDENCE ASYMMETRY between the two directions,
     and belongs to the FRESHNESS of the bitmask the caller passes:
@@ -220,21 +266,16 @@ def apply_tray_exist_bits(
       hash's presence token, the change callback, auto-assignment and the UI
       all un-saw the roll for 38 minutes.
 
-    Mutates ``units`` in place. Returns the number of slots cleared.
+    Mutates ``units`` in place. Returns the number of slots whose CONTENT this call
+    cleared — the clearing EDGE, not the idempotent re-assertion of an already-blank
+    tray, so the count still means "spools that just disappeared".
     """
-    if not tray_exist_bits_str:
-        return 0
-    try:
-        if isinstance(tray_exist_bits_str, int):
-            tray_exist_bits = tray_exist_bits_str
-        else:
-            tray_exist_bits = int(tray_exist_bits_str, 16)
-    except (ValueError, TypeError):
-        return 0
-    if tray_exist_bits == 0 and not power_on_flag:
+    tray_exist_bits = parse_tray_exist_bits(tray_exist_bits_str)
+    if tray_exist_bits is None:
         return 0
     if not isinstance(units, list):
         return 0
+    unit_bits = parse_tray_exist_bits(ams_exist_bits)
 
     cleared = 0
     for ams_unit in units:
@@ -250,21 +291,18 @@ def apply_tray_exist_bits(
         if not isinstance(ams_id, int) or ams_id >= 128:
             # Skip AMS-HT (id >= 128) — separate addressing scheme.
             continue
+        if unit_bits is not None and not unit_exist_bit_set(unit_bits, ams_id):
+            # The unit is not in this report's roster: its bits assert nothing.
+            continue
         for tray in ams_unit.get("tray", []):
             if not isinstance(tray, dict):
                 continue
-            tray_id_raw = tray.get("id")
-            if tray_id_raw is None:
+            tray_id = parse_int_field(tray.get("id"))
+            bit = slot_exist_bit(tray_exist_bits, ams_id, tray_id)
+            if bit is None:
+                # Unaddressable slot (unparseable / outside the four-per-unit stride).
                 continue
-            try:
-                tray_id = int(tray_id_raw) if isinstance(tray_id_raw, str) else tray_id_raw
-            except (ValueError, TypeError):
-                continue
-            if not isinstance(tray_id, int):
-                continue
-            global_bit = ams_id * 4 + tray_id
-            slot_exists = (tray_exist_bits >> global_bit) & 1
-            if slot_exists:
+            if bit:
                 # Occupied per the bitmask: promote a stuck state-9 slot (the
                 # mid-print-insert quirk — firmware never auto-read it, so state
                 # stays 9 with the bit set) to 10 so presence-keyed readers see
@@ -282,21 +320,15 @@ def apply_tray_exist_bits(
             # still take the idempotent clear below.
             if not allow_demote and parse_tray_state(tray.get("state")) in TRAY_PRESENT_STATES:
                 continue
+            had_content = bool(tray.get("tray_type"))
+            if had_content and log_label:
+                logger.debug(
+                    f"[{log_label}] Clearing empty slot: AMS {ams_id} slot {tray_id} "
+                    f"(tray_exist_bits bit {ams_id * TRAYS_PER_AMS_UNIT + tray_id} = 0)"
+                )
             tray["state"] = 9
-            if tray.get("tray_type"):
-                if log_label:
-                    logger.debug(
-                        f"[{log_label}] Clearing empty slot: AMS {ams_id} slot {tray_id} "
-                        f"(tray_exist_bits bit {global_bit} = 0)"
-                    )
-                tray["tray_type"] = ""
-                tray["tray_sub_brands"] = ""
-                tray["tray_color"] = ""
-                tray["tray_id_name"] = ""
-                tray["tag_uid"] = ZERO_TAG_UID
-                tray["tray_uuid"] = ZERO_TRAY_UUID
-                tray["tray_info_idx"] = ""
-                tray["remain"] = 0
+            tray.update(CLEARED_TRAY_FIELDS)
+            if had_content:
                 cleared += 1
     return cleared
 
@@ -491,6 +523,16 @@ class PrinterState:
     last_loaded_tray: int = -1
     # Pending load target - used to track what tray we're loading for H2D disambiguation
     pending_tray_target: int | None = None
+    # --- AMS exist-bit triage surface (last bits-carrying push) ---------------
+    # The three values a presence question is actually settled by, exposed because a
+    # 2026-08-10 wire investigation had to be run over raw MQTT to obtain them. Raw
+    # `tray_exist_bits` hex EXACTLY as the wire spelled it (None = the last push carried
+    # none), the firmware's `power_on_flag` (recorded, never acted on — it does NOT mean
+    # "AMS is powered": False is the normal steady state on most of the fleet), and the
+    # farm's own verdict on whether the mask may be acted on.
+    ams_tray_exist_bits: str | None = None
+    ams_power_on_flag: bool | None = None
+    ams_bits_trusted: bool = False
     # AMS status for filament change tracking (from print.ams.ams_status field)
     # ams_status is a combined value: lower 8 bits = sub status, bits 8-15 = main status
     # Main status: 0=idle, 1=filament_change, 2=rfid_identifying, 3=assist, 4=calibration, etc.
@@ -663,6 +705,7 @@ class BambuMQTTClient:
         on_print_complete: Callable[[dict], None] | None = None,
         on_ams_change: Callable[[list], None] | None = None,
         on_ams_push_raw: Callable[[object], None] | None = None,
+        on_ams_command_result: Callable[[dict], None] | None = None,
         on_layer_change: Callable[[int], None] | None = None,
         on_bed_temp_update: Callable[[float], None] | None = None,
         on_drying_complete: Callable[[int], None] | None = None,
@@ -686,6 +729,15 @@ class BambuMQTTClient:
         # only adds the tray_uuid — would not change it and would never be delivered.
         # Handlers MUST consume the payload synchronously; nothing here is copied.
         self.on_ams_push_raw = on_ams_push_raw
+        # Fired with the firmware's ACK of an AMS write we published — the wire's own
+        # verdict on whether the config was accepted (see _AMS_COMMAND_RESULT_COMMANDS).
+        # The payload is an OWNED dict of the echo's scalar fields only
+        # (_AMS_COMMAND_RESULT_FIELDS), built fresh per delivery: unlike the raw AMS
+        # hook, nothing the consumer holds aliases wire state, so it cannot be poisoned
+        # by the merge that follows. The echo's `ams` section is NOT here — it reached
+        # `_handle_ams_data` on the ordinary status path before this fires, and that
+        # stays the one origin for AMS state.
+        self.on_ams_command_result = on_ams_command_result
         self.on_layer_change = on_layer_change
         self.on_bed_temp_update = on_bed_temp_update
         # #1349: fired when an AMS unit's dry_time falls from >0 to 0 — i.e.
@@ -764,16 +816,24 @@ class BambuMQTTClient:
         self._raw_message_handlers: list[Callable[[str, bytes], None]] = []
         self._disconnection_event: threading.Event | None = None
         self._previous_ams_hash: str | None = None  # Track AMS changes
-        # Last-seen tray_exist_bits (firmware's canonical "which slots hold a
-        # spool" bitmask), cached whenever a payload carries it. Consulted by the
-        # incremental stale-clear in _handle_ams_data so a stuck state-9 partial
-        # for a slot the bitmask still marks occupied does not wipe a seated
-        # spool's identity. DELIBERATELY not reset on disconnect: the merged AMS
-        # state in state.raw_data persists across reconnects, so keeping the
-        # bitmask cache the same lifetime keeps the two consistent (a reconnect
-        # that carries fresh bits overwrites it; one that does not keeps the last
-        # truth, matching the merged trays it guards). None = never seen.
+        # Last-seen TRUSTED tray_exist_bits (firmware's canonical "which slots hold a
+        # spool" bitmask), cached whenever a payload carries one the trust verdict
+        # accepts (_note_exist_bits_trust). Consulted by the incremental stale-clear in
+        # _handle_ams_data so a stuck state-9 partial for a slot the bitmask still marks
+        # occupied does not wipe a seated spool's identity. Trusted-only because this
+        # cache is the mask every LATER bits-less push acts on: admitting a value the
+        # current push was not allowed to act on would let it act one push later.
+        # DELIBERATELY not reset on disconnect: the merged AMS state in state.raw_data
+        # persists across reconnects, so keeping the bitmask cache the same lifetime
+        # keeps the two consistent (a reconnect that carries fresh bits overwrites it;
+        # one that does not keeps the last truth, matching the merged trays it guards).
+        # None = never seen.
         self._last_tray_exist_bits: int | None = None
+        # Consecutive bits-carrying pushes that have reported the SAME all-zero
+        # tray_exist_bits, clamped at _ZERO_EXIST_BITS_TRUST_PUSHES. Reset by a non-zero
+        # mask (trusted immediately, so no streak is needed) and by a bits-less push
+        # (the run of evidence is broken — the next zero starts a fresh one).
+        self._zero_exist_bits_streak: int = 0
         # (ams_id, tray_id) -> monotonic() of the first push whose state-9 partial
         # CONTRADICTED the CACHED exist bit above. On the H2S dialect the mask rides
         # pushalls only, so the cache goes stale the moment a roll leaves between them:
@@ -900,6 +960,24 @@ class BambuMQTTClient:
         from backend.app.utils.printer_models import is_dual_nozzle_model
 
         return self._is_dual_nozzle or is_dual_nozzle_model(self.model)
+
+    @property
+    def captured_ams_mapping(self) -> list[int] | None:
+        """The ``ams_mapping`` of the print command that started the live job, or None.
+
+        The public, read-only view of ``_captured_ams_mapping``, which
+        :meth:`_handle_request_message` fills from any ``project_file`` crossing the
+        request topic and the job terminal clears. For a FOREIGN print it is the only
+        PRE-FAULT statement the slicer makes about how many filaments the job maps
+        (``spool_recovery._slicer_mapping``), which is why a consumer outside the
+        client needs it at all.
+
+        None is the ordinary answer, not an error: no live job, or a firmware whose
+        broker refuses the request-topic subscription, contributes no evidence.
+        Read-only by design — the capture is wire state and only the request-topic
+        handler may write it.
+        """
+        return self._captured_ams_mapping
 
     # Maximum time (seconds) without a message before considering connection stale
     STALE_TIMEOUT = 60.0
@@ -1212,14 +1290,21 @@ class BambuMQTTClient:
             if msg.topic == self.topic_subscribe:
                 self._report_messages_since_connect += 1
 
-            # Log message if logging is enabled
+            # Log message if logging is enabled. The SNAPSHOT is the point: the parsed
+            # payload is about to be handed to _handle_ams_data (which normalizes and
+            # merges the very tray dicts in it) and then to _update_state (which adopts
+            # it as raw_data and grafts the MERGED ams list into it), so a stored
+            # reference would serve the farm's own conclusions back as "the wire".
+            # deepcopy, not a json round-trip: the payload came out of json.loads, so it
+            # is dicts/lists/scalars only — deepcopy is exact, cheaper, and does not
+            # re-run a parser over data that already parsed once.
             if self._logging_enabled:
                 self._message_log.append(
                     MQTTLogEntry(
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         topic=msg.topic,
                         direction="in",
-                        payload=payload,
+                        payload=copy.deepcopy(payload),
                     )
                 )
             self._process_message(payload)
@@ -1469,10 +1554,51 @@ class BambuMQTTClient:
                 elif cmd == "ams_filament_setting":
                     self._last_ams_cmd_time = 0.0
                     self._ams_cmd_unanswered = 0
+                # The ACK lane. Last in this block so the echo has already served every
+                # in-client duty above (dev-mode probe, zombie detection) and — because
+                # `print.ams` is handled further up — the status half of the same payload
+                # is already merged: a consumer acting on the verdict sees the AMS state
+                # that came with it, never a half-applied push.
+                self._deliver_command_result(print_data)
             if "command" in print_data and print_data.get("command") == "extrusion_cali_get":
                 self._handle_kprofile_response(print_data)
 
             self._update_state(print_data)
+
+    def _deliver_command_result(self, print_data: dict) -> None:
+        """Hand an AMS write's firmware ACK to ``on_ams_command_result``.
+
+        The firmware answers every ``ams_filament_setting`` /
+        ``extrusion_cali_sel`` on the REPORT topic with the request's own
+        ``command`` plus a ``result``. That verdict is the only thing that
+        distinguishes a REFUSED write from one still in flight, so a lane that
+        re-publishes until the wire reflects a config is blind without it — the
+        bare-tray retry loop was answered ``fail`` on every attempt for hours and
+        had no way to know (2026-08-10).
+
+        Delivered as an OWNED, scalar-only dict: the consumer keeps no reference
+        into the payload the merge is about to mutate, which is the opposite
+        contract to ``on_ams_push_raw`` (there the aliasing IS the point). The
+        ``ams`` section that rides along on these echoes is deliberately absent —
+        it went through ``_handle_ams_data`` on the ordinary status path.
+
+        A payload that is not a dict, carries an unrelated command, or has no
+        ``result`` key is not an ACK and is ignored. Guarded like every other
+        entry hook: a farm-side failure must never break the MQTT callback chain.
+        """
+        if not self.on_ams_command_result:
+            return
+        if not isinstance(print_data, dict):
+            return
+        if print_data.get("command") not in _AMS_COMMAND_RESULT_COMMANDS:
+            return
+        if "result" not in print_data:
+            return
+        echo = {field: print_data[field] for field in _AMS_COMMAND_RESULT_FIELDS if field in print_data}
+        try:
+            self.on_ams_command_result(echo)
+        except Exception:
+            logger.exception("[%s] AMS command-result handler failed", self.serial_number)
 
     def _handle_system_response(self, data: dict):
         """Handle system responses including accessories info.
@@ -1901,6 +2027,35 @@ class BambuMQTTClient:
         """
         return slot_exist_bit_set(self._last_tray_exist_bits, ams_id, tray_id)
 
+    def _note_exist_bits_trust(self, bits: int | None) -> bool:
+        """Fold this push's ``tray_exist_bits`` into the streak; may the farm act on it?
+
+        THE trust authority for the mask, and the only stateful part of reading it —
+        which is why it lives on the client (the pure helpers in ``tray_fields`` see one
+        push at a time and could never answer this).
+
+        * ``bits is None`` — the push carried no mask. The streak breaks and the answer
+          is False; the caller treats the push as bits-less.
+        * a NON-ZERO mask — trusted immediately. A set bit only ever says "something is
+          in this slot", and believing that destroys nothing: the worst case is a
+          removal noticed one push late.
+        * an ALL-ZERO mask — trusted once :data:`_ZERO_EXIST_BITS_TRUST_PUSHES`
+          consecutive bits-carrying pushes have said the same thing. Zero is the value
+          that authorizes emptying every slot on the printer, and it is also what a boot
+          frame or a truncated report degrades to, so it must be corroborated by
+          repetition before it may release a binding.
+
+        Mutates the streak; call EXACTLY ONCE per push, before anything reads the mask.
+        """
+        if bits is None:
+            self._zero_exist_bits_streak = 0
+            return False
+        if bits != 0:
+            self._zero_exist_bits_streak = 0
+            return True
+        self._zero_exist_bits_streak = min(self._zero_exist_bits_streak + 1, _ZERO_EXIST_BITS_TRUST_PUSHES)
+        return self._zero_exist_bits_streak >= _ZERO_EXIST_BITS_TRUST_PUSHES
+
     def _note_evidence_owed(self, ams_id, tray_id, *, cause: str) -> None:
         """Record that only a fresh report can settle this slot's presence.
 
@@ -1961,12 +2116,18 @@ class BambuMQTTClient:
           safe here.
         * no exist bit for the slot (003-H2S veto): a mid-print insert sits at
           state 9 with its bitmask bit set. The veto stands either way, but its
-          EVIDENCE does not: a bit carried by THIS push is the mid-print insert and
-          is final, while a bit read from the CACHE is a contradiction only the
-          printer can settle (H2S sends the mask in pushalls only, so a roll that
+          EVIDENCE does not: a bit carried AND TRUSTED on THIS push is the mid-print
+          insert and is final, while a bit read from the CACHE is a contradiction only
+          the printer can settle (H2S sends the mask in pushalls only, so a roll that
           left between two pushalls keeps a stale set bit and its slot never becomes
           releasable). The cached case therefore records a pushall as OWED
           (:meth:`_note_evidence_owed`) instead of silently standing forever.
+
+        On current fleet firmware this method is the FALLBACK tier rather than the main
+        road: every ~1 Hz push carries the mask, so a stable-empty slot is answered by
+        the trusted bit directly. It stays because the mask is dialect-dependent (the
+        bare-list shape has nowhere to put one) and because the ~3-push trust window
+        means the first frames after a reconnect are bits-less by construction.
 
         The merged display copy decides only whether the injection is LOGGED, never
         whether it happens: a copy still holding content makes this the clearing
@@ -2046,9 +2207,12 @@ class BambuMQTTClient:
         # Handle nested ams structure: {"ams": {"ams": [...]}} or {"ams": [...]}
         # Also handle P1S partial updates: {"tray_now": ..., "tray_tar": ...} without "ams" key
         ams_list = None
-        # Did THIS push carry tray_exist_bits? Only the dict payload has a field to carry
-        # it in — a bare unit list (the H2S shape) structurally cannot — so the answer is
-        # False for every other shape. It is what separates a veto backed by the
+        # Did THIS push carry a tray_exist_bits mask the farm may ACT ON? Only the dict
+        # payload has a field to carry one in — a bare unit list (the H2S shape)
+        # structurally cannot — and an untrusted mask (_note_exist_bits_trust) is treated
+        # here EXACTLY as a mask the push did not carry: not cached, not handed to the raw
+        # hook, not applied to the merge, and not counted as answering an owed slot. One
+        # verdict, one meaning, everywhere. It is also what separates a veto backed by the
         # firmware's current mask from one backed by the cache (see _note_evidence_owed).
         push_carried_bits = False
         if isinstance(ams_data, dict):
@@ -2063,12 +2227,21 @@ class BambuMQTTClient:
             # the incremental stale-clear guard and the apply fallback can tell a
             # stuck state-9 partial for an OCCUPIED slot from a genuine removal
             # even when the minimal {id, state} partial firmware sends omits the
-            # field. Only overwrite when this push actually carries it (a partial
-            # without it keeps the last truth).
+            # field. Only overwrite when this push carries a mask the trust verdict
+            # accepts (a partial without one keeps the last truth).
             _exist_bits = parse_tray_exist_bits(ams_data.get("tray_exist_bits"))
-            if _exist_bits is not None:
+            push_carried_bits = self._note_exist_bits_trust(_exist_bits)
+            # Triage surface: what the wire SAID, kept whether or not it was trusted,
+            # beside the verdict — so an operator reading /status can see a mask being
+            # withheld instead of inferring it from behaviour (2026-08-10: a whole
+            # investigation went wrong for want of these three values).
+            self.state.ams_tray_exist_bits = (
+                None if ams_data.get("tray_exist_bits") is None else str(ams_data["tray_exist_bits"])
+            )
+            self.state.ams_power_on_flag = ams_data.get("power_on_flag")
+            self.state.ams_bits_trusted = push_carried_bits
+            if push_carried_bits:
                 self._last_tray_exist_bits = _exist_bits
-                push_carried_bits = True
                 # This report ANSWERS every owed slot, whatever it says: a bit now clear
                 # lets the next partial normalize (→ release), a bit still set resolves
                 # presence through the 9→10 promotion further down. Nothing stays owed.
@@ -2331,6 +2504,9 @@ class BambuMQTTClient:
                 logger.debug("[%s] AMS partial update (no tray data)", self.serial_number)
                 return
         elif isinstance(ams_data, list):
+            # A bare unit list structurally cannot carry the mask, so it breaks the
+            # all-zero streak exactly like a dict push that omits the field.
+            self._note_exist_bits_trust(None)
             ams_list = ams_data
         else:
             logger.warning("[%s] Unexpected AMS data format: %s", self.serial_number, type(ams_data))
@@ -2354,10 +2530,20 @@ class BambuMQTTClient:
         # are built inline and are owned, frozen objects) — nothing is copied for it, and
         # the merge mutates these dicts the moment this returns. Both payload shapes reach
         # it; the caller unwraps.
+        #
+        # ONE exception to "nothing is copied": an UNTRUSTED tray_exist_bits is withheld,
+        # because downstream the mask is presence evidence in both polarities and the
+        # observation layer has no way to judge it (trust is stateful; see
+        # _note_exist_bits_trust). Withholding is a SHALLOW copy minus the one key — the
+        # unit and tray dicts must stay the very objects the merge is about to mutate,
+        # which is the whole contract of consuming them here and now.
         # Guarded: a farm-side failure must never break the MQTT callback chain.
         if self.on_ams_push_raw:
+            raw_payload = ams_data
+            if isinstance(ams_data, dict) and not push_carried_bits and "tray_exist_bits" in ams_data:
+                raw_payload = {k: v for k, v in ams_data.items() if k != "tray_exist_bits"}
             try:
-                self.on_ams_push_raw(ams_data)
+                self.on_ams_push_raw(raw_payload)
             except Exception:
                 logger.exception("[%s] Raw AMS push handler failed", self.serial_number)
 
@@ -2492,26 +2678,24 @@ class BambuMQTTClient:
         # AMS card (#1726). See the helper's docstring for the full rationale and
         # the printer-shutdown guard.
         #
-        # When THIS push carries tray_exist_bits pass the raw value through
-        # unchanged (the helper's own bit=0 / power-off parse contract is
-        # byte-identical). When it OMITS the field — the minimal {id, state}
-        # partial H2D sends — fall back to the last-seen bitmask so a stuck
+        # When THIS push carries a TRUSTED tray_exist_bits, pass it through. When it
+        # carries none — the minimal {id, state} partial H2D sends — or one the trust
+        # verdict withheld, fall back to the last-seen trusted bitmask so a stuck
         # state-9 slot the bitmask still marks occupied is promoted 9→10 on that
         # partial too (and idempotently re-wiped when it marks a NON-present tray
         # empty), instead of sitting invisible until the next full push. A cached
         # mask may never demote a tray asserting state 10/11 — see allow_demote.
         if isinstance(ams_data, dict):
-            _bits_for_apply = ams_data.get("tray_exist_bits")
-            if _bits_for_apply is None:
-                _bits_for_apply = self._last_tray_exist_bits
+            _bits_for_apply = ams_data.get("tray_exist_bits") if push_carried_bits else self._last_tray_exist_bits
             apply_tray_exist_bits(
                 merged_ams,
                 _bits_for_apply,
-                power_on_flag=ams_data.get("power_on_flag", True),
+                ams_exist_bits=ams_data.get("ams_exist_bits"),
                 log_label=self.serial_number,
-                # Demotion needs FRESH evidence: only bits carried by THIS push may
-                # force a tray to empty; the cached fallback may promote only.
-                allow_demote=ams_data.get("tray_exist_bits") is not None,
+                # Demotion needs FRESH, BELIEVED evidence: only a mask carried and
+                # trusted on THIS push may force a tray to empty; the cached fallback
+                # may promote only.
+                allow_demote=push_carried_bits,
             )
 
         self.state.raw_data["ams"] = merged_ams
@@ -3701,7 +3885,12 @@ class BambuMQTTClient:
         if "vt_tray" in data and isinstance(data["vt_tray"], dict):
             data["vt_tray"] = [data["vt_tray"]]
 
-        self.state.raw_data = data
+        # Shallow copy, never the wire dict itself: the four restores below GRAFT the
+        # farm's own MERGED views (the deep-merged ams list above all) onto this object,
+        # and adopting the parsed payload by reference published those grafts back into
+        # anything else still holding it — notably the debug capture log, which then
+        # served the merged ams dict where the wire's stood.
+        self.state.raw_data = dict(data)
 
         # Restore preserved fields BEFORE any work that may release the GIL
         # (e.g. _probe_developer_mode publishes an MQTT message).
@@ -4751,14 +4940,16 @@ class BambuMQTTClient:
                 self._command_verb(command),
             )
             return False
-        # Log outgoing message if logging is enabled
+        # Log outgoing message if logging is enabled. Snapshotted for the same reason as
+        # the inbound side: a caller that reuses or post-mutates its command dict must
+        # not be able to rewrite what the log says it sent.
         if self._logging_enabled:
             self._message_log.append(
                 MQTTLogEntry(
                     timestamp=datetime.now(timezone.utc).isoformat(),
                     topic=self.topic_publish,
                     direction="out",
-                    payload=command,
+                    payload=copy.deepcopy(command),
                 )
             )
         info = self._client.publish(self.topic_publish, json.dumps(command), qos=1)

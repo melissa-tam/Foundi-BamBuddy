@@ -466,27 +466,33 @@ export function isBambuLabSpool(tray: {
 const TRAY_PRESENT_STATES: ReadonlySet<number> = new Set([10, 11]);
 
 /** How an AMS slot with no configured material should read to the operator. */
-export type EmptySlotKind = 'physical' | 'present' | 'reset';
+export type EmptySlotKind = 'physical' | 'present' | 'unknown';
 
 /** Classify a slot that carries no material identity (#1322 follow-up).
  *
- *  The bambu_mqtt handler canonicalizes state against tray_exist_bits in BOTH
- *  directions: an empty-by-bitmask slot is promoted to state=9, and an OCCUPIED
- *  slot stuck at state 9 (a spool inserted mid-print gets no auto-read —
- *  003-H2S) is promoted to state=10 ("present, not fed"). So state alone is the
- *  authoritative empty/present signal here.
+ *  Client mirror of the backend tri-state `tray_fields.tray_presence`, and it
+ *  mirrors it HONESTLY — including the third answer. The backend returns False
+ *  ("no spool") only for the ASSERTED cleared shape (`state == 9` AND
+ *  `tray_type == ""`); the raw stream is normalized into that shape on every
+ *  push, so a slot the firmware really believes is empty always carries it.
+ *  A key-less minimal tray (`{id, ...}` with no material key at all) is
+ *  therefore UNKNOWN, never empty — the pre-2026-08-10 classifier claimed
+ *  "empty" for any bare state 9 and so asserted a fact the wire never stated.
  *
- *  "physical" — firmware positively confirmed no spool (state 9). Every
- *  empty-by-bitmask slot lands here regardless of firmware payload shape.
+ *  "physical" — wire-asserted empty: state 9 WITH the empty-string material
+ *  assertion. `null`/`undefined` `tray_type` is the absence of an answer, not
+ *  an answer, and does NOT qualify.
  *
  *  "present" — firmware says a spool IS seated (state 10/11) but no material
  *  identity came with it: the AMS never got a clean read. 004-H2S held a ~90 %
  *  roll like this for a day while the UI drew an empty slot, so this kind MUST
- *  render distinctly from both "empty" and "unconfigured".
+ *  render distinctly from both "empty" and "unknown".
  *
- *  "reset" — no material configured and firmware has confirmed neither presence
- *  nor emptiness (state null, 3, or any other value — e.g. a slot the user
- *  cleared with "Reset Slot"). Rendered as "?" (unidentified), never "Empty".
+ *  "unknown" — everything else: a state-9 slot with no material assertion, the
+ *  dialect states (0/3/8/25/26/27 — an A1/P1S/H2C idle slot sits in these and
+ *  they mean nothing about presence), or a tray carrying no state at all. The
+ *  operator is told the state is unknown; the old "reset"/"No filament
+ *  assigned" copy asserted a user action that never happened on those dialects.
  *
  *  Returns null when the slot is loaded (tray_type is present).
  */
@@ -494,9 +500,9 @@ export function getEmptySlotKind(
   tray: { tray_type?: string | null; state?: number | null } | null | undefined,
 ): EmptySlotKind | null {
   if (tray?.tray_type) return null;
-  if (tray?.state === 9) return 'physical';
+  if (tray?.state === 9 && tray.tray_type === '') return 'physical';
   if (tray?.state != null && TRAY_PRESENT_STATES.has(tray.state)) return 'present';
-  return 'reset';
+  return 'unknown';
 }
 
 export interface AmsTrayLike {

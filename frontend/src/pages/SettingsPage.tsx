@@ -957,7 +957,6 @@ export function SettingsPage() {
       (settings.spool_recovery_step_timeout_s ?? 90) !== (localSettings.spool_recovery_step_timeout_s ?? 90) ||
       (settings.spool_recovery_protect_layers ?? 7) !== (localSettings.spool_recovery_protect_layers ?? 7) ||
       (settings.runout_auto_resume_enabled ?? true) !== (localSettings.runout_auto_resume_enabled ?? true) ||
-      (settings.auto_add_untagged ?? true) !== (localSettings.auto_add_untagged ?? true) ||
       (settings.tagless_default_filament ?? '') !== (localSettings.tagless_default_filament ?? '') ||
       (settings.queue_drying_enabled ?? false) !== (localSettings.queue_drying_enabled ?? false) ||
       (settings.queue_drying_block ?? false) !== (localSettings.queue_drying_block ?? false) ||
@@ -1078,7 +1077,6 @@ export function SettingsPage() {
         spool_recovery_max_attempts: localSettings.spool_recovery_max_attempts,
         spool_recovery_step_timeout_s: localSettings.spool_recovery_step_timeout_s,
         spool_recovery_protect_layers: localSettings.spool_recovery_protect_layers,
-        auto_add_untagged: localSettings.auto_add_untagged,
         tagless_default_filament: localSettings.tagless_default_filament,
         queue_drying_enabled: localSettings.queue_drying_enabled,
         queue_drying_block: localSettings.queue_drying_block,
@@ -5471,24 +5469,11 @@ export function SettingsPage() {
                     <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
                   </label>
                 </div>
-                {/* Auto-add untagged trays */}
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-white">{t('settings.autoAddUntagged')}</p>
-                    <p className="text-sm text-bambu-gray">
-                      {t('settings.autoAddUntaggedDesc')}
-                    </p>
-                  </div>
-                  <label className="relative inline-flex items-center cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={localSettings.auto_add_untagged ?? true}
-                      onChange={(e) => updateSetting('auto_add_untagged', e.target.checked)}
-                      className="sr-only peer"
-                    />
-                    <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
-                  </label>
-                </div>
+                {/* The "auto-add untagged trays" toggle was removed 2026-08-10: it
+                    switched OFF the tagless auto-mint lane, and with it the gram
+                    tracking that doctrine rules 1/2/4 require for every untagged
+                    roll on this fleet. The default filament below is the real
+                    control — emptying it turns the bare-tray feature off. */}
                 {/* Default filament for bare tagless trays (JSON-string setting,
                     mirrors gcode_snippets serialization; empty = feature off). */}
                 {(() => {

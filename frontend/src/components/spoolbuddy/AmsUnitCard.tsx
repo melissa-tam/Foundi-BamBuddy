@@ -153,7 +153,12 @@ function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, onCl
   // Firmware says a spool IS seated (state 10/11) but it could not be read.
   // Never draw that as an empty ring — 004-H2S hid a ~90 % roll that way.
   const presentUnread = isEmpty && emptyKind === 'present';
+  // The wire never stated presence either way (state-9 with no material
+  // assertion, a dialect idle state, or no state at all). Quieter than the
+  // seated-unread ring, but still not the positive claim "Empty".
+  const stateUnknown = isEmpty && emptyKind === 'unknown';
   const presentUnreadLabel = t('ams.slotPresentUnread');
+  const stateUnknownLabel = t('ams.slotStateUnknown');
   const color = trayColorToCSS(tray.tray_color);
   const amsFill = tray.remain !== null && tray.remain !== undefined && tray.remain >= 0 ? tray.remain : null;
   // If inventory says 0% but AMS reports positive remain, prefer AMS (#676)
@@ -182,8 +187,14 @@ function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, onCl
               ?
             </div>
           ) : (
-            <div className="w-full h-full rounded-full border-2 border-dashed border-gray-500 flex items-center justify-center">
+            <div
+              className={`w-full h-full rounded-full border-2 border-dashed flex items-center justify-center ${
+                stateUnknown ? 'border-gray-700' : 'border-gray-500'
+              }`}
+              title={stateUnknown ? stateUnknownLabel : undefined}
+            >
               <div className="w-3 h-3 rounded-full bg-gray-600" />
+              {stateUnknown && <span className="sr-only">{stateUnknownLabel}</span>}
             </div>
           )
         ) : (
@@ -200,14 +211,21 @@ function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, onCl
         )}
       </div>
 
-      {/* Material type */}
+      {/* Material type. Kiosk copy is translated like every other surface and
+          reads from the SAME classifier — it used to hard-code English that
+          contradicted the locales AND claimed a loaded-but-unconfigured slot for
+          every state the wire simply had not reported. */}
       <span
         className="text-sm text-white/70 truncate max-w-full"
-        title={presentUnread ? presentUnreadLabel : emptyKind === 'reset' ? 'Spool loaded — slot not configured' : undefined}
+        title={presentUnread ? presentUnreadLabel : stateUnknown ? stateUnknownLabel : undefined}
       >
         {isEmpty
-          ? (presentUnread ? presentUnreadLabel : emptyKind === 'reset' ? '?' : 'Empty')
-          : tray.tray_type || 'Unknown'}
+          ? (presentUnread
+              ? presentUnreadLabel
+              : stateUnknown
+                ? t('ams.slotStateUnknownShort')
+                : t('ams.slotEmpty'))
+          : tray.tray_type || t('ams.unknown')}
       </span>
 
       {/* Fill level bar */}

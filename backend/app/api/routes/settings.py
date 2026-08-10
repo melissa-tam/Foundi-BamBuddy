@@ -114,7 +114,6 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "spoolman_report_partial_usage",
             "auto_add_unknown_rfid",
             "disable_filament_warnings",
-            "auto_add_untagged",
             "spool_recovery_enabled",
             "runout_auto_resume_enabled",
             "respool_auto_enabled",

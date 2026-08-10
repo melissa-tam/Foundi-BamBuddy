@@ -33,9 +33,10 @@ def _patch_status(backup):
     )
 
 
-async def _effective_policy_handed_to_matcher(scheduler, backup_state, policy_setting):
-    """Drive ``_compute_ams_mapping_for_printer`` and capture the policy the
-    matcher actually receives (i.e. post-``effective_policy`` gate)."""
+async def _matcher_kwargs(scheduler, backup_state, policy_setting):
+    """Drive ``_compute_ams_mapping_for_printer`` and capture the keyword arguments
+    the matcher actually receives — the policy post-``effective_policy`` gate, and
+    the floor reading this lane asks for."""
     db = MagicMock()
     item = SimpleNamespace(filament_overrides=None, skip_filament_check=False, id=1)
     reqs = [{"slot_id": 1, "type": "PLA", "color": "#000000", "tray_info_idx": "", "used_grams": 10.0}]
@@ -53,10 +54,11 @@ async def _effective_policy_handed_to_matcher(scheduler, backup_state, policy_se
     ]
     captured: dict = {}
 
-    def _capture(required, loaded_, *, policy, inv, backup_on, min_start_g):
+    def _capture(required, loaded_, *, policy, inv, backup_on, min_start_g, require_known_grams=False):
         captured["policy"] = policy
         captured["backup_on"] = backup_on
         captured["min_start_g"] = min_start_g
+        captured["require_known_grams"] = require_known_grams
         return MatchOutcome(mapping=[0])
 
     with (
@@ -70,7 +72,7 @@ async def _effective_policy_handed_to_matcher(scheduler, backup_state, policy_se
     ):
         await scheduler._compute_ams_mapping_for_printer(db, printer_id=1, item=item)
 
-    return captured.get("policy")
+    return captured
 
 
 class TestEffectivePolicyGate:
@@ -91,27 +93,36 @@ class TestBackupGateThroughScheduler:
     @pytest.mark.asyncio
     async def test_backup_off_coerces_lowest_remaining_to_slot_order(self, scheduler):
         # #1766: backup OFF + lowest_remaining must reach the matcher as slot_order.
-        out = await _effective_policy_handed_to_matcher(
-            scheduler, backup_state=False, policy_setting="lowest_remaining"
-        )
-        assert out == "slot_order"
+        out = await _matcher_kwargs(scheduler, backup_state=False, policy_setting="lowest_remaining")
+        assert out["policy"] == "slot_order"
 
     @pytest.mark.asyncio
     async def test_backup_on_preserves_lowest_remaining(self, scheduler):
-        out = await _effective_policy_handed_to_matcher(scheduler, backup_state=True, policy_setting="lowest_remaining")
-        assert out == "lowest_remaining"
+        out = await _matcher_kwargs(scheduler, backup_state=True, policy_setting="lowest_remaining")
+        assert out["policy"] == "lowest_remaining"
 
     @pytest.mark.asyncio
     async def test_backup_unknown_preserves_lowest_remaining(self, scheduler):
         # None = unknown / unsupported (A1 family). Must NOT be treated as OFF.
-        out = await _effective_policy_handed_to_matcher(scheduler, backup_state=None, policy_setting="lowest_remaining")
-        assert out == "lowest_remaining"
+        out = await _matcher_kwargs(scheduler, backup_state=None, policy_setting="lowest_remaining")
+        assert out["policy"] == "lowest_remaining"
 
     @pytest.mark.asyncio
     async def test_first_loaded_reaches_matcher_regardless_of_backup(self, scheduler):
         # The farm default passes through unchanged even with backup OFF.
-        out = await _effective_policy_handed_to_matcher(scheduler, backup_state=False, policy_setting="first_loaded")
-        assert out == "first_loaded"
+        out = await _matcher_kwargs(scheduler, backup_state=False, policy_setting="first_loaded")
+        assert out["policy"] == "first_loaded"
+
+
+class TestStartLaneFloorReading:
+    @pytest.mark.asyncio
+    async def test_dispatch_mapping_asks_for_the_fail_closed_floor(self, scheduler):
+        """The dispatch / manual-start / preview mapping lane is a START: it must ask
+        the matcher for the fail-closed reading, so a roll the ledger cannot price is
+        reserved instead of started. (spool_recovery's mid-print donor search is the
+        only caller that leaves this off.)"""
+        out = await _matcher_kwargs(scheduler, backup_state=True, policy_setting="first_loaded")
+        assert out["require_known_grams"] is True
 
 
 async def _mapping_with_real_matcher(scheduler, *, policy_setting, min_start_g, inv):

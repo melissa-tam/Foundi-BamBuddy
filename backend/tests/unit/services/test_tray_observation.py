@@ -273,16 +273,16 @@ class TestPresence:
         the slot carries no filament."""
         assert observe_tray(1, 0, {"id": 0, "state": state, "tray_type": ""}).present is False
 
-    def test_exist_bit_vetoes_a_false_presence(self):
+    def test_a_set_exist_bit_seats_the_slot(self):
         """003-H2S: a mid-print insert sticks at state 9 while the bitmask reports it.
 
-        The merge pipeline promotes exactly this case 9→10 downstream; pre-merge we
-        resolve the contradiction to UNKNOWN — never to EMPTY, because EMPTY is what
-        authorizes releasing a binding.
+        The merge pipeline promotes exactly this case 9→10 downstream; pre-merge the
+        bit alone already answers PRESENT, which is what keeps a seated roll's binding
+        out of reach of release-on-empty.
         """
         obs = observe_tray(1, 0, STALE_EMPTY_TRAY, exist_bits=0b0100)  # AMS0 T2 bit set
         assert obs.exist_bit is True
-        assert obs.present is None
+        assert obs.present is True
 
     def test_exist_bit_clear_leaves_the_empty_shape_empty(self):
         obs = observe_tray(1, 0, STALE_EMPTY_TRAY, exist_bits=0b0000)
@@ -297,10 +297,22 @@ class TestPresence:
         assert obs.exist_bit is None
         assert obs.present is False
 
-    def test_exist_bit_never_manufactures_presence(self):
-        # Positive evidence only: a set bit does not turn an unknown into a True.
+    def test_a_set_exist_bit_answers_even_a_dialect_state(self):
+        # The A1/P1S always-3 dialect never reports presence in `state`; the mask does.
         obs = observe_tray(1, 0, {"id": 0, "state": 3}, exist_bits=0b0001)
         assert obs.exist_bit is True
+        assert obs.present is True
+
+    def test_a_clear_exist_bit_empties_a_keyless_stub(self):
+        """The printer-1 stable-empty shape — no `state`, no `tray_type`, nothing."""
+        obs = observe_tray(1, 0, {"id": 1}, exist_bits=0b0000)
+        assert obs.exist_bit is False
+        assert obs.present is False
+        assert observe_tray(1, 0, {"id": 1}).present is None, "…and UNKNOWN without a mask"
+
+    def test_a_clear_bit_against_a_present_state_is_unknown(self):
+        obs = observe_tray(1, 0, {"id": 0, "state": 11, "tray_type": "PETG"}, exist_bits=0b0000)
+        assert obs.exist_bit is False
         assert obs.present is None
 
     @pytest.mark.parametrize(
@@ -351,10 +363,12 @@ class TestSharedPresenceRule:
     def test_unknown_stays_unknown(self, state, tray_type, why):
         assert tray_presence(state, tray_type) is None, why
 
-    def test_exist_bit_vetoes_false_but_never_manufactures_true(self):
-        assert tray_presence(9, "", exist_bit=True) is None
+    def test_the_exist_bit_decides_in_both_polarities(self):
+        assert tray_presence(9, "", exist_bit=True) is True
         assert tray_presence(9, "", exist_bit=False) is False
-        assert tray_presence(3, "PETG", exist_bit=True) is None
+        assert tray_presence(3, "PETG", exist_bit=True) is True
+        assert tray_presence(3, "PETG", exist_bit=False) is False
+        assert tray_presence(11, "PETG", exist_bit=False) is None, "in-push contradiction"
 
     def test_observe_tray_uses_this_exact_rule(self):
         """No second presence implementation: the observation layer's answer IS this."""

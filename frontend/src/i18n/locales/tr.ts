@@ -191,6 +191,7 @@ export default {
         visionHold: 'Yazıcı görüşü: plaka boş değil — yatağı temizleyin, sonra yazıcıdan sürdürün',
         previousPrintFailed: 'Bekletildi: önceki baskı başarısız oldu',
         filamentShort: 'Filament az',
+        externalSpoolRunout: 'Harici makara bitti — AMS yuvasını değil, harici tutucuyu doldurun',
         startSpoolBelowMinimum: 'Atanan makara minimum başlangıç ağırlığının altında',
         filamentUnreadPending: 'Filament okunmadı — takılı makara okunuyor',
         no_usb_drive: 'Yazıcıda USB sürücü yok — bir USB-A sürücü (FAT32/exFAT) takın',
@@ -787,7 +788,6 @@ export default {
     // Toast mesajları
     toast: {
       printerDeleted: 'Yazıcı silindi',
-      missingSpoolAssignment: '{{printer}} üzerinde baskı başladı. Şunlar için eksik makara ataması: {{slots}}',
       printerAdded: 'Yazıcı eklendi',
       printerUpdated: 'Yazıcı güncellendi',
       failedToDelete: 'Yazıcı silinemedi',
@@ -907,6 +907,8 @@ export default {
     controls: 'Kontroller',
     // RFID
     rfid: {
+      disabledFilamentEngaged: 'Önce filamenti çıkarın — filament beslenirken AMS bir etiketi okuyamaz',
+      disabledWhileDrying: 'AMS kurutma yaparken kullanılamaz',
       reread: "RFID'yi yeniden oku",
     },
     // AMS yükle/çıkar (#891)
@@ -1554,6 +1556,8 @@ export default {
       confirmTitle: 'Az makarayla başlansın mı?',
       confirmIntro: 'Atanan makara bu baskıyı karşılayabilir ancak minimum başlangıç ağırlığının altında. Yine de başlatılsın mı?',
       slots: 'Etkilenen yuvalar: {{slots}}',
+      unknownGramsTitle: 'Tartılmamış makarayla başlatılsın mı?',
+      unknownGramsIntro: 'Eşleşen makara için kayıtlı bir ağırlık yok, bu yüzden baskının biteceği kanıtlanamıyor. Makarayı tartın veya atayın ya da yine de başlatın.',
       printAnyway: 'Yine de başlat',
     },
     farm: {
@@ -2331,8 +2335,6 @@ export default {
     spoolRecoveryStepTimeoutDesc: 'Her kurtarma adımının başarısız sayılmadan önce ne kadar çalışabileceği (15-600 sn).',
     spoolRecoveryProtectLayers: 'İlk katmanları koru',
     spoolRecoveryProtectLayersDesc: 'İlk N katman boyunca, minimum başlangıç ağırlığının altındaki makaralar yedek olarak kullanılamaz; bundan sonra kullanılabilir. 0 = az dolu makaralar her zaman uygundur.',
-    autoAddUntagged: 'Etiketsiz tepsileri otomatik ekle',
-    autoAddUntaggedDesc: 'RFID etiketi olmayan AMS tepsileri için otomatik olarak bir envanter makarası oluşturur. Yinelenenleri önlemek için makaraları manuel olarak önceden kaydediyorsanız kapatın. RFID etiketli makaraların Spoolman ayarlarında kendi otomatik ekleme anahtarı vardır.',
     taglessDefaultFilament: 'Etiketsiz boş tepsiler için varsayılan filament',
     taglessDefaultFilamentDesc: 'Yapılandırılmamış etiketsiz AMS tepsilerini bu filamentle otomatik yapılandırarak manuel kurulum olmadan baskı yapabilmelerini sağlar.',
     taglessBrand: 'Marka',
@@ -4543,7 +4545,6 @@ export default {
     addToInventoryFailed: 'Makara envantere eklenemedi',
     unknownSpoolToast: '{{printer}} yuva {{slot}} konumunda bilinmeyen filament {{material}} — envantere eklensin mi?',
     unknownSpoolSlot: 'Yuva',
-    taglessMintToast: '{{printer}} yuva {{slot}} üzerinde etiketsiz yeni bir makara izlenmeye başlandı',
     freshRoll: {
       promptToast: '{{printer}} yuva {{slot}} üzerinde yeni rulo mu?',
       sameRoll: 'Aynı rulo',
@@ -4985,17 +4986,19 @@ export default {
     empty: 'Boş',
     emptySlot: 'Boş yuva',
     slotEmpty: 'Boş',
-    slotUnconfigured: '?',
+    slotStateUnknown: 'Yuva durumu bilinmiyor — yazıcı içinde makara olup olmadığını bildirmedi',
+    slotStateUnknownShort: 'Bilinmiyor',
     slotPresentUnread: 'Makara var — tanınmıyor',
     slotStandingUnknown: "{{printer}}: {{slot}} numaralı yuvada AMS'nin okuyamadığı bir makara var — kontrol edin",
     outOfRotation: 'Rotasyon dışı — makara sıkışması algılandı; yeniden kullanmak için makarayı yeniden takın veya işareti temizleyin',
     outOfRotationShort: 'Rotasyon dışı',
-    emptySlotReset: 'Atanmış filament yok',
     emptySlotBinding: {
       title: 'Hâlâ atanmış',
       used: '{{grams}} g kullanıldı',
       ranOut: 'tükendi — yeni makara bekleniyor',
       awaitingInsert: 'takılması bekleniyor (ön tanımlı)',
+      seatedUnread: 'takılı — tanımlanması bekleniyor',
+      presenceUnknown: 'yuvada doğrulanmadı',
       notInserted: 'takılmadı',
       elsewhereHint: '(takılmadı — {{location}} yuvasına atanmış)',
       clear: 'Yuvayı boşalt',

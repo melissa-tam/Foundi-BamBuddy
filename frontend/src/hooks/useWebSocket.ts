@@ -11,7 +11,6 @@ import {
   type EjectProgressMessage,
   type EjectPhaseState,
   type RespoolPromptMessage,
-  type SpoolAutoAssignedMessage,
   type SpoolRespooledMessage,
   type TaglessFreshPromptMessage,
   type SlotStandingUnknownMessage,
@@ -24,7 +23,6 @@ interface WebSocketMessage {
   run_id?: number;
   data?: Record<string, unknown>;
   printer_name?: string;
-  missing_slots?: Array<{ slot?: string }>;
 }
 
 /** Farm flags whose set/clear must refetch the ['printers'] list (Phase 4.3b):
@@ -55,7 +53,6 @@ export function useWebSocket() {
   const reconnectTimeoutRef = useRef<number | null>(null);
   const queryClient = useQueryClient();
   const [isConnected, setIsConnected] = useState(false);
-  const lastMissingSpoolWarningRef = useRef<Map<number, string>>(new Map());
   const { showToast } = useToast();
   const { t } = useTranslation();
 
@@ -365,34 +362,13 @@ export function useWebSocket() {
         break;
       }
 
-      case 'missing_spool_assignment': {
-        if (message.printer_id === undefined || !Array.isArray(message.missing_slots)) {
-          break;
-        }
-
-        const missingSlotLabels = message.missing_slots
-          .map((slot) => (slot && typeof slot.slot === 'string' ? slot.slot : 'Unknown'))
-          .filter((slot) => slot.length > 0);
-
-        if (missingSlotLabels.length === 0) {
-          lastMissingSpoolWarningRef.current.delete(message.printer_id);
-          break;
-        }
-
-        const signature = missingSlotLabels.join('|');
-        if (lastMissingSpoolWarningRef.current.get(message.printer_id) === signature) {
-          break;
-        }
-        lastMissingSpoolWarningRef.current.set(message.printer_id, signature);
-
-        const printerName = message.printer_name || `Printer ${message.printer_id}`;
-        const toastMsg = t('printers.toast.missingSpoolAssignment', {
-          printer: printerName,
-          slots: missingSlotLabels.join(', '),
-        });
-        showToast(toastMsg, 'warning');
-        break;
-      }
+      // NOTE: `missing_spool_assignment` deliberately has NO client handler
+      // (autonomy ruling 2026-08-10). A print starting on trays with no inventory
+      // binding needs no human action — the pipeline binds them from the wire —
+      // and the slot's own present-unread ring already carries the state
+      // ambiently on the printer card. The event still ships: the
+      // provider-gated notification (default off) is the surface for operators
+      // who do want to be told.
 
       case 'print_complete':
         // Don't invalidate printerStatus here - it causes re-render cascade and browser freeze
@@ -444,28 +420,17 @@ export function useWebSocket() {
         debouncedInvalidate('slotPresets');
         break;
 
-      case 'spool_auto_assigned': {
+      case 'spool_auto_assigned':
         // A spool was auto-bound to a slot: either an RFID tag match OR the
-        // tagless silent-mint. Both refresh inventory + assignment caches; only
-        // the tagless path (origin: "tagless" — a genuinely NEW untagged roll)
-        // also surfaces a toast so the operator sees the auto-tracking happen.
-        const m = message as unknown as SpoolAutoAssignedMessage;
+        // tagless silent-mint. Refresh inventory + assignment caches — and say
+        // nothing (autonomy ruling 2026-08-10). The mint asks the operator for
+        // NOTHING: it is the tagless lane doing its job, the new row appears in
+        // inventory and on the slot by itself, and the backend already writes an
+        // INFO line for anyone reconstructing the history. A toast for it was
+        // interruption without an action.
         debouncedInvalidate('inventory-spools');
         debouncedInvalidate('spool-assignments');
-        if (m.origin === 'tagless') {
-          const printerName = queryClient
-            .getQueryData<Printer[]>(['printers'])
-            ?.find((p) => p.id === m.printer_id)?.name ?? `Printer ${m.printer_id}`;
-          showToast(
-            t('inventory.taglessMintToast', {
-              printer: printerName,
-              slot: (m.tray_id ?? 0) + 1,
-            }),
-            'success',
-          );
-        }
         break;
-      }
 
       case 'spool_usage_logged':
         // Filament consumption recorded - refresh spool data

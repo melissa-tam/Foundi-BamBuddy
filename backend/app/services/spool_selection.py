@@ -22,12 +22,34 @@ setting:
   *smart-cover* partition keeps a candidate that can finish the job on its own
   ahead of an older one that would run dry.
 
-Plus a minimum-start-weight rule (``min_start_spool_g``): a spool whose *known*
-remaining grams fall below the floor can never be the STARTING spool of a print
-(it stays as a firmware backup donor). When the only otherwise-matching spool is
-below the floor the requirement's slot is reported in
-:attr:`MatchOutcome.start_blocked_slots` so the caller can stage the job with a
-distinct reason instead of silently dispatching or falling back to a mismatch.
+Plus a minimum-start-weight rule (``min_start_spool_g``): a spool that cannot be
+PROVEN to hold at least the floor can never be the STARTING spool of a print (it
+stays a firmware backup donor). A candidate fails that proof two ways, kept
+distinct as :data:`START_BLOCK_BELOW_FLOOR` / :data:`START_BLOCK_UNKNOWN_GRAMS`:
+its known remaining is under the floor, or its remaining is UNKNOWN (an unbound
+tray, or a binding whose grams nothing can quote). Unknown fails CLOSED under
+``require_known_grams`` — a roll the ledger cannot price may hold 5 g, and an
+unpriceable candidate used to sit in ``eligible`` and start prints (prod trace
+2026-08-07 23:38:13, ``inv_g=None`` beside ``remain=46``). That reading is scoped
+to printers whose ledger demonstrably speaks: with NOT ONE loaded slot priced,
+the install keeps no spool inventory and every roll would be refused forever, so
+the unknown reserve stands down (the same stance the deficit lane already takes
+on undetermined grams). A gap in a ledger that IS in use is the closed hole.
+
+Fail-closed is the START reading only. ``spool_recovery``'s mid-print donor
+search leaves ``require_known_grams`` off by design: a refill runs against a 5 g
+hard floor to keep a live print moving, where refusing an unpriceable roll would
+stall the print it exists to rescue. Two consequences of the start reading are
+deliberate, both on a printer whose ledger speaks: an externally-held roll
+(``vt_tray``) is never inventory-tracked, so it is unpriceable by construction and
+cannot START a print, and a tray with no binding at all is likewise start-blocked.
+Both remain startable via "Print Anyway" (``skip_filament_check`` → floor 0) or
+``min_start_spool_g = 0``, which disable the floor and every reading of it at once.
+
+When the only otherwise-matching spool fails the proof, the requirement's slot is
+reported in :attr:`MatchOutcome.start_blocked_slots` (with its kind in
+``start_block_kinds``) so the caller can stage the job with a distinct reason
+instead of silently dispatching or falling back to a mismatch.
 
 Above every policy sits a hard exclude of unusable spools: a spool flagged with a
 mid-print feed fault (``Spool.feed_fault_at`` → :attr:`SlotInventory.out_of_rotation`),
@@ -52,6 +74,7 @@ The dispatch answer for such a slot is not "stage the job" but "read the slot" �
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -85,6 +108,29 @@ WAITING_REASON_START_MIN = "start_spool_below_minimum"
 # re-decides on real evidence. Self-clearing exactly like ``stagger_hold`` /
 # ``no_usb_drive`` — dispatch clears it, and a genuine deficit overwrites it.
 WAITING_REASON_UNREAD_PENDING = "filament_unread_pending"
+
+# Why a slot could not be started. ONE vocabulary, cited by the decision trace,
+# the staged waiting_reason (``farm_staging.build_staged_reason``) and the tests —
+# the two failures need different operator actions (top the roll up vs. give the
+# farm a weight for it), so they must stay tellable apart in triage.
+START_BLOCK_BELOW_FLOOR = "below_floor"
+START_BLOCK_UNKNOWN_GRAMS = "unknown_grams"
+
+
+def dominant_start_block(kinds: Iterable[str]) -> str | None:
+    """Collapse start-block kinds into the ONE kind that words a single hold.
+
+    ``unknown_grams`` only when EVERY block is unknown-grams: a mixed set contains
+    at least one roll the farm HAS priced below the floor, and "below minimum" is
+    the true statement about that roll. Empty ⇒ ``None`` (nothing is blocked).
+    Used per-slot by the matcher, per-outcome by :attr:`MatchOutcome.start_block_kind`,
+    and across candidate printers by the scheduler's model lane, so the rule that
+    decides the wording lives in exactly one place.
+    """
+    ks = set(kinds)
+    if not ks:
+        return None
+    return START_BLOCK_UNKNOWN_GRAMS if ks == {START_BLOCK_UNKNOWN_GRAMS} else START_BLOCK_BELOW_FLOOR
 
 
 @dataclass
@@ -137,14 +183,29 @@ class MatchOutcome:
     """Result of matching required filaments to loaded slots.
 
     ``mapping`` is the AMS mapping array (position = slot_id - 1, value =
-    global_tray_id or -1), or ``None`` when nothing to map. ``start_blocked_slots``
-    lists slot_ids that had NO eligible spool solely because every otherwise-
-    matching candidate was below the minimum-start floor (a dropped candidate
-    WOULD have matched) — the distinct "start spool below minimum" signal.
+    global_tray_id or -1), or ``None`` when nothing to map.
+
+    ``start_block_kinds`` maps slot_id → ``START_BLOCK_*`` for every slot that had
+    NO eligible spool solely because each otherwise-matching candidate failed the
+    minimum-start proof (a reserved candidate WOULD have matched) — the distinct
+    "cannot start on this" signal. It is THE start-block record: the
+    ``start_blocked_slots`` list is its key view, so the slot set and the reasons
+    can never disagree.
     """
 
     mapping: list[int] | None
-    start_blocked_slots: list[int] = field(default_factory=list)
+    start_block_kinds: dict[int, str] = field(default_factory=dict)
+
+    @property
+    def start_blocked_slots(self) -> list[int]:
+        """Slot_ids held back by the minimum-start proof (insertion-ordered)."""
+        return list(self.start_block_kinds)
+
+    @property
+    def start_block_kind(self) -> str | None:
+        """The one kind that words a hold covering this outcome (see
+        :func:`dominant_start_block`); ``None`` when nothing is start-blocked."""
+        return dominant_start_block(self.start_block_kinds.values())
 
 
 # ---------------------------------------------------------------------------
@@ -319,8 +380,18 @@ def match_filaments_to_slots(
     inv: dict[int, SlotInventory] | None,
     backup_on: bool | None,
     min_start_g: int,
+    require_known_grams: bool = False,
 ) -> MatchOutcome:
     """Match required filaments to loaded slots under the given policy.
+
+    ``require_known_grams`` is the START reading of the floor: a candidate whose
+    remaining grams are UNKNOWN is reserved instead of started, because an
+    unpriceable roll may hold 5 g. Dispatch / manual-start / preview all pass it;
+    the default is OFF for ``spool_recovery``'s mid-print donor search, which must
+    keep a live print fed against a 5 g hard floor (see the module docstring). It
+    takes effect only when at least one loaded slot HAS quotable grams — a printer
+    with no inventory at all is not tracking spools, and a floor that refuses every
+    roll would park it rather than protect it.
 
     Bucket precedence (unique tray_info_idx > exact colour > similar colour >
     type-only) and the nozzle filter are UNCHANGED from the legacy matcher. On
@@ -334,22 +405,36 @@ def match_filaments_to_slots(
        An UNREAD candidate (``loaded`` entry stamped ``unread`` — a seated tray with no
        identity at all) is excluded FIRST and independently of ``inv``, because that
        exclusion is a wire fact that holds whether or not the slot carries a binding.
-    1. ``min_start_g > 0`` drops candidates whose *known* remaining is below the
-       floor into a ``dropped`` reserve (unknown/unbound stay eligible).
+    1. ``min_start_g > 0`` reserves candidates that fail the minimum-start proof:
+       known remaining below the floor, and — under ``require_known_grams`` —
+       unknown remaining. Each reserve keeps its own list so the block it causes
+       can name its kind. ``min_start_g == 0`` disables the floor and BOTH
+       readings of it (that is what "Print Anyway" leans on).
     2. Eligible candidates are sorted by the policy key (``slot_order`` = none).
     3. ``first_loaded`` with backup not ON stable-partitions eligible into
        covering-first (a candidate covers when its remaining is unknown or
        >= the requirement's ``used_grams``), FIFO within each half.
-    4. The bucket scan runs on eligible; on a miss, if a dropped candidate WOULD
-       have matched, the slot is recorded start-blocked.
+    4. The bucket scan runs on eligible; on a miss, a reserved candidate that
+       WOULD have matched records the slot start-blocked under its reserve's kind.
     """
     if not required:
         return MatchOutcome(mapping=None)
 
+    # The START reading applies only where the ledger can speak. When NOT ONE loaded
+    # slot has quotable grams, this printer keeps no inventory at all (an install that
+    # does not use the spool module, a freshly-onboarded printer, a repair that left
+    # every slot unbound) and the floor has nothing to say about any of them: refusing
+    # every roll would park the printer instead of protecting it, and the deficit lane
+    # already treats undetermined grams as non-blocking for the same reason. The shape
+    # this closes is one unpriced roll BESIDE priced ones — a gap in a ledger that is
+    # demonstrably in use, which is what the 2026-08-07 23:38:13 trace showed.
+    ledger_priced = any(si.remaining_g is not None for si in inv.values()) if inv else False
+    reserve_unknown = require_known_grams and ledger_priced
+
     trace = policy != "slot_order" or min_start_g > 0
     used_tray_ids: set[int] = set()
     comparisons: list[dict] = []
-    start_blocked_slots: list[int] = []
+    start_block_kinds: dict[int, str] = {}
 
     for req in required:
         slot_id = req.get("slot_id", 0)
@@ -395,19 +480,25 @@ def match_filaments_to_slots(
         if req_nozzle_id is not None:
             available = [f for f in available if f.get("extruder_id") == req_nozzle_id]
 
-        # (1) minimum-start floor: reserve known-low candidates as backup donors.
+        # (1) minimum-start floor: reserve every candidate that cannot be PROVEN to
+        # clear it. Known-low rolls stay backup donors; unknown-grams rolls are
+        # reserved only under the START reading (``require_known_grams``) — the
+        # mid-print donor path must still be able to feed a print from a roll the
+        # ledger cannot price. The two reserves stay separate so a block names WHY.
+        eligible: list[dict] = []
+        dropped_low: list[dict] = []
+        dropped_unknown: list[dict] = []
         if min_start_g > 0:
-            eligible: list[dict] = []
-            dropped: list[dict] = []
             for f in available:
                 rem = _known_remaining(f, inv)
-                if rem is not None and rem < min_start_g:
-                    dropped.append(f)
+                if rem is None:
+                    (dropped_unknown if reserve_unknown else eligible).append(f)
+                elif rem < min_start_g:
+                    dropped_low.append(f)
                 else:
                     eligible.append(f)
         else:
             eligible = list(available)
-            dropped = []
 
         # (2) policy sort.
         _sort_candidates(eligible, policy, inv)
@@ -421,8 +512,9 @@ def match_filaments_to_slots(
 
         if trace:
             logger.info(
-                "[spool-select] slot=%s type=%r color=%r tii=%r nozzle=%s policy=%s min_start=%s; "
-                "eligible=%s dropped=%s excluded_oor=%s excluded_spent=%s excluded_archived=%s "
+                "[spool-select] slot=%s type=%r color=%r tii=%r nozzle=%s policy=%s min_start=%s "
+                "require_known_grams=%s ledger_priced=%s; eligible=%s dropped_below_floor=%s "
+                "dropped_unknown_grams=%s excluded_oor=%s excluded_spent=%s excluded_archived=%s "
                 "excluded_unread=%s",
                 slot_id,
                 req_type_repr(req),
@@ -431,24 +523,40 @@ def match_filaments_to_slots(
                 req_nozzle_id,
                 policy,
                 min_start_g,
+                require_known_grams,
+                ledger_priced,
                 _trace_rows(eligible, inv),
-                _trace_rows(dropped, inv),
+                _trace_rows(dropped_low, inv),
+                _trace_rows(dropped_unknown, inv),
                 excluded_oor,
                 excluded_spent,
                 excluded_archived,
                 excluded_unread,
             )
 
-        # (4) bucket scan on eligible; dropped-only match ⇒ start-blocked.
+        # (4) bucket scan on eligible; a reserve-only match ⇒ start-blocked, under
+        # the kind of the reserve(s) that would have matched.
         match = _scan_candidates(req, eligible)
-        if match is None and dropped:
-            _sort_candidates(dropped, policy, inv)
-            if _scan_candidates(req, dropped) is not None:
-                start_blocked_slots.append(slot_id)
+        if match is None:
+            matched_kinds: set[str] = set()
+            for reserve, reserve_kind in (
+                (dropped_low, START_BLOCK_BELOW_FLOOR),
+                (dropped_unknown, START_BLOCK_UNKNOWN_GRAMS),
+            ):
+                if not reserve:
+                    continue
+                _sort_candidates(reserve, policy, inv)
+                if _scan_candidates(req, reserve) is not None:
+                    matched_kinds.add(reserve_kind)
+            kind = dominant_start_block(matched_kinds)
+            if kind is not None:
+                start_block_kinds[slot_id] = kind
                 if trace:
                     logger.info(
-                        "[spool-select] slot=%s START-BLOCKED — only match(es) below %s g floor (kept as backup)",
+                        "[spool-select] slot=%s START-BLOCKED reason=%s — no match can be proven to clear "
+                        "the %s g floor (below-floor rolls stay backup donors; unpriced rolls cannot start)",
                         slot_id,
+                        kind,
                         min_start_g,
                     )
 
@@ -459,22 +567,22 @@ def match_filaments_to_slots(
                 logger.info("[spool-select] slot=%s -> picked gtid=%s", slot_id, match["global_tray_id"])
         else:
             comparisons.append({"slot_id": slot_id, "global_tray_id": -1})
-            if trace and slot_id not in start_blocked_slots:
+            if trace and slot_id not in start_block_kinds:
                 logger.info("[spool-select] slot=%s -> NO MATCH", slot_id)
 
     if not comparisons:
-        return MatchOutcome(mapping=None, start_blocked_slots=start_blocked_slots)
+        return MatchOutcome(mapping=None, start_block_kinds=start_block_kinds)
 
     max_slot_id = max(c["slot_id"] for c in comparisons)
     if max_slot_id <= 0:
-        return MatchOutcome(mapping=None, start_blocked_slots=start_blocked_slots)
+        return MatchOutcome(mapping=None, start_block_kinds=start_block_kinds)
 
     mapping = [-1] * max_slot_id
     for c in comparisons:
         sid = c["slot_id"]
         if sid and sid > 0:
             mapping[sid - 1] = c["global_tray_id"]
-    return MatchOutcome(mapping=mapping, start_blocked_slots=start_blocked_slots)
+    return MatchOutcome(mapping=mapping, start_block_kinds=start_block_kinds)
 
 
 def req_type_repr(req: dict) -> str:
@@ -684,19 +792,34 @@ async def _read_min_start_g(db: AsyncSession) -> int:
         return DEFAULT_MIN_START_SPOOL_G
 
 
-async def start_rule_blocked_slots(db: AsyncSession, item: PrintQueueItem) -> list[int]:
-    """Recompute the pinned printer's selection outcome and return the slot_ids
-    blocked purely by the minimum-start floor. Empty when the rule can't apply
-    (no pinned printer, Print-Anyway acknowledged, or the floor is disabled)."""
+async def start_rule_block_kinds(db: AsyncSession, item: PrintQueueItem) -> dict[int, str]:
+    """Recompute the pinned printer's selection outcome and return slot_id →
+    ``START_BLOCK_*`` for every slot blocked purely by the minimum-start proof
+    (below the floor, or unpriceable). Empty when the rule can't apply (no pinned
+    printer, Print-Anyway acknowledged, or the floor is disabled).
+
+    THE re-check every release path owes the floor: it runs the same
+    ``_compute_ams_mapping_for_printer`` the scheduler dispatches on, so a hold and
+    its release are decided by one predicate and cannot disagree into a
+    stage↔release bounce. Callers that only need "which slots" take the
+    :func:`start_rule_blocked_slots` view; callers that must WORD the block (the
+    manual-start 409) read the kinds, so the slot list and the reason can never come
+    from two different computations."""
     if item.printer_id is None or item.skip_filament_check:
-        return []
+        return {}
     if await _read_min_start_g(db) == 0:
-        return []
+        return {}
     # Function-local import: print_scheduler imports this module at load time.
     from backend.app.services.print_scheduler import scheduler
 
     outcome = await scheduler._compute_ams_mapping_for_printer(db, item.printer_id, item)
-    return list(outcome.start_blocked_slots)
+    return dict(outcome.start_block_kinds)
+
+
+async def start_rule_blocked_slots(db: AsyncSession, item: PrintQueueItem) -> list[int]:
+    """Slot_ids held back by the minimum-start proof — the key view of
+    :func:`start_rule_block_kinds`."""
+    return list(await start_rule_block_kinds(db, item))
 
 
 async def start_rule_blocks_item(db: AsyncSession, item: PrintQueueItem) -> bool:

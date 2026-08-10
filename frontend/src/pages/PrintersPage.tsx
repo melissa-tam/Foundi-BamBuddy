@@ -128,6 +128,7 @@ import { FileUploadModal } from '../components/FileUploadModal';
 import { PrintModal } from '../components/PrintModal';
 import { PrinterInfoModal } from '../components/PrinterInfoModal';
 import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, isBambuLabSpool, getEmptySlotKind, type EmptySlotKind } from '../utils/amsHelpers';
+import { slotPresence } from '../utils/spoolBindingStatus';
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
@@ -868,10 +869,12 @@ function TemperatureIndicator({ temp, goodThreshold = 28, fairThreshold = 35, on
 /** Caption i18n key for an AMS slot carrying no material identity.
  *  A 'present' slot (firmware says a spool IS seated, state 10/11, but it could
  *  not be read) must never read "Empty" — that is exactly how 004-H2S hid a
- *  ~90 % roll for a day. */
+ *  ~90 % roll for a day. An 'unknown' slot must not read "Empty" either: the
+ *  wire never asserted the cleared shape, so the caption says so instead of
+ *  making the claim for it. */
 function emptySlotLabelKey(kind: EmptySlotKind | null): string {
   if (kind === 'present') return 'ams.slotPresentUnread';
-  if (kind === 'reset') return 'ams.slotUnconfigured';
+  if (kind === 'unknown') return 'ams.slotStateUnknownShort';
   return 'ams.slotEmpty';
 }
 
@@ -3091,8 +3094,16 @@ function PrinterCard({
    * A binding that outlived the filament, for the EMPTY-slot hover card (W5a).
    * Maps the API rows onto the card's flags; the card owns the wording. Returns
    * `null` when the slot has no inventory binding at all (the common case).
+   *
+   * `kind` is the live wire classification of the very tray being rendered; it
+   * is combined with the assignment's own tri-state `present` by the shared
+   * `slotPresence` resolver. Passing presence in is what stops the card printing
+   * "not inserted" beneath a header that says a spool is present.
    */
-  const emptySlotBinding = (assignment: SpoolAssignment | undefined): EmptySlotBinding | null => {
+  const emptySlotBinding = (
+    assignment: SpoolAssignment | undefined,
+    kind: EmptySlotKind | null,
+  ): EmptySlotBinding | null => {
     const spool = assignment?.spool;
     if (!assignment || !spool) return null;
     return {
@@ -3101,6 +3112,7 @@ function PrinterCard({
       usedGrams: Math.max(0, Math.round(spool.weight_used ?? 0)),
       spent: !!spool.spent_at,
       preConfigured: !!assignment.pre_configured_at,
+      presence: slotPresence({ kind, present: assignment.present }),
     };
   };
 
@@ -3123,6 +3135,28 @@ function PrinterCard({
   }) => {
     const printerBusy = status?.state === 'RUNNING';
 
+    // "Re-read RFID" is refused by the AMS itself in two states, and the refusal
+    // used to arrive only server-side ("Please unload filament first") after the
+    // operator had already clicked — the dominant silent no-op on this menu. Both
+    // conditions are visible on the live status, so the button states the reason
+    // up front instead of failing behind the operator's back.
+    //   * filament engaged: the printer is feeding SOME tray (tray_now != 255).
+    //     Read raw, never the flicker-cached tray_now — a cached value would
+    //     disable the button on a printer that is no longer feeding anything.
+    //   * drying: the AMS holds a hard write-lockout for the whole dry cycle.
+    const filamentEngaged = status?.tray_now !== undefined && status.tray_now !== 255;
+    const amsDrying = (amsData.find((u) => u.id === amsId)?.dry_time ?? 0) > 0;
+    const rfidBlockReason = printerBusy
+      ? t('printers.bedJog.disabledWhilePrinting')
+      : !hasPermission('printers:ams_rfid')
+        ? t('printers.permission.noAmsRfid')
+        : amsDrying
+          ? t('printers.rfid.disabledWhileDrying')
+          : filamentEngaged
+            ? t('printers.rfid.disabledFilamentEngaged')
+            : undefined;
+    const rfidDisabled = !!rfidBlockReason;
+
     return (
       <>
         {outOfRotationSpool?.feed_fault_at && (
@@ -3135,17 +3169,17 @@ function PrinterCard({
         {includeRfid && (
           <button
             className={`w-full px-2 py-1.5 text-left text-xs flex items-center gap-2 rounded transition-colors ${
-              hasPermission('printers:ams_rfid')
-                ? 'text-white hover:bg-bambu-dark-tertiary'
-                : 'text-bambu-gray/50 cursor-not-allowed'
+              rfidDisabled
+                ? 'text-bambu-gray/50 cursor-not-allowed'
+                : 'text-white hover:bg-bambu-dark-tertiary'
             }`}
             onClick={(e) => {
               e.stopPropagation();
-              if (printerBusy || !hasPermission('printers:ams_rfid')) return;
+              if (rfidDisabled) return;
               refreshAmsSlotMutation.mutate({ amsId, slotId });
             }}
-            disabled={printerBusy || isRefreshing || !hasPermission('printers:ams_rfid')}
-            title={printerBusy ? t('printers.bedJog.disabledWhilePrinting') : !hasPermission('printers:ams_rfid') ? t('printers.permission.noAmsRfid') : undefined}
+            disabled={rfidDisabled || isRefreshing}
+            title={rfidBlockReason}
           >
             <RefreshCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin' : ''}`} />
             {t('printers.rfid.reread')}
@@ -5259,7 +5293,7 @@ function PrinterCard({
                                     ) : (
                                       <EmptySlotHoverCard
                                         kind={emptyKind ?? undefined}
-                                        binding={emptySlotBinding(inventoryAssignment)}
+                                        binding={emptySlotBinding(inventoryAssignment, emptyKind)}
                                         onClearSlot={() => onUnassignSpool?.(printer.id, ams.id, slotIdx)}
                                         actions={renderAmsSlotActions({
                                           amsId: ams.id,
@@ -5642,7 +5676,7 @@ function PrinterCard({
                                 ) : (
                                   <EmptySlotHoverCard
                                     kind={emptyKind ?? undefined}
-                                    binding={emptySlotBinding(htInventoryAssignment)}
+                                    binding={emptySlotBinding(htInventoryAssignment, emptyKind)}
                                     onClearSlot={() => onUnassignSpool?.(printer.id, ams.id, htSlotId)}
                                     actions={renderAmsSlotActions({
                                       amsId: ams.id,
@@ -5938,7 +5972,7 @@ function PrinterCard({
                                   ) : (
                                     <EmptySlotHoverCard
                                       kind={emptyKind ?? undefined}
-                                      binding={emptySlotBinding(extInventoryAssignment)}
+                                      binding={emptySlotBinding(extInventoryAssignment, emptyKind)}
                                       onClearSlot={() => onUnassignSpool?.(printer.id, 255, slotTrayId)}
                                       actions={renderAmsSlotActions({
                                         amsId: 255,

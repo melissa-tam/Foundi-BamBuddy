@@ -24,7 +24,9 @@ class TestDefaults:
         s = AppSettings()
         assert s.spool_selection_policy == "first_loaded"
         assert s.min_start_spool_g == 150  # R1: floor raised 120 -> 150
-        assert s.auto_add_untagged is True
+        # `auto_add_untagged` was deleted 2026-08-10 — it was a kill switch for
+        # the tagless auto-mint lane, which doctrine rules 1/2/4 make load-bearing.
+        assert not hasattr(s, "auto_add_untagged")
 
     def test_tagless_default_filament_default_shape(self):
         # W4: the shipped default carries the SPECIFIC Bambu PETG HF wire identity

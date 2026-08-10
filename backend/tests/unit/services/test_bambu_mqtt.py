@@ -807,12 +807,14 @@ class TestAMSDataMerging:
         assert mqtt_client.state.raw_data["ams"][0]["tray"][0]["state"] == 3
 
     def test_shutdown_message_preserves_ams_data(self, mqtt_client):
-        """Printer shutdown (power_on_flag=False) must not wipe AMS slot data (#765).
+        """A tray-less push must not wipe AMS slot data (#765).
 
-        When a printer shuts down it sends a final MQTT message with
-        tray_exist_bits='0' and power_on_flag=False. This all-zero value
-        previously caused every slot to be cleared, which then triggered
-        auto-unlink of all spool assignments on reconnect.
+        When a printer shuts down it sends a final MQTT message carrying
+        tray_exist_bits='0' and no `ams` list at all. What protects the slots is that
+        LAST fact — a push that describes no trays reaches no merge — and not the
+        `power_on_flag` guard that used to sit beside it, which is gone: the flag reads
+        False as the ordinary steady state across most of the fleet, so a guard keyed on
+        it discarded correct all-empty reports indefinitely.
         """
         # Initial state: two AMS units with loaded spools
         initial_ams = {
@@ -901,37 +903,63 @@ class TestAMSDataMerging:
         assert ams_data[0]["tray"][1]["tray_type"] == "", "Slot 1 should be cleared on removal"
         assert ams_data[0]["tray"][1]["tray_color"] == "", "Slot 1 color should be cleared"
 
-    def test_power_on_flag_defaults_true_when_absent(self, mqtt_client):
-        """When power_on_flag is not in the MQTT data, clearing must proceed normally.
+    def test_an_all_zero_mask_clears_once_it_has_repeated(self, mqtt_client):
+        """The trust ladder at the merge level, with ``power_on_flag`` absent entirely.
 
-        Ensures backwards compatibility with firmware that doesn't send power_on_flag.
+        A single all-zero mask is not acted on — that value is what a boot frame or a
+        truncated report degrades to, and it authorizes emptying every slot. Once
+        ``_ZERO_EXIST_BITS_TRUST_PUSHES`` consecutive pushes have said it, the slot is
+        cleared to the FULL cleared shape.
         """
-        # Initial state
-        initial_ams = {
-            "ams": [
-                {
-                    "id": 0,
-                    "tray": [
-                        {"id": 0, "tray_type": "PLA", "tray_color": "FF0000", "remain": 80},
-                    ],
-                },
-            ],
-            "tray_exist_bits": "1",
-        }
-        mqtt_client._handle_ams_data(initial_ams)
+        from backend.app.services.bambu_mqtt import _ZERO_EXIST_BITS_TRUST_PUSHES
 
-        # Update WITHOUT power_on_flag — should still clear when bit=0
-        update_ams = {
-            "ams": [{"id": 0, "tray": [{"id": 0}]}],
-            "tray_exist_bits": "0",
-            # No power_on_flag key at all
-        }
-        mqtt_client._handle_ams_data(update_ams)
-
-        ams_data = mqtt_client.state.raw_data["ams"]
-        assert ams_data[0]["tray"][0]["tray_type"] == "", (
-            "Without power_on_flag, clearing should proceed (defaults to True)"
+        mqtt_client._handle_ams_data(
+            {
+                "ams": [{"id": 0, "tray": [{"id": 0, "tray_type": "PLA", "tray_color": "FF0000", "remain": 80}]}],
+                "tray_exist_bits": "1",
+            }
         )
+
+        zero_push = {"ams": [{"id": 0, "tray": [{"id": 0}]}], "tray_exist_bits": "0"}
+        for _ in range(_ZERO_EXIST_BITS_TRUST_PUSHES - 1):
+            mqtt_client._handle_ams_data(zero_push)
+            assert mqtt_client.state.raw_data["ams"][0]["tray"][0]["tray_type"] == "PLA", (
+                "an unrepeated all-zero mask must not empty the slot"
+            )
+            assert mqtt_client.state.ams_bits_trusted is False
+
+        mqtt_client._handle_ams_data(zero_push)
+        tray = mqtt_client.state.raw_data["ams"][0]["tray"][0]
+        assert mqtt_client.state.ams_bits_trusted is True
+        assert tray["tray_type"] == ""
+        assert tray["state"] == 9
+        assert tray["remain"] == 0
+
+    def test_one_anomalous_zero_frame_never_empties_a_slot(self, mqtt_client):
+        """The streak is CONSECUTIVE: 'f' … '0' … 'f' leaves the slot untouched."""
+        loaded = {
+            "ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PLA", "remain": 80}]}],
+            "tray_exist_bits": "f",
+        }
+        mqtt_client._handle_ams_data(loaded)
+        mqtt_client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0}]}], "tray_exist_bits": "0"})
+        mqtt_client._handle_ams_data(loaded)
+        assert mqtt_client.state.raw_data["ams"][0]["tray"][0]["tray_type"] == "PLA"
+        assert mqtt_client._zero_exist_bits_streak == 0
+
+    def test_the_status_surface_reports_what_the_wire_said(self, mqtt_client):
+        """E3 triage fields: the raw hex, the firmware's flag, and OUR verdict — the
+        flag is RECORDED, never acted on (False is the fleet's normal steady state)."""
+        mqtt_client._handle_ams_data(
+            {
+                "ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PLA"}]}],
+                "tray_exist_bits": "2",
+                "power_on_flag": False,
+            }
+        )
+        assert mqtt_client.state.ams_tray_exist_bits == "2"
+        assert mqtt_client.state.ams_power_on_flag is False
+        assert mqtt_client.state.ams_bits_trusted is True, "a set bit is believed at once, flag or no flag"
 
     def test_idle_printer_with_power_off_and_nonzero_bits_clears_removed_slot(self, mqtt_client):
         """Spool removal on an idle X1C must be detected even when power_on_flag=False (#1365).
@@ -942,8 +970,10 @@ class TestAMSDataMerging:
         the real slot inventory. The original #765 guard skipped clearing
         whenever power_on_flag was false, so the bit transition that would
         mark a slot empty was discarded and the only way to refresh state
-        was a manual reconnect (pushall). The guard now skips clearing only
-        on the exact shutdown pattern (zero bits + power_on_flag=False).
+        was a manual reconnect (pushall). #1365 narrowed that guard; the
+        2026-08-10 fleet survey removed it outright, because the same "idle
+        printer reports False" behaviour turned out to be the fleet-wide norm
+        rather than an X1C quirk. The flag is now recorded and never acted on.
         """
         # Initial state: two AMS units, slot 1 of AMS 0 loaded (the one
         # we'll later remove).
@@ -1226,31 +1256,58 @@ class TestApplyTrayExistBitsHelper:
         assert apply_tray_exist_bits(units, "garbage") == 0
         assert units[0]["tray"][0]["tray_type"] == "PLA"
 
-    def test_shutdown_guard_zero_bits_with_power_off_skips(self):
+    def test_power_on_flag_is_not_a_parameter_and_a_zero_mask_clears(self):
+        """The #765 "printer shutdown" guard is GONE, premise and all.
+
+        It skipped an all-zero mask whenever ``power_on_flag`` was False. The live
+        fleet survey (2026-08-10) shows that flag reads False as the ordinary steady
+        state on printers whose AMS is awake and answering correctly, so the guard was
+        discarding true all-empty reports indefinitely. Trust in a zero mask is a
+        question about the push HISTORY and is settled by the client before it calls
+        here (``_note_exist_bits_trust``); this helper applies what it is given.
+        """
+        import inspect
+
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
-        units = [{"id": 0, "tray": [{"id": 0, "tray_type": "PLA", "tray_color": "FF0000FF"}]}]
-        cleared = apply_tray_exist_bits(units, "0", power_on_flag=False)
-        assert cleared == 0
-        # Slot preserved — wiping here would propagate phantom empties on
-        # every printer-off push.
-        assert units[0]["tray"][0]["tray_type"] == "PLA"
-
-    def test_zero_bits_with_power_on_still_clears(self):
-        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+        assert "power_on_flag" not in inspect.signature(apply_tray_exist_bits).parameters
 
         units = [{"id": 0, "tray": [{"id": 0, "tray_type": "PLA", "tray_color": "FF0000FF"}]}]
-        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True)
-        # Slot is genuinely empty per the printer's report.
+        cleared = apply_tray_exist_bits(units, "0")
         assert cleared == 1
         assert units[0]["tray"][0]["state"] == 9
         assert units[0]["tray"][0]["tray_type"] == ""
 
-    def test_nonzero_bits_with_power_off_still_clears_removed_slot(self):
-        """#1365: X1C reports power_on_flag=False between prints while the
-        AMS keeps reporting its actual slot inventory. The guard must skip
-        ONLY the all-zero + power-off combination, not nonzero + power-off.
-        """
+    def test_int_zero_mask_is_a_real_answer_not_an_absent_one(self):
+        """A cached mask arrives as an int, and ``0`` is falsy — the old truthiness
+        guard silently turned "every slot is empty" into "no mask at all"."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PLA"}]}]
+        assert apply_tray_exist_bits(units, 0) == 1
+        assert units[0]["tray"][0]["state"] == 9
+
+    def test_a_unit_absent_from_ams_exist_bits_takes_no_evidence(self):
+        """Its slice of the tray mask is zero because it is not being described, not
+        because its trays are bare — reading those zeros would invent a release."""
+        from backend.app.services.bambu_mqtt import apply_tray_exist_bits
+
+        units = [
+            {"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PLA"}]},
+            {"id": 1, "tray": [{"id": 0, "state": 11, "tray_type": "PETG"}]},
+        ]
+        # ams_exist_bits "1" lists unit 0 only; the tray mask is all-zero.
+        cleared = apply_tray_exist_bits(units, "0", ams_exist_bits="1")
+        assert cleared == 1
+        assert units[0]["tray"][0]["tray_type"] == ""
+        assert units[1]["tray"][0]["tray_type"] == "PETG", "unit 1 was never described"
+        # Absent ams_exist_bits gates nothing (unknown fails open).
+        assert apply_tray_exist_bits(units, "0") == 1
+        assert units[1]["tray"][0]["tray_type"] == ""
+
+    def test_nonzero_bits_still_clear_a_removed_slot(self):
+        """#1365 shape: the AMS keeps reporting its real inventory between prints, and
+        a mask with SOME bits set must still empty the slots whose bits are clear."""
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [
@@ -1262,8 +1319,8 @@ class TestApplyTrayExistBitsHelper:
                 ],
             }
         ]
-        # 0x1 = slot 0 loaded, slot 1 empty. Power off (steady-state idle).
-        cleared = apply_tray_exist_bits(units, "1", power_on_flag=False)
+        # 0x1 = slot 0 loaded, slot 1 empty.
+        cleared = apply_tray_exist_bits(units, "1")
         assert cleared == 1
         assert units[0]["tray"][0]["tray_type"] == "PLA"
         assert units[0]["tray"][1]["tray_type"] == ""
@@ -1273,7 +1330,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 0, "tray": [{"id": 0, "state": "11"}]}]
-        apply_tray_exist_bits(units, "0", power_on_flag=True)
+        apply_tray_exist_bits(units, "0")
         assert units[0]["tray"][0]["state"] == 9
         assert isinstance(units[0]["tray"][0]["state"], int)
 
@@ -1282,7 +1339,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 128, "tray": [{"id": 0, "tray_type": "PLA"}]}]
-        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True)
+        cleared = apply_tray_exist_bits(units, "0")
         assert cleared == 0
         assert units[0]["tray"][0]["tray_type"] == "PLA"
 
@@ -1300,7 +1357,7 @@ class TestApplyTrayExistBitsHelper:
             }
         ]
         # 0x1 = bit 0 set (slot 0), bit 1 clear (slot 1 empty).
-        cleared = apply_tray_exist_bits(units, "1", power_on_flag=True)
+        cleared = apply_tray_exist_bits(units, "1")
         assert cleared == 1
         assert units[0]["tray"][0]["tray_type"] == "PLA"
         assert units[0]["tray"][1]["tray_type"] == ""
@@ -1315,7 +1372,7 @@ class TestApplyTrayExistBitsHelper:
             {"id": 1, "tray": [{"id": i, "tray_type": "PETG"} for i in range(4)]},
         ]
         # 0x0f: all slots of AMS 0 loaded, all slots of AMS 1 empty.
-        cleared = apply_tray_exist_bits(units, "f", power_on_flag=True)
+        cleared = apply_tray_exist_bits(units, "f")
         assert cleared == 4
         for i in range(4):
             assert units[0]["tray"][i]["tray_type"] == "PLA"
@@ -1328,7 +1385,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 0, "tray": [{"id": 0, "state": "11"}]}]
-        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True)
+        cleared = apply_tray_exist_bits(units, "0")
         # No tray_type to clear → cleared counter stays 0 but state is set.
         assert cleared == 0
         assert units[0]["tray"][0]["state"] == 9
@@ -1342,7 +1399,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 0, "tray": [{"id": 2, "state": 9}]}]
-        cleared = apply_tray_exist_bits(units, "4", power_on_flag=True)  # bit 2 set
+        cleared = apply_tray_exist_bits(units, "4")  # bit 2 set
         assert cleared == 0
         assert units[0]["tray"][0]["state"] == 10
         assert isinstance(units[0]["tray"][0]["state"], int)
@@ -1354,7 +1411,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 0, "tray": [{"id": 0, "state": "9", "tray_type": "", "tag_uid": "0000000000000000"}]}]
-        apply_tray_exist_bits(units, "1", power_on_flag=True)  # bit 0 set
+        apply_tray_exist_bits(units, "1")  # bit 0 set
         tray = units[0]["tray"][0]
         assert tray["state"] == 10
         assert tray["tray_type"] == ""
@@ -1366,7 +1423,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 0, "tray": [{"id": 0, "state": 0}]}]
-        apply_tray_exist_bits(units, "1", power_on_flag=True)
+        apply_tray_exist_bits(units, "1")
         assert units[0]["tray"][0]["state"] == 0
 
     def test_present_states_with_bit_set_untouched(self):
@@ -1374,7 +1431,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 0, "tray": [{"id": 0, "state": 11}, {"id": 1, "state": 10}]}]
-        apply_tray_exist_bits(units, "3", power_on_flag=True)  # bits 0,1 set
+        apply_tray_exist_bits(units, "3")  # bits 0,1 set
         assert units[0]["tray"][0]["state"] == 11
         assert units[0]["tray"][1]["state"] == 10
 
@@ -1394,7 +1451,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PETG", "remain": 75}]}]
-        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True, allow_demote=True)
+        cleared = apply_tray_exist_bits(units, "0", allow_demote=True)
         assert cleared == 1
         assert units[0]["tray"][0]["state"] == 9
         assert units[0]["tray"][0]["tray_type"] == ""
@@ -1409,7 +1466,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 0, "tray": [{"id": 0, "state": 10, "tray_type": "PETG", "remain": 75}]}]
-        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True, allow_demote=False)
+        cleared = apply_tray_exist_bits(units, "0", allow_demote=False)
         assert cleared == 0
         assert units[0]["tray"][0]["state"] == 10
         assert units[0]["tray"][0]["tray_type"] == "PETG"
@@ -1429,7 +1486,7 @@ class TestApplyTrayExistBitsHelper:
                 ],
             }
         ]
-        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True, allow_demote=False)
+        cleared = apply_tray_exist_bits(units, "0", allow_demote=False)
         assert cleared == 0
         assert units[0]["tray"][0]["state"] == 11
         assert units[0]["tray"][0]["tray_type"] == "PLA"
@@ -1444,7 +1501,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 0, "tray": [{"id": 0, "state": 9, "tray_type": "", "remain": 0}]}]
-        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True, allow_demote=False)
+        cleared = apply_tray_exist_bits(units, "0", allow_demote=False)
         assert cleared == 0  # nothing to wipe → counter untouched
         assert units[0]["tray"][0]["state"] == 9
         assert units[0]["tray"][0]["tray_type"] == ""
@@ -1456,7 +1513,7 @@ class TestApplyTrayExistBitsHelper:
         from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 
         units = [{"id": 0, "tray": [{"id": 0, "state": 9, "tray_type": "PETG", "remain": 75}]}]
-        cleared = apply_tray_exist_bits(units, "0", power_on_flag=True, allow_demote=False)
+        cleared = apply_tray_exist_bits(units, "0", allow_demote=False)
         assert cleared == 1
         assert units[0]["tray"][0]["state"] == 9
         assert units[0]["tray"][0]["tray_type"] == ""
@@ -1471,7 +1528,7 @@ class TestApplyTrayExistBitsHelper:
 
         units = [{"id": 0, "tray": [{"id": 0, "state": 9}, {"id": 1, "state": 9}]}]
         # 0x1 = bit 0 set (promote), bit 1 clear (empty, stays 9).
-        cleared = apply_tray_exist_bits(units, "1", power_on_flag=True, allow_demote=False)
+        cleared = apply_tray_exist_bits(units, "1", allow_demote=False)
         assert cleared == 0
         assert units[0]["tray"][0]["state"] == 10
         assert units[0]["tray"][1]["state"] == 9
@@ -7303,13 +7360,18 @@ class TestTrayExistBitsStatePromotionMerge:
                 "tray_exist_bits": "1",
             }
         )
-        # Push 2: shutdown-shaped push (no `ams` list) carrying tray_exist_bits=0 +
-        # power_on_flag=False. It updates the cache to 0 but preserves slot data
-        # (the #765 shutdown early-return). Now the cache says slot 0 is empty.
-        client._handle_ams_data({"tray_exist_bits": "0", "power_on_flag": False})
-        assert self._tray(client, 0, 0)["tray_type"] == "PETG"  # shutdown preserved it
-        # Push 3: minimal {id, state:9} partial. Cached bit 0 → the stale-clear
-        # fires exactly as before the fix.
+        # Pushes 2..n: tray-less pushes carrying tray_exist_bits=0. They return before
+        # the merge (no `ams` list) so they touch no slot data, but they DO feed the
+        # trust streak — and only once it matures does the cache adopt the zero mask.
+        from backend.app.services.bambu_mqtt import _ZERO_EXIST_BITS_TRUST_PUSHES
+
+        for _ in range(_ZERO_EXIST_BITS_TRUST_PUSHES - 1):
+            client._handle_ams_data({"tray_exist_bits": "0"})
+        assert client._last_tray_exist_bits == 1, "an untrusted zero must never become the cache"
+        client._handle_ams_data({"tray_exist_bits": "0"})
+        assert client._last_tray_exist_bits == 0
+        assert self._tray(client, 0, 0)["tray_type"] == "PETG"  # tray-less pushes touch nothing
+        # Final push: minimal {id, state:9} partial. Cached bit 0 → the stale-clear fires.
         client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}]})
         assert self._tray(client, 0, 0)["tray_type"] == ""
 
@@ -7546,7 +7608,7 @@ class TestClearedTrayNormalization:
         import logging
 
         # Seed WITH a bitmask so the client caches it; bit 0 = AMS0 slot 0 occupied.
-        self._push(client, [dict(CAPTURED_LOADED_TRAY)], tray_exist_bits="1", power_on_flag=True)
+        self._push(client, [dict(CAPTURED_LOADED_TRAY)], tray_exist_bits="1")
         assert client._last_tray_exist_bits == 1
 
         caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
@@ -7723,20 +7785,28 @@ class TestEvidencePushall:
 
     def test_a_bits_carrying_push_answers_every_owed_slot(self, client):
         """The report the request asked for closes the epoch: nothing stays owed, and
-        the un-vetoed partials that follow assert EMPTY instead of owing again."""
+        the un-vetoed partials that follow assert EMPTY instead of owing again.
+
+        The answer is an all-zero mask, so it must repeat before the farm may act on
+        it — until then it is treated exactly as a bits-less push, owed slots included.
+        """
+        from backend.app.services.bambu_mqtt import _ZERO_EXIST_BITS_TRUST_PUSHES
+
         self._seat_with_bits(client)
         self._minimal_partial(client, times=2)
         assert client._evidence_owed, "precondition: the slot is owed a report"
 
-        client._handle_ams_data(
-            {
-                "ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}],
-                "tray_exist_bits": "0",
-                "power_on_flag": True,
-            }
-        )
+        cleared_report = {
+            "ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}],
+            "tray_exist_bits": "0",
+            "power_on_flag": True,
+        }
+        for _ in range(_ZERO_EXIST_BITS_TRUST_PUSHES - 1):
+            client._handle_ams_data(cleared_report)
+            assert client._evidence_owed, "an untrusted zero answers nothing"
+        client._handle_ams_data(cleared_report)
         assert client._evidence_owed == {}, "the answering report clears the whole epoch"
-        assert client.on_ams_push_raw.last(0, 0).present is False, "bit clear → the clear is injected"
+        assert client.on_ams_push_raw.last(0, 0).present is False, "bit clear → the slot reads EMPTY"
 
         self._minimal_partial(client, times=3)
         assert client._evidence_owed == {}, "no veto left to contradict — nothing re-owed"
@@ -7744,8 +7814,8 @@ class TestEvidencePushall:
 
     def test_bits_carried_by_this_push_owe_nothing(self, client, caplog):
         """003-H2S PROTECTION: a mid-print insert sits at state 9 with its bit SET in
-        the SAME push. That veto is the firmware's current answer — the slot is not
-        owed a report and no pushall goes out."""
+        the SAME push. That is the firmware's current answer — the slot reads SEATED,
+        it is not owed a report and no pushall goes out."""
         import logging
 
         caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
@@ -7760,7 +7830,7 @@ class TestEvidencePushall:
         assert client._evidence_owed == {}
         assert self._pushalls(client) == []
         assert self._evidence_logs(caplog, "[EVIDENCE]") == []
-        assert client.on_ams_push_raw.last(0, 0).present is None, "veto held: presence stays UNKNOWN"
+        assert client.on_ams_push_raw.last(0, 0).present is True, "the set bit IS the seating"
 
     def test_request_evidence_pushall_is_paced(self, client, caplog):
         """The service-side lane: one request, then defer — never a loop."""

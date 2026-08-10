@@ -7,8 +7,9 @@ multi-hour stall that breaks the lights-out promise (production incident
 auto-switches on RUNOUT; the ``07xx_8010`` tangle family always pauses and sits.
 
 This module is the single owner of the recovery state machine. On a recoverable
-HMS (feed fault, or a runout the firmware backup failed to rescue) during a FARM
-print it reproduces the operator's proven manual recovery sequence:
+HMS (feed fault, or a runout the firmware backup failed to rescue) — during ANY
+print, however it was started — it reproduces the operator's proven manual recovery
+sequence:
 
     (printer already PAUSEd) → [reset a wedged filament-change] → (SWAP COMMIT: take
     the jammed spool out of rotation) → unload → confirm the AMS finished the unload
@@ -58,7 +59,7 @@ SCOPE (WS2b, 2026-08-09). Entry is :func:`on_ams_fault`, and what it acts on com
 from the WS2a fault TAXONOMY (``hms_errors.classify_hms_entry`` over both wire
 lanes), not from a hand-kept code list and not from the notification dedup:
 
-* **mechanical_feed** → the swap machine below, on a FARM print. The trigger set is
+* **mechanical_feed** → the swap machine below, on ANY print. The trigger set is
   now the WHOLE class (the 2026-08-09 operator-ratified widening): the send-out
   8005, feed-into-extruder 8006 and feed-to-extruder 8028 families joined the 8010
   / 801E ones the machine has always acted on. An EXTRUDER-side fault still swaps,
@@ -74,11 +75,23 @@ lanes), not from a hand-kept code list and not from the notification dedup:
   Before WS2b nothing consumed this class at all: those faults waited on the
   generic pause-stall watchdog.
 
-FARM *and* FOREIGN. Everything except the swap machine works on a print the farm
-did not dispatch — the wire evidence a runout hold, its guidance and its resume
-need is all printer-side. A foreign incident never touches a queue row
-(``item_id`` NULL, no ``waiting_reason``); the swap machine stays farm-only because
-its single-feeder verdict needs the dispatch mapping a foreign print has none of.
+ORIGIN-AGNOSTIC (2026-08-10 operator ruling). ONE machine serves every print. A
+farm queue unit controls the queue-row PROJECTIONS (``waiting_reason``) and the
+retry bookkeeping — never which machine runs, and never whether one runs at all.
+The gate that used to route ``jam + no farm item`` straight to an escalation is
+gone: it made auto-recovery unreachable for most real workload, and it is why
+printer 4 rode a full mechanical cascade on 2026-08-06 (``0700_8005`` +
+``0700_0012``, then ``0700_8006`` + ``0700_0018`` 107 s later) with ZERO recovery
+while a screen-started print sat PAUSEd.
+
+What replaced it is EVIDENCE, not origin: :func:`_resolve_jammed_tray` reads the
+wire first (the fault's own slot attribution, then the live feeder), and only then
+asks a mapping to corroborate and to answer the one question a single feeder cannot
+— is this job multi-material, where a mid-print tray swap is unsound because the
+firmware re-loads the originally mapped slot at the next filament change. A foreign
+print HAS such a statement (the slicer's captured ``ams_mapping``), and when
+nothing answers, the fault escalates on ``jammed_tray_unresolved`` /
+``multi_feeder_job`` exactly as a farm print with the same ambiguity would.
 
 STATE IS DURABLE. The lifecycle lives in ``printer_incident`` rows (see
 ``services/printer_incidents``), not in module dicts: one OPEN incident per printer
@@ -244,6 +257,11 @@ WAITING_REASON_FAILED = "spool_jam_recovery_failed"
 # filament into the SAME slot, not swap). farm_stall treats it as attended so the
 # pause-stall watchdog doesn't double-escalate.
 WAITING_REASON_RUNOUT = "filament_runout_recovery_failed"
+# An EXTERNAL-spool runout. Distinct from the AMS runout because the instruction is
+# different IN KIND, not in tone: there is no slot to refill — the roll on the spool
+# HOLDER has to be replaced — and the AMS copy ("refill the AMS slot") sends the
+# operator to a tray that never fed this print.
+WAITING_REASON_EXTERNAL_RUNOUT = "external_spool_runout"
 # A PHYSICAL filament fault (broken filament, clogged extruder, failed pull-back).
 # Distinct from both: there is no swap to attempt and no slot to refill — the copy
 # must send the operator to the printer rather than to the spool inventory.
@@ -253,7 +271,13 @@ WAITING_REASON_PHYSICAL = "spool_physical_fault"
 # unrelated hold another owner stamped (plate vision, low filament, a stagger wait)
 # must survive a resume the recovery lane happened to observe.
 RECOVERY_WAITING_REASONS: frozenset[str] = frozenset(
-    {WAITING_REASON_RECOVERING, WAITING_REASON_FAILED, WAITING_REASON_RUNOUT, WAITING_REASON_PHYSICAL}
+    {
+        WAITING_REASON_RECOVERING,
+        WAITING_REASON_FAILED,
+        WAITING_REASON_RUNOUT,
+        WAITING_REASON_EXTERNAL_RUNOUT,
+        WAITING_REASON_PHYSICAL,
+    }
 )
 
 # kind -> the token its hold projects onto the farm queue unit (model docstring:
@@ -263,6 +287,21 @@ _WAITING_REASON_BY_KIND: dict[str, str] = {
     KIND_RUNOUT: WAITING_REASON_RUNOUT,
     KIND_PHYSICAL: WAITING_REASON_PHYSICAL,
 }
+
+
+def waiting_reason_for(kind: str, *, external: bool) -> str:
+    """The hold token this incident projects onto a farm queue unit.
+
+    ``external`` splits the one kind whose OPERATOR INSTRUCTION differs from its
+    kind: an external-spool runout is a ``runout`` incident in every other respect
+    (same hold, same guidance lane, same dual-evidence auto-resume) but has no AMS
+    slot to send anyone to. It is the only splitter — the class that sets it
+    (``RUNOUT_EXTERNAL``) maps to no other kind.
+    """
+    if external:
+        return WAITING_REASON_EXTERNAL_RUNOUT
+    return _WAITING_REASON_BY_KIND.get(kind, WAITING_REASON_FAILED)
+
 
 # --- Safety bounds (code constants, NOT operator knobs — precedent the client-
 #     owned settle-wait, bambu_mqtt._IDENTIFY_GATE_S / wait_ams_settle). The
@@ -366,9 +405,9 @@ _ESCALATE_DETAIL: dict[str, str] = {
         "A physical filament fault (broken filament, a clog, or a failed pull-back) — fresh filament "
         "cannot clear it, so no swap was attempted. Check the filament path at the printer, then resume."
     ),
-    "foreign_feed_fault": (
-        "A feed fault on a print Bambuddy did not dispatch. The auto-swap needs the dispatch mapping to know "
-        "which feeder jammed, and a foreign print carries none — left PAUSED for a human."
+    "recovery_interrupted": (
+        "A recovery was interrupted (the server restarted mid-swap) and the printer is still PAUSED with no "
+        "fault the wire can still name — check the filament path and resume on the printer."
     ),
     "external_spool_runout": (
         "The EXTERNAL spool holder ran out — there is no AMS slot to swap to. Load new filament on the "
@@ -890,6 +929,7 @@ def _resolve_fault_tray(
     kind: str,
     external: bool,
     candidates,
+    printer_id: int | None = None,
 ) -> tuple[int | None, str]:
     """Which global tray the fault names, and the feeder verdict.
 
@@ -898,21 +938,22 @@ def _resolve_fault_tray(
     * EXTERNAL runout — there is no AMS slot at all, and inventing one from the
       mapping would send the operator to a tray that never fed this print.
     * RUNOUT — the firmware's own CURRENT DEMAND, then the slot its attr named, then
-      (farm prints only) the mapping/``tray_now`` inference below.
+      the wire-first resolution below. 006-H2S 2026-07-26: mapping ``[0]``,
+      ``tray_now`` 255 and a standing ``0700_2200_0002_0001`` demand for slot 3 — the
+      inference answered global tray 0 and the escalation told the operator to refill
+      "AMS A slot 1", which the printer was not asking for and would not resume on. A
+      demand also settles the verdict as ``single``: it names ONE exact slot to
+      refill, honest guidance even on a multi-feeder job (a runout never enters the
+      swap machine anyway, doctrine invariant 9).
     * PHYSICAL — the attr-named slot only. These escalate either way, so a missing
       slot costs a less specific message, never a wrong one.
-    * JAM — the historical inference; the 8010 family carries no slot attribution.
-
-    A foreign print has no dispatch mapping, so the inference tier is farm-only.
+    * JAM — :func:`_resolve_jammed_tray`; the 8010 family carries no slot attribution.
     """
     if external:
         return None, "single"
     if kind == KIND_RUNOUT:
         demand = current_runout_demand(getattr(state, "hms_errors", None) or [])
         if demand is not None:
-            # A demand names ONE exact slot to refill, which is honest guidance even
-            # on a multi-feeder job (a runout never enters the swap machine anyway,
-            # doctrine invariant 9).
             return demand[0] * 4 + demand[1], "single"
     if kind in (KIND_RUNOUT, KIND_PHYSICAL):
         slot = _candidate_slot(
@@ -922,57 +963,188 @@ def _resolve_fault_tray(
             return slot[0] * 4 + slot[1], "single"
         if kind == KIND_PHYSICAL:
             return None, "single"
-    if item is None:
-        return None, "none"
-    return _resolve_jammed_tray(item, state, is_feed_fault=(kind == KIND_JAM))
+    return _resolve_jammed_tray(state, candidates=candidates, item=item, printer_id=printer_id)
 
 
-def _resolve_jammed_tray(item: PrintQueueItem, state, *, is_feed_fault: bool = True) -> tuple[int | None, str]:
-    """Which global tray jammed, and the feeder verdict.
+def _valid_feeder(value) -> int | None:
+    """A tray value that names a real AMS feeder (0..253), else ``None``.
 
-    ``single`` — a deterministic single-feeder farm job (mapping feeder, else the
-    live ``tray_now``). ``multi_feeder`` — >1 mapped feeder: a tray swap is
-    unsound (firmware re-loads the original slot), so the caller escalates.
-    ``none`` — nothing resolvable. Adapts ``spool_respool._resolve_exhausted_tray``.
-
-    For a RUNOUT incident (``is_feed_fault=False``) the FIRMWARE'S OWN DEMAND is
-    PRIMARY and the mapping/``tray_now`` inference is only the fallback. 006-H2S
-    2026-07-26: mapping ``[0]``, ``tray_now`` 255 (nothing feeding) and a standing
-    ``0700_2200_0002_0001`` demand for slot 3 — the inference answered global tray 0
-    and the escalation told the operator to refill "AMS A slot 1", which the printer
-    was not asking for and would not have resumed on. The demand decoder answers
-    slot 3 (global tray 2) from the wire. A demand also settles the feeder verdict as
-    ``single``: it names ONE exact slot to refill, which is honest guidance even on a
-    multi-feeder job (a runout escalates for a same-slot refill either way — it never
-    enters the swap machine, doctrine invariant 9).
-
-    Feed faults are untouched: the ``8010`` family carries no slot attribution, so
-    jam attribution stays mapping/``tray_now``-based.
+    254 (external spool) and 255 (nothing fed) are sentinels, not trays: neither is
+    something the swap machine can unload, nor a slot an operator can be sent to.
     """
-    if not is_feed_fault:
-        demand = current_runout_demand(getattr(state, "hms_errors", None) or [])
-        if demand is not None:
-            ams_id, tray_id = demand
-            return ams_id * 4 + tray_id, "single"
+    try:
+        tray = int(value)
+    except (TypeError, ValueError):
+        return None
+    return tray if 0 <= tray <= 253 else None
 
-    feeders: list[int] = []
-    if item.ams_mapping:
+
+def _mapping_feeders(mapping) -> list[int]:
+    """The distinct feeders a filament→tray mapping names, in mapping order.
+
+    Accepts both shapes one exists in: the farm item's JSON string and the raw list
+    the client captured off the request topic. ``-1`` (external) and anything
+    unparseable contribute nothing — a mapping we cannot read must not invent a
+    second feeder and escalate a recoverable job as multi-material.
+    """
+    if isinstance(mapping, str):
         try:
-            mapping = json.loads(item.ams_mapping)
-            feeders = [int(v) for v in mapping if isinstance(v, (int, float)) and int(v) >= 0]
+            mapping = json.loads(mapping)
         except (ValueError, TypeError):
-            feeders = []
-    tray_now = getattr(state, "tray_now", None)
-    live_ok = tray_now is not None and 0 <= tray_now <= 253
-    if len(feeders) == 1:
-        # Prefer the live feeding tray over the (possibly stale) single-feeder
-        # mapping; the mapping is the fallback when tray_now is unloaded/unknown.
-        return (tray_now if live_ok else feeders[0]), "single"
+            return []
+    if not isinstance(mapping, (list, tuple)):
+        return []
+    feeders = [int(v) for v in mapping if isinstance(v, (int, float)) and not isinstance(v, bool) and int(v) >= 0]
+    return list(dict.fromkeys(feeders))
+
+
+def _slicer_mapping(printer_id: int | None):
+    """The ``ams_mapping`` the SLICER sent when it started the live print, or ``None``.
+
+    ``bambu_mqtt`` captures it off the request topic (a ``project_file`` command
+    Bambuddy did not send) and clears it at the job terminal, which makes it the only
+    PRE-FAULT statement a foreign print makes about how many filaments it maps. Read
+    defensively: a client that never saw the request topic (the broker refuses that
+    subscription on some firmware) simply contributes no evidence.
+    """
+    if printer_id is None:
+        return None
+    client = printer_manager.get_client(printer_id)
+    return getattr(client, "captured_ams_mapping", None) if client is not None else None
+
+
+def _fed_feeders(state) -> list[int]:
+    """Feeders this job has actually FED from, in order, consecutive repeats collapsed.
+
+    The client's ``tray_change_log`` is a temporal record — it answers "which tray was
+    active", and a REPEAT in it is the fingerprint of alternation. Consecutive
+    duplicates are collapsed first because they are bookkeeping, not motion (the log
+    is seeded at print start and ``last_loaded_tray`` resets with it, so the first
+    real report can echo the seed).
+    """
+    runs: list[int] = []
+    for entry in getattr(state, "tray_change_log", None) or []:
+        tray = _valid_feeder(entry[0] if isinstance(entry, (tuple, list)) and entry else entry)
+        if tray is not None and (not runs or runs[-1] != tray):
+            runs.append(tray)
+    return runs
+
+
+def _job_feeders(state, item: PrintQueueItem | None, printer_id: int | None) -> tuple[list[int], str]:
+    """The feeders this JOB is known to use, and which witness answered.
+
+    Ordered by evidence strength, and the FIRST witness that speaks decides alone — a
+    union across witnesses would let a healed one-way move masquerade as a second
+    mapped filament, escalating ``multi_feeder_job`` on a job that is single-material
+    and recoverable:
+
+    * ``dispatch`` — the farm item's ``ams_mapping``: what WE told the printer to feed.
+    * ``slicer`` — the mapping Studio/Orca sent with a foreign ``project_file`` start.
+    * ``fed`` — the ``tray_change_log``, last resort. It contributes to the MULTI-feeder
+      verdict only when it shows the job RETURNING to a feeder it already left, which
+      is the signature of a multi-material job and which no one-way move can produce.
+      A firmware auto-refill and an earlier recovery swap both move exactly once, and
+      reading either as "multi-material" would take the whole farm-dispatched jam path
+      away the first time a backup slot took over.
+    """
+    mapped = _mapping_feeders(getattr(item, "ams_mapping", None) if item is not None else None)
+    if mapped:
+        return mapped, "dispatch"
+    mapped = _mapping_feeders(_slicer_mapping(printer_id))
+    if mapped:
+        return mapped, "slicer"
+    runs = _fed_feeders(state)
+    distinct = list(dict.fromkeys(runs))
+    if len(runs) > len(distinct):
+        return distinct, "fed"  # a feeder was returned to → genuinely multi-material
+    return distinct[:1], "fed"
+
+
+def _resolve_jammed_tray(
+    state,
+    *,
+    candidates=(),
+    item: PrintQueueItem | None = None,
+    printer_id: int | None = None,
+) -> tuple[int | None, str]:
+    """Which global tray jammed, and the feeder verdict. WIRE FIRST, origin-agnostic.
+
+    ``single`` — one deterministic feeder. ``multi_feeder`` — the job maps more than
+    one filament, so a mid-print tray swap is unsound (the firmware re-loads the
+    ORIGINALLY MAPPED slot at the next filament change) and the caller escalates.
+    ``none`` — nothing resolvable, also an escalation.
+
+    Evidence order, strongest first:
+
+    1. The fault's OWN slot attribution — only the attr-aware ``hms[]`` lane carries
+       one, and when it does it is the firmware naming the tray directly.
+    2. The multi-feeder verdict from :func:`_job_feeders`, evaluated BEFORE the live
+       feeder: a live ``tray_now`` on a multi-material job is a true answer to the
+       wrong question, because the swap it would authorise cannot hold.
+    3. The active feeder at fault time — ``tray_now``, then ``last_loaded_tray`` (the
+       last tray that actually fed THIS job, reset at every print start). After a feed
+       fault ``tray_now`` frequently reads 255 "nothing feeding" while the jam is on
+       the tray that was feeding a second earlier, which is exactly what
+       ``last_loaded_tray`` still holds.
+    4. The single mapped feeder, when the wire named none.
+    """
+    slot = _candidate_slot(candidates, AmsFaultClass.MECHANICAL_FEED)
+    if slot is not None:
+        return slot[0] * 4 + slot[1], "single"
+
+    feeders, _source = _job_feeders(state, item, printer_id)
     if len(feeders) > 1:
         return None, "multi_feeder"
-    if live_ok:
-        return tray_now, "single"
+
+    live = _valid_feeder(getattr(state, "tray_now", None))
+    if live is None:
+        live = _valid_feeder(getattr(state, "last_loaded_tray", None))
+    if live is not None:
+        return live, "single"
+    if feeders:
+        return feeders[0], "single"
     return None, "none"
+
+
+async def _route_fault(
+    db: AsyncSession,
+    *,
+    printer_id: int,
+    job_id: str,
+    kind: str,
+    verdict: str,
+    tray: int | None,
+) -> str | None:
+    """The escalation reason this fault routes to, or ``None`` to run the machine.
+
+    ONE routing table, shared by the entry gate and the startup re-entry, so a
+    restart can never resolve a fault differently from the push that raised it.
+
+    Deliberately BLIND to whether a farm unit is printing here. Origin decides the
+    queue-row projections and the retry bookkeeping, never the routing: a
+    ``jam + no farm item`` branch used to escalate before any evidence was weighed,
+    which made auto-recovery unreachable for most real workload (printer 4's
+    2026-08-06 mechanical cascade got no recovery at all). The AMBIGUITY that branch
+    was standing in for is still refused — it is just measured now.
+    """
+    if kind == KIND_PHYSICAL:
+        # Hands needed: a swap cannot clear a breakage, a clog or a failed
+        # pull-back. Escalated AT ENTRY (status, not just outcome) — before WS2b
+        # nothing owned this class at all and it waited on the pause-stall watchdog.
+        return "physical_fault"
+    if kind != KIND_JAM:
+        # A runout holds for a same-slot refill; the driver escalates it after
+        # confirming the PAUSE, and the guidance/auto-resume lanes take it from there.
+        return None
+    if verdict == "multi_feeder":
+        return "multi_feeder_job"
+    if tray is None:
+        return "jammed_tray_unresolved"
+    if await printer_incidents.count_resolved(db, printer_id, job_id, KIND_JAM) >= _MAX_SUCCESSES_PER_JOB:
+        # Flap bound: recovery keeps landing but the fault keeps coming back — an
+        # extruder-side problem a swap won't fix.
+        return "repeated_jams"
+    return None
 
 
 # --- entry ------------------------------------------------------------------
@@ -998,10 +1170,11 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
        A RESOLVED close deliberately does NOT bar re-entry — a genuine second tangle
        in one job must still be recovered, and the flap cap below is what bounds it.
 
-    Routing then follows the fault CLASS and whether a farm unit is printing here:
-    a farm mechanical fault runs the swap machine, a runout (farm or foreign) holds
-    for a same-slot refill, and a physical fault — or any fault on a foreign print
-    the swap machine cannot reason about — escalates at entry with the hold.
+    Routing is then :func:`_route_fault`'s alone and follows the fault CLASS and the
+    wire EVIDENCE, never the print's origin: a mechanical fault whose jammed feeder
+    resolves runs the swap machine, a runout holds for a same-slot refill, and a
+    physical fault — or a jam whose feeder is ambiguous — escalates at entry with the
+    hold. A farm queue unit only decides what gets PROJECTED onto the queue.
 
     Returns the spawned driver task (so tests can await it) or ``None`` when the
     incident was gated out or escalated at entry; ``main`` ignores the return.
@@ -1060,27 +1233,12 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 return None
 
             item = await _resolve_farm_item(db, printer_id, job_id)
-            tray, verdict = _resolve_fault_tray(item, state, kind=kind, external=external, candidates=candidates)
-
-            if kind == KIND_PHYSICAL:
-                # Hands needed: a swap cannot clear a breakage, a clog or a failed
-                # pull-back. Escalated AT ENTRY (status, not just outcome) — before
-                # WS2b nothing owned this class at all and it waited on the generic
-                # pause-stall watchdog.
-                escalate_reason = "physical_fault"
-            elif kind == KIND_JAM and item is None:
-                # The single-feeder verdict the swap machine needs comes from the
-                # dispatch mapping, and a foreign print has none.
-                escalate_reason = "foreign_feed_fault"
-            elif kind == KIND_JAM:
-                if verdict == "multi_feeder":
-                    escalate_reason = "multi_feeder_job"
-                elif tray is None:
-                    escalate_reason = "jammed_tray_unresolved"
-                elif await printer_incidents.count_resolved(db, printer_id, job_id, KIND_JAM) >= _MAX_SUCCESSES_PER_JOB:
-                    # Flap bound: recovery keeps landing but the fault keeps coming
-                    # back — an extruder-side problem a swap won't fix.
-                    escalate_reason = "repeated_jams"
+            tray, verdict = _resolve_fault_tray(
+                item, state, kind=kind, external=external, candidates=candidates, printer_id=printer_id
+            )
+            escalate_reason = await _route_fault(
+                db, printer_id=printer_id, job_id=job_id, kind=kind, verdict=verdict, tray=tray
+            )
 
             row = await printer_incidents.open_new(
                 db,
@@ -1153,9 +1311,10 @@ async def will_own(db: AsyncSession, printer_id: int, state) -> bool:
     (2) It MIRRORS :func:`on_ams_fault`'s durable entry gates — including the ones
         that mean "an incident ALREADY owns this", where suppression stays correct
         because the raw alert is the duplicate.
-    (3) Foreign prints included: since WS2b an incident owns their runouts and
-        physical faults too, so their raw alerts are duplicates in exactly the same
-        way.
+    (3) Foreign prints included: an incident owns EVERY class of their AMS faults —
+        runouts and physical faults since WS2b, mechanical ones since the 2026-08-10
+        origin-agnostic ruling — so their raw alerts are duplicates in exactly the
+        same way.
 
     Fails toward NOTIFYING: any exception returns False (never suppress a raw alert
     on the strength of a predicate that errored).
@@ -1825,7 +1984,15 @@ async def _requirement_from_assignment(incident: RecoveryIncident) -> dict | Non
 
 async def _requirement_from_file(incident: RecoveryIncident) -> dict | None:
     """Requirement parsed from the dispatched 3MF (last resort). Uses the first
-    filament requirement — single-feeder farm jobs carry exactly one."""
+    filament requirement — single-feeder farm jobs carry exactly one.
+
+    FARM-ONLY by nature: the tier reads the queue unit's own file, and a foreign
+    print has no unit to read it from. Its two predecessors (live jammed telemetry,
+    then the tray's bound spool) are origin-agnostic and carry that case.
+    """
+    if incident.item_id is None:
+        return None
+
     from backend.app.core.database import async_session
     from backend.app.services.print_scheduler import scheduler
 
@@ -2422,7 +2589,7 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
     detail = _ESCALATE_DETAIL.get(reason, reason)
     # The hold's projection onto the farm unit, one token per kind. A foreign print
     # has no unit — the incident row carries the whole state there.
-    token = _WAITING_REASON_BY_KIND.get(incident.kind, WAITING_REASON_FAILED)
+    token = waiting_reason_for(incident.kind, external=incident.external)
     slot_hint = "the external spool holder" if incident.external else runout_slot_desc(incident.jammed_global_tray)
     try:
         async with async_session() as db:
@@ -2673,17 +2840,27 @@ async def rearm_incidents_on_startup() -> int:
     * no live state at all (the printer has not reported yet) → leave it OPEN and
       decide later. The wire sampler closes it on the first RUNNING transition.
 
+    A row still reading ``recovering`` is the one shape none of those three answers
+    fits, and it is handled separately (:func:`_reenter_recovering_incident`): that
+    status is a PROMISE that a task is acting, and the restart broke it. Left alone
+    the row would sit open forever with nothing driving it — and because exclusivity
+    is one-open-per-printer, it would also block every future incident on that
+    printer for good.
+
     Returns the number of incidents closed. Never raises — startup must not block.
     """
     closed = 0
     try:
         from backend.app.core.database import async_session
 
+        driverless: list[tuple[int, int]] = []
         async with async_session() as db:
             for incident in await printer_incidents.all_open(db):
                 st = _get_state(incident.printer_id)
                 live = (getattr(st, "state", None) or "") if st is not None else ""
                 if not live or live.upper() in ("", "UNKNOWN", "PAUSE"):
+                    if incident.status == STATUS_RECOVERING:
+                        driverless.append((incident.id, incident.printer_id))
                     continue
                 await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
                 await _clear_hold_projection(db, incident.item_id)
@@ -2696,15 +2873,108 @@ async def rearm_incidents_on_startup() -> int:
                     live,
                 )
             open_now = await printer_incidents.rehydrate(db)
+        # After the cache rebuild, so a re-entry's own escalate/close writes are the
+        # last word on the projection rather than being overwritten by it.
+        for incident_id, printer_id in driverless:
+            await _reenter_recovering_incident(incident_id, printer_id)
         if closed or open_now:
             logger.info(
-                "spool_recovery: startup incident sweep — %d closed, %d still held",
+                "spool_recovery: startup incident sweep — %d closed, %d still held, %d re-entered",
                 closed,
                 open_now,
+                len(driverless),
             )
     except Exception:  # noqa: BLE001 — startup hygiene must never block the lifespan
         logger.exception("spool_recovery: startup incident sweep failed")
     return closed
+
+
+async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asyncio.Task | None:
+    """Give a driver back to an incident a restart left mid-swap. Never raises.
+
+    Re-entry is decided by the WIRE, exactly as the entry gate is: the live HMS set
+    is re-classified through the taxonomy and routed through :func:`_route_fault`, so
+    the fault either goes back to the swap machine or becomes an escalated hold that
+    a human, a RUNNING transition or the job's terminal can clear. The one outcome
+    that is not available is the one that used to happen — an open ``recovering`` row
+    with no task behind it.
+
+    A wire with NO actionable fault left is still not "fine": the printer is PAUSEd
+    (or has not reported) with a swap half-executed — possibly with the jammed feeder
+    unloaded and nothing loaded in its place — so it escalates rather than closing.
+    The lifecycle closes it for free the moment the printer is seen RUNNING.
+    """
+    try:
+        state = _get_state(printer_id)
+        candidates = live_candidates(state)
+
+        from backend.app.core.database import async_session
+        from backend.app.models.printer import Printer
+
+        async with async_session() as db:
+            row = await printer_incidents.get_open(db, printer_id)
+            if row is None or row.id != incident_id or row.status != STATUS_RECOVERING:
+                return None  # another lane resolved it between the sweep and here
+            settings = await _read_settings(db)
+            job_id = (getattr(state, "subtask_id", None) or "").strip() or row.job_id
+            item = await _resolve_farm_item(db, printer_id, job_id)
+            fault_class = _dominant_class(candidates)
+            if fault_class is None:
+                kind, external = row.kind, False
+                code, fingerprint = row.code, row.codes
+                tray = row.slot_global_tray
+                escalate_reason = "recovery_interrupted"
+            else:
+                kind = _KIND_BY_CLASS[fault_class]
+                external = fault_class is AmsFaultClass.RUNOUT_EXTERNAL
+                primary = _primary_candidate(candidates, fault_class)
+                code = primary.short_code if primary is not None else row.code
+                # The LIVE fingerprint, not the stored one: it is what an aborted
+                # close must bar and what the wire sampler re-arms, and the two would
+                # loop against each other if they named different faults.
+                fingerprint = candidate_fingerprint(candidates)
+                tray, verdict = _resolve_fault_tray(
+                    item, state, kind=kind, external=external, candidates=candidates, printer_id=printer_id
+                )
+                escalate_reason = await _route_fault(
+                    db, printer_id=printer_id, job_id=job_id, kind=kind, verdict=verdict, tray=tray
+                )
+            printer = await db.get(Printer, printer_id)
+            printer_name = (printer.name if printer else None) or f"printer {printer_id}"
+            mechanical = {c for c in candidates if c.fault_class is AmsFaultClass.MECHANICAL_FEED}
+            incident = RecoveryIncident(
+                incident_id=incident_id,
+                printer_id=printer_id,
+                job_id=job_id,
+                codes=frozenset(c.short_code for c in candidates) or frozenset({row.code}),
+                fingerprint=fingerprint,
+                item_id=item.id if item is not None else None,
+                settings=settings,
+                jammed_global_tray=tray,
+                kind=kind,
+                external=external,
+                extruder_side_only=bool(mechanical) and all(c.extruder_side for c in mechanical),
+                layer_at_fault=int(getattr(state, "layer_num", 0) or 0),
+                code=code,
+                printer_name=printer_name,
+                job_name=(getattr(state, "subtask_name", None) or "").strip() or "print",
+            )
+
+        logger.info(
+            "spool_recovery: startup — printer %s incident %s was left mid-swap, re-entering (%s)",
+            printer_id,
+            incident_id,
+            f"escalating={escalate_reason}" if escalate_reason else f"kind={kind} tray={tray}",
+        )
+        if escalate_reason is not None:
+            await _escalate(incident, escalate_reason)
+            return None
+        task = asyncio.create_task(_run_recovery(incident))
+        _active_tasks[printer_id] = task
+        return task
+    except Exception:  # noqa: BLE001 — startup hygiene must never block the lifespan
+        logger.exception("spool_recovery: re-entering incident %s failed for printer %s", incident_id, printer_id)
+        return None
 
 
 # --- runout guidance + refill auto-resume (006-H2S 2026-07-26) --------------
