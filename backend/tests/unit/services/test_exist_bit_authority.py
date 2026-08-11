@@ -402,3 +402,97 @@ def test_the_status_surface_carries_the_mask_the_flag_and_the_verdict(client):
     client._handle_ams_data(zero)
     assert (client.state.ams_tray_exist_bits, client.state.ams_power_on_flag) == ("0", True)
     assert client.state.ams_bits_trusted is False, "reported verbatim, believed only once repeated"
+
+
+# --- 8. the persistent bit-vs-state contradiction (deploy-night finding, 2026-08-10) ---
+
+
+#: Printer 4's TRUE post-emptying wire shape, captured live: the tray-level state
+#: latched at 10 while the mask's clear bit told the truth. One frame of this is a
+#: mid-insert race; three seconds of it is the firmware latch.
+PRINTER_4_LATCHED = [{"id": str(i), "state": 10} for i in range(4)]
+
+
+def _prime_trust(client):
+    """Three all-empty frames: establishes the zero-mask trust streak without ever
+    touching the contradiction streak (keyless stubs contradict nothing)."""
+    for _ in range(3):
+        client._handle_ams_data(copy.deepcopy(_ams_push(copy.deepcopy(PRINTER_1_KEYLESS), bits="0")))
+
+
+def _push_latched(client, *, bits="0"):
+    client._handle_ams_data(copy.deepcopy(_ams_push(copy.deepcopy(PRINTER_4_LATCHED), bits=bits)))
+
+
+class TestPersistentBitStateContradiction:
+    def test_the_connect_window_flicker_is_true_never_false(self, client):
+        """Before the mask earns trust, the latched state-10 rules briefly answer
+        PRESENT — the connect-era flicker observed live at deploy (the write lane's
+        own ack bound caps its cost). What it may never do is claim EMPTY."""
+        for _ in range(2):
+            _push_latched(client)
+            assert _observed(client).present is True
+
+    def test_the_contradiction_banks_unknown_then_the_mask_wins_on_the_third(self, client):
+        _prime_trust(client)
+        for push_n in (1, 2):
+            _push_latched(client)
+            assert _observed(client).present is None, f"contradicted push {push_n} must stay fail-open"
+        _push_latched(client)
+        obs = _observed(client)
+        assert obs.present is False
+        assert obs.tray_type == ""  # the full asserted-cleared shape, not a bare demote
+        merged = client.state.raw_data["ams"][0]["tray"][0]
+        assert merged.get("state") == 9 and merged.get("tray_type") == ""
+
+    def test_an_identity_bearing_tray_is_exempt(self, client):
+        _prime_trust(client)
+        tagged = [dict(t, tag_uid="3CF1F3E700000100", tray_uuid="A" * 32) for t in PRINTER_4_LATCHED]
+        for _ in range(5):
+            client._handle_ams_data(copy.deepcopy(_ams_push(copy.deepcopy(tagged), bits="0")))
+        # A real chip outranks the mask's absence claim: never normalized, never emptied.
+        assert _observed(client).present is not False
+
+    def test_an_agreeing_frame_voids_the_banked_streak(self, client):
+        _prime_trust(client)
+        _push_latched(client)
+        _push_latched(client)
+        # The mask agrees with the state for one frame (bit set): the contradiction
+        # episode is over; the two banked frames are void.
+        _push_latched(client, bits="f")
+        assert _observed(client).present is True
+        _prime_trust(client)  # 'f' reset the zero-mask trust; re-earn it
+        for push_n in (1, 2):
+            _push_latched(client)
+            assert _observed(client).present is None, f"post-reset push {push_n}"
+        _push_latched(client)
+        assert _observed(client).present is False
+
+    def test_untrusted_and_bits_less_frames_are_neutral_not_a_reset(self, client):
+        """Frames that carry no ACTIONABLE mask (bare-list, or a zero mask still
+        inside its trust streak) assert nothing about the contradiction — they
+        neither grant EMPTY nor void what trusted frames banked. A dialect that
+        interleaves bare-list frames would otherwise starve resolution forever."""
+        _prime_trust(client)
+        _push_latched(client)
+        _push_latched(client)  # bank = 2
+        client._handle_ams_data([{"id": 0, "tray": copy.deepcopy(PRINTER_4_LATCHED)}])
+        assert _observed(client).present is not False
+        # The bare frame reset the ZERO-MASK trust, so the next two zero-mask frames
+        # are untrusted — and therefore neutral: the bank must survive them.
+        _push_latched(client)
+        _push_latched(client)
+        assert _observed(client).present is not False
+        # Third zero frame re-earns trust; the tray still contradicts -> bank 2+1 = 3.
+        _push_latched(client)
+        assert _observed(client).present is False
+
+    def test_the_resolution_logs_once_per_episode(self, client, caplog):
+        import logging
+
+        _prime_trust(client)
+        with caplog.at_level(logging.INFO):
+            for _ in range(6):
+                _push_latched(client)
+        lines = [r for r in caplog.records if "the mask wins" in r.getMessage() and "tray 0" in r.getMessage()]
+        assert len(lines) == 1

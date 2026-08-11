@@ -29,6 +29,8 @@ from backend.app.services.tray_fields import (
     TRAYS_PER_AMS_UNIT,
     ZERO_TAG_UID,
     ZERO_TRAY_UUID,
+    normalized_tag_uid,
+    normalized_tray_uuid,
     parse_int_field,
     parse_tray_exist_bits,
     parse_tray_state,
@@ -126,6 +128,16 @@ _EVIDENCE_PUSHALL_MIN_S: float = 120.0
 # operator — in exchange for making a single anomalous frame unable to release a
 # binding. CODE CONSTANT, not a setting: it is a property of the wire, not a preference.
 _ZERO_EXIST_BITS_TRUST_PUSHES = 3
+
+# Consecutive TRUSTED pushes on which one slot's tray state (10/11) must contradict
+# its CLEAR mask bit before the mask's answer is asserted onto the tray
+# (_normalize_cleared_trays, second duty). Mirrors _ZERO_EXIST_BITS_TRUST_PUSHES —
+# the same "repetition turns a frame into a fact" reasoning, applied per slot: one
+# contradicted frame is a mid-insert race; three seconds of the same contradiction is
+# the firmware's tray-state latch (live-proven 2026-08-10, printer 4: state-10 stubs
+# beside a correct clear bit for hours while the mask was right on every sampled
+# printer in both polarities).
+_CONTRADICTED_STATE_TRUST_PUSHES = 3
 
 # AMS drying latch. `dry_time` (minutes remaining) is the primary "unit is drying"
 # signal, but the firmware only reports it once a cycle is under way. A monotonic
@@ -834,6 +846,10 @@ class BambuMQTTClient:
         # mask (trusted immediately, so no streak is needed) and by a bits-less push
         # (the run of evidence is broken — the next zero starts a fresh one).
         self._zero_exist_bits_streak: int = 0
+        # Per-slot count of consecutive TRUSTED pushes whose tray state contradicted a
+        # CLEAR mask bit (see _CONTRADICTED_STATE_TRUST_PUSHES). Entries drop the
+        # moment the contradiction stops holding for that slot.
+        self._bit_state_contradiction_streak: dict[tuple[int, int], int] = {}
         # (ams_id, tray_id) -> monotonic() of the first push whose state-9 partial
         # CONTRADICTED the CACHED exist bit above. On the H2S dialect the mask rides
         # pushalls only, so the cache goes stale the moment a roll leaves between them:
@@ -2088,8 +2104,28 @@ class BambuMQTTClient:
             t,
         )
 
-    def _normalize_cleared_trays(self, ams_data, *, push_carried_bits: bool) -> None:
+    def _normalize_cleared_trays(self, ams_data, *, push_carried_bits: bool, trusted_bits: int | None = None) -> None:
         """Give minimal state-9 tray partials the asserted-cleared shape, IN PLACE.
+
+        SECOND DUTY (2026-08-10, deploy-night finding): resolve a PERSISTENT in-push
+        self-contradiction — a tray asserting a PRESENT state (10/11) while the same
+        push's TRUSTED mask carries a CLEAR bit for the slot. ``tray_presence`` reads a
+        single contradicted push as UNKNOWN (fail-open: never release on evidence at
+        war with itself), which is right for the transient case — a roll being
+        registered mid-insert can race the mask by a frame. But the live fleet proved
+        the contradiction can STAND: printer 4's emptied trays reported ``state: 10``
+        stubs beside a correct ``tray_exist_bits`` clear bit for hours (the firmware's
+        tray-level state is the latch-prone side — the same staleness that built the
+        phantom-mint estate — while the mask has been verified correct on every
+        sampled printer, in both polarities). A contradiction that repeats across
+        :data:`_CONTRADICTED_STATE_TRUST_PUSHES` consecutive trusted pushes is not a
+        race, it is the latch — and the mask wins, exactly as the merged/display copy
+        has always resolved it (``apply_tray_exist_bits`` demotes with in-push bits).
+        The tray is rewritten to the asserted-cleared shape so BOTH lanes read one
+        interpretation. Never applied to a tray asserting IDENTITY (a real tag/uuid is
+        stronger evidence a roll is physically there than the mask's absence claim —
+        that contradiction stays UNKNOWN for a human/read to settle), and the streak
+        resets on any push where the contradiction does not hold.
 
         Runs immediately BEFORE the raw pre-merge hand-off so the spool pipeline
         observes the same clear the merge is about to apply to the display copy.
@@ -2168,13 +2204,46 @@ class BambuMQTTClient:
             for tray in trays:
                 if not isinstance(tray, dict):
                     continue
+                tray_id = tray.get("id")
+                # --- persistent bit-vs-state contradiction (second duty, docstring) ---
+                if trusted_bits is not None:
+                    slot_bit = slot_exist_bit(trusted_bits, ams_id, tray_id)
+                    state_val = parse_tray_state(tray.get("state"))
+                    key_a, key_t = parse_int_field(ams_id), parse_int_field(tray_id)
+                    if key_a is not None and key_t is not None:
+                        key = (key_a, key_t)
+                        contradicted = (
+                            slot_bit is False
+                            and state_val in TRAY_PRESENT_STATES
+                            and normalized_tag_uid(tray.get("tag_uid")) is None
+                            and normalized_tray_uuid(tray.get("tray_uuid")) is None
+                            and not (tray.get("tray_type") or "").strip()
+                        )
+                        if contradicted:
+                            streak = self._bit_state_contradiction_streak.get(key, 0) + 1
+                            self._bit_state_contradiction_streak[key] = streak
+                            if streak == _CONTRADICTED_STATE_TRUST_PUSHES:
+                                logger.info(
+                                    "[%s] AMS %s tray %s: state=%s contradicts the trusted clear bit "
+                                    "%d pushes running — the mask wins, asserting cleared",
+                                    self.serial_number,
+                                    ams_id,
+                                    tray_id,
+                                    tray.get("state"),
+                                    streak,
+                                )
+                            if streak >= _CONTRADICTED_STATE_TRUST_PUSHES:
+                                tray["state"] = 9
+                                tray.update(CLEARED_TRAY_FIELDS)
+                                continue
+                        else:
+                            self._bit_state_contradiction_streak.pop(key, None)
                 if "tray_type" in tray:
                     continue
                 # `parse_tray_state` returns None for an absent/unparseable state,
                 # which fails this comparison — strict 9 only.
                 if parse_tray_state(tray.get("state")) != 9:
                     continue
-                tray_id = tray.get("id")
                 if self._slot_exist_bit_known_set(ams_id, tray_id):
                     # Vetoed — but by WHOSE evidence? Bits this push carried are the
                     # firmware's current answer (003-H2S mid-print insert) and close the
@@ -2519,7 +2588,11 @@ class BambuMQTTClient:
         # was) left boot-forgotten slots asserting nothing forever, so their presence
         # read UNKNOWN and release-on-empty never fired. Strictness and the 003-H2S
         # exist-bit veto live in the method's docstring.
-        self._normalize_cleared_trays(ams_data, push_carried_bits=push_carried_bits)
+        self._normalize_cleared_trays(
+            ams_data,
+            push_carried_bits=push_carried_bits,
+            trusted_bits=self._last_tray_exist_bits if push_carried_bits else None,
+        )
 
         # RAW pre-merge hand-off — the LAST point at which the wire dicts still say only
         # what this push said (plus the normalization above). Everything below merges
