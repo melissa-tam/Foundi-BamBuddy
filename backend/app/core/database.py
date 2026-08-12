@@ -4205,6 +4205,69 @@ async def run_migrations(conn):
             _flipped.rowcount,
         )
 
+    # Repair (2026-08-12, 003-H2S external-spool dispatch incident): clear the CACHED
+    # ams_mapping on every pending queue item, once.
+    #
+    # The field changed meaning in this release. It used to hold a derivation the
+    # PrintModal computed at queue time and the scheduler replayed verbatim at
+    # dispatch, hours later, against whatever hardware happened to be in front of it —
+    # a stale materialised decision. It now holds an operator INSTRUCTION (an explicit
+    # slot pin) that the matcher takes as an INPUT while deciding afresh, every
+    # dispatch, from live tray state.
+    #
+    # Every value written before this release is therefore mis-typed data: a
+    # derivation sitting in a field that now reads as a human's instruction. The
+    # incident is what that costs — one dialog derived ``[254]`` (external spool)
+    # against printer 1, stamped it unseen onto nine queue items fanned out to
+    # printers 2-10, and item 532 dispatched it to a printer whose external holder was
+    # empty: firmware demanded external filament, the fault classified as an AMS jam,
+    # and the printer quarantined itself. Read as PINS those same rows would now hold
+    # nine jobs on "pinned tray unavailable" — honest, but still an instruction no
+    # operator ever gave. Cleared, they simply dispatch against live state.
+    #
+    # ONE-TIME, and that is the whole point: after the cutover a pending mapping IS an
+    # operator pin, and a migration that re-ran would silently delete a human's slot
+    # choice on every restart. Same durable-marker shape as the WS-F posture migration
+    # above — the settings row is written in the SAME nested transaction as the clear,
+    # so the pair is all-or-nothing and a second boot is a no-op.
+    #
+    # Scoped to ``status = 'pending'``: that is the fork's whole pre-dispatch
+    # vocabulary (pending / printing / completed / failed / skipped / cancelled), and
+    # a "staged" item is a pending row carrying manual_start + filament_short, so it is
+    # already inside. Rows past pending are deliberately untouched — for them the
+    # column is the RECORD of what actually fed the print, which usage tracking, the
+    # spent-ledger and recovery all read back. Plain SQL, valid on SQLite and
+    # PostgreSQL alike; DML → conn.execute inside begin_nested, per this module's
+    # convention.
+    _pin_cutover_marker = "migration_clear_pending_ams_mapping_20260812"
+    _pin_cutover_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _pin_cutover_marker})
+    ).scalar()
+    if not _pin_cutover_done:
+        _stale_mapped = (
+            await conn.execute(text("SELECT id FROM print_queue WHERE status = 'pending' AND ams_mapping IS NOT NULL"))
+        ).fetchall()
+        async with conn.begin_nested():
+            if _stale_mapped:
+                await conn.execute(
+                    text(
+                        "UPDATE print_queue SET ams_mapping = NULL WHERE status = 'pending' AND ams_mapping IS NOT NULL"
+                    )
+                )
+            await conn.execute(
+                text(
+                    "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                    "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                ),
+                {"key": _pin_cutover_marker},
+            )
+        if _stale_mapped:
+            logger.info(
+                "[MIGRATION] cleared pre-cutover cached AMS mappings on pending queue items: ids=%s "
+                "(one-time; ams_mapping is now an operator pin and the matcher decides at dispatch)",
+                [r[0] for r in _stale_mapped],
+            )
+
     # Migration (WS-F, 2026-08-10): drop the retired ``auto_add_untagged`` setting.
     # The key was a kill switch for the tagless auto-mint lane, which doctrine rules
     # 1/2/4 make load-bearing here — with it off, every untagged roll silently stops

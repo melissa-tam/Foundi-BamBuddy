@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, PlainSerializer, model_validator
+from pydantic import BaseModel, PlainSerializer, field_validator, model_validator
 
 
 # Custom serializer to ensure UTC datetimes have Z suffix
@@ -13,6 +13,51 @@ def serialize_utc_datetime(dt: datetime | None) -> str | None:
 
 
 UTCDatetime = Annotated[datetime | None, PlainSerializer(serialize_utc_datetime)]
+
+# AMS mapping wire-shape bounds. A global tray id is a byte on the wire: 0..127 for
+# regular AMS trays ((ams_id * 4) + slot_id), 128..253 for AMS-HT units, and 254/255
+# for the external/virtual trays. ``-1`` is the one negative the format defines ("no
+# tray for this filament"). 16 entries is the ceiling because a plate cannot carry
+# more filament slots than the fleet's largest tool count — well above the 4-slot AMS
+# reality, so it bounds a hostile payload without constraining a real one.
+_AMS_MAPPING_MIN_ID = 0
+_AMS_MAPPING_MAX_ID = 255
+_AMS_MAPPING_UNUSED = -1
+_AMS_MAPPING_MAX_LEN = 16
+
+
+def _validate_ams_mapping(value: object) -> object:
+    """SHAPE validation for ``ams_mapping`` — the REST input form, nothing more.
+
+    The field is an operator INSTRUCTION (pin a filament slot to a specific tray), so
+    the API's job is to reject payloads that could not describe one on any printer:
+    non-integers, booleans (``True`` is an ``int`` subclass and is never a tray id),
+    out-of-range ids, over-long arrays. Whether a well-formed pin is SATISFIABLE — that
+    tray loaded, that roll usable, that printer holding it — is a live question with
+    one answer-holder, the matcher at dispatch time. Answering it here as well would be
+    a second semantic gate that disagrees with the first the moment a spool moves.
+
+    Runs in "before" mode ON PURPOSE: pydantic's ``list[int]`` coercion happens first
+    otherwise, and it silently turns ``true`` into 1 and ``"3"`` into 3 — so an
+    after-validator can never see the values it exists to reject. A non-list is handed
+    straight back for pydantic's own type error to word.
+
+    Returns the value unchanged (``None`` passes through, preserving PATCH
+    exclude-unset semantics: this runs only on values the client actually sent).
+    """
+    if value is None or not isinstance(value, list):
+        return value
+    if len(value) > _AMS_MAPPING_MAX_LEN:
+        raise ValueError(f"ams_mapping accepts at most {_AMS_MAPPING_MAX_LEN} filament slots, got {len(value)}")
+    for index, entry in enumerate(value):
+        if isinstance(entry, bool) or not isinstance(entry, int):
+            raise ValueError(f"ams_mapping[{index}] must be an integer tray id, got {entry!r}")
+        if entry != _AMS_MAPPING_UNUSED and not (_AMS_MAPPING_MIN_ID <= entry <= _AMS_MAPPING_MAX_ID):
+            raise ValueError(
+                f"ams_mapping[{index}] must be {_AMS_MAPPING_UNUSED} (no tray) or "
+                f"{_AMS_MAPPING_MIN_ID}..{_AMS_MAPPING_MAX_ID}, got {entry}"
+            )
+    return value
 
 
 class PrintQueueItemCreate(BaseModel):
@@ -68,6 +113,8 @@ class PrintQueueItemCreate(BaseModel):
     # deletes them after creating the durable archive copy.
     cleanup_library_after_dispatch: bool = False
 
+    _check_ams_mapping = field_validator("ams_mapping", mode="before")(_validate_ams_mapping)
+
 
 class PrintQueueItemUpdate(BaseModel):
     printer_id: int | None = None
@@ -95,6 +142,11 @@ class PrintQueueItemUpdate(BaseModel):
     # physical nozzle position IDs from BambuStudio's project_file MQTT
     # body; sent back to the printer verbatim on dispatch.
     nozzle_mapping: list[int] | None = None
+
+    # Same shape rule as the create schema — one validator, both boundaries. A PATCH
+    # that omits the field is untouched (validators only see values that were sent),
+    # so the route's presence-keyed "omit = keep, null = clear" contract is intact.
+    _check_ams_mapping = field_validator("ams_mapping", mode="before")(_validate_ams_mapping)
 
 
 class PrintQueueItemResponse(BaseModel):

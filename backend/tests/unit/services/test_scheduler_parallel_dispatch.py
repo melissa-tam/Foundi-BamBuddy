@@ -25,7 +25,7 @@ from sqlalchemy import select
 
 import backend.app.services.print_scheduler as ps_module
 from backend.app.models.print_queue import PrintQueueItem
-from backend.app.services import print_scheduler as sched_mod
+from backend.app.services import print_scheduler as sched_mod, spool_selection
 from backend.app.services.print_scheduler import PrintScheduler
 
 pytestmark = pytest.mark.asyncio
@@ -45,6 +45,14 @@ def pd_scheduler(monkeypatch, test_engine):
     sched_mod.stagger_policy.reset()
     monkeypatch.setattr(sched_mod.stagger_policy, "budget", AsyncMock(return_value=99))
     monkeypatch.setattr(s, "_check_auto_drying", AsyncMock())
+    # The matcher runs on EVERY dispatch since 2026-08-12 (a stored mapping is an
+    # operator pin, not a result to replay), so this file has to pin it like any other
+    # collaborator it is not testing — the concurrency of the gather is the subject.
+    monkeypatch.setattr(
+        s,
+        "_compute_ams_mapping_for_printer",
+        AsyncMock(return_value=spool_selection.MatchOutcome(mapping=[0])),
+    )
     monkeypatch.setattr(s, "_block_on_filament_deficit", AsyncMock(return_value=False))
     monkeypatch.setattr(s, "_is_printer_idle", MagicMock(return_value=True))
     monkeypatch.setattr(s, "_read_dispatch_parallel_limit", AsyncMock(return_value=3))
@@ -75,7 +83,7 @@ def _make_fake_start(*, order, sessions, delays):
     simulating a slow FTPS upload.
     """
 
-    async def _fake_start(session, item):
+    async def _fake_start(session, item, *, ams_mapping=None):
         sessions.append(id(session))
         delay = delays.get(item.printer_id, 0.0)
         if delay:
@@ -173,7 +181,7 @@ async def test_task_exception_does_not_kill_gather_or_sibling(pd_scheduler, db_s
     # Neutralise the farm-policy hook the failure path funnels through.
     monkeypatch.setattr("backend.app.services.farm_policy.on_terminal", AsyncMock())
 
-    async def _start(session, item):
+    async def _start(session, item, *, ams_mapping=None):
         if item.printer_id == a_id:
             raise RuntimeError("boom during upload")
         item.status = "printing"
@@ -219,11 +227,16 @@ async def test_idempotency_guard_skips_non_pending_item(pd_scheduler, db_session
 
 
 async def test_plan_dispatch_one_printer_once_guard(pd_scheduler):
-    """_plan_dispatch drops a duplicate entry for a printer already in the plan."""
-    plan: list[tuple[int, int]] = []
+    """_plan_dispatch drops a duplicate entry for a printer already in the plan.
+
+    Each entry also carries the mapping DECIDED for that printer this tick (the
+    2026-08-12 contract keeps it off the item until the print starts), so the plan is
+    asserted as (item, printer, mapping) triples.
+    """
+    plan: list[ps_module._PlannedDispatch] = []
     planned: set[int] = set()
-    pd_scheduler._plan_dispatch(plan, planned, item_id=10, printer_id=5)
-    pd_scheduler._plan_dispatch(plan, planned, item_id=11, printer_id=5)  # duplicate printer
-    pd_scheduler._plan_dispatch(plan, planned, item_id=12, printer_id=6)
-    assert plan == [(10, 5), (12, 6)]
+    pd_scheduler._plan_dispatch(plan, planned, item_id=10, printer_id=5, ams_mapping=[3])
+    pd_scheduler._plan_dispatch(plan, planned, item_id=11, printer_id=5, ams_mapping=[0])  # duplicate printer
+    pd_scheduler._plan_dispatch(plan, planned, item_id=12, printer_id=6, ams_mapping=None)
+    assert [(e.item_id, e.printer_id, e.ams_mapping) for e in plan] == [(10, 5, [3]), (12, 6, None)]
     assert planned == {5, 6}

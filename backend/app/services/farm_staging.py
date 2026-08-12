@@ -157,8 +157,10 @@ async def release_filament_staged(db: AsyncSession, printer_id: int | None = Non
     """Un-stage system-staged (low-spool) queue items whose deficit has cleared.
 
     Scans pending items with ``manual_start`` AND ``filament_short`` (optionally
-    scoped to one printer), re-runs :func:`compute_deficit_for_queue_item`
-    against live spool state, and for each item whose deficit is now EMPTY:
+    scoped to one printer), re-decides each one against live tray state
+    (:func:`spool_selection.resolve_dispatch_outcome`) and re-runs
+    :func:`compute_deficit_for_queue_item` against that decision, and for each item
+    that is now fully dispatchable — empty deficit AND every requirement resolved:
     clears ``manual_start`` + ``filament_short`` (and the staging
     ``waiting_reason`` — any ``STAGING_REASON_PREFIX`` string or legacy token),
     so the next scheduler tick dispatches it. Items still short are left staged.
@@ -186,24 +188,32 @@ async def release_filament_staged(db: AsyncSession, printer_id: int | None = Non
 
     released = 0
     for item in items:
+        # Re-decide against LIVE state first: since ``ams_mapping`` became an operator
+        # pin rather than a cached derivation, the item cannot answer "which trays
+        # would this print feed from?" by itself — the mapping has to be computed, and
+        # it is computed by the very function the scheduler dispatches on, so a hold
+        # and its release can never disagree into a stage↔release bounce.
         try:
-            deficit = await compute_deficit_for_queue_item(db, item)
+            outcome = await spool_selection.resolve_dispatch_outcome(db, item)
+        except Exception as e:  # noqa: BLE001 — unknown state: keep it staged (fail-safe)
+            logger.warning("farm_staging: dispatch re-check failed for item %s — left staged: %s", item.id, e)
+            continue
+        try:
+            deficit = await compute_deficit_for_queue_item(
+                db, item, ams_mapping_override=spool_selection.mapping_json(outcome)
+            )
         except Exception as e:  # noqa: BLE001 — unknown spool state: keep it staged
             logger.warning("farm_staging: deficit re-check failed for item %s — left staged: %s", item.id, e)
             continue
         if deficit:
             continue  # still short — stays staged
-        # A pinned item can have an empty deficit yet still be blocked by the
-        # minimum-start floor: its grams-needed IS satisfiable, the only matching
-        # spool just cannot be proven startable (a below-floor backup donor, or a
-        # roll the ledger cannot price). Releasing it here would let the scheduler
-        # re-stage it next tick forever — so keep it staged until the start rule
-        # clears too, decided by the SAME predicate the scheduler dispatches on.
-        try:
-            if await spool_selection.start_rule_blocks_item(db, item):
-                continue
-        except Exception as e:  # noqa: BLE001 — unknown state: keep it staged (fail-safe)
-            logger.warning("farm_staging: start-rule re-check failed for item %s — left staged: %s", item.id, e)
+        # An item can have an empty deficit yet still be undispatchable: the only
+        # matching spool cannot be proven startable (a below-floor backup donor, or a
+        # roll the ledger cannot price), no loaded roll matches a requirement at all,
+        # or an operator pin names a tray that is not there. Releasing on grams alone
+        # would let the scheduler re-stage it next tick forever, so the release owes
+        # the WHOLE dispatch contract, not just the floor.
+        if not outcome.is_total:
             continue
         item.manual_start = False
         item.filament_short = False
@@ -224,6 +234,7 @@ async def release_filament_staged(db: AsyncSession, printer_id: int | None = Non
                 "filament_short",
                 spool_selection.WAITING_REASON_START_MIN,
                 spool_selection.WAITING_REASON_UNREAD_PENDING,
+                spool_selection.WAITING_REASON_PINNED_UNAVAILABLE,
             )
         ):
             item.waiting_reason = None

@@ -255,7 +255,7 @@ async def test_head_of_line_dispatches_to_second_printer_same_tick(
 
     started: dict = {}
 
-    async def _start(db, item):
+    async def _start(db, item, *, ams_mapping=None):
         item.status = "printing"
         started["printer_id"] = item.printer_id
         await db.commit()
@@ -511,7 +511,7 @@ async def test_model_loop_skips_start_blocked_candidate(cq_scheduler, db_session
 
     started: dict = {}
 
-    async def _start(db, item):
+    async def _start(db, item, *, ams_mapping=None):
         item.status = "printing"
         started["printer_id"] = item.printer_id
         await db.commit()
@@ -618,7 +618,7 @@ async def test_mixed_block_stages_generic_filament_short(cq_scheduler, db_sessio
 
 
 def _mk_start():
-    async def _start(db, item):
+    async def _start(db, item, *, ams_mapping=None):
         item.status = "printing"
         await db.commit()
 
@@ -851,7 +851,7 @@ class TestUnreadHoldDispatchOutcome:
 
     Driven through the REAL ``check_queue`` against a real in-memory DB, with the live
     AMS payload scripted: everything from ``_build_loaded_filaments`` through the matcher,
-    ``_mapping_uncovered`` and ``_hold_for_unread`` runs for real.
+    ``MatchOutcome.is_total`` and ``_hold_for_unread`` runs for real.
     """
 
     REQUIREMENTS = [{"slot_id": 1, "type": "PLA", "color": "#FFFFFF", "tray_info_idx": "", "used_grams": 100.0}]
@@ -957,10 +957,15 @@ class TestUnreadHoldDispatchOutcome:
             await self._pass(scheduler, maker, [dict(self.IDENTIFIED_TRAY)], mock_pm=mock_pm, start_mock=start_mock)
             item = await self._item(maker)
 
-            assert item.ams_mapping == "[0]", "the identified tray is matched normally"
             assert item.manual_start is False
             start_mock.assert_awaited_once()
             assert start_mock.await_args.args[:2] == (item.id, 1)
+            # The identified tray is matched normally and THAT decision is what
+            # dispatches. It travels with the dispatch (4th positional arg) rather than
+            # being written to the item first: until a print actually starts, the
+            # column belongs to the operator's pin, and this dispatch is stubbed out.
+            assert start_mock.await_args.args[3] == [0], "the identified tray is matched normally"
+            assert item.ams_mapping is None, "the record is written by the dispatch, never by the decision"
         finally:
             filament_deficit._reset_state()
             ams_presence._reset_state()
@@ -969,8 +974,15 @@ class TestUnreadHoldDispatchOutcome:
     @pytest.mark.asyncio
     async def test_no_unread_slot_still_stages_a_genuine_shortage(self):
         """The guard is narrow: with every tray identified, a requirement nothing can
-        satisfy takes the ORIGINAL path (mapping persisted, dispatch attempted) — the
-        unread hold never becomes a blanket excuse to stop deciding."""
+        satisfy is a decided answer, not an unknown one — so the unread hold stands
+        aside and the item is STAGED.
+
+        Rewritten 2026-08-12 with the total-outcome contract. It used to assert the
+        pre-contract behaviour — the all-``-1`` mapping persisted to the item and a
+        dispatch attempted anyway — which is precisely the shape that let a mapping
+        naming no filament source reach the wire (where the transport then read it as
+        "external spool print"). An item may not dispatch while ANY requirement is
+        unresolved; it takes the same staging lane a grams shortage takes."""
         from unittest.mock import AsyncMock, MagicMock
 
         from backend.app.services import ams_presence, filament_deficit
@@ -996,7 +1008,13 @@ class TestUnreadHoldDispatchOutcome:
             item = await self._item(maker)
 
             assert item.waiting_reason != WAITING_REASON_UNREAD_PENDING
-            assert item.ams_mapping == "[-1]", "unchanged behaviour when the slot IS known"
+            # Staged on the ordinary low-filament lane — a known, decided shortage.
+            assert item.manual_start is True
+            assert item.filament_short is True
+            assert item.waiting_reason.startswith("Low filament")
+            # Never dispatched, and no partial mapping left behind to be replayed.
+            start_mock.assert_not_awaited()
+            assert item.ams_mapping is None, "a mapping naming no filament source is never persisted or sent"
             mock_pm.request_evidence_pushall.assert_not_called()
         finally:
             filament_deficit._reset_state()

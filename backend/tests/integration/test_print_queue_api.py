@@ -546,7 +546,7 @@ class TestQueueStartEndpoint:
 
         item = await queue_item_factory(manual_start=True)
 
-        async def _fake_deficit(_db, _item):
+        async def _fake_deficit(_db, _item, **_kw):
             return [
                 fd_module.FilamentDeficit(
                     slot_id=1,
@@ -590,7 +590,7 @@ class TestQueueStartEndpoint:
         the distinct 409 so the UI can offer Print Anyway (spool-selection WI)."""
         item = await queue_item_factory(manual_start=True)
 
-        async def _no_deficit(_db, _item):
+        async def _no_deficit(_db, _item, **_kw):
             return []
 
         async def _blocked(_db, _item):
@@ -642,7 +642,7 @@ class TestQueueStartEndpoint:
         has no weight for at all is simply false."""
         item = await queue_item_factory(manual_start=True)
 
-        async def _no_deficit(_db, _item):
+        async def _no_deficit(_db, _item, **_kw):
             return []
 
         async def _blocked(_db, _item):
@@ -707,7 +707,7 @@ class TestQueueStartEndpoint:
         item = await queue_item_factory(manual_start=True, filament_short=True)
         called_with = {}
 
-        async def _fake_deficit(_db, _item):
+        async def _fake_deficit(_db, _item, **_kw):
             called_with["called"] = True
             return [
                 fd_module.FilamentDeficit(
@@ -799,7 +799,7 @@ class TestQueueStartEndpoint:
         item = await queue_item_factory(manual_start=True, skip_filament_check=True)
         called = {}
 
-        async def _fake_deficit(_db, _item):
+        async def _fake_deficit(_db, _item, **_kw):
             called["deficit"] = True
             return [
                 fd_module.FilamentDeficit(
@@ -840,7 +840,7 @@ class TestQueueStartEndpoint:
         item = await queue_item_factory(manual_start=True, skip_filament_check=True)
         called = {}
 
-        async def _no_deficit(_db, _item):
+        async def _no_deficit(_db, _item, **_kw):
             called["deficit"] = True
             return []
 
@@ -3169,3 +3169,99 @@ class TestReorderRoutePermission:
             json={"items": [{"id": 999999, "position": 1}]},
         )
         assert resp.status_code == 403, resp.text
+
+
+class TestAmsMappingShapeValidation:
+    """REST input-form validation for ``ams_mapping`` (2026-08-12).
+
+    The field is an operator INSTRUCTION, so the API rejects payloads that could not
+    describe one on any printer — non-integers, booleans, out-of-range ids, over-long
+    arrays. Whether a well-formed pin is SATISFIABLE is a live question owned by the
+    matcher at dispatch; answering it here too would be a second semantic gate that
+    disagrees with the first the moment a spool moves.
+    """
+
+    @pytest.fixture
+    async def printer(self, printer_factory):
+        return await printer_factory()
+
+    @pytest.fixture
+    async def archive(self, printer, archive_factory):
+        return await archive_factory(printer_id=printer.id)
+
+    @pytest.fixture
+    async def item(self, db_session, printer, archive):
+        """One pending queue item carrying an operator pin."""
+        from backend.app.models.print_queue import PrintQueueItem
+
+        row = PrintQueueItem(
+            printer_id=printer.id, archive_id=archive.id, status="pending", position=1, ams_mapping="[1]"
+        )
+        db_session.add(row)
+        await db_session.commit()
+        await db_session.refresh(row)
+        return row
+
+    VALID = [-1, 4, 254]
+    INVALID = [
+        pytest.param([256], id="above-the-byte-range"),
+        pytest.param([-2], id="negative-that-is-not-the-unused-sentinel"),
+        pytest.param([True], id="boolean-is-never-a-tray-id"),
+        pytest.param(["3"], id="string-digit-is-not-an-int"),
+        pytest.param([1.5], id="float"),
+        pytest.param([None], id="null-entry"),
+        pytest.param(list(range(17)), id="longer-than-any-plate"),
+        pytest.param("nope", id="not-a-list"),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_post_accepts_a_well_formed_pin(self, async_client: AsyncClient, printer, archive):
+        response = await async_client.post(
+            "/api/v1/queue/",
+            json={"printer_id": printer.id, "archive_id": archive.id, "ams_mapping": self.VALID},
+        )
+        assert response.status_code == 200
+        assert response.json()["ams_mapping"] == self.VALID
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("mapping", INVALID)
+    async def test_post_rejects_a_malformed_mapping(self, async_client: AsyncClient, printer, archive, mapping):
+        response = await async_client.post(
+            "/api/v1/queue/",
+            json={"printer_id": printer.id, "archive_id": archive.id, "ams_mapping": mapping},
+        )
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_patch_accepts_a_well_formed_pin(self, async_client: AsyncClient, item):
+        response = await async_client.patch(f"/api/v1/queue/{item.id}", json={"ams_mapping": self.VALID})
+        assert response.status_code == 200
+        assert response.json()["ams_mapping"] == self.VALID
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("mapping", INVALID)
+    async def test_patch_rejects_a_malformed_mapping(self, async_client: AsyncClient, item, mapping):
+        response = await async_client.patch(f"/api/v1/queue/{item.id}", json={"ams_mapping": mapping})
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_patch_omitting_the_field_keeps_the_stored_pin(self, async_client: AsyncClient, item):
+        """exclude-unset must survive the validator: the route keys on field PRESENCE,
+        so omitting ams_mapping means "keep" and must never be read as "clear"."""
+        response = await async_client.patch(f"/api/v1/queue/{item.id}", json={"plate_id": 3})
+        assert response.status_code == 200
+        assert response.json()["plate_id"] == 3
+        assert response.json()["ams_mapping"] == [1], "an omitted field is untouched"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_patch_null_clears_the_pin(self, async_client: AsyncClient, item):
+        """The other half of the presence contract: an explicit null drops the pin."""
+        response = await async_client.patch(f"/api/v1/queue/{item.id}", json={"ams_mapping": None})
+        assert response.status_code == 200
+        assert response.json()["ams_mapping"] is None

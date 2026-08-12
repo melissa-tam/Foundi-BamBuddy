@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from backend.app.services.spool_selection import (
     DEFAULT_MIN_START_SPOOL_G,
     DEFAULT_SELECTION_POLICY,
     SELECTION_POLICIES,
+    WAITING_REASON_PINNED_UNAVAILABLE,
     WAITING_REASON_UNREAD_PENDING,
     MatchOutcome,
     SlotInventory,
@@ -52,8 +54,10 @@ from backend.app.services.spool_selection import (
     colors_are_similar,
     dominant_start_block,
     effective_policy,
+    mapping_json,
     match_filaments_to_slots,
     normalize_color_for_compare,
+    parse_pins,
 )
 from backend.app.services.stagger import stagger_policy
 from backend.app.services.tray_fields import parse_tray_state, tray_presence, tray_unread
@@ -128,15 +132,22 @@ def _present_candidates(loaded: list[dict]) -> list[dict]:
     return [f for f in loaded if tray_presence(parse_tray_state(f.get("state")), f.get("type")) is not False]
 
 
-def _mapping_uncovered(mapping: list[int] | None) -> bool:
-    """True when a COMPUTED AMS mapping leaves at least one required slot unfilled.
+@dataclass(frozen=True)
+class _PlannedDispatch:
+    """One (queue item, printer, decided mapping) dispatch planned by this tick.
 
-    ``-1`` is the matcher's "no candidate for this requirement" value. ``None`` / an
-    empty mapping is NOT uncovered: those mean "nothing to map" (no filament
-    requirements in the 3MF, or no status), which is a legitimate mapping-free dispatch
-    and must never be confused with an unsatisfied requirement.
+    The mapping travels WITH the plan instead of being persisted on the item first:
+    ``ams_mapping`` is the operator's pin until the moment a print actually starts, so
+    writing the computed decision over it before the dispatch gates (stagger / USB /
+    capability) have cleared would destroy the instruction AND let the decision be
+    re-read as a pin on the next tick — the exact stale-materialised-decision shape
+    the 2026-08-11 external-spool incident came from. ``_start_print`` records it on
+    the item at the point of no return.
     """
-    return bool(mapping) and any(v is None or v < 0 for v in mapping)
+
+    item_id: int
+    printer_id: int
+    ams_mapping: list[int] | None
 
 
 class PrintScheduler:
@@ -407,7 +418,7 @@ class PrintScheduler:
             # dispatched concurrently so one printer's slow FTPS upload no longer
             # pushes another printer's dispatch to a later tick. ``planned_printers``
             # enforces one printer per tick's plan (point 6).
-            dispatch_plan: list[tuple[int, int]] = []
+            dispatch_plan: list[_PlannedDispatch] = []
             planned_printers: set[int] = set()
 
             for item in items:
@@ -511,62 +522,97 @@ class PrintScheduler:
                             )
                             continue
 
-                    # Compute AMS mapping if not already set
-                    if not item.ams_mapping:
-                        outcome = await self._compute_ams_mapping_for_printer(db, item.printer_id, item)
-                        if (
-                            outcome.start_blocked_slots or _mapping_uncovered(outcome.mapping)
-                        ) and await self._hold_for_unread(db, item, [item.printer_id]):
-                            # A requirement went unmatched (or matched only a
-                            # below-floor donor) while the printer still holds a
-                            # seated-but-unidentified roll — the material may be right
-                            # there. Hold for the read and persist NO mapping: an
-                            # all-``-1`` mapping written now would be reused verbatim by
-                            # every later tick (``if not item.ams_mapping``) and outlive
-                            # the read that was supposed to fix it.
-                            continue
-                        if outcome.start_blocked_slots:
-                            # No matching spool can be PROVEN to clear the minimum-start
-                            # floor — hold the job with a distinct reason naming which
-                            # proof failed (below the floor: they stay loaded as firmware
-                            # backup donors; unpriced: the farm has no weight for them).
-                            # Do NOT persist a mapping. Notify once per transition,
-                            # mirroring the filament-deficit path.
-                            # Already low-spool staged? The durable FLAG is the
-                            # transition signal (token-independent now the reason
-                            # is a rich string) — dedup the once-per-transition
-                            # notification off it.
-                            was_blocked = bool(item.filament_short)
-                            prior_reason = item.waiting_reason
-                            printer = await self._get_printer(db, item.printer_id)
-                            stage_reason = build_staged_reason(
-                                printer.name if printer else "", start_block=outcome.start_block_kind
+                    # Decide the AMS mapping — EVERY tick, against live tray state.
+                    # There is no "use the stored one" branch: a stored value is the
+                    # operator's PIN (an input the matcher honours), never a previous
+                    # result to replay (2026-08-11 external-spool incident).
+                    outcome = await self._compute_ams_mapping_for_printer(db, item.printer_id, item)
+                    # Four ways a decision can refuse to dispatch, each reading its OWN
+                    # record on the outcome and each owning its lane. Ordered by which
+                    # answer is most true, not by convenience: evidence first (a read may
+                    # dissolve the whole question), then a named tray that is simply
+                    # absent, then the floor's own vocabulary, then the residue.
+                    if (outcome.start_blocked_slots or outcome.pin_missing or not outcome.is_total) and (
+                        await self._hold_for_unread(db, item, [item.printer_id])
+                    ):
+                        # A requirement went unmatched (or matched only a below-floor
+                        # donor) while the printer still holds a seated-but-unidentified
+                        # roll — the material may be right there. Hold for the read;
+                        # nothing is written to the item, so the read that fixes it
+                        # decides the next tick.
+                        continue
+                    if await self._hold_for_pinned_tray(db, item, outcome):
+                        continue
+                    if outcome.start_blocked_slots:
+                        # No matching spool can be PROVEN to clear the minimum-start
+                        # floor — hold the job with a distinct reason naming which
+                        # proof failed (below the floor: they stay loaded as firmware
+                        # backup donors; unpriced: the farm has no weight for them).
+                        # Do NOT persist a mapping. Notify once per transition,
+                        # mirroring the filament-deficit path.
+                        # Already low-spool staged? The durable FLAG is the
+                        # transition signal (token-independent now the reason
+                        # is a rich string) — dedup the once-per-transition
+                        # notification off it.
+                        was_blocked = bool(item.filament_short)
+                        prior_reason = item.waiting_reason
+                        printer = await self._get_printer(db, item.printer_id)
+                        stage_reason = build_staged_reason(
+                            printer.name if printer else "", start_block=outcome.start_block_kind
+                        )
+                        await self._stage_filament_short(db, item, unpin=False, reason=stage_reason)
+                        logger.info(
+                            "Queue item %s: no startable spool on printer %s (slots %s, reason %s) — staged",
+                            item.id,
+                            item.printer_id,
+                            outcome.start_blocked_slots,
+                            outcome.start_block_kind,
+                        )
+                        if self._hold_is_new(was_held=was_blocked, prior_reason=prior_reason, reason=stage_reason):
+                            await self._notify_queue_waiting(
+                                db, item, stage_reason, (printer.model if printer else "") or ""
                             )
-                            await self._stage_filament_short(db, item, unpin=False, reason=stage_reason)
-                            logger.info(
-                                "Queue item %s: no startable spool on printer %s (slots %s, reason %s) — staged",
-                                item.id,
-                                item.printer_id,
-                                outcome.start_blocked_slots,
-                                outcome.start_block_kind,
+                        continue
+                    if not outcome.is_total:
+                        # Some requirement resolved to nothing at all (no roll of that
+                        # material is loaded and startable). The outcome contract is
+                        # TOTAL: dispatching now would send a partial ``-1`` mapping,
+                        # which on the wire means "nothing feeds this extruder". Carry it
+                        # on the same staging lane a grams shortage uses — same operator
+                        # action (put the right roll in), same release path.
+                        was_blocked = bool(item.filament_short)
+                        prior_reason = item.waiting_reason
+                        printer = await self._get_printer(db, item.printer_id)
+                        stage_reason = build_staged_reason(printer.name if printer else "")
+                        await self._stage_filament_short(db, item, unpin=False, reason=stage_reason)
+                        logger.info(
+                            "Queue item %s: printer %s has no loaded match for slot(s) %s — staged "
+                            "(a partial mapping is never dispatched)",
+                            item.id,
+                            item.printer_id,
+                            list(outcome.unmatched_slots),
+                        )
+                        if self._hold_is_new(was_held=was_blocked, prior_reason=prior_reason, reason=stage_reason):
+                            await self._notify_queue_waiting(
+                                db, item, stage_reason, (printer.model if printer else "") or ""
                             )
-                            if self._hold_is_new(was_held=was_blocked, prior_reason=prior_reason, reason=stage_reason):
-                                await self._notify_queue_waiting(
-                                    db, item, stage_reason, (printer.model if printer else "") or ""
-                                )
-                            continue
-                        if outcome.mapping:
-                            item.ams_mapping = json.dumps(outcome.mapping)
-                            logger.info(
-                                f"Queue item {item.id}: Computed AMS mapping for printer {item.printer_id}: {outcome.mapping}"
-                            )
-                            await db.commit()
+                        continue
+
+                    if outcome.mapping:
+                        logger.info(
+                            "Queue item %s: Computed AMS mapping for printer %s: %s",
+                            item.id,
+                            item.printer_id,
+                            outcome.mapping,
+                        )
 
                     # Filament-deficit pre-dispatch check (#1496). If the
                     # assigned spool can't satisfy any required slot grams,
                     # promote the item to manual_start so the user must
-                    # acknowledge via the ▶ button (which re-checks live).
-                    if await self._block_on_filament_deficit(db, item):
+                    # acknowledge via the ▶ button (which re-checks live). Checked
+                    # against THIS tick's decision (the override), never against the
+                    # stored field — which now holds pins, not a mapping.
+                    if await self._block_on_filament_deficit(db, item, ams_mapping_override=mapping_json(outcome)):
                         continue
 
                     # Power-stagger gate: hold if this window's start budget is
@@ -598,10 +644,11 @@ class PrintScheduler:
                     # printer's slow upload no longer delays another's dispatch to a
                     # later tick. Selection stays sequential, so busy_printers /
                     # stagger budget / SJF bookkeeping below still observe every
-                    # prior pick this tick. A user-pinned item's printer_id + mapping
-                    # are already persisted (mapping committed just above), so the
-                    # concurrent re-fetch sees the full assignment.
-                    self._plan_dispatch(dispatch_plan, planned_printers, item.id, dispatch_printer_id)
+                    # prior pick this tick. A user-pinned item's printer_id is already
+                    # persisted; the decided mapping rides the PLAN (see
+                    # _PlannedDispatch) rather than the item, so the pin survives until
+                    # the print actually starts.
+                    self._plan_dispatch(dispatch_plan, planned_printers, item.id, dispatch_printer_id, outcome.mapping)
                     busy_printers.add(dispatch_printer_id)
                     # Enter the module in-flight set (Phase E): this is the durable-
                     # across-kicks record of an admitted-but-not-yet-started heater
@@ -665,10 +712,18 @@ class PrintScheduler:
                     # passes its OWN deficit check, so a short low-id printer no longer
                     # swallows the whole run by staging every unit onto itself.
                     assigned_printer_id: int | None = None
-                    assigned_mapping: str | None = None
+                    assigned_mapping: list[int] | None = None
                     last_waiting_reason: str | None = None
                     candidates_deficit_blocked = 0
                     candidates_start_blocked = 0
+                    # Candidates rejected because a requirement resolved to NOTHING on
+                    # them (no loaded match) or because an operator PIN named a tray
+                    # they do not hold. Counted apart from the grams lanes: the first
+                    # shares the "put the right roll in" staging answer, the second is
+                    # a missing NAMED roll and gets its own honest token.
+                    candidates_unmatched = 0
+                    candidates_pin_blocked = 0
+                    pin_missing_seen: dict[int, int] = {}
                     # START_BLOCK_* kinds seen across the candidates this pass —
                     # collapsed into the ONE kind that words the staged reason.
                     start_block_kinds: set[str] = set()
@@ -688,17 +743,16 @@ class PrintScheduler:
                         if not candidate_id:
                             break
 
-                        # Compute this candidate's AMS mapping WITHOUT persisting it —
-                        # a losing candidate must leave no trace on the item.
-                        if item.ams_mapping:
-                            candidate_mapping = item.ams_mapping
-                            candidate_start_blocked: list[int] = []
-                            candidate_block_kind: str | None = None
-                        else:
-                            outcome = await self._compute_ams_mapping_for_printer(db, candidate_id, item)
-                            candidate_mapping = json.dumps(outcome.mapping) if outcome.mapping else None
-                            candidate_start_blocked = outcome.start_blocked_slots
-                            candidate_block_kind = outcome.start_block_kind
+                        # Decide THIS candidate's AMS mapping against its own live tray
+                        # state, WITHOUT persisting it — a losing candidate must leave
+                        # no trace on the item, and there is no printer-agnostic stored
+                        # mapping to reuse (a mapping is meaningful only for the printer
+                        # it was decided on: reusing one across the fleet is what put a
+                        # printer-1 external pick on nine other machines).
+                        outcome = await self._compute_ams_mapping_for_printer(db, candidate_id, item)
+                        candidate_mapping = mapping_json(outcome)
+                        candidate_start_blocked = outcome.start_blocked_slots
+                        candidate_block_kind = outcome.start_block_kind
 
                         # Deficit-check against THIS candidate via the override params
                         # (the item is never mutated). Print-Anyway skips the check.
@@ -743,8 +797,39 @@ class PrintScheduler:
                             )
                             continue
 
+                        # Operator PIN naming a tray this candidate does not hold. Not
+                        # a shortage — skip the candidate and keep searching; another
+                        # printer may well have the pinned tray.
+                        if outcome.pin_missing:
+                            deficit_blocked.add(candidate_id)
+                            candidates_pin_blocked += 1
+                            pin_missing_seen.update(outcome.pin_missing)
+                            logger.info(
+                                "Queue item %s: candidate printer %s does not hold pinned tray(s) %s — trying next",
+                                item.id,
+                                candidate_id,
+                                sorted(set(outcome.pin_missing.values())),
+                            )
+                            continue
+
+                        # Total-outcome contract: a candidate that leaves ANY
+                        # requirement unresolved is not a candidate. Dispatching it
+                        # would send a partial ``-1`` mapping ("nothing feeds this
+                        # extruder") to the printer.
+                        if not outcome.is_total:
+                            deficit_blocked.add(candidate_id)
+                            blocked_candidate_ids.append(candidate_id)
+                            candidates_unmatched += 1
+                            logger.info(
+                                "Queue item %s: candidate printer %s has no loaded match for slot(s) %s — trying next",
+                                item.id,
+                                candidate_id,
+                                list(outcome.unmatched_slots),
+                            )
+                            continue
+
                         assigned_printer_id = candidate_id
-                        assigned_mapping = candidate_mapping
+                        assigned_mapping = outcome.mapping
                         break
 
                     if assigned_printer_id:
@@ -786,7 +871,7 @@ class PrintScheduler:
                                 )
                                 continue
 
-                        # Assign printer + persist its mapping. Clear a stale
+                        # Assign the printer. Clear a stale
                         # assignment-time waiting reason, but PRESERVE a live
                         # "no_usb_drive" hold: _start_print owns that token and
                         # self-clears it on a successful dispatch (past the capability
@@ -796,8 +881,7 @@ class PrintScheduler:
                         # this optimistic clear would otherwise make every tick look like
                         # a fresh transition and re-notify.
                         item.printer_id = assigned_printer_id
-                        if assigned_mapping and not item.ams_mapping:
-                            item.ams_mapping = assigned_mapping
+                        if assigned_mapping:
                             logger.info(
                                 "Queue item %s: Computed AMS mapping for printer %s: %s",
                                 item.id,
@@ -829,12 +913,16 @@ class PrintScheduler:
                                 db=db,
                             )
 
-                        # Persist the assignment (printer_id + ams_mapping set just
-                        # above) BEFORE planning: the concurrent _start_print_by_id
-                        # re-fetches this item on its OWN session, so an uncommitted
-                        # assignment would be invisible there.
+                        # Persist the assignment (printer_id) BEFORE planning: the
+                        # concurrent _start_print_by_id re-fetches this item on its OWN
+                        # session, so an uncommitted assignment would be invisible
+                        # there. The decided mapping is NOT persisted here — it rides
+                        # the plan and is recorded when the print actually starts, so a
+                        # unit held at a later gate keeps its operator pin intact.
                         await db.commit()
-                        self._plan_dispatch(dispatch_plan, planned_printers, item.id, assigned_printer_id)
+                        self._plan_dispatch(
+                            dispatch_plan, planned_printers, item.id, assigned_printer_id, assigned_mapping
+                        )
                         busy_printers.add(assigned_printer_id)
                         # Enter the module in-flight set + arm the ramp-watch (Phase
                         # E; see direct-path note).
@@ -861,7 +949,17 @@ class PrintScheduler:
                                     other.been_jumped = True
                             await db.commit()
 
-                    elif candidates_deficit_blocked > 0 or candidates_start_blocked > 0:
+                    elif candidates_pin_blocked > 0 and candidates_deficit_blocked == 0:
+                        # Every candidate that could have run was rejected for the
+                        # pinned tray it does not hold (and nothing was merely short).
+                        # A missing NAMED roll is not a shortage, so it takes the honest
+                        # token rather than the "Low filament" staging lane: the item
+                        # stays pending and un-promoted, and the tick it is loaded on is
+                        # the tick it dispatches.
+                        await self._hold_for_pinned_tray(
+                            db, item, MatchOutcome(mapping=None, pin_missing=pin_missing_seen)
+                        )
+                    elif candidates_deficit_blocked > 0 or candidates_start_blocked > 0 or candidates_unmatched > 0:
                         # Every candidate that could have run was blocked on filament →
                         # stage the item UNPINNED so a later tick re-runs the full
                         # candidate search once any printer's spool is topped up. One
@@ -877,7 +975,14 @@ class PrintScheduler:
                         # just cannot see the material yet. Hold un-staged and un-pinned
                         # (the item was never pinned on this branch) for the read.
                         if not await self._hold_for_unread(db, item, list(blocked_candidate_ids)):
-                            start_min_only = candidates_deficit_blocked == 0 and candidates_start_blocked > 0
+                            # "Below minimum" only when the floor is the WHOLE story —
+                            # a grams shortage or an unmatched requirement anywhere in
+                            # the candidate set makes the generic wording the true one.
+                            start_min_only = (
+                                candidates_deficit_blocked == 0
+                                and candidates_unmatched == 0
+                                and candidates_start_blocked > 0
+                            )
                             blocked_names = await self._resolve_printer_names(db, blocked_candidate_ids)
                             who = ", ".join(blocked_names) if blocked_names else f"{item.target_model} printers"
                             stage_reason = build_staged_reason(
@@ -917,7 +1022,10 @@ class PrintScheduler:
                 await db.commit()
                 sem = asyncio.Semaphore(limit)
                 await asyncio.gather(
-                    *(self._start_print_by_id(item_id, printer_id, sem) for item_id, printer_id in dispatch_plan),
+                    *(
+                        self._start_print_by_id(planned.item_id, planned.printer_id, sem, planned.ams_mapping)
+                        for planned in dispatch_plan
+                    ),
                     return_exceptions=True,
                 )
 
@@ -1266,23 +1374,32 @@ class PrintScheduler:
     async def _compute_ams_mapping_for_printer(
         self, db: AsyncSession, printer_id: int, item: PrintQueueItem
     ) -> MatchOutcome:
-        """Compute the AMS mapping + start-block outcome for a printer.
+        """Decide the AMS mapping + block outcome for a printer, from LIVE state.
 
-        Called when a queue item has no ams_mapping set — either for model-based
-        items after printer assignment, or printer-specific items (e.g. from VP).
-        Applies the configured spool-selection policy (``spool_selection_policy``)
-        and the minimum-start-weight floor (``min_start_spool_g``) via the
-        ``spool_selection`` module.
+        THE decision point, run for EVERY dispatch evaluation — pinned items, each
+        candidate of a model-based item, and every re-check a release path makes.
+        There is no stored-mapping short-circuit: a mapping is only true of the tray
+        state and the printer it was decided against, so replaying one hours later (or
+        on a different machine) is exactly how a printer-1 external pick reached nine
+        other printers on 2026-08-11.
+
+        ``item.ams_mapping`` IS read here — as the operator's PIN input to the matcher
+        (:func:`spool_selection.match_filaments_to_slots`), never as a previous result.
+        Applies the configured spool-selection policy (``spool_selection_policy``) and
+        the minimum-start-weight floor (``min_start_spool_g``) to pinned and
+        auto-matched slots alike.
 
         Args:
             db: Database session
-            printer_id: The assigned printer ID
+            printer_id: The printer to decide against
             item: The queue item (contains archive_id or library_file_id)
 
         Returns:
             A ``MatchOutcome`` whose ``mapping`` is the AMS mapping array (or None
-            when no mapping is needed/possible) and whose ``start_blocked_slots``
-            names any slot held back purely by the minimum-start floor.
+            when no mapping is needed/possible), whose ``start_blocked_slots`` names
+            any slot held back purely by the minimum-start floor, whose ``pin_missing``
+            names any slot whose pinned tray is absent, and whose ``is_total`` says
+            whether the item may dispatch at all.
         """
         # Get printer status
         status = printer_manager.get_status(printer_id)
@@ -1318,7 +1435,13 @@ class PrintScheduler:
                             len(force_overrides),
                         )
                         return await self._build_override_direct_mapping(
-                            db, printer_id, force_overrides, status, eff_policy, min_start_g
+                            db,
+                            printer_id,
+                            force_overrides,
+                            status,
+                            eff_policy,
+                            min_start_g,
+                            parse_pins(item.ams_mapping),
                         )
                 except (json.JSONDecodeError, KeyError, TypeError) as e:
                     logger.warning("Queue item %s: Force-color fallback mapping failed: %s", item.id, e)
@@ -1367,6 +1490,8 @@ class PrintScheduler:
         # ``require_known_grams``: this is the START lane, so a candidate the ledger
         # cannot price is reserved rather than started (it may hold 5 g). The
         # mid-print donor lane in ``spool_recovery`` keeps the fail-open reading.
+        # ``pins``: the operator's stored slot instruction, narrowing (never
+        # bypassing) the candidate set inside this one matcher.
         return match_filaments_to_slots(
             filament_reqs,
             loaded_filaments,
@@ -1375,6 +1500,7 @@ class PrintScheduler:
             backup_on=status.ams_filament_backup,
             min_start_g=min_start_g,
             require_known_grams=True,
+            pins=parse_pins(item.ams_mapping),
         )
 
     async def _build_override_direct_mapping(
@@ -1385,6 +1511,7 @@ class PrintScheduler:
         status,
         policy: str,
         min_start_g: int,
+        pins: list[int] | None = None,
     ) -> MatchOutcome:
         """Build an AMS mapping directly from force-color overrides without a 3MF.
 
@@ -1392,8 +1519,8 @@ class PrintScheduler:
         slice_info is missing or unreadable) but ``force_color_match`` overrides
         are present. Each override's ``slot_id``, ``type``, and ``color`` are
         treated as the filament requirement for that slot and matched against the
-        current AMS state of the printer, threading the same policy / floor as the
-        normal path.
+        current AMS state of the printer, threading the same policy / floor / operator
+        pins as the normal path — one contract, no fallback-only exemptions.
 
         Returns a ``MatchOutcome`` (mapping None when the AMS has no filaments).
         """
@@ -1421,6 +1548,7 @@ class PrintScheduler:
             backup_on=getattr(status, "ams_filament_backup", None),
             min_start_g=min_start_g,
             require_known_grams=True,
+            pins=pins,
         )
 
     async def _get_filament_requirements(self, db: AsyncSession, item: PrintQueueItem) -> list[dict] | None:
@@ -2389,16 +2517,67 @@ class PrintScheduler:
                 logger.debug("unread-read request failed for printer %s (non-fatal)", pid, exc_info=True)
         return True
 
+    async def _hold_for_pinned_tray(
+        self,
+        db: AsyncSession,
+        item: PrintQueueItem,
+        outcome: MatchOutcome,
+    ) -> bool:
+        """Hold an item whose operator PIN names a tray the printer is not offering.
+
+        Returns True when the item was held — the caller skips its remaining branches
+        and the next tick re-decides.
+
+        A pin miss is NOT a shortage: nothing needs topping up, a specific roll is
+        simply not in the machine (pulled, never loaded, unread, out of rotation, on
+        another nozzle, or claimed by an earlier slot). Staging it as "Low filament"
+        would send the operator to weigh spools; the honest instruction is "load that
+        tray, or change the pick". So the item stays PENDING and un-promoted under
+        :data:`WAITING_REASON_PINNED_UNAVAILABLE` — self-clearing exactly like the
+        unread hold, because the matcher re-decides every tick and the moment the tray
+        appears the job dispatches with no further human step.
+
+        Notified once per transition (the same ``_hold_is_new`` rule the filament holds
+        use): unlike the unread hold's one-tick evidence round-trip, this one waits on
+        a human, and an unnoticed pin miss is a run that never starts.
+        """
+        if not outcome.pin_missing:
+            return False
+        prior_reason = item.waiting_reason
+        newly_held = prior_reason != WAITING_REASON_PINNED_UNAVAILABLE
+        if newly_held:
+            item.waiting_reason = WAITING_REASON_PINNED_UNAVAILABLE
+            await db.commit()
+        log = logger.info if newly_held else logger.debug
+        log(
+            "Queue item %s: held — pinned tray(s) %s unavailable on printer %s (slots %s)",
+            item.id,
+            sorted(set(outcome.pin_missing.values())),
+            item.printer_id,
+            outcome.pinned_unavailable_slots,
+        )
+        if newly_held:
+            printer = await self._get_printer(db, item.printer_id) if item.printer_id else None
+            await self._notify_queue_waiting(
+                db,
+                item,
+                WAITING_REASON_PINNED_UNAVAILABLE,
+                (printer.model if printer else item.target_model) or "",
+            )
+        return True
+
     async def _stage_filament_short(
         self, db: AsyncSession, item: PrintQueueItem, *, unpin: bool, reason: str = "filament_short"
     ) -> None:
         """Mark a queue item low-spool staged (#1496 / #Phase4).
 
         ``unpin=False`` keeps the item on its assigned printer (pinned path).
-        ``unpin=True`` clears the pin and its stale mapping — used by the
-        model-based path when EVERY eligible printer is short, so ``farm_staging``
-        releases it and the next tick re-runs the full candidate search across the
-        fleet. ``reason`` is the persisted ``waiting_reason`` — callers build a
+        ``unpin=True`` clears the PRINTER assignment — used by the model-based path
+        when EVERY eligible printer is short, so ``farm_staging`` releases it and the
+        next tick re-runs the full candidate search across the fleet. The item's
+        ``ams_mapping`` (the operator's slot instruction) is never cleared here: it is
+        not a per-printer derivation to invalidate, and staging must not silently
+        discard a human's pick. ``reason`` is the persisted ``waiting_reason`` — callers build a
         human-readable :func:`farm_staging.build_staged_reason` string that NAMES
         the blocked machine(s) (D9); the ``"filament_short"`` default is a legacy
         fallback for a caller that passes none.
@@ -2408,7 +2587,6 @@ class PrintScheduler:
         item.waiting_reason = reason
         if unpin:
             item.printer_id = None
-            item.ams_mapping = None
         await db.commit()
 
     async def _stage_model_item_filament_short(
@@ -2455,6 +2633,8 @@ class PrintScheduler:
         self,
         db: AsyncSession,
         item: PrintQueueItem,
+        *,
+        ams_mapping_override: str | None = None,
     ) -> bool:
         """Promote the pinned item to manual_start when the assigned spool is short (#1496).
 
@@ -2463,6 +2643,12 @@ class PrintScheduler:
         since been swapped to one with enough material clears the flag here
         so the next scheduler tick dispatches it. (The model-based path checks
         candidates inline via ``_compute_deficit_safe`` and does not call this.)
+
+        ``ams_mapping_override`` is THIS dispatch's decided mapping. The dispatch
+        caller always passes it: the grams question is "can the trays this print will
+        actually feed from cover it?", and since the stored field became an operator
+        pin the item can no longer answer that itself (a partial pin would price only
+        the pinned slots, an absent one nothing at all).
         """
         # User has explicitly acknowledged the deficit ("Print Anyway") —
         # don't re-flag, don't even compute. Without this short-circuit the
@@ -2480,7 +2666,7 @@ class PrintScheduler:
             )
             return False
 
-        deficit = await self._compute_deficit_safe(db, item)
+        deficit = await self._compute_deficit_safe(db, item, ams_mapping_override=ams_mapping_override)
 
         if deficit and await self._hold_for_unread(db, item, [item.printer_id]):
             # PHANTOM-DEFICIT GUARD: the printer holds a seated-but-unidentified roll,
@@ -2572,12 +2758,18 @@ class PrintScheduler:
 
     def _plan_dispatch(
         self,
-        dispatch_plan: list[tuple[int, int]],
+        dispatch_plan: list[_PlannedDispatch],
         planned_printers: set[int],
         item_id: int,
         printer_id: int,
+        ams_mapping: list[int] | None = None,
     ) -> None:
-        """Record a planned (queue_item, printer) dispatch for the concurrent phase.
+        """Record a planned (queue_item, printer, decided mapping) dispatch.
+
+        ``ams_mapping`` is THIS tick's decision for that printer — carried to the
+        concurrent dispatch phase instead of being written to the item, so the
+        operator's pin stays intact until a print actually starts (see
+        :class:`_PlannedDispatch`).
 
         One printer may appear at most once per tick's plan (point 6): the
         selection loop already guarantees this by adding each pick to
@@ -2593,9 +2785,11 @@ class PrintScheduler:
             )
             return
         planned_printers.add(printer_id)
-        dispatch_plan.append((item_id, printer_id))
+        dispatch_plan.append(_PlannedDispatch(item_id=item_id, printer_id=printer_id, ams_mapping=ams_mapping))
 
-    async def _start_print_by_id(self, item_id: int, printer_id: int, sem: asyncio.Semaphore) -> None:
+    async def _start_print_by_id(
+        self, item_id: int, printer_id: int, sem: asyncio.Semaphore, ams_mapping: list[int] | None = None
+    ) -> None:
         """Run one planned dispatch concurrently on its OWN session (latency Phase B).
 
         Bounded by ``sem`` (``dispatch_parallel_limit``). A fresh session lets the
@@ -2632,7 +2826,7 @@ class PrintScheduler:
                     )
                     return
                 try:
-                    await self._start_print(session, item)
+                    await self._start_print(session, item, ams_mapping=ams_mapping)
                 except Exception as exc:  # noqa: BLE001 — one task must not kill the gather
                     logger.exception("Dispatch (printer %s): queue item %s crashed during start", printer_id, item_id)
                     try:
@@ -2659,12 +2853,22 @@ class PrintScheduler:
         finally:
             stagger_policy.note_dispatch_settled(item_id)
 
-    async def _start_print(self, db: AsyncSession, item: PrintQueueItem):
+    async def _start_print(self, db: AsyncSession, item: PrintQueueItem, *, ams_mapping: list[int] | None = None):
         """Upload file and start print for a queue item.
 
         Supports two sources:
         - archive_id: Print from an existing archive
         - library_file_id: Print from a library file (file manager)
+
+        ``ams_mapping`` is the mapping the scheduler DECIDED for this dispatch
+        (``_compute_ams_mapping_for_printer`` against live tray state, pins honoured).
+        It is passed in rather than read off the item because ``item.ams_mapping``
+        holds the operator's PIN until a print starts — the decision is recorded onto
+        the item at the point of no return below, where it becomes the durable record
+        of what actually ran (items are single-dispatch, so it never round-trips as a
+        cache). ``None`` = a mapping-free dispatch: nothing is sent and nothing is
+        recorded, which is also what the hold paths above leave behind when they
+        return early.
         """
         logger.info("Starting queue item %s", item.id)
 
@@ -2747,15 +2951,15 @@ class PrintScheduler:
             # (here: no USB stick) must not become the unit's permanent home.
             # Leaving the pin turns the unit into a "specific printer" item the
             # model path never rebalances, funnelling the whole run onto one broken
-            # printer, one unit per tick, until the pool drains. Clear ams_mapping
-            # too: it was computed for THIS printer's AMS slot layout and the model
-            # path recomputes it per candidate. Always commit the un-pin (even when
-            # already waiting) so a unit held tick N and re-held tick N+1 still ends
-            # unpinned. A user-pinned unit (no target_model) keeps its printer and,
-            # exactly as before, commits only on the transition into the hold.
+            # printer, one unit per tick, until the pool drains. ``ams_mapping`` is
+            # deliberately NOT touched: it is the operator's slot instruction now, not
+            # a per-printer computation to invalidate, and a missing USB stick is no
+            # reason to discard what a human asked for. Always commit the un-pin (even
+            # when already waiting) so a unit held tick N and re-held tick N+1 still
+            # ends unpinned. A user-pinned unit (no target_model) keeps its printer
+            # and, exactly as before, commits only on the transition into the hold.
             if item.target_model:
                 item.printer_id = None
-                item.ams_mapping = None
                 item.waiting_reason = "no_usb_drive"
                 # Once-guard for the model path's per-assignment notification —
                 # re-selection of the same sick printer every tick must not
@@ -2786,14 +2990,15 @@ class PrintScheduler:
             # Same un-pin rationale as the USB hold above: a capability BLOCK on a
             # sick-but-idle printer (nozzle/model/filament mismatch) must not pin a
             # model-targeted unit onto it, or the run funnels one unit per tick onto
-            # the mismatched printer. Release the scheduler-made pin + its
-            # per-printer AMS mapping so the model path re-evaluates the fleet next
-            # tick; always commit the un-pin so a re-held unit still ends unpinned. A
+            # the mismatched printer. Release the scheduler-made printer pin so the
+            # model path re-evaluates the fleet next tick; always commit the un-pin so
+            # a re-held unit still ends unpinned. The operator's ``ams_mapping``
+            # instruction is left alone — the matcher re-decides per candidate anyway,
+            # and a capability block is not a reason to forget a human's slot choice. A
             # user-pinned unit (no target_model) holds in place, committing only on a
             # reason change, exactly as before.
             if item.target_model:
                 item.printer_id = None
-                item.ams_mapping = None
                 item.waiting_reason = capability.reason
                 # Once-guard for the model path's per-assignment notification
                 # (see _hold_unpinned_items in __init__).
@@ -3062,14 +3267,6 @@ class PrintScheduler:
             await self._power_off_if_needed(db, item)
             return
 
-        # Parse AMS mapping if stored
-        ams_mapping = None
-        if item.ams_mapping:
-            try:
-                ams_mapping = json.loads(item.ams_mapping)
-            except json.JSONDecodeError:
-                logger.warning("Queue item %s: Invalid AMS mapping JSON, ignoring", item.id)
-
         # Register as expected print so we don't create a duplicate archive
         # Only applicable for archive-based prints
         if archive:
@@ -3098,6 +3295,13 @@ class PrintScheduler:
         # accidentally reprinting the same file hours later.
         item.status = "printing"
         item.started_at = datetime.now(timezone.utc)
+        # Record what this dispatch actually feeds from. Before this line the field is
+        # the operator's INSTRUCTION (a pin, or nothing); from here on it is the
+        # RECORD of the decision that ran, which is what the ledger, usage tracking
+        # and recovery lanes read back for a printing/completed unit. Written here —
+        # past the USB and capability holds — so a held unit keeps its pin and no
+        # decision can ever be re-read as one on a later tick.
+        item.ams_mapping = json.dumps(ams_mapping) if ams_mapping else None
         await db.commit()
 
         for cleanup_path in cleanup_disk_paths:
@@ -3392,12 +3596,11 @@ class PrintScheduler:
                 return "already_moved_on"
             item.status = "pending"
             item.started_at = None
-            # Clear the scheduler-owned AMS mapping too: it was computed for this
-            # printer's AMS slot layout at the failed dispatch, and a stale mapping
-            # would replay against current AMS truth. The `if not item.ams_mapping`
-            # gate (~:394) recomputes it on the retry; identical clear + rationale
-            # already live on the model-hold un-pin path (~:2330). printer_id pinning
-            # is deliberately left untouched.
+            # Drop the dispatch RECORD written at start: that dispatch never landed,
+            # so the field must not describe it. Leaving it would also hand the next
+            # tick's matcher a decision dressed as an operator pin — the one thing the
+            # contract forbids. The retry re-decides from live state. printer_id
+            # pinning is deliberately left untouched.
             item.ams_mapping = None
             await db.commit()
             return "reverted"

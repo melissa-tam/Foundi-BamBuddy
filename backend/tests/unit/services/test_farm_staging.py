@@ -135,18 +135,35 @@ class TestReleaseFilamentStaged:
 
 
 def _patch_start_rule(monkeypatch, blocks: bool):
-    """Force the start-spool floor re-check to a fixed verdict."""
+    """Force the release path's live dispatch re-decision to a fixed verdict.
+
+    Rewritten for the 2026-08-12 pin contract: the release used to ask the floor-only
+    ``start_rule_blocks_item``, which no longer exists. It now re-decides the whole
+    dispatch through ``resolve_dispatch_outcome`` and refuses to release anything the
+    scheduler could not dispatch — a start-floor block being one of the ways a
+    requirement goes unresolved, alongside a pin miss and a plain no-match. Blocked is
+    modelled the way the matcher reports it: slot 1 unresolved.
+    """
+    outcome = (
+        spool_selection.MatchOutcome(
+            mapping=[-1],
+            start_block_kinds={1: spool_selection.START_BLOCK_BELOW_FLOOR},
+            unmatched_slots=(1,),
+        )
+        if blocks
+        else spool_selection.MatchOutcome(mapping=[0])
+    )
     monkeypatch.setattr(
         farm_staging.spool_selection,
-        "start_rule_blocks_item",
-        AsyncMock(return_value=blocks),
+        "resolve_dispatch_outcome",
+        AsyncMock(return_value=outcome),
     )
 
 
 class TestReleaseStartRuleGate:
-    """The release path also honours the minimum-start floor: a pinned item with
-    an empty deficit but a below-floor starting spool must NOT release (it would
-    re-stage next tick, bouncing)."""
+    """The release path honours the FULL dispatch contract, the minimum-start floor
+    included: an item with an empty deficit whose requirement still resolves to
+    nothing must NOT release (it would re-stage next tick, bouncing)."""
 
     async def test_keeps_still_start_blocked_item_staged(self, db_session, monkeypatch):
         item = await _add_staged(
@@ -182,7 +199,7 @@ class TestReleaseStartRuleGate:
         _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
         monkeypatch.setattr(
             farm_staging.spool_selection,
-            "start_rule_blocks_item",
+            "resolve_dispatch_outcome",
             AsyncMock(side_effect=RuntimeError("status unavailable")),
         )
         released = await farm_staging.release_filament_staged(db_session)
@@ -208,8 +225,8 @@ def _tray(gtid=0, ftype="PETG", color="#00FF00"):
 def _patch_real_start_rule(monkeypatch, slot_inv):
     """Answer the scheduler's mapping computation from ``slot_inv`` (the state of the
     ONE matching tray) through the REAL matcher, in the same fail-closed START reading
-    dispatch uses — so the release path's floor re-check runs for real
-    (``start_rule_blocks_item`` is NOT stubbed).
+    dispatch uses — so the release path's re-decision runs for real
+    (``resolve_dispatch_outcome`` is NOT stubbed).
 
     A priced PLA roll rides along on every case so the printer's ledger demonstrably
     speaks; it can never match the PETG requirement, so each case turns purely on the
@@ -236,7 +253,7 @@ def _patch_real_start_rule(monkeypatch, slot_inv):
 
 class TestReleaseAgainstTheRealStartFloor:
     """The release↔stage oscillation, pinned through the REAL predicate chain
-    (``start_rule_blocks_item`` → ``start_rule_blocked_slots`` → the matcher).
+    (``resolve_dispatch_outcome`` → ``_compute_ams_mapping_for_printer`` → the matcher).
 
     A start-weight hold has an EMPTY grams deficit BY CONSTRUCTION — the print's
     grams-needed is satisfiable, the roll just cannot be proven startable — so a

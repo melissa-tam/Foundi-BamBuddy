@@ -247,7 +247,7 @@ class TestStaggerLimitsStartsPerTick:
 
         started: list[int] = []
 
-        async def fake_start(db, item):
+        async def fake_start(db, item, *, ams_mapping=None):
             item.status = "printing"
             item.started_at = datetime.now(timezone.utc)
             await db.commit()
@@ -292,7 +292,7 @@ class TestStaggerLimitsStartsPerTick:
 
         started: list[int] = []
 
-        async def fake_start(db, item):
+        async def fake_start(db, item, *, ams_mapping=None):
             item.status = "printing"
             item.started_at = datetime.now(timezone.utc)
             await db.commit()

@@ -103,7 +103,11 @@ class TestUnpinOnHold:
         assert item.status == "pending"  # a WAIT, not a failure
         assert item.waiting_reason == "no_usb_drive"
         assert item.printer_id is None  # scheduler-made pin released
-        assert item.ams_mapping is None  # per-printer mapping cleared
+        # ams_mapping is PRESERVED (2026-08-12 contract). It used to be cleared here as
+        # a per-printer derivation to invalidate; it is now the operator's slot
+        # instruction, and a missing USB stick is no reason to discard what a human
+        # asked for. The matcher re-decides per candidate on the next tick anyway.
+        assert item.ams_mapping == "[0]"
         m.upload.assert_not_awaited()
         m.notif.assert_awaited_once()
 
@@ -129,7 +133,8 @@ class TestUnpinOnHold:
         assert item.status == "pending"
         assert item.waiting_reason == "nozzle mismatch: file 0.6 vs printer 0.4"
         assert item.printer_id is None
-        assert item.ams_mapping is None
+        # Preserved for the same reason as the USB hold above — see that comment.
+        assert item.ams_mapping == "[0]"
         m.upload.assert_not_awaited()
 
     async def test_user_pinned_item_held_not_unpinned_on_usb(self, db_session):
@@ -227,7 +232,9 @@ def cq_scheduler(monkeypatch, test_engine):
     monkeypatch.setattr(sched_mod.stagger_policy, "budget", AsyncMock(return_value=99))
     monkeypatch.setattr(s, "_check_auto_drying", AsyncMock())
     monkeypatch.setattr(s, "_get_job_name", AsyncMock(return_value="job"))
-    monkeypatch.setattr(s, "_compute_ams_mapping_for_printer", AsyncMock(return_value=ps_module.MatchOutcome(mapping=[0])))
+    monkeypatch.setattr(
+        s, "_compute_ams_mapping_for_printer", AsyncMock(return_value=ps_module.MatchOutcome(mapping=[0]))
+    )
     monkeypatch.setattr(s, "_compute_deficit_safe", AsyncMock(return_value=[]))
     monkeypatch.setattr(s, "_block_on_filament_deficit", AsyncMock(return_value=False))
     monkeypatch.setattr(s, "_is_printer_idle", MagicMock(return_value=True))
@@ -465,7 +472,7 @@ async def test_hold_unpin_guard_discarded_on_real_dispatch(cq_scheduler, db_sess
     # sourceless test units downstream of the gates).
     started: dict = {}
 
-    async def _start(db, it):
+    async def _start(db, it, *, ams_mapping=None):
         it.status = "printing"
         started["printer_id"] = it.printer_id
         await db.commit()

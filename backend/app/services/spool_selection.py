@@ -69,10 +69,22 @@ filament type, so the reason a phantom "no match" happened is visible in the dec
 trace and a future builder change cannot silently make unidentified rolls selectable.
 The dispatch answer for such a slot is not "stage the job" but "read the slot" —
 ``waiting_reason`` :data:`WAITING_REASON_UNREAD_PENDING`, driven by the scheduler.
+
+Finally, an operator may PIN a requirement slot to one specific tray
+(``PrintQueueItem.ams_mapping``, position = slot_id - 1). A pin is an INSTRUCTION,
+never a cached derivation: it narrows that requirement's candidate set to the pinned
+``global_tray_id`` and then every rule above applies to it unchanged — the unusable
+excludes, the nozzle filter and the minimum-start floor included. Only the bucket
+scan is skipped, because a pin already names the tray and filament TYPE is
+deliberately not enforced on it (an explicit cross-type pick is a ratified operator
+override, #1722). A pinned tray that is not among the live candidates leaves its slot
+unmatched under :data:`WAITING_REASON_PINNED_UNAVAILABLE` — a pin miss is a missing
+roll, not "low filament", and the two need different operator actions.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -108,6 +120,17 @@ WAITING_REASON_START_MIN = "start_spool_below_minimum"
 # re-decides on real evidence. Self-clearing exactly like ``stagger_hold`` /
 # ``no_usb_drive`` — dispatch clears it, and a genuine deficit overwrites it.
 WAITING_REASON_UNREAD_PENDING = "filament_unread_pending"
+# Machine waiting_reason token for a job whose operator PIN (an explicit
+# ``ams_mapping`` entry) names a tray that is not among the printer's live
+# candidates — pulled, never loaded, seated-but-unread, out of rotation/spent, or on
+# the wrong nozzle. Deliberately NOT a "Low filament" staging string: nothing is
+# short, a NAMED roll is simply not there, and the operator action is "load that tray
+# or drop the pin" rather than "top a spool up". Self-clearing like the tokens above —
+# the matcher re-decides every tick, so loading the tray dispatches the job with no
+# further human step. Also the ``POST /queue/{id}/start`` 409 code (mirroring
+# :data:`WAITING_REASON_START_MIN`), so the ▶ button explains itself instead of
+# leaving the item silently pending.
+WAITING_REASON_PINNED_UNAVAILABLE = "pinned_tray_unavailable"
 
 # Why a slot could not be started. ONE vocabulary, cited by the decision trace,
 # the staged waiting_reason (``farm_staging.build_staged_reason``) and the tests —
@@ -191,10 +214,27 @@ class MatchOutcome:
     "cannot start on this" signal. It is THE start-block record: the
     ``start_blocked_slots`` list is its key view, so the slot set and the reasons
     can never disagree.
+
+    ``pin_missing`` maps slot_id → the pinned ``global_tray_id`` for every slot whose
+    operator PIN named a tray the printer is not offering (see
+    :data:`WAITING_REASON_PINNED_UNAVAILABLE`). Kept apart from ``start_block_kinds``
+    because the two hold for opposite reasons — the roll is absent vs. the roll is
+    present but unstartable — and word different operator instructions.
+
+    ``unmatched_slots`` is the TOTAL-OUTCOME record: every requirement slot the
+    matcher could not resolve, whatever the cause (pin miss, start-block, or simply
+    no matching roll). It is derived from the REQUIREMENTS, never from scanning the
+    mapping array for ``-1``: requirement slot_ids can be sparse (a plate using only
+    filament 2 yields ``[-1, gtid]``), so a mapping scan reports a phantom hole for a
+    slot nothing ever asked about. Dispatch reads :attr:`is_total` — an item may not
+    start while ANY requirement is unresolved, because the alternative is a partial
+    ``-1`` mapping that means "nothing feeds this extruder" on the wire.
     """
 
     mapping: list[int] | None
     start_block_kinds: dict[int, str] = field(default_factory=dict)
+    pin_missing: dict[int, int] = field(default_factory=dict)
+    unmatched_slots: tuple[int, ...] = ()
 
     @property
     def start_blocked_slots(self) -> list[int]:
@@ -206,6 +246,22 @@ class MatchOutcome:
         """The one kind that words a hold covering this outcome (see
         :func:`dominant_start_block`); ``None`` when nothing is start-blocked."""
         return dominant_start_block(self.start_block_kinds.values())
+
+    @property
+    def pinned_unavailable_slots(self) -> list[int]:
+        """Slot_ids whose pinned tray is not among the live candidates."""
+        return list(self.pin_missing)
+
+    @property
+    def is_total(self) -> bool:
+        """True when every requirement resolved to a tray — the dispatch contract.
+
+        A mapping-free outcome (``mapping is None``: no requirements to map, no live
+        status, nothing loaded) is total by construction — there is no unresolved
+        requirement in it. That is the legitimate mapping-free dispatch the fork has
+        always allowed, and it must never be confused with a hole.
+        """
+        return not self.unmatched_slots
 
 
 # ---------------------------------------------------------------------------
@@ -326,11 +382,67 @@ def _covers(f: dict, inv: dict[int, SlotInventory] | None, used_grams: float | N
     return rem >= used_grams
 
 
+def filament_type_of(entry: dict) -> str:
+    """The upper-cased filament type of a requirement OR candidate dict.
+
+    ONE origin for reading the ``type`` key off either side of a comparison (both
+    shapes carry it under the same name), so the matcher's comparison casing, the
+    decision-trace log and any new caller can never drift apart.
+    """
+    return (entry.get("type") or "").upper()
+
+
+def filament_types_match(a: dict, b: dict) -> bool:
+    """True when two requirement/candidate dicts name the SAME canonical filament type.
+
+    THE type-equality rule — canonicalised on both sides (``PLA Basic`` ≡ ``PLA``),
+    so equivalent trade names never read as a mismatch. Extracted from the three
+    inlined compares this module used to carry; every type comparison, existing or
+    new, goes through here.
+    """
+    return canonical_filament_type(filament_type_of(a)) == canonical_filament_type(filament_type_of(b))
+
+
+def parse_pins(raw: str | None) -> list[int] | None:
+    """Parse a stored ``PrintQueueItem.ams_mapping`` JSON string into a pin array.
+
+    ONE origin for turning the stored TEXT column into the matcher's ``pins`` input.
+    Anything that is not a JSON list of ints reads as "no instruction" (``None``)
+    rather than raising: a malformed field must never wedge dispatch, and the
+    schema-level validator (``schemas/print_queue``) is what keeps well-formed values
+    well-formed at the API boundary.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return [v if isinstance(v, int) and not isinstance(v, bool) else -1 for v in parsed]
+
+
+def _pin_for(pins: list[int] | None, slot_id: int) -> int | None:
+    """The operator's explicit tray pin for ``slot_id``, or ``None`` for "no pin".
+
+    ``pins`` is the stored instruction array (position = slot_id - 1). A negative
+    entry (``-1``), a short array, a non-int and a bool (``True`` is an ``int``
+    subclass, and a boolean is never a tray id) all mean the same thing: this slot
+    carries no instruction and auto-matches.
+    """
+    if not pins or slot_id <= 0 or slot_id > len(pins):
+        return None
+    value = pins[slot_id - 1]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 def _scan_candidates(req: dict, candidates: list[dict]) -> dict | None:
     """Bucket-precedence match over a pre-sorted, nozzle-filtered, not-yet-used
     candidate list: unique tray_info_idx > exact colour > similar colour >
     type-only. Returns the chosen loaded-filament dict, or ``None``."""
-    req_type = (req.get("type") or "").upper()
     req_color = req.get("color", "")
     req_tray_info_idx = req.get("tray_info_idx", "")
 
@@ -356,8 +468,7 @@ def _scan_candidates(req: dict, candidates: list[dict]) -> dict | None:
 
     if not idx_match and not exact_match and not similar_match and not type_only_match:
         for f in candidates:
-            f_type = (f.get("type") or "").upper()
-            if canonical_filament_type(f_type) != canonical_filament_type(req_type):
+            if not filament_types_match(f, req):
                 continue
             f_color = f.get("color", "")
             if normalize_color_for_compare(f_color) == normalize_color_for_compare(req_color):
@@ -381,8 +492,23 @@ def match_filaments_to_slots(
     backup_on: bool | None,
     min_start_g: int,
     require_known_grams: bool = False,
+    pins: list[int] | None = None,
 ) -> MatchOutcome:
     """Match required filaments to loaded slots under the given policy.
+
+    ``pins`` is the operator's instruction array (``PrintQueueItem.ams_mapping``,
+    position = slot_id - 1; ``-1``/absent = no pin). It is an INPUT to this one
+    matcher, never a parallel path: a pinned requirement's candidate set is narrowed
+    to that single ``global_tray_id`` and then walks the SAME rules as any other —
+    the unusable hard-excludes, the nozzle filter and the minimum-start floor all
+    apply unchanged, so a pin can no more start a jammed, spent or below-floor roll
+    than an auto-match can (``skip_filament_check`` → ``min_start_g = 0`` remains the
+    one sanctioned override, and it works by disabling the floor for everyone).
+    Only the bucket scan is skipped: the pin already names the tray, and filament
+    TYPE is deliberately NOT enforced on it — the dialog shows the comparison and an
+    explicit cross-type pick is the operator's ratified override (#1722). A pinned
+    tray absent from the live candidates records the slot in
+    :attr:`MatchOutcome.pin_missing` and leaves it unmatched.
 
     ``require_known_grams`` is the START reading of the floor: a candidate whose
     remaining grams are UNKNOWN is reserved instead of started, because an
@@ -414,8 +540,10 @@ def match_filaments_to_slots(
     3. ``first_loaded`` with backup not ON stable-partitions eligible into
        covering-first (a candidate covers when its remaining is unknown or
        >= the requirement's ``used_grams``), FIFO within each half.
-    4. The bucket scan runs on eligible; on a miss, a reserved candidate that
-       WOULD have matched records the slot start-blocked under its reserve's kind.
+    4. The bucket scan runs on eligible (a PINNED slot takes its single surviving
+       candidate directly — see ``pins``); on a miss, a reserved candidate that
+       WOULD have matched records the slot start-blocked under its reserve's kind,
+       and a pin whose tray never reached the candidate set records ``pin_missing``.
     """
     if not required:
         return MatchOutcome(mapping=None)
@@ -431,14 +559,26 @@ def match_filaments_to_slots(
     ledger_priced = any(si.remaining_g is not None for si in inv.values()) if inv else False
     reserve_unknown = require_known_grams and ledger_priced
 
-    trace = policy != "slot_order" or min_start_g > 0
+    trace = policy != "slot_order" or min_start_g > 0 or bool(pins)
     used_tray_ids: set[int] = set()
     comparisons: list[dict] = []
     start_block_kinds: dict[int, str] = {}
+    pin_missing: dict[int, int] = {}
+    unmatched_slots: list[int] = []
 
     for req in required:
         slot_id = req.get("slot_id", 0)
         available = [f for f in loaded if f["global_tray_id"] not in used_tray_ids]
+
+        # Operator PIN: narrow this requirement to the one named tray BEFORE every
+        # other rule, so the pinned candidate is judged by exactly the rules an
+        # auto-matched one would face (excludes → nozzle → floor). The narrowing runs
+        # over the not-yet-used set, so two slots pinned to the SAME tray behave like
+        # any other double claim: the first takes it and the second reports its pin
+        # unavailable rather than silently feeding one roll to two requirements.
+        pin = _pin_for(pins, slot_id)
+        if pin is not None:
+            available = [f for f in available if f.get("global_tray_id") == pin]
 
         # (0) Unusable-spool hard exclude: a jammed / feed-fault spool
         # (out_of_rotation), a spent spool, or an ARCHIVED (retired) row leaves the
@@ -512,12 +652,13 @@ def match_filaments_to_slots(
 
         if trace:
             logger.info(
-                "[spool-select] slot=%s type=%r color=%r tii=%r nozzle=%s policy=%s min_start=%s "
+                "[spool-select] slot=%s pin=%s type=%r color=%r tii=%r nozzle=%s policy=%s min_start=%s "
                 "require_known_grams=%s ledger_priced=%s; eligible=%s dropped_below_floor=%s "
                 "dropped_unknown_grams=%s excluded_oor=%s excluded_spent=%s excluded_archived=%s "
                 "excluded_unread=%s",
                 slot_id,
-                req_type_repr(req),
+                pin,
+                filament_type_of(req),
                 req.get("color", ""),
                 req.get("tray_info_idx", ""),
                 req_nozzle_id,
@@ -534,31 +675,59 @@ def match_filaments_to_slots(
                 excluded_unread,
             )
 
-        # (4) bucket scan on eligible; a reserve-only match ⇒ start-blocked, under
-        # the kind of the reserve(s) that would have matched.
-        match = _scan_candidates(req, eligible)
+        # (4) selection. A PINNED slot takes its single surviving candidate outright:
+        # the pin already named the tray, so the bucket scan (which would re-impose a
+        # TYPE match) is deliberately not consulted — #1722, an explicit cross-type
+        # pick is the operator's call. Everything that could disqualify the roll has
+        # already run above. Unpinned slots keep the bucket precedence unchanged.
+        if pin is not None:
+            match = eligible[0] if eligible else None
+        else:
+            match = _scan_candidates(req, eligible)
         if match is None:
-            matched_kinds: set[str] = set()
-            for reserve, reserve_kind in (
-                (dropped_low, START_BLOCK_BELOW_FLOOR),
-                (dropped_unknown, START_BLOCK_UNKNOWN_GRAMS),
-            ):
-                if not reserve:
-                    continue
-                _sort_candidates(reserve, policy, inv)
-                if _scan_candidates(req, reserve) is not None:
-                    matched_kinds.add(reserve_kind)
-            kind = dominant_start_block(matched_kinds)
-            if kind is not None:
-                start_block_kinds[slot_id] = kind
-                if trace:
-                    logger.info(
-                        "[spool-select] slot=%s START-BLOCKED reason=%s — no match can be proven to clear "
-                        "the %s g floor (below-floor rolls stay backup donors; unpriced rolls cannot start)",
-                        slot_id,
-                        kind,
-                        min_start_g,
-                    )
+            if pin is not None:
+                # The pinned roll IS on the printer but failed the minimum-start
+                # proof: that is a start-block, worded by the floor's own vocabulary,
+                # NOT a missing tray. At most one candidate can survive the narrowing,
+                # so at most one reserve holds it.
+                kind = dominant_start_block(
+                    ({START_BLOCK_BELOW_FLOOR} if dropped_low else set())
+                    | ({START_BLOCK_UNKNOWN_GRAMS} if dropped_unknown else set())
+                )
+                if kind is not None:
+                    start_block_kinds[slot_id] = kind
+                else:
+                    pin_missing[slot_id] = pin
+                    if trace:
+                        logger.info(
+                            "[spool-select] slot=%s PINNED TRAY UNAVAILABLE gtid=%s — the pinned tray is not "
+                            "among this printer's live candidates (not loaded, unread, out of rotation/spent, "
+                            "on another nozzle, or already taken by an earlier slot)",
+                            slot_id,
+                            pin,
+                        )
+            else:
+                matched_kinds: set[str] = set()
+                for reserve, reserve_kind in (
+                    (dropped_low, START_BLOCK_BELOW_FLOOR),
+                    (dropped_unknown, START_BLOCK_UNKNOWN_GRAMS),
+                ):
+                    if not reserve:
+                        continue
+                    _sort_candidates(reserve, policy, inv)
+                    if _scan_candidates(req, reserve) is not None:
+                        matched_kinds.add(reserve_kind)
+                kind = dominant_start_block(matched_kinds)
+                if kind is not None:
+                    start_block_kinds[slot_id] = kind
+            if slot_id in start_block_kinds and trace:
+                logger.info(
+                    "[spool-select] slot=%s START-BLOCKED reason=%s — no match can be proven to clear "
+                    "the %s g floor (below-floor rolls stay backup donors; unpriced rolls cannot start)",
+                    slot_id,
+                    start_block_kinds[slot_id],
+                    min_start_g,
+                )
 
         if match:
             used_tray_ids.add(match["global_tray_id"])
@@ -566,29 +735,36 @@ def match_filaments_to_slots(
             if trace:
                 logger.info("[spool-select] slot=%s -> picked gtid=%s", slot_id, match["global_tray_id"])
         else:
+            # THE total-outcome record: every unresolved requirement lands here,
+            # whatever the cause, so no consumer has to re-derive "is this dispatchable"
+            # by scanning the mapping array (which cannot tell a hole from a sparse
+            # slot_id). Scoped to the same ``slot_id > 0`` the mapping build uses — a
+            # malformed requirement carries no wire position, so it can neither be
+            # dispatched against nor block a dispatch.
+            if slot_id and slot_id > 0:
+                unmatched_slots.append(slot_id)
             comparisons.append({"slot_id": slot_id, "global_tray_id": -1})
-            if trace and slot_id not in start_block_kinds:
+            if trace and slot_id not in start_block_kinds and slot_id not in pin_missing:
                 logger.info("[spool-select] slot=%s -> NO MATCH", slot_id)
 
+    outcome_extras = {
+        "start_block_kinds": start_block_kinds,
+        "pin_missing": pin_missing,
+        "unmatched_slots": tuple(unmatched_slots),
+    }
     if not comparisons:
-        return MatchOutcome(mapping=None, start_block_kinds=start_block_kinds)
+        return MatchOutcome(mapping=None, **outcome_extras)
 
     max_slot_id = max(c["slot_id"] for c in comparisons)
     if max_slot_id <= 0:
-        return MatchOutcome(mapping=None, start_block_kinds=start_block_kinds)
+        return MatchOutcome(mapping=None, **outcome_extras)
 
     mapping = [-1] * max_slot_id
     for c in comparisons:
         sid = c["slot_id"]
         if sid and sid > 0:
             mapping[sid - 1] = c["global_tray_id"]
-    return MatchOutcome(mapping=mapping, start_block_kinds=start_block_kinds)
-
-
-def req_type_repr(req: dict) -> str:
-    """The upper-cased requirement type (small helper so the trace log matches
-    the matcher's comparison casing)."""
-    return (req.get("type") or "").upper()
+    return MatchOutcome(mapping=mapping, **outcome_extras)
 
 
 def _trace_rows(rows: list[dict], inv: dict[int, SlotInventory] | None) -> list[dict]:
@@ -777,6 +953,46 @@ async def _fetch_spoolman_slot(spoolman_spool_id: int) -> tuple[float | None, fl
 
 
 # ---------------------------------------------------------------------------
+# Live dispatch outcome — THE one call every consumer of "what would this item
+# dispatch with?" makes (scheduler, release path, manual-start route, run detail).
+# ---------------------------------------------------------------------------
+async def resolve_dispatch_outcome(
+    db: AsyncSession, item: PrintQueueItem, printer_id: int | None = None
+) -> MatchOutcome:
+    """Run the matcher against LIVE tray state for ``item`` on a printer.
+
+    Decision time IS execution time (2026-08-12 contract): nothing caches a mapping
+    and replays it, so every consumer that needs to know what an item would dispatch
+    with — the scheduler's gates, ``farm_staging``'s release re-check, the
+    manual-start 409, the run-detail eligibility panel — asks HERE and gets the same
+    answer the dispatch itself would produce. ``item.ams_mapping`` is read by the
+    matcher as the operator's PIN input, never as a previous result.
+
+    ``printer_id`` overrides the item's own pin for candidate evaluation (the
+    model-based lane tries each idle printer in turn). Returns an empty outcome when
+    no printer is resolvable — there is nothing to decide against.
+    """
+    pid = printer_id if printer_id is not None else item.printer_id
+    if pid is None:
+        return MatchOutcome(mapping=None)
+    # Function-local import: print_scheduler imports this module at load time.
+    from backend.app.services.print_scheduler import scheduler
+
+    return await scheduler._compute_ams_mapping_for_printer(db, pid, item)
+
+
+def mapping_json(outcome: MatchOutcome) -> str:
+    """The outcome's mapping as the JSON string the storage/override params take.
+
+    ``"[]"`` for a mapping-free outcome, which every reader already treats as "no
+    mapping" — deliberately a VALUE rather than ``None``, because ``None`` means
+    "fall back to the item's stored field" in the deficit API, and falling back would
+    reintroduce reading a stored mapping as if it were a decision.
+    """
+    return json.dumps(outcome.mapping or [])
+
+
+# ---------------------------------------------------------------------------
 # Release-path guard
 # ---------------------------------------------------------------------------
 async def _read_min_start_g(db: AsyncSession) -> int:
@@ -798,30 +1014,15 @@ async def start_rule_block_kinds(db: AsyncSession, item: PrintQueueItem) -> dict
     (below the floor, or unpriceable). Empty when the rule can't apply (no pinned
     printer, Print-Anyway acknowledged, or the floor is disabled).
 
-    THE re-check every release path owes the floor: it runs the same
-    ``_compute_ams_mapping_for_printer`` the scheduler dispatches on, so a hold and
-    its release are decided by one predicate and cannot disagree into a
-    stage↔release bounce. Callers that only need "which slots" take the
-    :func:`start_rule_blocked_slots` view; callers that must WORD the block (the
-    manual-start 409) read the kinds, so the slot list and the reason can never come
-    from two different computations."""
+    The floor's WORDING view of :func:`resolve_dispatch_outcome` — the manual-start
+    409 needs to name which proof failed, and reading it off the same live outcome the
+    dispatch decides on means the slot list and the reason can never come from two
+    different computations. Callers asking the broader question ("is this item
+    dispatchable at all?") read :attr:`MatchOutcome.is_total` on that outcome instead:
+    a start-block is only one of the ways a requirement goes unresolved."""
     if item.printer_id is None or item.skip_filament_check:
         return {}
     if await _read_min_start_g(db) == 0:
         return {}
-    # Function-local import: print_scheduler imports this module at load time.
-    from backend.app.services.print_scheduler import scheduler
-
-    outcome = await scheduler._compute_ams_mapping_for_printer(db, item.printer_id, item)
+    outcome = await resolve_dispatch_outcome(db, item)
     return dict(outcome.start_block_kinds)
-
-
-async def start_rule_blocked_slots(db: AsyncSession, item: PrintQueueItem) -> list[int]:
-    """Slot_ids held back by the minimum-start proof — the key view of
-    :func:`start_rule_block_kinds`."""
-    return list(await start_rule_block_kinds(db, item))
-
-
-async def start_rule_blocks_item(db: AsyncSession, item: PrintQueueItem) -> bool:
-    """True when the minimum-start floor blocks this pinned item from starting."""
-    return bool(await start_rule_blocked_slots(db, item))

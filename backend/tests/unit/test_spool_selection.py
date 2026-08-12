@@ -18,7 +18,10 @@ from backend.app.services.spool_selection import (
     SlotInventory,
     dominant_start_block,
     effective_policy,
+    filament_type_of,
+    filament_types_match,
     match_filaments_to_slots,
+    parse_pins,
 )
 
 
@@ -40,7 +43,7 @@ def _req(slot_id=1, *, ftype="PLA", color="#FF0000", tii="", used_grams=0.0):
     return {"slot_id": slot_id, "type": ftype, "color": color, "tray_info_idx": tii, "used_grams": used_grams}
 
 
-def _match(required, loaded, *, policy, inv=None, backup_on=True, min_start_g=0, require_known_grams=False):
+def _match(required, loaded, *, policy, inv=None, backup_on=True, min_start_g=0, require_known_grams=False, pins=None):
     return match_filaments_to_slots(
         required,
         loaded,
@@ -49,6 +52,7 @@ def _match(required, loaded, *, policy, inv=None, backup_on=True, min_start_g=0,
         backup_on=backup_on,
         min_start_g=min_start_g,
         require_known_grams=require_known_grams,
+        pins=pins,
     )
 
 
@@ -575,3 +579,254 @@ class TestSpentExclusion:
         out = _match([_req()], loaded, policy="first_loaded", inv=inv)
         assert out.mapping == [0]
         assert out.start_blocked_slots == []
+
+
+# ---------------------------------------------------------------------------
+# Operator PINS (2026-08-12 contract; 003-H2S external-spool dispatch incident)
+#
+# ``ams_mapping`` is an INSTRUCTION, not a cached derivation. A pin narrows one
+# requirement's candidate set to the named tray INSIDE this matcher — it is never a
+# parallel path, so every rule the matcher applies to an auto-match applies to it too.
+# The full origin x spool-type x topology matrix is the test scope (operator ruling 11).
+# ---------------------------------------------------------------------------
+def _external(gtid=254, *, ftype="PETG", color="#00FF00"):
+    """The external/virtual tray as ``_build_loaded_filaments`` emits it — present as a
+    candidate if and only if that printer's vt_tray declares a filament type."""
+    return {
+        "type": ftype,
+        "color": color,
+        "tray_info_idx": "",
+        "ams_id": -1,
+        "tray_id": 0 if gtid == 254 else 1,
+        "global_tray_id": gtid,
+        "is_external": True,
+        "remain": -1,
+    }
+
+
+class TestPinsNarrowTheCandidateSet:
+    def test_no_pin_leaves_auto_matching_unchanged(self):
+        """The whole matrix's control case: pins absent => byte-identical behaviour."""
+        loaded = [_loaded(0, tray_id=0, color="#00FF00"), _loaded(1, tray_id=1, color="#FF0000")]
+        req = [_req(color="#FF0000")]
+        assert _match(req, loaded, policy="slot_order").mapping == [1]
+        assert _match(req, loaded, policy="slot_order", pins=None).mapping == [1]
+        assert _match(req, loaded, policy="slot_order", pins=[-1]).mapping == [1]
+
+    def test_lone_minus_one_is_no_pin_not_an_instruction(self):
+        """``-1`` is the format's "no tray for this slot" — it must read as ABSENCE of
+        an instruction, never as "pin to nothing" (which would strand every item the
+        dialog ever sent a partial mapping for)."""
+        out = _match([_req()], [_loaded(0, tray_id=0)], policy="slot_order", pins=[-1])
+        assert out.mapping == [0]
+        assert out.pin_missing == {}
+        assert out.is_total is True
+
+    def test_pin_to_present_ams_tray_is_chosen_over_the_auto_match(self):
+        loaded = [_loaded(0, tray_id=0, color="#FF0000"), _loaded(1, tray_id=1, color="#0000FF")]
+        # Auto-matching would take gtid 0 (exact colour); the pin takes gtid 1.
+        assert _match([_req(color="#FF0000")], loaded, policy="slot_order").mapping == [0]
+        out = _match([_req(color="#FF0000")], loaded, policy="slot_order", pins=[1])
+        assert out.mapping == [1]
+        assert out.is_total is True
+
+    def test_pin_to_absent_tray_leaves_the_slot_unmatched(self):
+        """The pinned tray is not loaded at all -> unmatched, recorded as a pin miss
+        (NOT a start-block: nothing is short, a named roll is missing)."""
+        out = _match([_req()], [_loaded(0, tray_id=0)], policy="slot_order", pins=[7])
+        assert out.mapping == [-1]
+        assert out.pin_missing == {1: 7}
+        assert out.pinned_unavailable_slots == [1]
+        assert out.start_blocked_slots == []
+        assert out.is_total is False
+
+    def test_pin_ignores_filament_type(self):
+        """#1722 precedent: an explicit cross-type pick is a ratified operator override.
+        The dialog shows the comparison; the matcher does not veto it."""
+        loaded = [_loaded(0, tray_id=0, ftype="PETG", color="#00FF00")]
+        assert _match([_req(ftype="PLA")], loaded, policy="slot_order").mapping == [-1]
+        assert _match([_req(ftype="PLA")], loaded, policy="slot_order", pins=[0]).mapping == [0]
+
+    def test_pin_still_obeys_the_minimum_start_floor(self):
+        """No floor exemption for pins — the roll IS there, it just cannot start, so it
+        is a START-BLOCK in the floor's own vocabulary, not a missing tray."""
+        inv = {0: SlotInventory(remaining_g=50.0, first_loaded_ord=None)}
+        out = _match([_req()], [_loaded(0, tray_id=0)], policy="slot_order", inv=inv, min_start_g=120, pins=[0])
+        assert out.mapping == [-1]
+        assert out.start_block_kinds == {1: START_BLOCK_BELOW_FLOOR}
+        assert out.pin_missing == {}, "the tray is present — this is not a pin miss"
+        assert out.is_total is False
+
+    def test_print_anyway_is_the_one_override_lane_for_a_pinned_low_roll(self):
+        """``skip_filament_check`` reaches the matcher as ``min_start_g=0`` — the single
+        sanctioned way past the floor, for pinned and auto-matched slots alike."""
+        inv = {0: SlotInventory(remaining_g=50.0, first_loaded_ord=None)}
+        out = _match([_req()], [_loaded(0, tray_id=0)], policy="slot_order", inv=inv, min_start_g=0, pins=[0])
+        assert out.mapping == [0]
+        assert out.is_total is True
+
+    def test_pin_to_unpriceable_roll_blocks_under_the_start_reading(self):
+        """The fail-closed floor reading applies to pins too: a roll the ledger cannot
+        price may hold 5 g. A priced roll rides along so the ledger demonstrably speaks."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1)]
+        inv = {1: SlotInventory(remaining_g=800.0, first_loaded_ord=None)}  # gtid 0 unpriced
+        out = _match(
+            [_req()], loaded, policy="slot_order", inv=inv, min_start_g=120, require_known_grams=True, pins=[0]
+        )
+        assert out.start_block_kinds == {1: START_BLOCK_UNKNOWN_GRAMS}
+        assert out.pin_missing == {}
+
+    def test_pin_to_spent_or_jammed_roll_reads_as_unavailable(self):
+        """The unusable hard-excludes run before the pin can be honoured — a spent or
+        out-of-rotation roll is invisible to selection, so the pin finds nothing."""
+        for flag in ("spent", "out_of_rotation"):
+            inv = {0: SlotInventory(remaining_g=800.0, first_loaded_ord=None, **{flag: True})}
+            out = _match([_req()], [_loaded(0, tray_id=0)], policy="slot_order", inv=inv, pins=[0])
+            assert out.pin_missing == {1: 0}, flag
+            assert out.is_total is False, flag
+
+    def test_pin_to_unread_tray_reads_as_unavailable(self):
+        """A seated-but-unidentified tray cannot be named, so it cannot be pinned to —
+        the scheduler's answer to this is "read the slot", not "dispatch anyway"."""
+        tray = _loaded(0, tray_id=0)
+        tray["type"] = ""
+        tray["unread"] = True
+        out = _match([_req()], [tray], policy="slot_order", pins=[0])
+        assert out.pin_missing == {1: 0}
+        assert out.is_total is False
+
+    def test_pin_to_wrong_nozzle_reads_as_unavailable(self):
+        """Cross-nozzle assignment fails the print, so the hard nozzle filter outranks
+        an instruction that would cross it (dual-nozzle topology)."""
+        tray = _loaded(4, tray_id=0)
+        tray["extruder_id"] = 1
+        req = _req()
+        req["nozzle_id"] = 0
+        out = _match([req], [tray], policy="slot_order", pins=[4])
+        assert out.pin_missing == {1: 4}
+
+    def test_duplicate_pins_give_the_tray_to_the_first_slot_only(self):
+        """One tray cannot feed two requirements here — the second slot reports its pin
+        unavailable rather than silently double-claiming the roll."""
+        reqs = [_req(slot_id=1), _req(slot_id=2)]
+        out = _match(reqs, [_loaded(0, tray_id=0)], policy="slot_order", pins=[0, 0])
+        assert out.mapping == [0, -1]
+        assert out.pin_missing == {2: 0}
+        assert out.is_total is False
+
+    def test_pins_are_positional_and_independent_per_slot(self):
+        """Position = slot_id - 1; an unpinned slot beside a pinned one still auto-matches."""
+        loaded = [_loaded(0, tray_id=0, ftype="PLA"), _loaded(1, tray_id=1, ftype="PETG")]
+        reqs = [_req(slot_id=1, ftype="PLA"), _req(slot_id=2, ftype="PETG")]
+        out = _match(reqs, loaded, policy="slot_order", pins=[-1, 1])
+        assert out.mapping == [0, 1]
+        assert out.is_total is True
+
+    def test_short_pin_array_leaves_later_slots_auto_matching(self):
+        reqs = [_req(slot_id=1, ftype="PLA"), _req(slot_id=2, ftype="PETG")]
+        loaded = [_loaded(0, tray_id=0, ftype="PLA"), _loaded(1, tray_id=1, ftype="PETG")]
+        out = _match(reqs, loaded, policy="slot_order", pins=[0])
+        assert out.mapping == [0, 1]
+
+
+class TestPinsToExternalTrays:
+    """AMS-vs-external is decided by the matcher from live candidates, never by a
+    workflow. The external tray is an ORDINARY candidate — present iff that printer's
+    vt_tray declares a type — so a pin to it resolves exactly like a pin to an AMS tray.
+    This is the printer-1 shape from the incident.
+    """
+
+    def test_pin_to_configured_external_is_chosen(self):
+        loaded = [_loaded(0, tray_id=0), _external(254)]
+        out = _match([_req()], loaded, policy="slot_order", pins=[254])
+        assert out.mapping == [254]
+        assert out.is_total is True
+
+    def test_pin_to_unconfigured_external_is_unmatched(self):
+        """An empty external holder emits NO candidate — which is precisely the printers
+        2-10 shape that dispatched ``[254]`` into a machine holding nothing."""
+        out = _match([_req()], [_loaded(0, tray_id=0)], policy="slot_order", pins=[254])
+        assert out.mapping == [-1]
+        assert out.pin_missing == {1: 254}
+        assert out.is_total is False
+
+    def test_dual_nozzle_pin_to_255_needs_the_second_vt_configured(self):
+        """On dual-nozzle hardware both 254 and 255 are candidates when configured."""
+        one_vt = [_external(254)]
+        both_vt = [_external(254), _external(255)]
+        assert _match([_req()], one_vt, policy="slot_order", pins=[255]).pin_missing == {1: 255}
+        assert _match([_req()], both_vt, policy="slot_order", pins=[255]).mapping == [255]
+
+    def test_mixed_ams_and_external_pins_resolve_independently(self):
+        """``[3, 254]``: an AMS tray for one slot, the external holder for the other."""
+        loaded = [_loaded(3, tray_id=3, ftype="PLA"), _external(254, ftype="PETG")]
+        reqs = [_req(slot_id=1, ftype="PLA"), _req(slot_id=2, ftype="PETG")]
+        out = _match(reqs, loaded, policy="slot_order", pins=[3, 254])
+        assert out.mapping == [3, 254]
+        assert out.is_total is True
+
+
+class TestTotalOutcomeContract:
+    """``is_total`` is the dispatch gate: an item may not start while ANY requirement
+    is unresolved, because a partial ``-1`` mapping means "nothing feeds this extruder".
+    Derived from the REQUIREMENTS, never by scanning the mapping for ``-1``."""
+
+    def test_sparse_slot_ids_are_not_holes(self):
+        """A plate using only filament 2 yields ``[-1, gtid]``. The leading ``-1`` is a
+        position nothing asked about — reading it as a hole would park the job forever."""
+        out = _match([_req(slot_id=2)], [_loaded(4, tray_id=0)], policy="slot_order")
+        assert out.mapping == [-1, 4]
+        assert out.unmatched_slots == ()
+        assert out.is_total is True
+
+    def test_a_genuine_no_match_is_a_hole(self):
+        out = _match([_req(ftype="PLA")], [_loaded(0, tray_id=0, ftype="ABS")], policy="slot_order")
+        assert out.unmatched_slots == (1,)
+        assert out.is_total is False
+
+    def test_mapping_free_outcome_is_total(self):
+        """No requirements => nothing unresolved. The fork's legitimate mapping-free
+        dispatch must never be confused with a hole."""
+        out = _match([], [_loaded(0, tray_id=0)], policy="slot_order")
+        assert out.mapping is None
+        assert out.is_total is True
+
+    def test_start_blocked_slot_is_also_unresolved(self):
+        """The two records agree by construction — a start-blocked slot fed nothing."""
+        inv = {0: SlotInventory(remaining_g=50.0, first_loaded_ord=None)}
+        out = _match([_req()], [_loaded(0, tray_id=0)], policy="slot_order", inv=inv, min_start_g=120)
+        assert out.start_blocked_slots == [1]
+        assert out.unmatched_slots == (1,)
+        assert out.is_total is False
+
+
+class TestParsePins:
+    """``parse_pins`` is the ONE origin for turning the stored TEXT column into pins."""
+
+    def test_parses_a_stored_mapping(self):
+        assert parse_pins("[0, -1, 254]") == [0, -1, 254]
+
+    def test_absent_or_malformed_reads_as_no_instruction(self):
+        for raw in (None, "", "not json", '{"a": 1}'):
+            assert parse_pins(raw) is None, raw
+
+    def test_booleans_and_non_ints_degrade_to_no_pin_for_that_slot(self):
+        """A malformed entry must never wedge dispatch — it reads as "no instruction"
+        for its slot while the well-formed entries beside it still apply."""
+        assert parse_pins('[true, "3", 4]') == [-1, -1, 4]
+
+
+class TestFilamentTypeHelpers:
+    """The type-equality compare has ONE implementation (it was inlined three times)."""
+
+    def test_types_match_is_case_insensitive_and_canonical_on_both_sides(self):
+        """Case folding is what ``canonical_filament_type`` guarantees on both sides —
+        the requirement dict carries the slicer's casing, the candidate the firmware's."""
+        assert filament_types_match({"type": "pla"}, {"type": "PLA"}) is True
+        assert filament_types_match({"type": "PETG"}, {"type": "petg"}) is True
+        assert filament_types_match({"type": "PETG"}, {"type": "PLA"}) is False
+
+    def test_missing_or_empty_type_reads_as_empty_string(self):
+        assert filament_type_of({}) == ""
+        assert filament_type_of({"type": None}) == ""
+        assert filament_type_of({"type": "petg"}) == "PETG"

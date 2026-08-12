@@ -29,6 +29,7 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.printer import Printer
 from backend.app.models.sku import SkuFile
+from backend.app.services import spool_selection
 from backend.app.services.capability_gate import (
     evaluate_capability,
     extract_file_capabilities,
@@ -494,10 +495,15 @@ async def _build_printer_eligibility(
         # 1. Filament deficit against THIS candidate printer (no item mutation).
         try:
             outcome = await print_scheduler._compute_ams_mapping_for_printer(db, printer.id, rep)
-            mapping = outcome.mapping
-            mapping_override = json.dumps(mapping) if mapping is not None else None
+            # Price what THIS candidate would dispatch with. ``None`` would fall back to
+            # the item's stored field, which is the operator's PIN (2026-08-12) — a
+            # partial pin prices only the pinned slots, so the panel would quietly
+            # under-report. ``mapping_json`` is the one origin for that conversion.
             deficit = await compute_deficit_for_queue_item(
-                db, rep, printer_id_override=printer.id, ams_mapping_override=mapping_override
+                db,
+                rep,
+                printer_id_override=printer.id,
+                ams_mapping_override=spool_selection.mapping_json(outcome),
             )
             if deficit:
                 needs = sum(d.required_grams for d in deficit)

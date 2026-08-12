@@ -89,7 +89,13 @@ class TestServiceHook:
 
         with (
             patch.object(farm_staging, "compute_deficit_for_queue_item", new=AsyncMock(return_value=[])),
-            patch.object(farm_staging.spool_selection, "start_rule_blocks_item", new=AsyncMock(return_value=False)),
+            # The release path re-decides the whole dispatch (2026-08-12 pin contract);
+            # a fully-resolved outcome is what "nothing blocks it any more" looks like.
+            patch.object(
+                farm_staging.spool_selection,
+                "resolve_dispatch_outcome",
+                new=AsyncMock(return_value=farm_staging.spool_selection.MatchOutcome(mapping=[0])),
+            ),
             patch("backend.app.services.dispatch_kick.dispatch_kick") as mock_dk,
         ):
             released = await farm_staging.release_filament_staged(db_session, printer.id)

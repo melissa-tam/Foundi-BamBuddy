@@ -4579,10 +4579,15 @@ class BambuMQTTClient:
             # Passing raw 254/255 in the flat array causes H2D firmware to fail
             # with 0700_8012 "Failed to get AMS mapping table".
             flat_ams_mapping = []
+            # The coerced view of the caller's mapping — built once here and reused by
+            # the translation gates below, so "what the wire means" is never re-derived
+            # from the raw argument with a second, subtly different coercion.
+            normalized_mapping: list[int] = []
             if ams_mapping is not None:
                 for tray_id in ams_mapping:
                     # Ensure tray_id is an integer (may be string from JSON)
                     tray_id = int(tray_id) if tray_id is not None else -1
+                    normalized_mapping.append(tray_id)
                     if tray_id == -1:
                         # Unmapped filament slot
                         flat_ams_mapping.append(-1)
@@ -4612,14 +4617,35 @@ class BambuMQTTClient:
                         flat_ams_mapping.append(tray_id)
                         ams_mapping2.append({"ams_id": ams_id, "slot_id": slot_id})
 
+            # An ALL-NEGATIVE mapping is untranslatable, and saying so is this layer's
+            # own job (2026-08-11 incident). "-1" means "no tray feeds this filament";
+            # a mapping made entirely of them describes a print with no filament source
+            # at all, which is NOT the same statement as "this print uses the external
+            # spool" — yet it used to be translated into exactly that (use_ams=False),
+            # sending a job to a printer whose external holder might hold nothing. Fail
+            # loud and early instead: no publish, no submission id minted, and
+            # start_print's established False return carries it back (the scheduler
+            # turns that into _fail_queue_item; direct-API and foreign callers get the
+            # same loud failure).
+            if normalized_mapping and all(t < 0 for t in normalized_mapping):
+                logger.error(
+                    "Refusing print start: ams_mapping %s maps no filament source "
+                    "(all -1/none — nothing would feed; this is NOT an external-spool print)",
+                    ams_mapping,
+                )
+                return False
+
             # If all mapped slots are external spool (no real AMS trays), force use_ams=False.
             # P1S/P1P with no AMS rejects use_ams=True with "Failed to get AMS mapping table".
             # Skip for dual-nozzle printers — use_ams controls nozzle routing there.
             # H2S falls through this gate now (#1386): it is single-nozzle and was
             # hitting the dual-nozzle bypass, which caused 07FF_8012 when printing
             # without an AMS attached.
-            if ams_mapping and use_ams and not is_dual_nozzle:
-                if all(t is None or int(t) < 0 or int(t) >= 254 for t in ams_mapping):
+            # Reaching here guarantees at least one entry is >= 254 (the all-negative
+            # refusal above returned), so this really is the external-print case rather
+            # than an unmatched one wearing its clothes.
+            if normalized_mapping and use_ams and not is_dual_nozzle:
+                if all(t < 0 or t >= 254 for t in normalized_mapping):
                     use_ams = False
                     logger.info(
                         "[%s] All filament slots use external spool — setting use_ams=False",

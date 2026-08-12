@@ -38,7 +38,8 @@ async def _matcher_kwargs(scheduler, backup_state, policy_setting):
     the matcher actually receives — the policy post-``effective_policy`` gate, and
     the floor reading this lane asks for."""
     db = MagicMock()
-    item = SimpleNamespace(filament_overrides=None, skip_filament_check=False, id=1)
+    # ams_mapping is read as the operator's pin input on every compute (2026-08-12).
+    item = SimpleNamespace(filament_overrides=None, skip_filament_check=False, id=1, ams_mapping=None)
     reqs = [{"slot_id": 1, "type": "PLA", "color": "#000000", "tray_info_idx": "", "used_grams": 10.0}]
     loaded = [
         {
@@ -54,9 +55,10 @@ async def _matcher_kwargs(scheduler, backup_state, policy_setting):
     ]
     captured: dict = {}
 
-    def _capture(required, loaded_, *, policy, inv, backup_on, min_start_g, require_known_grams=False):
+    def _capture(required, loaded_, *, policy, inv, backup_on, min_start_g, require_known_grams=False, pins=None):
         captured["policy"] = policy
         captured["backup_on"] = backup_on
+        captured["pins"] = pins
         captured["min_start_g"] = min_start_g
         captured["require_known_grams"] = require_known_grams
         return MatchOutcome(mapping=[0])
@@ -134,7 +136,8 @@ async def _mapping_with_real_matcher(scheduler, *, policy_setting, min_start_g, 
     (``slot_order`` + floor 0) it was skipped, letting a jammed / spent spool start.
     """
     db = MagicMock()
-    item = SimpleNamespace(filament_overrides=None, skip_filament_check=False, id=1)
+    # ams_mapping is read as the operator's pin input on every compute (2026-08-12).
+    item = SimpleNamespace(filament_overrides=None, skip_filament_check=False, id=1, ams_mapping=None)
     reqs = [{"slot_id": 1, "type": "PLA", "color": "#000000", "tray_info_idx": "", "used_grams": 10.0}]
     loaded = [
         {

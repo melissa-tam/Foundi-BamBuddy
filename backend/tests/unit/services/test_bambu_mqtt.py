@@ -5,6 +5,7 @@ These tests focus on timelapse tracking during prints.
 """
 
 import json
+import logging
 import time
 
 import pytest
@@ -4125,14 +4126,20 @@ class TestStartPrintAmsMapping:
         ]
 
     def test_unmapped_slots(self, mqtt_client):
-        """Unmapped slots (-1) produce -1 in flat and 0xFF/0xFF in mapping2."""
-        mqtt_client.start_print("test.3mf", ams_mapping=[-1, -1])
+        """An unmapped slot (-1) produces -1 in flat and 0xFF/0xFF in mapping2.
+
+        Driven with a real tray alongside since 2026-08-12: an ENTIRELY unmapped
+        mapping is now refused outright (see
+        ``TestStartPrintAllNegativeMappingRefused``), so the per-entry translation this
+        test exists for is asserted on a payload that still describes a printable job.
+        """
+        mqtt_client.start_print("test.3mf", ams_mapping=[-1, 4])
 
         cmd = self._get_published_command(mqtt_client)
-        assert cmd["ams_mapping"] == [-1, -1]
+        assert cmd["ams_mapping"] == [-1, 4]
         assert cmd["ams_mapping2"] == [
             {"ams_id": 255, "slot_id": 255},
-            {"ams_id": 255, "slot_id": 255},
+            {"ams_id": 1, "slot_id": 0},
         ]
 
     def test_external_main_nozzle_becomes_minus_one_in_flat(self, mqtt_client):
@@ -4224,9 +4231,17 @@ class TestStartPrintAmsMapping:
         cmd = self._get_published_command(mqtt_client)
         assert cmd["use_ams"] is False
 
-    def test_all_unmapped_sets_use_ams_false(self, mqtt_client):
-        """All unmapped slots on non-H2D printer sets use_ams=False."""
-        mqtt_client.start_print("test.3mf", ams_mapping=[-1, -1], use_ams=True)
+    def test_all_external_sets_use_ams_false(self, mqtt_client):
+        """An all-EXTERNAL mapping on a non-H2D printer sets use_ams=False.
+
+        Rewritten 2026-08-12. It used to drive ``[-1, -1]`` — an all-NEGATIVE mapping —
+        and assert use_ams=False, which is the translation defect behind the 003-H2S
+        incident: "no tray feeds this filament" was being restated on the wire as "this
+        print uses the external spool", and a printer with an unconfigured external
+        holder paused demanding filament that was never there. use_ams=False now means
+        what it says, so the external case is asserted with an actual external tray.
+        """
+        mqtt_client.start_print("test.3mf", ams_mapping=[254, 254], use_ams=True)
 
         cmd = self._get_published_command(mqtt_client)
         assert cmd["use_ams"] is False
@@ -7859,3 +7874,100 @@ class TestEvidencePushall:
 
         assert client.request_evidence_pushall("bound_presence_unknown") is False
         assert len(self._pushalls(client)) == 1
+
+
+class TestStartPrintAllNegativeMappingRefused:
+    """Translation honesty in the transport's OWN layer (2026-08-12).
+
+    ``-1`` means "no tray feeds this filament". A mapping made ENTIRELY of them
+    describes a print with no filament source at all — which is not the same statement
+    as "this print uses the external spool", yet that is exactly what it used to be
+    translated into (``use_ams=False``). On 2026-08-11 that sent item 532 to a printer
+    whose external holder was unconfigured: firmware demanded external filament, the
+    fault classified as an AMS jam, and the printer quarantined itself.
+
+    This is not a second copy of the scheduler's gate: S1 owns decision COMPLETENESS
+    for farm items, this owns truthful TRANSLATION for every caller of ``start_print``
+    (direct API, foreign callers, VP). ``start_print``'s bool return is the established
+    fail-loud seam — the scheduler converts False into ``_fail_queue_item``.
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        client = BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST123",
+            access_code="12345678",
+        )
+        client._client = MagicMock()
+        client.state.connected = True
+        return client
+
+    @pytest.mark.parametrize("mapping", [[-1], [-1, -1], [-1, -1, -1, -1], [None, -1], [None]])
+    def test_all_negative_refuses_and_never_publishes(self, mqtt_client, mapping, caplog):
+        with caplog.at_level(logging.ERROR):
+            assert mqtt_client.start_print("test.3mf", ams_mapping=mapping) is False
+        mqtt_client._client.publish.assert_not_called()
+        assert "Refusing print start" in caplog.text
+        assert "maps no filament source" in caplog.text
+
+    def test_refusal_precedes_the_submission_id_mint(self):
+        """Nothing may be mutated on the way to a refusal — a minted dispatch subtask id
+        would let correlation bind a job that was never sent."""
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        client = BambuMQTTClient(ip_address="1.2.3.4", serial_number="T2", access_code="1")
+        client._client = MagicMock()
+        client.state.connected = True
+        client.last_dispatch_subtask_id = "previous"
+
+        assert client.start_print("test.3mf", ams_mapping=[-1, -1]) is False
+        assert client.last_dispatch_subtask_id == "previous"
+        assert client.state.dispatched_plate_id is None
+
+    @pytest.mark.parametrize("use_ams", [True, False])
+    def test_refusal_is_unconditional_on_use_ams(self, mqtt_client, use_ams):
+        """The mapping is untranslatable whatever the caller asked for."""
+        assert mqtt_client.start_print("t.3mf", ams_mapping=[-1], use_ams=use_ams) is False
+        mqtt_client._client.publish.assert_not_called()
+
+    def test_refusal_applies_on_dual_nozzle_hardware_too(self, mqtt_client):
+        """Dual-nozzle models bypass the use_ams coercion, not the honesty check."""
+        mqtt_client._is_dual_nozzle = True
+        assert mqtt_client.start_print("t.3mf", ams_mapping=[-1, -1]) is False
+        mqtt_client._client.publish.assert_not_called()
+
+    def test_one_external_entry_makes_it_a_real_external_print(self, mqtt_client):
+        """``[-1, 254]``: a genuine external-spool print with one unused filament slot.
+        It publishes, and the flat mapping still carries the -1/254 translation."""
+        assert mqtt_client.start_print("test.3mf", ams_mapping=[-1, 254], use_ams=True) is True
+        cmd = json.loads(mqtt_client._client.publish.call_args[0][1])["print"]
+        assert cmd["ams_mapping"] == [-1, -1]
+        assert cmd["ams_mapping2"] == [{"ams_id": 255, "slot_id": 255}, {"ams_id": 255, "slot_id": 0}]
+        assert cmd["use_ams"] is False, "every mapped slot is external — the honest reading"
+
+    def test_a_plain_ams_mapping_is_unchanged(self, mqtt_client):
+        """The regression fence: ordinary dispatches translate exactly as before."""
+        assert mqtt_client.start_print("test.3mf", ams_mapping=[4], use_ams=True) is True
+        cmd = json.loads(mqtt_client._client.publish.call_args[0][1])["print"]
+        assert cmd["ams_mapping"] == [4]
+        assert cmd["ams_mapping2"] == [{"ams_id": 1, "slot_id": 0}]
+        assert cmd["use_ams"] is True
+
+    def test_no_mapping_at_all_is_not_a_refusal(self, mqtt_client):
+        """``None`` means "this print needs no mapping" — a legitimate mapping-free
+        dispatch (eject files, single-filament prints with no AMS). Only a NON-EMPTY
+        all-negative mapping is a lie."""
+        assert mqtt_client.start_print("test.3mf", ams_mapping=None) is True
+        cmd = json.loads(mqtt_client._client.publish.call_args[0][1])["print"]
+        assert "ams_mapping" not in cmd
+
+    def test_empty_mapping_is_not_a_refusal(self, mqtt_client):
+        assert mqtt_client.start_print("test.3mf", ams_mapping=[]) is True
+        mqtt_client._client.publish.assert_called_once()

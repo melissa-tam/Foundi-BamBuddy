@@ -1419,13 +1419,35 @@ async def start_queue_item(
     # A creation-time ack (#1698-followup) counts; the ▶ confirm is only for
     # un-acked items, so an already-acknowledged deficit never re-asks.
     if not (skip_filament_check or item.skip_filament_check):
-        deficit = await compute_deficit_for_queue_item(db, item)
+        from backend.app.services import spool_selection
+
+        # Decide the mapping the way dispatch will, then price THAT. The stored
+        # ``ams_mapping`` is the operator's pin, not a mapping to bill against: asking
+        # the deficit lane to read it would price only the pinned slots (or nothing at
+        # all), and the ▶ button would return "fine" seconds before the scheduler
+        # staged the item for the shortage it never checked.
+        outcome = await spool_selection.resolve_dispatch_outcome(db, item)
+        deficit = await compute_deficit_for_queue_item(
+            db, item, ams_mapping_override=spool_selection.mapping_json(outcome)
+        )
         if deficit:
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "insufficient_filament",
                     "deficit": [d.to_dict() for d in deficit],
+                },
+            )
+        # An explicit slot pin naming a tray the printer is not offering. Distinct 409
+        # so the dialog can say WHICH roll is missing — "Print Anyway" cannot conjure
+        # a tray, so the honest answer is load it or change the pick.
+        if outcome.pin_missing:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": spool_selection.WAITING_REASON_PINNED_UNAVAILABLE,
+                    "slots": outcome.pinned_unavailable_slots,
+                    "trays": sorted(set(outcome.pin_missing.values())),
                 },
             )
         # Minimum-start proof (#spool-selection): the assigned spool can cover the
