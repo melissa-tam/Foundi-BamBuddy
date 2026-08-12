@@ -501,6 +501,8 @@ class PrinterState:
     gcode_file: str | None = None
     subtask_id: str | None = None
     hms_errors: list = field(default_factory=list)  # List of HMSError
+    # Monotonic time of the last push that carried wire HMS evidence; local clears never stamp it.
+    hms_wire_at: float = 0.0
     kprofiles: list = field(default_factory=list)  # List of KProfile
     sdcard: bool = False  # SD card inserted
     store_to_sdcard: bool = False  # Store sent files on SD card (home_flag bit 11)
@@ -3580,6 +3582,10 @@ class BambuMQTTClient:
             hms_list = data["hms"]
             logger.debug("[%s] HMS data received: %s", self.serial_number, hms_list)
             self.state.hms_errors = []
+            # Stamped before the loop, so an EMPTY hms list stamps too — the wire
+            # saying "no faults" is evidence, and an appearance edge measured
+            # against an unstamped all-clear would re-fire every standing code.
+            self.state.hms_wire_at = time.monotonic()
             if isinstance(hms_list, list):
                 for hms in hms_list:
                     if isinstance(hms, dict):
@@ -3712,6 +3718,10 @@ class BambuMQTTClient:
                                     full_code=f"{print_error:08X}",
                                 )
                             )
+                            # Stamped only where an entry actually lands: the dedupe
+                            # skip above and the cancel-echo branch add no new wire
+                            # evidence, so neither may advance the edge clock.
+                            self.state.hms_wire_at = time.monotonic()
 
         # Parse home_flag first so SD-card detection below can prefer it.
         # Bit 8 = HAS_SDCARD_NORMAL, bit 9 = HAS_SDCARD_ABNORMAL, bit 11 = store-to-SD,

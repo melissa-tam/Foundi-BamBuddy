@@ -277,8 +277,8 @@ async def sync_printer_ams(
         for assignment in assign_result.scalars().all():
             spool = assignment.spool
             if spool and spool.label_weight > 0:
-                remaining = max(0.0, spool.label_weight - (spool.weight_used or 0))
-                inv_weights[(assignment.ams_id, assignment.tray_id)] = remaining
+                # ONE origin (Spool.remaining_g): a spent row seeds 0 g, not its ledger.
+                inv_weights[(assignment.ams_id, assignment.tray_id)] = spool.remaining_g
     except Exception as e:
         logger.debug("Could not load inventory weights for printer %s: %s", printer_id, e)
 
@@ -464,8 +464,8 @@ async def sync_all_printers(
         for assignment in assign_result.scalars().all():
             spool = assignment.spool
             if spool and spool.label_weight > 0:
-                remaining = max(0.0, spool.label_weight - (spool.weight_used or 0))
-                inventory_weights[(assignment.printer_id, assignment.ams_id, assignment.tray_id)] = remaining
+                # ONE origin (Spool.remaining_g): a spent row seeds 0 g, not its ledger.
+                inventory_weights[(assignment.printer_id, assignment.ams_id, assignment.tray_id)] = spool.remaining_g
     except Exception as e:
         logger.debug("Could not load inventory assignments for weight fallback: %s", e)
 

@@ -1281,20 +1281,96 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     # Check for new HMS errors and send notifications
     current_hms_errors = getattr(state, "hms_errors", []) or []
 
-    # Restart-replay runout suppression (S1). Seed / maintain the per-printer set of
-    # runout HMS codes already live at the FIRST status push, BEFORE the runout hook
-    # below and OUTSIDE the "HMS present" branch so the first push seeds even with
-    # zero HMS. After a restart the in-memory HMS notify dedup is empty, so a still-
-    # live runout would replay as "new" and mis-stamp a swapped-in fresh spool;
-    # note_status_push records those codes so mark_spent_on_runout skips them.
+    # Wire-HMS APPEARANCE EDGES (services/hms_edges), consumed exactly ONCE per push and
+    # fanned out to the edge-triggered STATE consumers below. These five decide farm
+    # STATE off an HMS code — spent_at stamps, a plate gate, a USB cleanup, an
+    # escalation's guidance — and they used to ride ``new_error_codes``, i.e.
+    # notify_dedup's 600 s re-NOTIFY window. That window is an alert policy on a level:
+    # it deliberately calls a code flapping out-and-back inside it ONE continuing
+    # incident, and pre-marks every code standing at restart as already-seen. Both are
+    # right for paging a human and wrong for a state decision — a runout re-appearing
+    # under a NEW job is a second physical exhaustion that must stamp again. Same axis
+    # error as the incident-spawn silent class kept at the bottom of this block (9
+    # runout episodes with no incident, no alert and no log line, 2026-08-09); that one
+    # is fixed by deriving from the LIVE list per push, these by an appearance edge.
+    #
+    # The tracker owns restart-replay suppression too: its first consumed frame per
+    # printer SEEDS without edging, so a code live when the process first sees the
+    # printer never fires (which is why the spool_respool S1 seed it replaced is gone).
+    edges = None
     try:
-        from backend.app.services.spool_respool import note_status_push as _note_runout_push
+        from backend.app.services import hms_edges
 
-        _note_runout_push(printer_id, state)
-    except Exception as _ne:  # noqa: BLE001 — seeding must never crash the status flow
-        logging.getLogger(__name__).warning(
-            "[RESPOOL] runout replay-seed hook failed for printer %s: %s", printer_id, _ne
-        )
+        edges = hms_edges.note_push(printer_id, state)
+    except Exception as _ee:  # noqa: BLE001 — edge detection must never crash the status flow
+        logging.getLogger(__name__).warning("[HMS-EDGES] edge detection failed for printer %s: %s", printer_id, _ee)
+
+    if edges:
+        # Reused-tag re-spool Tier 1, BOTH lanes: a runout HMS code that APPEARED on
+        # this frame stamps spent_at on the exhausted tray's spool, so the reused tag
+        # re-spools automatically on refill instead of mapping to the spent donor. The
+        # unrescued vocabulary (RUNOUT_HMS_CODES) and the firmware's own slot-attributed
+        # AUTO-SWITCH statement are separate lanes with separate attribution rules;
+        # deriving both from the appeared entries lives in the service, which owns the
+        # session and the guard. Thin fire-and-forget hook only.
+        try:
+            from backend.app.services.spool_respool import apply_runout_edges
+
+            asyncio.create_task(apply_runout_edges(printer_id, edges, state))
+        except Exception as _re:  # noqa: BLE001 — hook must never crash the status flow
+            logging.getLogger(__name__).warning(
+                "[RESPOOL] spent-on-runout hook failed for printer %s: %s", printer_id, _re
+            )
+
+        # Native plate-occupancy capture (Phase 3.3). The H2-series pre-print vision
+        # check (foreign-objects-on-heatbed / plate-marker) surfaces as an HMS code and
+        # PAUSEs the job on the printer. When such a code APPEARS and a farm unit is
+        # printing here, raise a human-clear-only plate gate + flag the unit so the loop
+        # shows the hold instead of silently stalling. Own session, fully guarded — the
+        # codes stay in hms_errors (they ARE faults).
+        _new_occupancy = edges.appeared_short & _HMS_PLATE_OCCUPANCY_CODES
+        if _new_occupancy:
+            try:
+                from backend.app.services.farm_correlation import on_native_plate_detection
+
+                async with async_session() as _plate_db:
+                    await on_native_plate_detection(_plate_db, printer_id, _new_occupancy)
+            except Exception as _pe:  # noqa: BLE001 — capture must never crash the status flow
+                logging.getLogger(__name__).warning(
+                    "[PLATE-VISION] native plate-occupancy capture failed for printer %s: %s", printer_id, _pe
+                )
+
+        # USB storage-low capture. When an HMS "USB full" code APPEARS, the farm
+        # auto-cleans the drive (recordings first, then oldest unused print files) and
+        # fires the dedicated on_storage_low notification with the outcome.
+        # Fire-and-forget so the slow FTP work never blocks the status flow; the service
+        # is fully self-guarded (unreachable FTPS → failure notification, never an
+        # exception).
+        _new_storage = edges.appeared_full & HMS_STORAGE_LOW_FULL_CODES
+        if _new_storage:
+            try:
+                asyncio.create_task(on_storage_low(printer_id, set(_new_storage)))
+            except Exception as _se:  # noqa: BLE001 — hook must never crash the status flow
+                logging.getLogger(__name__).warning(
+                    "[USB-STORAGE] storage-low hook failed for printer %s: %s", printer_id, _se
+                )
+
+        # Runout DEMAND-CHANGE guidance refresh (006-H2S 2026-07-26). While a unit sits
+        # ESCALATED on a runout, the firmware can move its demand to a DIFFERENT slot (a
+        # second roll empties, or the operator refilled the wrong one). Recovery's
+        # escalation latch correctly refuses to re-enter — but it also swallowed every
+        # trace of the move, leaving the operator with the original slot in hand for
+        # 12 h. This re-announces the escalation with the FRESH slot; it is GUIDANCE ONLY
+        # and never touches the latch. Orchestration + its own `_guidance_sent` dedup
+        # live in spool_recovery; this is a guarded hook.
+        try:
+            from backend.app.services.spool_recovery import maybe_refresh_runout_guidance
+
+            await maybe_refresh_runout_guidance(printer_id, edges.appeared_full, state)
+        except Exception as _ge:  # noqa: BLE001 — hook must never crash the status flow
+            logging.getLogger(__name__).warning(
+                "[SPOOL-RECOVERY] runout guidance refresh failed for printer %s: %s", printer_id, _ge
+            )
 
     # Re-spool Tier 1, HMS-FREE runout: the seamless AMS backup swap. Sampled HERE, on
     # every status push, and NOT from the AMS-change callback — that callback is gated
@@ -1447,12 +1523,10 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
 
         # Recoverable feed-fault / runout short codes among the NEW codes, computed
         # ONCE here so the notify session's recovery-owned suppression and the
-        # spool-recovery spawn below read the SAME set. hms_short_code is hoisted to
-        # here (it also feeds the plate-occupancy and runout hooks further down).
+        # spool-recovery spawn below read the SAME set. ``_code_word`` +
+        # ``runout_slot_from_hms`` serve that suppression's attr-aware companion test.
         from backend.app.services.hms_errors import (
-            _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
             _code_word,
-            hms_short_code,
             is_notify_suppressed,
             runout_slot_from_hms,
         )
@@ -1671,111 +1745,6 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
 
             except Exception as e:
                 logging.getLogger(__name__).warning(f"HMS error notification failed: {e}")
-
-            # Native plate-occupancy capture (Phase 3.3). The H2-series pre-print
-            # vision check (foreign-objects-on-heatbed / plate-marker) surfaces as an
-            # HMS code and PAUSEs the job on the printer. When such a code is NEW and
-            # a farm unit is printing here, raise a human-clear-only plate gate + flag
-            # the unit so the loop shows the hold instead of silently stalling. Own
-            # session, fully guarded — the codes stay in hms_errors (they ARE faults).
-            _new_occupancy = {
-                hms_short_code(e.attr, e.code) for e in current_hms_errors if e.full_code in new_error_codes
-            } & _HMS_PLATE_OCCUPANCY_CODES
-            if _new_occupancy:
-                try:
-                    from backend.app.services.farm_correlation import on_native_plate_detection
-
-                    async with async_session() as _plate_db:
-                        await on_native_plate_detection(_plate_db, printer_id, _new_occupancy)
-                except Exception as _pe:  # noqa: BLE001 — capture must never crash the status flow
-                    logging.getLogger(__name__).warning(
-                        "[PLATE-VISION] native plate-occupancy capture failed for printer %s: %s", printer_id, _pe
-                    )
-
-            # USB storage-low capture. When a NEW HMS "USB full" code arrives, the
-            # farm auto-cleans the drive (recordings first, then oldest unused print
-            # files) and fires the dedicated on_storage_low notification with the
-            # outcome. Fire-and-forget so the slow FTP work never blocks the status
-            # flow; the service is fully self-guarded (unreachable FTPS → failure
-            # notification, never an exception).
-            _new_storage = {
-                e.full_code for e in current_hms_errors if e.full_code in new_error_codes
-            } & HMS_STORAGE_LOW_FULL_CODES
-            if _new_storage:
-                try:
-                    asyncio.create_task(on_storage_low(printer_id, set(_new_storage)))
-                except Exception as _se:  # noqa: BLE001 — hook must never crash the status flow
-                    logging.getLogger(__name__).warning(
-                        "[USB-STORAGE] storage-low hook failed for printer %s: %s", printer_id, _se
-                    )
-
-            # Reused-tag re-spool Tier 1: a NEW hardware runout HMS code stamps
-            # spent_at on the exhausted tray's spool (resolved via the dispatched
-            # farm ams_mapping / live tray_now) so the reused tag re-spools
-            # automatically on refill instead of mapping to the spent donor.
-            # Orchestration lives in spool_respool; this is a guarded hook only.
-            from backend.app.services.hms_errors import (
-                RUNOUT_HMS_CODES as _RUNOUT_HMS_CODES,
-            )
-
-            _new_runout = {
-                hms_short_code(e.attr, e.code) for e in current_hms_errors if e.full_code in new_error_codes
-            } & _RUNOUT_HMS_CODES
-            if _new_runout:
-                try:
-                    from backend.app.services.spool_respool import mark_spent_on_runout
-
-                    async with async_session() as _respool_db:
-                        await mark_spent_on_runout(_respool_db, printer_id, _new_runout, state)
-                except Exception as _re:  # noqa: BLE001 — capture must never crash the status flow
-                    logging.getLogger(__name__).warning(
-                        "[RESPOOL] spent-on-runout capture failed for printer %s: %s", printer_id, _re
-                    )
-
-            # Re-spool Tier 1, RESCUED runout: the sibling of the hook above for the
-            # runout the AMS backup handled itself. That one keys off RUNOUT_HMS_CODES
-            # — the UNRESCUED vocabulary — so a successful firmware auto-refill (which
-            # only raises the slot-attributed 0700_2X00 family and keeps printing) never
-            # stamped anything, and the un-stamped row later surfaced as a spurious
-            # "Fresh roll?" prompt on the physical swap. Attribution is the firmware's
-            # own attr, so the events carry (full_code, attr, code_word) per entry and
-            # the service stamps EACH — one job can chain several slot runouts. Only the
-            # auto-switch code word qualifies as spent evidence (the bare demand can be a
-            # firmware-latched bogus ask); the wider family stays slot-RESOLUTION only.
-            _new_slot_runout = [
-                (e.full_code, int(e.attr or 0), _code_word(e.code))
-                for e in current_hms_errors
-                if e.full_code in new_error_codes
-                and _code_word(e.code) in _RUNOUT_AUTO_SWITCH_SPENT_CODE32
-                and runout_slot_from_hms(int(e.attr or 0), _code_word(e.code)) is not None
-            ]
-            if _new_slot_runout:
-                try:
-                    from backend.app.services.spool_respool import mark_spent_on_slot_runout
-
-                    async with async_session() as _slot_respool_db:
-                        await mark_spent_on_slot_runout(_slot_respool_db, printer_id, _new_slot_runout, state)
-                except Exception as _sre:  # noqa: BLE001 — capture must never crash the status flow
-                    logging.getLogger(__name__).warning(
-                        "[RESPOOL] spent-on-slot-runout capture failed for printer %s: %s", printer_id, _sre
-                    )
-
-            # Runout DEMAND-CHANGE guidance refresh (006-H2S 2026-07-26). While a
-            # unit sits ESCALATED on a runout, the firmware can move its demand to a
-            # DIFFERENT slot (a second roll empties, or the operator refilled the
-            # wrong one). Recovery's escalation latch correctly refuses to re-enter —
-            # but it also swallowed every trace of the move, leaving the operator with
-            # the original slot in hand for 12 h. This re-announces the escalation
-            # with the FRESH slot; it is GUIDANCE ONLY and never touches the latch.
-            # Orchestration + dedup live in spool_recovery; this is a guarded hook.
-            try:
-                from backend.app.services.spool_recovery import maybe_refresh_runout_guidance
-
-                await maybe_refresh_runout_guidance(printer_id, new_error_codes, state)
-            except Exception as _ge:  # noqa: BLE001 — hook must never crash the status flow
-                logging.getLogger(__name__).warning(
-                    "[SPOOL-RECOVERY] runout guidance refresh failed for printer %s: %s", printer_id, _ge
-                )
 
         # Automatic AMS incident ownership: a mechanical feed fault (tangle /
         # assist-motor overload / failed send-out) PAUSEs a farm print with no
@@ -2543,7 +2512,7 @@ async def on_print_start(printer_id: int, data: dict):
     # feeder change chosen by the NEXT job's dispatch mapping would otherwise read as a
     # mid-job firmware backup switch and falsely stamp the departed spool spent
     # (2026-07-20). Reset BEFORE the eject short-circuit below — an eject job is a
-    # boundary too. Guarded like the note_status_push seed; the logic lives in the service.
+    # boundary too. Guarded like the other per-push hooks; the logic lives in the service.
     try:
         from backend.app.services.spool_respool import reset_swap_edge_state
 

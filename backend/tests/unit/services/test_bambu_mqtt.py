@@ -5347,6 +5347,108 @@ class TestHMSFullCode:
         assert mqtt_client.state.hms_errors[0].actions == ["CHECK_ASSISTANT"]
 
 
+class TestHMSWireStamp:
+    """`hms_wire_at` is the transport truth behind hms_edges' appearance detector:
+    it advances ONLY on a push that carried wire HMS evidence. A local clear
+    (new print, operator "clear errors") empties hms_errors without the printer
+    having said anything, so it must not advance the clock — otherwise a code
+    still standing on the wire would read as a fresh appearance on the next push.
+
+    The "does not advance" cases pin the clock to SENTINEL first and assert exact
+    equality afterwards: a real stamp lands a large time.monotonic() value, so the
+    assertion discriminates even when two monotonic() calls fall in the same
+    Windows clock tick (a `== previous_stamp` assert would silently pass)."""
+
+    SENTINEL = 1.0
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST_WIRE",
+            access_code="12345678",
+        )
+
+    def test_starts_unstamped(self, mqtt_client):
+        assert mqtt_client.state.hms_wire_at == 0.0
+
+    def test_hms_key_advances_the_stamp(self, mqtt_client):
+        mqtt_client._update_state({"hms": [{"attr": 0x07FF0200, "code": 0x8011}]})
+        assert mqtt_client.state.hms_wire_at > self.SENTINEL
+
+    def test_empty_hms_list_advances_the_stamp(self, mqtt_client):
+        """An all-clear is real wire evidence — without it the appearance detector
+        could never observe a code leaving, so every flap-return would be missed.
+        The clock is zeroed first so the all-clear push must stamp on its own."""
+        mqtt_client._update_state({"hms": [{"attr": 0x07FF0200, "code": 0x8011}]})
+        assert len(mqtt_client.state.hms_errors) == 1
+        mqtt_client.state.hms_wire_at = 0.0
+
+        mqtt_client._update_state({"hms": []})
+        assert mqtt_client.state.hms_errors == []
+        assert mqtt_client.state.hms_wire_at > self.SENTINEL
+
+    def test_report_without_hms_key_does_not_advance_the_stamp(self, mqtt_client):
+        mqtt_client.state.hms_wire_at = self.SENTINEL
+        mqtt_client._update_state({"gcode_state": "RUNNING", "layer_num": 5})
+        assert mqtt_client.state.hms_wire_at == self.SENTINEL
+
+    def test_new_print_local_clear_does_not_advance_the_stamp(self, mqtt_client):
+        """The new-print/file-change branch wipes hms_errors locally. The printer
+        said nothing, so the stamp stays put and a standing code shows no edge."""
+        mqtt_client._update_state(
+            {
+                "gcode_state": "IDLE",
+                "gcode_file": "part.gcode",
+                "hms": [{"attr": 0x07FF0200, "code": 0x8011}],
+            }
+        )
+        assert len(mqtt_client.state.hms_errors) == 1
+        mqtt_client.state.hms_wire_at = self.SENTINEL
+
+        mqtt_client._update_state({"gcode_state": "RUNNING", "gcode_file": "part.gcode"})
+        assert mqtt_client.state.hms_errors == [], "new print must clear errors locally"
+        assert mqtt_client.state.hms_wire_at == self.SENTINEL
+
+    def test_clear_hms_errors_command_does_not_advance_the_stamp(self, mqtt_client):
+        from unittest.mock import MagicMock
+
+        mqtt_client._update_state({"hms": [{"attr": 0x07FF0200, "code": 0x8011}]})
+        assert len(mqtt_client.state.hms_errors) == 1
+        mqtt_client.state.hms_wire_at = self.SENTINEL
+
+        mqtt_client._client = MagicMock()
+        mqtt_client.state.connected = True
+        assert mqtt_client.clear_hms_errors() is True
+        assert mqtt_client.state.hms_errors == []
+        assert mqtt_client.state.hms_wire_at == self.SENTINEL
+
+    def test_print_error_append_advances_the_stamp(self, mqtt_client):
+        mqtt_client._update_state({"print_error": 0x05008061})
+        assert len(mqtt_client.state.hms_errors) == 1
+        assert mqtt_client.state.hms_wire_at > self.SENTINEL
+
+    def test_deduped_print_error_does_not_advance_the_stamp(self, mqtt_client):
+        """print_error repeating a code already in hms_errors appends nothing, so
+        it is not new evidence — stamping there would re-fire the standing code."""
+        mqtt_client._update_state({"hms": [{"attr": 0x05000000, "code": 0x8061}]})
+        assert len(mqtt_client.state.hms_errors) == 1
+        mqtt_client.state.hms_wire_at = self.SENTINEL
+
+        mqtt_client._update_state({"print_error": 0x05008061})
+        assert len(mqtt_client.state.hms_errors) == 1, "duplicate must not append"
+        assert mqtt_client.state.hms_wire_at == self.SENTINEL
+
+    def test_print_error_cancel_echo_does_not_advance_the_stamp(self, mqtt_client):
+        """The user-action echo is filtered out of hms_errors, so it appends
+        nothing and must leave the clock alone."""
+        mqtt_client._update_state({"print_error": 0x0500400E})
+        assert mqtt_client.state.hms_errors == []
+        assert mqtt_client.state.hms_wire_at == 0.0
+
+
 class TestHMSSeverityDecode:
     """Severity is the high 16 bits of `code` (1=fatal 2=serious 3=common
     4=info) — the legacy ``(attr >> 8) & 0xF`` decode read every real fault as

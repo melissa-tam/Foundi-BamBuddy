@@ -17,6 +17,7 @@ import { LinkSpoolModal } from '../../components/LinkSpoolModal';
 import { RespoolTagModal } from '../../components/RespoolTagModal';
 import { TaglessFreshModal } from '../../components/TaglessFreshModal';
 import { useToast } from '../../contexts/ToastContext';
+import { remainingGrams, remainingFraction } from '../../utils/spoolGrams';
 
 function isTrayEmpty(tray: AMSTray): boolean {
   return !tray.tray_type || tray.tray_type === '';
@@ -110,7 +111,7 @@ export function SpoolBuddyAmsPage() {
     for (const a of assignments) {
       const sp = a.spool;
       if (sp && sp.label_weight > 0 && sp.weight_used != null) {
-        const fill = Math.round(Math.max(0, sp.label_weight - sp.weight_used) / sp.label_weight * 100);
+        const fill = Math.round((remainingFraction(sp) ?? 0) * 100);
         map[`${a.ams_id}-${a.tray_id}`] = fill;
       }
     }
@@ -134,7 +135,7 @@ export function SpoolBuddyAmsPage() {
       if (slotAssign) {
         const spool = spoolmanInventorySpoolsCache.find(s => s.id === slotAssign.spoolman_spool_id);
         if (spool && (spool.label_weight ?? 0) > 0) {
-          return Math.round(Math.max(0, spool.label_weight - spool.weight_used) / spool.label_weight * 100);
+          return Math.round((remainingFraction(spool) ?? 0) * 100);
         }
       }
     }
@@ -488,7 +489,7 @@ export function SpoolBuddyAmsPage() {
         ams_id: amsId,
         tray_id: trayId,
         spool_id: spool.id,
-        remaining_g: Math.max(0, Math.round(spool.label_weight - spool.weight_used)),
+        remaining_g: Math.round(remainingGrams(spool)),
         material: spool.material,
         rgba: spool.rgba,
       },

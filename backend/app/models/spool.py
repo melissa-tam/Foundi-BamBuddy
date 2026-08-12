@@ -159,6 +159,20 @@ class Spool(Base):
     assignments: Mapped[list["SpoolAssignment"]] = relationship(back_populates="spool", cascade="all, delete-orphan")
     location: Mapped["Location | None"] = relationship(back_populates="spools")
 
+    @property
+    def remaining_g(self) -> float:
+        """THE one derivation of a row's remaining grams — emptiness is derived from
+        ``spent_at`` (doctrine rule 8), never written into the gram ledger.
+
+        A spent row reads 0.0 whatever the ledger says (an under-counted
+        ``weight_used`` must not present a run-dry roll as printable material), while
+        ``weight_used`` itself stays raw and lossless on the row — the operator-gated
+        un-spend restores the true remaining figure by clearing ``spent_at`` alone.
+        """
+        if self.spent_at is not None:
+            return 0.0
+        return max(0.0, float(self.label_weight or 0.0) - float(self.weight_used or 0.0))
+
 
 from backend.app.models.location import Location  # noqa: E402
 from backend.app.models.spool_assignment import SpoolAssignment  # noqa: E402

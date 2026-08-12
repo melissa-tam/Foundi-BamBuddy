@@ -152,8 +152,8 @@ async def seed_standing(
     """Pre-mark the printer's standing pre-restart HMS codes as already seen.
 
     Called on the FIRST status push per printer per process (the same one-shot
-    idiom as ``spool_respool.note_status_push``), BEFORE :func:`new_codes` runs
-    for that push. Returns the set of codes pre-marked (for logging/tests).
+    idiom as ``hms_edges.note_push``'s seeding frame), BEFORE :func:`new_codes`
+    runs for that push. Returns the set of codes pre-marked (for logging/tests).
 
     Semantics:
 
@@ -173,7 +173,7 @@ async def seed_standing(
     report. A fresh ``PrinterState`` broadcast at connect time (state
     ``"unknown"``, empty ``hms``) would consume the one-shot with an empty live
     set and let the standing codes re-blast on the next push — the same trap
-    ``spool_respool.note_status_push`` guards against.
+    ``hms_edges.note_push`` guards against.
     """
     _standing_seeded.add(printer_id)
     live = {k for k in live_keys if k}

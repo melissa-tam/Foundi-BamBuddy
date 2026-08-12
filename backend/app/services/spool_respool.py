@@ -7,14 +7,17 @@ spool ledger would otherwise map the tag to the SPENT donor row (weight_used ≈
 guard. This module is the single owner of the re-spool operation and its three
 certainty tiers:
 
-* **Tier 1 — spent-certain marking** (`mark_spent_on_runout`,
-  `mark_spent_on_slot_runout`, `sample_status_push` + `confirm_backup_swaps`): a
+* **Tier 1 — spent-certain marking** (`apply_runout_edges` → `mark_spent_on_runout` /
+  `mark_spent_on_slot_runout`, and `sample_status_push` + `confirm_backup_swaps`): a
   hardware runout signal (unrescued runout HMS / the firmware's own auto-switch
   statement / seamless AMS backup-swap) stamps ``spool.spent_at`` — the certainty
-  key. Never set by gram estimates. The backup-swap detector is a SAMPLER/CONFIRMER
-  pair, not one call: the sync sampler runs on every status push (~1 Hz) because the
-  tray_now edge it watches is invisible to the AMS-hash-gated callback, and only a
-  confirmed departure pays for a DB session.
+  key. Never set by gram estimates. The two HMS lanes fire on a wire-HMS APPEARANCE
+  EDGE (``services.hms_edges``): "NEW" is that tracker's answer, never the
+  notification dedup's 600 s re-notify window, which is a level-triggered alert policy
+  and the wrong axis for a state decision. The backup-swap detector is a
+  SAMPLER/CONFIRMER pair, not one call: the sync sampler runs on every status push
+  (~1 Hz) because the tray_now edge it watches is invisible to the AMS-hash-gated
+  callback, and only a confirmed departure pays for a DB session.
 * **Tier 2 — automatic re-spool** (`maybe_auto_or_prompt_respool`): a tag arrival
   resolving to a spent, LOADED tray physically cannot be the old (empty) spool,
   so it re-spools with no operator involvement — unless a standing "Same spool"
@@ -180,31 +183,6 @@ _jump_seen: dict[tuple[int, int, int], tuple[float, int]] = {}
 # :func:`_reset_state`.
 _spent_dedup: set[tuple[int, object, int]] = set()
 
-# S1 restart-replay suppression. The HMS dedup (``services.notify_dedup``) recognises
-# a standing code across a restart only when it was ALERTED on before (durable ledger
-# row); a never-notified code (no description / info severity) still replays as "new"
-# on the next push — and ``mark_spent_on_runout`` would re-stamp spent on whatever spool is bound to the
-# tray NOW, which after an operator swap during the pause is a FRESH roll (production
-# 2026-07-17 18:56: a fresh spool stamped spent+1000 g 7 s after insertion). These
-# two structures record the runout codes ALREADY LIVE at the first status push per
-# printer (via :func:`note_status_push`) so a replayed pre-restart runout is skipped,
-# while a genuinely-new runout appearing later is absent from the seed and stamps
-# normally. Process-lifetime like the edge dicts above; cleared by :func:`_reset_state`.
-_runout_seeded: set[int] = set()
-_seeded_runout_codes: dict[int, set[str]] = {}
-
-# S1 for the slot-attributed auto-switch family (:func:`mark_spent_on_slot_runout`),
-# keyed by the LOSSLESS ``full_code`` rather than the short code its sibling above
-# uses. The short code is unusable as identity here: ``hms_short_code`` keeps only
-# ``code & 0xFFFF``, dropping the code-word high bits that separate the demand
-# (0x00020001) from the purge notice (0x00030001) — both render ``07xx_0001`` — and
-# it keeps only ``attr >> 16``, dropping the slot byte, so all four slots of one AMS
-# render identically. Seeding on the short code would therefore suppress a genuine
-# NEW runout on a DIFFERENT slot, which is exactly the chained multi-slot case this
-# trigger exists for. Same lifecycle as the sets above: seeded once per printer per
-# process by :func:`note_status_push`, intersection-pruned on every later push.
-_seeded_slot_runout_full: dict[int, set[str]] = {}
-
 
 def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
@@ -220,9 +198,6 @@ def _reset_state() -> None:
     _respool_observation_logged.clear()
     _jump_seen.clear()
     _spent_dedup.clear()
-    _runout_seeded.clear()
-    _seeded_runout_codes.clear()
-    _seeded_slot_runout_full.clear()
     _filam_bak_groups.clear()
     _last_contradiction_scan_at = None
 
@@ -665,9 +640,13 @@ async def _resolve_exhausted_tray(
     Not stamping is the safe failure and that asymmetry is the entire design: a MISSED
     stamp self-heals forward (the next runout re-fires, the tagless fresh-roll prompt is
     the backstop, and the operator's physical swap surfaces it), while a FALSE stamp is
-    permanent — the grams-reconcile deliberately preserves the latch, there is no
-    un-spend lane by operator ruling, and the row is hard-excluded from selection until
-    somebody notices. Never widen step 3 to "guess something rather than nothing".
+    effectively permanent — the grams-reconcile deliberately preserves the latch, there
+    is no AUTOMATIC un-spend lane by operator ruling, and the row is hard-excluded from
+    selection until somebody notices. The single deliberate un-spend is operator-ANSWERED
+    and evidence-gated: dismissing the respool prompt (``POST
+    /inventory/spools/{id}/respool-dismiss``) NULLs ``spent_at`` when the live AMS remain
+    contradicts the stamp — a human looking at the tray, never a lane that clears stamps
+    on its own. Never widen step 3 to "guess something rather than nothing".
 
     The ``isinstance`` guard keeps the decode fail-closed on an absent / non-list
     ``hms_errors`` (MagicMock states in tests, a degenerate push in production), so
@@ -759,105 +738,83 @@ async def _resolve_exhausted_tray(
     return None
 
 
-def _live_runout_codes(state) -> set[str]:
-    """Runout HMS short codes currently live on ``state`` — the same short-code
-    derivation the runout hook / spool_recovery use (``hms_short_code(attr, code)``),
-    intersected with :data:`RUNOUT_HMS_CODES`."""
-    out: set[str] = set()
-    for e in getattr(state, "hms_errors", None) or []:
-        try:
-            out.add(hms_short_code(e.attr, e.code))
-        except Exception:  # noqa: BLE001 — a malformed HMS entry must not crash seeding
-            continue
-    return out & RUNOUT_HMS_CODES
+async def apply_runout_edges(printer_id: int, edges, state, session_factory=None) -> None:
+    """Tier 1 entry point: route ONE wire-HMS appearance edge into both spent stampers.
 
+    ``edges`` is an :class:`hms_edges.HmsEdgeReport` — the codes that APPEARED on the
+    frame ``main`` just consumed. That tracker, not the notification dedup, is what
+    "NEW" means for spent evidence: its 600 s re-notify window is a level-triggered
+    ALERT policy, and a runout re-appearing inside it under a different job is a second
+    physical exhaustion that must stamp a second time. Restart-replay suppression is the
+    tracker's own first-frame seed (a code live at first sight never edges), which is why
+    neither stamper carries a seed check any more.
 
-def _live_slot_runout_full(state) -> set[str]:
-    """``full_code``s of the slot-attributed AUTO-SWITCH runouts currently live on
-    ``state`` — the S1 seed alphabet of :func:`mark_spent_on_slot_runout`.
+    Both lanes are derived from ``edges.appeared`` — the live ``HMSError`` entries, which
+    are UNHASHABLE (mutable dataclass), so they are read into codes rather than sets:
 
-    Two conjunctive conditions, matching that trigger's own filter exactly so the seed
-    can never be narrower than what stamps: the code word is in the spent-evidence
-    subset (:data:`hms_errors._RUNOUT_AUTO_SWITCH_SPENT_CODE32`) AND its attr decodes
-    to a real slot. An entry whose slot fails to decode can never stamp, so seeding it
-    would only risk suppressing an unrelated code that happens to share its full_code.
+    * Lane A (:func:`mark_spent_on_runout`) — appeared short codes ∩
+      :data:`RUNOUT_HMS_CODES`, the UNRESCUED vocabulary;
+    * Lane B (:func:`mark_spent_on_slot_runout`) — per-entry ``(full_code, attr,
+      code_word)`` for the firmware's own AUTO-SWITCH statement only, each of which
+      decodes a real slot. The bare demand is deliberately excluded upstream in
+      :data:`hms_errors._RUNOUT_AUTO_SWITCH_SPENT_CODE32`.
+
+    Accepted residual: a runout that fired entirely DURING server downtime — living and
+    dying inside the gap, so it is neither live at the first consumed frame nor ever
+    seen to appear — never stamps spent. The tray's true state across the gap is
+    unknowable and a replayed stamp would mark whatever roll is in the slot NOW (the
+    2026-07-17 18:56 fresh-spool misattribution), so we fail safe. That case is bounded
+    by the pause-stall watchdog (the print sits PAUSEd and escalates), the tagless
+    fresh-roll prompt, and the Tier-3 respool prompt when the reused tag next arrives.
+
+    Fire-and-forget from ``main``: it owns its session (``session_factory`` is the test
+    seam, ``None`` meaning :data:`core.database.async_session`) and the whole body is
+    guarded, because an exception here would land in an orphaned task and must never
+    reach the MQTT status chain (fork invariant 10).
     """
-    from backend.app.services.hms_errors import (
-        _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
-        _code_word,
-        runout_slot_from_hms,
-    )
+    try:
+        from backend.app.services.hms_errors import (
+            _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
+            _code_word,
+            runout_slot_from_hms,
+        )
 
-    out: set[str] = set()
-    for e in getattr(state, "hms_errors", None) or []:
-        try:
-            code_word = _code_word(getattr(e, "code", 0))
-            if code_word not in _RUNOUT_AUTO_SWITCH_SPENT_CODE32:
-                continue
-            if runout_slot_from_hms(int(getattr(e, "attr", 0) or 0), code_word) is None:
-                continue
-            out.add(str(getattr(e, "full_code", "") or ""))
-        except Exception:  # noqa: BLE001 — a malformed HMS entry must not crash seeding
-            continue
-    return out
-
-
-def note_status_push(printer_id: int, state) -> None:
-    """Seed / maintain the per-printer restart-replay runout-suppression set (S1).
-
-    Called (guarded) from ``main.on_printer_status_change`` on every status push,
-    BEFORE the runout hook — hence outside the "HMS present" branch, so the FIRST
-    push per printer seeds even with zero HMS. That first push records the runout
-    codes live at that instant into ``_seeded_runout_codes[printer_id]``: after a
-    restart main lost its HMS dedup, so any code still live now would otherwise
-    replay as "new" and mis-stamp a swapped-in fresh spool. Every LATER push drops
-    seeded codes no longer live, so a genuine recurrence stamps normally; a code that
-    first appears only AFTER seeding is never added here → correctly treated as new.
-
-    Accepted residual: a runout that fired entirely DURING server downtime (never
-    observed live at the first push) never stamps spent — the tray's true state is
-    unknowable across the gap, so we fail safe. That case is bounded by the pause-
-    stall watchdog (the print sits PAUSEd and escalates) and the Tier-3 respool prompt
-    when the reused tag next arrives. Pure set bookkeeping; the caller owns guarding.
-
-    Maintains BOTH runout seeds off the same one-shot and the same "real report" gate:
-    the short-code set for :func:`mark_spent_on_runout` and the full-code set for
-    :func:`mark_spent_on_slot_runout`. One seeding pass, so the two triggers can never
-    disagree about which push was the first — a second one-shot could latch on a
-    different push and leave one family unguarded across the restart."""
-    live = _live_runout_codes(state)
-    live_slot_full = _live_slot_runout_full(state)
-    if printer_id not in _runout_seeded:
-        # The one-shot seed must capture a REAL printer report. A fresh
-        # PrinterState defaults to state="unknown" and the connect-time
-        # on_state_change broadcast fires before any report arrives — consuming
-        # the seed there would record an empty set and let a still-live runout
-        # replay as "new" on the next push (the exact mis-stamp this guards).
-        # Stay unseeded until the push carries a known gcode_state.
-        if (getattr(state, "state", None) or "unknown").lower() == "unknown":
+        appeared = edges.appeared
+        lane_a = {hms_short_code(e.attr, e.code) for e in appeared} & RUNOUT_HMS_CODES
+        lane_b = [
+            (e.full_code, int(e.attr or 0), _code_word(e.code))
+            for e in appeared
+            if _code_word(e.code) in _RUNOUT_AUTO_SWITCH_SPENT_CODE32
+            and runout_slot_from_hms(int(e.attr or 0), _code_word(e.code)) is not None
+        ]
+        if not lane_a and not lane_b:
             return
-        _runout_seeded.add(printer_id)
-        _seeded_runout_codes[printer_id] = set(live)
-        _seeded_slot_runout_full[printer_id] = set(live_slot_full)
-        return
-    seeded = _seeded_runout_codes.get(printer_id)
-    if seeded:
-        # Drop any seeded code no longer live so a genuine recurrence later stamps.
-        seeded.intersection_update(live)
-    seeded_full = _seeded_slot_runout_full.get(printer_id)
-    if seeded_full:
-        seeded_full.intersection_update(live_slot_full)
+        if session_factory is None:
+            from backend.app.core.database import async_session
+
+            session_factory = async_session
+        async with session_factory() as db:
+            if lane_a:
+                await mark_spent_on_runout(db, printer_id, lane_a, state)
+            if lane_b:
+                await mark_spent_on_slot_runout(db, printer_id, lane_b, state)
+    except Exception as e:  # noqa: BLE001 — a fire-and-forget task must never raise
+        logger.warning("Runout-edge apply failed for printer %s: %s", printer_id, e)
 
 
 async def mark_spent_on_runout(db: AsyncSession, printer_id: int, new_short_codes, state) -> Spool | None:
     """Tier 1: a NEW runout HMS code stamps spent_at on the exhausted tray's spool.
 
+    "NEW" means the code APPEARED on the wire-HMS edge tracker (``services.hms_edges``,
+    via :func:`apply_runout_edges`) — not that the notification dedup called it new.
+    Restart-replay suppression is that tracker's first-frame seed: a code already live
+    when the process first sees the printer never edges, so a swapped-in fresh spool
+    cannot be mis-stamped by a pre-restart runout.
+
     Resolves the exhausted tray via :func:`_resolve_exhausted_tray` — firmware slot
     attribution first, the dispatched farm ``ams_mapping`` / live ``tray_now`` only as
     inference. Idempotent: re-observing the code is a no-op once spent_at is set. No-op
-    in Spoolman mode. Skips a restart-replayed runout (a code seeded live at the first
-    push — see :func:`note_status_push`) so a swapped-in fresh spool is never
-    mis-stamped.
+    in Spoolman mode.
 
     The TRIGGERING codes carry one more fact than the vocabulary check consumes: their
     module half names the AMS unit (``07XX_8011`` → unit XX; the extruder-module
@@ -869,18 +826,6 @@ async def mark_spent_on_runout(db: AsyncSession, printer_id: int, new_short_code
         return None
     triggering = set(new_short_codes) & RUNOUT_HMS_CODES
     if not triggering:
-        return None
-    # S1: a code already live at the first status push after a restart is a replay of
-    # a PRE-restart runout (main lost its in-memory HMS dedup), NOT a fresh exhaustion.
-    # Stamping now would mis-mark whatever spool is bound to the slot NOW — after an
-    # operator swap during the pause that is a FRESH roll (the 18:56 misattribution).
-    seeded = _seeded_runout_codes.get(printer_id)
-    if seeded and triggering & seeded:
-        logger.info(
-            "Restart-replayed runout on printer %d (%s already live at first status push) — not stamping spent",
-            printer_id,
-            sorted(triggering & seeded),
-        )
         return None
     global_tray = await _resolve_exhausted_tray(db, printer_id, state, ams_hint=_ams_hint_from_short_codes(triggering))
     if global_tray is None:
@@ -910,7 +855,10 @@ async def mark_spent_on_slot_runout(db: AsyncSession, printer_id: int, events, s
     (a SPENT row takes the silent spent→mint path instead).
 
     ``events`` are ``(full_code, attr, code_word)`` tuples the caller has already
-    established are NEW this push. Attribution is ATTR-PRIMARY and PER EVENT — the
+    established APPEARED on this frame's wire-HMS edge (``services.hms_edges``, via
+    :func:`apply_runout_edges`) — which is also where restart-replay suppression lives
+    now: a code live at first sight never edges, so it can never stamp the roll an
+    operator swapped in during the downtime. Attribution is ATTR-PRIMARY and PER EVENT — the
     firmware names the exhausted slot in the attr, and one print can chain several
     (005-H2S 2026-07-30 ran three rolls dry inside a single job, its completion gram
     split proving four trays fed). Resolving once per push, or through tray_now, would
@@ -930,34 +878,24 @@ async def mark_spent_on_slot_runout(db: AsyncSession, printer_id: int, events, s
     way — the moment this loop gains a fallback it inherits the same gate.
 
     Returns the spools stamped by THIS call (empty when nothing qualified). No-op in
-    Spoolman mode; skips S1 restart replays; delegates the stamp itself to the shared
-    :func:`_mark_tray_spent` so the idempotency and fat-remainder WARNING are identical.
+    Spoolman mode; delegates the stamp itself to the shared :func:`_mark_tray_spent` so
+    the idempotency and fat-remainder WARNING are identical.
     """
     if await _spoolman_enabled(db):
         return []
     from backend.app.services.hms_errors import _RUNOUT_AUTO_SWITCH_SPENT_CODE32, runout_slot_from_hms
 
-    seeded = _seeded_slot_runout_full.get(printer_id) or set()
     subtask_id = getattr(state, "subtask_id", None)
     stamped: list[Spool] = []
-    for full_code, attr, code_word in events or []:
+    # ``_full_code`` is the edge tracker's lossless identity for the entry; the stamp
+    # itself attributes purely from the attr, so it is unpacked for shape only.
+    for _full_code, attr, code_word in events or []:
         # Re-assert the trigger vocabulary here, exactly as :func:`mark_spent_on_runout`
         # re-intersects RUNOUT_HMS_CODES despite its caller having filtered too. The
         # wider slot-attributed family decodes a slot just fine, so a caller that hands
         # over a bare DEMAND would silently archive a healthy roll — the 006 false-stamp
         # class. The narrow set is this function's contract, so it fails closed on it.
         if code_word not in _RUNOUT_AUTO_SWITCH_SPENT_CODE32:
-            continue
-        # S1: a code already live at the first status push after a restart is a replay
-        # of a PRE-restart runout, NOT a fresh exhaustion — stamping now would mis-mark
-        # whatever spool is bound to the slot NOW (a fresh roll after an operator swap).
-        if full_code in seeded:
-            logger.info(
-                "Restart-replayed slot runout on printer %d (%s already live at first status push) "
-                "— not stamping spent",
-                printer_id,
-                full_code,
-            )
             continue
         slot = runout_slot_from_hms(attr, code_word)
         if slot is None:
@@ -1166,7 +1104,7 @@ def sample_status_push(printer_id: int, state) -> list[int]:
     on this push (hand them to :func:`confirm_backup_swaps`).
 
     Called on EVERY status push (``main.on_printer_status_change``, ~1 Hz per printer)
-    beside :func:`note_status_push`, because that is the only cadence at which the
+    beside the wire-HMS edge tracker, because that is the only cadence at which the
     signal exists. The AMS-change callback this detector used to hang off is gated on
     bambu_mqtt's AMS hash, and ``tray_now`` is deliberately NOT hashed
     (``bambu_mqtt._ams_hash``) — so a seamless auto-switch surfaced there only when the
@@ -1307,10 +1245,14 @@ async def confirm_backup_swaps(
 #
 # A spent stamp is a one-way door. `_mark_tray_spent` deliberately leaves the gram
 # ledger intact so a false stamp is losslessly reversible IN PRINCIPLE, but by operator
-# ruling there is no un-spend LANE: the fix for a false stamp is to stop producing them
-# (D1 above), never to build machinery that clears them. Meanwhile a spent row is
-# hard-excluded from selection (`spool_selection.SlotInventory.spent`) and dropped by
-# `filament_deficit`, so the roll silently leaves service.
+# ruling there is no AUTOMATIC un-spend LANE: the fix for a false stamp is to stop
+# producing them (D1 above), never to build machinery that clears them on its own. The
+# one deliberate exception is operator-ANSWERED and evidence-gated — dismissing the
+# respool prompt (`POST /inventory/spools/{id}/respool-dismiss`) NULLs `spent_at` when
+# the live AMS remain contradicts the stamp, which is a human looking at the tray, not
+# a detector acting alone. Meanwhile a spent row is hard-excluded from selection
+# (`spool_selection.SlotInventory.spent`) and dropped by `filament_deficit`, so the roll
+# silently leaves service.
 #
 # Nothing compared the stamp against the wire. Spools 185 and 205 (printer 12, an H2C
 # with three AMS units behind a dual nozzle) were stamped spent on 2026-07-31 with

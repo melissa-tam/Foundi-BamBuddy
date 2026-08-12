@@ -2587,7 +2587,7 @@ export default {
     respoolAutoEnabled: '重複使用標籤時自動重新綁定',
     respoolAutoEnabledDesc: '關閉（預設）時，當用盡的標籤再次出現，農場會詢問而不是悄悄建立新料卷。僅在重複使用卷芯執行 Bambu 補料時啟用。',
     respoolPromptThreshold: '重新綁定提示閾值 (g)',
-    respoolPromptThresholdHelp: '當來源線軸剩餘不超過這麼多克且沒有硬體確認的用盡標記時，提示重新綁定重複使用的 Bambu 標籤（0–1000）',
+    respoolPromptThresholdHelp: '當重複使用的 Bambu 標籤出現、來源線軸剩餘不超過這麼多克且沒有硬體確認的用盡標記時，記錄一筆重新綁定觀察日誌（0–1000）。僅記錄 — 不會顯示提示。',
     farmUsbAutoCleanup: '儲存滿時自動清理 USB',
     farmUsbAutoCleanupHelp: '當 USB 儲存空間不足發生錯誤時，先自動刪除舊的攝影機錄影，再刪除最早的未使用列印檔案，以確保派發持續進行',
     dispatchResponsiveness: '派發回應速度',

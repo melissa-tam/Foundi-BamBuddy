@@ -2602,7 +2602,7 @@ export default {
     respoolAutoEnabled: 'Automatic re-spool on reused tags',
     respoolAutoEnabledDesc: 'When off (default), the farm prompts instead of silently minting a new spool when a spent tag reappears. Enable only when running Bambu refills on reused cores.',
     respoolPromptThreshold: 'Re-spool prompt threshold (g)',
-    respoolPromptThresholdHelp: 'Prompt to re-spool a reused Bambu tag when the donor spool has this many grams or fewer left and no hardware-certain spent marker (0–1000)',
+    respoolPromptThresholdHelp: 'Log a re-spool observation when a reused Bambu tag arrives with this many grams or fewer left on the donor spool and no hardware-certain spent marker (0–1000). Observation only — no prompt is raised.',
     farmUsbAutoCleanup: 'Auto-clean USB when full',
     farmUsbAutoCleanupHelp: 'On a USB-storage-low fault, automatically delete old camera recordings first, then the oldest unused print files, so dispatch keeps working',
     dispatchResponsiveness: 'Dispatch responsiveness',

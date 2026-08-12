@@ -2589,7 +2589,7 @@ export default {
     respoolAutoEnabled: 'Reasignación automática en etiquetas reutilizadas',
     respoolAutoEnabledDesc: 'Cuando está desactivado (predeterminado), la granja pregunta en lugar de crear silenciosamente una bobina nueva cuando reaparece una etiqueta gastada. Actívalo solo si usas recargas Bambu en núcleos reutilizados.',
     respoolPromptThreshold: 'Umbral de aviso de reasignación (g)',
-    respoolPromptThresholdHelp: 'Avisar para reasignar una etiqueta Bambu reutilizada cuando a la bobina de origen le queden estos gramos o menos y no haya un marcador de agotado verificado por hardware (0–1000)',
+    respoolPromptThresholdHelp: 'Registrar una observación de reasignación cuando llegue una etiqueta Bambu reutilizada y a la bobina de origen le queden estos gramos o menos sin un marcador de agotado verificado por hardware (0–1000). Solo es una observación — no se muestra ningún aviso.',
     farmUsbAutoCleanup: 'Limpiar USB automáticamente cuando esté lleno',
     farmUsbAutoCleanupHelp: 'Ante un fallo por almacenamiento USB lleno, eliminar automáticamente primero las grabaciones antiguas de la cámara y luego los archivos de impresión sin usar más antiguos, para que el despacho siga funcionando',
     dispatchResponsiveness: 'Capacidad de respuesta del despacho',

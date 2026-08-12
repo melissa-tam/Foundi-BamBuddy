@@ -6,6 +6,7 @@ import { api } from '../../api/client';
 import { useFilamentMapping, type LoadedFilament } from '../../hooks/useFilamentMapping';
 import { getGlobalTrayId, isExternalAmsId, effectiveSelectionPolicy, type SelectionOptions } from '../../utils/amsHelpers';
 import { getColorName } from '../../utils/colors';
+import { remainingGrams } from '../../utils/spoolGrams';
 import { InfoHint } from '../ui/InfoHint';
 import { useFilamentLabels } from './useFilamentLabels';
 import type { FilamentMappingProps } from './types';
@@ -129,7 +130,7 @@ export function FilamentMapping({
         map.set(globalTrayId, null);
         continue;
       }
-      map.set(globalTrayId, Math.max(0, Math.round((spool.label_weight ?? 0) - (spool.weight_used ?? 0))));
+      map.set(globalTrayId, Math.round(remainingGrams(spool)));
     }
     return map;
   }, [assignments]);

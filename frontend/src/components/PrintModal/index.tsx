@@ -19,6 +19,7 @@ import { toDateTimeLocalValue, parseUTCDate } from '../../utils/date';
 import { getGlobalTrayId, isExternalAmsId, isPlaceholderDate, effectiveSelectionPolicy, type SelectionOptions } from '../../utils/amsHelpers';
 import { InlineAlert } from '../ui/InlineAlert';
 import { readPrintModalMemory, writePrintModalMemory } from '../../utils/printModalMemory';
+import { remainingGrams } from '../../utils/spoolGrams';
 import { FilamentMapping } from './FilamentMapping';
 import { FilamentOverride } from './FilamentOverride';
 import { PlateSelector } from './PlateSelector';
@@ -761,12 +762,6 @@ export function PrintModal({
       const filamentReqs = effectiveFilamentReqs?.filaments ?? [];
 
       if (filamentReqs.length > 0 && spoolAssignmentsByPrinter.size > 0) {
-        const getRemainingWeight = (labelWeight: number, weightUsed: number) => {
-          if (!Number.isFinite(labelWeight) || labelWeight <= 0) return null;
-          if (!Number.isFinite(weightUsed) || weightUsed < 0) return null;
-          return Math.max(0, labelWeight - weightUsed);
-        };
-
         for (const printerId of selectedPrinters) {
           const printerMapping = getPreviewMappingForPrinter(printerId);
           if (!printerMapping) continue;
@@ -791,15 +786,20 @@ export function PrintModal({
             const spool = assignment?.spool;
             if (!spool) return;
 
-            const remainingGrams = getRemainingWeight(spool.label_weight, spool.weight_used);
-            if (remainingGrams === null) return;
-            if (remainingGrams >= req.used_grams) return;
+            // A roll we cannot price raises no warning — the same fail-open the
+            // former local helper encoded, kept as an explicit guard now that
+            // the arithmetic itself comes from the shared derivation.
+            if (!Number.isFinite(spool.label_weight) || spool.label_weight <= 0) return;
+            if (!Number.isFinite(spool.weight_used) || spool.weight_used < 0) return;
+
+            const remaining = remainingGrams(spool);
+            if (remaining >= req.used_grams) return;
 
             warningItems.push({
               printerName,
               slotLabel: slotLabelByTray.get(globalTrayId) ?? t('printModal.slotFallback', { id: req.slot_id }),
               requiredGrams: req.used_grams,
-              remainingGrams,
+              remainingGrams: remaining,
             });
           });
         }

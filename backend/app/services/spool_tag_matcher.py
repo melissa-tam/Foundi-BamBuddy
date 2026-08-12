@@ -359,6 +359,11 @@ async def find_matching_untagged_spool(db: AsyncSession, tray_data: dict) -> Spo
         .options(selectinload(Spool.k_profiles), selectinload(Spool.assignments))
         .where(
             Spool.archived_at.is_(None),
+            # A spent, untagged, unbound row is a FINISHED roll: a newly-arriving
+            # tag must always land on a DIFFERENT row, because claiming this one
+            # would hand a fresh roll a spent latch (hard-excluded from selection,
+            # and no automatic un-spend lane exists to undo it).
+            Spool.spent_at.is_(None),
             Spool.tag_uid.is_(None),
             Spool.tray_uuid.is_(None),
             ~Spool.assignments.any(),

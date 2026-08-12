@@ -2542,7 +2542,7 @@ export default {
     respoolAutoEnabled: 'Réaffectation automatique sur étiquettes réutilisées',
     respoolAutoEnabledDesc: 'Désactivé (par défaut), la ferme demande au lieu de créer silencieusement une nouvelle bobine quand une étiquette épuisée réapparaît. À activer uniquement si vous utilisez des recharges Bambu sur des noyaux réutilisés.',
     respoolPromptThreshold: 'Seuil d\'invite de réaffectation (g)',
-    respoolPromptThresholdHelp: 'Inviter à réaffecter une étiquette Bambu réutilisée lorsque la bobine d\'origine n\'a plus que ce nombre de grammes ou moins et sans marqueur d\'épuisement certifié matériel (0–1000)',
+    respoolPromptThresholdHelp: 'Consigner une observation de réaffectation lorsqu\'une étiquette Bambu réutilisée arrive alors que la bobine d\'origine n\'a plus que ce nombre de grammes ou moins et sans marqueur d\'épuisement certifié matériel (0–1000). Simple observation — aucune invite n\'est affichée.',
     farmUsbAutoCleanup: 'Nettoyer automatiquement l\'USB lorsqu\'il est plein',
     farmUsbAutoCleanupHelp: 'En cas de défaut de stockage USB plein, supprimer automatiquement d\'abord les anciens enregistrements de la caméra, puis les fichiers d\'impression inutilisés les plus anciens, afin que l\'envoi continue de fonctionner',
     dispatchResponsiveness: 'Réactivité de l\'envoi',

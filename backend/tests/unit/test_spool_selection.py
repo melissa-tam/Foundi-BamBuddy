@@ -6,7 +6,12 @@ guard tying the module constants to ``AppSettings``.
 """
 
 import logging
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from backend.app.models.spool import Spool
 from backend.app.schemas.settings import AppSettings
 from backend.app.services.spool_selection import (
     DEFAULT_MIN_START_SPOOL_G,
@@ -16,6 +21,7 @@ from backend.app.services.spool_selection import (
     START_BLOCK_UNKNOWN_GRAMS,
     MatchOutcome,
     SlotInventory,
+    build_slot_inventory,
     dominant_start_block,
     effective_policy,
     filament_type_of,
@@ -561,6 +567,103 @@ class TestSpentExclusion:
         assert "excluded_oor=[0]" in trace
         assert "excluded_spent=[1]" in trace
         assert "excluded_archived=[2]" in trace
+
+
+class TestRemainingGramsOrigin:
+    """``SlotInventory.remaining_g`` for an internal-inventory slot has ONE origin:
+    :attr:`Spool.remaining_g`, where emptiness is DERIVED from ``spent_at`` rather
+    than written into the gram ledger (``weight_used`` stays raw so the
+    operator-gated un-spend is lossless). The slot-level ``unread`` verdict outranks
+    that number — it speaks for the tray's physical contents, which no row-level
+    figure can. Rows are REAL (transient) ``Spool`` objects so these pin the model's
+    derivation, not a stub's arithmetic."""
+
+    @staticmethod
+    def _db(rows):
+        """Stub AsyncSession whose .execute().scalars().all() yields ``rows``."""
+        scalars = MagicMock()
+        scalars.all.return_value = rows
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=result)
+        return db
+
+    @staticmethod
+    def _internal_mode():
+        return patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False))
+
+    @staticmethod
+    def _assignment(spool, *, ams_id=0, tray_id=0):
+        return MagicMock(ams_id=ams_id, tray_id=tray_id, spool=spool)
+
+    @staticmethod
+    def _spool(*, weight_used, spent_at=None):
+        return Spool(
+            label_weight=1000,
+            weight_used=weight_used,
+            loaded_at=None,
+            first_loaded_at=None,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            feed_fault_at=None,
+            spent_at=spent_at,
+            archived_at=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_spent_row_reads_zero_though_its_ledger_says_positive(self):
+        """A spent row whose ``label_weight - weight_used`` is a healthy 950 g still
+        publishes 0.0: the stamp is the hardware's statement that the roll ran dry,
+        and an under-counted ledger must never present it as printable material.
+        The ``spent`` flag rides separately (it drives the hard exclude)."""
+        spool = self._spool(weight_used=50.0, spent_at=datetime(2026, 8, 1, tzinfo=timezone.utc))
+        loaded = [_loaded(0, tray_id=0)]
+        with self._internal_mode():
+            out = await build_slot_inventory(self._db([self._assignment(spool)]), printer_id=1, loaded=loaded)
+        assert out[0].remaining_g == 0.0
+        assert out[0].spent is True
+        # Storage is untouched — the derivation floors nothing on the row itself.
+        assert spool.weight_used == 50.0
+
+    @pytest.mark.asyncio
+    async def test_unread_slot_outranks_a_spent_row(self):
+        """Precedence: a SEATED-but-unidentified tray publishes ``None``
+        (undetermined) even when the binding it displaced is spent. The wire says a
+        roll is physically there and the farm cannot name it, so neither the ledger
+        figure NOR the derived zero is knowledge about this tray."""
+        spool = self._spool(weight_used=50.0, spent_at=datetime(2026, 8, 1, tzinfo=timezone.utc))
+        loaded = [dict(_loaded(0, tray_id=0), unread=True)]
+        with self._internal_mode():
+            out = await build_slot_inventory(self._db([self._assignment(spool)]), printer_id=1, loaded=loaded)
+        assert out[0].remaining_g is None
+        assert out[0].unread is True
+        assert out[0].spent is True  # the flag still reaches the trace / hard exclude
+
+    @pytest.mark.asyncio
+    async def test_live_row_still_publishes_its_ledger_remaining(self):
+        """The derivation is a spent-only override: a live row publishes the plain
+        ``label_weight - weight_used`` it always did."""
+        loaded = [_loaded(0, tray_id=0)]
+        with self._internal_mode():
+            out = await build_slot_inventory(
+                self._db([self._assignment(self._spool(weight_used=250.0))]), printer_id=1, loaded=loaded
+            )
+        assert out[0].remaining_g == 750.0
+        assert out[0].spent is False
+
+    def test_spent_slot_selection_outcome_unchanged_by_the_zero(self):
+        """Selection is untouched by the derived zero: spent slots are hard-excluded
+        (``excluded_spent``) BEFORE any remaining-grams read, so a spent slot is never
+        a candidate and never a floor-drop — whatever number it publishes."""
+        loaded = [_loaded(0, tray_id=0), _loaded(1, tray_id=1)]
+        for spent_remaining in (0.0, 500.0):
+            inv = {
+                0: SlotInventory(remaining_g=spent_remaining, first_loaded_ord=50.0, spent=True),
+                1: SlotInventory(remaining_g=500.0, first_loaded_ord=100.0),
+            }
+            out = _match([_req()], loaded, policy="first_loaded", inv=inv, min_start_g=150)
+            assert out.mapping == [1]
+            assert out.start_blocked_slots == []
 
     def test_archived_false_default_preserves_behavior(self):
         """archived defaults to False — untouched inventories select as before."""

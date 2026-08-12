@@ -6,6 +6,7 @@ import type { InventorySpool } from '../../api/client';
 import { spoolbuddyApi, api } from '../../api/client';
 import { SpoolIcon } from './SpoolIcon';
 import { spoolColorString } from '../../utils/colors';
+import { remainingGrams } from '../../utils/spoolGrams';
 
 const DEFAULT_CORE_WEIGHT_KEY = 'spoolbuddy-default-core-weight';
 
@@ -79,9 +80,7 @@ export function InventorySpoolInfoCard({
       : grossWeightFromScale
   );
 
-  const inventoryRemaining = Math.round(Math.max(0,
-    (spool.label_weight || 0) - (spool.weight_used || 0)
-  ));
+  const inventoryRemaining = Math.round(remainingGrams(spool));
 
   // Use live scale for remaining/fill only when scale has a meaningful reading.
   const minDynamicScaleReading = 10;
@@ -98,9 +97,7 @@ export function InventorySpoolInfoCard({
     ? (fillPercent > 50 ? '#22c55e' : fillPercent > 20 ? '#eab308' : '#ef4444')
     : '#808080';
 
-  const netWeight = Math.max(0,
-    (spool.label_weight || 0) - (spool.weight_used || 0)
-  );
+  const netWeight = remainingGrams(spool);
   const calculatedWeight = netWeight + coreWeight;
   const difference = grossWeightFromScale !== null ? grossWeightFromScale - calculatedWeight : null;
   const isMatch = difference !== null ? Math.abs(difference) <= 50 : null;

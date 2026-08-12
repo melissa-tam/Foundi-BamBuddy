@@ -4,6 +4,7 @@ import { X } from 'lucide-react';
 import type { InventorySpool } from '../../api/client';
 import { SpoolIcon } from './SpoolIcon';
 import { spoolColorString } from '../../utils/colors';
+import { remainingGrams } from '../../utils/spoolGrams';
 
 interface LinkSpoolModalProps {
   isOpen: boolean;
@@ -118,7 +119,7 @@ export function LinkSpoolModal({
                     </div>
                   </div>
                   <div className="text-sm font-mono text-zinc-500">
-                    {Math.max(0, spool.label_weight - spool.weight_used)}g
+                    {remainingGrams(spool)}g
                   </div>
                 </button>
               ))}

@@ -3430,8 +3430,10 @@ async def run_migrations(conn):
         ("on_foreign_print_paused", "1", "TRUE"),
         # WS3 spent-contradiction detector: a spool stamped SPENT is still seated in
         # its slot reading substantially full on the wire — a false spent stamp, which
-        # is permanent (there is no un-spend lane) and silently removes the roll from
-        # selection. Spools 185/205 sat like that for nine days before anyone noticed.
+        # no AUTOMATIC un-spend lane will ever undo (the one deliberate un-spend is
+        # operator-answered and evidence-gated: dismissing the respool prompt via
+        # POST /inventory/spools/{id}/respool-dismiss) and which silently removes the
+        # roll from selection. Spools 185/205 sat like that for nine days unnoticed.
         ("on_spent_contradiction", "1", "TRUE"),
         # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
         ("on_storage_low", "1", "TRUE"),
@@ -4082,8 +4084,12 @@ async def run_migrations(conn):
     # from selection and a same-roll discovery read concludes KEEP on the spent latch, so
     # the stamp is a closed loop — the slot is blocked FOREVER and no amount of correct
     # code reopens it. WS3 stopped producing these; only a repair clears the ones already
-    # written. There is no un-spend lane by operator ruling, which is precisely why this
-    # is a one-shot bounded repair and not a runtime path.
+    # written. There is no AUTOMATIC un-spend lane by operator ruling — the one deliberate
+    # un-spend is operator-ANSWERED and evidence-gated (dismissing the respool prompt via
+    # POST /inventory/spools/{id}/respool-dismiss NULLs spent_at when the live AMS remain
+    # contradicts the stamp), and it needs a human at a seated tray, which these unattended
+    # rows have no way to summon. That is precisely why this is a one-shot bounded repair
+    # and not a runtime path.
     #
     # BOUND-AND-LOADED is what makes a row functionality-blocking, hence the
     # spool_assignment predicate: an unbound false-spent row is cosmetic history and is

@@ -2587,7 +2587,7 @@ export default {
     respoolAutoEnabled: '重复使用标签时自动重新绑定',
     respoolAutoEnabledDesc: '关闭（默认）时，当用尽的标签再次出现，农场会询问而不是悄悄创建新料卷。仅在重复使用卷芯运行 Bambu 补料时启用。',
     respoolPromptThreshold: '重新绑定提示阈值 (g)',
-    respoolPromptThresholdHelp: '当供体料卷剩余不超过这么多克且没有硬件确认的用尽标记时，提示重新绑定重复使用的 Bambu 标签（0–1000）',
+    respoolPromptThresholdHelp: '当重复使用的 Bambu 标签出现、供体料卷剩余不超过这么多克且没有硬件确认的用尽标记时，记录一条重新绑定观察日志（0–1000）。仅记录 — 不会弹出提示。',
     farmUsbAutoCleanup: '存储满时自动清理 USB',
     farmUsbAutoCleanupHelp: '当 USB 存储空间不足出错时，先自动删除旧的摄像头录像，再删除最早的未使用打印文件，以保证派发继续进行',
     dispatchResponsiveness: '派发响应速度',

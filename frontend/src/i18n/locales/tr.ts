@@ -2590,7 +2590,7 @@ export default {
     respoolAutoEnabled: 'Yeniden kullanılan etiketlerde otomatik yeniden makara',
     respoolAutoEnabledDesc: 'Kapalıyken (varsayılan), tükenmiş bir etiket yeniden göründüğünde sessizce yeni bir makara oluşturmak yerine sorar. Yalnızca yeniden kullanılan çekirdeklerde Bambu dolumları kullanırken etkinleştirin.',
     respoolPromptThreshold: 'Yeniden makara istem eşiği (g)',
-    respoolPromptThresholdHelp: 'Kaynak makarada bu kadar veya daha az gram kaldığında ve donanımla kesinleşmiş tükenme işareti yokken yeniden kullanılan bir Bambu etiketini yeniden makaraya almak için istem göster (0–1000)',
+    respoolPromptThresholdHelp: 'Yeniden kullanılan bir Bambu etiketi geldiğinde kaynak makarada bu kadar veya daha az gram kaldıysa ve donanımla kesinleşmiş tükenme işareti yoksa bir yeniden makara gözlemi günlüğe yazılır (0–1000). Yalnızca gözlem — hiçbir istem gösterilmez.',
     farmUsbAutoCleanup: 'Dolduğunda USB\'yi otomatik temizle',
     farmUsbAutoCleanupHelp: 'USB depolama alanı dolu hatasında önce eski kamera kayıtlarını, ardından en eski kullanılmayan baskı dosyalarını otomatik olarak silerek gönderimin çalışmaya devam etmesini sağlar',
     dispatchResponsiveness: 'Gönderim tepkiselliği',

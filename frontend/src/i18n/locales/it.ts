@@ -2542,7 +2542,7 @@ export default {
     respoolAutoEnabled: 'Riassegnazione automatica su tag riutilizzati',
     respoolAutoEnabledDesc: 'Se disattivato (predefinito), la farm chiede conferma invece di creare silenziosamente una nuova bobina quando ricompare un tag esaurito. Attiva solo se usi ricariche Bambu su anime riutilizzate.',
     respoolPromptThreshold: 'Soglia richiesta riassegnazione (g)',
-    respoolPromptThresholdHelp: 'Richiedi di riassegnare un tag Bambu riutilizzato quando alla bobina di origine restano questi grammi o meno e non c\'è un marcatore di esaurimento certificato dall\'hardware (0–1000)',
+    respoolPromptThresholdHelp: 'Registra un\'osservazione di riassegnazione quando arriva un tag Bambu riutilizzato e alla bobina di origine restano questi grammi o meno senza un marcatore di esaurimento certificato dall\'hardware (0–1000). Solo un\'osservazione — non viene mostrata alcuna richiesta.',
     farmUsbAutoCleanup: 'Pulisci automaticamente l\'USB quando è pieno',
     farmUsbAutoCleanupHelp: 'In caso di errore per spazio USB esaurito, elimina automaticamente prima le vecchie registrazioni della telecamera, poi i file di stampa inutilizzati più vecchi, così l\'invio continua a funzionare',
     dispatchResponsiveness: 'Reattività dell\'invio',
