@@ -35,8 +35,13 @@ class RecoveryEscalation(Base):
     printer_id: Mapped[int] = mapped_column(ForeignKey("printers.id"), index=True, nullable=False)
     # Naive UTC, matching the fork's other timestamp columns (datetime.utcnow()).
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    # The escalation reason token (e.g. "unload_failed", "stuck_reset_failed") —
-    # forensic only; the quarantine decision is count-based, reason-agnostic.
+    # The escalation reason token (e.g. "unload_failed", "stuck_reset_failed"). Every
+    # escalation writes its row — the ledger is the complete forensic record — but the
+    # quarantine COUNT reads only the jam-machine's hardware-suspect reasons
+    # (``spool_recovery._JAM_QUARANTINE_REASONS``), because the quarantine's own
+    # sentence is a diagnosis ("AMS hardware suspected"). A reason-agnostic count said
+    # that about a printer whose AMS took no part in either escalation (003-H2S
+    # 2026-08-11: a morning runout plus an evening external-spool fault).
     reason: Mapped[str] = mapped_column(String(64), nullable=False)
     # The incident's primary HMS short code (e.g. "0700_8010"), or NULL when none.
     code: Mapped[str | None] = mapped_column(String(32), nullable=True)

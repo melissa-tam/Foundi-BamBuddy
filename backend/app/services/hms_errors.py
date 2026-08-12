@@ -1168,11 +1168,17 @@ class ClassifiedAmsFault:
     ``slot`` is the ``(ams_id, tray_id)`` the attr names via :func:`ams_slot_from_attr`,
     and is always ``None`` on the short-code lane — the short form discards the attr
     low byte that carries it.
+    ``external`` marks a fault on the EXTERNAL spool holder rather than inside an AMS
+    (see :data:`_EXTERNAL_UNIT_BYTES`). It is orthogonal to the class — the holder can
+    run out, fail to feed or need hands — and it is always paired with ``slot=None``,
+    because a holder has no AMS slot at all. Consumers use it to route away from every
+    AMS-shaped reaction (no swap, no tray to unload, no slot to send an operator to).
     """
 
     fault_class: AmsFaultClass
     extruder_side: bool
     slot: tuple[int, int] | None
+    external: bool = False
 
 
 # AMS-bearing modules: 0x07 AMS / AMS 2 Pro, 0x12 AMS lite, 0x18 AMS-HT. A code
@@ -1187,6 +1193,15 @@ _AMS_MODULES: frozenset[int] = frozenset({0x07, 0x12, 0x18})
 _TRAY_ATTR_BYTES: frozenset[int] = frozenset({0x20, 0x21, 0x22, 0x23})  # per-slot faults
 _MOTOR_ATTR_BYTES: frozenset[int] = frozenset({0x01, 0x10, 0x11, 0x12, 0x13})  # assist + feeder motors
 _RFID_ATTR_BYTES: frozenset[int] = frozenset({0x30, 0x31, 0x32, 0x33})  # per-slot RFID reader
+
+# The AMS-UNIT byte (``(attr >> 16) & 0xFF``) an EXTERNAL SPOOL HOLDER speaks under.
+# It is not an AMS unit at all: the firmware reuses the unit field to say "this fault
+# is on the spool holder", 0xFF for the (right/main) holder and 0xFE for the second
+# one dual-nozzle hardware carries. Both appear under the AMS module classes (07 and
+# 18), which is why the holder's faults reach an AMS classifier at all — and why
+# :func:`ams_slot_from_attr` fails closed on them (it accepts units 0..7 only), so an
+# external verdict can never carry a slot.
+_EXTERNAL_UNIT_BYTES: frozenset[int] = frozenset({0xFE, 0xFF})
 
 
 @dataclass(frozen=True)
@@ -1327,18 +1342,76 @@ _CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
 }
 
 
+# --- The EXTERNAL-holder code-word table -----------------------------------
+# The SAME code words the AMS table above classifies mean something else entirely
+# under an external unit byte, so the holder gets its own table rather than
+# borrowing rows that were read from AMS-unit catalog text. 003-H2S 2026-08-11 is
+# the proof: ``07FF_2000_0002_0002`` ("External filament is missing") fell through
+# the AMS table's deliberate tray-attr ``None`` for 0x00020002 and classified as
+# nothing at all, so the honest firmware demand was invisible while the follow-up
+# ``07FF_8006`` routed the print into the AMS jam machine.
+#
+# Scoped by the SAME submodule byte the AMS rows use: every row below was read from
+# the ``…2000…`` form, i.e. the holder presents as its unit's first "tray", so
+# :data:`_TRAY_ATTR_BYTES` is the scope and no second literal for 0x20 is minted.
+# The scoping is load-bearing, not decoration — the external unit byte also carries
+# whole families this table must NOT claim (``07FF_8000_0002_0002`` is "The position
+# of left hotend is abnormal during printing", ``07FF_6000_0002_0001`` is "External
+# spool may be tangled or jammed"), and they keep classifying ``None``.
+#
+# Catalog texts quoted verbatim per row (``app/data/hms_error_text_en.json.gz``);
+# the 0xFF variants are quoted, the 0xFE ones carry the same sentence naming the
+# left extruder, and the 18FE/18FF (AMS-HT) forms are byte-identical to the 07 ones.
+_EXTERNAL_CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
+    # -- RUNOUT_EXTERNAL: the holder has nothing to feed ----------------------
+    # "External filament has run out; please load a new filament."
+    0x00020001: (_CodeWordRow(_TRAY_ATTR_BYTES, AmsFaultClass.RUNOUT_EXTERNAL),),
+    # "External filament is missing; please load a new filament." (0xFE: "No
+    # filament was detected in the left extruder from the external spool; please
+    # load the new filament.") — THE 003-H2S code. It is the holder's twin of the
+    # AMS "slot is empty" ask, and unlike that one it HAS a farm consumer: the
+    # external lane holds the print and guides the operator to the holder.
+    0x00020002: (_CodeWordRow(_TRAY_ATTR_BYTES, AmsFaultClass.RUNOUT_EXTERNAL),),
+    # -- PHYSICAL_FAULT: hands at the printer, never a swap -------------------
+    # "Filament remains were detected in the PTFE tube between the Auxiliary
+    # Extruder and the Toolhead. Please refer to the Wiki for removal instructions."
+    0x00020003: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "Please pull the external filament from the extruder."
+    0x00020004: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "Auxiliary extruder feeding failed, possibly due to a clogged filament tube or
+    # worn filament, causing the extruder to slip. Please remove the filament, clear
+    # the tube, trim the worn section, and try again."
+    0x00020009: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # -- INFORMATIONAL --------------------------------------------------------
+    # "Flushing the remaining filament between the Auxiliary Extruder and the
+    # Toolhead. Please wait." An in-progress notice; no farm action.
+    0x00030007: (_CodeWordRow(_TRAY_ATTR_BYTES, _INFO),),
+}
+
+
 @dataclass(frozen=True)
 class _ShortRow:
-    """One classification in the lossy ``MMMM_CCCC`` short-code lane."""
+    """One classification in the lossy ``MMMM_CCCC`` short-code lane.
+
+    ``external`` marks a row whose modules are the EXTERNAL SPOOL HOLDER's — the
+    reason the mixed AMS+external families below are split in two: one fault text,
+    two different pieces of hardware, and only one of them has a tray to swap.
+    """
 
     fault_class: AmsFaultClass
     extruder_side: bool = False
+    external: bool = False
 
 
 _AMS_UNITS: tuple[str, ...] = ("0700", "0701", "0702", "0703", "0704", "0705", "0706", "0707")
 _AMS_HT_UNITS: tuple[str, ...] = ("1800", "1801", "1802")
 _AMS_LITE_UNITS: tuple[str, ...] = ("1200", "1201", "1202", "1203")
-_EXTERNAL_SPOOL: tuple[str, ...] = ("07FF",)
+# The external spool holder's module prefixes under the AMS module class — the short
+# form of :data:`_EXTERNAL_UNIT_BYTES`. BOTH sides: 07FF is the main/right holder and
+# 07FE the second one on dual-nozzle hardware, which carries the same catalog
+# sentences naming the left extruder. One origin — every external row spells the
+# family with this tuple, never a literal pair.
+_EXTERNAL_SPOOL: tuple[str, ...] = ("07FF", "07FE")
 
 # --- The print_error short-code table --------------------------------------
 # ``0700_0001`` is deliberately ABSENT and must never be added: the same low-16
@@ -1367,15 +1440,32 @@ _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
     # and swap triggers since the 2026-08-09 operator-ratified widening (WS2b) —
     # the fault they name is the same obstruction the 8010 family names, one step
     # further along the path.
+    #
+    # SPLIT AMS-vs-EXTERNAL (003-H2S 2026-08-11): one fault text, two different
+    # pieces of hardware. The AMS rows keep feeding the swap machine; the holder's
+    # rows carry ``external`` so recovery routes them to their own escalation — there
+    # is no AMS to unload, no sibling tray to swap to and no slot to blame, and the
+    # incident that proved it invented one, escalated ``jammed_tray_unresolved`` and
+    # quarantined the printer for "AMS hardware".
     # "The AMS failed to send out filament. You can clip the end of your filament
-    # flat, and reinsert…" / external: "Failed to feed the filament outside the AMS…"
-    ((*_AMS_UNITS, *_EXTERNAL_SPOOL), "8005", _ShortRow(_MECHANICAL)),
+    # flat, and reinsert…"
+    ((*_AMS_UNITS,), "8005", _ShortRow(_MECHANICAL)),
+    # external: "Failed to feed the filament outside the AMS. Please clip the end of
+    # the filament flat and check to see if the spool is stuck."
+    (_EXTERNAL_SPOOL, "8005", _ShortRow(_MECHANICAL, external=True)),
     # "Unable to feed filament into the extruder. This could be due to an entangled
-    # filament or a stuck spool…" / external: "Please feed filament into the PTFE
-    # tube until it can not be pushed any farther."
-    ((*_AMS_UNITS, *_EXTERNAL_SPOOL), "8006", _ShortRow(_MECHANICAL)),
+    # filament or a stuck spool…"
+    ((*_AMS_UNITS,), "8006", _ShortRow(_MECHANICAL)),
+    # external: "Please feed filament into the PTFE tube until it can not be pushed
+    # any farther." — the code standing on 003-H2S at the 21:45 PAUSE.
+    (_EXTERNAL_SPOOL, "8006", _ShortRow(_MECHANICAL, external=True)),
     # "Failed to feed filament to the extruder. Check the Assistant for troubleshooting."
-    (("0700", *_EXTERNAL_SPOOL), "8028", _ShortRow(_MECHANICAL)),
+    (("0700",), "8028", _ShortRow(_MECHANICAL)),
+    (_EXTERNAL_SPOOL, "8028", _ShortRow(_MECHANICAL, external=True)),
+    # C006's catalog text is BYTE-IDENTICAL to 8006's ("Please feed filament into the
+    # PTFE tube until it can not be pushed any farther.") — the firmware raises the
+    # C-form as the interactive prompt of the same ask. Twins share a lane.
+    (_EXTERNAL_SPOOL, "C006", _ShortRow(_MECHANICAL, external=True)),
     # -- RUNOUT: an AMS slot ran dry and the print is HELD --------------------
     # "AMS filament ran out. Please insert a new filament into the same AMS slot."
     # / printer-side "Filament ran out. Please load new filament."
@@ -1386,15 +1476,23 @@ _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
     # dual-nozzle H2 ("connected to the left / right extruder") / "The filament on
     # external spool has run out…". Never spent-stamps (no AMS slot to attribute)
     # and never swaps (there is no sibling tray to swap to).
-    ((*_EXTERNAL_SPOOL, "18FE", "18FF"), "8011", _ShortRow(AmsFaultClass.RUNOUT_EXTERNAL)),
-    (("0300",), "8015", _ShortRow(AmsFaultClass.RUNOUT_EXTERNAL)),
+    ((*_EXTERNAL_SPOOL, "18FE", "18FF"), "8011", _ShortRow(AmsFaultClass.RUNOUT_EXTERNAL, external=True)),
+    # The printer-module form of the same statement — it names the external spool in
+    # so many words, so it is external whatever module reports it.
+    (("0300",), "8015", _ShortRow(AmsFaultClass.RUNOUT_EXTERNAL, external=True)),
     # -- PHYSICAL_FAULT: needs physical work — never auto-recovered -----------
     # "Failed to pull out the filament from the extruder. This might be caused by
     # clogged extruder or filament broken inside the extruder."
-    ((*_AMS_UNITS, *_EXTERNAL_SPOOL), "8003", _ShortRow(_PHYSICAL)),
+    ((*_AMS_UNITS,), "8003", _ShortRow(_PHYSICAL)),
+    # external: "Please pull out the filament on the spool holder. If this message
+    # persists, please check to see if there is filament broken in the extruder."
+    (_EXTERNAL_SPOOL, "8003", _ShortRow(_PHYSICAL, external=True)),
     # "AMS failed to pull back filament. This could be due to a stuck spool or the
     # end of the filament being stuck in the path."
-    ((*_AMS_UNITS, *_EXTERNAL_SPOOL), "8004", _ShortRow(_PHYSICAL)),
+    ((*_AMS_UNITS,), "8004", _ShortRow(_PHYSICAL)),
+    # external: "Failed to pull back the filament from the toolhead to AMS. Please
+    # check whether the filament or the spool is stuck."
+    (_EXTERNAL_SPOOL, "8004", _ShortRow(_PHYSICAL, external=True)),
     # "Extruding filament failed. The extruder might be clogged."
     ((*_AMS_UNITS,), "8007", _ShortRow(_PHYSICAL)),
     # "Timeout purging old filament: Please check if the filament is stuck or the
@@ -1413,8 +1511,8 @@ _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
     # The manual-clearing asks the firmware raises for the external spool path:
     # "Please manually and slowly pull out the filament from the extruder…" /
     # "Press the black PTFE tube coupler and unplug the PTFE tube…"
-    (("07FF", "07FE"), "C011", _ShortRow(_PHYSICAL)),
-    (("07FF", "07FE"), "C012", _ShortRow(_PHYSICAL)),
+    (_EXTERNAL_SPOOL, "C011", _ShortRow(_PHYSICAL, external=True)),
+    (_EXTERNAL_SPOOL, "C012", _ShortRow(_PHYSICAL, external=True)),
     # -- RFID_READ ------------------------------------------------------------
     # "Failed to read the filament information." Names the AMS unit but NO slot.
     ((*_AMS_UNITS,), "4025", _ShortRow(_RFID)),
@@ -1513,10 +1611,18 @@ def classify_ams_fault(attr: int, code: int) -> ClassifiedAmsFault | None:
     submodule is owned by a dedicated decoder (the runout demand and the auto-switch
     spent evidence; see the table's header). ``None`` routes the fault to the generic
     notify lane; it never means "benign".
+
+    The AMS-UNIT byte picks the TABLE. An external spool holder (
+    :data:`_EXTERNAL_UNIT_BYTES`) is not an AMS unit and its code words say something
+    else entirely, so it is read from :data:`_EXTERNAL_CODE_WORD_TAXONOMY` alone —
+    borrowing an AMS row for it is what made ``07FF_2000_0002_0002`` invisible on
+    003-H2S. Every external verdict carries ``external=True`` and ``slot=None`` (a
+    holder has no slot, which :func:`ams_slot_from_attr` already enforces).
     """
     if (attr >> 24) & 0xFF not in _AMS_MODULES:
         return None
-    rows = _CODE_WORD_TAXONOMY.get(code)
+    external = (attr >> 16) & 0xFF in _EXTERNAL_UNIT_BYTES
+    rows = (_EXTERNAL_CODE_WORD_TAXONOMY if external else _CODE_WORD_TAXONOMY).get(code)
     if not rows:
         return None
     attr_byte = (attr >> 8) & 0xFF
@@ -1526,6 +1632,7 @@ def classify_ams_fault(attr: int, code: int) -> ClassifiedAmsFault | None:
                 fault_class=row.fault_class,
                 extruder_side=row.extruder_side,
                 slot=ams_slot_from_attr(attr),
+                external=external,
             )
     return None
 
@@ -1537,11 +1644,21 @@ def classify_short_code(short: str) -> ClassifiedAmsFault | None:
     discarded the attr low byte, so ``slot`` is always ``None`` and any code word
     whose meaning depends on its submodule is unclassifiable here (which is why
     ``0700_0001`` has no row — see the table's header).
+
+    ``external`` survives the lossy form intact: the short code keeps the whole
+    MODULE group (``07FF``/``07FE`` vs ``0700``…), which is the very field that says
+    "spool holder, not AMS" — so the split families classify to the right hardware
+    here even though the slot is gone.
     """
     row = _SHORT_CODE_TAXONOMY.get(short.upper())
     if row is None:
         return None
-    return ClassifiedAmsFault(fault_class=row.fault_class, extruder_side=row.extruder_side, slot=None)
+    return ClassifiedAmsFault(
+        fault_class=row.fault_class,
+        extruder_side=row.extruder_side,
+        slot=None,
+        external=row.external,
+    )
 
 
 def classify_hms_entry(e) -> ClassifiedAmsFault | None:
@@ -1610,6 +1727,14 @@ def current_runout_demand(hms_list) -> tuple[int, int] | None:
     [slot-1 auto-switched, slot-3 demand, bare 8011] → slot 3; at 13:51 a slot-2
     demand had been appended → slot 2.
 
+    EXTERNAL demands are deliberately NOT decoded here, even though the holder's
+    runout shares the ``0x00020001`` code word: an external holder has no AMS slot,
+    so :func:`ams_slot_from_attr` fails closed on its unit byte and this decoder
+    correctly answers ``None``. Nothing is missing — the external lane does not want
+    a slot. It watches CLASS MEMBERSHIP instead (``RUNOUT_EXTERNAL`` codes appearing
+    and disappearing on the wire, ``spool_recovery.note_demand_watch``), which is the
+    same auto-resume spawn the AMS lane reaches through a demand edge.
+
     Pure decode over any HMSError-shaped sequence (``.attr`` + ``.code``, the same
     shapes :func:`runout_slot_from_hms` consumers pass). A malformed entry is
     skipped, never raised — this runs inside MQTT callbacks (invariant 10).
@@ -1639,6 +1764,12 @@ def runout_hold_active(state) -> bool:
     * a runout code standing in ``hms_errors`` — either the slot-agnostic
       "insert into the SAME slot" family (``RUNOUT_HMS_CODES``) or any
       slot-attributed DEMAND (:func:`current_runout_demand`).
+
+    Both legs are AMS-SLOT vocabulary by design, so an EXTERNAL-holder runout is
+    deliberately not a "runout hold" here: this predicate exists to gate AMS writes
+    (the ``/ams/load`` 409, the refill auto-resume's slot reasoning) and a holder
+    fault neither blocks nor names one. The external lane holds through its own
+    incident and its own class-membership watch instead.
 
     Wire-proven in this state (006-H2S 2026-07-26, matching the 2026-07-19
     cross-slot finding): a load command produces NO AMS motion, LATCHES in firmware,

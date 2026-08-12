@@ -66,10 +66,19 @@ def _reset_state() -> None:
 def _slot_desc(incident: PrinterIncident) -> str | None:
     """Human slot name for the incident's fault, or ``None`` when it names none.
 
-    ``"external"`` for an external-spool runout: those name no AMS slot by nature
-    (:func:`hms_errors.runout_external_short_codes`), and rendering "unknown" for a
-    fault whose location IS known — the spool holder — would read as a farm failure
-    to attribute rather than the fact it is.
+    ``"external"`` for ANY fault on the external spool holder: those name no AMS slot
+    by nature, and rendering "unknown" for a fault whose location IS known — the
+    spool holder — would read as a farm failure to attribute rather than the fact it
+    is.
+
+    Externality is read from the taxonomy's own ``external`` verdict over the
+    incident's durable ``code`` (doctrine invariant 1: one origin — the classifier
+    decides what hardware a code names, never a second test here). It is deliberately
+    NOT the ``runout_external`` CLASS: since 2026-08-11 the holder speaks in every
+    class it can — a runout, a feed fault (``07FF_8006``) and a physical fault
+    (``07FF_8003``) — and a class test rendered the chip for the first of those only,
+    leaving an external feed fault looking like a jam whose tray the farm had failed
+    to identify. That is precisely the misreading the 003-H2S incident acted on.
     """
     if incident.slot_global_tray is not None:
         # Function-level import: spool_recovery imports THIS module at module level,
@@ -81,7 +90,7 @@ def _slot_desc(incident: PrinterIncident) -> str | None:
     from backend.app.services.hms_errors import classify_short_code
 
     verdict = classify_short_code(incident.code or "")
-    if verdict is not None and verdict.fault_class.value == "runout_external":
+    if verdict is not None and verdict.external:
         return "external"
     return None
 

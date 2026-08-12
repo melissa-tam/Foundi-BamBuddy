@@ -129,7 +129,6 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer_incident import (
     KIND_JAM,
@@ -262,6 +261,12 @@ WAITING_REASON_RUNOUT = "filament_runout_recovery_failed"
 # HOLDER has to be replaced — and the AMS copy ("refill the AMS slot") sends the
 # operator to a tray that never fed this print.
 WAITING_REASON_EXTERNAL_RUNOUT = "external_spool_runout"
+# An EXTERNAL-spool FEED fault (003-H2S 2026-08-11). The jam token is wrong here in
+# the same way the AMS runout copy is wrong for an external runout: it promises a
+# swap machine that has nothing to swap — no AMS, no sibling tray, no slot. The fix
+# is at the holder ("feed filament into the PTFE tube until it can not be pushed any
+# farther", which is literally what the firmware is asking).
+WAITING_REASON_EXTERNAL_FEED = "external_feed_fault"
 # A PHYSICAL filament fault (broken filament, clogged extruder, failed pull-back).
 # Distinct from both: there is no swap to attempt and no slot to refill — the copy
 # must send the operator to the printer rather than to the spool inventory.
@@ -269,13 +274,16 @@ WAITING_REASON_PHYSICAL = "spool_physical_fault"
 
 # The tokens THIS module owns. A hold that resolves clears only these — an
 # unrelated hold another owner stamped (plate vision, low filament, a stagger wait)
-# must survive a resume the recovery lane happened to observe.
+# must survive a resume the recovery lane happened to observe. ``farm_stall``
+# derives its ATTENDED-pause set from this one, so a token missing here would let
+# the pause-stall watchdog double-escalate a hold that already alerted.
 RECOVERY_WAITING_REASONS: frozenset[str] = frozenset(
     {
         WAITING_REASON_RECOVERING,
         WAITING_REASON_FAILED,
         WAITING_REASON_RUNOUT,
         WAITING_REASON_EXTERNAL_RUNOUT,
+        WAITING_REASON_EXTERNAL_FEED,
         WAITING_REASON_PHYSICAL,
     }
 )
@@ -289,17 +297,31 @@ _WAITING_REASON_BY_KIND: dict[str, str] = {
 }
 
 
+# The EXTERNAL overrides of the table above, by kind. ``external`` never changes
+# WHAT happened (the kind does that) — it changes WHERE the operator must go, and
+# only for the kinds whose AMS copy names a place that does not exist on a spool
+# holder. ``physical`` is deliberately absent: "a broken filament / a clog, go to the
+# printer" is already the right instruction on either hardware, so it keeps its one
+# token rather than minting a synonym.
+_EXTERNAL_WAITING_REASON_BY_KIND: dict[str, str] = {
+    KIND_RUNOUT: WAITING_REASON_EXTERNAL_RUNOUT,
+    KIND_JAM: WAITING_REASON_EXTERNAL_FEED,
+}
+
+
 def waiting_reason_for(kind: str, *, external: bool) -> str:
     """The hold token this incident projects onto a farm queue unit.
 
-    ``external`` splits the one kind whose OPERATOR INSTRUCTION differs from its
-    kind: an external-spool runout is a ``runout`` incident in every other respect
-    (same hold, same guidance lane, same dual-evidence auto-resume) but has no AMS
-    slot to send anyone to. It is the only splitter — the class that sets it
-    (``RUNOUT_EXTERNAL``) maps to no other kind.
+    ``external`` splits the kinds whose OPERATOR INSTRUCTION differs from their kind
+    on the spool holder. An external-spool runout is a ``runout`` incident in every
+    other respect (same hold, same guidance lane, same dual-evidence auto-resume) but
+    has no AMS slot to send anyone to; an external FEED fault is a ``jam`` incident
+    that no swap machine will ever touch (003-H2S 2026-08-11 — the jam token promised
+    exactly the swap the incident could not perform). A ``physical`` fault reads the
+    same on both, so it keeps one token.
     """
     if external:
-        return WAITING_REASON_EXTERNAL_RUNOUT
+        return _EXTERNAL_WAITING_REASON_BY_KIND.get(kind, _WAITING_REASON_BY_KIND.get(kind, WAITING_REASON_FAILED))
     return _WAITING_REASON_BY_KIND.get(kind, WAITING_REASON_FAILED)
 
 
@@ -413,6 +435,15 @@ _ESCALATE_DETAIL: dict[str, str] = {
         "The EXTERNAL spool holder ran out — there is no AMS slot to swap to. Load new filament on the "
         "spool holder and resume on the printer."
     ),
+    # 003-H2S 2026-08-11: this fault used to enter the AMS jam machine, invent a
+    # jammed tray it could not find, escalate "jammed_tray_unresolved" and quarantine
+    # the printer for AMS hardware — while the actual hardware involved was a spool
+    # holder with nothing loaded on it.
+    "external_feed_fault": (
+        "The EXTERNAL spool path failed to feed — check the spool and filament on the holder, feed filament "
+        "into the PTFE tube if asked, then resume on the printer. No AMS is involved and no swap will be "
+        "attempted."
+    ),
 }
 
 
@@ -458,14 +489,17 @@ class FaultCandidate:
 
     The tuple the entry gate reasons over: WHAT kind of fault (``fault_class``),
     WHICH code names it (``short_code`` — what the notifications say), WHERE it is
-    (``slot``, only the attr-aware ``hms[]`` lane can supply one) and whether the
-    EXTRUDER is the common factor.
+    (``slot``, only the attr-aware ``hms[]`` lane can supply one), whether the
+    EXTRUDER is the common factor, and whether the hardware is the EXTERNAL spool
+    holder rather than an AMS (``external``, straight from the taxonomy's verdict —
+    never re-derived from the code string here, doctrine invariant 1).
     """
 
     fault_class: AmsFaultClass
     short_code: str
     slot: tuple[int, int] | None
     extruder_side: bool
+    external: bool = False
 
 
 @dataclass(frozen=True)
@@ -490,7 +524,9 @@ class RecoveryIncident:
     settings: RecoverySettings
     jammed_global_tray: int | None
     kind: str
-    # True for an EXTERNAL-spool runout: no AMS slot, no sibling tray, different copy.
+    # True when the deciding fault is on the EXTERNAL spool holder (any class): no
+    # AMS slot, no sibling tray, no swap machine, different operator copy. Carried
+    # from the taxonomy verdict of the PRIMARY candidate, never re-derived.
     external: bool
     # True when EVERY mechanical-feed code is extruder-side (main extruder
     # overloaded). A re-jam then keeps the replacement in rotation — the extruder,
@@ -582,6 +618,48 @@ _stuck_resets: dict[tuple[int, str], int] = {}
 # not (009-H2S 2026-07-20: three same-fault escalations across the day).
 _JAM_QUARANTINE_WINDOW_H = 24
 _JAM_QUARANTINE_THRESHOLD = 2
+
+# WHICH escalations may count toward that quarantine — an ALLOWLIST, because the
+# quarantine's own sentence is a DIAGNOSIS ("AMS hardware suspected (buffer/feeder)")
+# and only the jam machine's own hardware-suspect outcomes are evidence for it.
+# 003-H2S 2026-08-11 proved a count over ALL reasons is a different statement from
+# the one it prints: the morning's filament RUNOUT plus an evening EXTERNAL-spool
+# fault reached 2-in-24h and quarantined a printer whose AMS was never involved in
+# either. Every escalation still records its row — the ledger is forensic and stays
+# complete; this governs only what the counter reads.
+#
+# COUNTS — the swap machine tried, or refused to try, and the filament PATH is the
+# suspect (buffer / feeder / PTFE / the tray it could not name):
+_JAM_QUARANTINE_REASONS: frozenset[str] = frozenset(
+    {
+        "jammed_tray_unresolved",  # a mechanical fault whose feeder no witness could name
+        "feed_path_blocked",  # clean unloads every round and still nothing would feed
+        "unload_failed",  # the AMS ignored the unload and the reset did not free it
+        "stuck_reset_failed",  # wedged mid filament-change, unresponsive to the firmware reset
+        "repeated_jams",  # recovered repeatedly this job and the fault keeps returning
+        "candidates_exhausted",  # every replacement loaded and none held a stable resume
+        "candidate_loads_failed",  # eligible spools were found and none of them would load
+    }
+)
+
+# NEVER COUNTS — everything whose cause is a consumable, the inventory, a lockout,
+# the JOB's shape, the external holder, or a restart artifact. Enumerated rather than
+# derived so a NEW reason token cannot join the count by default: the partition is
+# mirrored against ``_ESCALATE_DETAIL`` by test, and an unclassified token fails it.
+_NON_QUARANTINE_REASONS: frozenset[str] = frozenset(
+    {
+        "runout_needs_refill",  # a roll ran out — a consumable, not hardware (the 003-H2S row #1)
+        "external_spool_runout",  # the spool HOLDER ran out; no AMS took part
+        "external_feed_fault",  # the external feed path failed; no AMS took part
+        "physical_fault",  # breakage / clog / failed pull-back — hands, but not a buffer/feeder jam
+        "multi_feeder_job",  # the JOB's shape refused the swap; the AMS is fine
+        "no_eligible_spool",  # inventory: nothing to swap to, no load was ever attempted
+        "only_low_spools_in_protected_layers",  # inventory + the grams floor
+        "only_near_empty_spools",  # inventory: every match is effectively empty
+        "ams_drying",  # a lockout the farm declined to fight; the AMS is healthy
+        "recovery_interrupted",  # a restart artifact — kind-ambiguous, evidence of nothing
+    }
+)
 
 
 def _reset_state() -> None:
@@ -766,6 +844,7 @@ def live_candidates(state) -> frozenset[FaultCandidate]:
                 short_code=short,
                 slot=verdict.slot,
                 extruder_side=verdict.extruder_side,
+                external=verdict.external,
             )
         )
     return frozenset(out)
@@ -893,18 +972,28 @@ async def _read_settings(db: AsyncSession) -> RecoverySettings:
 
 
 async def _resolve_farm_item(db: AsyncSession, printer_id: int, job_id: str) -> PrintQueueItem | None:
-    """The printing FARM queue item whose dispatch_subtask_id matches the live
-    subtask id (farm-dispatched only — a foreign/local print never matches).
-    Mirrors farm_correlation's id-equality + farm-batch predicate."""
+    """The printing queue item this job IS, by dispatch id — or ``None`` (foreign).
+
+    The SAME predicate ``farm_correlation`` resolves a terminal with: this printer, a
+    ``printing`` row, ``dispatch_subtask_id`` equality, newest-first. The id is minted
+    per dispatch and stamped on EVERY dispatched item, so equality alone is the whole
+    identity test — a print the farm did not dispatch cannot match one, whatever else
+    is true about it.
+
+    003-H2S 2026-08-11: this used to add a ``print_batch`` join plus
+    ``sku_file_id IS NOT NULL`` on top, which no other id consumer applies. A farm
+    item started from a plain file (no SKU) therefore resolved ``None``, and its own
+    incident was logged, alerted and notified as **foreign** — no waiting_reason
+    projection on the unit the operator was watching, and no dispatch evidence for
+    the feeder resolution that needed it. Origin is what the id says it is.
+    """
     if not job_id:
         return None
     result = await db.execute(
         select(PrintQueueItem)
-        .join(PrintBatch, PrintQueueItem.batch_id == PrintBatch.id)
         .where(PrintQueueItem.printer_id == printer_id)
         .where(PrintQueueItem.status == "printing")
         .where(PrintQueueItem.dispatch_subtask_id == job_id)
-        .where(PrintBatch.sku_file_id.is_not(None))
         .order_by(PrintQueueItem.started_at.desc())
         .limit(1)
     )
@@ -935,8 +1024,10 @@ def _resolve_fault_tray(
 
     Ordering by kind, strongest evidence first:
 
-    * EXTERNAL runout — there is no AMS slot at all, and inventing one from the
-      mapping would send the operator to a tray that never fed this print.
+    * EXTERNAL (any class) — there is no AMS slot at all, and inventing one from the
+      mapping would send the operator to a tray that never fed this print. 003-H2S
+      2026-08-11 is the jam-class proof: the swap machine took the printer's live
+      feeder for the "jammed tray" of a fault that happened on the spool holder.
     * RUNOUT — the firmware's own CURRENT DEMAND, then the slot its attr named, then
       the wire-first resolution below. 006-H2S 2026-07-26: mapping ``[0]``,
       ``tray_now`` 255 and a standing ``0700_2200_0002_0001`` demand for slot 3 — the
@@ -1112,6 +1203,7 @@ async def _route_fault(
     printer_id: int,
     job_id: str,
     kind: str,
+    external: bool,
     verdict: str,
     tray: int | None,
 ) -> str | None:
@@ -1136,6 +1228,14 @@ async def _route_fault(
         # A runout holds for a same-slot refill; the driver escalates it after
         # confirming the PAUSE, and the guidance/auto-resume lanes take it from there.
         return None
+    if external:
+        # A feed fault on the EXTERNAL spool holder. Decided BEFORE any jam-machine
+        # question is asked, because every one of them presumes an AMS: there is no
+        # tray to resolve (so ``jammed_tray_unresolved`` would be a lie about a fault
+        # whose location is perfectly well known), nothing to unload, nothing to swap
+        # to, and no spool to take out of rotation. 003-H2S 2026-08-11 asked them all
+        # anyway and answered with the printer's own quarantine.
+        return "external_feed_fault"
     if verdict == "multi_feeder":
         return "multi_feeder_job"
     if tray is None:
@@ -1193,8 +1293,14 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
         if fault_class is None:  # pragma: no cover — non-empty candidates always decide
             return None
         kind = _KIND_BY_CLASS[fault_class]
-        external = fault_class is AmsFaultClass.RUNOUT_EXTERNAL
         primary = _primary_candidate(candidates, fault_class)
+        # The HARDWARE the deciding fault sits on, taken from the taxonomy's verdict
+        # for the very candidate whose code the operator is told about — so the copy,
+        # the routing and the message can never name different hardware. When AMS and
+        # external faults stand together, ``_primary_candidate``'s lowest-short-code
+        # order picks the AMS one (``0700_…`` < ``07FF_…``), which is correct: a real
+        # AMS fault beside a holder fault is still an AMS fault to recover.
+        external = primary.external if primary is not None else False
         code = primary.short_code if primary is not None else ""
 
         from backend.app.core.database import async_session
@@ -1237,7 +1343,7 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 item, state, kind=kind, external=external, candidates=candidates, printer_id=printer_id
             )
             escalate_reason = await _route_fault(
-                db, printer_id=printer_id, job_id=job_id, kind=kind, verdict=verdict, tray=tray
+                db, printer_id=printer_id, job_id=job_id, kind=kind, external=external, verdict=verdict, tray=tray
             )
 
             row = await printer_incidents.open_new(
@@ -2626,10 +2732,19 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
 
 async def _record_escalation_and_maybe_quarantine(db: AsyncSession, incident: RecoveryIncident, reason: str) -> None:
     """Record one durable ``recovery_escalation`` row, then quarantine the printer
-    when it has crossed :data:`_JAM_QUARANTINE_THRESHOLD` escalations within
-    :data:`_JAM_QUARANTINE_WINDOW_H` hours — a recurring AMS jam is hardware (buffer
-    / feeder), not a spool the swap machine can fix. Counting from the durable
-    ledger survives the restarts the in-memory latch cannot.
+    when its JAM-MACHINE escalations have crossed :data:`_JAM_QUARANTINE_THRESHOLD`
+    within :data:`_JAM_QUARANTINE_WINDOW_H` hours — a recurring AMS jam is hardware
+    (buffer / feeder), not a spool the swap machine can fix. Counting from the
+    durable ledger survives the restarts the in-memory latch cannot.
+
+    EVERY escalation records its row: the ledger is the forensic record of every
+    give-up and stays complete. The COUNT reads only :data:`_JAM_QUARANTINE_REASONS`,
+    and the trigger additionally requires THIS escalation to be one of them — so a
+    printer is quarantined for repeated jams only by repeated jams, and an
+    allowlisted row can never be tipped over the threshold by unrelated history.
+    003-H2S 2026-08-11: a 05:49 filament runout and a 21:45 external-spool fault made
+    "Repeated AMS jam escalations (2 in 24h) — AMS hardware suspected" about a
+    printer whose AMS had not been part of either fault.
 
     Called from :func:`_escalate` only — an operator takeover (:func:`_abort`)
     deliberately records nothing. Best-effort: any failure here must NOT break the
@@ -2656,6 +2771,11 @@ async def _record_escalation_and_maybe_quarantine(db: AsyncSession, incident: Re
         )
         await db.commit()
 
+        if reason not in _JAM_QUARANTINE_REASONS:
+            # Recorded, never counted — and it cannot tip an earlier jam over the
+            # threshold either, since the trigger is THIS escalation's own reason.
+            return
+
         window_start = now - timedelta(hours=_JAM_QUARANTINE_WINDOW_H)
         count = int(
             await db.scalar(
@@ -2663,6 +2783,7 @@ async def _record_escalation_and_maybe_quarantine(db: AsyncSession, incident: Re
                 .select_from(RecoveryEscalation)
                 .where(RecoveryEscalation.printer_id == incident.printer_id)
                 .where(RecoveryEscalation.created_at >= window_start)
+                .where(RecoveryEscalation.reason.in_(_JAM_QUARANTINE_REASONS))
             )
             or 0
         )
@@ -2926,8 +3047,8 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
                 escalate_reason = "recovery_interrupted"
             else:
                 kind = _KIND_BY_CLASS[fault_class]
-                external = fault_class is AmsFaultClass.RUNOUT_EXTERNAL
                 primary = _primary_candidate(candidates, fault_class)
+                external = primary.external if primary is not None else False
                 code = primary.short_code if primary is not None else row.code
                 # The LIVE fingerprint, not the stored one: it is what an aborted
                 # close must bar and what the wire sampler re-arms, and the two would
@@ -2937,7 +3058,7 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
                     item, state, kind=kind, external=external, candidates=candidates, printer_id=printer_id
                 )
                 escalate_reason = await _route_fault(
-                    db, printer_id=printer_id, job_id=job_id, kind=kind, verdict=verdict, tray=tray
+                    db, printer_id=printer_id, job_id=job_id, kind=kind, external=external, verdict=verdict, tray=tray
                 )
             printer = await db.get(Printer, printer_id)
             printer_name = (printer.name if printer else None) or f"printer {printer_id}"
@@ -3256,8 +3377,15 @@ def note_demand_watch(printer_id: int, state) -> None:
     * while PAUSEd, the DEMAND disappearing → :func:`_resume_after_refill` for the
       slot that was demanded (the firmware answered "filament is back");
     * while PAUSEd, an EXTERNAL-runout code disappearing → the same, with no slot.
-      The demand decoder covers AMS slots only, so the external lane watches its own
-      code: no code, no runout.
+      The demand decoder covers AMS slots only, so the external lane watches CLASS
+      MEMBERSHIP instead: no ``runout_external`` code standing, no runout.
+
+    That watch is scoped to the runout CLASS on purpose, not to "external faults".
+    An external FEED fault (``external_feed_fault``) is an interactive firmware
+    prompt — "feed filament into the PTFE tube until it can not be pushed any
+    farther", answered ON the printer — so its code clearing means the operator is
+    mid-dialogue, not that the print may be driven from here. Those resolve the
+    ordinary way: an observed RUNNING transition (above) or the job's terminal.
 
     Never raises (invariant 10) and never touches the DB — every spawned lane
     re-checks its own gates against durable state.
@@ -3268,6 +3396,8 @@ def note_demand_watch(printer_id: int, state) -> None:
         demand = current_runout_demand(hms_list)
         # Classified ONCE — this runs at ~1 Hz per printer.
         candidates = live_candidates(state)
+        # The RUNOUT class only — an external feed fault is a firmware dialogue the
+        # farm must not double-drive (see the docstring).
         externals = frozenset(c.short_code for c in candidates if c.fault_class is AmsFaultClass.RUNOUT_EXTERNAL)
         prev = _wire_sample.get(printer_id)
         _wire_sample[printer_id] = (live, demand, externals)

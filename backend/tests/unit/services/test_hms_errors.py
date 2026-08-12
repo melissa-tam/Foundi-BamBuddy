@@ -566,25 +566,59 @@ _SWAP_8010_MODULES = (
 # this IS the jam-swap machine's trigger vocabulary — the WS2a ``legacy_swap`` marker
 # that held the machine at the 8010/801E subset was scaffolding for a
 # behavior-neutral relocation and was deleted by the consumer wave that widened it.
+# The EXTERNAL spool holder's module prefixes. BOTH sides since 2026-08-11: 07FF is
+# the main/right holder and 07FE the second one dual-nozzle hardware carries, and the
+# catalog gives 07FE the same sentences naming the left extruder.
+_EXTERNAL_HOLDER_MODULES = ("07FF", "07FE")
+
 _EXPECTED_MECHANICAL = (
     _family(_SWAP_8010_MODULES, "8010")
     | {"0300_801E"}
-    | _family((*_AMS_UNIT_MODULES, "07FF"), "8005")
-    | _family((*_AMS_UNIT_MODULES, "07FF"), "8006")
-    | {"0700_8028", "07FF_8028"}
+    | _family(_AMS_UNIT_MODULES, "8005")
+    | _family(_AMS_UNIT_MODULES, "8006")
+    | {"0700_8028"}
+    # The external holder's own feed family — same fault text, different hardware, so
+    # they are SEPARATE rows carrying external=True (003-H2S 2026-08-11). C006 rides
+    # with them: its catalog text is byte-identical to 8006's.
+    | _family(_EXTERNAL_HOLDER_MODULES, "8005")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8006")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8028")
+    | _family(_EXTERNAL_HOLDER_MODULES, "C006")
 )
 _EXPECTED_RUNOUT = _family(_AMS_UNIT_MODULES, "8011") | {"0300_8004"}
-_EXPECTED_RUNOUT_EXTERNAL = {"07FF_8011", "18FE_8011", "18FF_8011", "0300_8015"}
+_EXPECTED_RUNOUT_EXTERNAL = _family(_EXTERNAL_HOLDER_MODULES, "8011") | {"18FE_8011", "18FF_8011", "0300_8015"}
 _EXPECTED_PHYSICAL = (
-    _family((*_AMS_UNIT_MODULES, "07FF"), "8003")
-    | _family((*_AMS_UNIT_MODULES, "07FF"), "8004")
+    _family(_AMS_UNIT_MODULES, "8003")
+    | _family(_AMS_UNIT_MODULES, "8004")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8003")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8004")
     | _family(_AMS_UNIT_MODULES, "8007")
     | {"0700_8013", "0700_8016", "0300_801A", "0300_801C", "0300_8016", "0300_4006"}
-    | {"07FF_C011", "07FE_C011", "07FF_C012", "07FE_C012"}
+    | _family(_EXTERNAL_HOLDER_MODULES, "C011")
+    | _family(_EXTERNAL_HOLDER_MODULES, "C012")
 )
 _EXPECTED_RFID = _family(_AMS_UNIT_MODULES, "4025")
 _EXPECTED_INFORMATIONAL = _family(_AMS_UNIT_MODULES, "0025")
 _EXPECTED_EXTRUDER_SIDE = {"0300_801E"}
+
+# Every short code whose verdict must carry ``external=True`` — the spool HOLDER's
+# hardware, whatever the class. Written out independently of the module's tables so a
+# row that quietly loses (or gains) the flag fails this pin: the flag is what keeps an
+# external fault out of the AMS jam machine, the tray resolver and the quarantine.
+_EXPECTED_EXTERNAL = (
+    _family(_EXTERNAL_HOLDER_MODULES, "8003")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8004")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8005")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8006")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8011")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8028")
+    | _family(_EXTERNAL_HOLDER_MODULES, "C006")
+    | _family(_EXTERNAL_HOLDER_MODULES, "C011")
+    | _family(_EXTERNAL_HOLDER_MODULES, "C012")
+    # The AMS-HT holders and the printer-module form of "the external spool has run
+    # out" — the same hardware named by other modules.
+    | {"18FE_8011", "18FF_8011", "0300_8015"}
+)
 
 _EXPECTED_SHORT_CLASSES = {
     "mechanical_feed": _EXPECTED_MECHANICAL,
@@ -708,6 +742,8 @@ class TestAmsFaultTaxonomyShortLane:
         assert verdict.extruder_side is (short in _EXPECTED_EXTRUDER_SIDE)
         # The short form discarded the attr low byte, so it can never name a slot.
         assert verdict.slot is None
+        # …but it KEPT the module group, which is what says "spool holder, not AMS".
+        assert verdict.external is (short in _EXPECTED_EXTERNAL), short
 
     def test_the_table_holds_no_unpinned_row(self):
         from backend.app.services.hms_errors import _SHORT_CODE_TAXONOMY
@@ -875,6 +911,122 @@ class TestAmsFaultTaxonomyCollisionPins:
         assert classify_ams_fault(_tray_attr(), 0x00020025).fault_class.value == "informational"
         assert classify_short_code("0700_0025").fault_class.value == "informational"
         assert "0700_0025" not in mechanical_feed_short_codes()
+
+
+def _external_attr(unit_byte: int = 0xFF, submodule: int = 0x20, module: int = 0x07) -> int:
+    """An EXTERNAL spool-holder attr — the ``07FF_2000`` / ``07FE_2000`` shape."""
+    return (module << 24) | (unit_byte << 16) | (submodule << 8)
+
+
+class TestExternalHolderCodeWordLane:
+    """003-H2S 2026-08-11: the holder's own code words were invisible.
+
+    ``07FF_2000_0002_0002`` ("External filament is missing") hit the AMS table's
+    deliberate tray-attr ``None`` for that code word and classified as nothing, so the
+    honest firmware demand raised no incident at all — while the follow-up
+    ``07FF_8006`` classified mechanical_feed and drove the print into the AMS jam
+    machine, which invented a jammed tray, escalated and quarantined the printer.
+    """
+
+    @pytest.mark.parametrize("code_word", [0x00020001, 0x00020002])
+    @pytest.mark.parametrize("unit_byte", [0xFF, 0xFE])
+    def test_the_holder_runout_words_classify_external(self, code_word, unit_byte):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        verdict = classify_ams_fault(_external_attr(unit_byte), code_word)
+        assert verdict is not None
+        assert verdict.fault_class.value == "runout_external"
+        assert verdict.external is True
+        # A holder has no AMS slot — the decode must never invent one.
+        assert verdict.slot is None
+
+    def test_the_ams_tray_meaning_of_the_same_word_is_still_none(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        # "AMS A Slot 1 is empty; please insert a new filament." — an empty-slot ASK
+        # no farm machine consumes. The external lane must not have changed it.
+        assert classify_ams_fault(_tray_attr(), 0x00020002) is None
+        assert classify_ams_fault(_tray_attr(), 0x00020001) is None
+
+    def test_the_ams_ht_holder_speaks_the_same_words(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        # 18FF/18FE carry the byte-identical catalog sentences.
+        verdict = classify_ams_fault(_external_attr(0xFF, module=0x18), 0x00020002)
+        assert verdict.fault_class.value == "runout_external" and verdict.external is True
+
+    def test_a_holder_submodule_outside_the_table_is_none(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        # The unit byte alone must NOT claim a code word: under 0x80 the SAME
+        # 0x00020002 is "The position of left hotend is abnormal during printing",
+        # and under 0x60 the same 0x00020001 is "External spool may be tangled or
+        # jammed" — neither is a runout, and reading them as one would hold a print
+        # for filament that is not missing.
+        assert classify_ams_fault(_external_attr(submodule=0x80), 0x00020002) is None
+        assert classify_ams_fault(_external_attr(submodule=0x60), 0x00020001) is None
+
+    def test_the_holders_physical_words_stay_physical(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        # "Filament remains were detected in the PTFE tube…" / "Please pull the
+        # external filament from the extruder." / "Auxiliary extruder feeding failed…"
+        for code_word in (0x00020003, 0x00020004, 0x00020009):
+            verdict = classify_ams_fault(_external_attr(), code_word)
+            assert verdict.fault_class.value == "physical_fault", hex(code_word)
+            assert verdict.external is True and verdict.slot is None
+
+    def test_a_non_ams_module_holder_attr_is_never_classified(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        # The module gate still comes first: 0x05 is the mainboard, not an AMS.
+        assert classify_ams_fault(_external_attr(module=0x05), 0x00020002) is None
+
+
+class TestExternalHolderShortLane:
+    """The split families: one fault text, two pieces of hardware, two rows."""
+
+    @pytest.mark.parametrize("holder", ["07FF", "07FE"])
+    @pytest.mark.parametrize("suffix", ["8005", "8006", "8028", "C006"])
+    def test_the_holder_feed_family_is_mechanical_and_external(self, holder, suffix):
+        from backend.app.services.hms_errors import classify_short_code
+
+        verdict = classify_short_code(f"{holder}_{suffix}")
+        assert verdict is not None
+        assert verdict.fault_class.value == "mechanical_feed"
+        assert verdict.external is True
+
+    def test_the_ams_side_of_the_same_family_is_not_external(self):
+        from backend.app.services.hms_errors import classify_short_code
+
+        for suffix in ("8005", "8006", "8028"):
+            verdict = classify_short_code(f"0700_{suffix}")
+            assert verdict.fault_class.value == "mechanical_feed"
+            assert verdict.external is False, suffix
+
+    def test_c006_shares_8006s_lane_because_the_text_is_identical(self):
+        from backend.app.services.hms_errors import classify_short_code, get_error_description
+
+        # "Please feed filament into the PTFE tube until it can not be pushed any
+        # farther." — byte-identical in the vendored catalog, so the two are twins.
+        assert get_error_description("07FF_C006") == get_error_description("07FF_8006")
+        assert classify_short_code("07FF_C006") == classify_short_code("07FF_8006")
+
+    def test_the_holder_runout_rows_are_external(self):
+        from backend.app.services.hms_errors import classify_short_code
+
+        for short in ("07FF_8011", "07FE_8011", "18FF_8011", "18FE_8011", "0300_8015"):
+            verdict = classify_short_code(short)
+            assert verdict.fault_class.value == "runout_external"
+            assert verdict.external is True, short
+
+    def test_the_runout_hms_codes_membership_is_untouched(self):
+        """The external lane must not have widened the AMS-slot runout vocabulary —
+        that set gates the spent-evidence and hold lanes."""
+        from backend.app.services.hms_errors import RUNOUT_HMS_CODES
+
+        assert RUNOUT_HMS_CODES == _OLD_RUNOUT_HMS_CODES_LITERAL
+        assert not any(short.startswith(("07FF", "07FE")) for short in RUNOUT_HMS_CODES)
 
 
 class TestHmsErrorsImportGraph:

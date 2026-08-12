@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.app.models.printer_incident import (
     KIND_JAM,
+    KIND_PHYSICAL,
     KIND_RUNOUT,
     RESOLVE_OBSERVED_RUNNING,
     STATUS_ABORTED,
@@ -199,6 +200,33 @@ class TestSnapshotProjection:
     async def test_a_jam_names_no_slot(self, db_session, printer_factory):
         printer = await printer_factory()
         await _open(db_session, printer.id, kind=KIND_JAM, code="0700_8010", codes="mechanical_feed:0700_8010")
+        assert printer_incidents.snapshot(printer.id)["slot_desc"] is None
+
+    async def test_an_external_feed_fault_reads_external_too(self, db_session, printer_factory):
+        """003-H2S 2026-08-11: the holder speaks in more than one class. A FEED fault
+        on it (``07FF_8006``, incident kind ``jam``) names no AMS slot for exactly the
+        same reason its runout does, so the chip must say so — a bare "jam" with no
+        slot reads as "the farm could not identify the tray", which is the misreading
+        that sent this incident into the swap machine in the first place."""
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_JAM, code="07FF_8006", codes="mechanical_feed:07FF_8006")
+
+        assert printer_incidents.snapshot(printer.id)["slot_desc"] == "external"
+
+    async def test_an_external_physical_fault_reads_external_too(self, db_session, printer_factory):
+        """The third class the holder speaks in ("Please pull out the filament on the
+        spool holder")."""
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_PHYSICAL, code="07FF_8003", codes="physical_fault:07FF_8003")
+
+        assert printer_incidents.snapshot(printer.id)["slot_desc"] == "external"
+
+    async def test_an_ams_physical_fault_names_no_external_holder(self, db_session, printer_factory):
+        """The liveness half: the marker must follow the HARDWARE, not the absence of
+        a slot. An AMS-side fault with no slot attribution stays unnamed."""
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_PHYSICAL, code="0700_8003", codes="physical_fault:0700_8003")
+
         assert printer_incidents.snapshot(printer.id)["slot_desc"] is None
 
     async def test_snapshot_is_none_without_a_printer_id(self):
