@@ -6,14 +6,8 @@ import { api, type InventorySpool, type PrinterStatus, type AMSTray } from '../.
 import { ConfirmModal } from '../ConfirmModal';
 import { AmsUnitCard, NozzleBadge } from './AmsUnitCard';
 import type { AmsThresholds } from './AmsUnitCard';
-import { getFillBarColor } from '../../utils/amsHelpers';
+import { formatAmsUnitName, getFillBarColor } from '../../utils/amsHelpers';
 import { getSwatchStyle } from '../../utils/colors';
-
-function getAmsName(id: number): string {
-  if (id <= 3) return `AMS ${String.fromCharCode(65 + id)}`;
-  if (id >= 128 && id <= 135) return `AMS HT ${String.fromCharCode(65 + id - 128)}`;
-  return `AMS ${id}`;
-}
 
 function isTrayEmpty(tray: AMSTray): boolean {
   return !tray.tray_type || tray.tray_type === '';
@@ -247,8 +241,8 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
   }, [amsUnits, vtTrays]);
 
   const getSlotLocationLabel = useCallback((amsId: number, trayId: number): string => {
-    if (amsId <= 3) return `${getAmsName(amsId)} ${t('ams.slot', 'Slot')} ${trayId + 1}`;
-    if (amsId >= 128 && amsId <= 135) return getAmsName(amsId);
+    if (amsId <= 3) return `${formatAmsUnitName(amsId)} ${t('ams.slot', 'Slot')} ${trayId + 1}`;
+    if (amsId >= 128 && amsId <= 135) return formatAmsUnitName(amsId);
     if (amsId === 254) return t('printers.extL', 'Ext-L');
     return isDualNozzle ? t('printers.extR', 'Ext-R') : t('printers.ext', 'Ext');
   }, [t, isDualNozzle]);
@@ -328,7 +322,7 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
       const amsFill = tray.remain != null && tray.remain >= 0 ? tray.remain : null;
       const resolvedInvFill = (invFill === 0 && amsFill !== null && amsFill > 0) ? null : invFill;
       items.push({
-        key: `ht-${unit.id}`, label: getAmsName(unit.id),
+        key: `ht-${unit.id}`, label: formatAmsUnitName(unit.id),
         amsId: unit.id, trayId: 0, tray, isEmpty: isTrayEmpty(tray),
         nozzleSide: getNozzleSide(unit.id),
         effectiveFill: resolvedInvFill ?? amsFill,

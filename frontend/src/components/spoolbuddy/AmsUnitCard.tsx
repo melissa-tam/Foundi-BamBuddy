@@ -1,6 +1,6 @@
 import { useTranslation } from 'react-i18next';
 import type { AMSUnit, AMSTray } from '../../api/client';
-import { getEmptySlotKind, getFillBarColor } from '../../utils/amsHelpers';
+import { formatAmsUnitName, getEmptySlotKind, getFillBarColor } from '../../utils/amsHelpers';
 
 function trayColorToCSS(color: string | null): string {
   if (!color) return '#808080';
@@ -9,12 +9,6 @@ function trayColorToCSS(color: string | null): string {
 
 function isTrayEmpty(tray: AMSTray): boolean {
   return !tray.tray_type || tray.tray_type === '';
-}
-
-function getAmsName(id: number): string {
-  if (id <= 3) return `AMS ${String.fromCharCode(65 + id)}`;
-  if (id >= 128 && id <= 135) return `AMS HT ${String.fromCharCode(65 + id - 128)}`;
-  return `AMS ${id}`;
 }
 
 // --- SVG Icons (matching PrintersPage Bambu Lab style) ---
@@ -275,7 +269,7 @@ export function AmsUnitCard({ unit, activeSlot, onConfigureSlot, isDualNozzle, n
       {/* Header */}
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-1.5">
-          <span className="text-white font-medium text-base">{getAmsName(unit.id)}</span>
+          <span className="text-white font-medium text-base">{formatAmsUnitName(unit.id)}</span>
           {isDualNozzle && nozzleSide && (
             <NozzleBadge side={nozzleSide} />
           )}

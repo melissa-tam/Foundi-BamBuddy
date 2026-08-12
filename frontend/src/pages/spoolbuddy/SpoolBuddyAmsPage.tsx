@@ -6,7 +6,7 @@ import { Layers, Settings2, Package, PackagePlus, RefreshCw, Unlink, Link2, X } 
 import type { SpoolBuddyOutletContext } from '../../components/spoolbuddy/SpoolBuddyLayout';
 import { api } from '../../api/client';
 import type { PrinterStatus, AMSTray, SpoolAssignment, RespoolPromptMessage, TaglessFreshPromptMessage } from '../../api/client';
-import { getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, formatSlotLabel, isBambuLabSpool } from '../../utils/amsHelpers';
+import { getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, formatSlotLabel, formatAmsUnitName, isBambuLabSpool } from '../../utils/amsHelpers';
 import { getSwatchStyle } from '../../utils/colors';
 import { mapModelCode } from '../../utils/printerModels';
 import { AmsUnitCard, HumidityIndicator, TemperatureIndicator, NozzleBadge } from '../../components/spoolbuddy/AmsUnitCard';
@@ -17,12 +17,6 @@ import { LinkSpoolModal } from '../../components/LinkSpoolModal';
 import { RespoolTagModal } from '../../components/RespoolTagModal';
 import { TaglessFreshModal } from '../../components/TaglessFreshModal';
 import { useToast } from '../../contexts/ToastContext';
-
-function getAmsName(amsId: number): string {
-  if (amsId <= 3) return `AMS ${String.fromCharCode(65 + amsId)}`;
-  if (amsId >= 128 && amsId <= 135) return `AMS HT ${String.fromCharCode(65 + amsId - 128)}`;
-  return `AMS ${amsId}`;
-}
 
 function isTrayEmpty(tray: AMSTray): boolean {
   return !tray.tray_type || tray.tray_type === '';
@@ -384,7 +378,7 @@ export function SpoolBuddyAmsPage() {
       extruderId: isDualNozzle ? extruderId : undefined,
       caliIdx: tray?.cali_idx,
       savedPresetId: slotPreset?.preset_id,
-      location: `${getAmsName(amsId)} Slot ${trayId + 1}`,
+      location: `${formatAmsUnitName(amsId)} Slot ${trayId + 1}`,
     };
 
     setSlotActionPicker(slotData);
@@ -550,7 +544,7 @@ export function SpoolBuddyAmsPage() {
       const resolvedInvFill = (invFill === 0 && amsFill !== null && amsFill > 0) ? null : invFill;
       items.push({
         key: `ht-${unit.id}`,
-        label: getAmsName(unit.id),
+        label: formatAmsUnitName(unit.id),
         tray,
         isEmpty: isTrayEmpty(tray),
         isActive: getActiveSlotForAms(unit.id) === 0,

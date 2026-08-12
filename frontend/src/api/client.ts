@@ -3037,23 +3037,24 @@ export interface TaglessFreshPromptMessage {
   rgba: string | null;
 }
 
-/** WS `slot_standing_unknown` payload — a tray has held a spool the AMS cannot
- *  read for long enough that it is no longer a transient read miss (004-H2S sat
- *  like that for a day while the UI drew an empty slot). Drives a transient
- *  warning toast only: unlike the respool / tagless-fresh prompts there is no
- *  durable state, no dequeue and no dismissal to sync — it is a nudge to go look
- *  at the printer, and the slot itself renders the standing state. */
+/** WS `slot_standing_unknown` payload — a binding whose slot presence has not
+ *  resolved either way (unknown, or asserted-empty with the binding still live)
+ *  after the paced evidence-ask ladder ran out of asks, so the farm can no
+ *  longer confirm the bound spool is in that slot. Single emitter: the
+ *  bound-presence escalation in `spool_tagless`, once per episode. Drives a
+ *  transient warning toast only: unlike the respool / tagless-fresh prompts
+ *  there is no durable state, no dequeue and no dismissal to sync — it is a
+ *  nudge to go look at the printer, and the slot itself renders the standing
+ *  state. */
 export interface SlotStandingUnknownMessage {
   printer_id: number;
   printer_name?: string | null;
   ams_id: number;
   tray_id: number;
-  /** WHICH standing condition raised it: `standing_unknown` = an owed identity read the
-   *  wire keeps refusing; `bound_presence_unknown` = a binding whose slot presence has
-   *  stopped being checkable (unknown, or asserted-empty with the binding still live).
-   *  Optional because the toast is deliberately case-agnostic today — one nudge to go
-   *  look at the printer either way. */
-  case?: 'standing_unknown' | 'bound_presence_unknown';
+  /** WHICH standing condition raised it. Only one exists — the owed-identity-read
+   *  case was demoted to a log line (operator ruling 2026-08-11) — but the
+   *  discriminator stays on the wire so a future case cannot arrive unlabelled. */
+  case?: 'bound_presence_unknown';
 }
 
 /** `GET /inventory/prompts/pending` — every operator question that is still

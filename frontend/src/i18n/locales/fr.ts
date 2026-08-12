@@ -5000,7 +5000,7 @@ export default {
     slotStateUnknown: 'État de l’emplacement inconnu — l’imprimante n’a pas indiqué si une bobine s’y trouve',
     slotStateUnknownShort: 'Inconnu',
     slotPresentUnread: 'Bobine présente — non reconnue',
-    slotStandingUnknown: "{{printer}} : l'emplacement {{slot}} contient une bobine que l'AMS ne peut pas lire — à vérifier",
+    slotBoundPresenceUnknown: "{{printer}} : l'emplacement {{slot}} de {{ams}} ne répond pas — impossible de confirmer que la bobine associée s'y trouve toujours. Vérifiez l'emplacement.",
     outOfRotation: 'Hors rotation — bourrage de bobine détecté ; réinsérez la bobine ou effacez l\'indicateur pour la réutiliser',
     outOfRotationShort: 'Hors rotation',
     emptySlotBinding: {

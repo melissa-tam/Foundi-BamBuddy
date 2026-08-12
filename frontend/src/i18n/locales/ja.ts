@@ -5011,7 +5011,7 @@ export default {
     slotStateUnknown: 'スロットの状態は不明です — スプールが入っているかどうかプリンターから報告がありません',
     slotStateUnknownShort: '不明',
     slotPresentUnread: 'スプールあり — 認識できません',
-    slotStandingUnknown: '{{printer}}: スロット {{slot}} に AMS が読み取れないスプールがあります — 確認してください',
+    slotBoundPresenceUnknown: '{{printer}}: {{ams}} スロット {{slot}} が応答しません — 割り当てられたスプールがまだあるか確認できません。スロットを確認してください',
     outOfRotation: 'ローテーション外 — スプール詰まりを検出。スプールを再挿入するかフラグを解除すると再利用できます',
     outOfRotationShort: 'ローテーション外',
     emptySlotBinding: {

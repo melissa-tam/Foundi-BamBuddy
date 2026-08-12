@@ -4803,7 +4803,7 @@ export default {
     slotStateUnknown: '슬롯 상태 알 수 없음 — 프린터가 스풀이 들어 있는지 보고하지 않았습니다',
     slotStateUnknownShort: '알 수 없음',
     slotPresentUnread: '스풀 있음 — 인식되지 않음',
-    slotStandingUnknown: '{{printer}}: 슬롯 {{slot}}에 AMS가 읽을 수 없는 스풀이 있습니다 — 확인하세요',
+    slotBoundPresenceUnknown: '{{printer}}: {{ams}} 슬롯 {{slot}}이(가) 응답하지 않습니다 — 할당된 스풀이 아직 있는지 확인할 수 없습니다. 슬롯을 확인하세요',
     outOfRotation: '로테이션 제외 — 스풀 걸림 감지됨. 스풀을 다시 삽입하거나 플래그를 해제하면 다시 사용할 수 있습니다',
     outOfRotationShort: '로테이션 제외',
     emptySlotBinding: {

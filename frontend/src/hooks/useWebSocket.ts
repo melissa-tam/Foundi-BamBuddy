@@ -15,6 +15,7 @@ import {
   type TaglessFreshPromptMessage,
   type SlotStandingUnknownMessage,
 } from '../api/client';
+import { formatAmsUnitName } from '../utils/amsHelpers';
 import { inventoryLocationsQueryKey } from '../utils/inventoryQueries';
 
 interface WebSocketMessage {
@@ -588,15 +589,20 @@ export function useWebSocket() {
       }
 
       case 'slot_standing_unknown': {
-        // A tray has held a spool the AMS can't read past the point where it
-        // could still be a transient read miss. Deliberately a plain transient
-        // warning toast, NOT a durable prompt lane: nothing to answer, nothing
-        // to dequeue — the slot itself renders the standing state, this is only
-        // the nudge to go look at the printer.
+        // ONE emitter: the bound-presence escalation ladder in spool_tagless —
+        // a slot with a bound spool whose presence won't resolve (unknown, or
+        // asserted-empty with the binding still live) fires this once per
+        // episode, at the THIRD unanswered evidence ask. So it means "the farm
+        // has genuinely asked and the wire won't answer", which is worth eyes.
+        // Deliberately still a plain transient warning toast, NOT a durable
+        // prompt lane: nothing to answer, nothing to dequeue — the slot itself
+        // renders the standing state, this is only the nudge to go look. The
+        // AMS unit is named because a multi-AMS printer has several slot 4s.
         const m = message as unknown as SlotStandingUnknownMessage;
         showToast(
-          t('ams.slotStandingUnknown', {
+          t('ams.slotBoundPresenceUnknown', {
             printer: m.printer_name || `Printer ${m.printer_id}`,
+            ams: formatAmsUnitName(m.ams_id ?? 0),
             slot: (m.tray_id ?? 0) + 1,
           }),
           'warning',

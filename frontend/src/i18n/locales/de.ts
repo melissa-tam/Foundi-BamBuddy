@@ -5011,7 +5011,7 @@ export default {
     slotStateUnknown: 'Fachstatus unbekannt — der Drucker hat nicht gemeldet, ob eine Spule darin liegt',
     slotStateUnknownShort: 'Unbekannt',
     slotPresentUnread: 'Spule vorhanden — nicht erkannt',
-    slotStandingUnknown: '{{printer}}: In Slot {{slot}} liegt eine Spule, die das AMS nicht lesen kann — bitte prüfen',
+    slotBoundPresenceUnknown: '{{printer}}: {{ams}} Slot {{slot}} antwortet nicht — die zugewiesene Spule lässt sich dort nicht bestätigen. Bitte prüfen Sie den Slot.',
     outOfRotation: 'Aus der Rotation — Spulenstau erkannt; Spule erneut einlegen oder Markierung löschen, um sie wiederzuverwenden',
     outOfRotationShort: 'Aus der Rotation',
     emptySlotBinding: {

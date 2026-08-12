@@ -2210,11 +2210,20 @@ class TestTerminalRemainRefresh:
         assert ams_presence._read_occasion_open(1, 0, 0) is False  # the read consumed it
 
 
-class TestStandingUnknownBroadcast:
-    """D5 (2026-08-07): ``_warn_owed_read_blocked`` only ever logged, so a slot whose
-    identity had been unknown for six hours produced nothing the operator could see. It
-    now also broadcasts, on the same bus and behind the SAME 1/hour/slot dedup — one
-    hourly signal, never a per-pass toast storm."""
+class TestOwedReadIsLogOnly:
+    """The blocked owed read is a LOG RECORD, never a toast (operator ruling 2026-08-11).
+
+    D5 (2026-08-07) had this lane broadcast ``slot_standing_unknown`` beside its WARN, on
+    the reasoning that a log line is invisible to the person who can fix the slot. Prod
+    disproved the premise: 79 of 80 firings in the week to 2026-08-11 carried the
+    "printer is mid-job" blocker, which is exactly the state nobody can act on — the
+    discovery read physically cannot run until the printer idles, and it drains by itself
+    when it does. The operator surfaces for the physical event behind it (a roll swapped
+    mid-print) are the tagless fresh-roll prompt and the slot's own seated-unread render.
+
+    The WS event itself survives with ONE emitter, spool_tagless's bound-presence
+    escalation — pinned end to end in test_spool_tagless_reconcile.py and
+    test_release_liveness.py, so this demotion cannot silence that lane unnoticed."""
 
     def _client(self):
         client = MagicMock()
@@ -2223,46 +2232,67 @@ class TestStandingUnknownBroadcast:
         client.ams_refresh_tray.return_value = (True, "ok")
         return client
 
-    async def _defer(self, db_session, monkeypatch, printer_id):
-        state = _pstate([_tray(0, state=11)], gcode_state="IDLE", tray_now=1)  # filament engaged
+    async def _defer(self, db_session, monkeypatch, printer_id, *, gcode_state="IDLE", tray_now=1):
+        # Defaults: idle printer, filament engaged (tray_now != 255). gcode_state="RUNNING"
+        # with tray_now=255 selects the OTHER blocker, the mid-job one the ruling is about.
+        state = _pstate([_tray(0, state=11)], gcode_state=gcode_state, tray_now=tray_now)
         _patch_pm(monkeypatch, status=state, client=self._client())
         return await ams_presence.maybe_command_owed_identify(db_session, printer_id, 0, 0, _tray(0, state=11), state)
 
-    async def test_broadcasts_once_per_dedup_window_with_the_payload_shape(
-        self, db_session, printer_factory, monkeypatch
+    @pytest.mark.parametrize(
+        ("blocker", "kwargs"),
+        [
+            ("printer is mid-job", {"gcode_state": "RUNNING", "tray_now": 255}),
+            ("filament engaged", {"gcode_state": "IDLE", "tray_now": 1}),
+        ],
+    )
+    async def test_a_blocked_read_warns_and_broadcasts_nothing(
+        self, db_session, printer_factory, monkeypatch, caplog, blocker, kwargs
     ):
         printer = await printer_factory(name="007-H2C")
         ws = AsyncMock()
         monkeypatch.setattr(ams_presence.ws_manager, "broadcast", ws)
         _arm_cycle(printer.id, 0, 0, age=ams_presence._OWED_READ_WARN_AFTER_S + 60)
 
-        assert await self._defer(db_session, monkeypatch, printer.id) is False
-        assert ws.await_count == 1
-        assert ws.call_args.args[0] == {
-            "type": "slot_standing_unknown",
-            "printer_id": printer.id,
-            "printer_name": "007-H2C",
-            "ams_id": 0,
-            "tray_id": 0,
-            # WHAT is unresolved: this lane's owed identity read. The bound-presence
-            # lane sends "bound_presence_unknown" on the same event and the same
-            # per-slot dedup, so the toast can word itself for either.
-            "case": "standing_unknown",
-        }
+        with caplog.at_level(logging.DEBUG, logger="backend.app.services.ams_presence"):
+            assert await self._defer(db_session, monkeypatch, printer.id, **kwargs) is False
 
-        # Same slot again inside the re-warn window → still deferred, still silent.
-        await self._defer(db_session, monkeypatch, printer.id)
-        assert ws.await_count == 1
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "identity unknown" in warnings[0].getMessage()
+        assert blocker in warnings[0].getMessage()
+        ws.assert_not_awaited()
 
-    async def test_a_recent_cycle_broadcasts_nothing(self, db_session, printer_factory, monkeypatch):
+    async def test_the_warn_still_paces_hourly_and_still_never_toasts(
+        self, db_session, printer_factory, monkeypatch, caplog
+    ):
+        # The demotion touched the toast only: _owed_read_warned_at keeps the record to one
+        # line per slot per _OWED_READ_REWARN_S, so a permanently-blocked slot never becomes
+        # the log's own noise.
+        printer = await printer_factory()
+        ws = AsyncMock()
+        monkeypatch.setattr(ams_presence.ws_manager, "broadcast", ws)
+        _arm_cycle(printer.id, 0, 0, age=ams_presence._OWED_READ_WARN_AFTER_S + 60)
+
+        with caplog.at_level(logging.DEBUG, logger="backend.app.services.ams_presence"):
+            for _ in range(3):
+                assert await self._defer(db_session, monkeypatch, printer.id) is False
+
+        assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+        ws.assert_not_awaited()
+
+    async def test_a_recent_cycle_neither_warns_nor_broadcasts(self, db_session, printer_factory, monkeypatch, caplog):
         # Below _OWED_READ_WARN_AFTER_S the defer is ordinary pacing — the next terminal
-        # drains it, and the operator has nothing to do.
+        # drains it, and there is nothing to record either way.
         printer = await printer_factory()
         ws = AsyncMock()
         monkeypatch.setattr(ams_presence.ws_manager, "broadcast", ws)
         _arm_cycle(printer.id, 0, 0, age=5)
 
-        assert await self._defer(db_session, monkeypatch, printer.id) is False
+        with caplog.at_level(logging.DEBUG, logger="backend.app.services.ams_presence"):
+            assert await self._defer(db_session, monkeypatch, printer.id) is False
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         ws.assert_not_awaited()
 
 

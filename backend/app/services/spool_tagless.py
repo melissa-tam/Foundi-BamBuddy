@@ -252,8 +252,10 @@ _PRESENCE_ASK_INTERVAL_S: float = 3600.0
 
 # The ask at which the farm stops asking the PRINTER quietly and tells the OPERATOR. The
 # machine has now had every chance the ladder above allows; past this the unresolved slot
-# is a human's problem, and it is raised exactly once per episode (the toast's own per-slot
-# dedup then spaces any repeat).
+# is a human's problem, and it is raised exactly once per episode. This rung IS the toast's
+# pacing (since 2026-08-11 this lane is the event's only emitter and it carries no dedup of
+# its own): reaching it costs a full ladder, so two successive episodes on one slot are
+# ≥85 min apart.
 _PRESENCE_ASK_ESCALATE_AT: int = len(_PRESENCE_ASK_GAPS_S) + 1
 
 # Settle delay before the farm may publish a filament IDENTITY into a slot. A spool

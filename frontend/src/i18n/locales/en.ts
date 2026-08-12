@@ -5037,7 +5037,7 @@ export default {
     slotStateUnknown: 'Slot state unknown — the printer has not reported whether a spool is in it',
     slotStateUnknownShort: 'Unknown',
     slotPresentUnread: 'Spool present — unrecognized',
-    slotStandingUnknown: "{{printer}}: slot {{slot}} has a spool the AMS can't read — check it",
+    slotBoundPresenceUnknown: "{{printer}}: {{ams}} slot {{slot}} isn't answering — can't confirm the bound spool is still there. Check the slot.",
     outOfRotation: 'Out of rotation — spool jam detected; re-insert the spool or clear the flag to reuse it',
     outOfRotationShort: 'Out of rotation',
     emptySlotBinding: {

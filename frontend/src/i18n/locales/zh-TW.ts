@@ -4999,7 +4999,7 @@ export default {
     slotStateUnknown: '料槽狀態未知 — 印表機未回報其中是否有料卷',
     slotStateUnknownShort: '未知',
     slotPresentUnread: '有料卷 — 無法識別',
-    slotStandingUnknown: '{{printer}}: 槽位 {{slot}} 中有 AMS 無法讀取的料卷 — 請檢查',
+    slotBoundPresenceUnknown: '{{printer}}: {{ams}} 槽位 {{slot}} 無回應 — 無法確認已綁定的料卷是否仍在其中，請檢查該槽位',
     outOfRotation: '已移出輪替 — 偵測到料卷卡料；重新插入料卷或清除標記即可再次使用',
     outOfRotationShort: '已移出輪替',
     emptySlotBinding: {

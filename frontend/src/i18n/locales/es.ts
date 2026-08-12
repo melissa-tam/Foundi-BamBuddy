@@ -5019,7 +5019,7 @@ export default {
     slotStateUnknown: 'Estado de la ranura desconocido — la impresora no ha informado si hay una bobina dentro',
     slotStateUnknownShort: 'Desconocido',
     slotPresentUnread: 'Bobina presente — no reconocida',
-    slotStandingUnknown: '{{printer}}: la ranura {{slot}} tiene una bobina que el AMS no puede leer — revísala',
+    slotBoundPresenceUnknown: '{{printer}}: la ranura {{slot}} de {{ams}} no responde — no se puede confirmar que la bobina asignada siga ahí. Revisa la ranura.',
     outOfRotation: 'Fuera de rotación — atasco de bobina detectado; vuelve a insertar la bobina o borra la marca para reutilizarla',
     outOfRotationShort: 'Fuera de rotación',
     emptySlotBinding: {

@@ -49,6 +49,20 @@ export function getAmsLabel(amsId: number | string, trayCount: number): string {
 }
 
 /**
+ * AMS unit NAME in the spelled-out convention: "AMS A" for the regular units
+ * (ids 0-3), "AMS HT A" for AMS-HT modules (ids 128-135), and a bare
+ * "AMS {id}" for anything outside both ranges. Unlike `getAmsLabel` — the
+ * compact "AMS-A"/"HT-A" chip form, which needs `trayCount` to tell the two
+ * families apart — this derives the family from the id range alone, so it is
+ * the form usable where only the id is on hand (WS payloads, toasts).
+ */
+export function formatAmsUnitName(amsId: number): string {
+  if (amsId <= 3) return `AMS ${String.fromCharCode(65 + amsId)}`;
+  if (amsId >= 128 && amsId <= 135) return `AMS HT ${String.fromCharCode(65 + amsId - 128)}`;
+  return `AMS ${amsId}`;
+}
+
+/**
  * Filament type equivalence groups.
  * Types within the same group are interchangeable on the printer side
  * (e.g., Bambu Lab firmware treats PA-CF and PA12-CF as compatible).

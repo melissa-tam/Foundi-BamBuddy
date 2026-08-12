@@ -24,10 +24,11 @@ vi.mock('react-i18next', () => ({
     // did fire (`printers.toast.missingSpoolAssignment` had exactly such a branch
     // until its toast was retired).
     t: (key: string, options?: Record<string, unknown>) => {
-      if (key === 'ams.slotStandingUnknown' && options) {
-        // Interpolated so the test can pin the 1-based slot rendering.
-        const { printer, slot } = options as { printer: string; slot: number };
-        return `${printer} standing-unknown slot ${slot}`;
+      if (key === 'ams.slotBoundPresenceUnknown' && options) {
+        // Interpolated so the test can pin the AMS unit letter and the 1-based
+        // slot rendering (a multi-AMS printer has several "slot 4"s).
+        const { printer, ams, slot } = options as { printer: string; ams: string; slot: number };
+        return `${printer} bound-presence-unknown ${ams} slot ${slot}`;
       }
       return key;
     },
@@ -804,7 +805,7 @@ describe('useWebSocket hook', () => {
       vi.unstubAllGlobals();
     });
 
-    it('toasts on slot_standing_unknown (transient nudge, no window event)', async () => {
+    it('toasts on slot_standing_unknown naming the AMS unit (transient nudge, no window event)', async () => {
       vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
         cb(0);
         return 0;
@@ -824,12 +825,31 @@ describe('useWebSocket hook', () => {
           printer_name: '004-H2S',
           ams_id: 0,
           tray_id: 2,
+          case: 'bound_presence_unknown',
         });
       });
 
       // tray_id 2 must render as slot 3 (1-based), matching the prompt hooks.
       await waitFor(() => {
-        expect(document.body.textContent).toContain('004-H2S standing-unknown slot 3');
+        expect(document.body.textContent).toContain('004-H2S bound-presence-unknown AMS A slot 3');
+      });
+
+      // The AMS unit is part of the identity: on a multi-AMS printer (008-H2C
+      // fired on AMS0-T3 and AMS1-T3 the same day) an unqualified "slot 4"
+      // names two different physical slots. ams_id 1 must read "AMS B".
+      act(() => {
+        ws.simulateMessage({
+          type: 'slot_standing_unknown',
+          printer_id: 8,
+          printer_name: '008-H2C',
+          ams_id: 1,
+          tray_id: 3,
+          case: 'bound_presence_unknown',
+        });
+      });
+
+      await waitFor(() => {
+        expect(document.body.textContent).toContain('008-H2C bound-presence-unknown AMS B slot 4');
       });
 
       vi.unstubAllGlobals();

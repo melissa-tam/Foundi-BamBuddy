@@ -4999,7 +4999,7 @@ export default {
     slotStateUnknown: 'Estado do slot desconhecido — a impressora não informou se há uma bobina dentro',
     slotStateUnknownShort: 'Desconhecido',
     slotPresentUnread: 'Bobina presente — não reconhecida',
-    slotStandingUnknown: '{{printer}}: o slot {{slot}} tem uma bobina que o AMS não consegue ler — verifique',
+    slotBoundPresenceUnknown: '{{printer}}: o slot {{slot}} do {{ams}} não responde — não é possível confirmar se a bobina associada ainda está lá. Verifique o slot.',
     outOfRotation: 'Fora de rotação — travamento de bobina detectado; reinsira a bobina ou limpe a marcação para reutilizá-la',
     outOfRotationShort: 'Fora de rotação',
     emptySlotBinding: {

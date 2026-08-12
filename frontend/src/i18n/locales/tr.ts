@@ -4989,7 +4989,7 @@ export default {
     slotStateUnknown: 'Yuva durumu bilinmiyor — yazıcı içinde makara olup olmadığını bildirmedi',
     slotStateUnknownShort: 'Bilinmiyor',
     slotPresentUnread: 'Makara var — tanınmıyor',
-    slotStandingUnknown: "{{printer}}: {{slot}} numaralı yuvada AMS'nin okuyamadığı bir makara var — kontrol edin",
+    slotBoundPresenceUnknown: '{{printer}}: {{ams}} {{slot}} numaralı yuva yanıt vermiyor — atanmış makaranın hâlâ orada olduğu doğrulanamıyor. Yuvayı kontrol edin.',
     outOfRotation: 'Rotasyon dışı — makara sıkışması algılandı; yeniden kullanmak için makarayı yeniden takın veya işareti temizleyin',
     outOfRotationShort: 'Rotasyon dışı',
     emptySlotBinding: {
