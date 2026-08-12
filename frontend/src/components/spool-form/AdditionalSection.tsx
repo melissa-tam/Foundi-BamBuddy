@@ -3,6 +3,7 @@ import { Scale } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useToast } from '../../contexts/ToastContext';
 import type { AdditionalSectionProps } from './types';
+import { remainingGrams } from '../../utils/spoolGrams';
 
 function SpoolWeightPicker({
   catalog,
@@ -188,7 +189,7 @@ export function AdditionalSection({
   const [newLocationName, setNewLocationName] = useState('');
   const [creatingLocation, setCreatingLocation] = useState(false);
 
-  const remainingWeight = Math.max(0, formData.label_weight - formData.weight_used);
+  const remainingWeight = remainingGrams(formData);
   const measuredDefault = formData.core_weight + remainingWeight;
 
   useEffect(() => {

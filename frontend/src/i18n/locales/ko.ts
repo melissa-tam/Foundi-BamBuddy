@@ -2469,7 +2469,7 @@ export default {
     respoolAutoEnabled: '재사용 태그 자동 재스풀',
     respoolAutoEnabledDesc: '꺼짐(기본값)이면 소진된 태그가 다시 나타날 때 새 스풀을 조용히 만들지 않고 확인을 요청합니다. 재사용 코어에 Bambu 리필을 사용할 때만 켜세요.',
     respoolPromptThreshold: '재스풀 알림 임계값 (g)',
-    respoolPromptThresholdHelp: '도너 스풀의 남은 양이 이 그램 수 이하이고 하드웨어로 확인된 소진 표시가 없을 때 재사용된 Bambu 태그의 재스풀을 알립니다 (0–1000)',
+    respoolPromptThresholdHelp: '재사용된 Bambu 태그가 나타나고 도너 스풀의 남은 양이 이 그램 수 이하이며 하드웨어로 확인된 소진 표시가 없을 때 재스풀 관찰을 로그에 기록합니다 (0–1000). 관찰 기록만 남깁니다 — 알림은 표시되지 않습니다.',
     farmUsbAutoCleanup: '가득 차면 USB 자동 정리',
     farmUsbAutoCleanupHelp: 'USB 저장 공간 부족 오류 시 오래된 카메라 녹화를 먼저 삭제하고 그다음 가장 오래된 미사용 인쇄 파일을 자동 삭제하여 디스패치가 계속 작동하도록 합니다',
     dispatchResponsiveness: '디스패치 응답성',

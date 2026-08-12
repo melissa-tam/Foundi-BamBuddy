@@ -161,7 +161,7 @@ class SlotInventory:
     """Per-slot inventory facts used by the selection policies.
 
     ``remaining_g`` is the operator's authoritative remaining weight (Bambuddy
-    ``label_weight - weight_used`` or Spoolman ``remaining_weight``); ``None``
+    :attr:`Spool.remaining_g` or Spoolman ``remaining_weight``); ``None``
     when the slot has no inventory binding (the sort then falls back to the MQTT
     ``remain`` percentage). ``first_loaded_ord`` is the FIFO ordinal in epoch
     seconds — time-in-AMS, i.e. when the roll currently in the tray last became
@@ -897,9 +897,6 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
         spool = by_slot.get((ams_id, tray_id))
         if spool is None:
             continue
-        label = float(spool.label_weight or 0)
-        used = float(spool.weight_used or 0)
-        remaining_g = max(0.0, label - used)
         # Seating-order precedence: the re-stampable loaded_at (a real re-seat /
         # binding change) beats the write-once first_loaded_at history, which beats
         # created_at. ord_src records which one won so the trace tells a genuine
@@ -911,8 +908,12 @@ async def build_slot_inventory(db: AsyncSession, printer_id: int, loaded: list[d
         else:
             ord_src = "created_at"
         first_ord = _dt_to_epoch(spool.loaded_at or spool.first_loaded_at or spool.created_at)
+        # Remaining grams have ONE origin: :attr:`Spool.remaining_g` (a spent row
+        # derives 0.0 there — the gram ledger itself is never floored). The slot-level
+        # ``unread`` verdict outranks it: that flag describes the tray's PHYSICAL
+        # contents, which no row-level number can speak for.
         out[gtid] = SlotInventory(
-            remaining_g=None if unread else remaining_g,
+            remaining_g=None if unread else spool.remaining_g,
             first_loaded_ord=first_ord,
             ord_src=ord_src,
             out_of_rotation=spool.feed_fault_at is not None,

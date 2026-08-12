@@ -2274,8 +2274,12 @@ class NotificationService:
         Its own event rather than a reuse of the respool prompt: that prompt asks the
         operator to DO something (move a tag onto a fresh roll), while this one reports
         a data contradiction with no safe automatic answer. The detector never mutates
-        the row — there is no un-spend lane by operator ruling, and inventing one here
-        would replace a visible wrong stamp with an invisible one.
+        the row — there is no AUTOMATIC un-spend lane by operator ruling, and inventing
+        one here would replace a visible wrong stamp with an invisible one. The single
+        deliberate un-spend is operator-ANSWERED and evidence-gated: dismissing the
+        respool prompt (``POST /inventory/spools/{id}/respool-dismiss``) NULLs
+        ``spent_at`` when the live AMS remain contradicts the stamp — a human looking at
+        the tray, not a detector acting on its own.
 
         One-shot per re-notify window — the caller (``spool_respool``) owns the durable
         dedup, because the contradiction is a STANDING state that re-derives on every

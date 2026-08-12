@@ -521,17 +521,15 @@ async def compute_deficit_for_queue_item(
             if assignment is None or assignment.spool is None:
                 continue
             spool = assignment.spool
-            if spool.spent_at is not None:
-                # A spent spool is KNOWN empty (remaining 0.0, not undetermined) — the
-                # spent stamp no longer floors weight_used, so an under-counted ledger
-                # must not read positive and let dispatch start a print on an empty roll.
-                remaining = 0.0
-            else:
-                label_weight = float(spool.label_weight or 0)
-                weight_used = float(spool.weight_used or 0)
-                if label_weight <= 0:
-                    continue
-                remaining = max(0.0, label_weight - weight_used)
+            # Remaining grams come from ONE origin: :attr:`Spool.remaining_g`, where a
+            # spent row derives 0.0 — KNOWN empty, not undetermined, so an under-counted
+            # ledger can never read positive and let dispatch start a print on an empty
+            # roll. A row with no label weight cannot be priced at all, which is
+            # UNDETERMINED (skip); a spent row is empty whatever its label claims, so
+            # that guard applies only while the row is not spent.
+            if spool.spent_at is None and float(spool.label_weight or 0) <= 0:
+                continue
+            remaining = spool.remaining_g
 
         if live_presence.get((ams_id, tray_id)) is False:
             # The mapped tray reads the cleared-tray shape: whatever the binding
@@ -643,18 +641,15 @@ async def compute_deficit_for_queue_item(
             if spool is None:
                 grams_by_slot[slot_key] = None
                 continue
-            if spool.spent_at is not None:
-                # Spent → KNOWN empty: contributes 0.0 to the pool (NOT undetermined,
-                # which would make the identity open-ended and never block). The spent
-                # stamp no longer floors weight_used, so the ledger can't read positive.
-                grams_by_slot[slot_key] = 0.0
-                continue
-            label_weight = float(spool.label_weight or 0)
-            weight_used = float(spool.weight_used or 0)
-            if label_weight <= 0:
+            # Same ONE origin as phase 1: :attr:`Spool.remaining_g`. Spent → KNOWN empty
+            # (0.0), so it contributes zero to the pool instead of making the identity
+            # open-ended and unblockable; a row with no label weight is unpriceable and
+            # stays UNDETERMINED (None). Spent outranks the label guard — an exhausted
+            # roll is empty whatever its label says.
+            if spool.spent_at is None and float(spool.label_weight or 0) <= 0:
                 grams_by_slot[slot_key] = None
                 continue
-            grams_by_slot[slot_key] = max(0.0, label_weight - weight_used)
+            grams_by_slot[slot_key] = spool.remaining_g
 
     # Same presence rule as phase 1, applied to the POOL: a binding whose tray reads
     # EMPTY contributes 0.0, never its ledger grams and never "undetermined" (which

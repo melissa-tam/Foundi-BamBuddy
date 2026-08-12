@@ -1,4 +1,5 @@
 import { useEffect, useReducer, useCallback } from 'react';
+import { remainingGrams } from '../utils/spoolGrams';
 
 export interface MatchedSpool {
   id: number;
@@ -186,7 +187,7 @@ export function useSpoolBuddyState() {
   }, [handleWeight, handleTagMatched, handleUnknownTag, handleTagRemoved, handleOnline, handleOffline]);
 
   const remainingWeight = state.matchedSpool
-    ? Math.max(0, state.matchedSpool.label_weight - state.matchedSpool.weight_used)
+    ? remainingGrams(state.matchedSpool)
     : null;
 
   const netWeight = state.weight !== null && state.matchedSpool

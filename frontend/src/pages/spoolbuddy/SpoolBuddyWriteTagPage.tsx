@@ -30,6 +30,7 @@ import {
   saveRecentColor,
 } from '../../components/spool-form/utils';
 import { MATERIALS } from '../../components/spool-form/constants';
+import { remainingGrams, remainingFraction } from '../../utils/spoolGrams';
 
 type Tab = 'existing' | 'new' | 'replace';
 type WriteStatus = 'idle' | 'selected' | 'writing' | 'success' | 'error';
@@ -363,8 +364,8 @@ function SpoolListItem({ spool, selected, showTag, onClick }: {
   showTag: boolean;
   onClick: () => void;
 }) {
-  const remaining = Math.max(0, spool.label_weight - spool.weight_used);
-  const pct = spool.label_weight > 0 ? Math.round((remaining / spool.label_weight) * 100) : 0;
+  const remaining = remainingGrams(spool);
+  const pct = Math.round((remainingFraction(spool) ?? 0) * 100);
 
   return (
     <button

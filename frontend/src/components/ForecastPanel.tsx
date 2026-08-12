@@ -14,6 +14,7 @@ import {
 import { api } from '../api/client';
 import type { InventorySpool, SpoolUsageRecord, FilamentSkuSettings, ShoppingListItem } from '../api/client';
 import { getSwatchStyle } from '../utils/colors';
+import { remainingGrams, remainingFraction } from '../utils/spoolGrams';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
 import { Modal } from './ui/Modal';
@@ -250,7 +251,7 @@ export function ForecastPanel({ spools }: { spools: InventorySpool[] }) {
       const marginValue = skuSettings?.safety_margin_value ?? 14;
       const marginUnit = skuSettings?.safety_margin_unit ?? 'days';
 
-      const totalRemainingG = group.spools.reduce((s, sp) => s + Math.max(0, sp.label_weight - sp.weight_used), 0);
+      const totalRemainingG = group.spools.reduce((s, sp) => s + remainingGrams(sp), 0);
       const totalLabelG = group.spools.reduce((s, sp) => s + sp.label_weight, 0);
       // Consumed since baseline (post-reset); see InventoryPage stats calc (#1390).
       const totalUsedG = group.spools.reduce((s, sp) => s + Math.max(0, sp.weight_used - (sp.weight_used_baseline ?? 0)), 0);
@@ -1080,8 +1081,8 @@ function ForecastRow({
                       </thead>
                       <tbody className="divide-y divide-bambu-dark-tertiary">
                         {f.group.spools.map((s) => {
-                          const remaining = Math.max(0, s.label_weight - s.weight_used);
-                          const pct = s.label_weight > 0 ? (remaining / s.label_weight) * 100 : 0;
+                          const remaining = remainingGrams(s);
+                          const pct = (remainingFraction(s) ?? 0) * 100;
                           return (
                             <tr key={s.id} className="hover:bg-bambu-dark-tertiary/30 transition-colors">
                               <td className="px-4 py-2">

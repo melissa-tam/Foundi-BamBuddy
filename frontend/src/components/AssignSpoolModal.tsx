@@ -11,6 +11,7 @@ import { useToast } from '../contexts/ToastContext';
 import { formatAssignmentSlotLabel } from '../utils/amsHelpers';
 import { filterSpoolsByQuery } from '../utils/inventorySearch';
 import { getSwatchStyle } from '../utils/colors';
+import { remainingGrams } from '../utils/spoolGrams';
 
 interface AssignSpoolModalProps {
   isOpen: boolean;
@@ -467,7 +468,7 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
                     </div>
                     {spool.label_weight && (
                       <p className="text-xs text-bambu-gray mt-1">
-                        {Math.max(0, Math.round(spool.label_weight - spool.weight_used))} / {spool.label_weight}g
+                        {Math.round(remainingGrams(spool))} / {spool.label_weight}g
                       </p>
                     )}
                     {staleClaim && (
@@ -564,7 +565,7 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
                             </div>
                             {spool.label_weight && (
                               <p className="text-xs text-bambu-gray mt-1">
-                                {Math.max(0, Math.round(spool.label_weight - spool.weight_used))} / {spool.label_weight}g
+                                {Math.round(remainingGrams(spool))} / {spool.label_weight}g
                               </p>
                             )}
                             {spool.note && (

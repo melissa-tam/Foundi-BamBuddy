@@ -5598,7 +5598,7 @@ export function SettingsPage() {
                     {t('settings.respoolPromptThreshold', 'Re-spool prompt threshold (g)')}
                   </label>
                   <p className="text-sm text-bambu-gray mb-1">
-                    {t('settings.respoolPromptThresholdHelp', 'Prompt to re-spool a reused Bambu tag when the donor spool has this many grams or fewer left and no hardware-certain spent marker (0–1000)')}
+                    {t('settings.respoolPromptThresholdHelp', 'Log a re-spool observation when a reused Bambu tag arrives with this many grams or fewer left on the donor spool and no hardware-certain spent marker (0–1000). Observation only — no prompt is raised.')}
                   </p>
                   <input
                     id="respool-prompt-threshold"

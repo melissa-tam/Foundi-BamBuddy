@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.app.models.spool import Spool
 from backend.app.services.print_scheduler import PrintScheduler
 from backend.app.services.spool_selection import SlotInventory, build_slot_inventory
 
@@ -52,8 +53,14 @@ def _spool(
     spent_at=None,
     archived_at=None,
 ):
-    """Internal-mode spool stub with the attributes build_slot_inventory reads."""
-    return SimpleNamespace(
+    """Internal-mode spool row with the attributes build_slot_inventory reads.
+
+    A REAL (transient, unpersisted) ``Spool`` rather than a namespace stub: the
+    builder reads ``spool.remaining_g``, the model's one derivation of remaining
+    grams, so a stub carrying its own ``label_weight - weight_used`` arithmetic
+    would test the stub instead of the rule.
+    """
+    return Spool(
         label_weight=label_weight,
         weight_used=weight_used,
         loaded_at=loaded_at,

@@ -8,6 +8,7 @@ import { AmsUnitCard, NozzleBadge } from './AmsUnitCard';
 import type { AmsThresholds } from './AmsUnitCard';
 import { formatAmsUnitName, getFillBarColor, isExternalAmsId } from '../../utils/amsHelpers';
 import { getSwatchStyle } from '../../utils/colors';
+import { remainingFraction } from '../../utils/spoolGrams';
 
 function isTrayEmpty(tray: AMSTray): boolean {
   return !tray.tray_type || tray.tray_type === '';
@@ -139,7 +140,7 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
     for (const a of assignments) {
       const sp = a.spool;
       if (sp && sp.label_weight > 0 && sp.weight_used != null) {
-        const fill = Math.round(Math.max(0, sp.label_weight - sp.weight_used) / sp.label_weight * 100);
+        const fill = Math.round((remainingFraction(sp) ?? 0) * 100);
         map[`${a.ams_id}-${a.tray_id}`] = fill;
       }
     }

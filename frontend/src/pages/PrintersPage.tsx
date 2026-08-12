@@ -129,6 +129,7 @@ import { PrintModal } from '../components/PrintModal';
 import { PrinterInfoModal } from '../components/PrinterInfoModal';
 import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, isBambuLabSpool, getEmptySlotKind, type EmptySlotKind } from '../utils/amsHelpers';
 import { slotPresence } from '../utils/spoolBindingStatus';
+import { remainingGrams, remainingFraction } from '../utils/spoolGrams';
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
@@ -3082,7 +3083,7 @@ function PrinterCard({
         ams_id: amsId,
         tray_id: trayId,
         spool_id: spool.id,
-        remaining_g: Math.max(0, Math.round(spool.label_weight - spool.weight_used)),
+        remaining_g: Math.round(remainingGrams(spool)),
         material: spool.material,
         rgba: spool.rgba,
       },
@@ -5054,14 +5055,17 @@ function PrinterCard({
                                 const slotSpoolForFill = slotAssignmentForFill
                                   ? spoolmanSpools?.find(s => s.id === slotAssignmentForFill.spoolman_spool_id)
                                   : undefined;
-                                const slotSpoolFill = (slotSpoolForFill && (slotSpoolForFill.label_weight ?? 0) > 0)
-                                  ? Math.round(Math.max(0, (slotSpoolForFill.label_weight ?? 0) - slotSpoolForFill.weight_used) / (slotSpoolForFill.label_weight ?? 1) * 100)
+                                const slotSpoolFill = slotSpoolForFill
+                                  ? (() => {
+                                      const fraction = remainingFraction(slotSpoolForFill);
+                                      return fraction === null ? null : Math.round(fraction * 100);
+                                    })()
                                   : null;
                                 const inventoryAssignment = onGetAssignment?.(printer.id, ams.id, slotIdx);
                                 const inventoryFill = (() => {
                                   const sp = inventoryAssignment?.spool;
                                   if (sp && sp.label_weight > 0 && sp.weight_used != null) {
-                                    return Math.round(Math.max(0, sp.label_weight - sp.weight_used) / sp.label_weight * 100);
+                                    return Math.round((remainingFraction(sp) ?? 0) * 100);
                                   }
                                   return null;
                                 })();
@@ -5212,7 +5216,7 @@ function PrinterCard({
                                                 brand: spoolmanSpool.brand ?? null,
                                                 color_name: spoolmanSpool.color_name ?? null,
                                                 remainingWeightGrams: spoolmanSpool.label_weight
-                                                  ? Math.max(0, Math.round(spoolmanSpool.label_weight - spoolmanSpool.weight_used))
+                                                  ? Math.round(remainingGrams(spoolmanSpool))
                                                   : undefined,
                                               } : null,
                                               onAssignSpool: () => setAssignSpoolModal({
@@ -5238,7 +5242,7 @@ function PrinterCard({
                                               material: assignment.spool.material,
                                               brand: assignment.spool.brand,
                                               color_name: assignment.spool.color_name,
-                                              remainingWeightGrams: Math.max(0, Math.round(assignment.spool.label_weight - assignment.spool.weight_used)),
+                                              remainingWeightGrams: Math.round(remainingGrams(assignment.spool)),
                                             } : null,
                                             onAssignSpool: () => setAssignSpoolModal({
                                               printerId: printer.id,
@@ -5361,7 +5365,7 @@ function PrinterCard({
                         const htInventoryFill = (() => {
                           const sp = htInventoryAssignment?.spool;
                           if (sp && sp.label_weight > 0 && sp.weight_used != null) {
-                            return Math.round(Math.max(0, sp.label_weight - sp.weight_used) / sp.label_weight * 100);
+                            return Math.round((remainingFraction(sp) ?? 0) * 100);
                           }
                           return null;
                         })();
@@ -5375,8 +5379,11 @@ function PrinterCard({
                         const htSlotSpoolForFill = htSlotAssignmentForFill
                           ? spoolmanSpools?.find(s => s.id === htSlotAssignmentForFill.spoolman_spool_id)
                           : undefined;
-                        const htSlotSpoolFill = (htSlotSpoolForFill && (htSlotSpoolForFill.label_weight ?? 0) > 0)
-                          ? Math.round(Math.max(0, (htSlotSpoolForFill.label_weight ?? 0) - htSlotSpoolForFill.weight_used) / (htSlotSpoolForFill.label_weight ?? 1) * 100)
+                        const htSlotSpoolFill = htSlotSpoolForFill
+                          ? (() => {
+                              const fraction = remainingFraction(htSlotSpoolForFill);
+                              return fraction === null ? null : Math.round(fraction * 100);
+                            })()
                           : null;
                         const htEffectiveFill = htSpoolmanFill ?? htSlotSpoolFill ?? htResolvedInventoryFill ?? (hasFillLevel ? tray.remain : null);
                         const htFillSource = (htSpoolmanFill !== null || htSlotSpoolFill !== null) ? 'spoolman' as const
@@ -5595,7 +5602,7 @@ function PrinterCard({
                                             brand: spoolmanSpool.brand ?? null,
                                             color_name: spoolmanSpool.color_name ?? null,
                                             remainingWeightGrams: spoolmanSpool.label_weight
-                                              ? Math.max(0, Math.round(spoolmanSpool.label_weight - spoolmanSpool.weight_used))
+                                              ? Math.round(remainingGrams(spoolmanSpool))
                                               : undefined,
                                           } : null,
                                           onAssignSpool: () => setAssignSpoolModal({
@@ -5621,7 +5628,7 @@ function PrinterCard({
                                           material: assignment.spool.material,
                                           brand: assignment.spool.brand,
                                           color_name: assignment.spool.color_name,
-                                          remainingWeightGrams: Math.max(0, Math.round(assignment.spool.label_weight - assignment.spool.weight_used)),
+                                          remainingWeightGrams: Math.round(remainingGrams(assignment.spool)),
                                         } : null,
                                         onAssignSpool: () => setAssignSpoolModal({
                                           printerId: printer.id,
@@ -5775,7 +5782,7 @@ function PrinterCard({
                               const extInventoryFill = (() => {
                                 const sp = extInventoryAssignment?.spool;
                                 if (sp && sp.label_weight > 0 && sp.weight_used != null) {
-                                  return Math.round(Math.max(0, sp.label_weight - sp.weight_used) / sp.label_weight * 100);
+                                  return Math.round((remainingFraction(sp) ?? 0) * 100);
                                 }
                                 return null;
                               })();
@@ -5790,8 +5797,11 @@ function PrinterCard({
                               const extSlotSpoolForFill = extSlotAssignmentForFill
                                 ? spoolmanSpools?.find(s => s.id === extSlotAssignmentForFill.spoolman_spool_id)
                                 : undefined;
-                              const extSlotSpoolFill = (extSlotSpoolForFill && (extSlotSpoolForFill.label_weight ?? 0) > 0)
-                                ? Math.round(Math.max(0, (extSlotSpoolForFill.label_weight ?? 0) - extSlotSpoolForFill.weight_used) / (extSlotSpoolForFill.label_weight ?? 1) * 100)
+                              const extSlotSpoolFill = extSlotSpoolForFill
+                                ? (() => {
+                                    const fraction = remainingFraction(extSlotSpoolForFill);
+                                    return fraction === null ? null : Math.round(fraction * 100);
+                                  })()
                                 : null;
                               const extEffectiveFill = extSpoolmanFill ?? extSlotSpoolFill ?? extResolvedInventoryFill ?? (extHasFillLevel ? extTray.remain : null);
                               const extFillSource = (extSpoolmanFill !== null || extSlotSpoolFill !== null) ? 'spoolman' as const
@@ -5891,7 +5901,7 @@ function PrinterCard({
                                               brand: spoolmanSpool.brand ?? null,
                                               color_name: spoolmanSpool.color_name ?? null,
                                               remainingWeightGrams: spoolmanSpool.label_weight
-                                                ? Math.max(0, Math.round(spoolmanSpool.label_weight - spoolmanSpool.weight_used))
+                                                ? Math.round(remainingGrams(spoolmanSpool))
                                                 : undefined,
                                             } : null,
                                             onAssignSpool: () => setAssignSpoolModal({
@@ -5917,7 +5927,7 @@ function PrinterCard({
                                             material: assignment.spool.material,
                                             brand: assignment.spool.brand,
                                             color_name: assignment.spool.color_name,
-                                            remainingWeightGrams: Math.max(0, Math.round(assignment.spool.label_weight - assignment.spool.weight_used)),
+                                            remainingWeightGrams: Math.round(remainingGrams(assignment.spool)),
                                           } : null,
                                           onAssignSpool: () => setAssignSpoolModal({
                                             printerId: printer.id,

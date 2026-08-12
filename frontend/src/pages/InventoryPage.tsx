@@ -36,6 +36,7 @@ import {
   invalidateSpoolAndLocationQueries,
 } from '../utils/inventoryQueries';
 import { aggregateGroupSpool } from '../utils/inventoryGrouping';
+import { remainingGrams, remainingFraction } from '../utils/spoolGrams';
 
 type ArchiveFilter = 'active' | 'archived';
 type UsageFilter = 'all' | 'used' | 'new' | 'lowstock';
@@ -389,7 +390,7 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
     if (scaleWeight == null) return <span className="text-sm text-bambu-gray/50" title="No scale measurement">-</span>;
 
     const coreWeight = spool.core_weight || 0;
-    const calculatedWeight = Math.max(0, spool.label_weight - spool.weight_used) + coreWeight;
+    const calculatedWeight = remainingGrams(spool) + coreWeight;
 
     // Edge case: scale < core_weight means spool is empty or not on scale — treat as match
     let difference: number;
@@ -458,10 +459,10 @@ const columnSortValues: Record<string, (spool: InventorySpool, assignmentMap: Re
   },
   storage_location: (s) => (s.storage_location || '').toLowerCase(),
   label_weight: (s) => s.label_weight,
-  net: (s) => Math.max(0, s.label_weight - s.weight_used),
-  gross: (s) => Math.max(0, s.label_weight - s.weight_used) + s.core_weight,
+  net: (s) => remainingGrams(s),
+  gross: (s) => remainingGrams(s) + s.core_weight,
   used: (s) => s.weight_used,
-  remaining: (s) => s.label_weight > 0 ? Math.max(0, s.label_weight - s.weight_used) / s.label_weight : 0,
+  remaining: (s) => remainingFraction(s) ?? 0,
   note: (s) => (s.note || '').toLowerCase(),
   data_origin: (s) => (s.data_origin || '').toLowerCase(),
   tag_type: (s) => (s.tag_type || '').toLowerCase(),
@@ -470,7 +471,7 @@ const columnSortValues: Record<string, (spool: InventorySpool, assignmentMap: Re
   cost_per_kg: (s) => s.cost_per_kg ?? 0,
   weight_check: (s) => {
     if (s.last_scale_weight == null) return -1;
-    const expectedGross = Math.max(0, s.label_weight - s.weight_used) + s.core_weight;
+    const expectedGross = remainingGrams(s) + s.core_weight;
     return Math.abs(s.last_scale_weight - expectedGross);
   },
 };
@@ -1019,9 +1020,9 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
       totalConsumed += Math.max(0, s.weight_used - (s.weight_used_baseline ?? 0));
       if (s.archived_at) continue;
       activeCount++;
-      const remaining = Math.max(0, s.label_weight - s.weight_used);
+      const remaining = remainingGrams(s);
       totalWeight += remaining;
-      const pct = s.label_weight > 0 ? (remaining / s.label_weight) * 100 : 0;
+      const pct = (remainingFraction(s) ?? 0) * 100;
       const threshold = s.low_stock_threshold_pct ?? lowStockThreshold;
       if (pct < threshold) lowStock++;
       const mat = s.material || 'Unknown';
@@ -1117,8 +1118,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
       filtered = filtered.filter((s) => s.weight_used === 0);
     } else if (usageFilter === 'lowstock') {
       filtered = filtered.filter((s) => {
-        const remaining = Math.max(0, s.label_weight - s.weight_used);
-        const pct = s.label_weight > 0 ? (remaining / s.label_weight) * 100 : 0;
+        const pct = (remainingFraction(s) ?? 0) * 100;
         const threshold = s.low_stock_threshold_pct ?? lowStockThreshold;
         return pct < threshold;
       });
@@ -1915,7 +1915,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                   // Total remaining filament across the group (#1368) — the
                   // headline number for the collapsed card, vs one member's.
                   const groupRemaining = groupSpools.reduce(
-                    (sum, s) => sum + Math.max(0, s.label_weight - s.weight_used),
+                    (sum, s) => sum + remainingGrams(s),
                     0,
                   );
                   const groupBannerStyle = buildFilamentBackground({
@@ -1960,8 +1960,8 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                       {isExpanded && (
                         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 mt-2 ml-4">
                           {groupSpools.map((spool) => {
-                            const remaining = Math.max(0, spool.label_weight - spool.weight_used);
-                            const pct = spool.label_weight > 0 ? (remaining / spool.label_weight) * 100 : 0;
+                            const remaining = remainingGrams(spool);
+                            const pct = (remainingFraction(spool) ?? 0) * 100;
                             return (
                               <SpoolCard
                                 key={spool.id}
@@ -1981,8 +1981,8 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                   );
                 }
                 const spool = item.spool;
-                const remaining = Math.max(0, spool.label_weight - spool.weight_used);
-                const pct = spool.label_weight > 0 ? (remaining / spool.label_weight) * 100 : 0;
+                const remaining = remainingGrams(spool);
+                const pct = (remainingFraction(spool) ?? 0) * 100;
                 return (
                   <SpoolCard
                     key={spool.id}
@@ -2086,8 +2086,8 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                       // Header row shows group totals (#1368): an aggregate
                       // spool plus remaining / pct summed across all members.
                       const headerSpool = aggregateGroupSpool(groupSpools);
-                      const remaining = Math.max(0, headerSpool.label_weight - headerSpool.weight_used);
-                      const pct = headerSpool.label_weight > 0 ? (remaining / headerSpool.label_weight) * 100 : 0;
+                      const remaining = remainingGrams(headerSpool);
+                      const pct = (remainingFraction(headerSpool) ?? 0) * 100;
                       return (
                         <SpoolTableGroup
                           key={`group-${key}`}
@@ -2126,8 +2126,8 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                       );
                     }
                     const spool = item.spool;
-                    const remaining = Math.max(0, spool.label_weight - spool.weight_used);
-                    const pct = spool.label_weight > 0 ? (remaining / spool.label_weight) * 100 : 0;
+                    const remaining = remainingGrams(spool);
+                    const pct = (remainingFraction(spool) ?? 0) * 100;
                     return (
                       <SpoolTableRow
                         key={spool.id}
@@ -2726,8 +2726,8 @@ function SpoolTableGroup({
       </tr>
       {/* Expanded individual rows */}
       {isExpanded && spools.map((spool) => {
-        const r = Math.max(0, spool.label_weight - spool.weight_used);
-        const p = spool.label_weight > 0 ? (r / spool.label_weight) * 100 : 0;
+        const r = remainingGrams(spool);
+        const p = (remainingFraction(spool) ?? 0) * 100;
         return (
           <SpoolTableRow
             key={spool.id}

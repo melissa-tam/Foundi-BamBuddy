@@ -3369,7 +3369,7 @@ def note_demand_watch(printer_id: int, state) -> None:
     """Per-push wire sampler: the second spawn source, and the hold's close edge.
 
     Sync, DB-free and in-memory — it rides the ~1 Hz status push beside
-    ``spool_respool.note_status_push``/``sample_status_push`` and only ever SPAWNS
+    ``hms_edges.note_push``/``spool_respool.sample_status_push`` and only ever SPAWNS
     work on an EDGE:
 
     * a transition INTO ``RUNNING`` → :func:`on_observed_running` (the printer is

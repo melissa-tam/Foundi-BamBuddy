@@ -2585,7 +2585,7 @@ export default {
     respoolAutoEnabled: '再利用タグの自動付け替え',
     respoolAutoEnabledDesc: 'オフ（既定）の場合、使い切ったタグが再び現れたときに新しいスプールを自動作成せず確認します。再利用コアで Bambu の詰め替えを使う場合のみ有効にしてください。',
     respoolPromptThreshold: '付け替え確認のしきい値 (g)',
-    respoolPromptThresholdHelp: 'ドナースプールの残量がこのグラム数以下で、ハードウェアで確定した使い切りマーカーがない場合に、再利用された Bambu タグの付け替えを確認します（0〜1000）',
+    respoolPromptThresholdHelp: '再利用された Bambu タグが現れ、ドナースプールの残量がこのグラム数以下で、ハードウェアで確定した使い切りマーカーがない場合に、付け替えの観測をログに記録します（0〜1000）。記録のみ — 確認は表示されません。',
     farmUsbAutoCleanup: '満杯時にUSBを自動クリーンアップ',
     farmUsbAutoCleanupHelp: 'USBストレージ不足エラー時に、まず古いカメラ録画を、次に最も古い未使用の印刷ファイルを自動削除して、ディスパッチを継続します',
     dispatchResponsiveness: 'ディスパッチの応答性',

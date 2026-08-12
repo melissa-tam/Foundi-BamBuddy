@@ -8,6 +8,7 @@ import type { InventorySpool } from '../../api/client';
 import { resolveSpoolColorName, getSwatchStyle, spoolColorString } from '../../utils/colors';
 import { formatAssignmentSlotLabel } from '../../utils/amsHelpers';
 import { filterSpoolsByQuery } from '../../utils/inventorySearch';
+import { remainingGrams, remainingFraction } from '../../utils/spoolGrams';
 import { InventorySpoolInfoCard } from '../../components/spoolbuddy/InventorySpoolInfoCard';
 import { AssignToAmsModal } from '../../components/spoolbuddy/AssignToAmsModal';
 import type { SpoolBuddyOutletContext } from '../../components/spoolbuddy/SpoolBuddyLayout';
@@ -22,12 +23,11 @@ function spoolColor(spool: InventorySpool): string {
 }
 
 function spoolRemaining(spool: InventorySpool): number {
-  return Math.max(0, spool.label_weight - spool.weight_used);
+  return remainingGrams(spool);
 }
 
 function spoolPct(spool: InventorySpool): number {
-  if (spool.label_weight <= 0) return 0;
-  return Math.max(0, Math.min(100, ((spool.label_weight - spool.weight_used) / spool.label_weight) * 100));
+  return Math.min(100, (remainingFraction(spool) ?? 0) * 100);
 }
 
 function spoolDisplayName(spool: InventorySpool): string {

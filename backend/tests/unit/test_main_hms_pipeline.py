@@ -14,13 +14,14 @@ about the pipeline's decisions only. Phase A's discovery-read suppression branch
 lives in the same loop and is pinned here too — the key switch must not change it.
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from backend.app import main as main_module
-from backend.app.services import notify_dedup
+from backend.app.services import hms_edges, notify_dedup
 
 # Two REAL production faults that share one attr — the collision the old key had.
 _ATTR = 0x07002000
@@ -43,9 +44,17 @@ def _hms(spec: SimpleNamespace) -> SimpleNamespace:
     )
 
 
-def _state(hms: list, layer_num: int = 0) -> SimpleNamespace:
+# Strictly-increasing wire stamp, one tick per constructed push. ``hms_edges.note_push``
+# consumes a frame only when ``hms_wire_at`` ADVANCES — the monotonic stamp bambu_mqtt
+# writes whenever a push carries an ``hms`` list, an empty one included (a wire
+# all-clear is evidence), and never on a local clear.
+_WIRE_AT = [1000.0]
+
+
+def _state(hms: list, layer_num: int = 0, tray_now: int = 255) -> SimpleNamespace:
     """Minimal PrinterState stub carrying HMS. ``layer_num`` varies the status key
     so consecutive pushes are not swallowed by the broadcast dedup."""
+    _WIRE_AT[0] += 1.0
     return SimpleNamespace(
         connected=True,
         state="IDLE",
@@ -59,26 +68,55 @@ def _state(hms: list, layer_num: int = 0) -> SimpleNamespace:
         big_fan2_speed=0,
         chamber_light="",
         active_extruder=0,
-        tray_now=255,
+        tray_now=tray_now,
         door_open=False,
         subtask_name="",
         subtask_id="",
         ams_filament_backup=None,
         hms_errors=list(hms),
+        hms_wire_at=_WIRE_AT[0],
         sdcard=True,
         remaining_time=0,
         gcode_file="",
     )
 
 
+async def _warm_up(printer_id: int, hms: list | None = None) -> None:
+    """Spend the edge tracker's SEEDING frame for ``printer_id``.
+
+    The first frame a process consumes per printer seeds without edging — that IS
+    restart-replay suppression — so every case that wants an APPEARANCE must burn one
+    frame first. Must be called INSIDE a ``_Harness`` (it drives the real callback), and
+    BEFORE the frame under test is constructed: ``_state`` stamps ``hms_wire_at`` at
+    construction time and the tracker only consumes a stamp that ADVANCED.
+    """
+    await main_module.on_printer_status_change(printer_id, _state(hms or [], layer_num=-1))
+
+
+async def _drain_tasks() -> None:
+    """Run the fire-and-forget tasks main spawned to completion.
+
+    ``asyncio.sleep(0)`` yields exactly once — enough for a task that awaits nothing,
+    but not for one that opens a session and queries (``apply_runout_edges``). Bounded
+    so a hung task fails the case instead of the suite.
+    """
+    for _ in range(20):
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+        if not pending:
+            return
+        await asyncio.wait(pending, timeout=1.0)
+
+
 @pytest.fixture(autouse=True)
 def _reset_state():
     notify_dedup._reset_state()
+    hms_edges._reset_state()  # the edge-triggered state consumers ride this ledger
     main_module._printer_last_connected.clear()
     main_module._printer_reconciled_since_connect.clear()
     main_module._last_status_broadcast.clear()
     yield
     notify_dedup._reset_state()
+    hms_edges._reset_state()
     main_module._printer_last_connected.clear()
     main_module._printer_reconciled_since_connect.clear()
     main_module._last_status_broadcast.clear()
@@ -162,6 +200,12 @@ class _Harness:
                 "backend.app.services.spool_recovery.maybe_refresh_runout_guidance",
                 new=self.guidance_refresh,
             ),
+            # The fire-and-forget services main spawns have no session to borrow and
+            # open their own from ``core.database`` (read at call time). Left alone that
+            # name is the APPLICATION's engine, so a spawned task would reach a real
+            # database from a unit test; stub it with the same mock main gets. A case
+            # that wants one of those lanes on a real engine re-patches it on top.
+            patch("backend.app.core.database.async_session", return_value=session_cm),
         ]
         for p in self._patches:
             p.start()
@@ -445,13 +489,15 @@ class TestRecoveryOwnedSuppression:
 @pytest.mark.asyncio
 class TestRunoutGuidanceRefreshHook:
     """006-H2S 2026-07-26 wiring pin: the HMS pipeline hands the guidance-refresh
-    lane THIS push's new full codes and the live state, and a hook failure can never
-    break the status flow (invariant 10). The lane's own decisions are pinned in
+    lane the codes that APPEARED on this frame's wire-HMS edge plus the live state, and
+    a hook failure can never break the status flow (invariant 10). The lane's own
+    decisions (including its `_guidance_sent` dedup) are pinned in
     test_spool_recovery.py."""
 
-    async def test_hook_receives_the_new_full_codes_and_state(self):
-        state = _state([_RUNOUT_COMPANION])
+    async def test_hook_receives_the_appeared_full_codes_and_state(self):
         with _Harness() as h:
+            await _warm_up(5)
+            state = _state([_RUNOUT_COMPANION])
             await main_module.on_printer_status_change(5, state)
 
         h.guidance_refresh.assert_awaited_once()
@@ -460,10 +506,19 @@ class TestRunoutGuidanceRefreshHook:
         assert args[1] == {_RUNOUT_COMPANION.full_code}
         assert args[2] is state
 
-    async def test_a_standing_code_does_not_re_invoke_the_hook(self):
-        """The hook rides ``new_error_codes``, so a code already alerted on this
-        lifetime does not re-trigger it."""
+    async def test_the_seeding_frame_never_invokes_the_hook(self):
+        """A code live on the first frame the process consumes is a restart replay —
+        it seeds instead of edging, so nothing downstream fires."""
         with _Harness() as h:
+            await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION]))
+
+        h.guidance_refresh.assert_not_awaited()
+
+    async def test_a_standing_code_does_not_re_invoke_the_hook(self):
+        """The hook rides the APPEARANCE edge, so a code standing across later frames
+        is one continuing observation and does not re-trigger it."""
+        with _Harness() as h:
+            await _warm_up(5)
             await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION], layer_num=1))
             await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION], layer_num=2))
 
@@ -472,6 +527,7 @@ class TestRunoutGuidanceRefreshHook:
     async def test_hook_failure_does_not_break_the_status_flow(self):
         with _Harness() as h:
             h.guidance_refresh.side_effect = RuntimeError("boom")
+            await _warm_up(5)
             await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION, _UNRELATED]))
 
         # The push completed: the ordinary code still notified and still stamped.
@@ -488,10 +544,10 @@ _AUTO_SWITCH = _err(code="0x30002", attr=0x07002200, module=0x07, full_code="070
 
 @pytest.mark.asyncio
 class TestSlotRunoutSpentHook:
-    """Fix-1 wiring pin: the pipeline builds the auto-switch spent events itself
-    (full_code + attr + code word per entry, so chained multi-slot runouts survive the
-    hand-off) and hands them to the trigger in its own session. The trigger's own
-    decisions are pinned in test_spool_respool.py."""
+    """Wiring pin for Lane B: an APPEARANCE edge spawns ``apply_runout_edges``, which
+    builds the auto-switch spent events (full_code + attr + code word per entry, so
+    chained multi-slot runouts survive the hand-off) and hands them to the trigger in
+    its own session. The trigger's own decisions are pinned in test_spool_respool.py."""
 
     @pytest.fixture(autouse=True)
     def _reset_respool_state(self):
@@ -501,8 +557,7 @@ class TestSlotRunoutSpentHook:
         yield
         spool_respool._reset_state()
 
-    async def test_new_auto_switch_code_invokes_the_hook_with_the_event_tuple(self):
-        state = _state([_AUTO_SWITCH])
+    async def test_an_appearing_auto_switch_code_invokes_the_hook_with_the_event_tuple(self):
         with (
             _Harness(),
             patch(
@@ -510,7 +565,10 @@ class TestSlotRunoutSpentHook:
                 new=AsyncMock(return_value=[]),
             ) as hook,
         ):
+            await _warm_up(5)
+            state = _state([_AUTO_SWITCH])
             await main_module.on_printer_status_change(5, state)
+            await _drain_tasks()
 
         hook.assert_awaited_once()
         args = hook.await_args.args
@@ -518,9 +576,24 @@ class TestSlotRunoutSpentHook:
         assert args[2] == [(_AUTO_SWITCH.full_code, 0x07002200, 0x00030002)]
         assert args[3] is state
 
+    async def test_a_code_live_on_the_seeding_frame_never_reaches_the_hook(self):
+        """Restart replay: the first frame the process consumes seeds, so a code already
+        standing there can never stamp the roll swapped in during the downtime."""
+        with (
+            _Harness(),
+            patch(
+                "backend.app.services.spool_respool.mark_spent_on_slot_runout",
+                new=AsyncMock(return_value=[]),
+            ) as hook,
+        ):
+            await main_module.on_printer_status_change(5, _state([_AUTO_SWITCH]))
+            await _drain_tasks()
+
+        hook.assert_not_awaited()
+
     async def test_demand_family_codes_never_reach_the_hook(self):
         """Only the auto-switch code word is spent evidence. The bare demand decodes a
-        slot just as well, so the pipeline filter is the only thing keeping a
+        slot just as well, so the lane filter is the only thing keeping a
         firmware-latched bogus demand (006-H2S) from archiving a healthy roll."""
         with (
             _Harness(),
@@ -529,13 +602,16 @@ class TestSlotRunoutSpentHook:
                 new=AsyncMock(return_value=[]),
             ) as hook,
         ):
+            await _warm_up(5)
             await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION]))
+            await _drain_tasks()
 
         hook.assert_not_awaited()
 
     async def test_a_standing_code_does_not_re_invoke_the_hook(self):
-        """The hook rides ``new_error_codes``, so the auto-switch code standing across
-        later pushes is one incident — it must not re-stamp whatever is bound now."""
+        """The hook rides the wire-HMS APPEARANCE edge, so the auto-switch code standing
+        across later frames is one observation — it must not re-stamp whatever is bound
+        now."""
         with (
             _Harness(),
             patch(
@@ -543,19 +619,25 @@ class TestSlotRunoutSpentHook:
                 new=AsyncMock(return_value=[]),
             ) as hook,
         ):
+            await _warm_up(5)
             await main_module.on_printer_status_change(5, _state([_AUTO_SWITCH], layer_num=1))
             await main_module.on_printer_status_change(5, _state([_AUTO_SWITCH], layer_num=2))
+            await _drain_tasks()
 
         assert hook.await_count == 1
 
     async def test_hook_failure_does_not_break_the_status_flow(self):
+        """The spawn site's guard (invariant 10). ``apply_runout_edges`` carries its own
+        whole-body guard as a fire-and-forget task; this pins the call site for the case
+        it cannot cover — a failure raised before the task is ever scheduled."""
         with (
             _Harness() as h,
             patch(
-                "backend.app.services.spool_respool.mark_spent_on_slot_runout",
-                new=AsyncMock(side_effect=RuntimeError("boom")),
+                "backend.app.services.spool_respool.apply_runout_edges",
+                new=MagicMock(side_effect=RuntimeError("boom")),
             ),
         ):
+            await _warm_up(5)
             await main_module.on_printer_status_change(5, _state([_AUTO_SWITCH, _UNRELATED]))
 
         # The push completed: the ordinary code still notified and still stamped.
@@ -675,7 +757,6 @@ class TestAutoSwitchNotificationSuppression:
 
     async def test_the_spent_hook_still_receives_it(self):
         """Suppressing a notification is not un-consuming the evidence."""
-        state = _state([_hms(_AUTO_SWITCH)])
         with (
             _Harness(),
             patch(
@@ -683,7 +764,9 @@ class TestAutoSwitchNotificationSuppression:
                 new=AsyncMock(return_value=[]),
             ) as hook,
         ):
-            await main_module.on_printer_status_change(5, state)
+            await _warm_up(5)
+            await main_module.on_printer_status_change(5, _state([_hms(_AUTO_SWITCH)]))
+            await _drain_tasks()
 
         hook.assert_awaited_once()
         assert hook.await_args.args[2] == [(_AUTO_SWITCH.full_code, 0x07002200, 0x00030002)]
@@ -714,3 +797,173 @@ class TestAutoSwitchNotificationSuppression:
             await main_module.on_printer_status_change(5, _state([_hms(overload)]))
 
         assert h.notify.on_printer_error.await_count == 1
+
+
+# --- the edge-triggered STATE consumers (W1c) --------------------------------
+# Five consumers used to ride ``new_error_codes`` — notify_dedup's 600 s re-NOTIFY
+# window. That window is a level-triggered ALERT policy: it deliberately calls a code
+# flapping out-and-back inside it ONE continuing incident, and pre-marks every code
+# standing at restart as already-seen. Right for paging a human, wrong for a state
+# decision. They now ride the wire-HMS APPEARANCE edge instead; these pin that the
+# switch actually happens — an edge fires them even when notify_dedup calls the code
+# stale, which is exactly the shape that was silently dropping them.
+
+# A native plate-occupancy code (H2-series pre-print vision check), and the USB
+# storage-low code — the two membership-tested consumers.
+_PLATE_OCCUPANCY = _err(code="0x808C", attr=0x05000000, module=0x05, full_code="050000000000808C")
+_STORAGE_LOW = _err(code="0x30004", attr=0x05000100, module=0x05, full_code="0500010000030004")
+
+
+async def _stale_then_reappear(printer_id: int, err: SimpleNamespace) -> None:
+    """Drive the shape the old ``new_error_codes`` gate could not see.
+
+    The code is pre-marked in notify_dedup (so it is NOT "new" for the alert lane on
+    either push), then a wire ALL-CLEAR frame seeds the edge tracker and the code
+    REAPPEARS. Only the appearance edge can fire on that.
+    """
+    import time as _time
+
+    notify_dedup.new_codes(printer_id, {err.full_code}, _time.time())
+    await main_module.on_printer_status_change(printer_id, _state([], layer_num=-1))
+    await main_module.on_printer_status_change(printer_id, _state([err], layer_num=1))
+
+
+@pytest.mark.asyncio
+class TestMovedConsumersRideTheAppearanceEdge:
+    async def test_plate_occupancy_fires_on_an_edge_notify_dedup_calls_stale(self):
+        with (
+            _Harness() as h,
+            patch(
+                "backend.app.services.farm_correlation.on_native_plate_detection", new=AsyncMock()
+            ) as plate_hook,
+        ):
+            await _stale_then_reappear(5, _PLATE_OCCUPANCY)
+
+        plate_hook.assert_awaited_once()
+        assert plate_hook.await_args.args[1] == 5
+        assert plate_hook.await_args.args[2] == {"0500_808C"}
+        # ...and the alert lane genuinely considered the code stale on that push.
+        h.notify.on_printer_error.assert_not_awaited()
+
+    async def test_storage_low_fires_on_an_edge_notify_dedup_calls_stale(self):
+        with (
+            _Harness() as h,
+            patch("backend.app.main.on_storage_low", new=AsyncMock()) as storage_hook,
+        ):
+            await _stale_then_reappear(5, _STORAGE_LOW)
+            await asyncio.sleep(0)  # let the fire-and-forget task run
+
+        storage_hook.assert_awaited_once()
+        assert storage_hook.await_args.args == (5, {_STORAGE_LOW.full_code})
+        h.notify.on_printer_error.assert_not_awaited()
+
+    async def test_guidance_refresh_fires_on_an_edge_notify_dedup_calls_stale(self):
+        with _Harness() as h:
+            await _stale_then_reappear(5, _RUNOUT_COMPANION)
+
+        h.guidance_refresh.assert_awaited_once()
+        assert h.guidance_refresh.await_args.args[1] == {_RUNOUT_COMPANION.full_code}
+        h.notify.on_printer_error.assert_not_awaited()
+
+
+# --- liveness: the stampers still WRITE ---------------------------------------
+# A cured storm and a starved lane are indistinguishable on absence metrics, so every
+# gating change here is paired with a probe that the thing still HAPPENS. These drive
+# the real callback against a real engine and assert the DB row.
+
+
+@pytest.fixture
+def sessions(test_engine):
+    """A real session factory for the pipeline, bound to the test engine."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    return async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def _seat_spool(db, printer_id: int, ams_id: int, tray_id: int):
+    """A full spool assigned to one AMS slot of ``printer_id``."""
+    from backend.app.models.spool import Spool
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    spool = Spool(material="PETG", label_weight=1000, core_weight=250, weight_used=950)
+    spool.k_profiles = []
+    spool.assignments = []
+    db.add(spool)
+    await db.flush()
+    db.add(SpoolAssignment(spool_id=spool.id, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id))
+    await db.commit()
+    return spool
+
+
+# The unrescued runout ("insert filament", print held): names its AMS unit in the attr
+# but no slot, so Lane A resolves the exhausted tray from the live feeder.
+_UNRESCUED_RUNOUT = _err(code="0x8011", attr=0x07000000, module=0x07, full_code="0700000000008011")
+
+
+def _runout_lane_on(session_factory):
+    """Give ONLY the runout lane a real database, and stand the rest of the block down.
+
+    ``apply_runout_edges`` opens its own session (``core.database.async_session``, read
+    at call time) because ``main`` fires it with none to borrow, so that is the name to
+    point at the test engine. ``main``'s own sessions stay mocked by ``_Harness`` and the
+    incident machine is stubbed out — deliberately, and not only for isolation: the test
+    engine is one in-memory SQLite database behind a StaticPool, i.e. a SINGLE shared
+    connection, so a second live session interleaving with the stamp's transaction
+    silently swallows the write. Production gives every session its own connection.
+    """
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    stack.enter_context(patch("backend.app.core.database.async_session", session_factory))
+    stack.enter_context(patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=False)))
+    stack.enter_context(patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()))
+    return stack
+
+
+@pytest.mark.asyncio
+class TestSpentStampingStillHappensEndToEnd:
+    @pytest.fixture(autouse=True)
+    def _reset_respool_state(self):
+        from backend.app.services import spool_respool
+
+        spool_respool._reset_state()
+        yield
+        spool_respool._reset_state()
+
+    async def test_lane_a_unrescued_runout_stamps_the_feeding_slot(self, db_session, printer_factory, sessions):
+        """The unrescued vocabulary, plain case: the runout appears, the spool feeding
+        the slot gets stamped, and the row is really written."""
+        printer = await printer_factory()
+        spool = await _seat_spool(db_session, printer.id, 0, 0)
+
+        with _Harness(), _runout_lane_on(sessions):
+            await _warm_up(printer.id)
+            await main_module.on_printer_status_change(
+                printer.id, _state([_UNRESCUED_RUNOUT], layer_num=1, tray_now=0)
+            )
+            await _drain_tasks()
+
+        await db_session.refresh(spool)
+        assert spool.spent_at is not None
+
+    async def test_lane_b_auto_switch_stamps_the_slot_the_firmware_named(
+        self, db_session, printer_factory, sessions
+    ):
+        """The firmware's own auto-switch statement, plain case: attr 0x07002200 names
+        AMS0 slot 3 (tray 2), so that roll is stamped and the slot now FEEDING — which a
+        tray_now inference would have picked — stays untouched."""
+        printer = await printer_factory()
+        exhausted = await _seat_spool(db_session, printer.id, 0, 2)
+        feeding = await _seat_spool(db_session, printer.id, 0, 0)
+
+        with _Harness(), _runout_lane_on(sessions):
+            await _warm_up(printer.id)
+            await main_module.on_printer_status_change(
+                printer.id, _state([_hms(_AUTO_SWITCH)], layer_num=1, tray_now=0)
+            )
+            await _drain_tasks()
+
+        await db_session.refresh(exhausted)
+        await db_session.refresh(feeding)
+        assert exhausted.spent_at is not None
+        assert feeding.spent_at is None

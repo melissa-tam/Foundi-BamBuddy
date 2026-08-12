@@ -10,9 +10,12 @@ client has to guess a unit for — a guess whose own fallbacks log "no AMS on ex
 using slot M".
 
 The asymmetry every test here defends: a MISSED spent stamp self-heals forward (the next
-runout re-fires, the fresh-roll prompt is the backstop), while a FALSE one is permanent —
-there is no un-spend lane by operator ruling. So the gates all fail toward NOT stamping,
-and the detector that finds the residue is forbidden from writing a spool row.
+runout re-fires, the fresh-roll prompt is the backstop), while a FALSE one is effectively
+permanent — there is no AUTOMATIC un-spend lane by operator ruling. (The single
+exception is operator-ANSWERED and evidence-gated: ``POST
+/inventory/spools/{id}/respool-dismiss`` NULLs ``spent_at`` when the live AMS remain
+contradicts the stamp.) So the gates all fail toward NOT stamping, and the detector that
+finds the residue is forbidden from writing a spool row.
 """
 
 import logging
@@ -496,8 +499,10 @@ def _live(printer_id, ams_id, tray_id, tray):
 async def test_detector_reports_contradiction_and_never_mutates_the_row(db_session, printer_factory):
     """R2 PIN: the 185/205 shape — spent, still assigned, tray present with the same
     identity, wire says 100 % full. It must be LOUD and it must change NOTHING. There is
-    no un-spend lane by operator ruling, and inventing one here would replace a visible
-    wrong stamp with an invisible one."""
+    no AUTOMATIC un-spend lane by operator ruling, and inventing one here would replace a
+    visible wrong stamp with an invisible one; the one deliberate un-spend is
+    operator-ANSWERED and evidence-gated (``POST /inventory/spools/{id}/respool-dismiss``
+    NULLs ``spent_at`` when the live AMS remain contradicts the stamp)."""
     printer = await printer_factory(model="H2C")
     spool = await _bind(
         db_session, printer.id, 1, 0, weight_used=0.0, tag_uid=TAG_UID, tray_uuid=TRAY_UUID, spent_at=datetime.utcnow()

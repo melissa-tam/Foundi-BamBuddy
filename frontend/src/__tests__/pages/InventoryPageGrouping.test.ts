@@ -11,6 +11,7 @@
 import { describe, it, expect } from 'vitest';
 import type { InventorySpool, SpoolAssignment } from '../../api/client';
 import { aggregateGroupSpool } from '../../utils/inventoryGrouping';
+import { remainingGrams } from '../../utils/spoolGrams';
 
 // Replicate the grouping key function from InventoryPage (not exported).
 // Must stay in lockstep with InventoryPage.tsx::spoolGroupKey — extra_colors
@@ -310,12 +311,29 @@ describe('aggregateGroupSpool (#1368)', () => {
       makeSpool({ id: 2, label_weight: 1000, weight_used: 600 }), // 400
     ];
     const agg = aggregateGroupSpool(members);
-    const perMember = members.reduce(
-      (sum, s) => sum + Math.max(0, s.label_weight - s.weight_used),
-      0,
-    );
+    const perMember = members.reduce((sum, s) => sum + remainingGrams(s), 0);
     expect(agg.label_weight - agg.weight_used).toBe(perMember);
     expect(agg.label_weight - agg.weight_used).toBe(1200);
+  });
+
+  it('a spent member contributes 0 to the group remaining', () => {
+    // aggregateGroupSpool sums RAW quantities by design (#1368) — it is not a
+    // remaining derivation. The displayed group remaining is the sum of the
+    // spent-aware per-member derivation, where a spent roll contributes 0
+    // however untouched its ledger looks.
+    const members = [
+      makeSpool({ id: 1, label_weight: 1000, weight_used: 200 }), // 800
+      makeSpool({ id: 2, label_weight: 1000, weight_used: 0, spent_at: '2026-08-09T12:00:00Z' }), // 0
+    ];
+    const groupRemaining = members.reduce((sum, s) => sum + remainingGrams(s), 0);
+    expect(remainingGrams(members[1])).toBe(0);
+    expect(groupRemaining).toBe(800);
+
+    // The raw aggregate still carries both members' quantities untouched —
+    // which is exactly why the display must not subtract them itself.
+    const agg = aggregateGroupSpool(members);
+    expect(agg.label_weight).toBe(2000);
+    expect(agg.weight_used).toBe(200);
   });
 
   it('carries identity fields from the first member', () => {

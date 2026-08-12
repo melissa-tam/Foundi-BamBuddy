@@ -2586,7 +2586,7 @@ export default {
     respoolAutoEnabled: 'Automatisches Umspulen bei wiederverwendeten Tags',
     respoolAutoEnabledDesc: 'Wenn deaktiviert (Standard), fragt die Farm nach, statt stillschweigend eine neue Spule anzulegen, wenn ein verbrauchter Tag wieder auftaucht. Nur aktivieren, wenn Bambu-Nachfüllungen auf wiederverwendeten Kernen laufen.',
     respoolPromptThreshold: 'Umspul-Aufforderungsschwelle (g)',
-    respoolPromptThresholdHelp: 'Zum Umspulen eines wiederverwendeten Bambu-Tags auffordern, wenn die Spenderspule so viele Gramm oder weniger übrig hat und keine hardware-sichere Leer-Markierung vorliegt (0–1000)',
+    respoolPromptThresholdHelp: 'Eine Umspul-Beobachtung protokollieren, wenn ein wiederverwendeter Bambu-Tag auftaucht, während die Spenderspule so viele Gramm oder weniger übrig hat und keine hardware-sichere Leer-Markierung vorliegt (0–1000). Nur eine Beobachtung — es wird keine Aufforderung angezeigt.',
     farmUsbAutoCleanup: 'USB bei vollem Speicher automatisch bereinigen',
     farmUsbAutoCleanupHelp: 'Bei einem Fehler wegen vollem USB-Speicher automatisch zuerst alte Kameraaufnahmen löschen, dann die ältesten ungenutzten Druckdateien, damit der Versand weiterläuft',
     dispatchResponsiveness: 'Reaktionsfähigkeit beim Versand',

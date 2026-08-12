@@ -2088,6 +2088,67 @@ async def test_find_matching_untagged_still_matches_unassigned_manual(db_session
     assert found.id == spool.id
 
 
+@pytest.mark.asyncio
+async def test_find_matching_untagged_excludes_spent_row(db_session):
+    """A spent, untagged, unbound row is a FINISHED roll — a newly-arriving tag
+    must never claim it (that would hand a fresh roll a spent latch)."""
+    from datetime import datetime
+
+    spool = Spool(
+        material="PLA",
+        subtype="Basic",
+        rgba="FFFFFFFF",
+        brand="Bambu Lab",
+        label_weight=1000,
+        core_weight=250,
+        spent_at=datetime.now(),
+    )
+    db_session.add(spool)
+    await db_session.commit()
+
+    found = await find_matching_untagged_spool(db_session, SAMPLE_TRAY)
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_find_matching_untagged_prefers_live_row_over_spent(db_session):
+    """The tag lands on a DIFFERENT row: an otherwise-identical non-spent row is
+    still attracted, even when the spent row is older and would win FIFO."""
+    import asyncio
+    from datetime import datetime
+
+    spent = Spool(
+        material="PLA",
+        subtype="Basic",
+        rgba="FFFFFFFF",
+        brand="Bambu Lab",
+        label_weight=1000,
+        core_weight=250,
+        spent_at=datetime.now(),
+    )
+    db_session.add(spent)
+    await db_session.flush()
+
+    # Distinct created_at: without the spent filter the OLDER spent row wins FIFO,
+    # so this ordering is what makes the test a regression guard.
+    await asyncio.sleep(0.05)
+
+    live = Spool(
+        material="PLA",
+        subtype="Basic",
+        rgba="FFFFFFFF",
+        brand="Bambu Lab",
+        label_weight=1000,
+        core_weight=250,
+    )
+    db_session.add(live)
+    await db_session.commit()
+
+    found = await find_matching_untagged_spool(db_session, SAMPLE_TRAY)
+    assert found is not None
+    assert found.id == live.id
+
+
 # -- auto_assign_spool stamps first_loaded_at once --------------------------
 
 

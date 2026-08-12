@@ -5,6 +5,7 @@ import type { MatchedSpool } from '../../hooks/useSpoolBuddyState';
 import { spoolbuddyApi } from '../../api/client';
 import { SpoolIcon } from './SpoolIcon';
 import { spoolColorString } from '../../utils/colors';
+import { remainingGrams } from '../../utils/spoolGrams';
 
 // Storage key for default core weight (shared with SpoolInfoCard)
 const DEFAULT_CORE_WEIGHT_KEY = 'spoolbuddy-default-core-weight';
@@ -156,7 +157,7 @@ function KnownSpoolView({ spool, scaleWeight, weightStable, syncing, synced, onS
     : '#808080';
 
   // Weight comparison
-  const netWeight = Math.max(0, (spool.label_weight || 0) - (spool.weight_used || 0));
+  const netWeight = remainingGrams(spool);
   const calculatedWeight = netWeight + coreWeight;
   const difference = grossWeight !== null ? grossWeight - calculatedWeight : null;
   const isMatch = difference !== null ? Math.abs(difference) <= 50 : null;

@@ -864,6 +864,7 @@ async def test_repair_unblocks_the_slot_for_selection(engine, session_maker):
     verified only by absence cannot tell a cure from a deeper deadlock."""
     from unittest.mock import AsyncMock, patch
 
+    from backend.app.models.spool import Spool
     from backend.app.services.spool_selection import build_slot_inventory
 
     ids = await _seed_false_spent_fixtures(session_maker)
@@ -881,10 +882,18 @@ async def test_repair_unblocks_the_slot_for_selection(engine, session_maker):
         with patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False)):
             after = await build_slot_inventory(session, printer_id=1, loaded=loaded)
     assert after[0].spent is False, "post-repair the roll is eligible again"
-    # Still the SAME binding, with its ledger intact — the repair clears one stamp, it
-    # does not rebind the slot or touch grams.
-    assert after[0].remaining_g == before[0].remaining_g
-    assert ids["false_spent"] is not None
+    # Still the SAME binding, with its GRAM LEDGER intact — the repair clears one stamp,
+    # it does not rebind the slot or touch grams. Remaining grams are DERIVED from the
+    # stamp (:attr:`Spool.remaining_g`), so the published figure legitimately moves:
+    # empty while stamped, back to the untouched ledger once cleared. Computing the
+    # expected figure from the raw columns is what makes this lossless-ness, not a
+    # tautology — a derivation that floored storage could not produce it.
+    async with session_maker() as session:
+        row = await session.get(Spool, ids["false_spent"])
+        ledger_remaining = float(row.label_weight) - float(row.weight_used)
+    assert ledger_remaining > 0, "fixture sanity: the false-spent row still carries grams"
+    assert before[0].remaining_g == 0.0, "a spent row prices as empty however full its ledger"
+    assert after[0].remaining_g == ledger_remaining, "clearing the stamp restores the intact ledger"
 
 
 # ---------------------------------------------------------------------------
