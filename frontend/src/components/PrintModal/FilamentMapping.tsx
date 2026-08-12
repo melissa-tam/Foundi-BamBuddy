@@ -3,9 +3,10 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Circle, Check, AlertTriangle, RefreshCw, ChevronDown, ChevronUp, Palette } from 'lucide-react';
 import { api } from '../../api/client';
-import { useFilamentMapping } from '../../hooks/useFilamentMapping';
-import { getGlobalTrayId, effectiveSelectionPolicy, type SelectionOptions } from '../../utils/amsHelpers';
+import { useFilamentMapping, type LoadedFilament } from '../../hooks/useFilamentMapping';
+import { getGlobalTrayId, isExternalAmsId, effectiveSelectionPolicy, type SelectionOptions } from '../../utils/amsHelpers';
 import { getColorName } from '../../utils/colors';
+import { InfoHint } from '../ui/InfoHint';
 import { useFilamentLabels } from './useFilamentLabels';
 import type { FilamentMappingProps } from './types';
 
@@ -104,10 +105,14 @@ export function FilamentMapping({
   // resolved — never blanks out the required row.
   const filamentLabels = useFilamentLabels(filamentReqs?.filaments);
 
+  // Both external-holder ids (254 single/left, 255 right) must resolve as
+  // external here, or an external assignment's spool never lines up with the
+  // mapping entry that points at it — no cost, no remaining weight, and no
+  // deficit warning for a slot the print will actually draw from.
   const trayCostMap = useMemo(() => {
     const map = new Map<number, number | null>();
     for (const assignment of assignments || []) {
-      const isExternal = assignment.ams_id === 255;
+      const isExternal = isExternalAmsId(assignment.ams_id);
       const globalTrayId = getGlobalTrayId(assignment.ams_id, assignment.tray_id, isExternal);
       map.set(globalTrayId, assignment.spool?.cost_per_kg ?? null);
     }
@@ -117,7 +122,7 @@ export function FilamentMapping({
   const trayRemainingWeightMap = useMemo(() => {
     const map = new Map<number, number | null>();
     for (const assignment of assignments || []) {
-      const isExternal = assignment.ams_id === 255;
+      const isExternal = isExternalAmsId(assignment.ams_id);
       const globalTrayId = getGlobalTrayId(assignment.ams_id, assignment.tray_id, isExternal);
       const spool = assignment.spool;
       if (!spool) {
@@ -161,6 +166,21 @@ export function FilamentMapping({
     const track = fs.in_slots.indexOf(globalTrayId);
     if (track < 0) return null;
     return fs.out_extruders[track] ?? null;
+  };
+
+  // The external spool holder is called out by TEXT, never by colour alone
+  // (WCAG 1.4.1): an external roll is not weight-tracked and the printer will
+  // demand filament at the holder itself, which is invisible to an operator who
+  // only sees "Ext-L". Display honesty only — nothing here asks the operator to
+  // CHOOSE a filament source: the backend matcher decides AMS vs external from
+  // live tray state at dispatch.
+  const externalSlotCount = loadedFilaments.filter((f) => isExternalAmsId(f.globalTrayId)).length;
+  const slotOptionLabel = (f: LoadedFilament): string => {
+    if (!isExternalAmsId(f.globalTrayId)) return f.label;
+    // Mirrors `buildLoadedFilaments`' own labelling (single holder → "External",
+    // dual → left/right), but through the shared translated vocabulary.
+    if (externalSlotCount <= 1) return t('printers.external');
+    return f.globalTrayId === 254 ? t('printers.extL') : t('printers.extR');
   };
 
   // Don't render if no filament requirements
@@ -281,11 +301,12 @@ export function FilamentMapping({
                 </span>
                 {/* Arrow */}
                 <span className="text-bambu-gray">→</span>
-                {/* Slot selector dropdown */}
+                {/* Slot selector dropdown + external-holder badge */}
+                <div className="flex items-center gap-1.5 min-w-0">
                 <select
                   value={item.loaded?.globalTrayId ?? ''}
                   onChange={(e) => handleSlotChange(slotId, e.target.value)}
-                  className={`flex-1 px-2 py-1 rounded border text-xs bg-bambu-dark-secondary focus:outline-none focus:ring-1 focus:ring-bambu-green ${
+                  className={`flex-1 min-w-0 px-2 py-1 rounded border text-xs bg-bambu-dark-secondary focus:outline-none focus:ring-1 focus:ring-bambu-green ${
                     item.status === 'match'
                       ? 'border-bambu-green/50 text-bambu-green'
                       : item.status === 'type_only'
@@ -330,11 +351,18 @@ export function FilamentMapping({
                           : ` [${ftsTargetExtruder === 1 ? t('printModal.leftNozzle') : t('printModal.rightNozzle')}]`;
                       return (
                         <option key={f.globalTrayId} value={f.globalTrayId} className="bg-bambu-dark text-white">
-                          {f.label}: {f.traySubBrands || f.type} ({f.colorName}){remainingLabel}{ftsBadge}
+                          {slotOptionLabel(f)}: {f.traySubBrands || f.type} ({f.colorName}){remainingLabel}{ftsBadge}
                         </option>
                       );
                   })}
                 </select>
+                {item.loaded && isExternalAmsId(item.loaded.globalTrayId) && (
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded border border-bambu-gray/30 bg-bambu-gray/10 px-1.5 py-0.5 text-[10px] leading-none text-bambu-gray">
+                    {t('printers.external')}
+                    <InfoHint text={t('printModal.externalSlotNote')} />
+                  </span>
+                )}
+                </div>
                 {/* Status icon */}
                 {item.status === 'match' ? (
                   <Check className="w-3 h-3 text-bambu-green" />

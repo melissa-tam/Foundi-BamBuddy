@@ -289,6 +289,20 @@ interface UseFilamentMappingResult {
   hasTypeMismatch: boolean;
   /** Whether any required filament has a color mismatch */
   hasColorMismatch: boolean;
+  /**
+   * True when at least one slot carries an EXPLICIT operator pin — a manual
+   * dropdown pick, or a mapping seeded from an edited/requeued item that still
+   * resolves against this printer's live trays.
+   *
+   * This is the whole test for "may `ams_mapping` be persisted?": a stored
+   * mapping is an operator INSTRUCTION, never a cache of an auto-derivation
+   * (2026-08-11 003-H2S external-spool incident — an auto-derived `[254]` was
+   * frozen onto nine printers that have no external spool). Auto-matched rows
+   * report `isManual: false`, and the manual branch above drops a seeded gtid
+   * that no longer resolves against `loadedFilaments`, so an unresolvable seed
+   * yields false on its own — no extra validation anywhere.
+   */
+  hasManualSelection: boolean;
 }
 
 /**
@@ -498,6 +512,7 @@ export function useFilamentMapping(
 
   const hasTypeMismatch = filamentComparison.some((f) => f.status === 'mismatch');
   const hasColorMismatch = filamentComparison.some((f) => f.status === 'type_only');
+  const hasManualSelection = filamentComparison.some((f) => f.isManual);
 
   return {
     loadedFilaments,
@@ -505,5 +520,6 @@ export function useFilamentMapping(
     amsMapping,
     hasTypeMismatch,
     hasColorMismatch,
+    hasManualSelection,
   };
 }

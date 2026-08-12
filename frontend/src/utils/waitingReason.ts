@@ -64,6 +64,18 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
       // the whole point of the token: telling an operator to refill an AMS slot
       // here sends them to the wrong side of the machine.
       return t('productionRuns.detail.waiting.externalSpoolRunout');
+    case 'external_feed_fault':
+      // The EXTERNAL path failed to FEED (not "ran out"): no AMS is involved,
+      // no swap will be attempted, and the fix is at the holder / PTFE tube.
+      // Routing this through the AMS jam copy sends the operator to the wrong
+      // side of the machine — the 003-H2S incident in miniature.
+      return t('productionRuns.detail.waiting.externalFeedFault');
+    case 'pinned_tray_unavailable':
+      // An operator-pinned slot isn't loaded on this printer. Deliberately NOT
+      // "low filament": nothing is short, the instruction simply can't be
+      // honoured here, and the operator's two real options (load that tray, or
+      // drop the pin) are both invisible under the deficit wording.
+      return t('productionRuns.detail.waiting.pinnedTrayUnavailable');
     case 'spool_physical_fault':
       return t('productionRuns.detail.waiting.spoolPhysicalFault');
     default:

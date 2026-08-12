@@ -6,7 +6,7 @@ import { api, type InventorySpool, type PrinterStatus, type AMSTray } from '../.
 import { ConfirmModal } from '../ConfirmModal';
 import { AmsUnitCard, NozzleBadge } from './AmsUnitCard';
 import type { AmsThresholds } from './AmsUnitCard';
-import { formatAmsUnitName, getFillBarColor } from '../../utils/amsHelpers';
+import { formatAmsUnitName, getFillBarColor, isExternalAmsId } from '../../utils/amsHelpers';
 import { getSwatchStyle } from '../../utils/colors';
 
 function isTrayEmpty(tray: AMSTray): boolean {
@@ -232,7 +232,7 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
   const isWaiting = configureMutation.isPending;
 
   const getTrayForSlot = useCallback((amsId: number, trayId: number): AMSTray | null => {
-    if (amsId === 254 || amsId === 255) {
+    if (isExternalAmsId(amsId)) {
       const extTrayId = amsId === 254 ? 254 : 254 + trayId;
       return vtTrays.find(t => (t.id ?? 254) === extTrayId) || null;
     }

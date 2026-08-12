@@ -16,7 +16,7 @@ import { getColorName } from '../../utils/colors';
 import { getCurrencySymbol } from '../../utils/currency';
 import { getBedTypeInfo } from '../../utils/bedType';
 import { toDateTimeLocalValue, parseUTCDate } from '../../utils/date';
-import { getGlobalTrayId, isPlaceholderDate, effectiveSelectionPolicy, type SelectionOptions } from '../../utils/amsHelpers';
+import { getGlobalTrayId, isExternalAmsId, isPlaceholderDate, effectiveSelectionPolicy, type SelectionOptions } from '../../utils/amsHelpers';
 import { InlineAlert } from '../ui/InlineAlert';
 import { readPrintModalMemory, writePrintModalMemory } from '../../utils/printModalMemory';
 import { FilamentMapping } from './FilamentMapping';
@@ -261,10 +261,20 @@ export function PrintModal({
   // This ensures the setting only affects initial state, not preventing unchecking
   const [initialExpandApplied, setInitialExpandApplied] = useState<Set<number>>(new Set());
 
-  // Printer counts and effective printer for filament mapping
+  // Printer counts and the single-printer mapping target.
   const effectivePrinterCount = selectedPrinters.length;
-  // For filament mapping, use first selected printer (mapping applies to all)
-  const effectivePrinterId = selectedPrinters.length > 0 ? selectedPrinters[0] : null;
+  // A filament mapping belongs to ONE printer and is meaningless on any other:
+  // slot 3 holds a different spool on every machine, and 254 (the external
+  // holder) exists only where a vt_tray is configured. The dialog therefore
+  // has a single-printer target only when exactly one printer is selected;
+  // a multi-printer selection previews each printer through
+  // `useMultiPrinterFilamentMapping`, per printer, against its own live trays.
+  //
+  // The deleted contract ("use first selected printer — mapping applies to
+  // all") is what caused the 2026-08-11 003-H2S incident: editing a pending
+  // item and adding nine printers stamped printer 1's auto-derived external
+  // mapping `[254]` onto nine machines with no external spool.
+  const singlePrinterId = selectedPrinters.length === 1 ? selectedPrinters[0] : null;
 
   // Queries
   const { data: settings } = useQuery({
@@ -470,9 +480,9 @@ export function PrintModal({
 
   // Only fetch printer status when single printer selected (for filament mapping)
   const { data: printerStatus } = useQuery({
-    queryKey: ['printer-status', effectivePrinterId],
-    queryFn: () => api.getPrinterStatus(effectivePrinterId!),
-    enabled: !!effectivePrinterId,
+    queryKey: ['printer-status', singlePrinterId],
+    queryFn: () => api.getPrinterStatus(singlePrinterId!),
+    enabled: !!singlePrinterId,
   });
 
   // Single-printer flow: resolve the backup-gated selection policy for this
@@ -481,11 +491,11 @@ export function PrintModal({
   // different backup states), so we pass the raw policy down there.
   const singlePrinterSelection: SelectionOptions = useMemo(() => ({
     policy: effectiveSelectionPolicy(settings?.spool_selection_policy, printerStatus?.ams_filament_backup),
-    inventoryByTrayId: effectivePrinterId ? inventoryByTrayIdPerPrinter.get(effectivePrinterId) : undefined,
-    firstLoadedByTrayId: effectivePrinterId ? firstLoadedByTrayIdPerPrinter.get(effectivePrinterId) : undefined,
-    outOfRotationByTrayId: effectivePrinterId ? outOfRotationByTrayIdPerPrinter.get(effectivePrinterId) : undefined,
+    inventoryByTrayId: singlePrinterId ? inventoryByTrayIdPerPrinter.get(singlePrinterId) : undefined,
+    firstLoadedByTrayId: singlePrinterId ? firstLoadedByTrayIdPerPrinter.get(singlePrinterId) : undefined,
+    outOfRotationByTrayId: singlePrinterId ? outOfRotationByTrayIdPerPrinter.get(singlePrinterId) : undefined,
     minStartG: settings?.min_start_spool_g,
-  }), [settings?.spool_selection_policy, settings?.min_start_spool_g, printerStatus?.ams_filament_backup, effectivePrinterId, inventoryByTrayIdPerPrinter, firstLoadedByTrayIdPerPrinter, outOfRotationByTrayIdPerPrinter]);
+  }), [settings?.spool_selection_policy, settings?.min_start_spool_g, printerStatus?.ams_filament_backup, singlePrinterId, inventoryByTrayIdPerPrinter, firstLoadedByTrayIdPerPrinter, outOfRotationByTrayIdPerPrinter]);
 
   const isPrinterCurrentlyDispatchable = (status: PrinterStatus | undefined): boolean => {
     if (!status?.connected) return false;
@@ -514,13 +524,34 @@ export function PrintModal({
     }
   };
 
-  // Get AMS mapping from hook (only when single printer selected)
-  const { amsMapping } = useFilamentMapping(
+  // Single-printer mapping preview. `amsMapping` is the FULL derived preview
+  // (pins + auto-matches) — what the panel draws, and what the deficit check
+  // prices. It is never what gets stored.
+  const { amsMapping, filamentComparison, hasManualSelection } = useFilamentMapping(
     effectiveFilamentReqs,
     printerStatus,
     manualMappings,
     singlePrinterSelection,
   );
+
+  // The storable half of that preview: ONLY the slots the operator actually
+  // pinned, every other position masked to -1 ("no pin — matcher decides at
+  // dispatch", the backend's own reading). Persisting the whole array would
+  // freeze auto-matched siblings into instructions they never were, which is
+  // the same stale-materialized-decision disease at slot granularity.
+  // `undefined` when nothing is pinned, so the field is omitted outright.
+  const operatorPinnedMapping = useMemo((): number[] | undefined => {
+    if (!hasManualSelection) return undefined;
+    const maxSlotId = Math.max(...filamentComparison.map((f) => f.slot_id || 0));
+    if (maxSlotId <= 0) return undefined;
+    const pins = new Array<number>(maxSlotId).fill(-1);
+    filamentComparison.forEach((f) => {
+      if (f.isManual && f.slot_id && f.slot_id > 0) {
+        pins[f.slot_id - 1] = f.loaded?.globalTrayId ?? -1;
+      }
+    });
+    return pins;
+  }, [filamentComparison, hasManualSelection]);
 
   // Multi-printer filament mapping (for per-printer configuration)
   const multiPrinterMapping = useMultiPrinterFilamentMapping(
@@ -626,7 +657,11 @@ export function PrintModal({
     const map = new Map<number, Map<number, SpoolAssignment>>();
     if (!spoolAssignments) return map;
     spoolAssignments.forEach((assignment) => {
-      const isExternal = assignment.ams_id === 255;
+      // 254 AND 255 are both the external holder — keying only on 255 mapped a
+      // left/single external assignment onto an AMS-shaped id, so an external
+      // pick never matched its spool row and silently skipped the pre-submit
+      // filament check below.
+      const isExternal = isExternalAmsId(assignment.ams_id);
       const globalTrayId = getGlobalTrayId(
         assignment.ams_id,
         assignment.tray_id,
@@ -677,6 +712,45 @@ export function PrintModal({
     // Clear any errors from a previous attempt before re-running.
     setSubmitErrors([]);
 
+    // ---- Preview vs. submit: two different questions about one mapping ----
+    //
+    // PREVIEW — "what would this printer print with right now?" Always
+    // per-printer, always derived from that printer's live trays. Used for the
+    // deficit warning below and for everything the dialog draws.
+    //
+    // SUBMIT — "what did the OPERATOR instruct?" `PrintQueueItem.ams_mapping`
+    // is an operator pin and nothing else; the backend matcher decides AMS vs
+    // external against live tray state at dispatch. Persisting a derivation
+    // would freeze a decision made now and execute it hours later against
+    // different hardware (the 003-H2S incident). So: no explicit pick, no
+    // field — omitted, not null (null CLEARS a stored pin on PATCH; omission
+    // keeps it, and the operator did not touch it).
+    const getPreviewMappingForPrinter = (printerId: number): number[] | undefined =>
+      selectedPrinters.length > 1
+        ? multiPrinterMapping.getFinalMapping(printerId)
+        : amsMapping;
+
+    const getSubmitMappingForPrinter = (printerId: number): number[] | undefined => {
+      if (selectedPrinters.length > 1) {
+        // Multi-printer: an instruction exists only where the operator HAND-PICKED
+        // slots for this printer. `useDefault === false` alone is not enough —
+        // `autoConfigurePrinter` (the "Expand custom mapping by default" setting,
+        // and the checkbox that opens the editor) fills the override with a live
+        // derivation and marks it `autoConfigured`. That is a preview wearing an
+        // override's clothes, and it must NOT be stored. A real pick in the
+        // inline editor clears the flag (`InlineMappingEditor.handleSlotChange`),
+        // which is exactly the signal we key on.
+        const printerConfig = perPrinterConfigs[printerId];
+        return printerConfig && !printerConfig.useDefault && !printerConfig.autoConfigured
+          ? multiPrinterMapping.getFinalMapping(printerId)
+          : undefined;
+      }
+      // Single printer: pins only — a manual dropdown pick, or a seeded
+      // requeue/edit mapping that still resolves against live trays. Slots the
+      // operator never touched ride along as -1, not as frozen auto-matches.
+      return operatorPinnedMapping;
+    };
+
     if (
       !options?.skipFilamentCheck &&
       !settings?.disable_filament_warnings &&
@@ -694,9 +768,7 @@ export function PrintModal({
         };
 
         for (const printerId of selectedPrinters) {
-          const printerMapping = selectedPrinters.length > 1
-            ? multiPrinterMapping.getFinalMapping(printerId)
-            : amsMapping;
+          const printerMapping = getPreviewMappingForPrinter(printerId);
           if (!printerMapping) continue;
 
           const printerStatusForWarning = selectedPrinters.length > 1
@@ -763,18 +835,6 @@ export function PrintModal({
       success: 0,
       failed: 0,
       errors: [],
-    };
-
-    // Get mapping for a specific printer (per-printer override or default)
-    const getMappingForPrinter = (printerId: number): number[] | undefined => {
-      // For multi-printer selection, check if this printer has an override
-      if (selectedPrinters.length > 1) {
-        const printerConfig = perPrinterConfigs[printerId];
-        if (printerConfig && !printerConfig.useDefault) {
-          return multiPrinterMapping.getFinalMapping(printerId);
-        }
-      }
-      return amsMapping;
     };
 
     // Convert filament overrides from Record to array format for API.
@@ -868,7 +928,10 @@ export function PrintModal({
       // persist that acknowledgement so the scheduler doesn't immediately
       // re-flag the item on its first dispatch tick (#1698-followup).
       skip_filament_check: options?.skipFilamentCheck === true ? true : undefined,
-      ams_mapping: printerId ? getMappingForPrinter(printerId) : undefined,
+      // Operator instruction only — `undefined` drops the key from the JSON
+      // body entirely, so an item with no explicit pick is created without a
+      // mapping and the matcher computes it at dispatch against live trays.
+      ams_mapping: printerId ? getSubmitMappingForPrinter(printerId) : undefined,
       plate_id: plateOverride !== undefined ? plateOverride : selectedPlate,
       scheduled_time: scheduleOptions.scheduleType === 'scheduled' && scheduleOptions.scheduledTime
         ? new Date(scheduleOptions.scheduledTime).toISOString()
@@ -946,8 +1009,14 @@ export function PrintModal({
 
           try {
             if (isEditing && progressCounter === 1) {
-              // Edit mode - update the original queue item for the first entry
-              const printerMapping = getMappingForPrinter(printerId);
+              // Edit mode - update the original queue item for the first entry.
+              // PATCH keys on FIELD PRESENCE: an omitted `ams_mapping` keeps
+              // whatever pin the item already carries, `null` clears it. An
+              // edit session that never touched the pick must therefore send
+              // neither a derivation nor an implicit null — `undefined` here
+              // drops the key from the body (JSON.stringify), which is exactly
+              // "the operator did not change this".
+              const printerMapping = getSubmitMappingForPrinter(printerId);
               const updateData: PrintQueueItemUpdate = {
                 printer_id: printerId,
                 target_model: null,
@@ -1123,7 +1192,7 @@ export function PrintModal({
   // - Single printer selected
   // - For archives: plate is selected (for multi-plate) or not required (single-plate)
   // - For library files: always show (no plate selection)
-  const showFilamentMapping = effectivePrinterId && selectedPlates.size <= 1 && (
+  const showFilamentMapping = singlePrinterId && selectedPlates.size <= 1 && (
     isLibraryFile || (isMultiPlate ? selectedPlate !== null : true)
   );
 
@@ -1286,7 +1355,7 @@ export function PrintModal({
             {/* Filament mapping - only show when single printer selected */}
             {showFilamentMapping && !archiveDataMissing && selectedPrinters.length === 1 && (
               <FilamentMapping
-                printerId={effectivePrinterId!}
+                printerId={singlePrinterId!}
                 filamentReqs={effectiveFilamentReqs}
                 manualMappings={manualMappings}
                 onManualMappingChange={setManualMappings}

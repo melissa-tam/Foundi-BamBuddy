@@ -207,10 +207,19 @@ function computeMappingWithOverrides(
   for (const req of filamentReqs.filaments) {
     const slotId = req.slot_id || 0;
 
-    // Check manual override first
+    // Check manual override first — but only when the pinned tray actually
+    // EXISTS on this printer. A pin is per-printer by nature: the same gtid on
+    // another machine is a different spool, or nothing at all (254 is the
+    // external holder, present only where a `vt_tray` is configured). Pushing an
+    // unresolvable gtid straight into the mapping made the preview claim a slot
+    // the printer cannot serve; it now falls through to auto-match, exactly as
+    // the single-printer `useFilamentMapping` manual branch already did.
     if (slotId > 0 && manualMappings[slotId] !== undefined) {
-      comparisons.push({ slot_id: slotId, globalTrayId: manualMappings[slotId] });
-      continue;
+      const pinnedTrayId = manualMappings[slotId];
+      if (loadedFilaments.some((f) => f.globalTrayId === pinnedTrayId)) {
+        comparisons.push({ slot_id: slotId, globalTrayId: pinnedTrayId });
+        continue;
+      }
     }
 
     // Auto-match with nozzle-aware filtering

@@ -148,6 +148,24 @@ export function formatSlotLabel(
 }
 
 /**
+ * Is this id the EXTERNAL spool holder rather than an AMS slot?
+ *
+ * Both 254 and 255 are external: 254 is the single / left holder and 255 the
+ * right holder on dual-nozzle hardware — the `vt_tray` ids the firmware reports
+ * and, identically, the `globalTrayId` values `buildLoadedFilaments` emits for
+ * them, so the same test answers the question for an assignment's `ams_id` and
+ * for a mapping entry alike.
+ *
+ * One origin because the half-test (`=== 255`) was wrong in a way that hid a
+ * production incident class: a `[254]` pick read as an ordinary AMS slot, so it
+ * never entered the pre-submit filament check and never showed itself as
+ * external anywhere in the dialog.
+ */
+export function isExternalAmsId(amsId: number): boolean {
+  return amsId === 254 || amsId === 255;
+}
+
+/**
  * Slot label straight from an assignment-shaped row.
  *
  * "External" (ams_id 254/255) and "AMS-HT" (ams_id >= 128) are properties of
@@ -156,7 +174,7 @@ export function formatSlotLabel(
  * a new unit class shows up.
  */
 export function formatAssignmentSlotLabel(slot: { ams_id: number; tray_id: number }): string {
-  const isExternal = slot.ams_id === 254 || slot.ams_id === 255;
+  const isExternal = isExternalAmsId(slot.ams_id);
   const isHt = !isExternal && slot.ams_id >= 128;
   return formatSlotLabel(slot.ams_id, slot.tray_id, isHt, isExternal);
 }
