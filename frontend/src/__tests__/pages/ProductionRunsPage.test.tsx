@@ -322,7 +322,9 @@ describe('ProductionRunsPage', () => {
 
     render(<ProductionRunsPage />);
 
-    expect(await screen.findByText(/low filament — swap the spool/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/low filament — load a spool and the farm resumes automatically/i),
+    ).toBeInTheDocument();
   });
 
   it('hides hold chips on healthy runs', async () => {

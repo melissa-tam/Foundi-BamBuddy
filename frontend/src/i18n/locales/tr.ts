@@ -155,7 +155,7 @@ export default {
       unknown: 'Duraklatıldı — çalışma ayrıntılarına bakın',
     },
     stagedBanner: {
-      lowSpool: '{{count}} ünite bekletiliyor: filament az — bobini değiştirin, sonra Sürdür\'e basın (veya Kuyruk sayfasından yeniden denetleyin).',
+      lowSpool: '{{count}} ünite bekletiliyor: filament az — bir bobin takın, çiftlik otomatik olarak devam eder (Sürdür de bunları hemen serbest bırakır).',
       other: '{{count}} ünite bekletiliyor — serbest bırakmak için Sürdür\'e basın.',
     },
     detail: {
@@ -1567,9 +1567,9 @@ export default {
       runBadgeTitle: 'Üretim çalışması #{{id}} kapsamında — ayrıntıyı aç',
       stopConsequence: 'Operatör durdurması sayılır: otomatik yeniden deneme yok; plakayı temizleyip Sürdür\'e basana kadar çalışma bu yazıcıyı bekletir.',
       destructiveNote: 'Bu öğe "{{run}}" üretim çalışmasına ait. Kaldırılırsa, bir sonraki Sürdür tamamlayana kadar çalışma eksik kalır.',
-      stagedBannerTitle: 'Filament az — bobini değiştirin, sonra Yeniden denetle\'ye basın',
-      stagedBannerBody: '{{count}} öğe filament denetimi tarafından bekletildi. Yeniden denetle yalnızca bobini artık yeterli olan öğeleri serbest bırakır.',
-      recheckButton: 'Yeniden denetle ve serbest bırak',
+      stagedBannerTitle: 'Filament az — bir bobin takın; çiftlik otomatik olarak devam eder',
+      stagedBannerBody: '{{count}} öğe filament bekliyor. Aşağıda listelenen yazıcılara filament takın — çiftlik bunu algılar ve bu öğeleri genellikle bir dakika içinde otomatik olarak serbest bırakır.',
+      recheckButton: 'Şimdi yeniden denetle',
       stagedBlockingHeading: 'Bekleniyor:',
       releasedToast: 'Bekletilen {{count}} öğe serbest bırakıldı',
       releasedNone: 'Hiçbir öğe serbest bırakılmadı — filament hâlâ az',

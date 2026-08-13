@@ -1745,6 +1745,15 @@ async def run_migrations(conn):
         )
         """,
     )
+    # Index for the per-spool, since-a-boundary history reads: the ledger-overcharge
+    # reconcile (spool_tagless.reconcile_ledger_overcharges) SUMs and re-points
+    # `spool_usage_history` rows for one spool at or after a re-bind instant, and the
+    # spool detail/stat readers scan one spool's rows in time order. Composite in that
+    # order so both the equality and the range ride one index.
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_spool_usage_history_spool_created ON spool_usage_history (spool_id, created_at)",
+    )
 
     # Migration: Add open_in_new_tab column to external_links
     await _safe_execute(conn, "ALTER TABLE external_links ADD COLUMN open_in_new_tab BOOLEAN DEFAULT 0")

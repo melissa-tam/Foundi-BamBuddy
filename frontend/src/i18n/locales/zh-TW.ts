@@ -155,7 +155,7 @@ export default {
       unknown: '已暫停 — 請查看執行詳情',
     },
     stagedBanner: {
-      lowSpool: '{{count}} 個單元被擱置：線材不足 — 更換線材卷後按繼續（或在佇列頁面重新檢查）。',
+      lowSpool: '{{count}} 個單元被擱置：線材不足 — 裝入線材卷即可，農場會自動繼續（按「繼續」可立即釋放）。',
       other: '{{count}} 個單元被擱置 — 按繼續以釋放。',
     },
     detail: {
@@ -1565,9 +1565,9 @@ export default {
       runBadgeTitle: '屬於生產執行 #{{id}} — 開啟執行詳情',
       stopConsequence: '將計為操作員停止：不自動重試；在您清理列印板並按繼續之前，該執行將佔住此印表機。',
       destructiveNote: '此項目屬於生產執行「{{run}}」。移除後，執行將缺件，直到下次按繼續補齊。',
-      stagedBannerTitle: '線材不足 — 更換線材卷後按重新檢查',
-      stagedBannerBody: '{{count}} 個項目被線材檢查擱置。重新檢查僅釋放線材現已足夠的項目。',
-      recheckButton: '重新檢查並釋放',
+      stagedBannerTitle: '線材不足 — 裝入線材卷即可，農場會自動繼續',
+      stagedBannerBody: '{{count}} 個項目正在等待線材。請為下方列出的印表機裝入線材——農場會偵測到並自動釋放這些項目，通常在一分鐘內完成。',
+      recheckButton: '立即重新檢查',
       stagedBlockingHeading: '等待中：',
       releasedToast: '已釋放 {{count}} 個擱置項目',
       releasedNone: '未釋放任何項目 — 線材仍然不足',

@@ -41,6 +41,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services import spool_selection
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
+from backend.app.services.tray_fields import TRAY_PRESENT_STATES
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -81,10 +82,20 @@ STAGING_REASON_PREFIX = "Low filament"
 # the roll weighs — so a shared "below minimum" sentence would be a lie for half
 # of them. Keys are ``spool_selection.START_BLOCK_*``; anything else (including
 # None) is the generic grams-deficit hold.
+#
+# Each phrase states the ASK and then the CONTRACT: the operator's only job is
+# the physical act (load / swap / weigh) — the farm's own release lane
+# (:func:`release_filament_staged`, driven by the AMS-change hook and the 60 s
+# periodic net) un-stages the items on its own. The old copy demanded a manual
+# "press Re-check", which was never true and sent operators hunting for a button
+# after they had already done the only thing that mattered (2026-08-12, 009-H2S).
+# The Re-check button survives as a backstop, not as the contract.
+_AUTO_RESUME_SUFFIX = "the farm resumes automatically"
 _START_BLOCK_WHAT = {
-    spool_selection.START_BLOCK_BELOW_FLOOR: "starting spool below minimum",
-    spool_selection.START_BLOCK_UNKNOWN_GRAMS: "starting spool weight unknown",
+    spool_selection.START_BLOCK_BELOW_FLOOR: f"starting spool below minimum — swap in a fuller spool and {_AUTO_RESUME_SUFFIX}",
+    spool_selection.START_BLOCK_UNKNOWN_GRAMS: f"starting spool weight unknown — weigh or assign the spool and {_AUTO_RESUME_SUFFIX}",
 }
+_GENERIC_WHAT = f"needs more filament — load a spool and {_AUTO_RESUME_SUFFIX}"
 
 
 def build_staged_reason(who: str, *, start_block: str | None = None) -> str:
@@ -96,9 +107,13 @@ def build_staged_reason(who: str, *, start_block: str | None = None) -> str:
     a minimum-start block (``spool_selection.dominant_start_block`` collapses a
     multi-slot / multi-printer hold to one kind); ``None`` is the generic
     "needs more filament" deficit hold.
+
+    Every variant ends in the automatic-release contract (see
+    :data:`_START_BLOCK_WHAT`): the operator loads filament, the farm detects it
+    and releases the staged items itself — no button press is owed.
     """
     who = (who or "").strip() or "assigned printer"
-    what = _START_BLOCK_WHAT.get(start_block or "", "needs more filament")
+    what = _START_BLOCK_WHAT.get(start_block or "", _GENERIC_WHAT)
     return f"{STAGING_REASON_PREFIX}: {who} ({what})"
 
 
@@ -112,10 +127,34 @@ def _reset_state() -> None:
 def compute_tray_signature(ams_data: list) -> str:
     """Stable hash of the spool-identity-bearing tray fields.
 
-    Built from tray type / remaining % / RFID uuid per slot — the fields that
-    change when a spool is swapped or refilled. Deliberately EXCLUDES volatile
-    telemetry (humidity, temperatures) so routine AMS pushes hash identically
-    and the release pass only runs on a material change.
+    Built from tray type / remaining % / RFID uuid / PRESENCE per slot — the
+    fields that change when a spool is swapped, refilled, inserted or pulled.
+    Deliberately EXCLUDES volatile telemetry (humidity, temperatures) so routine
+    AMS pushes hash identically and the release pass only runs on a material
+    change.
+
+    The presence token mirrors the MQTT layer's own change-hash
+    (``bambu_mqtt.py``, the ``ams_hash_data`` block), which learned the same
+    lesson first: a tagless third-party spool inserted into an EMPTY slot
+    changes no tray_type / tag / remain, so an identity-only signature is blind
+    to it. That blindness was proven in production on 2026-08-12 (009-H2S) — a
+    bare insert into an empty slot left this signature identical, the AMS-change
+    release hook skipped, and staged "Low filament" items waited for the tagless
+    autoconfig's tray_type adoption or the 60 s periodic net instead of
+    releasing on the insert. The two invariants come with it:
+
+    1. POSITIVE EVIDENCE ONLY — ``'p'`` means the wire asserted a seated spool
+       (state ∈ {10, 11}); everything else (state 9, None, unknown dialect codes
+       such as the H2C idle empty's ``state=0``) reads ``'a'``/absent rather
+       than being guessed at.
+    2. 10 AND 11 FOLD TO ONE TOKEN — the raw state is never hashed, because a
+       seated tray flips 10↔11 on every load/unload and would storm the hook
+       with churn that no operator action caused.
+
+    Firing the hook a little more eagerly is safe: the downstream release
+    predicate (:func:`release_filament_staged`) re-decides against live state
+    and fails safe while a slot is still unread, so an extra pass releases
+    nothing it shouldn't.
     """
     parts: list[str] = []
     for ams in ams_data or []:
@@ -125,8 +164,22 @@ def compute_tray_signature(ams_data: list) -> str:
         for tray in ams.get("tray", []) or []:
             if not isinstance(tray, dict):
                 continue
+            # state may arrive as int or str depending on firmware/merge path
+            # — normalize before the membership test. The seated vocabulary is
+            # ``tray_fields.TRAY_PRESENT_STATES`` (the one origin), not a local
+            # ``(10, 11)`` literal; the test stays a bare membership check
+            # rather than ``tray_fields.tray_presence`` because a hash token
+            # needs the BINARY positive-evidence answer, not the tri-state
+            # fail-open rule (whose ``None`` would have to fold to 'a' here
+            # anyway).
+            try:
+                tray_state = int(tray.get("state"))
+            except (TypeError, ValueError):
+                tray_state = None
+            presence = "p" if tray_state in TRAY_PRESENT_STATES else "a"
             parts.append(
-                f"{ams_id}:{tray.get('id')}:{tray.get('tray_type')}:{tray.get('remain')}:{tray.get('tray_uuid')}"
+                f"{ams_id}:{tray.get('id')}:{tray.get('tray_type')}:"
+                f"{tray.get('remain')}:{tray.get('tray_uuid')}:{presence}"
             )
     return hashlib.sha1("|".join(parts).encode("utf-8", "replace")).hexdigest()
 

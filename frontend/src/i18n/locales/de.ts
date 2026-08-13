@@ -155,7 +155,7 @@ export default {
       unknown: 'Pausiert — siehe Laufdetails',
     },
     stagedBanner: {
-      lowSpool: '{{count}} Einheit(en) zurückgehalten: Filament knapp — Spule wechseln, dann Fortsetzen drücken (oder auf der Warteschlangen-Seite neu prüfen).',
+      lowSpool: '{{count}} Einheit(en) zurückgehalten: Filament knapp — Spule einlegen, die Farm läuft automatisch weiter (Fortsetzen gibt sie sofort frei).',
       other: '{{count}} Einheit(en) zurückgestellt — zum Freigeben Fortsetzen drücken.',
     },
     detail: {
@@ -1565,9 +1565,9 @@ export default {
       runBadgeTitle: 'Teil von Produktionslauf #{{id}} — Laufdetails öffnen',
       stopConsequence: 'Zählt als Bediener-Stopp: keine automatische Wiederholung; der Lauf hält diesen Drucker an, bis Sie die Platte freigeben und Fortsetzen drücken.',
       destructiveNote: 'Dieses Element gehört zum Produktionslauf "{{run}}". Nach dem Entfernen fehlt dem Lauf eine Einheit, bis das nächste Fortsetzen ihn wieder auffüllt.',
-      stagedBannerTitle: 'Filament knapp — Spule wechseln, dann Neu prüfen drücken',
-      stagedBannerBody: '{{count}} Element(e) wurden von der Filamentprüfung zurückgestellt. Neu prüfen gibt nur Elemente frei, deren Spule jetzt genug Material hat.',
-      recheckButton: 'Neu prüfen und freigeben',
+      stagedBannerTitle: 'Filament knapp — Spule einlegen; die Farm läuft automatisch weiter',
+      stagedBannerBody: '{{count}} Element(e) warten auf Filament. Legen Sie Filament in die unten aufgeführten Drucker ein — die Farm erkennt es und gibt diese Elemente automatisch frei, meist innerhalb einer Minute.',
+      recheckButton: 'Jetzt neu prüfen',
       stagedBlockingHeading: 'Wartet auf:',
       releasedToast: '{{count}} zurückgestellte(s) Element(e) freigegeben',
       releasedNone: 'Keine Elemente freigegeben — Filament weiterhin knapp',

@@ -1367,6 +1367,16 @@ async def detect_spent_contradictions(db: AsyncSession, manager=None, *, now: fl
     Throttled to :data:`_SPENT_CONTRADICTION_MIN_INTERVAL_S` because its host tick runs
     ~45× faster than this walk is worth. ``manager``/``now`` are injectable for tests.
 
+    **This is also the throttled entry for the fleet's other ledger-integrity sweep**,
+    ``spool_tagless.reconcile_ledger_overcharges`` (2026-08-12, 009-H2S spool 290): the two
+    ask the same shape of question — does a durable claim on a spool row still survive
+    contact with the evidence — at the same cost and the same worthwhile cadence, so they
+    share ONE floor and ONE Spoolman gate rather than racing two. The sibling sweep lives
+    in ``spool_tagless`` because it needs that module's mint + bind mechanics, which cannot
+    be imported here (``spool_tagless`` imports THIS module at module scope); the deferred
+    call below is the one direction with no cycle. Its return value stays out of this
+    function's count, which remains "contradictions found" alone.
+
     FULLY self-guarding (invariant 10), at two levels: per row, so one unreadable
     printer cannot abort the sweep, and around the whole sweep, so nothing here can kill
     the scheduler-tick lane it hangs off. That is what lets the call site be a bare line
@@ -1391,10 +1401,19 @@ async def detect_spent_contradictions(db: AsyncSession, manager=None, *, now: fl
         manager = printer_manager
 
     try:
-        return await _scan_spent_contradictions(db, manager)
+        found = await _scan_spent_contradictions(db, manager)
     except Exception:  # noqa: BLE001 — an entry hook owns its guard; the tick must survive
         logger.exception("Spent-contradiction sweep failed (non-fatal)")
-        return 0
+        found = 0
+
+    # The sibling ledger-integrity sweep, under this entry's throttle and Spoolman gate
+    # (see the docstring). Deferred import: ``spool_tagless`` imports this module at module
+    # scope. Called bare on purpose — it is an entry hook that owns its own guard, so a
+    # try/except here would be the second guard on one contract.
+    from backend.app.services.spool_tagless import reconcile_ledger_overcharges
+
+    await reconcile_ledger_overcharges(db)
+    return found
 
 
 async def _scan_spent_contradictions(db: AsyncSession, manager) -> int:

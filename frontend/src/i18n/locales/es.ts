@@ -155,7 +155,7 @@ export default {
       unknown: 'Pausada — consulta el detalle de la ejecución',
     },
     stagedBanner: {
-      lowSpool: '{{count}} unidad(es) retenida(s): filamento insuficiente — cambie la bobina y pulse Reanudar (o Volver a comprobar en la página de cola).',
+      lowSpool: '{{count}} unidad(es) retenida(s): filamento insuficiente — cargue una bobina y la granja se reanuda automáticamente (Reanudar también las libera de inmediato).',
       other: '{{count}} unidad(es) retenida(s) — pulse Reanudar para liberarlas.',
     },
     detail: {
@@ -1565,9 +1565,9 @@ export default {
       runBadgeTitle: 'Parte de la serie de producción n.º {{id}} — abrir el detalle',
       stopConsequence: 'Cuenta como parada del operador: sin reintento automático; la serie retiene esta impresora hasta que despeje la cama y pulse Reanudar.',
       destructiveNote: 'Este elemento pertenece a la serie de producción "{{run}}". Al quitarlo, la serie queda incompleta hasta que el próximo Reanudar la reponga.',
-      stagedBannerTitle: 'Filamento insuficiente — cambie la bobina y pulse Volver a comprobar',
-      stagedBannerBody: '{{count}} elemento(s) quedaron retenidos por la comprobación de filamento. Volver a comprobar libera solo los elementos cuya bobina ya tiene material suficiente.',
-      recheckButton: 'Volver a comprobar y liberar',
+      stagedBannerTitle: 'Filamento insuficiente — cargue una bobina; la granja se reanuda automáticamente',
+      stagedBannerBody: '{{count}} elemento(s) esperan filamento. Cargue filamento en las impresoras indicadas abajo: la granja lo detecta y los libera automáticamente, normalmente en menos de un minuto.',
+      recheckButton: 'Volver a comprobar ahora',
       stagedBlockingHeading: 'Esperando:',
       releasedToast: '{{count}} elemento(s) retenido(s) liberado(s)',
       releasedNone: 'Ningún elemento liberado — el filamento sigue siendo insuficiente',

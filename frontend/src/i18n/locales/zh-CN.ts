@@ -155,7 +155,7 @@ export default {
       unknown: '已暂停 — 请查看运行详情',
     },
     stagedBanner: {
-      lowSpool: '{{count}} 个单元被搁置：耗材不足 — 更换料卷后按继续（或在队列页面重新检查）。',
+      lowSpool: '{{count}} 个单元被搁置：耗材不足 — 装入料卷即可，农场会自动继续（按“继续”可立即释放）。',
       other: '{{count}} 个单元被搁置 — 按继续以释放。',
     },
     detail: {
@@ -1565,9 +1565,9 @@ export default {
       runBadgeTitle: '属于生产运行 #{{id}} — 打开运行详情',
       stopConsequence: '将计为操作员停止：不自动重试；在您清理打印板并按继续之前，该运行将占住此打印机。',
       destructiveNote: '此项目属于生产运行“{{run}}”。移除后，运行将缺件，直到下次按继续补齐。',
-      stagedBannerTitle: '耗材不足 — 更换料卷后按重新检查',
-      stagedBannerBody: '{{count}} 个项目被耗材检查搁置。重新检查仅释放料卷现已足够的项目。',
-      recheckButton: '重新检查并释放',
+      stagedBannerTitle: '耗材不足 — 装入料卷即可，农场会自动继续',
+      stagedBannerBody: '{{count}} 个项目正在等待耗材。请给下方列出的打印机装入耗材——农场会检测到并自动释放这些项目，通常在一分钟内完成。',
+      recheckButton: '立即重新检查',
       stagedBlockingHeading: '等待中：',
       releasedToast: '已释放 {{count}} 个搁置项目',
       releasedNone: '未释放任何项目 — 耗材仍然不足',

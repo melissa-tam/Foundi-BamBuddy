@@ -155,7 +155,7 @@ export default {
       unknown: '일시정지됨 — 실행 세부정보를 확인하세요',
     },
     stagedBanner: {
-      lowSpool: '{{count}}개 유닛 보류 중: 필라멘트 부족 — 스풀을 교체한 뒤 재개(또는 대기열 페이지에서 재확인)를 누르세요.',
+      lowSpool: '{{count}}개 유닛 보류 중: 필라멘트 부족 — 스풀을 넣으면 팜이 자동으로 재개합니다(재개를 누르면 즉시 해제됩니다).',
       other: '{{count}}개 유닛 보류 중 — 재개를 누르면 해제됩니다.',
     },
     detail: {
@@ -1780,9 +1780,9 @@ export default {
       runBadgeTitle: '생산 런 #{{id}}의 일부 — 런 상세 열기',
       stopConsequence: '운영자 중지로 처리됩니다: 자동 재시도 없음. 플레이트를 비우고 재개를 누를 때까지 런이 이 프린터를 보류합니다.',
       destructiveNote: '이 항목은 생산 런 "{{run}}"에 속합니다. 제거하면 다음 재개로 보충될 때까지 런이 부족해집니다.',
-      stagedBannerTitle: '필라멘트 부족 — 스풀을 교체한 뒤 재확인을 누르세요',
-      stagedBannerBody: '{{count}}개 항목이 필라멘트 검사로 보류되었습니다. 재확인은 스풀에 재료가 충분해진 항목만 해제합니다.',
-      recheckButton: '재확인 후 해제',
+      stagedBannerTitle: '필라멘트 부족 — 스풀을 넣으면 팜이 자동으로 재개합니다',
+      stagedBannerBody: '{{count}}개 항목이 필라멘트를 기다리고 있습니다. 아래 표시된 프린터에 필라멘트를 넣으면 팜이 이를 감지해 보통 1분 이내에 자동으로 해제합니다.',
+      recheckButton: '지금 재확인',
       stagedBlockingHeading: '대기 중:',
       releasedToast: '보류된 {{count}}개 항목을 해제했습니다',
       releasedNone: '해제된 항목 없음 — 필라멘트가 여전히 부족합니다',

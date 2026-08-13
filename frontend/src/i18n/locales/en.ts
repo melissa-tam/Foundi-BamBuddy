@@ -155,7 +155,7 @@ export default {
       unknown: 'Paused — see run detail',
     },
     stagedBanner: {
-      lowSpool: '{{count}} unit(s) held: low filament — swap the spool, then press Resume (or Re-check on the Queue page).',
+      lowSpool: '{{count}} unit(s) held: low filament — load a spool and the farm resumes automatically (Resume also releases them immediately).',
       other: '{{count}} unit(s) staged — press Resume to release them.',
     },
     detail: {
@@ -1573,9 +1573,9 @@ export default {
       runBadgeTitle: 'Part of production run #{{id}} — open the run detail',
       stopConsequence: 'Counts as an operator stop: no auto-retry; the run holds this printer until you clear the plate and press Resume.',
       destructiveNote: 'This item belongs to production run "{{run}}". Removing it leaves the run short until the next Resume tops it back up.',
-      stagedBannerTitle: 'Low filament — swap the spool, then press Re-check',
-      stagedBannerBody: '{{count}} item(s) were staged by the low-spool check. Re-check releases only the items whose spool now has enough material.',
-      recheckButton: 'Re-check and release',
+      stagedBannerTitle: 'Low filament — load a spool; the farm resumes automatically',
+      stagedBannerBody: '{{count}} item(s) are waiting for filament. Load filament into the printer(s) listed below — the farm detects it and releases these automatically, usually within a minute.',
+      recheckButton: 'Re-check now',
       stagedBlockingHeading: 'Waiting on:',
       releasedToast: 'Released {{count}} staged item(s)',
       releasedNone: 'No items released — filament still short',

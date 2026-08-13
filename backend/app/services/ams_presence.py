@@ -750,6 +750,41 @@ def _filament_engaged(printer_id: int) -> bool:
     return tray_now is not None and tray_now != _TRAY_UNLOADED
 
 
+def read_unavailable_reason(printer_id: int, ams_id: int, tray_id: int) -> str | None:
+    """Why a commanded identify for this slot CANNOT run this epoch — or None if it can.
+
+    Public read-only view of the identify lane's wire-safety refusals for consumers
+    OUTSIDE it — currently ``spool_tagless``'s config-settle gate, which waits on an
+    identity ANSWER it will never get while the tray is engaged (2026-08-12, 009-H2S:
+    an untagged insert the AMS immediately engaged sat the full ``_CONFIG_SETTLE_MAX_S``
+    before minting, because no read could run and no firmware read was coming — the
+    autonomous ones happen at insert/load, so an identity still in flight would already
+    be asserting itself on the wire).
+
+    Reports ONLY causes that cannot self-clear while the printer sits idle: engaged
+    filament (:func:`_filament_engaged`) needs an unload somebody has to command.
+    Deliberately EXCLUDED are drying (:func:`unit_drying`) and an identify already in
+    flight (:func:`identify_in_flight`) — both clear on their own well inside a settle
+    window, and drying additionally refuses the tagless config write itself at the
+    client, so concluding a settle on either would only spend
+    ``spool_tagless._AUTOCONFIG_MAX_PUBLISHES`` strikes against a wire that is going to
+    answer ``fail`` (the shape-28 lesson: an unconsumed refusal is what turns a bounded
+    retry into ~40k writes a day).
+
+    Takes the full slot signature although today's only cause is printer-wide: the
+    QUESTION is per-slot ("can THIS slot be read now?"), and a future per-unit cause
+    slots in behind the same signature without an API break.
+
+    Non-consuming, and that is load-bearing: a refusal is not an ANSWER, and invariant 13
+    closes read entitlements only on answers. Asking here must therefore move no state at
+    all — no occasion consumption, no identity-learned stamp, no echo arm — because the
+    entitlement it preserves is exactly what lets a later DISENGAGED read discover the
+    roll and correct a slot the tagless default mis-identified. Never raises (invariant
+    10): an unreadable printer state reads as not-engaged, i.e. a read is available.
+    """
+    return "filament_engaged" if _filament_engaged(printer_id) else None
+
+
 # --- Assignment context ----------------------------------------------------
 
 

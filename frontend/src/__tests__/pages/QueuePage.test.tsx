@@ -698,10 +698,10 @@ describe('QueuePage farm surfaces (Phase 4)', () => {
     render(<QueuePage />);
 
     expect(
-      await screen.findByText(/low filament — swap the spool, then press re-check/i),
+      await screen.findByText(/low filament — load a spool; the farm resumes automatically/i),
     ).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole('button', { name: /re-check and release/i }));
+    await userEvent.click(screen.getByRole('button', { name: /re-check now/i }));
 
     await waitFor(() => expect(releaseCalled).toBe(true));
     expect(await screen.findByText(/released 1 staged item/i)).toBeInTheDocument();
@@ -763,11 +763,11 @@ describe('QueuePage farm surfaces (Phase 4)', () => {
 
     // Banner renders regardless of permission.
     expect(
-      await screen.findByText(/low filament — swap the spool, then press re-check/i),
+      await screen.findByText(/low filament — load a spool; the farm resumes automatically/i),
     ).toBeInTheDocument();
 
     // The release action is disabled and explains why on hover.
-    const btn = screen.getByRole('button', { name: /re-check and release/i });
+    const btn = screen.getByRole('button', { name: /re-check now/i });
     await waitFor(() => expect(btn).toBeDisabled());
     expect(btn).toHaveAttribute('title', 'Ask a queue admin to release these items');
   });
@@ -811,7 +811,7 @@ describe('QueuePage farm surfaces (Phase 4)', () => {
 
     render(<QueuePage />);
 
-    const btn = await screen.findByRole('button', { name: /re-check and release/i });
+    const btn = await screen.findByRole('button', { name: /re-check now/i });
     await waitFor(() => expect(btn).toBeEnabled());
     expect(btn).not.toHaveAttribute('title', 'Ask a queue admin to release these items');
   });
