@@ -183,7 +183,9 @@ describe('ProductionRunDetailPage', () => {
     expect(screen.getByText(/unit stopped by operator/i)).toBeInTheDocument();
     expect(screen.getByText('Printer blocked')).toBeInTheDocument();
     // Staged banners (low-spool actionable + generic)
-    expect(screen.getByText(/low filament — swap the spool/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/low filament — load a spool and the farm resumes automatically/i),
+    ).toBeInTheDocument();
     expect(screen.getByText(/1 unit\(s\) staged — press Resume/i)).toBeInTheDocument();
     // Per-printer reasons (now appear in both the chip and the not-eligible
     // panel, so the quarantine label + mismatch reason are non-unique).

@@ -155,7 +155,7 @@ export default {
       unknown: 'Pausada — consulte os detalhes da execução',
     },
     stagedBanner: {
-      lowSpool: '{{count}} unidade(s) retida(s): filamento insuficiente — troque a bobina e pressione Retomar (ou Verificar novamente na página da fila).',
+      lowSpool: '{{count}} unidade(s) retida(s): filamento insuficiente — coloque uma bobina e a fazenda retoma automaticamente (Retomar também as libera imediatamente).',
       other: '{{count}} unidade(s) retida(s) — pressione Retomar para liberá-las.',
     },
     detail: {
@@ -1565,9 +1565,9 @@ export default {
       runBadgeTitle: 'Parte da série de produção nº {{id}} — abrir detalhes',
       stopConsequence: 'Conta como parada do operador: sem nova tentativa automática; a série retém esta impressora até você liberar a placa e pressionar Retomar.',
       destructiveNote: 'Este item pertence à série de produção "{{run}}". Removê-lo deixa a série incompleta até o próximo Retomar repor.',
-      stagedBannerTitle: 'Filamento insuficiente — troque a bobina e pressione Verificar novamente',
-      stagedBannerBody: '{{count}} item(ns) foram retidos pela verificação de filamento. Verificar novamente libera apenas os itens cuja bobina agora tem material suficiente.',
-      recheckButton: 'Verificar novamente e liberar',
+      stagedBannerTitle: 'Filamento insuficiente — coloque uma bobina; a fazenda retoma automaticamente',
+      stagedBannerBody: '{{count}} item(ns) aguardando filamento. Coloque filamento nas impressoras listadas abaixo: a fazenda detecta e libera esses itens automaticamente, normalmente em menos de um minuto.',
+      recheckButton: 'Verificar novamente agora',
       stagedBlockingHeading: 'Aguardando:',
       releasedToast: '{{count}} item(ns) retido(s) liberado(s)',
       releasedNone: 'Nenhum item liberado — filamento ainda insuficiente',

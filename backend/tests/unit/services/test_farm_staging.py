@@ -326,6 +326,35 @@ class TestTraySignature:
     def test_stable_on_empty_payloads(self):
         assert farm_staging.compute_tray_signature([]) == farm_staging.compute_tray_signature([])
 
+    def test_bare_insert_into_empty_slot_changes_signature(self):
+        """The 2026-08-12 009-H2S class: a bare (untagged, unconfigured) spool
+        dropped into an empty slot changes NO identity field — only presence.
+        Without the presence token this hashed identically and the AMS-change
+        release hook skipped."""
+        empty = [{"id": 0, "tray": [{"id": 0, "state": 9, "tray_type": "", "remain": -1, "tray_uuid": None}]}]
+        seated = [{"id": 0, "tray": [{"id": 0, "state": 10, "tray_type": "", "remain": -1, "tray_uuid": None}]}]
+        assert farm_staging.compute_tray_signature(empty) != farm_staging.compute_tray_signature(seated)
+
+    def test_load_unload_flip_does_not_churn_signature(self):
+        """Invariant 2 of the token (mirroring bambu_mqtt): 10 and 11 fold to ONE
+        token, so a seated tray's load/unload flips never storm the hook."""
+        seated = [{"id": 0, "tray": [{"id": 0, "state": 10, "tray_type": "PETG", "remain": 80, "tray_uuid": "AA"}]}]
+        fed = [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PETG", "remain": 80, "tray_uuid": "AA"}]}]
+        assert farm_staging.compute_tray_signature(seated) == farm_staging.compute_tray_signature(fed)
+
+    @pytest.mark.parametrize("state", [0, 3, 25, None, "junk"])
+    def test_unknown_states_read_absent(self, state):
+        """Invariant 1: positive evidence only. A dialect code (H2C idle empties
+        report state=0), an unparseable value, or a missing key is NOT presence —
+        it hashes exactly like the wire-asserted empty."""
+        tray = {"id": 0, "tray_type": "", "remain": -1, "tray_uuid": None}
+        empty9 = [{"id": 0, "tray": [{**tray, "state": 9}]}]
+        if state is None:
+            other = [{"id": 0, "tray": [dict(tray)]}]  # state key absent entirely
+        else:
+            other = [{"id": 0, "tray": [{**tray, "state": state}]}]
+        assert farm_staging.compute_tray_signature(other) == farm_staging.compute_tray_signature(empty9)
+
 
 class TestAmsChangeHook:
     @pytest.fixture
@@ -387,6 +416,22 @@ class TestAmsChangeHook:
         assert item.manual_start is False
         assert item.filament_short is False
 
+    async def test_presence_only_change_releases_staged_farm_item(self, db_session, sessions, monkeypatch):
+        """End-to-end 009-H2S shape: ONLY presence changed between the two pushes
+        (bare spool into an empty slot — identical tray_type / remain / uuid), and
+        the hook must now get past the signature debounce to the release attempt
+        instead of waiting for tagless autoconfig or the 60 s periodic net."""
+        item = await self._seed_farm_staged(db_session)
+        _patch_deficit(monkeypatch, AsyncMock(return_value=[]))
+        tray = {"id": 0, "tray_type": "", "remain": -1, "tray_uuid": None}
+        before = [{"id": 0, "tray": [{**tray, "state": 9}]}]
+        after = [{"id": 0, "tray": [{**tray, "state": 10}]}]
+        await farm_staging.maybe_release_on_ams_change(1, before)  # seed
+        assert await farm_staging.maybe_release_on_ams_change(1, after) == 1
+        await db_session.refresh(item)
+        assert item.manual_start is False
+        assert item.filament_short is False
+
     async def test_changed_signature_without_staged_farm_items_short_circuits(self, db_session, sessions, monkeypatch):
         # Staged NON-farm item (batch without sku_file_id): the cheap pre-check
         # skips the release pass entirely on the AMS path.
@@ -414,31 +459,43 @@ class TestAmsChangeHook:
 class TestBuildStagedReason:
     """The rich low-spool staging reason (D9): names the blocked machine(s), is
     prefix-recognisable for the release-clear, and is NOT token-shaped so the
-    frontend humanizer passes it through verbatim."""
+    frontend humanizer passes it through verbatim.
+
+    Since 2026-08-12 every variant also states the AUTOMATIC-RELEASE contract:
+    the operator's only job is the physical act, the farm detects it and releases
+    the staged items itself. The old copy demanded a manual "press Re-check",
+    which the release lane made untrue.
+    """
 
     def test_names_printer_and_default_action(self):
         r = farm_staging.build_staged_reason("004-H2S")
+        assert r == "Low filament: 004-H2S (needs more filament — load a spool and the farm resumes automatically)"
         assert r.startswith(farm_staging.STAGING_REASON_PREFIX)
-        assert "004-H2S" in r
-        assert "needs more filament" in r
         # Not a bare machine token (has spaces/punctuation) → humanizer passthrough.
         assert " " in r and ":" in r
 
     def test_below_floor_variant(self):
         r = farm_staging.build_staged_reason("004-H2S", start_block=spool_selection.START_BLOCK_BELOW_FLOOR)
+        assert r == (
+            "Low filament: 004-H2S "
+            "(starting spool below minimum — swap in a fuller spool and the farm resumes automatically)"
+        )
         assert r.startswith(farm_staging.STAGING_REASON_PREFIX)
-        assert "starting spool below minimum" in r
 
     def test_unknown_grams_variant_does_not_claim_below_minimum(self):
         """An unpriceable roll is not a light roll: telling the operator to top it up
         would send them to a spool that may be full. The honest ask is a weight."""
         r = farm_staging.build_staged_reason("004-H2S", start_block=spool_selection.START_BLOCK_UNKNOWN_GRAMS)
-        assert "starting spool weight unknown" in r
+        assert r == (
+            "Low filament: 004-H2S "
+            "(starting spool weight unknown — weigh or assign the spool and the farm resumes automatically)"
+        )
         assert "below minimum" not in r
 
     def test_unknown_kind_falls_back_to_generic(self):
         """An unrecognised kind must never invent a claim about the spool."""
-        assert "needs more filament" in farm_staging.build_staged_reason("004-H2S", start_block="future_kind")
+        r = farm_staging.build_staged_reason("004-H2S", start_block="future_kind")
+        assert r == "Low filament: 004-H2S (needs more filament — load a spool and the farm resumes automatically)"
 
     def test_empty_who_falls_back(self):
         r = farm_staging.build_staged_reason("")

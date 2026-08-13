@@ -1424,6 +1424,54 @@ class TestEngagedFilamentDefer:
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: None)
         assert ams_presence._filament_engaged(1) is False  # printer gone → not engaged
 
+    def test_read_unavailable_reason_reports_only_the_unclearable_refusal(self, monkeypatch):
+        """The public view spool_tagless's config-settle gate asks: "can a commanded
+        identify for this slot run this epoch?". Engaged filament answers no (an idle
+        printer cannot clear it by itself); every not-engaged reading — including the
+        unreadable ones — answers None, i.e. a read IS available (fail-open)."""
+        for tray_now, expected in ((255, None), (None, None), (1, "filament_engaged"), (254, "filament_engaged")):
+            monkeypatch.setattr(
+                ams_presence.printer_manager, "get_status", lambda pid, t=tray_now: SimpleNamespace(tray_now=t)
+            )
+            assert ams_presence.read_unavailable_reason(1, 0, 0) == expected
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace())
+        assert ams_presence.read_unavailable_reason(1, 0, 0) is None  # state missing the field
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: None)
+        assert ams_presence.read_unavailable_reason(1, 0, 0) is None  # no state at all
+
+    def test_read_unavailable_reason_never_raises_on_an_unknown_printer(self, monkeypatch):
+        # It is asked from the AMS callback chain (invariant 10) and from a gate that must
+        # never wedge a slot: an unknown/exploding printer reads as "a read is available".
+        def _raise(pid):
+            raise KeyError(pid)
+
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", _raise)
+        assert ams_presence.read_unavailable_reason(999, 0, 0) is None
+
+    def test_read_unavailable_reason_consumes_nothing(self, monkeypatch):
+        # A refusal is not an ANSWER (invariant 13 closes entitlements only on answers):
+        # asking must leave the cycle, the occasion and the echo arm exactly as they were,
+        # so the read this epoch cannot run stays owed for the disengaged epoch that can.
+        _arm_cycle(1, 0, 0)
+        _arm_occasion(1, 0, 0)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(tray_now=1))
+        before = (
+            dict(ams_presence._physical_cycle_at),
+            dict(ams_presence._read_occasion_at),
+            dict(ams_presence._slot_read_at),
+            dict(ams_presence._echo_pending),
+        )
+
+        assert ams_presence.read_unavailable_reason(1, 0, 0) == "filament_engaged"
+
+        assert (
+            dict(ams_presence._physical_cycle_at),
+            dict(ams_presence._read_occasion_at),
+            dict(ams_presence._slot_read_at),
+            dict(ams_presence._echo_pending),
+        ) == before
+        assert ams_presence._unanswered_cycle(1, 0, 0) is True  # still owed a discovery read
+
 
 class TestLoadedAtReStamp:
     """A QUALIFIED genuine presence GAIN adjudicates the currently-bound row via

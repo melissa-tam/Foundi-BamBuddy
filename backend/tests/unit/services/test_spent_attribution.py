@@ -19,13 +19,16 @@ finds the residue is forbidden from writing a spool row.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
+from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import spool_respool
 from backend.app.services.bambu_mqtt import BambuMQTTClient, HMSError
 from backend.app.services.notification_service import notification_service
@@ -849,3 +852,407 @@ async def test_healthy_ledger_spent_prompt_keeps_its_numbers(db_session, printer
     assert len(sent) == 1
     assert sent[0]["ledger_unreliable"] is False
     assert sent[0]["donor_remaining_g"] == pytest.approx(40.0)
+
+
+# ===========================================================================
+# D5 â€” the ledger-overcharge reconcile (009-H2S spool 290, 2026-08-12)
+# ===========================================================================
+#
+# The incident replayed by every fixture below: a tagless row was re-bound to its slot by
+# a ``last_location_reclaim`` after a ~23-minute absence that was really a physical roll
+# swap. The old row then absorbed the NEW roll's charges and reached 1200.48 g used on a
+# 1000 g label â€” impossible â€” which drove ``remaining_g`` to 0, failed the 150 g start
+# floor, and staged the whole production run silently for six hours.
+#
+# The reclaim itself is doctrine-correct (rule 7 forbids a duration threshold from
+# deciding tagless identity), so nothing here second-guesses it. What is pinned instead is
+# the reconcile at the moment the ledger becomes PROVABLY impossible: overshoot AND a
+# recorded re-bind, exact attribution of the post-boundary charges, one WARNING as the
+# only surface, and TAGGED rows never auto-reconciled.
+
+_T0 = datetime(2026, 8, 11, 9, 0, 0)  # the row entered service
+_T1 = datetime(2026, 8, 12, 9, 56, 0)  # the reclaim re-bind â€” the boundary
+_PRE = (429.2,)  # charges this row genuinely fed, before the boundary
+_POST = (406.9, 364.4)  # the successor roll's charges: 771.3 g
+_MOVED = 771.3
+
+
+async def _overcharged(
+    db,
+    printer_id,
+    ams_id=0,
+    tray_id=0,
+    *,
+    pre=_PRE,
+    post=_POST,
+    created_at=_T0,
+    bound_at=_T1,
+    label_weight=1000,
+    weight_used=None,
+    bind=True,
+    **kwargs,
+):
+    """A tagless row whose ledger overshot its label, with per-print history either side
+    of a re-bind boundary. Timestamps are explicit because the boundary IS the evidence."""
+    fields = {
+        "material": "PETG",
+        "color_name": "Black",
+        "rgba": "000000FF",
+        "brand": "Bambu Lab",
+        "label_weight": label_weight,
+        "core_weight": 250,
+        "cost_per_kg": 24.5,
+        "category": "Production",
+        "slicer_filament": "GFG02",
+        "nozzle_temp_min": 240,
+        "nozzle_temp_max": 270,
+        "data_origin": "ams_auto",
+        "created_at": created_at,
+        "last_used": _T1,
+        "weight_used": sum(pre) + sum(post) if weight_used is None else weight_used,
+    }
+    fields.update(kwargs)
+    spool = Spool(**fields)
+    spool.k_profiles = []
+    spool.assignments = []
+    db.add(spool)
+    await db.flush()
+    for i, grams in enumerate(pre):
+        db.add(
+            SpoolUsageHistory(
+                spool_id=spool.id,
+                printer_id=printer_id,
+                print_name=f"pre-{spool.id}-{i}",
+                weight_used=grams,
+                created_at=created_at + timedelta(hours=1 + i),
+            )
+        )
+    for i, grams in enumerate(post):
+        db.add(
+            SpoolUsageHistory(
+                spool_id=spool.id,
+                printer_id=printer_id,
+                print_name=f"post-{spool.id}-{i}",
+                weight_used=grams,
+                created_at=bound_at + timedelta(hours=1 + i),
+            )
+        )
+    if bind:
+        db.add(
+            SpoolAssignment(
+                spool_id=spool.id,
+                printer_id=printer_id,
+                ams_id=ams_id,
+                tray_id=tray_id,
+                fingerprint_color="000000FF",
+                fingerprint_type="PETG",
+                created_at=bound_at,
+            )
+        )
+    await db.commit()
+    return spool
+
+
+async def _slot_spool(db, printer_id, ams_id, tray_id):
+    """The spool currently bound to a slot, or None."""
+    res = await db.execute(
+        select(SpoolAssignment)
+        .options(selectinload(SpoolAssignment.spool))
+        .where(
+            SpoolAssignment.printer_id == printer_id,
+            SpoolAssignment.ams_id == ams_id,
+            SpoolAssignment.tray_id == tray_id,
+        )
+    )
+    assignment = res.scalar_one_or_none()
+    return None if assignment is None else assignment.spool
+
+
+async def _history_owners(db, spool_id):
+    """{print_name: spool_id} for the history rows one fixture row created."""
+    res = await db.execute(
+        select(SpoolUsageHistory.print_name, SpoolUsageHistory.spool_id).where(
+            SpoolUsageHistory.print_name.endswith(f"-{spool_id}-0")
+            | SpoolUsageHistory.print_name.endswith(f"-{spool_id}-1")
+        )
+    )
+    return dict(res.all())
+
+
+@pytest.fixture
+def silent_surfaces(monkeypatch):
+    """Assert the operator ruling: ONE warning log is the only surface. No notification of
+    any kind, and no websocket announcement either."""
+    from backend.app.services import notification_service as notification_module, spool_tagless
+
+    notifier = AsyncMock()
+    broadcast = AsyncMock()
+    monkeypatch.setattr(notification_module, "notification_service", notifier)
+    monkeypatch.setattr(spool_tagless.ws_manager, "broadcast", broadcast)
+    return {"notifier": notifier, "broadcast": broadcast}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_moves_the_post_boundary_charges_to_a_minted_successor(
+    db_session, printer_factory, silent_surfaces, caplog
+):
+    """THE 009-H2S SPOOL 290 REPRODUCTION. Overshoot plus a recorded re-bind is the proof;
+    the attribution is the EXACT sum of the post-boundary charges, booked double-entry (the
+    successor gains what the old row loses) so no gram is invented or lost."""
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    old = await _overcharged(db_session, printer.id, 0, 2)
+    assert old.weight_used == pytest.approx(1200.5), "the fixture is the impossible ledger"
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
+        assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 1
+
+    successor = await _slot_spool(db_session, printer.id, 0, 2)
+    assert successor is not None and successor.id != old.id, "the slot now holds the new roll's row"
+    assert successor.weight_used == pytest.approx(_MOVED)
+    assert successor.remaining_g == pytest.approx(1000 - _MOVED), "it clears the 150 g start floor again"
+    assert successor.spent_at is None and successor.archived_at is None
+    assert successor.tag_uid is None and successor.tray_uuid is None
+    assert successor.data_origin == "ams_auto"
+    # Identity + pricing ride across: the physical filament did not change, only the roll.
+    for field in ("material", "color_name", "rgba", "brand", "label_weight", "core_weight"):
+        assert getattr(successor, field) == getattr(old, field), field
+    assert successor.cost_per_kg == pytest.approx(24.5)
+    assert successor.category == "Production"
+    assert successor.slicer_filament == "GFG02"
+    assert (successor.nozzle_temp_min, successor.nozzle_temp_max) == (240, 270)
+    assert successor.last_used == old.last_used, "the charges that moved are prints this roll fed"
+    assert successor.loaded_at is not None, "a binding change to a different row re-stamps the FIFO ordinal"
+
+    await db_session.refresh(old)
+    assert old.weight_used == pytest.approx(sum(_PRE)), "the old row keeps exactly what it genuinely fed"
+    assert old.archived_at is not None, "it left service at the boundary"
+    assert old.spent_at is None, "runout evidence is the exhaustion truth â€” this lane never stamps spent"
+
+    owners = await _history_owners(db_session, old.id)
+    assert owners[f"pre-{old.id}-0"] == old.id
+    assert owners[f"post-{old.id}-0"] == successor.id
+    assert owners[f"post-{old.id}-1"] == successor.id
+
+    assert "LEDGER-OVERCHARGE RECONCILED" in caplog.text
+    assert f"moved 771g (2 charges) to successor spool {successor.id}" in caplog.text
+    assert silent_surfaces["notifier"].method_calls == [], "no notification of any kind (operator ruling)"
+    silent_surfaces["broadcast"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_overshoot_without_a_rebind_is_left_completely_alone(db_session, printer_factory, caplog):
+    """Manufacturers overfill â€” some ship ~1100 g on a 1000 g label. A row bound
+    CONTINUOUSLY since it entered service therefore proves nothing by overshooting, and the
+    operator ruled that even a WARNING there is noise: rule 8 governs it until hardware
+    runout stamps it spent."""
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    # Same impossible number, but the bind is the ORIGINAL one (mint â†’ bind, seconds apart).
+    old = await _overcharged(db_session, printer.id, 0, 1, bound_at=_T0 + timedelta(seconds=3))
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
+        assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0
+
+    await db_session.refresh(old)
+    assert old.archived_at is None and old.weight_used == pytest.approx(1200.5)
+    assert (await _slot_spool(db_session, printer.id, 0, 1)).id == old.id
+    assert caplog.text == "", "no warning: a continuously-bound overshoot is not news"
+
+
+@pytest.mark.asyncio
+async def test_no_post_boundary_charges_means_nothing_to_attribute(db_session, printer_factory, caplog):
+    """With a boundary but no charges recorded after it there is no exact attribution to
+    make â€” and an inexact one is exactly what this lane refuses to do."""
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    old = await _overcharged(db_session, printer.id, 0, 0, pre=(1200.5,), post=())
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
+        assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0
+
+    await db_session.refresh(old)
+    assert old.archived_at is None and old.weight_used == pytest.approx(1200.5)
+    assert (await _slot_spool(db_session, printer.id, 0, 0)).id == old.id
+    assert caplog.text == ""
+
+
+@pytest.mark.asyncio
+async def test_tagged_row_is_warned_once_and_never_reconciled(db_session, printer_factory, silent_surfaces, caplog):
+    """A tagged row's identity is RFID-bound, and by rule 10 no tag has ever been reused on
+    this farm â€” so an impossible ledger there is MISATTRIBUTION evidence to root-cause, not
+    a roll change to book. Warn once per re-notify window, mutate nothing, ever."""
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    old = await _overcharged(db_session, printer.id, 1, 3, tag_uid=TAG_UID, tray_uuid=TRAY_UUID)
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
+        assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0
+    assert "LEDGER-OVERCHARGE (TAGGED, NOT RECONCILED)" in caplog.text
+    assert "RECONCILED:" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
+        assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0
+    assert caplog.text == "", "the durable ledger paces a STANDING complaint â€” one warning per window"
+
+    await db_session.refresh(old)
+    assert old.archived_at is None and old.weight_used == pytest.approx(1200.5)
+    assert (await _slot_spool(db_session, printer.id, 1, 3)).id == old.id, "no successor was minted"
+    assert silent_surfaces["notifier"].method_calls == [], "log-only: never a notification"
+
+
+@pytest.mark.asyncio
+async def test_a_sibling_chip_alone_still_counts_as_tagged(db_session, printer_factory, caplog):
+    """A Bambu roll carries two chips and either identifies it (invariant 1). A row whose
+    only recorded chip is the far one must take the tagged branch, or the auto-reconcile
+    would replace a tag-identified row on assumption-tier evidence."""
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    old = await _overcharged(db_session, printer.id, 0, 3, sibling_tag_uid=SIBLING_TAG_UID)
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
+        assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0
+
+    assert "TAGGED, NOT RECONCILED" in caplog.text
+    await db_session.refresh(old)
+    assert old.archived_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("over", "expected", "why"),
+    [
+        (19.0, 0, "inside the overfill + attribution-quantum margin: not provably impossible"),
+        (21.0, 1, "past the margin with a recorded re-bind: the two-fact proof is complete"),
+    ],
+)
+async def test_the_overcharge_margin_is_the_dividing_line(db_session, printer_factory, over, expected, why):
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    old = await _overcharged(db_session, printer.id, 0, 0, pre=(600.0,), post=(400.0 + over,))
+
+    assert await spool_tagless.reconcile_ledger_overcharges(db_session) == expected, why
+    await db_session.refresh(old)
+    assert (old.archived_at is not None) is bool(expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "why"),
+    [
+        ({"spent_at": _T1}, "a spent row's exhaustion is already hardware-established (rule 8)"),
+        ({"archived_at": _T1}, "an archived row is out of service â€” nothing to protect"),
+        ({"bind": False}, "with no live assignment there is no boundary and no slot to re-bind"),
+        ({"label_weight": 0}, "a zero label cannot be overshot"),
+    ],
+)
+async def test_rows_outside_the_candidate_set_are_never_touched(db_session, printer_factory, kwargs, why):
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    old = await _overcharged(db_session, printer.id, 0, 0, **kwargs)
+    archived_before = old.archived_at
+
+    assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0, why
+    await db_session.refresh(old)
+    assert old.archived_at == archived_before
+    assert old.weight_used == pytest.approx(1200.5)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_is_idempotent(db_session, printer_factory):
+    """The successor is minted and bound in the same instant, so it carries no re-bind
+    boundary of its own â€” a second pass finds nothing to prove and writes nothing."""
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    await _overcharged(db_session, printer.id, 0, 2)
+
+    assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 1
+    successor = await _slot_spool(db_session, printer.id, 0, 2)
+    assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0
+
+    still = await _slot_spool(db_session, printer.id, 0, 2)
+    assert still.id == successor.id
+    assert still.weight_used == pytest.approx(_MOVED)
+    assert still.archived_at is None
+
+
+@pytest.mark.asyncio
+async def test_one_bad_row_cannot_abort_the_sweep(db_session, printer_factory, monkeypatch):
+    """Invariant 10: an entry hook owns its guard. The first candidate explodes mid-write;
+    the second must still be reconciled and the caller must never see the exception."""
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    bad = await _overcharged(db_session, printer.id, 0, 0)
+    good = await _overcharged(db_session, printer.id, 0, 1)
+
+    real_mint = spool_tagless._mint_successor_row
+    calls = {"n": 0}
+    # Bare id, captured up front: the sweep's per-candidate rollback expires every object
+    # in the session, so holding the ORM row here would make the closure itself lazy-load.
+    bad_id = bad.id
+
+    async def _explode_once(db, departed, *, weight_used):
+        calls["n"] += 1
+        if departed.id == bad_id:
+            raise RuntimeError("history re-point exploded")
+        return await real_mint(db, departed, weight_used=weight_used)
+
+    monkeypatch.setattr(spool_tagless, "_mint_successor_row", _explode_once)
+
+    assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 1
+    assert calls["n"] == 2, "the sweep continued past the bad row"
+    await db_session.refresh(bad)
+    await db_session.refresh(good)
+    assert bad.archived_at is None, "the failed candidate rolled back cleanly"
+    assert good.archived_at is not None
+
+
+@pytest.mark.asyncio
+async def test_spoolman_installs_are_skipped(db_session, printer_factory):
+    """Spoolman owns the spool lifecycle there, so rewriting its ledger is not ours to do.
+    Driven through the REAL entry, which is where that gate lives."""
+    from backend.app.api.routes.settings import set_setting
+
+    printer = await printer_factory(model="H2S")
+    old = await _overcharged(db_session, printer.id, 0, 0)
+    await set_setting(db_session, "spoolman_enabled", "true")
+
+    assert await detect_spent_contradictions(db_session, MagicMock()) == 0
+    await db_session.refresh(old)
+    assert old.archived_at is None and old.weight_used == pytest.approx(1200.5)
+
+
+@pytest.mark.asyncio
+async def test_the_reconcile_rides_the_detector_entry_and_its_throttle(db_session, printer_factory):
+    """LIVENESS PIN + throttle. The sweep is reachable through the REAL entry hook (a lane
+    that is never CALLED is indistinguishable from one that finds nothing), and it shares
+    that entry's 15-minute floor rather than bringing a second one."""
+    printer = await printer_factory(model="H2S")
+    first = await _overcharged(db_session, printer.id, 0, 0)
+    manager = MagicMock()
+    manager.get_status = lambda _pid: None
+
+    await detect_spent_contradictions(db_session, manager, now=500.0)
+    await db_session.refresh(first)
+    assert first.archived_at is not None, "the reconcile ran from the detector entry"
+
+    second = await _overcharged(db_session, printer.id, 0, 1)
+    await detect_spent_contradictions(db_session, manager, now=600.0)
+    await db_session.refresh(second)
+    assert second.archived_at is None, "inside the shared floor: the sweep did not run"
+
+    await detect_spent_contradictions(
+        db_session, manager, now=500.0 + spool_respool._SPENT_CONTRADICTION_MIN_INTERVAL_S
+    )
+    await db_session.refresh(second)
+    assert second.archived_at is not None, "past the floor it runs again"

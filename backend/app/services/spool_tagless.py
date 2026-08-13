@@ -37,11 +37,13 @@ qualified-physical-cycle signal that releases it
 (:func:`qualified_cycle_pending` / :func:`consume_qualified_cycle`).
 
 Module edge state (``_autoconfig_window``, ``_autoconfig_epochs``,
-``_pending_physical_cycles``) mirrors the fork's other event-edge bookkeeping
+``_pending_physical_cycles``, ``_settle_concluded_logged``) mirrors the fork's other
+event-edge bookkeeping
 (``spool_respool._last_tray_now``). It is lost on restart — worst case a bare-tray
-config re-push waits one AMS push, a spent slot stays latched until a pull/reseat, and
-a write epoch starts over with full strikes (one more attempt, never a suppressed one;
-still bounded by the ladder, and the wire re-states its verdict on that attempt). The fresh-roll prompt is
+config re-push waits one AMS push, a spent slot stays latched until a pull/reseat, a
+write epoch starts over with full strikes (one more attempt, never a suppressed one;
+still bounded by the ladder, and the wire re-states its verdict on that attempt), and
+an unanswerable-identity conclusion logs its one INFO line a second time. The fresh-roll prompt is
 deliberately NOT in that set: its state is the durable
 ``Spool.fresh_prompt_pending_at`` stamp, because a question nobody was connected to
 hear must survive both an empty websocket list and a restart.
@@ -60,12 +62,13 @@ from datetime import datetime
 from time import monotonic
 from typing import TYPE_CHECKING, NamedTuple
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import ws_manager
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
+from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import ams_presence, spool_respool
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_binding import bind_spool_to_slot
@@ -178,6 +181,15 @@ _MINT_SETTLE_S = 5.0
 # discard there destroys the release signal before a consumer can ever see it.
 _pending_physical_cycles: set[tuple[int, int, int]] = set()
 
+# (printer_id, ams_id, tray_id) of slots whose config settle has already announced that
+# the slot's identity is UNANSWERABLE this epoch (:func:`_config_settling`'s third arm).
+# The gate is re-evaluated on every AMS push, so without this the one interesting line
+# would repeat at ~1 Hz for as long as the tray stays engaged. Purely a log dedup: it
+# gates NO decision, and the EPISODE it keys is the unanswered cycle itself — the marker
+# is discarded the moment ``identity_unanswered`` goes False, so the NEXT unanswered
+# cycle on the same slot announces its own conclusion.
+_settle_concluded_logged: set[tuple[int, int, int]] = set()
+
 # Fraction of a tagless row's label weight consumed past which a physical cycle
 # raises the over-consumption / fresh-roll prompt (W5). 0.7 = the roll is ≥70 %
 # consumed (≤300 g left on a 1000 g label) — operator setting 2026-07-20: a swap
@@ -281,6 +293,7 @@ def _reset_state() -> None:
     _autoconfig_window.reset()
     _autoconfig_epochs.clear()
     _pending_physical_cycles.clear()
+    _settle_concluded_logged.clear()
     _presence_stale_episodes.clear()
     _last_reconcile_at = None
 
@@ -336,10 +349,18 @@ def _tray_material(tray: dict) -> str:
 
 
 def is_tagless_spool(spool: Spool | None) -> bool:
-    """True when the spool carries no RFID identity (no tag_uid and no tray_uuid)."""
+    """True when the spool carries NO RFID identity at all.
+
+    All three identity columns count, ``sibling_tag_uid`` included: a Bambu roll carries
+    two chips sharing one ``tray_uuid`` and either one identifies it (invariant 1 — the
+    one either-chip law), so a row that has ever had its far side read is tag-identified
+    even in the (physically odd) state where the near ``tag_uid`` is blank. Reading only
+    ``tag_uid``/``tray_uuid`` here would call such a row tagless and hand it to the lanes
+    that are allowed to REPLACE a tagless row's identity on assumption-tier evidence.
+    """
     if spool is None:
         return False
-    return not (spool.tag_uid or spool.tray_uuid)
+    return not (spool.tag_uid or spool.tray_uuid or spool.sibling_tag_uid)
 
 
 def fingerprint_matches(spool: Spool, tray: dict) -> bool:
@@ -641,15 +662,51 @@ def _config_settling(printer_id: int, ams_id: int, tray_id: int) -> bool:
     long-settled) reads as settled, so the gate can never wedge a slot. Distinct from
     :func:`_mint_settling` (F1), which guards phantom MINTS over a much shorter window
     — this one guards the WIRE.
+
+    The second arm CONCLUDES EARLY when the answer it waits for cannot arrive. Waiting
+    is only ever worth it while an identity read is possible: an idle printer whose read
+    the wire refuses for a cause that will not self-clear
+    (``ams_presence.read_unavailable_reason`` — today engaged filament, which needs a
+    commanded unload) can produce no answer this epoch, and the firmware's own autonomous
+    reads happen at insert/load, so an identity still in flight would already be asserting
+    itself on the wire. Sitting out the cap there buys nothing and costs the slot: on
+    2026-08-12 an untagged roll inserted into an idle 009-H2S slot was engaged by the AMS
+    on the spot, the discovery read was refused for exactly that reason, and the tagless
+    mint waited the FULL :data:`_CONFIG_SETTLE_MAX_S` while the queue staged behind it.
+    The conclusion is by CAUSE, never by duration (doctrine rule 6) — the cap still owns
+    the "no cause, just old" case below — it SPENDS nothing (no occasion, cycle or echo
+    state moves: a refusal is not an answer, invariant 13, and the preserved entitlement is
+    what lets a later disengaged read correct a mis-defaulted roll), and it pre-approves
+    nothing: the write it releases is still re-evaluated at publish time by
+    :func:`_push_config` and the client's own refusal (invariant 2). Arm 1 is untouched —
+    a slot that gained presence seconds ago still waits out the firmware's insert-read
+    window whatever the feeder is doing.
     """
     if _printer_busy(printer_id, on_error=False):
         return False  # mid-print: no firmware auto-read exists to protect
     gain_age = ams_presence.recent_gain_age(printer_id, ams_id, tray_id)
     if gain_age is not None and gain_age < _CONFIG_SETTLE_S:
         return True
+    key = (printer_id, ams_id, tray_id)
     if not ams_presence.identity_unanswered(printer_id, ams_id, tray_id):
+        _settle_concluded_logged.discard(key)  # episode over: a later one re-announces
         return False
     cycle_age = ams_presence.last_physical_cycle_age(printer_id, ams_id, tray_id)
+    reason = ams_presence.read_unavailable_reason(printer_id, ams_id, tray_id)
+    if reason is not None:
+        if key not in _settle_concluded_logged:
+            _settle_concluded_logged.add(key)
+            logger.info(
+                "[Printer %s] AMS%d slot%d: identity unanswerable this epoch (%s) — "
+                "config settle concluded at ~%.0fs instead of the %.0fs cap",
+                printer_id,
+                ams_id,
+                tray_id,
+                reason,
+                cycle_age or 0.0,
+                _CONFIG_SETTLE_MAX_S,
+            )
+        return False
     return cycle_age is not None and cycle_age < _CONFIG_SETTLE_MAX_S
 
 
@@ -846,6 +903,342 @@ async def _replace_row_after_cycle(
         await db.commit()
     await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
     return new_spool
+
+
+# --- ledger-overcharge reconcile (009-H2S spool 290, 2026-08-12) ------------
+#
+# A tagless row can only ever be re-bound to its slot on IDENTITY-FREE evidence (a
+# ``last_location_*`` reclaim, a fingerprint match): there is no chip to say whether the
+# roll that came back is the roll that left. The reclaim is doctrine-CORRECT — rule 7
+# forbids any duration threshold from deciding tagless identity, so a 23-minute absence
+# that was really a physical roll swap is indistinguishable from a 23-minute drying trip,
+# and refusing to reclaim would break the far more common case. 009-H2S slot 2 took the
+# swap on 2026-08-12: spool 290 was reclaimed after that absence, absorbed the NEW roll's
+# prints, reached 1200.48 g used on a 1000 g label — physically impossible — and so read
+# ``remaining_g == 0``, failed the 150 g start floor and staged the whole production run
+# silently for six hours behind a row describing filament that no longer existed.
+#
+# This lane is NOT a second guess at the reclaim. It fires only once the ledger has become
+# PROVABLY impossible AND a known re-bind moment exists to attribute across. Two
+# independent facts are required and neither is sufficient alone:
+#
+#  * **Overshoot** past the label by more than :data:`_OVERCHARGE_MARGIN_G`. Alone this
+#    proves nothing: manufacturers overfill (some ship ~1100 g on a 1000 g label), so a
+#    row bound CONTINUOUSLY since it entered service gets no action and — by operator
+#    ruling — not even a warning, because a warning there is noise. Rule 8 governs it:
+#    hardware runout evidence is the exhaustion truth, never ``label − weight_used``.
+#  * **A recorded re-bind.** A release HARD-DELETES the assignment row, so a live
+#    ``SpoolAssignment.created_at`` is the moment of the CURRENT bind. Meaningfully later
+#    than the spool row's own ``created_at`` means the roll left and came back at a KNOWN
+#    instant — the only instant at which an unobserved swap could have happened.
+#
+# Attribution is then EXACT, never apportioned: the successor is charged the SUM of the
+# ``spool_usage_history`` rows recorded since that boundary, and those rows are RE-POINTED
+# to it (double entry — the old row is decremented by the same sum and archived). If the
+# swap actually happened at an EARLIER, unobserved cycle the successor is UNDER-charged,
+# which is the optimistic direction and the only admissible error: a roll that reads
+# fuller than it is simply runs out, and the runout machinery corrects it (rule 8). No
+# path here may ever over-charge the successor.
+#
+# TAGGED rows are never touched. Their identity is tag-bound, so an overshoot there is not
+# a swap story at all — it is misattribution evidence to root-cause by hand (rule 10: no
+# tag has ever been reused on this farm). They get one WARNING per row per re-notify
+# window and nothing else.
+
+# Grams past the label that still count as ordinary overfill + attribution slack rather
+# than an impossible ledger. ≈2 % of a 1 kg label — wide enough for the vendor overfill
+# the operator ruling names, and one layer-segment attribution quantum on top (the
+# ``usage_tracker`` charges a print's grams to feeders in ``tray_change_log`` segments, so
+# a single boundary segment can land a handful of grams on either side of the truth).
+# Deliberately a code constant, not a setting: it is derived from how the hardware and the
+# tracker behave, and nothing an operator could tune it to would be more correct.
+_OVERCHARGE_MARGIN_G = 20.0
+
+# How much later than the spool row's own creation an assignment's ``created_at`` must sit
+# before it counts as a RE-bind rather than the original one. A mint and its bind happen
+# inside one request — the gap is milliseconds to seconds (a mint, a flush, a bind, a
+# commit) — while the re-bind this lane looks for is separated from the mint by at least
+# one print. Two minutes is far above the former and far below the latter, so the boundary
+# test needs no other tuning.
+_RECONCILE_BOUNDARY_EPSILON_S = 120.0
+
+# Durable notify-ledger scope for the TAGGED warn-once branch. Its own key space (keyed by
+# spool, like the spent-contradiction scope beside it) so neither lane's window can be
+# governed by the other's prune or dedup.
+_LEDGER_OVERCHARGE_SCOPE = "ledger_overcharge"
+
+# Fields the successor inherits from the row it replaces: what the physical filament IS,
+# what it costs, and where inventory files it. Everything NOT listed is deliberately reset
+# — the grams ledger (the successor gets exactly the re-pointed charges), the tag columns
+# (a tagless mint has none), the spent/prompt/fault stamps (they described the old roll)
+# and the FIFO stamps (``spool_binding`` owns those, and the successor's service entry
+# genuinely IS this boundary).
+_SUCCESSOR_INHERITED_FIELDS = (
+    "material",
+    "subtype",
+    "color_name",
+    "rgba",
+    "extra_colors",
+    "effect_type",
+    "brand",
+    "slicer_filament",
+    "slicer_filament_name",
+    "nozzle_temp_min",
+    "nozzle_temp_max",
+    "label_weight",
+    "core_weight",
+    "core_weight_catalog_id",
+    "cost_per_kg",
+    "category",
+    "low_stock_threshold_pct",
+    "storage_location",
+    "location_id",
+)
+
+
+async def _mint_successor_row(db: AsyncSession, departed: Spool, *, weight_used: float) -> Spool:
+    """Mint the replacement row for a reconciled overcharge — same filament, fresh ledger.
+
+    NOT :func:`mint_tagless_spool`: that helper DERIVES an identity from a tray dict or the
+    tagless-default setting, and neither is the right source here. The physical roll in the
+    slot is the one whose grams we are re-attributing, so its identity is exactly the
+    departed row's (:data:`_SUCCESSOR_INHERITED_FIELDS`) — re-deriving from the default
+    would silently re-brand a roll the operator had corrected. Field parity with the mint
+    is otherwise kept verbatim: no tag columns, ``data_origin = ams_auto``,
+    ``tag_type = None``, and relationships initialised BEFORE ``add()`` to avoid an async
+    lazy load (#612).
+    """
+    kwargs = {name: getattr(departed, name) for name in _SUCCESSOR_INHERITED_FIELDS}
+    successor = Spool(**kwargs, weight_used=weight_used, data_origin=DATA_ORIGIN, tag_type=None)
+    # The charges moving across are prints this physical roll actually fed, so the
+    # feed-evidence field moves with them (rule 8 names ``last_used`` as the field that
+    # survives repairs and proves a roll fed).
+    successor.last_used = departed.last_used
+    successor.k_profiles = []
+    successor.assignments = []
+    db.add(successor)
+    await db.flush()
+    return successor
+
+
+async def _warn_tagged_overcharge(db: AsyncSession, spool: Spool, assignment: SpoolAssignment) -> None:
+    """One WARNING per tagged over-charged row per re-notify window. Never mutates.
+
+    A tagged row's identity is RFID, so the tagless swap story does not apply to it and an
+    automatic reconcile would destroy the evidence: by rule 10 no tag has ever been reused
+    on this farm, which makes an impossible ledger on a tagged row a MISATTRIBUTION to
+    root-cause, not a roll change to book. Log-only and deliberately NOT a notification —
+    the operator ruling for this whole lane is that the log line is the only surface.
+
+    Paced through the durable notify ledger (``notify_dedup``) rather than an in-memory
+    gate for the same reason the spent-contradiction detector is: the condition re-derives
+    identically on every pass forever, so an in-memory window would re-blast at every
+    deploy. Shares that lane's :data:`spool_respool._SPENT_CONTRADICTION_RENOTIFY_S`
+    window — one origin for "how often a STANDING ledger complaint may re-warn".
+    """
+    from backend.app.services import notify_dedup
+
+    key = f"spool:{spool.id}"
+    last = await notify_dedup.last_sent_at(db, _LEDGER_OVERCHARGE_SCOPE, key)
+    if last is not None and (datetime.utcnow() - last).total_seconds() < (
+        spool_respool._SPENT_CONTRADICTION_RENOTIFY_S
+    ):
+        return
+    logger.warning(
+        "[RESPOOL] LEDGER-OVERCHARGE (TAGGED, NOT RECONCILED): spool %d reads %.0fg used on a %.0fg label "
+        "at printer %d AMS%d-T%d, re-bound %s after the row was created %s. An RFID row's identity is "
+        "tag-bound and no tag has ever been reused on this farm, so this is misattribution evidence to "
+        "root-cause by hand — nothing was changed.",
+        spool.id,
+        float(spool.weight_used or 0.0),
+        float(spool.label_weight or 0.0),
+        assignment.printer_id,
+        assignment.ams_id,
+        assignment.tray_id,
+        assignment.created_at.isoformat() if assignment.created_at else "?",
+        spool.created_at.isoformat() if spool.created_at else "?",
+    )
+    await notify_dedup.record_sent(db, _LEDGER_OVERCHARGE_SCOPE, key)
+
+
+async def _reconcile_one_overcharge(
+    db: AsyncSession, spool: Spool, assignment: SpoolAssignment, boundary: datetime
+) -> bool:
+    """Move the post-boundary charges off an impossible tagless row onto a fresh successor.
+
+    Double entry, in one transaction: SUM the ``spool_usage_history`` rows at or after
+    ``boundary``, mint the successor carrying exactly that sum, RE-POINT those history rows
+    to it, decrement the old row by the same sum (clamped at 0) and archive it — it left
+    service at the boundary. Returns False, having written nothing, when the sum is not
+    positive: with no charges to move there is no attribution to make and the overshoot is
+    somebody else's evidence.
+
+    The successor is bound through ``spool_binding.bind_spool_to_slot``, the ONE binding
+    writer, which displaces the departed row's claim with its own INFO trail and
+    ``last_location_*`` stamp instead of a hand-rolled delete. The FIFO ordinal is left to
+    re-stamp normally (no ``preserve_ordinal``): the successor's service entry genuinely IS
+    this boundary — a different row is now bound to the slot, which is precisely the
+    binding change rule 7 re-stamps on. A fresh row holds no other binding, so the writer's
+    move damper cannot refuse the call.
+
+    **No AMS config is pushed** — deliberately, unlike :func:`_replace_row_after_cycle`,
+    which is a physical roll-change lane and must give the firmware an identity for a slot
+    whose contents just changed. Here the tray's wire config is already correct: the
+    physical roll never changed at this instant (the swap happened at the boundary, hours
+    ago) and the successor inherits the departed row's filament identity byte for byte, so
+    a write could only re-state what the slot already carries — and every avoided AMS write
+    is one less chance to split the firmware's auto-refill backup group.
+    """
+    counted = (
+        await db.execute(
+            select(func.count(SpoolUsageHistory.id), func.sum(SpoolUsageHistory.weight_used)).where(
+                SpoolUsageHistory.spool_id == spool.id,
+                SpoolUsageHistory.created_at >= boundary,
+            )
+        )
+    ).one()
+    charges = int(counted[0] or 0)
+    moved = float(counted[1] or 0.0)
+    if moved <= 0:
+        return False
+
+    before_used = float(spool.weight_used or 0.0)
+    successor = await _mint_successor_row(db, spool, weight_used=moved)
+    await db.execute(
+        update(SpoolUsageHistory)
+        .where(SpoolUsageHistory.spool_id == spool.id, SpoolUsageHistory.created_at >= boundary)
+        .values(spool_id=successor.id)
+    )
+    spool.weight_used = max(0.0, before_used - moved)
+    spool.archived_at = datetime.utcnow()
+
+    printer_id, ams_id, tray_id = assignment.printer_id, assignment.ams_id, assignment.tray_id
+    fingerprint_color, fingerprint_type = assignment.fingerprint_color, assignment.fingerprint_type
+    await bind_spool_to_slot(
+        db,
+        successor,
+        printer_id=printer_id,
+        ams_id=ams_id,
+        tray_id=tray_id,
+        fingerprint_color=fingerprint_color,
+        fingerprint_type=fingerprint_type,
+        origin="ledger_reconcile",
+    )
+    await db.commit()
+
+    logger.warning(
+        "[RESPOOL] LEDGER-OVERCHARGE RECONCILED: tagless spool %d read %.0fg used on a %.0fg label at "
+        "printer %d AMS%d-T%d; re-bind boundary %s — moved %.0fg (%d charges) to successor spool %d, "
+        "old row archived at %.0fg used. Runout evidence remains the exhaustion truth.",
+        spool.id,
+        before_used,
+        float(spool.label_weight or 0.0),
+        printer_id,
+        ams_id,
+        tray_id,
+        boundary.isoformat(),
+        moved,
+        charges,
+        successor.id,
+        float(spool.weight_used or 0.0),
+    )
+    return True
+
+
+async def reconcile_ledger_overcharges(db: AsyncSession) -> int:
+    """Reconcile every spool row whose gram ledger has become physically impossible.
+
+    See the section comment above for the incident and the two-fact proof. Candidates are
+    bound, un-archived, non-spent rows with a positive label reading more than
+    :data:`_OVERCHARGE_MARGIN_G` past it; a row with no re-bind boundary is skipped in
+    total silence (operator ruling: overfill is not news), a TAGGED row gets
+    :func:`_warn_tagged_overcharge` and nothing else, and a tagless row with a boundary is
+    reconciled by :func:`_reconcile_one_overcharge`. Returns how many rows it reconciled.
+
+    Rides the spent-contradiction detector's throttle and Spoolman gate — it is invoked
+    from inside ``spool_respool.detect_spent_contradictions``, so there is ONE throttled
+    ledger-integrity entry per reconcile tick rather than two competing floors, and
+    Spoolman installs (where the spool lifecycle is not ours to rewrite) never reach it.
+    The sweep lives HERE, beside :func:`_replace_row_after_cycle`, because it needs this
+    module's mint + bind mechanics and ``spool_respool`` cannot import them: this module
+    already imports ``spool_respool`` at module scope, so the dependency only runs the
+    other way as a deferred call.
+
+    Two accepted residuals, both documented rather than defended against:
+
+    * A print RUNNING during the reconcile may charge its terminal grams to the ARCHIVED
+      old row, because ``usage_tracker`` resolves the charged spool from a snapshot taken
+      at print START. Those grams then miss the successor — the optimistic direction
+      again, corrected by the runout backstop, and the alternative (blocking the reconcile
+      on an idle fleet) would leave the run staged for as long as the print lasts.
+    * ``SpoolUsageHistory`` is TRACKER-written only: an operator's scale weigh-in or a
+      manual ``weight_used`` edit never appears in it. That is exactly why ``moved`` is
+      summed from the history rows instead of taken as a ``weight_used`` delta — the sum
+      is the part of the ledger with per-print provenance to move, and a manual adjustment
+      the operator made to the old row is left on the old row, where they made it.
+
+    FULLY self-guarding (invariant 10), per candidate and around the whole sweep: this is
+    an entry hook, so nothing it does may reach the tick that hosts it.
+    """
+    try:
+        return await _scan_ledger_overcharges(db)
+    except Exception:  # noqa: BLE001 — an entry hook owns its guard; the tick must survive
+        logger.exception("Ledger-overcharge reconcile failed (non-fatal)")
+        return 0
+
+
+async def _scan_ledger_overcharges(db: AsyncSession) -> int:
+    """The sweep :func:`reconcile_ledger_overcharges` guards. See it.
+
+    Candidates are collected as bare IDs and each is re-loaded inside its own iteration,
+    never held as ORM rows across the loop. Every candidate ends in a COMMIT or a
+    ROLLBACK, and a rollback expires every object in the session — so an entity loaded up
+    front would lazy-load (and, on an async session, raise ``MissingGreenlet``) the moment
+    the next iteration touched it. The re-read also makes each candidate see the state the
+    previous one committed.
+    """
+    result = await db.execute(
+        select(SpoolAssignment.id, SpoolAssignment.spool_id)
+        .join(Spool, SpoolAssignment.spool_id == Spool.id)
+        .where(
+            Spool.archived_at.is_(None),
+            Spool.spent_at.is_(None),
+            Spool.label_weight > 0,
+            Spool.weight_used > Spool.label_weight + _OVERCHARGE_MARGIN_G,
+        )
+    )
+    reconciled = 0
+    for assignment_id, spool_id in result.all():
+        assignment = await db.get(SpoolAssignment, assignment_id)
+        spool = await db.get(Spool, spool_id)
+        if assignment is None or spool is None or assignment.spool_id != spool.id:
+            continue  # the binding moved under us since the candidate query
+        try:
+            boundary = assignment.created_at
+            created = spool.created_at
+            if boundary is None or created is None:
+                continue  # no timestamps, no provable boundary
+            if (boundary - created).total_seconds() <= _RECONCILE_BOUNDARY_EPSILON_S:
+                continue  # bound continuously since it entered service: overfill, not a swap
+            if not is_tagless_spool(spool):
+                await _warn_tagged_overcharge(db, spool, assignment)
+                continue
+            if await _reconcile_one_overcharge(db, spool, assignment, boundary):
+                reconciled += 1
+        except Exception:  # noqa: BLE001 — one bad row must not abort the sweep
+            logger.exception(
+                "Ledger-overcharge reconcile failed for spool %s on printer %s AMS%s-T%s",
+                spool.id,
+                assignment.printer_id,
+                assignment.ams_id,
+                assignment.tray_id,
+            )
+            try:
+                await db.rollback()  # a half-applied candidate must not ride the next one's commit
+            except Exception:  # noqa: BLE001 — a dead session cannot be rescued here
+                logger.exception("Ledger-overcharge rollback failed")
+                return reconciled
+    return reconciled
 
 
 # --- W5 tagless fresh-roll prompt ------------------------------------------
@@ -1889,8 +2282,6 @@ async def dispose_provisional_on_tag(db: AsyncSession, spool: Spool | None) -> s
     the disposition ("hard-deleted" / "archived" / "kept"). "kept" means the
     spool was not an auto-minted provisional row and must be left untouched.
     """
-    from backend.app.models.spool_usage_history import SpoolUsageHistory
-
     if spool is None or spool.data_origin != DATA_ORIGIN:
         return "kept"
     history_count = await db.scalar(

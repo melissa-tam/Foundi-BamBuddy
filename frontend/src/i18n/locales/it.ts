@@ -155,7 +155,7 @@ export default {
       unknown: 'In pausa — vedi i dettagli dell\'esecuzione',
     },
     stagedBanner: {
-      lowSpool: '{{count}} unità trattenute: filamento insufficiente — sostituisci la bobina, poi premi Riprendi (o Ricontrolla nella pagina Coda).',
+      lowSpool: '{{count}} unità trattenute: filamento insufficiente — carica una bobina e la farm riprende automaticamente (Riprendi le rilascia subito).',
       other: '{{count}} unità trattenute — premi Riprendi per rilasciarle.',
     },
     detail: {
@@ -1565,9 +1565,9 @@ export default {
       runBadgeTitle: 'Parte della serie di produzione n. {{id}} — apri il dettaglio',
       stopConsequence: 'Conta come arresto dell\'operatore: nessun nuovo tentativo automatico; la serie trattiene questa stampante finché non liberi il piatto e premi Riprendi.',
       destructiveNote: 'Questo elemento appartiene alla serie di produzione "{{run}}". Rimuovendolo la serie resta incompleta fino al prossimo Riprendi.',
-      stagedBannerTitle: 'Filamento insufficiente — sostituisci la bobina, poi premi Ricontrolla',
-      stagedBannerBody: '{{count}} elemento/i trattenuti dal controllo filamento. Ricontrolla rilascia solo gli elementi la cui bobina ora ha materiale sufficiente.',
-      recheckButton: 'Ricontrolla e rilascia',
+      stagedBannerTitle: 'Filamento insufficiente — carica una bobina; la farm riprende automaticamente',
+      stagedBannerBody: '{{count}} elemento/i in attesa di filamento. Carica il filamento nelle stampanti elencate qui sotto: la farm lo rileva e li rilascia automaticamente, di solito entro un minuto.',
+      recheckButton: 'Ricontrolla ora',
       stagedBlockingHeading: 'In attesa di:',
       releasedToast: '{{count}} elemento/i trattenuti rilasciati',
       releasedNone: 'Nessun elemento rilasciato — filamento ancora insufficiente',

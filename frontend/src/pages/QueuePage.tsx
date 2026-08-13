@@ -2111,9 +2111,12 @@ export function QueuePage() {
       )}
 
       {/* Phase 4.2: low-spool staging banner. Groups the system-staged rows
-          (manual_start + filament_short) under one actionable line: swap the
-          spool, then re-check — only items whose deficit actually cleared are
-          released. The per-row Play stays "Print anyway" (acknowledge). */}
+          (manual_start + filament_short) under one line whose ask is PHYSICAL:
+          load filament into the printer(s) named below. The farm detects the
+          load (AMS-change hook + 60 s periodic net) and releases the items whose
+          deficit actually cleared on its own — the Re-check button is a manual
+          backstop, not the contract (the copy demanded it until 2026-08-12).
+          The per-row Play stays "Print anyway" (acknowledge). */}
       {activeTab === 'queue' && systemStagedCount > 0 && (
         <div className="mb-4 flex items-center gap-3 px-4 py-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
           <AlertCircle className="w-5 h-5 text-yellow-700 dark:text-yellow-400 flex-shrink-0" />

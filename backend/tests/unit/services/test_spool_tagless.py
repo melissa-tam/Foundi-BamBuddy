@@ -1173,6 +1173,110 @@ class TestConfigSettleGate:
         assert spool_tagless._printer_busy(1, on_error=False) is False
 
 
+class TestUnanswerableIdentityConcludesTheSettle:
+    """2026-08-12 009-H2S PIN — an operator dropped an untagged roll into an IDLE
+    printer's empty slot and the AMS engaged it into the feeder on the spot, so the
+    commanded discovery read was REFUSED by the wire-safety guard ("filament engaged").
+    No answer could ever arrive — the firmware's autonomous reads happen at insert/load,
+    and one still in flight would already be asserting itself on the wire — yet the
+    unanswered-cycle arm sat out the full _CONFIG_SETTLE_MAX_S before the tagless mint,
+    holding the run's staged units behind a question nothing was going to answer. The
+    conclusion is by CAUSE (the read is unavailable, not merely slow), spends nothing,
+    and leaves arm 1 — the firmware's own insert-read window — fully intact."""
+
+    def _gain(self, monkeypatch, age):
+        monkeypatch.setattr("backend.app.services.ams_presence.recent_gain_age", lambda *a: age)
+
+    def _unanswered(self, monkeypatch, unanswered, cycle_age=None):
+        monkeypatch.setattr("backend.app.services.ams_presence.identity_unanswered", lambda *a: unanswered)
+        monkeypatch.setattr("backend.app.services.ams_presence.last_physical_cycle_age", lambda *a: cycle_age)
+
+    def _reason(self, monkeypatch, reason):
+        monkeypatch.setattr("backend.app.services.ams_presence.read_unavailable_reason", lambda *a: reason)
+
+    async def test_engaged_slot_concludes_and_the_mint_proceeds(self, db_session, printer_factory, env, monkeypatch):
+        # THE incident: engaged feeder, unanswered cycle only 30 s old — 570 s short of
+        # the cap. The gate concludes and the bare tray is configured on this very push.
+        printer = await printer_factory()
+        self._gain(monkeypatch, 300.0)
+        self._unanswered(monkeypatch, True, cycle_age=30.0)
+        self._reason(monkeypatch, "filament_engaged")
+
+        assert spool_tagless._config_settling(printer.id, 0, 0) is False
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is True
+        env.apply.assert_awaited_once()
+        assert await _assignment(db_session, printer.id) is not None
+
+    async def test_arm_one_still_holds_a_freshly_gained_engaged_slot(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
+        # Arm 1 is untouched: inside the 30 s gain window the firmware's OWN insert-read
+        # may still be running, and a write there destroys a state it never retries —
+        # true whatever the feeder is doing.
+        printer = await printer_factory()
+        self._gain(monkeypatch, 5.0)
+        self._unanswered(monkeypatch, True, cycle_age=5.0)
+        self._reason(monkeypatch, "filament_engaged")
+
+        assert spool_tagless._config_settling(printer.id, 0, 0) is True
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is False
+        env.apply.assert_not_awaited()
+
+    async def test_available_read_still_waits_out_the_cap(self, db_session, printer_factory, env, monkeypatch):
+        # Control: nothing is refusing the read, so the answer may still be coming and the
+        # pre-existing behaviour stands — defer until the cap, then fail open.
+        printer = await printer_factory()
+        self._gain(monkeypatch, 300.0)
+        self._unanswered(monkeypatch, True, cycle_age=30.0)
+        self._reason(monkeypatch, None)
+
+        assert spool_tagless._config_settling(printer.id, 0, 0) is True
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare()) is False
+        env.apply.assert_not_awaited()
+
+    def test_conclusion_logs_once_per_episode(self, env, monkeypatch, caplog):
+        """The INFO line is the production liveness anchor for this fix, so it must be
+        emitted — and it is a per-EPISODE announcement, not a per-push one: the gate is
+        re-evaluated on every AMS push, and the marker is dropped the moment the slot's
+        identity question closes so the NEXT unanswered cycle announces its own."""
+        self._gain(monkeypatch, 300.0)
+        self._reason(monkeypatch, "filament_engaged")
+
+        def _lines():
+            return [
+                r
+                for r in caplog.records
+                if r.name == "backend.app.services.spool_tagless"
+                and "identity unanswerable this epoch" in r.getMessage()
+            ]
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+            self._unanswered(monkeypatch, True, cycle_age=30.0)
+            assert spool_tagless._config_settling(1, 0, 2) is False
+            assert spool_tagless._config_settling(1, 0, 2) is False  # same episode, ~1 Hz
+            assert len(_lines()) == 1
+            first = _lines()[0]
+            assert first.levelno == logging.INFO
+            assert "AMS0 slot2" in first.getMessage() and "filament_engaged" in first.getMessage()
+            assert "~30s instead of the 600s cap" in first.getMessage()
+
+            # The identity question closes (a read finally answered) — episode over.
+            self._unanswered(monkeypatch, False)
+            assert spool_tagless._config_settling(1, 0, 2) is False
+            assert len(_lines()) == 1
+
+            # A NEW unanswered cycle is a new episode and announces again.
+            self._unanswered(monkeypatch, True, cycle_age=12.0)
+            assert spool_tagless._config_settling(1, 0, 2) is False
+            assert len(_lines()) == 2
+
+    def test_conclusion_marker_is_cleared_by_the_test_reset(self, monkeypatch):
+        # The new edge-state set joins _reset_state like every other one in this module.
+        spool_tagless._settle_concluded_logged.add((1, 0, 0))
+        spool_tagless._reset_state()
+        assert spool_tagless._settle_concluded_logged == set()
+
+
 class TestMidPrintIsNotGated:
     """The gate protects the firmware's post-insert AUTO-READ window, and that window
     only exists while IDLE: mid-print insertions get no automatic RFID read and no

@@ -155,7 +155,7 @@ export default {
       unknown: 'En pause — voir le détail de l\'exécution',
     },
     stagedBanner: {
-      lowSpool: '{{count}} unité(s) retenue(s) : filament insuffisant — changez la bobine, puis appuyez sur Reprendre (ou Revérifier sur la page File d\'attente).',
+      lowSpool: '{{count}} unité(s) retenue(s) : filament insuffisant — chargez une bobine et la ferme reprend automatiquement (Reprendre les libère aussi immédiatement).',
       other: '{{count}} unité(s) retenue(s) — appuyez sur Reprendre pour les libérer.',
     },
     detail: {
@@ -1565,9 +1565,9 @@ export default {
       runBadgeTitle: 'Fait partie de la série de production n°{{id}} — ouvrir le détail',
       stopConsequence: 'Compte comme un arrêt opérateur : pas de nouvelle tentative automatique ; la série retient cette imprimante jusqu\'à ce que vous dégagiez le plateau et appuyiez sur Reprendre.',
       destructiveNote: 'Cet élément appartient à la série de production "{{run}}". Le retirer laisse la série incomplète jusqu\'au prochain Reprendre.',
-      stagedBannerTitle: 'Filament insuffisant — changez la bobine, puis appuyez sur Revérifier',
-      stagedBannerBody: '{{count}} élément(s) retenus par le contrôle de filament. Revérifier ne libère que les éléments dont la bobine a désormais assez de matière.',
-      recheckButton: 'Revérifier et libérer',
+      stagedBannerTitle: 'Filament insuffisant — chargez une bobine ; la ferme reprend automatiquement',
+      stagedBannerBody: '{{count}} élément(s) attendent du filament. Chargez du filament dans les imprimantes listées ci-dessous : la ferme le détecte et les libère automatiquement, généralement en moins d\'une minute.',
+      recheckButton: 'Revérifier maintenant',
       stagedBlockingHeading: 'En attente de :',
       releasedToast: '{{count}} élément(s) retenu(s) libéré(s)',
       releasedNone: 'Aucun élément libéré — filament toujours insuffisant',
