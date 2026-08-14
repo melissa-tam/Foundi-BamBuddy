@@ -880,6 +880,51 @@ async def test_an_identity_move_does_not_ping_pong_back_to_the_old_slot(db_sessi
     assert (await _assignment(db_session, old.id, 0, 0)).spool_id != roll.id
 
 
+@pytest.mark.asyncio
+async def test_last_location_candidate_uses_shared_stmt(db_session, printer_factory, env, monkeypatch):
+    """One question, one origin — and the caller's own adjudication stays the caller's.
+
+    ``spool_binding.last_released_from_slot_stmt`` is the shared shape of "rows whose last
+    release was FROM this slot" (matching triple, newest first, unbound fleet-wide), asked
+    by this lane to find a RETURNING roll and by ``spool_respool``'s spent tier 2 to find
+    an EXHAUSTED one — the AMS empties a drained bay minutes before it declares the runout,
+    so both lanes read the same residue. The spent/archived exclusions must stay HERE and
+    must never migrate into the shared stmt: the spent lane has to SEE a spent newest row
+    to answer a duplicate trigger idempotently, while for reclaim that same row is no donor.
+    """
+    printer = await printer_factory()
+    donor = await _spool(db_session, material="PETG", rgba="000000FF", weight_used=400)
+    donor.last_location_printer_id = printer.id
+    donor.last_location_ams_id = 0
+    donor.last_location_tray_id = 3
+    donor.last_location_at = datetime.utcnow()
+    await db_session.commit()
+
+    calls: list[tuple[int, int, int]] = []
+    real = spool_binding.last_released_from_slot_stmt
+
+    def spy(printer_id, ams_id, tray_id):
+        calls.append((printer_id, ams_id, tray_id))
+        return real(printer_id, ams_id, tray_id)
+
+    monkeypatch.setattr(spool_binding, "last_released_from_slot_stmt", spy)
+    obs = _obs(printer.id, {"id": 3, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"})
+
+    assert await slot_pipeline._last_location_candidate(db_session, obs) is donor
+    assert calls == [(printer.id, 0, 3)]  # routed through the shared origin, with THIS slot
+
+    # The shared stmt would hand both of these over; reclaim's own filters refuse them.
+    donor.spent_at = datetime.utcnow()
+    await db_session.commit()
+    assert await slot_pipeline._last_location_candidate(db_session, obs) is None
+
+    donor.spent_at = None
+    donor.archived_at = datetime.utcnow()
+    await db_session.commit()
+    assert await slot_pipeline._last_location_candidate(db_session, obs) is None
+    assert len(calls) == 3  # every one of the three passes asked the shared origin
+
+
 # --- RELEASE ----------------------------------------------------------------
 
 

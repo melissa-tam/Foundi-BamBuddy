@@ -1061,17 +1061,42 @@ async def _warn_tagged_overcharge(db: AsyncSession, spool: Spool, assignment: Sp
     await notify_dedup.record_sent(db, _LEDGER_OVERCHARGE_SCOPE, key)
 
 
-async def _reconcile_one_overcharge(
-    db: AsyncSession, spool: Spool, assignment: SpoolAssignment, boundary: datetime
-) -> bool:
-    """Move the post-boundary charges off an impossible tagless row onto a fresh successor.
+async def replace_bound_row_with_successor(
+    db: AsyncSession,
+    spool: Spool,
+    assignment: SpoolAssignment,
+    boundary: datetime,
+    *,
+    stamp_donor_spent: bool = False,
+    require_positive_moved: bool = True,
+    origin: str = "ledger_reconcile",
+) -> Spool | None:
+    """Retire the row bound to a slot and hand that slot a successor carrying its grams.
 
-    Double entry, in one transaction: SUM the ``spool_usage_history`` rows at or after
-    ``boundary``, mint the successor carrying exactly that sum, RE-POINT those history rows
-    to it, decrement the old row by the same sum (clamped at 0) and archive it — it left
-    service at the boundary. Returns False, having written nothing, when the sum is not
-    positive: with no charges to move there is no attribution to make and the overshoot is
-    somebody else's evidence.
+    THE state change behind "the physical roll in this slot changed at ``boundary``, so
+    everything charged since then belongs to the NEW one". Double entry, in one unit of
+    work: SUM the ``spool_usage_history`` rows at or after ``boundary``, mint the successor
+    carrying exactly that sum, RE-POINT those history rows to it, decrement the departing
+    row by the same sum (clamped at 0) and archive it — it left service at the boundary.
+    Returns the successor, or None when nothing was written.
+
+    Two callers hold two different kinds of evidence for the same swap, which is what the
+    three keywords select between; the mechanics are identical, so they live here once:
+
+    * :func:`_reconcile_one_overcharge` (all defaults) — the ledger-overcharge sweep, where
+      the CHARGES THEMSELVES are the proof. Nothing to move ⇒ nothing proved, so
+      ``require_positive_moved`` returns None having written nothing, and the overshoot
+      stays somebody else's evidence.
+    * The one-time ``repair_runout_reclaim_20260813`` migration in ``core.database``, where
+      the OPERATOR'S RULING is the evidence (a runout-dead row resurrected onto a fresh
+      roll by ``last_location_reclaim``). There a zero-gram move is still a real roll change
+      to book — a print held on the runout charged nothing yet — hence
+      ``require_positive_moved=False``; and the departing row gets ``spent_at`` because it
+      physically ran dry. That last one is a direct write outside
+      ``spool_respool._mark_tray_spent``, the single live spent writer, and it is the
+      **sanctioned repair exception** (plan ``003-h2s-ran-out-of-eventual-harbor.md`` WS6):
+      a repair asserts a fact about a past the wire will never re-assert, so routing it
+      through a lane that resolves LIVE tray state would have nothing to resolve.
 
     The successor is bound through ``spool_binding.bind_spool_to_slot``, the ONE binding
     writer, which displaces the departed row's claim with its own INFO trail and
@@ -1088,42 +1113,80 @@ async def _reconcile_one_overcharge(
     ago) and the successor inherits the departed row's filament identity byte for byte, so
     a write could only re-state what the slot already carries — and every avoided AMS write
     is one less chance to split the firmware's auto-refill backup group.
-    """
-    counted = (
-        await db.execute(
-            select(func.count(SpoolUsageHistory.id), func.sum(SpoolUsageHistory.weight_used)).where(
-                SpoolUsageHistory.spool_id == spool.id,
-                SpoolUsageHistory.created_at >= boundary,
-            )
-        )
-    ).one()
-    charges = int(counted[0] or 0)
-    moved = float(counted[1] or 0.0)
-    if moved <= 0:
-        return False
 
-    before_used = float(spool.weight_used or 0.0)
+    Flush-only — the caller owns the commit, matching ``bind_spool_to_slot``'s contract and
+    both call sites' transaction shapes (the sweep's session; the migration's savepoint).
+    """
+    moved = float(
+        (
+            await db.execute(
+                select(func.sum(SpoolUsageHistory.weight_used)).where(
+                    SpoolUsageHistory.spool_id == spool.id,
+                    SpoolUsageHistory.created_at >= boundary,
+                )
+            )
+        ).scalar()
+        or 0.0
+    )
+    if moved <= 0 and require_positive_moved:
+        return None
+
+    # One clock reading for both stamps: the row left service and ran dry at the same
+    # instant as far as this repair is concerned.
+    now = datetime.utcnow()
     successor = await _mint_successor_row(db, spool, weight_used=moved)
     await db.execute(
         update(SpoolUsageHistory)
         .where(SpoolUsageHistory.spool_id == spool.id, SpoolUsageHistory.created_at >= boundary)
         .values(spool_id=successor.id)
     )
-    spool.weight_used = max(0.0, before_used - moved)
-    spool.archived_at = datetime.utcnow()
+    spool.weight_used = max(0.0, float(spool.weight_used or 0.0) - moved)
+    spool.archived_at = now
+    if stamp_donor_spent:
+        spool.spent_at = now
 
-    printer_id, ams_id, tray_id = assignment.printer_id, assignment.ams_id, assignment.tray_id
-    fingerprint_color, fingerprint_type = assignment.fingerprint_color, assignment.fingerprint_type
     await bind_spool_to_slot(
         db,
         successor,
-        printer_id=printer_id,
-        ams_id=ams_id,
-        tray_id=tray_id,
-        fingerprint_color=fingerprint_color,
-        fingerprint_type=fingerprint_type,
-        origin="ledger_reconcile",
+        printer_id=assignment.printer_id,
+        ams_id=assignment.ams_id,
+        tray_id=assignment.tray_id,
+        fingerprint_color=assignment.fingerprint_color,
+        fingerprint_type=assignment.fingerprint_type,
+        origin=origin,
     )
+    return successor
+
+
+async def _reconcile_one_overcharge(
+    db: AsyncSession, spool: Spool, assignment: SpoolAssignment, boundary: datetime
+) -> bool:
+    """The overcharge sweep's lane over :func:`replace_bound_row_with_successor`.
+
+    Contributes exactly what is this lane's own and not the shared mechanism's: the
+    commit (the sweep runs candidate-by-candidate, each ending in its own COMMIT or
+    ROLLBACK) and the narrative WARNING that names the impossible ledger. Returns False,
+    having written nothing, when there were no post-boundary charges to move — with no
+    charges there is no attribution to make and the overshoot is somebody else's evidence.
+    """
+    before_used = float(spool.weight_used or 0.0)
+    # Read off the assignment BEFORE the replace: the bind deletes that row and the commit
+    # detaches it, while the log below runs after both.
+    printer_id, ams_id, tray_id = assignment.printer_id, assignment.ams_id, assignment.tray_id
+    successor = await replace_bound_row_with_successor(db, spool, assignment, boundary)
+    if successor is None:
+        return False
+
+    # Every history row now pointing at the brand-new successor is one this call moved, so
+    # the narrative's charge count derives from the result rather than re-scanning the
+    # boundary predicate the mechanism already applied.
+    charges = int(
+        (
+            await db.execute(select(func.count(SpoolUsageHistory.id)).where(SpoolUsageHistory.spool_id == successor.id))
+        ).scalar()
+        or 0
+    )
+    moved = float(successor.weight_used or 0.0)
     await db.commit()
 
     logger.warning(

@@ -1313,10 +1313,19 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # AUTO-SWITCH statement are separate lanes with separate attribution rules;
         # deriving both from the appeared entries lives in the service, which owns the
         # session and the guard. Thin fire-and-forget hook only.
+        #
+        # Spawned through ``core.tasks`` and NOT a bare ``asyncio.create_task``: asyncio
+        # holds only a WEAK reference to a task whose handle the caller discards, so a
+        # discarded stamp task can be collected mid-await (or dropped at loop shutdown)
+        # and vanish without a traceback — one of the ways spent stamps died silently
+        # while every absence metric read "quiet". The helper keeps the strong reference
+        # and surfaces an uncaught exception under the task's name.
         try:
             from backend.app.services.spool_respool import apply_runout_edges
 
-            asyncio.create_task(apply_runout_edges(printer_id, edges, state))
+            spawn_background_task(
+                apply_runout_edges(printer_id, edges, state), name=f"runout-edges-p{printer_id}"
+            )
         except Exception as _re:  # noqa: BLE001 — hook must never crash the status flow
             logging.getLogger(__name__).warning(
                 "[RESPOOL] spent-on-runout hook failed for printer %s: %s", printer_id, _re
@@ -1345,11 +1354,14 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # fires the dedicated on_storage_low notification with the outcome.
         # Fire-and-forget so the slow FTP work never blocks the status flow; the service
         # is fully self-guarded (unreachable FTPS → failure notification, never an
-        # exception).
+        # exception). Strong-referenced for the same reason as the runout hook above: a
+        # long FTPS cleanup is exactly the shape a weakly-held task loses.
         _new_storage = edges.appeared_full & HMS_STORAGE_LOW_FULL_CODES
         if _new_storage:
             try:
-                asyncio.create_task(on_storage_low(printer_id, set(_new_storage)))
+                spawn_background_task(
+                    on_storage_low(printer_id, set(_new_storage)), name=f"storage-low-p{printer_id}"
+                )
             except Exception as _se:  # noqa: BLE001 — hook must never crash the status flow
                 logging.getLogger(__name__).warning(
                     "[USB-STORAGE] storage-low hook failed for printer %s: %s", printer_id, _se
@@ -1379,13 +1391,16 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     # exist-bit wipe) and the stable-feeder window was starved of samples outright. The
     # sampler is sync, in-memory and session-free precisely so it can ride this ~1 Hz
     # cadence; only a CONFIRMED departure pays for a session, fired and forgotten with
-    # the Spoolman gate inside it.
+    # the Spoolman gate inside it — strong-referenced (Path B is a spent lane too, and a
+    # collected confirmer is a missing stamp nobody can see).
     try:
         from backend.app.services.spool_respool import confirm_backup_swaps, sample_status_push
 
         _departed_trays = sample_status_push(printer_id, state)
         if _departed_trays:
-            asyncio.create_task(confirm_backup_swaps(printer_id, _departed_trays))
+            spawn_background_task(
+                confirm_backup_swaps(printer_id, _departed_trays), name=f"backup-swap-confirm-p{printer_id}"
+            )
     except Exception as _bse:  # noqa: BLE001 — sampling must never crash the status flow
         logging.getLogger(__name__).warning("[RESPOOL] backup-swap sampler failed for printer %s: %s", printer_id, _bse)
 
@@ -1884,6 +1899,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                 ams_weight_sync_allowed,
                 clear_ledger_decrease_window,
                 maybe_reconcile_tagged_ledger_decrease,
+                wire_identity_is_the_bound_row,
             )
 
             # Presence edges ride the RAW observation stream since E1 (2026-08-07):
@@ -1985,8 +2001,28 @@ async def on_ams_change(printer_id: int, ams_data: list):
                         # scheduler-tick reconcile lane is what covers a slot mid-print.
                         if not _ams_sync_allowed:
                             continue
+                        # IDENTITY GATE — the same one contract as the DECREASE lane
+                        # below: a ledger write derived from a wire reading requires the
+                        # wire to IDENTIFY the row it rewrites (uuid-primary, either-chip
+                        # tag fallback). Without it this lane wrote grams onto whatever row
+                        # happened to be bound to the slot, which is the documented spool-37
+                        # inflation (usage_tracker.py:69-77): a stale binding to another
+                        # printer's tray took that tray's remain% and climbed to 899 g used
+                        # on a physically full roll. Tagless rows are already inert here —
+                        # they report remain -1, which fails the 1..100 parse (doctrine
+                        # rule 8: only a TAGGED row has wire truth to defer to) — so this
+                        # costs them nothing and closes the tagged hole. Silence is never
+                        # agreement: a partial push asserting neither uuid nor tag skips ONE
+                        # sync and the next full push restores it. Deliberately NO spent
+                        # gate — a remain-vs-spent contradiction is
+                        # ``spool_respool.detect_spent_contradictions``' LOUD territory, and
+                        # a silent write-suppression is exactly how it would hide.
                         remain_raw = tray.get("remain")
-                        if remain_raw is not None and not existing_assignment.spool.weight_locked:
+                        if (
+                            remain_raw is not None
+                            and not existing_assignment.spool.weight_locked
+                            and wire_identity_is_the_bound_row(existing_assignment.spool, tray)
+                        ):
                             try:
                                 remain_val = int(remain_raw)
                             except (TypeError, ValueError):

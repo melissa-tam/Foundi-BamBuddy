@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backend.app import main as main_module
+from backend.app.core.tasks import spawn_background_task
 from backend.app.services import hms_edges, notify_dedup
 
 # Two REAL production faults that share one attr — the collision the old key had.
@@ -146,6 +147,22 @@ class _Harness:
         # that carries new codes and opens its OWN session, so it is stubbed here
         # for the whole file; its behavior is pinned in test_spool_recovery.py.
         self.guidance_refresh = AsyncMock(return_value=False)
+        # Names of the background tasks main spawned during the block, in order.
+        self.spawned: list[str] = []
+
+    def _spawn(self, coro, *, name=None):
+        """Record and REALLY spawn — ``main``'s fire-and-forget hooks must still run.
+
+        This used to be a blanket no-op stub, which was fine while the HMS hooks used a
+        bare ``asyncio.create_task``: stubbing the helper suppressed only the unrelated
+        reconnect lane. Since the runout / storage-low / backup-swap hooks moved onto
+        ``core.tasks.spawn_background_task`` (strong refs — a weakly-held stamp task can
+        be collected mid-await, one of the ways spent stamps died silently), a no-op stub
+        here would swallow the very lanes this file pins, and every liveness case below
+        would pass by proving nothing. The unrelated lanes are stood down individually.
+        """
+        self.spawned.append(name or "")
+        return spawn_background_task(coro, name=name)
 
     def __enter__(self):
         db = AsyncMock()
@@ -184,7 +201,11 @@ class _Harness:
             patch("backend.app.main.ws_manager", ws),
             patch("backend.app.main.mqtt_relay", relay),
             patch("backend.app.main.printer_manager", pm),
-            patch("backend.app.main.spawn_background_task"),
+            patch("backend.app.main.spawn_background_task", new=self._spawn),
+            # The one unrelated lane the old blanket stub was suppressing: the
+            # once-per-reconnect archive reconcile. It has nothing to do with HMS and
+            # would query through main's mocked session, so it is stood down by name.
+            patch("backend.app.main.reconcile_stale_active_prints", new=AsyncMock(return_value=0)),
             patch("backend.app.main.printer_state_to_dict", return_value={}),
             session_patch,
             patch("backend.app.main.notification_service", self.notify),
@@ -864,6 +885,44 @@ class TestMovedConsumersRideTheAppearanceEdge:
         h.guidance_refresh.assert_awaited_once()
         assert h.guidance_refresh.await_args.args[1] == {_RUNOUT_COMPANION.full_code}
         h.notify.on_printer_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestStatusHooksHoldAStrongTaskReference:
+    """The status callback's fire-and-forget hooks go through ``core.tasks``, never a
+    bare ``asyncio.create_task``.
+
+    asyncio holds only a WEAK reference to a task whose handle the caller discards, so a
+    spent-stamp task can be collected mid-await or dropped at loop shutdown and leave no
+    trace at all — indistinguishable from a lane that never fired, which is precisely the
+    failure mode the 2026-08-13 investigation spent three days on. The task NAME is the
+    other half: an uncaught exception surfaces under it, so it is part of the contract,
+    not decoration.
+    """
+
+    async def test_the_runout_edge_hook_is_spawned_by_name(self):
+        with (
+            _Harness() as h,
+            patch("backend.app.services.spool_respool.apply_runout_edges", new=AsyncMock()) as hook,
+        ):
+            await _warm_up(5)
+            await main_module.on_printer_status_change(5, _state([_AUTO_SWITCH]))
+            await _drain_tasks()
+
+        hook.assert_awaited_once()
+        assert "runout-edges-p5" in h.spawned
+
+    async def test_the_storage_low_hook_is_spawned_by_name(self):
+        with (
+            _Harness() as h,
+            patch("backend.app.main.on_storage_low", new=AsyncMock()) as storage_hook,
+        ):
+            await _warm_up(5)
+            await main_module.on_printer_status_change(5, _state([_hms(_STORAGE_LOW)]))
+            await _drain_tasks()
+
+        storage_hook.assert_awaited_once()
+        assert "storage-low-p5" in h.spawned
 
 
 # --- liveness: the stampers still WRITE ---------------------------------------

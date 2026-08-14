@@ -20,9 +20,9 @@ from backend.app.services.usage_tracker import (
     _parse_ams_mapping,
     _resolve_run_context,
     _track_from_3mf,
-    _wire_identity_is_the_bound_row,
     on_print_complete,
     on_print_start,
+    wire_identity_is_the_bound_row,
 )
 from backend.app.utils.threemf_tools import count_plates_in_slice_info
 
@@ -2972,7 +2972,7 @@ def _identity_tray(*, tag_uid=None, tray_uuid=None):
 
 
 class TestWireIdentityIsTheBoundRow:
-    """``_wire_identity_is_the_bound_row`` gates every tagged ledger write, so a false
+    """``wire_identity_is_the_bound_row`` gates every tagged ledger write, so a false
     "not the same roll" answer silently switches the weight-sync and decrease-reconcile
     lanes OFF for a roll that IS the bound one."""
 
@@ -2983,32 +2983,32 @@ class TestWireIdentityIsTheBoundRow:
 
     def test_the_near_chip_holds_the_gate(self):
         spool = self._spool(tag_uid=_NEAR_CHIP, sibling_tag_uid=_FAR_CHIP)
-        assert _wire_identity_is_the_bound_row(spool, _identity_tray(tag_uid=_NEAR_CHIP)) is True
+        assert wire_identity_is_the_bound_row(spool, _identity_tray(tag_uid=_NEAR_CHIP)) is True
 
     def test_the_sibling_chip_holds_the_gate_too(self):
         """THE FIX. The push carries the roll's far side and no uuid — the incremental
         shape. Comparing ``tag_uid`` alone answered False here and stopped the ledger
         from tracking a roll that was sitting right there, correctly bound."""
         spool = self._spool(tag_uid=_NEAR_CHIP, sibling_tag_uid=_FAR_CHIP)
-        assert _wire_identity_is_the_bound_row(spool, _identity_tray(tag_uid=_FAR_CHIP)) is True
+        assert wire_identity_is_the_bound_row(spool, _identity_tray(tag_uid=_FAR_CHIP)) is True
 
     def test_an_unrecorded_chip_does_not_hold_the_gate(self):
         """Before the pair is learned the far chip is genuinely unknown; answering True
         on faith would let a swapped-in roll rewrite the departing row's ledger."""
         spool = self._spool(tag_uid=_NEAR_CHIP)
-        assert _wire_identity_is_the_bound_row(spool, _identity_tray(tag_uid=_FAR_CHIP)) is False
+        assert wire_identity_is_the_bound_row(spool, _identity_tray(tag_uid=_FAR_CHIP)) is False
 
     def test_a_third_party_chip_never_holds_the_gate(self):
         spool = self._spool(tag_uid=_NEAR_CHIP, sibling_tag_uid=_FAR_CHIP)
-        assert _wire_identity_is_the_bound_row(spool, _identity_tray(tag_uid="A5E7210D00000100")) is False
+        assert wire_identity_is_the_bound_row(spool, _identity_tray(tag_uid="A5E7210D00000100")) is False
 
     def test_uuid_still_decides_first(self):
         """Unchanged precedence: an agreeing uuid settles it whatever the chips say."""
         spool = self._spool(tag_uid=_NEAR_CHIP, tray_uuid=_ROLL_UUID)
         tray = _identity_tray(tag_uid="A5E7210D00000100", tray_uuid=_ROLL_UUID)
-        assert _wire_identity_is_the_bound_row(spool, tray) is True
+        assert wire_identity_is_the_bound_row(spool, tray) is True
 
     def test_nothing_comparable_still_refuses(self):
         """Silence is never agreement — a tagless row and an untagged tray stay False."""
-        assert _wire_identity_is_the_bound_row(self._spool(), _identity_tray()) is False
-        assert _wire_identity_is_the_bound_row(self._spool(sibling_tag_uid=_FAR_CHIP), _identity_tray()) is False
+        assert wire_identity_is_the_bound_row(self._spool(), _identity_tray()) is False
+        assert wire_identity_is_the_bound_row(self._spool(sibling_tag_uid=_FAR_CHIP), _identity_tray()) is False

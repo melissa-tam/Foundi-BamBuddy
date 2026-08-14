@@ -517,3 +517,125 @@ class TestIdentityAgreement:
         spool = await _seed_spool(db_session, tagged=False)
         await _two_stable_pushes(db_session, spool, clock)
         assert spool.weight_used == SPOOL_37_USED
+
+
+# ── WS4: the SAME identity gate on the INCREASE-only lane ────────────────────
+#
+# ``wire_identity_is_the_bound_row`` is one contract with two writers, and until now
+# only the decrease lane above asked it. The increase-only sync in ``main.on_ams_change``
+# wrote grams onto whatever row happened to be bound to the slot — which is how spool 37
+# reached 899 g used in the first place (charged on 07-17 from another printer's tray
+# while stale-bound), i.e. the decrease lane spent this whole file repairing damage its
+# own gate would have prevented one lane over. These drive the REAL callback, because
+# the gate is only worth anything at the site that writes.
+
+
+@pytest.mark.asyncio
+class TestIncreaseSyncIdentityGate:
+    _TAGGED_ROW_USED = 100.0
+
+    @staticmethod
+    async def _seed_bound(db, printer_id, **kw):
+        spool = Spool(material="PETG", rgba="000000FF", label_weight=1000, **kw)
+        db.add(spool)
+        await db.commit()
+        await db.refresh(spool)
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        db.add(SpoolAssignment(spool_id=spool.id, printer_id=printer_id, ams_id=0, tray_id=3))
+        await db.commit()
+        return spool
+
+    @staticmethod
+    async def _drive(monkeypatch, db, printer_id, tray):
+        """One real ``on_ams_change`` push carrying ``tray`` on an IDLE printer."""
+        from types import SimpleNamespace
+
+        from backend.app.main import on_ams_change
+
+        ams_data = [{"id": 0, "tray": [tray]}]
+        state = SimpleNamespace(state="IDLE", raw_data={"ams": ams_data}, ams_extruder_map={}, tray_now=255)
+        TestConsumerLoopWiring._wire(monkeypatch, db, state)
+        await on_ams_change(printer_id, ams_data)
+        db.expunge_all()  # read the ROW back, never the identity-mapped instance
+
+    async def test_increase_sync_writes_when_the_wire_identifies_the_row(
+        self, db_session, printer_factory, notify, trusted, monkeypatch
+    ):
+        """Liveness arm — the gate must not be a silent off-switch. The bound roll's own
+        chip reads 50 % on a 1000 g label, so the ledger climbs to 500 g."""
+        printer = await printer_factory()
+        spool = await self._seed_bound(
+            db_session, printer.id, weight_used=self._TAGGED_ROW_USED, tag_uid=TAG_UID, tray_uuid=TRAY_UUID
+        )
+
+        await self._drive(monkeypatch, db_session, printer.id, _tray(remain=50))
+
+        assert (await db_session.get(Spool, spool.id)).weight_used == 500.0
+
+    async def test_increase_sync_refused_for_wrong_wire_identity(
+        self, db_session, printer_factory, notify, trusted, monkeypatch
+    ):
+        """THE FIX. A stranger's roll in the slot (the pipeline has not rebound it yet, or
+        the row is stale-bound to a tray it left) must never push this ledger up from that
+        roll's remain%. Before the gate this wrote 500 g onto a row the wire never
+        identified — the spool-37 inflation mechanism, verbatim."""
+        printer = await printer_factory()
+        spool = await self._seed_bound(
+            db_session, printer.id, weight_used=self._TAGGED_ROW_USED, tag_uid=TAG_UID, tray_uuid=TRAY_UUID
+        )
+        stranger = _tray(remain=50, tag_uid="1111222233334444", tray_uuid="99998888777766665555444433332222")
+
+        await self._drive(monkeypatch, db_session, printer.id, stranger)
+
+        assert (await db_session.get(Spool, spool.id)).weight_used == self._TAGGED_ROW_USED
+
+    async def test_increase_sync_passes_on_sibling_tag_read(
+        self, db_session, printer_factory, notify, trusted, monkeypatch
+    ):
+        """A Bambu roll carries TWO chips; a push showing only the far one, with no uuid
+        on either side, is still this roll identifying itself. Comparing ``tag_uid`` alone
+        would gate the lane OFF for a correctly-bound roll for as long as it faced that
+        way — the failure the either-chip comparer exists to prevent."""
+        printer = await printer_factory()
+        spool = await self._seed_bound(
+            db_session,
+            printer.id,
+            weight_used=self._TAGGED_ROW_USED,
+            tag_uid=TAG_UID,
+            sibling_tag_uid="1111222233334444",
+        )
+        far_side = _tray(remain=50, tag_uid="1111222233334444", tray_uuid="0" * 32)
+
+        await self._drive(monkeypatch, db_session, printer.id, far_side)
+
+        assert (await db_session.get(Spool, spool.id)).weight_used == 500.0
+
+    async def test_increase_sync_tagless_unaffected(
+        self, db_session, printer_factory, notify, trusted, monkeypatch
+    ):
+        """A tagless slot was already inert here and stays inert: the firmware reports
+        ``remain = -1`` for a roll whose chip it never read, which fails the 1..100 parse
+        long before the identity gate is consulted (doctrine rule 8 — only a TAGGED row
+        has wire truth to defer to). The gate costs this lane nothing."""
+        printer = await printer_factory()
+        spool = await self._seed_bound(db_session, printer.id, weight_used=250.0, data_origin="ams_auto")
+        bare = {"id": 3, "state": 11, "tray_type": "PETG", "tray_color": "000000FF", "remain": -1}
+
+        await self._drive(monkeypatch, db_session, printer.id, bare)
+
+        assert (await db_session.get(Spool, spool.id)).weight_used == 250.0
+
+    async def test_a_tagless_row_under_a_tagged_tray_is_refused(
+        self, db_session, printer_factory, notify, trusted, monkeypatch
+    ):
+        """The one behaviour this gate genuinely CHANGES, stated out loud: an untagged row
+        sitting where the wire does assert an identity used to take that roll's remain%.
+        It cannot — the row has no member to compare, so the push proves nothing about it,
+        and the binding is the pipeline's question to answer, not this lane's."""
+        printer = await printer_factory()
+        spool = await self._seed_bound(db_session, printer.id, weight_used=250.0, data_origin="ams_auto")
+
+        await self._drive(monkeypatch, db_session, printer.id, _tray(remain=50))
+
+        assert (await db_session.get(Spool, spool.id)).weight_used == 250.0

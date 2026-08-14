@@ -21,7 +21,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.models.spool_usage_history import SpoolUsageHistory
-from backend.app.services import hms_edges, spool_respool
+from backend.app.services import hms_edges, spool_binding, spool_respool
 from backend.app.services.bambu_mqtt import HMSError
 from backend.app.services.hms_errors import hms_short_code
 from backend.app.services.spool_respool import (
@@ -544,6 +544,147 @@ async def test_mark_spent_ignores_non_runout_codes(db_session, printer_factory):
     printer = await printer_factory()
     state = _make_state(0, 0, _tray(), tray_now=0)
     assert await mark_spent_on_runout(db_session, printer.id, {"0300_4057"}, state) is None
+
+
+# -- Tier 1: attribution across the release-before-runout gap ------------------
+#
+# The AMS clears a drained slot's exist bit ~3 min BEFORE it declares the runout, so on a
+# natural runout the binding is ALREADY released when the evidence lands (2026-08-13, three
+# timed pairs). Requiring a live assignment made every stamp fleet-wide a silent no-op from
+# the 2026-08-10 release wave onward; these pin the resolver that survives the release.
+
+_RESPOOL_LOGGER = "backend.app.services.spool_respool"
+
+
+def _empty_bay(*, tray_now=0):
+    """The runout push as the wire really delivers it: the drained bay already reads
+    cleared (its exist bit dropped minutes ago), while ``tray_now`` still names the slot."""
+    return _make_state(0, 0, _tray(tag_uid="", tray_uuid="", state=9, tray_type=""), tray_now=tray_now)
+
+
+async def _seed_released_row(db, printer_id, ams_id, tray_id, **kwargs):
+    """A row that was bound to the slot and then RELEASED through the real unbind writer.
+
+    Never hand-sets ``last_location_*``: the residue under test has to be the one
+    production stamps, or the test pins a fiction instead of the lane.
+    """
+    spool = Spool(material="PETG", label_weight=1000, core_weight=250, **kwargs)
+    spool.k_profiles = []
+    spool.assignments = []
+    db.add(spool)
+    await db.flush()
+    await _assign(db, printer_id, ams_id, tray_id, spool.id)
+    await db.commit()
+    assignment = (
+        await db.execute(select(SpoolAssignment).where(SpoolAssignment.spool_id == spool.id))
+    ).scalar_one()
+    await spool_binding.release_spool_from_slot(db, assignment, reason="cleared_tray")
+    await db.commit()
+    return spool
+
+
+def _runout(state, *, subtask_id="job-A"):
+    state.subtask_id = subtask_id
+    return state
+
+
+@pytest.mark.asyncio
+async def test_mark_spent_released_slot_resolves_last_location_victim(db_session, printer_factory, caplog):
+    """The runout evidence lands on an already-unbound slot → the release residue names
+    the victim, and the stamp says which tier answered."""
+    printer = await printer_factory()
+    spool = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=990.0)
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay()))
+
+    assert marked is not None and marked.id == spool.id
+    assert marked.spent_at is not None
+    assert marked.weight_used == 990.0  # the gram ledger stays raw (doctrine rule 8)
+    assert any("tier=last_location" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_mark_spent_prefers_live_assignment_over_last_location(db_session, printer_factory):
+    """Tier 1 outranks the residue — which is exactly why tier 2 needs no recency
+    threshold (doctrine rules 6/7): an operator refilling inside the ~3-min gap binds the
+    slot, and binding it is what makes the fresh roll the answer."""
+    printer = await printer_factory()
+    departed = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=990.0)
+    fresh = Spool(material="PETG", label_weight=1000, core_weight=250, weight_used=0)
+    fresh.k_profiles = []
+    fresh.assignments = []
+    db_session.add(fresh)
+    await db_session.flush()
+    await _assign(db_session, printer.id, 0, 0, fresh.id)
+    await db_session.commit()
+
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay()))
+
+    assert marked is not None and marked.id == fresh.id
+    await db_session.refresh(departed)
+    assert departed.spent_at is None  # the residue was never consulted
+
+
+@pytest.mark.asyncio
+async def test_mark_spent_last_location_newest_already_spent_is_idempotent(db_session, printer_factory):
+    """D1: adjudicate the NEWEST released row and never scan past it.
+
+    A second trigger for the same slot under a NEW job escapes ``_spent_dedup`` (that key
+    carries the job), so it re-enters the resolver. It must land on the already-spent
+    victim and no-op. A ``WHERE spent_at IS NULL`` query would step OVER that row onto the
+    older residue — a healthy roll that merely sat in this slot once — and stamp it
+    permanently, and a false stamp has no automatic way back (invariant 11).
+    """
+    printer = await printer_factory()
+    older = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=120.0)
+    # Age the OLDER release. Both stamps come from the writer's own utcnow(), and the
+    # Windows clock can render two same-millisecond releases as a tie; backdating makes
+    # "newest" decidable without sleeping on clock resolution.
+    older.last_location_at = datetime.utcnow() - timedelta(hours=1)
+    await db_session.commit()
+    newer = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=990.0)
+
+    first = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay()))
+    assert first is not None and first.id == newer.id
+    stamped_at = first.spent_at
+
+    second = await mark_spent_on_runout(
+        db_session, printer.id, {"0700_8011"}, _runout(_empty_bay(), subtask_id="job-B")
+    )
+
+    assert second is not None and second.id == newer.id  # the same victim, returned for dedup
+    assert second.spent_at == stamped_at  # no re-stamp
+    await db_session.refresh(older)
+    assert older.spent_at is None  # the healthy older residue is untouched
+
+
+@pytest.mark.asyncio
+async def test_mark_spent_last_location_archived_stands_down(db_session, printer_factory, caplog):
+    """Retired inventory is never stamped — and the refusal is a log line, not a silent
+    exit (six silent exits are how this failure hid for three days)."""
+    printer = await printer_factory()
+    spool = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=990.0)
+    spool.archived_at = datetime.utcnow()
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        assert await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay())) is None
+
+    await db_session.refresh(spool)
+    assert spool.spent_at is None
+    assert any("archived" in r.getMessage() and "stood down" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_mark_spent_no_victim_logs_suppression(db_session, printer_factory, caplog):
+    """A slot with no history at all stamps nothing, and says so."""
+    printer = await printer_factory()
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        assert await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay())) is None
+
+    assert any("no last-location victim" in r.getMessage() for r in caplog.records)
 
 
 # -- Tier 1: backup-swap detector (stable-feeder + pending-confirm rebuild) ----
@@ -2496,13 +2637,17 @@ async def test_slot_runout_chained_multi_slot_each_stamps(db_session, printer_fa
 
 
 @pytest.mark.asyncio
-async def test_slot_runout_demand_code_never_stamps(db_session, printer_factory):
-    """006-H2S latched-load pin. Every OTHER member of the slot-attributed family
-    decodes a slot perfectly well, so only the code-word gate stops them: a bare demand
-    can be a firmware-latched bogus ask for a slot that never ran dry, the purge notice
-    is transitional, and purge-abnormal is entangled with a tool-head fault. Pinned at
-    BOTH layers — the trigger's own re-assert and main's pipeline filter."""
-    from backend.app.services.hms_errors import _RUNOUT_AUTO_SWITCH_SPENT_CODE32, _code_word, runout_slot_from_hms
+async def test_bare_demand_still_never_stamps(db_session, printer_factory):
+    """006-H2S latched-load pin, kept after the 2026-08-13 vocabulary promotion.
+
+    Every OTHER member of the slot-attributed family decodes a slot perfectly well, so
+    only the code-word gate stops them: a bare demand can be a firmware-latched bogus ask
+    for a slot that never ran dry, and purge-abnormal is entangled with a tool-head fault
+    where the runout read itself may be wrong. (The pull-back notice 0x00030001 LEFT this
+    list on 2026-08-13 — it is the firmware's own per-event statement that the roll
+    ended, and the only one a terminal runout raises.) Pinned at BOTH layers — the
+    trigger's own re-assert and main's pipeline filter."""
+    from backend.app.services.hms_errors import _RUNOUT_SLOT_SPENT_CODE32, _code_word, runout_slot_from_hms
 
     printer = await printer_factory()
     healthy = await _new_spool(db_session, weight_used=300)
@@ -2513,22 +2658,207 @@ async def test_slot_runout_demand_code_never_stamps(db_session, printer_factory)
     state.subtask_id = "job-latched"
     errs = [
         _slot_runout_err(attr=0x07002200, code=0x00020001),  # bare demand
-        _slot_runout_err(attr=0x07002200, code=0x00030001),  # "please wait, purging"
         _slot_runout_err(attr=0x07002200, code=0x00020005),  # purge-abnormal
     ]
 
-    # Layer 1 — main's pipeline filter would never build an event for any of them,
+    # Layer 1 — main's pipeline filter would never build an event for either of them,
     # even though each decodes to a real slot (so the gate is the code word alone).
     for err in errs:
         code_word = _code_word(err.code)
         assert runout_slot_from_hms(err.attr, code_word) is not None
-        assert code_word not in _RUNOUT_AUTO_SWITCH_SPENT_CODE32
+        assert code_word not in _RUNOUT_SLOT_SPENT_CODE32
 
     # Layer 2 — handed to the trigger anyway, it fails closed on its own contract.
     stamped = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(e) for e in errs], state)
 
     assert stamped == []
     assert (await db_session.get(Spool, healthy.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_pullback_word_0x30001_stamps_per_event(db_session, printer_factory):
+    """003-H2S 2026-08-13, slot 4: a TERMINAL runout (no backup slot left) raises the
+    pull-back word 0x00030001 ONCE, slot-attributed, and then only the excluded bare
+    demand and the latching slot-agnostic 8011. Promoting it is what gives the terminal
+    class any per-event evidence at all — the auto-switch report structurally cannot
+    fire when the slot that ran dry was the last eligible one."""
+    printer = await printer_factory()
+    exhausted = await _new_spool(db_session, weight_used=900)
+    healthy = await _new_spool(db_session, weight_used=100)
+    await _assign(db_session, printer.id, 0, 3, exhausted.id)  # AMS0 slot 4 → tray 3
+    await _assign(db_session, printer.id, 0, 0, healthy.id)
+    await db_session.commit()
+
+    state = _make_state(0, 3, _tray(), gcode_state="PAUSE", tray_now=3)
+    state.subtask_id = "job-terminal"
+    err = _slot_runout_err(attr=0x07002300, code=0x00030001)
+    state.hms_errors = [err]
+
+    stamped = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(err)], state)
+
+    assert [s.id for s in stamped] == [exhausted.id]
+    assert (await db_session.get(Spool, exhausted.id)).spent_at is not None
+    assert (await db_session.get(Spool, healthy.id)).spent_at is None  # attr-exact, never fleet-wide
+
+
+@pytest.mark.asyncio
+async def test_pullback_then_auto_switch_same_slot_stamps_once(db_session, printer_factory):
+    """The RESCUED sequence: 0x30001 ("pulling the old filament back") is followed by
+    0x30002 ("switched to the slot with the same filament") naming the SAME slot. Two
+    words, one physical exhaustion — ``_spent_dedup`` is keyed per (printer, job, tray),
+    so the second is absorbed and the stamp time never moves."""
+    printer = await printer_factory()
+    exhausted = await _new_spool(db_session, weight_used=970)
+    await _assign(db_session, printer.id, 0, 2, exhausted.id)
+    await db_session.commit()
+
+    state = _make_state(0, 2, _tray(), gcode_state="RUNNING", tray_now=0)  # backup already feeding
+    state.subtask_id = "job-rescued"
+    pullback = _slot_runout_err(attr=0x07002200, code=0x00030001)
+    switched = _slot_runout_err(attr=0x07002200, code=0x00030002)
+
+    first = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(pullback)], state)
+    assert [s.id for s in first] == [exhausted.id]
+    stamped_at = first[0].spent_at
+
+    second = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(switched)], state)
+
+    assert second == []  # dedup absorbed it — not a second stamp
+    assert (await db_session.get(Spool, exhausted.id)).spent_at == stamped_at
+
+
+# -- WS2b: the DURABLE, incident-anchored stamp for HELD runouts ---------------
+#
+# Every lane above rides an ``hms_edges`` APPEARANCE edge, and those are ephemeral by
+# construction: the first frame a process consumes seeds instead of edging, so a deploy
+# landing inside a hold re-seeds the standing runout and no later frame can ever edge it.
+# A terminal runout holds for hours (003-H2S 2026-08-13: 12.5 h), so the durable event is
+# the recovery ESCALATION, and it carries its own stamp. These pin what that lane may
+# conclude — and, just as load-bearing, what it must refuse.
+
+
+def _held_runout_state(tray_dict, *, tray_id=3, subtask_id="job-held"):
+    """A PAUSEd printer standing on a same-slot refill demand for AMS0 slot ``tray_id``,
+    with that slot rendered as ``tray_dict`` — the one input the 006 stand-down reads.
+
+    The DEMAND is what the resolver answers from (step 1, ahead of any inference), which
+    is exactly the provenance the 006 class poisons: firmware can latch a demand for a
+    slot that never ran dry, so the slot alone is never enough to stamp on.
+    """
+    state = _make_state(0, tray_id, tray_dict, gcode_state="PAUSE", tray_now=tray_id)
+    state.subtask_id = subtask_id
+    state.hms_errors = [_slot_runout_err(attr=0x07000000 | ((0x20 + tray_id) << 8), code=0x00020001)]
+    return state
+
+
+_CLEARED_TRAY = {"state": 9, "tray_type": "", "tag_uid": "", "tray_uuid": ""}
+_SEATED_TRAY = {"state": 11, "tray_type": "PETG", "tag_uid": DONOR_TAG_UID, "tray_uuid": DONOR_TRAY_UUID}
+_SILENT_TRAY: dict = {}  # a partial push asserting neither state nor type → presence UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_runout_hold_stamp_stamps_wire_empty_slot(db_session, printer_factory, own_session_factory, caplog):
+    """The 003-H2S shape: the demanded slot reads wire-asserted EMPTY (its bay cleared
+    minutes before the firmware admitted why), and the roll that was released from it is
+    the victim — resolved through WS1's tier 2, not a live binding."""
+    printer = await printer_factory()
+    spool = await _seed_released_row(db_session, printer.id, 0, 3, weight_used=990.0)
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        await spool_respool.mark_spent_on_runout_hold(
+            printer.id, _held_runout_state(_CLEARED_TRAY), subtask_id="job-held", session_factory=own_session_factory
+        )
+
+    await db_session.refresh(spool)
+    assert spool.spent_at is not None
+    assert spool.weight_used == 990.0  # the gram ledger stays raw
+    assert any("tier=last_location" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_runout_hold_stamp_stands_down_on_loaded_slot(
+    db_session, printer_factory, own_session_factory, caplog
+):
+    """006-H2S 2026-07-26: a latched demand can name a slot that never ran dry. A roll
+    that truly ran out left its bay minutes ago, so an OCCUPIED demanded slot is the
+    bogus-latch shape — and stamping it would archive a healthy roll permanently."""
+    printer = await printer_factory()
+    spool = await _new_spool(db_session, weight_used=300)
+    await _assign(db_session, printer.id, 0, 3, spool.id)
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        await spool_respool.mark_spent_on_runout_hold(
+            printer.id, _held_runout_state(_SEATED_TRAY), subtask_id="job-held", session_factory=own_session_factory
+        )
+
+    await db_session.refresh(spool)
+    assert spool.spent_at is None
+    assert any("OCCUPIED" in r.getMessage() and "bogus-latch" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_runout_hold_stamp_stands_down_on_unknown_presence(
+    db_session, printer_factory, own_session_factory, caplog
+):
+    """Unknown is not empty. A partial push that asserts neither state nor tray_type
+    proves nothing about the bay, and this lane exists to cover the case the edges miss —
+    not to guess where they were silent. Its own log, distinct from the 006 refusal."""
+    printer = await printer_factory()
+    spool = await _seed_released_row(db_session, printer.id, 0, 3, weight_used=990.0)
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        await spool_respool.mark_spent_on_runout_hold(
+            printer.id, _held_runout_state(_SILENT_TRAY), subtask_id="job-held", session_factory=own_session_factory
+        )
+
+    await db_session.refresh(spool)
+    assert spool.spent_at is None
+    assert any("presence is UNKNOWN" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_runout_hold_stamp_noop_in_spoolman_mode(db_session, printer_factory, own_session_factory):
+    """Spoolman owns the ledger — every spent lane is gated off, this one included."""
+    from backend.app.api.routes.settings import set_setting
+
+    printer = await printer_factory()
+    spool = await _seed_released_row(db_session, printer.id, 0, 3, weight_used=990.0)
+    await set_setting(db_session, "spoolman_enabled", "true")
+    await db_session.commit()
+
+    await spool_respool.mark_spent_on_runout_hold(
+        printer.id, _held_runout_state(_CLEARED_TRAY), subtask_id="job-held", session_factory=own_session_factory
+    )
+
+    await db_session.refresh(spool)
+    assert spool.spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_runout_hold_stamp_dedups_with_edge_lane(db_session, printer_factory, own_session_factory, caplog):
+    """One physical exhaustion, two triggers: the edge fires at the runout instant and
+    the escalation follows minutes later on the same job and slot. ``_spent_dedup`` is
+    shared, so the second is a no-op that says so — the stamp time never moves."""
+    printer = await printer_factory()
+    spool = await _new_spool(db_session, weight_used=970)
+    await _assign(db_session, printer.id, 0, 3, spool.id)
+    await db_session.commit()
+
+    edge_state = _held_runout_state(_CLEARED_TRAY)
+    pullback = _slot_runout_err(attr=0x07002300, code=0x00030001)
+    stamped = await mark_spent_on_slot_runout(db_session, printer.id, [_slot_event(pullback)], edge_state)
+    assert [s.id for s in stamped] == [spool.id]
+    stamped_at = stamped[0].spent_at
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        await spool_respool.mark_spent_on_runout_hold(
+            printer.id, _held_runout_state(_CLEARED_TRAY), subtask_id="job-held", session_factory=own_session_factory
+        )
+
+    await db_session.refresh(spool)
+    assert spool.spent_at == stamped_at  # no re-stamp
+    assert any("the edge lane got there first" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio

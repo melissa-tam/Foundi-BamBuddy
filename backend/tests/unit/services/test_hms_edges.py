@@ -5,6 +5,8 @@ appends), so the entry-field access the module does is pinned against the shape
 production actually produces.
 """
 
+import logging
+
 import pytest
 
 from backend.app.services import hms_edges
@@ -75,6 +77,31 @@ class TestConsumeGuards:
 
 class TestSeeding:
     """Restart-replay suppression: a code live at first sight never fires."""
+
+    def test_seed_logs_standing_codes(self, caplog):
+        """The suppression is deliberate, but it is also what silences every edge-driven
+        state consumer for a fault standing across a deploy — a terminal runout can hold
+        for hours, so a deploy inside the hold re-seeds its codes and nothing can ever
+        edge them again. When a stamp then never lands, this line is what separates "the
+        lane is dead" from "the lane was correctly suppressed". One line per printer per
+        process: the seed branch runs exactly once."""
+        with caplog.at_level(logging.INFO, logger="backend.app.services.hms_edges"):
+            hms_edges.note_push(1, _state(wire_at=100.0, errors=(_hms(RUNOUT_ATTR, RUNOUT_CODE),)))
+            hms_edges.note_push(1, _state(wire_at=200.0, errors=(_hms(RUNOUT_ATTR, RUNOUT_CODE),)))
+
+        seeds = [r.getMessage() for r in caplog.records if "seeded printer" in r.getMessage()]
+        assert len(seeds) == 1
+        assert "1 standing HMS code(s)" in seeds[0]
+        assert RUNOUT_FULL in seeds[0]
+
+    def test_seed_logs_a_clean_printer_too(self, caplog):
+        """A quiet printer seeds as well, and says so — the line marks the boundary the
+        edge lane starts from, which is exactly what a triage needs when the question is
+        "did this process ever consume a frame for that printer?"."""
+        with caplog.at_level(logging.INFO, logger="backend.app.services.hms_edges"):
+            hms_edges.note_push(1, _state(wire_at=100.0))
+
+        assert any("0 standing HMS code(s)" in r.getMessage() for r in caplog.records)
 
     def test_first_known_frame_seeds_without_edging(self):
         report = hms_edges.note_push(1, _state(wire_at=100.0, errors=(_hms(RUNOUT_ATTR, RUNOUT_CODE),)))

@@ -145,7 +145,7 @@ from backend.app.models.printer_incident import (
 )
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import printer_incidents, tray_fields
+from backend.app.services import printer_incidents, spool_respool, tray_fields
 from backend.app.services.bambu_mqtt import AMS_STATUS_FILAMENT_CHANGE, AMS_STATUS_IDLE
 from backend.app.services.hms_errors import (
     RUNOUT_HMS_CODES,
@@ -2684,6 +2684,10 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
     by a sibling code, keeps the printer-card chip lit, and arms the hourly attention
     reminder. It closes when the printer is observed RUNNING again, at the job's
     terminal, or when the refill auto-resume lands — never by a timer.
+
+    A HELD AMS runout additionally carries the DURABLE spent stamp for the exhausted
+    roll (``spool_respool.mark_spent_on_runout_hold``, guarded) — see the call below for
+    why an escalation, and not a wire edge, is what a hold spanning a deploy can rely on.
     """
     from backend.app.core.database import async_session
     from backend.app.models.printer import Printer
@@ -2726,6 +2730,30 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
             # AMS keeps escalating within the window (reuse the SAME session).
             await _record_escalation_and_maybe_quarantine(db, incident, reason)
         logger.warning("spool_recovery: printer %s ESCALATED (%s) — left PAUSED", incident.printer_id, reason)
+        # A HELD runout's escalation IS the durable exhaustion record. The three
+        # edge-driven spent lanes hang off `hms_edges` appearance edges, which every
+        # restart re-seeds, so a hold that spans a deploy (or a standing PAUSE code
+        # re-escalated at boot) would otherwise never stamp. This escalation derives
+        # from the LIVE HMS list on a durable incident row, so it always fires — and
+        # STAMPING stays spool_respool's job (one writer for spent_at, invariant 1).
+        #
+        # Gated on the REASON, which excludes both siblings deliberately:
+        # `external_spool_runout` because the holder's left/right vt-tray attribution
+        # convention is unconfirmed (a wrong-side stamp on a dual-holder model is
+        # permanent), and `recovery_interrupted` because it is a restart artifact with
+        # no live runout evidence behind it. The kind check pins the pairing so a future
+        # reason rename cannot quietly point this at a different fault class.
+        if incident.kind == KIND_RUNOUT and reason == "runout_needs_refill":
+            try:
+                await spool_respool.mark_spent_on_runout_hold(
+                    incident.printer_id,
+                    _get_state(incident.printer_id),
+                    subtask_id=incident.job_id,
+                )
+            except Exception:  # noqa: BLE001 — an escalation must never fail because a stamp did
+                logger.warning(
+                    "spool_recovery: runout-hold spent stamp failed for printer %s", incident.printer_id, exc_info=True
+                )
     except Exception:  # noqa: BLE001 — never crash the driver
         logger.exception("spool_recovery: escalate handler failed for printer %s", incident.printer_id)
 
