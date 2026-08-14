@@ -12,6 +12,7 @@ short-circuit, and the presence-edge ``clear_on_reinsert``.
 import asyncio
 import json
 import logging
+from dataclasses import replace
 from datetime import datetime
 from unittest.mock import AsyncMock
 
@@ -959,6 +960,83 @@ async def test_runout_escalation_detail_names_slot_refill(db_session, printer_fa
 
     failed.assert_awaited_once()
     assert "same" in failed.call_args.kwargs["detail"].lower()  # "insert into the SAME slot"
+
+
+# --- WS2b: the escalation carries the DURABLE spent stamp --------------------
+#
+# The wire-edge spent lanes are re-seeded by every restart, so a hold spanning a deploy
+# would never stamp. The escalation is the durable, incident-anchored event, so it hands
+# the exhaustion to spool_respool — which stays the ONE spent writer. What matters here
+# is the GATE: which escalations may claim a roll ran out, and which may not.
+
+
+def _spy_hold_stamp(monkeypatch):
+    """Record every ``mark_spent_on_runout_hold`` call the escalation makes."""
+    from backend.app.services import spool_respool
+
+    calls: list[tuple] = []
+
+    async def _stamp(printer_id, state, *, subtask_id, session_factory=None):
+        calls.append((printer_id, subtask_id, state))
+
+    monkeypatch.setattr(spool_respool, "mark_spent_on_runout_hold", _stamp)
+    return calls
+
+
+async def test_runout_escalation_invokes_hold_stamp(db_session, printer_factory, install_settings, monkeypatch):
+    """A held AMS runout (``runout_needs_refill``) hands the stamp exactly one call,
+    naming this printer, this job, and the LIVE state — the resolver has to re-read the
+    wire itself rather than trust the incident row's stored tray (the 185/205 class)."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    _spy(monkeypatch, "on_spool_recovery_failed")
+    calls = _spy_hold_stamp(monkeypatch)
+    state = _make_state(hms=[_runout_same_slot_hms()])
+    _wire(monkeypatch, state, FakeClient(state))
+
+    task = await on_ams_fault(printer.id, state)
+    await task
+
+    assert [(pid, job) for pid, job, _st in calls] == [(printer.id, "task-1")]
+    assert calls[0][2] is state
+
+
+async def test_external_runout_escalation_does_not_stamp(db_session, printer_factory, install_settings, monkeypatch):
+    """The spool HOLDER ran dry (``external_spool_runout``). External rows are bindable
+    (ams_id 255), but which vt-tray a dual-holder model's fault names is unconfirmed —
+    and a wrong-side stamp is permanent, so v1 stamps nothing here."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    _spy(monkeypatch, "on_spool_recovery_failed")
+    calls = _spy_hold_stamp(monkeypatch)
+    state = _make_state(hms=[_external_runout_hms()])
+    _wire(monkeypatch, state, FakeClient(state))
+
+    task = await on_ams_fault(printer.id, state)
+    await task
+
+    assert calls == []
+
+
+async def test_recovery_interrupted_escalation_does_not_stamp(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """``recovery_interrupted`` is a RESTART ARTIFACT — a zombie ``recovering`` row whose
+    wire carries no actionable fault at all. It escalates because a half-executed swap is
+    not "fine", not because a roll ran out; there is no live runout evidence to stamp
+    from, whatever kind the stale row happened to carry."""
+    install_settings()
+    printer = await printer_factory()
+    _spy(monkeypatch, "on_spool_recovery_failed")
+    calls = _spy_hold_stamp(monkeypatch)
+    _wire(monkeypatch, _make_state(hms=[_runout_same_slot_hms()]), None)
+    runout_incident = replace(_incident(printer.id, step_timeout_s=0.05), kind=spool_recovery.KIND_RUNOUT)
+
+    await spool_recovery._escalate(runout_incident, "recovery_interrupted")
+
+    assert calls == []
 
 
 # ===========================================================================

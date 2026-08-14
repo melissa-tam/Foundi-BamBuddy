@@ -8,16 +8,19 @@ guard. This module is the single owner of the re-spool operation and its three
 certainty tiers:
 
 * **Tier 1 — spent-certain marking** (`apply_runout_edges` → `mark_spent_on_runout` /
-  `mark_spent_on_slot_runout`, and `sample_status_push` + `confirm_backup_swaps`): a
-  hardware runout signal (unrescued runout HMS / the firmware's own auto-switch
-  statement / seamless AMS backup-swap) stamps ``spool.spent_at`` — the certainty
-  key. Never set by gram estimates. The two HMS lanes fire on a wire-HMS APPEARANCE
-  EDGE (``services.hms_edges``): "NEW" is that tracker's answer, never the
-  notification dedup's 600 s re-notify window, which is a level-triggered alert policy
-  and the wrong axis for a state decision. The backup-swap detector is a
-  SAMPLER/CONFIRMER pair, not one call: the sync sampler runs on every status push
-  (~1 Hz) because the tray_now edge it watches is invisible to the AMS-hash-gated
-  callback, and only a confirmed departure pays for a DB session.
+  `mark_spent_on_slot_runout`, `mark_spent_on_runout_hold`, and `sample_status_push` +
+  `confirm_backup_swaps`): a hardware runout signal (unrescued runout HMS / the
+  firmware's own per-event slot-attributed runout words / a held-runout escalation /
+  seamless AMS backup-swap) stamps ``spool.spent_at`` — the certainty key. Never set by
+  gram estimates. The two HMS lanes fire on a wire-HMS APPEARANCE EDGE
+  (``services.hms_edges``): "NEW" is that tracker's answer, never the notification
+  dedup's 600 s re-notify window, which is a level-triggered alert policy and the wrong
+  axis for a state decision. Because those edges are re-seeded by every restart, the
+  HELD class has a second, DURABLE entry point that rides the recovery incident's
+  escalation instead of a wire edge (`mark_spent_on_runout_hold`). The backup-swap
+  detector is a SAMPLER/CONFIRMER pair, not one call: the sync sampler runs on every
+  status push (~1 Hz) because the tray_now edge it watches is invisible to the
+  AMS-hash-gated callback, and only a confirmed departure pays for a DB session.
 * **Tier 2 — automatic re-spool** (`maybe_auto_or_prompt_respool`): a tag arrival
   resolving to a spent, LOADED tray physically cannot be the old (empty) spool,
   so it re-spools with no operator involvement — unless a standing "Same spool"
@@ -61,6 +64,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.models.spool_usage_history import SpoolUsageHistory
+from backend.app.services import spool_binding
 from backend.app.services.hms_errors import RUNOUT_HMS_CODES, hms_short_code
 from backend.app.services.spool_tag_matcher import (
     ZERO_TAG_UID,
@@ -385,7 +389,48 @@ def _tray_loaded(tray: dict) -> bool:
 
 
 async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) -> Spool | None:
-    """Stamp spent_at on the spool assigned to the decoded slot. Idempotent."""
+    """Stamp spent_at on the roll that was in the decoded slot. Idempotent.
+
+    THE one spent writer — all four trigger lanes (unrescued HMS shorts, the firmware's
+    per-slot runout words, the HMS-free backup-swap confirmer, and the held-runout
+    escalation) funnel through here, so whichever roll this function names is the roll
+    the farm calls exhausted. It names it in two tiers, both pointing at the SAME
+    physical roll:
+
+    1. **the live binding** on (ams_id, tray_id) — correct whenever the AMS still claims
+       the slot at HMS time (the original design, unchanged);
+    2. **the newest row whose last release was FROM this slot**
+       (:func:`spool_binding.last_released_from_slot_stmt`), when nothing is bound —
+       including the broken shape where an assignment survives its deleted spool row.
+
+    Tier 2 is not a fallback nicety, it is the NORMAL path for a natural runout. The AMS
+    clears a drained slot's exist bit ~3 MINUTES BEFORE it declares the filament runout
+    (the tail is still traversing the feed path), proven 3× on 2026-08-13: releases at
+    03:55:46 / 06:41:47 / 07:02:52 against runout HMS at 03:58:20 / 06:44:44 / 07:05:33.
+    That release is CORRECT wire truth — an assignment claims where a roll physically IS
+    (doctrine rule 9) and the bay is empty — so exhaustion attribution has to SURVIVE the
+    release rather than fight it. It did not: this writer required a live assignment, and
+    from the 2026-08-10 release wave (which made bit-clear releases fire reliably for the
+    first time) until this change, every spent stamp fleet-wide was a silent no-op. The
+    dependency was never written down, which is why no review of that wave could flag it;
+    it is written down now.
+
+    **Tier 2 adjudicates THE NEWEST row and never scans past it** — deliberately NOT
+    ``WHERE spent_at IS NULL``. A duplicate trigger (the same slot re-raising under a new
+    job, where ``_spent_dedup`` no longer absorbs it) must resolve to the already-spent
+    victim and no-op; a spent-filtered query would step OVER that victim onto an OLDER
+    unspent release residue of the same slot — a healthy shelf roll that once sat there —
+    and stamp it permanently. Cross-cutting invariant 11 applied to the query shape: a
+    missed stamp self-heals forward, a false one never does.
+
+    No recency threshold on the residue (doctrine rules 6/7 — duration is never identity
+    evidence). The case a threshold would be reaching for, an operator inserting a fresh
+    roll inside the 3-minute gap, wins TIER 1 by construction: inserting it binds the slot.
+
+    An ARCHIVED newest victim stands down — retired inventory is never stamped — and so
+    does an empty slot history. Both say so in the log, because six silent exits are
+    exactly how this failure hid for three days.
+    """
     ams_id, tray_id = _decode_global_tray(global_tray)
     if ams_id is None:
         return None
@@ -399,9 +444,45 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
         )
     )
     assignment = result.scalar_one_or_none()
-    if assignment is None or assignment.spool is None:
-        return None
-    spool = assignment.spool
+    spool = assignment.spool if assignment is not None else None
+    tier = "assignment"
+
+    if spool is None:
+        # --- tier 2: the slot released its roll before the firmware admitted why ---
+        tier = "last_location"
+        victim = await db.execute(spool_binding.last_released_from_slot_stmt(printer_id, ams_id, tray_id).limit(1))
+        spool = victim.scalar_one_or_none()
+        if spool is None:
+            logger.info(
+                "no live assignment and no last-location victim — spent stamp suppressed (printer %d AMS%d-T%d)",
+                printer_id,
+                ams_id,
+                tray_id,
+            )
+            return None
+        # Adjudicate this row, whatever it says — walking on would land on an older
+        # residue of the same slot, which is a different (healthy) roll.
+        if spool.spent_at is not None:
+            logger.info(
+                "Spool %d already spent (printer %d AMS%d-T%d, tier=last_location) — duplicate runout trigger "
+                "for the same slot, no re-stamp",
+                spool.id,
+                printer_id,
+                ams_id,
+                tray_id,
+            )
+            return spool  # idempotent success: the caller still books its dedup key
+        if spool.archived_at is not None:
+            logger.info(
+                "Last-location victim spool %d is archived (printer %d AMS%d-T%d) — spent stamp stood down; "
+                "retired inventory is never stamped",
+                spool.id,
+                printer_id,
+                ams_id,
+                tray_id,
+            )
+            return None
+
     if spool.spent_at is not None:
         return spool  # idempotent — already marked spent
     spool.spent_at = datetime.utcnow()
@@ -432,11 +513,12 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
         )
     await db.commit()
     logger.info(
-        "Marked spool %d spent (printer %d AMS%d-T%d, hardware runout)",
+        "Marked spool %d spent (printer %d AMS%d-T%d, hardware runout, tier=%s)",
         spool.id,
         printer_id,
         ams_id,
         tray_id,
+        tier,
     )
     return spool
 
@@ -708,6 +790,16 @@ async def _resolve_exhausted_tray(
         candidate = tray_now
 
     if candidate is None:
+        # The last silent exit in the stamp path. Every tier declined: the firmware named
+        # no slot (no demand, nothing slot-attributed decoded), and inference had nothing
+        # admissible either — no single-feeder job, or a multi-feeder job whose tray_now is
+        # not one of its own feeders (the deliberate multi-filament fail-safe). Not
+        # stamping is correct here; being unable to tell that from a dead lane is not.
+        logger.info(
+            "[RESPOOL] runout attribution on printer %d: the firmware named no slot and inference "
+            "produced no admissible candidate — not stamping",
+            printer_id,
+        )
         return None
     if not ambiguous:
         return candidate
@@ -755,9 +847,10 @@ async def apply_runout_edges(printer_id: int, edges, state, session_factory=None
     * Lane A (:func:`mark_spent_on_runout`) — appeared short codes ∩
       :data:`RUNOUT_HMS_CODES`, the UNRESCUED vocabulary;
     * Lane B (:func:`mark_spent_on_slot_runout`) — per-entry ``(full_code, attr,
-      code_word)`` for the firmware's own AUTO-SWITCH statement only, each of which
-      decodes a real slot. The bare demand is deliberately excluded upstream in
-      :data:`hms_errors._RUNOUT_AUTO_SWITCH_SPENT_CODE32`.
+      code_word)`` for the firmware's own PER-EVENT, SLOT-ATTRIBUTED runout statements
+      (the pull-back notice and the auto-switch report), each of which decodes a real
+      slot. The bare demand is deliberately excluded upstream in
+      :data:`hms_errors._RUNOUT_SLOT_SPENT_CODE32`.
 
     Accepted residual: a runout that fired entirely DURING server downtime — living and
     dying inside the gap, so it is neither live at the first consumed frame nor ever
@@ -774,7 +867,7 @@ async def apply_runout_edges(printer_id: int, edges, state, session_factory=None
     """
     try:
         from backend.app.services.hms_errors import (
-            _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
+            _RUNOUT_SLOT_SPENT_CODE32,
             _code_word,
             runout_slot_from_hms,
         )
@@ -784,7 +877,7 @@ async def apply_runout_edges(printer_id: int, edges, state, session_factory=None
         lane_b = [
             (e.full_code, int(e.attr or 0), _code_word(e.code))
             for e in appeared
-            if _code_word(e.code) in _RUNOUT_AUTO_SWITCH_SPENT_CODE32
+            if _code_word(e.code) in _RUNOUT_SLOT_SPENT_CODE32
             and runout_slot_from_hms(int(e.attr or 0), _code_word(e.code)) is not None
         ]
         if not lane_a and not lane_b:
@@ -835,6 +928,16 @@ async def mark_spent_on_runout(db: AsyncSession, printer_id: int, new_short_code
     subtask_id = getattr(state, "subtask_id", None)
     key = (printer_id, subtask_id, global_tray)
     if key in _spent_dedup:
+        # Bounded and per-event: the dedup key carries the job, so this fires once per
+        # re-raise of the SAME runout on the same slot under the same job. It is a log
+        # line because the alternative is what hid the 2026-08-13 failure for three days —
+        # a suppressed stamp and a dead lane are indistinguishable from silence.
+        logger.info(
+            "[RESPOOL] spent stamp already booked for printer %d job %s tray %d — dedup",
+            printer_id,
+            subtask_id,
+            global_tray,
+        )
         return None
     spool = await _mark_tray_spent(db, printer_id, global_tray)
     if spool is not None:
@@ -843,16 +946,28 @@ async def mark_spent_on_runout(db: AsyncSession, printer_id: int, new_short_code
 
 
 async def mark_spent_on_slot_runout(db: AsyncSession, printer_id: int, events, state) -> list[Spool]:
-    """Tier 1: a NEW firmware AUTO-SWITCH runout stamps spent_at on the slot IT named.
+    """Tier 1: a NEW firmware PER-EVENT runout word stamps spent_at on the slot IT named.
 
-    The sibling of :func:`mark_spent_on_runout` for the case that trigger structurally
-    cannot see: a runout the AMS backup RESCUED. ``RUNOUT_HMS_CODES`` is the UNRESCUED
-    vocabulary (0300_8004 + 07xx_8011 — "insert filament", print held), so a successful
-    auto-refill — which raises only the slot-attributed ``0700_2X00`` family and keeps
-    printing — never stamped anything. Fleet evidence 2026-07-30: four confirmed
-    auto-refills across three printers, zero spent stamps; the un-stamped rows then
-    surfaced as spurious "Fresh roll?" prompts on the eventual physical swap
-    (a SPENT row takes the silent spent→mint path instead).
+    The sibling of :func:`mark_spent_on_runout` for the cases that trigger structurally
+    cannot see. ``RUNOUT_HMS_CODES`` is the UNRESCUED, slot-AGNOSTIC vocabulary
+    (0300_8004 + 07xx_8011 — "insert filament", print held), and it is both too narrow
+    and too coarse on its own:
+
+    * a runout the AMS backup RESCUED raises none of it — it raises only the
+      slot-attributed ``0700_2X00`` family and keeps printing (fleet evidence
+      2026-07-30: four confirmed auto-refills across three printers, zero spent stamps;
+      the un-stamped rows then surfaced as spurious "Fresh roll?" prompts on the
+      eventual physical swap, where a SPENT row takes the silent spent→mint path);
+    * the 8011 a TERMINAL runout does raise names no slot and LATCHES, so it depends
+      entirely on an appearance edge that a deploy re-seeds away.
+
+    Both are covered by the two PER-EVENT words this trigger consumes
+    (:data:`hms_errors._RUNOUT_SLOT_SPENT_CODE32`): the pull-back notice 0x00030001 and
+    the auto-switch report 0x00030002. They fire in a fixed order and cost nothing to
+    have both — on a TERMINAL runout only 0x30001 ever arrives (003-H2S 2026-08-13:
+    ~12 s before the demand, and the auto-switch can never come because there is no
+    backup slot left to switch to); on a RESCUED runout 0x30001 is followed by
+    0x30002 naming the SAME slot, and ``_spent_dedup`` absorbs the second.
 
     ``events`` are ``(full_code, attr, code_word)`` tuples the caller has already
     established APPEARED on this frame's wire-HMS edge (``services.hms_edges``, via
@@ -866,10 +981,10 @@ async def mark_spent_on_slot_runout(db: AsyncSession, printer_id: int, events, s
     ``_spent_dedup`` key so a re-raise of the same slot in the same job still can't
     double-stamp the roll the operator has since inserted.
 
-    Only :data:`hms_errors._RUNOUT_AUTO_SWITCH_SPENT_CODE32` may reach here — see that
-    constant for why the bare demand (0x00020001) is NOT spent evidence: 006-H2S proved
-    firmware can latch a bogus demand for a slot that never ran dry, and a demand-driven
-    stamp would have archived a healthy roll.
+    Only :data:`hms_errors._RUNOUT_SLOT_SPENT_CODE32` may reach here — see that constant
+    for why the bare demand (0x00020001) is NOT spent evidence: 006-H2S proved firmware
+    can latch a bogus demand for a slot that never ran dry, and a demand-driven stamp
+    would have archived a healthy roll.
 
     **This trigger needs no topology gate.** Attribution is `runout_slot_from_hms(attr,
     code_word)` and NOTHING else: an entry whose attr does not decode to a real slot is
@@ -883,7 +998,7 @@ async def mark_spent_on_slot_runout(db: AsyncSession, printer_id: int, events, s
     """
     if await _spoolman_enabled(db):
         return []
-    from backend.app.services.hms_errors import _RUNOUT_AUTO_SWITCH_SPENT_CODE32, runout_slot_from_hms
+    from backend.app.services.hms_errors import _RUNOUT_SLOT_SPENT_CODE32, runout_slot_from_hms
 
     subtask_id = getattr(state, "subtask_id", None)
     stamped: list[Spool] = []
@@ -895,7 +1010,7 @@ async def mark_spent_on_slot_runout(db: AsyncSession, printer_id: int, events, s
         # wider slot-attributed family decodes a slot just fine, so a caller that hands
         # over a bare DEMAND would silently archive a healthy roll — the 006 false-stamp
         # class. The narrow set is this function's contract, so it fails closed on it.
-        if code_word not in _RUNOUT_AUTO_SWITCH_SPENT_CODE32:
+        if code_word not in _RUNOUT_SLOT_SPENT_CODE32:
             continue
         slot = runout_slot_from_hms(attr, code_word)
         if slot is None:
@@ -906,12 +1021,136 @@ async def mark_spent_on_slot_runout(db: AsyncSession, printer_id: int, events, s
         # unrescued trigger so a runout seen by BOTH families stamps exactly once.
         key = (printer_id, subtask_id, global_tray)
         if key in _spent_dedup:
+            # The NORMAL rescued sequence lands here: 0x30001 stamps, 0x30002 names the
+            # same slot moments later and is absorbed. Saying so is what makes "absorbed"
+            # distinguishable from "never fired" in a prod log.
+            logger.info(
+                "[RESPOOL] spent stamp already booked for printer %d job %s tray %d — dedup",
+                printer_id,
+                subtask_id,
+                global_tray,
+            )
             continue
         spool = await _mark_tray_spent(db, printer_id, global_tray)
         if spool is not None:
             _spent_dedup.add(key)
             stamped.append(spool)
     return stamped
+
+
+async def mark_spent_on_runout_hold(printer_id: int, state, *, subtask_id, session_factory=None) -> None:
+    """Tier 1, the DURABLE lane: a HELD runout's ESCALATION stamps the exhausted slot.
+
+    Called from ``spool_recovery._escalate`` for ``runout_needs_refill`` only. The three
+    edge-driven lanes above all hang off ``hms_edges`` appearance edges, and those are
+    EPHEMERAL by construction: the first frame a process consumes SEEDS instead of
+    edging, so every restart re-seeds whatever runout is standing and no later frame can
+    ever edge it again. A terminal runout holds for hours (003-H2S 2026-08-13 held
+    12.5 h) — long enough for a deploy to land inside it — and its only non-latching,
+    slot-attributed word (0x00030001) fired seconds after the runout began, i.e. before
+    the deploy. This lane closes that gap: an ESCALATION is a durable, incident-anchored
+    event derived from the LIVE HMS list, so it fires on the boot path too (standing
+    PAUSE codes at startup → incident → ``_run_recovery`` → ``_escalate``).
+
+    It is deliberately a SECOND TRIGGER, not a second writer: everything below funnels
+    into :func:`_mark_tray_spent` with the same dedup key shape as its siblings, so a
+    runout seen by both an edge and an escalation stamps exactly once.
+
+    **The slot is RE-RESOLVED here, never taken from the caller** (D3). The incident row
+    carries a ``slot_global_tray`` whose provenance may be un-gated ``tray_now``
+    inference — the spools 185/205 class, where a bare slot number on a multi-AMS,
+    dual-nozzle printer was guessed into a unit. :func:`_resolve_exhausted_tray` is the
+    one resolver that applies the topology gate, so this lane inherits its fail-closed
+    behaviour instead of laundering a guess into a permanent stamp.
+
+    **The 006 stand-down** (D2): stamp ONLY when the resolved slot reads wire-asserted
+    EMPTY. A genuine terminal runout emptied its bay MINUTES before the firmware admitted
+    why (the release-before-runout ordering, three timed pairs on 2026-08-13), so by
+    escalation time the merged copy asserts the cleared shape. A BOGUS latched demand —
+    006-H2S 2026-07-26, where a load command issued during a hold resurfaced 12 h later
+    as a demand for a slot that never ran dry — names a slot that is still OCCUPIED.
+    Presence is read through the one canonical predicate
+    (:func:`tray_fields.tray_presence_from_dict`), and only ``False`` proceeds: ``True``
+    is the bogus-latch shape and ``None`` is no evidence at all. Standing down costs
+    nothing here — the edge lanes own the edge-time stamp, and a missed stamp self-heals
+    forward while a false one is permanent (invariant 11).
+
+    External-holder runouts never reach this function: the caller gates on the escalation
+    REASON, and ``external_spool_runout`` is excluded because the left/right vt-tray
+    attribution convention is unconfirmed (a wrong-side stamp on a dual-holder model
+    would be permanent).
+
+    Documented residual: an incident that has ALREADY escalated and is still open across
+    a restart re-fires nothing — but its escalation ran pre-restart under this same code,
+    so the stamp already landed. Nothing re-escalates a hold that is already held.
+
+    Owns its session (``session_factory`` is the test seam) and never raises: an
+    escalation must not fail because bookkeeping did (invariant 10). No-op in Spoolman
+    mode — Spoolman owns the ledger there.
+    """
+    try:
+        if session_factory is None:
+            from backend.app.core.database import async_session
+
+            session_factory = async_session
+        async with session_factory() as db:
+            if await _spoolman_enabled(db):
+                return
+            global_tray = await _resolve_exhausted_tray(db, printer_id, state)
+            if global_tray is None:
+                logger.info(
+                    "[RESPOOL] runout-hold stamp on printer %d: no slot resolved from the live evidence — "
+                    "not stamping (the resolver's own refusal already said why)",
+                    printer_id,
+                )
+                return
+            ams_id, tray_id = _decode_global_tray(global_tray)
+            if ams_id is None or tray_id is None:
+                logger.info(
+                    "[RESPOOL] runout-hold stamp on printer %d: resolved tray %s decodes to no AMS slot — not stamping",
+                    printer_id,
+                    global_tray,
+                )
+                return
+            presence = tray_presence_from_dict(_resolve_live_tray(state, ams_id, tray_id))
+            if presence is True:
+                logger.info(
+                    "[RESPOOL] runout-hold stamp on printer %d AMS%d-T%d: the demanded slot reads OCCUPIED — "
+                    "bogus-latch shape (006-H2S 2026-07-26), not stamping. A roll that truly ran dry left its "
+                    "bay minutes before the firmware said so",
+                    printer_id,
+                    ams_id,
+                    tray_id,
+                )
+                return
+            if presence is None:
+                logger.info(
+                    "[RESPOOL] runout-hold stamp on printer %d AMS%d-T%d: slot presence is UNKNOWN — not "
+                    "stamping; this durable lane needs a wire-asserted empty bay, and the edge lanes own the "
+                    "edge-time stamp",
+                    printer_id,
+                    ams_id,
+                    tray_id,
+                )
+                return
+            # Same key shape as both edge stampers — one stamp per (printer, job, tray),
+            # whichever trigger gets there first.
+            key = (printer_id, subtask_id, global_tray)
+            if key in _spent_dedup:
+                logger.info(
+                    "[RESPOOL] runout-hold stamp on printer %d AMS%d-T%d: already stamped for job %s — "
+                    "the edge lane got there first",
+                    printer_id,
+                    ams_id,
+                    tray_id,
+                    subtask_id,
+                )
+                return
+            spool = await _mark_tray_spent(db, printer_id, global_tray)
+            if spool is not None:
+                _spent_dedup.add(key)
+    except Exception as e:  # noqa: BLE001 — an escalation must never fail because a stamp did
+        logger.warning("Runout-hold spent stamp failed for printer %s: %s", printer_id, e)
 
 
 def _consume_commanded_load(printer_id: int, current: int) -> bool:

@@ -76,7 +76,7 @@ from sqlalchemy.orm import selectinload
 from backend.app.core.websocket import ws_manager
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import ams_presence, spool_tagless
+from backend.app.services import ams_presence, spool_binding, spool_tagless
 from backend.app.services.slot_state import (
     BindingView,
     Decision,
@@ -731,22 +731,23 @@ async def _last_location_candidate(db: AsyncSession, obs: TrayObservation) -> Sp
     "bound elsewhere". When nothing survives, None is the doctrine-correct answer: the
     table falls through to ``tagless_mint`` and the unidentified seated roll gets its own
     fresh ledger row instead of inheriting one that provably lives in another tray.
+
+    The slot-residue half of the query — the matching ``last_location_*`` triple, the
+    newest-first order and that ``~assignments.any()`` exclusion — is now
+    :func:`spool_binding.last_released_from_slot_stmt`, stated once beside the writer that
+    stamps the residue and shared with ``spool_respool``'s spent-attribution tier 2 (the
+    runout victim is the roll that left this slot, and the AMS empties the bay minutes
+    before it says so). What stays HERE is what only reclaim may say: spent and archived
+    rows are no donors, and the scan is bounded. Behaviour is unchanged in both halves.
     """
     printer_id, ams_id, tray_id = obs.slot
     res = await db.execute(
-        select(Spool)
+        spool_binding.last_released_from_slot_stmt(printer_id, ams_id, tray_id)
         .options(selectinload(Spool.k_profiles), selectinload(Spool.assignments))
         .where(
             Spool.archived_at.is_(None),
             Spool.spent_at.is_(None),
-            # Bound elsewhere ⇒ not a donor. Assumption-tier evidence may never steal a
-            # roll from a live binding (2026-08-07, spool 211 p10 A0T0 ↔ p7 A0T1).
-            ~Spool.assignments.any(),
-            Spool.last_location_printer_id == printer_id,
-            Spool.last_location_ams_id == ams_id,
-            Spool.last_location_tray_id == tray_id,
         )
-        .order_by(Spool.last_location_at.desc())
         .limit(_RECLAIM_SCAN_LIMIT)
     )
     for spool in res.scalars().all():

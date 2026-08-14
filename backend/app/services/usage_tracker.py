@@ -113,8 +113,15 @@ def _reset_ledger_decrease_state() -> None:
     _ledger_decrease_seen.clear()
 
 
-def _wire_identity_is_the_bound_row(spool: Spool, tray: dict) -> bool:
+def wire_identity_is_the_bound_row(spool: Spool, tray: dict) -> bool:
     """True when the roll ON THE WIRE is provably the row we are about to rewrite.
+
+    PUBLIC because it is ONE contract, not one lane's private helper: the decrease
+    reconcile below and ``main.on_ams_change``'s increase-only remain% sync are the two
+    ledger writers that derive grams from a wire reading, and both must answer this same
+    question first. It was private while only the decrease lane asked it, and the cost of
+    that asymmetry is the documented spool-37 case at the top of this section — the
+    INCREASE lane inflated a stale-bound row to 899 g from another slot's remain%.
 
     The whole justification for writing a ledger down is "the firmware read THIS
     roll's chip", so the identity must agree before the grams do. UUID-PRIMARY, per
@@ -165,7 +172,7 @@ async def maybe_reconcile_tagged_ledger_decrease(
     1. ``sync_allowed`` — the caller's ``ams_weight_sync_allowed`` verdict: the
        printer is idle and no archive is still ``printing``. Mid-print the usage
        tracker owns the ledger and the wire lags a live extrusion.
-    2. The wire identity IS the bound row (:func:`_wire_identity_is_the_bound_row`,
+    2. The wire identity IS the bound row (:func:`wire_identity_is_the_bound_row`,
        uuid-primary) — a tagless row has no wire truth to defer to, and a slot
        holding a DIFFERENT roll must never have this row's ledger rewritten from
        it — and the row is not ``weight_locked`` (an operator-pinned weight is
@@ -195,7 +202,7 @@ async def maybe_reconcile_tagged_ledger_decrease(
     margin = remain_jump_margin(spool, tray)
     if (
         not sync_allowed
-        or not _wire_identity_is_the_bound_row(spool, tray)
+        or not wire_identity_is_the_bound_row(spool, tray)
         or spool.weight_locked
         or margin is None
         or margin < _LEDGER_DECREASE_MARGIN_PCT

@@ -959,9 +959,11 @@ _RUNOUT_SLOT_CODE32: frozenset[int] = frozenset({0x00020001, 0x00020005, 0x00030
 #     tool head." The ask is a TOOL-HEAD inspection, not an insert; treating it as a
 #     demand would let the refill auto-resume drive a print back into a purge fault.
 #   * 0x00030001 OUT — "AMS A Slot 1 filament has run out. Please wait while old
-#     filament is purged." An in-progress notice ("please wait"), not an ask —
-#     the firmware follows it with the 0x00020001 demand or the 0x00030002
-#     auto-switch, whichever way the purge lands.
+#     filament is purged." An in-progress notice ("please wait"), not an ask, so the
+#     refill assist must not drive a resume off it. It is NOT always followed by a
+#     demand or by the auto-switch (003-H2S 2026-08-13 raised it alone on a terminal
+#     runout) — which is exactly why it IS spent evidence below, and still not a
+#     demand: naming the roll that ended and asking for a refill are different claims.
 #   * 0x00030002 OUT — "AMS A Slot 1 filament has run out and automatically
 #     switched to the slot with the same filament." NEVER a demand: the firmware
 #     backup already rescued the print and nothing is being asked for. It remains
@@ -970,29 +972,43 @@ _RUNOUT_SLOT_CODE32: frozenset[int] = frozenset({0x00020001, 0x00020005, 0x00030
 _RUNOUT_DEMAND_CODE32: frozenset[int] = frozenset({0x00020001})
 
 # The SPENT-EVIDENCE subset of :data:`_RUNOUT_SLOT_CODE32` — the code words whose
-# catalog text is the firmware's own statement that a roll PHYSICALLY RAN DRY, and
-# so may stamp ``spool.spent_at`` (``spool_respool.mark_spent_on_slot_runout``).
-# Deliberately narrower than both sets above, because a spent stamp is a ledger
-# mutation on the operator's inventory — a false one archives a healthy roll:
+# catalog text is the firmware's own PER-EVENT statement that the roll in a NAMED slot
+# PHYSICALLY RAN DRY, and so may stamp ``spool.spent_at``
+# (``spool_respool.mark_spent_on_slot_runout``). Deliberately narrower than both sets
+# above, because a spent stamp is a ledger mutation on the operator's inventory — a
+# false one archives a healthy roll:
 #
+#   * 0x00030001 IN — "AMS A Slot 1 filament has run out. Please wait while old
+#     filament is purged." (Screen wording: "…while old filament is pulled back.") The
+#     firmware's own per-event, slot-attributed statement that THIS roll ended — and
+#     the ONLY such word a TERMINAL runout raises, because 0x00030002 below reports a
+#     COMPLETED backup switch, which cannot exist when the slot that ran dry was the
+#     last eligible one. Excluded until 2026-08-13 on the premise that it "is always
+#     followed by the demand or the auto-switch, so it adds zero coverage": 003-H2S
+#     slot 4 DISPROVED that premise — 0x30001 fired once at 11:05:33Z and the only
+#     words that followed were the excluded bare demand and the LATCHING, slot-agnostic
+#     0700_8011, so nothing per-event ever named the slot again and the roll went
+#     un-stamped through a 12.5 h hold. It inherits none of the demand's risk either:
+#     it is transient (one appearance per runout event in ``hms_event`` history, n=1 —
+#     it never latches), so unlike a latched demand it cannot re-assert a stale claim
+#     on a slot somebody has since refilled.
 #   * 0x00030002 IN — "AMS A Slot 1 filament has run out and automatically switched
-#     to the slot with the same filament." The one family member that can ONLY mean
-#     the roll ended: the firmware is not asking for anything, it is REPORTING a
-#     completed backup switch it would never perform on a slot still feeding.
+#     to the slot with the same filament." The family member that can ONLY mean the
+#     roll ended: the firmware is not asking for anything, it is REPORTING a completed
+#     backup switch it would never perform on a slot still feeding.
 #   * 0x00020001 OUT — the bare demand. 006-H2S 2026-07-26 proved firmware can latch
 #     a BOGUS demand for a slot that never ran dry (a load command issued during a
 #     runout hold resurfaced 12 h later as a demand for the latched slot); stamping
 #     on a demand would have marked a healthy roll spent.
-#   * 0x00030001 OUT — "please wait while old filament is purged" is transitional and
-#     is ALWAYS followed by the demand or by the 0x00030002 auto-switch, whichever way
-#     the purge lands — so it adds zero coverage while inheriting the demand's risk.
 #   * 0x00020005 OUT — purge-abnormal, entangled with a tool-head fault ("check whether
 #     the filament is stuck in the tool head") where a misread of the runout itself is
 #     plausible. Residual coverage stays with the Tier-3 / fresh-roll prompts.
 #
 # All four remain in :data:`_RUNOUT_SLOT_CODE32` — this narrowing governs only WHETHER
-# to stamp, never slot RESOLUTION, which must keep consuming the whole parent set.
-_RUNOUT_AUTO_SWITCH_SPENT_CODE32: frozenset[int] = frozenset({0x00030002})
+# to stamp, never slot RESOLUTION, which must keep consuming the whole parent set. Both
+# members here carry the exhausted unit+slot in their attr, which is why their consumer
+# needs no topology gate (see ``spool_respool.mark_spent_on_slot_runout``).
+_RUNOUT_SLOT_SPENT_CODE32: frozenset[int] = frozenset({0x00030001, 0x00030002})
 
 # Code words whose OPERATOR NOTIFICATION is suppressed — a statement the firmware
 # makes about work it already finished, where the farm's only correct reaction is
@@ -1005,10 +1021,12 @@ _RUNOUT_AUTO_SWITCH_SPENT_CODE32: frozenset[int] = frozenset({0x00030002})
 #     notify band, so it paged the operator on every successful rescue — 87 alerts in
 #     14 days for prints that never paused.
 #
-# It is deliberately absent from the fault TAXONOMY and must stay absent: it is THE
-# spent evidence (:data:`_RUNOUT_AUTO_SWITCH_SPENT_CODE32`), and a second consumer
-# reading it as a generic fault would double-stamp the operator's ledger. Suppressing
-# a notification is not classifying a fault, which is why the two live apart.
+# It is deliberately absent from the fault TAXONOMY and must stay absent: it is spent
+# evidence (:data:`_RUNOUT_SLOT_SPENT_CODE32`), and a second consumer reading it as a
+# generic fault would double-stamp the operator's ledger. Suppressing a notification is
+# not classifying a fault, which is why the two live apart — and why this set is a
+# STRICT subset of the spent set: 0x00030001 is spent evidence too, but it still pages
+# (a terminal runout is a print the operator must attend to), so it is not listed here.
 NOTIFY_SUPPRESSED_CODE32: frozenset[int] = frozenset({0x00030002})
 
 
@@ -1221,7 +1239,7 @@ _INFO = AmsFaultClass.INFORMATIONAL
 # --- The hms[] code-word table ---------------------------------------------
 # Scoped to the submodules whose text was read; catalog sentence quoted per row.
 #
-# THREE code words are deliberately ABSENT so they classify None — each is owned by
+# FOUR code words are deliberately ABSENT so they classify None — each is owned by
 # a dedicated decoder and routing it through the generic taxonomy would regress a
 # ratified design:
 #   * 0x00020001 (tray attrs) — "AMS A Slot 3 filament has run out. Please insert a
@@ -1230,10 +1248,14 @@ _INFO = AmsFaultClass.INFORMATIONAL
 #     reached a fault classifier could route a runout into the swap machine. It is
 #     also NOT spent evidence: 006-H2S 2026-07-26 proved the firmware latches a
 #     BOGUS demand for a slot that never ran dry.
-#   * 0x00030002 (tray attrs) — "…has run out and automatically switched to the slot
-#     with the same filament." THE spent evidence, owned by
-#     :data:`_RUNOUT_AUTO_SWITCH_SPENT_CODE32` / ``spool_respool``. A second consumer
-#     reading it as a generic fault would double-stamp the operator's ledger.
+#   * 0x00030001 and 0x00030002 (tray attrs) — "…has run out. Please wait while old
+#     filament is purged." / "…has run out and automatically switched to the slot with
+#     the same filament." THE per-event spent evidence, owned by
+#     :data:`_RUNOUT_SLOT_SPENT_CODE32` / ``spool_respool``. A second consumer reading
+#     either as a generic fault would double-stamp the operator's ledger — spent
+#     evidence must never double-consume as a fault class. 0x00030001 classified
+#     INFORMATIONAL until 2026-08-13, which was behaviour-neutral (nothing consumes
+#     that class) and is why promoting it cost the taxonomy only this row.
 #   * 0x00020002 under TRAY attrs — "AMS A Slot 1 is empty; please insert a new
 #     filament." An empty-slot ASK, hazard-identical to the 0x00020001 demand: an
 #     empty slot is not evidence a roll ran dry and not a fault a swap can fix. The
@@ -1287,7 +1309,7 @@ _CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
     # "AMS A Slot 1 filament has run out, and purging the old filament went
     # abnormally; please check whether the filament is stuck in the tool head."
     # A runout ENTANGLED with a tool-head fault: the ask is an inspection, which is
-    # why it is neither RUNOUT nor spent evidence (see _RUNOUT_AUTO_SWITCH_SPENT_CODE32).
+    # why it is neither RUNOUT nor spent evidence (see _RUNOUT_SLOT_SPENT_CODE32).
     0x00020005: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
     # "AMS A has detected a breakage of the PTFE tube during filament loading…"
     0x00020006: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
@@ -1333,10 +1355,10 @@ _CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
     # change — one incident is not a lead-time proof, and the 8010 always follows
     # and IS the trigger, so acting on this would only widen the surface.
     0x00020025: (_CodeWordRow(_TRAY_ATTR_BYTES, _INFO),),
-    # "AMS A Slot 1 filament has run out. Please wait while old filament is
-    # purged." An in-progress notice, not an ask — the firmware follows it with the
-    # 0x00020001 demand or the 0x00030002 auto-switch, whichever way the purge lands.
-    0x00030001: (_CodeWordRow(_TRAY_ATTR_BYTES, _INFO),),
+    # 0x00030001 ("…has run out. Please wait while old filament is purged.") had its
+    # INFORMATIONAL row HERE until 2026-08-13. It is now per-event spent evidence
+    # (:data:`_RUNOUT_SLOT_SPENT_CODE32`) and so joins 0x00030002 in the deliberate
+    # absence listed in this table's header — one consumer per word.
     # "Checking the filament location of all AMS slots, please wait."
     0x00030007: (_CodeWordRow(_TRAY_ATTR_BYTES, _INFO),),
 }
@@ -1561,7 +1583,7 @@ def runout_short_codes() -> frozenset[str]:
     """AMS-slot UNRESCUED runout short codes — "the slot ran dry and the print is HELD".
 
     A runout the AMS backup rescued raises NONE of these (it raises the
-    slot-attributed auto-switch instead, :data:`_RUNOUT_AUTO_SWITCH_SPENT_CODE32`),
+    slot-attributed per-event words instead, :data:`_RUNOUT_SLOT_SPENT_CODE32`),
     which is why this set is the unrescued vocabulary only. The external-spool
     runouts are a SEPARATE set (:func:`runout_external_short_codes`) — they name no
     AMS slot, so nothing that resolves a tray may consume them.

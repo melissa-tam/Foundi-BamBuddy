@@ -689,7 +689,9 @@ _EXPECTED_TRAY_CODE_WORDS = {
     0x00010086: ("rfid_read", False),
     0x00020057: ("rfid_read", False),
     0x00020025: ("informational", False),
-    0x00030001: ("informational", False),
+    # 0x00030001 is deliberately ABSENT: it was INFORMATIONAL until 2026-08-13 and is
+    # now per-event spent evidence, which never double-consumes as a fault class
+    # (TestAmsFaultTaxonomyCollisionPins pins the absence).
     0x00030007: ("informational", False),
 }
 
@@ -868,12 +870,56 @@ class TestAmsFaultTaxonomyCollisionPins:
 
     def test_the_auto_switch_spent_evidence_is_not_classified(self):
         from backend.app.services.hms_errors import (
-            _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
+            _RUNOUT_SLOT_SPENT_CODE32,
             classify_ams_fault,
         )
 
         assert classify_ams_fault(_tray_attr(), 0x00030002) is None
-        assert 0x00030002 in _RUNOUT_AUTO_SWITCH_SPENT_CODE32
+        assert 0x00030002 in _RUNOUT_SLOT_SPENT_CODE32
+
+    def test_runout_slot_spent_set_members(self):
+        """Exactly the two PER-EVENT, slot-attributed runout words — and nothing else.
+
+        0x00030001 joined on 2026-08-13: it is the only such word a TERMINAL runout
+        raises (the auto-switch reports a completed backup switch, which cannot happen
+        when the LAST eligible slot is the one that ran dry), and 003-H2S slot 4 proved
+        the old "the demand or the auto-switch always follows it" premise false.
+        """
+        from backend.app.services.hms_errors import (
+            _RUNOUT_DEMAND_CODE32,
+            _RUNOUT_SLOT_CODE32,
+            _RUNOUT_SLOT_SPENT_CODE32,
+        )
+
+        assert set(_RUNOUT_SLOT_SPENT_CODE32) == {0x00030001, 0x00030002}
+        # The bare demand stays OUT (006-H2S bogus latch) and so does purge-abnormal…
+        assert not (_RUNOUT_SLOT_SPENT_CODE32 & _RUNOUT_DEMAND_CODE32)
+        assert 0x00020005 not in _RUNOUT_SLOT_SPENT_CODE32
+        # …while the RESOLUTION parent set still carries all four: this narrowing
+        # governs only whether to STAMP, never which slot a runout names.
+        assert _RUNOUT_SLOT_SPENT_CODE32 < _RUNOUT_SLOT_CODE32
+        assert set(_RUNOUT_SLOT_CODE32) == {0x00020001, 0x00020005, 0x00030001, 0x00030002}
+
+    def test_0x30001_absent_from_taxonomy_like_0x30002(self):
+        """Spent evidence must not double-consume as a fault class — the rule that kept
+        0x00030002 out of the table since it was written. Promoting 0x00030001 to spent
+        evidence therefore removed its INFORMATIONAL row, which is behaviour-neutral:
+        nothing consumes that class (``spool_recovery.ACTIONABLE_CLASSES`` excludes it),
+        and the short lane still bans ``07xx_0001`` so the entry classifies None on both
+        lanes rather than falling through to a jam trigger."""
+        from backend.app.services.hms_errors import (
+            _RUNOUT_SLOT_SPENT_CODE32,
+            classify_ams_fault,
+            classify_hms_entry,
+        )
+
+        attr = _tray_attr(tray=3)
+        for code in _RUNOUT_SLOT_SPENT_CODE32:
+            assert classify_ams_fault(attr, code) is None
+            entry = _fake_hms_error(
+                code=hex(code), attr=attr, module=7, severity=3, full_code=f"{attr:08X}{code:08X}"
+            )
+            assert classify_hms_entry(entry) is None
 
     def test_short_0700_0001_is_banned(self):
         from backend.app.services.hms_errors import classify_short_code
@@ -1106,13 +1152,20 @@ class TestNotifySuppression:
 
     def test_the_suppressed_code_stays_out_of_the_fault_taxonomy(self):
         """The set and the taxonomy are separate on purpose: suppressing an alert is
-        not classifying a fault, and this code word's ONE consumer is the spent lane."""
+        not classifying a fault, and this code word's ONE consumer is the spent lane.
+
+        Suppression is a STRICT SUBSET of the spent vocabulary, not a synonym for it:
+        0x00030001 became spent evidence on 2026-08-13 but keeps paging, because it is
+        raised by a TERMINAL runout — a print the operator has to attend to — whereas
+        0x00030002 announces a rescue nobody needs to act on.
+        """
         from backend.app.services.hms_errors import (
-            _RUNOUT_AUTO_SWITCH_SPENT_CODE32,
+            _RUNOUT_SLOT_SPENT_CODE32,
             NOTIFY_SUPPRESSED_CODE32,
             classify_ams_fault,
         )
 
-        assert NOTIFY_SUPPRESSED_CODE32 == _RUNOUT_AUTO_SWITCH_SPENT_CODE32
+        assert NOTIFY_SUPPRESSED_CODE32 < _RUNOUT_SLOT_SPENT_CODE32
+        assert set(NOTIFY_SUPPRESSED_CODE32) == {0x00030002}
         for code in NOTIFY_SUPPRESSED_CODE32:
             assert classify_ams_fault(0x07002200, code) is None

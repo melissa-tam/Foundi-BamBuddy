@@ -15,9 +15,12 @@ standing code across a job boundary or UI clear shows no edge.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from backend.app.services.hms_errors import hms_short_code
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,21 @@ def note_push(printer_id: int, state) -> HmsEdgeReport | None:
     live_full = frozenset(e.full_code for e in live)
     if prev is None:
         _edge_state[printer_id] = (wire_at, live_full)
+        # Restart-replay suppression is DELIBERATE, but it is also the mechanism that
+        # silences every edge-driven state consumer for a fault standing across a deploy —
+        # a terminal runout can hold for hours (003-H2S 2026-08-13: 12.5 h), so a deploy
+        # inside the hold re-seeds its codes and nothing can ever edge them again. When a
+        # stamp then never lands, this line is the difference between "the lane is dead"
+        # and "the lane was correctly suppressed"; the durable incident lane
+        # (``spool_respool.mark_spent_on_runout_hold``) is what covers the gap. Exactly one
+        # line per printer per process — the branch runs once by construction.
+        logger.info(
+            "[HMS-EDGES] seeded printer %d with %d standing HMS code(s) without edging (restart-replay "
+            "suppression): %s",
+            printer_id,
+            len(live_full),
+            ", ".join(sorted(live_full)) or "none",
+        )
         return None
 
     appeared_full = live_full - prev[1]

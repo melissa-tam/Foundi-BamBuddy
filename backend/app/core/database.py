@@ -4283,6 +4283,199 @@ async def run_migrations(conn):
                 [r[0] for r in _stale_mapped],
             )
 
+    # Repair (2026-08-13, the release-before-runout resurrection incident): retire the
+    # seven DEAD ledger rows that were re-bound onto freshly-loaded rolls, once.
+    #
+    # What happened (plan ``003-h2s-ran-out-of-eventual-harbor.md``): the AMS clears a
+    # drained slot's exist bit ~3 minutes BEFORE the firmware declares the runout, so
+    # ever since release-on-empty started firing reliably (wave 2, 08-10) every natural
+    # runout's binding was already gone when the runout HMS arrived — and the single
+    # spent writer resolves its victim from a LIVE assignment, so nothing was stamped
+    # fleet-wide for three days. The released row keeps its ``last_location_*``
+    # residue, which is exactly what the reclaim lane resurrects: on the evening of
+    # 08-13 seven printers took an exhausted roll's ledger row, complete with its
+    # ~900 g of history, and hung it on the brand-new roll the operator had just
+    # loaded ("100 g left" on a full spool).
+    #
+    # The repair states what physics already decided: the old row ran dry (spent +
+    # archived), and the roll now in that slot is a DIFFERENT spool, so it gets its own
+    # row carrying only what it has actually printed since the reclaim.
+    # ``stamp_donor_spent`` writes ``spent_at`` directly rather than through
+    # ``spool_respool._mark_tray_spent``, the one live writer — the sanctioned repair
+    # exception (plan WS6): a repair asserts a fact about a past the wire will never
+    # re-assert, and the live writer resolves its victim from tray state that has since
+    # moved on. ``require_positive_moved=False`` because a print held on the runout has
+    # charged nothing yet: a 0 g successor is still the correct answer to "which roll is
+    # in this slot".
+    #
+    # SCOPE IS EXACTLY THESE SEVEN (operator ruling). The wider population of rows
+    # charged past their label — 40 fleet-wide, most of them historical — is OUT of
+    # scope pending an operator ruling of its own; the live overcharge reconciler, the
+    # fresh-roll prompt and the spent-contradiction detector remain their lane.
+    #
+    # Shape B (durable settings marker) rather than a self-predicating idempotent
+    # UPDATE, and here that is not a style choice: the state this writes IS the state
+    # such a predicate would test for, so a re-running version would fight the
+    # operator's un-spend route at every boot — clear a wrong stamp by hand in the UI
+    # and the next restart would put it straight back. The marker INSERT rides the SAME
+    # transaction as the repair, so the pair is all-or-nothing and a second boot is a
+    # no-op.
+    #
+    # Executed through an ORM session joined to this connection as a SAVEPOINT so the
+    # state change can BE ``spool_tagless.replace_bound_row_with_successor`` — the same
+    # function the live overcharge reconciler runs (mint successor → re-point the usage
+    # history since the boundary → decrement + archive the donor → re-bind through the
+    # one binding writer). A hand-rolled SQL copy would be a second implementation of
+    # the fork's most invariant-dense write, free to drift from it. The successor is
+    # minted tagless-shaped (``ams_auto``, no tag columns) even where the donor was
+    # RFID: the fresh roll's own tag has not been read yet, and the tag matcher adopts
+    # the row when it is.
+    #
+    # Fully guarded: a repair that cannot run must never take startup migrations down
+    # for every install, and its rollback leaves the marker unwritten so a fixed build
+    # simply tries again. DML lives inside the savepoint, per this module's convention.
+    _reclaim_repair_marker = "repair_runout_reclaim_20260813"
+    _reclaim_repair_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _reclaim_repair_marker})
+    ).scalar()
+    if not _reclaim_repair_done:
+        # (dead ledger row, printer that resurrected it) — the seven from the incident
+        # triage. Naive UTC on both bounds, matching what the DB stores.
+        _reclaim_incident_rows = ((307, 5), (249, 8), (37, 3), (309, 7), (288, 1), (245, 4), (287, 2))
+        _reclaim_window_from = _dt(2026, 8, 13, 23, 30, 0)
+        _reclaim_window_to = _dt(2026, 8, 14, 0, 0, 0)
+        # Every line this block writes carries the marker key, repaired and skipped alike:
+        # the post-deploy probe is "grep the marker, count seven decisions", and a skip that
+        # only said ``[REPAIR]`` would be indistinguishable from the two other repairs above.
+        _log_tag = f"[REPAIR] {_reclaim_repair_marker}:"
+        try:
+            from sqlalchemy import select as _select
+            from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+
+            from backend.app.models.spool import Spool as _Spool
+            from backend.app.models.spool_assignment import SpoolAssignment as _SpoolAssignment
+            from backend.app.services.spool_tagless import replace_bound_row_with_successor
+
+            _repaired = 0
+            _reclaim_session = _AsyncSession(bind=conn, join_transaction_mode="create_savepoint")
+            try:
+                for _dead_id, _incident_printer_id in _reclaim_incident_rows:
+                    # RE-VERIFY every fact before touching a row: hours pass between the
+                    # incident and the deploy that carries this, and the live lanes may
+                    # have reached some of these rows first. Anything that no longer
+                    # matches the incident shape is left entirely alone and said out loud.
+                    _dead = await _reclaim_session.get(_Spool, _dead_id)
+                    if _dead is None:
+                        logger.info("%s skip spool %d: no such row", _log_tag, _dead_id)
+                        continue
+                    if _dead.spent_at is not None or _dead.archived_at is not None:
+                        logger.info(
+                            "%s skip spool %d: already retired (spent_at=%s, archived_at=%s) — "
+                            "a live lane got there first",
+                            _log_tag,
+                            _dead_id,
+                            _dead.spent_at,
+                            _dead.archived_at,
+                        )
+                        continue
+                    _bindings = (
+                        (
+                            await _reclaim_session.execute(
+                                _select(_SpoolAssignment).where(_SpoolAssignment.spool_id == _dead_id)
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    if len(_bindings) != 1:
+                        logger.info(
+                            "%s skip spool %d: %d live binding(s), expected exactly the reclaimed one",
+                            _log_tag,
+                            _dead_id,
+                            len(_bindings),
+                        )
+                        continue
+                    _binding = _bindings[0]
+                    if _binding.printer_id != _incident_printer_id:
+                        logger.info(
+                            "%s skip spool %d: bound to printer %s, the incident named printer %d — "
+                            "the roll has moved since",
+                            _log_tag,
+                            _dead_id,
+                            _binding.printer_id,
+                            _incident_printer_id,
+                        )
+                        continue
+                    _boundary = _binding.created_at
+                    if _boundary is None or not (_reclaim_window_from <= _boundary <= _reclaim_window_to):
+                        logger.info(
+                            "%s skip spool %d: binding created %s is outside the reclaim window %s..%s — "
+                            "a later re-bind owns this slot now",
+                            _log_tag,
+                            _dead_id,
+                            _boundary,
+                            _reclaim_window_from,
+                            _reclaim_window_to,
+                        )
+                        continue
+
+                    # Read the slot off the binding first: the replace deletes that row.
+                    _ams_id, _tray_id = _binding.ams_id, _binding.tray_id
+                    _used_before = float(_dead.weight_used or 0.0)
+                    _successor = await replace_bound_row_with_successor(
+                        _reclaim_session,
+                        _dead,
+                        _binding,
+                        _boundary,
+                        stamp_donor_spent=True,
+                        require_positive_moved=False,
+                        origin="repair_runout_reclaim",
+                    )
+                    if _successor is None:
+                        logger.info("%s skip spool %d: the successor replace declined to write", _log_tag, _dead_id)
+                        continue
+                    _repaired += 1
+                    logger.info(
+                        "%s spool %d retired spent+archived at printer %d AMS%d-T%d: %.0fg used -> %.0fg "
+                        "(moved %.0fg to successor spool %d, which now holds the slot)",
+                        _log_tag,
+                        _dead_id,
+                        _incident_printer_id,
+                        _ams_id,
+                        _tray_id,
+                        _used_before,
+                        float(_dead.weight_used or 0.0),
+                        float(_successor.weight_used or 0.0),
+                        _successor.id,
+                    )
+                await _reclaim_session.execute(
+                    text(
+                        "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                    ),
+                    {"key": _reclaim_repair_marker},
+                )
+                await _reclaim_session.commit()
+            except Exception:
+                await _reclaim_session.rollback()
+                raise
+            finally:
+                await _reclaim_session.close()
+            logger.info(
+                "%s %d of %d incident rows repaired, %d skipped (one-time; rows charged past their label "
+                "outside tonight's reclaim are out of scope by operator ruling)",
+                _log_tag,
+                _repaired,
+                len(_reclaim_incident_rows),
+                len(_reclaim_incident_rows) - _repaired,
+            )
+        except Exception:  # noqa: BLE001 — a repair must never take startup down for every install
+            logger.exception(
+                "[REPAIR] %s failed and was rolled back (non-fatal); the marker stays unwritten so a "
+                "later boot retries it",
+                _reclaim_repair_marker,
+            )
+
     # Migration (WS-F, 2026-08-10): drop the retired ``auto_add_untagged`` setting.
     # The key was a kill switch for the tagless auto-mint lane, which doctrine rules
     # 1/2/4 make load-bearing here — with it off, every untagged roll silently stops

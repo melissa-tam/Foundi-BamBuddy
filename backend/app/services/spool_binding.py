@@ -41,7 +41,7 @@ import logging
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 from sqlalchemy.orm import selectinload
 
 from backend.app.models.spool import Spool
@@ -96,6 +96,50 @@ def _stamp_last_location(spool: Spool, *, printer_id: int, ams_id: int, tray_id:
     spool.last_location_ams_id = ams_id
     spool.last_location_tray_id = tray_id
     spool.last_location_at = datetime.utcnow()
+
+
+def last_released_from_slot_stmt(printer_id: int, ams_id: int, tray_id: int) -> Select:
+    """Rows whose LAST release was FROM this slot — newest first, unbound fleet-wide.
+
+    The ONE origin for that question, and the read half of the residue
+    :func:`_stamp_last_location` above writes: writer and reader live in the same
+    module so the shape of "what the departure left behind" cannot drift between them.
+    Two lanes ask it, for opposite purposes, and the shared stmt is what keeps them
+    answering about the same set of rows:
+
+    * ``slot_pipeline._last_location_candidate`` — a roll came BACK: reclaim its grams
+      and its FIFO position instead of minting a fresh 0 g row (doctrine rule 7);
+    * ``spool_respool._mark_tray_spent`` tier 2 — a roll ran OUT: the AMS clears a
+      drained slot's exist bit minutes BEFORE it declares the runout, so by the time
+      the exhaustion evidence lands the binding is already gone (doctrine rule 9 — the
+      bay is empty, the release is correct) and this residue is the only thing left
+      that still names the victim.
+
+    ``~assignments.any()`` is part of the shared shape, not a caller's preference: a
+    row holding a live assignment is somewhere else NOW, and ``spool_assignment.spool_id``
+    is unique, so ANY assignment means "bound elsewhere". Both lanes need that exclusion
+    for the same reason (cross-cutting invariant 11, the evidence-tier asymmetry) —
+    last-location is ASSUMPTION-tier evidence, and assumption-tier evidence may neither
+    steal a roll from a positive location claim nor stamp one the wire says is seated in
+    another tray.
+
+    DELIBERATELY carries no spent / archived / fingerprint filter and no LIMIT: those
+    are the callers' OWN adjudications and they disagree on purpose. The reclaim lane
+    excludes spent and archived donors in SQL and then fingerprint-scans; the spent lane
+    must SEE a spent newest row to answer a duplicate trigger idempotently instead of
+    walking past it to an older, healthy residue of the same slot. Returning a stmt
+    rather than rows is what lets each compose its own answer in one query.
+    """
+    return (
+        select(Spool)
+        .where(
+            ~Spool.assignments.any(),
+            Spool.last_location_printer_id == printer_id,
+            Spool.last_location_ams_id == ams_id,
+            Spool.last_location_tray_id == tray_id,
+        )
+        .order_by(Spool.last_location_at.desc())
+    )
 
 
 def stamp_first_loaded(spool: Spool) -> None:
