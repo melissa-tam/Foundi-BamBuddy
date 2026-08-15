@@ -22,6 +22,7 @@ from backend.app.models.settings import Settings
 from backend.app.models.smart_plug import SmartPlug
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
+    cleanup_downloaded_3mf,
     delete_file_async,
     get_ftp_retry_settings,
     upload_file_async,
@@ -76,6 +77,14 @@ logger = logging.getLogger(__name__)
 # state value did change. SLICING is included because some firmwares park
 # briefly in SLICING between PREPARE and RUNNING while parsing the g-code.
 _ACTIVE_PRINT_STATES: frozenset[str] = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
+
+# Dispatch precondition: the queued item's source file is gone from disk. Held as a
+# WAIT (see ``_hold_dispatch_precondition``) rather than failed — 2026-08-14, a farm
+# bug deleted a library file out from under 22 pending units and every dispatch
+# insta-failed server-side, each failure counting toward the printer's
+# consecutive-failure streak until the whole fleet had quarantined itself overnight.
+# The frontend renders this token via ``utils/waitingReason.ts``.
+WAITING_REASON_LIBRARY_FILE_MISSING = "library_file_missing"
 
 # USB pre-flight: the H2 fleet reports USB presence (state.sdcard) ONLY inside a
 # full status report, which we must explicitly request (request_status_update →
@@ -2403,6 +2412,50 @@ class PrintScheduler:
         except Exception as e:
             logger.debug("queue-waiting notification failed for item %s: %s", item.id, e)
 
+    async def _hold_dispatch_precondition(
+        self,
+        db: AsyncSession,
+        item: PrintQueueItem,
+        printer: Printer | None,
+        reason: str,
+    ) -> None:
+        """Hold an item on an unmet dispatch PRECONDITION — a WAIT, never a failure.
+
+        The shared body behind the USB pre-flight and the missing-source-file gate:
+        conditions the printer/environment must satisfy before a dispatch can even be
+        attempted, and which no amount of failing the item would fix. The item stays
+        pending — no ``manual_start``, no retry burn, nothing terminal — so the next
+        tick re-checks and self-clears the hold when the precondition is met (the
+        dispatch commit drops the token once the item actually starts).
+
+        A model-targeted unit releases its scheduler-made printer pin: ``target_model``
+        set means the pin was made THIS tick by the model-based path, never by a user,
+        so a sick-but-idle printer must not become the unit's permanent home — leaving
+        it pinned funnels the whole run onto one broken printer, one unit per tick,
+        until the pool drains. Always commit the un-pin (even when already waiting) so
+        a unit held tick N and re-held tick N+1 still ends unpinned, and once-guard the
+        model path's per-assignment notification so re-selecting the same sick printer
+        every tick doesn't re-notify "assigned". A user-pinned unit (no
+        ``target_model``) keeps its printer and commits only on the transition INTO the
+        hold. ``ams_mapping`` is deliberately NOT touched in either case: it is the
+        operator's slot instruction, and an unmet precondition is no reason to discard
+        what a human asked for.
+
+        The waiting notification fires once per transition into the hold, so a
+        precondition unmet across many ticks notifies once.
+        """
+        already_waiting = item.waiting_reason == reason
+        if item.target_model:
+            item.printer_id = None
+            item.waiting_reason = reason
+            self._hold_unpinned_items.add(item.id)
+            await db.commit()
+        elif not already_waiting:
+            item.waiting_reason = reason
+            await db.commit()
+        if not already_waiting:
+            await self._notify_queue_waiting(db, item, reason, (printer.model if printer else "") or "")
+
     async def _get_job_name(self, db: AsyncSession, item: PrintQueueItem) -> str:
         """Get a human-readable name for a queue item."""
         if item.archive_id:
@@ -2938,44 +2991,15 @@ class PrintScheduler:
                     pass
             usb_status = printer_manager.get_status(item.printer_id)
         if usb_status is not None and getattr(usb_status, "sdcard", None) is False:
-            # Dedupe like the low-spool waiting notification: only fire on the
-            # transition INTO the hold (waiting_reason wasn't already
-            # no_usb_drive), so a stick left out across many ticks notifies once.
-            # We can't reuse the low-spool path's manual_start-based once-guard
-            # because this must stay a self-clearing pending wait.
-            already_waiting = item.waiting_reason == "no_usb_drive"
+            # Read the pin before the hold releases it, so the log names the printer
+            # that actually lacked the stick.
             held_printer_id = item.printer_id
-            # Release a model-targeted unit's scheduler-made assignment before
-            # holding. target_model set ⇒ the pin was made THIS tick by the
-            # model-based path, never a user choice — so a sick-but-idle printer
-            # (here: no USB stick) must not become the unit's permanent home.
-            # Leaving the pin turns the unit into a "specific printer" item the
-            # model path never rebalances, funnelling the whole run onto one broken
-            # printer, one unit per tick, until the pool drains. ``ams_mapping`` is
-            # deliberately NOT touched: it is the operator's slot instruction now, not
-            # a per-printer computation to invalidate, and a missing USB stick is no
-            # reason to discard what a human asked for. Always commit the un-pin (even
-            # when already waiting) so a unit held tick N and re-held tick N+1 still
-            # ends unpinned. A user-pinned unit (no target_model) keeps its printer
-            # and, exactly as before, commits only on the transition into the hold.
-            if item.target_model:
-                item.printer_id = None
-                item.waiting_reason = "no_usb_drive"
-                # Once-guard for the model path's per-assignment notification —
-                # re-selection of the same sick printer every tick must not
-                # re-notify "assigned" (see _hold_unpinned_items in __init__).
-                self._hold_unpinned_items.add(item.id)
-                await db.commit()
-            elif not already_waiting:
-                item.waiting_reason = "no_usb_drive"
-                await db.commit()
+            await self._hold_dispatch_precondition(db, item, printer, "no_usb_drive")
             logger.info(
                 "Queue item %s: USB pre-flight held dispatch — no USB drive in printer %s",
                 item.id,
                 held_printer_id,
             )
-            if not already_waiting:
-                await self._notify_queue_waiting(db, item, "no_usb_drive", (printer.model if printer else "") or "")
             return
 
         # Farm capability-matching gate (#Phase4). Non-farm items bypass it. A
@@ -3011,9 +3035,6 @@ class PrintScheduler:
             return
         if capability.warn:
             logger.warning("Queue item %s: capability warn-dispatch — %s", item.id, capability.reason)
-        if item.waiting_reason:
-            # Cleared to dispatch: drop any stale capability waiting reason.
-            item.waiting_reason = None
 
         # Determine source: archive or library file
         archive = None
@@ -3049,6 +3070,27 @@ class PrintScheduler:
             file_path = lib_path if lib_path.is_absolute() else settings.base_dir / library_file.file_path
             filename = library_file.filename
 
+            # The source file must exist BEFORE anything tries to copy it. A library
+            # row whose file is gone from disk is an unmet dispatch PRECONDITION, not
+            # a print failure: nothing about the printer is wrong, and failing the
+            # item neither restores the file nor stops the next unit trying. It used
+            # to reach the archive step first and surface as a FileNotFoundError there
+            # (handled below as a genuine IO failure) — on 2026-08-14 that insta-failed
+            # all 22 pending units of a deleted file, and two consecutive insta-fails
+            # quarantined each healthy printer in turn until the fleet had shut itself
+            # down. Held here as a WAIT instead, so restoring or re-uploading the file
+            # self-clears it on the next pass. The generic on-disk check further down
+            # stays as the archive-source equivalent.
+            if not file_path.exists():
+                await self._hold_dispatch_precondition(db, item, printer, WAITING_REASON_LIBRARY_FILE_MISSING)
+                logger.warning(
+                    "Queue item %s: dispatch held — library file %s missing from disk (%s)",
+                    item.id,
+                    item.library_file_id,
+                    file_path,
+                )
+                return
+
             # Create archive from library file so usage tracking has access to the 3MF
             queue_item_id = item.id
             try:
@@ -3072,17 +3114,35 @@ class PrintScheduler:
                 )
                 if archive:
                     item.archive_id = archive.id
-                    if item.cleanup_library_after_dispatch and not library_file.is_external:
-                        item.library_file_id = None
-                        cleanup_disk_paths.append(file_path)
-                        if library_file.thumbnail_path:
-                            thumb_path = Path(library_file.thumbnail_path)
-                            if not thumb_path.is_absolute():
-                                thumb_path = settings.base_dir / library_file.thumbnail_path
-                            cleanup_disk_paths.append(thumb_path)
-                        await db.delete(library_file)
-                        file_path = settings.base_dir / archive.file_path
-                        filename = archive.filename
+                    # Reaping the source needs BOTH the dispatch's intent and the
+                    # ROW's own truth. ``cleanup_library_after_dispatch`` arrives on
+                    # the create-queue-item request, so on its own it let any API
+                    # caller aim this deletion at a pre-existing user library entry;
+                    # ``transient`` is stamped only where the Direct-Print lane
+                    # creates the row it is about to print, and is what actually
+                    # authorises the delete. They answer different questions — may
+                    # THIS dispatch reap, and is THIS row reapable — so both are
+                    # required, and a flag pointed at an ordinary library file is
+                    # refused out loud rather than silently obeyed.
+                    if item.cleanup_library_after_dispatch:
+                        if not library_file.transient:
+                            logger.warning(
+                                "Queue item %s: refusing cleanup_library_after_dispatch — library file %s is not a "
+                                "transient upload; only the row's own origin authorises deleting it",
+                                item.id,
+                                library_file.id,
+                            )
+                        elif not library_file.is_external:
+                            item.library_file_id = None
+                            cleanup_disk_paths.append(file_path)
+                            if library_file.thumbnail_path:
+                                thumb_path = Path(library_file.thumbnail_path)
+                                if not thumb_path.is_absolute():
+                                    thumb_path = settings.base_dir / library_file.thumbnail_path
+                                cleanup_disk_paths.append(thumb_path)
+                            await db.delete(library_file)
+                            file_path = settings.base_dir / archive.file_path
+                            filename = archive.filename
                     await db.flush()
                     logger.info(
                         "Queue item %s: Created archive %s from library file %s",
@@ -3123,6 +3183,14 @@ class PrintScheduler:
             logger.error("Queue item %s: File not found: %s", item.id, file_path)
             await self._power_off_if_needed(db, item)
             return
+
+        # The DURABLE on-disk copy of what this dispatch uploads — the library file,
+        # or the archive copy when a transient library row was cleaned up above. Held
+        # separately because ``file_path`` is about to be rebound to the injected
+        # system-temp file, which is unlinked right after the upload: caching THAT in
+        # the cover cache publishes an already-deleted path and silently defeats the
+        # #1166 FTP-free cover on every injected dispatch.
+        durable_path = file_path
 
         # G-code injection for auto-print systems (#422): the upstream global
         # per-model start/end snippets only. Farm auto-eject is NOT injected here
@@ -3242,8 +3310,7 @@ class PrintScheduler:
             logger.error("Queue item %s: FTP error: %s (type: %s)", item.id, e, type(e).__name__)
 
         # Clean up injected temp file after upload attempt
-        if injected_path and injected_path.exists():
-            injected_path.unlink(missing_ok=True)
+        cleanup_downloaded_3mf(injected_path)
 
         if not uploaded:
             error_msg = (
@@ -3295,6 +3362,14 @@ class PrintScheduler:
         # accidentally reprinting the same file hours later.
         item.status = "printing"
         item.started_at = datetime.now(timezone.utc)
+        # Cleared to dispatch: drop any stale hold token. Dropped HERE, in the same
+        # write that commits the dispatch, and not at the capability gate further up
+        # — every gate BELOW that gate re-reads ``waiting_reason`` to tell a NEW hold
+        # from one already standing, and clearing it early made each of them look new
+        # on every tick (re-notifying an operator once per tick about one unchanged
+        # hold). Every non-dispatch exit from here on either sets its own reason or
+        # goes through ``_fail_queue_item``, which NULLs it.
+        item.waiting_reason = None
         # Record what this dispatch actually feeds from. Before this line the field is
         # the operator's INSTRUCTION (a pin, or nothing); from here on it is the
         # RECORD of the decision that ran, which is what the ledger, usage tracking
@@ -3385,10 +3460,10 @@ class PrintScheduler:
             await db.commit()
 
             # Register the local 3MF in the cover-cache so /cover skips FTP
-            # (#1166 follow-up). file_path was resolved earlier from either the
-            # archive or the library file row.
-            if file_path is not None:
-                cache_3mf_download(item.printer_id, remote_filename, file_path)
+            # (#1166 follow-up). Always the DURABLE copy, never the injected temp
+            # file — that one is already unlinked by the time a cover is requested.
+            if durable_path is not None:
+                cache_3mf_download(item.printer_id, remote_filename, durable_path)
 
             # Hold the printer against further dispatches until the watchdog
             # confirms the printer transitioned (or until the hard timeout).

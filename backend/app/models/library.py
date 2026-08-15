@@ -64,6 +64,23 @@ class LibraryFile(Base):
     # External file flag
     is_external: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # TRANSIENT upload (#730 Direct Print): this row exists only to feed one
+    # dispatch, so the scheduler may reap it once the archive owns its own copy of
+    # the 3MF. False on every ordinary library entry — a file a human deliberately
+    # added, which no dispatch may ever delete.
+    #
+    # This is the AUTHORITY for that deletion. The queue item's
+    # ``cleanup_library_after_dispatch`` is an inbound request field and states only
+    # INTENT; on its own it let any API caller aim a background deletion at someone
+    # else's library row. Transience is a fact about how the row was CREATED, so
+    # only the request that creates the row may assert it — never a later caller
+    # naming an id, which would just move the same hole one hop downstream.
+    # ``server_default`` (not just the Python-side default) so a fresh ``create_all``
+    # schema matches the ALTER'd one on an upgraded install, and so the raw-SQL
+    # INSERTs that other migrations and their tests use don't hit a NOT NULL with no
+    # default. "0" is the fork's dialect-safe boolean spelling (see archive.py).
+    transient: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+
     # File info
     filename: Mapped[str] = mapped_column(String(255))  # Original filename
     file_path: Mapped[str] = mapped_column(String(500))  # Storage path

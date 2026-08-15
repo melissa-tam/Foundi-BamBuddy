@@ -22,6 +22,7 @@ from backend.app.services.bambu_ftp import (
     BambuFTPClient,
     FileNotOnPrinterError,
     cache_3mf_download,
+    cleanup_downloaded_3mf,
     clear_3mf_cache,
     delete_file_async,
     download_file_async,
@@ -37,6 +38,22 @@ from backend.app.services.bambu_ftp import (
 # Needed because upload_file() skips voidresp() for all models,
 # so the server may still be processing the data channel close event.
 _UPLOAD_FLUSH_DELAY = 0.3
+
+
+def _isolate_system_temp(tmp_path: Path, monkeypatch) -> Path:
+    """Point ``tempfile.gettempdir()`` at a private directory.
+
+    pytest's ``tmp_path`` is itself under the real system temp root — one of the
+    two roots ``cleanup_downloaded_3mf`` treats as deletable scratch. A test that
+    builds a "durable" file under ``tmp_path`` would therefore be asserting
+    against scratch. Relocating the root makes the distinction real.
+    """
+    import tempfile
+
+    system_temp = tmp_path / "systemp"
+    system_temp.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(system_temp))
+    return system_temp
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +316,50 @@ class TestDownload:
         """download_file() returns None when not connected."""
         client = BambuFTPClient("127.0.0.1", "12345678")
         assert client.download_file("/cache/test.bin") is None
+
+    def test_download_refuses_existing_non_temp_destination(
+        self, ftp_client_factory, ftp_server, tmp_path, monkeypatch
+    ):
+        """A destination that already exists outside the scratch roots is user
+        data — opening it "wb" would truncate it and a failed transfer would then
+        delete it. Refuse before touching disk."""
+        from backend.app.core import config as _config
+
+        monkeypatch.setattr(_config.settings, "archive_dir", tmp_path / "archive")
+        _isolate_system_temp(tmp_path, monkeypatch)
+        ftp_server.add_file("cache/dl.bin", b"printer bytes")
+        library_file = tmp_path / "library_files" / "abcd.3mf"
+        library_file.parent.mkdir(parents=True)
+        library_file.write_bytes(b"library bytes")
+
+        client = ftp_client_factory()
+        client.connect()
+        try:
+            with pytest.raises(ValueError):
+                client.download_to_file("/cache/dl.bin", library_file)
+        finally:
+            client.disconnect()
+        assert library_file.read_bytes() == b"library bytes"
+
+    def test_download_overwrites_existing_temp_destination(self, ftp_client_factory, ftp_server, tmp_path, monkeypatch):
+        """The guard is scoped to durable paths: a stale scratch file is still
+        re-downloaded over (the retry lanes depend on it)."""
+        from backend.app.core import config as _config
+
+        monkeypatch.setattr(_config.settings, "archive_dir", tmp_path / "archive")
+        temp_dir = tmp_path / "archive" / "temp"
+        temp_dir.mkdir(parents=True)
+        stale = temp_dir / "dl.bin"
+        stale.write_bytes(b"stale bytes")
+        ftp_server.add_file("cache/dl.bin", b"fresh bytes")
+
+        client = ftp_client_factory()
+        client.connect()
+        try:
+            assert client.download_to_file("/cache/dl.bin", stale) is True
+        finally:
+            client.disconnect()
+        assert stale.read_bytes() == b"fresh bytes"
 
 
 # ---------------------------------------------------------------------------
@@ -1395,6 +1456,7 @@ class TestThreeMFCache:
         from backend.app.core import config as _config
 
         monkeypatch.setattr(_config.settings, "archive_dir", tmp_path / "archive")
+        _isolate_system_temp(tmp_path, monkeypatch)
         (tmp_path / "archive" / "temp").mkdir(parents=True)
 
         archive_file = tmp_path / "archive" / "1" / "20260504_wallhooks" / "wallhooks.gcode.3mf"
@@ -1422,3 +1484,66 @@ class TestThreeMFCache:
         assert archive_file.exists(), "archive 3mf must not be deleted by cache cleanup"
         assert library_file.exists(), "library 3mf must not be deleted by cache cleanup"
         assert not temp_file.exists(), "temp file should still be cleaned up"
+
+    def test_cleanup_deletes_archive_temp_download(self, tmp_path, monkeypatch):
+        """The archive scratch root is the FTPS download lane's own directory."""
+        from backend.app.core import config as _config
+
+        monkeypatch.setattr(_config.settings, "archive_dir", tmp_path / "archive")
+        temp_file = tmp_path / "archive" / "temp" / "cover_1_x.3mf"
+        temp_file.parent.mkdir(parents=True)
+        temp_file.write_bytes(b"temp bytes")
+
+        assert cleanup_downloaded_3mf(temp_file) is True
+        assert not temp_file.exists()
+
+    def test_cleanup_deletes_system_temp_download(self, tmp_path, monkeypatch):
+        """The system temp root is required too: G-code injection and the eject
+        build cache write there, and an archive-temp-only gate would leak them."""
+        import tempfile
+
+        from backend.app.core import config as _config
+
+        monkeypatch.setattr(_config.settings, "archive_dir", tmp_path / "archive")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".3mf") as tmp:
+            tmp.write(b"injected bytes")
+            injected = Path(tmp.name)
+
+        assert cleanup_downloaded_3mf(injected) is True
+        assert not injected.exists()
+
+    def test_cleanup_refuses_library_and_archive_copies(self, tmp_path, monkeypatch):
+        """Ownership is derived from the path, never from a caller's flag.
+
+        Dispatch publishes the LIBRARY file's own durable path to this cache
+        (#1166), so a consumer that treats a cache-returned path as its own
+        temp download must be refused — that assumption deleted user data.
+        """
+        from backend.app.core import config as _config
+
+        monkeypatch.setattr(_config.settings, "archive_dir", tmp_path / "archive")
+        # pytest's tmp_path lives UNDER the real system temp root, so relocate
+        # that root for this test — otherwise every "durable" path below would
+        # be scratch by construction and the assertions would be vacuous.
+        _isolate_system_temp(tmp_path, monkeypatch)
+        (tmp_path / "archive" / "temp").mkdir(parents=True)
+
+        library_file = tmp_path / "library_files" / "abcd.3mf"
+        library_file.parent.mkdir(parents=True)
+        library_file.write_bytes(b"library bytes")
+
+        archive_file = tmp_path / "archive" / "1" / "20260814_wallhooks" / "wallhooks.gcode.3mf"
+        archive_file.parent.mkdir(parents=True)
+        archive_file.write_bytes(b"archive bytes")
+
+        arbitrary = tmp_path / "elsewhere" / "notes.3mf"
+        arbitrary.parent.mkdir(parents=True)
+        arbitrary.write_bytes(b"arbitrary bytes")
+
+        for path in (library_file, archive_file, arbitrary):
+            assert cleanup_downloaded_3mf(path) is False, f"{path} must not be deletable"
+            assert path.exists(), f"{path} must survive a refused cleanup"
+
+    def test_cleanup_ignores_none(self):
+        """None is the "nothing to clean up" case, not a refusal to log."""
+        assert cleanup_downloaded_3mf(None) is False

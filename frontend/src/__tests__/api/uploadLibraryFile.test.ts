@@ -113,6 +113,24 @@ describe('uploadLibraryFile — request wiring', () => {
     expect(xhr.url).toBe('/api/v1/library/files?folder_id=5&generate_stl_thumbnails=false');
   });
 
+  it('sends transient=true only when the caller declares the upload disposable', () => {
+    // Direct Print uploads a file solely to feed one dispatch, so it declares the
+    // row transient AT CREATION — the only moment a client may say so about a row,
+    // since it is describing what it is making rather than claiming something about
+    // a file that already exists.
+    void api.uploadLibraryFile(makeFile(), null, true, { transient: true });
+    expect(MockXHR.instances[0].url).toBe(
+      '/api/v1/library/files?generate_stl_thumbnails=true&transient=true'
+    );
+  });
+
+  it('omits transient for an ordinary File Manager upload', () => {
+    void api.uploadLibraryFile(makeFile(), 5);
+    expect(MockXHR.instances[0].url).not.toContain('transient');
+    void api.uploadLibraryFile(makeFile(), 5, true, { transient: false });
+    expect(MockXHR.instances[1].url).not.toContain('transient');
+  });
+
   it('attaches the Authorization header when a token is set', () => {
     setAuthToken('tok-123');
     void api.uploadLibraryFile(makeFile(), null);

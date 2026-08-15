@@ -87,15 +87,13 @@ from backend.app.models.smart_plug import SmartPlug
 from backend.app.services import notify_dedup
 from backend.app.services.archive import ArchiveService
 from backend.app.services.archive_purge import archive_purge_service
-from backend.app.services.bambu_ftp import (
-    clear_3mf_cache,
-    get_cached_3mf,
-)
+from backend.app.services.bambu_ftp import clear_3mf_cache
 from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES, PrinterState
 from backend.app.services.eject.monitor import eject_cooldown_monitor
 from backend.app.services.foreign_archive import locate_3mf_for_print, maybe_schedule_foreign_3mf_retry
 from backend.app.services.github_backup import github_backup_service
 from backend.app.services.homeassistant import homeassistant_service
+from backend.app.services.library_integrity import library_integrity_service
 from backend.app.services.library_trash import library_trash_service
 from backend.app.services.local_backup import local_backup_service
 from backend.app.services.log_maintenance import log_maintenance_service
@@ -3170,11 +3168,11 @@ async def on_print_start(printer_id: int, data: dict):
         # the FTPS lane and the stale-plate correction live in services/foreign_archive
         # — one origin, shared with the in-flight capture retry armed below.
         lookup = await locate_3mf_for_print(printer, subtask_name, filename)
-        temp_path = lookup.temp_path
+        local_path = lookup.local_path
         downloaded_filename = lookup.filename
         subtask_name = lookup.subtask_name
 
-        if not downloaded_filename or not temp_path:
+        if not downloaded_filename or not local_path:
             logger.warning("Could not find 3MF file for print: %s", filename or subtask_name)
             # Create a fallback archive without 3MF data so the print is still tracked
             # This commonly happens with P1S/A1 printers where FTP has file size limitations
@@ -3304,119 +3302,106 @@ async def on_print_start(printer_id: int, data: dict):
                     await _send_print_start_notification(printer_id, data, logger=logger)
                 return
 
+        # Scope the 3MF parse to the plate that actually ran (#1697). Resolution
+        # is best-effort: a failure here must never break archive creation, so it
+        # is guarded and falls back to whole-project (None) parsing.
+        resolved_plate_id: int | None = None
         try:
-            # Scope the 3MF parse to the plate that actually ran (#1697). Resolution
-            # is best-effort: a failure here must never break archive creation, so it
-            # is guarded and falls back to whole-project (None) parsing.
-            resolved_plate_id: int | None = None
-            try:
-                from backend.app.services.farm_correlation import resolve_active_plate_id
+            from backend.app.services.farm_correlation import resolve_active_plate_id
 
-                resolved_plate_id = await resolve_active_plate_id(db, printer_id, subtask_id)
-            except Exception as e:
-                logger.debug("Could not resolve active plate_id for printer %s: %s", printer_id, e)
+            resolved_plate_id = await resolve_active_plate_id(db, printer_id, subtask_id)
+        except Exception as e:
+            logger.debug("Could not resolve active plate_id for printer %s: %s", printer_id, e)
 
-            # Archive the file with status "printing"
-            service = ArchiveService(db)
-            archive = await service.archive_print(
-                printer_id=printer_id,
-                source_file=temp_path,
-                print_data={**data, "status": "printing"},
-                subtask_id=subtask_id,
-                plate_id=resolved_plate_id,
+        # Archive the file with status "printing"
+        service = ArchiveService(db)
+        archive = await service.archive_print(
+            printer_id=printer_id,
+            source_file=local_path,
+            print_data={**data, "status": "printing"},
+            subtask_id=subtask_id,
+            plate_id=resolved_plate_id,
+        )
+
+        if archive:
+            # Track this active print (use both original filename and downloaded filename)
+            _active_prints[(printer_id, downloaded_filename)] = archive.id
+            if filename and filename != downloaded_filename:
+                _active_prints[(printer_id, filename)] = archive.id
+            if subtask_name:
+                _active_prints[(printer_id, f"{subtask_name}.3mf")] = archive.id
+
+            logger.info("Created archive %s for %s", archive.id, downloaded_filename)
+
+            _maybe_start_layer_timelapse(printer, printer_id, archive.id)
+
+            # Record starting energy from smart plug if available (#941: persisted column)
+            await _record_energy_start(archive, printer_id, db, context="auto-archive")
+
+            await ws_manager.send_archive_created(
+                {
+                    "id": archive.id,
+                    "printer_id": archive.printer_id,
+                    "filename": archive.filename,
+                    "print_name": archive.print_name,
+                    "status": archive.status,
+                }
             )
 
-            if archive:
-                # Track this active print (use both original filename and downloaded filename)
-                _active_prints[(printer_id, downloaded_filename)] = archive.id
-                if filename and filename != downloaded_filename:
-                    _active_prints[(printer_id, filename)] = archive.id
-                if subtask_name:
-                    _active_prints[(printer_id, f"{subtask_name}.3mf")] = archive.id
-
-                logger.info("Created archive %s for %s", archive.id, downloaded_filename)
-
-                _maybe_start_layer_timelapse(printer, printer_id, archive.id)
-
-                # Record starting energy from smart plug if available (#941: persisted column)
-                await _record_energy_start(archive, printer_id, db, context="auto-archive")
-
-                await ws_manager.send_archive_created(
-                    {
-                        "id": archive.id,
-                        "printer_id": archive.printer_id,
-                        "filename": archive.filename,
-                        "print_name": archive.print_name,
-                        "status": archive.status,
-                    }
+            # MQTT relay - publish archive created
+            try:
+                await mqtt_relay.on_archive_created(
+                    archive_id=archive.id,
+                    print_name=archive.print_name,
+                    printer_name=printer.name,
+                    status=archive.status,
                 )
+            except Exception:
+                pass  # Don't fail if MQTT fails
 
-                # MQTT relay - publish archive created
-                try:
-                    await mqtt_relay.on_archive_created(
-                        archive_id=archive.id,
-                        print_name=archive.print_name,
-                        printer_name=printer.name,
-                        status=archive.status,
-                    )
-                except Exception:
-                    pass  # Don't fail if MQTT fails
+            # Send notification with archive data (new archive created)
+            if not notification_sent:
+                archive_data = {
+                    "print_time_seconds": archive.print_time_seconds,
+                    "created_by_id": archive.created_by_id,
+                }
+                await _send_print_start_notification(printer_id, data, archive_data, logger)
 
-                # Send notification with archive data (new archive created)
-                if not notification_sent:
-                    archive_data = {
-                        "print_time_seconds": archive.print_time_seconds,
-                        "created_by_id": archive.created_by_id,
-                    }
-                    await _send_print_start_notification(printer_id, data, archive_data, logger)
+            # Extract printable objects for skip object functionality
+            try:
+                from backend.app.services.archive import extract_printable_objects_from_3mf
 
-                # Extract printable objects for skip object functionality
-                try:
-                    from backend.app.services.archive import extract_printable_objects_from_3mf
+                with open(local_path, "rb") as f:
+                    threemf_data = f.read()
+                # Extract with positions for UI overlay
+                printable_objects, bbox_all = extract_printable_objects_from_3mf(threemf_data, include_positions=True)
+                if printable_objects:
+                    # Store objects in printer state
+                    client = printer_manager.get_client(printer_id)
+                    if client:
+                        client.state.printable_objects = printable_objects
+                        client.state.printable_objects_bbox_all = bbox_all
+                        client.state.skipped_objects = []  # Reset skipped objects for new print
+                        logger.info("Loaded %s printable objects for printer %s", len(printable_objects), printer_id)
+            except Exception as e:
+                logger.debug("Failed to extract printable objects: %s", e)
 
-                    with open(temp_path, "rb") as f:
-                        threemf_data = f.read()
-                    # Extract with positions for UI overlay
-                    printable_objects, bbox_all = extract_printable_objects_from_3mf(
-                        threemf_data, include_positions=True
-                    )
-                    if printable_objects:
-                        # Store objects in printer state
-                        client = printer_manager.get_client(printer_id)
-                        if client:
-                            client.state.printable_objects = printable_objects
-                            client.state.printable_objects_bbox_all = bbox_all
-                            client.state.skipped_objects = []  # Reset skipped objects for new print
-                            logger.info(
-                                "Loaded %s printable objects for printer %s", len(printable_objects), printer_id
-                            )
-                except Exception as e:
-                    logger.debug("Failed to extract printable objects: %s", e)
+            # Store Spoolman tracking data for per-filament usage reporting
+            try:
+                await _store_spoolman_print_data(
+                    printer_id,
+                    archive.id,
+                    archive.file_path,
+                    db,
+                    printer_manager,
+                    ams_mapping=_get_start_ams_mapping(data, archive.id),
+                    plate_id=_get_start_plate_id(archive.id),
+                )
+            except Exception as e:
+                logger.warning("[SPOOLMAN] Failed to store tracking data: %s", e)
 
-                # Store Spoolman tracking data for per-filament usage reporting
-                try:
-                    await _store_spoolman_print_data(
-                        printer_id,
-                        archive.id,
-                        archive.file_path,
-                        db,
-                        printer_manager,
-                        ams_mapping=_get_start_ams_mapping(data, archive.id),
-                        plate_id=_get_start_plate_id(archive.id),
-                    )
-                except Exception as e:
-                    logger.warning("[SPOOLMAN] Failed to store tracking data: %s", e)
-
-                # Capture timelapse file baseline for snapshot-diff on completion
-                await _capture_timelapse_baseline_at_start(printer, printer_id, logger)
-        finally:
-            # Keep temp_path around until print completes so the cover endpoint
-            # can reuse it (#972). Cache eviction in on_print_complete deletes
-            # the file. If the cache entry was evicted early (file vanished),
-            # clean up any stragglers here to avoid leaking disk on retries.
-            cached_now = get_cached_3mf(printer_id, downloaded_filename) if downloaded_filename else None
-            if temp_path and temp_path.exists() and cached_now != temp_path:
-                temp_path.unlink()
+            # Capture timelapse file baseline for snapshot-diff on completion
+            await _capture_timelapse_baseline_at_start(printer, printer_id, logger)
 
 
 _TIMELAPSE_VIDEO_EXTENSIONS = (".mp4", ".avi")
@@ -6855,6 +6840,9 @@ async def lifespan(app: FastAPI):
     # Start the NSSM service-log maintenance sweeper (age-purge rotated NSSM logs)
     await log_maintenance_service.start_scheduler()
 
+    # Start the library file integrity sweep (detect active rows whose bytes are gone)
+    await library_integrity_service.start_scheduler()
+
     # Start AMS history recording
     start_ams_history_recording()
 
@@ -6905,6 +6893,7 @@ async def lifespan(app: FastAPI):
     library_trash_service.stop_scheduler()
     archive_purge_service.stop_scheduler()
     log_maintenance_service.stop_scheduler()
+    library_integrity_service.stop_scheduler()
     obico_detection_service.stop()
     stop_ams_history_recording()
     stop_printer_sensor_history_recording()

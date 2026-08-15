@@ -249,6 +249,23 @@ def mark_pending_eject_started(printer_id: int) -> None:
     )
 
 
+def _live_phase_telemetry(printer_id: int) -> tuple[int | None, float | None]:
+    """``(mc_print_line_number, mc_percent)`` off the live session — both None-tolerant.
+
+    Stall-localization breadcrumb only, never a decision input. The 2026-08-14 009-H2S
+    eject ran 106 s against an expected 84 s and was stopped with no way to tell whether
+    the lost time went into the bed drop or the sweep; percent is too coarse to separate
+    them over ~83 s, but an executing G-code line number falls inside exactly one phase.
+    Absent whenever there is no live session, and ``mc_print_line_number`` is additionally
+    unconfirmed on the H2S wire — the deployed logs are what will settle that.
+    """
+    client = printer_manager.get_client(printer_id)
+    state = getattr(client, "state", None)
+    if state is None:
+        return None, None
+    return getattr(state, "mc_print_line_number", None), getattr(state, "progress", None)
+
+
 async def _runtime_watchdog(
     printer_id: int,
     armed: PendingEject,
@@ -292,14 +309,17 @@ async def _runtime_watchdog(
         fired_at = datetime.now(timezone.utc)
         _pending_eject[printer_id] = dataclasses.replace(current, runtime_exceeded_at=fired_at)
         elapsed_s = (fired_at - (current.started_at or fired_at)).total_seconds()
+        line_number, percent = _live_phase_telemetry(printer_id)
         logger.warning(
-            "eject.remote: eject on printer %s still running at %.0fs (expected %.0fs, deadline %.0fs) — "
-            "suspect an under-bed obstruction or Z steps lost during the bed-drop; "
-            "stopping the eject job mid-flight before the sweep can scrape the plate",
+            "eject.remote: eject on printer %s still running at %.0fs (expected %.0fs, deadline %.0fs, "
+            "gcode line %s, %s%% done) — suspect an under-bed obstruction or Z steps lost during the "
+            "bed-drop; stopping the eject job mid-flight before the sweep can scrape the plate",
             printer_id,
             elapsed_s,
             armed.expected_runtime_s,
             deadline_s,
+            line_number,
+            percent,
         )
 
         # Deliberately NOT via mark_printer_stopped_by_user: this is not an operator
@@ -720,7 +740,12 @@ async def _upload_start_register_eject(
     ``plate_id``) and the eventual SD cleanup all key off the SAME ``remote_filename``
     (the bare ``job_stem``).
     """
-    from backend.app.services.bambu_ftp import get_ftp_retry_settings, upload_file_async, with_ftp_retry
+    from backend.app.services.bambu_ftp import (
+        cleanup_downloaded_3mf,
+        get_ftp_retry_settings,
+        upload_file_async,
+        with_ftp_retry,
+    )
     from backend.app.utils.filename import derive_remote_filename
 
     remote_filename = derive_remote_filename(f"{job_stem}.gcode.3mf")
@@ -769,10 +794,7 @@ async def _upload_start_register_eject(
         uploaded = False
         logger.error("eject.remote: %s eject upload error: %s", pending.purpose, exc)
     finally:
-        try:
-            eject_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        cleanup_downloaded_3mf(eject_path)
 
     if not uploaded:
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="failed")

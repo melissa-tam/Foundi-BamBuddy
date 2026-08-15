@@ -51,6 +51,12 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
       return t('productionRuns.detail.waiting.filamentUnreadPending');
     case 'no_usb_drive':
       return t('productionRuns.detail.waiting.no_usb_drive');
+    case 'library_file_missing':
+      // A dispatch PRECONDITION, like no_usb_drive: the item's source file is
+      // gone from disk, so nothing can be uploaded. The humanized fallback
+      // ("Library file missing") would not tell the operator that restoring or
+      // re-uploading the file is what releases the hold.
+      return t('productionRuns.detail.waiting.libraryFileMissing');
     case 'stagger_hold':
       return t('productionRuns.detail.waiting.staggerHold');
     case 'spool_jam_recovering':

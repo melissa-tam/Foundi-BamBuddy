@@ -38,6 +38,7 @@ from backend.app.services.archive import ArchiveService, peek_plate_index_in_3mf
 from backend.app.services.bambu_ftp import (
     FileNotOnPrinterError,
     cache_3mf_download,
+    cleanup_downloaded_3mf,
     download_file_async,
     get_cached_3mf,
     get_ftp_retry_settings,
@@ -66,16 +67,20 @@ class ThreeMFLookup:
 
     ``subtask_name`` is echoed back because a stale-plate correction rewrites it:
     the caller names its fallback archive from the corrected value (#1204).
+
+    ``local_path`` is borrowed (a library file or archive copy served from the
+    download cache) or cache-owned (a temp published to it) — never the caller's
+    to delete.
     """
 
-    temp_path: Path | None
+    local_path: Path | None
     filename: str | None
     subtask_name: str
     expected_plate: int | None
 
     @property
     def found(self) -> bool:
-        return self.temp_path is not None and self.filename is not None
+        return self.local_path is not None and self.filename is not None
 
 
 def _candidate_names(subtask_name: str, filename: str) -> list[str]:
@@ -303,10 +308,6 @@ async def locate_3mf_for_print(printer: Printer, subtask_name: str, filename: st
                                     try_filename,
                                     expected_plate,
                                 )
-                                try:
-                                    temp_path.unlink(missing_ok=True)
-                                except OSError:
-                                    pass
                                 temp_path = retry_temp_path
                                 downloaded_filename = try_filename
                                 subtask_name = corrected_subtask
@@ -314,11 +315,9 @@ async def locate_3mf_for_print(printer: Printer, subtask_name: str, filename: st
                                 retry_succeeded = True
                                 break
                             elif downloaded:
-                                # Wrong plate again — discard and keep trying
-                                try:
-                                    retry_temp_path.unlink(missing_ok=True)
-                                except OSError:
-                                    pass
+                                # Wrong plate again — never published, so discard
+                                # it here and keep trying.
+                                cleanup_downloaded_3mf(retry_temp_path)
                         except FileNotOnPrinterError:
                             continue
                         except Exception as e:  # noqa: BLE001 — next path
@@ -333,10 +332,6 @@ async def locate_3mf_for_print(printer: Printer, subtask_name: str, filename: st
                     "[CALLBACK] Could not re-download correct plate %s — falling back to no-3MF archive",
                     expected_plate,
                 )
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
                 temp_path = None
                 downloaded_filename = None
                 # Override the stale subtask_name so the fallback archive's
@@ -347,7 +342,7 @@ async def locate_3mf_for_print(printer: Printer, subtask_name: str, filename: st
     return ThreeMFLookup(
         # A miss leaves the last candidate's (never-written) temp path behind —
         # report no path rather than one nothing landed at.
-        temp_path=temp_path if downloaded_filename else None,
+        local_path=temp_path if downloaded_filename else None,
         filename=downloaded_filename,
         subtask_name=subtask_name,
         expected_plate=expected_plate,
@@ -482,10 +477,10 @@ async def _attempt_capture(
             live_filename,
         )
         lookup = await locate_3mf_for_print(printer, live_subtask, live_filename)
-        if not lookup.found or lookup.temp_path is None:
+        if not lookup.found or lookup.local_path is None:
             return False
 
-        attached = await ArchiveService(db).attach_3mf_to_archive(archive, lookup.temp_path, lookup.expected_plate)
+        attached = await ArchiveService(db).attach_3mf_to_archive(archive, lookup.local_path, lookup.expected_plate)
         if attached:
             logger.info(
                 "[FOREIGN-3MF] printer %s archive %s: captured %s on attempt %d — the run is chargeable again",

@@ -8073,3 +8073,56 @@ class TestStartPrintAllNegativeMappingRefused:
     def test_empty_mapping_is_not_a_refusal(self, mqtt_client):
         assert mqtt_client.start_print("test.3mf", ams_mapping=[]) is True
         mqtt_client._client.publish.assert_called_once()
+
+
+class TestPrintLineNumberParse:
+    """``mc_print_line_number`` retention (2026-08-14 eject stall-localization).
+
+    Percent alone cannot say whether a slow eject is stuck in the bed-drop or the
+    sweep; the executing G-code line lands inside one phase. The field's presence on
+    the H2S wire is UNVERIFIED, so the parse is defensive by design and every reader
+    treats None as "not published OR not parsed" — these tests pin that tolerance
+    rather than assuming the field arrives.
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        client = BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST123",
+            access_code="12345678",
+        )
+        return client
+
+    def test_absent_field_leaves_it_none(self, mqtt_client):
+        mqtt_client._process_message({"print": {"mc_percent": 42, "gcode_state": "RUNNING"}})
+        assert mqtt_client.state.progress == 42.0
+        assert mqtt_client.state.mc_print_line_number is None
+
+    def test_string_value_is_coerced_to_int(self, mqtt_client):
+        # Firmware spells this as a decimal string on the models where it has been seen.
+        mqtt_client._process_message({"print": {"mc_print_line_number": "41207"}})
+        assert mqtt_client.state.mc_print_line_number == 41207
+
+    def test_int_value_is_kept(self, mqtt_client):
+        mqtt_client._process_message({"print": {"mc_print_line_number": 512}})
+        assert mqtt_client.state.mc_print_line_number == 512
+
+    def test_junk_value_falls_back_to_none_without_killing_the_parse(self, mqtt_client):
+        # A log-only breadcrumb must never cost the rest of the status report: the
+        # sibling fields in the same block have to land regardless.
+        mqtt_client._process_message(
+            {"print": {"mc_print_line_number": "n/a", "mc_percent": 77, "mc_remaining_time": 12}}
+        )
+        assert mqtt_client.state.mc_print_line_number is None
+        assert mqtt_client.state.progress == 77.0
+        assert mqtt_client.state.remaining_time == 12
+
+    def test_incremental_push_without_the_field_keeps_the_last_value(self, mqtt_client):
+        # The H2S sends incremental pushes; a field absent from one is unchanged, not
+        # cleared — same convention as mc_percent.
+        mqtt_client._process_message({"print": {"mc_print_line_number": 900}})
+        mqtt_client._process_message({"print": {"mc_percent": 50}})
+        assert mqtt_client.state.mc_print_line_number == 900

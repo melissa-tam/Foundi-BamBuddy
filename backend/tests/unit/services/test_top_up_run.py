@@ -105,6 +105,27 @@ class TestTopUpRun:
         assert pend[0].printer_id == 3
         assert pend[0].first_article is False
 
+    async def test_unit_waiting_on_a_missing_library_file_counts_as_productive(self, db_session):
+        """A WAITing unit is still owed output, so it must not bleed replacements.
+
+        Since 2026-08-14 a unit whose source file vanished from disk holds as
+        ``pending`` with ``waiting_reason='library_file_missing'`` instead of failing.
+        Top-up counts a chain productive on live status alone, and ``pending`` is a
+        live status — but the pairing is load-bearing enough to pin: were the hold
+        ever to become terminal, every held unit would mint a replacement that would
+        hit the same missing file, and a run could top itself up without end.
+        """
+        batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=3)
+        await _add(db_session, batch, printer_id=3, status="completed", pos=1)
+        held = await _add(db_session, batch, printer_id=3, status="pending", pos=2)
+        held.waiting_reason = "library_file_missing"
+        await db_session.commit()
+
+        run = await _load_run(db_session, batch.id)
+        created = await top_up_run(db_session, run)
+        assert created == 0
+        assert await _pending_count(db_session, batch.id) == 1  # the held unit, and only it
+
     async def test_failed_with_live_retry_chain_counts_as_productive(self, db_session):
         # A failed primary + its pending retry = ONE productive chain → no deficit.
         batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=3)

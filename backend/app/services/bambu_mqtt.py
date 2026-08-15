@@ -556,6 +556,12 @@ class PrinterState:
     # mc_print_sub_stage - filament change step indicator from print.mc_print_sub_stage
     # Used by OrcaSlicer/BambuStudio to track progress during filament load/unload
     mc_print_sub_stage: int = 0
+    # Executing G-code line number from print.mc_print_line_number. Retained purely as
+    # eject stall-localization telemetry: percent alone cannot say whether a slow eject
+    # is stuck in the bed-drop or the sweep, but a line number lands inside one phase.
+    # UNVERIFIED on the H2S wire as of 2026-08-14 — no capture yet shows the field, so
+    # None here means "not published OR not parsed" and every reader must tolerate it.
+    mc_print_line_number: int | None = None
     # AMS mapping for dual nozzle: which slot is active (from ams.ams_exist_bits/tray_exist_bits)
     ams_mapping: list = field(default_factory=list)
     # Per-AMS extruder map: {ams_id: extruder_id} where 0=right/main, 1=left/deputy
@@ -3009,6 +3015,15 @@ class BambuMQTTClient:
             self.state.progress = float(data["mc_percent"])
         if "mc_remaining_time" in data:
             self.state.remaining_time = int(data["mc_remaining_time"])
+        if "mc_print_line_number" in data:
+            # Firmware spells this as a decimal STRING on the models where it has been
+            # seen, and its presence on H2S is unconfirmed — so coerce defensively and
+            # fall back to None. This is a log-only breadcrumb; a junk value must never
+            # cost the rest of the status parse.
+            try:
+                self.state.mc_print_line_number = int(data["mc_print_line_number"])
+            except (TypeError, ValueError):
+                self.state.mc_print_line_number = None
         if "mc_print_sub_stage" in data:
             new_sub_stage = int(data["mc_print_sub_stage"])
             if new_sub_stage != self.state.mc_print_sub_stage:

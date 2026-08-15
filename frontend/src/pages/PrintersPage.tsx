@@ -3034,7 +3034,11 @@ function PrinterCard({
 
     setIsDropUploading(true);
     try {
-      const result = await api.uploadLibraryFile(file, null);
+      // Direct Print: this upload exists only to feed the dispatch below, so the
+      // row is declared transient at creation. That row-level fact is what lets the
+      // scheduler delete it after archiving — the queue item's cleanup flag alone
+      // may not touch a file a human deliberately put in the library.
+      const result = await api.uploadLibraryFile(file, null, true, { transient: true });
 
       // Check printer compatibility if sliced_for_model is available in metadata
       const slicedFor = (result.metadata as Record<string, unknown>)?.sliced_for_model as string | undefined;
