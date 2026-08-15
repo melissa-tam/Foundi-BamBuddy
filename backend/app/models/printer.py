@@ -60,6 +60,14 @@ class Printer(Base):
     # human-readable trip reason for the UI/notification.
     quarantined: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     quarantine_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # When an operator last cleared a quarantine on this printer (UTC). The
+    # consecutive-failure streak is derived from queue history, so without this the
+    # history that tripped the quarantine is still there the instant it is cleared and
+    # ONE new failure re-trips "2 consecutive" — "Recover & resume" re-quarantined
+    # within seconds on 2026-08-14. Clearing means "an operator inspected this printer;
+    # count fresh", so the streak window starts here. NULL = never cleared (whole
+    # history counts), which is also the pre-migration value.
+    quarantine_cleared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 

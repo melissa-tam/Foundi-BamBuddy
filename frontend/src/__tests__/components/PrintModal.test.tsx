@@ -1407,9 +1407,15 @@ describe('PrintModal', () => {
 
   describe('cleanup_library_after_dispatch forwarding (#730)', () => {
     // The Printers-page Direct-Print flow passes cleanupLibraryAfterDispatch so the
-    // transient LibraryFile created by FileUploadModal is deleted once the archive
-    // owns its own copy. File Manager / Project Detail flows leave the prop unset so
-    // their deliberately-added library entries survive the print.
+    // library row it uploaded moments earlier is deleted once the archive owns its
+    // own copy. File Manager / Project Detail flows leave the prop unset so their
+    // deliberately-added library entries survive the print.
+    //
+    // This flag is INTENT only — half of the decision. The scheduler also requires
+    // the row itself to be `transient`, which the Direct-Print lane declares on its
+    // upload (PrintersPage's drop handler → api.uploadLibraryFile(..., { transient:
+    // true })). Without that second condition the flag alone could aim a background
+    // deletion at any library row an API caller cared to name.
     beforeEach(() => {
       server.use(
         http.get('/api/v1/library/files/:id', () => {

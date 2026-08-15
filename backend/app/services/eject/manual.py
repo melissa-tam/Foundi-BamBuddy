@@ -152,10 +152,9 @@ def _safe_unlink(path: Path | None) -> None:
     """Best-effort delete of a temp donor file (no-op for None / on-disk archives)."""
     if path is None:
         return
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
+    from backend.app.services.bambu_ftp import cleanup_downloaded_3mf
+
+    cleanup_downloaded_3mf(path)
 
 
 # --------------------------------------------------------------------------- #

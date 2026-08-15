@@ -3,9 +3,11 @@
 Two-stage file deletion for the library:
 
 1. Users / admins soft-delete files — the row stays in ``library_files`` with
-   ``deleted_at`` stamped; the bytes stay on disk. This is handled inline in
-   ``backend.app.api.routes.library`` and exposed to admins as a bulk "purge
-   old files" operation via :meth:`LibraryTrashService.purge_older_than`.
+   ``deleted_at`` stamped; the bytes stay on disk. Every delete lane in
+   ``backend.app.api.routes.library`` (single file, bulk, folder subtree) goes
+   through :meth:`LibraryTrashService.trash_file`; admins additionally get the
+   bulk "purge old files" operation via
+   :meth:`LibraryTrashService.purge_older_than`.
 
 2. A background sweeper in this service hard-deletes rows (and their bytes)
    whose ``deleted_at`` is older than the configured retention window.
@@ -26,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import settings as app_settings
 from backend.app.core.database import async_session
-from backend.app.models.library import LibraryFile
+from backend.app.models.library import LibraryFile, LibraryFolder
 from backend.app.models.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -361,7 +363,21 @@ class LibraryTrashService:
     @staticmethod
     def _unlink_on_disk(row: LibraryFile) -> None:
         """Best-effort cleanup of the file + thumbnail on disk."""
-        for rel in (row.file_path, row.thumbnail_path):
+        LibraryTrashService._unlink_paths(row.file_path, row.thumbnail_path)
+
+    @staticmethod
+    def _unlink_thumbnail(row: LibraryFile) -> None:
+        """Best-effort cleanup of the thumbnail Bambuddy generated for *row*.
+
+        An external row's bytes live outside Bambuddy's control; the thumbnail
+        is the only file of its set that we created, so it is the only one we
+        remove when such a row is dropped.
+        """
+        LibraryTrashService._unlink_paths(row.thumbnail_path)
+
+    @staticmethod
+    def _unlink_paths(*relative_paths: str | None) -> None:
+        for rel in relative_paths:
             abs_path = _to_absolute_path(rel)
             if abs_path is None:
                 continue
@@ -372,6 +388,82 @@ class LibraryTrashService:
                 logger.warning("Trash sweep: failed to unlink %s: %s", abs_path, e)
 
     # ---- User-facing trash ops ----------------------------------------
+
+    async def trash_file(
+        self,
+        db: AsyncSession,
+        file: LibraryFile,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Route ONE library file into the trash. The caller owns the commit.
+
+        The single implementation of "a user deleted this file": every delete
+        lane (single file, bulk, folder subtree) goes through here so a managed
+        upload can only ever be soft-deleted — its bytes stay on disk until the
+        retention sweeper takes them, and a restore is always possible until
+        then.
+
+        Returns True when the row was trashed, False when it was dropped
+        outright — external rows skip the trash because nothing about them is
+        restorable from disk. Re-trashing an already-trashed row keeps the
+        original ``deleted_at`` so the retention clock never restarts.
+        """
+        if file.is_external:
+            self._unlink_thumbnail(file)
+            await db.delete(file)
+            return False
+        if file.deleted_at is None:
+            file.deleted_at = now or datetime.now(timezone.utc)
+        return True
+
+    async def trash_folder_tree(self, db: AsyncSession, folder: LibraryFolder) -> int:
+        """Delete a folder subtree, routing every member file through the trash.
+
+        Returns the number of files that left the listing (trashed + dropped
+        external rows). The caller owns the commit.
+
+        Member rows are DETACHED from their folder before the folder rows go:
+        ``library_files.folder_id`` cascades on delete, so a trashed row still
+        pointing at a deleted folder would be hard-deleted along with it — the
+        bytes orphaned on disk with no row left to restore. A detached row
+        restores to the library root, which is where a row with no folder
+        already lives.
+        """
+        folder_ids = await self._subtree_folder_ids(db, folder.id)
+        result = await db.execute(select(LibraryFile).where(LibraryFile.folder_id.in_(folder_ids)))
+        members = list(result.scalars().all())
+
+        now = datetime.now(timezone.utc)
+        removed = 0
+        for file in members:
+            was_listed = file.deleted_at is None
+            if await self.trash_file(db, file, now=now):
+                file.folder_id = None
+            if was_listed:
+                removed += 1
+
+        # Flush the detach BEFORE the folder delete: the ORM cascade resolves
+        # ``folder.files`` from the database, and only a flushed NULL folder_id
+        # keeps the trashed rows out of that collection.
+        await db.flush()
+        await db.delete(folder)
+        return removed
+
+    @staticmethod
+    async def _subtree_folder_ids(db: AsyncSession, folder_id: int) -> list[int]:
+        """Folder ids of *folder_id* and every descendant, breadth-first.
+
+        Ids already seen are dropped from the frontier so a cyclic ``parent_id``
+        chain terminates instead of walking forever.
+        """
+        seen = {folder_id}
+        frontier = [folder_id]
+        while frontier:
+            result = await db.execute(select(LibraryFolder.id).where(LibraryFolder.parent_id.in_(frontier)))
+            frontier = [row[0] for row in result.all() if row[0] not in seen]
+            seen.update(frontier)
+        return list(seen)
 
     async def restore(self, db: AsyncSession, file: LibraryFile) -> LibraryFile:
         """Clear ``deleted_at`` so the file reappears in listings."""

@@ -6611,13 +6611,18 @@ export const api = {
     file: File,
     folderId?: number | null,
     generateStlThumbnails: boolean = true,
-    opts?: { onProgress?: (pct: number) => void }
+    // `transient` marks the created row as a throwaway upload made only to feed one
+    // dispatch (Direct Print), which the scheduler may delete after archiving it.
+    // Declared at CREATION so it describes the row this call is making; an ordinary
+    // File Manager upload omits it and stays permanent.
+    opts?: { onProgress?: (pct: number) => void; transient?: boolean }
   ): Promise<LibraryFileUploadResponse> => {
     const formData = new FormData();
     formData.append('file', file);
     const params = new URLSearchParams();
     if (folderId) params.set('folder_id', String(folderId));
     params.set('generate_stl_thumbnails', String(generateStlThumbnails));
+    if (opts?.transient) params.set('transient', 'true');
     // Uses XMLHttpRequest (not fetch) so the browser exposes real upload
     // progress via `upload.onprogress`. Auth header and success/error shapes
     // are preserved EXACTLY from the prior fetch path: resolve with the parsed

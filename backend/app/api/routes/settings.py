@@ -2,7 +2,7 @@ import io
 import logging
 import os
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -12,7 +12,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.auth import RequirePermissionIfAuthEnabled, caller_is_api_key, require_energy_cost_update
-from backend.app.core.config import settings as app_settings
+from backend.app.core.config import APP_VERSION, BUILD_VERSION, settings as app_settings
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
 from backend.app.models.settings import Settings
@@ -34,6 +34,166 @@ _SENSITIVE_FIELDS_FOR_API_KEY = (
     "ldap_bind_password",
     "erp_db_password",
 )
+
+
+# Top-level ZIP member recording what a backup actually contains. A backup ZIP
+# is produced even when individual files could not be copied, so completeness is
+# a fact the artifact has to carry with it — restore wipes the destination and
+# cannot re-derive it afterwards.
+BACKUP_MANIFEST_NAME = "backup_manifest.json"
+BACKUP_MANIFEST_VERSION = 1
+
+
+def _describe_copy_failure(name: str, exc: OSError) -> list[dict[str, str]]:
+    """Flatten one directory-copy failure into per-path manifest records.
+
+    ``shutil.copytree`` accumulates per-file failures and raises a single
+    ``shutil.Error`` carrying an ``(src, dst, why)`` triple per failed file, so
+    the manifest can name the affected paths instead of one opaque string.
+    """
+    import shutil
+
+    if isinstance(exc, shutil.Error) and exc.args and isinstance(exc.args[0], list):
+        records: list[dict[str, str]] = []
+        for entry in exc.args[0]:
+            if isinstance(entry, (tuple, list)) and len(entry) >= 3:
+                records.append({"dir": name, "path": str(entry[0]), "error": str(entry[2])})
+            else:
+                records.append({"dir": name, "path": "", "error": str(entry)})
+        if records:
+            return records
+    return [{"dir": name, "path": str(getattr(exc, "filename", "") or ""), "error": str(exc)}]
+
+
+def _parse_manifest(raw: bytes) -> dict | None:
+    """Parse manifest bytes; ``None`` means unreadable — never means 'clean'."""
+    import json
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_manifest_from_zip(zip_path: Path) -> dict | None:
+    """Read the manifest back out of a produced backup ZIP (absent → None)."""
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            raw = zf.read(BACKUP_MANIFEST_NAME)
+    except (KeyError, OSError, zipfile.BadZipFile):
+        return None
+    return _parse_manifest(raw)
+
+
+def _manifest_partial_dirs(manifest: dict | None) -> list[str]:
+    """Top-level directory names the manifest recorded copy failures for."""
+    failures = (manifest or {}).get("failures") or []
+    if not isinstance(failures, list):
+        return []
+    names = {str(f.get("dir")) for f in failures if isinstance(f, dict) and f.get("dir")}
+    return sorted(names)
+
+
+def _partial_refusal_reason(manifest_present: bool, manifest: dict | None) -> str | None:
+    """Why a restore of this backup must be refused, or None if it may proceed.
+
+    A backup ZIP written before manifests existed is allowed (the caller notes
+    the absence); a manifest that exists but cannot be trusted is not.
+    """
+    if not manifest_present:
+        return None
+    if manifest is None:
+        return "This backup's manifest is unreadable, so its completeness cannot be verified."
+    if not manifest.get("partial"):
+        return None
+    dirs = _manifest_partial_dirs(manifest)
+    where = f" Incomplete directories: {', '.join(dirs)}." if dirs else ""
+    return (
+        "This backup was recorded as INCOMPLETE when it was created — some files could not be copied."
+        f"{where} Restoring it would replace the current data with a known-partial copy."
+    )
+
+
+def _move_dir_contents(dest_dir: Path, aside_dir: Path) -> None:
+    """Move every child of ``dest_dir`` into a fresh ``aside_dir`` (same volume).
+
+    ``dest_dir`` itself is never renamed: on Docker installs it can be a bind
+    mount point. A failure part-way through moves the already-moved children
+    back, so the caller can treat a raise as "nothing was destroyed".
+    """
+    aside_dir.mkdir(parents=True, exist_ok=False)
+    moved: list[str] = []
+    try:
+        for item in dest_dir.iterdir():
+            os.replace(item, aside_dir / item.name)
+            moved.append(item.name)
+    except OSError:
+        for child in moved:
+            try:
+                os.replace(
+                    aside_dir / child, dest_dir / child
+                )  # SEC-PATH-OK: child is a name this function itself read from dest_dir.iterdir() and moved into aside_dir
+            except OSError:
+                logger.error("Could not move %s back into %s during abort", child, dest_dir, exc_info=True)
+        try:
+            aside_dir.rmdir()
+        except OSError:
+            pass
+        raise
+
+
+def _rollback_restored_dirs(moved_aside: list[tuple[str, Path, Path]]) -> str:
+    """Undo a failed directory restore; returns an operator-facing note.
+
+    Drains ``moved_aside`` (last moved first), so calling it again from an
+    outer handler is a no-op rather than a second, destructive pass.
+    """
+    import shutil
+
+    unrecovered: list[str] = []
+    rolled_back = False
+    while moved_aside:
+        name, dest_dir, aside_dir = moved_aside.pop()
+        rolled_back = True
+        try:
+            for item in dest_dir.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+            for item in aside_dir.iterdir():
+                os.replace(item, dest_dir / item.name)
+            aside_dir.rmdir()
+        except OSError:
+            logger.error("Rollback of %s failed; originals kept at %s", name, aside_dir, exc_info=True)
+            unrecovered.append(f"{name} (originals kept at {aside_dir})")
+    if unrecovered:
+        return "Rollback INCOMPLETE for: " + "; ".join(unrecovered) + "."
+    if not rolled_back:
+        return ""
+    return "All data directories were rolled back to their pre-restore state."
+
+
+def _discard_aside_dirs(moved_aside: list[tuple[str, Path, Path]]) -> str:
+    """Delete the pre-restore copies — the restore's commit point.
+
+    Drains ``moved_aside`` so a later failure can no longer roll back what has
+    already been committed.
+    """
+    import shutil
+
+    leftover: list[str] = []
+    while moved_aside:
+        _name, _dest_dir, aside_dir = moved_aside.pop()
+        try:
+            shutil.rmtree(aside_dir)
+        except OSError:
+            logger.warning("Could not remove pre-restore copy %s", aside_dir, exc_info=True)
+            leftover.append(str(aside_dir))
+    if leftover:
+        return "Note: pre-restore copies could not be deleted and still occupy disk: " + ", ".join(leftover) + "."
+    return ""
 
 
 def _sqlalchemy_type_to_sqlite_type(type_repr: str) -> str:
@@ -589,7 +749,12 @@ async def create_backup_zip(output_path: Path | None = None) -> tuple[Path, str]
     If output_path is given, the ZIP is written there.
     Otherwise a temporary file is created (caller must clean up).
     Returns (zip_path, filename).
+
+    Per-directory copy failures do not abort the backup, but every one of them
+    is recorded in the ZIP's ``backup_manifest.json`` — read it back with
+    ``_read_manifest_from_zip`` to learn whether the artifact is complete.
     """
+    import json
     import shutil
     import tempfile
 
@@ -617,7 +782,6 @@ async def create_backup_zip(output_path: Path | None = None) -> tuple[Path, str]
         else:
             # PostgreSQL: export to a portable SQLite file via SQLAlchemy.
             # This makes backups restorable on both SQLite and Postgres installs.
-            import json
             import sqlite3
 
             from backend.app.core.database import Base, engine
@@ -670,16 +834,26 @@ async def create_backup_zip(output_path: Path | None = None) -> tuple[Path, str]
             ("projects", base_dir / "projects"),
         ]
 
+        copy_failures: list[dict[str, str]] = []
+        included_dirs: list[str] = []
+
         for name, src_dir in dirs_to_backup:
             if src_dir.exists() and any(src_dir.iterdir()):
                 try:
                     shutil.copytree(
                         src_dir, temp_path / name
                     )  # SEC-PATH-OK: name iterates the dirs_to_backup tuple of constant strings ("archive", "virtual_printer", ...)
-                except shutil.Error as e:
+                except OSError as e:
+                    # shutil.Error (per-file failures) and PermissionError are
+                    # both OSError; a live farm holding file locks makes them
+                    # routine on Windows. The copy is best-effort, the manifest
+                    # is what makes the result honest.
+                    copy_failures.extend(_describe_copy_failure(name, e))
                     logger.warning("Some files in %s could not be copied: %s", name, e)
-                except PermissionError as e:
-                    logger.warning("Permission denied copying %s: %s", name, e)
+                if (
+                    temp_path / name
+                ).exists():  # SEC-PATH-OK: name iterates the dirs_to_backup tuple of constant strings ("archive", "virtual_printer", ...)
+                    included_dirs.append(name)
 
         # Include the MFA encryption key as a ZIP top-level entry alongside
         # bambuddy.db. Without it, encrypted client_secret / TOTP secret rows
@@ -698,6 +872,27 @@ async def create_backup_zip(output_path: Path | None = None) -> tuple[Path, str]
                     exc,
                 )
                 raise
+
+        manifest = {
+            "manifest_version": BACKUP_MANIFEST_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "app_version": APP_VERSION,
+            "build": BUILD_VERSION,
+            "included_dirs": included_dirs,
+            "partial": bool(copy_failures),
+            "failures": copy_failures,
+        }
+        (
+            temp_path / BACKUP_MANIFEST_NAME
+        ).write_text(  # SEC-PATH-OK: BACKUP_MANIFEST_NAME is a module-level constant string
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+        if copy_failures:
+            logger.warning(
+                "Backup is INCOMPLETE: %d file(s) could not be copied from %s",
+                len(copy_failures),
+                ", ".join(_manifest_partial_dirs(manifest)),
+            )
 
         # Create ZIP
         if output_path is not None:
@@ -723,15 +918,34 @@ async def create_backup(
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_BACKUP),
 ):
-    """Create a complete backup (database + all files) as a ZIP download."""
+    """Create a complete backup (database + all files) as a ZIP download.
+
+    An incomplete backup is still served, but never silently: the response
+    carries ``X-Backup-Partial: true`` plus an ``X-Backup-Warning`` naming the
+    affected directories, and the ZIP's manifest lists every failed path.
+    """
     from starlette.background import BackgroundTask
 
     try:
         zip_file, filename = await create_backup_zip()
+        headers: dict[str, str] = {}
+        manifest = _read_manifest_from_zip(zip_file)
+        if manifest and manifest.get("partial"):
+            failures = manifest.get("failures") or []
+            warning = (
+                f"This backup is INCOMPLETE: {len(failures)} file(s) could not be copied from "
+                f"{', '.join(_manifest_partial_dirs(manifest)) or 'unknown directories'}. "
+                "Restoring it will replace current data with a partial copy."
+            )
+            # HTTP header values are latin-1; manifest text is not guaranteed ASCII.
+            headers["X-Backup-Partial"] = "true"
+            headers["X-Backup-Warning"] = warning.encode("ascii", "replace").decode("ascii")
+            logger.warning("Serving a partial backup ZIP: %s", warning)
         return FileResponse(
             path=zip_file,
             filename=filename,
             media_type="application/zip",
+            headers=headers or None,
             background=BackgroundTask(lambda: zip_file.unlink(missing_ok=True)),
         )
     except Exception as e:
@@ -947,6 +1161,7 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
 @router.post("/restore")
 async def restore_backup(
     file: UploadFile = File(...),
+    force_partial: bool = False,
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_RESTORE),
 ):
@@ -954,6 +1169,13 @@ async def restore_backup(
 
     Replaces the database and all data directories from the backup ZIP.
     Requires a restart after restore.
+
+    A backup whose manifest records it as incomplete is refused with 409 unless
+    the ``force_partial=true`` query parameter is passed. Data directories are
+    replaced transactionally: the current contents are moved aside first and
+    moved back if any step fails, so a failed restore never destroys the
+    library. A ZIP with no manifest (written by an older build) is accepted and
+    the absence is reported in the response.
     """
     import shutil
     import tempfile
@@ -1001,6 +1223,33 @@ async def restore_backup(
         if not backup_db.exists():
             raise HTTPException(400, "Invalid backup: missing bambuddy.db")
 
+        # 2b. Completeness gate — refuse a known-partial backup before anything
+        # destructive runs. Nothing below this point is reversible for free.
+        manifest_path = (
+            temp_path / BACKUP_MANIFEST_NAME
+        )  # SEC-PATH-OK: BACKUP_MANIFEST_NAME is a module-level constant string
+        manifest_present = manifest_path.is_file()
+        manifest = _parse_manifest(manifest_path.read_bytes()) if manifest_present else None
+        refusal = _partial_refusal_reason(manifest_present, manifest)
+        if refusal and not force_partial:
+            # This endpoint's own contract is {success, message} (the only
+            # client reads those keys), so a refusal must not hide behind
+            # HTTPException's `detail`.
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "message": (
+                        f"{refusal} Nothing was changed. Re-send with force_partial=true to restore it anyway."
+                    ),
+                    "manifest_present": manifest_present,
+                },
+            )
+
+        # (name, destination, pre-restore copy) for every directory whose old
+        # contents are still recoverable — drained at the commit point.
+        moved_aside: list[tuple[str, Path, Path]] = []
+
         try:
             import asyncio
 
@@ -1043,6 +1292,55 @@ async def restore_backup(
             # 4. Close current database connections
             logger.info("Closing database connections...")
             await close_all_connections()
+
+            # 5. Replace data directories BEFORE any irreversible step.
+            # base_dir/archive holds every uploaded library file and every
+            # archive copy, so the old wipe-then-copy destroyed the library
+            # whenever a copy hit a locked file. Each destination's contents are
+            # MOVED to a sibling "<name>.pre-restore-<UTC>" — a rename on the
+            # same volume, no disk cost — and moved back if any step through the
+            # database swap fails. The destination directory itself is never
+            # renamed: on Docker it can be a bind-mount point.
+            dirs_to_restore = [
+                ("archive", base_dir / "archive"),
+                ("virtual_printer", base_dir / "virtual_printer"),
+                ("plate_calibration", app_settings.plate_calibration_dir),
+                ("icons", base_dir / "icons"),
+                ("projects", base_dir / "projects"),
+            ]
+            aside_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+            for name, dest_dir in dirs_to_restore:
+                src_dir = (
+                    temp_path / name
+                )  # SEC-PATH-OK: name iterates the dirs_to_restore tuple of constant strings ("archive", "virtual_printer", ...)
+                if not src_dir.exists():
+                    continue
+                logger.info("Restoring %s directory...", name)
+                aside_dir = dest_dir.parent / f"{dest_dir.name}.pre-restore-{aside_stamp}"
+                try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    _move_dir_contents(dest_dir, aside_dir)
+                    moved_aside.append((name, dest_dir, aside_dir))
+                    for item in src_dir.iterdir():
+                        dest_item = dest_dir / item.name
+                        if item.is_dir():
+                            shutil.copytree(item, dest_item)
+                        else:
+                            shutil.copy2(item, dest_item)
+                except OSError as e:
+                    logger.error("Restore of the %s directory failed: %s", name, e, exc_info=True)
+                    note = _rollback_restored_dirs(moved_aside)
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "success": False,
+                            "message": (
+                                f"Restore aborted while restoring the '{name}' directory: {e}. "
+                                f"The database was not modified. {note}"
+                            ).strip(),
+                        },
+                    )
 
             # B1: Restore the MFA encryption key file BEFORE the database swap.
             # If the key write fails (OSError, RO disk, full disk, EACCES) we
@@ -1087,12 +1385,21 @@ async def restore_backup(
                         e,
                         exc_info=True,
                     )
+                    note = _rollback_restored_dirs(moved_aside)
                     raise HTTPException(
                         status_code=500,
-                        detail=("Restore aborted: MFA key write failed. Database is unchanged. Check server logs."),
+                        detail=" ".join(
+                            part
+                            for part in (
+                                "Restore aborted: MFA key write failed. Database is unchanged.",
+                                note,
+                                "Check server logs.",
+                            )
+                            if part
+                        ),
                     ) from e
 
-            # 5. Replace database
+            # 6. Replace database
             logger.info("Restoring database from backup...")
             if is_sqlite():
                 db_path = Path(app_settings.database_url.replace("sqlite+aiosqlite:///", ""))
@@ -1133,48 +1440,11 @@ async def restore_backup(
                 logger.info("Importing SQLite backup into PostgreSQL...")
                 await _import_sqlite_to_postgres(backup_db, app_settings.database_url)
 
-            # 6. Replace data directories
-            # For Docker compatibility: clear contents then copy (don't delete mount points)
-            dirs_to_restore = [
-                ("archive", base_dir / "archive"),
-                ("virtual_printer", base_dir / "virtual_printer"),
-                ("plate_calibration", app_settings.plate_calibration_dir),
-                ("icons", base_dir / "icons"),
-                ("projects", base_dir / "projects"),
-            ]
+            # 7. Commit point: every directory and the database are in place, so
+            # the pre-restore copies are no longer a rollback target.
+            cleanup_note = _discard_aside_dirs(moved_aside)
 
-            skipped_dirs = []
-            for name, dest_dir in dirs_to_restore:
-                src_dir = (
-                    temp_path / name
-                )  # SEC-PATH-OK: name iterates the dirs_to_restore tuple of constant strings ("archive", "virtual_printer", ...)
-                if src_dir.exists():
-                    logger.info("Restoring %s directory...", name)
-                    try:
-                        # Clear destination contents (not the dir itself - may be Docker mount)
-                        if dest_dir.exists():
-                            for item in dest_dir.iterdir():
-                                try:
-                                    if item.is_dir():
-                                        shutil.rmtree(item)
-                                    else:
-                                        item.unlink()
-                                except OSError as e:
-                                    logger.warning("Could not delete %s: %s", item, e)
-                        else:
-                            dest_dir.mkdir(parents=True, exist_ok=True)
-                        # Copy contents from backup
-                        for item in src_dir.iterdir():
-                            dest_item = dest_dir / item.name
-                            if item.is_dir():
-                                shutil.copytree(item, dest_item)
-                            else:
-                                shutil.copy2(item, dest_item)
-                    except OSError as e:
-                        logger.warning("Could not restore %s directory: %s", name, e)
-                        skipped_dirs.append(name)
-
-            # 7. Reset the encryption singleton so the migration that runs
+            # 8. Reset the encryption singleton so the migration that runs
             # inside init_db() picks up the restored key file (if a new one
             # was written above). Without this reset, _get_fernet would
             # return the cached Fernet instance built from the previous key.
@@ -1184,19 +1454,28 @@ async def restore_backup(
             _enc_mod._key_source = None
             _enc_mod._warn_shown = False
 
-            # 8. Reinitialize the database engine and apply schema migrations so that
+            # 9. Reinitialize the database engine and apply schema migrations so that
             # tables added after the backup was created (e.g. ams_labels) exist
             # immediately, without requiring a manual restart.
             await reinitialize_database()
             await init_db()
 
             logger.info("Restore complete - restart required")
-            message = "Backup restored successfully. Please restart Bambuddy for changes to take effect."
-            if skipped_dirs:
-                message += f" Note: Some directories could not be restored ({', '.join(skipped_dirs)})."
+            parts = ["Backup restored successfully. Please restart Bambuddy for changes to take effect."]
+            if not manifest_present:
+                parts.append(
+                    "Note: this backup has no manifest (written by an older version), "
+                    "so its completeness could not be verified."
+                )
+            if refusal:
+                parts.append(f"WARNING: restored a backup recorded as incomplete (force_partial). {refusal}")
+            if cleanup_note:
+                parts.append(cleanup_note)
             return {
                 "success": True,
-                "message": message,
+                "message": " ".join(parts),
+                "manifest_present": manifest_present,
+                "restored_partial": bool(refusal),
             }
 
         except HTTPException:
@@ -1204,12 +1483,20 @@ async def restore_backup(
             # body (e.g. the key-write OSError → 500). The blanket
             # except Exception below would otherwise swallow them and replace
             # the operator-facing detail with a generic message.
+            # Each raise site rolls back first, so this drained call is a no-op.
+            _rollback_restored_dirs(moved_aside)
             raise
         except Exception as e:
             logger.error("Restore failed: %s", e, exc_info=True)
+            note = _rollback_restored_dirs(moved_aside)
             return JSONResponse(
                 status_code=500,
-                content={"success": False, "message": "Restore failed. Check server logs for details."},
+                content={
+                    "success": False,
+                    "message": " ".join(
+                        part for part in ("Restore failed. Check server logs for details.", note) if part
+                    ),
+                },
             )
 
 

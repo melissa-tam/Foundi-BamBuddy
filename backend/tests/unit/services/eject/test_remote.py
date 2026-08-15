@@ -1,11 +1,13 @@
 """Tests for the shared part-present eject dispatcher (eject.remote)."""
 
 import asyncio
+import logging
 import os
 import tempfile
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -779,3 +781,59 @@ class TestRuntimeWatchdogCancellation:
 
     async def test_cancelling_when_nothing_is_armed_is_a_noop(self):
         await remote.cancel_runtime_watchdog(90022)  # must not raise
+
+
+class TestKillDecisionTelemetry:
+    """The kill line must say WHERE the eject was when it was stopped.
+
+    The 2026-08-14 009-H2S eject ran 106 s against an expected 84 s and was stopped
+    with nothing in the record to attribute the +21 s to the bed-drop or the sweep.
+    The executing G-code line number falls inside exactly one of those phases, so
+    sampling it at the kill instant is what makes the next one diagnosable. Log-only:
+    no assertion here may become a stop condition."""
+
+    @staticmethod
+    def _client(line_number, percent):
+        return SimpleNamespace(state=SimpleNamespace(mc_print_line_number=line_number, progress=percent))
+
+    async def _fire(self, pid: int, caplog, client) -> str:
+        """Drive the fire path with ``client`` as the live session; return the kill line."""
+        from backend.app.services.eject import monitor as monitor_mod
+
+        armed = _armed()
+        remote.register_pending_eject(pid, armed)
+        try:
+            with (
+                patch.object(printer_manager, "get_client", MagicMock(return_value=client)),
+                patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
+                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock),
+                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch"),
+                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+            ):
+                await TestRuntimeWatchdogFires._run(pid, armed, _FakeSleep())
+        finally:
+            remote.pop_pending_eject(pid)
+        return next(r.getMessage() for r in caplog.records if "still running at" in r.getMessage())
+
+    async def test_kill_line_carries_the_line_number_and_percent(self, caplog):
+        message = await self._fire(90030, caplog, self._client(41207, 57.0))
+        assert "gcode line 41207" in message
+        assert "57.0% done" in message
+        # The runtimes it has always carried must survive the added fields.
+        assert "still running at 104s" in message and "expected 83s" in message
+
+    async def test_kill_line_tolerates_a_printer_with_no_live_session(self, caplog):
+        # A disconnected printer is exactly when a stop goes undelivered — the kill
+        # line still has to render rather than blow up inside the watchdog.
+        message = await self._fire(90031, caplog, None)
+        assert "gcode line None" in message and "None% done" in message
+
+    async def test_kill_line_tolerates_firmware_that_never_publishes_the_line_number(self, caplog):
+        # mc_print_line_number is UNVERIFIED on the H2S wire: absent field, not absent
+        # printer. Percent must still land so the breadcrumb is not all-or-nothing.
+        message = await self._fire(90032, caplog, self._client(None, 12.0))
+        assert "gcode line None" in message and "12.0% done" in message
+
+    async def test_telemetry_reader_tolerates_a_stateless_client(self):
+        with patch.object(printer_manager, "get_client", MagicMock(return_value=SimpleNamespace())):
+            assert remote._live_phase_telemetry(90033) == (None, None)

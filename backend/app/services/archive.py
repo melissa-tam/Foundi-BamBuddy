@@ -25,6 +25,13 @@ from backend.app.utils.threemf_tools import extract_nozzle_mapping_from_3mf
 
 logger = logging.getLogger(__name__)
 
+# Deletion guard for the archive estate — see _resolve_archive_dir_for_delete.
+# A per-print archive directory is exactly ``<printer_id|"unassigned">/<archive>``
+# under ``settings.archive_dir``; these first-level names belong to other estates
+# that share the same root and are never an archive's own directory.
+_ARCHIVE_DIR_DEPTH = 2
+_RESERVED_ARCHIVE_SUBDIRS = frozenset({"library", "temp"})
+
 
 def _copy_and_fsync(src: Path, dst: Path, chunk_size: int = 1024 * 1024) -> None:
     """Copy src to dst with an explicit chunked read/write and fsync the dst.
@@ -1736,12 +1743,21 @@ class ArchiveService:
         return True
 
     def _resolve_archive_dir_for_delete(self, archive: PrintArchive) -> Path | None:
-        """Return the on-disk directory that backs *archive*, after the same
-        two safety checks ``delete_archive`` enforces.
+        """Return the on-disk directory that backs *archive*, or ``None`` when
+        nothing may be removed from disk.
 
-        Extracted so soft-delete and hard-delete share the path-resolution
-        rules. Returns ``None`` when nothing should be removed from disk
-        (no file_path, path outside archive_dir, or path not deep enough).
+        The ONE path-resolution rule for every archive deletion lane (soft
+        delete, hard delete, and the unattended purge sweeper behind them).
+        The directory it returns is handed straight to ``shutil.rmtree``, so
+        it must be a per-print archive directory and nothing else:
+        :meth:`_ingest_3mf` is the only writer of ``PrintArchive.file_path``
+        and always lands the file at
+        ``archive_dir/<printer_id|"unassigned">/<timestamp_stem>/<file>``,
+        i.e. the parent is EXACTLY two parts under ``archive_dir``. A mere
+        "deep enough" test is not sufficient because other estates live inside
+        ``archive_dir`` at that same depth — the managed library
+        (``archive/library/files``) holds user uploads that no archive lane may
+        ever delete, and ``archive/temp`` is shared 3MF scratch space.
         """
         if not archive.file_path or not archive.file_path.strip():
             logger.error(
@@ -1763,10 +1779,15 @@ class ArchiveService:
                 f"path {archive_dir} is outside archive directory {settings.archive_dir}"
             )
             return None
-        if len(relative_path.parts) < 1:
-            logger.error(
-                f"SECURITY: Refusing to delete archive {archive.id} - "
-                f"path {archive_dir} is not deep enough inside archive directory"
+
+        parts = relative_path.parts
+        if len(parts) != _ARCHIVE_DIR_DEPTH or parts[0].lower() in _RESERVED_ARCHIVE_SUBDIRS:
+            logger.warning(
+                "SECURITY: Refusing to delete files for archive %s - path %s is not a "
+                "per-print archive directory (expected <printer>/<archive> directly under %s)",
+                archive.id,
+                archive_dir,
+                settings.archive_dir,
             )
             return None
         return archive_dir
@@ -1777,46 +1798,9 @@ class ArchiveService:
         if not archive:
             return False
 
-        # Resolve the directory to delete BEFORE committing the DB change
-        dir_to_delete: Path | None = None
-
-        if archive.file_path and archive.file_path.strip():
-            file_path = settings.base_dir / archive.file_path
-            if file_path.exists():
-                archive_dir = file_path.parent
-
-                # Safety check 1: archive_dir must be inside archive_dir
-                try:
-                    archive_dir.resolve().relative_to(settings.archive_dir.resolve())
-                except ValueError:
-                    logger.error(
-                        f"SECURITY: Refusing to delete archive {archive_id} - "
-                        f"path {archive_dir} is outside archive directory {settings.archive_dir}"
-                    )
-                    await self.db.delete(archive)
-                    await self.db.commit()
-                    return True
-
-                # Safety check 2: archive_dir must be at least 1 level deep inside archive_dir
-                try:
-                    relative_path = archive_dir.resolve().relative_to(settings.archive_dir.resolve())
-                    if len(relative_path.parts) < 1:
-                        logger.error(
-                            f"SECURITY: Refusing to delete archive {archive_id} - "
-                            f"path {archive_dir} is not deep enough inside archive directory"
-                        )
-                        await self.db.delete(archive)
-                        await self.db.commit()
-                        return True
-                except ValueError:
-                    pass  # Already handled above
-
-                dir_to_delete = archive_dir
-        else:
-            logger.error(
-                f"SECURITY: Refusing to delete files for archive {archive_id} - "
-                f"file_path is empty or invalid: '{archive.file_path}'"
-            )
+        # Resolve the directory to delete BEFORE committing the DB change. A
+        # refused resolution vetoes the rmtree only — the row still goes.
+        dir_to_delete = self._resolve_archive_dir_for_delete(archive)
 
         # NULL stale thumbnail_path on linked PrintLogEntries before the FK
         # SET-NULL cascade fires. The on-disk file is about to be removed by

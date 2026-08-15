@@ -1484,6 +1484,57 @@ class TestLibraryPermissions:
         assert response.status_code == 403
 
 
+class TestTransientUploadFlag:
+    """``transient`` is declared by the uploader, at row creation, and nowhere else.
+
+    A row created purely to feed one dispatch (#730 Direct Print) may be reaped by
+    the scheduler after archiving; an ordinary File Manager upload never may. The
+    distinction has to be a fact about the ROW — a request naming an existing id
+    could otherwise aim a background deletion at somebody else's library file — and
+    the only request entitled to state it is the one creating the row.
+    """
+
+    def _valid_3mf_bytes(self) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("Metadata/plate_1.gcode", "; G-code\nG28\n")
+        return buf.getvalue()
+
+    async def _upload(self, async_client: AsyncClient, name: str, params: dict | None = None):
+        files = {"file": (name, self._valid_3mf_bytes(), "application/zip")}
+        return await async_client.post("/api/v1/library/files", files=files, params=params or {})
+
+    async def _row(self, db_session, file_id: int):
+        from backend.app.models.library import LibraryFile
+
+        return await db_session.get(LibraryFile, file_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_upload_with_transient_true_stamps_the_row(self, async_client: AsyncClient, db_session):
+        response = await self._upload(async_client, "direct.gcode.3mf", {"transient": "true"})
+        assert response.status_code == 200
+        row = await self._row(db_session, response.json()["id"])
+        assert row.transient is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_default_upload_is_not_transient(self, async_client: AsyncClient, db_session):
+        """The File Manager lane sends nothing, and its files stay permanent."""
+        response = await self._upload(async_client, "keeper.gcode.3mf")
+        assert response.status_code == 200
+        row = await self._row(db_session, response.json()["id"])
+        assert row.transient is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_explicit_false_is_not_transient(self, async_client: AsyncClient, db_session):
+        response = await self._upload(async_client, "explicit.gcode.3mf", {"transient": "false"})
+        assert response.status_code == 200
+        row = await self._row(db_session, response.json()["id"])
+        assert row.transient is False
+
+
 class TestPrintFileUploadValidation:
     """#1401: pre-flight rejection of unprintable uploads at the library +
     archive routes. Smoke tests the shared ``validate_print_file_upload``

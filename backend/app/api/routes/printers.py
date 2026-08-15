@@ -41,6 +41,7 @@ from backend.app.schemas.printer import (
 )
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
+    cleanup_downloaded_3mf,
     delete_file_async,
     download_file_bytes_async,
     download_file_try_paths_async,
@@ -1066,14 +1067,12 @@ async def get_printer_cover(
     # avoids a second 36MB transfer competing with the printer's single FTP
     # socket (which produces the 425 errors that feed the retry storm).
     downloaded = False
-    using_cached = False
     for candidate_name in possible_filenames:
         cached = get_cached_3mf(printer_id, candidate_name)
         if cached:
             logger.info("Cover using cached 3MF from %s (avoided duplicate FTP)", cached)
             temp_path = cached
             downloaded = True
-            using_cached = True
             break
 
     if not downloaded:
@@ -1116,7 +1115,9 @@ async def get_printer_cover(
                 f"Could not download 3MF file for '{subtask_name}' from printer {printer.ip_address}. Tried: {possible_filenames}",
             )
 
-        # Share the fresh download with the archive flow.
+        # Share the fresh download with the archive flow. Published means the
+        # cache owns it — this request must not delete it on the way out
+        # (doing so left a dangling entry after every fresh cover fetch).
         cache_3mf_download(printer_id, temp_filename, temp_path)
 
     # Verify file actually exists and has content
@@ -1127,90 +1128,80 @@ async def get_printer_cover(
     logger.info("Downloaded file size: %s bytes", file_size)
 
     if file_size == 0:
-        if not using_cached:
-            temp_path.unlink()
         raise HTTPException(500, f"Downloaded file is empty for '{subtask_name}'")
 
+    # Extract thumbnail from 3MF (which is a ZIP file)
     try:
-        # Extract thumbnail from 3MF (which is a ZIP file)
-        try:
-            zf = zipfile.ZipFile(temp_path, "r")
-        except zipfile.BadZipFile:
-            raise HTTPException(500, "Downloaded file is not a valid 3MF/ZIP archive")
-        except OSError as e:
-            logger.error("Failed to open 3MF file: %s", e, exc_info=True)
-            raise HTTPException(500, "Failed to open 3MF file. Check server logs for details.")
+        zf = zipfile.ZipFile(temp_path, "r")
+    except zipfile.BadZipFile:
+        raise HTTPException(500, "Downloaded file is not a valid 3MF/ZIP archive")
+    except OSError as e:
+        logger.error("Failed to open 3MF file: %s", e, exc_info=True)
+        raise HTTPException(500, "Failed to open 3MF file. Check server logs for details.")
 
-        try:
-            # 3MF-scan fallback for plate detection (#1166). Per-plate archives
-            # sliced separately in Bambu Studio contain a single
-            # Metadata/plate_N.gcode for the active plate, even though
-            # thumbnails for all plates are bundled. Using that gcode's plate
-            # number prevents falling back to plate_1.png.
-            if plate_num is None:
-                plate_gcodes = [name for name in zf.namelist() if re.match(r"^Metadata/plate_\d+\.gcode$", name)]
-                if len(plate_gcodes) == 1:
-                    match = re.search(r"plate_(\d+)\.gcode", plate_gcodes[0])
-                    if match:
-                        plate_num = int(match.group(1))
-                        logger.info("Cover: detected plate %s from 3MF contents", plate_num)
-            if plate_num is None:
-                plate_num = 1
+    try:
+        # 3MF-scan fallback for plate detection (#1166). Per-plate archives
+        # sliced separately in Bambu Studio contain a single
+        # Metadata/plate_N.gcode for the active plate, even though
+        # thumbnails for all plates are bundled. Using that gcode's plate
+        # number prevents falling back to plate_1.png.
+        if plate_num is None:
+            plate_gcodes = [name for name in zf.namelist() if re.match(r"^Metadata/plate_\d+\.gcode$", name)]
+            if len(plate_gcodes) == 1:
+                match = re.search(r"plate_(\d+)\.gcode", plate_gcodes[0])
+                if match:
+                    plate_num = int(match.group(1))
+                    logger.info("Cover: detected plate %s from 3MF contents", plate_num)
+        if plate_num is None:
+            plate_num = 1
 
-            # Try common thumbnail paths in 3MF files
-            # Use plate_num to get the correct plate's thumbnail for multi-plate projects
-            # Use top-down view if requested (better for skip objects modal)
-            if view == "top":
-                thumbnail_paths = [
-                    f"Metadata/top_{plate_num}.png",
-                    # Fall back to plate 1 if specific plate not found
-                    "Metadata/top_1.png",
-                    f"Metadata/plate_{plate_num}.png",
-                    "Metadata/plate_1.png",
-                    "Metadata/thumbnail.png",
-                ]
-            else:
-                thumbnail_paths = [
-                    f"Metadata/plate_{plate_num}.png",
-                    # Fall back to plate 1 if specific plate not found
-                    "Metadata/plate_1.png",
-                    "Metadata/thumbnail.png",
-                    f"Metadata/plate_{plate_num}_small.png",
-                    "Metadata/plate_1_small.png",
-                    "Thumbnails/thumbnail.png",
-                    "thumbnail.png",
-                ]
+        # Try common thumbnail paths in 3MF files
+        # Use plate_num to get the correct plate's thumbnail for multi-plate projects
+        # Use top-down view if requested (better for skip objects modal)
+        if view == "top":
+            thumbnail_paths = [
+                f"Metadata/top_{plate_num}.png",
+                # Fall back to plate 1 if specific plate not found
+                "Metadata/top_1.png",
+                f"Metadata/plate_{plate_num}.png",
+                "Metadata/plate_1.png",
+                "Metadata/thumbnail.png",
+            ]
+        else:
+            thumbnail_paths = [
+                f"Metadata/plate_{plate_num}.png",
+                # Fall back to plate 1 if specific plate not found
+                "Metadata/plate_1.png",
+                "Metadata/thumbnail.png",
+                f"Metadata/plate_{plate_num}_small.png",
+                "Metadata/plate_1_small.png",
+                "Thumbnails/thumbnail.png",
+                "thumbnail.png",
+            ]
 
-            for thumb_path in thumbnail_paths:
-                try:
-                    image_data = zf.read(thumb_path)
-                    if printer_id not in _cover_cache:
-                        _cover_cache[printer_id] = {}
-                    _cover_cache[printer_id][(subtask_name, view_key)] = image_data
-                    return Response(content=image_data, media_type="image/png")
-                except KeyError:
-                    continue
+        for thumb_path in thumbnail_paths:
+            try:
+                image_data = zf.read(thumb_path)
+                if printer_id not in _cover_cache:
+                    _cover_cache[printer_id] = {}
+                _cover_cache[printer_id][(subtask_name, view_key)] = image_data
+                return Response(content=image_data, media_type="image/png")
+            except KeyError:
+                continue
 
-            # If no specific thumbnail found, try any PNG in Metadata
-            for name in zf.namelist():
-                if name.startswith("Metadata/") and name.endswith(".png"):
-                    image_data = zf.read(name)
-                    if printer_id not in _cover_cache:
-                        _cover_cache[printer_id] = {}
-                    _cover_cache[printer_id][(subtask_name, view_key)] = image_data
-                    return Response(content=image_data, media_type="image/png")
+        # If no specific thumbnail found, try any PNG in Metadata
+        for name in zf.namelist():
+            if name.startswith("Metadata/") and name.endswith(".png"):
+                image_data = zf.read(name)
+                if printer_id not in _cover_cache:
+                    _cover_cache[printer_id] = {}
+                _cover_cache[printer_id][(subtask_name, view_key)] = image_data
+                return Response(content=image_data, media_type="image/png")
 
-            _cover_404_cache.setdefault(printer_id, set()).add(cache_key)
-            raise HTTPException(404, "No thumbnail found in 3MF file")
-        finally:
-            zf.close()
-
+        _cover_404_cache.setdefault(printer_id, set()).add(cache_key)
+        raise HTTPException(404, "No thumbnail found in 3MF file")
     finally:
-        # Only delete when this invocation owns the file. A cached path is
-        # shared with the archive flow — removing it would force a refetch
-        # the next time either flow needs the 3MF.
-        if not using_cached and temp_path.exists():
-            temp_path.unlink()
+        zf.close()
 
 
 # ============================================
@@ -3495,8 +3486,7 @@ async def get_printable_objects(
             except Exception as e:
                 logger.debug("Failed to reload objects from printer: %s", e)
             finally:
-                if temp_path.exists():
-                    temp_path.unlink()
+                cleanup_downloaded_3mf(temp_path)
 
     # Return objects with their skip status and position data
     objects = []

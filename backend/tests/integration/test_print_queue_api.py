@@ -1048,6 +1048,78 @@ class TestQueueLibraryFileSupport:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_direct_print_lane_lands_both_deletion_conditions(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """The Direct-Print chain, walked over the real routes (#730).
+
+        Deleting the source after dispatch takes TWO independent facts, produced by
+        two different requests: the UPLOAD declares the row transient (what the file
+        IS), and the QUEUE-CREATE sets cleanup_library_after_dispatch (what this
+        dispatch may do). This pins the seam between them — the scheduler's use of
+        the pair is pinned in test_scheduler_cleanup_library.
+        """
+        import io
+        import zipfile
+
+        printer = await printer_factory()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("Metadata/plate_1.gcode", "; G-code\nG28\n")
+        upload = await async_client.post(
+            "/api/v1/library/files",
+            files={"file": ("dropped.gcode.3mf", buf.getvalue(), "application/zip")},
+            params={"transient": "true"},
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["id"]
+
+        response = await async_client.post(
+            "/api/v1/queue/",
+            json={
+                "printer_id": printer.id,
+                "library_file_id": file_id,
+                "cleanup_library_after_dispatch": True,
+            },
+        )
+        assert response.status_code == 200
+
+        from backend.app.models.library import LibraryFile
+        from backend.app.models.print_queue import PrintQueueItem
+
+        item = await db_session.get(PrintQueueItem, response.json()["id"])
+        row = await db_session.get(LibraryFile, file_id)
+        assert item.cleanup_library_after_dispatch is True
+        assert row.transient is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_ordinary_library_upload_cannot_be_reaped_by_a_flagged_item(
+        self, async_client: AsyncClient, printer_factory, library_file_factory, db_session
+    ):
+        """A caller may flag its dispatch, but that never makes someone else's file
+        disposable: the row it names is a plain library entry and stays non-transient,
+        which is the condition the scheduler refuses on."""
+        printer = await printer_factory()
+        lib_file = await library_file_factory()
+
+        response = await async_client.post(
+            "/api/v1/queue/",
+            json={
+                "printer_id": printer.id,
+                "library_file_id": lib_file.id,
+                "cleanup_library_after_dispatch": True,
+            },
+        )
+        assert response.status_code == 200
+
+        from backend.app.models.library import LibraryFile
+
+        row = await db_session.get(LibraryFile, lib_file.id)
+        assert row.transient is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_add_to_queue_library_file_with_options(
         self, async_client: AsyncClient, printer_factory, library_file_factory, db_session
     ):

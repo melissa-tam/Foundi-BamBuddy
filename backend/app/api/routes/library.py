@@ -64,6 +64,7 @@ from backend.app.schemas.library import (
 )
 from backend.app.schemas.slicer import SliceRequest, SliceResponse
 from backend.app.services.archive import ThreeMFParser
+from backend.app.services.library_trash import library_trash_service
 from backend.app.services.plate_thumbnail import inject_plate_thumbnails_if_missing
 from backend.app.services.stl_thumbnail import MIN_USABLE_STL_BYTES, generate_stl_thumbnail
 from backend.app.utils.filename import InvalidFilenameError, validate_print_filename
@@ -1215,7 +1216,12 @@ async def delete_folder(
     db: AsyncSession = Depends(get_db),
     _: User | None = Depends(require_permission_if_auth_enabled(Permission.LIBRARY_DELETE_ALL)),
 ):
-    """Delete a folder and all its contents (cascade).
+    """Delete a folder and move its contents to the trash.
+
+    Managed member files (this folder and every subfolder) go through the same
+    trash lane as a single-file delete: the row keeps its bytes and stays
+    restorable until the retention sweeper collects it. External members keep
+    their semantics — their bytes are never touched.
 
     Note: Folders require library:delete_all permission since they don't have
     ownership tracking.
@@ -1226,43 +1232,7 @@ async def delete_folder(
     if not folder:
         raise HTTPException(status_code=404, detail="Folder not found")
 
-    # External folders: only remove DB records, never delete files from external path
-    is_ext = folder.is_external
-
-    # Get all files in this folder and subfolders to delete from disk
-    async def get_all_file_ids(fid: int) -> list[int]:
-        """Recursively get all file IDs in a folder tree."""
-        file_ids = []
-
-        # Get files in this folder
-        files_result = await db.execute(
-            select(LibraryFile.id, LibraryFile.file_path, LibraryFile.thumbnail_path, LibraryFile.is_external).where(
-                LibraryFile.folder_id == fid
-            )
-        )
-        for fid_val, file_path, thumb_path, file_is_ext in files_result.all():
-            file_ids.append(fid_val)
-            # Only delete non-external files from disk
-            if not is_ext and not file_is_ext:
-                try:
-                    if file_path and os.path.exists(file_path):
-                        os.remove(file_path)
-                    if thumb_path and os.path.exists(thumb_path):
-                        os.remove(thumb_path)
-                except OSError as e:
-                    logger.warning("Failed to delete file: %s", e)
-
-        # Get child folders and recurse
-        children_result = await db.execute(select(LibraryFolder.id).where(LibraryFolder.parent_id == fid))
-        for (child_id,) in children_result.all():
-            file_ids.extend(await get_all_file_ids(child_id))
-
-        return file_ids
-
-    await get_all_file_ids(folder_id)
-
-    # Delete folder (cascade will handle files and subfolders)
-    await db.delete(folder)
+    await library_trash_service.trash_folder_tree(db, folder)
     await db.commit()
 
     return {"status": "success", "message": "Folder deleted"}
@@ -1936,10 +1906,21 @@ async def upload_file(
     file: UploadFile = File(...),
     folder_id: int | None = None,
     generate_stl_thumbnails: bool = Query(default=True),
+    transient: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     current_user: User | None = Depends(require_permission_if_auth_enabled(Permission.LIBRARY_UPLOAD)),
 ):
-    """Upload a file to the library."""
+    """Upload a file to the library.
+
+    ``transient`` marks the created row as a throwaway upload made purely to feed
+    one dispatch (#730 Direct Print), which the print scheduler may delete once the
+    archive owns its own copy of the 3MF. It is safe as an inbound field ONLY here,
+    at row creation: a client is describing the row it is creating in this very
+    request, never making a claim about a file somebody else uploaded. Defaults
+    False, so an ordinary File Manager upload is permanent — and the scheduler
+    additionally requires the queue item's own cleanup flag, so this alone never
+    deletes anything.
+    """
     try:
         if not file.filename:
             raise HTTPException(status_code=400, detail="Filename is required")
@@ -2078,6 +2059,7 @@ async def upload_file(
             thumbnail_path=to_relative_path(thumbnail_path) if thumbnail_path else None,
             file_metadata=_without_print_name(metadata) if metadata else None,
             created_by_id=current_user.id if current_user else None,
+            transient=transient,
         )
         db.add(library_file)
         await db.commit()
@@ -4336,22 +4318,11 @@ async def delete_file(
         if file.created_by_id != user.id:
             raise HTTPException(status_code=403, detail="You can only delete your own files")
 
-    if file.is_external:
-        # External files bypass the trash — just drop the DB row + our thumbnail.
-        abs_thumb_path = to_absolute_path(file.thumbnail_path)
-        if abs_thumb_path and abs_thumb_path.exists():
-            try:
-                abs_thumb_path.unlink()
-            except OSError as e:
-                logger.warning("Failed to delete thumbnail from disk: %s", e)
-        await db.delete(file)
-        await db.commit()
-        return {"status": "success", "message": "File deleted", "trashed": False}
-
-    # Managed file: soft-delete. Sweeper removes bytes + thumbnail after retention.
-    file.deleted_at = datetime.now(timezone.utc)
+    trashed = await library_trash_service.trash_file(db, file)
     await db.commit()
-    return {"status": "success", "message": "File moved to trash", "trashed": True}
+    if trashed:
+        return {"status": "success", "message": "File moved to trash", "trashed": True}
+    return {"status": "success", "message": "File deleted", "trashed": False}
 
 
 # ============ File Content Endpoints ============
@@ -4661,19 +4632,11 @@ async def bulk_delete(
             skipped_files += 1
             continue
 
-        if file.is_external:
-            abs_thumb_path = to_absolute_path(file.thumbnail_path)
-            if abs_thumb_path and abs_thumb_path.exists():
-                try:
-                    abs_thumb_path.unlink()
-                except OSError as e:
-                    logger.warning("Failed to delete thumbnail from disk: %s", e)
-            await db.delete(file)
-        else:
-            file.deleted_at = now
+        await library_trash_service.trash_file(db, file, now=now)
         deleted_files += 1
 
-    # Delete folders (cascade will handle contents)
+    # Delete folders. Members take the same trash lane as a folder delete, so
+    # the cascade can never hard-delete a managed upload.
     # Note: Folders don't have ownership tracking currently, require *_all permission
     for folder_id in data.folder_ids:
         if not can_modify_all:
@@ -4683,15 +4646,7 @@ async def bulk_delete(
         result = await db.execute(select(LibraryFolder).where(LibraryFolder.id == folder_id))
         folder = result.scalar_one_or_none()
         if folder:
-            # Count files that will be deleted
-            file_count_result = await db.execute(
-                select(func.count(LibraryFile.id)).where(
-                    LibraryFile.folder_id == folder_id,
-                    LibraryFile.deleted_at.is_(None),
-                )
-            )
-            deleted_files += file_count_result.scalar() or 0
-            await db.delete(folder)
+            deleted_files += await library_trash_service.trash_folder_tree(db, folder)
             deleted_folders += 1
 
     await db.commit()

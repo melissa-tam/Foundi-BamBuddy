@@ -548,16 +548,30 @@ async def recent_terminal_farm_items(db: AsyncSession, printer_id: int, limit: i
 
     "Farm" = the item belongs to a batch with a ``sku_file_id``. Ordered
     most-recent-first by ``completed_at``.
+
+    The window STARTS at the printer's ``quarantine_cleared_at`` when one is set:
+    the failure streak is derived from queue history, not from a counter, so
+    without that cutoff the very history that tripped a quarantine survives the
+    operator clearing it and the next single failure re-trips "N consecutive"
+    instantly (2026-08-14: "Recover & resume" re-quarantined within seconds, over
+    and over). Clearing a quarantine means "an operator inspected this printer;
+    count fresh", so pre-recovery outcomes are outside the window by definition.
+    NULL — never recovered — counts the whole history, which is the pre-migration
+    behaviour. This is the ONE place the streak window is defined; every consumer
+    reads it from here.
     """
-    result = await db.execute(
+    printer = await db.get(Printer, printer_id)
+    cleared_at = printer.quarantine_cleared_at if printer is not None else None
+    stmt = (
         select(PrintQueueItem)
         .join(PrintBatch, PrintQueueItem.batch_id == PrintBatch.id)
         .where(PrintQueueItem.printer_id == printer_id)
         .where(PrintBatch.sku_file_id.is_not(None))
         .where(PrintQueueItem.status.in_(_TERMINAL_RUN_OUTCOMES))
-        .order_by(PrintQueueItem.completed_at.desc())
-        .limit(limit)
     )
+    if cleared_at is not None:
+        stmt = stmt.where(PrintQueueItem.completed_at > cleared_at)
+    result = await db.execute(stmt.order_by(PrintQueueItem.completed_at.desc()).limit(limit))
     return list(result.scalars().all())
 
 
@@ -603,12 +617,23 @@ async def maybe_quarantine_printer(db: AsyncSession, batch: PrintBatch, item: Pr
 
 
 async def clear_quarantine(db: AsyncSession, printer_id: int) -> Printer:
-    """Clear a printer's quarantine flag + reason (route helper). 404 if missing."""
+    """Clear a printer's quarantine flag + reason (route helper). 404 if missing.
+
+    Also stamps ``quarantine_cleared_at``, which moves the start of the
+    consecutive-failure window (see :func:`recent_terminal_farm_items`) — the
+    clear and the streak reset are ONE act, so they are one write. This is the
+    single quarantine-clearing mutator, shared by the route and by
+    :func:`recover_printer`, so both get the reset. Stamped even when the printer
+    was not actually quarantined: the operator still asserted they inspected it,
+    and an idempotent repeat only moves the window forward over history that is
+    already outside it.
+    """
     printer = await db.get(Printer, printer_id)
     if printer is None:
         raise HTTPException(status_code=404, detail="Printer not found")
     printer.quarantined = False
     printer.quarantine_reason = None
+    printer.quarantine_cleared_at = datetime.now(timezone.utc)
     await db.commit()
     printer_manager.set_quarantined(printer_id, False)
     logger.info("farm_policy: quarantine cleared for printer %s", printer_id)

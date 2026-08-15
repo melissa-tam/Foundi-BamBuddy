@@ -1,3 +1,4 @@
+import json
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +26,10 @@ async def queue_factory(tmp_path):
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     case_counter = 0
 
-    async def make_case(*, cleanup=True, is_external=False, thumbnail_path=None):
+    # ``transient`` defaults True because every case here models the #730
+    # Direct-Print lane, whose upload IS a transient row. It is the ROW's truth that
+    # authorises the post-dispatch delete; ``cleanup`` is only the dispatch's intent.
+    async def make_case(*, cleanup=True, transient=True, is_external=False, thumbnail_path=None):
         nonlocal case_counter
         case_counter += 1
 
@@ -68,6 +72,7 @@ async def queue_factory(tmp_path):
                 thumbnail_path=thumbnail_db_path,
                 file_metadata=None,
                 is_external=is_external,
+                transient=transient,
             )
             db.add_all([printer, library_file])
             await db.flush()
@@ -99,6 +104,7 @@ async def queue_factory(tmp_path):
                 archive_path=None,
                 upload=AsyncMock(return_value=True),
                 start_print=MagicMock(return_value=True),
+                cache_3mf=MagicMock(),
             )
 
     try:
@@ -153,7 +159,7 @@ async def _dispatch_library_item(ctx, *, archive_failure=False, unlink_side_effe
         ),
         patch("backend.app.services.print_scheduler.delete_file_async", AsyncMock(return_value=True)),
         patch("backend.app.services.print_scheduler.upload_file_async", ctx.upload),
-        patch("backend.app.services.print_scheduler.cache_3mf_download", MagicMock()),
+        patch("backend.app.services.print_scheduler.cache_3mf_download", ctx.cache_3mf),
         patch("backend.app.services.print_scheduler.spawn_background_task", MagicMock()),
         patch("backend.app.services.notification_service.notification_service.on_queue_job_started", AsyncMock()),
         patch("backend.app.services.notification_service.notification_service.on_queue_job_failed", AsyncMock()),
@@ -321,3 +327,101 @@ async def test_oserror_during_unlink_logs_orphan_path_and_does_not_crash_dispatc
     assert "TRANSIENT_LIBRARY_FILE_ORPHAN" in caplog.text
     assert str(ctx.source_path) in caplog.text
     assert "permission denied" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cleanup_flag_alone_cannot_delete_a_non_transient_library_row(queue_factory, caplog):
+    """The request field states INTENT; the row states whether it may be reaped.
+
+    ``cleanup_library_after_dispatch`` arrives on the create-queue-item request, so
+    on its own it aimed a background deletion at any library row an API caller cared
+    to name — including a file a human deliberately added. A row that was not
+    created as a transient Direct-Print upload must survive its own dispatch, file
+    and DB row alike, and the refusal must be audible rather than silent.
+    """
+    ctx = await queue_factory(cleanup=True, transient=False, thumbnail_path="relative")
+
+    with caplog.at_level("WARNING", logger="backend.app.services.print_scheduler"):
+        await _dispatch_library_item(ctx)
+
+    item, library_file, archive = await _queue_snapshot(ctx)
+    # The print still goes ahead — refusing the deletion is not refusing the job.
+    assert item.status == "printing"
+    assert item.archive_id == archive.id
+    # The row and both of its files are untouched.
+    assert item.library_file_id == ctx.library_file_id
+    assert library_file is not None
+    assert ctx.source_path.exists()
+    assert ctx.thumbnail_path.exists()
+    assert "refusing cleanup_library_after_dispatch" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_transient_row_still_cleans_up_end_to_end(queue_factory):
+    """The Direct-Print lane's own upload is still reaped — row truth PLUS intent."""
+    ctx = await queue_factory(cleanup=True, transient=True)
+
+    await _dispatch_library_item(ctx)
+
+    item, library_file, _archive = await _queue_snapshot(ctx)
+    assert item.status == "printing"
+    assert item.library_file_id is None
+    assert library_file is None
+    assert not ctx.source_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_transient_row_without_the_dispatch_flag_survives(queue_factory):
+    """Transience alone does not reap: a dispatch that never asked keeps its source."""
+    ctx = await queue_factory(cleanup=False, transient=True)
+
+    await _dispatch_library_item(ctx)
+
+    item, library_file, _archive = await _queue_snapshot(ctx)
+    assert item.status == "printing"
+    assert item.library_file_id == ctx.library_file_id
+    assert library_file is not None
+    assert ctx.source_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_cover_cache_receives_the_durable_path_not_the_injected_temp(queue_factory, tmp_path):
+    """#1166 cover reuse must be handed a path that still exists after dispatch.
+
+    With ``gcode_injection`` on, the upload source is rebound to an injected
+    system-temp 3MF which is unlinked the moment the upload finishes. Caching THAT
+    published an already-deleted path, so every injected dispatch silently defeated
+    the FTP-free cover it was supposed to enable. The cache must get the durable
+    copy — here the archive copy, since this case also reaps its transient source.
+    """
+    ctx = await queue_factory(cleanup=True, transient=True)
+
+    injected_path = tmp_path / "injected-dispatch.3mf"
+    injected_path.write_bytes(b"injected 3mf")
+
+    async with ctx.session_maker() as db:
+        item = await db.get(PrintQueueItem, ctx.queue_item_id)
+        item.gcode_injection = True
+        await db.commit()
+
+    snippets = json.dumps({"X1C": {"start_gcode": "M117 hello", "end_gcode": "M117 bye"}})
+    with (
+        patch.object(PrintScheduler, "_get_setting", AsyncMock(return_value=snippets)),
+        patch(
+            "backend.app.utils.threemf_tools.inject_gcode_into_3mf",
+            MagicMock(return_value=injected_path),
+        ),
+    ):
+        await _dispatch_library_item(ctx)
+
+    item, _library_file, _archive = await _queue_snapshot(ctx)
+    assert item.status == "printing"
+    # The injected file really was the upload source, and really was cleaned up —
+    # otherwise this test would pass for the wrong reason.
+    assert ctx.upload.await_args.args[2] == injected_path
+    assert not injected_path.exists()
+
+    cached_path = ctx.cache_3mf.call_args.args[2]
+    assert cached_path != injected_path
+    assert cached_path == ctx.archive_path
+    assert cached_path.exists()

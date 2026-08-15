@@ -611,6 +611,9 @@ class TestPrintersAPI:
 
         assert response.status_code == 200
         assert response.content == b"PLATE_4_PNG"
+        # A cache-served 3MF is borrowed, not this request's to delete: the
+        # dispatch deposit for a farm print is the LIBRARY file's own path.
+        assert threemf_path.exists(), "a cover served from the cache must not delete the cached file"
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -654,6 +657,76 @@ class TestPrintersAPI:
 
         assert response.status_code == 200
         assert response.content == b"PLATE_3_PNG"
+        assert threemf_path.exists(), "a cover served from the cache must not delete the cached file"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_cover_fresh_download_stays_published_for_reuse(
+        self, async_client: AsyncClient, printer_factory, db_session, tmp_path, monkeypatch
+    ):
+        """A fresh cover download is PUBLISHED to the shared 3MF cache (#972), so
+        the cache owns it and this request must not unlink it on the way out.
+
+        Pre-fix the finally block deleted it unconditionally, leaving a dangling
+        cache entry after every fresh cover fetch — the archive flow and the next
+        cover request both re-downloaded the same file over the printer's single
+        FTP socket, which is the contention #972 exists to remove.
+        """
+        import io
+        import zipfile
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from backend.app.api.routes.printers import clear_cover_cache
+        from backend.app.core import config as _config
+        from backend.app.services.bambu_ftp import clear_3mf_cache, get_cached_3mf
+        from backend.app.services.bambu_mqtt import PrinterState
+
+        monkeypatch.setattr(_config.settings, "archive_dir", tmp_path / "archive")
+        printer = await printer_factory()
+        clear_3mf_cache(printer.id, delete_files=False)
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("Metadata/plate_1.png", b"FRESH_PLATE_1_PNG")
+            zf.writestr("Metadata/plate_1.gcode", "; plate 1 gcode\n")
+        payload = buf.getvalue()
+
+        async def _fake_download(_ip, _access_code, _remote_paths, local_path, **_kwargs):
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(payload)
+            return True
+
+        downloader = AsyncMock(side_effect=_fake_download)
+
+        state = PrinterState()
+        state.connected = True
+        state.state = "RUNNING"
+        state.subtask_name = "FreshModel"
+        state.gcode_file = "FreshModel.3mf"
+
+        try:
+            with (
+                patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+                patch("backend.app.api.routes.printers.download_file_try_paths_async", downloader),
+            ):
+                mock_pm.get_status = MagicMock(return_value=state)
+                mock_pm.is_awaiting_plate_clear = MagicMock(return_value=False)
+
+                first = await async_client.get(f"/api/v1/printers/{printer.id}/cover")
+                # The image memo would hide the deposit's reuse — drop it exactly
+                # as a print start does; the 3MF deposit legitimately survives that.
+                clear_cover_cache(printer.id)
+                second = await async_client.get(f"/api/v1/printers/{printer.id}/cover")
+
+            assert first.status_code == 200
+            assert first.content == b"FRESH_PLATE_1_PNG"
+            deposit = get_cached_3mf(printer.id, "FreshModel.gcode.3mf")
+            assert deposit is not None and deposit.exists(), "the published deposit must survive the request"
+            assert second.status_code == 200
+            assert second.content == b"FRESH_PLATE_1_PNG"
+            assert downloader.await_count == 1, "the second cover must be served from the deposit, not FTP"
+        finally:
+            clear_3mf_cache(printer.id)
 
     @pytest.mark.asyncio
     @pytest.mark.integration

@@ -29,6 +29,9 @@ describe('waitingReasonText', () => {
     );
     expect(waitingReasonText('filament_short', t)).toBe('productionRuns.detail.waiting.filamentShort');
     expect(waitingReasonText('no_usb_drive', t)).toBe('productionRuns.detail.waiting.no_usb_drive');
+    expect(waitingReasonText('library_file_missing', t)).toBe(
+      'productionRuns.detail.waiting.libraryFileMissing',
+    );
     expect(waitingReasonText('stagger_hold', t)).toBe('productionRuns.detail.waiting.staggerHold');
     expect(waitingReasonText('spool_jam_recovering', t)).toBe(
       'productionRuns.detail.waiting.spoolJamRecovering',

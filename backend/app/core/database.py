@@ -4497,6 +4497,43 @@ async def run_migrations(conn):
         async with conn.begin_nested():
             await conn.execute(text("DELETE FROM settings WHERE key = 'auto_add_untagged'"))
 
+    # Migration (2026-08-14, the deleted-library-file fleet quarantine): when an
+    # operator last cleared a quarantine on this printer.
+    #
+    # The consecutive-failure streak is DERIVED from queue history rather than kept in
+    # a counter (3NF), so clearing the quarantine flag left the tripping history in
+    # place and the very next failure re-derived "N consecutive" — "Recover & resume"
+    # re-quarantined the printer within seconds, every time. Recovery means "an
+    # operator inspected this printer; count fresh", which needs a durable boundary the
+    # streak query can start from. NULL — the pre-migration value, and the value on a
+    # printer never recovered — counts the whole history exactly as before.
+    #
+    # Idempotent ADD COLUMN (_safe_execute swallows "duplicate column name" /
+    # "already exists"). TIMESTAMP NULL is the dialect-safe spelling on SQLite and
+    # PostgreSQL alike, matching every other nullable stamp added in this function.
+    await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN quarantine_cleared_at TIMESTAMP NULL")
+
+    # Migration (2026-08-14): mark a library row as a TRANSIENT upload — one the
+    # Direct-Print lane created purely to feed a dispatch, which may be reaped once
+    # the archive owns its own copy.
+    #
+    # Post-dispatch deletion used to be authorised by ``cleanup_library_after_dispatch``
+    # on the queue item, a raw client request field: any API caller could point it at a
+    # pre-existing user library row and have a background flow delete a file nobody
+    # asked to delete. Transience is a property of the ROW's origin, not a claim a
+    # request may make about someone else's file, so the scheduler now requires this
+    # column and treats the queue-item flag as intent only.
+    #
+    # DEFAULT 0 is what makes the migration safe: every existing row — all of them
+    # user-owned library entries — becomes non-transient, i.e. undeletable by that
+    # path. Idempotent ADD COLUMN; ``BOOLEAN DEFAULT 0`` on SQLite, ``DEFAULT false``
+    # on PostgreSQL (which has no implicit int→bool cast), following the dialect split
+    # this function already uses for every boolean column.
+    if is_sqlite():
+        await _safe_execute(conn, "ALTER TABLE library_files ADD COLUMN transient BOOLEAN DEFAULT 0")
+    else:
+        await _safe_execute(conn, "ALTER TABLE library_files ADD COLUMN transient BOOLEAN DEFAULT FALSE")
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),

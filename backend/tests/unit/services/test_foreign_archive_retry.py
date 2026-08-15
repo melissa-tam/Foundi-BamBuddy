@@ -16,6 +16,7 @@ charges filament again.
 """
 
 import zipfile
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,22 +37,33 @@ LIVE_SUBTASK = "Bracket v4"
 LIVE_FILE = "Bracket v4.gcode.3mf"
 
 
-def _three_mf_bytes(tmp_path: Path, grams: float = 50.0, seconds: int = 1800) -> bytes:
-    """A single-plate 3MF carrying both readers' shapes: plate metadata for the
-    archive parse (ThreeMFParser) and a filament entry for the usage extractor.
-    The archive row and the charge come off the same captured file, so a fixture
-    that satisfies only one of them would prove nothing.
+def _three_mf_bytes(tmp_path: Path, grams: float = 50.0, seconds: int = 1800, plates: tuple[int, ...] = (1,)) -> bytes:
+    """A 3MF carrying both readers' shapes: plate metadata for the archive parse
+    (ThreeMFParser) and a filament entry for the usage extractor. The archive row
+    and the charge come off the same captured file, so a fixture that satisfies
+    only one of them would prove nothing.
+
+    ``plates`` names the plate indices to emit; the plate-mismatch check reads the
+    FIRST one, which is what makes a multi-plate project file look "wrong" to a
+    printer that is running a later plate (#1204).
     """
+    plate_blocks = []
+    for index in plates:
+        plate_blocks.extend(
+            [
+                "  <plate>",
+                f'    <metadata key="index" value="{index}"/>',
+                f'    <metadata key="prediction" value="{seconds}"/>',
+                f'    <metadata key="weight" value="{grams}"/>',
+                f'    <filament id="1" used_g="{grams}" type="PLA" color="#FF0000"/>',
+                "  </plate>",
+            ]
+        )
     slice_info = "\n".join(
         [
             '<?xml version="1.0" encoding="UTF-8"?>',
             "<config>",
-            "  <plate>",
-            '    <metadata key="index" value="1"/>',
-            f'    <metadata key="prediction" value="{seconds}"/>',
-            f'    <metadata key="weight" value="{grams}"/>',
-            f'    <filament id="1" used_g="{grams}" type="PLA" color="#FF0000"/>',
-            "  </plate>",
+            *plate_blocks,
             "</config>",
         ]
     )
@@ -219,7 +231,7 @@ async def test_foreign_start_miss_arms_the_capture_retry():
 
     spawned: list[str | None] = []
     patches, session = _start_harness(_farm_printer(), [], spawned=spawned)
-    miss = ThreeMFLookup(temp_path=None, filename=None, subtask_name=DEGENERATE_SUBTASK, expected_plate=1)
+    miss = ThreeMFLookup(local_path=None, filename=None, subtask_name=DEGENERATE_SUBTASK, expected_plate=1)
 
     with patch("backend.app.main.locate_3mf_for_print", new=AsyncMock(return_value=miss)):
         for p in patches:
@@ -256,7 +268,7 @@ async def test_farm_print_start_miss_does_not_arm_the_retry():
 
     spawned: list[str | None] = []
     patches, _session = _start_harness(_farm_printer(), [farm_item], spawned=spawned)
-    miss = ThreeMFLookup(temp_path=None, filename=None, subtask_name="SKU007.01", expected_plate=1)
+    miss = ThreeMFLookup(local_path=None, filename=None, subtask_name="SKU007.01", expected_plate=1)
 
     with patch("backend.app.main.locate_3mf_for_print", new=AsyncMock(return_value=miss)):
         for p in patches:
@@ -284,7 +296,7 @@ async def test_successful_start_capture_does_not_arm_the_retry(tmp_path):
 
     source = tmp_path / "Bracket v4.gcode.3mf"
     source.write_bytes(_three_mf_bytes(tmp_path))
-    hit = ThreeMFLookup(temp_path=source, filename=LIVE_FILE, subtask_name=LIVE_SUBTASK, expected_plate=1)
+    hit = ThreeMFLookup(local_path=source, filename=LIVE_FILE, subtask_name=LIVE_SUBTASK, expected_plate=1)
 
     spawned: list[str | None] = []
     patches, _session = _start_harness(_farm_printer(), [], spawned=spawned)
@@ -496,3 +508,79 @@ async def test_captured_foreign_print_charges_filament_again(db_session, printer
     assert charged > 0, "a captured foreign print must charge filament"
     assert charged == pytest.approx(42.0, abs=0.1)
     assert spool.weight_used == pytest.approx(42.0, abs=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Cache-hit lane: a donor served from the shared download cache is BORROWED
+# ---------------------------------------------------------------------------
+# The cache also holds durable paths — dispatch publishes the library file's own
+# path so /cover can skip FTP (#1166). The plate-mismatch branch used to unlink
+# whatever the cache handed it, which in production deleted a library file.
+
+
+@contextmanager
+def _mismatch_lane(cached: Path, available: dict[str, bytes]):
+    """locate_3mf_for_print with the cache serving ``cached`` and FTPS serving
+    ``available`` — the shape that drives the #1204 plate-mismatch correction."""
+    with ExitStack() as stack:
+        for p in (
+            patch.object(foreign_archive, "get_cached_3mf", MagicMock(return_value=cached)),
+            patch.object(foreign_archive, "cache_3mf_download", MagicMock()),
+            patch.object(foreign_archive, "get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0.0, 5.0))),
+            patch.object(foreign_archive, "download_file_async", _ftp_lane(available)),
+            patch.object(foreign_archive, "list_files_async", AsyncMock(return_value=[])),
+        ):
+            stack.enter_context(p)
+        yield
+
+
+def _library_donor(tmp_path: Path) -> tuple[Path, bytes]:
+    """A multi-plate library file the cache serves for a print running plate 3."""
+    payload = _three_mf_bytes(tmp_path, plates=(1, 3))
+    library_file = tmp_path / "library_files" / "abcd.3mf"
+    library_file.parent.mkdir(parents=True, exist_ok=True)
+    library_file.write_bytes(payload)
+    return library_file, payload
+
+
+MISMATCH_SUBTASK = "Bracket v4 - Plate 1"  # stale echo: the printer is on plate 3
+MISMATCH_FILE = "Metadata/plate_3.gcode"
+CORRECTED_FILE = "Bracket v4 - Plate 3.gcode.3mf"
+
+
+@pytest.mark.asyncio
+async def test_plate_mismatch_keeps_the_borrowed_library_file_when_the_retry_succeeds(tmp_path, monkeypatch):
+    """The cache hit is somebody else's file — replacing it must not delete it."""
+    from backend.app.core.config import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "archive_dir", tmp_path / "archives")
+    library_file, payload = _library_donor(tmp_path)
+    printer = SimpleNamespace(id=3, ip_address="10.0.0.3", access_code="12345678", model="H2S")
+
+    with _mismatch_lane(library_file, {f"/cache/{CORRECTED_FILE}": _three_mf_bytes(tmp_path, plates=(3,))}):
+        lookup = await foreign_archive.locate_3mf_for_print(printer, MISMATCH_SUBTASK, MISMATCH_FILE)
+
+    assert lookup.filename == CORRECTED_FILE, "the corrected re-download is what the caller archives"
+    assert lookup.local_path is not None and lookup.local_path != library_file
+    assert library_file.exists(), "the borrowed library file must survive the plate-mismatch swap"
+    assert library_file.read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_plate_mismatch_keeps_the_borrowed_library_file_when_the_retry_fails(tmp_path, monkeypatch):
+    """Same file, and the fallback branch that gives up on the correction —
+    the one that unlinked a production library file."""
+    from backend.app.core.config import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "archive_dir", tmp_path / "archives")
+    library_file, payload = _library_donor(tmp_path)
+    printer = SimpleNamespace(id=3, ip_address="10.0.0.3", access_code="12345678", model="H2S")
+
+    with _mismatch_lane(library_file, {}):
+        lookup = await foreign_archive.locate_3mf_for_print(printer, MISMATCH_SUBTASK, MISMATCH_FILE)
+
+    assert lookup.found is False, "no correct plate available → the caller falls back to a no-3MF archive"
+    assert lookup.local_path is None
+    assert lookup.subtask_name == "Bracket v4 - Plate 3", "the fallback archive is named for the right plate"
+    assert library_file.exists(), "the borrowed library file must survive the give-up branch"
+    assert library_file.read_bytes() == payload

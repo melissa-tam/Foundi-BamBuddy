@@ -340,7 +340,101 @@ class TestQuarantine:
         cleared = await farm_policy.clear_quarantine(db_session, printer.id)
         assert cleared.quarantined is False
         assert cleared.quarantine_reason is None
+        assert cleared.quarantine_cleared_at is not None
         assert printer_manager.is_quarantined(printer.id) is False
+
+    async def _fail_at(self, db, batch, prof, printer, when, position):
+        it = PrintQueueItem(
+            batch_id=batch.id,
+            printer_id=printer.id,
+            status="failed",
+            eject_profile_id=prof.id,
+            plate_id=1,
+            position=position,
+            completed_at=when,
+        )
+        db.add(it)
+        await db.commit()
+        return it
+
+    async def test_recovery_resets_the_streak_so_one_failure_does_not_requarantine(self, db_session):
+        """The 2026-08-14 fleet self-quarantine: recover must mean "count fresh".
+
+        The streak is DERIVED from queue history, so clearing the quarantine flag
+        alone left the two failures that tripped it sitting right there — the next
+        single failure re-derived "2 consecutive" and re-quarantined the printer
+        seconds after the operator clicked Recover, over and over.
+        """
+        batch, prof = await _mk_run(db_session, quantity=9, printer_ids=[0], require_fa=False, escalate=2)
+        printer = await self._mk_printer(db_session, "REC")
+        base = datetime.now(timezone.utc) - timedelta(minutes=30)
+
+        await self._fail_at(db_session, batch, prof, printer, base, 800)
+        second = await self._fail_at(db_session, batch, prof, printer, base + timedelta(minutes=1), 801)
+        assert await farm_policy.maybe_quarantine_printer(db_session, batch, second) is True
+
+        await farm_policy.clear_quarantine(db_session, printer.id)
+        await db_session.refresh(printer)
+        assert printer.quarantined is False
+
+        # ONE post-recovery failure: the pre-recovery pair is outside the window now,
+        # so a streak of 1 cannot reach the threshold of 2.
+        after_1 = await self._fail_at(db_session, batch, prof, printer, datetime.now(timezone.utc), 802)
+        assert await farm_policy.maybe_quarantine_printer(db_session, batch, after_1) is False
+        await db_session.refresh(printer)
+        assert printer.quarantined is False
+
+        # TWO post-recovery failures still quarantine — the policy is intact, it just
+        # counts from the recovery boundary.
+        after_2 = await self._fail_at(
+            db_session, batch, prof, printer, datetime.now(timezone.utc) + timedelta(seconds=1), 803
+        )
+        assert await farm_policy.maybe_quarantine_printer(db_session, batch, after_2) is True
+        await db_session.refresh(printer)
+        assert printer.quarantined is True
+        printer_manager.set_quarantined(printer.id, False)
+
+    async def test_streak_window_starts_at_the_recovery_stamp(self, db_session):
+        """The window itself — one origin, so every consumer sees the same history."""
+        batch, prof = await _mk_run(db_session, quantity=9, printer_ids=[0], require_fa=False, escalate=2)
+        printer = await self._mk_printer(db_session, "WIN")
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        await self._fail_at(db_session, batch, prof, printer, old, 810)
+        await self._fail_at(db_session, batch, prof, printer, old + timedelta(minutes=1), 811)
+        assert len(await farm_policy.recent_terminal_farm_items(db_session, printer.id, 5)) == 2
+
+        await farm_policy.clear_quarantine(db_session, printer.id)
+        assert await farm_policy.recent_terminal_farm_items(db_session, printer.id, 5) == []
+
+        await self._fail_at(db_session, batch, prof, printer, datetime.now(timezone.utc), 812)
+        fresh = await farm_policy.recent_terminal_farm_items(db_session, printer.id, 5)
+        assert [r.position for r in fresh] == [812]
+
+    async def test_success_after_recovery_still_resets_the_streak(self, db_session):
+        """Unchanged policy: a completed print breaks the run of failures."""
+        batch, prof = await _mk_run(db_session, quantity=9, printer_ids=[0], require_fa=False, escalate=2)
+        printer = await self._mk_printer(db_session, "SUC")
+        await farm_policy.clear_quarantine(db_session, printer.id)
+
+        base = datetime.now(timezone.utc)
+        await self._fail_at(db_session, batch, prof, printer, base, 820)
+        db_session.add(
+            PrintQueueItem(
+                batch_id=batch.id,
+                printer_id=printer.id,
+                status="completed",
+                eject_profile_id=prof.id,
+                plate_id=1,
+                position=821,
+                completed_at=base + timedelta(minutes=1),
+            )
+        )
+        await db_session.commit()
+        last = await self._fail_at(db_session, batch, prof, printer, base + timedelta(minutes=2), 822)
+
+        assert await farm_policy.maybe_quarantine_printer(db_session, batch, last) is False
+        await db_session.refresh(printer)
+        assert printer.quarantined is False
 
 
 class TestOperatorStop:

@@ -4,6 +4,7 @@ import logging
 import os
 import socket
 import ssl
+import tempfile
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -43,6 +44,56 @@ class FileNotOnPrinterError(Exception):
     instead of burning the full retry budget (up to 11 × 30s per path) on
     a lookup that cannot recover.
     """
+
+
+def _temp_roots() -> tuple[Path, ...]:
+    """The two directories the server owns for scratch 3MF files.
+
+    Resolved per call because ``archive_dir`` is settings-backed (and
+    monkeypatched by tests). Both roots are required: FTPS downloads land under
+    ``archive_dir/temp`` while G-code injection and the eject build cache use
+    the system temp dir.
+    """
+    from backend.app.core.config import settings as _config_settings
+
+    return (_config_settings.archive_dir / "temp", Path(tempfile.gettempdir()))
+
+
+def _is_temp_path(path: Path) -> bool:
+    """True when ``path`` is server scratch, i.e. safe to delete."""
+    for root in _temp_roots():
+        try:
+            if path.resolve().is_relative_to(root.resolve()):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def cleanup_downloaded_3mf(path: Path | None) -> bool:
+    """THE deletion gate for a 3MF a caller believes it downloaded itself.
+
+    Ownership is derived from the path, never from a flag: a 3MF handed around
+    the farm is just as likely to be the library file's own durable path
+    (dispatch publishes it to the download cache so /cover can skip FTP, #1166)
+    or a live archive copy. Deleting those destroys user data, so anything
+    outside the scratch roots is REFUSED and named in a WARNING.
+
+    A temp file published to the cache via :func:`cache_3mf_download` belongs to
+    the cache — its publisher must not clean it up; :func:`clear_3mf_cache` is
+    the reaper.
+    """
+    if path is None:
+        return False
+    if not _is_temp_path(path):
+        logger.warning("Refusing to delete 3MF outside the temp roots: %s (not this caller's file)", path)
+        return False
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("3MF cleanup skipped %s: %s", path, exc)
+        return False
+    return True
 
 
 class ImplicitFTP_TLS(FTP_TLS):
@@ -306,6 +357,12 @@ class BambuFTPClient:
             logger.warning("download_to_file called but FTP not connected")
             return False
 
+        # An EXISTING destination outside the scratch roots is user data (a
+        # library file, a live archive copy). Opening it "wb" truncates it and
+        # a failed transfer then deletes it, so refuse before touching disk.
+        if local_path.exists() and not _is_temp_path(local_path):
+            raise ValueError(f"Refusing to download over non-temp destination {local_path}")
+
         try:
             local_path.parent.mkdir(parents=True, exist_ok=True)
             with open(local_path, "wb") as f:
@@ -315,18 +372,12 @@ class BambuFTPClient:
             file_size = local_path.stat().st_size if local_path.exists() else 0
             if file_size == 0:
                 logger.warning("FTP download returned 0 bytes for %s", remote_path)
-                if local_path.exists():
-                    local_path.unlink()
+                cleanup_downloaded_3mf(local_path)
                 return False
             logger.info("Successfully downloaded %s to %s (%s bytes)", remote_path, local_path, file_size)
             return True
         except (OSError, ftplib.Error) as e:
-            # Clean up partial file if it exists
-            if local_path.exists():
-                try:
-                    local_path.unlink()
-                except OSError:
-                    pass  # Best-effort partial file cleanup; not critical if removal fails
+            cleanup_downloaded_3mf(local_path)
             # 550 means the file is not at this path. Surface as a sentinel so
             # with_ftp_retry can abandon this path immediately and the caller
             # can advance to the next candidate instead of retrying 11× at
@@ -781,31 +832,19 @@ def clear_3mf_cache(printer_id: int | None = None, delete_files: bool = True) ->
     — called from on_print_complete so temp files don't accumulate across
     prints. Tests that want to inspect the cache contents disable this.
 
-    Only paths inside ``archive_dir/temp`` are unlinked. The dispatch sites
-    added in #1166 also cache the live archive copy and library file bytes
-    so /cover can skip FTP — those are *user data*, never the cache's to
-    delete. Pre-fix this branch silently removed archive 3mfs on every print
-    completion (#1212 + private reports of "file disappeared overnight").
+    Only scratch paths are unlinked. The dispatch sites added in #1166 also
+    cache the live archive copy and library file bytes so /cover can skip FTP
+    — those are *user data*, never the cache's to delete. Pre-fix this branch
+    silently removed archive 3mfs on every print completion (#1212 + private
+    reports of "file disappeared overnight").
     """
-    from backend.app.core.config import settings as _config_settings
-
-    temp_root = _config_settings.archive_dir / "temp"
-
-    def _is_temp_path(path: Path) -> bool:
-        try:
-            return path.is_relative_to(temp_root)
-        except (OSError, ValueError):
-            return False
 
     def _maybe_unlink(path: Path) -> None:
-        if not delete_files or not path.exists():
-            return
-        if not _is_temp_path(path):
-            return
-        try:
-            path.unlink()
-        except OSError as exc:
-            logger.debug("3MF cache cleanup skipped %s: %s", path, exc)
+        # A durable entry is the expected #1166 case, so skip it silently here
+        # rather than through cleanup_downloaded_3mf's refusal WARNING (which
+        # exists for callers that believe they own the file).
+        if delete_files and _is_temp_path(path):
+            cleanup_downloaded_3mf(path)
 
     if printer_id is None:
         for path in list(_threemf_path_cache.values()):
