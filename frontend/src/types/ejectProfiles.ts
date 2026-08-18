@@ -50,6 +50,17 @@ export interface EjectProfileParams {
    *  before the sweep. null = feature off. Requires the target model's
    *  `z_travel_mm` geometry to be set, else generation fails closed. */
   bed_drop_clearance_mm: number | null;
+  /** Dwell (whole seconds, 1-300) the bed holds at the drop floor before it
+   *  returns to the lift height, giving a stuck part time to finish peeling.
+   *  Only meaningful while `bed_drop_clearance_mm` is set. null = no dwell. */
+  bed_drop_dwell_s: number | null;
+  /** Number of up-and-back strokes (1-10) the bed makes at the drop floor.
+   *  Paired with `bed_drop_jitter_mm` — both set or both null. Only meaningful
+   *  while `bed_drop_clearance_mm` is set. null = no jitter. */
+  bed_drop_jitter_cycles: number | null;
+  /** Travel (mm, 1-50) of each jitter stroke at the drop floor. Paired with
+   *  `bed_drop_jitter_cycles` — both set or both null. null = no jitter. */
+  bed_drop_jitter_mm: number | null;
 }
 
 /** A persisted eject profile as returned by the API. */
@@ -87,12 +98,25 @@ export const DEFAULT_EJECT_PROFILE_PARAMS: EjectProfileParams = {
   sweep_x_max_mm: null,
   sweep_start_frac: 1,
   bed_drop_clearance_mm: null,
+  bed_drop_dwell_s: null,
+  bed_drop_jitter_cycles: null,
+  bed_drop_jitter_mm: null,
 };
 
 /** UX prefill for the bed-drop clearance input when an operator first enables
  *  the assist (mm). This is the ONLY place the 50 lives; the persisted default
  *  is null (off) — this value only seeds the field once the toggle is on. */
 export const DEFAULT_BED_DROP_CLEARANCE_MM = 50;
+
+/** UX prefill for the bed-drop dwell input (seconds) when an operator first
+ *  enables the dwell. Prefill only — the persisted default stays null (off). */
+export const DEFAULT_BED_DROP_DWELL_S = 5;
+
+/** UX prefills for the bed-drop jitter pair when an operator first enables it
+ *  (stroke count + stroke travel in mm). Prefill only — the persisted default
+ *  for both stays null (off); the pair is written both-or-neither. */
+export const DEFAULT_BED_DROP_JITTER_CYCLES = 3;
+export const DEFAULT_BED_DROP_JITTER_MM = 10;
 
 /** Request body for the preview and dry-run (download) endpoints.
  *

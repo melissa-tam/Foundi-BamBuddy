@@ -42,6 +42,9 @@ const SOURCE = {
   sweep_x_max_mm: 300,
   sweep_start_frac: 0.5,
   bed_drop_clearance_mm: 25,
+  bed_drop_dwell_s: 8,
+  bed_drop_jitter_cycles: 4,
+  bed_drop_jitter_mm: 12,
   created_at: '2026-07-01T10:00:00Z',
   updated_at: '2026-07-01T10:00:00Z',
 };
@@ -67,6 +70,9 @@ const EXPECTED_COPY_PAYLOAD = {
   sweep_x_max_mm: 300,
   sweep_start_frac: 0.5,
   bed_drop_clearance_mm: 25,
+  bed_drop_dwell_s: 8,
+  bed_drop_jitter_cycles: 4,
+  bed_drop_jitter_mm: 12,
 };
 
 function geometryList() {

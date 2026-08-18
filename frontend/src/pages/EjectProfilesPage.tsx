@@ -44,6 +44,9 @@ import { Toggle } from '../components/Toggle';
 import { useToast } from '../contexts/ToastContext';
 import {
   DEFAULT_BED_DROP_CLEARANCE_MM,
+  DEFAULT_BED_DROP_DWELL_S,
+  DEFAULT_BED_DROP_JITTER_CYCLES,
+  DEFAULT_BED_DROP_JITTER_MM,
   DEFAULT_EJECT_PROFILE_PARAMS,
   type EjectProfile,
   type EjectProfileCreate,
@@ -163,6 +166,31 @@ function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose
       ? String(profile.bed_drop_clearance_mm)
       : String(DEFAULT_BED_DROP_CLEARANCE_MM),
   );
+  // Bed-drop dwell: hold at the drop floor before returning (null = no dwell).
+  // Refines the drop, so it only submits while the drop itself is enabled.
+  const [dwellEnabled, setDwellEnabled] = useState<boolean>(
+    profile ? profile.bed_drop_dwell_s != null : false,
+  );
+  const [dwellSeconds, setDwellSeconds] = useState<string>(
+    profile?.bed_drop_dwell_s != null
+      ? String(profile.bed_drop_dwell_s)
+      : String(DEFAULT_BED_DROP_DWELL_S),
+  );
+  // Bed-drop jitter: up-and-back strokes at the drop floor. The cycles/travel
+  // pair is both-or-neither, so one enable flag governs the two inputs.
+  const [jitterEnabled, setJitterEnabled] = useState<boolean>(
+    profile ? profile.bed_drop_jitter_cycles != null && profile.bed_drop_jitter_mm != null : false,
+  );
+  const [jitterCycles, setJitterCycles] = useState<string>(
+    profile?.bed_drop_jitter_cycles != null
+      ? String(profile.bed_drop_jitter_cycles)
+      : String(DEFAULT_BED_DROP_JITTER_CYCLES),
+  );
+  const [jitterMm, setJitterMm] = useState<string>(
+    profile?.bed_drop_jitter_mm != null
+      ? String(profile.bed_drop_jitter_mm)
+      : String(DEFAULT_BED_DROP_JITTER_MM),
+  );
   const [nameError, setNameError] = useState(false);
 
   // Geometry-derived validation bounds (Phase 2): registry rows give the bed
@@ -275,6 +303,32 @@ function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose
         ? Number(dropClearance)
         : DEFAULT_BED_DROP_CLEARANCE_MM
       : null;
+    // Dwell + jitter refine the drop itself, so they are only ever sent while
+    // the drop is on — turning the assist off clears all three together.
+    // Values are clamped to the backend's bounds; a cleared field falls back to
+    // the UX prefill rather than submitting NaN.
+    if (dropEnabled && dwellEnabled) {
+      const seconds = parseInt(dwellSeconds, 10);
+      params.bed_drop_dwell_s = Number.isFinite(seconds)
+        ? Math.min(300, Math.max(1, seconds))
+        : DEFAULT_BED_DROP_DWELL_S;
+    } else {
+      params.bed_drop_dwell_s = null;
+    }
+    // Jitter is a both-or-neither pair: never send a half-configured stroke.
+    if (dropEnabled && jitterEnabled) {
+      const cycles = parseInt(jitterCycles, 10);
+      const travel = jitterMm.trim() === '' ? Number.NaN : Number(jitterMm);
+      params.bed_drop_jitter_cycles = Number.isFinite(cycles)
+        ? Math.min(10, Math.max(1, cycles))
+        : DEFAULT_BED_DROP_JITTER_CYCLES;
+      params.bed_drop_jitter_mm = Number.isFinite(travel)
+        ? Math.min(50, Math.max(1, travel))
+        : DEFAULT_BED_DROP_JITTER_MM;
+    } else {
+      params.bed_drop_jitter_cycles = null;
+      params.bed_drop_jitter_mm = null;
+    }
     onSave({ name: name.trim(), ...params });
   };
 
@@ -464,24 +518,125 @@ function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose
               </div>
               <p className="text-xs text-bambu-gray mt-1">{t('ejectProfiles.fields.bedDropHelp')}</p>
               {dropEnabled && (
-                <div className="mt-3">
-                  <div className="flex items-center gap-1.5 mb-1">
-                    <label htmlFor="eject-bed-drop-clearance" className="block text-sm text-bambu-gray">
-                      {t('ejectProfiles.fields.bedDropClearance')}
-                    </label>
-                    <InfoHint text={t('ejectProfiles.tooltips.bedDropClearance')} />
+                <div className="mt-3 space-y-4">
+                  <div>
+                    <div className="flex items-center gap-1.5 mb-1">
+                      <label htmlFor="eject-bed-drop-clearance" className="block text-sm text-bambu-gray">
+                        {t('ejectProfiles.fields.bedDropClearance')}
+                      </label>
+                      <InfoHint text={t('ejectProfiles.tooltips.bedDropClearance')} />
+                    </div>
+                    <input
+                      id="eject-bed-drop-clearance"
+                      type="number"
+                      inputMode="decimal"
+                      min={0}
+                      max={200}
+                      step={5}
+                      value={dropClearance}
+                      onChange={(e) => setDropClearance(e.target.value)}
+                      className={inputClass}
+                    />
                   </div>
-                  <input
-                    id="eject-bed-drop-clearance"
-                    type="number"
-                    inputMode="decimal"
-                    min={0}
-                    max={200}
-                    step={5}
-                    value={dropClearance}
-                    onChange={(e) => setDropClearance(e.target.value)}
-                    className={inputClass}
-                  />
+
+                  {/* Dwell at the drop floor (refines the drop above) */}
+                  <div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="flex items-center gap-1.5">
+                        <span className="text-sm text-white">{t('ejectProfiles.fields.bedDropDwell')}</span>
+                        <InfoHint text={t('ejectProfiles.tooltips.bedDropDwell')} />
+                      </span>
+                      <Toggle
+                        checked={dwellEnabled}
+                        onChange={setDwellEnabled}
+                        aria-label={t('ejectProfiles.fields.bedDropDwell')}
+                      />
+                    </div>
+                    <p className="text-xs text-bambu-gray mt-1">
+                      {t('ejectProfiles.fields.bedDropDwellHelp')}
+                    </p>
+                    {dwellEnabled && (
+                      <div className="mt-3">
+                        <label
+                          htmlFor="eject-bed-drop-dwell-s"
+                          className="block text-sm text-bambu-gray mb-1"
+                        >
+                          {t('ejectProfiles.fields.bedDropDwell')}
+                        </label>
+                        <input
+                          id="eject-bed-drop-dwell-s"
+                          type="number"
+                          inputMode="numeric"
+                          min={1}
+                          max={300}
+                          step={1}
+                          value={dwellSeconds}
+                          onChange={(e) => setDwellSeconds(e.target.value)}
+                          className={inputClass}
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Jitter at the drop floor — cycles + travel, both or neither */}
+                  <div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="flex items-center gap-1.5">
+                        <span className="text-sm text-white">{t('ejectProfiles.fields.bedDropJitter')}</span>
+                        <InfoHint text={t('ejectProfiles.tooltips.bedDropJitter')} />
+                      </span>
+                      <Toggle
+                        checked={jitterEnabled}
+                        onChange={setJitterEnabled}
+                        aria-label={t('ejectProfiles.fields.bedDropJitter')}
+                      />
+                    </div>
+                    <p className="text-xs text-bambu-gray mt-1">
+                      {t('ejectProfiles.fields.bedDropJitterHelp')}
+                    </p>
+                    {jitterEnabled && (
+                      <div className="grid gap-3 sm:grid-cols-2 mt-3">
+                        <div>
+                          <label
+                            htmlFor="eject-bed-drop-jitter-cycles"
+                            className="block text-sm text-bambu-gray mb-1"
+                          >
+                            {t('ejectProfiles.fields.bedDropJitterCycles')}
+                          </label>
+                          <input
+                            id="eject-bed-drop-jitter-cycles"
+                            type="number"
+                            inputMode="numeric"
+                            min={1}
+                            max={10}
+                            step={1}
+                            value={jitterCycles}
+                            onChange={(e) => setJitterCycles(e.target.value)}
+                            className={inputClass}
+                          />
+                        </div>
+                        <div>
+                          <label
+                            htmlFor="eject-bed-drop-jitter-mm"
+                            className="block text-sm text-bambu-gray mb-1"
+                          >
+                            {t('ejectProfiles.fields.bedDropJitterMm')}
+                          </label>
+                          <input
+                            id="eject-bed-drop-jitter-mm"
+                            type="number"
+                            inputMode="decimal"
+                            min={1}
+                            max={50}
+                            step={0.5}
+                            value={jitterMm}
+                            onChange={(e) => setJitterMm(e.target.value)}
+                            className={inputClass}
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
               {bedDropWarning && (
