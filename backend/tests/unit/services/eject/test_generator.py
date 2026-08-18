@@ -10,8 +10,13 @@ import pytest
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.generator import (
     EJECT_RUNTIME_OVERHEAD_S,
+    PHASE_BEACON_LIFTED,
+    PHASE_BEACON_PARK,
+    PHASE_BEACON_SWEEP,
+    SWEEP_PHASE_MARKER,
     EjectGenerationError,
     estimate_runtime_s,
+    estimate_runtime_segments,
     generate_eject_gcode,
 )
 from backend.app.services.eject.remote import eject_abort_deadline_s
@@ -762,3 +767,138 @@ class TestBuildSummaryLog:
         with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):
             generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
         assert "drop_z=off" in caplog.records[0].getMessage()
+
+
+class TestPhaseBeacons:
+    """The three M73 beacons the eject runtime watchdog times.
+
+    mc_percent is M73-driven end to end and resets to 0 at job start, and the H2S
+    publishes no mc_print_line_number — so these commands are the ONLY in-band signal
+    that says which phase the machine is in. Their POSITIONS are the contract: the
+    watchdog's pre-sweep guarantee rests on "percent below the sweep beacon ⇒ the sweep
+    has not started", which only holds while P50 sits directly above the sweep marker."""
+
+    @staticmethod
+    def _lines(gcode: str) -> list[str]:
+        return [ln.strip() for ln in gcode.splitlines()]
+
+    def test_lifted_beacon_follows_the_prologue_lift(self):
+        lines = self._lines(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
+        lift_idx = lines.index("G1 Z40 F900")
+        assert lines[lift_idx + 1].startswith(PHASE_BEACON_LIFTED + " ;")
+        # ...and it precedes the heater-off section, so the drop span it opens covers the
+        # whole pre-sweep block rather than starting mid-way through it.
+        assert lift_idx + 1 < lines.index("; --- bed heater off ---")
+
+    @pytest.mark.parametrize("bed_drop", [None, 50.0], ids=["drop-off", "drop-on"])
+    def test_sweep_beacon_sits_immediately_above_the_sweep_marker(self, bed_drop):
+        # ONE emission site: with the bed-drop assist on the beacon must land after the
+        # whole assist, with it off directly after M140 S0 — in both cases adjacent to
+        # the marker, which is what makes the boundary unambiguous.
+        lines = self._lines(generate_eject_gcode(_profile(bed_drop_clearance_mm=bed_drop), 30.0, H2S_GEOMETRY))
+        marker_idx = lines.index(SWEEP_PHASE_MARKER)
+        assert lines[marker_idx - 1].startswith(PHASE_BEACON_SWEEP + " ;")
+        assert sum(1 for ln in lines if ln.startswith(PHASE_BEACON_SWEEP + " ")) == 1
+
+    def test_park_beacon_closes_the_sweep_before_the_park_move(self):
+        profile = _profile()
+        lines = self._lines(generate_eject_gcode(profile, 30.0, H2S_GEOMETRY))
+        park_idx = lines.index(PHASE_BEACON_PARK + " ; phase beacon: sweep done - eject runtime watchdog")
+        # The park's Z move (bed clear FIRST, then the traverse to centre) follows it.
+        assert lines[park_idx + 1] == "G1 Z40 F900"
+        assert lines[park_idx + 2].startswith("G1 X170 Y160")
+        # The last skim lane precedes it — the beacon closes the sweep, never splits it.
+        assert lines.index("; --- final skim ---") < park_idx
+
+    def test_beacons_are_ordered_and_the_epilogue_hundred_still_closes(self):
+        gcode = generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY)
+        codes = [ln.split(";", 1)[0].strip() for ln in gcode.splitlines()]
+        # First-token match: the stock epilogue also carries `M73.2 R1.0` (a different
+        # command), which is exactly why the estimator splits on the exact literals.
+        assert [c for c in codes if c.split()[:1] == ["M73"]] == [
+            PHASE_BEACON_LIFTED,
+            PHASE_BEACON_SWEEP,
+            PHASE_BEACON_PARK,
+            "M73 P100 R0",
+        ]
+
+    def test_beacon_lines_are_pure_ascii(self):
+        # The printer executes these bytes. Every eject block shipped to date has been
+        # ASCII-only; a beacon comment must not be the first exception.
+        gcode = generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY)
+        gcode.encode("ascii")
+
+    def test_a_beacon_bearing_block_passes_the_validator_unchanged(self):
+        # M73 is not a motion / homing / tool-change command, so the validator has no
+        # case for it — this locks that the beacons stay invisible to every guard.
+        for overrides in ({}, {"bed_drop_clearance_mm": 50.0}):
+            profile = _profile(**overrides)
+            gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+            assert PHASE_BEACON_LIFTED in gcode
+            result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY)
+            assert result.ok, result.errors
+
+
+class TestEstimateRuntimeSegments:
+    """The per-phase split behind the pre-sweep guarantee. The whole-job estimate can
+    only catch a stall that overruns the ENTIRE eject; drop_span_s bounds the phase that
+    actually stalls, on its own."""
+
+    def test_segments_sum_to_the_total_for_every_golden(self):
+        # Exact equality, not approx: the total IS the sum, computed by one walk. Any
+        # drift here means a second code path started scoring the block.
+        golden_dir = pathlib.Path(__file__).parent / "golden"
+        goldens = sorted(golden_dir.glob("*.gcode"))
+        assert len(goldens) == 9, f"expected 9 golden fixtures, found {len(goldens)}"
+        for path in goldens:
+            gcode = path.read_text()
+            seg = estimate_runtime_segments(gcode)
+            assert seg.pre_s + seg.drop_span_s + seg.sweep_s + EJECT_RUNTIME_OVERHEAD_S == estimate_runtime_s(gcode)
+            assert seg.total_s == estimate_runtime_s(gcode)
+
+    def test_drop_span_holds_exactly_the_bed_drop_motion(self):
+        # lift 40 → 290 → 40 at F900 = 500 mm of commanded travel, and nothing else in
+        # the drop-less block's span (M140 S0 costs no time).
+        drop = estimate_runtime_segments(generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY))
+        plain = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
+        assert plain.drop_span_s == 0.0
+        assert drop.drop_span_s == pytest.approx(500.0 / 900.0 * 60.0, abs=0.01)
+
+    def test_drop_span_includes_the_floor_dwell_and_jitter(self):
+        # Both act AT the drop floor, so both are inside the phase the watchdog bounds —
+        # a 5 s hold omitted from the span would make every such eject look overrun.
+        profile = _profile(
+            bed_drop_clearance_mm=50.0, bed_drop_dwell_s=5, bed_drop_jitter_cycles=3, bed_drop_jitter_mm=10.0
+        )
+        seg = estimate_runtime_segments(generate_eject_gcode(profile, 30.0, H2S_GEOMETRY))
+        bare = estimate_runtime_segments(generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY))
+        assert seg.drop_span_s - bare.drop_span_s == pytest.approx(5.0 + 2 * 3 * 10.0 / 900.0 * 60.0, abs=0.01)
+
+    def test_pre_segment_carries_the_unmeasurable_lift_only(self):
+        # The prologue's first Z move has no known origin (G28 never homes Z with a part
+        # on the plate), so it scores 0 — and the overhead belongs to no phase.
+        seg = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
+        assert seg.pre_s == 0.0
+        assert seg.sweep_s > 0.0
+
+    def test_the_epilogue_beacon_never_opens_a_segment(self):
+        # Only the two exact beacon literals split. M73 P100 R0 (and the P75 marker)
+        # must stay inside sweep_s, or the sweep's time would leak out of the estimate.
+        gcode = "G28 X Y\nM73 P5\nG1 Z100 F900\nG1 Z50 F900\nM73 P50\nM73 P75\nM400 S3\nM73 P100 R0\nM400 S4\n"
+        seg = estimate_runtime_segments(gcode)
+        assert seg.drop_span_s == pytest.approx(50.0 / 900.0 * 60.0, abs=0.01)
+        assert seg.sweep_s == pytest.approx(7.0)
+
+    def test_a_repeated_beacon_cannot_reopen_a_closed_segment(self):
+        # Defensive: boundaries only advance, so a replayed P5 after the sweep opened
+        # cannot pull sweep motion back into the drop span.
+        gcode = "G28 X Y\nM73 P5\nG1 Z100 F900\nM73 P50\nM73 P5\nM400 S9\n"
+        seg = estimate_runtime_segments(gcode)
+        assert seg.drop_span_s == 0.0
+        assert seg.sweep_s == pytest.approx(9.0)
+
+    def test_a_conditional_dwell_is_excluded_from_every_segment(self):
+        gcode = "M73 P5\nM73 P50\nM622 J1\nM400 S180\nM623\nM400 S2\n"
+        seg = estimate_runtime_segments(gcode)
+        assert (seg.pre_s, seg.drop_span_s) == (0.0, 0.0)
+        assert seg.sweep_s == pytest.approx(2.0)

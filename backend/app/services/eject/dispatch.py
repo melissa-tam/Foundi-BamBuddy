@@ -23,7 +23,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.services.eject.build_cache import EjectBuildError, get_or_build_eject_file
 from backend.app.services.eject.generator import (
     EjectGenerationError,
-    estimate_runtime_s,
+    estimate_runtime_segments,
     generate_eject_gcode,
 )
 from backend.app.services.eject.validator import validate_eject_gcode
@@ -47,10 +47,17 @@ class BuiltEject:
     geometry) and is consumed much later, at the eject job's terminal, to decide
     whether the sweep can be trusted. Dispatch threads it onto the
     :class:`~backend.app.services.eject.remote.PendingEject` that survives until then.
+
+    ``drop_span_s`` is the bed-drop phase's own budget (the commanded time between the
+    M73 phase beacons), and is set ONLY for a profile that actually drops the bed. A
+    drop-less block's pre-sweep motion is just the prologue lift, which cannot stall
+    against an under-bed obstruction, so it carries None and the watchdog's edge lane
+    stays disarmed rather than timing a phase that does not exist.
     """
 
     path: Path
     expected_runtime_s: float
+    drop_span_s: float | None
 
 
 def _parse_max_z_height(source_path: Path, plate_id: int) -> float | None:
@@ -129,18 +136,27 @@ async def build_part_present_eject_file(
     validation = validate_eject_gcode(block, profile, max_z, geometry)
     if not validation.ok:
         raise EjectGenerationError("Part-present eject validation failed: " + "; ".join(validation.errors))
-    expected_runtime_s = estimate_runtime_s(block)
+    segments = estimate_runtime_segments(block)
+    # The drop span is only meaningful when the block actually drops the bed — see
+    # BuiltEject.drop_span_s. Between the beacons a drop-less block holds nothing but
+    # `M140 S0`, so publishing its ~0 s span would arm the edge lane on a phase that
+    # cannot stall.
+    drop_span_s = segments.drop_span_s if profile.bed_drop_clearance_mm is not None else None
 
     try:
         path = await get_or_build_eject_file(Path(source_path), plate_id, block)
     except EjectBuildError as exc:
         raise EjectGenerationError(f"Failed to repack the part-present eject 3mf: {exc}") from exc
     logger.info(
-        "eject.dispatch: built part-present eject from %s plate %s (max_z %.2fmm, profile %r) — expected runtime %.0fs",
+        "eject.dispatch: built part-present eject from %s plate %s (max_z %.2fmm, profile %r) — expected runtime "
+        "%.0fs (pre %.0fs, bed-drop span %s, sweep %.0fs)",
         Path(source_path).name,
         plate_id,
         max_z,
         profile.name,
-        expected_runtime_s,
+        segments.total_s,
+        segments.pre_s,
+        f"{drop_span_s:.0f}s" if drop_span_s is not None else "off",
+        segments.sweep_s,
     )
-    return BuiltEject(path=path, expected_runtime_s=expected_runtime_s)
+    return BuiltEject(path=path, expected_runtime_s=segments.total_s, drop_span_s=drop_span_s)

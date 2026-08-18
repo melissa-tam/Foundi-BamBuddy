@@ -1,6 +1,7 @@
 """Tests for the shared part-present eject dispatcher (eject.remote)."""
 
 import asyncio
+import contextlib
 import logging
 import os
 import tempfile
@@ -836,4 +837,328 @@ class TestKillDecisionTelemetry:
 
     async def test_telemetry_reader_tolerates_a_stateless_client(self):
         with patch.object(printer_manager, "get_client", MagicMock(return_value=SimpleNamespace())):
-            assert remote._live_phase_telemetry(90033) == (None, None)
+            assert remote._live_phase_telemetry(90033) == (None, None, None)
+
+    async def test_telemetry_reader_carries_the_progress_recency_stamp(self):
+        # The percent field always holds SOME value; only its wire stamp says whether
+        # that value describes the phase running now (see PrinterState.progress_wire_at).
+        state = SimpleNamespace(mc_print_line_number=7, progress=42.0, progress_wire_at=1234.5)
+        with patch.object(printer_manager, "get_client", MagicMock(return_value=SimpleNamespace(state=state))):
+            assert remote._live_phase_telemetry(90034) == (7, 42.0, 1234.5)
+
+
+class _FakeClock:
+    """The ONE time source a polling-watchdog test drives.
+
+    The watchdog's sleeps and its clock must come from the same source, so this supplies
+    both: ``sleep`` records the delay, advances ``now`` by it and yields to the event
+    loop so the test can interleave (cancelling mid-run, for one). No wall-clock time
+    passes, so a 104 s deadline sequence runs in microseconds."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+        self.delays: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.now += delay
+        await asyncio.sleep(0)
+
+
+class _ProgressFeed:
+    """Scripted ``mc_percent`` samples, one consumed per telemetry read.
+
+    Each entry is ``(percent, wire_age_s)``: what the live session reports and how old
+    that push is when read. ``wire_age_s=None`` means the stamp PREDATES the arming — a
+    value held over from before this eject, which the watchdog must treat as no evidence
+    at all. The last entry repeats once exhausted, so a test scripts only the interesting
+    part of the timeline."""
+
+    def __init__(self, clock: _FakeClock, samples: list[tuple[float, float | None]]) -> None:
+        self._clock = clock
+        self._samples = list(samples)
+        self.reads = 0
+
+    def __call__(self, printer_id: int) -> SimpleNamespace:
+        percent, age = self._samples[min(self.reads, len(self._samples) - 1)]
+        self.reads += 1
+        wire_at = 0.0 if age is None else self._clock.now - age
+        return SimpleNamespace(
+            state=SimpleNamespace(mc_print_line_number=None, progress=percent, progress_wire_at=wire_at)
+        )
+
+
+def _armed_with_drop(pid_item: int = 5, *, drop_span_s: float = 30.0, **kw) -> remote.PendingEject:
+    """A started production pending carrying a bed-drop budget (arms the edge lane).
+
+    83 s expected → a 103.75 s whole-job deadline; a 30 s drop span → an 8 s margin (the
+    floor) → the drop deadline lands 38 s after the observed P5 edge."""
+    kw.setdefault("expected_runtime_s", 83.0)
+    kw.setdefault("started_at", datetime.now(timezone.utc))
+    return remote.PendingEject("production", 1, pid_item, drop_span_s=drop_span_s, **kw)
+
+
+@contextlib.contextmanager
+def _watchdog_env(feed: _ProgressFeed, *, stop_delivered: bool = True):
+    """Patch every collaborator the fire path touches; yields the mocks."""
+    from backend.app.services.eject import monitor as monitor_mod
+
+    with (
+        patch.object(printer_manager, "get_client", MagicMock(side_effect=feed)),
+        patch.object(printer_manager, "stop_print", MagicMock(return_value=stop_delivered)) as stop,
+        patch.object(printer_manager, "request_evidence_pushall", MagicMock(return_value=True)) as pushall,
+        patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
+        patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
+    ):
+        yield SimpleNamespace(stop=stop, pushall=pushall, notify=notify, escalate=escalate)
+
+
+def _spawn_watchdog(pid: int, armed: remote.PendingEject, clock: _FakeClock) -> asyncio.Task:
+    """Spawn the watchdog exactly as the arming path does (real registry lifecycle)."""
+    from backend.app.core.tasks import spawn_background_task
+
+    task = spawn_background_task(
+        remote._runtime_watchdog(pid, armed, sleep=clock.sleep, clock=clock), name=f"wd-edge-{pid}"
+    )
+    remote._runtime_watchdogs[pid] = task
+    return task
+
+
+def _kill_line(caplog) -> str:
+    return next(r.getMessage() for r in caplog.records if "still running at" in r.getMessage())
+
+
+class TestEjectMarginMath:
+    """Two margins, one clamp. The drop margin is tighter on both ends because it is
+    measured from an OBSERVED beacon edge, so it pays for none of the upload / spin-up /
+    start-echo variance the whole-job margin has to absorb."""
+
+    async def test_abort_margin_keeps_the_twenty_and_sixty_second_clamps(self):
+        assert remote._abort_margin_s(40.0) == 20.0  # floor
+        assert remote._abort_margin_s(160.0) == 40.0  # fraction
+        assert remote._abort_margin_s(400.0) == 60.0  # cap
+
+    async def test_drop_margin_floors_at_eight_and_caps_at_twenty(self):
+        # The 8 s floor covers the estimator's ~±3 s, the ~1 Hz push cadence and the 2 s
+        # poll — below that a healthy drop could be killed by sampling alone.
+        assert remote._drop_margin_s(4.0) == 8.0
+        assert remote._drop_margin_s(30.0) == 8.0  # 7.5 → floored
+        assert remote._drop_margin_s(48.0) == 12.0
+        assert remote._drop_margin_s(200.0) == 20.0
+
+    async def test_deadline_is_the_estimate_plus_its_margin(self):
+        assert remote.eject_abort_deadline_s(83.0) == 83.0 + remote._abort_margin_s(83.0)
+
+
+class TestRuntimeWatchdogPhaseEdges:
+    """The pre-sweep guarantee (2026-08-15 009-H2S bed-drop stalls).
+
+    The whole-job deadline can only catch a stall that overruns the ENTIRE eject (~59 s
+    on the production profile); a shorter one lets the sweep run on a bed that lost Z
+    steps. mc_percent is M73-driven, so the block's phase beacons make the bed-drop phase
+    boundable on its own — and a percent below the sweep beacon PROVES the sweep has not
+    started, which is what makes stopping there safe."""
+
+    async def test_drop_overrun_with_the_sweep_unreached_stops_the_job(self, caplog):
+        # Percent parked at the lifted beacon: the printer is still executing drop-phase
+        # lines 42 s in, against a 30 s budget + 8 s margin. This is the incident shape.
+        pid = 90040
+        armed = _armed_with_drop()
+        remote.register_pending_eject(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0)])
+        try:
+            with (
+                _watchdog_env(feed) as env,
+                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+            ):
+                await _spawn_watchdog(pid, armed, clock)
+            env.stop.assert_called_once_with(pid)
+            assert remote.peek_pending_eject(pid).runtime_exceeded_at is not None
+            message = _kill_line(caplog)
+            assert "stage=drop" in message and "stage=drop_late" not in message
+            detail = env.notify.await_args.kwargs["source_detail"]
+            assert "bed-drop" in detail and "under the heatbed" in detail
+            env.escalate.assert_called_once_with(pid)
+            assert pid not in remote._runtime_watchdogs
+            # Killed on the DROP deadline (t5 + 38 s), far short of the 103.75 s whole-job one.
+            assert clock.now - 1000.0 == pytest.approx(42.0)
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_sweep_beacon_arriving_after_the_drop_deadline_still_stops(self, caplog):
+        # The drop verifiably ran long. The sweep opens with rear positioning at lift
+        # height, so the stop still lands before the toolhead can reach the plate.
+        pid = 90041
+        armed = _armed_with_drop()
+        remote.register_pending_eject(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0)] * 20 + [(50.0, 0.0)])
+        try:
+            with (
+                _watchdog_env(feed) as env,
+                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+            ):
+                await _spawn_watchdog(pid, armed, clock)
+            env.stop.assert_called_once_with(pid)
+            assert "stage=drop_late" in _kill_line(caplog)
+            assert "bed-drop" in env.notify.await_args.kwargs["source_detail"]
+            assert remote.peek_pending_eject(pid).runtime_exceeded_at is not None
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_healthy_phase_sequence_never_kills_and_cancels_on_resolution(self, db_session, caplog):
+        # 0 → 5 → 50 → 75: the drop cleared inside its budget, so no phase rule may fire.
+        # The eject's terminal then cancels the task, which is the NORMAL exit.
+        pid = 90042
+        armed = _armed_with_drop()
+        remote.register_pending_eject(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(0.0, 0.0), (5.0, 0.0), (50.0, 0.0), (75.0, 0.0)])
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
+        ):
+            task = _spawn_watchdog(pid, armed, clock)
+            for _ in range(200):
+                if feed.reads >= 4:
+                    break
+                await asyncio.sleep(0)
+            await remote.clear_pending_eject(db_session, pid)
+            env.stop.assert_not_called()
+            env.notify.assert_not_awaited()
+        # LIVENESS: the lane really ran the sequence — a silent watchdog would satisfy
+        # every "did not fire" assertion above without ever observing a phase edge.
+        assert feed.reads >= 4
+        assert [r for r in caplog.records if "bed-drop phase cleared" in r.getMessage()]
+        assert task.cancelled()
+        assert pid not in remote._runtime_watchdogs
+        assert remote.peek_pending_eject(pid) is None
+
+    async def test_beacons_never_reflected_falls_back_to_the_whole_job_deadline(self, caplog):
+        # mc_percent stuck at 0 while fresh: the firmware is publishing, but the beacons
+        # are not landing in it. The lane must degrade to the original rule, exactly once,
+        # and the whole-job deadline must still fire.
+        pid = 90043
+        armed = _armed_with_drop()
+        remote.register_pending_eject(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(0.0, 0.0)])
+        try:
+            with (
+                _watchdog_env(feed) as env,
+                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+            ):
+                await _spawn_watchdog(pid, armed, clock)
+            fallbacks = [r for r in caplog.records if "phase beacons not reflected" in r.getMessage()]
+            assert len(fallbacks) == 1
+            env.stop.assert_called_once_with(pid)
+            assert "stage=total" in _kill_line(caplog)
+            assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_stale_evidence_never_kills_and_asks_once_for_a_fresh_report(self, caplog):
+        # One fresh sample opens the drop window, then the link goes quiet: every later
+        # sample is stamped before this eject even armed. Stale evidence advances nothing
+        # and justifies no stop — the lane asks for ONE pushall and leaves the whole-job
+        # deadline as the backstop.
+        pid = 90044
+        armed = _armed_with_drop()
+        remote.register_pending_eject(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (5.0, None)])
+        try:
+            with (
+                _watchdog_env(feed) as env,
+                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+            ):
+                await _spawn_watchdog(pid, armed, clock)
+            env.pushall.assert_called_once_with(pid, remote._EVIDENCE_REASON)
+            env.stop.assert_called_once_with(pid)
+            assert "stage=total" in _kill_line(caplog)  # NOT a drop kill
+            assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_aged_out_sample_is_not_evidence_either(self, caplog):
+        # Stamped after arming but far older than the freshness window: a link that went
+        # silent mid-eject is not a phase report, so the drop rule must not fire on it.
+        pid = 90045
+        armed = _armed_with_drop()
+        remote.register_pending_eject(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (5.0, remote._PROGRESS_FRESH_S + 30.0)])
+        try:
+            with (
+                _watchdog_env(feed) as env,
+                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+            ):
+                await _spawn_watchdog(pid, armed, clock)
+            assert "stage=total" in _kill_line(caplog)
+            env.stop.assert_called_once_with(pid)
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_superseded_pending_stands_the_edge_lane_down(self):
+        # The eject this task was armed for resolved and a NEW one took the printer.
+        pid = 90046
+        armed = _armed_with_drop(5)
+        remote.register_pending_eject(pid, _armed_with_drop(6))
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0)])
+        try:
+            with _watchdog_env(feed) as env:
+                await _spawn_watchdog(pid, armed, clock)
+            env.stop.assert_not_called()
+            env.notify.assert_not_awaited()
+            assert remote.peek_pending_eject(pid).runtime_exceeded_at is None
+            assert pid not in remote._runtime_watchdogs
+        finally:
+            remote.pop_pending_eject(pid)
+
+
+class TestRuntimeWatchdogDeadlineOnlyFallback:
+    """Without a drop budget the watchdog is EXACTLY what it was before the edge lane:
+    one sleep to the whole-job deadline, then the same stop. A rehydrated post-restart
+    pending and every drop-less profile land here."""
+
+    async def test_no_drop_span_sleeps_straight_to_the_total_deadline(self, caplog):
+        pid = 90050
+        armed = _armed()  # drop_span_s defaults to None
+        remote.register_pending_eject(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0)])
+        try:
+            with (
+                _watchdog_env(feed) as env,
+                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+            ):
+                await _spawn_watchdog(pid, armed, clock)
+            assert clock.delays == [103.75]  # one sleep, no polling
+            env.stop.assert_called_once_with(pid)
+            assert "stage=total" in _kill_line(caplog)
+            # The pre-edge-lane operator wording is untouched for this stage.
+            detail = env.notify.await_args.kwargs["source_detail"]
+            assert "STOPPED mid-job" in detail and "104" in detail and "83" in detail
+        finally:
+            remote.pop_pending_eject(pid)
+
+    async def test_a_drop_budget_that_cannot_beat_the_total_deadline_polls_nothing(self):
+        # 100 s span + 20 s margin = 120 s, past the 103.75 s whole-job deadline: the
+        # phase rule could never fire first, so arming it would only add failure modes.
+        pid = 90051
+        armed = _armed_with_drop(drop_span_s=100.0)
+        remote.register_pending_eject(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0)])
+        try:
+            with _watchdog_env(feed) as env:
+                await _spawn_watchdog(pid, armed, clock)
+            assert clock.delays == [103.75]
+            env.stop.assert_called_once_with(pid)
+        finally:
+            remote.pop_pending_eject(pid)

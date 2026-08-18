@@ -17,13 +17,24 @@ rectangle and the envelope both arrive as a :class:`ModelGeometry` resolved from
 the ``printer_model_geometry`` registry (``services.eject.geometry``), so adding
 a printer model is a DB row, not a code change.
 
-The module also owns :func:`estimate_runtime_s`, the EXPECTED execution time of a
-generated block. There is no Z telemetry in the MQTT feed, so an eject whose
-bed-drop stalls against an obstruction (lost steps, bed returning too high) still
-reports ``completed`` — job RUNTIME is the only observable signature of that
-failure. The estimate is what the in-flight runtime watchdog turns into an abort
-deadline (``eject.remote.eject_abort_deadline_s``), so an eject still executing at
-that deadline is STOPPED mid-job instead of judged after the fact.
+The module also owns :func:`estimate_runtime_segments` (and its total-only façade
+:func:`estimate_runtime_s`), the EXPECTED execution time of a generated block. There
+is no Z telemetry in the MQTT feed, so an eject whose bed-drop stalls against an
+obstruction (lost steps, bed returning too high) still reports ``completed`` — job
+RUNTIME is the only observable signature of that failure. The estimate is what the
+in-flight runtime watchdog turns into an abort deadline
+(``eject.remote.eject_abort_deadline_s``), so an eject still executing at that
+deadline is STOPPED mid-job instead of judged after the fact.
+
+A whole-job deadline can only catch a stall long enough to push the WHOLE eject past
+its margin (~59 s on the production profile), so the block also emits M73 PHASE
+BEACONS (:data:`PHASE_BEACON_LIFTED` / :data:`PHASE_BEACON_SWEEP` /
+:data:`PHASE_BEACON_PARK`). ``mc_percent`` is entirely M73-driven and resets to 0 at
+job start, so those three commands are the ONLY in-band phase signal the wire carries
+(``mc_print_line_number`` is absent on the H2S). The watchdog times the EDGES between
+them against :attr:`EjectRuntimeSegments.drop_span_s`, which bounds the bed-drop phase
+on its own — the sweep is provably unreached while ``mc_percent`` sits below the sweep
+beacon.
 
 Two optional tunings narrow the sweep: an X sub-band (``sweep_x_min_mm`` /
 ``sweep_x_max_mm``) confines the lanes to part of the bed width instead of the
@@ -52,6 +63,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME, is_bedslinger_model, is_dual_nozzle_model
@@ -95,6 +107,24 @@ EJECT_RUNTIME_OVERHEAD_S = 25.0
 # in an injected file (and greppable in dry-run downloads).
 BLOCK_START_PREFIX = "; ===== FARM EJECT BLOCK profile="
 BLOCK_END_MARKER = "; ===== FARM EJECT BLOCK END ====="
+
+# The sweep section's marker comment — the ONE origin shared by the emitter and by
+# the beacon that must sit immediately above it (a second literal would let the two
+# drift and silently move the drop/sweep boundary the watchdog times).
+SWEEP_PHASE_MARKER = "; --- sweep: push part off the front edge ---"
+
+# M73 PHASE BEACONS. ``mc_percent`` is M73-driven end to end and resets to 0 when the
+# eject job starts, so these three commands publish the block's phase boundaries over
+# the only in-band channel the wire has (the H2S publishes no ``mc_print_line_number``).
+# The percentages are arbitrary ORDERED markers, not progress: the watchdog only asks
+# "is the reported percent still below the sweep beacon?". The completion epilogue's
+# stock ``M73 P100 R0`` closes the series and is emitted verbatim with it.
+PHASE_BEACON_LIFTED_PCT = 5  # prologue done, bed-drop phase begins
+PHASE_BEACON_SWEEP_PCT = 50  # bed-drop done, sweep begins
+PHASE_BEACON_PARK_PCT = 75  # sweep done, park begins
+PHASE_BEACON_LIFTED = f"M73 P{PHASE_BEACON_LIFTED_PCT}"
+PHASE_BEACON_SWEEP = f"M73 P{PHASE_BEACON_SWEEP_PCT}"
+PHASE_BEACON_PARK = f"M73 P{PHASE_BEACON_PARK_PCT}"
 
 # Completion epilogue — the stock machine-end FINISH TAIL, copied verbatim from a
 # production H2S plate (foundi-FarmManager/Print Files/
@@ -187,15 +217,50 @@ def block_start_marker(profile: EjectProfile) -> str:
     return f"{BLOCK_START_PREFIX}{profile.name} ====="
 
 
+@dataclass(frozen=True)
+class EjectRuntimeSegments:
+    """One eject block's commanded time, split at the M73 phase beacons.
+
+    The split exists because the whole-job deadline can only catch a stall big enough
+    to overrun the ENTIRE eject's margin. ``drop_span_s`` bounds the bed-drop phase by
+    itself, which is the phase that stalls (2026-07-31 gouged plate, 2026-08-15 009-H2S)
+    and the one that must be caught BEFORE the sweep touches the plate.
+
+    ``pre_s`` and ``sweep_s`` carry no share of :data:`EJECT_RUNTIME_OVERHEAD_S` — the
+    overhead is job spin-up plus the finish chime, neither of which belongs to a phase —
+    so only ``total_s`` includes it.
+    """
+
+    pre_s: float  # motion before the M73 P5 beacon (prologue lift, unmeasurable Z aside)
+    drop_span_s: float  # commanded time between the P5 and P50 beacons (motion + M400 S dwells)
+    sweep_s: float  # the P50 beacon onward (sweep, park, epilogue)
+    total_s: float  # pre + drop_span + sweep + EJECT_RUNTIME_OVERHEAD_S
+
+
 def estimate_runtime_s(gcode: str) -> float:
     """Expected wall-clock execution time (seconds) of an eject block.
 
+    Total-only façade over :func:`estimate_runtime_segments` — the same single walk, so
+    the two can never disagree about what the machine was told to do."""
+    return estimate_runtime_segments(gcode).total_s
+
+
+def estimate_runtime_segments(gcode: str) -> EjectRuntimeSegments:
+    """Per-phase expected execution time of an eject block.
+
     A deliberately small kinematic model — constant-velocity moves at the modal
-    feedrate, no acceleration/jerk profile — because it feeds a ×1.5 anomaly
-    threshold, not a progress bar. It systematically UNDER-states a real machine
-    (which must accelerate into every move), which is the safe direction: the
+    feedrate, no acceleration/jerk profile — because it feeds an abort deadline, not a
+    progress bar. It systematically UNDER-states a real machine (which must accelerate
+    into every move), which is the safe direction: the
     :data:`EJECT_RUNTIME_OVERHEAD_S` constant absorbs the difference and the guard
-    factor absorbs the rest.
+    margins absorb the rest.
+
+    Segment boundaries are the two EXACT beacon lines :data:`PHASE_BEACON_LIFTED` and
+    :data:`PHASE_BEACON_SWEEP` (after comment stripping). Matching the literal — not
+    "any M73" — is what keeps the epilogue's stock ``M73 P100 R0`` and the
+    :data:`PHASE_BEACON_PARK` marker inside ``sweep_s`` where they belong. Boundaries
+    only ever advance, so a repeated beacon cannot reopen a closed segment. M73 itself
+    contributes no time (it falls through the motion branches, as it always has).
 
     Domain rules baked in:
 
@@ -218,7 +283,9 @@ def estimate_runtime_s(gcode: str) -> float:
     * A move emitted before any feedrate has been seen contributes no time
       (defensive — the generator always emits an explicit F).
     """
-    total_s = 0.0
+    # Index 0 = pre, 1 = drop span, 2 = sweep; the beacons advance `segment`.
+    segments = [0.0, 0.0, 0.0]
+    segment = 0
     feed_mm_min: float | None = None
     # None = position not yet known on that axis (see the G28/unknown-axis rules).
     pos: dict[str, float | None] = {"X": None, "Y": None, "Z": None}
@@ -238,6 +305,12 @@ def estimate_runtime_s(gcode: str) -> float:
             if code.startswith("M623"):
                 in_conditional = False
             continue
+        if code == PHASE_BEACON_LIFTED:
+            segment = max(segment, 1)
+            continue
+        if code == PHASE_BEACON_SWEEP:
+            segment = max(segment, 2)
+            continue
 
         tokens = code.split()
         word = tokens[0].upper()
@@ -251,7 +324,7 @@ def estimate_runtime_s(gcode: str) -> float:
             for token in tokens[1:]:
                 if token[0].upper() == "S":
                     try:
-                        total_s += float(token[1:])
+                        segments[segment] += float(token[1:])
                     except ValueError:
                         pass
                     break
@@ -277,9 +350,15 @@ def estimate_runtime_s(gcode: str) -> float:
                     squared += (value - prior) ** 2
                 pos[axis] = value
         if feed_mm_min and squared > 0:
-            total_s += math.sqrt(squared) / feed_mm_min * 60.0
+            segments[segment] += math.sqrt(squared) / feed_mm_min * 60.0
 
-    return total_s + EJECT_RUNTIME_OVERHEAD_S
+    pre_s, drop_span_s, sweep_s = segments
+    return EjectRuntimeSegments(
+        pre_s=pre_s,
+        drop_span_s=drop_span_s,
+        sweep_s=sweep_s,
+        total_s=pre_s + drop_span_s + sweep_s + EJECT_RUNTIME_OVERHEAD_S,
+    )
 
 
 def generate_eject_gcode(
@@ -401,6 +480,9 @@ def generate_eject_gcode(
     # bed-drop assist and as the validator's expected Z ceiling for a non-drop block.
     lift_z = max_z_height + profile.clearance_mm
     lines.append(f"G1 Z{_fmt(lift_z)} F900")
+    # Phase beacon consumed by the eject runtime watchdog: the edge it times the
+    # bed-drop span from (mc_percent is M73-driven and resets to 0 at job start).
+    lines.append(f"{PHASE_BEACON_LIFTED} ; phase beacon: prologue done - eject runtime watchdog")
 
     # --- bed heater off ---------------------------------------------------
     # Command the bed heater off defensively. The cooldown WAIT is no longer in
@@ -478,7 +560,11 @@ def generate_eject_gcode(
         lines.append(f"G1 Z{_fmt(lift_z)} F900")
 
     # --- sweep: push the part off the FRONT (door side) -------------------
-    lines.append("; --- sweep: push part off the front edge ---")
+    # Phase beacon consumed by the eject runtime watchdog: ONE emission site, directly
+    # above the sweep marker, so "percent below this beacon" always means the sweep has
+    # not started — with the bed-drop assist on or off.
+    lines.append(f"{PHASE_BEACON_SWEEP} ; phase beacon: sweep begins - eject runtime watchdog")
+    lines.append(SWEEP_PHASE_MARKER)
     # Park behind the part (rear service area) at the first lane.
     lines.append(f"G1 X{_fmt(x_lanes[0])} Y{_fmt(back_y)} F9000")
 
@@ -510,6 +596,9 @@ def generate_eject_gcode(
     # part with clearance 0. Drop the bed clear FIRST (toolhead still at the rear,
     # off the bed), THEN traverse to centre — never a low-Z diagonal across the
     # bed interior that would drag the nozzle through a surviving part.
+    # Phase beacon consumed by the eject runtime watchdog: the sweep is over, so a
+    # percent at/above it can never be read as a job still executing sweep lanes.
+    lines.append(f"{PHASE_BEACON_PARK} ; phase beacon: sweep done - eject runtime watchdog")
     park_z = max(lift_z, PARK_Z_MM)
     park_x = _clamp(bed_x / 2, x_min, x_max)
     park_y = _clamp(bed_y / 2, y_min, y_max)

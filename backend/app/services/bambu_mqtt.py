@@ -493,6 +493,13 @@ class PrinterState:
     current_print: str | None = None
     subtask_name: str | None = None
     progress: float = 0.0
+    # Monotonic time of the last push that CARRIED `mc_percent` (0.0 = never). Same
+    # precedent as `hms_wire_at`: only a frame actually bearing the field stamps it, so
+    # a reader can tell a fresh value from one held over from an earlier push. The
+    # generic `_last_message_time` counts ANY message and so cannot date this VALUE —
+    # which the eject runtime watchdog needs, because it times M73 phase edges and must
+    # never treat a stale percent as evidence about the phase running now.
+    progress_wire_at: float = 0.0
     remaining_time: int = 0
     layer_num: int = 0
     total_layers: int = 0
@@ -3013,6 +3020,8 @@ class BambuMQTTClient:
             if self.state.progress > 0:
                 self._last_valid_progress = self.state.progress
             self.state.progress = float(data["mc_percent"])
+            # THIS push carried the value — stamp its recency (see progress_wire_at).
+            self.state.progress_wire_at = time.monotonic()
         if "mc_remaining_time" in data:
             self.state.remaining_time = int(data["mc_remaining_time"])
         if "mc_print_line_number" in data:

@@ -4,8 +4,10 @@ M17
 G28 X Y
 G90
 G1 Z60 F900
+M73 P5 ; phase beacon: prologue done - eject runtime watchdog
 ; --- bed heater off ---
 M140 S0
+M73 P50 ; phase beacon: sweep begins - eject runtime watchdog
 ; --- sweep: push part off the front edge ---
 G1 X3 Y322 F9000
 G1 Z25 F600
@@ -28,6 +30,7 @@ G1 Y322 F9000
 G1 X337 F9000
 G1 Y-2 F3000
 G1 Y322 F9000
+M73 P75 ; phase beacon: sweep done - eject runtime watchdog
 G1 Z60 F900
 G1 X170 Y160 F9000
 ; --- completion epilogue: stock machine-end finish tail (job ends FINISH) ---

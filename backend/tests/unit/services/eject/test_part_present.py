@@ -14,6 +14,7 @@ from backend.app.services.eject.generator import (
     EJECT_RUNTIME_OVERHEAD_S,
     EjectGenerationError,
     estimate_runtime_s,
+    estimate_runtime_segments,
 )
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
 from backend.app.utils.threemf_tools import (
@@ -219,3 +220,48 @@ class TestBuildPartPresentEjectFile:
         assert "M140 S0" in gcode
         assert "M190" not in gcode
         assert "FARM EJECT BLOCK" in gcode
+
+
+class TestBuiltEjectDropSpan:
+    """The bed-drop phase budget the build hands to the runtime watchdog.
+
+    It arms the watchdog's edge lane, which stops a drop that overruns BEFORE the sweep
+    can touch the plate — the class of stall too short to overrun the whole job (~59 s
+    on the production profile) and therefore invisible to the total deadline alone."""
+
+    @pytest.mark.asyncio
+    async def test_populated_only_when_the_profile_drops_the_bed(self):
+        src = _make_3mf()
+        built = dropless = None
+        try:
+            built = await build_part_present_eject_file(src, 1, _profile(bed_drop_clearance_mm=50.0), H2S_GEOMETRY)
+            dropless = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+
+            # With the assist on: the block's own P5→P50 span. The donor's part is
+            # 18 mm, so the lift is 28 and the drop floor 340-50=290 → 524 mm at F900.
+            assert built.drop_span_s == pytest.approx(2 * (290.0 - 28.0) / 900.0 * 60.0, abs=0.01)
+            assert built.drop_span_s == pytest.approx(
+                estimate_runtime_segments(_read_plate_gcode(built.path)).drop_span_s
+            )
+            # Without it, the pre-sweep motion is just the prologue lift, which cannot
+            # stall against an under-bed obstruction — so the edge lane stays disarmed
+            # rather than timing a ~0 s phase.
+            assert dropless.drop_span_s is None
+        finally:
+            src.unlink(missing_ok=True)
+            for artifact in (built, dropless):
+                if artifact:
+                    artifact.path.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_span_is_a_strict_part_of_the_expected_runtime(self):
+        src = _make_3mf()
+        built = None
+        try:
+            built = await build_part_present_eject_file(src, 1, _profile(bed_drop_clearance_mm=50.0), H2S_GEOMETRY)
+            assert 0 < built.drop_span_s < built.expected_runtime_s
+            assert built.expected_runtime_s == estimate_runtime_s(_read_plate_gcode(built.path))
+        finally:
+            src.unlink(missing_ok=True)
+            if built:
+                built.path.unlink(missing_ok=True)

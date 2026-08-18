@@ -8126,3 +8126,54 @@ class TestPrintLineNumberParse:
         mqtt_client._process_message({"print": {"mc_print_line_number": 900}})
         mqtt_client._process_message({"print": {"mc_percent": 50}})
         assert mqtt_client.state.mc_print_line_number == 900
+
+
+class TestProgressWireRecency:
+    """``progress_wire_at`` — the recency stamp on ``mc_percent``.
+
+    The percent field always holds SOME value, so its own value cannot say whether it
+    describes the job running now. The eject runtime watchdog decides on M73 phase
+    edges, so it needs to distinguish a percent this push carried from one held over
+    from an earlier push — which is what this stamp, and only this stamp, answers.
+    Same precedent as ``hms_wire_at``: only a frame BEARING the field stamps it.
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(ip_address="192.168.1.100", serial_number="TEST123", access_code="12345678")
+
+    def test_starts_unstamped(self, mqtt_client):
+        assert mqtt_client.state.progress_wire_at == 0.0
+
+    def test_a_percent_bearing_push_stamps_it(self, mqtt_client):
+        import time
+
+        before = time.monotonic()
+        mqtt_client._process_message({"print": {"mc_percent": 5, "gcode_state": "RUNNING"}})
+        assert mqtt_client.state.progress == 5.0
+        assert mqtt_client.state.progress_wire_at >= before
+
+    def test_a_push_without_the_field_does_not_stamp_it(self, mqtt_client):
+        # An incremental push carrying anything else leaves the percent unchanged — so it
+        # must leave the stamp unchanged too, or a silent link would look freshly reported.
+        mqtt_client._process_message({"print": {"mc_percent": 50}})
+        stamped = mqtt_client.state.progress_wire_at
+        assert stamped > 0.0
+        mqtt_client._process_message({"print": {"gcode_state": "RUNNING", "mc_remaining_time": 30}})
+        assert mqtt_client.state.progress == 50.0  # value retained...
+        assert mqtt_client.state.progress_wire_at == stamped  # ...but not re-dated
+
+    def test_every_percent_bearing_push_advances_it(self, mqtt_client):
+        mqtt_client._process_message({"print": {"mc_percent": 5}})
+        first = mqtt_client.state.progress_wire_at
+        mqtt_client._process_message({"print": {"mc_percent": 5}})  # same VALUE, new push
+        assert mqtt_client.state.progress_wire_at >= first
+
+    def test_a_zero_percent_push_is_still_a_report(self, mqtt_client):
+        # The eject job resets mc_percent to 0 at start; that zero is evidence the job
+        # began, not an absence of evidence.
+        mqtt_client._process_message({"print": {"mc_percent": 0, "gcode_state": "RUNNING"}})
+        assert mqtt_client.state.progress == 0.0
+        assert mqtt_client.state.progress_wire_at > 0.0
