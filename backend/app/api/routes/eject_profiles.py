@@ -40,6 +40,7 @@ from backend.app.schemas.eject_profile import (
     EjectProfileResponse,
     EjectProfileUpdate,
     EjectValidationResponse,
+    validate_drop_floor_requires_drop,
 )
 from backend.app.services.eject.build_cache import EjectBuildError, get_or_build_eject_file
 from backend.app.services.eject.generator import (
@@ -229,6 +230,17 @@ async def update_eject_profile(
     updates = data.model_dump(exclude_unset=True)
     for key, value in updates.items():
         setattr(profile, key, value)
+    # The drop-floor rule binds the MERGED row, which is the first place both the
+    # patch and the stored values exist: clearing bed_drop_clearance_mm while a
+    # dwell/jitter stays behind would store a profile that cannot generate, and the
+    # failure would surface with a finished plate already waiting on the eject.
+    try:
+        validate_drop_floor_requires_drop(
+            profile.bed_drop_clearance_mm, profile.bed_drop_dwell_s, profile.bed_drop_jitter_cycles
+        )
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
         await db.commit()
     except IntegrityError as exc:

@@ -63,6 +63,9 @@ _DEFAULTS = {
     "sweep_x_max_mm": None,
     "sweep_start_frac": 1.0,
     "bed_drop_clearance_mm": None,
+    "bed_drop_dwell_s": None,
+    "bed_drop_jitter_cycles": None,
+    "bed_drop_jitter_mm": None,
 }
 
 
@@ -108,6 +111,33 @@ MATRIX = [
     # These 2 goldens ARE the deliberate, ladder-gated recipe addition.
     ("drop_h2s_z30", H2S_GEOMETRY, {"name": "drop", "bed_drop_clearance_mm": 50.0}, 30.0),
     ("drop_h2c_z30", H2C_GEOMETRY, {"name": "drop", "bed_drop_clearance_mm": 50.0}, 30.0),
+    # Bed-drop floor behaviours: 3 x 10 mm jitter strokes then a 5 s hold, emitted
+    # drop → jitter → dwell → return. H2S jitters 290↔280 and H2C 275↔265 — up
+    # FIRST, so neither passes its drop target. Ladder-gated like the drop pair.
+    (
+        "dropdwelljitter_h2s_z30",
+        H2S_GEOMETRY,
+        {
+            "name": "dropdj",
+            "bed_drop_clearance_mm": 50.0,
+            "bed_drop_dwell_s": 5,
+            "bed_drop_jitter_cycles": 3,
+            "bed_drop_jitter_mm": 10.0,
+        },
+        30.0,
+    ),
+    (
+        "dropdwelljitter_h2c_z30",
+        H2C_GEOMETRY,
+        {
+            "name": "dropdj",
+            "bed_drop_clearance_mm": 50.0,
+            "bed_drop_dwell_s": 5,
+            "bed_drop_jitter_cycles": 3,
+            "bed_drop_jitter_mm": 10.0,
+        },
+        30.0,
+    ),
 ]
 
 

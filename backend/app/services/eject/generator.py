@@ -41,7 +41,11 @@ nozzle), then returns to the lift height before the sweep runs — jolting a
 stuck part loose without changing the sweep itself. The machine bottom is the
 target model's ``z_travel_mm`` (from the geometry registry, never hardcoded);
 a profile that enables the assist against a model with no ``z_travel_mm`` fails
-closed.
+closed. Two further tunings act AT that drop floor, emitted drop → jitter →
+dwell → return: ``bed_drop_jitter_cycles``/``bed_drop_jitter_mm`` oscillate the
+bed up-then-back (up FIRST, so no move passes the drop target) and
+``bed_drop_dwell_s`` holds there for whole seconds as ``M400 S<n>``. Both are
+NULL = off and both fail closed without the drop itself.
 """
 
 from __future__ import annotations
@@ -412,7 +416,20 @@ def generate_eject_gcode(
     # height — a mechanical jolt to release a part the sweep alone can't shift.
     # NULL clearance = assist off (the 5 golden fixtures stay byte-identical).
     bed_drop = profile.bed_drop_clearance_mm
+    # Drop-FLOOR behaviours (both optional, NULL = off). Read defensively: a
+    # transient profile built without these attributes still generates (mirrors the
+    # sweep_start_frac / final_skim None handling below).
+    dwell_s: int | None = getattr(profile, "bed_drop_dwell_s", None)
+    jitter_cycles: int | None = getattr(profile, "bed_drop_jitter_cycles", None)
+    jitter_mm: float | None = getattr(profile, "bed_drop_jitter_mm", None)
     drop_z: float | None = None
+    if bed_drop is None and (dwell_s is not None or jitter_cycles is not None or jitter_mm is not None):
+        # Both behaviours are motions AT the drop floor — without the drop there is
+        # no floor. Fail closed instead of silently discarding configured motion.
+        raise EjectGenerationError(
+            "bed-drop dwell/jitter require the bed-drop release assist — set bed_drop_clearance_mm, "
+            "or clear bed_drop_dwell_s / bed_drop_jitter_cycles / bed_drop_jitter_mm in this profile"
+        )
     if bed_drop is not None:
         if is_bedslinger_model(geometry.model_key):
             # A bed-slinger's bed is fixed in Z (the gantry carries Z), so there is
@@ -433,8 +450,31 @@ def generate_eject_gcode(
                 f"bed-drop target Z{drop_z:g} (z_travel {geometry.z_travel_mm:g} - clearance "
                 f"{bed_drop:g}) is not below the lift height Z{lift_z:g} — degenerate drop"
             )
+        if (jitter_cycles is None) != (jitter_mm is None):
+            raise EjectGenerationError(
+                "bed-drop jitter needs bed_drop_jitter_cycles and bed_drop_jitter_mm both set or both null"
+            )
+        if jitter_mm is not None and jitter_mm >= drop_z - lift_z:
+            raise EjectGenerationError(
+                f"bed-drop jitter {jitter_mm:g} mm reaches Z{drop_z - jitter_mm:g} from the drop target "
+                f"Z{drop_z:g} — oscillation would cross the lift height Z{lift_z:g}"
+            )
         lines.append("; --- bed-drop release assist: full down + return ---")
         lines.append(f"G1 Z{_fmt(drop_z)} F900")
+        if jitter_cycles is not None and jitter_mm is not None:
+            # Every stroke rises AWAY from the machine bottom first and returns to the
+            # drop target, so no move passes drop_z — the block's Z ceiling is
+            # unchanged and the validator needs no new case.
+            lines.append(f"; --- bed-drop jitter: {jitter_cycles} x {_fmt(jitter_mm)}mm at the drop floor ---")
+            for _ in range(jitter_cycles):
+                lines.append(f"G1 Z{_fmt(drop_z - jitter_mm)} F900")
+                lines.append(f"G1 Z{_fmt(drop_z)} F900")
+        if dwell_s is not None:
+            # `M400 S<n>` (whole seconds) is the verified dwell dialect AND the only
+            # form estimate_runtime_s counts; G4 is invisible to it, and the in-flight
+            # abort watchdog consumes that estimate as its deadline.
+            lines.append(f"; --- bed-drop dwell: hold {dwell_s}s at the floor to peel the part ---")
+            lines.append(f"M400 S{dwell_s}")
         lines.append(f"G1 Z{_fmt(lift_z)} F900")
 
     # --- sweep: push the part off the FRONT (door side) -------------------
@@ -492,12 +532,14 @@ def generate_eject_gcode(
     # the bed-drop target above all — is here, per built file.
     logger.info(
         "eject.generator: built block profile=%r model=%s max_z=%smm lift_z=%s drop_z=%s "
-        "sweep_z=%s lanes=%d span=[%s, %s]",
+        "dwell=%s jitter=%s sweep_z=%s lanes=%d span=[%s, %s]",
         profile.name,
         geometry.model_key,
         _fmt(max_z_height),
         _fmt(lift_z),
         _fmt(drop_z) if drop_z is not None else "off",
+        dwell_s if dwell_s is not None else "off",
+        f"{jitter_cycles}x{_fmt(jitter_mm)}mm" if jitter_cycles is not None and jitter_mm is not None else "off",
         [_fmt(z) for z in z_levels],
         len(x_lanes),
         _fmt(lane_lo),

@@ -41,6 +41,9 @@ def _profile(**overrides) -> EjectProfile:
         "sweep_x_max_mm": None,
         "sweep_start_frac": 1.0,
         "bed_drop_clearance_mm": None,
+        "bed_drop_dwell_s": None,
+        "bed_drop_jitter_cycles": None,
+        "bed_drop_jitter_mm": None,
     }
     defaults.update(overrides)
     profile = EjectProfile()
@@ -490,6 +493,99 @@ class TestBedDropReleaseAssist:
             assert drop_z in gcode
             result = validate_eject_gcode(gcode, profile, 30.0, geometry)
             assert result.ok, result.errors
+
+
+class TestBedDropDwellAndJitter:
+    """The two drop-FLOOR behaviours. Emission order is drop → jitter → dwell →
+    return; jitter strokes rise AWAY from the machine bottom first so no move
+    passes the drop target, and the dwell is `M400 S<n>` (the only dwell form the
+    runtime estimator counts, and the abort watchdog consumes that estimate)."""
+
+    def test_emission_order_is_drop_jitter_dwell_return(self):
+        # H2S z_travel 340 - clearance 50 -> drop 290; lift 40; 3 x 10 mm strokes
+        # oscillate 290 -> 280 -> 290, then a 5 s hold, then the return.
+        profile = _profile(
+            bed_drop_clearance_mm=50.0,
+            bed_drop_dwell_s=5,
+            bed_drop_jitter_cycles=3,
+            bed_drop_jitter_mm=10.0,
+        )
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        lines = [ln.strip() for ln in gcode.splitlines()]
+        marker_idx = lines.index("; --- bed-drop release assist: full down + return ---")
+        block = [ln for ln in lines[marker_idx + 1 :] if ln and not ln.startswith(";")]
+        assert block[:9] == [
+            "G1 Z290 F900",  # drop to the floor
+            "G1 Z280 F900",  # jitter 1: up (away from the machine bottom) ...
+            "G1 Z290 F900",  # ... and back to the floor
+            "G1 Z280 F900",  # jitter 2
+            "G1 Z290 F900",
+            "G1 Z280 F900",  # jitter 3
+            "G1 Z290 F900",
+            "M400 S5",  # dwell at the floor, AFTER the strokes
+            "G1 Z40 F900",  # return to the lift height, LAST
+        ]
+
+    def test_dwell_alone_sits_between_drop_and_return(self):
+        profile = _profile(bed_drop_clearance_mm=50.0, bed_drop_dwell_s=7)
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        lines = [ln.strip() for ln in gcode.splitlines()]
+        marker_idx = lines.index("; --- bed-drop release assist: full down + return ---")
+        assert lines[marker_idx + 1] == "G1 Z290 F900"
+        assert lines[marker_idx + 3] == "M400 S7"  # +2 is the dwell comment
+        assert lines[marker_idx + 4] == "G1 Z40 F900"
+
+    def test_dwell_is_m400_never_g4(self):
+        # G4 is invisible to estimate_runtime_s, which the abort watchdog consumes.
+        profile = _profile(bed_drop_clearance_mm=50.0, bed_drop_dwell_s=5)
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        assert "M400 S5" in gcode
+        assert not any(ln.strip().startswith("G4") for ln in gcode.splitlines())
+
+    def test_jitter_never_passes_the_drop_target(self):
+        profile = _profile(bed_drop_clearance_mm=50.0, bed_drop_jitter_cycles=2, bed_drop_jitter_mm=10.0)
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        assert max(_sweep_z_values(gcode)) == pytest.approx(290.0)
+
+    def test_disabled_emits_neither(self):
+        gcode = generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY)
+        assert "bed-drop jitter" not in gcode
+        assert "bed-drop dwell" not in gcode
+
+    def test_one_sided_jitter_rejected(self):
+        for overrides in ({"bed_drop_jitter_cycles": 3}, {"bed_drop_jitter_mm": 10.0}):
+            with pytest.raises(EjectGenerationError, match="both set or both null"):
+                generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0, **overrides), 30.0, H2S_GEOMETRY)
+
+    def test_jitter_reaching_the_lift_height_rejected(self):
+        # drop 290 - lift 40 = 250 mm of span; a 250 mm stroke lands ON the lift.
+        profile = _profile(bed_drop_clearance_mm=50.0, bed_drop_jitter_cycles=1, bed_drop_jitter_mm=250.0)
+        with pytest.raises(EjectGenerationError, match="cross the lift height"):
+            generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+
+    def test_dwell_without_bed_drop_rejected(self):
+        with pytest.raises(EjectGenerationError, match="require the bed-drop release assist"):
+            generate_eject_gcode(_profile(bed_drop_dwell_s=5), 30.0, H2S_GEOMETRY)
+
+    def test_jitter_without_bed_drop_rejected(self):
+        profile = _profile(bed_drop_jitter_cycles=3, bed_drop_jitter_mm=10.0)
+        with pytest.raises(EjectGenerationError, match="require the bed-drop release assist"):
+            generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+
+    def test_dwell_adds_exactly_its_seconds_to_the_estimate(self):
+        base = _profile(bed_drop_clearance_mm=50.0)
+        held = _profile(bed_drop_clearance_mm=50.0, bed_drop_dwell_s=5)
+        plain_s = estimate_runtime_s(generate_eject_gcode(base, 30.0, H2S_GEOMETRY))
+        dwell_s = estimate_runtime_s(generate_eject_gcode(held, 30.0, H2S_GEOMETRY))
+        assert dwell_s - plain_s == pytest.approx(5.0, abs=0.01)
+
+    def test_jitter_adds_its_stroke_time_to_the_estimate(self):
+        # 3 cycles x 2 moves x 10 mm at F900 = 60 mm of travel.
+        base = _profile(bed_drop_clearance_mm=50.0)
+        shaken = _profile(bed_drop_clearance_mm=50.0, bed_drop_jitter_cycles=3, bed_drop_jitter_mm=10.0)
+        plain_s = estimate_runtime_s(generate_eject_gcode(base, 30.0, H2S_GEOMETRY))
+        jitter_s = estimate_runtime_s(generate_eject_gcode(shaken, 30.0, H2S_GEOMETRY))
+        assert jitter_s - plain_s == pytest.approx(2 * 3 * 10.0 / 900.0 * 60.0, abs=0.01)
 
 
 class TestBedslingerBedDropGuard:

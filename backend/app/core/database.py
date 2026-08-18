@@ -817,6 +817,15 @@ async def run_migrations(conn):
     # COLUMN (SQLite swallows "duplicate column name", Postgres "already exists").
     await _safe_execute(conn, "ALTER TABLE eject_profiles ADD COLUMN bed_drop_clearance_mm FLOAT")
 
+    # Migration: Add the bed-drop DWELL + JITTER behaviours to eject_profiles (farm
+    # eject v2 drop floor). All nullable — NULL = off, so an existing profile keeps
+    # the plain down-and-return drop and the golden fixtures stay byte-identical.
+    # Dwell is whole seconds (emitted `M400 S<n>`); the two jitter columns are
+    # both-or-neither (enforced by the schema + the generator).
+    await _safe_execute(conn, "ALTER TABLE eject_profiles ADD COLUMN bed_drop_dwell_s INTEGER")
+    await _safe_execute(conn, "ALTER TABLE eject_profiles ADD COLUMN bed_drop_jitter_cycles INTEGER")
+    await _safe_execute(conn, "ALTER TABLE eject_profiles ADD COLUMN bed_drop_jitter_mm FLOAT")
+
     # Migration: Drop eject_profiles.cooldown_retries (farm eject went
     # server-dispatched motion-only). The cooldown wait moved OUT of the injected
     # G-code into the eject monitor, which holds the plate gate until the live bed

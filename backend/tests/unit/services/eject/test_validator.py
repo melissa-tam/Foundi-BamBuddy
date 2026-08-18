@@ -30,6 +30,9 @@ def _profile(**overrides) -> EjectProfile:
         "sweep_x_max_mm": None,
         "sweep_start_frac": 1.0,
         "bed_drop_clearance_mm": None,
+        "bed_drop_dwell_s": None,
+        "bed_drop_jitter_cycles": None,
+        "bed_drop_jitter_mm": None,
     }
     defaults.update(overrides)
     profile = EjectProfile()
@@ -300,6 +303,22 @@ class TestUpperZCeilingGuard:
         result = validate_eject_gcode(bad, profile, 30.0, H2S_GEOMETRY)
         assert not result.ok
         assert any("Z ceiling" in e for e in result.errors), result.errors
+
+    def test_drop_floor_dwell_and_jitter_block_passes_unchanged_validator(self):
+        # The drop-floor behaviours need NO validator case: every jitter stroke
+        # rises AWAY from the machine bottom (290 -> 280 -> 290) so the ceiling is
+        # still the drop target, and the dwell is an M400 (not a move) — this locks
+        # "no validator change" as a fact on both geometries.
+        for geometry in (H2S_GEOMETRY, H2C_GEOMETRY):
+            profile = _profile(
+                bed_drop_clearance_mm=50.0,
+                bed_drop_dwell_s=5,
+                bed_drop_jitter_cycles=3,
+                bed_drop_jitter_mm=10.0,
+            )
+            gcode = generate_eject_gcode(profile, 30.0, geometry)
+            result = validate_eject_gcode(gcode, profile, 30.0, geometry)
+            assert result.ok, result.errors
 
     def test_drop_with_missing_z_travel_rejected(self):
         geom = replace(H2S_GEOMETRY, z_travel_mm=None)

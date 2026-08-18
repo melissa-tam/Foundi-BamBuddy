@@ -310,6 +310,130 @@ class TestEjectProfileCrud:
         )
         assert resp.status_code == 422
 
+    async def test_drop_floor_dwell_and_jitter_round_trip(self, async_client: AsyncClient):
+        # Create with both drop-floor behaviours on; CREATE, GET and UPDATE echo them.
+        body = _valid_profile_body(
+            name="dropdjcrud",
+            bed_drop_clearance_mm=50.0,
+            bed_drop_dwell_s=5,
+            bed_drop_jitter_cycles=3,
+            bed_drop_jitter_mm=10.0,
+        )
+        resp = await async_client.post("/api/v1/eject-profiles", json=body)
+        assert resp.status_code == 201, resp.text
+        created = resp.json()
+        assert (created["bed_drop_dwell_s"], created["bed_drop_jitter_cycles"], created["bed_drop_jitter_mm"]) == (
+            5,
+            3,
+            10.0,
+        )
+        got = (await async_client.get(f"/api/v1/eject-profiles/{created['id']}")).json()
+        assert (got["bed_drop_dwell_s"], got["bed_drop_jitter_cycles"], got["bed_drop_jitter_mm"]) == (5, 3, 10.0)
+        resp = await async_client.put(
+            f"/api/v1/eject-profiles/{created['id']}",
+            json={"bed_drop_dwell_s": 12, "bed_drop_jitter_cycles": 2, "bed_drop_jitter_mm": 4.0},
+        )
+        assert resp.status_code == 200, resp.text
+        updated = resp.json()
+        assert (updated["bed_drop_dwell_s"], updated["bed_drop_jitter_cycles"], updated["bed_drop_jitter_mm"]) == (
+            12,
+            2,
+            4.0,
+        )
+
+    async def test_drop_floor_behaviours_default_null(self, async_client: AsyncClient):
+        # Omitting them -> null (both off, the plain down-and-return drop).
+        resp = await async_client.post(
+            "/api/v1/eject-profiles", json=_valid_profile_body(name="dropdjnull", bed_drop_clearance_mm=50.0)
+        )
+        assert resp.status_code == 201, resp.text
+        created = resp.json()
+        assert created["bed_drop_dwell_s"] is None
+        assert created["bed_drop_jitter_cycles"] is None
+        assert created["bed_drop_jitter_mm"] is None
+
+    async def test_one_sided_jitter_422(self, async_client: AsyncClient):
+        for name, overrides in (
+            ("jitcycles", {"bed_drop_jitter_cycles": 3}),
+            ("jitmm", {"bed_drop_jitter_mm": 10.0}),
+        ):
+            resp = await async_client.post(
+                "/api/v1/eject-profiles",
+                json=_valid_profile_body(name=name, bed_drop_clearance_mm=50.0, **overrides),
+            )
+            assert resp.status_code == 422, resp.text
+
+    async def test_one_sided_jitter_update_422(self, async_client: AsyncClient):
+        # Partial update: touching one jitter field requires supplying both.
+        pid = (
+            await async_client.post(
+                "/api/v1/eject-profiles",
+                json=_valid_profile_body(name="jitupd", bed_drop_clearance_mm=50.0),
+            )
+        ).json()["id"]
+        resp = await async_client.put(f"/api/v1/eject-profiles/{pid}", json={"bed_drop_jitter_cycles": 3})
+        assert resp.status_code == 422, resp.text
+
+    async def test_dwell_without_bed_drop_422(self, async_client: AsyncClient):
+        # Both behaviours act AT the drop floor — without the drop there is no floor.
+        resp = await async_client.post(
+            "/api/v1/eject-profiles", json=_valid_profile_body(name="dwellnodrop", bed_drop_dwell_s=5)
+        )
+        assert resp.status_code == 422, resp.text
+
+    async def test_jitter_without_bed_drop_422(self, async_client: AsyncClient):
+        resp = await async_client.post(
+            "/api/v1/eject-profiles",
+            json=_valid_profile_body(name="jitnodrop", bed_drop_jitter_cycles=3, bed_drop_jitter_mm=10.0),
+        )
+        assert resp.status_code == 422, resp.text
+
+    async def test_update_clearing_drop_while_dwell_remains_422(self, async_client: AsyncClient):
+        # The rule binds the MERGED row: clearing the clearance alone would strand
+        # the dwell and store a profile that cannot generate — 422 at save time
+        # instead of a fail-closed raise with a finished plate waiting on the eject.
+        pid = (
+            await async_client.post(
+                "/api/v1/eject-profiles",
+                json=_valid_profile_body(name="stranddwell", bed_drop_clearance_mm=50.0, bed_drop_dwell_s=5),
+            )
+        ).json()["id"]
+        resp = await async_client.put(f"/api/v1/eject-profiles/{pid}", json={"bed_drop_clearance_mm": None})
+        assert resp.status_code == 422, resp.text
+        # The rejected patch left the stored row intact (rolled back, still usable).
+        got = (await async_client.get(f"/api/v1/eject-profiles/{pid}")).json()
+        assert got["bed_drop_clearance_mm"] == 50.0
+        assert got["bed_drop_dwell_s"] == 5
+
+    async def test_update_clearing_drop_and_behaviours_together_ok(self, async_client: AsyncClient):
+        # Clearing the whole assist in ONE patch is the supported way back to off.
+        pid = (
+            await async_client.post(
+                "/api/v1/eject-profiles",
+                json=_valid_profile_body(
+                    name="clearall",
+                    bed_drop_clearance_mm=50.0,
+                    bed_drop_dwell_s=5,
+                    bed_drop_jitter_cycles=3,
+                    bed_drop_jitter_mm=10.0,
+                ),
+            )
+        ).json()["id"]
+        resp = await async_client.put(
+            f"/api/v1/eject-profiles/{pid}",
+            json={
+                "bed_drop_clearance_mm": None,
+                "bed_drop_dwell_s": None,
+                "bed_drop_jitter_cycles": None,
+                "bed_drop_jitter_mm": None,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        cleared = resp.json()
+        assert cleared["bed_drop_clearance_mm"] is None
+        assert cleared["bed_drop_dwell_s"] is None
+        assert cleared["bed_drop_jitter_cycles"] is None
+
 
 @pytest.mark.asyncio
 @pytest.mark.integration

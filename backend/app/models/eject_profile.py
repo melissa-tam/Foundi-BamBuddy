@@ -73,5 +73,17 @@ class EjectProfile(Base):
     # = off. The clearance is kept from the machine bottom during the drop.
     bed_drop_clearance_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Optional hold at the drop floor (whole seconds). NULL = no dwell. Emitted as
+    # `M400 S<n>` — the only dwell form the runtime estimator counts, and the abort
+    # watchdog consumes that estimate, so a G4 dwell would be invisible to both.
+    bed_drop_dwell_s: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Optional oscillation at the drop floor: this many up-then-back strokes of
+    # bed_drop_jitter_mm each. Both columns are set or both NULL (NULL = no jitter).
+    # Each stroke rises AWAY from the machine bottom first, so no move ever passes
+    # the drop target — the eject Z ceiling stays the drop Z.
+    bed_drop_jitter_cycles: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bed_drop_jitter_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
