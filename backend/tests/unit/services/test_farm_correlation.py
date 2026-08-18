@@ -16,6 +16,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.farm_correlation import (
     classify_stop,
+    farm_model_work_pending,
     farm_work_targets_printer,
     on_native_plate_detection,
     resolve_active_plate_id,
@@ -33,6 +34,7 @@ async def _add_item(
     library_file_id=None,
     batch_id=None,
     plate_id=None,
+    target_model=None,
 ):
     item = PrintQueueItem(
         printer_id=printer_id,
@@ -42,6 +44,7 @@ async def _add_item(
         library_file_id=library_file_id,
         batch_id=batch_id,
         plate_id=plate_id,
+        target_model=target_model,
         started_at=datetime.now(timezone.utc),
     )
     db.add(item)
@@ -191,6 +194,60 @@ class TestFarmWorkTargetsPrinter:
         batch = await _add_farm_batch(db_session)
         await _add_item(db_session, printer_id=5, status="completed", batch_id=batch.id)
         assert await farm_work_targets_printer(db_session, 5) is False
+
+
+class TestFarmModelWorkPending:
+    """The sibling helper: UNASSIGNED farm work targeted at a printer MODEL.
+
+    Consumed by the idle deep-park, which must not lower a bed the scheduler is
+    about to land a model-targeted unit on. Matching mirrors
+    ``print_scheduler._find_idle_printer_for_model``: the item's ``target_model``
+    is normalised, then compared case-insensitively to the printer's model.
+    """
+
+    async def test_true_for_model_targeted_pending_item(self, db_session):
+        batch = await _add_farm_batch(db_session)
+        await _add_item(db_session, printer_id=None, status="pending", batch_id=batch.id, target_model="H2S")
+        assert await farm_model_work_pending(db_session, "H2S") is True
+
+    async def test_true_for_alias_spelling_and_case(self, db_session):
+        # The scheduler normalises the item's target_model ("Bambu Lab H2S" → "H2S")
+        # and compares case-insensitively against the stored Printer.model.
+        batch = await _add_farm_batch(db_session)
+        await _add_item(db_session, printer_id=None, status="pending", batch_id=batch.id, target_model="Bambu Lab H2S")
+        assert await farm_model_work_pending(db_session, "H2S") is True
+        assert await farm_model_work_pending(db_session, "h2s") is True
+
+    async def test_false_for_printing_item(self, db_session):
+        # Only PENDING work is slated; a printing item is already on a printer.
+        batch = await _add_farm_batch(db_session)
+        await _add_item(db_session, printer_id=None, status="printing", batch_id=batch.id, target_model="H2S")
+        assert await farm_model_work_pending(db_session, "H2S") is False
+
+    async def test_false_for_printer_bound_item(self, db_session):
+        # A pinned item is farm_work_targets_printer's business, not this helper's.
+        batch = await _add_farm_batch(db_session)
+        await _add_item(db_session, printer_id=5, status="pending", batch_id=batch.id, target_model="H2S")
+        assert await farm_model_work_pending(db_session, "H2S") is False
+
+    async def test_false_for_non_farm_batch(self, db_session):
+        plain = PrintBatch(name="plain")  # no sku_file_id → not a farm batch
+        db_session.add(plain)
+        await db_session.commit()
+        await db_session.refresh(plain)
+        await _add_item(db_session, printer_id=None, status="pending", batch_id=plain.id, target_model="H2S")
+        assert await farm_model_work_pending(db_session, "H2S") is False
+
+    async def test_false_for_a_different_model(self, db_session):
+        batch = await _add_farm_batch(db_session)
+        await _add_item(db_session, printer_id=None, status="pending", batch_id=batch.id, target_model="P1S")
+        assert await farm_model_work_pending(db_session, "H2S") is False
+
+    async def test_false_for_missing_printer_model(self, db_session):
+        batch = await _add_farm_batch(db_session)
+        await _add_item(db_session, printer_id=None, status="pending", batch_id=batch.id, target_model="H2S")
+        assert await farm_model_work_pending(db_session, None) is False
+        assert await farm_model_work_pending(db_session, "  ") is False
 
 
 class TestResolveActivePlateId:

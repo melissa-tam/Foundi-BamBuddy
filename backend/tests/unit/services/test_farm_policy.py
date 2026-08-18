@@ -13,6 +13,7 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.models.printer_model_geometry import PrinterModelGeometry
 from backend.app.models.sku import Sku, SkuFile
 from backend.app.services import farm_policy
 from backend.app.services.notification_service import notification_service
@@ -1668,6 +1669,221 @@ class TestEjectRuntimeExceededMark:
         assert cleared == []
         quarantine.assert_awaited_once()
         escalate.assert_not_called()
+
+
+class _ParkClient:
+    """Minimal MQTT-client stand-in: records G-code and reports send success.
+
+    ``last_dispatch_subtask_id`` is what ``matches_pending_eject`` reads to confirm
+    the terminal is our dispatched eject.
+    """
+
+    def __init__(self, *, subtask: str | None = "SUB-E", ok: bool = True) -> None:
+        self.last_dispatch_subtask_id = subtask
+        self.ok = ok
+        self.sent: list[str] = []
+
+    def send_gcode(self, gcode: str) -> bool:
+        self.sent.append(gcode)
+        return self.ok
+
+
+class TestIdleDeepPark:
+    """After a CLEAN PRODUCTION eject on a printer with nothing slated, the bed is
+    lowered to a percentage of the model's Z travel over the ``gcode_line`` lane.
+
+    The park is cosmetic, so every guard is a silent skip and every failure is a log
+    line: the terminal chain (gate release included) must complete regardless. It is
+    production-only — the manual branch has an operator standing at the machine —
+    and never runs after a watchdog-killed or failed eject, where the machine's
+    motion state is exactly what is in doubt.
+    """
+
+    async def _mk_printer(self, db, name, model="H2S"):
+        p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model=model)
+        db.add(p)
+        await db.commit()
+        await db.refresh(p)
+        return p
+
+    async def _seed_geometry(self, db, *, model_key="H2S", z_travel=340.0):
+        """The test DB is built with ``create_all`` only, so registry rows are absent."""
+        db.add(
+            PrinterModelGeometry(
+                model_key=model_key,
+                bed_x=340,
+                bed_y=320,
+                env_x_min=0,
+                env_x_max=340,
+                env_y_min=-16,
+                env_y_max=325,
+                max_part_height_mm=42,
+                z_travel_mm=z_travel,
+                validated=True,
+                notes="test seed",
+            )
+        )
+        await db.commit()
+
+    async def _terminal(self, db, printer, client, *, final_status="completed", pending=None):
+        """Drive one eject terminal; returns the set_awaiting_plate_clear calls."""
+        from backend.app.services.eject import monitor as monitor_mod, remote
+
+        remote.register_pending_eject(printer.id, pending or remote.PendingEject("production", None, None))
+        cleared: list[tuple[int, bool]] = []
+        try:
+            with (
+                patch.object(farm_policy.printer_manager, "get_client", return_value=client),
+                patch.object(
+                    farm_policy.printer_manager,
+                    "set_awaiting_plate_clear",
+                    side_effect=lambda pid, v, **kw: cleared.append((pid, v)),
+                ),
+                patch.object(farm_policy, "quarantine_printer", new_callable=AsyncMock),
+                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock),
+                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch"),
+            ):
+                await farm_policy.on_terminal(db, printer.id, None, final_status, completed_subtask_id="SUB-E")
+            return cleared
+        finally:
+            remote.pop_pending_eject(printer.id)
+
+    async def test_parks_idle_printer_after_clean_production_eject(self, db_session):
+        printer = await self._mk_printer(db_session, "PARKok")
+        await self._seed_geometry(db_session)
+        client = _ParkClient()
+        cleared = await self._terminal(db_session, printer, client)
+        assert cleared == [(printer.id, False)]  # gate released as before
+        # 75 % of 340 mm. M400 drains the queue BEFORE M18 releases the steppers —
+        # cutting them mid-descent would drop the bed the rest of the way.
+        assert client.sent == ["M17\nG90\nG1 Z255.0 F900\nM400\nM18"]
+
+    async def test_no_park_when_work_is_bound_to_the_printer(self, db_session):
+        printer = await self._mk_printer(db_session, "PARKbound")
+        await self._seed_geometry(db_session)
+        await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=True)
+        client = _ParkClient()
+        await self._terminal(db_session, printer, client)
+        assert client.sent == []  # the next unit is about to use this bed
+
+    async def test_no_park_when_model_targeted_work_is_pending(self, db_session):
+        printer = await self._mk_printer(db_session, "PARKmodel")
+        await self._seed_geometry(db_session)
+        # Unassigned, model-targeted work the scheduler could land right here.
+        await _mk_run(db_session, quantity=2, printer_ids=None, target_model="H2S", require_fa=True)
+        client = _ParkClient()
+        await self._terminal(db_session, printer, client)
+        assert client.sent == []
+
+    async def test_no_park_on_bedslinger_model(self, db_session):
+        # The gantry carries Z and the bed is fixed in Z — there is no bed travel to
+        # park into (the same physics that refuses the eject bed-drop).
+        printer = await self._mk_printer(db_session, "PARKa1", model="A1")
+        await self._seed_geometry(db_session, model_key="A1", z_travel=250.0)
+        client = _ParkClient()
+        await self._terminal(db_session, printer, client)
+        assert client.sent == []
+
+    async def test_no_park_without_a_geometry_row(self, db_session):
+        printer = await self._mk_printer(db_session, "PARKnogeo")
+        client = _ParkClient()
+        cleared = await self._terminal(db_session, printer, client)
+        assert cleared == [(printer.id, False)]  # terminal chain unaffected
+        assert client.sent == []
+
+    async def test_no_park_when_z_travel_is_null(self, db_session):
+        # A2L-shaped row: no commandable Z travel recorded → nothing to take a
+        # percentage of, so the park has no defensible target.
+        printer = await self._mk_printer(db_session, "PARKnullz")
+        await self._seed_geometry(db_session, z_travel=None)
+        client = _ParkClient()
+        await self._terminal(db_session, printer, client)
+        assert client.sent == []
+
+    async def test_no_park_when_setting_is_off(self, db_session):
+        from backend.app.api.routes.settings import set_setting
+
+        printer = await self._mk_printer(db_session, "PARKoff")
+        await self._seed_geometry(db_session)
+        await set_setting(db_session, "farm_idle_park_enabled", "false")
+        await db_session.commit()
+        client = _ParkClient()
+        await self._terminal(db_session, printer, client)
+        assert client.sent == []
+
+    async def test_refused_command_is_warn_only(self, db_session):
+        # send_gcode False (disconnected client) must not raise, retry, or escalate —
+        # the terminal chain still completes.
+        printer = await self._mk_printer(db_session, "PARKrefused")
+        await self._seed_geometry(db_session)
+        client = _ParkClient(ok=False)
+        cleared = await self._terminal(db_session, printer, client)
+        assert cleared == [(printer.id, False)]
+        assert client.sent == ["M17\nG90\nG1 Z255.0 F900\nM400\nM18"]  # attempted once, not retried
+
+    async def test_percent_is_clamped_and_bad_values_fall_back(self, db_session):
+        from backend.app.api.routes.settings import set_setting
+
+        printer = await self._mk_printer(db_session, "PARKpct")
+        await self._seed_geometry(db_session)
+
+        await set_setting(db_session, "farm_idle_park_percent", "200")  # above the 95 ceiling
+        await db_session.commit()
+        client = _ParkClient()
+        await self._terminal(db_session, printer, client)
+        assert client.sent == ["M17\nG90\nG1 Z323.0 F900\nM400\nM18"]  # 95 % of 340
+
+        await set_setting(db_session, "farm_idle_park_percent", "5")  # below the 10 floor
+        await db_session.commit()
+        client = _ParkClient()
+        await self._terminal(db_session, printer, client)
+        assert client.sent == ["M17\nG90\nG1 Z34.0 F900\nM400\nM18"]  # 10 % of 340
+
+        await set_setting(db_session, "farm_idle_park_percent", "not-a-number")
+        await db_session.commit()
+        client = _ParkClient()
+        await self._terminal(db_session, printer, client)
+        assert client.sent == ["M17\nG90\nG1 Z255.0 F900\nM400\nM18"]  # schema default 75 %
+
+    async def test_never_parks_after_a_watchdog_killed_eject(self, db_session):
+        # The stalled-sweep branch returns before the gate release: a machine whose
+        # motion is under suspicion must never be commanded to move further.
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "PARKkilled")
+        await self._seed_geometry(db_session)
+        killed = remote.PendingEject(
+            "production",
+            None,
+            None,
+            expected_runtime_s=83.0,
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=179),
+            runtime_exceeded_at=datetime.now(timezone.utc) - timedelta(seconds=75),
+        )
+        client = _ParkClient()
+        cleared = await self._terminal(db_session, printer, client, pending=killed)
+        assert cleared == []  # gate KEPT
+        assert client.sent == []
+
+    async def test_never_parks_on_a_failed_eject(self, db_session):
+        printer = await self._mk_printer(db_session, "PARKfailed")
+        await self._seed_geometry(db_session)
+        client = _ParkClient()
+        cleared = await self._terminal(db_session, printer, client, final_status="failed")
+        assert cleared == []  # sweep unverified — gate kept
+        assert client.sent == []
+
+    async def test_never_parks_on_the_manual_branch(self, db_session):
+        # A manual (foreign-plate) eject means an operator is at the machine; their
+        # plate stays at working height.
+        from backend.app.services.eject import remote
+
+        printer = await self._mk_printer(db_session, "PARKmanual")
+        await self._seed_geometry(db_session)
+        client = _ParkClient()
+        cleared = await self._terminal(db_session, printer, client, pending=remote.PendingEject("manual", None, None))
+        assert cleared == [(printer.id, False)]  # gate released by the manual branch
+        assert client.sent == []
 
 
 class TestFaEjectCooldownGate:

@@ -660,6 +660,17 @@ class AppSettings(BaseModel):
         default=True,
         description="On a USB-storage-low HMS fault, auto-delete old camera recordings then oldest unused print files",
     )
+    farm_idle_park_enabled: bool = Field(
+        default=True,
+        description="Lower the bed to the set percentage of Z travel after a clean production eject when nothing is "
+        "queued for the printer",
+    )
+    farm_idle_park_percent: int = Field(
+        default=75,
+        ge=10,
+        le=95,
+        description="Idle park depth as a percentage of the model's commandable Z travel (10-95)",
+    )
 
     # Reused-tag auto re-spool (peel a spent Bambu RFID tag onto a fresh
     # third-party spool). `respool_prompt_threshold_g` is the remaining-grams
@@ -829,6 +840,8 @@ class AppSettingsUpdate(BaseModel):
     farm_cooldown_stall_epsilon_c: float | None = Field(default=None, ge=0.1, le=20.0)
     farm_cooldown_max_hold_minutes: int | None = Field(default=None, ge=0, le=720)
     farm_cooldown_plateau_eject_margin_c: float | None = Field(default=None, ge=0.0, le=50.0)
+    farm_idle_park_enabled: bool | None = None
+    farm_idle_park_percent: int | None = Field(default=None, ge=10, le=95)
     respool_prompt_threshold_g: int | None = Field(default=None, ge=0, le=1000)
     respool_last_brand: str | None = None
 

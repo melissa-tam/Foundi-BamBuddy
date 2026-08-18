@@ -78,6 +78,32 @@ class TestSettingsAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_update_farm_idle_park(self, async_client: AsyncClient):
+        """The idle deep-park keys round-trip TYPED (bool/int) through the
+        coercion whitelists — without them a stored setting reads back as a string."""
+        # Schema defaults when never written.
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_idle_park_enabled"] is True
+        assert response.json()["farm_idle_park_percent"] == 75
+
+        response = await async_client.put(
+            "/api/v1/settings/", json={"farm_idle_park_enabled": False, "farm_idle_park_percent": 60}
+        )
+        assert response.status_code == 200
+        assert response.json()["farm_idle_park_enabled"] is False
+        assert response.json()["farm_idle_park_percent"] == 60
+
+        # Persisted read-back through the bool + int parse whitelists.
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_idle_park_enabled"] is False
+        assert response.json()["farm_idle_park_percent"] == 60
+
+        # Bounds are enforced by the schema (10-95).
+        response = await async_client.put("/api/v1/settings/", json={"farm_idle_park_percent": 99})
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_update_respool_auto_enabled(self, async_client: AsyncClient):
         """respool_auto_enabled round-trips (default False → True → back) through the
         boolean-parse whitelist."""

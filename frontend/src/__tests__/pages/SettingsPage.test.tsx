@@ -780,6 +780,91 @@ describe('SettingsPage', () => {
       );
     });
 
+    it('renders the idle bed park controls seeded to their defaults', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Idle bed park')).toBeInTheDocument();
+      });
+
+      // mockSettings omits both keys, so the component's `?? default` fallbacks show.
+      const percent = screen.getByLabelText('Park depth (% of Z travel)') as HTMLInputElement;
+      expect(percent.value).toBe('75');
+      expect(percent.disabled).toBe(false);
+    });
+
+    it('round-trips the park depth through the save endpoint', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const percent = await waitFor(() => screen.getByLabelText('Park depth (% of Z travel)'));
+      fireEvent.change(percent, { target: { value: '60' } });
+
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          // Only touched keys carry a value — an untouched toggle stays absent from
+          // the payload (the page's standing behaviour for every setting).
+          expect(receivedBody!.farm_idle_park_percent).toBe(60);
+        },
+        { timeout: 5000 },
+      );
+    });
+
+    it('toggling idle bed park off saves and disables the depth input', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const row = await waitFor(() => {
+        const found = screen.getByText('Idle bed park').closest('.justify-between');
+        expect(found).not.toBeNull();
+        return found as HTMLElement;
+      });
+      await user.click(within(row).getByRole('checkbox'));
+
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          expect(receivedBody!.farm_idle_park_enabled).toBe(false);
+        },
+        { timeout: 5000 },
+      );
+      // The depth is meaningless while the park is off.
+      expect((screen.getByLabelText('Park depth (% of Z travel)') as HTMLInputElement).disabled).toBe(true);
+    });
+
     it('cross-tab search finds the Dispatch responsiveness card', async () => {
       const user = userEvent.setup();
       render(<SettingsPage />);

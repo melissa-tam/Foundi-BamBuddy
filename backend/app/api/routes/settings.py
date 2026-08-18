@@ -294,6 +294,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "print_drying_enabled",
             "require_plate_clear",
             "farm_usb_auto_cleanup",
+            "farm_idle_park_enabled",
             "queue_shortest_first",
             "default_bed_levelling",
             "default_flow_cali",
@@ -350,6 +351,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "farm_pause_stall_minutes",
             "farm_cooldown_stall_window_minutes",
             "farm_cooldown_max_hold_minutes",
+            "farm_idle_park_percent",
             "respool_prompt_threshold_g",
             "erp_db_port",
         ]:

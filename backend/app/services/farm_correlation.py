@@ -70,6 +70,7 @@ from sqlalchemy import select
 
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
+from backend.app.utils.printer_models import normalize_printer_model
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -402,3 +403,45 @@ async def farm_work_targets_printer(db: AsyncSession, printer_id: int) -> bool:
         .limit(1)
     )
     return result.first() is not None
+
+
+async def farm_model_work_pending(db: AsyncSession, printer_model: str | None) -> bool:
+    """True if any UNASSIGNED farm queue item is model-targeted at ``printer_model``.
+
+    The sibling of :func:`farm_work_targets_printer` for work that names a MODEL
+    rather than a printer: a pending farm item with ``printer_id IS NULL`` and a
+    ``target_model`` the scheduler could land on any printer of that model — this
+    one included. Deliberately a separate function: ``farm_work_targets_printer``
+    drives plate-gate semantics (bound work only) and must not widen.
+
+    Matching mirrors ``print_scheduler._find_idle_printer_for_model``: the ITEM's
+    ``target_model`` is run through :func:`normalize_printer_model` and compared
+    case-insensitively against the printer's stored model. The comparison happens
+    in Python over the distinct target_model values because no SQL-side
+    normalisation exists — the scheduler normalises in Python too, so the two
+    answers cannot drift.
+
+    Consumer: the idle deep-park (``farm_policy._maybe_idle_deep_park``). The park
+    is cosmetic, so an over-TRUE answer costs nothing but a skipped park; a
+    false NEGATIVE would park a bed the scheduler is about to print on.
+    """
+    if not printer_model or not printer_model.strip():
+        # No model on the printer row ⇒ nothing can be model-targeted at it. Answer
+        # False rather than scanning: an unknown model matches no target.
+        return False
+
+    result = await db.execute(
+        select(PrintQueueItem.target_model)
+        .join(PrintBatch, PrintQueueItem.batch_id == PrintBatch.id)
+        .where(PrintQueueItem.printer_id.is_(None))
+        .where(PrintQueueItem.status == "pending")
+        .where(PrintQueueItem.target_model.is_not(None))
+        .where(PrintBatch.sku_file_id.is_not(None))
+        .distinct()
+    )
+    wanted = printer_model.strip().lower()
+    for target_model in result.scalars().all():
+        normalized = normalize_printer_model(target_model) or target_model
+        if normalized and normalized.lower() == wanted:
+            return True
+    return False

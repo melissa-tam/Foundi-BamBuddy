@@ -76,7 +76,7 @@ registerSettingsSearch({ labelKey: 'settings.plateClear', labelFallback: 'Plate-
 registerSettingsSearch({ labelKey: 'settings.gcodeInjection', labelFallback: 'G-code Injection', tab: 'queue', keywords: 'gcode injection start end autoprint farmloop swapmod autoclear printflow', anchor: 'card-gcode' });
 registerSettingsSearch({ labelKey: 'settings.slicerCard', labelFallback: 'Slicer', tab: 'queue', keywords: 'slicer orcaslicer bambustudio orca bambu api sidecar url docker preferred', anchor: 'card-slicer' });
 registerSettingsSearch({ labelKey: 'settings.queueDrying', tab: 'queue', keywords: 'drying presets temperature time humidity ams', anchor: 'card-drying' });
-registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog', anchor: 'card-farm-production' });
+registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog idle park deep bed lower position', anchor: 'card-farm-production' });
 registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown stall window epsilon plateau min cooling per check give up timer close enough margin release threshold warn floor bed temperature quarantine', anchor: 'card-farm-cooldown' });
 registerSettingsSearch({ labelKey: 'settings.dispatchResponsiveness', labelFallback: 'Dispatch responsiveness', tab: 'farm', keywords: 'dispatch responsiveness latency poll interval queue check kick debounce coalesce usb preflight fresh window max wait parallel concurrency upload skip identical slim 3mf mesh thumbnail eject file speed', anchor: 'card-dispatch-responsiveness' });
 registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool prompt threshold reused tag grams rfid', anchor: 'card-filamentchecks' });
@@ -1017,6 +1017,8 @@ export function SettingsPage() {
       (settings.farm_cooldown_max_hold_minutes ?? 180) !== (localSettings.farm_cooldown_max_hold_minutes ?? 180) ||
       (settings.farm_cooldown_plateau_eject_margin_c ?? 3) !== (localSettings.farm_cooldown_plateau_eject_margin_c ?? 3) ||
       (settings.farm_usb_auto_cleanup ?? true) !== (localSettings.farm_usb_auto_cleanup ?? true) ||
+      (settings.farm_idle_park_enabled ?? true) !== (localSettings.farm_idle_park_enabled ?? true) ||
+      (settings.farm_idle_park_percent ?? 75) !== (localSettings.farm_idle_park_percent ?? 75) ||
       (settings.queue_check_interval_seconds ?? 30) !== (localSettings.queue_check_interval_seconds ?? 30) ||
       (settings.dispatch_kick_debounce_seconds ?? 1) !== (localSettings.dispatch_kick_debounce_seconds ?? 1) ||
       (settings.usb_preflight_fresh_window_seconds ?? 10) !== (localSettings.usb_preflight_fresh_window_seconds ?? 10) ||
@@ -1138,6 +1140,8 @@ export function SettingsPage() {
         farm_cooldown_max_hold_minutes: localSettings.farm_cooldown_max_hold_minutes,
         farm_cooldown_plateau_eject_margin_c: localSettings.farm_cooldown_plateau_eject_margin_c,
         farm_usb_auto_cleanup: localSettings.farm_usb_auto_cleanup,
+        farm_idle_park_enabled: localSettings.farm_idle_park_enabled,
+        farm_idle_park_percent: localSettings.farm_idle_park_percent,
         queue_check_interval_seconds: localSettings.queue_check_interval_seconds,
         dispatch_kick_debounce_seconds: localSettings.dispatch_kick_debounce_seconds,
         usb_preflight_fresh_window_seconds: localSettings.usb_preflight_fresh_window_seconds,
@@ -5056,6 +5060,43 @@ export function SettingsPage() {
                   />
                   <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
                 </label>
+              </div>
+              <div className="flex items-center justify-between pt-1">
+                <div className="flex-1 mr-4">
+                  <p className="text-sm text-white">
+                    {t('settings.farmIdlePark', 'Idle bed park')}
+                  </p>
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmIdleParkHelp', 'After a clean production eject with nothing queued for the printer, the bed lowers to the set percentage of Z travel.')}
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={localSettings.farm_idle_park_enabled ?? true}
+                    onChange={(e) => updateSetting('farm_idle_park_enabled', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
+              </div>
+              <div className={`sm:max-w-xs ${(localSettings.farm_idle_park_enabled ?? true) ? '' : 'opacity-50'}`}>
+                <label htmlFor="farm-idle-park-percent" className="block text-xs text-bambu-gray mb-1">
+                  {t('settings.farmIdleParkPercent', 'Park depth (% of Z travel)')}
+                </label>
+                <input
+                  id="farm-idle-park-percent"
+                  type="number"
+                  min={10}
+                  max={95}
+                  value={localSettings.farm_idle_park_percent ?? 75}
+                  onChange={(e) => updateSetting('farm_idle_park_percent', Math.max(10, Math.min(95, parseInt(e.target.value) || 75)))}
+                  disabled={!(localSettings.farm_idle_park_enabled ?? true)}
+                  className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                />
+                <p className="text-xs text-bambu-gray mt-1">
+                  {t('settings.farmIdleParkPercentHelp', 'Depth as a percentage of the model Z travel; bedslinger models never park (10–95)')}
+                </p>
               </div>
             </CardContent>
           </Card>

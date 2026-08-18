@@ -1345,6 +1345,13 @@ export interface AppSettings {
   // USB storage-low auto-cleanup: on a "USB full" HMS fault, auto-delete old
   // camera recordings then oldest unused print files so dispatch keeps working.
   farm_usb_auto_cleanup: boolean;
+  // Idle deep-park: after a clean PRODUCTION eject on a printer with nothing
+  // slated (no bound farm work, no model-targeted pending work), lower the bed to
+  // this percentage of the model's commandable Z travel. Server-side G-code, not
+  // part of the eject file. Bedslinger models and models with no recorded Z
+  // travel never park.
+  farm_idle_park_enabled: boolean;
+  farm_idle_park_percent: number;
   // Dispatch responsiveness (latency-reduction wave). Event kicks make dispatch
   // immediate; these tune the fallback poll, kick coalescing, USB-preflight
   // freshness, upload concurrency, and eject-file upload optimizations.

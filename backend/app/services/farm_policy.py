@@ -42,10 +42,13 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.sku import SkuFile
-from backend.app.services.eject import remote as eject_remote
+from backend.app.schemas.settings import AppSettings
+from backend.app.services import farm_correlation
+from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
+from backend.app.utils.printer_models import is_bedslinger_model
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -359,6 +362,9 @@ async def on_terminal(
                     logger.info(
                         "farm_policy: production eject on printer %s completed — plate-clear gate released", printer_id
                     )
+                    # Production ONLY (operator ruling): a manual eject has an operator
+                    # standing at the machine, so its plate must stay at working height.
+                    await _maybe_idle_deep_park(db, printer_id)
                 else:
                     # Sweep unverified: KEEP the gate, quarantine the printer, and
                     # pause the unit's run if it now has no available printers.
@@ -409,6 +415,102 @@ async def on_terminal(
             await on_operator_stop(db, batch, item)
     except Exception:  # noqa: BLE001 — policy must never crash the callback chain
         logger.exception("farm_policy.on_terminal failed for item=%s status=%s", queue_item_id, final_status)
+
+
+# --------------------------------------------------------------------------- #
+# Idle deep-park
+# --------------------------------------------------------------------------- #
+# Fallbacks come from the settings schema itself, so the default lives in ONE place
+# (same pattern as services/eject/monitor.py's cooldown fallbacks).
+_IDLE_PARK_ENABLED_DEFAULT: bool = bool(AppSettings.model_fields["farm_idle_park_enabled"].default)
+_IDLE_PARK_PERCENT_DEFAULT: int = int(AppSettings.model_fields["farm_idle_park_percent"].default)
+_IDLE_PARK_PERCENT_MIN = 10
+_IDLE_PARK_PERCENT_MAX = 95
+
+
+async def _maybe_idle_deep_park(db: AsyncSession, printer_id: int) -> None:
+    """Lower the bed of an idle printer after a clean PRODUCTION eject.
+
+    A printer whose plate was just swept and that has nothing slated parks its bed
+    deep (a configured percentage of the model's commandable Z travel), so the idle
+    fleet sits in a consistent, reachable position instead of at whatever height the
+    last sweep left. Server-side G-code over the MQTT ``gcode_line`` lane — it is
+    deliberately NOT part of the eject file, because the eject file's runtime is
+    watchdogged and a park appended to it would read as a stalled sweep.
+
+    Purely cosmetic, therefore fail-quiet by construction: every failure path is a
+    log line. Nothing here escalates, retries, quarantines, or raises into the
+    terminal chain — a printer that never parks is a printer that is simply parked
+    where the eject left it.
+
+    Skipped when: the setting is off; farm work (bound OR model-targeted) is slated
+    for the printer; the model is a bedslinger (the gantry carries Z — there is no
+    bed-on-Z travel to park into, the same physics that refuses the eject bed-drop);
+    or the model has no geometry row / no ``z_travel_mm`` (nothing to take a
+    percentage of).
+
+    Callers: the production-eject completed branch of :func:`on_terminal` only. The
+    watchdog-killed branch returns before it (a stalled sweep must never command
+    more motion) and the manual branch never calls it (an operator is present).
+    """
+    try:
+        from backend.app.api.routes.settings import get_setting
+
+        raw_enabled = await get_setting(db, "farm_idle_park_enabled")
+        enabled = _IDLE_PARK_ENABLED_DEFAULT if raw_enabled is None else raw_enabled.strip().lower() == "true"
+        if not enabled:
+            return
+
+        # Work bound to THIS printer, then work targeted at its MODEL that the
+        # scheduler could land here — either way the bed is about to be used.
+        if await farm_correlation.farm_work_targets_printer(db, printer_id):
+            return
+        printer = await db.get(Printer, printer_id)
+        if printer is None:
+            return
+        if await farm_correlation.farm_model_work_pending(db, printer.model):
+            return
+
+        if is_bedslinger_model(printer.model):
+            return
+
+        geometry = await eject_geometry.get_geometry(db, printer.model)
+        if geometry is None or geometry.z_travel_mm is None:
+            logger.debug(
+                "farm_policy: idle deep-park skipped on printer %s — no z_travel_mm for model %r",
+                printer_id,
+                printer.model,
+            )
+            return
+
+        raw_percent = await get_setting(db, "farm_idle_park_percent")
+        try:
+            percent = int(raw_percent) if raw_percent is not None else _IDLE_PARK_PERCENT_DEFAULT
+        except (TypeError, ValueError):
+            percent = _IDLE_PARK_PERCENT_DEFAULT
+        percent = max(_IDLE_PARK_PERCENT_MIN, min(_IDLE_PARK_PERCENT_MAX, percent))
+        park_z = geometry.z_travel_mm * percent / 100.0
+
+        client = printer_manager.get_client(printer_id)
+        if client is None:
+            logger.warning("farm_policy: idle deep-park skipped on printer %s — no MQTT client", printer_id)
+            return
+        # M400 BEFORE M18 is deliberate: drain the motion queue so the steppers are
+        # only released once the descent has actually finished. Cutting them
+        # mid-descent drops the bed the rest of the way under its own weight.
+        ok = client.send_gcode(f"M17\nG90\nG1 Z{park_z:.1f} F900\nM400\nM18")
+        if ok:
+            logger.info(
+                "farm_policy: idle deep-park sent on printer %s (Z%.1f = %d%% of z_travel %.0f)",
+                printer_id,
+                park_z,
+                percent,
+                geometry.z_travel_mm,
+            )
+        else:
+            logger.warning("farm_policy: idle deep-park command refused on printer %s", printer_id)
+    except Exception:  # noqa: BLE001 — cosmetic lane: never raises into the terminal chain
+        logger.warning("farm_policy: idle deep-park failed on printer %s", printer_id, exc_info=True)
 
 
 async def _on_item_completed(
