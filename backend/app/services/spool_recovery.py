@@ -1197,6 +1197,62 @@ def _resolve_jammed_tray(
     return None, "none"
 
 
+def _feeder_before_edge(state, *, item: PrintQueueItem | None = None, printer_id: int | None = None) -> int | None:
+    """Which global tray was feeding IMMEDIATELY BEFORE an AMS presence edge, or None.
+
+    A DIFFERENT question from :func:`_resolve_jammed_tray`'s, asked over the same
+    witnesses — so the witnesses are shared and only the ORDER changes. The jam case
+    asks "which tray is the fault on, right now"; this asks "which tray was feeding a
+    moment ago", and the two disagree on exactly the witness the answer turns on:
+
+    * ``last_loaded_tray`` FIRST — the last tray that actually fed THIS job (reset at
+      every print start), which is the closest thing the wire has to a record of the
+      instant before the edge;
+    * then the job's single mapped feeder (:func:`_job_feeders` — the farm item's
+      dispatch mapping, the slicer's mapping, then the fed log), which speaks for the
+      whole job and therefore also for the instant before the edge;
+    * ``tray_now`` LAST, and only as a fallback. At a loss edge it may ALREADY have
+      moved (a firmware auto-refill switches to a backup slot the instant the first one
+      runs dry), and after a stopped feed it reads the 255 sentinel, which means
+      "nothing is feeding" and never "the path is clear" (invariant 8). Trusting it
+      first is how "was this slot feeding?" would answer False for the very slot that
+      just ran out.
+
+    A multi-feeder job with no ``last_loaded_tray`` answers None rather than guessing:
+    an ambiguous answer here would either accuse a healthy slot or exonerate the
+    draining one, and the caller's fallback (the live-HMS runout evidence, once the
+    firmware speaks ~3 minutes later) is the honest second chance.
+    """
+    fed = _valid_feeder(getattr(state, "last_loaded_tray", None))
+    if fed is not None:
+        return fed
+    feeders, _source = _job_feeders(state, item, printer_id)
+    if len(feeders) == 1:
+        return feeders[0]
+    return _valid_feeder(getattr(state, "tray_now", None))
+
+
+def slot_was_feeding(state, ams_id: int, tray_id: int, *, item: PrintQueueItem | None = None) -> bool:
+    """Was ``(ams_id, tray_id)`` the active feeder, as of just before now?
+
+    The public verb ``ams_presence`` asks at a presence-LOSS edge (its de-bounce lane's
+    runout-suspect stamp). It lives HERE because feeder resolution is this module's, and
+    a second resolver in the presence lane would be the drift the fork forbids —
+    :func:`_feeder_before_edge` composes the same witnesses, and the comparison rides
+    ``spool_respool._decode_global_tray``, the one origin for the global-tray encoding.
+
+    Never raises: an unreadable state answers False (not evidence of a feed).
+    """
+    try:
+        feeder = _feeder_before_edge(state, item=item)
+    except Exception:  # noqa: BLE001 — a predicate for a callback may never raise
+        logger.exception("spool_recovery: feeder resolution failed for AMS%d-T%d", ams_id, tray_id)
+        return False
+    if feeder is None:
+        return False
+    return _decode_global_tray(feeder) == (ams_id, tray_id)
+
+
 async def _route_fault(
     db: AsyncSession,
     *,

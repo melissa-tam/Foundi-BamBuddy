@@ -85,7 +85,17 @@ async def _bind_spool(db_session, printer_id, ams_id, tray_id, spool):
     await db_session.commit()
 
 
-async def _bind(db_session, spool, printer_id, ams_id, tray_id, *, origin="rfid_auto", preserve_ordinal=False):
+async def _bind(
+    db_session,
+    spool,
+    printer_id,
+    ams_id,
+    tray_id,
+    *,
+    origin="rfid_auto",
+    preserve_ordinal=False,
+    bind_moment=None,
+):
     """Bind through the production writer and commit (callers own the commit)."""
     assignment = await bind_spool_to_slot(
         db_session,
@@ -97,6 +107,7 @@ async def _bind(db_session, spool, printer_id, ams_id, tray_id, *, origin="rfid_
         fingerprint_type="PLA",
         origin=origin,
         preserve_ordinal=preserve_ordinal,
+        bind_moment=bind_moment,
     )
     await db_session.commit()
     return assignment
@@ -616,6 +627,40 @@ async def test_pairing_change_restamps_without_preserve_ordinal(db_session, prin
 
     await db_session.refresh(incoming)
     assert incoming.loaded_at != _SENTINEL
+
+
+# -- bind_moment: a de-bounce re-states a binding, it does not begin one ------
+
+
+@pytest.mark.asyncio
+async def test_bind_moment_is_carried_onto_the_rebuilt_row(db_session, printer_factory):
+    """``SpoolAssignment.created_at`` is read as "an unobserved swap happened at THIS
+    instant" (``spool_tagless.reconcile_ledger_overcharges``), so a lane that has just
+    certified that NOTHING physically happened must hand the old moment back rather than
+    stamp a new one. The writer carries whatever it is given, verbatim."""
+    printer = await printer_factory()
+    returning = await _fresh_spool(db_session)
+
+    assignment = await _bind(db_session, returning, printer.id, 0, 0, bind_moment=_SENTINEL)
+
+    assert assignment.created_at == _SENTINEL
+    await db_session.refresh(assignment)
+    assert assignment.created_at == _SENTINEL, "and it survives the round trip, not just the flush"
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_bind_still_stamps_its_own_moment(db_session, printer_factory):
+    """The liveness half: omitting ``bind_moment`` leaves the column's server default in
+    charge, which is what every genuine bind — an identity read, a mint, an operator
+    assign — depends on to give the reconciler a real boundary to adjudicate across."""
+    printer = await printer_factory()
+    arriving = await _fresh_spool(db_session)
+
+    assignment = await _bind(db_session, arriving, printer.id, 0, 0)
+
+    await db_session.refresh(assignment)
+    assert assignment.created_at is not None
+    assert assignment.created_at != _SENTINEL
 
 
 # -- the MOVE damper (007-H2C spool-194 flip-flop storm) ----------------------

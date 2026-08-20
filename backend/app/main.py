@@ -3167,7 +3167,15 @@ async def on_print_start(printer_id: int, data: dict):
         # Locate + download the 3MF the printer is running. Candidate derivation,
         # the FTPS lane and the stale-plate correction live in services/foreign_archive
         # — one origin, shared with the in-flight capture retry armed below.
-        lookup = await locate_3mf_for_print(printer, subtask_name, filename)
+        #
+        # A print the farm dispatched needs none of that: its queue item names the
+        # source file and the plate, so hand that donor over and the lookup becomes
+        # a lookup instead of a guess-and-verify. Foreign prints resolve None here
+        # and keep the derivation lane (and its #1204 plate cross-check) verbatim.
+        from backend.app.services.farm_correlation import resolve_dispatch_donor
+
+        known_donor = await resolve_dispatch_donor(db, printer_id, subtask_id)
+        lookup = await locate_3mf_for_print(printer, subtask_name, filename, known_donor=known_donor)
         local_path = lookup.local_path
         downloaded_filename = lookup.filename
         subtask_name = lookup.subtask_name

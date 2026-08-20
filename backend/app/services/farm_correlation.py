@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import select
@@ -99,6 +100,30 @@ class TerminalResolution:
 
     item: PrintQueueItem | None
     verdict: Verdict
+
+
+@dataclass(frozen=True)
+class DispatchDonor:
+    """The on-disk source ``.gcode.3mf`` a farm dispatch prints FROM, and its plate.
+
+    "Donor" is the fork's word for the source file a derived artefact is built from
+    (``eject.manual._ForeignSource.donor_path``). Here it answers the question every
+    consumer of a farm print asks in a slightly different way — the archive capture
+    ("which 3MF do I attach?"), the eject builder ("which 3MF do I repack?") and the
+    usage tracker ("which slice_info do I charge from?").
+
+    ``local_path`` is BORROWED — it is the library file or the archive copy, never a
+    temp — so no consumer may delete or truncate it (the 2026-08-15 durable-file-loss
+    class). ``plate_id`` is the plate the FARM dispatched, which is authoritative
+    over anything parsed out of the file or echoed by the printer: a hand-spliced
+    ladder plate can declare a different index internally and still be the file that
+    ran.
+    """
+
+    local_path: Path
+    filename: str
+    plate_id: int | None
+    item_id: int
 
 
 def _normalize_name(name: str | None) -> str | None:
@@ -246,21 +271,22 @@ async def resolve_terminal_item(db: AsyncSession, printer_id: int, payload: dict
     return TerminalResolution(None, "none")
 
 
-async def resolve_active_plate_id(db: AsyncSession, printer_id: int, subtask_id: str | None) -> int | None:
-    """Return the ``plate_id`` of the queue item currently printing on ``printer_id``.
+async def resolve_printing_item(db: AsyncSession, printer_id: int, subtask_id: str | None) -> PrintQueueItem | None:
+    """The queue item currently ``printing`` on ``printer_id``, or None.
 
-    Used at print-start / archive-creation to scope the 3MF parse to the plate that
-    actually ran (#1697): a multi-plate ``.gcode.3mf`` carries every plate's
-    prediction + weight, so without the printed plate's index the archive would
-    store the summed-across-plates totals for a single-plate print.
+    The ONE in-flight attribution used by the print-START lanes, mirroring
+    :func:`resolve_terminal_item`'s identity discipline: when the printer echoes a
+    ``subtask_id`` equal to a printing item's stamped ``dispatch_subtask_id`` that
+    item wins (the id Bambuddy minted for this exact dispatch). Otherwise the sole
+    ``printing`` item on the printer is the best attribution — more than one
+    un-id-matched printing item is genuinely ambiguous, and ambiguity attributes
+    nothing rather than guessing.
 
-    Resolution mirrors :func:`resolve_terminal_item`'s identity discipline: when the
-    printer echoes a ``subtask_id`` equal to a printing item's stamped
-    ``dispatch_subtask_id`` that item wins (the id Bambuddy minted for this exact
-    dispatch). Otherwise the sole ``printing`` item on the printer is the best
-    attribution. Returns that item's ``plate_id`` — which may itself be ``None`` for
-    a non-plate-scoped (single-plate / non-farm) print — or ``None`` when nothing is
-    printing or the printer runs more than one un-id-matched job.
+    Separate from :func:`resolve_terminal_item` on purpose: this filters
+    ``status == "printing"`` (right at print start, wrong at completion, where the
+    scheduler has already stamped a terminal status — see
+    ``usage_tracker._resolve_run_context``) and it draws no ``foreign``/``none``
+    verdict, because a print start has nothing to protect farm state from yet.
     """
     result = await db.execute(
         select(PrintQueueItem)
@@ -276,13 +302,135 @@ async def resolve_active_plate_id(db: AsyncSession, printer_id: int, subtask_id:
     if subtask:
         for item in candidates:
             if item.dispatch_subtask_id and item.dispatch_subtask_id == subtask:
-                return item.plate_id
+                return item
 
     # No id match: the sole printing unit is the best attribution. More than one
     # un-id-matched printing item is genuinely ambiguous — attribute nothing.
     if len(candidates) == 1:
-        return candidates[0].plate_id
+        return candidates[0]
     return None
+
+
+async def resolve_active_plate_id(db: AsyncSession, printer_id: int, subtask_id: str | None) -> int | None:
+    """Return the ``plate_id`` of the queue item currently printing on ``printer_id``.
+
+    Used at print-start / archive-creation to scope the 3MF parse to the plate that
+    actually ran (#1697): a multi-plate ``.gcode.3mf`` carries every plate's
+    prediction + weight, so without the printed plate's index the archive would
+    store the summed-across-plates totals for a single-plate print.
+
+    Attribution is :func:`resolve_printing_item`'s (one origin). Returns that item's
+    ``plate_id`` — which may itself be ``None`` for a non-plate-scoped (single-plate
+    / non-farm) print — or ``None`` when nothing is printing or the printer runs more
+    than one un-id-matched job.
+    """
+    item = await resolve_printing_item(db, printer_id, subtask_id)
+    return item.plate_id if item is not None else None
+
+
+async def resolve_item_donor(db: AsyncSession, item: PrintQueueItem) -> DispatchDonor | None:
+    """The on-disk source ``.gcode.3mf`` ``item`` printed from, or None.
+
+    THE one origin for "which file did this unit actually print, and which plate of
+    it". Two rows can answer, in this order:
+
+    * ``library_file_id`` — the dispatched source, present for the whole run's
+      lifetime and the file the scheduler uploaded (``print_scheduler`` resolves the
+      same pair at dispatch; G-code injection happens on a system temp AFTER this
+      file is read, so the durable copy is always the un-injected original);
+    * ``archive_id`` — the per-dispatch archive copy, which is what remains when a
+      transient Direct-Print library row was reaped after dispatch
+      (``cleanup_library_after_dispatch`` nulls ``library_file_id`` and rebinds the
+      item to the archive).
+
+    Both are checked with ``is_file()`` rather than ``exists()``: an archive row
+    created without a 3MF carries ``file_path == ""``, and ``base_dir / ""`` is the
+    base directory itself — which ``exists()`` happily confirms, handing the caller a
+    DIRECTORY as a donor.
+
+    Returns None when neither row resolves to bytes on disk; the caller decides
+    whether that is a 409, a fall-back-to-guessing, or a wait (the missing-library
+    file WAIT of 2026-08-15).
+    """
+    from backend.app.core.config import settings as app_settings
+    from backend.app.models.archive import PrintArchive
+    from backend.app.models.library import LibraryFile
+
+    if item.library_file_id:
+        library_file = await db.get(LibraryFile, item.library_file_id)
+        if library_file is not None and library_file.file_path:
+            lib_path = Path(library_file.file_path)
+            path = lib_path if lib_path.is_absolute() else app_settings.base_dir / library_file.file_path
+            if path.is_file():
+                return DispatchDonor(
+                    local_path=path,
+                    filename=library_file.filename or path.name,
+                    plate_id=item.plate_id,
+                    item_id=item.id,
+                )
+
+    if item.archive_id:
+        archive = await db.get(PrintArchive, item.archive_id)
+        if archive is not None and archive.file_path:
+            path = app_settings.base_dir / archive.file_path
+            if path.is_file():
+                return DispatchDonor(
+                    local_path=path,
+                    filename=archive.filename or path.name,
+                    plate_id=item.plate_id,
+                    item_id=item.id,
+                )
+
+    return None
+
+
+async def resolve_dispatch_donor(db: AsyncSession, printer_id: int, subtask_id: str | None) -> DispatchDonor | None:
+    """The donor of the print STARTING on ``printer_id``, when the farm dispatched it.
+
+    A farm dispatch never has to guess which file it is printing: the queue item
+    records the source row and the plate. Handing that to
+    ``foreign_archive.locate_3mf_for_print`` turns the print-start capture from a
+    name-guess-and-verify into a lookup, which is what closes the 2026-08-18
+    zero-gram bleed — see that function's ``known_donor`` docstring for the incident.
+
+    Returns None for every print the farm did NOT dispatch (a Bambu Studio / LAN
+    job), which is exactly when the guessing lane is the right one. A donor row
+    whose bytes are gone from disk also answers None, so a deleted library file
+    degrades to guessing rather than to a hard failure.
+
+    **ID-CONFIRMED ONLY, and that is a deliberate narrowing of
+    :func:`resolve_printing_item`'s verdict.** That function's sole-printing-item
+    fallback is right for scoping a plate — the cost of getting it wrong is a
+    mis-summed weight on one archive row — but this answer decides WHICH FILE a
+    print is recorded as having run, and the farm item sitting in ``printing`` on a
+    printer is not always the job that just started (a screen-started print on a
+    printer whose farm unit has not gone terminal yet). Supplying a donor there
+    would archive the farm's file against somebody else's print. So the echoed
+    ``subtask_id`` must equal the id Bambuddy minted for this exact dispatch, which
+    the scheduler commits synchronously the moment ``start_print`` is accepted —
+    long before the printer can echo a status back.
+
+    A degenerate echo (empty ``subtask_id`` — a screen RESTART, 2026-07-21) is
+    therefore refused rather than assumed. That mirrors the standing split in the
+    foreign-eject lanes: the MANUAL flow may assume the printer's last farm item
+    behind a human confirmation, while the AUTOMATIC paths stay fail-closed. This is
+    an automatic path.
+    """
+    subtask = (subtask_id or "").strip()
+    if not subtask:
+        return None
+    item = await resolve_printing_item(db, printer_id, subtask)
+    if item is None or item.dispatch_subtask_id != subtask:
+        return None
+    donor = await resolve_item_donor(db, item)
+    if donor is None:
+        logger.info(
+            "[DONOR] printer %s: queue item %s claims this print but neither its library file nor its "
+            "archive copy is on disk — falling back to name-derived 3MF lookup",
+            printer_id,
+            item.id,
+        )
+    return donor
 
 
 def classify_stop(payload: dict, printer_id: int, user_stopped_printer_ids: set[int]) -> str | None:

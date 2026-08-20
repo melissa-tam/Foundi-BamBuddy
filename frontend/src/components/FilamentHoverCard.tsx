@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useLayoutEffect, useId, type ReactNode } f
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { Droplets, Copy, Check, Settings2, Package, PackagePlus, Unlink, RefreshCw } from 'lucide-react';
+import { Droplets, Copy, Check, Settings2, Package, PackagePlus, Undo2, Unlink, RefreshCw } from 'lucide-react';
 import { isLightColor } from '../utils/colors';
 import type { EmptySlotKind } from '../utils/amsHelpers';
 import { resolveSpoolBindingStatus, type SlotPresence } from '../utils/spoolBindingStatus';
@@ -43,6 +43,13 @@ interface InventoryConfig {
   // the operator's only signal that an untagged roll was physically swapped —
   // a tagless slot has no RFID event to infer it from.
   onNewRoll?: () => void;
+  // "Restore previous roll" (rule 12, R8): set ONLY while a "Re-check slot" mint
+  // on this slot still has a standing undo offer
+  // (`SpoolAssignment.recheck_undo_available`). The mint's toast carries the same
+  // action, but a timed toast must never be an action's only path
+  // (WCAG 2.2 2.2.1), so the offer also lives on the slot itself — as its own
+  // affordance, never folded into the identity line.
+  onRestorePreviousRoll?: () => void;
 }
 
 interface ConfigureSlotConfig {
@@ -459,6 +466,22 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                     >
                       <PackagePlus className="w-3.5 h-3.5" />
                       {t('inventory.freshRoll.manualAction')}
+                    </button>
+                  )}
+                  {/* Standing undo for a "Re-check slot" mint. An offer, not an
+                      interruption: it sits in the normal tab order and never
+                      takes focus. */}
+                  {inventory.onRestorePreviousRoll && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        inventory.onRestorePreviousRoll?.();
+                      }}
+                      aria-label={t('printers.rfid.restorePreviousRoll')}
+                      className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue"
+                    >
+                      <Undo2 className="w-3.5 h-3.5" />
+                      {t('printers.rfid.restorePreviousRoll')}
                     </button>
                   )}
                 </div>

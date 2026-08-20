@@ -24,11 +24,14 @@ vi.mock('react-i18next', () => ({
     // did fire (`printers.toast.missingSpoolAssignment` had exactly such a branch
     // until its toast was retired).
     t: (key: string, options?: Record<string, unknown>) => {
-      if (key === 'ams.slotBoundPresenceUnknown' && options) {
+      if ((key === 'ams.slotBoundPresenceUnknown' || key === 'ams.slotSpentSwapPark') && options) {
         // Interpolated so the test can pin the AMS unit letter and the 1-based
-        // slot rendering (a multi-AMS printer has several "slot 4"s).
+        // slot rendering (a multi-AMS printer has several "slot 4"s). Both
+        // standing-unknown cases go through here so a test can prove they render
+        // DIFFERENT sentences — one wire event, two situations.
         const { printer, ams, slot } = options as { printer: string; ams: string; slot: number };
-        return `${printer} bound-presence-unknown ${ams} slot ${slot}`;
+        const label = key === 'ams.slotSpentSwapPark' ? 'spent-swap-park' : 'bound-presence-unknown';
+        return `${printer} ${label} ${ams} slot ${slot}`;
       }
       return key;
     },
@@ -851,6 +854,43 @@ describe('useWebSocket hook', () => {
       await waitFor(() => {
         expect(document.body.textContent).toContain('008-H2C bound-presence-unknown AMS B slot 4');
       });
+
+      vi.unstubAllGlobals();
+    });
+
+    it('words the spent-swap park as its OWN situation, not the presence one', async () => {
+      // WS2. One wire event, two situations: a slot whose presence will not resolve
+      // is a wire that stopped answering, while a spent-swap park is a wire answering
+      // perfectly with nothing the farm may act on — and only the second has a
+      // one-click way out. Sharing a sentence would send the operator to look for a
+      // problem that is not there.
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        cb(0);
+        return 0;
+      });
+      const { useWebSocket } = await import('../../hooks/useWebSocket');
+
+      renderHook(() => useWebSocket(), { wrapper: createWrapper(queryClient) });
+      const ws = await waitForWs();
+      act(() => {
+        ws.open();
+      });
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'slot_standing_unknown',
+          printer_id: 4,
+          printer_name: '004-H2S',
+          ams_id: 0,
+          tray_id: 2,
+          case: 'spent_swap_park',
+        });
+      });
+
+      await waitFor(() => {
+        expect(document.body.textContent).toContain('004-H2S spent-swap-park AMS A slot 3');
+      });
+      expect(document.body.textContent).not.toContain('bound-presence-unknown');
 
       vi.unstubAllGlobals();
     });

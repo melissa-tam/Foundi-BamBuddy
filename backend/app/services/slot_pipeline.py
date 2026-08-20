@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -74,9 +75,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import ws_manager
+from backend.app.models.printer_incident import KIND_RUNOUT, PrinterIncident
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import ams_presence, spool_binding, spool_tagless
+from backend.app.services import ams_presence, printer_incidents, slot_recheck, spool_binding, spool_tagless
 from backend.app.services.slot_state import (
     BindingView,
     Decision,
@@ -96,6 +98,8 @@ from backend.app.services.spool_tag_matcher import (
     find_spool_sharing_tray_uuid,
     link_tag_to_inventory_spool,
 )
+from backend.app.services.spool_tagless import is_tagless_spool
+from backend.app.services.tray_fields import TRAY_PRESENT_STATES, parse_tray_exist_bits, slot_exist_bit
 from backend.app.services.tray_observation import TrayObservation, observation_tray_dict
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_types import canonical_filament_type
@@ -130,6 +134,38 @@ _IDENTITY_CLAIM_REASONS = frozenset({"pre_configured_apply_identity", "identity_
 # whether a cycle is consumed — so the string is named once here instead of being spelled
 # out at both.
 _NO_TAG_SWAP_REASON = "spent_swap_no_tag_read"
+
+# The operator's re-check verdicts (``slot_state`` row 3½, doctrine rule 12). Named here
+# because three lanes below branch on them: the spent arm's evidence shape, the pending
+# cycle's disposal, and the intent's own resolution.
+_RECHECK_SWAP_REASON = "operator_recheck_swap"
+_RECHECK_MINT_REASON = "operator_recheck_mint"
+_RECHECK_REASONS = frozenset({_RECHECK_SWAP_REASON, _RECHECK_MINT_REASON})
+
+# The G3 reused-core swap (``slot_state`` row 2.0): a FINISHED row holding the slot whose
+# own tag reads back over a seated tray. Named here because the spent arm branches on it.
+_REUSED_CORE_SWAP_REASON = "reused_core_swap"
+
+# Spent-swap reasons whose proof is NOT a qualified physical cycle, so demanding one would
+# veto the very swap they exist to perform. ``spent_swap_no_tag_read`` rests on an answered
+# commanded read; ``operator_recheck_swap`` rests on that PLUS a human's answer;
+# ``reused_core_swap`` rests on an IDENTITY READ, which is the strongest evidence the farm
+# has — identity-tier evidence may displace ANY binding, while the physical cycle this set
+# waives is assumption-tier (invariant 11). All three are therefore corroborated by
+# observation-asserted presence rather than by ``tray_loaded``.
+_CYCLELESS_SWAP_REASONS = frozenset({_NO_TAG_SWAP_REASON, _RECHECK_SWAP_REASON, _REUSED_CORE_SWAP_REASON})
+
+# …and the subset of THOSE that still SPEND a pending cycle when one happens to exist. Both
+# describe a swap a human physically performed, so an observed cycle on that slot is about
+# THIS swap and must not survive to authorise a later one with nothing behind it.
+# ``spent_swap_no_tag_read`` is deliberately absent: its tray is BARE by construction, which
+# is the shape the cycle lane cannot reach, so it has nothing to spend.
+_CYCLE_SPENDING_SWAP_REASONS = frozenset({_RECHECK_SWAP_REASON, _REUSED_CORE_SWAP_REASON})
+
+# Outcomes that RETIRE the slot's pending physical cycle: both leave a DIFFERENT row
+# holding the slot, so the swap evidence has been answered and may not be replayed by a
+# later spent binding. See :func:`_settle_physical_cycle` for the full five-outcome table.
+_CYCLE_DISCARDING_KINDS = frozenset({DecisionKind.MINT, DecisionKind.BIND})
 
 # Orchestrator-side release reason. Deliberately NOT in ``slot_state.RESOLUTION_REASONS``:
 # an assignment whose spool row is gone never reaches the table at all (there is nothing
@@ -189,11 +225,6 @@ _NEED_GATED_REASONS = frozenset(
         "identity_ambiguous_owed_full_read",
     }
 )
-
-# How many last-location rows to inspect before giving up on a reclaim donor. The query
-# is already ordered most-recent-first and filtered to ONE slot, so this is a runaway
-# guard, not a policy knob.
-_RECLAIM_SCAN_LIMIT = 25
 
 # One lock per printer: a pass reads the slot's binding, decides, and writes, and two
 # concurrent pushes interleaving those steps is how a slot gets two assignment rows —
@@ -500,6 +531,7 @@ async def _process_observation(
     from_state = _believed_state(binding)
 
     decision, applied = await _apply(obs, deps, assignment, decision, seen, tray_counts or {})
+    await _settle_recheck_intent(obs, deps, decision, applied, ctx)
 
     # The RIGHT side of the transition is what the APPLIED decision leaves behind, not
     # ``state`` — that is ``derive_state`` against the PRE-transition binding, so logging
@@ -513,6 +545,75 @@ async def _process_observation(
     return AppliedTransition(
         slot=obs.slot, from_state=from_state, to_state=to_state, decision=decision, applied=applied
     )
+
+
+#: Decision kinds that ANSWER an open re-check by re-deciding the slot through some other
+#: lane. A tag landed and the identity lane bound it (scenario R4), the roll was pulled, a
+#: fresh row was minted, a spent swap completed — in every case the question "what is in this
+#: slot?" now has an answer, so leaving the intent open would make the farm go on owing a
+#: read for a slot it has just resolved.
+#:
+#: KEEP / DEFER / NONE are excluded because the slot is still unresolved and the operator is
+#: still waiting. **RECLAIM is excluded too, and that one is not obvious.** The de-bounce
+#: concludes the exact OPPOSITE of the click: it says the release was spurious and the same
+#: roll never left, while the operator has just said something moved. It is also
+#: assumption-tier evidence (invariant 11) against a human answer, which rule 6 names an
+#: identity ORACLE. Letting it settle the intent would silently swallow the answer and hand
+#: the slot back to the very row the operator was correcting — so the intent stays open, the
+#: owed read still lands, and row 3½ then replaces the de-bounced row.
+_RECHECK_SETTLING_KINDS = frozenset(
+    {DecisionKind.BIND, DecisionKind.MINT, DecisionKind.RELEASE, DecisionKind.REPLACE_SPENT}
+)
+
+
+async def _settle_recheck_intent(
+    obs: TrayObservation, deps: PipelineDeps, decision: Decision, applied: bool, ctx: ResolutionContext
+) -> None:
+    """Close the slot's open re-check intent, or ask for the read it is still waiting on.
+
+    The intent's whole lifecycle in one place, run after the decision has been applied so it
+    reads the OUTCOME rather than guessing at it (the same SRP lesson
+    :func:`_settle_physical_cycle` records for the physical cycle).
+
+    * The re-check's OWN verdicts resolve it carrying the minted row — the one fact that
+      scopes the acknowledgement's undo to mints the operator caused.
+    * Any other applied re-decision resolves it carrying nothing: the question was answered
+      by a better oracle (scenario R4 is exactly this — a tag landed, row 2 decided).
+    * Otherwise the slot is still unresolved, so ASK. Not need-gated, because the click IS
+      the need and ``identify_needed`` answers None for an ordinary bound tagless slot; paced
+      and wire-safe inside ``slot_recheck.maybe_ask``.
+
+    Fully guarded: this is a satellite of the identity pass and may never cost it a slot
+    (cross-cutting invariant 10).
+    """
+    printer_id, ams_id, tray_id = obs.slot
+    try:
+        if not await slot_recheck.has_open_intent(deps.db, printer_id, ams_id, tray_id):
+            # The common case by far: no question is outstanding for this slot, and the
+            # memory index answers it without a query.
+            return
+        if applied and decision.reason in _RECHECK_REASONS:
+            # The MINTED row's id, read back from the slot rather than from the decision:
+            # a MINT's ``spool_id`` is None (the row did not exist when the table decided)
+            # and a REPLACE_SPENT's names the row that just RETIRED. The binding is the
+            # only honest answer to "what did this click create?".
+            minted_id = (
+                await deps.db.execute(
+                    select(SpoolAssignment.spool_id).where(
+                        SpoolAssignment.printer_id == printer_id,
+                        SpoolAssignment.ams_id == ams_id,
+                        SpoolAssignment.tray_id == tray_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            await slot_recheck.resolve_slot(deps.db, printer_id, ams_id, tray_id, minted_spool_id=minted_id)
+            return
+        if applied and decision.kind in _RECHECK_SETTLING_KINDS:
+            await slot_recheck.resolve_slot(deps.db, printer_id, ams_id, tray_id)
+            return
+        await slot_recheck.maybe_ask(deps.db, printer_id, ams_id, tray_id, busy=ctx.busy, seated=obs.present is True)
+    except Exception:  # noqa: BLE001 — invariant 10: nothing escapes into the callback chain
+        logger.exception("[slot-state] re-check intent settle failed for printer %d A%dT%d", *obs.slot)
 
 
 async def _load_assignment(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> SpoolAssignment | None:
@@ -549,10 +650,6 @@ async def _release_orphan(obs: TrayObservation, deps: PipelineDeps, assignment: 
 # --- views ------------------------------------------------------------------
 
 
-def _is_tagless(spool: Spool) -> bool:
-    return not (spool.tag_uid or spool.tray_uuid)
-
-
 def _binding_view(assignment: SpoolAssignment | None) -> BindingView | None:
     """The slot's current binding as the table sees it.
 
@@ -560,17 +657,21 @@ def _binding_view(assignment: SpoolAssignment | None) -> BindingView | None:
     snapshot is what "the filament this binding stands for" means (and what phase-1
     compared), while the spool's material/rgba is the roll's own identity and may have
     been edited by an operator.
+
+    ``spent`` reads ``Spool.is_finished_roll`` rather than re-spelling its ``spent_at``
+    test: the table's two G3 conclusions are BUILT on that predicate meaning one thing
+    (see the model), and a mirror is only a mirror while it goes through the original.
     """
     if assignment is None or assignment.spool is None:
         return None
     spool = assignment.spool
     return BindingView(
         spool_id=spool.id,
-        is_tagless=_is_tagless(spool),
+        is_tagless=is_tagless_spool(spool),
         tag_uid=spool.tag_uid,
         sibling_tag_uid=spool.sibling_tag_uid,
         tray_uuid=spool.tray_uuid,
-        spent=spool.spent_at is not None,
+        spent=spool.is_finished_roll,
         archived=spool.archived_at is not None,
         fingerprint_type=assignment.fingerprint_type,
         fingerprint_color=assignment.fingerprint_color,
@@ -583,11 +684,11 @@ def _spool_view(spool: Spool) -> SpoolView:
     because an unbound row has no assignment snapshot to speak for it."""
     return BindingView(
         spool_id=spool.id,
-        is_tagless=_is_tagless(spool),
+        is_tagless=is_tagless_spool(spool),
         tag_uid=spool.tag_uid,
         sibling_tag_uid=spool.sibling_tag_uid,
         tray_uuid=spool.tray_uuid,
-        spent=spool.spent_at is not None,
+        spent=spool.is_finished_roll,
         archived=spool.archived_at is not None,
         fingerprint_type=spool.material,
         fingerprint_color=spool.rgba,
@@ -678,7 +779,7 @@ async def _untagged_claim_candidate(
         # Re-read the ROW rather than trusting the view: the view's identity fields are a
         # snapshot, and linking a tag onto a row that already carries one would be the
         # duplicate-identity hazard this whole lane exists to avoid.
-        if spool is not None and spool.archived_at is None and _is_tagless(spool):
+        if spool is not None and spool.archived_at is None and is_tagless_spool(spool):
             return spool
     return await find_matching_untagged_spool(db, observation_tray_dict(obs))
 
@@ -694,51 +795,51 @@ def _fingerprint_compatible(obs: TrayObservation, spool: Spool) -> bool:
     return canonical_filament_type(obs.tray_type or "") == canonical_filament_type(spool.material or "")
 
 
-async def _last_location_candidate(db: AsyncSession, obs: TrayObservation) -> Spool | None:
-    """The reclaim donor: the roll most recently released FROM THIS SLOT that still
-    fingerprint-matches what the wire now reports (doctrine rule 7).
+async def _debounce_candidate(db: AsyncSession, obs: TrayObservation) -> Spool | None:
+    """The DE-BOUNCE donor: the one roll that last left THIS slot, iff it may stand for a
+    spurious release.
 
-    ``last_location_*`` is the durable residue ``spool_binding.release_spool_from_slot``
-    stamps, which is what lets a pulled-and-returned roll keep its grams AND its FIFO
-    position instead of minting a fresh 0 g row. Archived and spent rows are excluded:
-    a retired roll may not reclaim a slot, and a spent one belongs to the W1 latch.
+    This lane used to be called the "reclaim", and the rename is the point. It was written
+    as an identity claim — "a pulled roll came back to where it was" — and on this fleet it
+    could not be one: every production tray reports ``tag_uid: null``, ``tray_uuid: null``,
+    ``remain: -1``, so :func:`_fingerprint_compatible` (material + colour) is ALWAYS TRUE,
+    against ``last_location_*`` residue that nothing ever clears and no age bounds. It hung
+    spool 292 (954.4 g used) and spool 298 (936.1 g) onto brand-new rolls after 997 and 804
+    minutes, and every queued unit staged "Low filament" on full filament (shape 32).
 
-    A donor that is BOUND SOMEWHERE ELSE is excluded too, and that exclusion is an
-    evidence-tier rule, not an optimisation. Reclaim is ASSUMPTION-tier ("a pulled roll
-    came back to where it was" — the stamp is residue, nothing observed it return); a live
-    binding is a POSITIVE location claim already written for that roll. So the asymmetry is
-    deliberate and load-bearing: an IDENTITY-tier bind (table row 2) may displace any
-    binding fleet-wide — the AMS read that roll's OWN tag THERE, which outranks every
-    assumption — while an assumption-tier reclaim may displace nothing.
+    What the 8-day gap distribution showed is that the lane was really doing a DIFFERENT,
+    load-bearing job: of 52 reclaims with a matched prior release, **14 landed under five
+    minutes** — four at 0.0 min across four printers inside one minute — which no human
+    performs. Those are SPURIOUS releases (one glitched exist bit hard-deletes a binding
+    since wave 2), and the lane was silently repairing them. Deleting it outright would
+    reset a part-used roll to label weight several times a day and walk it straight through
+    the ``min_start_spool_g`` gate. So the lane survives, SCOPED to what it can actually
+    prove: a glitch filter, never an identity oracle (doctrine rule 7 as amended
+    2026-08-19, and its amendment block).
 
-    Without it the two lanes ping-pong forever (prod 2026-08-07, spool 211): the operator
-    moved the roll from printer 10 A0T0 to printer 7 A0T1; p7's wire asserted the roll's
-    sibling tag + tray_uuid, so ``identity_resolved_candidate`` bound it there and the
-    writer's move semantics swept p10's row — correct. But p10's tray still carried config
-    residue (PETG, state 11 — another roll seated, no identity asserted) and spool 211's
-    ``last_location_*`` still pointed at p10 A0T0, so p10's very next evaluation reclaimed
-    the roll straight back and swept p7, which re-read the tag and took it again: ~1 Hz,
-    damped to one move per ``spool_binding._MOVE_DAMPER_S`` in each direction, converging
-    never.
+    THIS function owns the two SPOOL-side conditions; the two wire-side ones
+    (``reseat_within_window``, ``runout_suspect``) are computed in :func:`_build_context`
+    and weighed by the table, so ``slot_state.resolve`` stays a pure function of its inputs.
 
-    The exclusion is a WHERE clause rather than a post-scan skip for two reasons: it is the
-    same ``~assignments.any()`` the attract lane already uses for its own hijack guard
-    (``spool_tag_matcher.find_matching_untagged_spool``), so "a row that already holds a
-    slot" keeps ONE meaning fork-wide; and :data:`_RECLAIM_SCAN_LIMIT` then spends its
-    budget on eligible donors only, so an OLDER honest donor for this slot stays reachable
-    behind a bound one. This lane is consulted only for an UNBOUND slot (table row 4c) and
-    ``spool_assignment.spool_id`` is unique, so ANY live assignment on a donor means
-    "bound elsewhere". When nothing survives, None is the doctrine-correct answer: the
-    table falls through to ``tagless_mint`` and the unidentified seated roll gets its own
-    fresh ledger row instead of inheriting one that provably lives in another tray.
+    * **The slot's single last occupant — adjudicated, never scanned past** (``.limit(1)``).
+      The old query scanned up to 25 released rows and took the first fingerprint match,
+      which is a search through noise; there is exactly ONE candidate a spurious release can
+      be about (operator ruling 15). This is the same discipline
+      ``spool_respool._mark_tray_spent``'s tier 2 already applies to the same residue: walk
+      past the newest row and you stamp an OLDER, healthy one — permanently.
+    * **The donor is UNTAGGED** (``spool_tagless.is_tagless_spool``, all three identity
+      columns). A tagged roll re-asserts its own identity the moment the AMS reads it, so a
+      breadcrumb can only ever PRE-EMPT that read — which is exactly what drove spool 250 to
+      1246 g on a 1000 g label and made the ledger-overcharge lane warn twice that it could
+      not reconcile a tag-bound row. Doctrine rule 11: an assumption may not speak for a roll
+      that can speak for itself.
 
-    The slot-residue half of the query — the matching ``last_location_*`` triple, the
-    newest-first order and that ``~assignments.any()`` exclusion — is now
-    :func:`spool_binding.last_released_from_slot_stmt`, stated once beside the writer that
-    stamps the residue and shared with ``spool_respool``'s spent-attribution tier 2 (the
-    runout victim is the roll that left this slot, and the AMS empties the bay minutes
-    before it says so). What stays HERE is what only reclaim may say: spent and archived
-    rows are no donors, and the scan is bounded. Behaviour is unchanged in both halves.
+    Archived and spent rows stay excluded (a retired roll may not take a slot; a spent one
+    belongs to the W1 latch, and that filter is precisely why a runout whose stamp already
+    landed MINTS — scenario T6). A donor BOUND SOMEWHERE ELSE stays excluded too, as an
+    evidence-tier rule rather than an optimisation: assumption-tier evidence may displace
+    nothing a live binding holds (invariant 11; the spool-211 ping-pong, shape 26). With no
+    surviving donor, None is the doctrine-correct answer and the table mints.
     """
     printer_id, ams_id, tray_id = obs.slot
     res = await db.execute(
@@ -747,16 +848,72 @@ async def _last_location_candidate(db: AsyncSession, obs: TrayObservation) -> Sp
         .where(
             Spool.archived_at.is_(None),
             Spool.spent_at.is_(None),
+            # Bound elsewhere ⇒ not a donor (invariant 11, shape 26).
+            ~Spool.assignments.any(),
         )
-        .limit(_RECLAIM_SCAN_LIMIT)
+        .limit(1)
     )
-    for spool in res.scalars().all():
-        if _fingerprint_compatible(obs, spool):
-            return spool
-    return None
+    donor = res.scalars().first()
+    if donor is None:
+        return None
+    # Adjudicate the ONE row; never fall through to an older one (operator ruling 15).
+    if not is_tagless_spool(donor):
+        logger.info(
+            "[slot-state] printer=%d A%dT%d de-bounce refused: donor spool %d is TAGGED "
+            "(rule 11 — its own tag outranks a breadcrumb)",
+            printer_id,
+            ams_id,
+            tray_id,
+            donor.id,
+        )
+        return None
+    if not _fingerprint_compatible(obs, donor):
+        return None
+    return donor
 
 
-# --- context ----------------------------------------------------------------
+def _runout_suspect(obs: TrayObservation, deps: PipelineDeps, incident: PrinterIncident | None) -> bool:
+    """Does this slot's current occupancy follow a RUNOUT rather than a glitch?
+
+    Operator ruling 15's second clause — **a runout release is never a glitch** — and the
+    reason the de-bounce is disqualified BY CAUSE before its window is ever consulted
+    (doctrine rule 6's "by cause, never by duration", applied to a decision rather than a
+    read).
+
+    Without this the wave would have made things WORSE for the case it most needed to fix.
+    The AMS clears a drained slot's exist bit **~3 minutes BEFORE** it declares the runout
+    (shape 31, three timed pairs): inside that gap the departed row is released but not yet
+    spent, so the ``spent_at`` filter cannot see it, and the de-bounce would bind the
+    EXHAUSTED row to the fresh roll the operator just loaded — after which the runout's own
+    HMS stamps ``spent_at`` on it and the slot reads ~950 g used / 0 g remaining. Scoping
+    the lane to short gaps CONCENTRATES that case, because a refill on a slot the AMS is
+    demanding is precisely a fast return (scenarios T7/T8).
+
+    Two evidences, either sufficient:
+
+    * **After the HMS** — an OPEN ``runout`` incident naming this exact slot. Matched on the
+      slot, never blanket-per-printer: a genuine glitch on slot 2 while slot 3 is held for a
+      runout must still de-bounce, and over-suspecting mints a part-used roll back to label
+      weight, which is the unsafe direction.
+    * **Inside the gap** — the slot was the ACTIVE FEEDER of a live print when its presence
+      was lost (``ams_presence.reseat_under_active_feed``, stamped at the loss edge by
+      ``spool_recovery.slot_was_feeding``). A slot that loses presence while it is feeding is
+      running out or being pulled mid-print; neither is a glitch.
+
+    Deliberately NOT exhaustive: a firmware auto-refill that switches to a backup BEFORE the
+    bit clears leaves no feeder evidence at the loss edge, and a restart inside the gap loses
+    the stamp entirely. Those cases still de-bounce, and are caught by the SECOND layer —
+    the physical cycle survives an unbound resolution, so the runout's spent stamp drives
+    ``REPLACE_SPENT`` on the very next push (scenarios T8b/T8c). Prevention where the cause
+    is visible; repair where it is not.
+    """
+    printer_id, ams_id, tray_id = obs.slot
+    if ams_presence.reseat_under_active_feed(printer_id, ams_id, tray_id):
+        return True
+    if incident is None or incident.kind != KIND_RUNOUT:
+        return False
+    # Global tray convention: ams_id * 4 + tray_id (external holders are 254+).
+    return incident.slot_global_tray == ams_id * 4 + tray_id
 
 
 async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: BindingView | None) -> ResolutionContext:
@@ -776,19 +933,30 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
             if claim is not None:
                 untagged_claim_candidate = _spool_view(claim)
 
-    last_location_candidate = None
+    # The de-bounce lane's three inputs, all resolved HERE so ``slot_state.resolve`` stays a
+    # pure function of its arguments (the same shape ``qualified_cycle_pending`` uses). The
+    # wire-side predicates are only read when a donor actually exists, so an ordinary slot
+    # costs no extra work.
+    debounce_candidate = None
+    reseat_within_window = False
+    runout_suspect = False
     if binding is None and obs.config_nonempty and not obs.identity_asserted:
-        donor = await _last_location_candidate(deps.db, obs)
+        donor = await _debounce_candidate(deps.db, obs)
         if donor is not None:
-            last_location_candidate = _spool_view(donor)
+            debounce_candidate = _spool_view(donor)
+            reseat_within_window = ams_presence.reseat_within_window(printer_id, ams_id, tray_id)
+            runout_suspect = _runout_suspect(obs, deps, await printer_incidents.get_open(deps.db, printer_id))
 
     return ResolutionContext(
         binding=binding,
         identity_candidate=identity_candidate,
         untagged_claim_candidate=untagged_claim_candidate,
-        last_location_candidate=last_location_candidate,
+        debounce_candidate=debounce_candidate,
+        reseat_within_window=reseat_within_window,
+        runout_suspect=runout_suspect,
         qualified_cycle_pending=spool_tagless.qualified_cycle_pending(printer_id, ams_id, tray_id),
         no_tag_read_answered=_no_tag_read_answered(obs, binding),
+        operator_recheck_answered=await _operator_recheck_answered(obs, deps, binding),
         auto_add_unknown=await _auto_add_unknown(deps),
         busy=_printer_busy(deps),
         settling=_settling(printer_id, ams_id, tray_id),
@@ -798,22 +966,90 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
     )
 
 
-def _no_tag_read_answered(obs: TrayObservation, binding: BindingView | None) -> bool:
-    """Did a commanded discovery read on this slot answer NO TAG over a spent TAGGED row?
+async def _operator_recheck_answered(obs: TrayObservation, deps: PipelineDeps, binding: BindingView | None) -> bool:
+    """Has the operator's re-check of this slot got its ANSWER? (doctrine rule 12, WS11)
 
-    Scoped to the ONE constellation the table's ``spent_swap_no_tag_read`` row can conclude
-    on (spent binding, tag-bearing row), so the ledger peek costs nothing on every other
-    slot. The TRAY facts are decided HERE, from this push's observation, and handed to
+    Both halves, resolved here so ``slot_state.resolve`` stays pure — the same shape
+    ``qualified_cycle_pending`` and the de-bounce's two predicates already use:
+
+    * a DURABLE open intent for this slot (``slot_recheck.has_open_intent`` — a process-memory
+      index over the rows, so this costs no query per push);
+    * a commanded discovery read that came back finding NO CHIP
+      (``slot_recheck.tag_ness_answered``).
+
+    Ordered cheapest-first, and every early return is a doctrine rule rather than a
+    micro-optimisation. Presence must be the tri-state True (invariant 3 — an unknown is never
+    resolved toward action, and an answered read needs a seated tray to have been read AT).
+    A busy printer can never satisfy this at all: mid-print the farm commands no reads
+    (rule 5), so any stamp still standing predates the print and cannot be an answer ABOUT
+    the roll inserted during it — believing it is exactly how scenario R4's reused-tag RFID
+    roll would be mis-minted as tagless.
+
+    A pre-configured binding is excluded here as well as in the table: operator intent is
+    never guessed over (scenario T13), so a slot awaiting a pre-assigned roll owes the
+    re-check nothing.
+    """
+    if obs.present is not True or obs.identity_asserted:
+        return False
+    if binding is not None and binding.pre_configured:
+        return False
+    if _printer_busy(deps):
+        return False
+    try:
+        if not await slot_recheck.has_open_intent(deps.db, *obs.slot):
+            return False
+        return slot_recheck.tag_ness_answered(*obs.slot, seated=True, identity_asserted=obs.identity_asserted)
+    except Exception:  # noqa: BLE001 — an unreadable intent is "no answer", never a crash
+        logger.exception("[slot-state] re-check intent lookup failed for printer %d A%dT%d", *obs.slot)
+        return False
+
+
+def _no_tag_read_answered(obs: TrayObservation, binding: BindingView | None) -> bool:
+    """Did a commanded discovery read on this slot answer NO TAG over a row that CLAIMS one?
+
+    Doctrine rule 11 (operator-ratified 2026-08-19): *a tagless roll can NEVER be an RFID
+    roll — in every scenario, not one lane.* Finding no chip over a binding that has one is
+    the same certainty class as two disagreeing ``tray_uuid``s, and the certainty does not
+    depend on whether the roll ran dry or on how much the tray happened to say about itself.
+    Two gates confined it here until this wave and both are gone:
+
+    * **the SPENT gate.** Whether the bound roll is exhausted has nothing to do with whether
+      the seated object IS that roll. This is the restriction rule 11 names by name.
+    * **the BARE-tray argument.** ``read_answered_no_tag`` takes bare-ness as a
+      caller-supplied constraint, and this caller used to hand it the strictest possible
+      reading — "this push asserted neither configuration nor identity". A third-party PETG
+      roll reports ``tray_type: "PETG"``, ``tray_info_idx: "GFG02"``, ``tag_uid: null``:
+      CONFIGURED, not bare, and the commonest physical shape on this fleet — so the evidence
+      could never fire for scenario G7 at all. It now hands over the GENERAL bare-ness
+      (``not obs.identity_asserted``), which is what the answer lane itself already uses
+      (``ams_presence.on_tray_observations`` → ``close_answered_read``) and what
+      ``slot_recheck.tag_ness_answered`` passes. ``read_answered_no_tag``'s own contract is
+      untouched: its ``_discovery_read_at`` stamp still drives the ``0700_0081`` HMS
+      suppression, and no caller had its meaning changed underneath it.
+
+      Row 5a loses nothing by this: it is reached only through rows 5/6, which by
+      construction mean "nothing asserted about identity OR configuration", so its
+      bare-tray guarantee comes from its POSITION in the table and never from this
+      argument.
+
+    Two gates REMAIN, and both are logic rather than caution: ``binding is None`` (nothing
+    bound, nothing to contradict) and ``binding.is_tagless`` (a binding that claims no
+    identity has nothing to contradict either, and the same bare core reads identically
+    before and after a swap — scenario G9, the arm that must not fire). ``is_tagless`` is
+    the canonical three-column test (``spool_tagless.is_tagless_spool``, sibling chip
+    included) resolved when the view was built; a two-column reading is the exact bug this
+    wave already deleted once. The table states the same refusal itself, in
+    ``slot_state._no_tag_answer_contradicts`` — that is where the doctrine is decided, this
+    is the cheap exit that spares the ledger peek for every slot that can never conclude.
+
+    The TRAY facts are decided HERE, from this push's observation, and handed to
     ``ams_presence`` — the read economy owns the read stamps, the observation lane owns
     presence and assertion (``ams_presence`` must never re-derive either from the merged
-    view, which can be a chimera).
-
-    ``tray_seated`` is the observation's own tri-state presence — the canonical rule, which
-    now also answers True on a trusted exist bit the per-tray ``state`` has not caught up
-    with. ``tray_bare`` is "this push asserted neither configuration nor identity" — the
-    shape that makes row 4's cycle lane unreachable in the first place.
+    view, which can be a chimera). ``tray_seated`` is the observation's own tri-state
+    presence — the canonical rule, which also answers True on a trusted exist bit the
+    per-tray ``state`` has not caught up with.
     """
-    if binding is None or not binding.spent or binding.is_tagless:
+    if binding is None or binding.is_tagless:
         return False
     printer_id, ams_id, tray_id = obs.slot
     try:
@@ -822,7 +1058,7 @@ def _no_tag_read_answered(obs: TrayObservation, binding: BindingView | None) -> 
             ams_id,
             tray_id,
             tray_seated=obs.present is True,
-            tray_bare=not obs.config_nonempty and not obs.identity_asserted,
+            tray_bare=not obs.identity_asserted,
         )
     except Exception:  # noqa: BLE001 — an unreadable ledger is "no evidence", never a crash
         logger.exception("[slot-state] no-tag read evidence lookup failed for printer %d A%dT%d", *obs.slot)
@@ -906,23 +1142,28 @@ async def _apply(
     prior_spool_id = assignment.spool_id if assignment is not None else None
 
     if kind is DecisionKind.KEEP:
+        # No cycle bookkeeping: a KEEP re-states the binding it found, so whatever
+        # evidence is pending on the slot is still pending ABOUT that binding. Both
+        # KEEP shapes want it left alone — the spent latch needs it for row 4a's
+        # release, and a live tagless row's cycle belongs to the fresh-roll prompt lane,
+        # which already made its own decision in the await that armed it.
         await _apply_keep(obs, deps, assignment, decision)
         return decision, False
 
+    outcome: tuple[Decision, bool] | None = None
     if kind is DecisionKind.BIND:
-        return await _apply_bind(obs, deps, decision, seen, prior_spool_id)
-
-    if kind is DecisionKind.MINT:
-        return await _apply_mint(obs, deps, decision, seen, prior_spool_id)
-
-    if kind is DecisionKind.RECLAIM:
-        return await _apply_reclaim(obs, deps, decision, seen)
-
-    if kind is DecisionKind.RELEASE:
-        return await _apply_release(obs, deps, assignment, decision)
-
-    if kind is DecisionKind.REPLACE_SPENT:
-        return await _apply_replace_spent(obs, deps, assignment, decision, seen)
+        outcome = await _apply_bind(obs, deps, decision, seen, prior_spool_id)
+    elif kind is DecisionKind.MINT:
+        outcome = await _apply_mint(obs, deps, decision, seen, prior_spool_id)
+    elif kind is DecisionKind.RECLAIM:
+        outcome = await _apply_reclaim(obs, deps, decision, seen)
+    elif kind is DecisionKind.RELEASE:
+        outcome = await _apply_release(obs, deps, assignment, decision)
+    elif kind is DecisionKind.REPLACE_SPENT:
+        outcome = await _apply_replace_spent(obs, deps, assignment, decision, seen)
+    if outcome is not None:
+        _settle_physical_cycle(obs, kind, applied=outcome[1])
+        return outcome
 
     # DEFER / NONE: the two identity-owed shapes buy an answer instead of guessing;
     # everything else is a deliberate no-op this push. The observation's tray dict rides
@@ -956,6 +1197,74 @@ async def _apply(
         decision.reason or "-",
     )
     return decision, False
+
+
+def _settle_physical_cycle(obs: TrayObservation, kind: DecisionKind, *, applied: bool) -> None:
+    """Own the slot's pending physical cycle for the outcome THIS pass just landed.
+
+    The cycle (``spool_tagless._pending_physical_cycles``) is per-slot swap currency: a
+    measured ≥ ``_MIN_PHYSICAL_ABSENT_S`` absence→presence pair, armed at the gain edge and
+    spent by exactly one consumer. Its lifecycle decision used to be taken in
+    ``spool_tagless._maybe_prompt_fresh_roll`` — a PROMPT function, running inside the very
+    await that arms the entry, i.e. BEFORE any outcome exists — which is why it could only
+    guess: ``spool is None ⇒ discard``. That guess is precisely wrong for the shape it hits
+    most, because an UNBOUND slot is exactly what a refill lands in during the ~3-minute
+    bay-clear→HMS gap (shape 31): the roll's binding was released minutes before the
+    firmware admitted the runout, the de-bounce re-binds the exhausted row, the runout then
+    stamps ``spent_at`` on it — and row 4a needs a pending cycle to fire ``REPLACE_SPENT``.
+    The prompt lane had already thrown it away, so the slot parked on ``KEEP("spent_latch")``
+    until a human pulled and re-seated the roll (scenarios T8b/T8c — the cases the
+    cause-based disqualification is structurally blind to, because the feeder had already
+    moved or the loss-edge evidence died in a restart).
+
+    So the decision moved HERE, where the outcome is known. One owner, one layer, and a
+    reviewer can read the whole contract in one place:
+
+    =================  =========  =====================================================
+    Outcome            Cycle      Why
+    =================  =========  =====================================================
+    ``MINT``           discard    A fresh row has no spent transition coming. **This is
+                                  the leak bound** — a cycle left pending forever would
+                                  let a LATER spent binding on this slot fire
+                                  ``REPLACE_SPENT`` with no physical event behind it.
+    ``BIND``           discard    Same bound, other direction: another roll's row now
+                                  holds the slot, so the departed roll's swap evidence
+                                  is spent currency (this also preserves the prompt
+                                  lane's old "not tagless ⇒ discard" outcome, which a
+                                  tag-driven bind used to reach).
+    ``RECLAIM``        preserve   The de-bounce re-bound an EXISTING row that evidence
+                                  still in flight may yet declare exhausted. This is
+                                  layer 2 of the gap fix.
+    ``REPLACE_SPENT``  consume    Unchanged: :func:`_apply_replace_spent` spends it
+                                  itself, as the evidence it acted on.
+    ``KEEP``           preserve   Never reaches here (see :func:`_apply`) — the spent
+                                  latch's release signal and the fresh-roll prompt's own
+                                  currency both survive a KEEP.
+    =================  =========  =====================================================
+
+    ``RELEASE`` is deliberately absent from the discarding set: the roll LEFT, and the
+    departure's own artefacts (``last_location_*``, the dismissed prompt) are what the next
+    arrival reads. Nothing new is asserted about the slot, so nothing is spent here.
+
+    Gated on ``applied``: a decision the writer refused (the move damper, the per-pass
+    seen-set, a vanished row) changed nothing, so the next push re-decides the same slot
+    and must re-decide it on intact inputs.
+    """
+    if not applied or kind not in _CYCLE_DISCARDING_KINDS:
+        return
+    printer_id, ams_id, tray_id = obs.slot
+    # Through the module's own pop — ONE implementation of "spend this slot's cycle",
+    # shared by the consumer that acts on the evidence and the owner that retires it. The
+    # log line is where the two intents differ, and the count of these is how a reviewer
+    # confirms the bound is actually being applied.
+    if spool_tagless.consume_qualified_cycle(printer_id, ams_id, tray_id):
+        logger.debug(
+            "[slot-state] printer=%d A%dT%d physical cycle discarded: %s left a different row on the slot",
+            printer_id,
+            ams_id,
+            tray_id,
+            kind.value,
+        )
 
 
 async def _apply_keep(
@@ -1210,20 +1519,280 @@ async def _apply_reclaim(
         # Doctrine rule 7: the SAME roll returning from a pull keeps its FIFO seating
         # position — the ordinal must not be re-stamped just because the row was rebuilt.
         preserve_ordinal=True,
+        # …and, for the same reason, keeps its BIND MOMENT (:func:`_debounce_bind_moment`).
+        bind_moment=_debounce_bind_moment(spool),
     )
     if assignment is None:
         return decision, False
     await deps.db.commit()
     seen.add(spool.id)
+    absence = ams_presence.reseat_absence(printer_id, ams_id, tray_id)
     logger.info(
-        "[slot-state] printer=%d A%dT%d reclaimed spool %d from its last location (ordinal preserved)",
+        "[slot-state] printer=%d A%dT%d de-bounced spool %d back onto its last location "
+        "(measured absence %s, ordinal + bind moment preserved)",
         printer_id,
         ams_id,
         tray_id,
         spool.id,
+        "unknown" if absence is None else f"{absence:.0f}s",
     )
     await _emit_auto_assigned(obs, deps, spool)
     return decision, True
+
+
+def _debounce_bind_moment(spool: Spool) -> datetime | None:
+    """When this roll's CURRENT seating began — the moment a de-bounce re-states.
+
+    A de-bounce is the farm's assertion that **nothing physically happened**: the release
+    it repairs was spurious, so the roll never left and its binding never really ended
+    (doctrine rule 7 as amended 2026-08-19). Letting the writer stamp a fresh
+    ``SpoolAssignment.created_at`` would say the opposite, because that column is the ONE
+    "an unobserved swap happened at a KNOWN instant" boundary
+    ``spool_tagless.reconcile_ledger_overcharges`` adjudicates across. Before the scoping
+    that inference was merely weak; after it, the only reclaim that survives is one the
+    farm has just certified as NOT a physical event — so a boundary stamped here would be
+    actively false, and a de-bounced roll that later overshot its label would be split
+    into a phantom successor for a swap that never occurred.
+
+    ``loaded_at`` is that moment: the re-stampable FIFO ordinal, written by the binding
+    writer at every genuine binding change and deliberately NOT re-written by this lane
+    (``preserve_ordinal``), so it still names the last time a roll really did enter this
+    slot. Using it keeps the reconciler's one remaining reachable trigger intact — an
+    operator manually assigning an old row to a slot holding a new roll re-stamps
+    ``loaded_at``, and a glitch after that carries THAT boundary forward rather than
+    erasing it (scenario C5).
+
+    The fallbacks are for rows predating the ordinal (``first_loaded_at``, then the row's
+    own creation); all-NULL returns None and the writer's server default stamps now,
+    which is the pre-wave behaviour and no worse than it was.
+    """
+    return spool.loaded_at or spool.first_loaded_at or spool.created_at
+
+
+# --- release evidence (WS7 — diagnosis, never a decision) --------------------
+
+# How fresh the last FULL status report must be for THIS push to be read as that same
+# pushall. The AMS block rides the same ``print`` frame that carries ``sdcard``, and
+# ``sdcard`` is what stamps ``PrinterState.last_full_report_at`` — so a pushall's own
+# pipeline pass sees an age of ~0, while the ~1 Hz incrementals that follow it see a
+# whole second or more. At 1 Hz the very first incremental AFTER a pushall is the one
+# ambiguous case, which is why the raw age is logged BESIDE the label: the number is the
+# fact, ``push=`` is only the reading of it.
+_PUSHALL_SAME_FRAME_S = 1.0
+
+
+def _presence_rule(obs: TrayObservation) -> str:
+    """WHICH branch of ``tray_fields.tray_presence`` produced ``obs.present``.
+
+    A mirror of that function's six-row branch table, kept here as a NAME generator
+    only: it decides nothing, and the rule it reports is cross-checked against the
+    presence the observation lane actually resolved. A mirror can drift from its
+    original, so drift is made VISIBLE rather than silently reported as fact — a
+    disagreement appends ``!drift`` instead of asserting a branch that did not run.
+    That is the honest failure mode for a diagnostic whose whole purpose is to be
+    believed six hours later by someone with no context.
+
+    The two names that matter for a release are ``bit_clear`` (a TRUSTED in-push mask
+    bit said the slot is bare — the invariant-12 authority wave 2 made
+    release-authorizing, and therefore the branch a single glitched bit travels down)
+    and ``cleared_shape`` (no in-push bit for this slot at all, so emptiness came from
+    the fallback tier: the wire's own state-9 + asserted-empty ``tray_type``, or the
+    shape ``bambu_mqtt._normalize_cleared_trays`` injects once the CACHED mask's veto
+    lets it through). Telling those two apart at the release edge is most of the answer
+    to "was this a real departure or a bit glitch?".
+    """
+    if obs.exist_bit is True:
+        rule, implied = "bit_set", True
+    elif obs.exist_bit is False:
+        if obs.state in TRAY_PRESENT_STATES:
+            rule, implied = "bit_clear_contradicted", None
+        else:
+            rule, implied = "bit_clear", False
+    elif obs.state in TRAY_PRESENT_STATES:
+        rule, implied = "state_present", True
+    elif obs.state is not None and obs.tray_type == "":
+        rule, implied = "cleared_shape", False
+    else:
+        rule, implied = "no_evidence", None
+    return rule if implied is obs.present else f"{rule}!drift"
+
+
+def _mask_facts(obs: TrayObservation, deps: PipelineDeps) -> tuple[str, str, str]:
+    """``(mask, trusted, source)`` for the exist-bit evidence behind this release.
+
+    The mask itself is only knowable from the client — ``PrinterState.ams_tray_exist_bits``
+    / ``ams_bits_trusted`` are the triage surface wave 2 added for exactly this question —
+    and that copy is the LAST bits-carrying push, which is not necessarily this one: the
+    pipeline pass is scheduled off the raw AMS hook, so a later push can overtake it. The
+    observation is what carries THIS push's answer for THIS slot (``obs.exist_bit``,
+    already trust-filtered and unit-gated upstream), so the two are reported together and
+    ``source`` says how they relate rather than pretending they are the same fact:
+
+    * ``push`` — this push carried a trusted, unit-listed bit for the slot, and nothing in
+      the cached hex contradicts it (it agrees, or the cache has no bit for this slot, or
+      there is no cached hex at all), so ``mask`` may be read as the mask that decided;
+    * ``push_cache_moved`` — this push carried the bit and the cached hex holds a DIFFERENT
+      one for the same slot, which can only mean a later push overtook this pass. The
+      deciding evidence is ``bit=``; the hex is a newer frame's, so never read it as the
+      mask behind this release. The distinction is kept sharp deliberately: reporting an
+      absent cache as "moved" would manufacture a wire anomaly out of a missing client;
+    * ``cached`` — this push offered the slot NO bit (the H2S trap: some firmware paths
+      send ``tray_exist_bits`` in pushalls only). Presence came from the tray-level
+      fallback tier, where a cached mask can only ever act as the promote-only VETO in
+      ``_normalize_cleared_trays`` — it may promote a stuck tray to seated, never demote
+      one (``apply_tray_exist_bits allow_demote``), so a cached mask can permit this
+      release but never author it;
+    * ``none`` — no mask is known at all; the fallback tier ran unassisted.
+
+    Trust is reported from the client's own verdict, except where this push's bit exists:
+    an untrusted mask is stripped before the observation lane ever sees it, so a present
+    ``obs.exist_bit`` is trusted by construction.
+
+    Guarded on its OWN, not only by the caller: an unreadable client must cost the record
+    its three mask fields (rendered ``?``, which is distinct from ``-``/``none`` meaning
+    "genuinely absent") and nothing else. The observation half of the line is the half a
+    triager needs most, and losing it because a disconnecting client raised would be the
+    diagnostic failing exactly when something is going wrong.
+    """
+    try:
+        state = getattr(deps.client, "state", None)
+        cached_hex = getattr(state, "ams_tray_exist_bits", None)
+        cached_bits = parse_tray_exist_bits(cached_hex)
+        cached_bit = slot_exist_bit(cached_bits, obs.ams_id, obs.tray_id)
+        mask = str(cached_hex) if cached_hex not in (None, "") else "-"
+
+        if obs.exist_bit is not None:
+            moved = cached_bit is not None and cached_bit is not obs.exist_bit
+            return mask, "yes", ("push_cache_moved" if moved else "push")
+        trusted = "yes" if getattr(state, "ams_bits_trusted", False) else "no"
+        return mask, trusted, ("cached" if cached_bits is not None else "none")
+    except Exception:  # noqa: BLE001 — an unreadable client is unknown evidence, never a crash
+        return "?", "?", "?"
+
+
+def _push_shape(deps: PipelineDeps) -> tuple[str, str]:
+    """``(shape, age)`` — was this push a full report (pushall) or an incremental?
+
+    Inferred from ``PrinterState.last_full_report_at`` against
+    :data:`_PUSHALL_SAME_FRAME_S`; ``("?", "-")`` when the printer has never delivered a
+    full report, and ``("?", "?")`` when the client could not be read at all, because
+    "unknown" must never render as "incremental" and the two unknowns have different
+    causes. Guarded here for the same reason :func:`_mask_facts` is.
+    """
+    try:
+        last_full = getattr(getattr(deps.client, "state", None), "last_full_report_at", 0.0)
+        try:
+            last_full = float(last_full or 0.0)
+        except (TypeError, ValueError):
+            last_full = 0.0
+        if last_full <= 0.0:
+            return "?", "-"
+        age = time.monotonic() - last_full
+        return ("full" if age < _PUSHALL_SAME_FRAME_S else "incr"), f"{age:.1f}s"
+    except Exception:  # noqa: BLE001 — an unreadable client is unknown evidence, never a crash
+        return "?", "?"
+
+
+def _was_feeding(printer_id: int, ams_id: int, tray_id: int) -> str:
+    """``yes``/``no``/``?`` — was this slot the active feeder when it lost presence?
+
+    The loss-edge stamp ``spool_recovery.slot_was_feeding`` writes and the de-bounce lane's
+    own runout-suspect test reads back (:func:`_runout_suspect`). A PEEK, never consuming,
+    and guarded to ``?`` so an unreadable ledger costs one field rather than the line.
+    """
+    try:
+        return "yes" if ams_presence.reseat_under_active_feed(printer_id, ams_id, tray_id) else "no"
+    except Exception:  # noqa: BLE001 — an unreadable ledger is unknown cause, never a crash
+        return "?"
+
+
+def _release_evidence(obs: TrayObservation, deps: PipelineDeps, spool: Spool | None, decision: Decision) -> str | None:
+    """ONE greppable INFO line reconstructing why this release fired. Never raises.
+
+    **Diagnosis, not a decision.** Nothing here is read by any branch; deleting this
+    function would not move a single release by one push. It exists because the 8-day
+    measurement that scoped the de-bounce lane (doctrine rule 7 as amended 2026-08-19)
+    found **14 of 52 last-location reclaims returning in under five minutes — four at
+    0.0 minutes, across four different printers, inside one minute, on the same spool**.
+    No human pulls and re-seats a roll that fast, so those releases were SPURIOUS: the
+    tray reported absent for a push while the roll sat physically seated, and the reclaim
+    lane was silently repairing it. Since wave 2 made a cleared exist bit
+    release-authorizing (invariant 12), one glitched bit hard-DELETES a binding — and a
+    binding deletion is the event that starts the whole identity problem. The de-bounce
+    contains the damage; it explains nothing. This line is what makes the NEXT occurrence
+    explainable from the log alone, with no live reproduction.
+
+    Every field is here because reconstructing the decision needs it, and nothing else is:
+
+    * ``presence``/``rule`` — the tri-state the observation lane resolved and WHICH branch
+      produced it (:func:`_presence_rule`). ``rule=bit_clear`` is the glitch-suspect path;
+      ``rule=cleared_shape`` is the fallback tier and a different investigation entirely.
+    * ``bit``/``state``/``type``/``cfg``/``id`` — the raw per-tray facts THIS push asserted,
+      which are the rule's own inputs. ``cfg=0 id=0`` beside ``state=9`` is the minimal
+      ``{id, state}`` partial; a full report asserts configuration, so these corroborate
+      the push shape independently of the clock.
+    * ``mask``/``mask_trusted``/``mask_src`` — the exist-bit mask, the trust verdict
+      (the unit-present gate and the all-zero streak rule), and whether it is THIS push's
+      or a cached copy (:func:`_mask_facts`). The promote-only cached asymmetry means a
+      cached mask can permit a release but never author one.
+    * ``push``/``push_age`` — pushall or incremental (:func:`_push_shape`). The known trap
+      is that some H2S firmware paths carry ``tray_exist_bits`` in pushalls ONLY, so a
+      release on an incremental had no in-push mask by construction.
+    * ``feeding``/``printing`` — the CAUSE test, and the discriminator that separates a
+      glitch from a real departure at the release edge. ``feeding=yes`` means this slot was
+      the active feeder of a live print when it lost presence, i.e. a runout or a mid-print
+      pull — never a glitch (operator ruling 15). Read at the release rather than queried
+      from an incident on purpose: the AMS clears a drained slot's exist bit ~3 min BEFORE
+      it declares the runout, so the incident does not exist yet, while the loss-edge feeder
+      stamp does — ``ams_presence.on_tray_observations`` derives this push's edges before
+      the pipeline resolves the same push.
+    * ``spool``/``tagless``/``used_g``/``label_g`` — the subject and its grams: what a
+      spurious release puts at risk, and whether the de-bounce could even take it back
+      (only an untagged donor may).
+
+    Correlating a T1 de-bounce against a genuine roll change takes this line plus the
+    de-bounce's own (``_apply_reclaim``, which logs the MEASURED absence): same slot, same
+    spool, a sub-window absence and ``feeding=no`` here is row T1; a long absence, or
+    ``feeding=yes``, is a real departure.
+
+    ``_release_orphan`` deliberately does not emit this. An orphan release is a
+    DB-integrity event — the assignment outlived its spool row — with no grams to name and
+    no wire evidence to weigh, so the writer's own line already says everything true
+    about it.
+
+    Returns the line, or ``None`` when the record could not be built. **A diagnostic that
+    can raise is worse than no diagnostic at all** (cross-cutting invariant 10): the
+    caller logs whatever comes back and releases either way.
+    """
+    try:
+        printer_id, ams_id, tray_id = obs.slot
+        mask, mask_trusted, mask_src = _mask_facts(obs, deps)
+        push, push_age = _push_shape(deps)
+        bit = "-" if obs.exist_bit is None else ("1" if obs.exist_bit else "0")
+        presence = "unknown" if obs.present is None else str(obs.present)
+        tray_type = "-" if obs.tray_type is None else (repr(obs.tray_type) if obs.tray_type == "" else obs.tray_type)
+        used = "-" if spool is None or spool.weight_used is None else f"{float(spool.weight_used):.1f}"
+        label = "-" if spool is None or spool.label_weight is None else f"{float(spool.label_weight):.1f}"
+        tagless = "-" if spool is None else ("yes" if is_tagless_spool(spool) else "no")
+        # A missing spool row is the orphan shape ``_release_orphan`` normally intercepts;
+        # rendering it as "-" rather than crashing keeps the record honest if one ever
+        # reaches here by another route.
+        spool_id = "-" if spool is None else spool.id
+        return (
+            f"[slot-state] release-evidence printer={printer_id} A{ams_id}T{tray_id} "
+            f"spool={spool_id} "
+            f"reason={decision.reason or '-'} tagless={tagless} used_g={used} label_g={label} "
+            f"presence={presence} rule={_presence_rule(obs)} "
+            f"bit={bit} state={'-' if obs.state is None else obs.state} type={tray_type} "
+            f"cfg={int(obs.config_asserted)} id={int(obs.identity_asserted)} "
+            f"mask={mask} mask_trusted={mask_trusted} mask_src={mask_src} "
+            f"push={push} push_age={push_age} "
+            f"feeding={_was_feeding(printer_id, ams_id, tray_id)} "
+            f"printing={'yes' if _printer_busy(deps) else 'no'}"
+        )
+    except Exception:  # noqa: BLE001 — a diagnostic may never cost a release (invariant 10)
+        logger.exception("[slot-state] release-evidence record failed for slot %s", getattr(obs, "slot", "?"))
+        return None
 
 
 async def _apply_release(
@@ -1233,8 +1802,15 @@ async def _apply_release(
         return decision, False
     printer_id, ams_id, tray_id = obs.slot
     spool = assignment.spool
+    # WS7: the record is BUILT here, while the binding and this push's observation still
+    # sit side by side, and EMITTED after the write lands — so the line means "a release
+    # happened", never "one was attempted". It reads nothing back through the session
+    # afterwards, so it cannot be tripped by the commit.
+    evidence = _release_evidence(obs, deps, spool, decision)
     prompt_cleared = await release_spool_from_slot(deps.db, assignment, reason=decision.reason)
     await deps.db.commit()
+    if evidence is not None:
+        logger.info("%s", evidence)
     if decision.reason == "cleared_tray":
         # The roll left, so a never-fed ``ams_auto`` row it displaced-and-abandoned has
         # nothing left to stand for: dispose it here rather than leave a 0 g ghost in
@@ -1311,11 +1887,16 @@ async def _dispose_ghost(obs: TrayObservation, deps: PipelineDeps, spool: Spool 
 async def _dispose_displaced(
     obs: TrayObservation, deps: PipelineDeps, prior_spool_id: int | None, bound_spool_id: int
 ) -> None:
-    """Route the row a successful bind just DISPLACED off this slot. Two lanes only.
+    """Route the row a successful bind just SUPERSEDED. Two lanes only.
+
+    Called for the row that held this SLOT (both bind funnels) and for the row that owned
+    this IDENTITY when a finished one was minted past (:func:`_apply_mint`, scenario G3) —
+    one routing for both, because the justification below is written about the newcomer's
+    evidence, not about which claim the old row was making.
 
     The writer's move semantics unbind the incumbent fleet-wide (one spool ⇔ at most one
     slot), which is correct for the ledger and silent about the row itself. Two kinds of
-    incumbent must not survive as active inventory:
+    superseded row must not survive as active inventory:
 
     * a never-fed ``ams_auto`` GHOST → :func:`_dispose_ghost` (the canonical disposal);
     * a SPENT row of any origin → archived. The newcomer's identity is positive proof the
@@ -1362,10 +1943,32 @@ async def _apply_mint(
     and now a row may have appeared (a concurrent pass, an operator add) — and some
     mint rows exist precisely for contract-violating shapes. Re-asking the DB is cheap;
     a twin ledger row for one physical roll is not (the sibling-tag failure mode).
+
+    Exactly ONE row is never a valid conversion target, and the exception is the guard's
+    own premise rather than a hole in it. A **FINISHED** roll (``Spool.is_finished_roll``
+    — the ONE encoding, read here exactly as ``slot_state`` row 2.3a reads it) is not a
+    live occupant: a runout means that row reached zero, filament cannot be added to a 0 g
+    roll, so its tag reading back is a NEW roll on a reused core (doctrine rule 3 /
+    operator ruling 3, scenario G3). Binding the newcomer onto it would BE the
+    resurrection — the fresh roll inheriting a 0 g ledger and a spent latch, staging every
+    run behind it — so the mint proceeds and the superseded owner is retired once the
+    successor has actually landed. Everything else about the guard is untouched: a LIVE
+    row owning this identity still takes the bind, one physical roll to one row.
     """
+    superseded_owner_id: int | None = None
     if obs.identity_asserted:
         owner = await _identity_candidate(deps.db, obs)
-        if owner is not None:
+        if owner is not None and owner.is_finished_roll:
+            logger.info(
+                "[slot-state] printer=%d A%dT%d mint kept: spool %d owns this identity but is a FINISHED roll "
+                "— new roll on a reused core (doctrine rule 3)",
+                obs.printer_id,
+                obs.ams_id,
+                obs.tray_id,
+                owner.id,
+            )
+            superseded_owner_id = owner.id
+        elif owner is not None:
             logger.info(
                 "[slot-state] printer=%d A%dT%d mint converted to bind: spool %d already owns this identity",
                 obs.printer_id,
@@ -1383,6 +1986,20 @@ async def _apply_mint(
     _decision, applied = await _bind_minted(
         obs, deps, decision, spool, seen, fingerprint, from_default, prior_spool_id=prior_spool_id
     )
+    if applied and superseded_owner_id is not None:
+        # The successor now carries this identity, so the finished row must stop owning
+        # it. Not tidiness: :func:`_identity_candidate` answers "who owns this identity?"
+        # with a ``LIMIT 1`` over ACTIVE rows, so two active owners make it answer
+        # differently from one push to the next — and the roll's next slot move would find
+        # the finished one, refuse it here again, and mint a THIRD row for the same
+        # physical roll. That is the very failure this guard exists to prevent, so closing
+        # the identity is part of minting past it, not a separate concern.
+        #
+        # Through the canonical displacement router: its spent lane archives (a soft hide
+        # — grams and ``spent_at`` stay exactly as the runout left them, rule 8). Idempotent
+        # against the call :func:`_bind_minted` already made for the slot's prior occupant,
+        # which is the same row whenever the finished owner also held this slot.
+        await _dispose_displaced(obs, deps, superseded_owner_id, spool.id)
     return _decision, applied
 
 
@@ -1447,7 +2064,7 @@ async def _apply_replace_spent(
     (operator-created) is archived too: the roll ran out and physically left, so it must
     not keep claiming a slot.
 
-    Serves the table's TWO spent-swap reasons, which differ only in what proves the roll
+    Serves the table's spent-swap reasons, which differ only in what proves the roll
     changed (and therefore in the tray shape they accept — see the pre-gate):
 
     * ``spent_swap_confirmed`` — a QUALIFIED PHYSICAL CYCLE over a configured/fed tray. The
@@ -1456,14 +2073,29 @@ async def _apply_replace_spent(
       seated BARE tray whose binding is tagged (2026-08-07, spool 226). There is no cycle to
       consume; ``ams_presence``'s one-read-per-binding-epoch occasion is what makes that
       evidence non-repeating.
+    * ``reused_core_swap`` — the bound row is a FINISHED roll and its OWN tag reads back
+      over a seated tray (G3, doctrine rule 3). An identity read is the strongest evidence
+      the farm has, and it is self-pacing: the swap it performs mints the successor onto
+      the slot, so the next push resolves by identity (row 2.1 KEEP) and cannot replay it.
+    * ``operator_recheck_swap`` — the no-tag answer PLUS a human's answer (rule 12).
 
     Everything after the pre-gates is shared verbatim — one disposal, one mint funnel, one
     writer — and the INFO line names the reason so prod triage can tell them apart.
+
+    The departed row is the slot's INCUMBENT (``assignment.spool``), and that is the arm's
+    definition rather than an oversight: every ``REPLACE_SPENT`` the table emits passes
+    ``spool_id=binding.spool_id``, and ``binding`` is :func:`_binding_view` of this very
+    assignment — so ``decision.spool_id`` cannot name a different row, and re-reading it
+    here would be a guard that can never fire. A conclusion about some OTHER row (row 2.3a's
+    finished identity OWNER) deliberately does NOT route here for exactly that reason: this
+    arm archives whatever holds the slot, so pointing it at a non-incumbent would retire the
+    live roll standing in the tray. That case mints instead, and retires its superseded
+    owner in :func:`_apply_mint`.
     """
     printer_id, ams_id, tray_id = obs.slot
     if assignment is None or assignment.spool is None:
         return decision, False
-    no_tag_evidence = decision.reason == _NO_TAG_SWAP_REASON
+    cycleless_evidence = decision.reason in _CYCLELESS_SWAP_REASONS
 
     # Pre-gate: a dead roll re-seated without filament fed is not a swap — no churn
     # (mirrors ``spool_tagless``'s ``_tray_loaded`` gate in branch (3)). That flap
@@ -1471,12 +2103,13 @@ async def _apply_replace_spent(
     # there, "this tray is configured or fed" is the only corroboration the physical cycle
     # has that a roll is really in the slot.
     #
-    # ``spent_swap_no_tag_read`` corroborates differently and more strongly — the table
-    # already required observation-asserted presence AND an answered commanded read — and
-    # its tray is BARE by construction (that is why the cycle lane cannot reach it), so
-    # ``tray_loaded`` can only ever answer False for it. Re-assert the very presence the
-    # decision was made on (the canonical tri-state rule, not a second state test that
-    # could disagree with it); the answered read is what rules out a flap there.
+    # The cycleless reasons corroborate differently and more strongly — the table already
+    # required observation-asserted presence, plus an answered commanded read
+    # (``spent_swap_no_tag_read``, whose tray is BARE by construction, so ``tray_loaded``
+    # can only ever answer False for it) or an identity read (``reused_core_swap``, whose
+    # own gate IS ``obs.present is True``). Re-assert the very presence the decision was
+    # made on (the canonical tri-state rule, not a second state test that could disagree
+    # with it); the read is what rules out a flap there.
     #
     # PRESENCE, not the seated state specifically. A no-tag answer read off a FEEDING
     # tray would prove nothing — the tag faces away from the reader once the filament is
@@ -1487,7 +2120,7 @@ async def _apply_replace_spent(
     # mismatch one layer down — the table decides on ``present is True``, so a slot that
     # was read bare and has since been fed produced a decision this gate silently threw
     # away, every push, forever.
-    tray_ok = obs.present is True if no_tag_evidence else spool_tagless.tray_loaded(observation_tray_dict(obs))
+    tray_ok = obs.present is True if cycleless_evidence else spool_tagless.tray_loaded(observation_tray_dict(obs))
     if not tray_ok:
         logger.debug(
             "[slot-state] printer=%d A%dT%d spent-replace skipped: tray present but not loaded (reason=%s)",
@@ -1500,10 +2133,30 @@ async def _apply_replace_spent(
 
     # Consume the qualified physical cycle — the ONE thing that releases the W1 latch,
     # and it is spent exactly here so a later push cannot replay the same swap. Only the
-    # CYCLE-evidence reason has one to consume: ``spent_swap_no_tag_read`` rests on the
-    # answered read (whose one-per-epoch pacing lives in ``ams_presence``), so demanding a
-    # cycle here would veto every swap this arm exists to perform.
-    if not no_tag_evidence and not spool_tagless.consume_qualified_cycle(printer_id, ams_id, tray_id):
+    # CYCLE-evidence reason has one to consume: the cycleless reasons rest on a READ
+    # (whose one-per-epoch pacing lives in ``ams_presence``, or which is self-pacing for
+    # ``reused_core_swap``), so demanding a cycle here would veto every swap they exist to
+    # perform — and a G3 swap would then no-op on every push where no cycle happened to be
+    # pending, leaving the fresh roll printing against the drained row's 0 g ledger until
+    # the merged lane's respool tier 2 happened to converge on the same outcome.
+    if decision.reason in _CYCLE_SPENDING_SWAP_REASONS:
+        # These two SPEND a pending cycle but are never vetoed by its absence, and both
+        # halves of that are load-bearing.
+        #
+        # Spending matters because a physical swap on this slot may well have been observed
+        # — the operator's re-check was admissible precisely because an un-acted-on cycle
+        # was standing, and a reused-core swap is a pull-and-reseat when the farm happens to
+        # see the edges. Once acted on, that same cycle must not be replayable by a LATER
+        # spent binding with no physical event behind it (the leak the outcome-driven
+        # disposal below bounds).
+        #
+        # Requiring it would be wrong in the other direction: the evidence here is a READ.
+        # A restart can erase the in-memory cycle while the re-check's DURABLE intent
+        # survives (the whole reason the intent is durable), and a roll wound onto its own
+        # core between two pushes may never present an absence long enough to qualify —
+        # neither says anything about what the tag just proved.
+        spool_tagless.consume_qualified_cycle(printer_id, ams_id, tray_id)
+    elif not cycleless_evidence and not spool_tagless.consume_qualified_cycle(printer_id, ams_id, tray_id):
         logger.debug(
             "[slot-state] printer=%d A%dT%d spent-replace skipped: no qualified cycle to consume",
             printer_id,
@@ -1618,7 +2271,7 @@ async def _emit_auto_assigned(obs: TrayObservation, deps: PipelineDeps, spool: S
         "tray_id": tray_id,
         "spool_id": spool.id,
     }
-    if _is_tagless(spool):
+    if is_tagless_spool(spool):
         payload["origin"] = "tagless"
     await deps.emit(payload)
 

@@ -12,7 +12,12 @@ This module owns:
 
 * :func:`locate_3mf_for_print` — the ONE candidate-derivation + FTPS download +
   stale-plate correction implementation. ``main.on_print_start`` and the retry
-  below are both callers; there is no second copy.
+  below are both callers; there is no second copy. Its ``known_donor`` argument is
+  how a caller that already KNOWS the source file says so (a farm dispatch — see
+  ``farm_correlation.resolve_dispatch_donor``); everything else in here is the
+  answer for a print whose source the farm has to guess. Supplied versus derived is
+  an argument, deliberately not a second lane: there is one archive path and this
+  module stays the module for the guessing half of it.
 * :func:`maybe_schedule_foreign_3mf_retry` — the bounded in-flight retry armed
   when the start-time capture missed AND no farm queue item claims the print.
   Farm prints need no retry: their 3MF is already in the library / a previous
@@ -45,7 +50,7 @@ from backend.app.services.bambu_ftp import (
     list_files_async,
     with_ftp_retry,
 )
-from backend.app.services.farm_correlation import resolve_terminal_item
+from backend.app.services.farm_correlation import DispatchDonor, resolve_terminal_item
 from backend.app.services.printer_manager import parse_plate_id, printer_manager
 
 logger = logging.getLogger(__name__)
@@ -153,7 +158,13 @@ async def _download(
     )
 
 
-async def locate_3mf_for_print(printer: Printer, subtask_name: str, filename: str) -> ThreeMFLookup:
+async def locate_3mf_for_print(
+    printer: Printer,
+    subtask_name: str,
+    filename: str,
+    *,
+    known_donor: DispatchDonor | None = None,
+) -> ThreeMFLookup:
     """Find and download the 3MF the printer is running, into the archive temp dir.
 
     Order: shared download cache → direct FTPS fetch of each candidate name from
@@ -164,7 +175,58 @@ async def locate_3mf_for_print(printer: Printer, subtask_name: str, filename: st
     A miss returns a lookup whose ``found`` is False, carrying the corrected
     ``subtask_name`` so the caller's fallback archive is at least named for the
     right plate.
+
+    ``known_donor`` is the SUPPLIED answer to everything above, and the only thing
+    that distinguishes a farm dispatch from a foreign print here. The derivation
+    lane exists because a foreign print's source is unknown — its name must be
+    guessed from the MQTT echo and the guess must then be cross-checked, because a
+    stale ``subtask_name`` across consecutive plates lands on the PREVIOUS plate's
+    still-resident upload (#1204). A print the farm dispatched has no such problem:
+    the queue item records the file and the plate, so
+    ``farm_correlation.resolve_dispatch_donor`` hands them over and the guess-plus-
+    check is skipped whole — not weakened, skipped, because there is nothing left to
+    guess. Foreign prints keep the guard exactly as it was.
+
+    Skipping it is not an optimisation, it is the fix for a production bleed: the
+    2026-08-18 run printed a hand-spliced ladder file whose ``slice_info`` declares
+    plate 1 while dispatch ran its ``Metadata/plate_3.gcode``. The cross-check read
+    the internal 1, compared it to the 3 parsed from the printer's ``gcode_file``,
+    called the farm's OWN file a stale-name mismatch and discarded it. The fallback
+    archive that followed carried no 3MF, so ``usage_tracker`` had no slicer data —
+    and on a tagless tray (``remain: -1``, always) the 3MF is the ONLY gram source,
+    so 15 consecutive prints charged ZERO grams and two 1 kg rolls read "0 g used"
+    after 5.8 h each.
+
+    A donor whose bytes are no longer on disk falls through to the derivation lane
+    rather than failing: the guessing path is a worse answer, never a wrong one.
     """
+    if known_donor is not None:
+        if known_donor.local_path.is_file():
+            # The item's own plate outranks the gcode_file echo; fall back to the
+            # echo only for a unit that carries no plate (single-plate / non-farm).
+            expected = known_donor.plate_id if known_donor.plate_id is not None else parse_plate_id(filename)
+            logger.info(
+                "[CALLBACK] printer %s: queue item %s dispatched this print — using its known donor %s "
+                "(plate %s), skipping the name-derived lookup and the #1204 plate cross-check",
+                printer.id,
+                known_donor.item_id,
+                known_donor.filename,
+                expected,
+            )
+            return ThreeMFLookup(
+                local_path=known_donor.local_path,
+                filename=known_donor.filename,
+                subtask_name=subtask_name,
+                expected_plate=expected,
+            )
+        logger.warning(
+            "[CALLBACK] printer %s: queue item %s names donor %s but it is not on disk — "
+            "falling back to the name-derived 3MF lookup",
+            printer.id,
+            known_donor.item_id,
+            known_donor.local_path,
+        )
+
     possible_names = _candidate_names(subtask_name, filename)
     logger.info("Trying filenames: %s", possible_names)
 

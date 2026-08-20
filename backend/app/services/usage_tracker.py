@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 # double-counts this module's precise per-print 3MF deduction (#880).
 _ACTIVE_PRINT_GCODE_STATES = ("RUNNING", "PAUSE", "PREPARE", "SLICING")
 
+# Durable dedup for the zero-gram page (scenario C6). The WARN log is the per-print
+# RECORD and is never suppressed; the notification is the PAGE, and one page per
+# printer per window is what an operator can act on. This class of bleed repeats on
+# every dispatch — fifteen prints on 2026-08-18 — so a page per print would bury the
+# very fact it exists to surface.
+_ZERO_CHARGE_SCOPE = "zero_gram_charge"
+_ZERO_CHARGE_RENOTIFY_S = 6 * 3600.0
+
 
 async def ams_weight_sync_allowed(db: AsyncSession, printer_id: int, state) -> bool:
     """Whether a caller may fold this printer's AMS remain% into spool
@@ -494,6 +502,49 @@ def _global_tray_to_ams_key(global_tray_id: int) -> tuple[int, int]:
     if global_tray_id >= 128:
         return (global_tray_id, 0)
     return (global_tray_id // 4, global_tray_id % 4)
+
+
+def _print_feeder_keys(
+    ams_mapping: list[int] | None,
+    state,
+    extra_global_tray: int | None = None,
+) -> set[tuple[int, int]]:
+    """The ``(ams_id, tray_id)`` slots a print actually fed from.
+
+    Three independent witnesses, unioned because each is blind where another sees:
+    the dispatch ``ams_mapping`` (the decided slots, durable on the queue item), the
+    ``tray_change_log`` (every slot the job switched to mid-print, incl. a firmware
+    auto-refill's backup) and one caller-supplied global tray — print-start's
+    ``tray_now`` for the remain%-delta fallback, the job's ``last_loaded_tray`` for a
+    terminal that has no session left.
+
+    One origin because two consumers ask the same question for opposite reasons: the
+    fallback needs it to NOT charge a slot the print never touched (#1269), and the
+    zero-gram guard needs it to name the slot that fed a print charging nothing. A
+    second copy would let those two disagree about what "this print's feeder" means.
+
+    They pass DIFFERENT witnesses, deliberately. The change log and ``tray_now`` are
+    OBSERVATIONS of what is physically in the feed path, and a motion-only job — an
+    eject sweep, an empty-bed dry-run — inherits the previous print's still-loaded
+    tray, so both would name a feeder for a job that consumed nothing by design (the
+    log is even seeded from ``tray_now`` at print start, ``bambu_mqtt`` W6.1). That
+    is harmless for the fallback, which only widens a set it then intersects against
+    a real remain% drop, and would be a false page for the zero-gram guard — so that
+    caller passes the dispatch mapping alone, which is a DECISION rather than an
+    observation, and an eject decides no AMS slot at all.
+    """
+    keys: set[tuple[int, int]] = set()
+    for gid in ams_mapping or []:
+        if isinstance(gid, int) and gid >= 0:
+            keys.add(_global_tray_to_ams_key(gid))
+    for change in getattr(state, "tray_change_log", None) or []:
+        if isinstance(change, (tuple, list)) and len(change) >= 1:
+            gid = change[0]
+            if isinstance(gid, int) and gid >= 0:
+                keys.add(_global_tray_to_ams_key(gid))
+    if isinstance(extra_global_tray, int) and extra_global_tray >= 0:
+        keys.add(_global_tray_to_ams_key(extra_global_tray))
+    return keys
 
 
 def _assign_segments_to_slots(
@@ -992,21 +1043,7 @@ async def on_print_complete(
             # Without this guard, swapping a spool in an UNUSED slot mid-print
             # makes that slot's remain% drop to 0, which the fallback below
             # would otherwise charge to the originally-assigned spool.
-            def _global_to_ams_key(global_tray_id: int) -> tuple[int, int]:
-                return _global_tray_to_ams_key(global_tray_id)
-
-            print_used_keys: set[tuple[int, int]] = set()
-            if ams_mapping:
-                for gid in ams_mapping:
-                    if isinstance(gid, int) and gid >= 0:
-                        print_used_keys.add(_global_to_ams_key(gid))
-            for change in getattr(state, "tray_change_log", None) or []:
-                if isinstance(change, (tuple, list)) and len(change) >= 1:
-                    gid = change[0]
-                    if isinstance(gid, int) and gid >= 0:
-                        print_used_keys.add(_global_to_ams_key(gid))
-            if session.tray_now_at_start is not None and session.tray_now_at_start >= 0:
-                print_used_keys.add(_global_to_ams_key(session.tray_now_at_start))
+            print_used_keys = _print_feeder_keys(ams_mapping, state, session.tray_now_at_start)
 
             # Collect all trays to check: AMS trays + VT (external) trays
             # Each entry: (ams_id_for_assignment, tray_id_for_assignment, current_remain, label)
@@ -1183,7 +1220,148 @@ async def on_print_complete(
                     archive.cost = round(total_cost, 2)
                     await db.commit()
 
+    # A COMPLETED print that charged nothing while a TAGLESS roll fed it is not an
+    # edge case, it is an impossibility — and one that costs nothing to produce,
+    # because every failure in this module's primary path (no archive, no 3MF, an
+    # unreadable plate) returns an EMPTY list rather than raising. Make it loud.
+    charged_grams = sum(r.get("weight_used") or 0 for r in results)
+    if charged_grams <= 0:
+        try:
+            await _warn_zero_gram_tagless_charge(
+                db,
+                printer_id=printer_id,
+                archive_id=archive_id,
+                status=status,
+                print_name=print_name,
+                ams_mapping=ams_mapping,
+            )
+        except Exception:  # noqa: BLE001 — a guard that breaks the thing it guards is worse than the silence
+            logger.exception("[UsageTracker] zero-gram check failed for printer %s archive %s", printer_id, archive_id)
+
     return results
+
+
+async def _warn_zero_gram_tagless_charge(
+    db: AsyncSession,
+    *,
+    printer_id: int,
+    archive_id: int | None,
+    status: str,
+    print_name: str,
+    ams_mapping: list[int] | None,
+) -> None:
+    """WARN + notify when a completed print charged 0 g on a tagless feeder (C6).
+
+    **Why this cannot be left to fail loudly on its own.** For a TAGGED roll two
+    independent gram sources exist — the slicer 3MF and the AMS remain%-delta — so
+    losing one still charges the print. A tagless tray has exactly one: this fleet's
+    AMS answers ``remain: -1`` for every untagged roll, always, so the delta lane
+    cannot price it and the 3MF is the whole accounting. Every way of losing that
+    3MF ends in ``return []`` here, which is indistinguishable from "this print used
+    no filament" — a completed print silently charging nothing, forever. That is how
+    15 consecutive prints from 2026-08-18 00:12 charged zero grams while two 1 kg
+    rolls sat reading "0 g used" after 5.8 h each. Doctrine rule 4 makes tagless gram
+    tracking mandatory, so the no-op is a defect and has to announce itself.
+
+    Deliberately narrow, because a false page here trains an operator to ignore a
+    true one:
+
+    * **COMPLETED only.** A cancelled or failed print legitimately charges ~nothing
+      when it died early; only a finished one makes zero grams impossible.
+    * **AMS feeders only** (``ams_id != 255``). An external holder is excluded for
+      the same reason its runouts never stamp spent (scenario T14): the left/right
+      vt-tray attribution convention is unconfirmed.
+    * **The DISPATCH MAPPING is the only feeder witness** — never the change log or
+      ``last_loaded_tray``. Both of those observe what is physically in the feed
+      path, and a motion-only job (an eject sweep, an empty-bed dry-run) runs with
+      the previous print's roll still loaded, so both would name that production
+      slot for a job whose zero grams are correct. The mapping is a decision, and a
+      motion-only job decides no AMS slot at all.
+    * **A tagless feeder must actually be identified.** If no AMS slot resolves to a
+      tagless spool, the zero is either explainable or unattributable, and an
+      unattributable page names nothing an operator can act on — so it stays an INFO
+      record instead.
+
+    Reports rather than repairs: the grams of a print with no slicer data are not
+    recoverable afterwards, and writing an invented figure would replace a visible
+    hole with an invisible wrong number (the same reasoning that keeps
+    ``detect_spent_contradictions`` non-mutating).
+    """
+    if status != "completed":
+        return
+
+    from backend.app.models.printer import Printer
+    from backend.app.services import notify_dedup
+    from backend.app.services.notification_service import notification_service
+    from backend.app.services.spool_recovery import runout_slot_desc
+    from backend.app.services.spool_tagless import is_tagless_spool
+
+    # ``runout_slot_desc`` is the ONE origin for slot wording, so this page names a
+    # slot the way every other operator surface does. The roll is named by id +
+    # material rather than through either module's private ``_spool_label``: this
+    # event only ever fires for a TAGLESS row, whose brand and colour_name are blank
+    # by construction (auto-minted from ``tagless_default_filament``), so the label
+    # helper would degrade to the material anyway — and there are already two copies
+    # of it in the tree without this adding a third.
+
+    # The DISPATCH MAPPING alone — see ``_print_feeder_keys``. The observational
+    # witnesses (tray_change_log, last_loaded_tray) both derive from ``tray_now``,
+    # which reports the filament physically in the path, and an eject sweep or an
+    # empty-bed dry-run runs with the previous print's roll still loaded. Naming a
+    # feeder from those would page after every single eject, for a job whose zero
+    # grams are correct.
+    feeder_keys = _print_feeder_keys(ams_mapping, None)
+    ams_keys = sorted(key for key in feeder_keys if key[0] != 255)
+    if not ams_keys:
+        logger.info(
+            "[UsageTracker] printer %s archive %s: '%s' completed charging 0 g and no AMS feeder could be "
+            "named (mapping=%s) — nothing to attribute the shortfall to",
+            printer_id,
+            archive_id,
+            print_name,
+            ams_mapping,
+        )
+        return
+
+    for ams_id, tray_id in ams_keys:
+        spool_id = await _resolve_spool_id_for_tray(printer_id, ams_id, tray_id, db)
+        if spool_id is None:
+            continue
+        spool = await db.get(Spool, spool_id)
+        if spool is None or not is_tagless_spool(spool):
+            continue
+
+        slot_desc = runout_slot_desc(ams_id * 4 + tray_id) or f"AMS{ams_id}-T{tray_id}"
+        logger.warning(
+            "[UsageTracker] ZERO-GRAM CHARGE: printer %s archive %s completed '%s' and charged 0 g, but %s is "
+            "fed by TAGLESS spool %s — a tagless tray reports remain: -1, so the print's 3MF was its only gram "
+            "source and the archive has none. That roll's ledger is now short by this print.",
+            printer_id,
+            archive_id,
+            print_name,
+            slot_desc,
+            spool.id,
+        )
+
+        printer = await db.get(Printer, printer_id)
+        printer_name = (printer.name if printer is not None else None) or f"Printer {printer_id}"
+        # One page per printer per window: this class of bleed repeats on EVERY
+        # print, and fifteen identical pages bury the fact they are reporting.
+        key = f"printer:{printer_id}"
+        last = await notify_dedup.last_sent_at(db, _ZERO_CHARGE_SCOPE, key)
+        if last is not None and (datetime.utcnow() - last).total_seconds() < _ZERO_CHARGE_RENOTIFY_S:
+            return
+        await notification_service.on_zero_gram_charge(
+            printer_id,
+            printer_name,
+            print_name,
+            slot_desc,
+            spool.id,
+            (spool.material or "unknown material"),
+            db,
+        )
+        await notify_dedup.record_sent(db, _ZERO_CHARGE_SCOPE, key)
+        return
 
 
 async def _resolve_3mf_fallback(archive, db: AsyncSession, base_dir):

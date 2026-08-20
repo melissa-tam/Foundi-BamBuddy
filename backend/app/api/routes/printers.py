@@ -38,6 +38,7 @@ from backend.app.schemas.printer import (
     PrinterStatus,
     PrinterUpdate,
     PrintOptionsResponse,
+    SlotRecheckResponse,
 )
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
@@ -3574,15 +3575,52 @@ async def skip_objects(
 # =============================================================================
 
 
-@router.post("/{printer_id}/ams/{ams_id}/slot/{slot_id}/refresh")
-async def refresh_ams_slot(
+#: How long the re-check may wait for the identity pass to land its conclusion.
+#:
+#: Only ever entered when the tag-ness answer is ALREADY in hand and the printer is idle —
+#: i.e. when the pipeline's next raw push (~1 Hz) will conclude — so this buys the operator
+#: the real verdict instead of a "queued" they would have to interpret. It is a RESPONSE
+#: budget, not a decision input: on expiry the honest "queued" is returned and the mint
+#: still lands a moment later through the acknowledgement.
+_RECHECK_SETTLE_BUDGET_S = 3.0
+_RECHECK_POLL_S = 0.25
+
+
+@router.post("/{printer_id}/ams/{ams_id}/slot/{slot_id}/recheck", response_model=SlotRecheckResponse)
+async def recheck_ams_slot(
     printer_id: int,
     ams_id: int,
     slot_id: int,
-    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_AMS_RFID),
+    user: User | None = RequirePermissionIfAuthEnabled(Permission.PRINTERS_AMS_RFID),
     db: AsyncSession = Depends(get_db),
 ):
-    """Re-read RFID for an AMS slot (triggers filament info refresh)."""
+    """Re-check an AMS slot: the operator's answer as the farm's second identity oracle.
+
+    Doctrine rule 12 (operator-ratified 2026-08-19). Renamed from "Re-read RFID" because on
+    a tagless slot the control never reads anything, and a label promising a hardware action
+    that cannot happen is how shape 32's operator lost 21 minutes. The action keeps ONE name
+    through the whole flow — the control says "Re-check slot", the result says "re-checked",
+    never "RFID read complete".
+
+    **This route decides nothing about identity.** It records intent and reports; the verdict
+    is emitted by ``slot_state.resolve`` through the same mint path every other mint uses
+    (``slot_recheck`` module docstring — an endpoint that resolved the slot itself would
+    re-create the inline lane the 2026-08-02 hard cutover deleted).
+
+    Verdicts, straight from rule 12's contract table (§4.1 rows R1–R8):
+
+    * ``empty`` — nothing seated, so nothing to conclude (R6). Refused with a sentence, not a
+      bare 400: the refusal is a status message the UI must be able to announce.
+    * ``unchanged`` — no un-acted-on physical cycle on this slot (R1). The change from before
+      is that it ANSWERS instead of spinning.
+    * ``identified`` — the wire already asserts a tag here, so the identity lane owns this
+      slot and the click adds nothing (R4's tag-found half).
+    * ``minted`` — the answer was in hand and the pipeline concluded within the budget
+      (R2/R5/R8). Carries the new row and the assumed weight, plus the undo offer.
+    * ``queued`` — intent recorded, the tag-ness question is not answerable yet: mid-print the
+      farm never commands a read (rule 5), so the honest state is ``tray_unread`` and the
+      conclusion lands at the next idle window (R3/R4).
+    """
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
     printer = result.scalar_one_or_none()
     if not printer:
@@ -3592,29 +3630,184 @@ async def refresh_ams_slot(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    # Route through the single identify commander so this read gets the same
-    # bookkeeping as every other one — notably the echo-consume flag, so the
-    # firmware's identify flap (present→9→present over ~20 s) doesn't ignite the
-    # ams_presence re-read loop from its settle-back gain. ``enforce_need=False``:
-    # a deliberate operator act bypasses the NEED check, never wire safety (the
-    # client still refuses while drying / identifying). Local import — printers.py
-    # doesn't import ams_presence at module level (matches main.py's local-import
-    # pattern at :1912/:4644).
-    from backend.app.services import ams_presence
+    # Local imports — printers.py keeps the AMS services out of module scope (the
+    # main.py local-import pattern at :1912/:4644; slot_recheck pulls the pipeline's model
+    # graph in with it).
+    from backend.app.services import ams_presence, slot_recheck, spool_tagless
+    from backend.app.services.tray_observation import observe_tray
 
-    success, message = await ams_presence.command_identify(
-        printer_id, ams_id, slot_id, source="manual_refresh", enforce_need=False
+    def _answer(verdict: str, **extra) -> SlotRecheckResponse:
+        return SlotRecheckResponse(
+            verdict=verdict, printer_id=printer_id, ams_id=ams_id, tray_id=slot_id, **extra
+        )
+
+    # Read the slot through the SAME observation the pipeline decides on, so the route's
+    # preconditions and the table's rows can never disagree about what "seated" or "the wire
+    # asserts an identity" means. In particular ``identity_asserted`` here is the RFID pair —
+    # ``tray_fields.tray_identity_asserted`` counts a configured ``tray_type`` as identity,
+    # which is true for every autoconfigured TAGLESS tray on this fleet and would answer
+    # "tag found" for the exact slots this verb exists to serve.
+    tray = ams_presence.live_tray(printer_id, ams_id, slot_id)
+    obs = observe_tray(printer_id, ams_id, tray) if tray is not None else None
+    seated = obs.present if obs is not None else None
+    identity = obs.identity_asserted if obs is not None else False
+
+    # R6 — nothing seated. Only a wire-ASSERTED empty refuses; presence UNKNOWN falls
+    # through, because an unknown must never be resolved toward "there is nothing there".
+    if seated is False:
+        return _answer("empty")
+
+    # R4's tag-found half — the RFID lane is the stronger oracle and already owns this slot
+    # on every push, so no intent is recorded: there is no question for a human answer to
+    # settle. The READ still happens, which is the one thing this branch must not drop —
+    # on a tagged slot the old "Re-read RFID" was a genuine and useful hardware action
+    # (refresh the remaining-%, re-assert the K-profile), it is guaranteed answerable here,
+    # and the rename must not quietly remove a capability. Doctrine rule 12 renamed the
+    # verb; it did not narrow it.
+    if identity:
+        _spawn_pa_reapply_if_read(
+            await ams_presence.command_identify(
+                printer_id, ams_id, slot_id, source="manual_refresh", reason="rfid_refresh", enforce_need=False
+            ),
+            printer_id,
+            ams_id,
+            slot_id,
+        )
+        return _answer(
+            "identified",
+            brand=(tray or {}).get("tray_sub_brands") or None,
+            material=(tray or {}).get("tray_type") or None,
+        )
+
+    # R1 — rule 12's guard. No un-acted-on physical cycle on this slot means the farm has no
+    # evidence anything moved, and the click concludes NOTHING and says so. The escape hatch
+    # for a swap the farm never observed is the OTHER verb, "New roll…", which asserts rather
+    # than infers and needs no cycle at all.
+    if not spool_tagless.qualified_cycle_pending(printer_id, ams_id, slot_id):
+        return _answer("unchanged")
+
+    await slot_recheck.open_intent(db, printer_id, ams_id, slot_id, requested_by=getattr(user, "id", None))
+
+    # Ask now if this is a moment to ask; ``maybe_ask`` owns every refusal (mid-print, not
+    # seated, already answered, in flight, paced) so the policy lives in one place.
+    issued = await slot_recheck.maybe_ask(
+        db,
+        printer_id,
+        ams_id,
+        slot_id,
+        busy=ams_presence.printer_running(getattr(client, "state", None)),
+        seated=seated is True,
     )
-    if not success:
-        raise HTTPException(400, message)
+    _spawn_pa_reapply_if_read(issued, printer_id, ams_id, slot_id)
 
-    # Apply PA profile after delay (RFID re-read takes a few seconds)
+    concluded = await _await_recheck_conclusion(db, printer_id, ams_id, slot_id)
+    if concluded is None:
+        return _answer("queued")
+    return _answer(
+        "minted",
+        spool_id=concluded.id,
+        label_weight_g=float(concluded.label_weight or 0),
+        brand=concluded.brand,
+        material=concluded.material,
+        undo_available=True,
+    )
+
+
+def _spawn_pa_reapply_if_read(issued, printer_id: int, ams_id: int, slot_id: int) -> None:
+    """Re-assert the operator's K-profile behind a read that actually happened.
+
+    Unchanged from the route this replaces, and hung off BOTH ask paths so the tagged-slot
+    refresh and the tagless-slot discovery read get identical treatment. ``issued`` accepts
+    either the bool ``slot_recheck.maybe_ask`` returns or ``command_identify``'s
+    ``(ok, message)`` pair — one call site per path, one behaviour.
+    """
+    ok = issued[0] if isinstance(issued, tuple) else bool(issued)
+    if not ok:
+        return
     spawn_background_task(
         _apply_pa_after_refresh(printer_id, ams_id, slot_id),
         name=f"apply-pa-after-refresh-{printer_id}-{ams_id}-{slot_id}",
     )
 
-    return {"success": True, "message": message}
+
+async def _await_recheck_conclusion(db: AsyncSession, printer_id: int, ams_id: int, slot_id: int):
+    """Wait, briefly and boundedly, for the identity pass to mint — or give up and say so.
+
+    The pipeline runs off the raw MQTT push (~1 Hz), which is the ONLY lane allowed to decide
+    identity, so the endpoint cannot conclude for itself without re-creating the inline lane
+    the hard cutover deleted. What it can do is wait out one or two pushes when a conclusion
+    is imminent, so R2/R5 get "new roll recorded" rather than a "queued" that resolves a
+    second later. Nothing depends on the wait: on expiry the intent is still open and the
+    conclusion still lands, announced by the acknowledgement.
+    """
+    from backend.app.models.slot_recheck import SlotRecheckIntent
+    from backend.app.models.spool import Spool
+
+    deadline = asyncio.get_running_loop().time() + _RECHECK_SETTLE_BUDGET_S
+    while True:
+        await asyncio.sleep(_RECHECK_POLL_S)
+        # End this session's read transaction between polls. The conclusion is committed by
+        # the pipeline's OWN session (it runs off the MQTT push, which owns no request
+        # scope), so a snapshot held open here would poll a view of the database taken
+        # before the mint and time out against work that has already landed. Nothing is
+        # pending — the intent was committed on the way in — so the rollback only releases
+        # the snapshot and expires the identity map.
+        await db.rollback()
+        minted_id = (
+            await db.execute(
+                select(SlotRecheckIntent.minted_spool_id)
+                .where(
+                    SlotRecheckIntent.printer_id == printer_id,
+                    SlotRecheckIntent.ams_id == ams_id,
+                    SlotRecheckIntent.tray_id == slot_id,
+                    SlotRecheckIntent.resolved_at.is_not(None),
+                )
+                .order_by(SlotRecheckIntent.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if minted_id is not None:
+            return await db.get(Spool, minted_id)
+        if asyncio.get_running_loop().time() >= deadline:
+            return None
+
+
+@router.post("/{printer_id}/ams/{ams_id}/slot/{slot_id}/recheck/undo", response_model=SlotRecheckResponse)
+async def undo_ams_slot_recheck(
+    printer_id: int,
+    ams_id: int,
+    slot_id: int,
+    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_AMS_RFID),
+    db: AsyncSession = Depends(get_db),
+):
+    """Restore the roll a click-driven mint displaced (the acknowledgement's undo, R8).
+
+    Rule 12's honest false positive, surfaced rather than hidden: an operator who re-seated
+    the SAME roll after a jam clear and then re-checked gets a fresh row at label weight, and
+    this hands the slot back to the row that was there — with any grams charged in between.
+
+    All of it goes through ``spool_tagless.replace_bound_row_with_predecessor``, the mirror of
+    the module's existing charge-re-attribution lane, so the undo is not a second way to
+    write a binding.
+    """
+    from backend.app.services import slot_recheck
+
+    if not await db.scalar(select(Printer.id).where(Printer.id == printer_id)):
+        raise HTTPException(404, "Printer not found")
+
+    restored, reason = await slot_recheck.undo(db, printer_id, ams_id, slot_id)
+    if restored is None:
+        raise HTTPException(409, reason)
+    return SlotRecheckResponse(
+        verdict="restored",
+        printer_id=printer_id,
+        ams_id=ams_id,
+        tray_id=slot_id,
+        spool_id=restored.id,
+        label_weight_g=float(restored.label_weight or 0),
+        brand=restored.brand,
+        material=restored.material,
+    )
 
 
 async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):

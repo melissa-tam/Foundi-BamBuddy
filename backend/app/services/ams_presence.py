@@ -74,7 +74,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -129,6 +129,29 @@ _absent_since: dict[tuple[int, int, int], float] = {}
 # constant, not operator-tunable.
 _MIN_PHYSICAL_ABSENT_S = 5.0
 
+# How long a slot may read ABSENT and still have its returning roll treated as the
+# roll that left — the DE-BOUNCE window (``slot_pipeline._debounce_candidate``,
+# table row 4c).
+#
+# **This is a GLITCH FILTER, and it is NOT the 5-SECOND flap filter above.** The two
+# answer different questions and must never be conflated: ``_MIN_PHYSICAL_ABSENT_S``
+# asks "did the wire really lose this tray, or did the state flap?", while this asks
+# "is the release the farm acted on explicable as a SPURIOUS one?". Neither decides
+# identity positively (doctrine rule 7 as amended 2026-08-19): outside this window
+# the farm asserts NOTHING about the roll and the table MINTS; inside it a reclaim is
+# admitted as a de-bounce for a release that most likely never happened, bounded to
+# the slot's single last occupant, untagged, MEASURED, and disqualified by CAUSE
+# whenever the release has a physical explanation (a runout, a mid-print pull).
+#
+# 300 s is read off the fleet, not chosen: over 8 days, 52 reclaims had a matched
+# prior release on the same slot. Eleven returned in under 2 minutes (four at 0.0 min,
+# on four different printers inside one minute — no human does that; those are the
+# spurious releases this lane silently repairs) and three more between 2 and 5 min.
+# The short cluster ENDS at 1.7 min and the next reclaim in the whole record is at
+# 23 min, so five minutes sits in an empty valley: every gap the fleet actually
+# produces is either far inside it or far outside it.
+_RESEAT_WINDOW_S = 300.0
+
 # (printer_id, ams_id, tray_id) -> whether the slot's CURRENT absence began under
 # identify activity (:func:`_identify_explains_absence` at the PRESENT→ABSENT edge).
 # An RFID identify UNLOADS the tray for ~10–20 s, so that absence is a read flap and
@@ -137,6 +160,47 @@ _MIN_PHYSICAL_ABSENT_S = 5.0
 # _absent_since (set and popped in lockstep with it); a missing entry reads as "not
 # identify-explained", the same conservative default every edge map here takes.
 _absent_under_identify: dict[tuple[int, int, int], bool] = {}
+
+# (printer_id, ams_id, tray_id) -> whether the slot was the ACTIVE FEEDER of a LIVE
+# print at the PRESENT→ABSENT edge (:func:`_slot_was_active_feeder`, evaluated at that
+# edge while the wire evidence is freshest). The third stamp beside the two above, and
+# the reason it exists is the ~3-minute gap the 2026-08-13 wave measured: **the AMS
+# clears a drained slot's exist bit ~3 min BEFORE it declares the runout**. Inside that
+# gap the departed row is released but not yet ``spent_at``-stamped, so nothing in the
+# de-bounce donor query excludes it and a refill made during the gap would re-bind the
+# EXHAUSTED row onto the fresh roll (the 08-13 resurrection, shape 31, one incident
+# short of repeating).
+#
+# A slot losing presence WHILE IT IS FEEDING is running out or being pulled mid-print.
+# Neither is a glitch, so its return is a REFILL and must mint. Decided by CAUSE, never
+# by timing (doctrine rule 6 / invariant 6) — the same discipline as
+# :data:`_absent_under_identify`, which it is set and popped in lockstep with.
+_absent_under_active_feed: dict[tuple[int, int, int], bool] = {}
+
+
+class _Reseat(NamedTuple):
+    """What the slot's most recent presence GAIN measured about the absence before it.
+
+    ``absent_for`` is the MEASURED absence in seconds, or ``None`` when its start was
+    never observed (a restart's first batch, a tray first seen in a later partial, two
+    coalesced edges). ``None`` is not "short" — it is UNKNOWN, and an unknown duration
+    can never license a de-bounce (scenario T11).
+
+    ``under_active_feed`` is :data:`_absent_under_active_feed` as it stood at the loss
+    edge that opened this absence.
+    """
+
+    absent_for: float | None
+    under_active_feed: bool
+
+
+# (printer_id, ams_id, tray_id) -> the slot's most recent :class:`_Reseat`. Written at
+# the GAIN edge, dropped at the next LOSS edge (a slot that is absent again has no
+# standing return to speak for), and read — never consumed — by the slot pipeline's
+# de-bounce lane. Non-consuming on purpose, exactly like ``_physical_cycle_at``: the
+# pipeline may DEFER a slot for several pushes (a settle window, a drying unit) and the
+# fact it needs is a property of the wire's last edge pair, not of any one pass.
+_reseat: dict[tuple[int, int, int], _Reseat] = {}
 
 # Printers whose first observation batch (post-restart) has been processed. The first
 # batch only seeds the presence map (no re-read); later pushes act on gains. The connect
@@ -296,6 +360,8 @@ def _reset_state() -> None:
     _last_presence.clear()
     _absent_since.clear()
     _absent_under_identify.clear()
+    _absent_under_active_feed.clear()
+    _reseat.clear()
     _primed.clear()
     _swept_subtasks.clear()
     _echo_pending.clear()
@@ -414,6 +480,16 @@ def record_reread(printer_id: int, ams_id: int, tray_id: int) -> None:
     tray = _find_tray(printer_id, ams_id, tray_id)
     if tray is not None and _tray_present(tray):
         _echo_pending[(printer_id, ams_id, tray_id)] = time.monotonic()
+
+
+def live_tray(printer_id: int, ams_id: int, tray_id: int) -> dict | None:
+    """Public view of :func:`_find_tray` — the live tray dict for a slot, or None.
+
+    One scan, one place. Exposed for the operator lanes that need the CURRENT tray outside a
+    push callback (the "Re-check slot" endpoint's seated/identity preconditions) rather than
+    having each of them re-walk the merged payload with its own field parsing.
+    """
+    return _find_tray(printer_id, ams_id, tray_id)
 
 
 def identify_in_flight(printer_id: int, ams_id: int, tray_id: int) -> bool:
@@ -609,6 +685,85 @@ def open_ambiguity_occasion(printer_id: int, ams_id: int, tray_id: int, spool_id
     QUIETLY and consumes nothing, so the occasion survives to be spent on the idle edge.
     """
     _open_episode_occasion(printer_id, ams_id, tray_id, cause="identity_ambiguous", epoch=(spool_id, tag))
+
+
+# --- Re-seat evidence (the de-bounce lane's two inputs) --------------------
+
+
+def _slot_was_active_feeder(printer_id: int, ams_id: int, tray_id: int, state, running: bool) -> bool:
+    """Was this slot FEEDING a live print at the moment it lost presence?
+
+    Evaluated at the PRESENT→ABSENT edge and stamped into
+    :data:`_absent_under_active_feed`, because this question has an answer only while
+    the evidence is fresh: seconds later the firmware has moved on, and minutes later
+    (the ~3-minute bay-clear→HMS gap) the exhaustion evidence that would have explained
+    the departure has not even arrived yet.
+
+    A slot that goes empty while it is feeding is running out, or is being pulled
+    mid-print. Neither is a spurious release, so its return is a REFILL and must mint a
+    fresh row rather than de-bounce onto the row that just drained (scenarios T7/T8).
+
+    **The resolution order is the REVERSE of the jam case's, and getting it backwards
+    would make this condition silently never fire.** ``spool_recovery`` owns the one
+    wire-first feeder resolution and is asked here through its public
+    :func:`spool_recovery.slot_was_feeding`, which orders ``last_loaded_tray`` and the
+    job's mapping AHEAD of ``tray_now``: the question here is which slot was feeding
+    IMMEDIATELY BEFORE this edge, and at that instant ``tray_now`` may already have
+    moved (a firmware auto-refill switches to a backup slot) or read the 255 sentinel,
+    which means "nothing is feeding" and never "the path is clear" (invariant 8).
+
+    Idle printer ⇒ False: ``last_loaded_tray`` and the mapping are per-JOB state, and
+    reading them between prints would attribute a stale feeder to an operator's
+    ordinary roll change. Never raises — an unresolvable answer is "not suspect", and
+    the pipeline's live-HMS half of the runout-suspect test covers the same ground once
+    the firmware has spoken.
+    """
+    if not running:
+        return False
+    try:
+        from backend.app.services.spool_recovery import slot_was_feeding
+
+        return slot_was_feeding(state, ams_id, tray_id)
+    except Exception:  # noqa: BLE001 — an unresolvable feeder is not evidence of a runout
+        logger.exception(
+            "AMS presence: active-feeder resolution failed for printer %d AMS%d-T%d", printer_id, ams_id, tray_id
+        )
+        return False
+
+
+def reseat_within_window(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Did this slot's last presence GAIN return a roll inside the de-bounce window?
+
+    True only when the absence was MEASURED and shorter than :data:`_RESEAT_WINDOW_S`.
+    An absence whose start was never observed answers False, deliberately: ``None`` is
+    UNKNOWN, not "short", and the farm asserts nothing about a roll it did not watch
+    leave (scenario T11 — a restart while the roll is out mints on re-seat).
+
+    PEEK, never consuming (like :func:`last_physical_cycle_age`): the pipeline may defer
+    a slot for several pushes, and the fact is a property of the wire's last edge pair.
+    """
+    entry = _reseat.get((printer_id, ams_id, tray_id))
+    return entry is not None and entry.absent_for is not None and entry.absent_for < _RESEAT_WINDOW_S
+
+
+def reseat_under_active_feed(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Was this slot the active feeder of a live print when its current occupancy began?
+
+    The loss-edge half of the de-bounce lane's runout-suspect test
+    (:func:`_slot_was_active_feeder`), read back at the gain the release preceded. PEEK.
+    """
+    entry = _reseat.get((printer_id, ams_id, tray_id))
+    return entry is not None and entry.under_active_feed
+
+
+def reseat_absence(printer_id: int, ams_id: int, tray_id: int) -> float | None:
+    """The MEASURED absence (seconds) before this slot's last gain, or None if unknown.
+
+    For the log lines only — every decision reads the two predicates above, so a caller
+    can never re-derive its own window from this number.
+    """
+    entry = _reseat.get((printer_id, ams_id, tray_id))
+    return entry.absent_for if entry is not None else None
 
 
 # --- Change-evidence ledger -----------------------------------------------
@@ -1095,22 +1250,30 @@ async def broadcast_standing_unknown(
     unreachable websocket layer must not abort the caller, which is a scheduler-tick lane
     walking the whole fleet.
 
-    ONE emitter since the operator ruling of 2026-08-11:
-    ``spool_tagless._age_bound_presence_stale``'s escalation rung
-    (``case="bound_presence_unknown"`` — a binding whose slot presence has resolved
-    neither way after the whole ask ladder, i.e. the farm no longer knows whether the roll
-    it thinks it has is there). ``case`` is REQUIRED and names WHAT is unresolved so the
-    frontend can word the toast for the situation rather than for the event; the owed-read
-    lane that used to pass a second case is log-only now
-    (:func:`_warn_owed_read_blocked`).
+    TWO emitters, both in ``spool_tagless``'s reconcile walk and both once per episode:
+
+    * ``_age_bound_presence_stale``'s escalation rung (``case="bound_presence_unknown"``)
+      — a binding whose slot presence has resolved neither way after the whole ask ladder,
+      i.e. the farm no longer knows whether the roll it thinks it has is there;
+    * ``_age_spent_swap_park`` (``case="spent_swap_park"``, 2026-08-19) — a SPENT binding
+      under a tray that IS answering (present and configured) with no qualified cycle and
+      no answered read to release the W1 latch, so ``slot_state`` row 4a keeps returning
+      ``spent_latch`` and the slot parks silently forever.
+
+    They are siblings, not one lane with a flag: their predicates are opposite on
+    spent-ness, on presence and on configuration, and only the SURFACE is shared so the
+    console keeps one vocabulary for "this slot is standing unresolved". ``case`` is
+    REQUIRED and names WHAT is unresolved so the frontend can word the toast for the
+    situation rather than for the event; the owed-read lane that used to pass a third case
+    is log-only now (:func:`_warn_owed_read_blocked`).
 
     NO dedup here, deliberately. The hourly per-slot gate this function used to carry
-    existed to fold TWO lanes' toasts into ONE signal for one physical slot; with the
-    owed-read lane demoted there is nothing left to fold, and the surviving lane's own
-    episode math already spaces its escalations far wider than the gate ever did —
-    maturity at 900 s, then +600 s and +3600 s to reach the escalation rung, so ≥85 min
-    between the escalations of two successive episodes on one slot. A gate that can never
-    fire is a lie about who owns the pacing: the ladder does.
+    existed to fold two lanes' toasts into ONE signal for one physical slot by TIME; both
+    surviving lanes pace themselves by EPISODE instead, which is stricter and honest about
+    who owns the pacing — the presence ladder needs a full ladder (maturity at 900 s, then
+    +600 s and +3600 s) to reach its rung, and the park alerts exactly once for as long as
+    the same spent row holds the same seated slot. A gate that can never fire is a lie
+    about where the pacing lives.
     """
     try:
         from backend.app.models.printer import Printer
@@ -1518,6 +1681,16 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
                 # however long it runs (duration ≠ identity, the doctrine's rule 6).
                 _absent_since[key] = time.monotonic()
                 _absent_under_identify[key] = _identify_explains_absence(printer_id, ams_id, tray_id)
+                # …and the third stamp: was this slot FEEDING when it emptied? Recorded
+                # here for the same reason as the one above — the answer exists only
+                # while the evidence is fresh, and inside the ~3-minute bay-clear→HMS
+                # gap the firmware has not yet said why the bay went empty. A slot that
+                # empties mid-feed is running out or being pulled, never glitching, so
+                # its return is a refill and the de-bounce lane must refuse it.
+                _absent_under_active_feed[key] = _slot_was_active_feeder(printer_id, ams_id, tray_id, state, running)
+                # The slot is absent again: whatever its last return measured no longer
+                # describes it.
+                _reseat.pop(key, None)
 
             if present is True and not prev:
                 # Consume the slot's commanded-read cause on the FIRST gain that
@@ -1558,6 +1731,14 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
                 # suppressed discovery read is not.
                 absent_at = _absent_since.pop(key, None)
                 absent_for = None if absent_at is None else time.monotonic() - absent_at
+                # Bank what this return MEASURED, for the slot pipeline's de-bounce lane
+                # (``slot_state`` row 4c). Popped in lockstep with ``_absent_since``, and
+                # recorded regardless of ``identify_explained`` below: an identify flap is
+                # precisely a case where the roll never moved, so a release it provoked is
+                # exactly the spurious one the de-bounce exists to repair. Duration is
+                # only ever a NEGATIVE here — outside the window the table mints — so this
+                # never becomes a timer deciding identity (doctrine rule 7 as amended).
+                _reseat[key] = _Reseat(absent_for, _absent_under_active_feed.pop(key, False))
                 # An identify unloads the tray, and a print start engages the AMS:
                 # an absence that BEGAN under identify activity (flag captured at its
                 # start edge, freshest there), or one explained by ANY non-physical

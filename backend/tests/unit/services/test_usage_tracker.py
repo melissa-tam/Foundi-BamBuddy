@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backend.app.models.spool_usage_history import SpoolUsageHistory
+from backend.app.services import usage_tracker as usage_tracker_module
 from backend.app.services.usage_tracker import (
     PrintSession,
     _active_sessions,
@@ -581,12 +582,19 @@ class TestTaglessAmsAutoSpools:
         # remain guard must skip before the assignment/spool lookups.
         db.execute = AsyncMock(side_effect=[MagicMock(), MagicMock()])
 
-        results = await on_print_complete(1, {"status": "completed"}, pm, db)
+        # The zero-gram guard (scenario C6) runs AFTER both charging lanes and does
+        # its own assignment lookup by design — this shape is exactly what it exists
+        # to report. Held out here so the query count keeps measuring the lane this
+        # test is about, and asserted below so its firing is covered rather than
+        # merely tolerated.
+        with patch.object(usage_tracker_module, "_warn_zero_gram_tagless_charge", AsyncMock()) as zero_gram_guard:
+            results = await on_print_complete(1, {"status": "completed"}, pm, db)
 
         assert results == []
         db.commit.assert_not_called()
         # Guard fired before any assignment/spool query (only 3MF searches ran).
         assert db.execute.await_count <= 2
+        zero_gram_guard.assert_awaited_once(), "a completed print charging 0 g must reach the C6 guard"
 
 
 class TestSpoolAssignmentSnapshot:

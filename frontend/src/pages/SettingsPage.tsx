@@ -79,7 +79,7 @@ registerSettingsSearch({ labelKey: 'settings.queueDrying', tab: 'queue', keyword
 registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog idle park deep bed lower position', anchor: 'card-farm-production' });
 registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown stall window epsilon plateau min cooling per check give up timer close enough margin release threshold warn floor bed temperature quarantine', anchor: 'card-farm-cooldown' });
 registerSettingsSearch({ labelKey: 'settings.dispatchResponsiveness', labelFallback: 'Dispatch responsiveness', tab: 'farm', keywords: 'dispatch responsiveness latency poll interval queue check kick debounce coalesce usb preflight fresh window max wait parallel concurrency upload skip identical slim 3mf mesh thumbnail eject file speed', anchor: 'card-dispatch-responsiveness' });
-registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool prompt threshold reused tag grams rfid', anchor: 'card-filamentchecks' });
+registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool observation prompt threshold reused tag grams rfid', anchor: 'card-filamentchecks' });
 registerSettingsSearch({ labelKey: 'settings.printModal', tab: 'filament', keywords: 'print modal custom mapping', anchor: 'card-printmodal' });
 registerSettingsSearch({ labelKey: 'settings.amsDisplayThresholds', tab: 'filament', keywords: 'ams humidity temperature threshold history retention', anchor: 'card-amsthresholds' });
 registerSettingsSearch({ labelKey: 'settings.externalUrl', tab: 'network', keywords: 'external url reverse proxy public notification link', anchor: 'card-externalurl' });
@@ -1134,7 +1134,6 @@ export function SettingsPage() {
         farm_offline_stall_minutes: localSettings.farm_offline_stall_minutes,
         farm_pause_stall_minutes: localSettings.farm_pause_stall_minutes,
         respool_prompt_threshold_g: localSettings.respool_prompt_threshold_g,
-        respool_auto_enabled: localSettings.respool_auto_enabled,
         farm_cooldown_stall_window_minutes: localSettings.farm_cooldown_stall_window_minutes,
         farm_cooldown_stall_epsilon_c: localSettings.farm_cooldown_stall_epsilon_c,
         farm_cooldown_max_hold_minutes: localSettings.farm_cooldown_max_hold_minutes,
@@ -5633,13 +5632,16 @@ export function SettingsPage() {
                     </div>
                   );
                 })()}
-                {/* Reused-tag re-spool prompt threshold (relocated from Farm Production, plan 4a) */}
+                {/* Reused-tag re-spool OBSERVATION threshold. Named for what it governs:
+                    tier 3 was demoted to a log line 2026-08-10 and the tier-2 toggle that
+                    once made "prompt" true of this card went with WS3 (2026-08-19), so a
+                    label promising a prompt would now have no referent on the page. */}
                 <div>
                   <label htmlFor="respool-prompt-threshold" className="block text-white mb-1">
-                    {t('settings.respoolPromptThreshold', 'Re-spool prompt threshold (g)')}
+                    {t('settings.respoolPromptThreshold', 'Re-spool observation threshold (g)')}
                   </label>
                   <p className="text-sm text-bambu-gray mb-1">
-                    {t('settings.respoolPromptThresholdHelp', 'Log a re-spool observation when a reused Bambu tag arrives with this many grams or fewer left on the donor spool and no hardware-certain spent marker (0–1000). Observation only — no prompt is raised.')}
+                    {t('settings.respoolPromptThresholdHelp', 'Log a re-spool observation when a reused Bambu tag arrives with this many grams or fewer left on the donor spool and no hardware-certain spent marker (0–1000).')}
                   </p>
                   <input
                     id="respool-prompt-threshold"
@@ -5650,23 +5652,6 @@ export function SettingsPage() {
                     onChange={(e) => updateSetting('respool_prompt_threshold_g', Math.max(0, Math.min(1000, parseInt(e.target.value) || 0)))}
                     className="w-32 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
-                </div>
-                {/* Automatic re-spool on reused tags (W3.1) — default off: prompt
-                    instead of silently minting when a spent tag reappears. */}
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-white">{t('settings.respoolAutoEnabled')}</p>
-                    <p className="text-sm text-bambu-gray">{t('settings.respoolAutoEnabledDesc')}</p>
-                  </div>
-                  <label className="relative inline-flex items-center cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={localSettings.respool_auto_enabled ?? false}
-                      onChange={(e) => updateSetting('respool_auto_enabled', e.target.checked)}
-                      className="sr-only peer"
-                    />
-                    <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
-                  </label>
                 </div>
               </CardContent>
             </Card>

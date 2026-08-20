@@ -440,6 +440,33 @@ export interface AMSUnit {
   module_type: string;    // "ams", "n3f", "n3s"
 }
 
+/**
+ * What "Re-check slot" concluded — one verdict, one sentence for the operator.
+ *
+ * The route this replaces ("Re-read RFID") answered with a bare success flag, so
+ * a tagless slot — where nothing can be read — produced no state change and no
+ * sentence (incident shape 32: 21 minutes of clicking against silence). Every
+ * outcome now carries a verdict the UI renders in a live region:
+ *   - `unchanged`  no un-acted-on physical cycle on this slot; nothing concluded
+ *   - `minted`     a new roll was recorded (carries the row + assumed weight)
+ *   - `identified` the wire already asserts a tag here; the RFID lane owns it
+ *   - `queued`     intent recorded; the read lands at the next idle window
+ *   - `empty`      nothing seated — a refusal WITH a sentence, not an error
+ *   - `restored`   the undo route handed the slot back to the previous roll
+ */
+export interface SlotRecheckResult {
+  verdict: 'unchanged' | 'minted' | 'identified' | 'queued' | 'empty' | 'restored';
+  printer_id: number;
+  ams_id: number;
+  tray_id: number;
+  spool_id: number | null;
+  label_weight_g: number | null;
+  brand: string | null;
+  material: string | null;
+  /** A click-driven mint is offering its one-click undo (rule 12, R8). */
+  undo_available: boolean;
+}
+
 export interface NozzleInfo {
   nozzle_type: string;  // "stainless_steel" or "hardened_steel"
   nozzle_diameter: string;  // e.g., "0.4"
@@ -1407,10 +1434,6 @@ export interface AppSettings {
   // spent marker, prompt the operator to re-spool once the donor's remaining
   // grams drop at or below this threshold (default 30).
   respool_prompt_threshold_g: number;
-  // Automatic re-spool on reused tags: when false (default), a reappearing spent
-  // tag raises the re-spool PROMPT instead of silently minting a fresh spool.
-  // Enable only when running Bambu refills on reused cores.
-  respool_auto_enabled: boolean;
 }
 
 export type AppSettingsUpdate = Partial<AppSettings>;
@@ -3060,10 +3083,13 @@ export interface SlotStandingUnknownMessage {
   printer_name?: string | null;
   ams_id: number;
   tray_id: number;
-  /** WHICH standing condition raised it. Only one exists — the owed-identity-read
-   *  case was demoted to a log line (operator ruling 2026-08-11) — but the
-   *  discriminator stays on the wire so a future case cannot arrive unlabelled. */
-  case?: 'bound_presence_unknown';
+  /** WHICH standing condition raised it, so the toast can word the SITUATION rather
+   *  than the event. Two exist: `bound_presence_unknown` (a binding whose slot presence
+   *  will not resolve either way) and `spent_swap_park` (a spent binding under a tray
+   *  that IS answering — present and configured — with no evidence the decision table
+   *  may act on, so the slot is latched with nothing to release it). The owed-identity
+   *  -read case was demoted to a log line (operator ruling 2026-08-11). */
+  case?: 'bound_presence_unknown' | 'spent_swap_park';
 }
 
 /** `GET /inventory/prompts/pending` — every operator question that is still
@@ -3278,6 +3304,12 @@ export interface SpoolAssignment {
    *  firmware dialect that never reports presence). Consumers must branch on
    *  `=== false` only — unknown always fails open. */
   present?: boolean | null;
+  /** A "Re-check slot" mint on this slot still has a standing undo offer, derived
+   *  per request (never stored) and false again once the slot is re-decided. The
+   *  toast that announces the mint is timed, so the slot card carries the same
+   *  offer — a timed notification must never be the only path to an action
+   *  (WCAG 2.2 2.2.1). Optional: older servers and test fixtures omit it. */
+  recheck_undo_available?: boolean;
 }
 
 export interface FilamentSkuSettings {
@@ -4245,9 +4277,20 @@ export const api = {
     }),
 
   // AMS Control
-  refreshAmsSlot: (printerId: number, amsId: number, slotId: number) =>
-    request<{ success: boolean; message: string }>(
-      `/printers/${printerId}/ams/${amsId}/slot/${slotId}/refresh`,
+  /** Re-check a slot: the operator's answer as the farm's second identity oracle.
+   *  Always resolves with a verdict — including `empty`, which is a refusal the
+   *  UI announces rather than an error. */
+  recheckAmsSlot: (printerId: number, amsId: number, slotId: number) =>
+    request<SlotRecheckResult>(
+      `/printers/${printerId}/ams/${amsId}/slot/${slotId}/recheck`,
+      { method: 'POST' }
+    ),
+
+  /** Hand the slot back to the roll a click-driven mint displaced (verdict
+   *  `restored`). 409s with a plain-string reason token when no offer stands. */
+  undoAmsSlotRecheck: (printerId: number, amsId: number, slotId: number) =>
+    request<SlotRecheckResult>(
+      `/printers/${printerId}/ams/${amsId}/slot/${slotId}/recheck/undo`,
       { method: 'POST' }
     ),
 

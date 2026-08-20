@@ -643,3 +643,58 @@ describe('FilamentHoverCard "New roll…" verb (W5a)', () => {
     expect(screen.queryByRole('button', { name: /New roll/i })).not.toBeInTheDocument();
   });
 });
+
+// WS11 R8 — the standing undo for a "Re-check slot" mint. The card renders the
+// verb purely on the presence of the handler; PrintersPage derives that from the
+// backend's `recheck_undo_available`, so the offer lapsing removes the verb.
+describe('FilamentHoverCard "Restore previous roll" verb (WS11 R8)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  it('renders the verb as a keyboard-operable button and invokes the handler', async () => {
+    const onRestorePreviousRoll = vi.fn();
+    renderWithHover(
+      <FilamentHoverCard
+        data={baseFilamentData}
+        inventory={{
+          assignedSpool: { id: 140, material: 'PETG', brand: 'Overture', color_name: 'Black' },
+          onRestorePreviousRoll,
+        }}
+      >
+        <div>trigger</div>
+      </FilamentHoverCard>
+    );
+    vi.advanceTimersByTime(100);
+
+    const button = await screen.findByRole('button', { name: 'Restore previous roll' });
+    // An offer, not an interruption: rendering it must not move focus.
+    expect(button).not.toHaveFocus();
+    // In the tab order (a real button, no tabindex=-1) and operable by keyboard.
+    expect(button).not.toHaveAttribute('tabindex');
+    button.focus();
+    fireEvent.keyDown(button, { key: 'Enter' });
+    fireEvent.click(button);
+    expect(onRestorePreviousRoll).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits the verb when no undo offer stands', async () => {
+    renderWithHover(
+      <FilamentHoverCard
+        data={baseFilamentData}
+        inventory={{
+          assignedSpool: { id: 140, material: 'PETG', brand: 'Overture', color_name: 'Black' },
+          onNewRoll: vi.fn(),
+        }}
+      >
+        <div>trigger</div>
+      </FilamentHoverCard>
+    );
+    vi.advanceTimersByTime(100);
+
+    await screen.findByRole('button', { name: /New roll/i });
+    expect(
+      screen.queryByRole('button', { name: 'Restore previous roll' })
+    ).not.toBeInTheDocument();
+  });
+});

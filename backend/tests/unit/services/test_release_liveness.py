@@ -264,6 +264,50 @@ async def test_stale_bit_starves_the_release_and_the_answering_report_delivers_i
     assert f"printer={wired.printer.id} A0T0" in released[0]
 
 
+async def test_the_release_evidence_record_rides_the_production_journey(db_session, wired, sessions, passes, caplog):
+    """WS7 liveness: the record fires on a REAL release, from REAL wire evidence.
+
+    Its unit tests hand-build observations and a stub client, which proves the grammar but
+    not that the fields ever get populated in production — the same blind spot that let
+    release-on-empty sit at zero firings while every suite stayed green (memory
+    ``liveness-paired-verification``). So this asserts the line through the whole chain:
+    ``_handle_ams_data`` → the raw hook → ``observe_ams_push`` → the pipeline, with the
+    mask read back as the wire spelled it.
+
+    ``push=?`` here is CORRECT, not a gap: ``last_full_report_at`` is stamped by the
+    ``sdcard`` key on a full ``print`` frame, and this harness delivers the AMS block on
+    its own — so the printer has genuinely never delivered a full report, and the record
+    must say so rather than infer a shape it cannot see.
+    """
+    spool = await _bind(db_session, wired.printer.id)
+    slot = (wired.printer.id, 0, 0)
+
+    with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
+        await _push(wired, passes, _cleared_pushall())
+
+    assert await _assignment(sessions, *slot) is None, "the release itself must still fire"
+    evidence = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _PIPELINE_LOGGER and r.getMessage().startswith("[slot-state] release-evidence")
+    ]
+    assert len(evidence) == 1, f"exactly one record per release, got {evidence}"
+    line = evidence[0]
+
+    assert f"printer={wired.printer.id} A0T0 " in line
+    assert f"spool={spool.id} reason=cleared_tray" in line
+    assert "used_g=932.0 label_g=1000.0" in line
+    # The wire's own mask, carried through the client's triage surface untouched.
+    assert "mask=0 " in line, f"the wire spelled tray_exist_bits '0': {line}"
+    # An all-zero mask is not trusted until it repeats, so this release came off the
+    # FALLBACK tier — the tray asserting its own emptiness — and the record says exactly
+    # that rather than crediting the bit.
+    assert "presence=False rule=cleared_shape" in line
+    assert "mask_trusted=no mask_src=cached" in line
+    assert "push=? push_age=-" in line
+    assert "feeding=no printing=no" in line
+
+
 async def test_the_release_survives_the_partials_that_follow_it(db_session, wired, sessions, passes):
     """Recurrence guard: once released, the steady-state partials neither resurrect the
     binding nor re-owe a report — there is no veto left to contradict."""

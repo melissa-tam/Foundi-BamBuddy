@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, func
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.core.database import Base
@@ -159,6 +160,41 @@ class Spool(Base):
     assignments: Mapped[list["SpoolAssignment"]] = relationship(back_populates="spool", cascade="all, delete-orphan")
     location: Mapped["Location | None"] = relationship(back_populates="spools")
 
+    @hybrid_property
+    def is_finished_roll(self) -> bool:
+        """THE one encoding of "a spent row is a FINISHED roll" (doctrine rules 3 and 8).
+
+        A runout means this row reached ZERO. You cannot add filament to a 0 g roll, so
+        whatever is physically in the slot afterwards is a DIFFERENT roll — on a reused
+        core if the same RFID tag comes back (operator ruling 3, 2026-08-19). That single
+        statement licenses two OPPOSITE conclusions, which is precisely why it is named
+        once here instead of being spelled out at each site:
+
+        * **The untagged lane EXCLUDES it** — ``spool_tag_matcher.find_matching_untagged_spool``
+          filters ``~Spool.is_finished_roll``: a newly-arriving tag must always land on a
+          DIFFERENT row, because claiming this one would hand a fresh roll a spent latch
+          (hard-excluded from selection, and no automatic un-spend lane exists to undo it).
+        * **The tagged lane READS it as evidence** — ``spool_respool``'s tier 2 concludes
+          from ``spool.is_finished_roll`` plus a LOADED tray that the tag came back on a
+          reused core, and re-spools it onto a fresh row. Concluded from evidence, never
+          asked (scenario G3).
+
+        A ``hybrid_property`` because those two call sites live on opposite sides of the
+        ORM boundary — one is a WHERE clause, the other a row already in hand — and a
+        second spelling is exactly how the doctrine drifts: the same two-copies shape the
+        2026-08-19 wave deleted from ``_is_tagless``, where a later identity-column change
+        updated one copy and not the other. Derived at read time from ``spent_at``; there
+        is NO stored flag, for the same reason :attr:`remaining_g` has none (rule 8 — the
+        ledger stays raw, so clearing ``spent_at`` alone un-finishes the row).
+        """
+        return self.spent_at is not None
+
+    @is_finished_roll.inplace.expression
+    @classmethod
+    def _is_finished_roll_expression(cls):
+        """SQL form of :attr:`is_finished_roll` — same statement, WHERE-clause side."""
+        return cls.spent_at.is_not(None)
+
     @property
     def remaining_g(self) -> float:
         """THE one derivation of a row's remaining grams — emptiness is derived from
@@ -172,6 +208,30 @@ class Spool(Base):
         if self.spent_at is not None:
             return 0.0
         return max(0.0, float(self.label_weight or 0.0) - float(self.weight_used or 0.0))
+
+    @property
+    def delivered_g(self) -> float | None:
+        """What this roll ACTUALLY held, once the hardware has said it is empty.
+
+        ``label_weight`` on a minted row is an ASSUMPTION — the tagless default's nominal
+        figure, not a reading of the roll in the tray. The hardware runout is the only
+        moment the truth becomes knowable, and at that moment the answer is simply the
+        grams the farm watched it feed. So this is a DERIVATION, never a column and never a
+        write-back over ``label_weight``: overwriting the label would conflate "what we
+        assumed" with "what it delivered" in one field and destroy the nominal figure that
+        cost-per-kg and inventory reporting read (operator ruling 18).
+
+        ``None`` until ``spent_at`` is stamped — an un-spent roll has delivered nothing
+        final, and a caller must not treat its running total as a capacity.
+
+        The gap between assumption and delivery is NORMAL in both directions and is not an
+        error to be flagged: a part-used roll an operator seated delivers ~800 g on a
+        1000 g label, and some brands ship ~1100 g on that same label. Both are ordinary
+        stock, which is why the spent stamp records this figure instead of warning about it.
+        """
+        if self.spent_at is None:
+            return None
+        return max(0.0, float(self.weight_used or 0.0))
 
 
 from backend.app.models.location import Location  # noqa: E402
