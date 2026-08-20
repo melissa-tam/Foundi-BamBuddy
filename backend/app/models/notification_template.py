@@ -255,6 +255,17 @@ DEFAULT_TEMPLATES = [
         "title_template": "Spool marked spent is still loaded — {printer_name}",
         "body_template": "Spool #{spool_id} ({spool_label}) is marked SPENT but is still seated in {slot} on {printer_name}, and the AMS reports it {remain}% full. A spent spool is excluded from every print, so this roll is out of service. Check whether the spent stamp was correct.",
     },
+    # WS6: a print COMPLETED and charged nothing while a TAGLESS roll fed it. A
+    # tagless tray reports remain: -1 forever, so the slicer 3MF is the only thing
+    # that can price it — and a lost 3MF makes the charge silently ZERO instead of
+    # failing. The copy names the roll and the file, because the fix is always the
+    # file: the archive row for that print has no 3MF attached.
+    {
+        "event_type": "zero_gram_charge",
+        "name": "Print Charged No Filament",
+        "title_template": "Print charged no filament — {printer_name}",
+        "body_template": "{printer_name} completed '{job_name}' and charged 0 g, but {slot} is fed by tagless spool #{spool_id} ({spool_material}), whose only gram source is the print's 3MF. The ledger for that roll is now short by this print. Check that the archive for this print has its 3MF attached.",
+    },
     {
         "event_type": "storage_low",
         "name": "USB Storage Low (auto-cleanup)",

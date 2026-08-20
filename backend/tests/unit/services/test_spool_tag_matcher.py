@@ -2088,6 +2088,74 @@ async def test_find_matching_untagged_still_matches_unassigned_manual(db_session
     assert found.id == spool.id
 
 
+class TestFinishedRollPredicate:
+    """ONE definition, TWO opposite conclusions — ``Spool.is_finished_roll`` (WS3).
+
+    "A spent row is a FINISHED roll" is a single doctrine statement (rules 3 and 8), and
+    the two lanes that consume it want OPPOSITE things from it:
+
+    * the UNTAGGED attract lane EXCLUDES it — a newly-arriving tag must land on a
+      different row, or a fresh roll inherits a spent latch;
+    * the TAGGED lane READS it as EVIDENCE — a finished roll whose tag comes back on a
+      loaded tray is a new roll on a reused core (scenario G3, operator ruling 3).
+
+    Spelling the ``spent_at`` test out at each site is exactly how a doctrine statement
+    drifts (the two-copies shape this wave deleted from ``_is_tagless``), so the rule is
+    named once on the model and both sites call it. These three tests are that claim:
+    the predicate itself, and each conclusion drawn from it.
+    """
+
+    def test_the_predicate_answers_in_both_worlds(self):
+        """One name, usable as a Python bool AND as a WHERE clause — which is the whole
+        reason it can be shared by an ORM query and a row already in hand."""
+        from datetime import datetime
+
+        live = Spool(material="PLA", rgba="FFFFFFFF")
+        assert live.is_finished_roll is False
+        live.spent_at = datetime.now()
+        assert live.is_finished_roll is True
+
+        assert str(Spool.is_finished_roll.expression) == "spool.spent_at IS NOT NULL"
+        assert str(~Spool.is_finished_roll) == "spool.spent_at IS NULL"
+
+    @pytest.mark.asyncio
+    async def test_conclusion_one_the_untagged_lane_excludes_it(self, db_session):
+        """``find_matching_untagged_spool`` filters ``~Spool.is_finished_roll``."""
+        from datetime import datetime
+
+        finished = Spool(
+            material="PLA",
+            subtype="Basic",
+            rgba="FFFFFFFF",
+            brand="Bambu Lab",
+            label_weight=1000,
+            core_weight=250,
+            spent_at=datetime.now(),
+        )
+        db_session.add(finished)
+        await db_session.commit()
+
+        assert finished.is_finished_roll is True
+        assert await find_matching_untagged_spool(db_session, SAMPLE_TRAY) is None
+
+    @pytest.mark.asyncio
+    async def test_conclusion_two_the_tagged_lane_reads_it_as_evidence(self, db_session):
+        """``spool_respool``'s tier-2 gate opens on the SAME predicate, in the opposite
+        direction: a finished roll is the reason to look, not the reason to skip."""
+        from datetime import datetime
+
+        from backend.app.services.spool_respool import should_evaluate_respool
+
+        tray = {"id": 0, "state": 11, "tray_type": "PLA", "tray_color": "FFFFFFFF"}
+        spool = Spool(material="PLA", rgba="FFFFFFFF", label_weight=1000, weight_used=0.0)
+        db_session.add(spool)
+        await db_session.commit()
+
+        assert should_evaluate_respool(spool, tray, 1, 0, 0) is False  # live row: nothing to conclude
+        spool.spent_at = datetime.now()
+        assert should_evaluate_respool(spool, tray, 1, 0, 0) is True  # finished roll: evidence
+
+
 @pytest.mark.asyncio
 async def test_find_matching_untagged_excludes_spent_row(db_session):
     """A spent, untagged, unbound row is a FINISHED roll — a newly-arriving tag

@@ -864,6 +864,195 @@ class TestBoundPresenceStaleArm:
         assert len(manager.pushall_calls) == 2
 
 
+class TestSpentSwapParkArm:
+    """WS2 — the spent-swap park must not be a SILENT deadlock.
+
+    ``slot_state`` row 4a releases the W1 spent latch on a QUALIFIED PHYSICAL CYCLE, and
+    4a′/5a on an ANSWERED no-tag read over a binding that CLAIMS a tag. A spent binding
+    under a CONFIGURED, seated tray with neither can reach neither — and for a TAGLESS
+    incumbent the answered-read escape does not exist by design (doctrine rule 11's
+    one-way clause: over a binding that claims no identity a no-tag read proves nothing,
+    because the same bare core reads identically before and after a swap). So the row
+    returns ``KEEP("spent_latch")`` forever, on a production slot, saying nothing.
+
+    This arm makes that LOUD. It is a SIBLING of the bound-presence arm, not a branch of
+    it: opposite on spent-ness, opposite on presence, and it needs configuration where the
+    other needs nothing. Only the operator SURFACE is shared. It asks the printer for
+    NOTHING — the wire has already said everything it can — so there is no ladder here,
+    only the single escalation, once per episode.
+    """
+
+    _PAST = _T0 + spool_tagless._SPENT_SWAP_PARK_AFTER_S + 1.0
+
+    async def test_a_parked_spent_slot_tells_the_operator_once_per_episode(
+        self, db_session, printer_factory, env
+    ):
+        printer = await printer_factory(name="004-H2S")
+        await _seed_assignment(db_session, printer.id, 0, 2, spent=True)
+        manager = _FakeManager({printer.id: _state([_present_tray(2)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        env.ws.assert_not_awaited()  # first sighting only opens the episode
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+        payload = env.ws.await_args.args[0]
+        assert payload["type"] == "slot_standing_unknown"
+        assert payload["case"] == "spent_swap_park"
+        assert (payload["printer_id"], payload["ams_id"], payload["tray_id"]) == (printer.id, 0, 2)
+        assert payload["printer_name"] == "004-H2S"
+        assert env.ws.await_count == 1
+        # Nothing is asked of the PRINTER: it is already answering perfectly.
+        assert manager.pushall_calls == []
+
+        # …and the park stays exactly one surface for as long as it stands.
+        for extra in (60.0, 3600.0, 86400.0):
+            await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST + extra)
+        assert env.ws.await_count == 1
+
+    async def test_the_two_arms_do_not_merge(self, db_session, printer_factory, env):
+        """LIVENESS PAIR + separation, in one pass.
+
+        A NON-spent slot whose presence reads absent still takes the ORIGINAL arm — the
+        one that asks the printer for a fresh report and escalates only after its whole
+        ladder — while a spent+present+configured slot takes the new one. Merging the two
+        predicates under one name is the ``_is_tagless`` mistake in a different costume,
+        so the two must remain distinguishable by what they emit and what they ask for.
+        """
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 0)  # live row, absent tray
+        await _seed_assignment(db_session, printer.id, 0, 1, spent=True)  # parked row, present tray
+        manager = _FakeManager({printer.id: _state([_cleared_tray(0), _present_tray(1)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        assert manager.pushall_calls == []
+        env.ws.assert_not_awaited()
+
+        # Past BOTH maturities: the park escalates immediately, the presence arm only asks.
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+        assert manager.pushall_calls == [(printer.id, "bound_presence_unknown")]  # slot 0's ask
+        assert [c.args[0]["case"] for c in env.ws.await_args_list] == ["spent_swap_park"]  # slot 1's surface
+
+        # Each keeps its own episode state, keyed to its own slot.
+        assert (printer.id, 0, 0) in spool_tagless._presence_stale_episodes
+        assert (printer.id, 0, 0) not in spool_tagless._spent_swap_park_episodes
+        assert (printer.id, 0, 1) in spool_tagless._spent_swap_park_episodes
+        assert (printer.id, 0, 1) not in spool_tagless._presence_stale_episodes
+
+    async def test_a_pending_qualified_cycle_is_not_a_park(self, db_session, printer_factory, env):
+        """A slot holding the release evidence is one push from resolving, not parked.
+
+        Row 4a fires ``REPLACE_SPENT`` on the next push for exactly this state, so telling
+        the operator about it would be an interruption about something already in hand.
+        The peek must also not CONSUME the cycle — that would destroy the very evidence
+        that ends the park.
+        """
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 1, spent=True)
+        spool_tagless._pending_physical_cycles.add((printer.id, 0, 1))
+        manager = _FakeManager({printer.id: _state([_present_tray(1)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+
+        env.ws.assert_not_awaited()
+        assert (printer.id, 0, 1) not in spool_tagless._spent_swap_park_episodes
+        assert spool_tagless.qualified_cycle_pending(printer.id, 0, 1), "the peek must not consume it"
+
+    @pytest.mark.parametrize(
+        ("why", "tray", "spent", "pre_configured"),
+        [
+            # The latch is not this arm's business when the row is LIVE — that slot is
+            # the bound-presence arm's, and only when its presence stops answering.
+            ("a live binding", _present_tray(1), False, False),
+            # A BARE tray under a spent binding is rows 5/5a's constellation: the
+            # answered-read escape reaches it, so it is not a park.
+            ("a bare tray", _bare_tray(1), True, False),
+            # Presence absent → row 3's ``spent_latch_on_empty``, which is the latch doing
+            # its job over an empty bay. There is no roll to be a different roll.
+            ("an absent tray", _cleared_tray(1), True, False),
+            ("an unknown presence", _unknown_tray(1), True, False),
+            # CONFIGURED but presence UNKNOWN (the A1/P1S constant ``state=3`` dialect).
+            # This is the case that isolates the presence gate from the config gate: an
+            # unknown is never resolved toward action (invariant 3), so a slot the farm
+            # cannot confirm is even occupied is not a slot it may call parked.
+            ("a configured tray whose presence is unknown", _a1_tray(1), True, False),
+            # Operator intent is never guessed over (scenario T13).
+            ("a pre-configured binding", _present_tray(1), True, True),
+        ],
+    )
+    async def test_only_the_park_itself_is_flagged(
+        self, db_session, printer_factory, env, why, tray, spent, pre_configured
+    ):
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 1, spent=spent)
+        if pre_configured:
+            row = await _assignment(db_session, printer.id, 0, 1)
+            row.pre_configured_at = datetime.utcnow()
+            await db_session.commit()
+        manager = _FakeManager({printer.id: _state([tray])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+
+        assert [c for c in env.ws.await_args_list if c.args[0].get("case") == "spent_swap_park"] == [], why
+        assert (printer.id, 0, 1) not in spool_tagless._spent_swap_park_episodes, why
+
+    async def test_an_unbound_slot_is_never_flagged(self, db_session, printer_factory, env):
+        """Nothing holds the slot, so there is no latch to be parked behind."""
+        printer = await printer_factory()
+        manager = _FakeManager({printer.id: _state([_present_tray(1)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+
+        env.ws.assert_not_awaited()
+        assert (printer.id, 0, 1) not in spool_tagless._spent_swap_park_episodes
+
+    async def test_the_park_ending_closes_the_episode_and_re_arms(self, db_session, printer_factory, env):
+        """The episode is one continuous run of the SAME park. Un-spending the row ends it;
+        a later park on the same slot is a NEW situation and earns its own surface."""
+        printer = await printer_factory()
+        spool = await _seed_assignment(db_session, printer.id, 0, 1, spent=True)
+        key = (printer.id, 0, 1)
+        manager = _FakeManager({printer.id: _state([_present_tray(1)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST)
+        assert env.ws.await_count == 1
+
+        refreshed = await db_session.get(Spool, spool.id)
+        refreshed.spent_at = None  # the row is live again → the park is over
+        await db_session.commit()
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=self._PAST + 60)
+        assert key not in spool_tagless._spent_swap_park_episodes
+
+        refreshed.spent_at = datetime.utcnow()  # …and a NEW park opens on the same slot
+        await db_session.commit()
+        reopened = self._PAST + 120
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=reopened)
+        assert env.ws.await_count == 1, "the new episode starts its own clock"
+        await spool_tagless.reconcile_slot_config(
+            db_session, manager=manager, now=reopened + spool_tagless._SPENT_SWAP_PARK_AFTER_S + 1
+        )
+        assert env.ws.await_count == 2
+
+    async def test_the_park_matures_on_its_OWN_threshold(self, db_session, printer_factory, env, monkeypatch):
+        """The two arms' maturities agree today, and that must stay a COINCIDENCE.
+
+        They measure different situations — one a wire that has stopped answering, the
+        other a wire answering perfectly with no evidence the table may act on — so the
+        park reads its own constant. Moving the presence arm's must not move the park's.
+        """
+        monkeypatch.setattr(spool_tagless, "_SPENT_SWAP_PARK_AFTER_S", 60.0)
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 1, spent=True)
+        manager = _FakeManager({printer.id: _state([_present_tray(1)])})
+
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+        await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0 + 61.0)
+        assert env.ws.await_count == 1, "matured on the park's own threshold, not the presence arm's"
+
+
 # --- B: scheduler registration ---------------------------------------------
 
 

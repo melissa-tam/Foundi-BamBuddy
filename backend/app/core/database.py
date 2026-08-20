@@ -206,6 +206,7 @@ async def init_db():
         shopping_list,
         sku,
         slot_preset,
+        slot_recheck,
         smart_plug,
         smart_plug_energy_snapshot,
         spool,
@@ -3453,6 +3454,14 @@ async def run_migrations(conn):
         # POST /inventory/spools/{id}/respool-dismiss) and which silently removes the
         # roll from selection. Spools 185/205 sat like that for nine days unnoticed.
         ("on_spent_contradiction", "1", "TRUE"),
+        # WS6 zero-gram detector: a print COMPLETED while a TAGLESS roll fed it and
+        # charged nothing. A tagless tray reports remain: -1 forever, so the slicer
+        # 3MF is its ONLY gram source — lose the 3MF and the charge silently becomes
+        # zero rather than failing. 15 consecutive prints did exactly that on
+        # 2026-08-18 (two 1 kg rolls read "0 g used" after 5.8 h each) and nothing
+        # anywhere said so. Doctrine rule 4 makes tagless gram tracking mandatory,
+        # which makes a silent no-op a defect, not a shrug.
+        ("on_zero_gram_charge", "1", "TRUE"),
         # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
         ("on_storage_low", "1", "TRUE"),
         # Cooldown escalation: post-print eject cooldown is running long (bed still
@@ -4542,6 +4551,65 @@ async def run_migrations(conn):
         await _safe_execute(conn, "ALTER TABLE library_files ADD COLUMN transient BOOLEAN DEFAULT 0")
     else:
         await _safe_execute(conn, "ALTER TABLE library_files ADD COLUMN transient BOOLEAN DEFAULT FALSE")
+
+    # Migration (WS11, 2026-08-19): the operator's "Re-check slot" intent — doctrine
+    # rule 12's durable half (incident shape 32).
+    #
+    # Rule 6 has always named two identity oracles, "an RFID tag OR a human answer", and
+    # only the tag was wired up: the re-read endpoint passed no ``reason``, so no
+    # discovery stamp was ever taken, so nothing could ever conclude, and on 2026-08-19
+    # the operator clicked it for 21 minutes against total silence. Rule 12 makes the
+    # click evidence — but evidence that concludes on the tag-ness ANSWER, never on the
+    # click, because mid-print the farm never commands a read and a new Bambu roll is
+    # then indistinguishable from a third-party one. A print runs for hours and a restart
+    # inside it is ordinary, so the answer has to outlive both.
+    #
+    # This is the plan's ONE declared exception to "no new durable state": the 08-09
+    # verdict allows only the incident row because everything else is a timer or an edge
+    # the wire re-answers for free, and a human's click is neither. Same one-OPEN-row
+    # shape as printer_incident, enforced by a PARTIAL unique index instead of a dict a
+    # restart empties, so a second click is idempotent by construction.
+    await _safe_execute(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS slot_recheck_intent (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            printer_id INTEGER NOT NULL REFERENCES printers(id) ON DELETE CASCADE,
+            ams_id INTEGER NOT NULL,
+            tray_id INTEGER NOT NULL,
+            requested_at TIMESTAMP NOT NULL,
+            requested_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            resolved_at TIMESTAMP,
+            minted_spool_id INTEGER REFERENCES spool(id) ON DELETE SET NULL
+        )
+        """
+        if is_sqlite()
+        else """
+        CREATE TABLE IF NOT EXISTS slot_recheck_intent (
+            id SERIAL PRIMARY KEY,
+            printer_id INTEGER NOT NULL REFERENCES printers(id) ON DELETE CASCADE,
+            ams_id INTEGER NOT NULL,
+            tray_id INTEGER NOT NULL,
+            requested_at TIMESTAMP NOT NULL,
+            requested_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            resolved_at TIMESTAMP,
+            minted_spool_id INTEGER REFERENCES spool(id) ON DELETE SET NULL
+        )
+        """,
+    )
+    # ONE OPEN intent per slot. Same name the model declares, so create_all and this DDL
+    # converge on one index object; resolved intents fall outside the predicate and
+    # accumulate as history.
+    await _safe_execute(
+        conn,
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_slot_recheck_intent_open "
+        "ON slot_recheck_intent (printer_id, ams_id, tray_id) WHERE resolved_at IS NULL",
+    )
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_slot_recheck_intent_slot "
+        "ON slot_recheck_intent (printer_id, ams_id, tray_id)",
+    )
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (

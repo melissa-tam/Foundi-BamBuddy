@@ -119,7 +119,10 @@ describe('ProductionRunDetailPage', () => {
     );
 
     renderDetail();
-    expect(screen.getByRole('status')).toBeInTheDocument(); // loading spinner
+    // Two live regions exist: the page's loading spinner (rendered first) and
+    // the app-level toast viewport, which is itself a role="status" region.
+    const [loadingRegion] = screen.getAllByRole('status');
+    expect(loadingRegion).toHaveTextContent(/loading/i); // loading spinner
 
     expect(await screen.findByText('WID-001 run')).toBeInTheDocument();
     expect(screen.getByText('Active')).toBeInTheDocument();

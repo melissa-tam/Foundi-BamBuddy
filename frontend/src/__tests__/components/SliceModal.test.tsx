@@ -405,7 +405,9 @@ describe('SliceModal', () => {
     });
 
     await waitFor(() => expect(screen.getByText('Imported X1C 0.4')).toBeDefined());
-    expect(screen.queryByRole('status')).toBeNull();
+    // Scoped to the dialog: the app-level toast viewport is itself a
+    // role="status" live region, so an unscoped query would always match it.
+    expect(within(screen.getByRole('dialog')).queryByRole('status')).toBeNull();
   });
 
   it('renders an "expired" banner when cloud_status is expired', async () => {
@@ -421,7 +423,7 @@ describe('SliceModal', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByRole('status')).toHaveTextContent(/expired/i);
+      expect(within(screen.getByRole('dialog')).getByRole('status')).toHaveTextContent(/expired/i);
     });
   });
 
@@ -432,7 +434,9 @@ describe('SliceModal', () => {
     });
     await waitFor(() => expect(screen.getByText('My Custom X1C')).toBeDefined());
     // No status-role banner should be rendered on the happy path.
-    expect(screen.queryByRole('status')).toBeNull();
+    // Scoped to the dialog: the app-level toast viewport is itself a
+    // role="status" live region, so an unscoped query would always match it.
+    expect(within(screen.getByRole('dialog')).queryByRole('status')).toBeNull();
   });
 
   // ----- Multi-plate flow -----------------------------------------------

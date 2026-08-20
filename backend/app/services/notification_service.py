@@ -2310,6 +2310,63 @@ class NotificationService:
             variables=variables,
         )
 
+    async def on_zero_gram_charge(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        job_name: str,
+        slot: str,
+        spool_id: int,
+        spool_material: str,
+        db: AsyncSession,
+    ):
+        """Fire when a COMPLETED print charged zero grams on a tagless feeder.
+
+        A tagless tray never reports a quantity — the AMS answers ``remain: -1`` for
+        every roll on this fleet — so the slicer 3MF is the ONE thing that can price
+        it, and the remain%-delta fallback that rescues a tagged tray cannot run. The
+        consequence of losing the 3MF is therefore not a failure but a SILENCE: usage
+        tracking returns an empty result, every row stays exactly as it was, and the
+        farm looks like it worked. Fifteen consecutive prints did that on 2026-08-18
+        (a hand-spliced ladder plate whose internal index disagreed with the
+        dispatched plate, so the print-start capture discarded the farm's own file),
+        leaving two 1 kg rolls reading "0 g used" after 5.8 h each.
+
+        Doctrine rule 4 makes tagless gram tracking mandatory, which is what turns
+        this from an accepted gap into a defect that must announce itself. There is
+        nothing to auto-correct here — the grams for a print with no slicer data are
+        not recoverable after the fact — so this event does exactly one thing: it
+        makes the silence audible while the roll is still in the machine.
+
+        One page per printer per re-notify window — the caller (``usage_tracker``)
+        owns the durable dedup, because a bleed of this kind repeats every print and
+        the operator needs to know it is happening, not be told fifteen times.
+        """
+        providers = await self._get_providers_for_event(db, "on_zero_gram_charge", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "job_name": job_name,
+            "slot": slot,
+            "spool_id": str(spool_id),
+            "spool_material": spool_material,
+        }
+
+        title, message = await self._build_message_from_template(db, "zero_gram_charge", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "zero_gram_charge",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
     async def on_storage_low(
         self,
         printer_id: int | None,

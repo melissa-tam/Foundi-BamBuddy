@@ -22,9 +22,11 @@ certainty tiers:
   status push (~1 Hz) because the tray_now edge it watches is invisible to the
   AMS-hash-gated callback, and only a confirmed departure pays for a DB session.
 * **Tier 2 — automatic re-spool** (`maybe_auto_or_prompt_respool`): a tag arrival
-  resolving to a spent, LOADED tray physically cannot be the old (empty) spool,
-  so it re-spools with no operator involvement — unless a standing "Same spool"
-  dismissal still holds for the slot (see below).
+  resolving to a FINISHED roll (`Spool.is_finished_roll`) on a LOADED tray physically
+  cannot be the old (empty) spool, so it re-spools with no operator involvement —
+  unless a standing "Same spool" dismissal still holds for the slot (see below). It
+  CONCLUDES; it never asks (operator ruling 3, 2026-08-19 — the `respool_auto_enabled`
+  toggle that used to make it ask is deleted, not defaulted on).
 * **Tier 3 — one-click prompt** (`maybe_auto_or_prompt_respool`): uncertain cases
   (spent_at NULL) broadcast a ``respool_prompt`` WS event mirroring the
   ``unknown_tag`` flow — but ONLY with physical evidence that the roll could have
@@ -36,8 +38,9 @@ answers "Same spool" (``respool_dismissed_at`` stamped), the whole spent branch 
 Tier-2 auto AND any spent-tier prompt — stays suppressed until a qualified ≥5 s
 presence cycle occurs on the slot AFTER the answer (:func:`_dismissal_stands`).
 Replacing the roll is such a cycle, so genuine exhaustion still surfaces, but a
-standing false spent stamp stops re-reacting (and, with auto on, stops minting
-phantom fresh rows) the moment it is dismissed.
+standing false spent stamp stops re-reacting — and stops minting phantom fresh rows —
+the moment it is dismissed. That dismissal is now the ONLY brake in front of tier 2,
+which is why it is checked before the conclusion rather than after it.
 
 The core operation `respool_tag` disposes the donor, mints a fresh full
 third-party spool (weight_locked, spent_at NULL), copies K-profiles, re-assigns
@@ -140,11 +143,43 @@ _NO_JOB = object()
 # edge dicts but deliberately NOT this marker — it is this belt-and-braces layer's own.
 _last_sample_job: dict[int, object] = {}
 
-# A hardware runout that stamps a spool spent while its gram ledger still shows more
-# than this remaining is a drift / initial-state signal worth surfacing in triage
-# (reused core, a mid-life row minted as full, or accrual drift) — not silent loss.
-# The spent stamp still stands (hardware evidence is authoritative); this only logs.
-_SPENT_LEDGER_REMAIN_WARN_G = 150.0
+# How far a roll's DELIVERED grams may fall short of its assumed label before the spent
+# stamp bothers to record the gap. This used to be a WARNING floor, on the reading that a
+# fat remainder at runout signalled drift or an initial-state error. Operator ruling 18
+# (2026-08-19) retired that reading: a minted row's label weight is an ASSUMPTION, so a
+# part-used roll an operator seated legitimately delivers ~800 g on a 1000 g label, and
+# some brands ship ~1100 g on the same label. Both are ordinary stock. The gap is
+# therefore RECORDED, not warned about — the hardware runout is what closes the roll's
+# true capacity (``Spool.delivered_g``), and 14 rows carrying 843/580/576/453/418/417 g
+# "remaining" at their stamp were every one of them a part-used roll minted as full.
+_SPENT_DELIVERY_GAP_NOTE_G = 150.0
+
+# How long after a slot's bay cleared the exhaustion evidence FOR THAT CLEAR may still
+# arrive — the scope of one runout episode, used by :func:`_bound_after_the_bay_cleared`
+# and nowhere else.
+#
+# The AMS clears a drained slot's exist bit ~3 MINUTES BEFORE it declares the runout (the
+# tail is still traversing the feed path; three timed pairs on 2026-08-13 — 03:55:46 →
+# 03:58:20, 06:41:47 → 06:44:44, 07:02:52 → 07:05:33). A release and the HMS that explains
+# it are therefore two halves of ONE physical episode, separated by a firmware delay, and a
+# slot accumulates many such clears over its life. Deciding whether the roll bound RIGHT NOW
+# could be the roll that drained needs to know WHICH clear the arriving evidence is about,
+# and the gap is the only thing that says so.
+#
+# This is not identity evidence and it concludes nothing on its own (doctrine rules 6/7 —
+# duration never decides identity POSITIVELY). It decides one NEGATIVE: outside the window
+# the farm asserts nothing new and tier 1 keeps its incumbent, which is the ordinary and
+# overwhelmingly common answer (a slot's previous occupant left hours or days ago).
+#
+# 600 s is ~3.4x the measured maximum gap: wide enough to absorb firmware variance, a
+# queued push and a restart landing inside the episode, and far short of the "operator
+# refilled and the slot has been printing for an hour" shape, which must never disqualify
+# tier 1. Both mis-sizings cost a FALSE stamp, in opposite directions — too narrow stamps
+# the operator's brand-new roll (the shipped regression this constant exists to close), too
+# wide stamps a healthy roll pulled from the slot shortly before a genuinely different
+# roll's runout. The measured physics is the only defensible anchor, so the value is tied to
+# it rather than to a round number that felt safe.
+_BAY_CLEAR_TO_RUNOUT_GAP_S = 600.0
 
 # Seconds a tray_now value must hold unchanged during RUNNING to count as the stable
 # feeder, and for a pending backup swap to confirm into a spent stamp.
@@ -286,15 +321,6 @@ async def _spoolman_enabled(db: AsyncSession) -> bool:
     return bool(value) and value.lower() == "true"
 
 
-async def _respool_auto_enabled(db: AsyncSession) -> bool:
-    """Whether Tier-2 automatic re-spool is on. Absent → False (operator directive:
-    the farm does NOT reuse tags yet, so a spent+loaded arrival prompts by default)."""
-    from backend.app.api.routes.settings import get_setting
-
-    value = await get_setting(db, "respool_auto_enabled")
-    return bool(value) and value.strip().lower() == "true"
-
-
 async def _respool_last_brand(db: AsyncSession) -> str:
     from backend.app.api.routes.settings import get_setting
 
@@ -388,6 +414,123 @@ def _tray_loaded(tray: dict) -> bool:
 # --- Tier 1: spent-certain marking -----------------------------------------
 
 
+def _last_clear_of(spool: Spool | None, *, printer_id: int, ams_id: int, tray_id: int) -> datetime | None:
+    """When ``spool``'s last release was FROM this exact slot, or None.
+
+    A column read on a row already in hand, not a second answer to
+    ``last_released_from_slot_stmt``'s question: that stmt asks which UNBOUND rows last left
+    a slot (donor candidates, and a row holding a live binding is deliberately excluded
+    because it is somewhere else NOW). This asks something the stmt cannot: whether the row
+    the caller is holding recorded its own departure from this slot before returning to it.
+    """
+    if spool is None:
+        return None
+    here = (spool.last_location_printer_id, spool.last_location_ams_id, spool.last_location_tray_id)
+    if here != (printer_id, ams_id, tray_id):
+        return None
+    return spool.last_location_at
+
+
+def _bound_after_the_bay_cleared(
+    assignment: SpoolAssignment | None,
+    residue: Spool | None,
+    *,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+) -> bool:
+    """Did the roll bound to this slot arrive AFTER the bay-clear this runout explains?
+
+    Tier 1's ELIGIBILITY test, and a physical impossibility rather than a heuristic: a roll
+    that was bound to the slot only after the bay emptied cannot be the roll that emptied it.
+
+    It exists because the 2026-08-19 spool-identity wave changed a precondition this lane
+    depends on without re-checking the lane (the shape memory ``liveness-paired-verification``
+    is about — the same way the 08-13 wave starved every spent stamp for three days). That
+    wave made a refill inside the ~3-minute bay-clear→HMS gap MINT a fresh row and bind it
+    (scenarios T7/T8 — "a runout release is never a glitch"), which is correct. But tier 1
+    resolves its victim from the LIVE :class:`SpoolAssignment`, so the runout HMS arriving
+    two minutes later stamped whatever was bound: probe result ``FRESH spent_at:
+    2026-08-20 10:29:14 used: 0.0`` / ``DRAINED spent_at: None used: 900.0``. The brand-new
+    roll then reads 0 g remaining (rule 8 derives emptiness from ``spent_at``), is
+    hard-excluded from selection with no automatic un-spend lane — the slot is dead until a
+    human intervenes — while the roll that actually ran dry stays un-spent and remains a
+    selection and reclaim candidate.
+
+    Two facts decide it, both already durable, neither of them new state:
+
+    * ``SpoolAssignment.created_at`` — the bind moment. The same wave made it meaningful:
+      a genuine MINT stamps a fresh one, while a DE-BOUNCE deliberately carries the
+      incumbent's ORIGINAL moment forward (``bind_spool_to_slot(..., bind_moment=...)``,
+      ``slot_pipeline._debounce_bind_moment``). That is precisely what keeps a de-bounced
+      roll ELIGIBLE here: its binding began before the spurious release, so it is the same
+      seating and the same roll — scenario T8b, where tier 1 stamping the incumbent is the
+      right answer.
+    * ``Spool.last_location_at`` on the residue — when the departing roll's release stamped
+      its breadcrumb, i.e. when the bay cleared.
+
+    Ordering alone cannot decide this, and that is the whole subtlety. In the ordinary case
+    (T6) the incumbent ALSO bound after the slot's previous occupant left — every roll does.
+    What separates "bound after the clear this runout is about" from "bound after some clear
+    weeks of prod ago" is :data:`_BAY_CLEAR_TO_RUNOUT_GAP_S`, the measured firmware delay
+    between the two halves of one runout episode. So both conditions are required: the
+    ordering states the impossibility, the window says which clear is being talked about.
+
+    Three exits keep tier 1, and each is a distinct reason, not a defensive default:
+
+    * **No residue.** Tier 1 stands aside only in favour of a NAMED alternative. With
+      nothing for tier 2 to resolve, disqualifying the incumbent buys no correctness and
+      costs a stamp — and the shape is real (a glitched exist bit releases a TAGGED roll,
+      whose next read re-binds it with a fresh moment).
+    * **The incumbent vacated this bay more recently than the residue did**
+      (:func:`_last_clear_of`). Then the residue's departure predates the incumbent's whole
+      tenure here, so it cannot be the roll that just drained; the only candidates are the
+      incumbent and nothing, and only the incumbent has evidence.
+    * **The binding predates the clear.** Either this IS the drained roll (its own release
+      has not happened, and on a bits-less dialect never will), or a de-bounce carried its
+      original moment across a spurious one, or it simply DISPLACED the previous occupant —
+      a bay that never emptied.
+
+    **Accepted residual, stated rather than hidden:** two departures from one slot inside
+    the window, where the more recent departure's row has since re-bound with a FRESH moment
+    (a tagged roll re-read after a glitch release, which does not preserve a bind moment),
+    resolves the clear to that row's own departure and keeps tier 1 — correct — but the
+    mirror shape, where the returning row's breadcrumb has been overwritten elsewhere, would
+    attribute to the older residue. It needs two roll departures from one slot inside ten
+    minutes, and the alternative (no window at all) is the shipped regression.
+    """
+    if assignment is None or residue is None:
+        return False
+    bound_at = getattr(assignment, "created_at", None)
+    cleared_at = getattr(residue, "last_location_at", None)
+    if bound_at is None or cleared_at is None:
+        return False
+    own_clear = _last_clear_of(
+        getattr(assignment, "spool", None), printer_id=printer_id, ams_id=ams_id, tray_id=tray_id
+    )
+    if own_clear is not None and own_clear >= cleared_at:
+        return False
+    if bound_at <= cleared_at:
+        return False
+    return (datetime.utcnow() - cleared_at).total_seconds() <= _BAY_CLEAR_TO_RUNOUT_GAP_S
+
+
+async def _newest_released_from_slot(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> Spool | None:
+    """The ONE row this slot last released, or None — read through the shared origin.
+
+    ``spool_binding.last_released_from_slot_stmt`` is that origin (writer and reader in one
+    module); this is the spent lane's single call site for it, so the eligibility test and
+    tier 2 provably adjudicate the SAME row rather than two queries that could drift apart.
+
+    ``.limit(1)`` and no filters: the newest row is adjudicated wherever it leads (already
+    spent → idempotent, archived → stand down). A ``spent_at IS NULL`` filter here would
+    walk PAST the victim onto an older, healthy residue of the same slot and stamp it
+    permanently — cross-cutting invariant 11 applied to the query shape.
+    """
+    result = await db.execute(spool_binding.last_released_from_slot_stmt(printer_id, ams_id, tray_id).limit(1))
+    return result.scalar_one_or_none()
+
+
 async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) -> Spool | None:
     """Stamp spent_at on the roll that was in the decoded slot. Idempotent.
 
@@ -398,10 +541,13 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
     physical roll:
 
     1. **the live binding** on (ams_id, tray_id) — correct whenever the AMS still claims
-       the slot at HMS time (the original design, unchanged);
+       the slot at HMS time, and whenever that binding began BEFORE the bay-clear this
+       runout is explaining (:func:`_bound_after_the_bay_cleared`);
     2. **the newest row whose last release was FROM this slot**
        (:func:`spool_binding.last_released_from_slot_stmt`), when nothing is bound —
-       including the broken shape where an assignment survives its deleted spool row.
+       including the broken shape where an assignment survives its deleted spool row —
+       and when tier 1's incumbent was seated after the bay emptied, which is a roll that
+       physically cannot have drained it.
 
     Tier 2 is not a fallback nicety, it is the NORMAL path for a natural runout. The AMS
     clears a drained slot's exist bit ~3 MINUTES BEFORE it declares the filament runout
@@ -423,13 +569,28 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
     and stamp it permanently. Cross-cutting invariant 11 applied to the query shape: a
     missed stamp self-heals forward, a false one never does.
 
-    No recency threshold on the residue (doctrine rules 6/7 — duration is never identity
-    evidence). The case a threshold would be reaching for, an operator inserting a fresh
-    roll inside the 3-minute gap, wins TIER 1 by construction: inserting it binds the slot.
+    **Tier 1 is no longer unconditional, and the case that changed it is the one the
+    paragraph above used to dismiss.** "An operator inserting a fresh roll inside the
+    3-minute gap wins TIER 1 by construction: inserting it binds the slot" was true, and it
+    was the bug: the 2026-08-19 wave made that insertion MINT a fresh row (T7/T8 — a runout
+    release is never a glitch), so tier 1 stamped the brand-new roll spent at 0 g used and
+    left the roll that actually ran dry un-stamped and still selectable. The eligibility
+    test :func:`_bound_after_the_bay_cleared` is the fix, and it is a statement about
+    physics rather than a recency threshold on the residue: a roll bound after the bay
+    emptied cannot be the roll that emptied it. When it fires, the ladder falls through to
+    tier 2 — the row that actually left this slot — and the fresh roll is never touched.
 
     An ARCHIVED newest victim stands down — retired inventory is never stamped — and so
     does an empty slot history. Both say so in the log, because six silent exits are
     exactly how this failure hid for three days.
+
+    A NEW stamp additionally hands the slot to ``spool_tagless.reattribute_early_runout``,
+    the backward direction of the charge re-attribution lane: a roll that ran out far short
+    of its assumed label may be a mint the 5-minute de-bounce window produced over a roll
+    that never actually left (rule 7's amendment, scenarios T5/T11), and the runout is the
+    only moment that is knowable. It is a strictly ADDITIVE hook running after the commit —
+    it decides nothing about which row is stamped here, cannot fail into this lane, and
+    stands down on anything short of an exact fit.
     """
     ams_id, tray_id = _decode_global_tray(global_tray)
     if ams_id is None:
@@ -447,11 +608,31 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
     spool = assignment.spool if assignment is not None else None
     tier = "assignment"
 
+    # Read once, used by both tiers: the eligibility test below needs the same row tier 2
+    # would adjudicate, so resolving it twice could only let them disagree.
+    residue = await _newest_released_from_slot(db, printer_id, ams_id, tray_id)
+
+    if spool is not None and _bound_after_the_bay_cleared(
+        assignment, residue, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id
+    ):
+        logger.info(
+            "[RESPOOL] tier 1 stands aside on printer %d AMS%d-T%d: spool %d was bound at %s, "
+            "AFTER this bay cleared at %s (%.0fs ago) — a roll seated after the bay emptied cannot "
+            "be the roll that drained it, so the exhaustion belongs to the released row",
+            printer_id,
+            ams_id,
+            tray_id,
+            spool.id,
+            assignment.created_at,
+            residue.last_location_at,
+            (datetime.utcnow() - residue.last_location_at).total_seconds(),
+        )
+        spool = None
+
     if spool is None:
         # --- tier 2: the slot released its roll before the firmware admitted why ---
         tier = "last_location"
-        victim = await db.execute(spool_binding.last_released_from_slot_stmt(printer_id, ams_id, tray_id).limit(1))
-        spool = victim.scalar_one_or_none()
+        spool = residue
         if spool is None:
             logger.info(
                 "no live assignment and no last-location victim — spent stamp suppressed (printer %d AMS%d-T%d)",
@@ -493,23 +674,23 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
     # unrecoverable (2026-07-19). Leaving grams intact lets the evidence-gated
     # dismissal un-spend restore the exact prior weight losslessly.
     #
-    # Surface a spent stamp landing on a fat ledger remainder: a hardware runout with
-    # lots of grams still on the books is the drift / initial-state contradiction (the
-    # tagged path already raises the trigger=spent respool prompt and the tagless path
-    # the next-cycle W5 fresh-roll prompt, but neither names THIS gap). No new prompt
-    # machinery — the WARNING is the triage floor.
-    remaining_g = float(spool.label_weight or 0) - float(spool.weight_used or 0)
-    if remaining_g > _SPENT_LEDGER_REMAIN_WARN_G:
-        logger.warning(
-            "Spool %d marked spent (printer %d AMS%d-T%d) with %.0f g still on the ledger "
-            "(> %.0f g floor) — hardware runout with a fat remainder signals drift or an "
-            "initial-state error (reused core / mid-life row minted as full), not silent loss",
+    # The runout closes this roll's TRUE capacity, so record what it delivered rather than
+    # complaining that the delivery missed an assumption (operator ruling 18). The stamp is
+    # already committed below; this is the durable artifact of the figure, which nothing
+    # used to produce — the old WARNING fired on the NORMAL shape and so read as noise.
+    assumed_g = float(spool.label_weight or 0)
+    shortfall_g = assumed_g - float(spool.weight_used or 0)
+    if shortfall_g > _SPENT_DELIVERY_GAP_NOTE_G:
+        logger.info(
+            "Spool %d delivered %.0f g against an assumed %.0f g label (printer %d AMS%d-T%d) "
+            "— the runout closes its true capacity; a part-used roll seated as full is the "
+            "ordinary cause and is not an error",
             spool.id,
+            float(spool.weight_used or 0),
+            assumed_g,
             printer_id,
             ams_id,
             tray_id,
-            remaining_g,
-            _SPENT_LEDGER_REMAIN_WARN_G,
         )
     await db.commit()
     logger.info(
@@ -520,6 +701,23 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
         tray_id,
         tier,
     )
+
+    # The stamp above is the wire's statement and is now durable. What it additionally lets
+    # the farm SETTLE is whether this row was ever a separate roll at all: a runout far
+    # short of the assumed label is how a mistaken mint announces itself (rule 7's amended
+    # 5-minute window mints on every longer absence — scenarios T5/T11 — and that mint
+    # over-promises the start gate), and the fix is the BACKWARD direction of the one charge
+    # re-attribution lane. Hooked HERE because this is the single spent writer all four
+    # trigger lanes funnel through, so the correction gets exactly one entry and the
+    # stamping decision above is untouched by it.
+    #
+    # Deferred import: ``spool_tagless`` imports THIS module at module scope, so the
+    # dependency may only run the other way as a call — the same shape
+    # ``detect_spent_contradictions`` uses for the forward direction. Fully self-guarding on
+    # its own side (invariant 10); it can neither raise into this lane nor alter the stamp.
+    from backend.app.services.spool_tagless import reattribute_early_runout
+
+    await reattribute_early_runout(db, spool, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id)
     return spool
 
 
@@ -2251,12 +2449,14 @@ def should_evaluate_respool(spool: Spool, tray: dict, printer_id: int, ams_id: i
     """Single-origin gate for the existing-assignment respool call site.
 
     True when :func:`maybe_auto_or_prompt_respool` should run for a slot whose
-    ``SpoolAssignment`` survived: either the spool is hardware-spent (Tier 1/2) or
-    the tray shows a CORROBORATED remain-jump refill the gram ledger missed (a Tier 3
-    trigger). Keeps the jump logic out of ``main.on_ams_change`` so there is one
-    definition; the slot coordinates are what let the jump corroborate per slot.
+    ``SpoolAssignment`` survived: either the row is a FINISHED roll
+    (``Spool.is_finished_roll`` — the ONE encoding, read here as tier-2 evidence rather
+    than as an exclusion) or the tray shows a CORROBORATED remain-jump refill the gram
+    ledger missed (a Tier 3 trigger). Keeps the jump logic out of ``main.on_ams_change``
+    so there is one definition; the slot coordinates are what let the jump corroborate
+    per slot.
     """
-    return spool.spent_at is not None or _remain_jump(spool, tray, printer_id, ams_id, tray_id)
+    return spool.is_finished_roll or _remain_jump(spool, tray, printer_id, ams_id, tray_id)
 
 
 async def maybe_auto_or_prompt_respool(
@@ -2273,11 +2473,15 @@ async def maybe_auto_or_prompt_respool(
       qualified physical cycle has happened on the slot since the answer
       (:func:`_dismissal_stands`), the whole spent branch — Tier-2 auto AND prompt —
       is suppressed. A qualified roll swap after the answer re-arms it.
-    * Tier 2 (auto): ``spool.spent_at`` set AND the tray is LOADED → the physical
-      spool cannot be the spent one, so re-spool with the server-held last brand
-      and return the NEW spool (the caller must skip its own auto-assign — the
-      re-spool already re-assigned the slot). Empty brand or a sibling conflict
-      falls through to the prompt instead.
+    * Tier 2 (CONCLUDES, never asks): the row is a FINISHED roll
+      (``Spool.is_finished_roll``) AND the tray is LOADED → the physical spool cannot be
+      the spent one (you cannot add filament to a 0 g roll), so re-spool with the
+      server-held last brand and return the NEW spool (the caller must skip its own
+      auto-assign — the re-spool already re-assigned the slot). Since 2026-08-19 there is
+      no ``respool_auto_enabled`` toggle in front of this: the conclusion follows from
+      evidence (operator ruling 3). The prompt survives ONLY where the conclusion cannot
+      be EXECUTED — no brand to mint with, or a sibling-tag conflict — which is an
+      escalation, not an alternative verdict.
     * Tier 3 (prompt): ``spent_at`` NULL, the ledger is plausible, and (remaining ≤
       threshold OR a corroborated remain-jump refill the ledger missed) AND the slot
       shows recent physical evidence a roll could have changed
@@ -2291,7 +2495,7 @@ async def maybe_auto_or_prompt_respool(
     if await _spoolman_enabled(db):
         return None
 
-    if spool.spent_at is not None:
+    if spool.is_finished_roll:
         if not _tray_loaded(tray):
             return None  # spent but not loaded → dead spool re-inserted, no trigger
         if _dismissal_stands(spool, printer_id, ams_id, tray_id):
@@ -2302,13 +2506,17 @@ async def maybe_auto_or_prompt_respool(
             # every tag re-read from minting a phantom fresh row. A qualified swap after
             # the answer re-arms the branch, so a genuine later exhaustion still surfaces.
             return None
-        if not await _respool_auto_enabled(db):
-            # Tier-2 auto re-spool disabled (default): a spent+loaded tag arrival
-            # surfaces the one-click prompt instead of silently minting a fresh row,
-            # so a false spent stamp can never auto-corrupt the ledger — the operator
-            # confirms the physical roll before the tag moves onto a fresh spool.
-            await _broadcast_respool_prompt(db, printer_id, ams_id, tray_id, tray, spool)
-            return None
+        # No ask here, and no toggle in front of it (operator ruling 3, 2026-08-19).
+        # ``respool_auto_enabled`` used to gate this branch to OFF and prompt instead; it
+        # encoded the superseded directive "the farm does NOT reuse tags yet", and the
+        # ruling that superseded it is not a preference but a physical fact: you cannot
+        # add filament to a 0 g roll, so a FINISHED roll reading LOADED can only be a new
+        # roll on a reused core. That is CONCLUDED from evidence, never asked — the
+        # setting was deleted rather than defaulted ON, because leaving it would leave a
+        # dual path where a false spent stamp is the operator's problem to adjudicate on
+        # every arrival. False stamps are root-caused at tier 1 (topology-gated since
+        # 2026-08-09); the standing "Same spool" dismissal above is still the per-slot
+        # brake, and it is checked BEFORE this point.
         brand = (await _respool_last_brand(db)).strip()
         if not brand:
             # 3b-5: before the first-ever manual re-spool the server-held last

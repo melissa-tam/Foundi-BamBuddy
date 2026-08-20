@@ -1888,10 +1888,26 @@ async def list_assignments(
         for lbl in lbl_result.scalars().all():
             label_by_serial[lbl.ams_serial_number] = lbl.label
 
+    # Standing "Restore previous roll" offers, ONE query for the whole listing. The offer is
+    # derived, never stored: a slot carries it while the row bound there is still the row an
+    # operator's re-check click minted (doctrine rule 12's acknowledgement, scenario R8).
+    # It rides the assignment payload because the undo has to outlive the toast that
+    # announces it (WCAG 2.2 2.2.1 — a timed toast may never be the only path to an action).
+    from backend.app.services import slot_recheck
+
+    try:
+        undo_slots = await slot_recheck.pending_undo_slots(
+            db, {(a.printer_id, a.ams_id, a.tray_id): a.spool_id for a in assignments}
+        )
+    except Exception:  # noqa: BLE001 — an unreadable offer is "no offer", never a 500 on a listing
+        logger.exception("Re-check undo offer lookup failed for the assignments listing")
+        undo_slots = set()
+
     # Build response objects, attaching ams_label where available
     responses: list[SpoolAssignmentResponse] = []
     for a in assignments:
         resp = SpoolAssignmentResponse.model_validate(a)
+        resp.recheck_undo_available = (a.printer_id, a.ams_id, a.tray_id) in undo_slots
         # Additive tri-state presence. A printer we hold no live status for is
         # simply absent from the map → None ("unknown"), never False.
         resp.present = presence_map.get(a.printer_id, {}).get((a.ams_id, a.tray_id))

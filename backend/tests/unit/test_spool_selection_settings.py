@@ -52,17 +52,18 @@ class TestDefaults:
 
 
 class TestRespoolAutoEnabled:
-    """The W3 Tier-2 auto-respool toggle (default OFF)."""
+    """The W3 Tier-2 auto-respool toggle is GONE (2026-08-19, operator ruling 3).
 
-    def test_default_is_false(self):
-        assert AppSettings().respool_auto_enabled is False
+    It used to default OFF and make tier 2 ask instead of concluding, encoding the
+    superseded directive "the farm does NOT reuse tags yet". What superseded it is not a
+    preference but a physical fact — you cannot add filament to a 0 g roll — so a FINISHED
+    roll reading LOADED can only be a new roll on a reused core, and the tier concludes.
+    Deleted rather than defaulted ON: leaving it would leave a dual path.
+    """
 
-    @pytest.mark.parametrize("value", [True, False])
-    def test_update_twin_accepts_bool(self, value):
-        assert AppSettingsUpdate(respool_auto_enabled=value).respool_auto_enabled is value
-
-    def test_update_twin_accepts_none(self):
-        assert AppSettingsUpdate(respool_auto_enabled=None).respool_auto_enabled is None
+    def test_the_toggle_is_gone_from_both_schemas(self):
+        assert "respool_auto_enabled" not in AppSettings.model_fields
+        assert "respool_auto_enabled" not in AppSettingsUpdate.model_fields
 
 
 class TestSpoolSelectionPolicyValidator:

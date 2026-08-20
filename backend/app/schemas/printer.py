@@ -444,3 +444,27 @@ class DiagnosticRequest(BaseModel):
     ip_address: str
     serial_number: str | None = None
     access_code: str | None = None
+
+
+class SlotRecheckResponse(BaseModel):
+    """What "Re-check slot" concluded — the sentence the operator actually gets.
+
+    The endpoint this replaces returned a bare 200/400 with nothing renderable, and THAT is
+    the bug it exists to close (incident shape 32: 21 minutes of clicking against silence).
+    Every outcome in doctrine rule 12's contract carries a verdict here and the UI renders
+    exactly one sentence per verdict in a ``role="status"`` live region.
+
+    ``verdict`` values: ``unchanged`` (R1) | ``minted`` (R2/R3/R5/R8) | ``identified`` (R4's
+    tag-found half) | ``queued`` (R3/R4 mid-print) | ``empty`` (R6) | ``restored`` (the
+    acknowledgement's undo).
+    """
+
+    verdict: str
+    printer_id: int
+    ams_id: int
+    tray_id: int
+    spool_id: int | None = None
+    label_weight_g: float | None = None
+    brand: str | None = None
+    material: str | None = None
+    undo_available: bool = False

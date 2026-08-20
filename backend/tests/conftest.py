@@ -138,6 +138,7 @@ async def test_engine():
         project_bom,
         settings,
         slot_preset,
+        slot_recheck,  # noqa: F401 — WS11 durable operator re-check intents
         smart_plug,
         smart_plug_energy_snapshot,  # noqa: F401
         sponsor_toast_state,  # noqa: F401

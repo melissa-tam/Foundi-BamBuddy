@@ -82,9 +82,11 @@ class DecisionKind(str, Enum):
     * ``MINT`` — create a new spool row from ``mint_spec`` and bind it.
       ``mint_spec["replace_existing"]`` is True when a bound, different row must be
       unlinked first.
-    * ``RECLAIM`` — ordinal-PRESERVING rebind of an existing row (doctrine rule 7:
-      a mid-life re-seat keeps its FIFO position, so ``loaded_at`` must NOT be
-      re-stamped).
+    * ``RECLAIM`` — the DE-BOUNCE: an ordinal-PRESERVING rebind of the slot's own last
+      occupant after a release the evidence says never physically happened (doctrine
+      rule 7: a mid-life re-seat keeps its FIFO position, so ``loaded_at`` must NOT be
+      re-stamped — and since 2026-08-19 the bind MOMENT is preserved too, because a
+      de-bounce must not stamp the swap boundary the ledger reconciler reads).
     * ``RELEASE`` — unbind: the slot is empty and the roll's location claim is no
       longer true (operator ruling 1 — assignment = physical location truth).
     * ``REPLACE_SPENT`` — the W1 silent spent→mint: archive the drained row and mint
@@ -121,6 +123,14 @@ RESOLUTION_REASONS = frozenset(
         "sibling_tag_read",
         "identity_ambiguous_owed_full_read",
         "identity_resolved_candidate",
+        # A FINISHED roll is never a live occupant (doctrine rule 3, operator ruling 3):
+        # its tag reading LOADED is a fresh roll on a reused core. Row 2.0 emits this when
+        # the finished row HOLDS the slot — retire it, mint its successor. When it merely
+        # OWNS the tag (row 2.3a) there is no reason of its own: the row is discarded as a
+        # candidate and the ordinary unowned-identity lane decides, so what surfaces is
+        # that lane's reason (``partial_identity_owed_full_read`` /
+        # ``unknown_identity_auto_add`` / ``unknown_tag_prompt_owed``).
+        "reused_core_swap",
         "partial_identity_owed_full_read",
         "pre_configured_apply_identity",
         "identity_claims_untagged_row",
@@ -136,8 +146,12 @@ RESOLUTION_REASONS = frozenset(
         "spent_latch",
         "pre_configured_apply",
         "tagged_row_awaits_tag_lane",
-        "last_location_reclaim",
+        "reseat_debounce",
         "tagless_mint",
+        "runout_suspect_mint",
+        # Row 3½ — the operator's re-check (doctrine rule 12), concluded on the ANSWER.
+        "operator_recheck_mint",
+        "operator_recheck_swap",
         "archived_bound_replaced",
         "fingerprint_matches",
         "different_filament",
@@ -151,6 +165,10 @@ RESOLUTION_REASONS = frozenset(
         # …and the answer to that read, when it comes back NO TAG over a spent TAGGED
         # binding: hardware-certain different roll — swap to the tagless default.
         "spent_swap_no_tag_read",
+        # The same proof over a LIVE tagged binding (doctrine rule 11, 2026-08-19): the
+        # roll that left is not exhausted, so it is unlinked and keeps its grams while a
+        # fresh tagless row takes the slot. Rows 4b′ and 5b.
+        "tagged_swap_no_tag_read",
         "no_signal",
     }
 )
@@ -158,8 +176,8 @@ RESOLUTION_REASONS = frozenset(
 #: The subset of :data:`RESOLUTION_REASONS` whose APPLIED decision leaves the slot
 #: positively identified — row 2, the RFID lane, where the wire asserted an identity and
 #: the decision resolves it onto a row. Every other binding decision is an assumption,
-#: however good: the tagless pre-config apply, a fingerprint mint, a last-location
-#: reclaim and a spent replacement all bind a row nothing has READ in that slot.
+#: however good: the tagless pre-config apply, a fingerprint mint, a re-seat de-bounce
+#: and a spent replacement all bind a row nothing has READ in that slot.
 #:
 #: Keyed on the reason rather than a new :class:`Decision` field because the reason set
 #: is ALREADY this module's public contract with the orchestrator, which distinguishes
@@ -183,8 +201,8 @@ class BindingView:
     """A read-only view of a spool row + its binding, as the caller resolved it.
 
     Used for three roles, all the same shape: the slot's CURRENT binding, the
-    ``identity_candidate``, and the ``last_location_candidate``. Keeping one shape
-    means the table never has to care which query produced a row.
+    ``identity_candidate``, and the ``debounce_candidate``. Keeping one shape means
+    the table never has to care which query produced a row.
 
     ``fingerprint_type`` / ``fingerprint_color`` are "the filament this row stands
     for" — the assignment's fingerprint for a bound row, the spool's material/rgba
@@ -259,20 +277,55 @@ class ResolutionContext:
     # consumes this only under the same evidence gate as MINT (the full identity pair),
     # so a partial read can never land a tag on an operator's row.
     untagged_claim_candidate: SpoolView | None = None
-    # Most-recent non-archived, non-spent, fingerprint-compatible spool whose last
-    # location IS this slot (doctrine rule 7 reclaim donor).
-    last_location_candidate: SpoolView | None = None
+    # The slot's SINGLE last occupant, when it is still a legitimate de-bounce donor:
+    # the newest row released FROM this slot, adjudicated and never scanned past, and
+    # only when it is non-archived, non-spent, UNTAGGED and fingerprint-compatible with
+    # what the wire now reports (``slot_pipeline._debounce_candidate``). None = there is
+    # nothing to de-bounce onto and the table mints.
+    debounce_candidate: SpoolView | None = None
+    # The slot's last presence GAIN returned a roll after a MEASURED absence shorter
+    # than ``ams_presence._RESEAT_WINDOW_S`` — i.e. the release the farm acted on is
+    # explicable as a SPURIOUS one. False for an absence whose start was never observed
+    # (UNKNOWN is not "short") and for every longer gap. Computed OUTSIDE the table so
+    # this stays a pure function of its inputs.
+    reseat_within_window: bool = False
+    # …and the CAUSE veto: this slot's release has a PHYSICAL explanation, so it was
+    # never a glitch. True when the slot was the active feeder of a live print at the
+    # loss edge (the ~3-minute bay-clear→HMS gap), or when the firmware is standing on
+    # a runout for it right now (an open runout incident, a live demand, a standing
+    # runout code). Also computed outside the table.
+    runout_suspect: bool = False
     # A physical roll cycle (≥ _MIN_PHYSICAL_ABSENT_S absence) is pending on this
     # slot — the ONLY thing that releases the W1 spent latch (doctrine rule 6:
     # duration is a flap filter, never identity).
     qualified_cycle_pending: bool = False
-    # A commanded DISCOVERY read on this slot ANSWERED "no tag" and the tray is still
-    # seated + bare (``ams_presence.read_answered_no_tag`` — the read economy owns the
-    # stamps, the observation lane supplies the tray facts). Hardware evidence, not a
-    # timer: the firmware was asked what is in the slot and said "nothing with a chip".
-    # Only ever computed for a SPENT, TAGGED binding (see row 5's
-    # ``spent_swap_no_tag_read``); False everywhere else, including "not yet asked".
+    # A commanded DISCOVERY read on this slot ANSWERED "no tag" while something is still
+    # seated (``ams_presence.read_answered_no_tag`` — the read economy owns the stamps,
+    # the observation lane supplies the tray facts). Hardware evidence, not a timer: the
+    # firmware was asked what is in the slot and said "nothing with a chip".
+    #
+    # Computed for ANY binding that CLAIMS a tag (doctrine rule 11, 2026-08-19) — spent or
+    # live, bare tray or configured — and consumed by the four arms
+    # :func:`_no_tag_answer_contradicts` gates. It was scoped to the spent+bare
+    # constellation until this wave, which is why scenario G7 (a Bambu roll swapped for a
+    # third-party one, the tray reporting configuration and no tag) persisted silently with
+    # the wrong row bound. False everywhere else, and False for "not yet asked": silence is
+    # not an answer (scenario G10).
     no_tag_read_answered: bool = False
+    # The operator pressed "Re-check slot" on this slot (doctrine rule 12 — the click is
+    # rule 6's own second identity oracle, "an RFID tag OR a human answer"), the durable
+    # intent is still open, AND the tag-ness question has been ANSWERED: a commanded
+    # discovery read came back finding no chip. Both halves are required and both are
+    # resolved OUTSIDE the table (``slot_pipeline._operator_recheck_answered``), so this
+    # stays a pure function of its inputs.
+    #
+    # "Answered, never the click alone" is the guard that makes the verb safe: mid-print
+    # the farm never commands a read (rule 5), so a slot holding a brand-new or reused-tag
+    # Bambu roll is indistinguishable from a tagless one, and minting tagless there is
+    # precisely the "guess published into an unresolved slot destroys the firmware's
+    # answer" failure (invariant 5). Until the answer lands this stays False and the slot
+    # renders as the honest ``tray_unread`` interim state it already had.
+    operator_recheck_answered: bool = False
     auto_add_unknown: bool = True
     busy: bool = False  # printer RUNNING/PAUSE
     settling: bool = False  # mint/config settle window
@@ -360,8 +413,9 @@ def post_state(decision: Decision, derived: SlotState) -> SlotState:
         return SlotState.OCCUPIED_ASSUMED
 
     if kind is DecisionKind.RECLAIM:
-        # Doctrine rule 7's donor is chosen by last location + fingerprint. Nothing read
-        # the roll, so the rebind is an assumption tier however confident the match.
+        # The de-bounce's donor is the slot's last occupant, admitted on a measured
+        # sub-window absence with no physical cause. Nothing READ the roll, so the
+        # rebind is assumption-tier however well the evidence rules out a swap.
         return SlotState.OCCUPIED_ASSUMED
 
     if kind is DecisionKind.REPLACE_SPENT:
@@ -418,10 +472,41 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
 
         relation = identity_relation(binding, obs) if binding is not None else None
 
+        # 2.0 — the identity resolves to a FINISHED roll, and the tray reads LOADED.
+        # Doctrine rule 3 / operator ruling 3 (2026-08-19), scenario G3: "runout on an
+        # RFID means g = 0, and any future read of the same tag is a new roll — how do you
+        # add filament to 0 g? you can't, therefore a new roll on a reused core. It doesn't
+        # need breadcrumbs." The physics is the whole argument: a roll the hardware
+        # declared empty cannot come back holding filament, so the tag is on a DIFFERENT
+        # roll. That is CONCLUDED from evidence, never asked.
+        #
+        # This row used to not exist and the lane was spent-BLIND in both directions: a
+        # bound finished row fell to 2.1's KEEP (the slot kept describing filament that no
+        # longer existed, and the fresh roll printed against a ledger reading 0 g
+        # remaining), and an unbound one fell to 2.3's BIND — the ledger RESURRECTION that
+        # incident shape 31 is made of, reached here through the tagged door instead of
+        # the breadcrumb one.
+        if _finished_roll_reading_loaded(binding, obs) and relation == "same":
+            # The finished row HOLDS this slot, so retiring it and minting its successor is
+            # one transition, not two — the same ``REPLACE_SPENT`` arm every other spent
+            # roll swap uses, so the disposal (a pristine auto-mint is deleted, a
+            # ledger-bearing row archived), the mint funnel and the binding writer stay one
+            # lane. The departing row keeps its grams and its ``spent_at``: archiving is a
+            # soft-hide, and the ledger stays raw (rule 8). Minting from the TRAY carries
+            # the tag onto the successor, which is what makes the reused core resolvable on
+            # the next push instead of leaving two active rows claiming one ``tray_uuid``.
+            return Decision(
+                DecisionKind.REPLACE_SPENT,
+                spool_id=binding.spool_id,
+                mint_spec=_mint_spec_from_tray(obs),
+                reason="reused_core_swap",
+            )
+
         # 2.1 — the bound row IS this roll (uuid agreement, or a plain tag agreement
-        # when no uuid is in play). A spent tagged row also lands here: the respool
-        # tiers (doctrine rule 3) are a CONSUMER the orchestrator runs on a KEEP —
-        # this table never auto-respools.
+        # when no uuid is in play). A LIVE tagged row lands here and KEEPs, unchanged —
+        # 2.0 above took the finished ones, and only those. The respool tiers (doctrine
+        # rule 3) remain a CONSUMER the orchestrator runs on a KEEP; what this table now
+        # refuses to do is treat a FINISHED roll as a live occupant.
         if binding is not None and relation == "same":
             return Decision(DecisionKind.KEEP, spool_id=binding.spool_id, reason=_keep_reason(binding, obs))
 
@@ -439,6 +524,43 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         # 2.3 — the binding is uuid-PROVEN to be a different roll, absent, or
         # identity-less. Whatever row owns this identity is the answer.
         candidate = ctx.identity_candidate
+        if candidate is not None and candidate.spent:
+            # 2.3a — the row that owns this identity is a FINISHED roll (the second half
+            # of ruling 3, and the branch that had no test in either direction). It is the
+            # normal post-runout shape for a tagged roll: the AMS clears the drained
+            # slot's exist bit ~3 min BEFORE it declares the runout, so the binding is
+            # released first and the spent stamp lands on an UNBOUND row (the 2026-08-13
+            # tier-2 attribution). The operator then puts a fresh roll on the reused core,
+            # the tag reads, and this lane used to BIND the drained row straight back onto
+            # the slot — the fresh roll instantly reading 0 g remaining and staging every
+            # run behind it.
+            #
+            # A finished roll is not a bindable owner, so it is treated as NO owner and the
+            # lane below decides — under exactly the gates every other unowned identity
+            # meets. That is deliberate, and it is what makes G3's "mint a fresh row
+            # carrying the tag" ONE lane instead of a second copy of the mint written here:
+            #
+            # * a PARTIAL read still buys a full one first (2.3's DEFER) — minting on a
+            #   half-read identity is precisely how one roll becomes two rows, and a
+            #   reused core has no exemption from that;
+            # * ``auto_add_unknown`` still decides mint-vs-prompt (2.5/2.6). The
+            #   CONCLUSION "this is a different roll" is never asked (ruling 3); whether
+            #   the farm may create inventory rows unattended is a separate operator
+            #   policy that applies to every unknown roll.
+            #
+            # ``candidate.spent`` — the view's mirror of ``Spool.is_finished_roll`` — and
+            # NOT :func:`_finished_roll_reading_loaded`: presence gates the RETIRE in 2.0,
+            # where acting on an unknown would destroy a ledger row. REFUSING to bind
+            # costs nothing in any presence state, and the refusal is the fail-safe half
+            # of invariant 11's asymmetry — a bind not made self-heals on the next push,
+            # a resurrected spent row is permanent.
+            #
+            # The table mutates nothing: the finished row keeps its grams, its ``spent_at``
+            # and its tag. Retiring it belongs to the writer, at the moment the successor
+            # actually lands — ``slot_pipeline._apply_mint``, whose mint existence recheck
+            # must skip finished rolls for this same reason or it would convert the
+            # successor's MINT straight back into the resurrection.
+            candidate = None
         if candidate is not None and identity_relation(candidate, obs) == "same":
             if binding is not None and candidate.spool_id == binding.spool_id:
                 # The candidate lookup resolved back to the row already bound here
@@ -513,6 +635,72 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         # (003-T2/140, 006-T2/166, 009-T3/96, 012-T3/156, 007C-A0T1/214).
         return Decision(DecisionKind.RELEASE, spool_id=binding.spool_id, reason="cleared_tray")
 
+    # -- Row 3½: the operator answered ---------------------------------------
+    # Doctrine rule 12 (operator-ratified 2026-08-19, incident shape 32): the re-check
+    # click is EVIDENCE — nobody presses it unless something physically happened — and it
+    # is rule 6's own second identity oracle ("an RFID tag **or a human answer**") finally
+    # wired up. This amends nothing; it finishes something.
+    #
+    # ``operator_recheck_answered`` already carries BOTH halves of rule 12's safety
+    # (see :class:`ResolutionContext`): an open durable intent, and a commanded discovery
+    # read that ANSWERED no chip. So by the time the table sees it, the question "is this
+    # a different roll?" has a human's yes and the firmware's "nothing with a tag here" —
+    # which is strictly more evidence than the tagless lane below ever gets on its own.
+    #
+    # WHERE this sits is the design. AFTER row 1 (wire safety still wins — deferring costs
+    # one push, guessing costs an incident), AFTER row 2 (a tag on the wire outranks any
+    # human: scenario R4's "the identity lane decides" IS row 2 deciding), and AFTER row 3
+    # (a roll pulled between the click and the answer releases; there is nothing to
+    # re-check in an empty bay). BEFORE row 4, because the whole point is that every one
+    # of row 4's tagless verdicts — the de-bounce, the fingerprint KEEP, the spent latch —
+    # is an inference the operator has just overruled with better evidence.
+    #
+    # Three exclusions, each a doctrine rule rather than caution:
+    #
+    #  * a PRE-CONFIGURED binding is untouched (scenario T13): operator intent is never
+    #    guessed over, and a pre-config bind-to-empty IS operator intent — row 4b applies
+    #    it, and re-checking a slot cannot mean discarding the roll the operator assigned
+    #    to it;
+    #  * something must be SEATED. Row 3 owns ``present is False`` outright, and the
+    #    endpoint refuses an empty slot up front (scenario R6), but presence UNKNOWN
+    #    reaches here and must assert nothing — an unknown is never resolved toward action
+    #    (invariant 3);
+    #  * a mint spec must be DERIVABLE. With a bare tray and no configured tagless default
+    #    the only row that could be minted is an identity-less husk, which is worse than
+    #    the honest unresolved state the slot already renders.
+    if (
+        ctx.operator_recheck_answered
+        and obs.present is not False
+        and not (binding is not None and binding.pre_configured)
+        and (ctx.tagless_default is not None or obs.config_nonempty)
+    ):
+        if binding is not None and binding.spent:
+            # The spent-latch park (scenario R5), which otherwise waits for a physical
+            # cycle that may never come. REPLACE_SPENT rather than MINT because the
+            # drained row must be RETIRED, not merely displaced — the same arm every
+            # other spent-roll swap uses, so the disposal, the mint funnel and the
+            # binding writer stay one lane.
+            return Decision(
+                DecisionKind.REPLACE_SPENT,
+                spool_id=binding.spool_id,
+                mint_spec=_tagless_mint_spec(obs, ctx, departed=binding),
+                reason="operator_recheck_swap",
+            )
+        # Scenarios R2/R3/R8. ``departed=binding`` makes the mint spec fall back to the
+        # tagless default whenever the tray still carries the outgoing row's config —
+        # firmware leftover after a swap — so the fresh roll gets a clean identity
+        # instead of inheriting the description of the roll that left.
+        #
+        # R8 is the honest false positive this verb accepts by design: an operator who
+        # re-seated the SAME roll after a jam clear gets a new row at label weight. It is
+        # surfaced rather than hidden — the acknowledgement offers a one-click undo — and
+        # it self-corrects at that roll's next runout.
+        return Decision(
+            DecisionKind.MINT,
+            mint_spec=_tagless_mint_spec(obs, ctx, departed=binding, replace_existing=binding is not None),
+            reason="operator_recheck_mint",
+        )
+
     # -- Row 4: tagless lane — configuration asserted, no identity -----------
     # "No tag" is the fleet's common case for third-party rolls (doctrine rule 2:
     # the tagless default is assumed unless a tag or an operator says otherwise).
@@ -543,6 +731,23 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
                     mint_spec=_tagless_mint_spec(obs, ctx, departed=binding),
                     reason="spent_swap_confirmed",
                 )
+            # 4a′ — no cycle, but the READ answered. Rule 11 (:func:`_no_tag_answer_contradicts`):
+            # a commanded read that found no chip over a TAGGED spent row is positive proof
+            # of a different roll, and it does not become less positive because the tray
+            # happens to carry configuration. Row 5a concluded on exactly this evidence for
+            # a BARE tray and this arm was its missing twin: the same slot, the same answer,
+            # parked forever on ``spent_latch`` because the firmware had left the departed
+            # roll's ``tray_type``/``tray_info_idx`` behind (the ordinary shape after a swap
+            # — see ``_tagless_mint_spec``'s ``departed`` fallback, which exists for it).
+            # The cycle arm stays FIRST: a measured physical event is the primary evidence
+            # and keeps its own reason.
+            if _no_tag_answer_contradicts(obs, ctx):
+                return Decision(
+                    DecisionKind.REPLACE_SPENT,
+                    spool_id=binding.spool_id,
+                    mint_spec=_tagless_mint_spec(obs, ctx, departed=binding),
+                    reason="spent_swap_no_tag_read",
+                )
             # No cycle: the runout-instant state flap must not phantom-mint over a
             # still-present dead roll.
             return Decision(DecisionKind.KEEP, spool_id=binding.spool_id, reason="spent_latch")
@@ -566,26 +771,96 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
             return Decision(DecisionKind.BIND, spool_id=binding.spool_id, reason="pre_configured_apply")
 
         # 4b′ — the row bound here is TAGGED, but this push carried no RFID fields.
-        # That is not evidence the roll left: periodic AMS pushes routinely omit
-        # identity (which is exactly why the merge preserves it), and a tagged row
-        # is only ever re-decided by the tag lane or by the empty shape at row 3.
-        # Mirrors the pre-cutover tagless branch tree's (2) "not ours" return.
+        # Two very different things can produce that, and the whole of this row is
+        # telling them apart: "not asked" versus "asked and answered" (doctrine rule 11).
         if binding is not None and not binding.is_tagless:
+            # ASKED AND ANSWERED — scenario G7, the commonest physical swap on this
+            # fleet and the one that used to persist silently with the wrong row bound:
+            # a Bambu roll pulled, a third-party roll seated, the tray reporting
+            # ``tray_type: "PETG"``, ``tray_info_idx: "GFG02"``, ``tag_uid: null``. The
+            # evidence for it existed the whole time — a commanded discovery read came
+            # back finding no chip — and row 5a's own comment already called that
+            # "positive proof of a different roll, the same certainty class as a uuid
+            # disagreement". It was simply confined to spent rows and bare trays. It is
+            # not confined any more (:func:`_no_tag_answer_contradicts`).
+            #
+            # The departed row is NOT archived: it is a live roll that left this slot,
+            # not an exhausted one, so it keeps its grams and its history and is merely
+            # unlinked (``replace_existing``) — the same disposition ``different_filament``
+            # gives a tagless row the fingerprint refutes. ``departed=binding`` makes the
+            # mint fall back to the tagless default whenever the tray still carries the
+            # OUTGOING roll's configuration (firmware leftover after a swap), so the fresh
+            # roll gets a clean identity instead of inheriting the description of the roll
+            # that left.
+            #
+            # A transient read failure on a genuinely tagged roll self-corrects: the next
+            # successful read finds the tag and row 2 displaces the never-fed minted row
+            # (the same asymmetry ``read_answered_no_tag`` documents — the settle floor and
+            # the in-flight gate are what make the answer worth this much).
+            if _no_tag_answer_contradicts(obs, ctx):
+                return Decision(
+                    DecisionKind.MINT,
+                    mint_spec=_tagless_mint_spec(obs, ctx, departed=binding, replace_existing=True),
+                    reason="tagged_swap_no_tag_read",
+                )
+            # NOT ASKED — silence, scenario G10. A periodic AMS push routinely omits
+            # identity (which is exactly why the merge preserves it), so this is no
+            # evidence the roll left, and a tagged row is otherwise only ever re-decided
+            # by the tag lane or by the empty shape at row 3. Mirrors the pre-cutover
+            # tagless branch tree's (2) "not ours" return.
             return Decision(DecisionKind.KEEP, spool_id=binding.spool_id, reason="tagged_row_awaits_tag_lane")
 
         if binding is None:
-            # 4c — reclaim: this roll was pulled from THIS slot and came back
-            # (maintenance/drying). Rebinding the same row preserves its grams AND
-            # its FIFO position — the rebind must NOT re-stamp loaded_at
-            # (doctrine rule 7).
-            if ctx.last_location_candidate is not None:
-                return Decision(
-                    DecisionKind.RECLAIM,
-                    spool_id=ctx.last_location_candidate.spool_id,
-                    reason="last_location_reclaim",
-                )
-            # 4d — nothing to reclaim: mint. (The settle gate that protects a fresh
-            # mint from the firmware's pending RFID read already fired at row 1.)
+            # 4c — DE-BOUNCE: the release this slot acted on was most likely SPURIOUS,
+            # so the roll never left and its row keeps its grams AND its FIFO position
+            # (doctrine rule 7 — the rebind must not re-stamp ``loaded_at``).
+            #
+            # THIS LANE IS A GLITCH FILTER, NOT AN IDENTITY ORACLE (rule 7 as amended
+            # 2026-08-19, operator-ratified). It used to fire on nothing but a
+            # ``last_location_*`` breadcrumb plus a fingerprint match — and on this
+            # fleet every roll is black PETG reporting ``tag_uid: null, tray_uuid:
+            # null, remain: -1``, so that test is ALWAYS TRUE against residue that is
+            # never cleared and has no age bound. 002/005-H2S, 2026-08-19: two AMS
+            # units sat empty for three days, one fresh roll went into each, and the
+            # farm re-attached spool 292 (954.4 g used of 1000) and spool 298 (936.1 g)
+            # to them. Both landed under the 150 g start floor and staged whole
+            # production runs behind a row describing filament that no longer existed.
+            #
+            # It cannot simply be deleted either: 14 of 52 reclaims in 8 days returned
+            # inside 5 minutes (four at 0.0 min across four printers inside ONE minute),
+            # which no human produces — those are SPURIOUS releases this lane silently
+            # repairs, and minting on them would reset a part-used roll to a full label
+            # and bypass the start floor several times a day, unattended.
+            #
+            # So it is SCOPED. Four of the five conditions are the caller's
+            # (``slot_pipeline._debounce_candidate``: the slot's single last occupant,
+            # adjudicated and never scanned past; untagged, because a tagged roll
+            # re-asserts its own identity and a breadcrumb can only pre-empt it;
+            # non-spent, non-archived; fingerprint-compatible). The two here are the
+            # ones a REVIEWER must be able to see in the table:
+            #
+            #  * ``reseat_within_window`` — the absence was MEASURED and short. Duration
+            #    decides no identity POSITIVELY: outside the window the farm asserts
+            #    nothing and MINTS, which is the whole of what timing may say.
+            #  * ``runout_suspect`` — decided by CAUSE, never by timing (rule 6 /
+            #    invariant 6). A runout release is never a glitch, and the AMS clears a
+            #    drained slot's exist bit ~3 min BEFORE it declares the runout, so a
+            #    refill made inside that gap is exactly a FAST return onto a row that is
+            #    exhausted but not yet ``spent_at``-stamped (the 08-13 resurrection,
+            #    shape 31). Without this veto, scoping the window would make that case
+            #    the DOMINANT surviving reclaim instead of one among many.
+            donor = ctx.debounce_candidate
+            if donor is not None and ctx.reseat_within_window:
+                if ctx.runout_suspect:
+                    # The window would have admitted this one; the cause refuses it. Its
+                    # own reason, because the COUNT of these is how the farm confirms
+                    # T7/T8 are being caught rather than silently never firing.
+                    return Decision(
+                        DecisionKind.MINT, mint_spec=_tagless_mint_spec(obs, ctx), reason="runout_suspect_mint"
+                    )
+                return Decision(DecisionKind.RECLAIM, spool_id=donor.spool_id, reason="reseat_debounce")
+            # 4d — nothing to de-bounce onto: mint. (The settle gate that protects a
+            # fresh mint from the firmware's pending RFID read already fired at row 1.)
             return Decision(DecisionKind.MINT, mint_spec=_tagless_mint_spec(obs, ctx), reason="tagless_mint")
 
         # 4e/4f — bound row.
@@ -646,17 +921,21 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
             # instead of waiting for evidence that can never arrive: the tray is bare, so
             # row 4's cycle machinery is unreachable by construction.
             #
-            # Scoped to TAGGED spent bindings on purpose. Over a spent TAGLESS binding a
-            # no-tag read proves nothing at all (the same core reads the same way before and
-            # after a swap — same-core ambiguity), so that case stays with the
-            # qualified-cycle machinery which measures a PHYSICAL event instead.
-            if (
-                binding is not None
-                and not binding.is_tagless
-                and not ctx.busy
-                and ctx.no_tag_read_answered
-                and ctx.tagless_default is not None
-            ):
+            # Since 2026-08-19 (doctrine rule 11) this arm is ONE CALLER of the general
+            # predicate rather than its only definition — the conclusion is unchanged and
+            # its guards are unchanged, they simply live in
+            # :func:`_no_tag_answer_contradicts` now, beside the three other constellations
+            # the same proof licenses. Scenario G9 (a spent TAGLESS binding) is still
+            # excluded, and still for the reason this row first gave: over a claim-less
+            # binding a no-tag read proves nothing at all, because the same core reads the
+            # same way before and after a swap. That case stays with the qualified-cycle
+            # machinery, which measures a PHYSICAL event instead.
+            #
+            # ``tagless_default`` stays a LOCAL guard: this row is reached only on a BARE
+            # tray, which carries no fields to mint the replacement from, so with no default
+            # configured there is nothing to bind and the slot keeps owing its read. Row 4b′
+            # needs no such guard — a configured tray can always mint from itself.
+            if _no_tag_answer_contradicts(obs, ctx) and ctx.tagless_default is not None:
                 return Decision(
                     DecisionKind.REPLACE_SPENT,
                     spool_id=binding.spool_id,
@@ -673,6 +952,25 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         return Decision(DecisionKind.KEEP, spool_id=binding.spool_id, reason="spent_latch")
     if binding is not None and binding.pre_configured:
         return Decision(DecisionKind.KEEP, spool_id=binding.spool_id, reason="pre_configured_awaiting_insert")
+
+    # 5b — row 5a's mirror for a LIVE tagged binding: same bare tray, same answered
+    # no-tag read, same proof (doctrine rule 11) — only the departed row is a roll that
+    # LEFT rather than one that ran dry, so it is unlinked and keeps its grams instead of
+    # being archived. Without this arm the constellation fell to ``identity_unresolved``
+    # and re-owed a read it had already been given — the exact silence that parked spool
+    # 226 for a day (observed-incidents shape 25), reproduced one binding-state over.
+    # ``close_answered_read`` now spends the entitlements on that answer, so the slot
+    # would not even go on asking: it would simply sit wrong and quiet.
+    #
+    # Ordered AFTER the pre-configured KEEP on purpose: operator intent is never guessed
+    # over (scenario T13), so a slot awaiting a pre-assigned roll owes this nothing — the
+    # same exclusion ``_operator_recheck_answered`` makes for the same reason.
+    if _no_tag_answer_contradicts(obs, ctx) and ctx.tagless_default is not None:
+        return Decision(
+            DecisionKind.MINT,
+            mint_spec=_tagless_mint_spec(obs, ctx, departed=binding, replace_existing=True),
+            reason="tagged_swap_no_tag_read",
+        )
 
     if state is SlotState.OCCUPIED_UNRESOLVED:
         if ctx.busy:
@@ -759,6 +1057,84 @@ def _fingerprint_matches(view: BindingView, obs: TrayObservation) -> bool:
     if not colors_similar(obs.tray_color or "", view.fingerprint_color or ""):
         return False
     return canonical_filament_type(obs.tray_type or "") == canonical_filament_type(view.fingerprint_type or "")
+
+
+def _finished_roll_reading_loaded(view: SpoolView | None, obs: TrayObservation) -> bool:
+    """G3's RETIRE evidence: a FINISHED roll whose tray reads LOADED.
+
+    Doctrine rule 3 / operator ruling 3 (2026-08-19). A runout means the row reached
+    zero, and filament cannot be added to a 0 g roll — so the same tag reading back over
+    a SEATED tray is a new roll on a reused core, with the certainty of a physical
+    impossibility rather than of a heuristic. Row **2.0** acts on it: the finished row
+    HOLDS the slot → ``REPLACE_SPENT``, retire it and mint its successor carrying the tag.
+
+    ``view.spent`` is this table's mirror of ``Spool.is_finished_roll`` — the ONE model
+    -side encoding of "a spent row is a FINISHED roll", which the untagged attract lane
+    reads as an EXCLUSION and the tagged lanes read as EVIDENCE. The view field is
+    computed by the orchestrator so this function stays pure, exactly as
+    ``BindingView.is_tagless`` mirrors ``spool_tagless.is_tagless_spool``.
+
+    ``obs.present is True`` is the tri-state rule (invariant 3), and it is the table's
+    form of "the tray reads loaded": presence UNKNOWN asserts nothing and must never
+    resolve toward retiring a row, and presence FALSE never reaches row 2 at all (the
+    identity-vs-cleared contradiction returns above). Erring LATE here costs one pushall;
+    erring early would retire a row on a push that said nothing.
+
+    Row 2.3a — the finished row merely OWNS the tag — deliberately does NOT come through
+    here. It refuses to BIND rather than retiring anything, and a refusal is fail-safe in
+    every presence state, so gating it on presence would only leave the resurrection door
+    open on a push that carried no presence at all. It tests ``candidate.spent`` directly:
+    same mirror, without the evidence clause this one adds for the mutation.
+    """
+    return view is not None and view.spent and obs.present is True
+
+
+def _no_tag_answer_contradicts(obs: TrayObservation, ctx: ResolutionContext) -> bool:
+    """A tagless roll can NEVER be an RFID roll — doctrine rule 11, in ONE place.
+
+    A commanded discovery read that ANSWERED "no chip" over a binding that CLAIMS one is
+    positive proof of a different roll: the same certainty class as a ``tray_uuid``
+    disagreement, and it does not care what else is true of the row. The table used to say
+    exactly this in row 5a's own comment and then confine the conclusion to one
+    constellation (spent row, bare tray), so the commonest physical shape on this fleet — a
+    Bambu roll swapped for a third-party one, which reports ``tray_type: "PETG"``,
+    ``tray_info_idx: "GFG02"``, ``tag_uid: null`` — persisted silently with the wrong row
+    bound (scenario G7). This predicate is the whole of rule 11's positive clause; the FOUR
+    arms that call it are the several conclusions it licenses:
+
+    * row 4a — spent binding, CONFIGURED tray → ``spent_swap_no_tag_read``;
+    * row 4b′ — live binding, CONFIGURED tray → ``tagged_swap_no_tag_read`` (G7);
+    * row 5a — spent binding, BARE tray → ``spent_swap_no_tag_read`` (the original,
+      2026-08-07 spool 226 / 001-H2S slot 1; observed-incidents shape 25);
+    * rows 5/6 — live binding, BARE tray → ``tagged_swap_no_tag_read``.
+
+    ONE-WAY BY LOGIC, NOT BY TIMIDITY, and the three refusals are each a doctrine rule:
+
+    * ``binding.is_tagless`` — a binding that claims NO identity has nothing to contradict,
+      and the same bare core reads identically before and after a swap (same-core
+      ambiguity). Scenario **G9**: the arm that must NOT fire. That case keeps belonging to
+      the qualified-cycle machinery, which measures a PHYSICAL event instead. Stated HERE,
+      in the table, and NOT only in the caller that computes the read evidence
+      (``slot_pipeline._no_tag_read_answered``, whose matching gate is a cheap exit that
+      spares the ledger peek): the two express the same rule and neither is a redundant
+      guard on the other — delete either and rule 11's one-way clause stops being
+      assertable where it is decided.
+    * ``obs.present is True`` — the tri-state (invariant 3). Nothing seated, nothing to be
+      a different roll; an unknown is never resolved toward a binding write.
+    * ``not ctx.busy`` — doctrine rule 5. Mid-print the farm commands no reads, so an
+      answer still standing during a print predates it and says nothing about a roll
+      inserted since. Believing it is how scenario R4's reused-tag RFID roll would be
+      mis-minted as tagless.
+
+    ``ctx.no_tag_read_answered`` is "asked AND answered", never "not asked" — a periodic
+    push that merely omits the RFID fields is SILENCE and keeps the binding (scenario
+    **G10**). That distinction lives in ``ams_presence.read_answered_no_tag``, which owns
+    the read stamps and the settle floor; this table only consumes its verdict.
+    """
+    binding = ctx.binding
+    if binding is None or binding.is_tagless:
+        return False
+    return ctx.no_tag_read_answered and obs.present is True and not ctx.busy
 
 
 def _mint_spec_from_tray(obs: TrayObservation, *, replace_existing: bool = False) -> dict:

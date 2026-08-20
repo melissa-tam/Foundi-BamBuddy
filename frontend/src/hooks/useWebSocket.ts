@@ -589,18 +589,25 @@ export function useWebSocket() {
       }
 
       case 'slot_standing_unknown': {
-        // ONE emitter: the bound-presence escalation ladder in spool_tagless —
-        // a slot with a bound spool whose presence won't resolve (unknown, or
-        // asserted-empty with the binding still live) fires this once per
-        // episode, at the THIRD unanswered evidence ask. So it means "the farm
-        // has genuinely asked and the wire won't answer", which is worth eyes.
+        // TWO emitters, both in spool_tagless's reconcile walk and both once per
+        // episode. `bound_presence_unknown`: a slot with a bound spool whose
+        // presence won't resolve (unknown, or asserted-empty with the binding
+        // still live), at the THIRD unanswered evidence ask — "the farm has
+        // genuinely asked and the wire won't answer". `spent_swap_park`: a spent
+        // binding under a tray that IS answering (present and configured) with no
+        // qualified roll cycle and no answered read, so the runout latch has
+        // nothing that can release it and the slot sits out of service. Different
+        // situations, so different sentences — and the second one names the way
+        // out, because there is one (Re-check slot).
         // Deliberately still a plain transient warning toast, NOT a durable
         // prompt lane: nothing to answer, nothing to dequeue — the slot itself
         // renders the standing state, this is only the nudge to go look. The
         // AMS unit is named because a multi-AMS printer has several slot 4s.
         const m = message as unknown as SlotStandingUnknownMessage;
+        const standingKey =
+          m.case === 'spent_swap_park' ? 'ams.slotSpentSwapPark' : 'ams.slotBoundPresenceUnknown';
         showToast(
-          t('ams.slotBoundPresenceUnknown', {
+          t(standingKey, {
             printer: m.printer_name || `Printer ${m.printer_id}`,
             ams: formatAmsUnitName(m.ams_id ?? 0),
             slot: (m.tray_id ?? 0) + 1,

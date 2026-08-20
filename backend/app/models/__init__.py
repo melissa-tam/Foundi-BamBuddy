@@ -30,6 +30,7 @@ from backend.app.models.project import Project
 from backend.app.models.recovery_escalation import RecoveryEscalation
 from backend.app.models.settings import Settings
 from backend.app.models.sku import Sku, SkuFile
+from backend.app.models.slot_recheck import SlotRecheckIntent
 from backend.app.models.smart_plug import SmartPlug
 from backend.app.models.smart_plug_energy_snapshot import SmartPlugEnergySnapshot
 from backend.app.models.sponsor_toast_state import SponsorToastState
@@ -86,6 +87,7 @@ __all__ = [
     "OrcaBaseProfile",
     "Spool",
     "SpoolKProfile",
+    "SlotRecheckIntent",
     "SpoolAssignment",
     "SpoolCatalogEntry",
     "SpoolUsageHistory",

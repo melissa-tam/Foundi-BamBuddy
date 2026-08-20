@@ -359,11 +359,14 @@ async def find_matching_untagged_spool(db: AsyncSession, tray_data: dict) -> Spo
         .options(selectinload(Spool.k_profiles), selectinload(Spool.assignments))
         .where(
             Spool.archived_at.is_(None),
-            # A spent, untagged, unbound row is a FINISHED roll: a newly-arriving
-            # tag must always land on a DIFFERENT row, because claiming this one
-            # would hand a fresh roll a spent latch (hard-excluded from selection,
-            # and no automatic un-spend lane exists to undo it).
-            Spool.spent_at.is_(None),
+            # A FINISHED roll is never an attract candidate: a newly-arriving tag must
+            # always land on a DIFFERENT row. ``Spool.is_finished_roll`` is the ONE
+            # encoding of that doctrine statement (see the model) — the tagged lane draws
+            # the OPPOSITE conclusion from the SAME predicate, reading a finished roll as
+            # evidence of a reused core (``spool_respool`` tier 2, scenario G3). Two
+            # conclusions, one definition; spelling the ``spent_at`` test out again here
+            # is what would let them drift.
+            ~Spool.is_finished_roll,
             Spool.tag_uid.is_(None),
             Spool.tray_uuid.is_(None),
             ~Spool.assignments.any(),
@@ -722,6 +725,13 @@ async def find_spool_sharing_tray_uuid(db: AsyncSession, tray_uuid: str) -> Spoo
     Because a Bambu roll carries TWO RFID tags sharing one ``tray_uuid``, the returned
     row's stored ``tag_uid`` may legitimately differ from any tag the caller scanned —
     that is a sibling read of the same roll, not a signal to mint.
+
+    A SPENT row is returned like any other, deliberately (``archived_at`` is the only
+    exclusion). ``Spool.is_finished_roll`` is EVIDENCE in this lane, not a disqualifier:
+    a finished roll whose tag reads loaded is an operator's fresh roll on a reused core,
+    and the caller must be able to SEE the finished row to conclude that (scenario G3,
+    operator ruling 3). Filtering it out here would hide the evidence and leave the
+    reappearing tag looking like a brand-new roll with no history at all.
     """
     uuid_norm = _normalize_tray_uuid(tray_uuid)
     if not uuid_norm or uuid_norm == ZERO_TRAY_UUID or uuid_norm == "0" * len(uuid_norm):

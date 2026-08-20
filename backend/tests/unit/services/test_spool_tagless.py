@@ -909,6 +909,27 @@ class TestNotePhysicalCycle:
         env.ws.assert_not_awaited()  # spent -> silent
         assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles  # left for the W1 transition
 
+    async def test_records_pending_unbound_leaves_it_for_the_pipeline(self, db_session, printer_factory, env, sessions):
+        """2026-08-19 (shape 32, layer 2): an UNBOUND slot no longer discards here.
+
+        This lane runs inside the very await that ARMS the cycle — i.e. BEFORE the pipeline
+        has decided anything — so ``spool is None`` was only ever a guess, and it was the
+        wrong one for the shape that hits it most. A refill inside the ~3-minute
+        bay-clear→HMS gap lands on an unbound slot (the runout's release fired minutes
+        before its own evidence); the pipeline de-bounces onto the exhausted row, the runout
+        stamps it spent, and row 4a needs THIS cycle to fire ``REPLACE_SPENT``. Discarding
+        it parked the slot until a human pulled and re-seated the roll.
+
+        The lifecycle decision now belongs to ``slot_pipeline._settle_physical_cycle``,
+        which runs in the apply step of the deciding pass. The two arms above are the
+        liveness pair for the outcomes that did NOT move: a live tagless binding still gets
+        its prompt and still pops, a spent binding still survives.
+        """
+        printer = await printer_factory()  # nothing bound to AMS0-T0 at all
+        await spool_tagless.note_physical_cycle(printer.id, 0, 0)
+        env.ws.assert_not_awaited()  # no binding ⇒ nothing to ask about
+        assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles
+
 
 class TestTaglessReplay:
     """The snapshot + replay pair, driven ENTIRELY from the durable stamp — no module

@@ -36,9 +36,7 @@ from typing import TYPE_CHECKING, Literal
 from sqlalchemy import select
 
 from backend.app.core.tasks import spawn_background_task
-from backend.app.models.archive import PrintArchive
 from backend.app.models.eject_profile import EjectProfile
-from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.eject import progress as eject_progress
@@ -838,29 +836,20 @@ class EjectDispatchError(RuntimeError):
 
 
 async def _resolve_source_path(db: AsyncSession, item: PrintQueueItem) -> Path:
-    """Resolve the on-disk source ``.gcode.3mf`` for ``item`` (the file it printed).
+    """The on-disk source ``.gcode.3mf`` for ``item`` (the file it printed), or a 409.
 
-    Prefers the library file (present for the whole run's lifetime), falling back
-    to the per-dispatch archive copy when the library file was cleaned up after
-    dispatch. Raises :class:`EjectDispatchError` (409) when neither resolves to an
-    existing file.
+    Thin adapter over ``farm_correlation.resolve_item_donor``, which is THE
+    "which file did this unit print" resolver — the same question the print-start
+    archive capture asks, answered once. This lane's only difference is that a
+    missing donor is a dispatch precondition failure rather than a fall-back-to-
+    guessing, so it raises instead of returning None.
     """
-    from backend.app.core.config import settings as app_settings
+    from backend.app.services.farm_correlation import resolve_item_donor
 
-    if item.library_file_id:
-        lib = await db.get(LibraryFile, item.library_file_id)
-        if lib is not None:
-            lib_path = Path(lib.file_path)
-            path = lib_path if lib_path.is_absolute() else app_settings.base_dir / lib.file_path
-            if path.exists():
-                return path
-    if item.archive_id:
-        archive = await db.get(PrintArchive, item.archive_id)
-        if archive is not None:
-            path = app_settings.base_dir / archive.file_path
-            if path.exists():
-                return path
-    raise EjectDispatchError("Eject source file not found on disk for the finished unit", status_code=409)
+    donor = await resolve_item_donor(db, item)
+    if donor is None:
+        raise EjectDispatchError("Eject source file not found on disk for the finished unit", status_code=409)
+    return donor.local_path
 
 
 async def dispatch_part_present_eject(

@@ -124,14 +124,6 @@ class AppSettings(BaseModel):
         default=True,
         description="Automatically recover mid-print AMS feed faults by swapping to the next eligible spool",
     )
-    # Tier-2 auto re-spool of a reused Bambu tag onto a fresh third-party spool.
-    # Default OFF (operator directive — the farm does NOT reuse tags yet): a
-    # spent+loaded tag arrival surfaces the one-click prompt instead of silently
-    # minting a fresh row, so a false spent stamp can never auto-corrupt the ledger.
-    respool_auto_enabled: bool = Field(
-        default=False,
-        description="Automatically re-spool a reused Bambu RFID tag onto a fresh spool (off = prompt instead)",
-    )
     spool_recovery_max_attempts: int = Field(
         default=2,
         ge=1,
@@ -710,7 +702,6 @@ class AppSettingsUpdate(BaseModel):
     spool_selection_policy: str | None = None
     min_start_spool_g: int | None = Field(default=None, ge=0, le=10000)
     spool_recovery_enabled: bool | None = None
-    respool_auto_enabled: bool | None = None
     spool_recovery_max_attempts: int | None = Field(default=None, ge=1, le=5)
     spool_recovery_step_timeout_s: int | None = Field(default=None, ge=15, le=600)
     spool_recovery_protect_layers: int | None = Field(default=None, ge=0, le=1000)

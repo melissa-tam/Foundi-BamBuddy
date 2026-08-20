@@ -539,13 +539,178 @@ class TestRow2IdentityLane:
         decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
         assert decision == Decision(DecisionKind.NONE, reason="identity_presence_conflict")
 
-    def test_a_spent_tagged_row_still_keeps_here(self):
-        """The respool tiers (doctrine rule 3) are a CONSUMER the orchestrator runs
-        on a KEEP — this table never auto-respools."""
+    def test_a_spent_tagged_row_reading_loaded_is_a_new_roll_on_a_reused_core(self):
+        """G3 / operator ruling 3 (2026-08-19) — the INVERSION of the old contract.
+
+        This test used to be ``test_a_spent_tagged_row_still_keeps_here`` and pinned the
+        opposite: a spent tagged row KEEPing while "the respool tiers are a CONSUMER the
+        orchestrator runs on a KEEP". The KEEP was the bug. A runout means the row reached
+        zero, and filament cannot be added to a 0 g roll — so the same tag reading back
+        over a seated tray is a NEW roll on a reused core, and keeping the drained row
+        bound left the fresh roll printing against a ledger reading 0 g remaining. The row
+        is retired and its successor minted CARRYING THE TAG, concluded from evidence and
+        never asked.
+        """
         bound = _view(spool_id=37, is_tagless=False, tag_uid="1C63F1E700000100", spent=True)
         obs = _obs(tag_uid="1C63F1E700000100", remain=100)
         decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound, identity_candidate=bound))
+        assert decision.kind is DecisionKind.REPLACE_SPENT
+        assert decision.reason == "reused_core_swap"
+        # The drained row is the one being retired…
+        assert decision.spool_id == 37
+        # …and the successor carries the tag, so the reused core stays resolvable on the
+        # next push instead of leaving two active rows claiming one identity.
+        assert decision.mint_spec["tag_uid"] == "1C63F1E700000100"
+        assert decision.mint_spec["source"] == "tray"
+
+    def test_a_LIVE_tagged_row_reading_loaded_still_keeps_by_identity(self):
+        """LIVENESS PAIR for the row above — G3 must not swallow the ordinary case.
+
+        The same shape with ``spent=False`` is a tagged roll simply being re-read, which
+        is the overwhelmingly common event on this fleet. It KEEPs, exactly as before.
+        """
+        bound = _view(spool_id=37, is_tagless=False, tag_uid="1C63F1E700000100", spent=False)
+        obs = _obs(tag_uid="1C63F1E700000100", remain=100)
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound, identity_candidate=bound))
+        assert decision == Decision(DecisionKind.KEEP, spool_id=37, reason="identity_matches_bound")
+
+    def test_a_spent_tagged_row_whose_presence_is_UNKNOWN_keeps_its_latch(self):
+        """"The tray reads loaded" is the tri-state True (invariant 3), not "not empty".
+
+        A push that asserts the tag but says nothing about presence is no evidence a fresh
+        roll is seated, and retiring a row on it would be acting on an unknown. Erring LATE
+        costs one pushall; erring early destroys a ledger row.
+        """
+        bound = _view(spool_id=37, is_tagless=False, tag_uid="1C63F1E700000100", spent=True)
+        obs = _obs(tag_uid="1C63F1E700000100", present=None)
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
         assert decision.kind is DecisionKind.KEEP
+
+    def test_an_UNBOUND_spent_row_owning_this_tag_is_never_resurrected(self):
+        """G3's second shape, and the branch that had no test in either direction.
+
+        The normal post-runout state for a tagged roll is spent AND UNBOUND: the AMS clears
+        the drained slot's exist bit ~3 min BEFORE it declares the runout, so the binding is
+        released first and the spent stamp lands on an unbound row (the 2026-08-13 tier-2
+        attribution). The operator then puts a fresh roll on the reused core; the tag reads;
+        and row 2.3 used to BIND the drained row straight back onto the slot — the fresh
+        roll instantly reading 0 g remaining and staging every run behind it. That is
+        incident shape 31 reached through the tagged door.
+
+        The finished row is not a bindable owner, so it is discarded as a candidate and the
+        ordinary unowned-identity lane resolves the slot: a FRESH row carrying the tag
+        (G3 — "mint a fresh row carrying the tag"). The refusal alone would close the
+        resurrection and leave the slot unresolved forever, which is the same silence in a
+        different costume.
+        """
+        tag = "1C63F1E700000100"
+        uuid = "8AC9EC0847FD41D0890870319F2E1975"
+        finished = _view(spool_id=292, is_tagless=False, tag_uid=tag, tray_uuid=uuid, spent=True)
+        obs = _obs(tag_uid=tag, tray_uuid=uuid)
+        decision = resolve(obs, derive_state(obs, None), ResolutionContext(identity_candidate=finished))
+        assert decision.kind is DecisionKind.MINT
+        assert decision.reason == "unknown_identity_auto_add"
+        # The successor carries BOTH identity members, so the next push resolves on the
+        # uuid instead of re-deciding this branch.
+        assert decision.mint_spec["tag_uid"] == tag
+        assert decision.mint_spec["tray_uuid"] == uuid
+        # …and it never names the finished row: nothing binds to it, nothing retires it
+        # here (the table mutates nothing — the writer retires the superseded owner).
+        assert decision.spool_id is None
+
+    def test_a_finished_owner_is_refused_even_when_presence_is_UNKNOWN(self):
+        """The refusal is NOT presence-gated, and the asymmetry is the reason.
+
+        Presence gates the RETIRE in row 2.0, where acting on an unknown would destroy a
+        ledger row. Refusing to BIND costs nothing in any presence state, so gating it the
+        same way would leave the resurrection door open on exactly the shape that walks
+        through it most — an incremental push carrying the tag and no tray state at all.
+        A bind not made self-heals on the next push; a resurrected spent row does not.
+        """
+        tag = "1C63F1E700000100"
+        uuid = "8AC9EC0847FD41D0890870319F2E1975"
+        finished = _view(spool_id=292, is_tagless=False, tag_uid=tag, tray_uuid=uuid, spent=True)
+        obs = _obs(tag_uid=tag, tray_uuid=uuid, present=None)
+        decision = resolve(obs, derive_state(obs, None), ResolutionContext(identity_candidate=finished))
+        assert decision.spool_id != 292
+        assert decision.kind is DecisionKind.MINT
+
+    def test_a_finished_owner_on_a_PARTIAL_read_still_buys_the_full_one(self):
+        """Discarding the owner hands the slot to the ordinary lane — gates included.
+
+        A reused core has no exemption from the full-pair rule: a push carrying one member
+        of the identity pair is indistinguishable from a B-side sibling read, and minting on
+        it is how one roll becomes two rows. Emitting the mint inside row 2.3a would have
+        skipped this DEFER, which is the whole argument for discarding the candidate rather
+        than writing a second mint there.
+        """
+        tag = "1C63F1E700000100"
+        finished = _view(spool_id=292, is_tagless=False, tag_uid=tag, tray_uuid=None, spent=True)
+        obs = _obs(tag_uid=tag)
+        assert obs.tray_uuid is None
+        decision = resolve(obs, derive_state(obs, None), ResolutionContext(identity_candidate=finished))
+        assert decision == Decision(DecisionKind.DEFER, reason="partial_identity_owed_full_read")
+
+    def test_a_finished_owner_with_auto_add_OFF_prompts_instead_of_minting(self):
+        """The CONCLUSION is never asked; whether the farm may create rows unattended is.
+
+        Ruling 3 settles "this is a different roll" from evidence. It says nothing about
+        ``auto_add_unknown``, which is a separate operator policy over every unknown roll —
+        so the discarded candidate lands on the same prompt lane any other unowned identity
+        would. What matters is what does NOT happen: no bind onto the finished row.
+        """
+        tag = "1C63F1E700000100"
+        uuid = "8AC9EC0847FD41D0890870319F2E1975"
+        finished = _view(spool_id=292, is_tagless=False, tag_uid=tag, tray_uuid=uuid, spent=True)
+        obs = _obs(tag_uid=tag, tray_uuid=uuid)
+        decision = resolve(
+            obs,
+            derive_state(obs, None),
+            ResolutionContext(identity_candidate=finished, auto_add_unknown=False),
+        )
+        assert decision == Decision(DecisionKind.NONE, reason="unknown_tag_prompt_owed")
+
+    def test_an_UNBOUND_LIVE_row_owning_this_tag_still_binds(self):
+        """LIVENESS PAIR — the other direction of the same untested branch.
+
+        A live row that owns the identity is still the answer (``identity_resolved_candidate``,
+        scenario G2 — a tagged roll moved to another printer). Only FINISHED rolls are
+        refused, and only because a finished roll is not a live occupant.
+        """
+        tag = "1C63F1E700000100"
+        uuid = "8AC9EC0847FD41D0890870319F2E1975"
+        live = _view(spool_id=292, is_tagless=False, tag_uid=tag, tray_uuid=uuid, spent=False)
+        obs = _obs(tag_uid=tag, tray_uuid=uuid)
+        decision = resolve(obs, derive_state(obs, None), ResolutionContext(identity_candidate=live))
+        assert decision == Decision(DecisionKind.BIND, spool_id=292, reason="identity_resolved_candidate")
+
+    def test_a_finished_candidate_never_ROUTES_A_RETIRE_at_a_LIVE_incumbent(self):
+        """A finished CANDIDATE never becomes a ``REPLACE_SPENT``, and that is structural.
+
+        ``REPLACE_SPENT`` archives whatever holds the SLOT (``_apply_replace_spent`` takes
+        its departed row from the assignment, which is what every emission's
+        ``binding.spool_id`` names). A finished candidate is not this slot's occupant, so
+        routing it through that arm would retire the live roll standing in the tray. The
+        table therefore mints instead: the incumbent is displaced by the writer's ordinary
+        move semantics — exactly as a LIVE owner's bind would displace it — and nothing
+        retires spool 46.
+        """
+        tag = "1C63F1E700000100"
+        uuid = "8AC9EC0847FD41D0890870319F2E1975"
+        incumbent = _view(
+            spool_id=46, is_tagless=False, tag_uid="EC96F1E700000100", tray_uuid="A74AC09B2B8443BCB0112C15631EFCEC"
+        )
+        finished = _view(spool_id=292, is_tagless=False, tag_uid=tag, tray_uuid=uuid, spent=True)
+        obs = _obs(tag_uid=tag, tray_uuid=uuid)
+        decision = resolve(
+            obs,
+            derive_state(obs, incumbent),
+            ResolutionContext(binding=incumbent, identity_candidate=finished),
+        )
+        assert decision.kind is DecisionKind.MINT
+        assert decision.mint_spec["replace_existing"] is True
+        # Neither the finished row nor the incumbent is named for retirement.
+        assert decision.spool_id is None
 
 
 class TestRow2UntaggedClaim:
@@ -766,11 +931,56 @@ class TestRow4TaglessLane:
         decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
         assert decision == Decision(DecisionKind.BIND, spool_id=210, reason="pre_configured_apply"), label
 
-    def test_reclaim_preserves_the_row_of_a_roll_that_came_back(self):
+    def test_a_debounce_preserves_the_row_when_the_absence_was_short_and_uncaused(self):
+        """T1 — a glitched exist bit, the roll never moved. The lane's ONE real job."""
         donor = _view(spool_id=168)
         obs = _obs()
-        decision = resolve(obs, derive_state(obs, None), ResolutionContext(last_location_candidate=donor))
-        assert decision == Decision(DecisionKind.RECLAIM, spool_id=168, reason="last_location_reclaim")
+        ctx = ResolutionContext(debounce_candidate=donor, reseat_within_window=True)
+        decision = resolve(obs, derive_state(obs, None), ctx)
+        assert decision == Decision(DecisionKind.RECLAIM, spool_id=168, reason="reseat_debounce")
+
+    def test_a_donor_outside_the_window_mints_instead(self):
+        """T2/T3/T5 — shape 32. Outside the window the farm asserts NOTHING."""
+        obs = _obs()
+        ctx = ResolutionContext(
+            debounce_candidate=_view(spool_id=292), reseat_within_window=False, tagless_default=TAGLESS_DEFAULT
+        )
+        decision = resolve(obs, derive_state(obs, None), ctx)
+        assert decision.kind is DecisionKind.MINT
+        assert decision.reason == "tagless_mint"
+
+    def test_a_runout_suspect_slot_mints_even_inside_the_window(self):
+        """T7/T8 — operator ruling 15: a runout release is never a glitch.
+
+        The regression gate for this wave. Without it, scoping the lane to short gaps
+        CONCENTRATES the reclaim on exactly the refill-after-runout case, because a refill
+        on a demanded slot is precisely a fast return.
+        """
+        obs = _obs()
+        ctx = ResolutionContext(
+            debounce_candidate=_view(spool_id=292),
+            reseat_within_window=True,
+            runout_suspect=True,
+            tagless_default=TAGLESS_DEFAULT,
+        )
+        decision = resolve(obs, derive_state(obs, None), ctx)
+        assert decision.kind is DecisionKind.MINT
+        assert decision.reason == "runout_suspect_mint"
+
+    def test_cause_is_weighed_before_duration(self):
+        """Doctrine rule 6 applied to a decision: BY CAUSE, never by timing.
+
+        Pinned as its own case because the two orderings are indistinguishable on the
+        happy path and only diverge here.
+        """
+        obs = _obs()
+        both = ResolutionContext(
+            debounce_candidate=_view(spool_id=1),
+            reseat_within_window=True,
+            runout_suspect=True,
+            tagless_default=TAGLESS_DEFAULT,
+        )
+        assert resolve(obs, derive_state(obs, None), both).kind is DecisionKind.MINT
 
     def test_mint_when_there_is_nothing_to_reclaim(self):
         obs = _obs()
@@ -783,9 +993,11 @@ class TestRow4TaglessLane:
         assert decision.mint_spec["tray_type"] == "PETG"
         assert decision.mint_spec["replace_existing"] is False
 
-    def test_reclaim_outranks_mint(self):
+    def test_debounce_outranks_mint_inside_the_window(self):
         obs = _obs()
-        ctx = ResolutionContext(last_location_candidate=_view(spool_id=168), tagless_default=TAGLESS_DEFAULT)
+        ctx = ResolutionContext(
+            debounce_candidate=_view(spool_id=168), reseat_within_window=True, tagless_default=TAGLESS_DEFAULT
+        )
         assert resolve(obs, derive_state(obs, None), ctx).kind is DecisionKind.RECLAIM
 
     @pytest.mark.parametrize(
@@ -866,8 +1078,16 @@ class TestRow4TaglessLane:
         assert decision == Decision(DecisionKind.KEEP, spool_id=212, reason="spent_latch")
 
     def test_a_tag_read_over_a_spent_row_still_belongs_to_row_2(self):
-        """The respool tiers' entry point is unchanged: a push that ASSERTS the bound
-        row's identity KEEPs at row 2.1, which is where the orchestrator runs them."""
+        """Row ownership is unchanged: a push that ASSERTS the bound row's identity is
+        decided by the IDENTITY lane, never by row 4's tagless machinery.
+
+        What row 2 concludes there changed on 2026-08-19 (G3 — the tag is on a reused
+        core, so the drained row retires and its successor carries the tag), and the
+        distinction this test exists for is unaffected: the identity lane owns the push.
+        The proof is in the mint spec — row 2 mints from the TRAY's identity, while row
+        4a's ``spent_swap_confirmed`` would have minted from the tagless default and
+        thrown the tag away.
+        """
         tag = "1C63F1E700000100"
         uuid = "8AC9EC0847FD41D0890870319F2E1975"
         bound = _view(spool_id=212, is_tagless=False, tag_uid=tag, tray_uuid=uuid, spent=True)
@@ -877,7 +1097,10 @@ class TestRow4TaglessLane:
             derive_state(obs, bound),
             ResolutionContext(binding=bound, qualified_cycle_pending=True, tagless_default=TAGLESS_DEFAULT),
         )
-        assert decision == Decision(DecisionKind.KEEP, spool_id=212, reason="identity_matches_bound")
+        assert decision.reason == "reused_core_swap"
+        assert decision.spool_id == 212
+        assert decision.mint_spec["source"] == "tray"
+        assert decision.mint_spec["tray_uuid"] == uuid
 
     def test_tagless_lane_runs_mid_print(self):
         """A configured tagless slot is OCCUPIED_ASSUMED, not UNRESOLVED — the
@@ -1083,6 +1306,249 @@ class TestSpentSwapOnANoTagRead:
 
     def test_the_reason_is_part_of_the_public_contract(self):
         assert "spent_swap_no_tag_read" in RESOLUTION_REASONS
+
+
+class TestTheContradictionIsGeneral:
+    """Doctrine rule 11 — a tagless roll can NEVER be an RFID roll, in EVERY scenario.
+
+    Operator-ratified 2026-08-19: *"finding no chip over a binding that has one is positive
+    proof of a different roll. This should be happening for all scenarios… a tagless cannot
+    be an rfid roll in ALL scenarios, im not sure why it's bounded to just spent spools."*
+
+    The table already argued exactly this, in row 5a's own comment ("the same certainty class
+    as a uuid disagreement"), and then confined the conclusion to ONE constellation — a spent
+    row under a BARE tray. Two gates did the confining and both are gone: ``not
+    binding.spent`` in ``slot_pipeline._no_tag_read_answered``, and the strict ``tray_bare``
+    it handed ``ams_presence.read_answered_no_tag``. The second was the larger one: a
+    third-party PETG roll reports ``tray_type: "PETG"``, ``tray_info_idx: "GFG02"``,
+    ``tag_uid: null`` — CONFIGURED, not bare — so the evidence could never fire for the
+    commonest physical swap on this fleet.
+
+    The four quadrants of the contradiction, all pinned here:
+
+    * **G7** tagged binding + answered no-tag + a CONFIGURED tray ⇒ retire, mint tagless;
+    * **G8** tagless binding + a tag asserted ⇒ displaced by identity (already correct);
+    * **G9** tagless binding + answered no-tag ⇒ NO conclusion (the arm that must not fire);
+    * **G10** a push that merely OMITS the RFID fields ⇒ KEEP (silence is not an answer).
+    """
+
+    LIVE_TAG = "1C63F1E700000200"
+    BARE = {"id": 1, "state": 10}  # seated, no config, no tag
+
+    def _tagged_live(self, **kw):
+        """The G7 departed row: an RFID Bambu roll, still live, bound to the slot."""
+        return _view(spool_id=301, is_tagless=False, tag_uid=self.LIVE_TAG, **kw)
+
+    def _ctx(self, bound, **kw):
+        base = {"binding": bound, "no_tag_read_answered": True, "tagless_default": TAGLESS_DEFAULT}
+        base.update(kw)
+        return ResolutionContext(**base)
+
+    def _resolve(self, obs, bound, **kw):
+        return resolve(obs, derive_state(obs, bound), self._ctx(bound, **kw))
+
+    # --- G7: the configured tray, which is the whole point ------------------
+
+    def test_G7_a_CONFIGURED_tray_answering_no_tag_retires_the_tagged_binding(self):
+        """THE fix. The tray is configured — asserted here, because a bare-tray-only
+        predicate could never fire for it and that is precisely why G7 persisted silently
+        with the wrong row bound."""
+        obs = _obs()
+        assert obs.config_nonempty is True and obs.identity_asserted is False
+        bound = self._tagged_live()
+
+        decision = self._resolve(obs, bound)
+
+        assert decision.kind is DecisionKind.MINT
+        assert decision.reason == "tagged_swap_no_tag_read"
+
+    def test_G7_the_departed_row_is_UNLINKED_not_archived(self):
+        """A roll that LEFT is not a roll that ran dry: it keeps its grams and its history
+        and is merely unbound (``replace_existing``), which is what separates this from row
+        5a's ``REPLACE_SPENT``. The Decision carries no ``spool_id`` for exactly that reason
+        — there is no row to archive."""
+        decision = self._resolve(_obs(), self._tagged_live())
+
+        assert decision.kind is DecisionKind.MINT
+        assert decision.spool_id is None
+        assert decision.mint_spec["replace_existing"] is True
+
+    def test_G7_firmware_leftover_config_mints_from_the_tagless_DEFAULT(self):
+        """The configuration a swapped-into tray reports is usually the DEPARTED roll's,
+        left behind by the firmware. ``departed=binding`` is what makes the fresh roll get a
+        clean identity instead of inheriting the description of the roll that left."""
+        decision = self._resolve(_obs(), self._tagged_live())
+
+        assert decision.mint_spec["source"] == "tagless_default"
+        assert decision.mint_spec["default_filament"] == TAGLESS_DEFAULT
+
+    def test_G7_a_genuinely_different_filament_mints_from_the_TRAY(self):
+        """When the tray's configuration is NOT the departed row's, it is the new roll's own
+        and the mint uses it."""
+        obs = _obs(tray_type="PLA", tray_color="FF0000FF", tray_info_idx="GFA00")
+        decision = self._resolve(obs, self._tagged_live())
+
+        assert decision.reason == "tagged_swap_no_tag_read"
+        assert decision.mint_spec["source"] == "tray"
+        assert (decision.mint_spec["tray_type"], decision.mint_spec["tray_color"]) == ("PLA", "FF0000FF")
+
+    def test_G7_mid_print_keeps_the_binding(self):
+        """Doctrine rule 5 outranks the evidence: mid-print the farm commands no reads, so an
+        answer still standing during a print predates it and says nothing about a roll
+        inserted since (the scenario-R4 mis-mint this refusal exists to prevent)."""
+        decision = self._resolve(_obs(), self._tagged_live(), busy=True)
+
+        assert decision == Decision(DecisionKind.KEEP, spool_id=301, reason="tagged_row_awaits_tag_lane")
+
+    def test_G7_presence_unknown_keeps_the_binding(self):
+        """Invariant 3's tri-state: nothing asserted seated, nothing to be a different roll.
+        An unknown is never resolved toward a binding write."""
+        decision = self._resolve(_obs(present=None, state=None), self._tagged_live())
+
+        assert decision == Decision(DecisionKind.KEEP, spool_id=301, reason="tagged_row_awaits_tag_lane")
+
+    def test_G7_an_operators_pre_config_intent_is_never_guessed_over(self):
+        """Scenario T13. A pre-configured binding is the operator saying which roll is going
+        into this slot; the one-shot apply outranks the contradiction, exactly as it outranks
+        de-bounce and mint — and exactly as ``_operator_recheck_answered`` excludes it."""
+        decision = self._resolve(_obs(), self._tagged_live(pre_configured=True))
+
+        assert decision == Decision(DecisionKind.BIND, spool_id=301, reason="pre_configured_apply")
+
+    # --- G10: silence is not an answer --------------------------------------
+
+    def test_G10_a_push_that_merely_OMITS_the_rfid_fields_still_keeps_the_binding(self):
+        """Row 4b′'s original contract, which the new arm must not swallow. Periodic AMS
+        pushes routinely omit identity — that is why the merge preserves it — so "not asked"
+        and "asked and answered" must stay different things."""
+        decision = self._resolve(_obs(), self._tagged_live(), no_tag_read_answered=False)
+
+        assert decision == Decision(DecisionKind.KEEP, spool_id=301, reason="tagged_row_awaits_tag_lane")
+
+    def test_G10_holds_for_a_BARE_tray_too(self):
+        """The same distinction one row down: with no answer, a bare tray under a live tagged
+        binding still only OWES a read."""
+        obs = observe_tray(1, 0, dict(self.BARE))
+        decision = self._resolve(obs, self._tagged_live(), no_tag_read_answered=False)
+
+        assert decision == Decision(DecisionKind.NONE, reason="identity_unresolved")
+
+    # --- G9: the arm that must NOT fire -------------------------------------
+
+    def test_G9_a_TAGLESS_binding_has_no_claim_to_contradict_configured_tray(self):
+        """**Do not "fix" this test.** Rule 11 is one-way BY LOGIC, not by timidity: a
+        binding that claims NO identity has nothing for a no-tag read to disagree with, and
+        the same bare core reads identically before and after a swap (same-core ambiguity).
+        The answer here is the ordinary fingerprint KEEP — the contradiction lane is not
+        consulted at all."""
+        bound = _view(spool_id=140)  # is_tagless=True
+        decision = self._resolve(_obs(), bound)
+
+        assert decision == Decision(DecisionKind.KEEP, spool_id=140, reason="fingerprint_matches")
+
+    def test_G9_a_TAGLESS_binding_has_no_claim_to_contradict_bare_tray(self):
+        """**Do not "fix" this test either.** Same logic, bare tray: the slot owes a read,
+        and nothing about the no-tag answer licenses retiring a claim-less row. Same-core
+        ambiguity is resolved by a PHYSICAL event (the qualified-cycle machinery), never by
+        this evidence."""
+        obs = observe_tray(1, 0, dict(self.BARE))
+        decision = self._resolve(obs, _view(spool_id=140))
+
+        assert decision == Decision(DecisionKind.NONE, reason="identity_unresolved")
+
+    def test_G9_holds_when_the_tagless_row_carries_only_a_SIBLING_tag(self):
+        """G6's converse. ``is_tagless`` is the canonical THREE-column test resolved when the
+        view was built, so a row whose only identity is the roll's far-side chip is TAGGED —
+        it has a claim, and the contradiction applies to it."""
+        bound = _view(spool_id=302, is_tagless=False, sibling_tag_uid=self.LIVE_TAG)
+        decision = self._resolve(_obs(), bound)
+
+        assert decision.reason == "tagged_swap_no_tag_read"
+
+    # --- G8: tagless → tagged, already correct ------------------------------
+
+    def test_G8_a_tag_asserted_over_a_tagless_binding_binds_the_tags_OWNER(self):
+        """Pre-existing behaviour, pinned by its first test — row 2.2 deliberately falls
+        through for a claim-less binding ("it simply has no claim to weigh"), and 2.3
+        displaces it by identity. Cited, not rebuilt."""
+        bound = _view(spool_id=140)  # tagless, holding the slot
+        owner = _view(spool_id=303, is_tagless=False, tag_uid=self.LIVE_TAG, tray_uuid="UUID-G8")
+        obs = _obs(tag_uid=self.LIVE_TAG, tray_uuid="UUID-G8")
+
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound, identity_candidate=owner))
+
+        assert decision == Decision(DecisionKind.BIND, spool_id=303, reason="identity_resolved_candidate")
+
+    def test_G8_an_unknown_tag_over_a_tagless_binding_mints_and_displaces_it(self):
+        """The other half of the same row: no row owns the identity, so the full pair mints a
+        new RFID row and the tagless row is unlinked (``replace_existing``) — it keeps its
+        grams, it simply no longer claims this slot."""
+        bound = _view(spool_id=140)
+        obs = _obs(tag_uid=self.LIVE_TAG, tray_uuid="UUID-G8")
+
+        decision = resolve(obs, derive_state(obs, bound), ResolutionContext(binding=bound))
+
+        assert decision.kind is DecisionKind.MINT
+        assert decision.reason == "unknown_identity_auto_add"
+        assert decision.mint_spec["replace_existing"] is True
+
+    # --- the two mirror arms the generalisation also unblocks ---------------
+
+    def test_a_SPENT_tagged_binding_under_a_CONFIGURED_tray_now_concludes_too(self):
+        """Row 4a′ — row 5a's missing twin. The same slot, the same answer, parked forever on
+        ``spent_latch`` for no better reason than that the firmware had left the departed
+        roll's ``tray_type`` behind. Proof does not become less positive because the tray
+        happens to carry configuration."""
+        bound = self._tagged_live(spent=True)
+        decision = self._resolve(_obs(), bound, qualified_cycle_pending=False)
+
+        assert decision.kind is DecisionKind.REPLACE_SPENT
+        assert decision.spool_id == 301
+        assert decision.reason == "spent_swap_no_tag_read"
+
+    def test_a_measured_physical_cycle_still_wins_its_own_reason(self):
+        """Ordering pin: the cycle arm stays FIRST. A measured physical event is the primary
+        evidence and keeps ``spent_swap_confirmed``, so the COUNT of each reason in the logs
+        goes on meaning what it meant."""
+        bound = self._tagged_live(spent=True)
+        decision = self._resolve(_obs(), bound, qualified_cycle_pending=True)
+
+        assert decision.reason == "spent_swap_confirmed"
+
+    def test_a_LIVE_tagged_binding_under_a_BARE_tray_mirrors_row_5a(self):
+        """Row 5b. Without it this constellation fell to ``identity_unresolved`` and re-owed a
+        read it had already been given — the exact silence that parked spool 226 for a day
+        (2026-08-07), reproduced one binding-state over. It differs from 5a only in the
+        disposition of the departed row: unlinked, not archived."""
+        obs = observe_tray(1, 0, dict(self.BARE))
+        assert (obs.present, obs.identity_asserted, obs.config_nonempty) == (True, False, False)
+
+        decision = self._resolve(obs, self._tagged_live())
+
+        assert decision.kind is DecisionKind.MINT
+        assert decision.reason == "tagged_swap_no_tag_read"
+        assert decision.mint_spec["source"] == "tagless_default"
+        assert decision.mint_spec["replace_existing"] is True
+
+    def test_a_bare_slot_with_no_tagless_default_keeps_owing_its_read(self):
+        """A bare tray carries no fields to mint the replacement FROM, so with no default
+        configured there is nothing to bind — the same local guard row 5a has, for the same
+        reason. Row 4b′ needs none: a configured tray can always mint from itself."""
+        obs = observe_tray(1, 0, dict(self.BARE))
+        decision = self._resolve(obs, self._tagged_live(), tagless_default=None)
+
+        assert decision == Decision(DecisionKind.NONE, reason="identity_unresolved")
+
+    def test_a_bare_slot_awaiting_a_PRE_CONFIGURED_roll_is_left_alone(self):
+        """Scenario T13 again, one row down: 5b is ordered AFTER the pre-configured KEEP, so
+        operator intent is never guessed over here either."""
+        obs = observe_tray(1, 0, dict(self.BARE))
+        decision = self._resolve(obs, self._tagged_live(pre_configured=True))
+
+        assert decision == Decision(DecisionKind.KEEP, spool_id=301, reason="pre_configured_awaiting_insert")
+
+    def test_the_reason_is_part_of_the_public_contract(self):
+        assert "tagged_swap_no_tag_read" in RESOLUTION_REASONS
 
 
 # --- I/O-free contract ------------------------------------------------------

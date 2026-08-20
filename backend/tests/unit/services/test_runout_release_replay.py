@@ -21,9 +21,17 @@ never seed a module's internal set. A test that hand-places the state its subjec
 supposed to derive proves only that the assertion matches the seed (house lesson,
 memory ``liveness-paired-verification``): a cured storm and a starved lane look identical
 from the outside, so the pins here are that the stamp HAPPENS, on the right row, once.
+
+ONE declared exception, added with the 2026-08-19 gap cases (⑥): ``_seed_reseat`` states
+the wire's loss→gain edge pair instead of manufacturing it. Those edges belong to
+``ams_presence`` and are pinned by its own suite, and reproducing them here would mean
+either sleeping out a five-second flap filter or patching the monotonic clock. Everything
+those cases actually test — the cycle's arming, its survival, the pipeline's decision, the
+spent stamp and the self-heal — still runs through the production entry points.
 """
 
 import logging
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -214,6 +222,35 @@ class _Recorder:
         return True
 
 
+def _seed_reseat(printer_id, ams_id, tray_id, *, absent_for, under_active_feed=False):
+    """Stand in for the wire's loss→gain edge pair on one slot.
+
+    The de-bounce lane reads two PEEK predicates the presence lane banks at the gain
+    (``ams_presence.reseat_within_window`` / ``reseat_under_active_feed``). Those edges are
+    ``ams_presence``'s own subject and are pinned by its suite; what is under test HERE is
+    what the pipeline and the spent lanes do with the answer, so the pair is stated
+    explicitly rather than manufactured by sleeping out a five-second flap filter.
+    """
+    ams_presence._reseat[(printer_id, ams_id, tray_id)] = ams_presence._Reseat(absent_for, under_active_feed)
+
+
+@pytest.fixture
+def cycle_sessions(test_engine, monkeypatch):
+    """Point ``spool_tagless``'s own-session opener at the test engine.
+
+    ``note_physical_cycle`` — the production entry the presence lane calls on a qualified
+    gain — runs its prompt lane in a session of its own, because the AMS callback has none
+    to lend. Patched here so the ARMING path is the real one rather than a poked set.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    import backend.app.core.database as core_db
+
+    maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(core_db, "async_session", maker)
+    return maker
+
+
 @pytest.fixture
 def pipeline_env(monkeypatch):
     recorder = _Recorder()
@@ -325,7 +362,7 @@ async def test_refill_after_stamp_gains_mint_not_reclaim(
     # caused by the spent stamp and by nothing else (fingerprint, slot or boundness).
     donor.spent_at = None
     await db_session.commit()
-    assert await slot_pipeline._last_location_candidate(db_session, obs) is donor
+    assert await slot_pipeline._debounce_candidate(db_session, obs) is donor
 
 
 # --- ③ the chained, RESCUED shape -------------------------------------------
@@ -471,3 +508,185 @@ async def test_bogus_demand_replay_never_stamps_loaded_slot(
     assert any("OCCUPIED" in r.getMessage() and "bogus-latch" in r.getMessage() for r in caplog.records)
     # And the binding is untouched — a stand-down changes nothing at all.
     assert (await _assignment_spool(db_session, printer.id, 0, 3)).id == healthy.id
+
+
+# --- ⑥ the gap refill layer 1 cannot see (T8b/T8c) ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_gap_refill_debounces_then_self_heals_on_the_spent_stamp(
+    db_session, printer_factory, own_session_factory, pipeline_env, cycle_sessions
+):
+    """T8b: the firmware auto-refilled to a backup BEFORE the bit cleared, so the CAUSE
+    test is blind — and the slot must still not park.
+
+    The de-bounce is disqualified by cause when the slot was the active feeder at the loss
+    edge. A firmware auto-refill moves the feeder to a backup slot FIRST, so the drained
+    bay empties while feeding nothing: no feeder evidence, no open incident yet (the HMS is
+    still ~3 minutes out), and a refill inside that window looks exactly like a fast return.
+    It therefore DE-BOUNCES onto the exhausted-but-not-yet-spent row — which is survivable
+    only because the physical cycle outlives an unbound resolution. When the runout finally
+    lands, tier 1 stamps the row now bound to the slot, and the very next push hits row 4a
+    with a cycle still pending: ``REPLACE_SPENT``, one second, no operator action.
+
+    Before this wave the prompt lane discarded that cycle the moment it found the slot
+    unbound, so the stamp landed on a latch nothing could release and the slot parked until
+    a human pulled and re-seated the roll (CLAUDE.md's 2026-08-13 gotcha (b)).
+    """
+    printer = await printer_factory()
+    exhausted = await _bind(db_session, printer.id, 0, 3, weight_used=900.0)
+    await _release(db_session, exhausted)  # T−3 min: the bay clears, minutes before the HMS
+
+    # T−1 min: the operator refills. A measured, short absence and NO feeder evidence —
+    # the auto-refill had already moved the feed away from this slot.
+    await spool_tagless.note_physical_cycle(printer.id, 0, 3)
+    _seed_reseat(printer.id, 0, 3, absent_for=45.0, under_active_feed=False)
+    obs = observe_tray(printer.id, 0, _seated(3))
+    deps = _deps(db_session, pipeline_env)
+    debounced = await run_slot_pipeline(printer.id, [obs], deps)
+
+    assert debounced[0].decision.reason == "reseat_debounce"
+    assert (await _assignment_spool(db_session, printer.id, 0, 3)).id == exhausted.id
+    assert spool_tagless.qualified_cycle_pending(printer.id, 0, 3) is True, (
+        "the cycle must survive the unbound resolution — this is the whole of layer 2"
+    )
+
+    # T−0: the runout HMS. The slot is bound again, so tier 1 names the right roll.
+    await _push(printer.id, _state(trays=[_seated(3)]), own_session_factory)
+    await _push(
+        printer.id,
+        _state(trays=[_seated(3)], hms=[_pullback(3), _demand(3), _insert_filament()]),
+        own_session_factory,
+    )
+    db_session.expunge_all()
+    assert (await db_session.get(Spool, exhausted.id)).spent_at is not None
+
+    # The next push heals it — the same arm that handles every other spent-roll swap.
+    healed = await run_slot_pipeline(printer.id, [obs], deps)
+
+    assert healed[0].decision.reason == "spent_swap_confirmed"
+    assert healed[0].applied is True
+    successor = await _assignment_spool(db_session, printer.id, 0, 3)
+    assert successor.id != exhausted.id
+    assert successor.spent_at is None
+    assert (successor.weight_used or 0) == 0, "the fresh roll starts at zero, not at the drained row's 900 g"
+    db_session.expunge_all()
+    drained = await db_session.get(Spool, exhausted.id)
+    assert drained.spent_at is not None and drained.archived_at is not None
+    assert drained.weight_used == 900.0  # the ledger stays raw
+    assert spool_tagless.qualified_cycle_pending(printer.id, 0, 3) is False, "spent exactly once"
+
+
+@pytest.mark.asyncio
+async def test_gap_refill_after_a_restart_mints_and_never_resurrects_the_drained_row(
+    db_session, printer_factory, own_session_factory, pipeline_env, cycle_sessions
+):
+    """T8c: a restart lands inside the gap — every loss-edge fact is gone.
+
+    A deploy inside a three-minute window is ordinary, and every presence edge is process
+    memory by construction. After it the slot's absence has UNKNOWN duration, and unknown is
+    never "short" (rule 7 as amended, condition 4): the farm asserts nothing and MINTS, so
+    the fresh roll gets its own row and the drained one is never resurrected — which is the
+    outcome the operator needs, reached without the de-bounce rather than through it.
+
+    Recorded divergence from the plan's matrix row, which predicted "the same self-heal as
+    T8b" here: a restart wipes ``_absent_since`` together with the feeder stamp, so the
+    refill's gain measures no absence at all. That answers the de-bounce NO (mint) instead
+    of yes-then-heal, and it also means the presence lane banks no qualified cycle — nothing
+    for layer 2 to preserve. The mint is the better of the two answers (the fresh roll never
+    carries the drained row's grams, not even for three minutes) and the drained row keeps
+    its own history for the spent lane's tier-2 attribution.
+    """
+    printer = await printer_factory()
+    exhausted = await _bind(db_session, printer.id, 0, 3, weight_used=900.0)
+    await _release(db_session, exhausted)
+
+    # --- the deploy: a fresh process knows nothing about this printer's wire history ---
+    for mod in (spool_respool, hms_edges, ams_presence, slot_pipeline, spool_tagless):
+        mod._reset_state()
+
+    obs = observe_tray(printer.id, 0, _seated(3))
+    deps = _deps(db_session, pipeline_env)
+    refilled = await run_slot_pipeline(printer.id, [obs], deps)
+
+    assert refilled[0].decision.reason == "tagless_mint"
+    minted = await _assignment_spool(db_session, printer.id, 0, 3)
+    assert minted.id != exhausted.id
+    assert (minted.weight_used or 0) == 0
+    db_session.expunge_all()
+    drained = await db_session.get(Spool, exhausted.id)
+    assert drained.spent_at is None and drained.archived_at is None
+    assert drained.weight_used == 900.0
+    still_bound = await db_session.scalar(
+        select(func.count(SpoolAssignment.id)).where(SpoolAssignment.spool_id == drained.id)
+    )
+    assert still_bound == 0
+    assert spool_tagless.qualified_cycle_pending(printer.id, 0, 3) is False, (
+        "no measured cycle survives a restart, so none can be replayed later either"
+    )
+
+
+# --- ⑦ the stamp that lands after the refill (T7/T8/T8c) ---------------------
+
+
+@pytest.mark.asyncio
+async def test_a_refill_inside_the_gap_never_takes_the_drained_rolls_spent_stamp(
+    db_session, printer_factory, own_session_factory, pipeline_env, cycle_sessions
+):
+    """The other half of ⑥: the runout HMS arrives once the fresh roll is ALREADY bound.
+
+    ⑥ proves the refill mints its own row. This proves the exhaustion evidence that follows
+    still names the roll that ran dry — the regression the spool-identity wave shipped, and a
+    textbook case of a wave changing a lane's precondition without re-checking the consumer
+    (memory ``liveness-paired-verification``; the 08-13 wave starved every spent stamp the
+    same way). ``_mark_tray_spent`` tier 1 reads the LIVE assignment, so with a fresh row
+    bound it stamped that: probe output ``FRESH spent_at: 2026-08-20 10:29:14 used: 0.0`` /
+    ``DRAINED spent_at: None used: 900.0``. A brand-new roll reading 0 g remaining is
+    hard-excluded from selection with no automatic un-spend lane — the slot is dead until a
+    human intervenes — while the drained row stays selectable AND a reclaim candidate.
+
+    The restart is in here because T8c's timeline is the strictest version of the same
+    ordering: the refill mints (no measured absence survives a deploy, so no de-bounce is even
+    possible) and the drained row is left with nothing but its ``last_location_*`` residue to
+    speak for it.
+    """
+    printer = await printer_factory()
+    exhausted = await _bind(db_session, printer.id, 0, 3, weight_used=900.0)
+    await _release(db_session, exhausted)
+    # The bay cleared ~3 minutes before the firmware admits why (shape 31's three timed
+    # pairs). The RELEASE is production's own — only the clock is moved to where the wire
+    # really puts it, because same-instant stamps are not orderable: this one carries
+    # microseconds while ``SpoolAssignment.created_at`` is CURRENT_TIMESTAMP, truncated to
+    # the second.
+    exhausted.last_location_at = datetime.utcnow() - timedelta(minutes=3)
+    await db_session.commit()
+
+    # --- the deploy lands inside the gap: a fresh process, no presence history ---
+    for mod in (spool_respool, hms_edges, ams_presence, slot_pipeline, spool_tagless):
+        mod._reset_state()
+
+    obs = observe_tray(printer.id, 0, _seated(3))
+    refilled = await run_slot_pipeline(printer.id, [obs], _deps(db_session, pipeline_env))
+    assert refilled[0].decision.reason == "tagless_mint"
+    fresh_id = (await _assignment_spool(db_session, printer.id, 0, 3)).id
+
+    # A quiet frame seeds the tracker, then the runout appears — on a slot that now reads
+    # occupied by somebody else's roll.
+    await _push(printer.id, _state(trays=[_seated(3)]), own_session_factory)
+    await _push(
+        printer.id,
+        _state(trays=[_seated(3)], hms=[_pullback(3), _demand(3), _insert_filament()]),
+        own_session_factory,
+    )
+
+    db_session.expunge_all()
+    drained = await db_session.get(Spool, exhausted.id)
+    assert drained.spent_at is not None, "the roll that ran dry is the roll that gets stamped"
+    assert drained.weight_used == 900.0  # the ledger stays raw
+    fresh = await db_session.get(Spool, fresh_id)
+    assert fresh.spent_at is None, "the operator's brand-new roll must never be called exhausted"
+    assert (fresh.weight_used or 0) == 0
+    assert fresh.remaining_g > 0, "…and must still price as printable material to selection"
+    assert await _spent_count(db_session) == 1  # exactly one roll called exhausted
+    # The slot keeps the fresh roll: a stamp on an UNBOUND row moves no binding.
+    assert (await _assignment_spool(db_session, printer.id, 0, 3)).id == fresh_id

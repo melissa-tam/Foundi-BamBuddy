@@ -92,7 +92,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
 import { formatDateOnly, formatETA, formatDuration, parseUTCDate } from '../utils/date';
-import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, RespoolPromptMessage, TaglessFreshPromptMessage } from '../api/client';
+import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, RespoolPromptMessage, SlotRecheckResult, TaglessFreshPromptMessage } from '../api/client';
 import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
@@ -1795,7 +1795,7 @@ function PrinterCard({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const { showToast } = useToast();
+  const { showToast, showPersistentToast, dismissToast } = useToast();
   const { hasPermission } = useAuth();
   const [showMenu, setShowMenu] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -2699,46 +2699,140 @@ function PrinterCard({
     refetchInterval: showSkipObjectsModal ? 5000 : (isPrintingWithObjects ? 30000 : false), // 5s when modal open, 30s otherwise
   });
 
-  // State for tracking which AMS slot is being refreshed
-  const [refreshingSlot, setRefreshingSlot] = useState<{ amsId: number; slotId: number } | null>(null);
+  // State for tracking which AMS slot is being re-checked
+  const [recheckingSlot, setRecheckingSlot] = useState<{ amsId: number; slotId: number } | null>(null);
   // Track if we've seen the printer enter "busy" state (ams_status_main !== 0)
   const seenBusyStateRef = useRef<boolean>(false);
   // Fallback timeout ref
-  const refreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recheckTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Minimum display time passed
   const minTimePassedRef = useRef<boolean>(false);
 
-  // AMS slot refresh mutation
-  const refreshAmsSlotMutation = useMutation({
+  /**
+   * The sentence one re-check verdict gets. Silence WAS the bug (incident shape
+   * 32), so every verdict — including the two that change nothing, `unchanged`
+   * and `empty` — resolves to copy here; there is no branch that says nothing.
+   *
+   * `{{slot}}` is the 1-based slot number the rest of the card already prints.
+   * `identified` composes brand + material rather than interpolating both, so a
+   * tag carrying only one of them can never render "null" or a dangling space,
+   * and a tag carrying neither falls through to its own key.
+   */
+  const recheckSentence = (result: SlotRecheckResult): string => {
+    const slot = result.tray_id + 1;
+    switch (result.verdict) {
+      case 'minted':
+        return t('printers.toast.recheckMinted', {
+          slot,
+          grams: Math.round(result.label_weight_g ?? 0).toLocaleString(),
+        });
+      case 'identified': {
+        const identity = [result.brand, result.material].filter(Boolean).join(' ');
+        return identity
+          ? t('printers.toast.recheckIdentified', { slot, identity })
+          : t('printers.toast.recheckIdentifiedUnnamed', { slot });
+      }
+      case 'queued':
+        return t('printers.toast.recheckQueued', { slot });
+      case 'empty':
+        return t('printers.toast.recheckEmpty', { slot });
+      case 'restored':
+        return t('printers.toast.recheckRestored', { slot });
+      case 'unchanged':
+      default:
+        return t('printers.toast.recheckUnchanged', { slot });
+    }
+  };
+
+  /** Toast id for one slot's re-check acknowledgement (one per slot, replaced). */
+  const recheckToastId = (amsId: number, slotId: number) =>
+    `slot-recheck-${printer.id}-${amsId}-${slotId}`;
+
+  /** Every query that shows a slot's binding, so an undo lands everywhere at once. */
+  const invalidateSlotBindingQueries = () => {
+    for (const queryKey of [
+      ['inventory-spools'],
+      ['spoolman-inventory-spools'],
+      ['inventory-locations'],
+      ['spool-assignments'],
+      ['spoolman-slot-assignments'],
+      ['spoolman-slot-assignments-all'],
+    ]) {
+      queryClient.invalidateQueries({ queryKey });
+    }
+  };
+
+  /** Undo a click-driven mint — from the acknowledgement toast or the slot card. */
+  const undoRecheckMutation = useMutation({
     mutationFn: ({ amsId, slotId }: { amsId: number; slotId: number }) =>
-      api.refreshAmsSlot(printer.id, amsId, slotId),
+      api.undoAmsSlotRecheck(printer.id, amsId, slotId),
+    onSuccess: (result, { amsId, slotId }) => {
+      dismissToast(recheckToastId(amsId, slotId));
+      invalidateSlotBindingQueries();
+      showToast(recheckSentence(result), 'success');
+    },
+    onError: (error: Error, { slotId }) => {
+      // The 409 detail is a reason token, not operator copy: name the three the
+      // backend can return and keep the raw string only as the last resort.
+      const slot = slotId + 1;
+      const reasons: Record<string, string> = {
+        no_offer: t('printers.toast.recheckUndoNoOffer', { slot }),
+        no_predecessor: t('printers.toast.recheckUndoNoPredecessor', { slot }),
+        mint_gone: t('printers.toast.recheckUndoMintGone', { slot }),
+      };
+      showToast(
+        reasons[error.message] ??
+          t('printers.toast.recheckUndoFailed', { slot, detail: error.message }),
+        'error',
+      );
+    },
+  });
+
+  // AMS slot re-check mutation
+  const recheckAmsSlotMutation = useMutation({
+    mutationFn: ({ amsId, slotId }: { amsId: number; slotId: number }) =>
+      api.recheckAmsSlot(printer.id, amsId, slotId),
     onMutate: ({ amsId, slotId }) => {
       // Clear any existing timeout
-      if (refreshTimeoutRef.current) {
-        clearTimeout(refreshTimeoutRef.current);
+      if (recheckTimeoutRef.current) {
+        clearTimeout(recheckTimeoutRef.current);
       }
       // Reset state
       seenBusyStateRef.current = false;
       minTimePassedRef.current = false;
-      setRefreshingSlot({ amsId, slotId });
+      setRecheckingSlot({ amsId, slotId });
       // Minimum display time (2 seconds)
       setTimeout(() => {
         minTimePassedRef.current = true;
       }, 2000);
       // Fallback timeout (30 seconds max)
-      refreshTimeoutRef.current = setTimeout(() => {
-        setRefreshingSlot(null);
+      recheckTimeoutRef.current = setTimeout(() => {
+        setRecheckingSlot(null);
       }, 30000);
     },
-    onSuccess: (data) => {
-      showToast(data.message || t('printers.toast.rfidRereadInitiated'));
+    onSuccess: (result, { amsId, slotId }) => {
+      // A mint may be an operator who merely re-seated the SAME roll, so the
+      // acknowledgement carries its own undo. Persistent, because an undo the
+      // operator has to catch before it fades is not an undo — the slot card
+      // carries the same offer for as long as the backend stands behind it.
+      if (result.verdict === 'minted') invalidateSlotBindingQueries();
+      if (result.verdict === 'minted' && result.undo_available) {
+        showPersistentToast(recheckToastId(amsId, slotId), recheckSentence(result), 'success', {
+          actions: [{
+            label: t('printers.rfid.restorePreviousRoll'),
+            onClick: () => undoRecheckMutation.mutate({ amsId, slotId }),
+          }],
+        });
+        return;
+      }
+      showToast(recheckSentence(result), result.verdict === 'empty' ? 'warning' : 'info');
     },
     onError: (error: Error) => {
-      showToast(error.message || t('printers.toast.failedToRereadRfid'), 'error');
-      if (refreshTimeoutRef.current) {
-        clearTimeout(refreshTimeoutRef.current);
+      showToast(error.message || t('printers.toast.recheckFailed'), 'error');
+      if (recheckTimeoutRef.current) {
+        clearTimeout(recheckTimeoutRef.current);
       }
-      setRefreshingSlot(null);
+      setRecheckingSlot(null);
     },
   });
 
@@ -2906,7 +3000,7 @@ function PrinterCard({
   const deferredClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    if (!refreshingSlot) return;
+    if (!recheckingSlot) return;
 
     const amsStatus = status?.ams_status_main ?? 0;
 
@@ -2924,18 +3018,18 @@ function PrinterCard({
     if (seenBusyStateRef.current && amsStatus === 0) {
       if (minTimePassedRef.current) {
         // Min time passed - clear now
-        if (refreshTimeoutRef.current) {
-          clearTimeout(refreshTimeoutRef.current);
+        if (recheckTimeoutRef.current) {
+          clearTimeout(recheckTimeoutRef.current);
         }
-        setRefreshingSlot(null);
+        setRecheckingSlot(null);
       } else {
         // Schedule clear after min time (2 seconds from start)
         if (!deferredClearRef.current) {
           deferredClearRef.current = setTimeout(() => {
-            if (refreshTimeoutRef.current) {
-              clearTimeout(refreshTimeoutRef.current);
+            if (recheckTimeoutRef.current) {
+              clearTimeout(recheckTimeoutRef.current);
             }
-            setRefreshingSlot(null);
+            setRecheckingSlot(null);
           }, 2000);
         }
       }
@@ -2946,7 +3040,7 @@ function PrinterCard({
         clearTimeout(deferredClearRef.current);
       }
     };
-  }, [status?.ams_status_main, refreshingSlot]);
+  }, [status?.ams_status_main, recheckingSlot]);
 
   useEffect(() => {
     if (!showMenu) return;
@@ -3096,6 +3190,19 @@ function PrinterCard({
   };
 
   /**
+   * "Restore previous roll" verb for a slot whose last "Re-check slot" mint still
+   * has a standing undo offer (rule 12, R8).
+   *
+   * The offer is the backend's derived `recheck_undo_available` — it goes false by
+   * itself once the slot is re-decided, so the verb disappears without the page
+   * tracking anything. Returns `undefined` (verb hidden) when no offer stands.
+   */
+  const recheckUndoAction = (amsId: number, trayId: number, assignment: SpoolAssignment | undefined) => {
+    if (!assignment?.recheck_undo_available) return undefined;
+    return () => undoRecheckMutation.mutate({ amsId, slotId: trayId });
+  };
+
+  /**
    * A binding that outlived the filament, for the EMPTY-slot hover card (W5a).
    * Maps the API rows onto the card's flags; the card owns the wording. Returns
    * `null` when the slot has no inventory binding at all (the common case).
@@ -3125,14 +3232,14 @@ function PrinterCard({
     amsId,
     slotId,
     loadTrayId,
-    isRefreshing,
+    isRechecking,
     includeRfid = true,
     outOfRotationSpool = null,
   }: {
     amsId: number;
     slotId: number;
     loadTrayId: number;
-    isRefreshing?: boolean;
+    isRechecking?: boolean;
     includeRfid?: boolean;
     // The inventory spool bound to this slot, when a feed-fault jam took it out
     // of rotation. Present only at occupied slots; the chip clears the flag.
@@ -3140,7 +3247,7 @@ function PrinterCard({
   }) => {
     const printerBusy = status?.state === 'RUNNING';
 
-    // "Re-read RFID" is refused by the AMS itself in two states, and the refusal
+    // "Re-check slot" is refused by the AMS itself in two states, and the refusal
     // used to arrive only server-side ("Please unload filament first") after the
     // operator had already clicked — the dominant silent no-op on this menu. Both
     // conditions are visible on the live status, so the button states the reason
@@ -3181,13 +3288,13 @@ function PrinterCard({
             onClick={(e) => {
               e.stopPropagation();
               if (rfidDisabled) return;
-              refreshAmsSlotMutation.mutate({ amsId, slotId });
+              recheckAmsSlotMutation.mutate({ amsId, slotId });
             }}
-            disabled={rfidDisabled || isRefreshing}
+            disabled={rfidDisabled || isRechecking}
             title={rfidBlockReason}
           >
-            <RefreshCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin' : ''}`} />
-            {t('printers.rfid.reread')}
+            <RefreshCw className={`w-3 h-3 ${isRechecking ? 'animate-spin' : ''}`} />
+            {t('printers.rfid.recheck')}
           </button>
         )}
         <button
@@ -5106,8 +5213,8 @@ function PrinterCard({
                                 } : null;
 
                                 // Check if this specific slot is being refreshed
-                                const isRefreshing = refreshingSlot?.amsId === ams.id &&
-                                  refreshingSlot?.slotId === slotIdx;
+                                const isRechecking = recheckingSlot?.amsId === ams.id &&
+                                  recheckingSlot?.slotId === slotIdx;
 
                                 // #1762 (comment 2): which print-slot is mapped to THIS AMS slot.
                                 const activePrintSlotIdx = activeMapping.indexOf(globalTrayId);
@@ -5167,7 +5274,7 @@ function PrinterCard({
                                 return (
                                   <div key={slotIdx} className={`relative group w-full ${filamentSlotClass}`}>
                                     {/* Loading overlay during RFID re-read */}
-                                    {isRefreshing && (
+                                    {isRechecking && (
                                       <div className="absolute inset-0 bg-bambu-dark-tertiary/80 rounded flex items-center justify-center z-20">
                                         <RefreshCw className="w-4 h-4 text-bambu-green animate-spin" />
                                       </div>
@@ -5180,7 +5287,7 @@ function PrinterCard({
                                           amsId: ams.id,
                                           slotId: slotIdx,
                                           loadTrayId: ams.id * 4 + slotIdx,
-                                          isRefreshing,
+                                          isRechecking,
                                           outOfRotationSpool: inventoryAssignment?.spool ?? null,
                                         })}
                                         spoolman={{
@@ -5277,6 +5384,7 @@ function PrinterCard({
                                               label_weight_prefill: null,
                                             }) : undefined,
                                             onNewRoll: newRollAction(ams.id, slotIdx, assignment),
+                                            onRestorePreviousRoll: recheckUndoAction(ams.id, slotIdx, assignment),
                                             isAssigned: !!assignment || isBambuLabSpool(tray),
                                           };
                                         })()}
@@ -5307,7 +5415,7 @@ function PrinterCard({
                                           amsId: ams.id,
                                           slotId: slotIdx,
                                           loadTrayId: ams.id * 4 + slotIdx,
-                                          isRefreshing,
+                                          isRechecking,
                                         })}
                                         configureSlot={{
                                           enabled: hasPermission('printers:control'),
@@ -5409,8 +5517,8 @@ function PrinterCard({
                         } : null;
 
                         // Check if this specific slot is being refreshed
-                        const isHtRefreshing = refreshingSlot?.amsId === ams.id &&
-                          refreshingSlot?.slotId === htSlotId;
+                        const isHtRechecking = recheckingSlot?.amsId === ams.id &&
+                          recheckingSlot?.slotId === htSlotId;
 
                         // #1762 (comment 2): active print-slot index for this HT slot.
                         const htActivePrintSlotIdx = activeMapping.indexOf(globalTrayId);
@@ -5558,7 +5666,7 @@ function PrinterCard({
                               {/* Slot wrapper with loading overlay */}
                               <div className="relative group min-w-14 flex-1">
                                 {/* Loading overlay during RFID re-read */}
-                                {isHtRefreshing && (
+                                {isHtRechecking && (
                                   <div className="absolute inset-0 bg-bambu-dark-tertiary/80 rounded flex items-center justify-center z-20">
                                     <RefreshCw className="w-4 h-4 text-bambu-green animate-spin" />
                                   </div>
@@ -5571,7 +5679,7 @@ function PrinterCard({
                                       amsId: ams.id,
                                       slotId: htSlotId,
                                       loadTrayId: ams.id * 4 + htSlotId,
-                                      isRefreshing: isHtRefreshing,
+                                      isRechecking: isHtRechecking,
                                       outOfRotationSpool: htInventoryAssignment?.spool ?? null,
                                     })}
                                     spoolman={{
@@ -5663,6 +5771,7 @@ function PrinterCard({
                                           label_weight_prefill: null,
                                         }) : undefined,
                                         onNewRoll: newRollAction(ams.id, htSlotId, assignment),
+                                        onRestorePreviousRoll: recheckUndoAction(ams.id, htSlotId, assignment),
                                         isAssigned: !!assignment || isBambuLabSpool(tray),
                                       };
                                     })()}
@@ -5693,7 +5802,7 @@ function PrinterCard({
                                       amsId: ams.id,
                                       slotId: htSlotId,
                                       loadTrayId: ams.id * 4 + htSlotId,
-                                      isRefreshing: isHtRefreshing,
+                                      isRechecking: isHtRechecking,
                                     })}
                                     configureSlot={{
                                       enabled: hasPermission('printers:control'),
@@ -5962,6 +6071,7 @@ function PrinterCard({
                                             label_weight_prefill: null,
                                           }) : undefined,
                                           onNewRoll: newRollAction(255, slotTrayId, assignment),
+                                          onRestorePreviousRoll: recheckUndoAction(255, slotTrayId, assignment),
                                           isAssigned: !!assignment || isBambuLabSpool(extTray),
                                         };
                                       })()}

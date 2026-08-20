@@ -172,8 +172,21 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
       {/* Toast Container — to the left of the bug-report bubble (bottom-4 right-4 w-12).
           The kiosk layout suppresses this entire viewport so SpoolBuddy displays stay
-          free of main-app notifications. */}
-      <div className={`fixed bottom-4 right-20 z-[60] flex flex-col items-end gap-2 ${viewportSuppressed ? 'hidden' : ''}`}>
+          free of main-app notifications.
+
+          The viewport IS the live region (WCAG 2.2 4.1.3 Status Messages): toasts are
+          status messages, and a toast whose entire content is the message — "Slot 2
+          unchanged" — is invisible to a screen reader without one. It is declared here,
+          on the always-mounted container, never on the individual toasts: a live region
+          must exist before its content changes, and per-toast regions double-announce.
+          `aria-atomic="false"` so a second toast joining the stack announces only itself
+          instead of re-reading every toast on screen. */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="false"
+        className={`fixed bottom-4 right-20 z-[60] flex flex-col items-end gap-2 ${viewportSuppressed ? 'hidden' : ''}`}
+      >
         {toasts.map((toast) => (
           <div
             key={toast.id}

@@ -280,6 +280,19 @@ class SpoolAssignmentResponse(BaseModel):
     # live status — never stored — so a consumer can distinguish "empty" from
     # "we don't know" instead of guessing. Read-only; ignored on input.
     present: bool | None = None
+    # True while this slot carries a standing "Restore previous roll" offer: the row bound
+    # here was minted by an operator's "Re-check slot" click and is STILL the bound row
+    # (``slot_recheck.pending_undo``). Doctrine rule 12's honest false positive — an operator
+    # who merely re-seated the same roll after a jam clear gets a fresh row at label weight —
+    # surfaced with a one-click exit rather than hidden.
+    #
+    # DERIVED per request, never stored, and bounded by an EVENT rather than a timer: the
+    # slot's next physical cycle, mint or bind re-decides the slot, which dissolves the offer
+    # by cause. It rides here rather than on a poll of its own because the offer must outlive
+    # the toast that announces it (WCAG 2.2 2.2.1 — a timed toast may never be the only path
+    # to an action) and this is the payload the slot card already holds. Read-only; ignored
+    # on input.
+    recheck_undo_available: bool = False
 
     class Config:
         from_attributes = True

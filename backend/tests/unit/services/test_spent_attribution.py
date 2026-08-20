@@ -776,6 +776,22 @@ async def test_reconcile_slot_config_actually_invokes_the_detector_liveness_pin(
 # ===========================================================================
 
 
+async def _no_brand_to_respool_with(db) -> None:
+    """Force Tier 2's ESCALATION arm, which is the only one that still prompts.
+
+    Since 2026-08-19 (operator ruling 3) a spent + loaded tag arrival CONCLUDES — the
+    ``respool_auto_enabled`` toggle that used to make it ask is deleted. The prompt did
+    not go with it: "I know what happened but cannot carry it out" is an escalation, and
+    a re-spool with no brand to mint the fresh row from is exactly that. Both brand
+    sources have to go — the ``respool_last_brand`` prefill and the
+    ``tagless_default_filament`` fallback it drops to.
+    """
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db, "respool_last_brand", "")
+    await set_setting(db, "tagless_default_filament", "")
+
+
 @pytest.mark.asyncio
 async def test_spent_prompt_flags_an_impossible_ledger_and_omits_the_number(
     db_session, printer_factory, wire, caplog, monkeypatch
@@ -800,6 +816,7 @@ async def test_spent_prompt_flags_an_impossible_ledger_and_omits_the_number(
     donor.k_profiles = []
     donor.assignments = []
     db_session.add(donor)
+    await _no_brand_to_respool_with(db_session)
     await db_session.commit()
 
     tray = _tray()
@@ -838,6 +855,7 @@ async def test_healthy_ledger_spent_prompt_keeps_its_numbers(db_session, printer
     donor.k_profiles = []
     donor.assignments = []
     db_session.add(donor)
+    await _no_brand_to_respool_with(db_session)
     await db_session.commit()
 
     tray = _tray()
@@ -864,11 +882,19 @@ async def test_healthy_ledger_spent_prompt_keeps_its_numbers(db_session, printer
 # 1000 g label â€” impossible â€” which drove ``remaining_g`` to 0, failed the 150 g start
 # floor, and staged the whole production run silently for six hours.
 #
-# The reclaim itself is doctrine-correct (rule 7 forbids a duration threshold from
-# deciding tagless identity), so nothing here second-guesses it. What is pinned instead is
-# the reconcile at the moment the ledger becomes PROVABLY impossible: overshoot AND a
-# recorded re-bind, exact attribution of the post-boundary charges, one WARNING as the
-# only surface, and TAGGED rows never auto-reconciled.
+# Nothing here second-guesses the lane that produced that binding; what is pinned is the
+# reconcile at the moment the ledger becomes PROVABLY impossible: overshoot AND a recorded
+# re-bind, exact attribution of the post-boundary charges, one WARNING as the only surface,
+# and TAGGED rows never auto-reconciled.
+#
+# The sentence that used to stand here — "the reclaim itself is doctrine-correct (rule 7
+# forbids a duration threshold from deciding tagless identity)" — is superseded by rule 7's
+# 2026-08-19 amendment, the same claim (and the same cost) as the module header it echoed.
+# The reclaim is now a scoped de-bounce for a SPURIOUS release, and a de-bounce stamps no
+# re-bind boundary at all (``slot_pipeline._debounce_bind_moment``, pinned in
+# ``test_slot_pipeline``), which leaves an operator's manual re-assign as this lane's
+# remaining reachable trigger. The fixtures below therefore describe a boundary that is
+# still real, not one the de-bounce would create.
 
 _T0 = datetime(2026, 8, 11, 9, 0, 0)  # the row entered service
 _T1 = datetime(2026, 8, 12, 9, 56, 0)  # the reclaim re-bind â€” the boundary
@@ -1256,3 +1282,455 @@ async def test_the_reconcile_rides_the_detector_entry_and_its_throttle(db_sessio
     )
     await db_session.refresh(second)
     assert second.archived_at is not None, "past the floor it runs again"
+
+
+# ===========================================================================
+# D6 — the BACKWARD direction: an early runout hands the charges back (C3/C4)
+# ===========================================================================
+#
+# The mirror of D5, and the price of doctrine rule 7's 2026-08-19 amendment. Scoping the
+# breadcrumb reclaim to a 5-minute glitch filter made the farm MINT a fresh row at label
+# weight for every longer absence — right for a genuine roll change (T2/T3, the 002/005-H2S
+# incident), wrong for a roll pulled for an external dry, a jam clear or an inspection and
+# returned later (T5), and wrong for a restart that lands while the roll is out (T11).
+# Those write an ASSUMED full roll over a part-used one and so OVER-PROMISE the 150 g start
+# floor, which starts prints that die instead of staging them.
+#
+# The runout is the only moment the hardware states that roll's real capacity, so it is
+# where the mistake becomes recoverable: a row that ran dry having delivered far less than
+# its assumed label either was a part-used roll seated as full (C2 — ordinary stock,
+# operator ruling 4) or is the farm's own mistaken mint, in which case its delivered grams
+# ARE the remainder the row it displaced still had on the books.
+#
+# Rulings 4 and 5 genuinely conflict in the band where a DIFFERENT part-used roll happens
+# to deliver roughly what the departed row had left, and every test below is written so
+# that band resolves to ruling 4. The stand-down arm is the feature; the acting arm is the
+# optimisation.
+
+_R0 = datetime(2026, 8, 17, 8, 0, 0)  # the departed roll left this slot (pulled for a dry)
+_M0 = datetime(2026, 8, 17, 8, 40, 0)  # 40 min later — outside the window — its return MINTED
+_R1 = datetime(2026, 8, 18, 12, 0, 0)  # the mint's own bay-clear, ~3 min before its runout
+
+
+async def _released(db, printer_id, ams_id, tray_id, *, at, **kwargs):
+    """An UNBOUND row whose last recorded location is this slot.
+
+    Exactly the residue a release leaves behind (``spool_binding._stamp_last_location``),
+    which is the only thing still naming the victim once the AMS has cleared the bay —
+    ~3 minutes before it declares the runout (incident shape 31).
+    """
+    fields = {
+        "material": "PETG",
+        "color_name": "Black",
+        "rgba": "000000FF",
+        "brand": "Bambu Lab",
+        "label_weight": 1000,
+        "core_weight": 250,
+        "weight_used": 0.0,
+        "data_origin": "ams_auto",
+        "created_at": _R0,
+        "last_location_printer_id": printer_id,
+        "last_location_ams_id": ams_id,
+        "last_location_tray_id": tray_id,
+        "last_location_at": at,
+    }
+    fields.update(kwargs)
+    spool = Spool(**fields)
+    spool.k_profiles = []
+    spool.assignments = []
+    db.add(spool)
+    await db.flush()
+    await db.commit()
+    return spool
+
+
+async def _mistaken_mint(db, printer_id, ams_id, tray_id, *, delivered, at=_R1, **kwargs):
+    """The row rule 7's window minted when the roll came back, one history row per print."""
+    spool = await _released(
+        db, printer_id, ams_id, tray_id, at=at, created_at=_M0, weight_used=sum(delivered), **kwargs
+    )
+    for i, grams in enumerate(delivered):
+        db.add(
+            SpoolUsageHistory(
+                spool_id=spool.id,
+                printer_id=printer_id,
+                print_name=f"mint-{spool.id}-{i}",
+                weight_used=grams,
+                created_at=_M0 + timedelta(hours=1 + i),
+            )
+        )
+    await db.commit()
+    return spool
+
+
+async def _charges_of(db, spool_id):
+    """[(print_name, grams)] currently pointing at a row — the double-entry witness."""
+    res = await db.execute(
+        select(SpoolUsageHistory.print_name, SpoolUsageHistory.weight_used)
+        .where(SpoolUsageHistory.spool_id == spool_id)
+        .order_by(SpoolUsageHistory.print_name)
+    )
+    return [(name, round(float(grams), 1)) for name, grams in res.all()]
+
+
+async def _spool_rows(db):
+    res = await db.execute(select(Spool.id))
+    return sorted(r[0] for r in res.all())
+
+
+async def _runout(db, printer_id, ams_id, tray_id):
+    """Drive the one spent writer for a slot, exactly as every trigger lane does."""
+    return await spool_respool._mark_tray_spent(db, printer_id, ams_id * 4 + tray_id)
+
+
+@pytest.mark.asyncio
+async def test_an_early_runout_hands_the_charges_back_to_the_row_it_displaced(
+    db_session, printer_factory, wire, caplog
+):
+    """SCENARIO C3, driven through the REAL firmware trigger.
+
+    A 300 g part-roll is pulled for a dry, comes back 40 minutes later and mints a fresh
+    row assumed to hold 1000 g. It runs out after 300 g — exactly the remainder the
+    departed row still had — so the roll never changed and the mint did. The charges go
+    back with their own weights (RE-POINTED, not duplicated and not apportioned), the mint
+    is retired, and the departed row carries both the true total and the runout itself.
+    """
+    printer = await printer_factory(model="H2S")
+    departed = await _released(db_session, printer.id, 0, 2, at=_R0, weight_used=700.0)
+    mint = await _mistaken_mint(db_session, printer.id, 0, 2, delivered=(180.0, 120.0))
+    before = await _spool_rows(db_session)
+
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+        stamped = await mark_spent_on_slot_runout(
+            db_session,
+            printer.id,
+            [("00000000" + f"{_AUTO_SWITCH_CODE:08X}", _attr(0, 2), _AUTO_SWITCH_CODE)],
+            wire["state"],
+        )
+
+    assert [s.id for s in stamped] == [mint.id], "tier 2 names the row that just left the slot"
+
+    await db_session.refresh(departed)
+    await db_session.refresh(mint)
+    assert departed.weight_used == pytest.approx(1000.0), "700 g it genuinely fed + the mint's 300 g"
+    assert departed.spent_at == mint.spent_at, "ONE runout, re-attributed — never re-stamped off a fresh clock"
+    assert departed.archived_at is None, "the surviving row stays in inventory"
+    assert departed.remaining_g == pytest.approx(0.0), "spent ⇒ zero is derived, rule 8"
+    assert mint.archived_at is not None, "the mistaken mint is retired"
+    assert mint.weight_used == pytest.approx(0.0), "it kept nothing it never fed"
+
+    assert await _charges_of(db_session, mint.id) == [], "every charge left the mint"
+    assert await _charges_of(db_session, departed.id) == [
+        (f"mint-{mint.id}-0", 180.0),
+        (f"mint-{mint.id}-1", 120.0),
+    ], "RE-POINTED with their own weights: double entry, not duplicated and not apportioned"
+    assert await _spool_rows(db_session) == before, "the backward direction mints nothing"
+
+    assert "EARLY-RUNOUT RE-ATTRIBUTED" in caplog.text
+    assert "300 g went back to it" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("over", "acts", "why"),
+    [
+        (21.0, False, "21 g over the remainder: a DIFFERENT part-used roll, ruling 4 wins the band"),
+        (-21.0, False, "21 g under: the same band on the other side — stand-down is the default"),
+        (19.0, True, "inside the fit margin: one roll's worth of filament left this slot in total"),
+        (-19.0, True, "inside the fit margin on the low side"),
+    ],
+)
+async def test_the_fit_margin_is_the_dividing_line_and_the_band_belongs_to_ruling_4(
+    db_session, printer_factory, caplog, over, acts, why
+):
+    """SCENARIO C4 (and its two acting neighbours), pinned at both band edges.
+
+    The two failing cases are the hard ones on purpose: a genuinely different part-used
+    roll that happens to deliver almost exactly what the departed row had left is
+    INDISTINGUISHABLE in the data from the same roll coming back. A generous margin would
+    resolve that toward ruling 5 and silently merge two physical rolls into one ledger row,
+    permanently. So the margin is tight and the band is treated as ruling 4's case.
+    """
+    printer = await printer_factory(model="H2S")
+    departed = await _released(db_session, printer.id, 0, 1, at=_R0, weight_used=700.0)
+    delivered = 300.0 + over
+    mint = await _mistaken_mint(db_session, printer.id, 0, 1, delivered=(delivered,))
+
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+        assert (await _runout(db_session, printer.id, 0, 1)).id == mint.id
+
+    await db_session.refresh(departed)
+    await db_session.refresh(mint)
+    if acts:
+        assert departed.weight_used == pytest.approx(700.0 + delivered), why
+        assert departed.spent_at is not None and mint.archived_at is not None
+        assert "EARLY-RUNOUT RE-ATTRIBUTED" in caplog.text
+        return
+
+    assert departed.weight_used == pytest.approx(700.0), why
+    assert departed.spent_at is None, "the departed row is not declared exhausted on a guess"
+    assert departed.archived_at is None
+    assert mint.archived_at is None, "the mint stands as the roll it recorded"
+    assert mint.weight_used == pytest.approx(delivered), "its grams stand as delivered (ruling 4)"
+    assert await _charges_of(db_session, mint.id) == [(f"mint-{mint.id}-0", round(delivered, 1))]
+    assert "EARLY-RUNOUT NOT RE-ATTRIBUTED" in caplog.text
+    assert "operator ruling 4" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_tagged_successor_is_never_touched(db_session, printer_factory, caplog):
+    """Rule 10: no tag has ever been reused on this farm, so a tagged row's identity is
+    FACTUAL. An early runout there is misattribution evidence to root-cause by hand, never
+    a mistaken mint to unwind — and the grams would fit perfectly if the gate were open."""
+    printer = await printer_factory(model="H2S")
+    departed = await _released(db_session, printer.id, 0, 3, at=_R0, weight_used=700.0)
+    mint = await _mistaken_mint(
+        db_session, printer.id, 0, 3, delivered=(300.0,), tag_uid=TAG_UID, tray_uuid=TRAY_UUID
+    )
+
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+        assert (await _runout(db_session, printer.id, 0, 3)).id == mint.id
+
+    await db_session.refresh(departed)
+    await db_session.refresh(mint)
+    assert departed.weight_used == pytest.approx(700.0) and departed.spent_at is None
+    assert mint.archived_at is None and mint.weight_used == pytest.approx(300.0)
+    assert "EARLY-RUNOUT" not in caplog.text, "an ordinary tagged runout is not news"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "fragment", "why"),
+    [
+        ({"tag_uid": TAG_UID, "tray_uuid": TRAY_UUID}, "tag-identified", "rule 10, the departed side"),
+        ({"sibling_tag_uid": SIBLING_TAG_UID}, "tag-identified", "either chip identifies a roll (invariant 1)"),
+        ({"archived_at": _T1}, "archived", "retired inventory is never resurrected"),
+        ({"spent_at": _T1}, "ran out itself", "a row that already ran dry had no remainder to hand over"),
+        ({"label_weight": 0}, "no label to price", "an unpriceable row cannot state a remainder"),
+    ],
+)
+async def test_the_single_candidate_is_adjudicated_wherever_it_leads(
+    db_session, printer_factory, caplog, kwargs, fragment, why
+):
+    """Rule 7's amendment bounds this lane to the slot's SINGLE last occupant. When that
+    one row cannot be adjudicated the answer is "nothing happens", never "look further" —
+    the grams fit perfectly in every case below and are still refused."""
+    printer = await printer_factory(model="H2S")
+    departed = await _released(db_session, printer.id, 1, 0, at=_R0, weight_used=700.0, **kwargs)
+    mint = await _mistaken_mint(db_session, printer.id, 1, 0, delivered=(300.0,))
+
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+        assert (await _runout(db_session, printer.id, 1, 0)).id == mint.id
+
+    await db_session.refresh(departed)
+    await db_session.refresh(mint)
+    assert departed.weight_used == pytest.approx(700.0), why
+    assert mint.archived_at is None and mint.weight_used == pytest.approx(300.0)
+    assert "EARLY-RUNOUT NOT RE-ATTRIBUTED" in caplog.text
+    assert fragment in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_lane_never_scans_past_its_one_candidate_for_a_row_that_fits(
+    db_session, printer_factory, caplog
+):
+    """THE discipline that separates an adjudication from a search through noise.
+
+    An OLDER residue of the same slot fits the delivered grams exactly; the slot's actual
+    last occupant does not. Scanning would find the flattering answer and permanently merge
+    two rolls that never met. ``_mark_tray_spent`` tier 2 refuses the same walk for the same
+    reason: a missed correction self-heals, a false one does not.
+    """
+    printer = await printer_factory(model="H2S")
+    flattering = await _released(db_session, printer.id, 0, 0, at=_R0 - timedelta(days=2), weight_used=700.0)
+    last_occupant = await _released(db_session, printer.id, 0, 0, at=_R0, weight_used=100.0)
+    mint = await _mistaken_mint(db_session, printer.id, 0, 0, delivered=(300.0,))
+
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+        assert (await _runout(db_session, printer.id, 0, 0)).id == mint.id
+
+    for row in (flattering, last_occupant, mint):
+        await db_session.refresh(row)
+    assert flattering.weight_used == pytest.approx(700.0), "the older residue was never even considered"
+    assert flattering.spent_at is None
+    assert last_occupant.weight_used == pytest.approx(100.0), "the one candidate simply did not fit"
+    assert mint.archived_at is None
+    assert f"spool {last_occupant.id}'s 900 g remainder" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_live_binding_stands_the_lane_down(db_session, printer_factory, caplog):
+    """CROSS-CUTTING INVARIANT 11, pinned as the dependency this lane rests on.
+
+    An arithmetic fit is assumption-tier evidence, which may displace NOTHING a live
+    binding holds. This lane escapes that only because the AMS clears a drained slot's
+    exist bit ~3 minutes BEFORE declaring the runout, so by spent-stamp time the assignment
+    is already gone and both rows are dead. Here the stamp lands on a STILL-BOUND row —
+    tier 1 — and the lane must find no candidate and write nothing. If a future change ever
+    makes spent stamping fire while the binding is live, this test is the one that says the
+    exemption has evaporated with it.
+
+    The slot deliberately carries TWO earlier departures, the OLDER of which fits the bound
+    row's delivered grams exactly. That is what makes this a safety test rather than a
+    message test: drop the "the spent row must be this slot's own most recent departure"
+    guard and the lane does not merely explain itself badly, it charges 300 g onto a
+    healthy shelf roll that was never in this slot at the time.
+    """
+    printer = await printer_factory(model="H2S")
+    fitting_older = await _released(
+        db_session, printer.id, 0, 1, at=_R0 - timedelta(days=2), weight_used=700.0
+    )
+    # Departed long enough ago that _bound_after_the_bay_cleared keeps tier 1.
+    departed = await _released(db_session, printer.id, 0, 1, at=_R0, weight_used=100.0)
+    bound = await _bind(db_session, printer.id, 0, 1, weight_used=300.0, data_origin="ams_auto")
+
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+        assert (await _runout(db_session, printer.id, 0, 1)).id == bound.id
+
+    for row in (fitting_older, departed, bound):
+        await db_session.refresh(row)
+    assert bound.spent_at is not None, "LIVENESS: the stamp itself is untouched by this lane"
+    assert bound.archived_at is None, "a bound row is never retired by an assumption"
+    assert bound.weight_used == pytest.approx(300.0), "its charges stay on it"
+    assert fitting_older.weight_used == pytest.approx(700.0), "the flattering fit is never reached"
+    assert fitting_older.spent_at is None
+    assert departed.weight_used == pytest.approx(100.0) and departed.spent_at is None
+    assert "not this slot's most recent departure" in caplog.text
+    assert "invariant 11" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_two_re_attribution_directions_cannot_ping_pong(db_session, printer_factory, caplog):
+    """INCIDENT SHAPE 26, asserted rather than argued.
+
+    Two lanes acting on one row set from mirror evidence is the spool-211 oscillation. The
+    fixture is built to TEMPT the forward sweep — the merged row lands at 1019 g on a
+    1000 g label, genuinely past it — and three independent guards keep it standing down,
+    in the order they actually bite:
+
+    1. the surviving row now carries ``spent_at``, and the sweep's candidate query filters
+       ``spent_at IS NULL``. This is the dominant guard and the one that holds even when
+       the departed row was already over its own label before the merge;
+    2. it holds no live assignment, which the sweep JOINs on — this direction never
+       re-binds, which is the layering reason it cannot feed the other one;
+    3. arithmetically, a set of grams that FITS cannot overshoot the label by more than the
+       same margin, because the fit gap and the overshoot are the same quantity.
+
+    The second call re-seats the row by hand to remove guard 2 and pin that the answer is
+    still "no action" — asserted, not argued.
+    """
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    departed = await _released(db_session, printer.id, 0, 2, at=_R0, weight_used=800.0)
+    mint = await _mistaken_mint(db_session, printer.id, 0, 2, delivered=(219.0,))
+
+    assert (await _runout(db_session, printer.id, 0, 2)).id == mint.id
+    await db_session.refresh(departed)
+    assert departed.weight_used == pytest.approx(1019.0), "past the label, and correctly so"
+
+    caplog.clear()  # the correction above logs its own line; only the SWEEP is on trial here
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
+        assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0
+    await db_session.refresh(departed)
+    assert departed.weight_used == pytest.approx(1019.0), "the forward sweep took no action"
+    assert await _charges_of(db_session, departed.id) == [(f"mint-{mint.id}-0", 219.0)]
+    assert "LEDGER-OVERCHARGE" not in caplog.text, "not even a warning: there is nothing here to reconcile"
+
+    # And with the row re-seated by hand — the one state the forward sweep needs.
+    db_session.add(SpoolAssignment(spool_id=departed.id, printer_id=printer.id, ams_id=0, tray_id=2))
+    await db_session.commit()
+    assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0
+    await db_session.refresh(departed)
+    assert departed.weight_used == pytest.approx(1019.0), "a fitting merge can never clear the margin"
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_runout_trigger_changes_nothing_further(db_session, printer_factory):
+    """The retired mint is ARCHIVED, not deleted, so it stays the row this slot's next
+    runout trigger resolves onto — which is what makes the whole lane idempotent. A second
+    trigger must not charge the departed row twice."""
+    printer = await printer_factory(model="H2S")
+    departed = await _released(db_session, printer.id, 0, 3, at=_R0, weight_used=700.0)
+    mint = await _mistaken_mint(db_session, printer.id, 0, 3, delivered=(300.0,))
+
+    assert (await _runout(db_session, printer.id, 0, 3)).id == mint.id
+    again = await _runout(db_session, printer.id, 0, 3)
+
+    assert again is not None and again.id == mint.id, "the tombstone answers the duplicate"
+    await db_session.refresh(departed)
+    assert departed.weight_used == pytest.approx(1000.0), "charged exactly once"
+    assert await _charges_of(db_session, departed.id) == [(f"mint-{mint.id}-0", 300.0)]
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_runout_still_stamps_and_this_lane_stays_out_of_it(db_session, printer_factory, caplog):
+    """LIVENESS PAIR, half one. A suppression that is too eager is indistinguishable from a
+    lane that never fires, so the positive path is re-proven: a full roll running out
+    normally still gets its stamp, and the correction does not so much as log."""
+    printer = await printer_factory(model="H2S")
+    departed = await _released(db_session, printer.id, 1, 1, at=_R0, weight_used=700.0)
+    normal = await _mistaken_mint(db_session, printer.id, 1, 1, delivered=(600.0, 350.0))
+
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+        stamped = await _runout(db_session, printer.id, 1, 1)
+
+    assert stamped is not None and stamped.id == normal.id
+    await db_session.refresh(normal)
+    await db_session.refresh(departed)
+    assert normal.spent_at is not None and normal.archived_at is None
+    assert normal.delivered_g == pytest.approx(950.0), "it delivered about a full roll — no mistake to undo"
+    assert departed.weight_used == pytest.approx(700.0) and departed.spent_at is None
+    assert "EARLY-RUNOUT" not in caplog.text, "every ordinary runout would be noise"
+
+
+@pytest.mark.asyncio
+async def test_the_forward_overcharge_reconcile_still_fires_on_its_own_trigger(db_session, printer_factory):
+    """LIVENESS PAIR, half two. The backward direction shares ``_hand_charges_back`` and the
+    ``last_released_from_slot_stmt`` origin with its neighbours; this re-proves the forward
+    sweep still reconciles its own genuine trigger after that surgery."""
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    old = await _overcharged(db_session, printer.id, 0, 0)
+
+    assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 1
+    await db_session.refresh(old)
+    assert old.archived_at is not None and old.weight_used == pytest.approx(sum(_PRE))
+
+
+@pytest.mark.asyncio
+async def test_the_acknowledgement_undo_still_hands_charges_back_and_re_binds(
+    db_session, printer_factory, silent_surfaces
+):
+    """LIVENESS PAIR, half three — the OTHER caller of the extracted double entry.
+
+    Rule 12's undo (scenario R8) and the early-runout correction are one concept from two
+    evidences, so they share ``_hand_charges_back``. What is only true of the undo is
+    checked here: the predecessor goes back INTO the slot and the charges follow it.
+    """
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    predecessor = await _released(db_session, printer.id, 0, 0, at=_R0, weight_used=700.0)
+    mint = await _mistaken_mint(db_session, printer.id, 0, 0, delivered=(120.0,))
+
+    moved = await spool_tagless.replace_bound_row_with_predecessor(
+        db_session,
+        mint,
+        predecessor,
+        _M0,
+        printer_id=printer.id,
+        ams_id=0,
+        tray_id=0,
+        fingerprint_color="000000FF",
+        fingerprint_type="PETG",
+        origin="recheck_undo",
+    )
+    await db_session.commit()
+
+    assert moved == pytest.approx(120.0)
+    await db_session.refresh(predecessor)
+    assert predecessor.weight_used == pytest.approx(820.0)
+    assert (await _slot_spool(db_session, printer.id, 0, 0)).id == predecessor.id
+    assert await _charges_of(db_session, predecessor.id) == [(f"mint-{mint.id}-0", 120.0)]

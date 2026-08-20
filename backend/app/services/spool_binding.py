@@ -107,7 +107,7 @@ def last_released_from_slot_stmt(printer_id: int, ams_id: int, tray_id: int) -> 
     Two lanes ask it, for opposite purposes, and the shared stmt is what keeps them
     answering about the same set of rows:
 
-    * ``slot_pipeline._last_location_candidate`` — a roll came BACK: reclaim its grams
+    * ``slot_pipeline._debounce_candidate`` — a roll came BACK: de-bounce its grams
       and its FIFO position instead of minting a fresh 0 g row (doctrine rule 7);
     * ``spool_respool._mark_tray_spent`` tier 2 — a roll ran OUT: the AMS clears a
       drained slot's exist bit minutes BEFORE it declares the runout, so by the time
@@ -305,6 +305,7 @@ async def bind_spool_to_slot(
     fingerprint_type: str | None,
     origin: str,
     preserve_ordinal: bool = False,
+    bind_moment: datetime | None = None,
 ) -> SpoolAssignment | None:
     """Bind ``spool`` to one AMS slot with MOVE semantics — the ONE binding writer.
 
@@ -348,6 +349,24 @@ async def bind_spool_to_slot(
     keeps its FIFO seating position (doctrine rule 7 — a mid-life re-seat keeps
     position). Without it the reclaim would look like a new roll to the
     ``first_loaded`` selector purely because the binding row was rebuilt.
+
+    ``bind_moment`` is its counterpart for the OTHER durable fact a rebuilt row would
+    otherwise re-state: ``SpoolAssignment.created_at``. That column is not decoration —
+    ``spool_tagless.reconcile_ledger_overcharges`` reads it as the ONE instant at which
+    an unobserved roll swap could have happened (meaningfully later than the spool row's
+    own ``created_at`` ⇒ the roll left and came back), so every fresh stamp ASSERTS that
+    a physical event occurred here. A de-bounce asserts the opposite — the 2026-08-19
+    scoping admits it only for a release the farm has just certified as SPURIOUS (rule 7
+    as amended) — and a boundary stamped there would split a de-bounced roll that later
+    overshoots its label into a phantom successor for a swap that provably did not
+    happen. So the de-bounce hands in the moment its roll's CURRENT seating actually
+    began (``slot_pipeline._debounce_bind_moment``) instead of minting a new one. None =
+    now, via the column's server default, which is what every genuine bind wants.
+
+    Deliberately a separate argument rather than a second meaning for
+    ``preserve_ordinal``: the two preserve different facts for different consumers (the
+    FIFO selector vs the overcharge reconciler), and one caller passing both is not a
+    reason to fuse two contracts into one flag.
 
     ``origin`` ("rfid_auto" | "tagless_setting" | "manual_api") is log attribution
     plus exactly ONE behavioural carve-out — :data:`OPERATOR_ORIGIN` bypasses the
@@ -438,6 +457,9 @@ async def bind_spool_to_slot(
         fingerprint_color=fingerprint_color,
         fingerprint_type=fingerprint_type,
     )
+    if bind_moment is not None:
+        # Carried forward, not re-stamped — see the ``bind_moment`` paragraph above.
+        assignment.created_at = bind_moment
     db.add(assignment)
     await db.flush()
 

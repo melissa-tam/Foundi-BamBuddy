@@ -1376,7 +1376,8 @@ describe('PrintersPage Phase 13 — EmptySlotHoverCard onAssignSpool wiring', ()
  * The local branch was missing both. As a result a BL-RFID-tagged slot in
  * local-Inventory mode showed an "Assign Spool" button (because no manual
  * SpoolAssignment exists), and a manually-assigned BL-RFID slot showed
- * "Unassign" — which would be overwritten on the next RFID re-read.
+ * "Unassign" — which would be overwritten the next time the identity lane
+ * reads the tag (autonomously, or behind an operator's "Re-check slot").
  *
  * The same FilamentHoverCard mock from the Phase 13 block above captures
  * inventory props on every render so we can inspect them after setup.
@@ -1555,7 +1556,7 @@ describe('PrintersPage Phase 14 — Local-Branch BL-detection symmetry', () => {
     // For BL-detected slots in local mode, onUnassignSpool must always be
     // undefined — even when a manual assignment exists. Otherwise the user
     // could unassign a BL-RFID slot that the printer would re-assign on the
-    // next re-read, surprising them with phantom ghost-assignments.
+    // next identity read, surprising them with phantom ghost-assignments.
     const definedUnassign = phase14HoverCardProps.filter(
       p => typeof (p.inventory as { onUnassignSpool?: () => void } | undefined)?.onUnassignSpool === 'function'
     );

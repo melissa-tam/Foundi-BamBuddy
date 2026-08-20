@@ -104,20 +104,20 @@ class TestSettingsAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_update_respool_auto_enabled(self, async_client: AsyncClient):
-        """respool_auto_enabled round-trips (default False → True → back) through the
-        boolean-parse whitelist."""
-        # Defaults OFF when never written (operator directive — no tag reuse yet).
-        response = await async_client.get("/api/v1/settings/")
-        assert response.json()["respool_auto_enabled"] is False
+    async def test_respool_auto_enabled_is_gone_and_unsettable(self, async_client: AsyncClient):
+        """The Tier-2 toggle cannot be re-introduced through the API (WS3, 2026-08-19).
 
+        It used to round-trip False → True → back through the boolean-parse whitelist.
+        Operator ruling 3 superseded what it encoded — a FINISHED roll reading LOADED can
+        only be a new roll on a reused core — so the schema field, the update twin and the
+        route whitelist entry all went, and a PUT carrying it is ignored rather than
+        restoring a dual path where the farm asks a question physics already answered.
+        """
         response = await async_client.put("/api/v1/settings/", json={"respool_auto_enabled": True})
         assert response.status_code == 200
-        assert response.json()["respool_auto_enabled"] is True
-
-        # Persisted read-back through the boolean-parse whitelist.
-        response = await async_client.get("/api/v1/settings/")
-        assert response.json()["respool_auto_enabled"] is True
+        assert "respool_auto_enabled" not in response.json()
+        get_resp = await async_client.get("/api/v1/settings/")
+        assert "respool_auto_enabled" not in get_resp.json()
 
     @pytest.mark.asyncio
     @pytest.mark.integration

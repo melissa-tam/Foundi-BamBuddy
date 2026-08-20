@@ -141,3 +141,54 @@ describe('ToastContext viewport suppression', () => {
     expect(findViewport()?.className).not.toContain('hidden');
   });
 });
+
+describe('ToastContext live region', () => {
+  // WCAG 2.2 4.1.3 Status Messages. Toasts are status messages, and some carry
+  // their entire content in the message ("Slot 2 unchanged") — without a live
+  // region those are silent to a screen reader, which is the very failure mode
+  // WS11 exists to close. The region is declared once on the always-mounted
+  // viewport, never per toast: a live region must pre-exist its content, and
+  // per-toast regions double-announce.
+  function ToastProbe() {
+    const { showToast } = useToast();
+    return <button data-testid="show-toast" onClick={() => showToast('slot 2 unchanged', 'info')} />;
+  }
+
+  it('declares the toast viewport as a polite, non-atomic status region', () => {
+    const { container, getByTestId } = render(
+      <ToastProvider>
+        <ToastProbe />
+      </ToastProvider>
+    );
+
+    const viewport = container.querySelector('div.fixed.bottom-4.right-20') as HTMLElement;
+    expect(viewport).not.toBeNull();
+    expect(viewport.getAttribute('role')).toBe('status');
+    expect(viewport.getAttribute('aria-live')).toBe('polite');
+    expect(viewport.getAttribute('aria-atomic')).toBe('false');
+
+    // The region is the same element before and after a toast lands, so the
+    // message is an in-place content change an assistive tech can observe.
+    act(() => {
+      getByTestId('show-toast').click();
+    });
+    expect(container.querySelector('div.fixed.bottom-4.right-20')).toBe(viewport);
+    expect(viewport.textContent).toContain('slot 2 unchanged');
+  });
+
+  it('puts no aria-live on the individual toasts', () => {
+    const { container, getByTestId } = render(
+      <ToastProvider>
+        <ToastProbe />
+      </ToastProvider>
+    );
+
+    act(() => {
+      getByTestId('show-toast').click();
+    });
+
+    const viewport = container.querySelector('div.fixed.bottom-4.right-20') as HTMLElement;
+    expect(viewport.querySelectorAll('[aria-live]')).toHaveLength(0);
+    expect(viewport.querySelectorAll('[role="status"], [role="alert"]')).toHaveLength(0);
+  });
+});

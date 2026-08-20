@@ -604,26 +604,250 @@ async def test_mark_spent_released_slot_resolves_last_location_victim(db_session
     assert any("tier=last_location" in r.getMessage() for r in caplog.records)
 
 
+async def _seed_bound_row(db, printer_id, ams_id, tray_id, **kwargs) -> Spool:
+    """A row bound to the slot RIGHT NOW — tier 1's incumbent."""
+    spool = Spool(material="PETG", label_weight=1000, core_weight=250, **kwargs)
+    spool.k_profiles = []
+    spool.assignments = []
+    db.add(spool)
+    await db.flush()
+    await _assign(db, printer_id, ams_id, tray_id, spool.id)
+    await db.commit()
+    return spool
+
+
+async def _backdate_release(db, spool: Spool, *, minutes: float) -> None:
+    """Age a release stamp to where the scenario's physics actually puts it.
+
+    The bay clears MINUTES before the runout HMS, so a test that leaves both stamps at
+    ``utcnow()`` is not the production timeline. It is also not decidable: ``last_location_at``
+    is a Python ``utcnow()`` with microseconds while ``SpoolAssignment.created_at`` is
+    SQLite's ``CURRENT_TIMESTAMP``, truncated to the second — the same precedent (and the same
+    reason) as the D1 idempotency case above.
+    """
+    spool.last_location_at = datetime.utcnow() - timedelta(minutes=minutes)
+    await db.commit()
+
+
 @pytest.mark.asyncio
-async def test_mark_spent_prefers_live_assignment_over_last_location(db_session, printer_factory):
-    """Tier 1 outranks the residue — which is exactly why tier 2 needs no recency
-    threshold (doctrine rules 6/7): an operator refilling inside the ~3-min gap binds the
-    slot, and binding it is what makes the fresh roll the answer."""
+async def test_mark_spent_prefers_a_live_assignment_seated_before_the_bay_cleared(db_session, printer_factory, caplog):
+    """T6 — the ordinary runout, and the LIVENESS half of the eligibility test below.
+
+    The drained roll is still bound when the evidence lands, so tier 1 names it. The slot
+    deliberately also carries an OLD residue from a previous occupant, because EVERY
+    incumbent was bound after some clear: if ordering alone decided eligibility, tier 1 would
+    stand aside on every runout on the fleet and the fix would be worse than the regression
+    (memory ``liveness-paired-verification`` — a cured storm and a starved lane are identical
+    on an absence metric).
+    """
     printer = await printer_factory()
-    departed = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=990.0)
-    fresh = Spool(material="PETG", label_weight=1000, core_weight=250, weight_used=0)
-    fresh.k_profiles = []
-    fresh.assignments = []
-    db_session.add(fresh)
-    await db_session.flush()
-    await _assign(db_session, printer.id, 0, 0, fresh.id)
+    previous = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=970.0)
+    await _backdate_release(db_session, previous, minutes=2 * 24 * 60)  # left two days ago
+    drained = await _seed_bound_row(db_session, printer.id, 0, 0, weight_used=990.0)
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay()))
+
+    assert marked is not None and marked.id == drained.id
+    assert any("tier=assignment" in r.getMessage() for r in caplog.records)
+    await db_session.refresh(previous)
+    assert previous.spent_at is None  # an ancient residue is not this runout's victim
+
+
+@pytest.mark.asyncio
+async def test_mark_spent_stands_aside_when_the_incumbent_was_seated_after_the_bay_cleared(
+    db_session, printer_factory, caplog
+):
+    """T7/T8 — the 2026-08-19 regression, inverted.
+
+    The spool-identity wave made a refill inside the ~3-minute bay-clear→HMS gap MINT a fresh
+    row and bind it ("a runout release is never a glitch"), which is correct — and it changed
+    the precondition tier 1 rests on. Tier 1 resolved its victim from the LIVE assignment, so
+    the runout arriving two minutes later stamped the operator's brand-new roll: probe output
+    ``FRESH spent_at: 2026-08-20 10:29:14 used: 0.0`` / ``DRAINED spent_at: None used:
+    900.0``. The fresh roll then reads 0 g remaining (rule 8 derives emptiness from
+    ``spent_at``) and is hard-excluded from selection with no automatic un-spend lane, while
+    the roll that actually ran dry stays selectable and reclaimable.
+
+    A roll seated after the bay emptied cannot be the roll that emptied it, so tier 1 stands
+    aside and tier 2 resolves the row that actually left.
+    """
+    printer = await printer_factory()
+    drained = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=900.0)
+    await _backdate_release(db_session, drained, minutes=3)  # the measured firmware gap
+    fresh = await _seed_bound_row(db_session, printer.id, 0, 0, weight_used=0)
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay()))
+
+    assert marked is not None and marked.id == drained.id
+    assert marked.spent_at is not None
+    assert marked.weight_used == 900.0  # the ledger stays raw (doctrine rule 8)
+    await db_session.refresh(fresh)
+    assert fresh.spent_at is None, "the operator's brand-new roll must never be called exhausted"
+    assert fresh.remaining_g == pytest.approx(1000.0), "…and must still price as a full roll to selection"
+    assert any("tier=last_location" in r.getMessage() for r in caplog.records)
+    assert any("stands aside" in r.getMessage() for r in caplog.records), "a suppressed stamp always says why"
+
+
+@pytest.mark.asyncio
+async def test_a_clear_older_than_the_episode_window_leaves_tier_1_alone(db_session, printer_factory):
+    """The window is what says WHICH of a slot's clears the arriving evidence is about.
+
+    Outside it the farm asserts nothing new: the incumbent has been seated far longer than
+    any bay-clear→HMS gap the firmware has ever shown, so it is the roll that has been
+    feeding, and it is the one the runout is about. Pinned as the deliberate cost it is —
+    the alternative reading (an HMS half an hour late) has never been observed.
+    """
+    printer = await printer_factory()
+    departed = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=400.0)
+    await _backdate_release(db_session, departed, minutes=(spool_respool._BAY_CLEAR_TO_RUNOUT_GAP_S / 60) + 5)
+    incumbent = await _seed_bound_row(db_session, printer.id, 0, 0, weight_used=800.0)
+
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay()))
+
+    assert marked is not None and marked.id == incumbent.id
+    await db_session.refresh(departed)
+    assert departed.spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_debounced_roll_that_came_back_keeps_the_stamp(db_session, printer_factory):
+    """T8b — the same roll re-bound after a spurious release is still tier 1's victim.
+
+    Two independent facts keep it eligible, and both are the 2026-08-19 wave's own work: the
+    de-bounce carries the incumbent's ORIGINAL bind moment forward
+    (``bind_spool_to_slot(..., bind_moment=...)``), so its binding predates the clear; and its
+    breadcrumb records that IT vacated this bay more recently than the stranger residue did,
+    which puts that residue before its tenure. Either way the stranger is not the drained roll.
+    """
+    printer = await printer_factory()
+    stranger = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=120.0)
+    await _backdate_release(db_session, stranger, minutes=8)
+    drained = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=900.0)
+    await _backdate_release(db_session, drained, minutes=3)
+    # The de-bounce: the SAME row re-bound, handing back the moment its seating began.
+    await spool_binding.bind_spool_to_slot(
+        db_session,
+        drained,
+        printer_id=printer.id,
+        ams_id=0,
+        tray_id=0,
+        fingerprint_color=None,
+        fingerprint_type="PETG",
+        origin="tagless_setting",
+        preserve_ordinal=True,
+        bind_moment=datetime.utcnow() - timedelta(minutes=40),
+    )
     await db_session.commit()
 
     marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay()))
 
-    assert marked is not None and marked.id == fresh.id
-    await db_session.refresh(departed)
-    assert departed.spent_at is None  # the residue was never consulted
+    assert marked is not None and marked.id == drained.id
+    await db_session.refresh(stranger)
+    assert stranger.spent_at is None
+
+
+class TestBayClearEligibility:
+    """Every clause of :func:`spool_respool._bound_after_the_bay_cleared`, in isolation.
+
+    The scenario cases above prove the ladder as a whole; these say WHICH fact each answer
+    rests on, so a later edit that keeps the end-to-end behaviour by accident still fails
+    here. Pure function, no session — the two timestamps and the slot are all it reads.
+    """
+
+    SLOT = {"printer_id": 1, "ams_id": 0, "tray_id": 0}
+
+    def _residue(self, *, minutes_ago: float, slot=(1, 0, 0)) -> Spool:
+        printer_id, ams_id, tray_id = slot
+        return Spool(
+            material="PETG",
+            label_weight=1000,
+            last_location_printer_id=printer_id,
+            last_location_ams_id=ams_id,
+            last_location_tray_id=tray_id,
+            last_location_at=datetime.utcnow() - timedelta(minutes=minutes_ago),
+        )
+
+    def _binding(self, *, minutes_ago: float, spool: Spool | None = None) -> SpoolAssignment:
+        return SpoolAssignment(
+            spool=spool if spool is not None else Spool(material="PETG", label_weight=1000),
+            printer_id=1,
+            ams_id=0,
+            tray_id=0,
+            created_at=datetime.utcnow() - timedelta(minutes=minutes_ago),
+        )
+
+    def test_seated_after_a_clear_inside_the_window_is_disqualified(self):
+        """T7/T8: the bay emptied three minutes ago and this roll arrived after it."""
+        assert (
+            spool_respool._bound_after_the_bay_cleared(
+                self._binding(minutes_ago=1), self._residue(minutes_ago=3), **self.SLOT
+            )
+            is True
+        )
+
+    def test_a_clear_outside_the_window_is_a_different_episode(self):
+        """T6: every incumbent was bound after SOME clear — the window says which one
+        this runout is about, and an ancient one is not it."""
+        outside = (spool_respool._BAY_CLEAR_TO_RUNOUT_GAP_S / 60) + 1
+        assert (
+            spool_respool._bound_after_the_bay_cleared(
+                self._binding(minutes_ago=1), self._residue(minutes_ago=outside), **self.SLOT
+            )
+            is False
+        )
+
+    def test_a_binding_that_predates_the_clear_is_never_disqualified(self):
+        """The de-bounce's bind moment is carried back across the spurious release
+        (``bind_spool_to_slot(..., bind_moment=...)``), and that is what keeps it eligible."""
+        assert (
+            spool_respool._bound_after_the_bay_cleared(
+                self._binding(minutes_ago=40), self._residue(minutes_ago=3), **self.SLOT
+            )
+            is False
+        )
+
+    def test_an_incumbent_that_left_this_bay_more_recently_wins(self):
+        """A returning roll's own breadcrumb puts the residue's departure BEFORE its tenure,
+        so the residue cannot be the roll that just drained — only the incumbent can."""
+        returner = self._residue(minutes_ago=2)  # its own release, from this same slot
+        assert (
+            spool_respool._bound_after_the_bay_cleared(
+                self._binding(minutes_ago=1, spool=returner), self._residue(minutes_ago=6), **self.SLOT
+            )
+            is False
+        )
+
+    def test_a_breadcrumb_from_another_slot_does_not_count_as_this_bay_clearing(self):
+        """``_last_clear_of`` is slot-exact: a roll that left AMS0-T2 says nothing about
+        whether AMS0-T0's bay emptied."""
+        elsewhere = self._residue(minutes_ago=2, slot=(1, 0, 2))
+        assert (
+            spool_respool._bound_after_the_bay_cleared(
+                self._binding(minutes_ago=1, spool=elsewhere), self._residue(minutes_ago=6), **self.SLOT
+            )
+            is True
+        )
+
+    @pytest.mark.parametrize(
+        ("assignment", "residue", "why"),
+        [
+            (None, "residue", "no incumbent — tier 2 is already the answer"),
+            ("binding", None, "no residue: tier 1 stands aside only in favour of a NAMED alternative"),
+        ],
+    )
+    def test_a_missing_half_keeps_tier_1(self, assignment, residue, why):
+        binding = self._binding(minutes_ago=1) if assignment == "binding" else None
+        left = self._residue(minutes_ago=3) if residue == "residue" else None
+        assert spool_respool._bound_after_the_bay_cleared(binding, left, **self.SLOT) is False, why
+
+    def test_an_unstamped_column_decides_nothing(self):
+        """Neither half may be inferred: a NULL breadcrumb is silence, and silence keeps
+        the ordinary path rather than redirecting a permanent stamp onto a guess."""
+        residue = self._residue(minutes_ago=3)
+        residue.last_location_at = None
+        assert spool_respool._bound_after_the_bay_cleared(self._binding(minutes_ago=1), residue, **self.SLOT) is False
 
 
 @pytest.mark.asyncio
@@ -1138,7 +1362,6 @@ async def test_gate_spent_and_loaded_auto_respools(db_session, printer_factory, 
     from backend.app.api.routes.settings import set_setting
 
     await set_setting(db_session, "respool_last_brand", "Polymaker")
-    await set_setting(db_session, "respool_auto_enabled", "true")  # Tier-2 auto path under test
     await db_session.commit()
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
@@ -1230,7 +1453,6 @@ async def test_gate_auto_sibling_conflict_falls_back_to_prompt(db_session, print
     from backend.app.api.routes.settings import set_setting
 
     await set_setting(db_session, "respool_last_brand", "Polymaker")
-    await set_setting(db_session, "respool_auto_enabled", "true")  # exercise the auto→sibling-conflict path
     await db_session.commit()
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(tag_uid=DONOR_TAG_UID, state=11)))
@@ -1314,7 +1536,7 @@ async def test_spent_dismissal_stands_no_cycle_suppresses_auto_and_prompt(db_ses
     """R4 test 1 (MUTATION PIN). A spent + loaded spool the operator answered
     "Same spool" on, with NO physical cycle recorded since (the accessor returns
     None — e.g. right after a restart), broadcasts NOTHING and does NOT auto-respool
-    even with respool_auto_enabled ON and a last brand set. This is the whole fix:
+    even with a last brand set and Tier 2 otherwise ready to conclude. This is the whole fix:
     the false spent stamp on spool 106 re-fired for days because the spent branch
     ignored the dismissal.
 
@@ -1326,8 +1548,7 @@ async def test_spent_dismissal_stands_no_cycle_suppresses_auto_and_prompt(db_ses
     donor.respool_dismissed_at = datetime.utcnow()
     from backend.app.api.routes.settings import set_setting
 
-    await set_setting(db_session, "respool_last_brand", "Polymaker")  # auto WOULD fire if the gate were gone
-    await set_setting(db_session, "respool_auto_enabled", "true")
+    await set_setting(db_session, "respool_last_brand", "Polymaker")  # Tier 2 WOULD conclude if the gate were gone
     await db_session.commit()
     # No _record_physical_cycle: last_physical_cycle_age → None → dismissal stands.
 
@@ -1341,13 +1562,26 @@ async def test_spent_dismissal_stands_no_cycle_suppresses_auto_and_prompt(db_ses
 
 
 @pytest.mark.asyncio
-async def test_spent_dismissal_cycle_after_rearms_prompt_when_auto_off(db_session, printer_factory, monkeypatch):
-    """R4 test 2 (auto OFF). A qualified physical cycle STRICTLY AFTER the dismissal
-    re-arms the spent branch: the one-click prompt fires again (a genuine roll swap
-    on a dismissed slot must surface)."""
+async def test_spent_dismissal_cycle_after_rearms_the_escalation_when_unexecutable(
+    db_session, printer_factory, monkeypatch
+):
+    """R4 test 2 (the surviving prompt arm). A qualified physical cycle STRICTLY AFTER the
+    dismissal re-arms the spent branch, and when the CONCLUSION cannot be executed — no
+    brand anywhere to mint the fresh row with — it escalates to the one-click prompt.
+
+    This test used to prove "auto OFF → prompt". That toggle is deleted (operator ruling 3,
+    2026-08-19): tier 2 concludes on evidence. The prompt did not go with it, because
+    "I know what happened but cannot carry it out" is an escalation, not an alternative
+    verdict — and the re-arm contract it pins (a genuine roll swap on a dismissed slot
+    must surface) is unchanged.
+    """
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=True)
     donor.respool_dismissed_at = datetime.utcnow() - timedelta(seconds=100)  # dismissed 100 s ago
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db_session, "respool_last_brand", "")  # no prefill…
+    await set_setting(db_session, "tagless_default_filament", "")  # …and no default to fall back on
     await db_session.commit()
     _record_physical_cycle(printer.id, age_s=0.0)  # cycle just now → age (~0) < 100 → after dismissal
 
@@ -1355,23 +1589,24 @@ async def test_spent_dismissal_cycle_after_rearms_prompt_when_auto_off(db_sessio
     broadcasts = _spy_broadcast(monkeypatch)
     result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
 
-    assert result is None  # auto off → prompt, not a mint
+    assert result is None  # nothing minted — there was no brand to mint with
     prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
     assert len(prompts) == 1
     assert prompts[0]["trigger"] == "spent"
+    assert (await db_session.get(Spool, donor.id)).archived_at is None  # donor untouched
 
 
 @pytest.mark.asyncio
-async def test_spent_dismissal_cycle_after_rearms_auto_when_auto_on(db_session, printer_factory, monkeypatch):
-    """R4 test 2 (auto ON). The same post-dismissal cycle re-arms the Tier-2 auto
-    path — the spent + loaded tag re-spools to a fresh row."""
+async def test_spent_dismissal_cycle_after_rearms_the_tier2_conclusion(db_session, printer_factory, monkeypatch):
+    """R4 test 2 (the conclusion). The same post-dismissal cycle re-arms Tier 2 and it
+    CONCLUDES — the spent + loaded tag re-spools to a fresh row, with nothing asked and no
+    toggle in front of it (operator ruling 3, 2026-08-19)."""
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=True)
     donor.respool_dismissed_at = datetime.utcnow() - timedelta(seconds=100)
     from backend.app.api.routes.settings import set_setting
 
     await set_setting(db_session, "respool_last_brand", "Polymaker")
-    await set_setting(db_session, "respool_auto_enabled", "true")
     await db_session.commit()
     _record_physical_cycle(printer.id, age_s=0.0)  # cycle after the dismissal → re-arm
 
@@ -1395,7 +1630,6 @@ async def test_spent_dismissal_cycle_before_stays_suppressed(db_session, printer
     from backend.app.api.routes.settings import set_setting
 
     await set_setting(db_session, "respool_last_brand", "Polymaker")
-    await set_setting(db_session, "respool_auto_enabled", "true")
     await db_session.commit()
     _record_physical_cycle(printer.id, age_s=100.0)  # cycle 100 s ago → age (100) ≥ 0 → predates
 
@@ -1411,14 +1645,33 @@ async def test_spent_dismissal_cycle_before_stays_suppressed(db_session, printer
 # -- R5: prompt provenance payload fields ------------------------------------
 
 
+async def _clear_respool_brands(db) -> None:
+    """Remove every brand Tier 2 could mint a fresh row with.
+
+    Since 2026-08-19 Tier 2 CONCLUDES on a spent + loaded arrival (operator ruling 3), so
+    the only remaining way to observe the prompt payload from the live gate is the
+    ESCALATION arm — the conclusion is right but unexecutable. Both brand sources have to
+    go: the ``respool_last_brand`` prefill and the ``tagless_default_filament`` fallback
+    it drops to.
+    """
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db, "respool_last_brand", "")
+    await set_setting(db, "tagless_default_filament", "")
+
+
+
+
 @pytest.mark.asyncio
 async def test_respool_prompt_payload_carries_provenance(db_session, printer_factory, monkeypatch):
     """R5. The spent-tier prompt payload carries the additive provenance fields so
     the UI can show the evidence and its age: spent_at + spent_age_s, the live AMS
     remain %, the ledger-implied remain %, and when the roll became bound."""
     printer = await printer_factory()
-    # Spent, loaded, NOT dismissed, auto OFF → a clean spent prompt fires.
+    # Spent, loaded, NOT dismissed, and NO brand anywhere: Tier 2's conclusion stands but
+    # cannot be executed, which is the one arm that still raises this prompt (WS3).
     donor = await _make_donor(db_session, spent=True, weight_used=990.0)  # ledger 1% of a 1000 g label
+    await _clear_respool_brands(db_session)
     await db_session.commit()
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))  # tray remain=100
@@ -1443,6 +1696,7 @@ async def test_respool_prompt_payload_nulls_when_absent(db_session, printer_fact
     ledger % still computes from the durable row."""
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=True, weight_used=990.0)  # ledger 1% of a 1000 g label
+    await _clear_respool_brands(db_session)  # no brand → the conclusion escalates to the prompt
     await db_session.commit()
 
     garbage = _tray(state=11)
@@ -1476,7 +1730,6 @@ async def test_gate_tier2_empty_last_brand_uses_tagless_default(db_session, prin
         "tagless_default_filament",
         '{"brand": "eSun", "material": "PETG", "subtype": "HF", "rgba": "00FF00FF"}',
     )
-    await set_setting(db_session, "respool_auto_enabled", "true")  # Tier-2 auto brand-fallback under test
     await db_session.commit()
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
@@ -1499,7 +1752,6 @@ async def test_gate_tier2_both_empty_falls_back_to_prompt(db_session, printer_fa
     from backend.app.api.routes.settings import set_setting
 
     await set_setting(db_session, "tagless_default_filament", "")  # explicit off
-    await set_setting(db_session, "respool_auto_enabled", "true")  # auto ON, but no brand to auto with
     await db_session.commit()
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
@@ -2308,10 +2560,20 @@ def test_ledger_corrupt_tolerance_boundary():
 
 async def _fire_live_prompt(db, printer, monkeypatch, *, weight_used=990.0):
     """Fire a real prompt so _respool_prompt_dedup is populated exactly as the live
-    gate populates it. Tier 2 (spent ∧ loaded — the firmware's own exhaustion
-    statement) is the ONLY prompting tier since the 2026-08-10 demotion, so the
-    replay lane is armed through the path that can actually arm it.
+    gate populates it.
+
+    Since 2026-08-19 (operator ruling 3) tier 2 CONCLUDES on a spent ∧ loaded arrival
+    instead of asking, so the only way the live gate still arms a prompt is the
+    ESCALATION arm: the conclusion is correct but cannot be EXECUTED. Both brand sources
+    are cleared here to produce exactly that — no ``respool_last_brand``, no
+    ``tagless_default_filament`` — because a re-spool with no brand to mint with is the
+    one thing tier 2 will not invent. Arming through the path that can actually arm it is
+    the point of this helper; a hand-stuffed dedup entry would pin nothing.
     Returns (donor, broadcasts_spy)."""
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db, "respool_last_brand", "")
+    await set_setting(db, "tagless_default_filament", "")
     donor = await _make_donor(db, spent=True, weight_used=weight_used)  # remaining 10
     await db.commit()
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
@@ -2458,34 +2720,61 @@ async def test_rebroadcast_noop_in_spoolman_mode(db_session, printer_factory, mo
     assert sent == []
 
 
-# -- W3: respool_auto_enabled quarantine (Tier-2 auto OFF by default) ----------
+# -- WS3: Tier 2 CONCLUDES on a reused core; it never asks --------------------
 
 
 @pytest.mark.asyncio
-async def test_gate_spent_loaded_prompts_when_auto_disabled(db_session, printer_factory, monkeypatch):
-    """respool_auto_enabled defaults OFF: a spent+loaded tag arrival broadcasts the
-    one-click PROMPT instead of silently auto-minting a fresh row. A last brand IS
-    set, proving the gate is the toggle — not a missing brand.
+async def test_gate_spent_loaded_concludes_without_asking(db_session, printer_factory, monkeypatch):
+    """The INVERSION of the old ``respool_auto_enabled`` quarantine (operator ruling 3).
 
-    Also pins that the hardware-certain path is untouched by the Phase-C evidence
-    gates: no physical cycle is recorded here and it still prompts (the runout IS
-    the hardware event), carrying ``trigger="spent"`` so the UI keeps the
-    reused-tag framing for it."""
+    This test used to be ``test_gate_spent_loaded_prompts_when_auto_disabled`` and pinned
+    the toggle's OFF default: a spent+loaded tag arrival broadcast the one-click prompt
+    instead of minting. The toggle is deleted. A FINISHED roll
+    (``Spool.is_finished_roll``) reading LOADED is a physical impossibility unless the
+    filament is on a different roll, so the tier concludes: the donor is disposed and a
+    fresh full row carrying the tag takes the slot, with no question asked.
+
+    Still pinned from the original: the hardware-certain path needs no Phase-C physical
+    evidence — no cycle is recorded here and it still fires, because the runout IS the
+    hardware event.
+    """
     printer = await printer_factory()
     donor = await _make_donor(db_session, spent=True)
     from backend.app.api.routes.settings import set_setting
 
-    await set_setting(db_session, "respool_last_brand", "Polymaker")  # auto WOULD work if enabled
+    await set_setting(db_session, "respool_last_brand", "Polymaker")
     await db_session.commit()
 
     _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=11)))
     broadcasts = _spy_broadcast(monkeypatch)
     result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=11), donor)
 
-    assert result is None  # NOT auto-respooled
-    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
-    assert len(prompts) == 1  # prompted instead
-    assert prompts[0]["trigger"] == "spent"
+    assert result is not None and result is not donor  # concluded: a fresh re-spooled row
+    assert result.tag_type == RESPOOL_TAG_TYPE
+    assert result.weight_used == 0
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []  # nothing asked
+
+
+@pytest.mark.asyncio
+async def test_gate_spent_but_not_loaded_still_concludes_nothing(db_session, printer_factory, monkeypatch):
+    """LIVENESS PAIR — "reading LOADED" is half the evidence and it is still enforced.
+
+    A spent row re-inserted with no filament fed is a dead roll back in its slot, not a
+    reused core: the tier stands down exactly as before. Deleting the toggle widened WHEN
+    the tier concludes, never WHAT counts as evidence."""
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=True)
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db_session, "respool_last_brand", "Polymaker")
+    await db_session.commit()
+
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(state=9)))
+    broadcasts = _spy_broadcast(monkeypatch)
+    result = await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, _tray(state=9), donor)
+
+    assert result is None
+    assert [b for b in broadcasts if b["type"] == "respool_prompt"] == []
     assert (await db_session.get(Spool, donor.id)).archived_at is None  # donor untouched
 
 
@@ -3205,3 +3494,56 @@ async def test_sample_status_push_job_boundary_discards(db_session, printer_fact
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
     assert spool_respool.sample_status_push(printer.id, _running(2, subtask_id="B")) == []
     assert (await db_session.get(Spool, tray0_spool.id)).spent_at is None
+
+
+# --- the runout closes the roll's TRUE capacity (2026-08-19, operator ruling 18) --------
+
+
+class TestDeliveredCapacity:
+    """Scenario C2. A minted row's ``label_weight`` is an ASSUMPTION, not a reading of the
+    roll in the tray; the hardware runout is the only moment its real capacity becomes
+    knowable, and the answer is simply what the farm watched it feed.
+
+    Both directions of the gap are ORDINARY STOCK, which is the whole point of the ruling:
+    a part-used roll an operator seated delivers well under its label, and some brands ship
+    ~1100 g on a 1000 g label. Neither is an error, so neither may be warned about.
+    """
+
+    def test_an_unspent_row_has_delivered_nothing_final(self):
+        """A running total is not a capacity — callers must not read one as the other."""
+        assert Spool(label_weight=1000, weight_used=400.0).delivered_g is None
+
+    def test_a_part_used_roll_delivers_what_it_fed(self):
+        spool = Spool(label_weight=1000, weight_used=800.0, spent_at=datetime.utcnow())
+        assert spool.delivered_g == pytest.approx(800.0)
+        assert spool.remaining_g == 0.0  # spent ⇒ empty on every surface (rule 8)
+        assert spool.weight_used == pytest.approx(800.0)  # …while the ledger stays RAW
+
+    def test_an_overfilled_roll_delivers_more_than_its_label(self):
+        """~1100 g on a 1000 g label is ordinary stock, not misattribution."""
+        assert Spool(label_weight=1000, weight_used=1100.0, spent_at=datetime.utcnow()).delivered_g == pytest.approx(
+            1100.0
+        )
+
+    def test_the_label_is_never_written_back(self):
+        """One origin, no stored duplicate: overwriting the label would conflate 'what we
+        assumed' with 'what it delivered' and destroy the nominal figure cost-per-kg reads."""
+        spool = Spool(label_weight=1000, weight_used=800.0, spent_at=datetime.utcnow())
+        assert spool.label_weight == 1000
+
+
+@pytest.mark.asyncio
+async def test_a_short_delivery_is_RECORDED_not_warned(db_session, printer_factory, caplog):
+    """The old WARNING fired on the NORMAL shape and so read as noise — 14 live rows carried
+    843/580/576/453/418/417 g 'remaining' at their stamp, every one a part-used roll minted
+    as full. The stamp now produces the durable artifact of the delivered figure instead."""
+    printer = await printer_factory()
+    spool = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=300.0)
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay()))
+
+    assert marked is not None and marked.id == spool.id
+    assert marked.delivered_g == pytest.approx(300.0)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], "a normal short delivery must not warn"
+    assert any("delivered 300 g against an assumed" in r.getMessage() for r in caplog.records)

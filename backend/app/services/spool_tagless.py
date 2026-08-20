@@ -71,7 +71,7 @@ from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import ams_presence, spool_respool
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.spool_binding import bind_spool_to_slot
+from backend.app.services.spool_binding import bind_spool_to_slot, last_released_from_slot_stmt
 from backend.app.services.spool_tag_matcher import (
     auto_assign_spool,
     is_bambu_tag,
@@ -179,6 +179,16 @@ _MINT_SETTLE_S = 5.0
 # NON-spent outcomes discard. :func:`_maybe_prompt_fresh_roll` upholds this by checking
 # spent-ness FIRST: it runs inside the same await that ARMS the entry, so any earlier
 # discard there destroys the release signal before a consumer can ever see it.
+#
+# …and it survives an UNBOUND slot for the same reason (2026-08-19, shape 32): the roll
+# that ran out is released ~3 minutes BEFORE the firmware declares the runout, so a refill
+# inside that gap resolves on an unbound slot whose spent stamp has not landed yet. This
+# lane cannot know that outcome — it runs before the pipeline decides — so the discard
+# decision for an unbound slot belongs to ``slot_pipeline._settle_physical_cycle``, which
+# runs in the APPLY step of the deciding pass (MINT/BIND retire it; a de-bounce preserves
+# it so the imminent spent stamp can still drive REPLACE_SPENT). Ownership, not politeness:
+# a per-slot resource must not have its lifecycle decided by a function that cannot see
+# what happened to the slot.
 _pending_physical_cycles: set[tuple[int, int, int]] = set()
 
 # (printer_id, ams_id, tray_id) of slots whose config settle has already announced that
@@ -236,6 +246,28 @@ class _PresenceStaleEpisode(NamedTuple):
 # from the next pass's live state and the DB.
 _presence_stale_episodes: dict[tuple[int, int, int], _PresenceStaleEpisode] = {}
 
+
+class _SpentSwapParkEpisode(NamedTuple):
+    """One continuous run of the SAME spent binding parked under a seated, configured tray.
+
+    ``spool_id`` is the episode's identity: while that row still holds the slot and the
+    tray still reads present+configured, the farm is looking at one unchanging park.
+    ``first_seen`` is when it started; ``alerted`` records that the operator has been told
+    about THIS episode, which is what makes the surface exactly one-per-episode.
+    """
+
+    first_seen: float
+    spool_id: int
+    alerted: bool
+
+
+# (printer_id, ams_id, tray_id) -> the open spent-swap park for that slot. Deliberately a
+# SEPARATE map from :data:`_presence_stale_episodes`: the two arms watch opposite
+# predicates (spent vs non-spent, present vs absent-or-unknown, configured vs any) and
+# folding them into one keyed state would make "which situation is this slot in?"
+# unanswerable — the same conflation the 2026-08-19 wave deleted from ``_is_tagless``.
+_spent_swap_park_episodes: dict[tuple[int, int, int], _SpentSwapParkEpisode] = {}
+
 # How long ONE presence-stale reading must stand before the farm stops waiting for the
 # wire to volunteer an answer. Deliberately well past every ORDINARY stale window: mid-
 # print the H2S reduces its tray blocks to presence-unknown partials for the whole job,
@@ -270,6 +302,16 @@ _PRESENCE_ASK_INTERVAL_S: float = 3600.0
 # ≥85 min apart.
 _PRESENCE_ASK_ESCALATE_AT: int = len(_PRESENCE_ASK_GAPS_S) + 1
 
+# How long a SPENT binding may sit parked under a seated, configured tray before the
+# operator is told. Its own constant, not a reuse of
+# :data:`_BOUND_PRESENCE_STALE_AFTER_S`, because it is measured against a different
+# situation: there the wire has stopped answering, here the wire is answering perfectly
+# and the farm simply has no evidence it is allowed to act on. The value matches because
+# the judgement is the same — a quarter of an hour is past every ordinary transient (a
+# runout's own recovery, a print finishing, an eject) — and pinning them to one another
+# would make a later change to either silently move the other.
+_SPENT_SWAP_PARK_AFTER_S: float = 900.0
+
 # Settle delay before the farm may publish a filament IDENTITY into a slot. A spool
 # inserted into a slot that still carries a surviving tagless binding looks BARE for
 # ~1 s while the firmware runs its own RFID read; an ``ams_filament_setting`` write
@@ -295,6 +337,7 @@ def _reset_state() -> None:
     _pending_physical_cycles.clear()
     _settle_concluded_logged.clear()
     _presence_stale_episodes.clear()
+    _spent_swap_park_episodes.clear()
     _last_reconcile_at = None
 
 
@@ -908,17 +951,44 @@ async def _replace_row_after_cycle(
 # --- ledger-overcharge reconcile (009-H2S spool 290, 2026-08-12) ------------
 #
 # A tagless row can only ever be re-bound to its slot on IDENTITY-FREE evidence (a
-# ``last_location_*`` reclaim, a fingerprint match): there is no chip to say whether the
-# roll that came back is the roll that left. The reclaim is doctrine-CORRECT — rule 7
-# forbids any duration threshold from deciding tagless identity, so a 23-minute absence
-# that was really a physical roll swap is indistinguishable from a 23-minute drying trip,
-# and refusing to reclaim would break the far more common case. 009-H2S slot 2 took the
-# swap on 2026-08-12: spool 290 was reclaimed after that absence, absorbed the NEW roll's
+# ``last_location_*`` breadcrumb, a fingerprint match): there is no chip to say whether the
+# roll that came back is the roll that left. 009-H2S slot 2 took a swap on that evidence on
+# 2026-08-12: spool 290 was re-bound after a 23-minute absence, absorbed the NEW roll's
 # prints, reached 1200.48 g used on a 1000 g label — physically impossible — and so read
 # ``remaining_g == 0``, failed the 150 g start floor and staged the whole production run
 # silently for six hours behind a row describing filament that no longer existed.
 #
-# This lane is NOT a second guess at the reclaim. It fires only once the ledger has become
+# THE HEADER THIS REPLACES ASSERTED THE OPPOSITE, AND THAT ASSERTION COST THREE SESSIONS.
+# It read: the reclaim is "doctrine-CORRECT — rule 7 forbids any duration threshold from
+# deciding tagless identity … refusing to reclaim would break the far more common case."
+# Both clauses are superseded (2026-08-19, operator-ratified — shape 32, whose
+# fourth-attempt table shows each of the three prior rejections of a bounded window
+# immediately preceding an incident of this class):
+#
+#  * **Rule 7 IS AMENDED.** Duration still decides no tagless identity POSITIVELY; a
+#    bounded window decides the NEGATIVE — outside it the farm asserts nothing and MINTS.
+#    The prohibition on timing-based novelty is replaced by a prohibition on UNBOUNDED,
+#    CAUSE-BLIND breadcrumb reclaim. The lane survives only as a de-bounce for a SPURIOUS
+#    release: the slot's single last occupant, untagged, absence MEASURED and inside
+#    ``ams_presence._RESEAT_WINDOW_S``, and disqualified BY CAUSE whenever the release has
+#    a physical explanation — a runout, a mid-print pull (``slot_pipeline
+#    ._debounce_candidate`` / ``_runout_suspect``).
+#  * **"The far more common case" was finally MEASURED, and it is not the case that
+#    sentence meant.** Of 52 reclaims with a matched prior release over 8 days, 14 returned
+#    inside five minutes — four at 0.0 min across four printers inside ONE minute, which no
+#    human performs — and those are spurious releases the lane was silently repairing. The
+#    other 36 spanned 23 min to 3.3 days and were information-free guesses. The gap
+#    distribution has an empty valley between 1.7 min and 23 min, so the boundary is
+#    confirmed by data rather than chosen, and the common case is now correctly served
+#    rather than used as the argument for serving nothing correctly.
+#
+# What that leaves for THIS lane is stated below and is unchanged in kind — but note its
+# reach has narrowed by design: a de-bounce no longer stamps a re-bind boundary at all
+# (``slot_pipeline._debounce_bind_moment`` carries the incumbent moment forward, because
+# the farm has just certified that no physical event happened), so the surviving reachable
+# trigger is an operator manually assigning an old row to a slot holding a new roll.
+#
+# This lane is NOT a second guess at the de-bounce. It fires only once the ledger has become
 # PROVABLY impossible AND a known re-bind moment exists to attribute across. Two
 # independent facts are required and neither is sufficient alone:
 #
@@ -953,6 +1023,34 @@ async def _replace_row_after_cycle(
 # Deliberately a code constant, not a setting: it is derived from how the hardware and the
 # tracker behave, and nothing an operator could tune it to would be more correct.
 _OVERCHARGE_MARGIN_G = 20.0
+
+# The MIRROR margin, for the backward direction (:func:`reattribute_early_runout`). It
+# answers a different question from the one above and so gets its own derivation rather
+# than the same number by habit — conflating two margins is how a safety direction gets
+# inverted without anyone noticing.
+#
+# The comparison here is "does what the successor DELIVERED account for what the departed
+# row still had on the books": two farm-accumulated ``usage_tracker`` ledgers, read across
+# one assumed label. The only slack in that which is genuinely NOISE is the tracker's
+# layer-segment attribution quantum — "a handful of grams on either side of the truth", as
+# the margin above puts it — once per ledger, so roughly two quanta. 20 g, 2 % of a 1 kg
+# label.
+#
+# **Vendor overfill is deliberately NOT budgeted for here, unlike above.** Same physical
+# fact, opposite side of the safety line: up there a WIDER margin means FEWER reconciles
+# (silence, the safe direction), while a wider margin here means MORE merges — and a merge
+# that is wrong writes two physical rolls into one ledger row, permanently. Operator
+# rulings 4 and 5 genuinely conflict in that band, because a DIFFERENT part-used roll can
+# deliver roughly what the departed row had left, and the band belongs to ruling 4: a
+# different roll, stand down, log it (scenario C4). The acting arm is an optimisation; the
+# stand-down arm is the feature. So a roll that really was overfilled fails the fit test
+# and is simply not corrected — a missed correction self-heals at the next runout, a wrong
+# one never does (cross-cutting invariant 11's asymmetry).
+#
+# A code constant and not a setting, for :data:`_OVERCHARGE_MARGIN_G`'s reason: it is
+# derived from how the tracker attributes grams, and nothing an operator could tune it to
+# would be more correct.
+_REATTRIBUTION_FIT_MARGIN_G = 20.0
 
 # How much later than the spool row's own creation an assignment's ``created_at`` must sit
 # before it counts as a RE-bind rather than the original one. A mint and its bind happen
@@ -1061,6 +1159,150 @@ async def _warn_tagged_overcharge(db: AsyncSession, spool: Spool, assignment: Sp
     await notify_dedup.record_sent(db, _LEDGER_OVERCHARGE_SCOPE, key)
 
 
+async def _charges_since(db: AsyncSession, spool_id: int, boundary: datetime) -> float:
+    """Grams charged to ``spool_id`` at or after ``boundary``. One origin, two directions."""
+    return float(
+        (
+            await db.execute(
+                select(func.sum(SpoolUsageHistory.weight_used)).where(
+                    SpoolUsageHistory.spool_id == spool_id,
+                    SpoolUsageHistory.created_at >= boundary,
+                )
+            )
+        ).scalar()
+        or 0.0
+    )
+
+
+async def _repoint_charges(db: AsyncSession, *, from_spool_id: int, to_spool_id: int, boundary: datetime) -> None:
+    """Move every usage-history row at or after ``boundary`` from one spool row to another.
+
+    Charge re-attribution is ONE lane with TWO directions, and this is the half both share
+    (house rule: one canonical implementation per feature). FORWARD — a swap the farm
+    swallowed, so grams charged since the boundary belong to a SUCCESSOR
+    (:func:`replace_bound_row_with_successor`). BACKWARD — a roll change the farm invented,
+    so those grams go back to the PREDECESSOR that never actually left
+    (:func:`replace_bound_row_with_predecessor`). Same double entry, opposite evidence;
+    the callers own the ``weight_used`` arithmetic and the disposal because those genuinely
+    differ.
+    """
+    await db.execute(
+        update(SpoolUsageHistory)
+        .where(SpoolUsageHistory.spool_id == from_spool_id, SpoolUsageHistory.created_at >= boundary)
+        .values(spool_id=to_spool_id)
+    )
+
+
+async def _hand_charges_back(db: AsyncSession, *, row: Spool, predecessor: Spool, boundary: datetime) -> float:
+    """Move ``row``'s post-boundary charges back onto ``predecessor``. Returns the grams moved.
+
+    The BACKWARD half of the one re-attribution lane, shared by both of its triggers so the
+    double-entry arithmetic — which ledger gains, which loses, and where the clamp goes —
+    has exactly one body (house rule: one canonical implementation per feature). The two
+    triggers hold different evidence for the same conclusion, "the row change never
+    happened":
+
+    * :func:`replace_bound_row_with_predecessor` — a HUMAN says so (doctrine rule 12's
+      acknowledgement undo, scenario R8), and the predecessor goes back into the slot;
+    * :func:`reattribute_early_runout` — the HARDWARE says so, by running the successor out
+      on grams that only add up as the predecessor's remainder (scenario C3), and nothing
+      is re-bound because the slot is empty.
+
+    Disposal, re-binding and any stamp a caller carries across stay OUT of here: those are
+    what genuinely differ between the two, and folding them in would make this function
+    mean two things. Zero grams writes nothing at all — with no per-print provenance to
+    move there is no attribution to make, the same refusal the forward direction encodes as
+    ``require_positive_moved``. Flush-free; the callers own both the flush and the commit.
+    """
+    moved = await _charges_since(db, row.id, boundary)
+    if moved <= 0:
+        return 0.0
+    await _repoint_charges(db, from_spool_id=row.id, to_spool_id=predecessor.id, boundary=boundary)
+    predecessor.weight_used = float(predecessor.weight_used or 0.0) + moved
+    row.weight_used = max(0.0, float(row.weight_used or 0.0) - moved)
+    return moved
+
+
+async def replace_bound_row_with_predecessor(
+    db: AsyncSession,
+    row: Spool,
+    predecessor: Spool,
+    boundary: datetime,
+    *,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    fingerprint_color: str | None,
+    fingerprint_type: str | None,
+    origin: str,
+) -> float:
+    """Retract a mint: hand its grams back to the row it displaced and re-bind that row.
+
+    The MIRROR of :func:`replace_bound_row_with_successor`, in the same module and over the
+    same re-pointing primitive (:func:`_repoint_charges`), because they are one concept in
+    two directions rather than two lanes. Forward evidence is "the charges themselves prove
+    a swap"; backward evidence is "a human says the swap never happened" — doctrine rule 12's
+    acknowledgement, whose whole reason to exist is that an operator re-checking a slot they
+    merely re-seated gets an HONEST false positive with a one-click exit (scenario R8). The
+    HARDWARE can say the same thing (:func:`reattribute_early_runout`, scenario C3), which
+    is why the double entry itself lives in the shared :func:`_hand_charges_back` and only
+    the disposal and the re-bind are stated here.
+
+    Sequence, one unit of work: SUM the grams charged to ``row`` at or after ``boundary``,
+    re-point those history rows to ``predecessor``, add the sum back to its ``weight_used``,
+    zero the retracted row's share, dispose it through the fork's canonical disposal
+    (``dispose_provisional_on_tag`` — a pristine auto-minted row is hard-deleted, a
+    ledger-bearing one archived) and re-bind ``predecessor`` to the slot through the ONE
+    binding writer.
+
+    ``preserve_ordinal=True``: the predecessor is resuming a service life that never ended,
+    so re-stamping ``loaded_at`` would move a roll to the back of the FIFO queue for a
+    binding change the operator has just declared did not happen (doctrine rule 7 — a
+    mid-life re-seat keeps its position).
+
+    ``archived_at`` is cleared when the retracted mint's own path set it — an archived row
+    must never hold a location claim (table row 4e would replace it on the next push, which
+    is the undo undoing itself). ``spent_at`` is deliberately NOT cleared: that is hardware
+    evidence, and the operator ruling of 2026-08-09 forbids an un-spend lane outright. A
+    restored spent row therefore lands back in exactly the parked state the click found,
+    which is what "restore the previous roll" means.
+
+    Returns the grams moved back. Flush-only — the caller owns the commit, matching
+    ``bind_spool_to_slot``'s contract and this module's other re-attribution entry point.
+    """
+    moved = await _hand_charges_back(db, row=row, predecessor=predecessor, boundary=boundary)
+
+    predecessor.archived_at = None
+    disposition = await dispose_provisional_on_tag(db, row)
+    if disposition == "kept":
+        row.archived_at = datetime.utcnow()
+    await db.flush()
+
+    await bind_spool_to_slot(
+        db,
+        predecessor,
+        printer_id=printer_id,
+        ams_id=ams_id,
+        tray_id=tray_id,
+        fingerprint_color=fingerprint_color,
+        fingerprint_type=fingerprint_type,
+        origin=origin,
+        preserve_ordinal=True,
+    )
+    logger.info(
+        "[tagless] printer=%d A%dT%d re-check mint spool %d retracted (%s); spool %d restored with %.1f g "
+        "handed back",
+        printer_id,
+        ams_id,
+        tray_id,
+        row.id,
+        disposition,
+        predecessor.id,
+        moved,
+    )
+    return moved
+
+
 async def replace_bound_row_with_successor(
     db: AsyncSession,
     spool: Spool,
@@ -1117,17 +1359,7 @@ async def replace_bound_row_with_successor(
     Flush-only — the caller owns the commit, matching ``bind_spool_to_slot``'s contract and
     both call sites' transaction shapes (the sweep's session; the migration's savepoint).
     """
-    moved = float(
-        (
-            await db.execute(
-                select(func.sum(SpoolUsageHistory.weight_used)).where(
-                    SpoolUsageHistory.spool_id == spool.id,
-                    SpoolUsageHistory.created_at >= boundary,
-                )
-            )
-        ).scalar()
-        or 0.0
-    )
+    moved = await _charges_since(db, spool.id, boundary)
     if moved <= 0 and require_positive_moved:
         return None
 
@@ -1135,11 +1367,7 @@ async def replace_bound_row_with_successor(
     # instant as far as this repair is concerned.
     now = datetime.utcnow()
     successor = await _mint_successor_row(db, spool, weight_used=moved)
-    await db.execute(
-        update(SpoolUsageHistory)
-        .where(SpoolUsageHistory.spool_id == spool.id, SpoolUsageHistory.created_at >= boundary)
-        .values(spool_id=successor.id)
-    )
+    await _repoint_charges(db, from_spool_id=spool.id, to_spool_id=successor.id, boundary=boundary)
     spool.weight_used = max(0.0, float(spool.weight_used or 0.0) - moved)
     spool.archived_at = now
     if stamp_donor_spent:
@@ -1304,6 +1532,243 @@ async def _scan_ledger_overcharges(db: AsyncSession) -> int:
     return reconciled
 
 
+# --- the BACKWARD direction: an early runout hands the charges back ---------
+#
+# Scenarios C3/C4, and the price of doctrine rule 7's 2026-08-19 amendment rather than a
+# nicety on top of it. Scoping the breadcrumb reclaim to a 5-minute glitch filter made the
+# farm MINT a fresh row at label weight for every longer absence. That is right for a
+# genuine roll change (T2/T3 — the 002/005-H2S incident) and WRONG for a roll pulled for an
+# external dry, a jam clear, a tangle fix or an inspection and returned later (T5), and for
+# a restart that lands while the roll is out (T11). Those write an ASSUMED full roll over a
+# part-used one, which OVER-PROMISES the ``min_start_spool_g`` start gate — the direction
+# the operator named critical, because it starts prints that die instead of staging them.
+# The amendment's own text accepts that cost only on the condition stated here: it
+# "self-corrects at that roll's next runout rather than persisting silently".
+#
+# This lane is that correction, and it acts at the only moment the hardware states the
+# truth. A row that ran dry having delivered far less than its assumed label is one of two
+# things: a part-used roll an operator legitimately seated as full (scenario C2 — ordinary
+# stock, operator ruling 4, nothing to do), or the farm's own mistaken mint, in which case
+# the grams it delivered ARE the remainder still on the books of the row it displaced. When
+# those add up the charges go back and the mint is retired (C3); when they do not, nothing
+# happens and the reason is logged (C4).
+#
+# **Why this may act at all, given cross-cutting invariant 11.** Assumption-tier evidence
+# may displace NOTHING a live binding holds, and an arithmetic fit is assumption-tier — a
+# coincidence-sized argument, not an identity read. The escape is a timing FACT, not an
+# exemption: the AMS clears a drained slot's exist bit ~3 MINUTES BEFORE it declares the
+# runout (incident shape 31, timed 3× on 2026-08-13), so by the time a spent stamp exists
+# the release has already hard-deleted the assignment. Both rows this lane adjudicates are
+# therefore DEAD — unbound, out of service — and it displaces nothing.
+#
+# That is ENFORCED, not assumed. ``last_released_from_slot_stmt`` carries
+# ``~Spool.assignments.any()``, and this lane additionally requires the spent row to be the
+# NEWEST row that query returns, so a spent stamp landing while the binding is still live
+# finds no candidate and stands down. **If a future change ever makes spent stamping fire
+# while the binding is live, this exemption evaporates with it** — the stand-down is what
+# keeps that change safe, so it must never be "fixed" into a lookup that ignores the
+# assignment.
+#
+# Error direction, as everywhere else in this module: only ever the optimistic one. Grams
+# that do not fit are left exactly where they are. A missed correction self-heals at that
+# roll's next runout; a wrong one is permanent.
+
+
+async def reattribute_early_runout(
+    db: AsyncSession,
+    spent: Spool,
+    *,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+) -> Spool | None:
+    """Entry hook for the backward correction; returns the row the charges went back to.
+
+    See the section comment above. Called from ``spool_respool._mark_tray_spent`` — THE one
+    spent writer — immediately after it commits a NEW stamp, so every one of the four
+    trigger lanes reaches this once and none of them reaches it twice: a duplicate trigger
+    returns from that function's idempotent branch and never gets here.
+
+    FULLY self-guarding (cross-cutting invariant 10). The spent stamp is already durable
+    when this runs, and a correction that is by construction optional must never be able to
+    take that stamp — or the MQTT callback chain hosting it — down with it.
+    """
+    try:
+        return await _reattribute_early_runout(db, spent, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id)
+    except Exception:  # noqa: BLE001 — an entry hook owns its guard; the stamp above must survive
+        logger.exception("Early-runout re-attribution failed (non-fatal)")
+        try:
+            await db.rollback()  # a half-applied re-point must not ride somebody else's commit
+        except Exception:  # noqa: BLE001 — a dead session cannot be rescued here
+            logger.exception("Early-runout re-attribution rollback failed")
+        return None
+
+
+async def _reattribute_early_runout(
+    db: AsyncSession, spent: Spool, *, printer_id: int, ams_id: int, tray_id: int
+) -> Spool | None:
+    """The adjudication and the write that :func:`reattribute_early_runout` guards. See it.
+
+    Three questions, in cost order, each answered before the next is asked:
+
+    1. **Is there a mistake to correct?** Only for a row the FARM minted
+       (:data:`DATA_ORIGIN` — an operator's own inventory record is never retracted by a
+       detector, the same boundary :func:`dispose_provisional_on_tag` draws), untagged
+       (doctrine rule 10 — a tagged row's identity is factual, and an over- or under-spend
+       there is misattribution to root-cause by hand, never a roll change to book), that ran
+       out having delivered less than its assumed label by more than
+       ``spool_respool._SPENT_DELIVERY_GAP_NOTE_G``. That floor is deliberately NOT a second
+       constant: it is the very gap the spent stamp already RECORDS as this roll's true
+       capacity (operator ruling 18), so "the delivery was worth a note" and "the delivery
+       was worth checking" stay one threshold with one origin. A roll that delivered about a
+       full label was minted correctly and there is nothing here to recover.
+    2. **Which row could it have displaced?** EXACTLY ONE — the slot's single last departed
+       roll, taken immediately ahead of the one that just ran out (rule 7's amendment:
+       "bounded to the slot's single last occupant"). Read through
+       ``spool_binding.last_released_from_slot_stmt``, the ONE origin for that question, and
+       adjudicated wherever it leads. This lane never scans past it hunting for a row that
+       fits — that discipline is the whole difference between an adjudication and a search
+       through noise, and it is the same refusal ``_mark_tray_spent`` tier 2 makes.
+    3. **Do the grams add up?** The successor's ``Spool.delivered_g`` — the derivation that
+       exists for exactly this consumer — against the departed row's ``Spool.remaining_g``,
+       the one gram origin per side since 2026-08-12. Inside
+       :data:`_REATTRIBUTION_FIT_MARGIN_G` the physical roll never changed; outside it a
+       DIFFERENT part-used roll delivered what it delivered (operator ruling 4) and nothing
+       is written.
+
+    The write, when all three answer yes: the successor's per-print charges go back through
+    the shared :func:`_hand_charges_back`; the departed row inherits the runout's own
+    ``spent_at`` INSTANT — re-attributed, never re-stamped off a fresh clock, because one
+    runout happened and ``_mark_tray_spent`` remains its sole author. That stamp is not
+    decoration either: it is what removes the departed row from the de-bounce donor query
+    and from ``spool_tag_matcher.find_matching_untagged_spool`` (both filter
+    ``spent_at IS NULL``), so the roll that actually ran dry cannot be reclaimed onto the
+    next fresh one — the resurrection half of incident shape 31.
+
+    The mistaken row is ARCHIVED rather than disposed, unlike the acknowledgement undo's
+    hard-delete. It is still this slot's most recent departure, so it stays the row a
+    duplicate runout trigger resolves onto and answers idempotently, and it is the row the
+    calling trigger lane is holding as its return value.
+
+    Nothing is re-bound. The slot is empty — the roll ran out and the bay cleared minutes
+    ago — so a bind would claim a location for filament that is not there (doctrine rule 9),
+    and it would additionally hand the FORWARD sweep the live assignment it requires, which
+    is the one thing keeping these two directions from oscillating over a single row set
+    (incident shape 26, the spool-211 ping-pong).
+
+    Every exit before question 3 is SILENT on purpose: those describe every ordinary runout
+    on the fleet, and an INFO line per runout saying "this was a normal runout" is the kind
+    of noise the 2026-08-10 wave demoted six surfaces to remove. From the point a candidate
+    exists, BOTH outcomes log — the stand-down is a decision this lane made and C4 is the
+    arm that matters most.
+    """
+    delivered = spent.delivered_g
+    assumed_g = float(spent.label_weight or 0.0)
+    boundary = spent.created_at
+    if (
+        delivered is None  # not stamped spent: nothing has been settled yet
+        or delivered <= 0  # fed nothing: no grams, so no evidence either way
+        or assumed_g <= 0  # unpriceable row: no assumption to have got wrong
+        or boundary is None  # no creation instant, so no provable "everything since" set
+        or spent.data_origin != DATA_ORIGIN  # not a row the farm minted
+        or not is_tagless_spool(spent)  # rule 10
+        or (assumed_g - delivered) <= spool_respool._SPENT_DELIVERY_GAP_NOTE_G
+    ):
+        return None
+
+    rows = (
+        (await db.execute(last_released_from_slot_stmt(printer_id, ams_id, tray_id).limit(2))).scalars().all()
+    )
+    if not rows or rows[0].id != spent.id:
+        logger.info(
+            "[RESPOOL] EARLY-RUNOUT NOT RE-ATTRIBUTED: spool %d is not this slot's most recent departure "
+            "(printer %d AMS%d-T%d) — it is still bound, or another roll has left the slot since. "
+            "Assumption-tier evidence displaces nothing a live binding holds (invariant 11).",
+            spent.id,
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return None
+
+    departed = rows[1] if len(rows) > 1 else None
+    remainder = 0.0
+    if departed is None:
+        why = "this slot has no earlier departure on record, so there is no row it could have displaced"
+    elif not is_tagless_spool(departed):
+        why = f"the departed row (spool {departed.id}) is tag-identified — its identity is factual (rule 10)"
+    elif departed.archived_at is not None:
+        why = f"the departed row (spool {departed.id}) is archived — retired inventory is never resurrected"
+    elif departed.spent_at is not None:
+        why = f"the departed row (spool {departed.id}) ran out itself, so it had no remainder to hand over"
+    elif float(departed.label_weight or 0.0) <= 0:
+        why = f"the departed row (spool {departed.id}) has no label to price a remainder against"
+    else:
+        remainder = departed.remaining_g
+        why = ""
+        if abs(delivered - remainder) > _REATTRIBUTION_FIT_MARGIN_G:
+            why = (
+                f"it delivered {delivered:.0f} g against spool {departed.id}'s {remainder:.0f} g remainder, "
+                f"{abs(delivered - remainder):.0f} g outside the {_REATTRIBUTION_FIT_MARGIN_G:.0f} g fit "
+                "margin — the ambiguous band belongs to 'a different part-used roll' (operator ruling 4)"
+            )
+
+    if why:
+        logger.info(
+            "[RESPOOL] EARLY-RUNOUT NOT RE-ATTRIBUTED: spool %d ran out at %.0f g on an assumed %.0f g label "
+            "(printer %d AMS%d-T%d) — %s. Its grams stand as delivered.",
+            spent.id,
+            delivered,
+            assumed_g,
+            printer_id,
+            ams_id,
+            tray_id,
+            why,
+        )
+        return None
+
+    runout_at = spent.spent_at
+    moved = await _hand_charges_back(db, row=spent, predecessor=departed, boundary=boundary)
+    if moved <= 0:
+        # The fit was arithmetic; the MOVE needs per-print provenance. ``spool_usage_history``
+        # is tracker-written only, so a manual ``weight_used`` edit or a scale weigh-in never
+        # appears in it — and it stays on the row the operator put it on, exactly as the
+        # forward direction refuses an attribution it cannot make exactly.
+        logger.info(
+            "[RESPOOL] EARLY-RUNOUT NOT RE-ATTRIBUTED: spool %d fits spool %d's remainder but carries no "
+            "per-print charges to move (printer %d AMS%d-T%d) — no exact attribution is available.",
+            spent.id,
+            departed.id,
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return None
+
+    departed.spent_at = runout_at
+    spent.archived_at = datetime.utcnow()
+    await db.commit()
+
+    logger.info(
+        "[RESPOOL] EARLY-RUNOUT RE-ATTRIBUTED: mistaken mint spool %d ran out at %.0f g on an assumed %.0f g "
+        "label (printer %d AMS%d-T%d) — that is the %.0f g remainder spool %d still had when it left this "
+        "slot, so %.0f g went back to it. Spool %d now reads %.0f g used and carries the runout; the mint is "
+        "archived. The roll never changed, the mint did (rule 7's amended window, scenario C3).",
+        spent.id,
+        delivered,
+        assumed_g,
+        printer_id,
+        ams_id,
+        tray_id,
+        remainder,
+        departed.id,
+        moved,
+        departed.id,
+        float(departed.weight_used or 0.0),
+    )
+    return departed
+
+
 # --- W5 tagless fresh-roll prompt ------------------------------------------
 
 
@@ -1392,10 +1857,13 @@ async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: in
 
     Reads the slot's kept assignment. A SPENT bound row **of any tag-ness** leaves the
     pending cycle for the W1 spent→mint transition (certain fresh roll — silent, no
-    prompt). A NON-spent row whose tray is STILL PRESENT and is consumed past
-    :data:`_FRESH_ROLL_PROMPT_USED_FRAC` of its label broadcasts ``tagless_fresh_prompt``
-    and stamps ``fresh_prompt_pending_at``. Every non-spent outcome (prompt, absent tray,
-    or sub-threshold) POPs the pending cycle — no latch is involved for non-spent rows.
+    prompt). An UNBOUND slot leaves it too, for the pipeline to settle per outcome (see
+    the branch comment — 2026-08-19, shape 32 layer 2). A NON-spent BOUND row whose tray
+    is STILL PRESENT and is consumed past :data:`_FRESH_ROLL_PROMPT_USED_FRAC` of its
+    label broadcasts ``tagless_fresh_prompt`` and stamps ``fresh_prompt_pending_at``.
+    Every non-spent BOUND outcome (prompt, absent tray, sub-threshold, or a tagged row
+    with nothing tagless to ask about) POPs the pending cycle — no latch is involved for
+    non-spent rows.
 
     The spent check running FIRST is load-bearing (see the
     :data:`_pending_physical_cycles` survival invariant), not cosmetic ordering.
@@ -1428,7 +1896,20 @@ async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: in
     # latching its slot against the fresh roll physically seated in it).
     if spool is not None and spool.spent_at is not None:
         return  # leave the pending cycle for the W1 spent→mint transition (silent)
-    if spool is None or not is_tagless_spool(spool):
+    if spool is None:
+        # UNBOUND — and this lane may not decide what happens to the cycle, because it
+        # runs BEFORE the outcome exists. It used to discard here, which is exactly
+        # backwards for the shape that hits it most: a refill inside the ~3-minute
+        # bay-clear→HMS gap arrives at an unbound slot (the runout's release landed
+        # minutes before its own evidence), the pipeline de-bounces onto the exhausted
+        # row, the runout then stamps it spent — and row 4a needs THIS cycle to fire
+        # ``REPLACE_SPENT`` and hand the fresh roll its own row. Discarding it parked the
+        # slot until a human pulled and re-seated (scenarios T8b/T8c, shape 32's layer 2).
+        # ``slot_pipeline._settle_physical_cycle`` owns the decision now, per outcome, in
+        # the apply step of the same pass — with no binding here there is nothing to
+        # prompt about either way.
+        return
+    if not is_tagless_spool(spool):
         _pending_physical_cycles.discard(key)  # nothing tagless bound to latch/prompt
         return
     # Presence re-check before the stamp (2026-08-07). The cycle that got us here is a
@@ -1513,7 +1994,13 @@ def consume_qualified_cycle(printer_id: int, ams_id: int, tray_id: int) -> bool:
     """Spend this slot's pending physical cycle. True when there was one to spend.
 
     The W1 spent-latch RELEASE, popped exactly once — the same discard the branch-(3) /
-    bare-tray transitions perform, exposed for the slot pipeline's REPLACE_SPENT arm.
+    bare-tray transitions perform, exposed for the slot pipeline.
+
+    ONE pop, two intents, and the difference lives in the caller's log line rather than in
+    a second function: the pipeline's ``REPLACE_SPENT`` arm spends it as the EVIDENCE it
+    acted on, while ``slot_pipeline._settle_physical_cycle`` retires it as the slot's
+    lifecycle owner when a MINT or a BIND leaves a different row holding the slot (the
+    bound that keeps a surviving cycle from replaying as a phantom swap two pushes later).
     """
     key = (printer_id, ams_id, tray_id)
     if key not in _pending_physical_cycles:
@@ -2132,6 +2619,96 @@ async def _age_bound_presence_stale(
     manager.request_evidence_pushall(printer_id, "bound_presence_unknown")
 
 
+async def _age_spent_swap_park(
+    db: AsyncSession,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    tray: dict,
+    assignment: SpoolAssignment | None,
+    now: float,
+) -> None:
+    """Make the spent-swap park LOUD. Sibling of :func:`_age_bound_presence_stale`, not a
+    branch of it.
+
+    THE PARK. ``slot_state`` row 4a releases the W1 spent latch on a QUALIFIED PHYSICAL
+    CYCLE, and 4a′/5a release it on an ANSWERED no-tag read over a binding that CLAIMS a
+    tag. A spent binding sitting under a CONFIGURED, seated tray with neither of those can
+    reach neither: the cycle already happened (or never will), and for a TAGLESS incumbent
+    the answered-read escape does not exist by design — over a binding that claims no
+    identity a no-tag read proves nothing, because the same bare core reads identically
+    before and after a swap (doctrine rule 11's one-way clause, scenario G9). So the row
+    returns ``KEEP("spent_latch")`` and waits for evidence that may never arrive, on a
+    production slot, forever and silently. That silence is the defect; the latch is not.
+
+    WHY A SIBLING, AND NOT AN ARM OF ``_age_bound_presence_stale``. That function's
+    predicate is the OPPOSITE on all three axes — it ages a NON-spent binding (it pops its
+    episode for a spent one) whose presence reads None or False, i.e. a slot whose wire has
+    stopped answering. This park is spent, PRESENT and CONFIGURED: the wire is answering
+    perfectly. Bolting one onto the other would put two unrelated situations under one
+    name and one episode map, which is the ``_is_tagless`` mistake in a different costume.
+    What IS shared is the thing worth sharing: the operator SURFACE
+    (``ams_presence.broadcast_standing_unknown``), so the console keeps one vocabulary for
+    "this slot is standing unresolved" instead of growing a second one.
+
+    NO TIMER DECIDES IDENTITY. :data:`_SPENT_SWAP_PARK_AFTER_S` gates only whether a HUMAN
+    is asked; the farm still concludes nothing about which roll is seated, and no binding,
+    row or gram moves here. That is precisely the carve-out doctrine rule 6 makes — a
+    duration may gate an action whose false-positive cost is trivial, and the cost of one
+    toast on a slot that was about to resolve itself is a toast. The operator's exit is
+    already built: "Re-check slot" concludes the swap in one click (rule 12, scenario R5).
+
+    ONE SURFACE PER EPISODE. An episode is one continuous run of the same spent row parked
+    under a seated configured tray; it closes when the binding changes, the row stops being
+    spent, the tray stops reading present+configured, or a qualified cycle arrives (any of
+    which means the park is over and a later one is a NEW situation, timed from then).
+    Unlike the presence ladder there is nothing to re-ask the printer for — the wire has
+    already said everything it can — so there is no backoff ladder here, only the single
+    escalation the ladder exists to reach.
+    """
+    key = (printer_id, ams_id, tray_id)
+    spool = assignment.spool if assignment is not None else None
+    parked = (
+        assignment is not None
+        and spool is not None
+        and spool.is_finished_roll
+        and assignment.pre_configured_at is None
+        # The canonical tri-state rule, never a re-derivation from tray_type emptiness.
+        and tray_presence_from_dict(tray) is True
+        and bool((tray.get("tray_type") or "").strip())
+        # A pending cycle IS the release row 4a is waiting for, and it fires on the next
+        # push — so a slot holding one is not parked, it is one push from resolving. PEEK
+        # only: consuming it here would destroy the very evidence that ends the park.
+        and not qualified_cycle_pending(printer_id, ams_id, tray_id)
+    )
+    if not parked:
+        _spent_swap_park_episodes.pop(key, None)
+        return
+
+    episode = _spent_swap_park_episodes.get(key)
+    if episode is None or episode.spool_id != assignment.spool_id:
+        _spent_swap_park_episodes[key] = _SpentSwapParkEpisode(now, assignment.spool_id, alerted=False)
+        return
+    if episode.alerted or (now - episode.first_seen) < _SPENT_SWAP_PARK_AFTER_S:
+        return
+
+    # Stamp BEFORE the surface: a broadcast that raises or is refused must not turn a
+    # once-per-episode alert into a once-per-pass one (the same ordering the presence
+    # ladder uses for its rung).
+    _spent_swap_park_episodes[key] = episode._replace(alerted=True)
+    logger.warning(
+        "Spent spool %d has held printer %d AMS%d-T%d for %.0fs under a seated, configured tray with no "
+        "qualified roll cycle and no answered read to release it — the slot is parked. Telling the operator "
+        "(Re-check slot concludes it in one click).",
+        assignment.spool_id,
+        printer_id,
+        ams_id,
+        tray_id,
+        now - episode.first_seen,
+    )
+    await ams_presence.broadcast_standing_unknown(db, printer_id, ams_id, tray_id, case="spent_swap_park")
+
+
 async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> int:
     """Re-drive slot config the firmware never applied — the DURABLE retry lane.
 
@@ -2154,7 +2731,10 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
     permanently-engaged extruder). A fourth arm watches PRESENCE rather than identity —
     :func:`_age_bound_presence_stale` ages a bound slot whose merged presence has stopped
     being a checkable claim and, once per episode, asks the printer and the operator to
-    settle it. All of them keep every guard they carry (RFID
+    settle it. A fifth — :func:`_age_spent_swap_park` — is its sibling on the opposite
+    predicate: a SPENT binding under a tray that IS answering (present and configured) with
+    no release evidence the decision table may act on, which parks the slot silently
+    forever. All of them keep every guard they carry (RFID
     early-exit, spent latch, identify/drying defer, mint settle, config settle,
     operator/RFID-bound never-overwrite, wire-safety refusals, their own retry
     windows) — this lane supplies the missing OCCASION to retry, never a new
@@ -2298,6 +2878,13 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
                     # unknown IDENTITY; this one chases a stale PRESENCE, which is what a
                     # binding is actually a claim about (doctrine rule 9).
                     await _age_bound_presence_stale(db, printer_id, ams_id, tray_id, tray, assignment, now, manager)
+
+                    # SPENT-SWAP PARK — the arm above's sibling, on the opposite
+                    # predicate: a spent binding under a tray that is answering
+                    # perfectly (present AND configured) and has no release evidence
+                    # the decision table can act on. Nothing to ask the printer for
+                    # here, so it asks the OPERATOR, once per episode.
+                    await _age_spent_swap_park(db, printer_id, ams_id, tray_id, tray, assignment, now)
                 except Exception:  # noqa: BLE001 — one bad slot must not abort the pass
                     logger.exception(
                         "Slot-config reconcile failed for printer %d AMS%d-T%d",
