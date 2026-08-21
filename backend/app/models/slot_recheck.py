@@ -59,9 +59,7 @@ class SlotRecheckIntent(Base):
     # Who asked. NULL when auth is disabled — the fork's other operator-attributed
     # columns take the same shape. SET NULL, not CASCADE: deleting a user must not
     # erase a slot's identity history.
-    requested_by: Mapped[int | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
-    )
+    requested_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     # NULL = OPEN: the farm still owes this slot an answer. Set the moment the decision
     # table concludes for the slot, whatever the conclusion was.
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -69,9 +67,13 @@ class SlotRecheckIntent(Base):
     # way (a tag landed and the identity lane decided; the roll was pulled). The only
     # thing that scopes the acknowledgement + undo to mints the operator caused.
     # SET NULL so purging a spool row cannot orphan the intent's history.
-    minted_spool_id: Mapped[int | None] = mapped_column(
-        ForeignKey("spool.id", ondelete="SET NULL"), nullable=True
-    )
+    #
+    # It is also the RETRACTION: ``slot_recheck.undo`` NULLs it once the mint has been
+    # handed back, because "resolved, nothing standing" is exactly what NULL already
+    # means here. That is why the undo needs no ``undone_at`` column — a second boolean
+    # for a state this one already expresses would be two sources for one fact, and the
+    # act's own log line plus the archived row carry the history a flag could not.
+    minted_spool_id: Mapped[int | None] = mapped_column(ForeignKey("spool.id", ondelete="SET NULL"), nullable=True)
 
     __table_args__ = (
         # ONE open intent per slot. PARTIAL (SQLite >= 3.8 and PostgreSQL both honour the

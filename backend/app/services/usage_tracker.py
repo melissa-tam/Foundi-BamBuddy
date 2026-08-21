@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from time import monotonic
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +37,9 @@ _ACTIVE_PRINT_GCODE_STATES = ("RUNNING", "PAUSE", "PREPARE", "SLICING")
 # very fact it exists to surface.
 _ZERO_CHARGE_SCOPE = "zero_gram_charge"
 _ZERO_CHARGE_RENOTIFY_S = 6 * 3600.0
+
+# Which witnesses ``_print_feeder_keys`` may consult — see that function.
+Witnesses = Literal["all", "dispatch_only"]
 
 
 async def ams_weight_sync_allowed(db: AsyncSession, printer_id: int, state) -> bool:
@@ -506,8 +510,10 @@ def _global_tray_to_ams_key(global_tray_id: int) -> tuple[int, int]:
 
 def _print_feeder_keys(
     ams_mapping: list[int] | None,
-    state,
+    state=None,
     extra_global_tray: int | None = None,
+    *,
+    witnesses: Witnesses = "all",
 ) -> set[tuple[int, int]]:
     """The ``(ams_id, tray_id)`` slots a print actually fed from.
 
@@ -523,20 +529,26 @@ def _print_feeder_keys(
     zero-gram guard needs it to name the slot that fed a print charging nothing. A
     second copy would let those two disagree about what "this print's feeder" means.
 
-    They pass DIFFERENT witnesses, deliberately. The change log and ``tray_now`` are
-    OBSERVATIONS of what is physically in the feed path, and a motion-only job — an
-    eject sweep, an empty-bed dry-run — inherits the previous print's still-loaded
-    tray, so both would name a feeder for a job that consumed nothing by design (the
-    log is even seeded from ``tray_now`` at print start, ``bambu_mqtt`` W6.1). That
-    is harmless for the fallback, which only widens a set it then intersects against
-    a real remain% drop, and would be a false page for the zero-gram guard — so that
-    caller passes the dispatch mapping alone, which is a DECISION rather than an
-    observation, and an eject decides no AMS slot at all.
+    ``witnesses`` is how they differ, named at the call site rather than implied by a
+    null argument:
+
+    * ``"all"`` — mapping ∪ change log ∪ ``extra_global_tray``. The remain%-delta
+      fallback wants every candidate, because it only WIDENS a set it then
+      intersects against a real remain% drop, so a spurious member costs nothing.
+    * ``"dispatch_only"`` — the mapping alone, and the observational arguments are
+      ignored outright. The change log and ``tray_now`` observe what is physically
+      in the feed path, and a motion-only job — an eject sweep, an empty-bed dry-run
+      — inherits the previous print's still-loaded tray (the log is even seeded from
+      ``tray_now`` at print start, ``bambu_mqtt`` W6.1). Naming a feeder from those
+      would page the zero-gram guard after every eject on every printer. The mapping
+      is a DECISION rather than an observation, and an eject decides no AMS slot.
     """
     keys: set[tuple[int, int]] = set()
     for gid in ams_mapping or []:
         if isinstance(gid, int) and gid >= 0:
             keys.add(_global_tray_to_ams_key(gid))
+    if witnesses == "dispatch_only":
+        return keys
     for change in getattr(state, "tray_change_log", None) or []:
         if isinstance(change, (tuple, list)) and len(change) >= 1:
             gid = change[0]
@@ -676,26 +688,46 @@ async def _resolve_run_context(
     filters ``status == "printing"``, which is wrong at completion (the row is
     already terminal by the time usage runs).
     """
-    from backend.app.models.print_queue import PrintQueueItem
-
     # 1. Session fast path — print-start captured both values, no query needed.
     if session is not None:
         return session.plate_id, session.ams_mapping
 
-    # 2. dispatch_subtask_id match (id-bound, any status).
-    subtask = (data.get("subtask_id") or "").strip()
-    if subtask:
+    item = await _resolve_run_item(db, (data.get("subtask_id") or "").strip() or None, archive_id)
+    if item is None:
+        return None, None
+    return item.plate_id, _parse_ams_mapping(item.ams_mapping)
+
+
+async def _resolve_run_item(db: AsyncSession, subtask_id: str | None, archive_id: int | None):
+    """The farm queue item a completing print belongs to, or None.
+
+    ONE origin for "which dispatched unit was this print", shared by
+    :func:`_resolve_run_context` (which wants its plate + mapping) and the 3MF
+    donor fallback in :func:`_track_from_3mf` (which wants its source file). Two
+    rows can answer, most-bound first:
+
+    1. the item whose ``dispatch_subtask_id`` equals the terminal payload's
+       ``subtask_id`` — the id Bambuddy minted for this exact dispatch, accepted at
+       any status because the scheduler may already have stamped the row terminal;
+    2. the item linked to this ``archive_id`` (the id-less path: a firmware that
+       resets ``subtask_id`` on cancel, or a pre-stamping row). Reprints reuse the
+       archive, so the most recently started matching row wins.
+
+    Returns None for every print the farm did not dispatch, which is what keeps the
+    foreign/screen-print lanes on their own (guessing) path.
+    """
+    from backend.app.models.print_queue import PrintQueueItem
+
+    if subtask_id:
         result = await db.execute(
             select(PrintQueueItem)
-            .where(PrintQueueItem.dispatch_subtask_id == subtask)
+            .where(PrintQueueItem.dispatch_subtask_id == subtask_id)
             .order_by(PrintQueueItem.started_at.desc())
         )
         item = result.scalars().first()
         if item is not None:
-            return item.plate_id, _parse_ams_mapping(item.ams_mapping)
+            return item
 
-    # 3. archive_id-linked queue item (session lost; reprints reuse the archive so
-    #    take the most recently started matching row).
     if archive_id:
         result = await db.execute(
             select(PrintQueueItem)
@@ -703,11 +735,9 @@ async def _resolve_run_context(
             .where(PrintQueueItem.status.in_(_RUN_CONTEXT_STATUSES))
             .order_by(PrintQueueItem.started_at.desc())
         )
-        item = result.scalars().first()
-        if item is not None:
-            return item.plate_id, _parse_ams_mapping(item.ams_mapping)
+        return result.scalars().first()
 
-    return None, None
+    return None
 
 
 def _to_epoch_seconds(value: datetime | None) -> float | None:
@@ -1009,7 +1039,13 @@ async def on_print_complete(
         if search_filename:
             threemf_path = await _find_3mf_by_filename(printer_id, search_filename, db, app_settings.base_dir)
 
-    if archive_id or threemf_path:
+    # The echoed dispatch id lets the 3MF lane fall back to the farm's OWN donor
+    # file when neither the archive nor a same-named copy yields one — so it is also
+    # a reason to ENTER that lane with no archive at all (auto-archive off): a farm
+    # dispatch is chargeable from the file it was dispatched with, always.
+    terminal_subtask = (data.get("subtask_id") or "").strip() or None
+
+    if archive_id or threemf_path or terminal_subtask:
         threemf_results = await _track_from_3mf(
             printer_id,
             archive_id,
@@ -1027,6 +1063,7 @@ async def on_print_complete(
             print_started_at=session.started_at if session else None,
             threemf_path=threemf_path,
             plate_id=resolved_plate_id,
+            subtask_id=terminal_subtask,
         )
         results.extend(threemf_results)
 
@@ -1282,6 +1319,16 @@ async def _warn_zero_gram_tagless_charge(
       unattributable page names nothing an operator can act on — so it stays an INFO
       record instead.
 
+    **What the two surfaces each carry.** The WARN names EVERY zero-charged tagless
+    feeder of this print (a multi-material run can lose several rolls' grams at
+    once, and a log naming only the first hides the rest of the shortfall). The
+    PAGE is deduped ``printer:{id}`` for 6 h and names the FIRST such feeder only:
+    its body template is singular by construction ("… but {slot} is fed by tagless
+    spool #{spool_id} ({spool_material})"), templates are seeded once and never
+    re-seeded on an existing install, so a plural caller would render broken copy on
+    every farm already in production. The WARN is the complete record; the page is
+    the pointer to it.
+
     Reports rather than repairs: the grams of a print with no slicer data are not
     recoverable afterwards, and writing an invented figure would replace a visible
     hole with an invisible wrong number (the same reasoning that keeps
@@ -1294,6 +1341,7 @@ async def _warn_zero_gram_tagless_charge(
     from backend.app.services import notify_dedup
     from backend.app.services.notification_service import notification_service
     from backend.app.services.spool_recovery import runout_slot_desc
+    from backend.app.services.spool_respool import encode_global_tray
     from backend.app.services.spool_tagless import is_tagless_spool
 
     # ``runout_slot_desc`` is the ONE origin for slot wording, so this page names a
@@ -1310,7 +1358,7 @@ async def _warn_zero_gram_tagless_charge(
     # empty-bed dry-run runs with the previous print's roll still loaded. Naming a
     # feeder from those would page after every single eject, for a job whose zero
     # grams are correct.
-    feeder_keys = _print_feeder_keys(ams_mapping, None)
+    feeder_keys = _print_feeder_keys(ams_mapping, witnesses="dispatch_only")
     ams_keys = sorted(key for key in feeder_keys if key[0] != 255)
     if not ams_keys:
         logger.info(
@@ -1323,6 +1371,10 @@ async def _warn_zero_gram_tagless_charge(
         )
         return
 
+    # Collect EVERY tagless feeder first — a multi-material print can lose several
+    # rolls' grams in one completion, and reporting only the first understates the
+    # shortfall in the one record that survives (the log).
+    tagless_feeders: list[tuple[str, Spool]] = []
     for ams_id, tray_id in ams_keys:
         spool_id = await _resolve_spool_id_for_tray(printer_id, ams_id, tray_id, db)
         if spool_id is None:
@@ -1330,38 +1382,86 @@ async def _warn_zero_gram_tagless_charge(
         spool = await db.get(Spool, spool_id)
         if spool is None or not is_tagless_spool(spool):
             continue
+        # Through the fork's ONE global-tray codec (invariant 1): the bare ``ams_id * 4``
+        # arithmetic that used to sit here is wrong for an AMS-HT unit (``global == ams_id``)
+        # and for the external holder (254/255), and both would land on some OTHER unit's
+        # slot wording. ``None`` from the encoder falls through to the raw ``AMS%d-T%d``
+        # rendering, exactly as an unnameable global already did.
+        slot_desc = runout_slot_desc(encode_global_tray(ams_id, tray_id)) or f"AMS{ams_id}-T{tray_id}"
+        tagless_feeders.append((slot_desc, spool))
 
-        slot_desc = runout_slot_desc(ams_id * 4 + tray_id) or f"AMS{ams_id}-T{tray_id}"
-        logger.warning(
-            "[UsageTracker] ZERO-GRAM CHARGE: printer %s archive %s completed '%s' and charged 0 g, but %s is "
-            "fed by TAGLESS spool %s — a tagless tray reports remain: -1, so the print's 3MF was its only gram "
-            "source and the archive has none. That roll's ledger is now short by this print.",
+    if not tagless_feeders:
+        logger.info(
+            "[UsageTracker] printer %s archive %s: '%s' completed charging 0 g; feeders %s are all tagged or "
+            "unassigned — a tagged roll has the AMS remain%%-delta as a second gram source, so this zero is not "
+            "the impossibility the page reports",
             printer_id,
             archive_id,
             print_name,
-            slot_desc,
-            spool.id,
+            ", ".join(f"AMS{ams_id}-T{tray_id}" for ams_id, tray_id in ams_keys),
         )
-
-        printer = await db.get(Printer, printer_id)
-        printer_name = (printer.name if printer is not None else None) or f"Printer {printer_id}"
-        # One page per printer per window: this class of bleed repeats on EVERY
-        # print, and fifteen identical pages bury the fact they are reporting.
-        key = f"printer:{printer_id}"
-        last = await notify_dedup.last_sent_at(db, _ZERO_CHARGE_SCOPE, key)
-        if last is not None and (datetime.utcnow() - last).total_seconds() < _ZERO_CHARGE_RENOTIFY_S:
-            return
-        await notification_service.on_zero_gram_charge(
-            printer_id,
-            printer_name,
-            print_name,
-            slot_desc,
-            spool.id,
-            (spool.material or "unknown material"),
-            db,
-        )
-        await notify_dedup.record_sent(db, _ZERO_CHARGE_SCOPE, key)
         return
+
+    logger.warning(
+        "[UsageTracker] ZERO-GRAM CHARGE: printer %s archive %s completed '%s' and charged 0 g, but %s — a "
+        "tagless tray reports remain: -1, so the print's 3MF was its only gram source and the archive has none. "
+        "Those rolls' ledgers are now short by this print.",
+        printer_id,
+        archive_id,
+        print_name,
+        "; ".join(f"{slot_desc} is fed by TAGLESS spool {spool.id}" for slot_desc, spool in tagless_feeders),
+    )
+
+    printer = await db.get(Printer, printer_id)
+    printer_name = (printer.name if printer is not None else None) or f"Printer {printer_id}"
+    # One page per printer per window: this class of bleed repeats on EVERY print,
+    # and fifteen identical pages bury the fact they are reporting. The page names
+    # the FIRST tagless feeder — its template is singular and is seeded once per
+    # install, so plural copy here would render broken on every existing farm; the
+    # WARN above is the complete record.
+    key = f"printer:{printer_id}"
+    last = await notify_dedup.last_sent_at(db, _ZERO_CHARGE_SCOPE, key)
+    if last is not None and (datetime.utcnow() - last).total_seconds() < _ZERO_CHARGE_RENOTIFY_S:
+        return
+    first_slot_desc, first_spool = tagless_feeders[0]
+    await notification_service.on_zero_gram_charge(
+        printer_id,
+        printer_name,
+        print_name,
+        first_slot_desc,
+        first_spool.id,
+        (first_spool.material or "unknown material"),
+        db,
+    )
+    await notify_dedup.record_sent(db, _ZERO_CHARGE_SCOPE, key)
+
+
+async def _dispatch_donor_for_completion(db: AsyncSession, subtask_id: str | None, archive_id: int | None):
+    """The on-disk source 3MF the farm dispatched for this completing print, or None.
+
+    A thin join of the two existing origins — :func:`_resolve_run_item` (which unit)
+    and ``farm_correlation.resolve_item_donor`` (which file that unit printed from,
+    the same answer the eject builder and the print-start archive capture consume).
+    No third resolver: everything about "which file" stays in ``farm_correlation``,
+    and the donor's ``local_path`` is BORROWED — read only, never deleted or
+    truncated (the 2026-08-15 durable-file-loss class).
+
+    Deliberately WIDER than ``resolve_dispatch_donor``'s id-confirmed-only rule, and
+    only because completion is a different question from print start. At START the
+    risk is attributing the farm's file to a job that is not ours, which would
+    archive somebody else's print as having run our 3MF — so that lane demands
+    ``dispatch_subtask_id`` equality. Here the item is reached the same way this
+    module already resolves the run's plate and mapping (id first, then the archive
+    link this very completion is finalizing), and being wrong costs a gram figure on
+    a print that would otherwise have been charged NOTHING — the strictly worse
+    error, and the one that is invisible.
+    """
+    from backend.app.services import farm_correlation
+
+    item = await _resolve_run_item(db, subtask_id, archive_id)
+    if item is None:
+        return None
+    return await farm_correlation.resolve_item_donor(db, item)
 
 
 async def _resolve_3mf_fallback(archive, db: AsyncSession, base_dir):
@@ -1516,6 +1616,7 @@ async def _track_from_3mf(
     print_started_at: datetime | None = None,
     threemf_path=None,
     plate_id: int | None = None,
+    subtask_id: str | None = None,
 ) -> list[dict]:
     """Track usage from 3MF per-filament slicer data (primary path).
 
@@ -1525,6 +1626,14 @@ async def _track_from_3mf(
 
     When archive_id is None (auto-archive disabled), a pre-resolved threemf_path
     can be provided to still track filament usage from slicer data.
+
+    File resolution order — ONE lane, three ways of naming its ``file_path``:
+    a caller-supplied ``threemf_path`` → the archive's own copy → a same-named
+    library/previous-archive file (``_resolve_3mf_fallback``) → the DISPATCH DONOR
+    of the farm unit that printed it (``subtask_id``/``archive_id`` →
+    ``farm_correlation.resolve_item_donor``). Everything after the path is
+    resolved — plate scoping, the per-feeder split, the gram charging — is common
+    to all four; only the file's provenance differs.
 
     When ``plate_id`` is set (queue prints of a single plate from a multi-plate
     3MF), only that plate's filaments contribute. Without it the 3MF parser sums
@@ -1565,6 +1674,32 @@ async def _track_from_3mf(
         # Fallback: find 3MF from library or a previous archive with the same filename
         if file_path is None:
             file_path = await _resolve_3mf_fallback(archive, db, app_settings.base_dir)
+
+    # Last resort: the DISPATCH DONOR — the file the farm itself uploaded for this
+    # unit. The print-start capture (``farm_correlation.resolve_dispatch_donor`` →
+    # ``foreign_archive.locate_3mf_for_print``) normally attaches it to the archive
+    # row, but that runs exactly once, at START, and anything that loses it there
+    # (an FTPS outage, a fallback archive written before the donor lane existed —
+    # printer 1 / archive 783 / spool 338 on 2026-08-20) leaves a COMPLETED print
+    # with no gram source at all. The queue item still names the source row and the
+    # plate, so completion can ask the same shared origin the eject builder and the
+    # archive capture ask, and charge from the borrowed library file directly.
+    # A print the farm did not dispatch resolves no item, hence no donor, and keeps
+    # the existing skip.
+    if file_path is None:
+        donor = await _dispatch_donor_for_completion(db, subtask_id, archive_id)
+        if donor is not None:
+            file_path = donor.local_path
+            if plate_id is None:
+                plate_id = donor.plate_id
+            logger.info(
+                "[UsageTracker] 3MF: charged from the dispatch donor %s (queue item %s, plate %s); the archive "
+                "%s carried no 3MF",
+                donor.local_path,
+                donor.item_id,
+                plate_id,
+                archive_id,
+            )
 
     if file_path is None:
         logger.info("[UsageTracker] 3MF: no file available for archive %s, skipping", archive_id)

@@ -35,7 +35,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../api/client', () => ({
-  api: { taglessFresh: vi.fn().mockResolvedValue({}) },
+  api: { dismissFreshRollPrompt: vi.fn().mockResolvedValue({}) },
 }));
 
 interface ToastAction {
@@ -74,7 +74,7 @@ function actionsOfLastToast(): ToastAction[] {
 describe('useTaglessFreshPrompt', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    (api.taglessFresh as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    (api.dismissFreshRollPrompt as ReturnType<typeof vi.fn>).mockResolvedValue({});
   });
 
   it('starts with no open modal', () => {
@@ -126,7 +126,7 @@ describe('useTaglessFreshPrompt', () => {
     ]);
   });
 
-  it('"Same roll" POSTs answer:"same" with the spool id + slot triple and clears the toast', async () => {
+  it('"Same roll" POSTs the per-cycle dismissal with the spool id + slot triple and clears the toast', async () => {
     renderHook(() => useTaglessFreshPrompt(), { wrapper: createWrapper() });
     act(() => dispatchPrompt(makePrompt()));
 
@@ -134,11 +134,10 @@ describe('useTaglessFreshPrompt', () => {
       actionsOfLastToast()[0].onClick();
     });
 
-    expect(api.taglessFresh).toHaveBeenCalledWith(55, {
+    expect(api.dismissFreshRollPrompt).toHaveBeenCalledWith(55, {
       printer_id: 1,
       ams_id: 0,
       tray_id: 2,
-      answer: 'same',
     });
     await waitFor(() => expect(dismissToast).toHaveBeenCalledWith('tagless-fresh-1-0-2'));
   });

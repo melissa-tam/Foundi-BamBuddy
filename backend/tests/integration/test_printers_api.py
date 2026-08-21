@@ -1092,83 +1092,124 @@ class TestPrintControlAPI:
             mock_client.resume_print.assert_called_once()
 
 
-class TestAMSRefreshAPI:
-    """Integration tests for AMS slot refresh endpoint."""
+class TestAMSSlotRecheckAPI:
+    """Integration tests for the "Re-check slot" endpoint.
+
+    The ``/ams/{ams}/slot/{slot}/refresh`` verb these tests used to drive is GONE. It
+    answered a bare 200/400 carrying nothing renderable, which is the silence incident
+    shape 32's operator spent 21 minutes clicking against; doctrine rule 12 replaced it
+    with ``/recheck``, whose every outcome is a named verdict.
+
+    The route itself decides NOTHING about identity: it checks that the printer exists and
+    is connected, then hands the question to ``slot_recheck.evaluate`` and carries the
+    verdict to the wire field-for-field (``SlotRecheckResponse``).
+    """
+
+    #: A tagged tray as the wire presents one — seated, RFID pair asserted. It drives the
+    #: ``identified`` row (R4's tag-found half), the branch that still performs a real
+    #: hardware read: the rename narrowed the label, never the capability.
+    TAGGED_TRAY = {
+        "id": "1",
+        "state": "10",
+        "tray_type": "PLA",
+        "tray_sub_brands": "PLA Basic",
+        "tag_uid": "9B2C4D5E00000000",
+        "tray_uuid": "A1B2C3D4E5F60718293A4B5C6D7E8F90",
+        "remain": 80,
+    }
+
+    @staticmethod
+    def _swallow(coro, **kwargs):
+        """Stand in for ``spawn_background_task`` — close the coroutine, never run it.
+
+        The K-profile re-apply sleeps 5 s before touching the printer; what is under test
+        is only WHETHER a read armed it.
+        """
+        coro.close()
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_ams_refresh_not_found(self, async_client: AsyncClient):
+    async def test_recheck_not_found(self, async_client: AsyncClient):
         """Verify 404 for non-existent printer."""
-        response = await async_client.post("/api/v1/printers/99999/ams/0/slot/0/refresh")
+        response = await async_client.post("/api/v1/printers/99999/ams/0/slot/0/recheck")
         assert response.status_code == 404
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_ams_refresh_not_connected(self, async_client: AsyncClient, printer_factory):
+    async def test_recheck_not_connected(self, async_client: AsyncClient, printer_factory):
         """Verify error when printer is not connected."""
         printer = await printer_factory(name="Disconnected Printer")
 
         with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
             mock_pm.get_client.return_value = None
 
-            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/0/slot/0/refresh")
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/0/slot/0/recheck")
 
             assert response.status_code == 400
             assert "not connected" in response.json()["detail"].lower()
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_ams_refresh_success(self, async_client: AsyncClient, printer_factory):
-        """Verify successful AMS refresh request."""
+    async def test_recheck_tagged_slot_issues_read_and_reports_identified(
+        self, async_client: AsyncClient, printer_factory
+    ):
+        """A tagged slot: the RFID lane owns the identity, and the read still goes out."""
         printer = await printer_factory(name="Printer with AMS")
 
-        mock_client = MagicMock()
-        mock_client.ams_refresh_tray.return_value = (True, "Refreshing AMS 0 tray 1")
+        identify = AsyncMock(return_value=(True, "Identifying AMS 0 tray 1"))
 
-        # The route delegates to ams_presence.command_identify (the single identify
-        # commander), which resolves the client through the SERVICE's printer_manager
-        # reference — both have to see the mock.
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch("backend.app.services.ams_presence.printer_manager") as mock_pm_svc,
-            patch("backend.app.services.ams_presence.record_reread") as mock_record,
+            patch("backend.app.services.ams_presence.live_tray", return_value=self.TAGGED_TRAY),
+            patch("backend.app.services.ams_presence.command_identify", identify),
+            patch("backend.app.api.routes.printers.spawn_background_task", side_effect=self._swallow) as mock_spawn,
         ):
-            mock_pm.get_client.return_value = mock_client
-            mock_pm_svc.get_client.return_value = mock_client
+            mock_pm.get_client.return_value = MagicMock()
 
-            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/0/slot/1/refresh")
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/0/slot/1/recheck")
 
             assert response.status_code == 200
             result = response.json()
-            assert result["success"] is True
-            mock_client.ams_refresh_tray.assert_called_once_with(0, 1)
-            # A successful refresh arms the echo-consume flag so the firmware's
-            # identify flap doesn't ignite the ams_presence re-read loop.
-            mock_record.assert_called_once_with(printer.id, 0, 1)
+            assert result["verdict"] == "identified"
+            assert result["read_issued"] is True
+            assert result["material"] == "PLA"
+            assert result["brand"] == "PLA Basic"
+            # Nothing was minted, so there is nothing to retract.
+            assert result["undo_available"] is False
+            assert identify.await_args.args == (printer.id, 0, 1)
+            assert identify.await_args.kwargs["reason"] == "rfid_refresh"
+            # A read that actually went out arms the K-profile re-apply behind it.
+            mock_spawn.assert_called_once()
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_ams_refresh_filament_loaded(self, async_client: AsyncClient, printer_factory):
-        """Verify error when filament is loaded (can't refresh while loaded)."""
+    async def test_recheck_reports_a_refused_read_instead_of_erroring(self, async_client: AsyncClient, printer_factory):
+        """Wire safety refusing the read (filament engaged) is a REPORT, not a failure.
+
+        The old verb 400'd here, which told the operator nothing about the slot. The
+        verdict still stands — the wire asserts a tag either way — and ``read_issued``
+        carries the one fact the 400 used to hide: the farm could not ask.
+        """
         printer = await printer_factory(name="Printer with AMS")
 
-        mock_client = MagicMock()
-        mock_client.ams_refresh_tray.return_value = (False, "Please unload filament first")
+        identify = AsyncMock(return_value=(False, "Please unload filament first"))
 
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch("backend.app.services.ams_presence.printer_manager") as mock_pm_svc,
-            patch("backend.app.services.ams_presence.record_reread") as mock_record,
+            patch("backend.app.services.ams_presence.live_tray", return_value=self.TAGGED_TRAY),
+            patch("backend.app.services.ams_presence.command_identify", identify),
+            patch("backend.app.api.routes.printers.spawn_background_task", side_effect=self._swallow) as mock_spawn,
         ):
-            mock_pm.get_client.return_value = mock_client
-            mock_pm_svc.get_client.return_value = mock_client
+            mock_pm.get_client.return_value = MagicMock()
 
-            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/0/slot/0/refresh")
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/0/slot/1/recheck")
 
-            assert response.status_code == 400
-            assert "unload" in response.json()["detail"].lower()
-            # A refused refresh runs no identify cycle → the flag must NOT be armed.
-            mock_record.assert_not_called()
+            assert response.status_code == 200
+            result = response.json()
+            assert result["verdict"] == "identified"
+            assert result["read_issued"] is False
+            # No read happened → no RFID answer for the K-profile to follow.
+            mock_spawn.assert_not_called()
 
 
 class TestAMSLoadUnloadAPI:
@@ -1901,7 +1942,9 @@ class TestChamberLightAPI:
 
             response = await async_client.post(f"/api/v1/printers/{printer.id}/chamber-light?on=true")
 
-            assert response.status_code == 500
+            # 502, not 500: an undelivered command is the PRINTER's session failing, and
+            # ``send_command`` has been fail-loud about that since the command-latency wave.
+            assert response.status_code == 502
             assert "failed" in response.json()["detail"].lower()
 
 

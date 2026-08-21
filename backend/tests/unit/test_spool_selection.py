@@ -237,6 +237,73 @@ class TestMinStartFloor:
         assert out.start_blocked_slots == []
 
 
+class TestRowT10SubFloorDonor:
+    """§4.1 row T10 — a sub-floor roll left seated as a firmware backup donor: **KEEP**.
+
+    The row's verdict is "never pulled, never re-decided", and the two halves of that are
+    owned by different modules. This class pins the SELECTION half: the same 90 g roll is
+    refused by the START lane (``require_known_grams`` on, the full
+    ``min_start_spool_g`` floor) and accepted by the MID-PRINT lane, where
+    ``spool_recovery`` lowers the floor to its hard minimum past the protected layers —
+    a low-but-not-empty roll is a valid replacement, a known-empty one never is.
+
+    Read the pair as one statement: "below the floor" is a fact about STARTING a print,
+    not about the roll's fitness or its identity. The binding half — no release, no mint,
+    no write — is
+    ``services/test_slot_pipeline.py::test_T10_a_sub_floor_roll_left_seated_is_never_re_decided``.
+    """
+
+    SUB_FLOOR_G = 90.0  # under the 150 g start floor, far above the 5 g replacement floor
+
+    def _sub_floor_only(self):
+        loaded = [_loaded(0, tray_id=0, color="#FF0000")]
+        inv = {0: SlotInventory(remaining_g=self.SUB_FLOOR_G, first_loaded_ord=100.0)}
+        return loaded, inv
+
+    def test_the_start_lane_refuses_it_and_names_the_floor(self):
+        loaded, inv = self._sub_floor_only()
+        out = _match(
+            [_req(color="#FF0000")],
+            loaded,
+            policy="first_loaded",
+            inv=inv,
+            min_start_g=DEFAULT_MIN_START_SPOOL_G,
+            require_known_grams=True,
+        )
+        assert out.mapping == [-1], "no print STARTS on it"
+        assert out.start_blocked_slots == [1]
+        assert out.start_block_kinds == {1: START_BLOCK_BELOW_FLOOR}
+
+    def test_the_mid_print_replacement_lane_still_takes_it(self):
+        """The liveness half. Without it, "the floor holds" and "the roll is unusable"
+        look identical — and the doctrine sentence T10 encodes is that they differ."""
+        from backend.app.services.spool_recovery import _RECOVERY_HARD_MIN_G
+
+        loaded, inv = self._sub_floor_only()
+        out = _match(
+            [_req(color="#FF0000")],
+            loaded,
+            policy="first_loaded",
+            inv=inv,
+            min_start_g=_RECOVERY_HARD_MIN_G,
+        )
+        assert out.mapping == [0], "still a donor mid-print"
+        assert out.start_blocked_slots == []
+        assert _RECOVERY_HARD_MIN_G < self.SUB_FLOOR_G < DEFAULT_MIN_START_SPOOL_G, (
+            "the fixture must sit between the two floors, or the pair proves nothing"
+        )
+
+    def test_a_genuinely_empty_roll_is_refused_by_both(self):
+        """The other side of the replacement floor: 'low' is a donor, 'empty' is not."""
+        from backend.app.services.spool_recovery import _RECOVERY_HARD_MIN_G
+
+        loaded = [_loaded(0, tray_id=0, color="#FF0000")]
+        inv = {0: SlotInventory(remaining_g=2.0, first_loaded_ord=100.0)}
+        out = _match([_req(color="#FF0000")], loaded, policy="first_loaded", inv=inv, min_start_g=_RECOVERY_HARD_MIN_G)
+        assert out.mapping == [-1]
+        assert out.start_blocked_slots == [1]
+
+
 class TestStartBlockedSlots:
     def test_start_blocked_when_dropped_would_have_matched(self):
         """Only matching spool is below the floor → slot is start-blocked, no mapping."""

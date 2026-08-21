@@ -2,6 +2,8 @@ import asyncio
 import logging
 import re
 import zipfile
+from dataclasses import asdict
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
@@ -65,6 +67,11 @@ from backend.app.services.printer_manager import (
 from backend.app.services.spool_recovery import runout_slot_desc
 from backend.app.services.tray_fields import tray_presence_map
 from backend.app.utils.http import build_content_disposition
+
+if TYPE_CHECKING:
+    # Type-only: the AMS services stay out of this module's runtime import graph (see the
+    # local imports below — ``slot_recheck`` pulls the slot pipeline's model graph in with it).
+    from backend.app.services.slot_recheck import RecheckVerdict
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/printers", tags=["printers"])
@@ -3575,17 +3582,6 @@ async def skip_objects(
 # =============================================================================
 
 
-#: How long the re-check may wait for the identity pass to land its conclusion.
-#:
-#: Only ever entered when the tag-ness answer is ALREADY in hand and the printer is idle —
-#: i.e. when the pipeline's next raw push (~1 Hz) will conclude — so this buys the operator
-#: the real verdict instead of a "queued" they would have to interpret. It is a RESPONSE
-#: budget, not a decision input: on expiry the honest "queued" is returned and the mint
-#: still lands a moment later through the acknowledgement.
-_RECHECK_SETTLE_BUDGET_S = 3.0
-_RECHECK_POLL_S = 0.25
-
-
 @router.post("/{printer_id}/ams/{ams_id}/slot/{slot_id}/recheck", response_model=SlotRecheckResponse)
 async def recheck_ams_slot(
     printer_id: int,
@@ -3602,10 +3598,13 @@ async def recheck_ams_slot(
     through the whole flow — the control says "Re-check slot", the result says "re-checked",
     never "RFID read complete".
 
-    **This route decides nothing about identity.** It records intent and reports; the verdict
-    is emitted by ``slot_state.resolve`` through the same mint path every other mint uses
-    (``slot_recheck`` module docstring — an endpoint that resolved the slot itself would
-    re-create the inline lane the 2026-08-02 hard cutover deleted).
+    **This route decides nothing at all.** It checks the two things a controller owns — does
+    the printer exist, is it connected — and hands the question to
+    ``slot_recheck.evaluate``, which owns every row of rule 12's contract table and returns
+    the verdict whole. The mint itself belongs to neither: it is emitted by
+    ``slot_state.resolve`` through the same path every other mint uses (``slot_recheck``
+    module docstring — an endpoint that resolved the slot itself would re-create the inline
+    lane the 2026-08-02 hard cutover deleted).
 
     Verdicts, straight from rule 12's contract table (§4.1 rows R1–R8):
 
@@ -3626,103 +3625,38 @@ async def recheck_ams_slot(
     if not printer:
         raise HTTPException(404, "Printer not found")
 
-    client = printer_manager.get_client(printer_id)
-    if not client:
+    if printer_manager.get_client(printer_id) is None:
         raise HTTPException(400, "Printer not connected")
 
-    # Local imports — printers.py keeps the AMS services out of module scope (the
-    # main.py local-import pattern at :1912/:4644; slot_recheck pulls the pipeline's model
-    # graph in with it).
-    from backend.app.services import ams_presence, slot_recheck, spool_tagless
-    from backend.app.services.tray_observation import observe_tray
+    # Local import — printers.py keeps the AMS services out of module scope (the main.py
+    # local-import pattern at :1912/:4644; slot_recheck pulls the pipeline's model graph in
+    # with it).
+    from backend.app.services import slot_recheck
 
-    def _answer(verdict: str, **extra) -> SlotRecheckResponse:
-        return SlotRecheckResponse(
-            verdict=verdict, printer_id=printer_id, ams_id=ams_id, tray_id=slot_id, **extra
-        )
-
-    # Read the slot through the SAME observation the pipeline decides on, so the route's
-    # preconditions and the table's rows can never disagree about what "seated" or "the wire
-    # asserts an identity" means. In particular ``identity_asserted`` here is the RFID pair —
-    # ``tray_fields.tray_identity_asserted`` counts a configured ``tray_type`` as identity,
-    # which is true for every autoconfigured TAGLESS tray on this fleet and would answer
-    # "tag found" for the exact slots this verb exists to serve.
-    tray = ams_presence.live_tray(printer_id, ams_id, slot_id)
-    obs = observe_tray(printer_id, ams_id, tray) if tray is not None else None
-    seated = obs.present if obs is not None else None
-    identity = obs.identity_asserted if obs is not None else False
-
-    # R6 — nothing seated. Only a wire-ASSERTED empty refuses; presence UNKNOWN falls
-    # through, because an unknown must never be resolved toward "there is nothing there".
-    if seated is False:
-        return _answer("empty")
-
-    # R4's tag-found half — the RFID lane is the stronger oracle and already owns this slot
-    # on every push, so no intent is recorded: there is no question for a human answer to
-    # settle. The READ still happens, which is the one thing this branch must not drop —
-    # on a tagged slot the old "Re-read RFID" was a genuine and useful hardware action
-    # (refresh the remaining-%, re-assert the K-profile), it is guaranteed answerable here,
-    # and the rename must not quietly remove a capability. Doctrine rule 12 renamed the
-    # verb; it did not narrow it.
-    if identity:
-        _spawn_pa_reapply_if_read(
-            await ams_presence.command_identify(
-                printer_id, ams_id, slot_id, source="manual_refresh", reason="rfid_refresh", enforce_need=False
-            ),
-            printer_id,
-            ams_id,
-            slot_id,
-        )
-        return _answer(
-            "identified",
-            brand=(tray or {}).get("tray_sub_brands") or None,
-            material=(tray or {}).get("tray_type") or None,
-        )
-
-    # R1 — rule 12's guard. No un-acted-on physical cycle on this slot means the farm has no
-    # evidence anything moved, and the click concludes NOTHING and says so. The escape hatch
-    # for a swap the farm never observed is the OTHER verb, "New roll…", which asserts rather
-    # than infers and needs no cycle at all.
-    if not spool_tagless.qualified_cycle_pending(printer_id, ams_id, slot_id):
-        return _answer("unchanged")
-
-    await slot_recheck.open_intent(db, printer_id, ams_id, slot_id, requested_by=getattr(user, "id", None))
-
-    # Ask now if this is a moment to ask; ``maybe_ask`` owns every refusal (mid-print, not
-    # seated, already answered, in flight, paced) so the policy lives in one place.
-    issued = await slot_recheck.maybe_ask(
-        db,
-        printer_id,
-        ams_id,
-        slot_id,
-        busy=ams_presence.printer_running(getattr(client, "state", None)),
-        seated=seated is True,
-    )
-    _spawn_pa_reapply_if_read(issued, printer_id, ams_id, slot_id)
-
-    concluded = await _await_recheck_conclusion(db, printer_id, ams_id, slot_id)
-    if concluded is None:
-        return _answer("queued")
-    return _answer(
-        "minted",
-        spool_id=concluded.id,
-        label_weight_g=float(concluded.label_weight or 0),
-        brand=concluded.brand,
-        material=concluded.material,
-        undo_available=True,
-    )
+    verdict = await slot_recheck.evaluate(db, printer_id, ams_id, slot_id, requested_by=getattr(user, "id", None))
+    _spawn_pa_reapply_if_read(verdict.read_issued, printer_id, ams_id, slot_id)
+    return _recheck_response(verdict)
 
 
-def _spawn_pa_reapply_if_read(issued, printer_id: int, ams_id: int, slot_id: int) -> None:
+def _recheck_response(verdict: "RecheckVerdict") -> SlotRecheckResponse:
+    """The ONE mapping from the service's verdict to the wire.
+
+    Field-for-field by construction: the response model carries exactly the dataclass's
+    fields, so a field added to the contract cannot reach the wire on one path and be dropped
+    on another (both the re-check and its undo return through here).
+    """
+    return SlotRecheckResponse(**asdict(verdict))
+
+
+def _spawn_pa_reapply_if_read(read_issued: bool, printer_id: int, ams_id: int, slot_id: int) -> None:
     """Re-assert the operator's K-profile behind a read that actually happened.
 
-    Unchanged from the route this replaces, and hung off BOTH ask paths so the tagged-slot
-    refresh and the tagless-slot discovery read get identical treatment. ``issued`` accepts
-    either the bool ``slot_recheck.maybe_ask`` returns or ``command_identify``'s
-    ``(ok, message)`` pair — one call site per path, one behaviour.
+    Hung off ``RecheckVerdict.read_issued``, which is true for whichever of the two ask paths
+    fired — the tagged-slot ``rfid_refresh`` or the tagless-slot ``discovery`` read — so both
+    get identical treatment through one typed call site. A refused read spawns nothing: there
+    is no RFID answer coming for the K-profile to follow.
     """
-    ok = issued[0] if isinstance(issued, tuple) else bool(issued)
-    if not ok:
+    if not read_issued:
         return
     spawn_background_task(
         _apply_pa_after_refresh(printer_id, ams_id, slot_id),
@@ -3730,46 +3664,25 @@ def _spawn_pa_reapply_if_read(issued, printer_id: int, ams_id: int, slot_id: int
     )
 
 
-async def _await_recheck_conclusion(db: AsyncSession, printer_id: int, ams_id: int, slot_id: int):
-    """Wait, briefly and boundedly, for the identity pass to mint — or give up and say so.
+#: English fallbacks for the undo's refusals, keyed by the reason ``slot_recheck.undo``
+#: returns. The service owns the REASONS (they are facts about the slot's history); the
+#: controller owns their English, exactly as every other structured error in this fork does —
+#: the UI never shows these strings, it looks the ``code`` up in i18n and falls back to them
+#: only for non-UI clients.
+_UNDO_REFUSALS: dict[str, str] = {
+    "no_offer": (
+        "No restore offer stands for this slot: the row bound here was not created by a "
+        "re-check, or the slot has been re-decided since."
+    ),
+    "no_predecessor": "Nothing left this slot when the re-check minted, so there is no previous roll to hand back.",
+    "mint_gone": "The row the re-check created no longer exists.",
+    "predecessor_bound_elsewhere": (
+        "The previous roll is bound to another slot now; restoring it here would put one physical roll in two trays."
+    ),
+}
 
-    The pipeline runs off the raw MQTT push (~1 Hz), which is the ONLY lane allowed to decide
-    identity, so the endpoint cannot conclude for itself without re-creating the inline lane
-    the hard cutover deleted. What it can do is wait out one or two pushes when a conclusion
-    is imminent, so R2/R5 get "new roll recorded" rather than a "queued" that resolves a
-    second later. Nothing depends on the wait: on expiry the intent is still open and the
-    conclusion still lands, announced by the acknowledgement.
-    """
-    from backend.app.models.slot_recheck import SlotRecheckIntent
-    from backend.app.models.spool import Spool
-
-    deadline = asyncio.get_running_loop().time() + _RECHECK_SETTLE_BUDGET_S
-    while True:
-        await asyncio.sleep(_RECHECK_POLL_S)
-        # End this session's read transaction between polls. The conclusion is committed by
-        # the pipeline's OWN session (it runs off the MQTT push, which owns no request
-        # scope), so a snapshot held open here would poll a view of the database taken
-        # before the mint and time out against work that has already landed. Nothing is
-        # pending — the intent was committed on the way in — so the rollback only releases
-        # the snapshot and expires the identity map.
-        await db.rollback()
-        minted_id = (
-            await db.execute(
-                select(SlotRecheckIntent.minted_spool_id)
-                .where(
-                    SlotRecheckIntent.printer_id == printer_id,
-                    SlotRecheckIntent.ams_id == ams_id,
-                    SlotRecheckIntent.tray_id == slot_id,
-                    SlotRecheckIntent.resolved_at.is_not(None),
-                )
-                .order_by(SlotRecheckIntent.id.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if minted_id is not None:
-            return await db.get(Spool, minted_id)
-        if asyncio.get_running_loop().time() >= deadline:
-            return None
+#: A reason with no English of its own is still a structured refusal — never a bare string.
+_UNDO_REFUSAL_FALLBACK = "The previous roll could not be restored."
 
 
 @router.post("/{printer_id}/ams/{ams_id}/slot/{slot_id}/recheck/undo", response_model=SlotRecheckResponse)
@@ -3789,6 +3702,10 @@ async def undo_ams_slot_recheck(
     All of it goes through ``spool_tagless.replace_bound_row_with_predecessor``, the mirror of
     the module's existing charge-re-attribution lane, so the undo is not a second way to
     write a binding.
+
+    Every refusal is a STRUCTURED 409 (:data:`_UNDO_REFUSALS`) — the offer can only be
+    declined for reasons the operator has to be able to read, and a bare-string detail leaves
+    the UI with nothing but English to show.
     """
     from backend.app.services import slot_recheck
 
@@ -3797,16 +3714,27 @@ async def undo_ams_slot_recheck(
 
     restored, reason = await slot_recheck.undo(db, printer_id, ams_id, slot_id)
     if restored is None:
-        raise HTTPException(409, reason)
-    return SlotRecheckResponse(
-        verdict="restored",
-        printer_id=printer_id,
-        ams_id=ams_id,
-        tray_id=slot_id,
-        spool_id=restored.id,
-        label_weight_g=float(restored.label_weight or 0),
-        brand=restored.brand,
-        material=restored.material,
+        # Structured, like every other coded refusal in this fork (``printers.py``'s
+        # ``printer_connection_failed`` at :153, ``inventory.py``'s
+        # ``csv_import_too_large`` at :1191, ``printer_eject.py``'s ``foreign_plate`` /
+        # ``bed_hot`` at :60/:71): ``{"code", "message"}``, where the frontend renders the
+        # user-facing sentence from ``code`` via i18n (``ApiError.code``) and ``message`` is
+        # the English fallback for non-UI clients (curl / scripts).
+        raise HTTPException(
+            status_code=409,
+            detail={"code": reason, "message": _UNDO_REFUSALS.get(reason, _UNDO_REFUSAL_FALLBACK)},
+        )
+    return _recheck_response(
+        slot_recheck.RecheckVerdict(
+            verdict="restored",
+            printer_id=printer_id,
+            ams_id=ams_id,
+            tray_id=slot_id,
+            spool_id=restored.id,
+            label_weight_g=float(restored.label_weight or 0),
+            brand=restored.brand,
+            material=restored.material,
+        )
     )
 
 

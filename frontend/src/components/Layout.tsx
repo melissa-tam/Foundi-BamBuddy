@@ -16,8 +16,7 @@ import { useUnknownTagPrompt } from '../hooks/useUnknownTagPrompt';
 import { useRespoolPrompt } from '../hooks/useRespoolPrompt';
 import { useTaglessFreshPrompt } from '../hooks/useTaglessFreshPrompt';
 import { usePendingPromptSync } from '../hooks/usePendingPromptSync';
-import { RespoolTagModal } from './RespoolTagModal';
-import { TaglessFreshModal } from './TaglessFreshModal';
+import { NewRollModal } from './NewRollModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { CardHeader, CardContent } from './Card';
@@ -928,12 +927,15 @@ export function Layout() {
         <Outlet />
       </main>
 
-      <RespoolTagModal
+      {/* One form, two prompt queues: each hook normalises its own WS payload
+          into the shared `NewRollContext`, so the dialog never learns which
+          question raised it. */}
+      <NewRollModal
         context={respoolPrompt.activeContext}
         onClose={respoolPrompt.closeModal}
       />
 
-      <TaglessFreshModal
+      <NewRollModal
         context={taglessFreshPrompt.activeContext}
         onClose={taglessFreshPrompt.closeModal}
       />

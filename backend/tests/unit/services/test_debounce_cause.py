@@ -9,12 +9,13 @@ whole wave exists to close (memory `liveness-paired-verification`).
 So these cases drive `run_slot_pipeline` and seed only what the WIRE would have produced:
 the presence lane's loss→gain ledger and, for the post-HMS arm, a real `PrinterIncident` row.
 
-Scenario contract: `bambu-ams-behavior/resources/spool-subsystem.md` §4.1 rows T1, T7, T8.
+Scenario contract: `bambu-ams-behavior/resources/spool-subsystem.md` §4.1 rows T1, T4, T7, T8.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -23,6 +24,7 @@ from backend.app.models.printer_incident import KIND_JAM, KIND_RUNOUT, STATUS_ES
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services import ams_presence, printer_incidents, slot_pipeline, spool_tagless
+from backend.app.services.bambu_mqtt import HMSError
 from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
 from backend.app.services.slot_state import DecisionKind
 from backend.app.services.tray_observation import observe_tray
@@ -47,12 +49,16 @@ def _isolate(monkeypatch):
     ams_presence._reset_state()
 
 
-async def _departed_roll(db, printer_id, ams_id, tray_id, *, weight_used=940.0):
+async def _departed_roll(db, printer_id, ams_id, tray_id, *, weight_used=940.0, released_at=None, spent=False):
     """A tagless row that was released FROM this slot and is not yet spent.
 
     This is the exact residue the ~3-min bay-clear→HMS gap leaves behind: the binding is
     already gone, but the runout has not been declared, so nothing has stamped `spent_at`
     and the `spent_at IS NULL` donor filter cannot exclude it (shape 32, Path B).
+
+    ``released_at`` and ``spent`` exist for the two-residue cases: a slot that has released
+    more than one roll over its life is the ordinary shape, and the ORDER of those releases
+    is the whole question the adjudication answers.
     """
     spool = Spool(
         material="PETG",
@@ -60,10 +66,11 @@ async def _departed_roll(db, printer_id, ams_id, tray_id, *, weight_used=940.0):
         label_weight=1000,
         weight_used=weight_used,
         data_origin="ams_auto",
+        spent_at=datetime.utcnow() if spent else None,
         last_location_printer_id=printer_id,
         last_location_ams_id=ams_id,
         last_location_tray_id=tray_id,
-        last_location_at=datetime.utcnow(),
+        last_location_at=released_at if released_at is not None else datetime.utcnow(),
     )
     db.add(spool)
     await db.commit()
@@ -111,8 +118,205 @@ async def _no_settings(_key):
     return None
 
 
-def _deps(db):
-    return PipelineDeps(db=db, get_setting=_no_settings)
+def _deps(db, client=None):
+    return PipelineDeps(db=db, client=client, get_setting=_no_settings)
+
+
+# --- the WIRE-DRIVEN half (no ledger seeding at all) -------------------------
+#
+# Everything above states the loss→gain pair via ``_seed_gain``, which pins the TABLE's
+# arms. Everything below derives it, because the two are not the same claim: on
+# 2026-08-20 the release-evidence record was found reading the wrong one of
+# ``ams_presence``'s two feeder ledgers, and every seeded test agreed with it. A
+# predicate that never fires is indistinguishable from one that works (memory
+# ``liveness-paired-verification``), so the cause test owes a probe that drives
+# ``ams_presence.on_tray_observations`` — the production entry ``printer_manager`` calls
+# one pass ahead of the pipeline — and lets the stamps be written by the code under test.
+
+
+def _state(*, running=True, last_loaded_tray=-1, tray_now=255, hms=(), snow=None):
+    """The printer state the presence pass and the pipeline read at an edge."""
+    return SimpleNamespace(
+        state="RUNNING" if running else "IDLE",
+        ams_status_main=0,
+        last_loaded_tray=last_loaded_tray,
+        tray_now=tray_now,
+        hms_errors=list(hms),
+        h2d_extruder_snow=dict(snow or {}),
+        raw_data={},
+    )
+
+
+def _patch_wire(monkeypatch, state, *, dual=False):
+    """Point BOTH wire readers at ``state``; ``dual`` makes the client a Vortek machine."""
+    client = SimpleNamespace(
+        state=state,
+        is_dual_nozzle=dual,
+        ams_unit_drying=lambda _ams_id: False,
+        ams_write_refusal=lambda _ams_id: None,
+    )
+    monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: state)
+    monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+    return client
+
+
+async def _wire_cycle(db, printer_id, ams_id, tray_id):
+    """A REAL present→absent→present edge pair on one slot, through the presence pass.
+
+    Three pushes, because the first batch per printer only SEEDS (a refill done while the
+    server was down must not read as a gain). The absence is sub-second, so it is measured
+    and inside the de-bounce window while staying well under the 5 s flap filter — which is
+    the same shape the fleet's spurious releases have, and the reason the lane exists.
+    """
+    seated = observe_tray(printer_id, ams_id, {"id": tray_id, **_PETG})
+    cleared = observe_tray(printer_id, ams_id, {"id": tray_id, "state": 9, "tray_type": ""})
+    await ams_presence.on_tray_observations(printer_id, [seated], db)
+    await ams_presence.on_tray_observations(printer_id, [cleared], db)
+    await ams_presence.on_tray_observations(printer_id, [seated], db)
+    # Step the GAIN CLOCK past the F1 mint-settle window (``_MINT_SETTLE_S``), which defers
+    # any fresh mint for 5 s so the firmware's own post-insert RFID read can land first.
+    # Production pays that with one more push; a test cannot sleep it out. This moves a
+    # TIMESTAMP and nothing else — no reseat entry, no feeder stamp, no cycle is invented,
+    # so every fact the cause test reads is still one the code under test derived.
+    key = (printer_id, ams_id, tray_id)
+    ams_presence._gain_at[key] -= spool_tagless._MINT_SETTLE_S + 1.0
+    return seated
+
+
+def _hms(attr: int, code: int) -> HMSError:
+    return HMSError(
+        code=hex(code), attr=attr, module=(attr >> 24) & 0xFF, severity=2, full_code=f"{attr:08X}{code:08X}"
+    )
+
+
+def _demand(ams_id: int, tray_id: int) -> HMSError:
+    """``0x00020001`` — "AMS A Slot N filament has run out. Please insert a new filament."
+
+    The firmware's own standing, slot-attributed ask. Admitted as runout SUSPICION and
+    deliberately never as spent evidence: the cost of a false suspicion is a fresh ledger
+    row at label weight, the cost of a false stamp is a permanently archived roll.
+    """
+    return _hms(0x07000000 | (ams_id << 16) | ((0x20 + tray_id) << 8), 0x00020001)
+
+
+@pytest.mark.asyncio
+async def test_a_live_feeder_losing_presence_mints_through_the_real_presence_lane(
+    db_session, printer_factory, monkeypatch
+):
+    """T7 LIVENESS: the feeder arm, with the loss-edge stamp DERIVED rather than stated.
+
+    The printer is RUNNING and the wire says this slot is the tray that last actually fed
+    the job; the bay empties and the operator refills it seconds later. Nothing seeds
+    ``_reseat`` or ``_absent_under_active_feed`` — the presence pass writes them from the
+    same pushes the pipeline then resolves, exactly as production orders the two.
+    """
+    printer = await printer_factory()
+    donor = await _departed_roll(db_session, printer.id, 0, 2)
+    _patch_wire(monkeypatch, _state(last_loaded_tray=2, tray_now=2))
+
+    seated = await _wire_cycle(db_session, printer.id, 0, 2)
+    transitions = await run_slot_pipeline(printer.id, [seated], _deps(db_session))
+
+    assert transitions[0].decision.kind is DecisionKind.MINT
+    assert transitions[0].decision.reason == "runout_suspect_mint"
+    await db_session.refresh(donor)
+    assert donor.weight_used == 940.0, "the exhausted row is left alone, not re-charged"
+
+
+@pytest.mark.asyncio
+async def test_a_slot_that_was_not_feeding_still_de_bounces_through_the_real_presence_lane(
+    db_session, printer_factory, monkeypatch
+):
+    """The negative half of the same probe — and the one that keeps it honest.
+
+    Identical wire shape, identical timing, live print: the ONLY difference is that the
+    job's feeder is a different slot. Without this case a feeder test that answered "yes"
+    for everything would pass just as loudly.
+    """
+    printer = await printer_factory()
+    donor = await _departed_roll(db_session, printer.id, 0, 3)
+    _patch_wire(monkeypatch, _state(last_loaded_tray=0, tray_now=0))  # slot 0 is feeding, not 3
+
+    seated = await _wire_cycle(db_session, printer.id, 0, 3)
+    transitions = await run_slot_pipeline(printer.id, [seated], _deps(db_session))
+
+    assert transitions[0].decision.kind is DecisionKind.RECLAIM
+    assert transitions[0].decision.reason == "reseat_debounce"
+    assert transitions[0].decision.spool_id == donor.id
+
+
+@pytest.mark.asyncio
+async def test_a_standing_firmware_demand_for_this_slot_mints(db_session, printer_factory, monkeypatch):
+    """The WIRE arm: the firmware is asking for filament in this exact slot, right now.
+
+    Covers what the incident arm structurally cannot. A ``printer_incident`` row is bounded
+    to ONE OPEN per printer by design, so a cascade's second dry slot never gets one — and
+    a printer already holding a JAM has no runout row at all. The HMS list keeps naming
+    every dry slot independently, so the decision reads the wire.
+
+    Here the loss edge carries NO feeder evidence (a firmware auto-refill had already moved
+    the feed to a backup before the bit cleared, which is the T8b shape) and there is no
+    incident: the demand alone must disqualify the de-bounce.
+    """
+    printer = await printer_factory()
+    donor = await _departed_roll(db_session, printer.id, 0, 1)
+    state = _state(last_loaded_tray=-1, tray_now=255, hms=[_demand(0, 1)])
+    client = _patch_wire(monkeypatch, state)
+
+    seated = await _wire_cycle(db_session, printer.id, 0, 1)
+    transitions = await run_slot_pipeline(printer.id, [seated], _deps(db_session, client))
+
+    assert transitions[0].decision.kind is DecisionKind.MINT
+    assert transitions[0].decision.reason == "runout_suspect_mint"
+    await db_session.refresh(donor)
+    assert donor.weight_used == 940.0
+
+
+@pytest.mark.asyncio
+async def test_a_standing_demand_for_a_DIFFERENT_slot_does_not_disqualify_this_one(
+    db_session, printer_factory, monkeypatch
+):
+    """Per-slot, never per-printer — the same over-suspicion guard the incident arm keeps.
+
+    A blanket "is this printer holding a runout?" test would mint a part-used roll back to
+    label weight every time a neighbour slot ran dry, and walk it through the start floor.
+    """
+    printer = await printer_factory()
+    donor = await _departed_roll(db_session, printer.id, 0, 3)
+    state = _state(last_loaded_tray=-1, tray_now=255, hms=[_demand(0, 1)])  # slot 1, not 3
+    client = _patch_wire(monkeypatch, state)
+
+    seated = await _wire_cycle(db_session, printer.id, 0, 3)
+    transitions = await run_slot_pipeline(printer.id, [seated], _deps(db_session, client))
+
+    assert transitions[0].decision.kind is DecisionKind.RECLAIM
+    assert transitions[0].decision.spool_id == donor.id
+
+
+@pytest.mark.asyncio
+async def test_a_dual_nozzle_slot_feeding_the_OTHER_hotend_counts_as_feeding(db_session, printer_factory, monkeypatch):
+    """H2C/H2D: ``tray_now`` describes ONE hotend, so a two-nozzle machine needs both.
+
+    On a Vortek printer the single ``tray_now`` / ``last_loaded_tray`` pair speaks for the
+    ACTIVE extruder only. A slot feeding the deputy nozzle therefore answered "not feeding"
+    for every consumer of the feeder resolution — so a mid-print pull there de-bounced onto
+    the row that was still printing. The firmware's own per-extruder map
+    (``PrinterState.h2d_extruder_snow``, normalized to global tray ids) is the answer, and a
+    slot feeding EITHER nozzle was feeding.
+    """
+    printer = await printer_factory()
+    donor = await _departed_roll(db_session, printer.id, 0, 2)
+    # The active hotend (0) is feeding slot 0; the deputy (1) is feeding slot 2 — ours.
+    state = _state(last_loaded_tray=0, tray_now=0, snow={0: 0, 1: 2})
+    _patch_wire(monkeypatch, state, dual=True)
+
+    seated = await _wire_cycle(db_session, printer.id, 0, 2)
+    transitions = await run_slot_pipeline(printer.id, [seated], _deps(db_session))
+
+    assert transitions[0].decision.kind is DecisionKind.MINT
+    assert transitions[0].decision.reason == "runout_suspect_mint"
+    await db_session.refresh(donor)
+    assert donor.weight_used == 940.0
 
 
 @pytest.mark.asyncio
@@ -134,6 +338,43 @@ async def test_a_short_uncaused_absence_still_de_bounces(db_session, printer_fac
     assert transitions[0].decision.spool_id == donor.id
     await db_session.refresh(donor)
     assert donor.weight_used == 940.0, "the de-bounced roll keeps its grams"
+    assert await db_session.scalar(select(Spool.id).where(Spool.id != donor.id)) is None, "no row was minted"
+
+
+@pytest.mark.asyncio
+async def test_an_idle_swap_inside_the_window_de_bounces_and_that_cost_is_accepted(
+    db_session, printer_factory, monkeypatch
+):
+    """§4.1 row T4 — the amendment's ACCEPTED WRONG ANSWER, pinned as such.
+
+    The operator swaps rolls on an IDLE printer and the bay is empty ~3 minutes: inside
+    `_RESEAT_WINDOW_S`, with no runout cause anywhere (idle machine, no HMS, no incident,
+    nothing feeding). The de-bounce therefore fires and the NEW roll inherits the old
+    row's grams. That verdict is wrong about the filament and RIGHT about the doctrine:
+    the window decides only "did anything physically happen?" (rule 7 as amended), and
+    every cause the farm can actually observe says no.
+
+    It is pinned so it is a decision rather than a surprise. The cost is bounded and
+    recoverable — C3's early-runout reverse correction hands the charges back when the
+    mis-attributed roll runs out short — and the row exists to stop a later session
+    "fixing" it by widening the cause test into a duration guess, which is exactly the
+    move rule 7's amendment forbids.
+
+    The window's far side is not re-proved here: T2/T3/T5 own it
+    (`test_slot_state.py::TestRow4TaglessLane::test_a_donor_outside_the_window_mints_instead`).
+    """
+    printer = await printer_factory()
+    donor = await _departed_roll(db_session, printer.id, 0, 3)
+    client = _patch_wire(monkeypatch, _state(running=False))  # IDLE, no HMS, no feeder
+    _seed_gain(printer.id, 0, 3, absent_for=180.0)  # ~3 minutes, measured
+
+    transitions = await run_slot_pipeline(printer.id, [_obs(printer.id, 3)], _deps(db_session, client))
+
+    assert transitions[0].decision.kind is DecisionKind.RECLAIM
+    assert transitions[0].decision.reason == "reseat_debounce"
+    assert transitions[0].decision.spool_id == donor.id
+    await db_session.refresh(donor)
+    assert donor.weight_used == 940.0, "the de-bounced row keeps its grams — that IS the accepted cost"
     assert await db_session.scalar(select(Spool.id).where(Spool.id != donor.id)) is None, "no row was minted"
 
 
@@ -241,6 +482,91 @@ async def test_no_gain_record_at_all_mints(db_session, printer_factory):
 
     assert transitions[0].decision.kind is DecisionKind.MINT
     assert transitions[0].decision.reason == "tagless_mint"
+
+
+@pytest.mark.asyncio
+async def test_a_spent_newest_residue_is_never_scanned_past_to_an_older_healthy_one(db_session, printer_factory):
+    """The "single last occupant" clause, pinned against the failure it names.
+
+    The lane's own docstring said "adjudicated, NEVER SCANNED PAST" while the query applied
+    ``archived_at IS NULL`` / ``spent_at IS NULL`` / ``~assignments.any()`` in SQL, ahead of
+    the ``LIMIT 1``. A ``WHERE`` clause does not skip an ineligible row — it makes the row
+    INVISIBLE — so the query answered with the newest row that happened to PASS, and the
+    "adjudication" adjudicated a roll that was never this slot's last occupant.
+
+    The shape below is the ordinary end of a natural runout: the roll that just drained is
+    released and stamped spent, and an older healthy roll that once sat in this tray is still
+    on the shelf carrying its own breadcrumb. The spent filter hides the drained row, the
+    query returns the SHELF roll, and the de-bounce reclaims 400 g of somebody else's ledger
+    onto the brand-new roll the operator just loaded. Nothing heals it afterwards either —
+    the reclaimed row is healthy, so it never runs out and never gets stamped.
+
+    Scenario contract §4.1 row T6: a runout whose stamp has landed MINTS.
+    """
+    printer = await printer_factory()
+    older_healthy = await _departed_roll(
+        db_session,
+        printer.id,
+        0,
+        3,
+        weight_used=400.0,
+        released_at=datetime.utcnow() - timedelta(hours=1),
+    )
+    drained = await _departed_roll(db_session, printer.id, 0, 3, weight_used=990.0, spent=True)
+    _seed_gain(printer.id, 0, 3, absent_for=25.0)
+
+    transitions = await run_slot_pipeline(printer.id, [_obs(printer.id, 3)], _deps(db_session))
+
+    assert transitions[0].decision.kind is DecisionKind.MINT
+    assert transitions[0].decision.reason == "tagless_mint"
+
+    await db_session.refresh(older_healthy)
+    assert older_healthy.weight_used == 400.0, "the shelf roll's ledger is untouched"
+    bound = await db_session.scalar(select(SpoolAssignment.spool_id).where(SpoolAssignment.printer_id == printer.id))
+    assert bound not in (older_healthy.id, drained.id), "neither residue may take the slot"
+    minted = await db_session.get(Spool, bound)
+    assert (minted.weight_used or 0) == 0, "the fresh roll gets a fresh ledger"
+
+
+@pytest.mark.asyncio
+async def test_a_newest_residue_bound_elsewhere_mints(db_session, printer_factory):
+    """The subtlest of the three SQL filters, and the reason the shared stmt lost it.
+
+    A slot MOVE stamps ``last_location_* = the OLD slot`` at move time, so the row that most
+    recently left this bay is routinely one that is bound in ANOTHER tray right now.
+    ``~assignments.any()`` in SQL did not make that row ineligible, it made it
+    UNREPRESENTABLE — every reader of the residue silently got the next row down, an older
+    occupant of the same slot and a different physical roll.
+
+    The verdict itself is unchanged and is invariant 11: assumption-tier evidence may
+    displace nothing a live binding holds (shape 26, the spool-211 ping-pong). What changed
+    is that the refusal is now a stated conclusion about the right row, and the fall-through
+    is a mint rather than a reach past it.
+    """
+    printer = await printer_factory()
+    older_healthy = await _departed_roll(
+        db_session,
+        printer.id,
+        0,
+        3,
+        weight_used=400.0,
+        released_at=datetime.utcnow() - timedelta(hours=1),
+    )
+    moved = await _departed_roll(db_session, printer.id, 0, 3, weight_used=250.0)
+    db_session.add(SpoolAssignment(spool_id=moved.id, printer_id=printer.id, ams_id=0, tray_id=1))
+    await db_session.commit()
+    _seed_gain(printer.id, 0, 3, absent_for=25.0)
+
+    transitions = await run_slot_pipeline(printer.id, [_obs(printer.id, 3)], _deps(db_session))
+
+    assert transitions[0].decision.kind is DecisionKind.MINT
+    assert transitions[0].decision.reason == "tagless_mint"
+
+    await db_session.refresh(older_healthy)
+    assert older_healthy.weight_used == 400.0
+    # The moved roll stayed exactly where the wire says it is — one roll, one slot.
+    still_there = await db_session.scalar(select(SpoolAssignment.tray_id).where(SpoolAssignment.spool_id == moved.id))
+    assert still_there == 1
 
 
 @pytest.mark.asyncio

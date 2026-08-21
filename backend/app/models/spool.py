@@ -133,6 +133,15 @@ class Spool(Base):
     # 006-H2S proved was wrongly overloaded as seating order (a stale ledger row
     # lent its age to a fresh roll). NULL falls back to ``first_loaded_at`` /
     # ``created_at`` in the selector.
+    #
+    # SECOND CONSUMER since 2026-08-19: a de-bounce carries this value forward as the
+    # re-bound assignment's ``created_at`` (``slot_pipeline._debounce_bind_moment`` →
+    # ``spool_binding.bind_spool_to_slot(bind_moment=…)``), which is the SWAP BOUNDARY
+    # ``spool_tagless.reconcile_ledger_overcharges`` adjudicates across. So this column no
+    # longer only orders the FIFO selector — it also decides which usage rows a successor
+    # row may be charged for. A hand-edited or clock-skewed value therefore has a second,
+    # non-obvious blast radius; the writer refuses a moment in the future for exactly that
+    # reason.
     loaded_at: Mapped[datetime | None] = mapped_column(DateTime)
     # Last AMS slot this roll was RELEASED from, stamped by the one unbind writer
     # (``spool_binding.release_spool_from_slot`` and the move/displacement sweep in

@@ -463,6 +463,15 @@ export interface SlotRecheckResult {
   label_weight_g: number | null;
   brand: string | null;
   material: string | null;
+  /**
+   * Did a read actually go out on the wire for this click? A refusal (drying, an
+   * identify already in flight, filament engaged, the ask pace) reports false
+   * rather than being swallowed — on the `identified` verdict that is the whole
+   * difference between "the farm asked the tag again" and "the farm is repeating
+   * what the wire already said", and the operator has to be able to tell them
+   * apart before deciding whether the reading is stale.
+   */
+  read_issued: boolean;
   /** A click-driven mint is offering its one-click undo (rule 12, R8). */
   undo_available: boolean;
 }
@@ -2974,19 +2983,6 @@ export interface SpoolmanBulkCreateResult {
   failed_count: number;
 }
 
-// ── Reused-tag re-spool (spent Bambu RFID tag → fresh third-party spool) ─────
-/** POST body for `POST /inventory/spools/respool`. `brand` is required and
- *  non-empty; the optional numeric/text fields ride the fresh spool row. */
-export interface RespoolRequest {
-  printer_id: number;
-  ams_id: number;
-  tray_id: number;
-  brand: string;
-  label_weight?: number | null;
-  cost_per_kg?: number | null;
-  note?: string | null;
-}
-
 /** Why a `respool_prompt` fired, so the UI can say the true thing:
  *  - `spent`       — a hardware runout marked the roll empty,
  *  - `remain_jump` — the AMS reports far more filament than the record holds
@@ -3174,15 +3170,16 @@ export interface EjectPhaseState {
   ts: string;
 }
 
-/** POST body for `POST /inventory/spools/{spool_id}/tagless-fresh`. `answer`
- *  "fresh" archives the current tagless row and mints a replacement (the
- *  optional brand/label_weight/cost/note ride the new row); "same" clears the
- *  prompt for THIS physical cycle only. */
-export interface TaglessFreshRequest {
+/** POST body for `POST /inventory/spools/{spool_id}/new-roll` — THE operator
+ *  statement that the roll on a slot was physically replaced. ONE shape for both
+ *  ledger lanes: the backend reads tag-ness off the bound row and either mints a
+ *  tagless successor or re-spools the reused Bambu tag. `brand` is optional here
+ *  and required by the tagged lane only (422 when a tagged row arrives blank);
+ *  the other fields ride the new row. */
+export interface NewRollRequest {
   printer_id: number;
   ams_id: number;
   tray_id: number;
-  answer: 'fresh' | 'same';
   brand?: string | null;
   label_weight?: number | null;
   cost_per_kg?: number | null;
@@ -3306,10 +3303,19 @@ export interface SpoolAssignment {
   present?: boolean | null;
   /** A "Re-check slot" mint on this slot still has a standing undo offer, derived
    *  per request (never stored) and false again once the slot is re-decided. The
-   *  toast that announces the mint is timed, so the slot card carries the same
-   *  offer — a timed notification must never be the only path to an action
-   *  (WCAG 2.2 2.2.1). Optional: older servers and test fixtures omit it. */
+   *  toast that announces the mint carries the same action but is dismissible and
+   *  gone on navigation, so the SLOT CARD is the offer's durable home — and it has
+   *  to be reachable by keyboard, since that card is where every slot action
+   *  lives. Optional: older servers and test fixtures omit it. */
   recheck_undo_available?: boolean;
+  /** An OPEN "Re-check slot" intent stands on this slot, derived per request
+   *  (never stored) and false again once the intent concludes. A click taken
+   *  while the printer is mid-print answers `queued` and records a durable
+   *  intent that lands at the next answerable read (rule 12), so the slot has to
+   *  SHOW the outstanding check for as long as it stands — pending is a STATE,
+   *  not an event, and there is no announcement when it concludes.
+   *  Optional: older servers and test fixtures omit it. */
+  recheck_pending?: boolean;
 }
 
 export interface FilamentSkuSettings {
@@ -5790,13 +5796,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  // Reused Bambu RFID tag now on a fresh third-party spool: archive/dispose the
-  // spent donor row, create a fresh weight-locked spool, and rewire the slot.
-  respoolTag: (data: RespoolRequest) =>
-    request<InventorySpool>('/inventory/spools/respool', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    }),
   // Operator answered "Same spool" to the uncertain-tier re-spool prompt:
   // persist the dismissal (stamps `respool_dismissed_at` so the prompt stops
   // firing for this spool across reseats / restarts) and echo the AMS slot
@@ -5810,14 +5809,24 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(slot ?? {}),
     }),
-  // Answer the tagless fresh-roll prompt (W5): "fresh" archives the current
-  // tagless row and mints a replacement (optional brand/weight/cost on the new
-  // row); "same" clears the prompt for this physical cycle only. The response
-  // body is the fresh spool on "fresh" and ignored on "same".
-  taglessFresh: (spoolId: number, data: TaglessFreshRequest) =>
-    request<InventorySpool>(`/inventory/spools/${spoolId}/tagless-fresh`, {
+  // THE slot verb for "this roll was physically replaced", for a bound row of
+  // EITHER tag-ness: the backend picks the ledger lane (tagless mint vs reused-tag
+  // re-spool) from the row itself. Returns the NEW spool.
+  newRoll: (spoolId: number, data: NewRollRequest) =>
+    request<InventorySpool>(`/inventory/spools/${spoolId}/new-roll`, {
       method: 'POST',
       body: JSON.stringify(data),
+    }),
+  // Operator answered "Same roll" to the tagless fresh-roll prompt: clear the
+  // prompt for THIS physical cycle only (a later roll swap re-asks) and echo the
+  // slot triple so the WS dismissal reaches every open client.
+  dismissFreshRollPrompt: (
+    spoolId: number,
+    slot: { printer_id: number; ams_id: number; tray_id: number },
+  ) =>
+    request<InventorySpool>(`/inventory/spools/${spoolId}/fresh-roll-dismiss`, {
+      method: 'POST',
+      body: JSON.stringify(slot),
     }),
   // Recovery lane for the per-slot operator prompts (fresh-roll + re-spool):
   // list the questions that are still unanswered. The websocket broadcast is

@@ -500,6 +500,66 @@ class TestCurrentRunoutDemand:
         assert current_runout_demand([motion]) is None
 
 
+class TestRunoutStandingForSlot:
+    """Is the firmware standing on a runout for THIS slot? — the de-bounce lane's wire arm.
+
+    A different question from :func:`current_runout_demand`'s. That one asks WHICH slot the
+    operator must fill and is deliberately narrow (only the insert-here demand). This one
+    asks whether a NAMED slot's bay emptied because it ran dry, and every slot-attributed
+    runout word answers it — including the ones that ask for nothing.
+
+    It exists because the farm's own durable record cannot: a ``printer_incident`` row is
+    bounded to ONE OPEN per printer, so a cascade's second dry slot never gets one and a
+    printer already holding a jam has no runout row at all, while the wire keeps naming
+    every dry slot independently.
+    """
+
+    def _standing(self, hms, ams_id=0, tray_id=0):
+        from backend.app.services.hms_errors import runout_standing_for_slot
+
+        return runout_standing_for_slot(hms, ams_id, tray_id)
+
+    def test_the_demand_names_its_own_slot(self):
+        assert self._standing(_INCIDENT_0123, 0, 2) is True
+
+    def test_a_demand_for_a_neighbour_slot_says_nothing_about_this_one(self):
+        # Per-slot, never per-printer: a blanket read would mint a part-used roll back to
+        # label weight every time a NEIGHBOUR ran dry.
+        assert self._standing(_INCIDENT_0123, 0, 3) is False
+
+    def test_a_cascade_names_both_slots_at_once(self):
+        # ``current_runout_demand`` answers with the LAST demand only, which is right for
+        # "where do I send the operator" and wrong here: both bays really did run dry.
+        assert self._standing(_INCIDENT_1351, 0, 2) is True
+        assert self._standing(_INCIDENT_1351, 0, 1) is True
+
+    def test_the_auto_switch_report_counts(self):
+        # "…has run out and automatically switched to the slot with the same filament":
+        # nothing is being ASKED for, but the slot named unquestionably ran dry.
+        assert self._standing([_D_SLOT1_AUTOSWITCHED], 0, 0) is True
+
+    def test_the_pull_back_notice_counts(self):
+        wait = _fake_hms_error(code="0x30001", attr=0x07002200, module=7, severity=3, full_code="0700220000030001")
+        assert self._standing([wait], 0, 2) is True
+
+    def test_the_slot_agnostic_8011_names_nobody(self):
+        # It IS a runout, and it carries no slot byte — so it can never disqualify a
+        # specific slot's de-bounce. The caller's other arms cover that case.
+        assert self._standing([_D_BARE_8011], 0, 0) is False
+
+    def test_an_empty_or_missing_list_is_no_evidence(self):
+        assert self._standing([]) is False
+        assert self._standing(None) is False
+
+    def test_a_malformed_entry_is_skipped_not_raised(self):
+        junk = SimpleNamespace(code=object(), attr="not-an-int")
+        assert self._standing([junk, _D_SLOT3_DEMAND], 0, 2) is True
+
+    def test_a_non_ams_module_carrying_the_same_code_word_is_rejected(self):
+        motion = _fake_hms_error(code="0x20001", attr=0x03002000, module=3, full_code="0300200000020001")
+        assert self._standing([motion], 0, 0) is False
+
+
 class TestRunoutHoldActive:
     """The shared PAUSE+runout predicate behind the guidance, the refill auto-resume
     and the /ams/load 409 — so they can never disagree about the hold state."""
@@ -916,9 +976,7 @@ class TestAmsFaultTaxonomyCollisionPins:
         attr = _tray_attr(tray=3)
         for code in _RUNOUT_SLOT_SPENT_CODE32:
             assert classify_ams_fault(attr, code) is None
-            entry = _fake_hms_error(
-                code=hex(code), attr=attr, module=7, severity=3, full_code=f"{attr:08X}{code:08X}"
-            )
+            entry = _fake_hms_error(code=hex(code), attr=attr, module=7, severity=3, full_code=f"{attr:08X}{code:08X}")
             assert classify_hms_entry(entry) is None
 
     def test_short_0700_0001_is_banned(self):

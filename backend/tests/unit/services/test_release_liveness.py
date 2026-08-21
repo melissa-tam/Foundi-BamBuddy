@@ -278,11 +278,18 @@ async def test_the_release_evidence_record_rides_the_production_journey(db_sessi
     ``sdcard`` key on a full ``print`` frame, and this harness delivers the AMS block on
     its own — so the printer has genuinely never delivered a full report, and the record
     must say so rather than infer a shape it cannot see.
+
+    The SEATED frame first is what makes ``feeding=no`` mean anything. Without it the slot
+    never produces a PRESENT→ABSENT edge, so the loss-side feeder stamp is simply absent and
+    the honest reading is ``?`` — and asserting ``no`` against that would pass for the wrong
+    reason forever, which is precisely how the field came to be read off the wrong ledger.
+    Here the edge is real and the printer is idle, so ``no`` is a derived answer.
     """
     spool = await _bind(db_session, wired.printer.id)
     slot = (wired.printer.id, 0, 0)
 
     with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
+        await _push(wired, passes, _seated_pushall())
         await _push(wired, passes, _cleared_pushall())
 
     assert await _assignment(sessions, *slot) is None, "the release itself must still fire"
@@ -306,6 +313,49 @@ async def test_the_release_evidence_record_rides_the_production_journey(db_sessi
     assert "mask_trusted=no mask_src=cached" in line
     assert "push=? push_age=-" in line
     assert "feeding=no printing=no" in line
+
+
+async def test_the_release_evidence_names_the_feeder_when_a_feeding_slot_empties(
+    db_session, wired, sessions, passes, caplog
+):
+    """LIVENESS for ``feeding=``: the field must be able to answer YES on the real journey.
+
+    It could not. ``ams_presence`` keeps "was this slot feeding?" in two places — stamped at
+    the LOSS edge (``_absent_under_active_feed``) and carried into ``_reseat`` at the GAIN —
+    and ``_reseat`` is dropped at every loss. The release-evidence record read the GAIN-side
+    accessor, so at a release (where the roll has not come back) it consulted a map that is
+    empty by construction and reported ``feeding=no`` for every release the farm has ever
+    made, including every runout. The unit tests agreed with it because they seeded the same
+    wrong map by hand; only the production journey can tell the two apart, which is this
+    file's whole reason to exist (memory ``liveness-paired-verification``).
+
+    The shape is a mid-print departure: the printer is RUNNING, the wire says this slot is
+    the tray that last actually fed the job, and the bay then empties — a runout or a
+    mid-print pull, never a glitch (operator ruling 15). Nothing here is seeded: the loss
+    edge is derived by the presence pass from the same push the pipeline then resolves.
+    """
+    spool = await _bind(db_session, wired.printer.id)
+    slot = (wired.printer.id, 0, 0)
+
+    # A live print whose last actual feeder is A0T0 (global tray 0*4+0).
+    wired.client.state.state = "RUNNING"
+    wired.client.state.last_loaded_tray = 0
+    wired.client.state.tray_now = 0
+
+    with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
+        await _push(wired, passes, _seated_pushall())  # seeds presence; no edge yet
+        await _push(wired, passes, _cleared_pushall())  # the PRESENT→ABSENT edge + the release
+
+    assert await _assignment(sessions, *slot) is None, "a mid-print departure still releases the binding"
+    evidence = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _PIPELINE_LOGGER and r.getMessage().startswith("[slot-state] release-evidence")
+    ]
+    assert len(evidence) == 1, f"exactly one record per release, got {evidence}"
+    line = evidence[0]
+    assert f"spool={spool.id} reason=cleared_tray" in line
+    assert "feeding=yes printing=yes" in line, f"the loss-edge feeder answer must reach the record: {line}"
 
 
 async def test_the_release_survives_the_partials_that_follow_it(db_session, wired, sessions, passes):

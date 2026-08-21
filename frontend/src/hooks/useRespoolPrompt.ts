@@ -5,6 +5,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { api } from '../api/client';
 import type { Printer, RespoolPromptMessage } from '../api/client';
+import type { NewRollContext } from '../utils/newRollContext';
 import { formatDuration } from '../utils/date';
 import {
   slotKey,
@@ -24,9 +25,16 @@ import {
  * explicit answers:
  *   - "Same spool"  → POST `respool-dismiss` (persists the answer so the prompt
  *                     never fires again for this spool) and clear the slot.
- *   - "Review…"     → open `RespoolTagModal` for the full re-spool form.
+ *   - "Review…"     → open the shared `NewRollModal` on this slot, which posts the
+ *                     merged `POST /inventory/spools/{id}/new-roll`. Offered only
+ *                     when the prompt names a donor row — with no row there is
+ *                     nothing to retire and the form could not be keyed.
  * Dismissing the toast (X) is deliberately NOT an answer — it just hides the
  * toast for now.
+ *
+ * The prompt is an ESCALATION, not a question the farm could have answered
+ * itself: it knows what happened to the slot and cannot carry it out without the
+ * operator naming the replacement roll.
  *
  * All the per-slot mechanics — queue + dedup, persistent toast raise/clear,
  * cross-client dismissal via the `respool-prompt-dismissed` window-event bridge
@@ -41,7 +49,7 @@ export function useRespoolPrompt() {
   const queryClient = useQueryClient();
   const { showToast } = useToast();
 
-  const [activeContext, setActiveContext] = useState<RespoolPromptMessage | null>(null);
+  const [activeContext, setActiveContext] = useState<NewRollContext | null>(null);
 
   const isAuthed = !authEnabled || !!user;
 
@@ -78,12 +86,38 @@ export function useRespoolPrompt() {
 
   // "Review…": hide the toast, take the slot out of the queue (so the raise
   // effect can't resurrect the toast while the modal is open), and open the
-  // modal on this slot.
+  // shared new-roll form on this slot.
+  //
+  // The WS payload is translated into the form's own context here rather than
+  // being handed over raw: three surfaces open that one form, and it must not
+  // know which of them did. `donor_spool_id` is the row the operator is retiring,
+  // and therefore the endpoint's key — the caller guarantees it is non-null by
+  // only offering "Review…" when the prompt names one.
   const handleReview = useCallback(
     (prompt: RespoolPromptMessage, helpers: SlotPromptHelpers) => {
+      if (prompt.donor_spool_id == null) return;
       helpers.dismissSlotToast(prompt);
       helpers.dequeue(prompt);
-      setActiveContext(prompt);
+      setActiveContext({
+        printer_id: prompt.printer_id,
+        ams_id: prompt.ams_id,
+        tray_id: prompt.tray_id,
+        spool_id: prompt.donor_spool_id,
+        tagged: true,
+        origin: 'prompt',
+        tray_count: prompt.tray_count,
+        material: prompt.tray_sub_brands || prompt.tray_type,
+        rgba: prompt.tray_color,
+        tag_identity: prompt.tag_uid || prompt.tray_uuid,
+        // An impossible ledger (weight_used past the label) makes every derived
+        // "remaining" meaningless — prod prompts announced "remaining −792.9 g".
+        // The question stands; only the number is withdrawn, exactly as the toast
+        // does it.
+        remaining_g: prompt.ledger_unreliable ? null : prompt.donor_remaining_g,
+        brand_prefill: prompt.brand_prefill,
+        label_weight_prefill: prompt.label_weight_prefill,
+        trigger: prompt.trigger ?? null,
+      });
     },
     [],
   );
@@ -148,7 +182,16 @@ export function useRespoolPrompt() {
             label: t('inventory.respool.sameSpoolAction'),
             onClick: () => handleSameSpool(prompt, helpers.removeSlot),
           },
-          { label: t('inventory.respool.reviewAction'), onClick: () => handleReview(prompt, helpers) },
+          // No donor row → nothing to retire, so the form has no key and the offer
+          // would dead-end. "Same spool" still answers the question.
+          ...(prompt.donor_spool_id != null
+            ? [
+                {
+                  label: t('inventory.respool.reviewAction'),
+                  onClick: () => handleReview(prompt, helpers),
+                },
+              ]
+            : []),
         ],
       };
     },

@@ -220,7 +220,7 @@ _swept_subtasks: dict[int, str] = {}
 # on_tray_observations would answer with ANOTHER re-read — a self-sustaining ~22 s loop.
 # This one-shot flag lets the NEXT gain on the slot be recognized as our own
 # command's echo and swallowed exactly once. It is NOT a time-suppression window:
-# empty slots never arm (see record_reread), so a real insertion made right after
+# empty slots never arm (see record_recheck_read), so a real insertion made right after
 # a print ends is never eaten; only the identify echo is.
 _echo_pending: dict[tuple[int, int, int], float] = {}
 
@@ -462,7 +462,7 @@ def _tray_tagged(tray: dict) -> bool:
 # --- Echo-consume flag -----------------------------------------------------
 
 
-def record_reread(printer_id: int, ams_id: int, tray_id: int) -> None:
+def record_recheck_read(printer_id: int, ams_id: int, tray_id: int) -> None:
     """Arm the one-shot echo-consume flag for a commanded RFID re-read.
 
     Call this immediately after a re-read command (``ams_get_rfid``) is accepted
@@ -476,6 +476,11 @@ def record_reread(printer_id: int, ams_id: int, tray_id: int) -> None:
     made right after a print ends — the exact operator flow this design protects.
     All commanders route through :func:`command_identify`, which calls this, so the
     present-at-command-time guard lives in one place.
+
+    Named for the ACT — the farm re-checking what is in a slot by commanding a read — and
+    that covers every source ``command_identify`` serves: the idle-gain lane, the terminal
+    sweep, the reconcile drain and the operator's "Re-check slot" click alike. It is NOT
+    scoped to ``services.slot_recheck``, which owns only the operator half of that list.
     """
     tray = _find_tray(printer_id, ams_id, tray_id)
     if tray is not None and _tray_present(tray):
@@ -518,7 +523,7 @@ def _identify_explains_absence(printer_id: int, ams_id: int, tray_id: int) -> bo
     a then-present slot — the common case, and the one that keeps a genuine swap on a
     DIFFERENT slot from being suppressed) and, as a secondary, unit-scoped
     ``ams_status_main == AMS_STATUS_IDENTIFYING`` — the ONLY signal a state-9
-    seated-yet-unread commanded read leaves (``record_reread`` deliberately never arms the
+    seated-yet-unread commanded read leaves (``record_recheck_read`` deliberately never arms the
     echo on a state-9 slot, so the incident's flap slips the echo lane) and the ONLY signal
     a firmware-AUTONOMOUS re-read, which carries no command at all, leaves at all.
 
@@ -566,7 +571,7 @@ def _identify_explains_gain(
        unit's live ``AMS_STATUS_IDENTIFYING`` (:func:`_identify_explains_absence`, kept
        verbatim: it is the freshest signal, and it is also what the loss edge captured);
     b. WE commanded a read on the slot, whatever the tray's state was at command time.
-       ``record_reread`` arms the echo flag only for a state-10/11 slot (an identify on an
+       ``record_recheck_read`` arms the echo flag only for a state-10/11 slot (an identify on an
        empty slot leaves no edge to swallow), so a read commanded on a state-9 tray slipped
        the whole suppression lane and its flap banked as a physical cycle. ``commanded_at``
        is passed in ALREADY CONSUMED by the caller: a command explains at most ONE flap.
@@ -712,6 +717,12 @@ def _slot_was_active_feeder(printer_id: int, ams_id: int, tray_id: int, state, r
     moved (a firmware auto-refill switches to a backup slot) or read the 255 sentinel,
     which means "nothing is feeding" and never "the path is clear" (invariant 8).
 
+    ``printer_id`` is passed through deliberately (2026-08-20): without it the resolver
+    could reach neither the job's SLICER mapping (captured on the client, so the
+    contracted mapping tier was absent for this caller) nor the DUAL-NOZZLE per-extruder
+    feeders — on an H2C a slot feeding the non-active hotend answered "not feeding", so a
+    mid-print pull there de-bounced onto the row that was still printing.
+
     Idle printer ⇒ False: ``last_loaded_tray`` and the mapping are per-JOB state, and
     reading them between prints would attribute a stale feeder to an operator's
     ordinary roll change. Never raises — an unresolvable answer is "not suspect", and
@@ -723,7 +734,7 @@ def _slot_was_active_feeder(printer_id: int, ams_id: int, tray_id: int, state, r
     try:
         from backend.app.services.spool_recovery import slot_was_feeding
 
-        return slot_was_feeding(state, ams_id, tray_id)
+        return slot_was_feeding(state, ams_id, tray_id, printer_id=printer_id)
     except Exception:  # noqa: BLE001 — an unresolvable feeder is not evidence of a runout
         logger.exception(
             "AMS presence: active-feeder resolution failed for printer %d AMS%d-T%d", printer_id, ams_id, tray_id
@@ -749,11 +760,40 @@ def reseat_within_window(printer_id: int, ams_id: int, tray_id: int) -> bool:
 def reseat_under_active_feed(printer_id: int, ams_id: int, tray_id: int) -> bool:
     """Was this slot the active feeder of a live print when its current occupancy began?
 
-    The loss-edge half of the de-bounce lane's runout-suspect test
-    (:func:`_slot_was_active_feeder`), read back at the gain the release preceded. PEEK.
+    The GAIN-SIDE readback of :func:`_slot_was_active_feeder`: the loss edge stamped
+    :data:`_absent_under_active_feed`, the gain carried that stamp into :data:`_reseat`,
+    and the de-bounce lane's runout-suspect test (``slot_pipeline._runout_suspect``) reads
+    it here — because that test runs when the roll is BACK, adjudicating the return.
+
+    Its loss-side twin is :func:`absent_under_active_feed`, and the two are not
+    interchangeable: this one answers only while the slot is OCCUPIED again, that one only
+    while it is still ABSENT. Reading the wrong one is a predicate that can never fire
+    (2026-08-20: the release-evidence line's ``feeding=`` field did exactly that). PEEK.
     """
     entry = _reseat.get((printer_id, ams_id, tray_id))
     return entry is not None and entry.under_active_feed
+
+
+def absent_under_active_feed(printer_id: int, ams_id: int, tray_id: int) -> bool | None:
+    """Was this slot the active feeder when its CURRENT absence began? Tri-state PEEK.
+
+    The LOSS-SIDE view of the same fact :func:`reseat_under_active_feed` reads at the gain,
+    and the one a RELEASE can actually consult: a release fires while the slot is still
+    absent, so ``_reseat`` — which is written at the gain and dropped at the next loss —
+    holds nothing for it at all. ``slot_pipeline._release_evidence``'s ``feeding=`` field
+    read the gain-side accessor and could therefore never report ``yes``; the presence pass
+    runs BEFORE the pipeline resolves the same push (``printer_manager``'s ordering
+    guarantee), so by the time the release is decided the loss edge has already stamped
+    :data:`_absent_under_active_feed` and this answers it truthfully.
+
+    ``None`` means the loss edge was never observed for this slot in this process — a
+    restart, a first-batch seed, or a slot that has simply never lost presence — and is
+    reported as ``?`` rather than ``no``, because "not observed" is not "not feeding"
+    (the same UNKNOWN-is-not-a-negative discipline ``obs.present`` and ``_Reseat.absent_for``
+    already keep). Diagnostic-only: nothing branches on it. PEEK, never consuming — the
+    entry is popped exactly once, at the gain that ends the absence.
+    """
+    return _absent_under_active_feed.get((printer_id, ams_id, tray_id))
 
 
 def reseat_absence(printer_id: int, ams_id: int, tray_id: int) -> float | None:
@@ -1204,14 +1244,14 @@ async def command_identify(
         # flaps the tray present→9→present, and that settle-back gain must be
         # swallowed, not answered with another read. A refused command starts no
         # identify → no echo → nothing to arm, and no identity was learned either.
-        record_reread(printer_id, ams_id, tray_id)
+        record_recheck_read(printer_id, ams_id, tray_id)
         note_identity_learned(printer_id, ams_id, tray_id)
         # The read is spent: the slot's occasion closes until a NEW cause opens one (a
         # qualified physical cycle or the next terminal's between-prints policy). This is
         # what makes a standing condition cost ONE read instead of one per pass.
         _consume_read_occasion(printer_id, ams_id, tray_id)
         # Cause record for the presence-edge suppression tier — stamped for EVERY
-        # accepted command, including one on a state-9 tray, which ``record_reread``
+        # accepted command, including one on a state-9 tray, which ``record_recheck_read``
         # deliberately does not arm (an empty slot leaves no edge to swallow, but the
         # identify cycle it starts still flaps the tray).
         _commanded_read_at[key] = time.monotonic()
@@ -1457,6 +1497,17 @@ def read_answered_no_tag(printer_id: int, ams_id: int, tray_id: int, *, tray_sea
     * we ASKED this slot a question that can answer "no tag" — ``_discovery_read_at`` holds
       a stamp for it (only :func:`command_identify` stamps it, only for a ``discovery``
       read);
+    * **no qualified physical cycle has happened SINCE that stamp.** An answer describes the
+      roll that was in the tray when it was given; somebody pulling that roll out and putting
+      a different one in makes it an answer about an object that is no longer there. This is
+      an invalidation BY CAUSE, which is the only kind rule 7 permits — expressly NOT an age
+      ceiling, because a duration can decide no identity and a slot nobody has touched for a
+      week still holds a perfectly good answer. It matters because the 2026-08-19 wave
+      widened the consumers of this predicate from one (row 5a, spent + tagged + bare) to
+      every binding quadrant, so a stamp that used to reach almost nothing now reaches an
+      operator's own hand-assigned row. Note the pairing with :func:`close_answered_read`,
+      which POPS the cycle on the pass that consumes an answer: an answered read therefore
+      stands until a NEW qualified gain re-sets it, and this test is that re-set's teeth;
     * at least :data:`_NO_TAG_ANSWER_SETTLE_S` has elapsed since that stamp;
     * no identify is in flight on the slot (:func:`identify_in_flight`);
     * ``_slot_read_at`` is NOT newer than the discovery stamp. A tag landing re-stamps it
@@ -1487,12 +1538,41 @@ def read_answered_no_tag(printer_id: int, ams_id: int, tray_id: int, *, tray_sea
     stamp = _discovery_read_at.get(key)
     if stamp is None:
         return False
+    cycle_at = _physical_cycle_at.get(key)
+    if cycle_at is not None and cycle_at > stamp:
+        # The slot changed after the question was put: this answer is about a roll that
+        # left. Never POP ``_discovery_read_at`` to express that — the same stamp drives
+        # the ``0700_0081`` suppression in :func:`is_expected_read_failure`, and a read
+        # commanded moments before a re-seat must still own its own expected failure.
+        return False
     if time.monotonic() - stamp < _NO_TAG_ANSWER_SETTLE_S:
         return False
     if identify_in_flight(printer_id, ams_id, tray_id):
         return False
     read_at = _slot_read_at.get(key)
     return not (read_at is not None and read_at > stamp)
+
+
+def note_operator_statement(printer_id: int, ams_id: int, tray_id: int) -> None:
+    """An operator has just STATED what is in this slot — the second identity oracle spoke.
+
+    Doctrine rule 6 names two identity oracles, "an RFID tag **or a human answer**", and rule
+    12 wires the human one up. A manual assign, a "New roll…" answer, a tag linked by hand:
+    each is a statement of fact about the physical slot, and the farm's own stale inferences
+    about it must stop outranking it. Rule 12's guard applies in the other direction too —
+    the statement concludes the identity question, so a read whose answer predates it is
+    answering about the roll the operator has just replaced.
+
+    Implemented as a documented, greppable alias of :func:`note_identity_learned` rather than
+    a second ledger, because "the slot's identity is current as of now" is *exactly* the fact
+    both events assert and :func:`read_answered_no_tag` already treats a newer ``_slot_read_at``
+    as "answered with something newer". One name per event, one ledger per fact: the alias
+    exists so the operator lane is findable from the route side (grep this name) without a
+    controller having to know which in-memory map the read economy keeps.
+
+    Pure in-memory, never raises, safe to call for a slot nothing has ever observed.
+    """
+    note_identity_learned(printer_id, ams_id, tray_id)
 
 
 # (printer_id, ams_id, tray_id) -> the ``_discovery_read_at`` stamp whose NO-TAG answer has
@@ -1883,12 +1963,28 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
             # every observation, not only gains: the answer lands ~15 s after the command,
             # by which time the slot is emitting steady-state pushes. Non-destructive to
             # the row-5a conclusion the pipeline draws from the same fact one step later.
+            #
+            # BARE-NESS IS THE RFID PAIR, and nothing else (2026-08-20). This lane used to
+            # hand over ``tray_identity_asserted``, which ALSO counts ``tray_type`` and
+            # ``tray_info_idx`` — so for the commonest physical shape on this fleet (a
+            # third-party PETG roll: ``tray_type: "PETG"``, ``tray_info_idx: "GFG02"``,
+            # ``tag_uid: null`` — scenario G7) the close lane could never fire: the
+            # entitlements stayed unspent, ``_physical_cycle_at`` / ``_read_occasion_at``
+            # lingered, and the next ``rfid_refresh`` read on a chipless tray raised an
+            # UNSUPPRESSED ``0700_0081`` that can never self-clear (invariant 4). The
+            # question this predicate answers is "did the read find a CHIP?", and only the
+            # atomic tag/uuid pair can answer it — configuration is what the farm or the
+            # firmware wrote INTO the tray, never what the tray said about itself.
+            # ``slot_pipeline._no_tag_read_answered`` passes the same reading; row 5a's
+            # bare-TRAY constellation is guaranteed by its POSITION in the table (rows 5/6
+            # mean "nothing asserted about identity OR configuration"), never by this
+            # argument.
             close_answered_read(
                 printer_id,
                 ams_id,
                 tray_id,
                 tray_seated=obs.present is True,
-                tray_bare=not tray_identity_asserted(observation_tray_dict(obs)),
+                tray_bare=not obs.identity_asserted,
             )
 
             # Steady state: act only on a genuine presence GAIN, and only while

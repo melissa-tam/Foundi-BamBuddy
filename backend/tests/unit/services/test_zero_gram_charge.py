@@ -153,7 +153,14 @@ async def _seed_tagless_spool(db, printer_id: int, *, ams_id: int = 0, tray_id: 
     return spool
 
 
-async def _seed_farm_item(db, printer_id: int, subtask_id: str, *, plate_id: int | None = DISPATCHED_PLATE):
+async def _seed_farm_item(
+    db,
+    printer_id: int,
+    subtask_id: str,
+    *,
+    plate_id: int | None = DISPATCHED_PLATE,
+    ams_mapping: str = "[0]",
+):
     """The dispatched unit: the row that KNOWS the file and the plate."""
     from backend.app.models.print_queue import PrintQueueItem
 
@@ -162,7 +169,7 @@ async def _seed_farm_item(db, printer_id: int, subtask_id: str, *, plate_id: int
         status="printing",
         dispatch_subtask_id=subtask_id,
         plate_id=plate_id,
-        ams_mapping="[0]",
+        ams_mapping=ams_mapping,
         started_at=datetime.now(timezone.utc) - timedelta(hours=5),
     )
     db.add(item)
@@ -746,3 +753,235 @@ async def test_a_foreign_print_gets_no_donor_even_while_a_farm_unit_is_printing(
     assert await resolve_dispatch_donor(db_session, printer.id, None) is None
     # Liveness: the farm's own dispatch still resolves.
     assert await resolve_dispatch_donor(db_session, printer.id, "FARM-815") is not None
+
+
+# ---------------------------------------------------------------------------
+# Layer 1 at COMPLETION — the donor is asked again when the archive has no 3MF
+# ---------------------------------------------------------------------------
+#
+# The print-start capture is the normal way the donor reaches the archive, but it
+# runs exactly ONCE and anything that loses it there is permanent for that print:
+# on 2026-08-20 printer 1 started archive 783 under the pre-donor code ("Created
+# fallback archive 783 for plate_3 (no 3MF available)") and finished under the new
+# one, so completion logged "3MF: no file available for archive 783, skipping" and
+# then paged the zero-gram warning for spool 338. The queue item still named the
+# file the whole time. Completion now asks the same shared origin, which also
+# covers every future start-time failure (FTPS down, a printer that will not serve
+# the file, a restart across the capture).
+
+
+@pytest.mark.asyncio
+async def test_a_completed_print_with_no_archive_file_charges_from_the_dispatch_donor(
+    db_session, printer_factory, tmp_path, monkeypatch, caplog
+):
+    """THE 2026-08-20 SHAPE: file-less archive, resolvable item, grams charged."""
+    from backend.app.core.config import settings as app_settings
+    from backend.app.services.usage_tracker import _active_sessions, on_print_complete
+
+    monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+    monkeypatch.setattr(app_settings, "archive_dir", tmp_path / "archives")
+    _active_sessions.clear()
+
+    printer = await printer_factory()
+    donor_path = _library_donor(tmp_path)
+    library_row = await _seed_library_file(db_session, donor_path, tmp_path)
+    spool = await _seed_tagless_spool(db_session, printer.id)
+    item = await _seed_farm_item(db_session, printer.id, "FARM-783")
+    item.library_file_id = library_row.id
+    archive = await _seed_archive(db_session, printer.id)  # the fallback archive: no 3MF
+    await db_session.commit()
+
+    notify = AsyncMock()
+    with (
+        patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify),
+        caplog.at_level(logging.INFO, logger="backend.app.services.usage_tracker"),
+    ):
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed", "subtask_id": "FARM-783"},
+            printer_manager=_settled_printer_manager(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+    await db_session.refresh(spool)
+    assert sum(r["weight_used"] for r in results) == pytest.approx(PLATE_3_GRAMS, abs=0.1), (
+        "the DISPATCHED plate's grams, charged from the file the farm itself uploaded"
+    )
+    assert spool.weight_used == pytest.approx(PLATE_3_GRAMS, abs=0.1)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("charged from the dispatch donor" in m for m in messages), "the fallback must name itself in the log"
+    assert not any("ZERO-GRAM CHARGE" in m for m in messages), "a charged print is not a zero-gram bleed"
+    notify.assert_not_awaited()
+    assert donor_path.exists(), "the donor is BORROWED — charging from it must never consume it"
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_stands_down_when_the_donor_bytes_are_gone(
+    db_session, printer_factory, tmp_path, monkeypatch, caplog
+):
+    """No bytes, no invented grams: the existing skip + the zero-gram page, intact.
+
+    The item still names a library row and an archive row — both of whose files are
+    gone — which is precisely the state that must NOT be talked into a charge.
+    """
+    from backend.app.core.config import settings as app_settings
+    from backend.app.services.usage_tracker import _active_sessions, on_print_complete
+
+    monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+    monkeypatch.setattr(app_settings, "archive_dir", tmp_path / "archives")
+    _active_sessions.clear()
+
+    printer = await printer_factory()
+    donor_path = _library_donor(tmp_path)
+    library_row = await _seed_library_file(db_session, donor_path, tmp_path)
+    library_row.file_path = "library/files/deleted.3mf"  # row survives, bytes do not
+    spool = await _seed_tagless_spool(db_session, printer.id)
+    archive = await _seed_archive(db_session, printer.id)
+    item = await _seed_farm_item(db_session, printer.id, "FARM-784")
+    item.library_file_id = library_row.id
+    item.archive_id = archive.id  # and that archive row carries file_path="" — no bytes either
+    await db_session.commit()
+
+    notify = AsyncMock()
+    with (
+        patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify),
+        caplog.at_level(logging.INFO, logger="backend.app.services.usage_tracker"),
+    ):
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed", "subtask_id": "FARM-784"},
+            printer_manager=_settled_printer_manager(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+    await db_session.refresh(spool)
+    assert results == [], "nothing on disk to price the print from — the skip is still the honest answer"
+    assert spool.weight_used == 0.0
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"no file available for archive {archive.id}" in m for m in messages)
+    assert not any("charged from the dispatch donor" in m for m in messages)
+    assert any("ZERO-GRAM CHARGE" in m for m in messages), "the loss must still be loud"
+    notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_print_with_no_archive_file_still_skips(
+    db_session, printer_factory, tmp_path, monkeypatch, caplog
+):
+    """LIVENESS for the other half: no farm item ⇒ no donor ⇒ the lane is unchanged.
+
+    A screen- or Studio-started print has no queue item to name a file, and this
+    fallback must never reach for one — inventing a donor for somebody else's job
+    would charge the farm's own filament figures onto a print that never ran it.
+    """
+    from backend.app.core.config import settings as app_settings
+    from backend.app.services.usage_tracker import _active_sessions, on_print_complete
+
+    monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+    monkeypatch.setattr(app_settings, "archive_dir", tmp_path / "archives")
+    _active_sessions.clear()
+
+    printer = await printer_factory()
+    # The farm's own file sits right there in the library — and stays unused.
+    donor_path = _library_donor(tmp_path)
+    await _seed_library_file(db_session, donor_path, tmp_path)
+    spool = await _seed_tagless_spool(db_session, printer.id)
+    archive = await _seed_archive(db_session, printer.id)
+
+    notify = AsyncMock()
+    with (
+        patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify),
+        caplog.at_level(logging.INFO, logger="backend.app.services.usage_tracker"),
+    ):
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed", "subtask_id": "STUDIO-77"},
+            printer_manager=_settled_printer_manager(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+    await db_session.refresh(spool)
+    assert results == []
+    assert spool.weight_used == 0.0
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"no file available for archive {archive.id}" in m for m in messages)
+    assert not any("charged from the dispatch donor" in m for m in messages), (
+        "a foreign print must never be handed the farm's file"
+    )
+    notify.assert_not_awaited(), "no dispatch mapping ⇒ no feeder can be named ⇒ nothing actionable to page"
+
+
+# ---------------------------------------------------------------------------
+# Witness selection and the page's honest scope (A9.4)
+# ---------------------------------------------------------------------------
+
+
+def test_feeder_witness_selection_is_named_at_the_call_site():
+    """``dispatch_only`` drops the observational witnesses; ``all`` keeps them.
+
+    Both arms are asserted together because the two callers need OPPOSITE answers
+    from one implementation: the remain%-delta fallback wants every candidate it can
+    get, the zero-gram guard wants the dispatch DECISION alone.
+    """
+    from backend.app.services.usage_tracker import _print_feeder_keys
+
+    state = SimpleNamespace(tray_change_log=[(1, 12)])
+
+    assert _print_feeder_keys([0], state, 2) == {(0, 0), (0, 1), (0, 2)}, "the union is still the default"
+    assert _print_feeder_keys([0], state, 2, witnesses="dispatch_only") == {(0, 0)}, (
+        "an eject inherits the previous print's loaded tray — only the mapping may name its feeder"
+    )
+    assert _print_feeder_keys(None, state, 2, witnesses="dispatch_only") == set(), (
+        "a job that decided no AMS slot names no feeder at all"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_warning_names_every_tagless_feeder_while_the_page_stays_one(
+    db_session, printer_factory, tmp_path, monkeypatch, caplog
+):
+    """A multi-material print can lose several rolls' grams in one completion.
+
+    The WARN is the complete record and names every zero-charged tagless feeder;
+    the PAGE is one per printer per window and names the first, because its body
+    template is singular and is seeded once per install (plural copy in the caller
+    would render broken on every farm already in production).
+    """
+    from backend.app.core.config import settings as app_settings
+    from backend.app.services.usage_tracker import _active_sessions, on_print_complete
+
+    monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+    monkeypatch.setattr(app_settings, "archive_dir", tmp_path / "archives")
+    _active_sessions.clear()
+
+    printer = await printer_factory(name="005-H2S")
+    first = await _seed_tagless_spool(db_session, printer.id, ams_id=0, tray_id=0)
+    second = await _seed_tagless_spool(db_session, printer.id, ams_id=0, tray_id=1)
+    await _seed_farm_item(db_session, printer.id, "FARM-790", ams_mapping="[0, 1]")
+    archive = await _seed_archive(db_session, printer.id)
+
+    notify = AsyncMock()
+    with (
+        patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify),
+        caplog.at_level(logging.WARNING, logger="backend.app.services.usage_tracker"),
+    ):
+        await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed", "subtask_id": "FARM-790"},
+            printer_manager=_settled_printer_manager(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+    warnings = [r.getMessage() for r in caplog.records if "ZERO-GRAM CHARGE" in r.getMessage()]
+    assert len(warnings) == 1, "one record per print, not one per feeder"
+    assert "AMS A slot 1" in warnings[0] and "AMS A slot 2" in warnings[0], "every affected slot is named"
+    assert f"spool {first.id}" in warnings[0] and f"spool {second.id}" in warnings[0], "and every affected roll"
+
+    notify.assert_awaited_once()
+    args = notify.await_args.args
+    assert args[3] == "AMS A slot 1", "the page names the first tagless feeder — the singular template's shape"
+    assert args[4] == first.id

@@ -447,6 +447,13 @@ body {
   .spoolbuddy-spool-glow {
     transition: none;
   }
+
+  /* Toasts arrive without the slide (WCAG 2.2 2.3.3). Dropping the animation
+     lands them at the keyframe end state — fully opaque, untranslated — so the
+     message is present immediately rather than mid-transition. */
+  .animate-slide-in {
+    animation: none;
+  }
 }
 
 /* SpoolBuddy quick menu slide-down */

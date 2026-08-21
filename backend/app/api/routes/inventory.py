@@ -1532,45 +1532,37 @@ async def dismiss_respool_prompt(
     return result.scalar_one()
 
 
-class TaglessFreshRequest(BaseModel):
-    """Body for ``POST /inventory/spools/{id}/tagless-fresh`` (W5).
+class FreshRollDismissRequest(BaseModel):
+    """Body for ``POST /inventory/spools/{id}/fresh-roll-dismiss`` (W5).
 
-    ``answer="same"`` clears the fresh-roll prompt for THIS physical cycle only (it
-    NULLs the row's pending stamp; the next qualified cycle re-stamps and re-asks).
-    ``answer="fresh"`` archives the current tagless row and mints a replacement,
-    applying the optional brand/label_weight/cost_per_kg/note to the new row.
+    The operator's "Same roll" answer to the tagless fresh-roll prompt. The slot
+    triple is required — it is echoed on the dismissal broadcast so every open
+    client drops the matching toast.
     """
 
     printer_id: int
     ams_id: int
     tray_id: int
-    answer: str  # "fresh" | "same"
-    brand: str | None = None
-    label_weight: int | None = None
-    cost_per_kg: float | None = None
-    note: str | None = None
 
 
-@router.post("/spools/{spool_id}/tagless-fresh", response_model=SpoolResponse)
-async def answer_tagless_fresh(
+@router.post("/spools/{spool_id}/fresh-roll-dismiss", response_model=SpoolResponse)
+async def dismiss_fresh_roll_prompt(
     spool_id: int,
-    req: TaglessFreshRequest,
+    req: FreshRollDismissRequest,
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
 ):
-    """Answer the W5 tagless fresh-roll prompt for a slot.
+    """Answer the W5 tagless fresh-roll prompt with "Same roll".
 
-    * ``answer="same"`` — the operator confirms it is the SAME roll: NULL the row's
-      ``fresh_prompt_pending_at`` stamp and broadcast ``tagless_fresh_prompt_dismissed``
-      so open clients drop the toast. NO permanent suppression (deliberate divergence
-      from the respool prompt's ``respool_dismissed_at``) — the next qualified physical
-      cycle re-stamps and re-asks.
-    * ``answer="fresh"`` — a fresh roll is on the slot: archive the current tagless row
-      (grams preserved), mint + bind + push a replacement (default-vs-tray via the shared
-      W1 transition) with the optional brand/label_weight/cost_per_kg/note; broadcast the
-      fresh assign + ``inventory_changed`` + the dismissed event. Returns the NEW spool.
+    NULLs the row's ``fresh_prompt_pending_at`` stamp and broadcasts
+    ``tagless_fresh_prompt_dismissed`` so open clients drop the toast. NO permanent
+    suppression (deliberate divergence from the respool prompt's
+    ``respool_dismissed_at``) — the next qualified physical cycle re-stamps and re-asks.
 
-    404 unknown spool; 409 when a fresh answer can't resolve the slot's live tray.
+    The opposite answer ("a fresh roll is on the slot") is not a dismissal at all but a
+    ledger operation, and lives on its own verb: ``POST /spools/{id}/new-roll``.
+
+    404 for an unknown spool.
     """
     from backend.app.services import spool_tagless
 
@@ -1579,31 +1571,132 @@ async def answer_tagless_fresh(
     if not spool:
         raise HTTPException(404, "Spool not found")
 
-    if req.answer == "same":
-        await spool_tagless.clear_fresh_prompt(db, spool)
-        await spool_tagless.broadcast_tagless_fresh_dismissed(req.printer_id, req.ams_id, req.tray_id)
-        return spool
-
-    if req.answer != "fresh":
-        raise HTTPException(422, "answer must be 'fresh' or 'same'")
-
-    try:
-        new_spool = await spool_tagless.apply_fresh_roll(
-            db,
-            spool,
-            req.printer_id,
-            req.ams_id,
-            req.tray_id,
-            brand=req.brand,
-            label_weight=req.label_weight,
-            cost_per_kg=req.cost_per_kg,
-            note=req.note,
-        )
-    except ValueError as exc:
-        raise HTTPException(409, str(exc))
-
+    await spool_tagless.clear_fresh_prompt(db, spool)
     await spool_tagless.broadcast_tagless_fresh_dismissed(req.printer_id, req.ams_id, req.tray_id)
-    await ws_manager.broadcast({"type": "inventory_changed"})
+    return spool
+
+
+class NewRollRequest(BaseModel):
+    """Body for ``POST /inventory/spools/{id}/new-roll`` — THE operator statement that
+    the physical roll on a slot changed.
+
+    One shape for both ledger lanes. ``brand`` is optional here and required by the
+    TAGGED lane only (a re-spool mints a third-party row that must carry a brand; a
+    tagless mint falls back to the configured tagless default), so the requirement is
+    enforced in the controller where tag-ness is known rather than duplicated into two
+    request schemas.
+    """
+
+    printer_id: int
+    ams_id: int
+    tray_id: int
+    brand: str | None = None
+    label_weight: int | None = None
+    cost_per_kg: float | None = None
+    note: str | None = None
+
+
+@router.post("/spools/{spool_id}/new-roll", response_model=SpoolResponse)
+async def record_new_roll(
+    spool_id: int,
+    req: NewRollRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+):
+    """Record that the roll bound to this slot was physically replaced.
+
+    ONE operator verb over two ledger lanes, because the operator is stating one thing —
+    "the roll on this slot is a different, full roll now" — and only the BOOKKEEPING
+    differs. Tag-ness is not something the operator should have to classify: the bound
+    row already knows it (``spool_tagless.is_tagless_spool``, the either-chip reading),
+    so the controller reads it and dispatches:
+
+    * TAGLESS row → :func:`spool_tagless.apply_fresh_roll`. Archives the current row
+      (grams preserved), mints + binds + pushes a replacement, clears the prompt stamp.
+    * TAGGED row → :func:`spool_respool.respool_tag`. Disposes the donor, mints a fresh
+      full third-party row on the REUSED Bambu tag, copies the K-profiles and rebinds.
+
+    Doctrine (rule 10): this verb does NOT decide that a tag was reused — it carries out
+    what the operator states. An operator asserting a new roll on a tagged core is an
+    operator STATEMENT, so the call ends at
+    :func:`slot_recheck.note_operator_statement`: any open re-check intent is answered and
+    the read economy's identity ledger is stamped, otherwise the post-print no-tag read
+    mints row 3½'s ``operator_recheck_mint(replace_existing=True)`` straight over the row
+    this call just created.
+
+    404 unknown spool; 409 when the row is not bound to the named slot, when the slot's
+    live tray cannot be resolved, or (tagged lane) in Spoolman mode / on a sibling-tag
+    conflict; 404 when the printer is not connected; 422 when a tagged row is submitted
+    with no brand. Returns the NEW spool row in both lanes.
+    """
+    from backend.app.api.routes.settings import get_setting
+    from backend.app.services import slot_recheck as _slot_recheck, spool_respool, spool_tagless
+
+    result = await db.execute(select(Spool).options(selectinload(Spool.k_profiles)).where(Spool.id == spool_id))
+    spool = result.scalar_one_or_none()
+    if not spool:
+        raise HTTPException(404, "Spool not found")
+
+    # The verb is keyed by the BOUND row, so the binding is the contract: a row that does
+    # not live on the named slot cannot have been swapped out of it, and acting anyway
+    # would retire one slot's ledger while binding a successor to another.
+    bound = await db.execute(
+        select(SpoolAssignment.id).where(
+            SpoolAssignment.spool_id == spool_id,
+            SpoolAssignment.printer_id == req.printer_id,
+            SpoolAssignment.ams_id == req.ams_id,
+            SpoolAssignment.tray_id == req.tray_id,
+        )
+    )
+    if bound.scalar_one_or_none() is None:
+        raise HTTPException(
+            409,
+            f"Spool #{spool_id} is not assigned to printer {req.printer_id} AMS {req.ams_id} slot {req.tray_id + 1}.",
+        )
+
+    if spool_tagless.is_tagless_spool(spool):
+        try:
+            new_spool = await spool_tagless.apply_fresh_roll(
+                db,
+                spool,
+                req.printer_id,
+                req.ams_id,
+                req.tray_id,
+                brand=req.brand,
+                label_weight=req.label_weight,
+                cost_per_kg=req.cost_per_kg,
+                note=req.note,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        await _slot_recheck.note_operator_statement(db, req.printer_id, req.ams_id, req.tray_id)
+        await spool_tagless.broadcast_tagless_fresh_dismissed(req.printer_id, req.ams_id, req.tray_id)
+        await ws_manager.broadcast({"type": "inventory_changed"})
+    else:
+        spoolman_enabled = await get_setting(db, "spoolman_enabled")
+        if spoolman_enabled and spoolman_enabled.lower() == "true":
+            raise HTTPException(
+                409,
+                "Recording a new roll is unavailable in Spoolman mode — Spoolman owns the spool lifecycle.",
+            )
+        brand = (req.brand or "").strip()
+        if not brand:
+            raise HTTPException(422, "brand is required when the slot's spool carries an RFID tag.")
+        try:
+            new_spool = await spool_respool.respool_tag(
+                db,
+                printer_id=req.printer_id,
+                ams_id=req.ams_id,
+                tray_id=req.tray_id,
+                brand=brand,
+                label_weight=req.label_weight,
+                cost_per_kg=req.cost_per_kg,
+                note=req.note,
+            )
+        except spool_respool.RespoolError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
+        await _slot_recheck.note_operator_statement(db, req.printer_id, req.ams_id, req.tray_id)
+
     result = await db.execute(select(Spool).options(selectinload(Spool.k_profiles)).where(Spool.id == new_spool.id))
     return result.scalar_one()
 
@@ -1903,11 +1996,26 @@ async def list_assignments(
         logger.exception("Re-check undo offer lookup failed for the assignments listing")
         undo_slots = set()
 
+    # Slots whose re-check is still OWED an answer, same one-query shape and same guard. A
+    # pending re-check is a STATE the slot carries, not an announcement made once (operator
+    # decision 2026-08-20): the "queued" verdict rides a toast the operator loses the moment
+    # they look away, and a click with no visible consequence is exactly what shape 32's
+    # operator read as a broken control. Guarded separately from the undo lookup so one
+    # unreadable fact cannot blank the other.
+    try:
+        pending_slots = await slot_recheck.open_intent_slots(
+            db, [(a.printer_id, a.ams_id, a.tray_id) for a in assignments]
+        )
+    except Exception:  # noqa: BLE001 — an unreadable intent is "nothing pending", never a 500
+        logger.exception("Re-check pending lookup failed for the assignments listing")
+        pending_slots = set()
+
     # Build response objects, attaching ams_label where available
     responses: list[SpoolAssignmentResponse] = []
     for a in assignments:
         resp = SpoolAssignmentResponse.model_validate(a)
         resp.recheck_undo_available = (a.printer_id, a.ams_id, a.tray_id) in undo_slots
+        resp.recheck_pending = (a.printer_id, a.ams_id, a.tray_id) in pending_slots
         # Additive tri-state presence. A printer we hold no live status for is
         # simply absent from the map → None ("unknown"), never False.
         resp.present = presence_map.get(a.printer_id, {}).get((a.ams_id, a.tray_id))
@@ -2077,6 +2185,16 @@ async def assign_spool(
     await db.commit()
     pending_config = assignment.pre_configured_at is not None
 
+    # The operator has STATED what is in this slot (doctrine rule 6's second identity
+    # oracle, rule 12). Close the slot's open re-check intent and stamp the read economy,
+    # or the farm's own stale inferences outlive the statement: an open intent answers
+    # no-tag after the print and row 3½ mints over this row, and once ``pre_configured_at``
+    # clears above, a stale no-tag read meets a TAGGED hand-assigned row at row 4b′ and
+    # ``tagged_swap_no_tag_read`` unlinks it. Guarded inside the hook.
+    from backend.app.services import slot_recheck as _slot_recheck
+
+    await _slot_recheck.note_operator_statement(db, data.printer_id, data.ams_id, data.tray_id)
+
     # Return assignment with spool data
     result = await db.execute(
         select(SpoolAssignment)
@@ -2159,7 +2277,7 @@ async def unassign_spool(
     if prompt_cleared:
         # The roll this slot's fresh-roll question was about is no longer claimed to be
         # there, so every open client drops the toast — same dismissal event the
-        # operator's own answer emits (``POST /spools/{id}/tagless-fresh``).
+        # operator's own answer emits (``POST /spools/{id}/fresh-roll-dismiss``).
         from backend.app.services import spool_tagless
 
         await spool_tagless.broadcast_tagless_fresh_dismissed(printer_id, ams_id, tray_id)
@@ -2289,6 +2407,25 @@ async def link_tag_to_spool(
         spool.data_origin = data.data_origin
 
     await db.commit()
+
+    # Linking a tag by hand is an identity statement about whatever slot the row is bound to
+    # (rule 12). The request names no slot — the SPOOL is the subject — so the slot comes from
+    # the row's live binding, and an unbound row simply has no slot to speak for. Without this
+    # the row becomes TAGGED while a stale no-tag read still stands, which is precisely row
+    # 4b′'s ``tagged_swap_no_tag_read`` shape: the tag the operator just linked would get the
+    # row unlinked and a tagless one minted in its place.
+    from backend.app.services import slot_recheck as _slot_recheck
+
+    bound_slot = (
+        await db.execute(
+            select(SpoolAssignment.printer_id, SpoolAssignment.ams_id, SpoolAssignment.tray_id).where(
+                SpoolAssignment.spool_id == spool_id
+            )
+        )
+    ).first()
+    if bound_slot is not None:
+        await _slot_recheck.note_operator_statement(db, *bound_slot)
+
     result = await db.execute(select(Spool).options(selectinload(Spool.k_profiles)).where(Spool.id == spool_id))
     return result.scalar_one()
 
@@ -2857,6 +2994,15 @@ async def create_spool_from_slot(
         tray_info_idx=tray.get("tray_info_idx", ""),
     )
     await db.commit()
+
+    # "+ Add to inventory" registers the roll the operator is looking at AND binds it here,
+    # so it is an identity statement about the slot exactly like the manual assign is
+    # (rule 12). It only ever reaches a TAGGED tray (the ``is_valid_tag`` guard above), which
+    # is the shape a stale no-tag read would unlink at row 4b′.
+    from backend.app.services import slot_recheck as _slot_recheck
+
+    await _slot_recheck.note_operator_statement(db, req.printer_id, req.ams_id, req.tray_id)
+
     await ws_manager.broadcast({"type": "inventory_changed"})
     await ws_manager.broadcast(
         {

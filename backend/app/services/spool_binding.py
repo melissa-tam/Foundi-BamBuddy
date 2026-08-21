@@ -74,6 +74,14 @@ _move_damper = RetryWindow(_MOVE_DAMPER_S)
 # The one origin exempt from the move damper: an operator's explicit assign is a
 # statement of fact, not a wire observation, so it is never second-guessed. This is
 # the SOLE behavioural effect ``origin`` has — every other use is log attribution.
+#
+# A bind carrying this origin is only HALF of what an operator statement owes: the
+# CONTROLLER must also call ``slot_recheck.note_operator_statement`` after its commit, so
+# the slot's open re-check intent closes and any older no-tag read stops outranking the
+# fact just stated (2026-08-20 — both silent classes ended with the operator's own row
+# unlinked and a tagless row minted over it). The hook lives up in ``slot_recheck``
+# because it spans the intent table and the read economy; this module must never call
+# upward to reach it, which is exactly why the duty is recorded here instead.
 OPERATOR_ORIGIN = "manual_api"
 
 
@@ -99,12 +107,12 @@ def _stamp_last_location(spool: Spool, *, printer_id: int, ams_id: int, tray_id:
 
 
 def last_released_from_slot_stmt(printer_id: int, ams_id: int, tray_id: int) -> Select:
-    """Rows whose LAST release was FROM this slot — newest first, unbound fleet-wide.
+    """Rows whose LAST release was FROM this slot — newest first. NO eligibility filter.
 
     The ONE origin for that question, and the read half of the residue
     :func:`_stamp_last_location` above writes: writer and reader live in the same
     module so the shape of "what the departure left behind" cannot drift between them.
-    Two lanes ask it, for opposite purposes, and the shared stmt is what keeps them
+    Several lanes ask it, for opposite purposes, and the shared stmt is what keeps them
     answering about the same set of rows:
 
     * ``slot_pipeline._debounce_candidate`` — a roll came BACK: de-bounce its grams
@@ -113,33 +121,69 @@ def last_released_from_slot_stmt(printer_id: int, ams_id: int, tray_id: int) -> 
       drained slot's exist bit minutes BEFORE it declares the runout, so by the time
       the exhaustion evidence lands the binding is already gone (doctrine rule 9 — the
       bay is empty, the release is correct) and this residue is the only thing left
-      that still names the victim.
+      that still names the victim;
+    * ``slot_recheck.undo`` — the acknowledgement's predecessor;
+    * ``spool_tagless._reattribute_early_runout`` — the backward charge correction.
 
-    ``~assignments.any()`` is part of the shared shape, not a caller's preference: a
-    row holding a live assignment is somewhere else NOW, and ``spool_assignment.spool_id``
-    is unique, so ANY assignment means "bound elsewhere". Both lanes need that exclusion
-    for the same reason (cross-cutting invariant 11, the evidence-tier asymmetry) —
-    last-location is ASSUMPTION-tier evidence, and assumption-tier evidence may neither
-    steal a roll from a positive location claim nor stamp one the wire says is seated in
-    another tray.
+    **The question this answers is "what left this slot LAST", and every eligibility
+    test is a CALLER adjudication on the row it returns — in PYTHON, never in SQL.**
+    That is the single discipline the shape exists to enforce (cross-cutting invariant
+    11 applied to a query): a ``WHERE`` clause does not skip a row, it makes the row
+    INVISIBLE, so the caller silently gets the newest row that happens to pass the
+    filter — an OLDER residue of the same slot, a different physical roll — and acts on
+    it believing it is the slot's last occupant. The de-bounce carried
+    ``archived_at IS NULL`` / ``spent_at IS NULL`` / ``~assignments.any()`` in SQL and
+    did exactly that: it walked past a just-drained roll onto an older healthy one and
+    reclaimed THAT onto a brand-new roll, where nothing could ever heal it because the
+    older row never goes spent.
 
-    DELIBERATELY carries no spent / archived / fingerprint filter and no LIMIT: those
-    are the callers' OWN adjudications and they disagree on purpose. The reclaim lane
-    excludes spent and archived donors in SQL and then fingerprint-scans; the spent lane
-    must SEE a spent newest row to answer a duplicate trigger idempotently instead of
-    walking past it to an older, healthy residue of the same slot. Returning a stmt
-    rather than rows is what lets each compose its own answer in one query.
+    ``~assignments.any()`` was the last filter to leave, and it was the subtlest: a slot
+    MOVE stamps ``last_location_* = the OLD slot`` at move time
+    (:func:`bind_spool_to_slot`'s sweep), so the row that most recently left this slot is
+    routinely one that is bound somewhere else NOW — and excluding it in SQL made that
+    row unrepresentable to EVERY caller rather than merely ineligible to one. Ask
+    :func:`bound_elsewhere` about the returned row instead: invariant 11 still holds
+    (assumption-tier evidence may displace nothing a live binding holds), it is now a
+    stated refusal with a log line rather than a silent fall-through.
+
+    Carries no LIMIT either: ``.limit(1)`` is the norm, but the early-runout lane needs
+    the two newest and composing that is the caller's business. Returning a stmt rather
+    than rows is what lets each compose its own answer in one query.
     """
     return (
         select(Spool)
+        .options(selectinload(Spool.assignments))
+        # The eager load has to be AUTHORITATIVE, not merely present. This module creates
+        # assignments with ``db.add(SpoolAssignment(spool_id=...))`` rather than by appending
+        # to ``spool.assignments``, so a Spool whose collection was loaded earlier in the same
+        # session keeps a stale (often EMPTY) copy across a re-bind — and :func:`bound_elsewhere`
+        # would then clear a roll that is demonstrably seated in another tray. Without this,
+        # the guard would be correct only by coincidence of session lifetime.
+        .execution_options(populate_existing=True)
         .where(
-            ~Spool.assignments.any(),
             Spool.last_location_printer_id == printer_id,
             Spool.last_location_ams_id == ams_id,
             Spool.last_location_tray_id == tray_id,
         )
         .order_by(Spool.last_location_at.desc())
     )
+
+
+def bound_elsewhere(spool: Spool) -> bool:
+    """Does this row hold a LIVE binding — i.e. is the roll claimed by some slot right now?
+
+    The adjudication :func:`last_released_from_slot_stmt` no longer makes for its callers.
+    ``spool_assignment.spool_id`` is unique fleet-wide (one spool ⇔ at most one slot), so
+    ANY surviving assignment means "this roll is somewhere else NOW" — and a
+    ``last_location_*`` breadcrumb is ASSUMPTION-tier evidence, which may neither steal a
+    roll from a positive location claim nor stamp one the wire says is seated in another
+    tray (cross-cutting invariant 11; incident shape 26, the spool-211 ping-pong).
+
+    Reads the relationship the stmt eager-loads, so it costs no IO on a row that came from
+    it. Lives beside the stmt for the same reason the stamp does: one module owns the
+    residue's shape, its reader, and the one question every reader must ask of it.
+    """
+    return bool(spool.assignments)
 
 
 def stamp_first_loaded(spool: Spool) -> None:
@@ -459,6 +503,33 @@ async def bind_spool_to_slot(
     )
     if bind_moment is not None:
         # Carried forward, not re-stamped — see the ``bind_moment`` paragraph above.
+        #
+        # Guarded against a FUTURE moment. Every source of this value is a stored column
+        # (``loaded_at`` / ``first_loaded_at`` / ``created_at``), and a stored timestamp can
+        # be ahead of now for reasons that have nothing to do with this lane: a host clock
+        # stepped backwards by NTP, a DB restored from a machine in another timezone, a row
+        # written by hand. Accepting one would push ``SpoolAssignment.created_at`` — which is
+        # the ONE "an unobserved swap happened at a KNOWN instant" boundary
+        # ``spool_tagless.reconcile_ledger_overcharges`` adjudicates across — into the
+        # future, where NOTHING is later than it: the reconciler would then charge the
+        # successor an EMPTY usage window and silently reconcile nothing, forever.
+        # Falling back to now is the pre-``bind_moment`` behaviour and costs at most the
+        # de-bounce's ordinal-preservation nicety; the WARNING is what makes a skewed clock
+        # findable instead of presenting as a reconciler that quietly stopped working.
+        now = datetime.utcnow()
+        if bind_moment > now:
+            logger.warning(
+                "[slot-state] spool %d -> printer %d A%dT%d: refusing a FUTURE bind moment %s (now %s) — "
+                "stamping now instead. A binding moment ahead of the clock would put the overcharge "
+                "reconciler's swap boundary beyond every usage row it could ever charge.",
+                spool.id,
+                printer_id,
+                ams_id,
+                tray_id,
+                bind_moment.isoformat(),
+                now.isoformat(),
+            )
+            bind_moment = now
         assignment.created_at = bind_moment
     db.add(assignment)
     await db.flush()

@@ -58,7 +58,6 @@ from backend.app.api.routes import (
     printers,
     production_runs,
     projects,
-    respool,
     settings as settings_routes,
     skus,
     slice_jobs,
@@ -1321,9 +1320,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         try:
             from backend.app.services.spool_respool import apply_runout_edges
 
-            spawn_background_task(
-                apply_runout_edges(printer_id, edges, state), name=f"runout-edges-p{printer_id}"
-            )
+            spawn_background_task(apply_runout_edges(printer_id, edges, state), name=f"runout-edges-p{printer_id}")
         except Exception as _re:  # noqa: BLE001 — hook must never crash the status flow
             logging.getLogger(__name__).warning(
                 "[RESPOOL] spent-on-runout hook failed for printer %s: %s", printer_id, _re
@@ -1357,9 +1354,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         _new_storage = edges.appeared_full & HMS_STORAGE_LOW_FULL_CODES
         if _new_storage:
             try:
-                spawn_background_task(
-                    on_storage_low(printer_id, set(_new_storage)), name=f"storage-low-p{printer_id}"
-                )
+                spawn_background_task(on_storage_low(printer_id, set(_new_storage)), name=f"storage-low-p{printer_id}")
             except Exception as _se:  # noqa: BLE001 — hook must never crash the status flow
                 logging.getLogger(__name__).warning(
                     "[USB-STORAGE] storage-low hook failed for printer %s: %s", printer_id, _se
@@ -4113,6 +4108,19 @@ async def on_print_complete(printer_id: int, data: dict):
         await on_job_terminal(printer_id)
     except Exception as _ite:  # noqa: BLE001 — incident close must never crash the completion callback
         logger.warning("[SPOOL-RECOVERY] incident close failed on print complete for printer %s: %s", printer_id, _ite)
+
+    # Retire any physical cycle a DE-BOUNCE preserved on this printer (2026-08-20). The
+    # preservation exists so a runout's spent stamp — which lands ~3 min after the bay
+    # clears — can still drive REPLACE_SPENT on the next push; a job boundary is the CAUSE
+    # bound on that wait, because a stamp arriving after this print ended belongs to a
+    # different physical story. Unconditional and symmetric to the two resets above; the
+    # decision (a stamped row keeps its cycle) lives in the service.
+    try:
+        from backend.app.services.spool_tagless import expire_debounce_preserved_cycles
+
+        await expire_debounce_preserved_cycles(printer_id)
+    except Exception as _dpc:  # noqa: BLE001 — a lifecycle hook must never crash the completion callback
+        logger.warning("[TAGLESS] de-bounce cycle expiry failed on print complete for printer %s: %s", printer_id, _dpc)
 
     # Drop the 3MF download cache for this printer (#972). The print is over,
     # nothing else legitimately needs the bytes; keeping them would only risk
@@ -7389,7 +7397,6 @@ app.include_router(eject_profiles.router, prefix=app_settings.api_prefix)
 app.include_router(model_geometry.router, prefix=app_settings.api_prefix)
 app.include_router(skus.router, prefix=app_settings.api_prefix)
 app.include_router(production_runs.router, prefix=app_settings.api_prefix)
-app.include_router(respool.router, prefix=app_settings.api_prefix)
 app.include_router(projects.router, prefix=app_settings.api_prefix)
 app.include_router(library.router, prefix=app_settings.api_prefix)
 app.include_router(library_tags.router, prefix=app_settings.api_prefix)
