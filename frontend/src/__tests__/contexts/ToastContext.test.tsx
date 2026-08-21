@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { act, render, renderHook } from '@testing-library/react';
+import { act, render, renderHook, screen, within } from '@testing-library/react';
 import { type ReactNode } from 'react';
 import { ToastProvider, useToast } from '../../contexts/ToastContext';
 
@@ -176,7 +176,7 @@ describe('ToastContext live region', () => {
     expect(viewport.textContent).toContain('slot 2 unchanged');
   });
 
-  it('puts no aria-live on the individual toasts', () => {
+  it('gives no toast a live region of its own, and keeps the controls out of the live scope', () => {
     const { container, getByTestId } = render(
       <ToastProvider>
         <ToastProbe />
@@ -188,7 +188,69 @@ describe('ToastContext live region', () => {
     });
 
     const viewport = container.querySelector('div.fixed.bottom-4.right-20') as HTMLElement;
-    expect(viewport.querySelectorAll('[aria-live]')).toHaveLength(0);
+    // Still exactly one region, still the always-mounted viewport: a per-toast
+    // region double-announces and has to pre-exist its own content.
     expect(viewport.querySelectorAll('[role="status"], [role="alert"]')).toHaveLength(0);
+
+    // The only aria-live inside is the EXCLUSION around the controls, so what
+    // gets announced is the sentence rather than the sentence plus its buttons.
+    const nested = Array.from(viewport.querySelectorAll('[aria-live]'));
+    expect(nested.map((el) => el.getAttribute('aria-live'))).toEqual(['off']);
+
+    const excluded = nested[0] as HTMLElement;
+    expect(excluded.textContent).not.toContain('slot 2 unchanged');
+    expect(within(excluded).getByRole('button', { name: 'Dismiss' })).toBeInTheDocument();
+    // …and the announced text is still inside the region itself.
+    expect(within(viewport).getByText('slot 2 unchanged')).toBeInTheDocument();
+  });
+});
+
+describe('ToastContext persistent toasts', () => {
+  // The "Re-check slot" acknowledgement carries the undo for a mint. It is
+  // created with showPersistentToast, which schedules NO auto-dismiss timer —
+  // the operator dismisses it, or leaves it standing. (The durable path to the
+  // same action is the slot card; this is the fast one.)
+  function AckProbe() {
+    const { showPersistentToast } = useToast();
+    return (
+      <button
+        data-testid="show-ack"
+        onClick={() =>
+          showPersistentToast('slot-recheck-1-0-1', 'Slot 2: new roll recorded. 1,000 g assumed.', 'success', {
+            actions: [{ label: 'Restore previous roll', onClick: () => {} }],
+          })
+        }
+      />
+    );
+  }
+
+  it('does not auto-dismiss an acknowledgement created with showPersistentToast', () => {
+    vi.useFakeTimers();
+    const { getByTestId } = render(
+      <ToastProvider>
+        <AckProbe />
+      </ToastProvider>
+    );
+
+    act(() => {
+      getByTestId('show-ack').click();
+    });
+    expect(screen.getByText('Slot 2: new roll recorded. 1,000 g assumed.')).toBeInTheDocument();
+
+    // Well past the longest severity window (errors, 8 s).
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+
+    expect(screen.getByText('Slot 2: new roll recorded. 1,000 g assumed.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Restore previous roll' })).toBeInTheDocument();
+
+    // It goes when the operator says so, not when a clock does.
+    act(() => {
+      screen.getByRole('button', { name: 'Dismiss' }).click();
+    });
+    expect(screen.queryByText('Slot 2: new roll recorded. 1,000 g assumed.')).not.toBeInTheDocument();
+
+    vi.useRealTimers();
   });
 });

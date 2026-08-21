@@ -376,6 +376,14 @@ export function useWebSocket() {
         // The printer_status websocket messages will naturally update the status
         debouncedInvalidate('archives');
         debouncedInvalidate('archiveStats');
+        // A terminal opens the idle window in which a QUEUED "Re-check slot"
+        // intent finally gets its answerable read (rule 12), so the assignment
+        // rows — which carry the derived `recheck_pending` — are stale the
+        // moment the print ends. This is the only edge that clears the pending
+        // line; without it a concluded check would sit on the card for the rest
+        // of the 30 s staleTime. Broadcast for EVERY terminal, farm-dispatched
+        // or foreign, which is the origin-agnostic edge this needs.
+        debouncedInvalidate('spool-assignments');
         // A completed print means any in-flight eject sweep on that printer is
         // done — clear its live phase chip immediately (Phase C).
         if (message.printer_id !== undefined) {

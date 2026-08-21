@@ -293,6 +293,17 @@ class SpoolAssignmentResponse(BaseModel):
     # to an action) and this is the payload the slot card already holds. Read-only; ignored
     # on input.
     recheck_undo_available: bool = False
+    # True while this slot carries an OPEN re-check intent: the operator clicked "Re-check
+    # slot", the tag-ness question is not answerable yet (mid-print the farm commands no
+    # read — doctrine rule 5), and the answer is still owed
+    # (``slot_recheck.open_intent_slots``).
+    #
+    # A pending re-check is a STATE, not an announcement (operator decision 2026-08-20). The
+    # "queued" verdict is delivered once, in a toast the operator loses the moment they look
+    # away, and shape 32's whole lesson is that a control with no visible consequence reads as
+    # broken — so the slot carries the fact until it concludes. DERIVED per request, never
+    # stored; read-only, ignored on input.
+    recheck_pending: bool = False
 
     class Config:
         from_attributes = True

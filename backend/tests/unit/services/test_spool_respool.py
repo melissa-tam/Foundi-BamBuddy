@@ -575,9 +575,7 @@ async def _seed_released_row(db, printer_id, ams_id, tray_id, **kwargs):
     await db.flush()
     await _assign(db, printer_id, ams_id, tray_id, spool.id)
     await db.commit()
-    assignment = (
-        await db.execute(select(SpoolAssignment).where(SpoolAssignment.spool_id == spool.id))
-    ).scalar_one()
+    assignment = (await db.execute(select(SpoolAssignment).where(SpoolAssignment.spool_id == spool.id))).scalar_one()
     await spool_binding.release_spool_from_slot(db, assignment, reason="cleared_tray")
     await db.commit()
     return spool
@@ -688,6 +686,49 @@ async def test_mark_spent_stands_aside_when_the_incumbent_was_seated_after_the_b
     assert fresh.remaining_g == pytest.approx(1000.0), "…and must still price as a full roll to selection"
     assert any("tier=last_location" in r.getMessage() for r in caplog.records)
     assert any("stands aside" in r.getMessage() for r in caplog.records), "a suppressed stamp always says why"
+
+
+@pytest.mark.asyncio
+async def test_a_residue_bound_elsewhere_is_no_victim_and_never_hands_tier_1_to_an_older_row(
+    db_session, printer_factory, caplog
+):
+    """The slot's last occupant MOVED to another tray — so this slot has no victim at all.
+
+    A move stamps ``last_location_* = the OLD slot`` (``spool_binding.bind_spool_to_slot``'s
+    sweep), so the row that most recently left this bay is routinely one the wire now seats
+    somewhere else. The shared residue query used to exclude such a row in SQL, which did not
+    make it INELIGIBLE — it made it INVISIBLE, and the lane then answered with the next row
+    down: an OLDER occupant of the same slot, a different physical roll, still healthy on the
+    shelf.
+
+    That silent substitution reached further than tier 2, because tier 1's eligibility test
+    weighs the incumbent's bind moment against *this* residue's clear. Handed the older row's
+    ancient-but-in-window clear, tier 1 stood aside from a perfectly good live binding and
+    tier 2 stamped the shelf roll spent — permanently, with no un-spend lane (operator ruling
+    2026-08-09).
+
+    With the residue adjudicated rather than filtered, both halves come out right: no victim
+    is named, and tier 1 keeps the roll that was actually feeding.
+    """
+    printer = await printer_factory()
+    older = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=400.0)
+    await _backdate_release(db_session, older, minutes=4)
+    moved = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=250.0)
+    await _backdate_release(db_session, moved, minutes=2)
+    await _assign(db_session, printer.id, 0, 2, moved.id)  # re-seated in a DIFFERENT tray
+    await db_session.commit()
+    drained = await _seed_bound_row(db_session, printer.id, 0, 0, weight_used=980.0)
+
+    with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
+        marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _runout(_empty_bay()))
+
+    assert marked is not None and marked.id == drained.id
+    assert any("tier=assignment" in r.getMessage() for r in caplog.records)
+    assert any("bound elsewhere" in r.getMessage() for r in caplog.records), "a refused residue says why"
+    for row in (older, moved):
+        await db_session.refresh(row)
+    assert older.spent_at is None, "the shelf roll is not this slot's last occupant and is never stamped"
+    assert moved.spent_at is None, "…and a roll the wire seats in another tray is not exhausted either"
 
 
 @pytest.mark.asyncio
@@ -1660,8 +1701,6 @@ async def _clear_respool_brands(db) -> None:
     await set_setting(db, "tagless_default_filament", "")
 
 
-
-
 @pytest.mark.asyncio
 async def test_respool_prompt_payload_carries_provenance(db_session, printer_factory, monkeypatch):
     """R5. The spent-tier prompt payload carries the additive provenance fields so
@@ -1996,9 +2035,7 @@ async def test_apply_runout_edges_swallows_a_stamper_failure(
 
 
 @pytest.mark.asyncio
-async def test_runout_live_on_the_first_consumed_frame_never_stamps(
-    db_session, printer_factory, own_session_factory
-):
+async def test_runout_live_on_the_first_consumed_frame_never_stamps(db_session, printer_factory, own_session_factory):
     """Restart replay, Lane A: the first frame the process consumes carries a live
     runout → it SEEDS instead of edging, so the fresh roll now bound to the slot is
     not mis-stamped (the 2026-07-17 18:56 misattribution)."""
@@ -2130,6 +2167,157 @@ async def test_runout_reappearing_under_a_new_job_stamps_again(db_session, print
 
     await db_session.refresh(second)
     assert second.spent_at is not None  # TWO spent rows, one per physical exhaustion
+
+
+# -- §4.1 row T14: the EXTERNAL spool holder ---------------------------------
+#
+# A NO-OP row, so its pin has to assert an absence — and an absence assertion is only
+# worth anything beside a liveness arm that proves the same harness stamps when it
+# should (memory ``liveness-paired-verification``). Both arms below share one fixture
+# and differ in a single wire byte: the module half of the HMS attr.
+
+
+async def _external_and_ams_rows(db, printer_id):
+    """One roll on the external vt_tray holder (``ams_id=255``, the ``tray_id + 254``
+    convention) and one in AMS 0 slot 0, with a farm job feeding the AMS slot."""
+    external = await _new_spool(db, weight_used=900)
+    await _assign(db, printer_id, 255, 0, external.id)
+    in_ams = await _new_spool(db, weight_used=900)
+    await _assign(db, printer_id, 0, 0, in_ams.id)
+    await _single_feeder_item(db, printer_id, mapping="[0, -1, -1, -1]")
+    await db.commit()
+    return external, in_ams
+
+
+@pytest.mark.asyncio
+async def test_an_external_holder_runout_stamps_nothing_spent(db_session, printer_factory, own_session_factory):
+    """§4.1 row T14 — the external spool holder runs out: **no spent stamp**, ever.
+
+    Deliberate and unchanged since the lane was written. External rows are bindable, but
+    the left/right vt-tray attribution convention on a dual-holder machine is UNCONFIRMED,
+    and a wrong-side stamp is permanent (there is no automatic un-spend). A missed stamp
+    self-heals forward; a false one does not — so this fault class stands down entirely.
+
+    The suppression is STRUCTURAL, which is what makes it durable: ``07FF``/``07FE``
+    classify as :class:`AmsFaultClass.RUNOUT_EXTERNAL`, a class disjoint from the
+    AMS-slot runout vocabulary Lane A intersects, and the external code words are not in
+    Lane B's per-event set either. Neither lane has anything to consume, so nothing
+    resolves a tray and nothing writes.
+
+    Both rows are checked, not just the external one: an external runout must not be
+    laundered onto the AMS roll by any inference tier either.
+    """
+    from backend.app.services.hms_errors import RUNOUT_HMS_CODES, runout_external_short_codes
+
+    printer = await printer_factory()
+    external, in_ams = await _external_and_ams_rows(db_session, printer.id)
+
+    await _push(printer.id, _wire(_make_state(0, 0, _tray(), tray_now=255)), own_session_factory)  # seed
+
+    fire = _make_state(0, 0, _tray(), tray_now=255)
+    fire.subtask_id = "job-ext"
+    # "External filament has run out; please load a new filament." — module 07FF.
+    edges = await _push(printer.id, _wire(fire, _runout_err(attr=0x07FF0000)), own_session_factory)
+
+    assert edges is not None, "the code DID appear on the wire — this is a suppression, not a miss"
+    assert "07FF_8011" in edges.appeared_short
+    assert "07FF_8011" in runout_external_short_codes()
+    assert not (runout_external_short_codes() & RUNOUT_HMS_CODES), "the two runout vocabularies stay disjoint"
+
+    await db_session.refresh(external)
+    await db_session.refresh(in_ams)
+    assert external.spent_at is None, "the holder's own row is never stamped (attribution unconfirmed)"
+    assert in_ams.spent_at is None, "and the fault is never re-attributed to an AMS slot"
+
+
+@pytest.mark.asyncio
+async def test_an_ams_slot_runout_on_the_same_fixture_still_stamps(db_session, printer_factory, own_session_factory):
+    """T14's liveness pair: one byte of the attr apart (``0700`` instead of ``07FF``) and
+    the very same push stamps the AMS roll. Without this, a dead edge seam and a correct
+    external stand-down are indistinguishable."""
+    printer = await printer_factory()
+    external, in_ams = await _external_and_ams_rows(db_session, printer.id)
+
+    await _push(printer.id, _wire(_make_state(0, 0, _tray(), tray_now=255)), own_session_factory)  # seed
+
+    fire = _make_state(0, 0, _tray(), tray_now=255)
+    fire.subtask_id = "job-ams"
+    await _push(printer.id, _wire(fire, _runout_err(attr=0x07000000)), own_session_factory)
+
+    await db_session.refresh(external)
+    await db_session.refresh(in_ams)
+    assert in_ams.spent_at is not None, "the AMS-slot runout stamps — the seam is alive"
+    assert external.spent_at is None
+
+
+@pytest.fixture
+def recovery_own_sessions(test_engine, monkeypatch):
+    """Point the recovery driver's own-session openers at the test engine (the shape
+    ``test_spool_recovery.py`` uses); scoped to the escalation-lane case below."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    import backend.app.core.database as core_db
+
+    maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(core_db, "async_session", maker)
+    return maker
+
+
+def _runout_incident(printer_id, *, external):
+    from backend.app.services import spool_recovery
+
+    return spool_recovery.RecoveryIncident(
+        incident_id=0,  # names no durable row: mark_escalated is a no-op for a missing one
+        printer_id=printer_id,
+        job_id="task-ext",
+        codes=frozenset({"07FF_8011" if external else "0700_8011"}),
+        fingerprint="runout",
+        item_id=None,
+        settings=spool_recovery.RecoverySettings(enabled=True, max_attempts=2, step_timeout_s=0.05, protect_layers=7),
+        jammed_global_tray=254 if external else 0,
+        kind=spool_recovery.KIND_RUNOUT,
+        external=external,
+        extruder_side_only=False,
+        layer_at_fault=50,
+        code="07FF_8011" if external else "0700_8011",
+        printer_name="003-H2S",
+        job_name="SKU007",
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_durable_escalation_lane_also_stands_down_for_the_external_holder(
+    db_session, printer_factory, recovery_own_sessions, monkeypatch, caplog
+):
+    """§4.1 row T14, the OTHER lane — and the one a reader is most likely to miss.
+
+    The wire edges are ephemeral (every restart re-seeds them), so a runout HOLD that
+    spans a deploy stamps from its ESCALATION instead. That lane is gated on the
+    escalation REASON, and ``external_spool_runout`` is excluded for the same permanence
+    argument as above. The kind/reason pairing is what the gate reads, so the pin drives
+    ``_escalate`` itself rather than asserting the shape of a condition.
+
+    The control arm is the whole point: an AMS-slot runout hold on an otherwise identical
+    incident DOES reach the stamper.
+    """
+    from backend.app.services import spool_recovery
+    from backend.app.services.notification_service import notification_service
+
+    printer = await printer_factory()
+    monkeypatch.setattr(notification_service, "on_spool_recovery_failed", AsyncMock())
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(), tray_now=255))
+    stamps = AsyncMock()
+    monkeypatch.setattr(spool_respool, "mark_spent_on_runout_hold", stamps)
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
+        await spool_recovery._escalate(_runout_incident(printer.id, external=True), "external_spool_runout")
+
+    stamps.assert_not_awaited()
+    assert any("external_spool_runout" in m for m in caplog.messages), "the hold names its reason in the log"
+
+    # Liveness: the AMS-slot hold on the same driver still carries the durable stamp.
+    await spool_recovery._escalate(_runout_incident(printer.id, external=False), "runout_needs_refill")
+    stamps.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -3065,9 +3253,7 @@ async def test_runout_hold_stamp_stamps_wire_empty_slot(db_session, printer_fact
 
 
 @pytest.mark.asyncio
-async def test_runout_hold_stamp_stands_down_on_loaded_slot(
-    db_session, printer_factory, own_session_factory, caplog
-):
+async def test_runout_hold_stamp_stands_down_on_loaded_slot(db_session, printer_factory, own_session_factory, caplog):
     """006-H2S 2026-07-26: a latched demand can name a slot that never ran dry. A roll
     that truly ran out left its bay minutes ago, so an OCCUPIED demanded slot is the
     bogus-latch shape — and stamping it would archive a healthy roll permanently."""
@@ -3216,9 +3402,7 @@ async def test_slot_runout_edges_are_full_code_scoped_so_another_slot_still_stam
 
 
 @pytest.mark.asyncio
-async def test_slot_runout_reappearing_under_a_new_job_stamps_again(
-    db_session, printer_factory, own_session_factory
-):
+async def test_slot_runout_reappearing_under_a_new_job_stamps_again(db_session, printer_factory, own_session_factory):
     """THE flap-window bug, Lane B: the firmware's auto-switch statement clears and
     returns under a NEW job inside notify_dedup's 600 s window. That is a second roll
     physically running dry on the same slot, and it must stamp again."""
@@ -3263,9 +3447,7 @@ async def test_slot_runout_reappearing_under_a_new_job_stamps_again(
 
 
 @pytest.mark.asyncio
-async def test_slot_runout_restart_replay_fresh_spool_not_stamped(
-    db_session, printer_factory, own_session_factory
-):
+async def test_slot_runout_restart_replay_fresh_spool_not_stamped(db_session, printer_factory, own_session_factory):
     """End-to-end restart scenario for Lane B (mirror of the 8011 pin): the donor stamps
     pre-restart; the restart drops the process state; the operator swaps a fresh roll
     onto the slot; the same auto-switch code is still live on the first frame the new
@@ -3547,3 +3729,47 @@ async def test_a_short_delivery_is_RECORDED_not_warned(db_session, printer_facto
     assert marked.delivered_g == pytest.approx(300.0)
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING], "a normal short delivery must not warn"
     assert any("delivered 300 g against an assumed" in r.getMessage() for r in caplog.records)
+
+
+class TestGlobalTrayCodec:
+    """The ONE global-tray encoding (invariant 1), and its exact inverse.
+
+    A bare ``ams_id * 4 + tray_id`` is correct for a regular AMS and silently wrong for the
+    other two conventions the fleet actually runs — which is why the arithmetic is not to be
+    re-spelled at call sites.
+    """
+
+    def _codec(self):
+        from backend.app.services.spool_respool import decode_global_tray, encode_global_tray
+
+        return encode_global_tray, decode_global_tray
+
+    def test_regular_ams_round_trips(self):
+        encode, decode = self._codec()
+        for ams_id in range(4):
+            for tray_id in range(4):
+                assert decode(encode(ams_id, tray_id)) == (ams_id, tray_id)
+        assert encode(0, 3) == 3 and encode(1, 0) == 4
+
+    def test_ams_ht_is_its_own_unit_id_not_the_multiplication(self):
+        encode, decode = self._codec()
+        assert encode(128, 0) == 128, "a single-tray AMS-HT reports global == ams_id"
+        assert decode(128) == (128, 0)
+        assert encode(128, 1) is None, "an AMS-HT has no second tray to name"
+
+    def test_the_external_holder_uses_the_254_convention(self):
+        encode, decode = self._codec()
+        assert (encode(255, 0), encode(255, 1)) == (254, 255)
+        assert decode(254) == (255, 0) and decode(255) == (255, 1)
+        assert encode(255, 2) is None
+
+    def test_an_unaddressable_slot_fails_closed(self):
+        encode, _decode = self._codec()
+        # A fabricated global id would compare EQUAL to some real slot and mis-attribute a
+        # fault to it, so every unrepresentable input answers None rather than guessing.
+        assert encode(None, 0) is None
+        assert encode(0, None) is None
+        assert encode(-1, 0) is None
+        assert encode(0, 4) is None
+        assert encode(200, 0) is None
+        assert encode("x", 0) is None

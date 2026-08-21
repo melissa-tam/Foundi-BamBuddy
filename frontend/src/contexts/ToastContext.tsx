@@ -1,5 +1,15 @@
 import { AlertCircle, CheckCircle, Info, Loader2, X, XCircle } from 'lucide-react';
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
+
+/**
+ * Focus ring for the toast's own controls. Deliberately NOT the hover cards'
+ * ring (`HOVER_CARD_CONTROL_FOCUS`): the offset colour has to match the surface
+ * BEHIND the control, and toasts float over the page background while the slot
+ * cards sit on `bg-bambu-dark-secondary`.
+ */
+const TOAST_CONTROL_FOCUS =
+  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark';
 
 export type ToastType = 'success' | 'error' | 'warning' | 'info' | 'loading';
 
@@ -91,6 +101,7 @@ const bgColors = {
 };
 
 export function ToastProvider({ children }: { children: ReactNode }) {
+  const { t } = useTranslation();
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [viewportSuppressed, setViewportSuppressed] = useState(false);
   const timeoutRefs = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
@@ -180,7 +191,16 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           on the always-mounted container, never on the individual toasts: a live region
           must exist before its content changes, and per-toast regions double-announce.
           `aria-atomic="false"` so a second toast joining the stack announces only itself
-          instead of re-reading every toast on screen. */}
+          instead of re-reading every toast on screen.
+
+          What the live scope covers is the announced TEXT only: each toast's controls
+          sit in an `aria-live="off"` subtree, so an arriving toast is read as its
+          sentence rather than as the sentence plus its button labels, and a control
+          re-rendering in place can never re-trigger an announcement. The controls stay
+          fully in the accessibility tree — they are excluded from the LIVE region, not
+          hidden. (A DOM-sibling split was rejected: it forces either duplicated message
+          text — two nodes matching every toast assertion — or a live region per toast,
+          which double-announces and must pre-exist its own content.) */}
       <div
         role="status"
         aria-live="polite"
@@ -194,47 +214,51 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           >
             {icons[toast.type]}
             <span className="text-white text-sm">{toast.message}</span>
-            {toast.actions && toast.actions.length > 0 &&
-              // In-app button actions: each onClick owns its own dismissal
-              // (e.g. dismiss only on success), so we do NOT auto-clear here.
-              toast.actions.map((action, i) => (
-                <button
-                  key={`${toast.id}-action-${i}`}
-                  type="button"
-                  onClick={action.onClick}
-                  className="ml-2 px-2 py-1 rounded text-xs font-medium bg-bambu-green/20 text-bambu-green hover:bg-bambu-green/30 whitespace-nowrap"
+            <div aria-live="off" className="flex items-center">
+              {toast.actions && toast.actions.length > 0 &&
+                // In-app button actions: each onClick owns its own dismissal
+                // (e.g. dismiss only on success), so we do NOT auto-clear here.
+                toast.actions.map((action, i) => (
+                  <button
+                    key={`${toast.id}-action-${i}`}
+                    type="button"
+                    onClick={action.onClick}
+                    className={`ml-2 px-2 py-1 rounded text-xs font-medium bg-bambu-green/20 text-bambu-green hover:bg-bambu-green/30 whitespace-nowrap ${TOAST_CONTROL_FOCUS}`}
+                  >
+                    {action.label}
+                  </button>
+                ))}
+              {toast.action && (
+                <a
+                  href={toast.action.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => {
+                    // An action carrying its own onClick handles activation
+                    // programmatically (e.g. in-app SPA navigation via
+                    // react-router). Prevent the default new-tab open so we don't
+                    // ALSO follow href. Actions with only an href (external links,
+                    // e.g. the sponsor prompt) keep the default new-tab behavior.
+                    if (toast.action?.onClick) {
+                      e.preventDefault();
+                      toast.action.onClick();
+                    }
+                    dismissToast(toast.id);
+                  }}
+                  className={`ml-2 px-2 py-1 rounded text-xs font-medium bg-bambu-green/20 text-bambu-green hover:bg-bambu-green/30 whitespace-nowrap ${TOAST_CONTROL_FOCUS}`}
                 >
-                  {action.label}
-                </button>
-              ))}
-            {toast.action && (
-              <a
-                href={toast.action.href}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={(e) => {
-                  // An action carrying its own onClick handles activation
-                  // programmatically (e.g. in-app SPA navigation via
-                  // react-router). Prevent the default new-tab open so we don't
-                  // ALSO follow href. Actions with only an href (external links,
-                  // e.g. the sponsor prompt) keep the default new-tab behavior.
-                  if (toast.action?.onClick) {
-                    e.preventDefault();
-                    toast.action.onClick();
-                  }
-                  dismissToast(toast.id);
-                }}
-                className="ml-2 px-2 py-1 rounded text-xs font-medium bg-bambu-green/20 text-bambu-green hover:bg-bambu-green/30 whitespace-nowrap"
+                  {toast.action.label}
+                </a>
+              )}
+              <button
+                type="button"
+                onClick={() => dismissToast(toast.id)}
+                aria-label={t('common.dismiss')}
+                className={`ml-2 rounded text-bambu-gray hover:text-white transition-colors ${TOAST_CONTROL_FOCUS}`}
               >
-                {toast.action.label}
-              </a>
-            )}
-            <button
-              onClick={() => dismissToast(toast.id)}
-              className="ml-2 text-bambu-gray hover:text-white transition-colors"
-            >
-              <X className="w-4 h-4" />
-            </button>
+                <X className="w-4 h-4" />
+              </button>
+            </div>
           </div>
         ))}
       </div>

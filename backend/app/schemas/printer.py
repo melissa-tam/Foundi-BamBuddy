@@ -1,6 +1,17 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+#: The CLOSED set of answers "Re-check slot" can give — doctrine rule 12's contract table
+#: (``bambu-ams-behavior`` ``resources/spool-subsystem.md`` §4.1, rows R1–R8) spelled as a
+#: type, so neither the service that decides nor the wire that carries can invent a sixth.
+#:
+#: Lives here, in the dependency-free DTO layer, because both sides need it at RUNTIME:
+#: pydantic validates against it and ``slot_recheck.RecheckVerdict`` is typed by it. The
+#: reverse direction — the service owning it and the schema importing it — would pull the
+#: slot pipeline's whole model graph into every import of this module.
+RecheckOutcome = Literal["unchanged", "minted", "identified", "queued", "empty", "restored"]
 
 
 class PrinterBase(BaseModel):
@@ -457,9 +468,16 @@ class SlotRecheckResponse(BaseModel):
     ``verdict`` values: ``unchanged`` (R1) | ``minted`` (R2/R3/R5/R8) | ``identified`` (R4's
     tag-found half) | ``queued`` (R3/R4 mid-print) | ``empty`` (R6) | ``restored`` (the
     acknowledgement's undo).
+
+    The wire type is CLOSED (``RecheckOutcome``), and deliberately so: the frontend's
+    ``recheckSentence`` ends in a ``default:`` arm that renders an unrecognised verdict as
+    "nothing moved in this slot", so a bare ``str`` here would let a new outcome reach the
+    operator as the exact false no-op — the original silence bug — instead of failing loudly
+    at the boundary. Built field-for-field from ``slot_recheck.RecheckVerdict``; the service
+    decides, this only carries.
     """
 
-    verdict: str
+    verdict: RecheckOutcome
     printer_id: int
     ams_id: int
     tray_id: int
@@ -467,4 +485,9 @@ class SlotRecheckResponse(BaseModel):
     label_weight_g: float | None = None
     brand: str | None = None
     material: str | None = None
+    # Did a read actually go out on the wire for this click? The tagged-slot refresh and the
+    # tagless-slot discovery read both report here, and a refusal (drying, an identify in
+    # flight, filament engaged, the ask pace) reports False rather than being swallowed —
+    # the operator must be able to tell "the farm asked" from "the farm could not ask".
+    read_issued: bool = False
     undo_available: bool = False

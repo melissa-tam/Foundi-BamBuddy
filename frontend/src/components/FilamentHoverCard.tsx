@@ -1,13 +1,26 @@
-import { useState, useRef, useEffect, useLayoutEffect, useId, type ReactNode } from 'react';
+import { useState, useRef, useLayoutEffect, useId, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { Droplets, Copy, Check, Settings2, Package, PackagePlus, Undo2, Unlink, RefreshCw } from 'lucide-react';
+import { Droplets, Copy, Check, Clock, Settings2, Package, PackagePlus, Undo2, Unlink } from 'lucide-react';
 import { isLightColor } from '../utils/colors';
 import type { EmptySlotKind } from '../utils/amsHelpers';
 import { resolveSpoolBindingStatus, type SlotPresence } from '../utils/spoolBindingStatus';
+import { useHoverCardDisclosure } from '../hooks/useHoverCardDisclosure';
 import { Modal } from './ui/Modal';
 import { ConfirmModal } from './ConfirmModal';
+
+/**
+ * Focus ring for every control INSIDE a slot hover card, and for the toast
+ * action buttons that carry the same offers. The cards sit on
+ * `bg-bambu-dark-secondary`, so the ring offsets against that rather than the
+ * page background (WCAG 2.2 2.4.7 / 2.4.11 — the keyboard path added with
+ * `useHoverCardDisclosure` is worthless if the focused control is invisible).
+ * Exported so PrintersPage's slot-action buttons, which render INTO the card
+ * through the `actions` prop, use the one definition.
+ */
+export const HOVER_CARD_CONTROL_FOCUS =
+  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark-secondary';
 
 interface FilamentData {
   vendor: 'Bambu Lab' | 'Generic';
@@ -35,20 +48,20 @@ interface InventoryConfig {
   onUnassignSpool?: () => void;
   assignedSpool?: { id: number; material: string; brand: string | null; color_name: string | null; remainingWeightGrams?: number | null } | null;
   isAssigned?: boolean;
-  // Reused-tag re-spool: set only when the tray carries a valid RFID identity
-  // (tag_uid / tray_uuid). Opens the manual re-spool modal for the slot.
-  onRespoolTag?: () => void;
-  // Tagless "New roll…" (W5a): set ONLY when the slot's bound spool carries no
-  // tag_uid. Retires the current ledger row and mints a fresh full one, which is
-  // the operator's only signal that an untagged roll was physically swapped —
-  // a tagless slot has no RFID event to infer it from.
+  // "New roll…" (W5a): set whenever the slot has a BOUND ledger row, of either
+  // tag-ness. It retires that row and starts a fresh full one — for an untagged
+  // roll this click is the farm's only possible swap signal, and for a tagged one
+  // it moves the Bambu tag onto the new roll. It replaced a second verb
+  // ("Re-spool tag…") that asked the operator the same question and differed only
+  // in the bookkeeping the backend does behind it, which the bound row already
+  // determines. Absent when nothing is bound: no row, nothing to retire.
   onNewRoll?: () => void;
   // "Restore previous roll" (rule 12, R8): set ONLY while a "Re-check slot" mint
   // on this slot still has a standing undo offer
   // (`SpoolAssignment.recheck_undo_available`). The mint's toast carries the same
-  // action, but a timed toast must never be an action's only path
-  // (WCAG 2.2 2.2.1), so the offer also lives on the slot itself — as its own
-  // affordance, never folded into the identity line.
+  // action, but a toast can be dismissed or navigated away from, so the slot
+  // itself is the offer's durable home — its own affordance, never folded into
+  // the identity line, and reachable by keyboard like every other card action.
   onRestorePreviousRoll?: () => void;
 }
 
@@ -62,20 +75,39 @@ interface FilamentHoverCardProps {
   children: ReactNode;
   disabled?: boolean;
   className?: string;
+  /**
+   * Accessible name for the slot: "<AMS label> slot <n>: <material>", composed
+   * by the caller (`ams.slotDialogLabel`). REQUIRED — the card is the only home
+   * of every slot action, so a nameless trigger hides them from anyone not
+   * using a mouse.
+   */
+  label: string;
   spoolman?: SpoolmanConfig;
   inventory?: InventoryConfig;
   configureSlot?: ConfigureSlotConfig;
+  /**
+   * A standing "Re-check slot" intent on this slot, already composed by the
+   * caller (`printers.rfid.recheckPending`). Set ONLY while the backend's
+   * derived `SpoolAssignment.recheck_pending` is true: the click was taken
+   * mid-print, the intent is durable, and it concludes at the next answerable
+   * read with no announcement of its own — so the card is where the operator
+   * sees that the check is still outstanding. Its own line, never folded into
+   * the identity line, which states what the slot HOLDS.
+   */
+  pendingNote?: string;
   actions?: ReactNode;
 }
 
 /**
  * A hover card that displays filament details when hovering over AMS slots.
  * Replaces the basic browser tooltip with a styled popover.
+ *
+ * Disclosure (pointer, focus, keyboard, Escape) lives in
+ * `useHoverCardDisclosure` — shared verbatim with `EmptySlotHoverCard`.
  */
-export function FilamentHoverCard({ data, children, disabled, className = '', spoolman, inventory, configureSlot, actions }: FilamentHoverCardProps) {
+export function FilamentHoverCard({ data, children, disabled, className = '', label, spoolman, inventory, configureSlot, pendingNote, actions }: FilamentHoverCardProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const [isVisible, setIsVisible] = useState(false);
   const [position, setPosition] = useState<'top' | 'bottom'>('top');
   // Screen-space coordinates for the portaled card (#1336 follow-up). Using
   // a portal + position:fixed lets the popover escape sibling printer cards
@@ -88,7 +120,12 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
   const unlinkTitleId = useId();
   const triggerRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const { isVisible, triggerProps, cardProps } = useHoverCardDisclosure({
+    triggerRef,
+    cardRef,
+    label,
+    disabled,
+  });
 
   const handleCopyUuid = () => {
     const uuid = data.trayUuid;
@@ -164,25 +201,6 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
     };
   }, [isVisible]);
 
-  const handleMouseEnter = () => {
-    if (disabled) return;
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    // Small delay to prevent flicker on quick mouse movements
-    timeoutRef.current = setTimeout(() => setIsVisible(true), 80);
-  };
-
-  const handleMouseLeave = () => {
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => setIsVisible(false), 100);
-  };
-
-  // Cleanup timeout on unmount
-  useEffect(() => {
-    return () => {
-      if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    };
-  }, []);
-
   // Get fill bar color based on percentage
   const getFillColor = (fill: number): string => {
     if (fill <= 15) return '#ef4444'; // red
@@ -198,9 +216,8 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
     <div
       ref={triggerRef}
       data-testid="filament-slot"
-      className={`relative ${className}`}
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={handleMouseLeave}
+      className={`relative rounded-lg ${className} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark`}
+      {...triggerProps}
     >
       {children}
 
@@ -212,7 +229,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
       {isVisible && createPortal(
         <div
           ref={cardRef}
-          className="fixed z-[60]"
+          className="fixed z-[60] focus:outline-none"
           style={{
             top: coords?.top ?? -9999,
             left: coords?.left ?? -9999,
@@ -220,8 +237,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
             // Hide until coords are computed to avoid a (-9999,-9999) flash.
             visibility: coords ? 'visible' : 'hidden',
           }}
-          onMouseEnter={handleMouseEnter}
-          onMouseLeave={handleMouseLeave}
+          {...cardProps}
         >
           {/* Card container */}
           <div className="
@@ -325,7 +341,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                           e.stopPropagation();
                           handleCopyUuid();
                         }}
-                        className="flex items-center gap-1 text-xs text-bambu-gray hover:text-white transition-colors"
+                        className={`flex items-center gap-1 rounded text-xs text-bambu-gray hover:text-white transition-colors ${HOVER_CARD_CONTROL_FOCUS}`}
                         title="Copy spool UUID"
                       >
                         <span className="font-mono text-[10px] truncate max-w-[80px]">
@@ -350,7 +366,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                           e.stopPropagation();
                           navigate(`/inventory?spool=${spoolman.linkedSpoolId}`);
                         }}
-                        className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-green/20 hover:bg-bambu-green/30 text-bambu-green"
+                        className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-green/20 hover:bg-bambu-green/30 text-bambu-green ${HOVER_CARD_CONTROL_FOCUS}`}
                         title={t('inventory.openInInventory')}
                       >
                         <Package className="w-3.5 h-3.5" />
@@ -402,7 +418,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                             e.stopPropagation();
                             navigate(`/inventory?spool=${inventory.assignedSpool!.id}`);
                           }}
-                          className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-green/20 hover:bg-bambu-green/30 text-bambu-green"
+                          className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-green/20 hover:bg-bambu-green/30 text-bambu-green ${HOVER_CARD_CONTROL_FOCUS}`}
                           title={t('inventory.openInInventory')}
                         >
                           <Package className="w-3.5 h-3.5" />
@@ -415,7 +431,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                             e.stopPropagation();
                             inventory.onUnassignSpool?.();
                           }}
-                          className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-red-500/20 hover:bg-red-500/30 text-red-400"
+                          className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-red-500/20 hover:bg-red-500/30 text-red-400 ${HOVER_CARD_CONTROL_FOCUS}`}
                         >
                           <Unlink className="w-3.5 h-3.5" />
                           {t('inventory.unassignSpool')}
@@ -429,7 +445,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                         inventory.onAssignSpool?.();
                       }}
                       disabled={!!inventory.isAssigned}
-                      className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 text-bambu-blue ${
+                      className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 text-bambu-blue ${HOVER_CARD_CONTROL_FOCUS} ${
                         inventory.isAssigned ? 'opacity-50 cursor-not-allowed' : 'hover:bg-bambu-blue/30'
                       }`}
                     >
@@ -437,35 +453,20 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                       {t('inventory.assignSpool')}
                     </button>
                   ) : null}
-                  {/* Re-spool a reused Bambu tag now on a fresh third-party
-                      spool — shown only when the tray has a valid RFID
-                      identity (parent gates via isBambuLabSpool). */}
-                  {inventory.onRespoolTag && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        inventory.onRespoolTag?.();
-                      }}
-                      aria-label={t('inventory.respool.action')}
-                      className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5" />
-                      {t('inventory.respool.action')}
-                    </button>
-                  )}
-                  {/* Tagless counterpart of "Re-spool tag…": the untagged roll on
-                      this slot was physically replaced. */}
+                  {/* The roll on this slot was physically replaced. ONE verb for
+                      both ledger lanes — the bound row carries the tag-ness the
+                      backend needs, so the operator never has to classify it. */}
                   {inventory.onNewRoll && (
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
                         inventory.onNewRoll?.();
                       }}
-                      aria-label={t('inventory.freshRoll.manualAction')}
-                      className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue"
+                      aria-label={t('inventory.newRoll')}
+                      className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue ${HOVER_CARD_CONTROL_FOCUS}`}
                     >
                       <PackagePlus className="w-3.5 h-3.5" />
-                      {t('inventory.freshRoll.manualAction')}
+                      {t('inventory.newRoll')}
                     </button>
                   )}
                   {/* Standing undo for a "Re-check slot" mint. An offer, not an
@@ -478,7 +479,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                         inventory.onRestorePreviousRoll?.();
                       }}
                       aria-label={t('printers.rfid.restorePreviousRoll')}
-                      className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue"
+                      className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue ${HOVER_CARD_CONTROL_FOCUS}`}
                     >
                       <Undo2 className="w-3.5 h-3.5" />
                       {t('printers.rfid.restorePreviousRoll')}
@@ -495,12 +496,24 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                       e.stopPropagation();
                       configureSlot.onConfigure?.();
                     }}
-                    className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue"
+                    className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue ${HOVER_CARD_CONTROL_FOCUS}`}
                     title={t('ams.configureSlot')}
                   >
                     <Settings2 className="w-3.5 h-3.5" />
                     {t('ams.configure')}
                   </button>
+                </div>
+              )}
+              {/* Standing "Re-check slot" intent. A state line, not an action:
+                  it reports that a check is outstanding and stops. It sits
+                  above the actions because it explains why the verb below is
+                  showing "Re-check pending" instead of offering the click. */}
+              {pendingNote && (
+                <div className="pt-2 mt-2 border-t border-bambu-dark-tertiary">
+                  <p className="text-[10px] text-bambu-gray flex items-start gap-1">
+                    <Clock className="w-3 h-3 mt-px shrink-0" aria-hidden="true" />
+                    <span>{pendingNote}</span>
+                  </p>
                 </div>
               )}
               {actions && (
@@ -546,7 +559,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
             <div className="flex gap-2">
               <button
                 onClick={() => setShowUnlinkConfirm(false)}
-                className="flex-1 px-3 py-2 text-sm font-medium rounded transition-colors bg-bambu-dark hover:bg-bambu-dark-tertiary text-white"
+                className={`flex-1 px-3 py-2 text-sm font-medium rounded transition-colors bg-bambu-dark hover:bg-bambu-dark-tertiary text-white ${HOVER_CARD_CONTROL_FOCUS}`}
               >
                 {t('common.cancel')}
               </button>
@@ -555,7 +568,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', sp
                   spoolman?.onUnlinkSpool?.();
                   setShowUnlinkConfirm(false);
                 }}
-                className="flex-1 px-3 py-2 text-sm font-medium rounded transition-colors bg-red-500/20 hover:bg-red-500/30 text-red-400"
+                className={`flex-1 px-3 py-2 text-sm font-medium rounded transition-colors bg-red-500/20 hover:bg-red-500/30 text-red-400 ${HOVER_CARD_CONTROL_FOCUS}`}
               >
                 {t('inventory.unassignSpool')}
               </button>
@@ -597,6 +610,12 @@ export interface EmptySlotBinding {
 interface EmptySlotHoverCardProps {
   children: ReactNode;
   className?: string;
+  /**
+   * Accessible name for the slot: "<AMS label> slot <n>: <state>", composed by
+   * the caller (`ams.slotDialogLabel`). REQUIRED for the same reason as on
+   * `FilamentHoverCard` — "Unassign" and "Configure" have no other home.
+   */
+  label: string;
   configureSlot?: ConfigureSlotConfig;
   onAssignSpool?: () => void;
   actions?: ReactNode;
@@ -612,37 +631,29 @@ interface EmptySlotHoverCardProps {
   binding?: EmptySlotBinding | null;
   // Releases `binding` from the slot (DELETE /inventory/assignments/…). Gated
   // behind a confirm dialog; omit to hide the verb (e.g. no permission).
-  onClearSlot?: () => void;
+  //
+  // Named for what it DOES, not for the card it sits on: this is the same
+  // `operator_clear` release the occupied card offers as "Unassign spool", against
+  // the same endpoint. It used to be called "Clear slot" here purely because the
+  // slot happened to read empty, which made one operation look like two.
+  onUnassignSpool?: () => void;
   /** Keeps the confirm dialog in its busy state while the DELETE is in flight. */
-  clearPending?: boolean;
+  unassignPending?: boolean;
 }
 
-export function EmptySlotHoverCard({ children, className = '', configureSlot, onAssignSpool, actions, kind, binding, onClearSlot, clearPending }: EmptySlotHoverCardProps) {
+export function EmptySlotHoverCard({ children, className = '', label, configureSlot, onAssignSpool, actions, kind, binding, onUnassignSpool, unassignPending }: EmptySlotHoverCardProps) {
   const { t } = useTranslation();
-  const [isVisible, setIsVisible] = useState(false);
-  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [showUnassignConfirm, setShowUnassignConfirm] = useState(false);
   // Screen-space coords for the portaled card — same pattern as
   // FilamentHoverCard, see comment there (#1336 follow-up).
   const [coords, setCoords] = useState<{ top: number; left: number } | null>(null);
   const triggerRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const handleMouseEnter = () => {
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => setIsVisible(true), 80);
-  };
-
-  const handleMouseLeave = () => {
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => setIsVisible(false), 100);
-  };
-
-  useEffect(() => {
-    return () => {
-      if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    };
-  }, []);
+  const { isVisible, triggerProps, cardProps } = useHoverCardDisclosure({
+    triggerRef,
+    cardRef,
+    label,
+  });
 
   useLayoutEffect(() => {
     if (!isVisible) {
@@ -676,36 +687,34 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
   // LOCATION column so the two surfaces can never drift apart.
   const bindingStatus = binding ? resolveSpoolBindingStatus(binding) : null;
 
-  // "Clear slot" is the manual escape hatch for a STALE LOCATION CLAIM, and it is
-  // offered only where the claim can be stale: a wire-asserted empty slot, or one
+  // "Unassign spool" is the manual escape hatch for a STALE LOCATION CLAIM, and it
+  // is offered only where the claim can be stale: a wire-asserted empty slot, or one
   // whose presence the printer never stated. On a SEATED-but-unread slot it is
   // semantically void — the pipeline re-derives a binding for the roll that is
   // physically in there, so clearing removes a row that comes straight back, and
   // treating clear-slot as the resolution for an unread tray is the defect the
   // operator ruled against (it also mints the phantom rows the WS-G repair
   // archives). The honest resolution there is identification, not deletion.
-  const canClearSlot = !!binding && !!onClearSlot && kind !== 'present';
+  const canUnassign = !!binding && !!onUnassignSpool && kind !== 'present';
 
   return (
     <div
       ref={triggerRef}
-      className={`relative ${className}`}
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={handleMouseLeave}
+      className={`relative rounded-lg ${className} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark`}
+      {...triggerProps}
     >
       {children}
 
       {isVisible && createPortal(
         <div
           ref={cardRef}
-          className="fixed z-[60]"
+          className="fixed z-[60] focus:outline-none"
           style={{
             top: coords?.top ?? -9999,
             left: coords?.left ?? -9999,
             visibility: coords ? 'visible' : 'hidden',
           }}
-          onMouseEnter={handleMouseEnter}
-          onMouseLeave={handleMouseLeave}
+          {...cardProps}
         >
           <div className="
             bg-bambu-dark-secondary border border-bambu-dark-tertiary
@@ -738,16 +747,16 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
               </div>
             )}
             {/* Configure slot button */}
-            {(configureSlot?.enabled || onAssignSpool || actions || canClearSlot) && (
+            {(configureSlot?.enabled || onAssignSpool || actions || canUnassign) && (
               <div className="px-2 pb-2 space-y-1">
-                {canClearSlot && binding && (
+                {canUnassign && binding && (
                   <button
-                    onClick={(e) => { e.stopPropagation(); setShowClearConfirm(true); }}
-                    aria-label={t('ams.emptySlotBinding.clearAria', { spool: binding.label })}
-                    className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-amber-500/20 hover:bg-amber-500/30 text-amber-400"
+                    onClick={(e) => { e.stopPropagation(); setShowUnassignConfirm(true); }}
+                    aria-label={t('ams.emptySlotBinding.unassignAria', { spool: binding.label })}
+                    className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 ${HOVER_CARD_CONTROL_FOCUS}`}
                   >
                     <Unlink className="w-3.5 h-3.5" />
-                    {t('ams.emptySlotBinding.clear')}
+                    {t('inventory.unassignSpool')}
                   </button>
                 )}
                 {configureSlot?.enabled && (
@@ -756,7 +765,7 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
                       e.stopPropagation();
                       configureSlot.onConfigure?.();
                     }}
-                    className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue"
+                    className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue ${HOVER_CARD_CONTROL_FOCUS}`}
                     title={t('ams.configureSlot')}
                   >
                     <Settings2 className="w-3.5 h-3.5" />
@@ -766,7 +775,7 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
                 {onAssignSpool && (
                   <button
                     onClick={(e) => { e.stopPropagation(); onAssignSpool(); }}
-                    className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue"
+                    className={`w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded transition-colors bg-bambu-blue/20 hover:bg-bambu-blue/30 text-bambu-blue ${HOVER_CARD_CONTROL_FOCUS}`}
                   >
                     <Package className="w-3.5 h-3.5" />
                     {t('inventory.assignSpool')}
@@ -790,23 +799,23 @@ export function EmptySlotHoverCard({ children, className = '', configureSlot, on
         document.body,
       )}
 
-      {/* Clear-slot confirmation. Rendered from the always-mounted trigger (not
-          the hover popover, which unmounts on mouse-out) so the dialog survives
-          the pointer leaving the slot. */}
-      {showClearConfirm && binding && (
+      {/* Unassign confirmation. Rendered from the always-mounted trigger (not the
+          hover popover, which unmounts on mouse-out) so the dialog survives the
+          pointer leaving the slot. */}
+      {showUnassignConfirm && binding && (
         <ConfirmModal
-          title={t('ams.emptySlotBinding.clearTitle')}
-          message={t('ams.emptySlotBinding.clearMessage', { spool: binding.label })}
-          confirmText={t('ams.emptySlotBinding.clear')}
+          title={t('ams.emptySlotBinding.unassignTitle')}
+          message={t('ams.emptySlotBinding.unassignMessage', { spool: binding.label })}
+          confirmText={t('inventory.unassignSpool')}
           cancelText={t('common.cancel')}
           variant="warning"
           overlayZIndex="z-[100]"
-          isLoading={!!clearPending}
+          isLoading={!!unassignPending}
           onConfirm={() => {
-            onClearSlot?.();
-            setShowClearConfirm(false);
+            onUnassignSpool?.();
+            setShowUnassignConfirm(false);
           }}
-          onCancel={() => setShowClearConfirm(false)}
+          onCancel={() => setShowUnassignConfirm(false)}
         />
       )}
     </div>

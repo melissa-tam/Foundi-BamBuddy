@@ -340,13 +340,21 @@ async def _respool_prompt_threshold_g(db: AsyncSession) -> int:
 # --- tray geometry helpers --------------------------------------------------
 
 
-def _decode_global_tray(global_tray: int | None) -> tuple[int | None, int | None]:
+def decode_global_tray(global_tray: int | None) -> tuple[int | None, int | None]:
     """Decode a global tray id to (ams_id, tray_id) for SpoolAssignment lookup.
 
-    Mirrors the encoding used across bambu_mqtt / main: regular AMS
-    ``global = ams_id*4 + slot``; AMS-HT (128-191) reports ``global == ams_id``
-    (single tray); external vt_tray 254/255 maps to ams_id=255 slot 0/1 (the
-    ``tray_id + 254`` convention from the auto-unlink path).
+    THE fork's global-tray codec, with :func:`encode_global_tray` as its exact inverse
+    (cross-cutting invariant 1 — one origin per magic value). Three conventions, only one
+    of which is the obvious arithmetic:
+
+    * regular AMS — ``global = ams_id * 4 + slot`` (0..127);
+    * AMS-HT (128..191) — a single-tray unit reports ``global == ams_id``, so the ``* 4``
+      arithmetic is simply WRONG for it;
+    * external vt_tray 254/255 → ``ams_id = 255``, slot 0/1 (the ``tray_id + 254``
+      convention from the auto-unlink path).
+
+    A bare ``ams_id * 4 + tray_id`` anywhere in the fork silently drops the last two, which
+    is why the codec is public and the arithmetic is not to be re-spelled at call sites.
     """
     if global_tray is None or global_tray < 0:
         return (None, None)
@@ -357,6 +365,32 @@ def _decode_global_tray(global_tray: int | None) -> tuple[int | None, int | None
     if global_tray <= 127:
         return (global_tray // 4, global_tray % 4)
     return (None, None)
+
+
+def encode_global_tray(ams_id: int | None, tray_id: int | None) -> int | None:
+    """Encode ``(ams_id, tray_id)`` to a global tray id — the inverse of the decoder above.
+
+    Every convention the decoder knows, applied in the same order, so a round trip through
+    the pair is the identity for every slot the fork can name. ``None`` for an unaddressable
+    slot (either half missing, a negative, or an AMS unit outside the layout), because a
+    fabricated global id would compare EQUAL to some real slot and quietly mis-attribute a
+    fault to it — fail closed, exactly as the decoder does.
+    """
+    if ams_id is None or tray_id is None:
+        return None
+    try:
+        unit, slot = int(ams_id), int(tray_id)
+    except (TypeError, ValueError):
+        return None
+    if unit < 0 or slot < 0:
+        return None
+    if unit == 255:  # the external vt_tray holder: 254/255
+        return 254 + slot if slot <= 1 else None
+    if 128 <= unit <= 191:  # AMS-HT — single tray, the unit id IS the global id
+        return unit if slot == 0 else None
+    if unit <= 31 and slot <= 3:
+        return unit * 4 + slot
+    return None
 
 
 def _iter_ams_units(state) -> list:
@@ -418,10 +452,10 @@ def _last_clear_of(spool: Spool | None, *, printer_id: int, ams_id: int, tray_id
     """When ``spool``'s last release was FROM this exact slot, or None.
 
     A column read on a row already in hand, not a second answer to
-    ``last_released_from_slot_stmt``'s question: that stmt asks which UNBOUND rows last left
-    a slot (donor candidates, and a row holding a live binding is deliberately excluded
-    because it is somewhere else NOW). This asks something the stmt cannot: whether the row
-    the caller is holding recorded its own departure from this slot before returning to it.
+    ``last_released_from_slot_stmt``'s question: that stmt asks which row last left a slot
+    (a single candidate, adjudicated by its caller). This asks something the stmt cannot:
+    whether the row the caller is holding recorded its own departure from this slot before
+    returning to it.
     """
     if spool is None:
         return None
@@ -526,9 +560,32 @@ async def _newest_released_from_slot(db: AsyncSession, printer_id: int, ams_id: 
     spent → idempotent, archived → stand down). A ``spent_at IS NULL`` filter here would
     walk PAST the victim onto an older, healthy residue of the same slot and stamp it
     permanently — cross-cutting invariant 11 applied to the query shape.
+
+    The ONE adjudication made here rather than by :func:`_mark_tray_spent` is BOUND
+    ELSEWHERE, and it is made here because it answers the question with None rather than
+    changing what the answer means. A slot MOVE stamps ``last_location_* = the old slot``,
+    so the row that last left this bay is routinely one that now lives in another tray;
+    exhaustion is a claim about a roll's contents, and stamping a row the wire says is
+    seated somewhere else is precisely the assumption-tier overreach invariant 11 forbids.
+    Returning None here is also what keeps ``_bound_after_the_bay_cleared`` honest: with no
+    admissible residue there is no alternative victim to name, so tier 1 keeps the live
+    binding instead of standing aside in favour of an OLDER residue this function would
+    otherwise have had to reach past to find.
     """
     result = await db.execute(spool_binding.last_released_from_slot_stmt(printer_id, ams_id, tray_id).limit(1))
-    return result.scalar_one_or_none()
+    residue = result.scalar_one_or_none()
+    if residue is not None and spool_binding.bound_elsewhere(residue):
+        logger.info(
+            "[RESPOOL] printer %d AMS%d-T%d: this slot's last occupant, spool %d, is bound elsewhere now — "
+            "no last-location victim (invariant 11: a breadcrumb never stamps a roll the wire seats in "
+            "another tray, and an older residue is a different roll)",
+            printer_id,
+            ams_id,
+            tray_id,
+            residue.id,
+        )
+        return None
+    return residue
 
 
 async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) -> Spool | None:
@@ -592,7 +649,7 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
     it decides nothing about which row is stamped here, cannot fail into this lane, and
     stands down on anything short of an exact fit.
     """
-    ams_id, tray_id = _decode_global_tray(global_tray)
+    ams_id, tray_id = decode_global_tray(global_tray)
     if ams_id is None:
         return None
     result = await db.execute(
@@ -1302,7 +1359,7 @@ async def mark_spent_on_runout_hold(printer_id: int, state, *, subtask_id, sessi
                     printer_id,
                 )
                 return
-            ams_id, tray_id = _decode_global_tray(global_tray)
+            ams_id, tray_id = decode_global_tray(global_tray)
             if ams_id is None or tray_id is None:
                 logger.info(
                     "[RESPOOL] runout-hold stamp on printer %d: resolved tray %s decodes to no AMS slot — not stamping",

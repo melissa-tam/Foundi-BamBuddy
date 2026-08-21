@@ -38,6 +38,7 @@ from backend.app.services.spool_respool import (
     mark_spent_on_runout,
     mark_spent_on_slot_runout,
 )
+from backend.app.services.spool_tagless import reattribute_early_runout
 
 # --- wire fixtures -----------------------------------------------------------
 
@@ -1068,24 +1069,122 @@ async def test_reconcile_moves_the_post_boundary_charges_to_a_minted_successor(
 
 
 @pytest.mark.asyncio
-async def test_overshoot_without_a_rebind_is_left_completely_alone(db_session, printer_factory, caplog):
-    """Manufacturers overfill â€” some ship ~1100 g on a 1000 g label. A row bound
+@pytest.mark.parametrize(
+    ("pre", "post"),
+    [
+        pytest.param((1100.0,), (), id="c1_a_fresh_roll_delivers_1100g_on_a_1000g_label"),
+        pytest.param(_PRE, _POST, id="the_incident_ledger_without_its_boundary"),
+    ],
+)
+async def test_overshoot_without_a_rebind_is_left_completely_alone(db_session, printer_factory, caplog, pre, post):
+    """§4.1 row C1 — a fresh roll delivering more than its label is **silent**.
+
+    Manufacturers overfill â€” some ship ~1100 g on a 1000 g label. A row bound
     CONTINUOUSLY since it entered service therefore proves nothing by overshooting, and the
     operator ruled that even a WARNING there is noise: rule 8 governs it until hardware
-    runout stamps it spent."""
+    runout stamps it spent.
+
+    Two shapes, one verdict: C1's literal vendor overfill, and the 009-H2S incident ledger
+    with its re-bind boundary removed. The second is the discriminator — the same
+    impossible number that IS reconciled two tests up is left alone here — so what the
+    lane acts on is provably the BOUNDARY and never the overshoot."""
     from backend.app.services import spool_tagless
 
     printer = await printer_factory(model="H2S")
-    # Same impossible number, but the bind is the ORIGINAL one (mint â†’ bind, seconds apart).
-    old = await _overcharged(db_session, printer.id, 0, 1, bound_at=_T0 + timedelta(seconds=3))
+    # The bind is the ORIGINAL one (mint â†’ bind, seconds apart) — no boundary to prove.
+    old = await _overcharged(db_session, printer.id, 0, 1, pre=pre, post=post, bound_at=_T0 + timedelta(seconds=3))
+    delivered = sum(pre) + sum(post)
+    assert delivered > 1000 + 20, "the fixture must clear the overcharge margin, or it proves nothing"
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
         assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0
 
     await db_session.refresh(old)
-    assert old.archived_at is None and old.weight_used == pytest.approx(1200.5)
+    assert old.archived_at is None and old.weight_used == pytest.approx(delivered)
     assert (await _slot_spool(db_session, printer.id, 0, 1)).id == old.id
     assert caplog.text == "", "no warning: a continuously-bound overshoot is not news"
+
+
+@pytest.mark.asyncio
+async def test_c5_an_operator_assigning_an_old_row_over_a_new_roll_is_reconciled(
+    db_session, printer_factory, silent_surfaces, caplog
+):
+    """§4.1 row C5 — the ONE remaining reachable trigger for this lane, driven the way an
+    operator reaches it.
+
+    Since the de-bounce carries the incumbent's bind moment forward
+    (``test_slot_pipeline.py::test_a_debounce_stamps_no_swap_boundary_for_the_overcharge_reconciler``),
+    the farm's own lanes no longer manufacture a re-bind boundary. What still does is a
+    human: `POST /assignments` puts a part-used row from the shelf onto a slot that is
+    physically holding a different, newer roll. The next prints then charge the NEW roll's
+    grams to the OLD row, and the ledger becomes provably impossible.
+
+    So the boundary here is written by the REAL binding writer at ``OPERATOR_ORIGIN`` —
+    the same call the route makes — rather than stated as a fixture timestamp. That is the
+    difference between this case and the generic sweep tests above: it proves the trigger
+    is REACHABLE through a production path, not merely that the sweep works when handed a
+    boundary. The displaced incumbent is part of the shape too: the writer sweeps its
+    binding, which is exactly why the operator's mistake goes unnoticed until the grams
+    give it away.
+    """
+    from backend.app.services import spool_binding, spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    # The slot physically holds a NEW roll, minted at label weight and bound to it.
+    incumbent = await _bind(db_session, printer.id, 0, 2, weight_used=0.0, data_origin="ams_auto")
+    # The operator's pick from the shelf: an old, part-used, unbound row.
+    old = await _overcharged(
+        db_session, printer.id, 0, 2, pre=(900.0,), post=(), weight_used=900.0, bind=False, created_at=_T0
+    )
+
+    assignment = await spool_binding.bind_spool_to_slot(
+        db_session,
+        old,
+        printer_id=printer.id,
+        ams_id=0,
+        tray_id=2,
+        fingerprint_color="000000FF",
+        fingerprint_type="PETG",
+        origin=spool_binding.OPERATOR_ORIGIN,
+    )
+    await db_session.commit()
+    assert assignment is not None
+    boundary = assignment.created_at
+    assert (boundary - _T0).total_seconds() > 120, "the manual assign IS the re-bind boundary"
+    assert await _slot_spool(db_session, printer.id, 0, 2) is not None
+    assert (await _slot_spool(db_session, printer.id, 0, 2)).id == old.id, "the incumbent was displaced"
+
+    # The next two prints run on the NEW roll and are charged to the OLD row: 900 + 140 g
+    # used against a 1000 g label — past the 20 g margin, so no vendor overfill explains it.
+    for i, grams in enumerate((80.0, 60.0)):
+        db_session.add(
+            SpoolUsageHistory(
+                spool_id=old.id,
+                printer_id=printer.id,
+                print_name=f"post-{old.id}-{i}",
+                weight_used=grams,
+                created_at=boundary + timedelta(minutes=10 * (i + 1)),
+            )
+        )
+    old.weight_used = 1040.0
+    await db_session.commit()
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
+        assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 1
+
+    successor = await _slot_spool(db_session, printer.id, 0, 2)
+    assert successor is not None and successor.id not in (old.id, incumbent.id)
+    assert successor.weight_used == pytest.approx(140.0), "the successor carries exactly the post-boundary charges"
+    assert successor.remaining_g == pytest.approx(860.0), "and clears the start floor again"
+    await db_session.refresh(old)
+    assert old.weight_used == pytest.approx(900.0), "the old row keeps only what it genuinely fed"
+    assert old.archived_at is not None
+
+    owners = await _history_owners(db_session, old.id)
+    assert owners[f"post-{old.id}-0"] == successor.id
+    assert owners[f"post-{old.id}-1"] == successor.id
+    assert "LEDGER-OVERCHARGE RECONCILED" in caplog.text
+    assert silent_surfaces["notifier"].method_calls == [], "log-only, as everywhere in this lane"
 
 
 @pytest.mark.asyncio
@@ -1108,9 +1207,15 @@ async def test_no_post_boundary_charges_means_nothing_to_attribute(db_session, p
 
 @pytest.mark.asyncio
 async def test_tagged_row_is_warned_once_and_never_reconciled(db_session, printer_factory, silent_surfaces, caplog):
-    """A tagged row's identity is RFID-bound, and by rule 10 no tag has ever been reused on
+    """§4.1 row G5 — a TAGGED roll over-spending its label is **WARN only**.
+
+    A tagged row's identity is RFID-bound, and by rule 10 no tag has ever been reused on
     this farm â€” so an impossible ledger there is MISATTRIBUTION evidence to root-cause, not
-    a roll change to book. Warn once per re-notify window, mutate nothing, ever."""
+    a roll change to book. Warn once per re-notify window, mutate nothing, ever.
+
+    Everything the tagless arm does — successor mint, charge re-pointing, archival — is
+    asserted here NOT to happen, which is G5's whole content: the reconciler's reach stops
+    where factual identity begins."""
     from backend.app.services import spool_tagless
 
     printer = await printer_factory(model="H2S")
@@ -1484,9 +1589,7 @@ async def test_a_tagged_successor_is_never_touched(db_session, printer_factory, 
     a mistaken mint to unwind — and the grams would fit perfectly if the gate were open."""
     printer = await printer_factory(model="H2S")
     departed = await _released(db_session, printer.id, 0, 3, at=_R0, weight_used=700.0)
-    mint = await _mistaken_mint(
-        db_session, printer.id, 0, 3, delivered=(300.0,), tag_uid=TAG_UID, tray_uuid=TRAY_UUID
-    )
+    mint = await _mistaken_mint(db_session, printer.id, 0, 3, delivered=(300.0,), tag_uid=TAG_UID, tray_uuid=TRAY_UUID)
 
     with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
         assert (await _runout(db_session, printer.id, 0, 3)).id == mint.id
@@ -1531,9 +1634,7 @@ async def test_the_single_candidate_is_adjudicated_wherever_it_leads(
 
 
 @pytest.mark.asyncio
-async def test_the_lane_never_scans_past_its_one_candidate_for_a_row_that_fits(
-    db_session, printer_factory, caplog
-):
+async def test_the_lane_never_scans_past_its_one_candidate_for_a_row_that_fits(db_session, printer_factory, caplog):
     """THE discipline that separates an adjudication from a search through noise.
 
     An OLDER residue of the same slot fits the delivered grams exactly; the slot's actual
@@ -1559,6 +1660,43 @@ async def test_the_lane_never_scans_past_its_one_candidate_for_a_row_that_fits(
 
 
 @pytest.mark.asyncio
+async def test_a_spent_row_bound_elsewhere_stands_the_lane_down(db_session, printer_factory, caplog):
+    """The same invariant-11 dependency, through the hole the SQL filter used to plug.
+
+    This lane may adjudicate two rows at all ONLY because both are DEAD by the time a spent
+    stamp exists — the bay clears ~3 minutes before the runout is declared, so the assignment
+    is already gone. That was enforced by ``~Spool.assignments.any()`` living inside the
+    shared residue query, i.e. by a filter this lane did not write and could not see.
+
+    The filter is gone (in SQL it did not skip an ineligible row, it made the row invisible
+    and silently substituted an OLDER occupant of the same slot), so the requirement is now
+    stated HERE. Pinned with the spent row itself re-bound in another tray: the exemption
+    has evaporated, and the lane must write nothing rather than re-point the charges of a
+    roll the wire says is loaded somewhere else.
+    """
+    printer = await printer_factory(model="H2S")
+    departed = await _released(db_session, printer.id, 0, 2, at=_R0, weight_used=700.0)
+    mint = await _mistaken_mint(db_session, printer.id, 0, 2, delivered=(180.0, 120.0))
+    mint.spent_at = datetime(2026, 8, 18, 12, 3, 0)  # the runout that would normally trigger it
+    db_session.add(SpoolAssignment(spool_id=mint.id, printer_id=printer.id, ams_id=0, tray_id=3))
+    await db_session.commit()
+    before = await _charges_of(db_session, mint.id)
+
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+        handed_back = await reattribute_early_runout(db_session, mint, printer_id=printer.id, ams_id=0, tray_id=2)
+
+    assert handed_back is None
+    for row in (departed, mint):
+        await db_session.refresh(row)
+    assert await _charges_of(db_session, mint.id) == before, "its charges stay exactly where they are"
+    assert mint.archived_at is None, "a row the wire seats in a tray is never retired by an assumption"
+    assert departed.weight_used == pytest.approx(700.0)
+    assert departed.spent_at is None
+    assert "not this slot's most recent UNBOUND departure" in caplog.text
+    assert "invariant 11" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_a_live_binding_stands_the_lane_down(db_session, printer_factory, caplog):
     """CROSS-CUTTING INVARIANT 11, pinned as the dependency this lane rests on.
 
@@ -1577,9 +1715,7 @@ async def test_a_live_binding_stands_the_lane_down(db_session, printer_factory, 
     healthy shelf roll that was never in this slot at the time.
     """
     printer = await printer_factory(model="H2S")
-    fitting_older = await _released(
-        db_session, printer.id, 0, 1, at=_R0 - timedelta(days=2), weight_used=700.0
-    )
+    fitting_older = await _released(db_session, printer.id, 0, 1, at=_R0 - timedelta(days=2), weight_used=700.0)
     # Departed long enough ago that _bound_after_the_bay_cleared keeps tier 1.
     departed = await _released(db_session, printer.id, 0, 1, at=_R0, weight_used=100.0)
     bound = await _bind(db_session, printer.id, 0, 1, weight_used=300.0, data_origin="ams_auto")
@@ -1595,7 +1731,7 @@ async def test_a_live_binding_stands_the_lane_down(db_session, printer_factory, 
     assert fitting_older.weight_used == pytest.approx(700.0), "the flattering fit is never reached"
     assert fitting_older.spent_at is None
     assert departed.weight_used == pytest.approx(100.0) and departed.spent_at is None
-    assert "not this slot's most recent departure" in caplog.text
+    assert "not this slot's most recent UNBOUND departure" in caplog.text
     assert "invariant 11" in caplog.text
 
 

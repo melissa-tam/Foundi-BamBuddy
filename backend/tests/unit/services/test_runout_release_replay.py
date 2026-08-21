@@ -49,6 +49,7 @@ from backend.app.services import (
 )
 from backend.app.services.bambu_mqtt import HMSError
 from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
+from backend.app.services.slot_state import DecisionKind
 from backend.app.services.tray_observation import observe_tray
 
 _RESPOOL_LOGGER = "backend.app.services.spool_respool"
@@ -164,9 +165,7 @@ async def _bind(db, printer_id: int, ams_id: int, tray_id: int, **kwargs) -> Spo
 async def _release(db, spool: Spool) -> None:
     """Empty the bay through the REAL unbind writer — the residue under test has to be the
     one production stamps, never a hand-written ``last_location_*`` triple."""
-    assignment = (
-        await db.execute(select(SpoolAssignment).where(SpoolAssignment.spool_id == spool.id))
-    ).scalar_one()
+    assignment = (await db.execute(select(SpoolAssignment).where(SpoolAssignment.spool_id == spool.id))).scalar_one()
     await spool_binding.release_spool_from_slot(db, assignment, reason="cleared_tray")
     await db.commit()
 
@@ -369,9 +368,7 @@ async def test_refill_after_stamp_gains_mint_not_reclaim(
 
 
 @pytest.mark.asyncio
-async def test_rescued_cascade_stamps_each_departed_slot_once(
-    db_session, printer_factory, own_session_factory, caplog
-):
+async def test_rescued_cascade_stamps_each_departed_slot_once(db_session, printer_factory, own_session_factory, caplog):
     """Two rolls drained inside ONE job, each stamped exactly once.
 
     A rescued runout raises the pull-back and then, once the firmware has switched to the
@@ -428,9 +425,7 @@ async def test_rescued_cascade_stamps_each_departed_slot_once(
 
 
 @pytest.mark.asyncio
-async def test_deploy_restart_midway_escalation_stamp_lands(
-    db_session, printer_factory, own_session_factory, caplog
-):
+async def test_deploy_restart_midway_escalation_stamp_lands(db_session, printer_factory, own_session_factory, caplog):
     """A restart mid-hold: the edges are seeded away, and the ESCALATION carries the stamp.
 
     A terminal runout holds for hours, so a deploy inside it is ordinary. Every edge lane
@@ -476,9 +471,7 @@ async def test_deploy_restart_midway_escalation_stamp_lands(
 
 
 @pytest.mark.asyncio
-async def test_bogus_demand_replay_never_stamps_loaded_slot(
-    db_session, printer_factory, own_session_factory, caplog
-):
+async def test_bogus_demand_replay_never_stamps_loaded_slot(db_session, printer_factory, own_session_factory, caplog):
     """006-H2S 2026-07-26 replayed against the new durable lane: zero stamps.
 
     A UI Load click during a runout hold published a change-filament that moved nothing,
@@ -575,6 +568,102 @@ async def test_gap_refill_debounces_then_self_heals_on_the_spent_stamp(
     assert drained.spent_at is not None and drained.archived_at is not None
     assert drained.weight_used == 900.0  # the ledger stays raw
     assert spool_tagless.qualified_cycle_pending(printer.id, 0, 3) is False, "spent exactly once"
+
+
+@pytest.mark.asyncio
+async def test_a_debounce_preserved_cycle_expires_at_the_job_terminal(
+    db_session, printer_factory, own_session_factory, pipeline_env, cycle_sessions
+):
+    """The BOUND on T8b's layer 2 — the same case, with the runout that never comes.
+
+    A de-bounce preserves the slot's physical cycle so an imminent ``spent_at`` stamp can
+    still drive ``REPLACE_SPENT`` (the gap self-heal above). That preservation had no owner:
+    the evidence it waits for has a ~3-MINUTE life, but the cycle sat pending indefinitely,
+    so a GENUINE runout of the de-bounced roll hours later — an ordinary end to that roll's
+    life — would fire ``REPLACE_SPENT`` with no physical event behind it, retiring the
+    drained row and minting a successor onto a slot holding a state-11 drained core nobody
+    had touched.
+
+    The bound is a CAUSE, not a timer (doctrine rule 6): the printer's next JOB TERMINAL.
+    The stamp that would justify the swap belongs to the print that was running when the bay
+    emptied; once that print has ended, a stamp arriving later is a different story.
+    """
+    printer = await printer_factory()
+    exhausted = await _bind(db_session, printer.id, 0, 3, weight_used=900.0)
+    await _release(db_session, exhausted)
+
+    await spool_tagless.note_physical_cycle(printer.id, 0, 3)
+    _seed_reseat(printer.id, 0, 3, absent_for=45.0, under_active_feed=False)
+    obs = observe_tray(printer.id, 0, _seated(3))
+    deps = _deps(db_session, pipeline_env)
+    debounced = await run_slot_pipeline(printer.id, [obs], deps)
+    assert debounced[0].decision.reason == "reseat_debounce"
+    assert spool_tagless.qualified_cycle_pending(printer.id, 0, 3) is True
+
+    # The print ends with no runout ever declared for this slot.
+    assert await spool_tagless.expire_debounce_preserved_cycles(printer.id) == 1
+    assert spool_tagless.qualified_cycle_pending(printer.id, 0, 3) is False
+
+    # HOURS later the de-bounced roll genuinely runs out and IS stamped — correctly, on the
+    # row that is bound to the slot. That stamp must not now be read as a roll SWAP.
+    await _push(printer.id, _state(trays=[_seated(3)]), own_session_factory)
+    await _push(
+        printer.id,
+        _state(trays=[_seated(3)], hms=[_pullback(3), _demand(3), _insert_filament()]),
+        own_session_factory,
+    )
+    db_session.expunge_all()
+    assert (await db_session.get(Spool, exhausted.id)).spent_at is not None
+
+    latched = await run_slot_pipeline(printer.id, [obs], deps)
+
+    assert latched[0].decision.kind is DecisionKind.KEEP
+    assert latched[0].decision.reason == "spent_latch", "no cycle, no swap — the latch waits for a real one"
+    assert (await _assignment_spool(db_session, printer.id, 0, 3)).id == exhausted.id
+    assert await db_session.scalar(select(func.count(Spool.id))) == 1, "nothing was minted"
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_that_lands_before_the_terminal_keeps_its_cycle(
+    db_session, printer_factory, own_session_factory, pipeline_env, cycle_sessions
+):
+    """…and the expiry must not take T8b's own self-heal away (the liveness half).
+
+    A print that ENDS inside the three-minute gap is ordinary, and the terminal callback is
+    not ordered against the ~1 Hz push that would apply the swap. So the expiry stands down
+    for any slot whose bound row is ALREADY stamped: the evidence is in hand and the swap is
+    due on the very next push. Same asymmetry rule 8 states for the stamp itself — a missed
+    swap self-heals forward at the next physical cycle, an unfounded one is a mint the
+    operator never asked for.
+    """
+    printer = await printer_factory()
+    exhausted = await _bind(db_session, printer.id, 0, 3, weight_used=900.0)
+    await _release(db_session, exhausted)
+
+    await spool_tagless.note_physical_cycle(printer.id, 0, 3)
+    _seed_reseat(printer.id, 0, 3, absent_for=45.0, under_active_feed=False)
+    obs = observe_tray(printer.id, 0, _seated(3))
+    deps = _deps(db_session, pipeline_env)
+    assert (await run_slot_pipeline(printer.id, [obs], deps))[0].decision.reason == "reseat_debounce"
+
+    # The runout lands FIRST — the T8b timeline — and only then does the print terminate.
+    await _push(printer.id, _state(trays=[_seated(3)]), own_session_factory)
+    await _push(
+        printer.id,
+        _state(trays=[_seated(3)], hms=[_pullback(3), _demand(3), _insert_filament()]),
+        own_session_factory,
+    )
+    db_session.expunge_all()
+    assert (await db_session.get(Spool, exhausted.id)).spent_at is not None
+
+    assert await spool_tagless.expire_debounce_preserved_cycles(printer.id) == 0
+    assert spool_tagless.qualified_cycle_pending(printer.id, 0, 3) is True
+
+    healed = await run_slot_pipeline(printer.id, [obs], deps)
+
+    assert healed[0].decision.reason == "spent_swap_confirmed"
+    assert healed[0].applied is True
+    assert (await _assignment_spool(db_session, printer.id, 0, 3)).id != exhausted.id
 
 
 @pytest.mark.asyncio

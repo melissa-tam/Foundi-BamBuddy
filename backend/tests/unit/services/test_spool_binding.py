@@ -25,7 +25,7 @@ they were relocated from ``test_spool_tag_matcher.py`` when the stamps moved out
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import func, inspect as sa_inspect, select
@@ -661,6 +661,35 @@ async def test_an_ordinary_bind_still_stamps_its_own_moment(db_session, printer_
     await db_session.refresh(assignment)
     assert assignment.created_at is not None
     assert assignment.created_at != _SENTINEL
+
+
+@pytest.mark.asyncio
+async def test_a_future_bind_moment_is_refused_and_stamped_now(db_session, printer_factory, caplog):
+    """A moment ahead of the clock is refused — the reconciler's boundary must be reachable.
+
+    Every source of ``bind_moment`` is a stored column (``loaded_at`` / ``first_loaded_at`` /
+    ``created_at``), and a stored timestamp can sit in the future for reasons this lane has
+    nothing to do with: NTP stepping a host back, a DB restored from a box in another
+    timezone, a row written by hand. Accepting one would put
+    ``SpoolAssignment.created_at`` — the ONE "an unobserved swap happened at a KNOWN instant"
+    boundary ``spool_tagless.reconcile_ledger_overcharges`` adjudicates across — beyond every
+    usage row that could ever be charged against it, so the reconciler would silently charge
+    an EMPTY window forever. Falling back to now costs only the de-bounce's
+    ordinal-preservation nicety; the WARNING is what makes a skewed clock findable instead of
+    presenting as a repair lane that quietly stopped working.
+    """
+    printer = await printer_factory()
+    returning = await _fresh_spool(db_session)
+    future = datetime.utcnow() + timedelta(days=1)
+
+    with caplog.at_level(logging.WARNING, logger=_BINDING_LOGGER):
+        assignment = await _bind(db_session, returning, printer.id, 0, 0, bind_moment=future)
+
+    assert assignment is not None
+    await db_session.refresh(assignment)
+    assert assignment.created_at < future, "a future moment is never carried onto the row"
+    warnings = _warning_messages(caplog)
+    assert any("FUTURE bind moment" in m for m in warnings), warnings
 
 
 # -- the MOVE damper (007-H2C spool-194 flip-flop storm) ----------------------

@@ -5,6 +5,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { api } from '../api/client';
 import type { Printer, TaglessFreshPromptMessage } from '../api/client';
+import type { NewRollContext } from '../utils/newRollContext';
 import {
   slotKey,
   useSlotPrompt,
@@ -20,9 +21,10 @@ import {
  * cycle) can't be told apart from a swapped-in fresh roll by RFID remain — there
  * is no tag — so the backend broadcasts `tagless_fresh_prompt` and each queued
  * slot raises a persistent, non-blocking toast with two answers:
- *   - "Same roll" → POST `tagless-fresh` answer:"same" (per-cycle dismiss — a
- *                   later roll swap re-asks) and clear the slot.
- *   - "Review…"   → open `TaglessFreshModal` to record the fresh roll.
+ *   - "Same roll" → POST `fresh-roll-dismiss` (per-cycle dismiss — a later roll
+ *                   swap re-asks) and clear the slot.
+ *   - "Review…"   → open the shared `NewRollModal` to record the fresh roll,
+ *                   which posts the merged `POST /inventory/spools/{id}/new-roll`.
  *
  * Shares all per-slot mechanics (queue + dedup, persistent toast raise/clear,
  * cross-client dismissal via the `tagless-fresh-prompt-dismissed` window-event
@@ -35,7 +37,7 @@ export function useTaglessFreshPrompt() {
   const queryClient = useQueryClient();
   const { showToast } = useToast();
 
-  const [activeContext, setActiveContext] = useState<TaglessFreshPromptMessage | null>(null);
+  const [activeContext, setActiveContext] = useState<NewRollContext | null>(null);
 
   const isAuthed = !authEnabled || !!user;
 
@@ -57,7 +59,7 @@ export function useTaglessFreshPrompt() {
         tray_id: prompt.tray_id,
       };
       api
-        .taglessFresh(prompt.spool_id, { ...triple, answer: 'same' })
+        .dismissFreshRollPrompt(prompt.spool_id, triple)
         .then(() => removeSlot(triple))
         .catch((error: Error) =>
           showToast(error.message || t('inventory.freshRoll.dismissFailed'), 'error'),
@@ -67,12 +69,25 @@ export function useTaglessFreshPrompt() {
   );
 
   // "Review…": hide the toast, take the slot out of the queue (so the raise
-  // effect can't resurrect it while the modal is open), and open the modal.
+  // effect can't resurrect it while the modal is open), and open the shared
+  // new-roll form on this slot. The WS payload is translated into the form's own
+  // context here rather than handed over raw — three surfaces open that one form
+  // and it must not know which of them did.
   const handleReview = useCallback(
     (prompt: TaglessFreshPromptMessage, helpers: SlotPromptHelpers) => {
       helpers.dismissSlotToast(prompt);
       helpers.dequeue(prompt);
-      setActiveContext(prompt);
+      setActiveContext({
+        printer_id: prompt.printer_id,
+        ams_id: prompt.ams_id,
+        tray_id: prompt.tray_id,
+        spool_id: prompt.spool_id,
+        tagged: false,
+        origin: 'prompt',
+        material: prompt.material,
+        rgba: prompt.rgba,
+        remaining_g: prompt.remaining_g,
+      });
     },
     [],
   );

@@ -85,7 +85,7 @@ export function OutOfRotationChip({ spoolId, faultCode, className = '' }: OutOfR
           returnMutation.mutate();
         }}
         disabled={returnMutation.isPending}
-        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-bambu-green/20 hover:bg-bambu-green/30 text-bambu-green transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-bambu-green/20 hover:bg-bambu-green/30 text-bambu-green transition-colors disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green"
         title={t('inventory.returnToRotation')}
       >
         <RotateCcw

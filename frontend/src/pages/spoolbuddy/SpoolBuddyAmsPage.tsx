@@ -2,10 +2,10 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Layers, Settings2, Package, PackagePlus, RefreshCw, Unlink, Link2, X } from 'lucide-react';
+import { Layers, Settings2, Package, PackagePlus, Unlink, Link2, X } from 'lucide-react';
 import type { SpoolBuddyOutletContext } from '../../components/spoolbuddy/SpoolBuddyLayout';
 import { api } from '../../api/client';
-import type { PrinterStatus, AMSTray, SpoolAssignment, RespoolPromptMessage, TaglessFreshPromptMessage } from '../../api/client';
+import type { PrinterStatus, AMSTray, SpoolAssignment } from '../../api/client';
 import { getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, formatSlotLabel, formatAmsUnitName, isBambuLabSpool } from '../../utils/amsHelpers';
 import { getSwatchStyle } from '../../utils/colors';
 import { mapModelCode } from '../../utils/printerModels';
@@ -14,10 +14,10 @@ import type { AmsThresholds } from '../../components/spoolbuddy/AmsUnitCard';
 import { ConfigureAmsSlotModal } from '../../components/ConfigureAmsSlotModal';
 import { AssignSpoolModal } from '../../components/AssignSpoolModal';
 import { LinkSpoolModal } from '../../components/LinkSpoolModal';
-import { RespoolTagModal } from '../../components/RespoolTagModal';
-import { TaglessFreshModal } from '../../components/TaglessFreshModal';
+import { NewRollModal } from '../../components/NewRollModal';
+import { manualNewRollContext, type NewRollContext } from '../../utils/newRollContext';
 import { useToast } from '../../contexts/ToastContext';
-import { remainingGrams, remainingFraction } from '../../utils/spoolGrams';
+import { remainingFraction } from '../../utils/spoolGrams';
 
 function isTrayEmpty(tray: AMSTray): boolean {
   return !tray.tray_type || tray.tray_type === '';
@@ -272,8 +272,8 @@ export function SpoolBuddyAmsPage() {
   // Per-slot operator verbs (W5a), shared verbatim with the printer card:
   // "Re-spool tag…" for a TAGGED slot and "New roll…" for a TAGLESS one. Both
   // reuse the app-wide modals rather than re-implementing the flows here.
-  const [respoolContext, setRespoolContext] = useState<RespoolPromptMessage | null>(null);
-  const [newRollContext, setNewRollContext] = useState<{ prompt: TaglessFreshPromptMessage; usedGrams: number } | null>(null);
+  // The ONE per-slot "New roll…" verb, for a bound row of either tag-ness.
+  const [newRollContext, setNewRollContext] = useState<NewRollContext | null>(null);
 
   const getAssignment = useCallback((amsId: number, trayId: number): SpoolAssignment | undefined => {
     return assignments?.find(a => a.ams_id === Number(amsId) && a.tray_id === Number(trayId));
@@ -454,47 +454,15 @@ export function SpoolBuddyAmsPage() {
     unassignMutation.mutate({ printerId: selectedPrinterId, amsId, trayId });
   }, [slotActionPicker, selectedPrinterId, unassignMutation]);
 
-  // "Re-spool tag…" — parity with the printer card's tray action. The manual
-  // path carries no prefill/trigger, which is what keeps the reused-tag framing.
-  const openRespoolFromPicker = useCallback(() => {
-    if (!slotActionPicker || !selectedPrinterId) return;
-    const { amsId, trayId, tray, trayCount } = slotActionPicker;
-    setSlotActionPicker(null);
-    setRespoolContext({
-      printer_id: selectedPrinterId,
-      ams_id: amsId,
-      tray_id: trayId,
-      tag_uid: tray?.tag_uid ?? null,
-      tray_uuid: tray?.tray_uuid ?? null,
-      tray_type: tray?.tray_type ?? null,
-      tray_color: tray?.tray_color ?? null,
-      tray_sub_brands: tray?.tray_sub_brands ?? null,
-      tray_count: trayCount,
-      donor_spool_id: null,
-      donor_remaining_g: null,
-      brand_prefill: null,
-      label_weight_prefill: null,
-    });
-  }, [slotActionPicker, selectedPrinterId]);
-
-  // "New roll…" — the tagless counterpart. Offered only for a bound spool with
-  // no RFID tag, since an untagged roll cannot announce its own replacement.
+  // "New roll…" — parity with the printer card's slot verb, through the same
+  // shared context builder. Offered for any BOUND row: an untagged roll cannot
+  // announce its own replacement, and a tagged one still needs its tag moved onto
+  // the new roll — one operator act, two ledger lanes the backend picks.
   const openNewRollFromPicker = useCallback((spool: NonNullable<SpoolAssignment['spool']>) => {
     if (!slotActionPicker || !selectedPrinterId) return;
-    const { amsId, trayId } = slotActionPicker;
+    const { amsId, trayId, trayCount } = slotActionPicker;
     setSlotActionPicker(null);
-    setNewRollContext({
-      prompt: {
-        printer_id: selectedPrinterId,
-        ams_id: amsId,
-        tray_id: trayId,
-        spool_id: spool.id,
-        remaining_g: Math.round(remainingGrams(spool)),
-        material: spool.material,
-        rgba: spool.rgba,
-      },
-      usedGrams: Math.max(0, Math.round(spool.weight_used ?? 0)),
-    });
+    setNewRollContext(manualNewRollContext(selectedPrinterId, amsId, trayId, spool, trayCount));
   }, [slotActionPicker, selectedPrinterId]);
 
   // Set alert for low filament in status bar
@@ -843,44 +811,31 @@ export function SpoolBuddyAmsPage() {
                     Spoolman branch (Phase 14 A3). Manual changes would be
                     overwritten on the next RFID re-read. */}
                 {!spoolmanEnabled && (() => {
+                  // ONE verb for "the roll on this slot changed", whatever the row's
+                  // tag-ness — the operator states the swap, the backend picks the
+                  // ledger lane. Offered for any BOUND row: without one there is
+                  // nothing to retire and no key for the call.
+                  const boundSpool = assignment?.spool ?? null;
                   // A BL-RFID tray is owned by the printer firmware, so
-                  // assign/unassign stay suppressed (Phase 14 A3) — but the tag
-                  // itself can be moved onto a fresh roll, which is exactly what
-                  // the printer card offers there too (W5a parity).
-                  if (isBambuLabSpool(slotActionPicker?.tray)) {
-                    return (
-                      <button
-                        onClick={openRespoolFromPicker}
-                        aria-label={t('inventory.respool.action')}
-                        className="w-full flex items-center gap-3 p-3 rounded-lg bg-bambu-dark border border-bambu-dark-tertiary hover:border-bambu-blue transition-colors text-left"
-                      >
-                        <RefreshCw className="w-5 h-5 text-bambu-blue flex-shrink-0" />
-                        <div>
-                          <p className="text-white font-medium">{t('inventory.respool.action')}</p>
-                          <p className="text-xs text-bambu-gray">{t('inventory.respool.actionDesc')}</p>
-                        </div>
-                      </button>
-                    );
-                  }
-                  // Tagless bound roll: the operator's click is the only swap
-                  // signal the ledger will ever get.
-                  const taglessSpool = assignment?.spool && !assignment.spool.tag_uid ? assignment.spool : null;
+                  // assign/unassign stay suppressed (Phase 14 A3) — the roll swap is
+                  // not an assignment change and stays offered (W5a parity).
+                  const rfidOwned = isBambuLabSpool(slotActionPicker?.tray);
                   return (
                     <>
-                      {taglessSpool && (
+                      {boundSpool && (
                         <button
-                          onClick={() => openNewRollFromPicker(taglessSpool)}
-                          aria-label={t('inventory.freshRoll.manualAction')}
+                          onClick={() => openNewRollFromPicker(boundSpool)}
+                          aria-label={t('inventory.newRoll')}
                           className="w-full flex items-center gap-3 p-3 rounded-lg bg-bambu-dark border border-bambu-dark-tertiary hover:border-bambu-blue transition-colors text-left"
                         >
                           <PackagePlus className="w-5 h-5 text-bambu-blue flex-shrink-0" />
                           <div>
-                            <p className="text-white font-medium">{t('inventory.freshRoll.manualAction')}</p>
+                            <p className="text-white font-medium">{t('inventory.newRoll')}</p>
                             <p className="text-xs text-bambu-gray">{t('inventory.freshRoll.manualDesc')}</p>
                           </div>
                         </button>
                       )}
-                      {assignment ? (
+                      {rfidOwned ? null : assignment ? (
                         <button
                           onClick={handleUnassignFromPicker}
                           disabled={unassignMutation.isPending}
@@ -983,16 +938,10 @@ export function SpoolBuddyAmsPage() {
         />
       )}
 
-      {/* Per-slot operator verbs — the same modals the printer card opens, so
-          the flows stay canonical across kiosk and desktop (W5a). */}
-      <RespoolTagModal
-        context={respoolContext}
-        onClose={() => setRespoolContext(null)}
-      />
-      <TaglessFreshModal
-        context={newRollContext?.prompt ?? null}
-        usedGrams={newRollContext?.usedGrams ?? null}
-        manual
+      {/* Per-slot operator verb — the same form the printer card opens, so the
+          flow stays canonical across kiosk and desktop (W5a). */}
+      <NewRollModal
+        context={newRollContext}
         onClose={() => setNewRollContext(null)}
       />
 

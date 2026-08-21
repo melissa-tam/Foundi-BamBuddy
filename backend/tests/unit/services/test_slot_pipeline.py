@@ -819,6 +819,50 @@ async def test_reclaim_rebinds_the_last_location_row_preserving_the_ordinal(db_s
 
 
 @pytest.mark.asyncio
+async def test_a_deferring_slot_never_pays_for_the_donor_lookup(db_session, printer_factory, env, monkeypatch):
+    """Row 1 decides FIRST, so the de-bounce lane's DB work must not be done for nothing.
+
+    ``slot_state.resolve`` returns DEFER on drying / identify-in-flight / settling before it
+    reads a single other field — a perfect tag match on the wire does not beat wire safety.
+    All three inputs are cheap in-memory reads, so evaluating them ahead of the donor query
+    is a pure reorder: the context built is identical either way. What it buys is that a
+    drying unit or a settling insertion — the steady state for minutes at a time, at ~1 Hz
+    per slot per printer — stops issuing a query whose answer could never be consulted.
+    """
+    printer = await printer_factory()
+    donor = await _spool(db_session, material="PETG", rgba="000000FF", weight_used=400)
+    donor.last_location_printer_id = printer.id
+    donor.last_location_ams_id = 0
+    donor.last_location_tray_id = 3
+    donor.last_location_at = datetime.utcnow()
+    await db_session.commit()
+
+    lookups: list[tuple] = []
+    real = slot_pipeline._debounce_candidate
+
+    async def counting(db, obs):
+        lookups.append(obs.slot)
+        return await real(db, obs)
+
+    monkeypatch.setattr(slot_pipeline, "_debounce_candidate", counting)
+
+    obs = _obs(printer.id, {"id": 3, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"})
+    _seed_reseat(printer.id, 0, 3, absent_for=30.0)
+
+    deferred = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env, _FakeClient(drying=True)))
+
+    assert deferred[0].decision == Decision(DecisionKind.DEFER, reason="ams_drying")
+    assert lookups == [], "a slot whose decision is already made must not query for a donor"
+
+    # LIVENESS: the same slot, with wire safety clear, still runs the lookup and de-bounces —
+    # so the skip above is a skipped COST, never a skipped decision.
+    resolved = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert resolved[0].decision == Decision(DecisionKind.RECLAIM, spool_id=donor.id, reason="reseat_debounce")
+    assert lookups == [(printer.id, 0, 3)]
+
+
+@pytest.mark.asyncio
 async def test_a_different_filament_at_the_last_location_mints_instead(db_session, printer_factory, env):
     """The reclaim donor must fingerprint-match the wire; a different filament is a
     different roll and gets its own row."""
@@ -898,7 +942,13 @@ async def test_reclaim_still_works_for_a_returned_roll(db_session, printer_facto
 
 @pytest.mark.asyncio
 async def test_an_identity_move_does_not_ping_pong_back_to_the_old_slot(db_session, printer_factory, env):
-    """The 2026-08-07 loop end to end, through the real writer.
+    """§4.1 row G2 — a tagged roll moved to ANOTHER printer, and the 2026-08-07 loop end
+    to end, through the real writer.
+
+    G2's verdict has two halves and both are asserted here: the roll BINDS BY IDENTITY at
+    its new printer (a tag is factual evidence, so nothing about the old location is
+    consulted), and the old slot's binding goes with it — the writer's move semantics keep
+    one spool ⇔ at most one slot fleet-wide, which is what the assignment count below pins.
 
     Pass 1 is the identity bind on the new printer, whose move sweep is what stamps the
     roll's ``last_location_*`` at the OLD slot. Pass 2 evaluates that vacated slot, which
@@ -924,6 +974,14 @@ async def test_an_identity_move_does_not_ping_pong_back_to_the_old_slot(db_sessi
     assert moved[0].decision == Decision(DecisionKind.BIND, spool_id=roll.id, reason="identity_resolved_candidate")
     await db_session.refresh(roll)
     assert (roll.last_location_printer_id, roll.last_location_ams_id, roll.last_location_tray_id) == (old.id, 0, 0)
+    # G2's second half: the move RELEASED the old slot. One spool ⇔ one slot, fleet-wide —
+    # asserted as a count, because "the new binding exists" would also pass with the old
+    # row still standing beside it (the 012-H2S duplicate that fed one roll into two ledgers).
+    held = (
+        (await db_session.execute(select(SpoolAssignment).where(SpoolAssignment.spool_id == roll.id))).scalars().all()
+    )
+    assert [(a.printer_id, a.ams_id, a.tray_id) for a in held] == [(new.id, 0, 1)]
+    assert await _assignment(db_session, old.id, 0, 0) is None, "the vacated slot holds nothing yet"
 
     # Pass 2 — the vacated slot: config residue from another seated roll, no identity.
     residue = _obs(old.id, {"id": 0, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"})
@@ -932,6 +990,82 @@ async def test_an_identity_move_does_not_ping_pong_back_to_the_old_slot(db_sessi
     assert back[0].decision.reason == "tagless_mint"  # NOT last_location_reclaim
     assert (await _assignment(db_session, new.id, 0, 1)).spool_id == roll.id  # the bind stayed put
     assert (await _assignment(db_session, old.id, 0, 0)).spool_id != roll.id
+
+
+@pytest.mark.asyncio
+async def test_T9_a_tagless_roll_carried_to_another_slot_releases_A_and_mints_at_B(db_session, printer_factory, env):
+    """§4.1 row T9 — the HARD LIMIT of rule 9, asserted rather than described.
+
+    A tagless roll physically carried from slot A to slot B is unknowable: no tag names it
+    and no breadcrumb spans slots, because ``_debounce_candidate`` asks one question —
+    "which roll last left THIS slot?" — and B has never held this one. So A releases
+    (``cleared_tray``, keeping its grams and its last-location stamp) and B mints a fresh
+    row at label weight. The grams do not travel.
+
+    The absence at B is seeded SHORT and measured on purpose. Inside the de-bounce window
+    is where a per-printer (rather than per-slot) donor lookup would look most defensible,
+    and it is exactly the shape that would hand A's ledger to B's roll — so the window is
+    held open here and the mint must happen anyway.
+
+    Only a tag (G2) or a weigh-in closes this case; the matrix says so, and this is why.
+    """
+    printer = await printer_factory()
+    roll = await _spool(db_session, material="PETG", rgba="000000FF", weight_used=612)
+    await _bind_row(db_session, roll, printer.id, 0, 0)
+
+    # Pass 1 — slot A is now empty on the wire: the location claim is dropped.
+    cleared = _obs(printer.id, {"id": 0, "state": 9, "tray_type": ""})
+    released = await run_slot_pipeline(printer.id, [cleared], _deps(db_session, env))
+
+    assert released[0].decision == Decision(DecisionKind.RELEASE, spool_id=roll.id, reason="cleared_tray")
+    assert await _assignment(db_session, printer.id, 0, 0) is None
+
+    # Pass 2 — the same physical roll, seated by hand in slot B moments later.
+    _seed_reseat(printer.id, 0, 1, absent_for=30.0)
+    arrived = await run_slot_pipeline(printer.id, [_obs(printer.id, {"id": 1, **_SEATED_PETG})], _deps(db_session, env))
+
+    assert arrived[0].decision.reason == "tagless_mint"
+    minted_row = await _assignment(db_session, printer.id, 0, 1)
+    assert minted_row is not None and minted_row.spool_id != roll.id
+    minted = await db_session.get(Spool, minted_row.spool_id)
+    assert (minted.weight_used or 0) == 0, "B's row starts at label weight — an assumption, honestly made"
+
+    await db_session.refresh(roll)
+    assert roll.weight_used == 612, "the carried roll's grams stay on the row it left behind"
+    assert roll.spent_at is None and roll.archived_at is None, "it is unbound, not retired"
+    assert (
+        await db_session.scalar(select(func.count(SpoolAssignment.id)).where(SpoolAssignment.spool_id == roll.id))
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_T10_a_sub_floor_roll_left_seated_is_never_re_decided(db_session, printer_factory, env):
+    """§4.1 row T10, the BINDING half — a below-floor roll left in the AMS as a firmware
+    backup donor is KEPT: no release, no mint, no write of any kind.
+
+    The start floor (``min_start_spool_g``) is a DISPATCH gate and lives entirely in
+    ``spool_selection``; the identity lanes never learned about grams and must not. A roll
+    the scheduler refuses to start a print on is still, physically, the roll in that slot —
+    re-deciding its identity because it is nearly empty would mint a stranger over a ledger
+    that is about to be finished by the firmware's own auto-refill.
+
+    The selection half — start-blocked below the floor, still eligible as a mid-print
+    replacement — is `backend/tests/unit/test_spool_selection.py::TestRowT10SubFloorDonor`.
+    """
+    printer = await printer_factory()
+    nearly_empty = await _spool(db_session, material="PETG", rgba="000000FF", weight_used=930)
+    await _bind_row(db_session, nearly_empty, printer.id, 0, 2)
+
+    obs = _obs(printer.id, {"id": 2, **_SEATED_PETG})
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))
+
+    assert transitions[0].decision == Decision(
+        DecisionKind.KEEP, spool_id=nearly_empty.id, reason="fingerprint_matches"
+    )
+    assert (await _assignment(db_session, printer.id, 0, 2)).spool_id == nearly_empty.id
+    assert await _spool_count(db_session) == 1, "nothing was minted beside it"
+    await db_session.refresh(nearly_empty)
+    assert nearly_empty.weight_used == 930 and nearly_empty.spent_at is None
 
 
 @pytest.mark.asyncio
@@ -1344,7 +1478,14 @@ async def test_the_release_record_carries_every_field_the_reconstruction_needs(
 
     # Push shape, and the cause test that separates a glitch from a real departure.
     assert f["push"] == "full"
-    assert (f["feeding"], f["printing"]) == ("no", "no")
+    # ``feeding=?`` is the HONEST answer here and not a gap: this case drives the pipeline
+    # directly, so no presence pass ever observed a loss edge for the slot and the loss-side
+    # stamp does not exist. ``?`` means "never observed", which is deliberately NOT ``no`` —
+    # a restart or a first-batch seed lands in the same state, and reporting either as "this
+    # slot was idle" is the fabrication the tri-state exists to refuse. The ``no`` and
+    # ``yes`` readings are pinned where a real loss edge is derived (the sibling case below,
+    # and ``test_release_liveness``' production-wiring pair).
+    assert (f["feeding"], f["printing"]) == ("?", "no")
 
     # A0T2 is a bare token, not a key=value pair — assert it on the line itself.
     assert " A0T2 " in _evidence_line(caplog)
@@ -1537,7 +1678,9 @@ async def test_a_failing_record_never_costs_the_release(db_session, printer_fact
 
 
 @pytest.mark.asyncio
-async def test_a_debounce_and_a_real_departure_are_told_apart_by_the_record(db_session, printer_factory, env, caplog):
+async def test_a_debounce_and_a_real_departure_are_told_apart_by_the_record(
+    db_session, printer_factory, env, caplog, monkeypatch
+):
     """The whole point of collecting this: which releases were glitches?
 
     Two slots on one printer lose presence in the same pass, on the same wire shape. The
@@ -1548,6 +1691,12 @@ async def test_a_debounce_and_a_real_departure_are_told_apart_by_the_record(db_s
 
     Then the T2 roll comes straight back and DE-BOUNCES, and its own line names the same
     spool — closing the correlation a triager six hours later has to make by hand.
+
+    The loss edges are DERIVED, never seeded: ``ams_presence.on_tray_observations`` runs on
+    the same push, one pass ahead of the pipeline, exactly as ``printer_manager`` orders them
+    in production. That ordering is the whole reason the field can be truthful, and seeding
+    the ledger by hand is how this assertion passed for weeks while ``feeding=`` was reading
+    the wrong (gain-side) map and could never answer ``yes`` in production.
     """
     printer = await printer_factory()
     glitched = await _spool(db_session, material="PETG", rgba="000000FF", weight_used=300)
@@ -1555,14 +1704,26 @@ async def test_a_debounce_and_a_real_departure_are_told_apart_by_the_record(db_s
     await _bind_row(db_session, glitched, printer.id, 0, 2)
     await _bind_row(db_session, drained, printer.id, 0, 3)
 
-    # The loss-edge stamps the presence lane writes: T3 was feeding, T2 was not.
-    _seed_reseat(printer.id, 0, 2, absent_for=None, under_active_feed=False)
-    _seed_reseat(printer.id, 0, 3, absent_for=None, under_active_feed=True)
+    # A live print whose last actual feeder was T3 (global tray 0*4+3). T2 is idle.
+    monkeypatch.setattr(
+        ams_presence.printer_manager,
+        "get_status",
+        lambda pid: SimpleNamespace(state="RUNNING", last_loaded_tray=3, tray_now=3, raw_data={}),
+    )
 
+    seated = [
+        observe_tray(printer.id, 0, {"id": 2, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"}),
+        observe_tray(printer.id, 0, {"id": 3, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"}),
+    ]
     cleared = [
         observe_tray(printer.id, 0, {"id": 2, "state": 9, "tray_type": ""}, exist_bits=0),
         observe_tray(printer.id, 0, {"id": 3, "state": 9, "tray_type": ""}, exist_bits=0),
     ]
+    # First batch seeds presence only (a refill done while the server was down is not a
+    # gain); the second is the PRESENT→ABSENT edge that stamps the feeder answer.
+    await ams_presence.on_tray_observations(printer.id, seated, db_session)
+    await ams_presence.on_tray_observations(printer.id, cleared, db_session)
+
     with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
         await run_slot_pipeline(printer.id, cleared, _deps(db_session, env))
 
@@ -3169,6 +3330,93 @@ class TestReusedCoreAtTheApplyLayer:
         await db_session.refresh(finished)
         assert finished.archived_at is not None
         assert finished.spent_at == _SENTINEL
+
+    @staticmethod
+    def _capture_pages(monkeypatch) -> list[tuple]:
+        """Record every ``on_spent_contradiction`` call the apply layer raises."""
+        from backend.app.services import notification_service as notification_module
+
+        pages: list[tuple] = []
+
+        async def _record(printer_id, printer_name, spool_id, spool_label, slot, remain, db):
+            pages.append((printer_id, printer_name, spool_id, spool_label, slot, remain))
+
+        monkeypatch.setattr(notification_module.notification_service, "on_spent_contradiction", _record)
+        return pages
+
+    @pytest.mark.asyncio
+    async def test_every_reused_core_swap_pages_a_human_to_verify_it(
+        self, db_session, printer_factory, env, caplog, monkeypatch
+    ):
+        """Doctrine rule 10 is the operator's ground truth: NO tag has ever been reused here.
+
+        Rule 3 keeps the capability and the physics forces the conclusion, so the swap is
+        never withheld — but rule 10 was re-confirmed by the 2026-08-09 full-history audit
+        (every respool prompt this farm has ever raised was a false positive), which makes
+        the FIRST firing of this arm evidence to verify rather than a routine event. Two
+        readings, both named for the operator: a genuine first reuse, or a FALSE ``spent_at``
+        stamp that needs root-causing. There is deliberately no un-spend lane (operator
+        ruling 2026-08-09) — the page asks a human to look, it never edits the stamp.
+        """
+        printer = await printer_factory()
+        finished = await self._finished(db_session)
+        await _bind_row(db_session, finished, printer.id, 0, 0)
+        pages = self._capture_pages(monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger=_PIPELINE_LOGGER):
+            transitions = await run_slot_pipeline(printer.id, [self._tagged(printer.id)], _deps(db_session, env))
+
+        assert transitions[0].decision.reason == "reused_core_swap"
+        assert transitions[0].applied is True, "the conclusion is never withheld — only verified"
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("REUSED CORE" in m for m in warnings), warnings
+        line = next(m for m in warnings if "REUSED CORE" in m)
+        assert f"spent spool {finished.id}" in line and self.TAG in line
+        assert "delivered 987.4 g of 1000 g" in line, line
+        assert "first RFID-tag reuse on this farm" in line and "spent stamp is false" in line
+        assert "NEVER FED" not in line, "a fed row is not the stronger contradiction"
+
+        assert len(pages) == 1, f"exactly one page per firing, got {pages}"
+        assert pages[0][0] == printer.id and pages[0][2] == finished.id
+        assert "delivered 987 g" in pages[0][3]
+
+        # …and the swap itself landed exactly as the un-paged version did.
+        row = await _assignment(db_session, printer.id, 0, 0)
+        successor = await db_session.get(Spool, row.spool_id)
+        assert successor.id != finished.id
+        assert (successor.tag_uid, successor.tray_uuid) == (self.TAG, self.UUID)
+        await db_session.refresh(finished)
+        assert finished.archived_at is not None and finished.spent_at == _SENTINEL
+
+    @pytest.mark.asyncio
+    async def test_a_never_fed_finished_row_is_named_as_the_stronger_contradiction(
+        self, db_session, printer_factory, env, caplog, monkeypatch
+    ):
+        """A row that consumed NOTHING cannot have run out — so "spent" is the doubtful half.
+
+        Same conclusion, same swap, louder message: ``weight_used`` under
+        ``NEVER_FED_MAX_G`` means the two facts on the row are self-contradictory
+        independently of any reuse story, which is exactly the shape the 2026-08-09 repair
+        migration retired in bulk. Naming it in the same page is what tells the operator
+        which of the two readings to check FIRST.
+        """
+        printer = await printer_factory()
+        finished = await self._finished(db_session, weight_used=0.0)
+        await _bind_row(db_session, finished, printer.id, 0, 0)
+        pages = self._capture_pages(monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger=_PIPELINE_LOGGER):
+            transitions = await run_slot_pipeline(printer.id, [self._tagged(printer.id)], _deps(db_session, env))
+
+        assert transitions[0].decision.reason == "reused_core_swap"
+        assert transitions[0].applied is True
+        line = next(m for m in (r.getMessage() for r in caplog.records) if "REUSED CORE" in m)
+        assert "NEVER FED" in line and "cannot have run out" in line, line
+        assert len(pages) == 1 and "NEVER FED" in pages[0][3]
+
+        row = await _assignment(db_session, printer.id, 0, 0)
+        successor = await db_session.get(Spool, row.spool_id)
+        assert successor.id != finished.id and successor.spent_at is None
 
     @pytest.mark.asyncio
     async def test_a_LIVE_owner_still_converts_the_mint_into_a_bind(self, db_session, printer_factory, env, caplog):

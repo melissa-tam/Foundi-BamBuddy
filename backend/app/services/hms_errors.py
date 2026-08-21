@@ -1774,6 +1774,61 @@ def current_runout_demand(hms_list) -> tuple[int, int] | None:
     return demand
 
 
+def runout_standing_for_slot(hms_list, ams_id: int, tray_id: int) -> bool:
+    """Is the firmware STANDING on a runout that names THIS slot, right now?
+
+    The PER-SLOT runout question, asked of a live ``state.hms_errors`` list. It exists
+    because "the firmware has said this slot ran dry" and "the farm has an open incident
+    for it" are different facts with different lifetimes, and the second one is bounded to
+    ONE open row per printer by design (``printer_incident``'s partial unique index): during
+    a cascade the second slot's runout never gets an incident of its own, and on a printer
+    already holding a JAM there is no runout row to match at all. The wire keeps saying it
+    either way, so this reads the wire.
+
+    Matched STRICTLY on ``(ams_id, tray_id)``, never blanket-per-printer — the same rule
+    ``slot_pipeline._runout_suspect`` applies to the incident arm, and for the same reason:
+    a genuine glitch on slot 2 while slot 3 is dry must still be treated as a glitch.
+
+    Two decoders, both already canonical here, neither re-spelled:
+
+    * :func:`runout_slot_from_hms` over the slot-attributed family
+      (:data:`_RUNOUT_SLOT_CODE32`) — the demand (``0x00020001``), the purge-abnormal
+      runout (``0x00020005``), the pull-back notice (``0x00030001``) and the auto-switch
+      report (``0x00030002``). All four are the firmware naming a slot that ran out; they
+      differ only in what is being ASKED, which matters to the guidance and spent lanes and
+      not at all to "did this bay empty because it ran dry?".
+    * the taxonomy's own ``RUNOUT``-class view over :func:`classify_hms_entry`, for any
+      class member that carries a slot. Today none does — the classified runout rows live
+      in the lossy short-code lane, which discards the attr byte that names the slot — so
+      this arm is currently a no-op by construction and is kept because it is the arm that
+      stays correct if a slot-carrying RUNOUT row is ever added.
+
+    **The bare demand is admitted here and deliberately NOT admitted as spent evidence**
+    (``_RUNOUT_SLOT_SPENT_CODE32``). The asymmetry is the cost of a false positive: a
+    demand-driven ``spent_at`` stamp permanently archives a healthy roll (006-H2S 2026-07-26
+    proved the firmware latches a demand for a slot that never ran dry), while a
+    demand-driven runout SUSPICION only means a returning roll mints a fresh ledger row at
+    label weight instead of de-bouncing onto its old one — the accepted, self-correcting
+    cost the 2026-08-19 rule-7 amendment already writes down, and the direction the reverse
+    correction exists for.
+
+    Pure decode over any HMSError-shaped sequence; a malformed entry is skipped, never
+    raised — every caller is on an MQTT callback path (invariant 10).
+    """
+    target = (ams_id, tray_id)
+    for e in hms_list or []:
+        try:
+            attr = int(getattr(e, "attr", 0) or 0)
+            if runout_slot_from_hms(attr, _code_word(getattr(e, "code", 0))) == target:
+                return True
+        except (TypeError, ValueError):  # a malformed HMS entry must not break the decode
+            continue
+        verdict = classify_hms_entry(e)
+        if verdict is not None and verdict.fault_class is AmsFaultClass.RUNOUT and verdict.slot == target:
+            return True
+    return False
+
+
 def runout_hold_active(state) -> bool:
     """True when the printer is PAUSEd holding for a same-slot filament refill.
 

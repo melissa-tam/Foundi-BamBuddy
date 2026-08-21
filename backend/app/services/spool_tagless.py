@@ -71,7 +71,7 @@ from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import ams_presence, spool_respool
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.spool_binding import bind_spool_to_slot, last_released_from_slot_stmt
+from backend.app.services.spool_binding import bind_spool_to_slot, bound_elsewhere, last_released_from_slot_stmt
 from backend.app.services.spool_tag_matcher import (
     auto_assign_spool,
     is_bambu_tag,
@@ -190,6 +190,25 @@ _MINT_SETTLE_S = 5.0
 # a per-slot resource must not have its lifecycle decided by a function that cannot see
 # what happened to the slot.
 _pending_physical_cycles: set[tuple[int, int, int]] = set()
+
+# The subset of :data:`_pending_physical_cycles` that is only still pending because a
+# DE-BOUNCE preserved it, and which therefore needs an OWNER (2026-08-20).
+#
+# ``slot_pipeline._settle_physical_cycle`` preserves a cycle across a RECLAIM so the
+# runout's imminent ``spent_at`` stamp can still drive ``REPLACE_SPENT`` on the next push
+# (the T8b self-heal, layer 2 of the bay-clear→HMS gap fix). That preservation had no
+# expiry at all: the evidence it stands on has a ~3-MINUTE life, but the cycle sat in the
+# set indefinitely, so a spent stamp landing on that slot HOURS later — an ordinary,
+# genuine runout of the very roll that de-bounced back — would fire ``REPLACE_SPENT`` with
+# no physical event behind it, retiring the drained row and minting a successor onto a
+# slot holding a state-11 drained core that nobody has touched.
+#
+# The bound is a CAUSE, not a timer (doctrine rule 6): the printer's next JOB TERMINAL.
+# A job boundary is the natural scope for gap evidence — the runout that would justify the
+# swap belongs to the print that was running when the bay emptied, and once that print has
+# ended, a stamp arriving later belongs to a different story. See
+# :func:`expire_debounce_preserved_cycles`.
+_debounce_preserved_cycles: set[tuple[int, int, int]] = set()
 
 # (printer_id, ams_id, tray_id) of slots whose config settle has already announced that
 # the slot's identity is UNANSWERABLE this epoch (:func:`_config_settling`'s third arm).
@@ -335,6 +354,7 @@ def _reset_state() -> None:
     _autoconfig_window.reset()
     _autoconfig_epochs.clear()
     _pending_physical_cycles.clear()
+    _debounce_preserved_cycles.clear()
     _settle_concluded_logged.clear()
     _presence_stale_episodes.clear()
     _spent_swap_park_episodes.clear()
@@ -844,7 +864,7 @@ async def _broadcast_auto_assigned(
 
 
 def _apply_new_fields(spool: Spool, fields: dict | None) -> None:
-    """Apply the tagless-fresh route's optional manual fields onto a fresh row.
+    """Apply the new-roll route's optional manual fields onto a fresh row.
 
     Only non-empty values write (a blank field leaves the mint default). Used when
     the operator records a Fresh roll with brand / label weight / cost / note.
@@ -881,7 +901,7 @@ async def _replace_row_after_cycle(
     """Archive a departed tagless row and mint+bind+push its replacement (W1/W5).
 
     The OPERATOR lane's spent-binding / fresh-roll transition, shared by
-    :func:`maybe_autoconfigure_bare_tray` and the W5 tagless-fresh route
+    :func:`maybe_autoconfigure_bare_tray` and the W5 new-roll route
     (:func:`apply_fresh_roll` — the "New roll" verb). The WIRE lane's equivalent is the
     pipeline's ``REPLACE_SPENT`` arm (``slot_pipeline._apply_replace_spent``), which
     mirrors this behaviour with one documented difference (it disposes a pristine
@@ -1290,8 +1310,7 @@ async def replace_bound_row_with_predecessor(
         preserve_ordinal=True,
     )
     logger.info(
-        "[tagless] printer=%d A%dT%d re-check mint spool %d retracted (%s); spool %d restored with %.1f g "
-        "handed back",
+        "[tagless] printer=%d A%dT%d re-check mint spool %d retracted (%s); spool %d restored with %.1f g handed back",
         printer_id,
         ams_id,
         tray_id,
@@ -1561,13 +1580,16 @@ async def _scan_ledger_overcharges(db: AsyncSession) -> int:
 # the release has already hard-deleted the assignment. Both rows this lane adjudicates are
 # therefore DEAD — unbound, out of service — and it displaces nothing.
 #
-# That is ENFORCED, not assumed. ``last_released_from_slot_stmt`` carries
-# ``~Spool.assignments.any()``, and this lane additionally requires the spent row to be the
-# NEWEST row that query returns, so a spent stamp landing while the binding is still live
-# finds no candidate and stands down. **If a future change ever makes spent stamping fire
-# while the binding is live, this exemption evaporates with it** — the stand-down is what
-# keeps that change safe, so it must never be "fixed" into a lookup that ignores the
-# assignment.
+# That is ENFORCED, not assumed — by THIS lane, explicitly. ``last_released_from_slot_stmt``
+# used to carry ``~Spool.assignments.any()`` and the enforcement was borrowed from it; that
+# filter is gone (a SQL eligibility test does not skip an ineligible row, it makes the row
+# invisible and silently answers with an OLDER residue — a different physical roll), so both
+# rows are now checked HERE with ``spool_binding.bound_elsewhere``. The lane additionally
+# requires the spent row to be the NEWEST row the query returns, so a spent stamp landing
+# while the binding is still live finds no candidate and stands down. **If a future change
+# ever makes spent stamping fire while the binding is live, this exemption evaporates with
+# it** — the stand-down is what keeps that change safe, so it must never be "fixed" into a
+# lookup that ignores the assignment.
 #
 # Error direction, as everywhere else in this module: only ever the optimistic one. Grams
 # that do not fit are left exactly where they are. A missed correction self-heals at that
@@ -1676,14 +1698,13 @@ async def _reattribute_early_runout(
     ):
         return None
 
-    rows = (
-        (await db.execute(last_released_from_slot_stmt(printer_id, ams_id, tray_id).limit(2))).scalars().all()
-    )
-    if not rows or rows[0].id != spent.id:
+    rows = (await db.execute(last_released_from_slot_stmt(printer_id, ams_id, tray_id).limit(2))).scalars().all()
+    if not rows or rows[0].id != spent.id or bound_elsewhere(rows[0]):
         logger.info(
-            "[RESPOOL] EARLY-RUNOUT NOT RE-ATTRIBUTED: spool %d is not this slot's most recent departure "
-            "(printer %d AMS%d-T%d) — it is still bound, or another roll has left the slot since. "
-            "Assumption-tier evidence displaces nothing a live binding holds (invariant 11).",
+            "[RESPOOL] EARLY-RUNOUT NOT RE-ATTRIBUTED: spool %d is not this slot's most recent UNBOUND "
+            "departure (printer %d AMS%d-T%d) — it is still bound, it has been re-bound elsewhere, or "
+            "another roll has left the slot since. Assumption-tier evidence displaces nothing a live "
+            "binding holds (invariant 11).",
             spent.id,
             printer_id,
             ams_id,
@@ -1695,6 +1716,11 @@ async def _reattribute_early_runout(
     remainder = 0.0
     if departed is None:
         why = "this slot has no earlier departure on record, so there is no row it could have displaced"
+    elif bound_elsewhere(departed):
+        why = (
+            f"the departed row (spool {departed.id}) holds a live binding in another tray — a breadcrumb "
+            "may not re-charge a roll the wire says is seated elsewhere (invariant 11)"
+        )
     elif not is_tagless_spool(departed):
         why = f"the departed row (spool {departed.id}) is tag-identified — its identity is factual (rule 10)"
     elif departed.archived_at is not None:
@@ -1843,7 +1869,7 @@ async def clear_fresh_prompt(db: AsyncSession, spool: Spool) -> None:
     """Answer a spool's fresh-roll prompt — NULL the durable pending stamp.
 
     Both answers land here ("Fresh roll" via :func:`apply_fresh_roll`, "Same spool"
-    via the tagless-fresh route). Idempotent: an already-clear row is a no-op, so a
+    via the new-roll / fresh-roll-dismiss routes). Idempotent: an already-clear row is a no-op, so a
     double answer or a replayed toast costs nothing.
     """
     if spool.fresh_prompt_pending_at is None:
@@ -2006,7 +2032,85 @@ def consume_qualified_cycle(printer_id: int, ams_id: int, tray_id: int) -> bool:
     if key not in _pending_physical_cycles:
         return False
     _pending_physical_cycles.discard(key)
+    _debounce_preserved_cycles.discard(key)  # the cycle is gone; its owner-mark means nothing
     return True
+
+
+def mark_cycle_preserved_by_debounce(printer_id: int, ams_id: int, tray_id: int) -> bool:
+    """Record that this slot's still-pending cycle survives only because a DE-BOUNCE kept it.
+
+    Called from ``slot_pipeline._settle_physical_cycle``'s RECLAIM arm — the one outcome that
+    preserves a cycle deliberately rather than by simply not touching it. Marking it is what
+    gives that preservation an OWNER (:func:`expire_debounce_preserved_cycles`); see
+    :data:`_debounce_preserved_cycles` for why an unowned one is a real hazard.
+
+    A no-op (and False) when no cycle is actually pending: a mark without currency would
+    outlive the thing it describes and expire nothing.
+    """
+    key = (printer_id, ams_id, tray_id)
+    if key not in _pending_physical_cycles:
+        return False
+    _debounce_preserved_cycles.add(key)
+    return True
+
+
+async def expire_debounce_preserved_cycles(printer_id: int) -> int:
+    """A print ended on this printer — retire its de-bounce-preserved cycles. Returns the count.
+
+    The CAUSE bound on the T8b preservation (:data:`_debounce_preserved_cycles`). A cycle kept
+    across a de-bounce is waiting for ONE specific thing: the runout of the print that was
+    running when the bay emptied, whose ``spent_at`` stamp lands ~3 minutes later and fires
+    ``REPLACE_SPENT`` on the next push. Once that print has reached a terminal, the wait is
+    over — a stamp arriving afterwards belongs to a later print and a later physical story,
+    and honouring it would swap a roll on evidence of an event that never happened.
+
+    **The spent stamp WINS a race with this hook**, deliberately: a slot whose bound row is
+    already stamped has its evidence in hand, the swap is due on the very next push, and the
+    terminal callback and that push are not ordered against each other. So a stamped row keeps
+    its cycle and T8b's self-heal survives a print that ends inside the gap; only the
+    UNSTAMPED ones — the ones still waiting for evidence that is no longer coming — are
+    retired. That is the same asymmetry rule 8 states for the stamp itself: a missed swap
+    self-heals forward at the next physical cycle, an unfounded one is a mint the operator
+    never asked for.
+
+    Its own session (the completion callback has none to lend), and never raises — this is a
+    lifecycle hook on the terminal path (invariant 10).
+    """
+    keys = [key for key in _debounce_preserved_cycles if key[0] == printer_id]
+    if not keys:
+        return 0
+    expired = 0
+    try:
+        from backend.app.core.database import async_session
+
+        async with async_session() as db:
+            for key in keys:
+                _, ams_id, tray_id = key
+                spent_at = await db.scalar(
+                    select(Spool.spent_at)
+                    .join(SpoolAssignment, SpoolAssignment.spool_id == Spool.id)
+                    .where(
+                        SpoolAssignment.printer_id == printer_id,
+                        SpoolAssignment.ams_id == ams_id,
+                        SpoolAssignment.tray_id == tray_id,
+                    )
+                )
+                if spent_at is not None:
+                    continue  # the evidence landed — the swap is due, not expired
+                _debounce_preserved_cycles.discard(key)
+                _pending_physical_cycles.discard(key)
+                expired += 1
+                logger.info(
+                    "[TAGLESS] printer %d AMS%d-T%d: de-bounce-preserved physical cycle retired at the job "
+                    "terminal — the runout it was waiting for never arrived, so a later spent stamp must not "
+                    "replay it as a roll swap",
+                    printer_id,
+                    ams_id,
+                    tray_id,
+                )
+    except Exception:  # noqa: BLE001 — a terminal lifecycle hook must never crash the callback
+        logger.exception("expire_debounce_preserved_cycles failed for printer %s", printer_id)
+    return expired
 
 
 async def apply_fresh_roll(

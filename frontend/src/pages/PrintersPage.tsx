@@ -92,7 +92,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
 import { formatDateOnly, formatETA, formatDuration, parseUTCDate } from '../utils/date';
-import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, RespoolPromptMessage, SlotRecheckResult, TaglessFreshPromptMessage } from '../api/client';
+import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, SlotRecheckResult } from '../api/client';
 import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
@@ -113,12 +113,12 @@ import { AMSHistoryModal } from '../components/AMSHistoryModal';
 import { AmsBackupModal } from '../components/AmsBackupModal';
 import { HeaterHistoryModal } from '../components/HeaterHistoryModal';
 import type { HeaterSensorKind } from '../api/client';
-import { FilamentHoverCard, EmptySlotHoverCard } from '../components/FilamentHoverCard';
+import { FilamentHoverCard, EmptySlotHoverCard, HOVER_CARD_CONTROL_FOCUS } from '../components/FilamentHoverCard';
 import type { EmptySlotBinding } from '../components/FilamentHoverCard';
 import { LinkSpoolModal } from '../components/LinkSpoolModal';
 import { AssignSpoolModal } from '../components/AssignSpoolModal';
-import { RespoolTagModal } from '../components/RespoolTagModal';
-import { TaglessFreshModal } from '../components/TaglessFreshModal';
+import { NewRollModal } from '../components/NewRollModal';
+import { manualNewRollContext, type NewRollContext } from '../utils/newRollContext';
 import { ConfigureAmsSlotModal } from '../components/ConfigureAmsSlotModal';
 import { useToast } from '../contexts/ToastContext';
 import { ChamberLight } from '../components/icons/ChamberLight';
@@ -1792,7 +1792,7 @@ function PrinterCard({
    *  printer isn't on a farm run or the fleet query is unavailable/403. */
   farmContext?: FarmPrinterContext | null;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const { showToast, showPersistentToast, dismissToast } = useToast();
@@ -1882,12 +1882,9 @@ function PrinterCard({
     trayId: number;
     trayInfo: { type: string; color: string; location: string; material?: string; profile?: string };
   } | null>(null);
-  // Manual "Re-spool tag…" tray action — opens RespoolTagModal for the slot.
-  const [respoolContext, setRespoolContext] = useState<RespoolPromptMessage | null>(null);
-  // Manual "New roll…" tray action (W5a) — the tagless counterpart of
-  // "Re-spool tag…". Carries the retired row's used grams alongside the prompt
-  // payload so the confirm copy can name exactly what is being archived.
-  const [newRollContext, setNewRollContext] = useState<{ prompt: TaglessFreshPromptMessage; usedGrams: number } | null>(null);
+  // The ONE manual "New roll…" slot verb (W5a), for a bound row of either
+  // tag-ness — the operator states the swap, the backend picks the ledger lane.
+  const [newRollContext, setNewRollContext] = useState<NewRollContext | null>(null);
   const [configureSlotModal, setConfigureSlotModal] = useState<{
     amsId: number;
     trayId: number;
@@ -2705,8 +2702,19 @@ function PrinterCard({
   const seenBusyStateRef = useRef<boolean>(false);
   // Fallback timeout ref
   const recheckTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Minimum-display timer — held so unmount and the error path clear it as well
+  // (an unheld setTimeout writes a ref on a torn-down card).
+  const recheckMinTimeRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Minimum display time passed
   const minTimePassedRef = useRef<boolean>(false);
+
+  // Both re-check timers die with the card. A printer card unmounts on a filter
+  // change or a page switch, and a timer that outlives it writes refs (and, via
+  // the fallback, state) on a torn-down component.
+  useEffect(() => () => {
+    if (recheckTimeoutRef.current) clearTimeout(recheckTimeoutRef.current);
+    if (recheckMinTimeRef.current) clearTimeout(recheckMinTimeRef.current);
+  }, []);
 
   /**
    * The sentence one re-check verdict gets. Silence WAS the bug (incident shape
@@ -2724,13 +2732,19 @@ function PrinterCard({
       case 'minted':
         return t('printers.toast.recheckMinted', {
           slot,
-          grams: Math.round(result.label_weight_g ?? 0).toLocaleString(),
+          grams: Math.round(result.label_weight_g ?? 0).toLocaleString(i18n.language),
         });
       case 'identified': {
         const identity = [result.brand, result.material].filter(Boolean).join(' ');
-        return identity
+        if (!identity) return t('printers.toast.recheckIdentifiedUnnamed', { slot });
+        // The verdict reports the identity the wire ALREADY asserts. Whether the
+        // farm also got a fresh read out is a separate fact: the AMS refuses one
+        // while drying, while an identify is in flight, or while the filament is
+        // engaged. Saying "recorded from its tag" in that case would claim a read
+        // that never happened, so the deferral is named instead of hidden.
+        return result.read_issued
           ? t('printers.toast.recheckIdentified', { slot, identity })
-          : t('printers.toast.recheckIdentifiedUnnamed', { slot });
+          : t('printers.toast.recheckIdentifiedNoRead', { slot, identity });
       }
       case 'queued':
         return t('printers.toast.recheckQueued', { slot });
@@ -2772,16 +2786,21 @@ function PrinterCard({
       showToast(recheckSentence(result), 'success');
     },
     onError: (error: Error, { slotId }) => {
-      // The 409 detail is a reason token, not operator copy: name the three the
-      // backend can return and keep the raw string only as the last resort.
+      // Every undo refusal is a STRUCTURED 409 (`{code, message}`), so the reason
+      // is read off `ApiError.code` — a stable token — never off the message. The
+      // message is the backend's English fallback for non-UI clients: matching on
+      // it made this lookup break the moment anyone reworded a sentence, and it
+      // silently degraded to the raw English in every non-en locale.
       const slot = slotId + 1;
       const reasons: Record<string, string> = {
         no_offer: t('printers.toast.recheckUndoNoOffer', { slot }),
         no_predecessor: t('printers.toast.recheckUndoNoPredecessor', { slot }),
         mint_gone: t('printers.toast.recheckUndoMintGone', { slot }),
+        predecessor_bound_elsewhere: t('printers.toast.recheckUndoBoundElsewhere', { slot }),
       };
+      const code = error instanceof ApiError ? error.code : null;
       showToast(
-        reasons[error.message] ??
+        (code ? reasons[code] : undefined) ??
           t('printers.toast.recheckUndoFailed', { slot, detail: error.message }),
         'error',
       );
@@ -2797,12 +2816,15 @@ function PrinterCard({
       if (recheckTimeoutRef.current) {
         clearTimeout(recheckTimeoutRef.current);
       }
+      if (recheckMinTimeRef.current) {
+        clearTimeout(recheckMinTimeRef.current);
+      }
       // Reset state
       seenBusyStateRef.current = false;
       minTimePassedRef.current = false;
       setRecheckingSlot({ amsId, slotId });
       // Minimum display time (2 seconds)
-      setTimeout(() => {
+      recheckMinTimeRef.current = setTimeout(() => {
         minTimePassedRef.current = true;
       }, 2000);
       // Fallback timeout (30 seconds max)
@@ -2815,7 +2837,11 @@ function PrinterCard({
       // acknowledgement carries its own undo. Persistent, because an undo the
       // operator has to catch before it fades is not an undo — the slot card
       // carries the same offer for as long as the backend stands behind it.
-      if (result.verdict === 'minted') invalidateSlotBindingQueries();
+      // A mint rewrites the slot's binding; a `queued` verdict writes only the
+      // durable intent. Both are read back off the assignment rows, so both
+      // refetch — without this the "Re-check pending" line would wait out the
+      // 30 s staleTime before appearing on a click the operator just made.
+      if (result.verdict === 'minted' || result.verdict === 'queued') invalidateSlotBindingQueries();
       if (result.verdict === 'minted' && result.undo_available) {
         showPersistentToast(recheckToastId(amsId, slotId), recheckSentence(result), 'success', {
           actions: [{
@@ -2827,10 +2853,13 @@ function PrinterCard({
       }
       showToast(recheckSentence(result), result.verdict === 'empty' ? 'warning' : 'info');
     },
-    onError: (error: Error) => {
-      showToast(error.message || t('printers.toast.recheckFailed'), 'error');
+    onError: (error: Error, { slotId }) => {
+      showToast(error.message || t('printers.toast.recheckFailed', { slot: slotId + 1 }), 'error');
       if (recheckTimeoutRef.current) {
         clearTimeout(recheckTimeoutRef.current);
+      }
+      if (recheckMinTimeRef.current) {
+        clearTimeout(recheckMinTimeRef.current);
       }
       setRecheckingSlot(null);
     },
@@ -3165,28 +3194,26 @@ function PrinterCard({
   const footerIconButtonClass = '!h-8 !min-h-8 !w-8 !px-0 !py-0';
 
   /**
-   * "New roll…" verb for a slot whose bound spool carries NO RFID tag (W5a).
+   * "New roll…" — THE verb for "the roll on this slot was physically replaced",
+   * for a bound row of EITHER tag-ness (W5a).
    *
-   * A tagged roll announces its own replacement over the wire; an untagged one
-   * cannot, so the operator's click IS the swap signal. Returns `undefined`
-   * (verb hidden) when nothing is bound or the bound row is tagged — the tagged
-   * case is served by "Re-spool tag…" instead.
+   * It replaced two verbs ("Re-spool tag…" on tagged rows, "New roll…" on tagless
+   * ones) that asked the operator the same question and differed only in the
+   * bookkeeping behind it. Tag-ness is not the operator's to classify — the bound
+   * row already carries it and the backend reads it there.
+   *
+   * Returns `undefined` (verb hidden) when nothing is bound: with no row there is
+   * nothing to retire and no key for the call.
    */
-  const newRollAction = (amsId: number, trayId: number, assignment: SpoolAssignment | undefined) => {
+  const newRollAction = (
+    amsId: number,
+    trayId: number,
+    trayCount: number,
+    assignment: SpoolAssignment | undefined,
+  ) => {
     const spool = assignment?.spool;
-    if (!spool || spool.tag_uid) return undefined;
-    return () => setNewRollContext({
-      prompt: {
-        printer_id: printer.id,
-        ams_id: amsId,
-        tray_id: trayId,
-        spool_id: spool.id,
-        remaining_g: Math.round(remainingGrams(spool)),
-        material: spool.material,
-        rgba: spool.rgba,
-      },
-      usedGrams: Math.max(0, Math.round(spool.weight_used ?? 0)),
-    });
+    if (!spool) return undefined;
+    return () => setNewRollContext(manualNewRollContext(printer.id, amsId, trayId, spool, trayCount));
   };
 
   /**
@@ -3201,6 +3228,19 @@ function PrinterCard({
     if (!assignment?.recheck_undo_available) return undefined;
     return () => undoRecheckMutation.mutate({ amsId, slotId: trayId });
   };
+
+  /**
+   * "Re-check pending" line for a slot whose re-check intent is still open.
+   *
+   * A click taken mid-print is ACCEPTED (rule 12): the backend records a durable
+   * per-slot intent, answers `queued`, and concludes it at the next answerable
+   * read — with no announcement, because by then the operator has moved on. So
+   * the outstanding check is carried as a STATE for as long as it stands, read
+   * straight off the backend's derived `recheck_pending`; it disappears by
+   * itself when the intent concludes. Returns `undefined` when none is open.
+   */
+  const recheckPendingNote = (assignment: SpoolAssignment | undefined): string | undefined =>
+    assignment?.recheck_pending ? t('printers.rfid.recheckPending') : undefined;
 
   /**
    * A binding that outlived the filament, for the EMPTY-slot hover card (W5a).
@@ -3228,6 +3268,19 @@ function PrinterCard({
     };
   };
 
+  /**
+   * Accessible name shared by a slot's hover trigger and the card it opens.
+   * Names the unit, the 1-based slot and what the slot holds, because that card
+   * is the ONLY home of the slot's actions — an unnamed trigger hides "Re-check
+   * slot", Load, Unload and the rest from anyone not using a mouse.
+   */
+  const slotCardLabel = (
+    amsId: number,
+    trayCount: number,
+    slot: number | string,
+    content: string,
+  ) => t('ams.slotDialogLabel', { ams: getAmsLabel(amsId, trayCount), slot, content });
+
   const renderAmsSlotActions = ({
     amsId,
     slotId,
@@ -3247,27 +3300,35 @@ function PrinterCard({
   }) => {
     const printerBusy = status?.state === 'RUNNING';
 
-    // "Re-check slot" is refused by the AMS itself in two states, and the refusal
-    // used to arrive only server-side ("Please unload filament first") after the
-    // operator had already clicked — the dominant silent no-op on this menu. Both
-    // conditions are visible on the live status, so the button states the reason
-    // up front instead of failing behind the operator's back.
-    //   * filament engaged: the printer is feeding SOME tray (tray_now != 255).
-    //     Read raw, never the flicker-cached tray_now — a cached value would
-    //     disable the button on a printer that is no longer feeding anything.
-    //   * drying: the AMS holds a hard write-lockout for the whole dry cycle.
-    const filamentEngaged = status?.tray_now !== undefined && status.tray_now !== 255;
+    // "Re-check slot" is offered THROUGH a print. A running printer and engaged
+    // filament used to disable it, on the reasoning that the AMS refuses to read
+    // a tag in either state — but a refused read is not a refused CHECK: the
+    // backend records a durable per-slot intent, answers `queued`, and concludes
+    // it at the next answerable read (rule 12). Disabling the button made the
+    // queued path — the whole reason the intent table exists — unreachable, so
+    // neither condition gates the click any more; they only move the answer
+    // later, which the title says.
+    //
+    // What still blocks:
+    //   * permission: no `printers:ams_rfid`, nothing to queue.
+    //   * drying: the AMS holds a hard write-lockout for the whole dry cycle,
+    //     and the intent lane is not a way around a lockout.
+    //   * an intent already standing on this slot: a second click would record
+    //     nothing new, so the verb reports the state instead of re-offering.
     const amsDrying = (amsData.find((u) => u.id === amsId)?.dry_time ?? 0) > 0;
-    const rfidBlockReason = printerBusy
-      ? t('printers.bedJog.disabledWhilePrinting')
-      : !hasPermission('printers:ams_rfid')
-        ? t('printers.permission.noAmsRfid')
-        : amsDrying
-          ? t('printers.rfid.disabledWhileDrying')
-          : filamentEngaged
-            ? t('printers.rfid.disabledFilamentEngaged')
-            : undefined;
+    const recheckPending = !!onGetAssignment?.(printer.id, amsId, slotId)?.recheck_pending;
+    const rfidBlockReason = !hasPermission('printers:ams_rfid')
+      ? t('printers.permission.noAmsRfid')
+      : amsDrying
+        ? t('printers.rfid.disabledWhileDrying')
+        : recheckPending
+          ? t('printers.rfid.recheckPending')
+          : undefined;
     const rfidDisabled = !!rfidBlockReason;
+    // Nothing blocking, but a print in flight: the click lands, it just lands
+    // late. Say so up front rather than letting the queued verdict be a surprise.
+    const rfidTitle =
+      rfidBlockReason ?? (isPrintingOrPaused ? t('printers.rfid.recheckQueuedTooltip') : undefined);
 
     return (
       <>
@@ -3280,7 +3341,7 @@ function PrinterCard({
         )}
         {includeRfid && (
           <button
-            className={`w-full px-2 py-1.5 text-left text-xs flex items-center gap-2 rounded transition-colors ${
+            className={`w-full px-2 py-1.5 text-left text-xs flex items-center gap-2 rounded transition-colors ${HOVER_CARD_CONTROL_FOCUS} ${
               rfidDisabled
                 ? 'text-bambu-gray/50 cursor-not-allowed'
                 : 'text-white hover:bg-bambu-dark-tertiary'
@@ -3291,14 +3352,18 @@ function PrinterCard({
               recheckAmsSlotMutation.mutate({ amsId, slotId });
             }}
             disabled={rfidDisabled || isRechecking}
-            title={rfidBlockReason}
+            title={rfidTitle}
           >
-            <RefreshCw className={`w-3 h-3 ${isRechecking ? 'animate-spin' : ''}`} />
-            {t('printers.rfid.recheck')}
+            {recheckPending ? (
+              <Clock className="w-3 h-3" />
+            ) : (
+              <RefreshCw className={`w-3 h-3 ${isRechecking ? 'animate-spin' : ''}`} />
+            )}
+            {recheckPending ? t('printers.rfid.recheckPending') : t('printers.rfid.recheck')}
           </button>
         )}
         <button
-          className={`w-full px-2 py-1.5 text-left text-xs flex items-center gap-2 rounded transition-colors ${
+          className={`w-full px-2 py-1.5 text-left text-xs flex items-center gap-2 rounded transition-colors ${HOVER_CARD_CONTROL_FOCUS} ${
             hasPermission('printers:control')
               ? 'text-white hover:bg-bambu-dark-tertiary'
               : 'text-bambu-gray/50 cursor-not-allowed'
@@ -3314,26 +3379,48 @@ function PrinterCard({
           <LogIn className="w-3 h-3" />
           {t('printers.ams.load')}
         </button>
-        <button
-          className={`w-full px-2 py-1.5 text-left text-xs flex items-center gap-2 rounded transition-colors ${
-            hasPermission('printers:control')
-              ? 'text-white hover:bg-bambu-dark-tertiary'
-              : 'text-bambu-gray/50 cursor-not-allowed'
-          }`}
-          onClick={(e) => {
-            e.stopPropagation();
-            if (printerBusy || !hasPermission('printers:control')) return;
-            unloadAmsMutation.mutate();
-          }}
-          disabled={printerBusy || !hasPermission('printers:control')}
-          title={printerBusy ? t('printers.bedJog.disabledWhilePrinting') : !hasPermission('printers:control') ? t('printers.permission.noControl') : undefined}
-        >
-          <LogOut className="w-3 h-3" />
-          {t('printers.ams.unload')}
-        </button>
       </>
     );
   };
+
+  /**
+   * "Unload" for a whole AMS unit, rendered ONCE in its header.
+   *
+   * `POST /printers/{id}/ams/unload` takes no tray argument — it retracts whatever
+   * filament is currently loaded into the toolhead — so the verb is printer-level,
+   * not per slot. It used to render inside EVERY slot's action list, four identical
+   * copies per unit, which read as an offer to unload THAT slot; the wire has no
+   * way to express that. "Load" stays per slot because it does take a tray.
+   */
+  const amsUnloadButton = (() => {
+    const printerBusy = status?.state === 'RUNNING';
+    const blocked = printerBusy || !hasPermission('printers:control');
+    return (
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          if (blocked) return;
+          unloadAmsMutation.mutate();
+        }}
+        disabled={blocked}
+        aria-label={t('printers.ams.unload')}
+        title={
+          printerBusy
+            ? t('printers.bedJog.disabledWhilePrinting')
+            : !hasPermission('printers:control')
+              ? t('printers.permission.noControl')
+              : t('printers.ams.unload')
+        }
+        className={`ml-1 flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] transition-colors ${HOVER_CARD_CONTROL_FOCUS} ${
+          blocked
+            ? 'bg-bambu-dark text-bambu-gray/50 cursor-not-allowed'
+            : 'bg-bambu-dark text-bambu-gray hover:text-white hover:bg-bambu-dark/80'
+        }`}
+      >
+        <LogOut className="w-3 h-3" />
+      </button>
+    );
+  })();
 
   const printerActionsMenu = (
     <div ref={printerActionsMenuRef} className="relative flex-shrink-0">
@@ -5109,6 +5196,9 @@ function PrinterCard({
                                   )}
                                 </div>
                               )}
+                              {/* Unload is printer-level (no tray argument), so it
+                                  belongs to the unit, not to each of its slots. */}
+                              {amsUnloadButton}
                             </div>
                             {/* Drying status bar */}
                             {ams.dry_time > 0 && (
@@ -5283,6 +5373,8 @@ function PrinterCard({
                                     {filamentData ? (
                                       <FilamentHoverCard
                                         data={filamentData}
+                                        label={slotCardLabel(ams.id, ams.tray.length, slotIdx + 1, tray?.tray_type || filamentData.profile)}
+                                        pendingNote={recheckPendingNote(inventoryAssignment)}
                                         actions={renderAmsSlotActions({
                                           amsId: ams.id,
                                           slotId: slotIdx,
@@ -5368,22 +5460,7 @@ function PrinterCard({
                                               },
                                             }),
                                             onUnassignSpool: (assignment && !isBambuLabSpool(tray)) ? () => onUnassignSpool?.(printer.id, ams.id, slotIdx) : undefined,
-                                            onRespoolTag: isBambuLabSpool(tray) ? () => setRespoolContext({
-                                              printer_id: printer.id,
-                                              ams_id: ams.id,
-                                              tray_id: slotIdx,
-                                              tag_uid: tray?.tag_uid ?? null,
-                                              tray_uuid: tray?.tray_uuid ?? null,
-                                              tray_type: tray?.tray_type ?? null,
-                                              tray_color: tray?.tray_color ?? null,
-                                              tray_sub_brands: tray?.tray_sub_brands ?? null,
-                                              tray_count: ams.tray.length,
-                                              donor_spool_id: null,
-                                              donor_remaining_g: null,
-                                              brand_prefill: null,
-                                              label_weight_prefill: null,
-                                            }) : undefined,
-                                            onNewRoll: newRollAction(ams.id, slotIdx, assignment),
+                                            onNewRoll: newRollAction(ams.id, slotIdx, ams.tray.length, assignment),
                                             onRestorePreviousRoll: recheckUndoAction(ams.id, slotIdx, assignment),
                                             isAssigned: !!assignment || isBambuLabSpool(tray),
                                           };
@@ -5409,8 +5486,9 @@ function PrinterCard({
                                     ) : (
                                       <EmptySlotHoverCard
                                         kind={emptyKind ?? undefined}
+                                        label={slotCardLabel(ams.id, ams.tray.length, slotIdx + 1, t(emptySlotLabelKey(emptyKind)))}
                                         binding={emptySlotBinding(inventoryAssignment, emptyKind)}
-                                        onClearSlot={() => onUnassignSpool?.(printer.id, ams.id, slotIdx)}
+                                        onUnassignSpool={() => onUnassignSpool?.(printer.id, ams.id, slotIdx)}
                                         actions={renderAmsSlotActions({
                                           amsId: ams.id,
                                           slotId: slotIdx,
@@ -5636,6 +5714,7 @@ function PrinterCard({
                                   </button>
                                 </div>
                               )}
+                              {amsUnloadButton}
                             </div>
                             {/* HT AMS drying status bar */}
                             {ams.dry_time > 0 && (
@@ -5675,6 +5754,8 @@ function PrinterCard({
                                 {filamentData ? (
                                   <FilamentHoverCard
                                     data={filamentData}
+                                    label={slotCardLabel(ams.id, ams.tray.length, htSlotId + 1, tray?.tray_type || filamentData.profile)}
+                                    pendingNote={recheckPendingNote(htInventoryAssignment)}
                                     actions={renderAmsSlotActions({
                                       amsId: ams.id,
                                       slotId: htSlotId,
@@ -5755,22 +5836,7 @@ function PrinterCard({
                                           },
                                         }),
                                         onUnassignSpool: (assignment && !isBambuLabSpool(tray)) ? () => onUnassignSpool?.(printer.id, ams.id, htSlotId) : undefined,
-                                        onRespoolTag: isBambuLabSpool(tray) ? () => setRespoolContext({
-                                          printer_id: printer.id,
-                                          ams_id: ams.id,
-                                          tray_id: htSlotId,
-                                          tag_uid: tray?.tag_uid ?? null,
-                                          tray_uuid: tray?.tray_uuid ?? null,
-                                          tray_type: tray?.tray_type ?? null,
-                                          tray_color: tray?.tray_color ?? null,
-                                          tray_sub_brands: tray?.tray_sub_brands ?? null,
-                                          tray_count: ams.tray.length,
-                                          donor_spool_id: null,
-                                          donor_remaining_g: null,
-                                          brand_prefill: null,
-                                          label_weight_prefill: null,
-                                        }) : undefined,
-                                        onNewRoll: newRollAction(ams.id, htSlotId, assignment),
+                                        onNewRoll: newRollAction(ams.id, htSlotId, ams.tray.length, assignment),
                                         onRestorePreviousRoll: recheckUndoAction(ams.id, htSlotId, assignment),
                                         isAssigned: !!assignment || isBambuLabSpool(tray),
                                       };
@@ -5796,8 +5862,9 @@ function PrinterCard({
                                 ) : (
                                   <EmptySlotHoverCard
                                     kind={emptyKind ?? undefined}
+                                    label={slotCardLabel(ams.id, ams.tray.length, htSlotId + 1, t(emptySlotLabelKey(emptyKind)))}
                                     binding={emptySlotBinding(htInventoryAssignment, emptyKind)}
-                                    onClearSlot={() => onUnassignSpool?.(printer.id, ams.id, htSlotId)}
+                                    onUnassignSpool={() => onUnassignSpool?.(printer.id, ams.id, htSlotId)}
                                     actions={renderAmsSlotActions({
                                       amsId: ams.id,
                                       slotId: htSlotId,
@@ -5870,6 +5937,7 @@ function PrinterCard({
                         <div style={getAmsCardStyle(status.vt_tray.length)} className="min-w-0 p-2 bg-bambu-dark rounded-[10px] space-y-1">
                           <div className="flex w-full min-h-7 items-center gap-1.5 rounded-lg bg-bambu-dark-secondary px-2 py-1">
                             <span className="block min-w-0 flex-1 truncate text-[10px] text-white font-medium">{t('printers.external')}</span>
+                            {amsUnloadButton}
                           </div>
                           <div className={`grid w-full ${status.vt_tray.length > 1 ? 'grid-cols-[repeat(2,minmax(3.5rem,1fr))]' : 'grid-cols-[minmax(3.5rem,1fr)]'} gap-1`}>
                             {[...status.vt_tray].sort((a, b) => (a.id ?? 254) - (b.id ?? 254)).map((extTray) => {
@@ -5975,6 +6043,7 @@ function PrinterCard({
                                   {!isEmpty ? (
                                     <FilamentHoverCard
                                       data={extFilamentData}
+                                      label={slotCardLabel(255, 1, isDualNozzle ? (extTrayId === 254 ? 'L' : 'R') : slotTrayId + 1, extTray.tray_type || extFilamentData.profile)}
                                       actions={renderAmsSlotActions({
                                         amsId: 255,
                                         slotId: slotTrayId,
@@ -6055,22 +6124,7 @@ function PrinterCard({
                                             },
                                           }),
                                           onUnassignSpool: (assignment && !isBambuLabSpool(extTray)) ? () => onUnassignSpool?.(printer.id, 255, slotTrayId) : undefined,
-                                          onRespoolTag: isBambuLabSpool(extTray) ? () => setRespoolContext({
-                                            printer_id: printer.id,
-                                            ams_id: 255,
-                                            tray_id: slotTrayId,
-                                            tag_uid: extTray.tag_uid ?? null,
-                                            tray_uuid: extTray.tray_uuid ?? null,
-                                            tray_type: extTray.tray_type ?? null,
-                                            tray_color: extTray.tray_color ?? null,
-                                            tray_sub_brands: extTray.tray_sub_brands ?? null,
-                                            tray_count: null,
-                                            donor_spool_id: null,
-                                            donor_remaining_g: null,
-                                            brand_prefill: null,
-                                            label_weight_prefill: null,
-                                          }) : undefined,
-                                          onNewRoll: newRollAction(255, slotTrayId, assignment),
+                                          onNewRoll: newRollAction(255, slotTrayId, 1, assignment),
                                           onRestorePreviousRoll: recheckUndoAction(255, slotTrayId, assignment),
                                           isAssigned: !!assignment || isBambuLabSpool(extTray),
                                         };
@@ -6096,8 +6150,9 @@ function PrinterCard({
                                   ) : (
                                     <EmptySlotHoverCard
                                       kind={emptyKind ?? undefined}
+                                      label={slotCardLabel(255, 1, isDualNozzle ? (extTrayId === 254 ? 'L' : 'R') : slotTrayId + 1, t(emptySlotLabelKey(emptyKind)))}
                                       binding={emptySlotBinding(extInventoryAssignment, emptyKind)}
-                                      onClearSlot={() => onUnassignSpool?.(printer.id, 255, slotTrayId)}
+                                      onUnassignSpool={() => onUnassignSpool?.(printer.id, 255, slotTrayId)}
                                       actions={renderAmsSlotActions({
                                         amsId: 255,
                                         slotId: slotTrayId,
@@ -7078,17 +7133,9 @@ function PrinterCard({
         />
       )}
 
-      {/* Re-spool Tag Modal (manual tray action) */}
-      <RespoolTagModal
-        context={respoolContext}
-        onClose={() => setRespoolContext(null)}
-      />
-
-      {/* New-roll Modal (manual tray action on a TAGLESS slot, W5a) */}
-      <TaglessFreshModal
-        context={newRollContext?.prompt ?? null}
-        usedGrams={newRollContext?.usedGrams ?? null}
-        manual
+      {/* "New roll…" — the one manual slot verb, both ledger lanes (W5a) */}
+      <NewRollModal
+        context={newRollContext}
         onClose={() => setNewRollContext(null)}
       />
 

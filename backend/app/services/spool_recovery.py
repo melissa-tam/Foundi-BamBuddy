@@ -157,7 +157,7 @@ from backend.app.services.hms_errors import (
     mechanical_feed_short_codes,
 )
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.spool_respool import _decode_global_tray
+from backend.app.services.spool_respool import decode_global_tray, encode_global_tray
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -1197,6 +1197,44 @@ def _resolve_jammed_tray(
     return None, "none"
 
 
+def _dual_nozzle_feeders(state, printer_id: int | None) -> list[int]:
+    """Every extruder's own feeder on a DUAL-NOZZLE machine, from the per-extruder map.
+
+    ``state.tray_now`` is a SINGLE value, and on an H2C/H2D it describes only whichever
+    hotend is active — so a slot feeding the OTHER nozzle reads as "not feeding" and every
+    consumer of :func:`_feeder_before_edge` silently answers False for it. The wire carries
+    the honest answer: ``bambu_mqtt`` normalizes ``device.extruder.info[N].snow`` into
+    ``PrinterState.h2d_extruder_snow`` (``{extruder_id: global_tray}``) on exactly these
+    machines. A slot feeding EITHER nozzle was feeding.
+
+    Gated on ``BambuMQTTClient.is_dual_nozzle`` — the public topology question, which is
+    also the fork's stated rule that "the nozzle TOPOLOGY changes what a wire field is
+    allowed to mean". Read through the client because the flag is runtime wire state and
+    ``PrinterState`` does not carry it; ``printer_id`` is therefore required for this
+    witness, and a caller that cannot supply one (or a disconnected client) simply
+    contributes nothing here and falls back to the single-tray path.
+
+    Empty list = no per-extruder evidence: a single-nozzle printer, a dual-nozzle one whose
+    firmware has not sent the extruder block yet, or an unreadable client. Never raises.
+    """
+    if printer_id is None:
+        return []
+    try:
+        client = printer_manager.get_client(printer_id)
+        if client is None or not client.is_dual_nozzle:
+            return []
+        snow = getattr(state, "h2d_extruder_snow", None) or {}
+        feeders: list[int] = []
+        for value in snow.values():
+            tray = _valid_feeder(value)
+            if tray is not None and tray not in feeders:
+                feeders.append(tray)
+        return feeders
+    except Exception:  # noqa: BLE001 — an unreadable topology contributes no evidence
+        logger.exception("spool_recovery: per-extruder feeder read failed for printer %s", printer_id)
+        return []
+
+
 def _feeder_before_edge(state, *, item: PrintQueueItem | None = None, printer_id: int | None = None) -> int | None:
     """Which global tray was feeding IMMEDIATELY BEFORE an AMS presence edge, or None.
 
@@ -1222,6 +1260,11 @@ def _feeder_before_edge(state, *, item: PrintQueueItem | None = None, printer_id
     an ambiguous answer here would either accuse a healthy slot or exonerate the
     draining one, and the caller's fallback (the live-HMS runout evidence, once the
     firmware speaks ~3 minutes later) is the honest second chance.
+
+    SINGLE-tray by contract, and that is why it cannot answer a dual-nozzle machine on its
+    own: two hotends can be feeding at once, so "the feeder" is not a well-formed question
+    there. :func:`slot_was_feeding` asks the per-extruder witness separately
+    (:func:`_dual_nozzle_feeders`) and treats this as the fallback tier.
     """
     fed = _valid_feeder(getattr(state, "last_loaded_tray", None))
     if fed is not None:
@@ -1232,25 +1275,42 @@ def _feeder_before_edge(state, *, item: PrintQueueItem | None = None, printer_id
     return _valid_feeder(getattr(state, "tray_now", None))
 
 
-def slot_was_feeding(state, ams_id: int, tray_id: int, *, item: PrintQueueItem | None = None) -> bool:
+def slot_was_feeding(
+    state, ams_id: int, tray_id: int, *, item: PrintQueueItem | None = None, printer_id: int | None = None
+) -> bool:
     """Was ``(ams_id, tray_id)`` the active feeder, as of just before now?
 
     The public verb ``ams_presence`` asks at a presence-LOSS edge (its de-bounce lane's
     runout-suspect stamp). It lives HERE because feeder resolution is this module's, and
     a second resolver in the presence lane would be the drift the fork forbids —
     :func:`_feeder_before_edge` composes the same witnesses, and the comparison rides
-    ``spool_respool._decode_global_tray``, the one origin for the global-tray encoding.
+    ``spool_respool.decode_global_tray``, the one origin for the global-tray encoding.
+
+    ``printer_id`` unlocks two witnesses that are unreachable from ``state`` alone, and
+    both were silently missing before 2026-08-20:
+
+    * the job's SLICER mapping (``_job_feeders`` → ``_slicer_mapping``), which the client
+      captures off the request topic — so the contracted order "``last_loaded_tray`` +
+      mapping AHEAD of ``tray_now``" only actually had its mapping tier for callers that
+      passed an ``item``;
+    * the DUAL-NOZZLE per-extruder feeders (:func:`_dual_nozzle_feeders`), asked FIRST
+      because a positive there is a direct wire statement about a specific hotend, while
+      everything ``_feeder_before_edge`` composes is a single-value approximation of a
+      two-value fact.
 
     Never raises: an unreadable state answers False (not evidence of a feed).
     """
     try:
-        feeder = _feeder_before_edge(state, item=item)
+        for feeder in _dual_nozzle_feeders(state, printer_id):
+            if decode_global_tray(feeder) == (ams_id, tray_id):
+                return True
+        feeder = _feeder_before_edge(state, item=item, printer_id=printer_id)
     except Exception:  # noqa: BLE001 — a predicate for a callback may never raise
         logger.exception("spool_recovery: feeder resolution failed for AMS%d-T%d", ams_id, tray_id)
         return False
     if feeder is None:
         return False
-    return _decode_global_tray(feeder) == (ams_id, tray_id)
+    return decode_global_tray(feeder) == (ams_id, tray_id)
 
 
 async def _route_fault(
@@ -1913,7 +1973,7 @@ def _ams_unit_for_tray(global_tray: int | None) -> int:
     have no unit and map to the client's own 255 sentinel, for which the unit-scoped
     drying hazard is vacuously false.
     """
-    ams_id, _tray_id = _decode_global_tray(global_tray)
+    ams_id, _tray_id = decode_global_tray(global_tray)
     return 255 if ams_id is None else ams_id
 
 
@@ -2113,7 +2173,7 @@ async def _requirement_from_assignment(incident: RecoveryIncident) -> dict | Non
     rgba). ``None`` when the tray decodes to no AMS slot or has no bound spool."""
     if incident.jammed_global_tray is None:
         return None
-    ams_id, tray_id = _decode_global_tray(incident.jammed_global_tray)
+    ams_id, tray_id = decode_global_tray(incident.jammed_global_tray)
     if ams_id is None:
         return None
     from backend.app.core.database import async_session
@@ -2383,7 +2443,11 @@ async def _log_tray_snapshot(incident: RecoveryIncident) -> None:
                 tray_id = int(tray.get("id", -1))
             except (TypeError, ValueError):
                 continue
-            global_tray = ams_id if ams_id >= 128 else ams_id * 4 + tray_id
+            # Invariant 1: the codec is the one origin for this arithmetic. It knows the
+            # AMS-HT and vt_tray conventions a bare ``ams_id * 4 + tray_id`` drops, and
+            # fails CLOSED (``None``) on a slot it cannot name rather than fabricating a
+            # label that would compare equal to some real slot in this very line.
+            global_tray = encode_global_tray(ams_id, tray_id)
             tt = (tray.get("tray_type") or "") or "-"
             col = tray.get("tray_color") or "-"
             rows.append(
@@ -2555,7 +2619,7 @@ async def _mark_out_of_rotation(incident: RecoveryIncident, global_tray: int, *,
     from backend.app.models.printer import Printer
     from backend.app.services.notification_service import notification_service
 
-    ams_id, tray_id = _decode_global_tray(global_tray)
+    ams_id, tray_id = decode_global_tray(global_tray)
     slot_desc = f"AMS{ams_id} slot {tray_id}" if ams_id is not None else f"tray {global_tray}"
     spool_desc = f"tray {global_tray}"
     try:
@@ -2612,7 +2676,7 @@ async def _describe_slot(db: AsyncSession, printer_id: int, global_tray: int | N
     """Human description of the spool bound to a slot (for notifications)."""
     if global_tray is None:
         return "unknown spool"
-    ams_id, tray_id = _decode_global_tray(global_tray)
+    ams_id, tray_id = decode_global_tray(global_tray)
     if ams_id is None:
         return f"tray {global_tray}"
     res = await db.execute(
@@ -2692,7 +2756,7 @@ async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = T
                 if jammed is None:
                     slot_desc = "the same slot"
                 else:
-                    ams_id, tray_id = _decode_global_tray(jammed)
+                    ams_id, tray_id = decode_global_tray(jammed)
                     slot_desc = f"AMS{ams_id} slot {tray_id}" if ams_id is not None else f"tray {jammed}"
                 spool_desc = await _describe_slot(db, incident.printer_id, jammed)
                 printer = await db.get(Printer, incident.printer_id)
@@ -2925,7 +2989,7 @@ async def _clear_oor_if_resumed_on_jammed_feeder(db: AsyncSession, incident: Rec
         return
     if getattr(st, "tray_now", None) != jammed:
         return
-    ams_id, tray_id = _decode_global_tray(jammed)
+    ams_id, tray_id = decode_global_tray(jammed)
     if ams_id is None or tray_id is None:
         return
     tray = _live_tray_dict(st, ams_id, tray_id) or {}

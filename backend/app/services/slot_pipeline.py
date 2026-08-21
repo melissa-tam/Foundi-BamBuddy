@@ -78,7 +78,14 @@ from backend.app.core.websocket import ws_manager
 from backend.app.models.printer_incident import KIND_RUNOUT, PrinterIncident
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import ams_presence, printer_incidents, slot_recheck, spool_binding, spool_tagless
+from backend.app.services import (
+    ams_presence,
+    hms_errors,
+    printer_incidents,
+    slot_recheck,
+    spool_binding,
+    spool_tagless,
+)
 from backend.app.services.slot_state import (
     BindingView,
     Decision,
@@ -92,6 +99,7 @@ from backend.app.services.slot_state import (
     resolve,
 )
 from backend.app.services.spool_binding import NEVER_FED_MAX_G, bind_spool_to_slot, release_spool_from_slot
+from backend.app.services.spool_respool import encode_global_tray
 from backend.app.services.spool_tag_matcher import (
     create_spool_from_tray,
     find_matching_untagged_spool,
@@ -834,42 +842,74 @@ async def _debounce_candidate(db: AsyncSession, obs: TrayObservation) -> Spool |
       not reconcile a tag-bound row. Doctrine rule 11: an assumption may not speak for a roll
       that can speak for itself.
 
-    Archived and spent rows stay excluded (a retired roll may not take a slot; a spent one
-    belongs to the W1 latch, and that filter is precisely why a runout whose stamp already
-    landed MINTS — scenario T6). A donor BOUND SOMEWHERE ELSE stays excluded too, as an
-    evidence-tier rule rather than an optimisation: assumption-tier evidence may displace
-    nothing a live binding holds (invariant 11; the spool-211 ping-pong, shape 26). With no
-    surviving donor, None is the doctrine-correct answer and the table mints.
+    Archived, spent and bound-elsewhere rows are all REFUSED — but they are refused in
+    PYTHON, on the one row the query returned, and never filtered out in SQL. That
+    distinction is the whole of the "never scanned past" clause and it is not a style
+    preference: a ``WHERE`` clause does not skip an ineligible row, it makes it INVISIBLE,
+    so the query silently answers with the newest row that happens to PASS — an OLDER
+    residue of the same slot, a different physical roll. The shipped filters did exactly
+    that: a just-drained roll (released inside the ~3-minute bay-clear→HMS gap, so not yet
+    spent... and then spent moments later) was stepped over onto a healthy shelf roll that
+    once sat in the same tray, and THAT row was reclaimed onto the brand-new one. Nothing
+    could heal it afterwards, because the reclaimed row never runs out.
+
+    So each refusal is now a stated conclusion with its own log line:
+
+    * ARCHIVED — retired inventory may not take a slot;
+    * SPENT — the W1 latch owns a drained row, which is why a runout whose stamp has
+      already landed MINTS (scenario T6);
+    * BOUND ELSEWHERE — assumption-tier evidence may displace nothing a live binding holds
+      (invariant 11; the spool-211 ping-pong, shape 26). A slot MOVE stamps the OLD slot's
+      breadcrumb, so this is an ordinary shape, not an exotic one.
+
+    With no surviving donor, None is the doctrine-correct answer and the table mints.
     """
     printer_id, ams_id, tray_id = obs.slot
     res = await db.execute(
         spool_binding.last_released_from_slot_stmt(printer_id, ams_id, tray_id)
-        .options(selectinload(Spool.k_profiles), selectinload(Spool.assignments))
-        .where(
-            Spool.archived_at.is_(None),
-            Spool.spent_at.is_(None),
-            # Bound elsewhere ⇒ not a donor (invariant 11, shape 26).
-            ~Spool.assignments.any(),
-        )
+        .options(selectinload(Spool.k_profiles))
         .limit(1)
     )
     donor = res.scalars().first()
     if donor is None:
         return None
     # Adjudicate the ONE row; never fall through to an older one (operator ruling 15).
-    if not is_tagless_spool(donor):
+    refusal: str | None = None
+    if donor.archived_at is not None:
+        refusal = "ARCHIVED (retired inventory never takes a slot)"
+    elif donor.spent_at is not None:
+        refusal = "SPENT (the drained roll belongs to the W1 latch — scenario T6)"
+    elif spool_binding.bound_elsewhere(donor):
+        refusal = "BOUND ELSEWHERE (invariant 11 — a breadcrumb displaces no live binding)"
+    elif not is_tagless_spool(donor):
+        refusal = "TAGGED (rule 11 — its own tag outranks a breadcrumb)"
+    if refusal is not None:
         logger.info(
-            "[slot-state] printer=%d A%dT%d de-bounce refused: donor spool %d is TAGGED "
-            "(rule 11 — its own tag outranks a breadcrumb)",
+            "[slot-state] printer=%d A%dT%d de-bounce refused: this slot's last occupant, spool %d, is %s "
+            "— minting rather than reaching past it to an older residue",
             printer_id,
             ams_id,
             tray_id,
             donor.id,
+            refusal,
         )
         return None
     if not _fingerprint_compatible(obs, donor):
         return None
     return donor
+
+
+def _live_hms(deps: PipelineDeps) -> list:
+    """The printer's live ``state.hms_errors`` list, or empty. Never raises.
+
+    Guarded on its own for the same reason :func:`_mask_facts` is: a disconnecting client
+    is missing EVIDENCE, and missing evidence must read as "nothing standing", never as an
+    exception on the AMS callback path (invariant 10).
+    """
+    try:
+        return list(getattr(getattr(deps.client, "state", None), "hms_errors", None) or [])
+    except Exception:  # noqa: BLE001 — an unreadable client asserts nothing
+        return []
 
 
 def _runout_suspect(obs: TrayObservation, deps: PipelineDeps, incident: PrinterIncident | None) -> bool:
@@ -889,35 +929,68 @@ def _runout_suspect(obs: TrayObservation, deps: PipelineDeps, incident: PrinterI
     the lane to short gaps CONCENTRATES that case, because a refill on a slot the AMS is
     demanding is precisely a fast return (scenarios T7/T8).
 
-    Two evidences, either sufficient:
+    THREE evidences, any one sufficient, each covering what the others structurally cannot.
+    All three are matched on THIS EXACT SLOT, never blanket-per-printer: a genuine glitch on
+    slot 2 while slot 3 is held for a runout must still de-bounce, and over-suspecting mints
+    a part-used roll back to label weight, which is the unsafe direction.
 
-    * **After the HMS** — an OPEN ``runout`` incident naming this exact slot. Matched on the
-      slot, never blanket-per-printer: a genuine glitch on slot 2 while slot 3 is held for a
-      runout must still de-bounce, and over-suspecting mints a part-used roll back to label
-      weight, which is the unsafe direction.
     * **Inside the gap** — the slot was the ACTIVE FEEDER of a live print when its presence
-      was lost (``ams_presence.reseat_under_active_feed``, stamped at the loss edge by
-      ``spool_recovery.slot_was_feeding``). A slot that loses presence while it is feeding is
-      running out or being pulled mid-print; neither is a glitch.
+      was lost (``ams_presence.reseat_under_active_feed``, the gain-side readback of the
+      loss-edge stamp ``spool_recovery.slot_was_feeding`` wrote). A slot that loses presence
+      while it is feeding is running out or being pulled mid-print; neither is a glitch.
+      Blind when a firmware auto-refill moved the feed to a backup BEFORE the bit cleared,
+      and erased entirely by a restart inside the gap.
+    * **On the wire, right now** — the firmware is standing on a slot-attributed runout for
+      this slot (``hms_errors.runout_standing_for_slot`` over the live HMS list). This is
+      the arm that covers a CASCADE's second slot and a printer whose one open incident is
+      a JAM, because an incident row is bounded to ONE OPEN PER PRINTER by design
+      (``printer_incident``'s partial unique index) while the wire keeps naming every dry
+      slot independently. It also survives what the loss edge cannot: it is re-read from the
+      live push on every pass, so a restart re-derives it for free.
+    * **After the HMS** — an OPEN ``runout`` incident naming this exact slot. Kept beside
+      the wire arm rather than replaced by it: the incident is the farm's DURABLE record of
+      a hold, and a firmware that clears its HMS while the print is still held (a demand
+      that goes CLEAR while PAUSEd — the refill-done evidence the resume lane watches for)
+      would otherwise take the suspicion away at exactly the moment the operator is
+      standing at the printer with a fresh roll.
 
-    Deliberately NOT exhaustive: a firmware auto-refill that switches to a backup BEFORE the
-    bit clears leaves no feeder evidence at the loss edge, and a restart inside the gap loses
-    the stamp entirely. Those cases still de-bounce, and are caught by the SECOND layer —
-    the physical cycle survives an unbound resolution, so the runout's spent stamp drives
-    ``REPLACE_SPENT`` on the very next push (scenarios T8b/T8c). Prevention where the cause
-    is visible; repair where it is not.
+    Still not exhaustive, and the SECOND layer is what makes that acceptable: the physical
+    cycle survives an unbound resolution, so a runout whose spent stamp lands after a
+    de-bounce drives ``REPLACE_SPENT`` on the very next push (scenarios T8b/T8c). Prevention
+    where the cause is visible; repair where it is not.
     """
     printer_id, ams_id, tray_id = obs.slot
     if ams_presence.reseat_under_active_feed(printer_id, ams_id, tray_id):
         return True
+    try:
+        if hms_errors.runout_standing_for_slot(_live_hms(deps), ams_id, tray_id):
+            return True
+    except Exception:  # noqa: BLE001 — an undecodable HMS list is no evidence, never a crash
+        logger.exception("[slot-state] live runout decode failed for printer %d A%dT%d", printer_id, ams_id, tray_id)
     if incident is None or incident.kind != KIND_RUNOUT:
         return False
-    # Global tray convention: ams_id * 4 + tray_id (external holders are 254+).
-    return incident.slot_global_tray == ams_id * 4 + tray_id
+    # Through the fork's ONE global-tray codec (invariant 1): the bare ``ams_id * 4``
+    # arithmetic that used to sit here is wrong for an AMS-HT unit (``global == ams_id``)
+    # and for the external holder (254/255), so on those topologies it compared the
+    # incident's honest global id against a fabricated one and answered False forever.
+    return incident.slot_global_tray == encode_global_tray(ams_id, tray_id)
 
 
 async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: BindingView | None) -> ResolutionContext:
     printer_id, ams_id, tray_id = obs.slot
+
+    # Row 1's inputs FIRST. All three are cheap, synchronous, in-memory reads, and the
+    # table returns DEFER on any of them before it looks at a single other field
+    # (``slot_state.resolve``: drying → identify_in_flight → settling, ahead of even a
+    # perfect tag match). Evaluating them here is a pure reorder — the ResolutionContext
+    # this builds is identical either way — but it lets the de-bounce lane's DB work be
+    # skipped for a slot whose decision is already made. A drying unit or a settling
+    # insertion is the steady state for minutes at a time on a busy printer, at ~1 Hz per
+    # slot, so this is a query per push per slot that could never influence anything.
+    drying = _drying(deps, ams_id)
+    identify_in_flight = _identify_in_flight(deps, ams_id)
+    settling = _settling(printer_id, ams_id, tray_id)
+    deferring = drying or identify_in_flight or settling
 
     identity_candidate = None
     untagged_claim_candidate = None
@@ -940,7 +1013,7 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
     debounce_candidate = None
     reseat_within_window = False
     runout_suspect = False
-    if binding is None and obs.config_nonempty and not obs.identity_asserted:
+    if not deferring and binding is None and obs.config_nonempty and not obs.identity_asserted:
         donor = await _debounce_candidate(deps.db, obs)
         if donor is not None:
             debounce_candidate = _spool_view(donor)
@@ -959,9 +1032,9 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
         operator_recheck_answered=await _operator_recheck_answered(obs, deps, binding),
         auto_add_unknown=await _auto_add_unknown(deps),
         busy=_printer_busy(deps),
-        settling=_settling(printer_id, ams_id, tray_id),
-        identify_in_flight=_identify_in_flight(deps, ams_id),
-        drying=_drying(deps, ams_id),
+        settling=settling,
+        identify_in_flight=identify_in_flight,
+        drying=drying,
         tagless_default=await _tagless_default(deps),
     )
 
@@ -1020,12 +1093,23 @@ def _no_tag_read_answered(obs: TrayObservation, binding: BindingView | None) -> 
       reading — "this push asserted neither configuration nor identity". A third-party PETG
       roll reports ``tray_type: "PETG"``, ``tray_info_idx: "GFG02"``, ``tag_uid: null``:
       CONFIGURED, not bare, and the commonest physical shape on this fleet — so the evidence
-      could never fire for scenario G7 at all. It now hands over the GENERAL bare-ness
-      (``not obs.identity_asserted``), which is what the answer lane itself already uses
-      (``ams_presence.on_tray_observations`` → ``close_answered_read``) and what
-      ``slot_recheck.tag_ness_answered`` passes. ``read_answered_no_tag``'s own contract is
-      untouched: its ``_discovery_read_at`` stamp still drives the ``0700_0081`` HMS
-      suppression, and no caller had its meaning changed underneath it.
+      could never fire for scenario G7 at all. It now hands over the RFID-PAIR reading
+      (``not obs.identity_asserted``), the only one that answers the question actually being
+      asked — "did the commanded read find a CHIP?" — because configuration is what the farm
+      or the firmware wrote INTO the tray, never what the tray said about itself.
+
+      **The two readings were NOT equivalent, and this docstring used to say they were**
+      (2026-08-20, capsule A4). ``ams_presence.on_tray_observations``' own
+      ``close_answered_read`` call was still passing ``tray_identity_asserted`` — which
+      counts ``tray_type`` / ``tray_info_idx`` — so on exactly the G7 shape this arm was
+      widened for, the CLOSE lane never fired: read entitlements went unspent,
+      ``_physical_cycle_at`` / ``_read_occasion_at`` lingered, and the next ``rfid_refresh``
+      on a chipless tray raised an UNSUPPRESSED ``0700_0081`` (invariant 4 — a code that can
+      never self-clear on a tagless slot). That lane now passes this same reading, so there
+      is ONE bare-ness in the codebase and the claim below is true rather than aspirational.
+      ``read_answered_no_tag``'s own contract is untouched: its ``_discovery_read_at`` stamp
+      still drives the ``0700_0081`` HMS suppression, and no caller had its meaning changed
+      underneath it.
 
       Row 5a loses nothing by this: it is reached only through rows 5/6, which by
       construction mean "nothing asserted about identity OR configuration", so its
@@ -1234,7 +1318,15 @@ def _settle_physical_cycle(obs: TrayObservation, kind: DecisionKind, *, applied:
                                   tag-driven bind used to reach).
     ``RECLAIM``        preserve   The de-bounce re-bound an EXISTING row that evidence
                                   still in flight may yet declare exhausted. This is
-                                  layer 2 of the gap fix.
+                                  layer 2 of the gap fix — and the ONLY preservation with
+                                  a deadline: it is MARKED
+                                  (``spool_tagless.mark_cycle_preserved_by_debounce``) and
+                                  retired at the printer's next JOB TERMINAL unless the
+                                  bound row has been stamped spent by then
+                                  (``expire_debounce_preserved_cycles``). The evidence it
+                                  waits for has a ~3-minute life; without an owner the
+                                  cycle sat forever and a genuine runout HOURS later could
+                                  fire ``REPLACE_SPENT`` with no physical event behind it.
     ``REPLACE_SPENT``  consume    Unchanged: :func:`_apply_replace_spent` spends it
                                   itself, as the evidence it acted on.
     ``KEEP``           preserve   Never reaches here (see :func:`_apply`) — the spent
@@ -1250,9 +1342,14 @@ def _settle_physical_cycle(obs: TrayObservation, kind: DecisionKind, *, applied:
     seen-set, a vanished row) changed nothing, so the next push re-decides the same slot
     and must re-decide it on intact inputs.
     """
+    printer_id, ams_id, tray_id = obs.slot
+    if applied and kind is DecisionKind.RECLAIM:
+        # Preservation with an owner: the de-bounce is the one outcome that KEEPS a cycle on
+        # purpose, so it says so and the terminal hook can retire it (see the table above).
+        spool_tagless.mark_cycle_preserved_by_debounce(printer_id, ams_id, tray_id)
+        return
     if not applied or kind not in _CYCLE_DISCARDING_KINDS:
         return
-    printer_id, ams_id, tray_id = obs.slot
     # Through the module's own pop — ONE implementation of "spend this slot's cycle",
     # shared by the consumer that acts on the evidence and the owner that retires it. The
     # log line is where the two intents differ, and the count of these is how a reviewer
@@ -1696,14 +1793,29 @@ def _push_shape(deps: PipelineDeps) -> tuple[str, str]:
 def _was_feeding(printer_id: int, ams_id: int, tray_id: int) -> str:
     """``yes``/``no``/``?`` — was this slot the active feeder when it lost presence?
 
-    The loss-edge stamp ``spool_recovery.slot_was_feeding`` writes and the de-bounce lane's
-    own runout-suspect test reads back (:func:`_runout_suspect`). A PEEK, never consuming,
-    and guarded to ``?`` so an unreadable ledger costs one field rather than the line.
+    Reads the LOSS-SIDE stamp (``ams_presence.absent_under_active_feed``), which is the only
+    one that exists at a release: ``ams_presence`` keeps the same fact in two places, stamped
+    at the loss edge (``_absent_under_active_feed``) and carried into ``_reseat`` at the gain,
+    and ``_reseat`` is DROPPED at every loss. This field read the gain-side accessor
+    (``reseat_under_active_feed``, which :func:`_runout_suspect` correctly uses to adjudicate
+    a RETURN) and so could never answer ``yes`` — a diagnostic whose most load-bearing
+    discriminator was structurally dead (2026-08-20).
+
+    The ordering that makes this truthful is ``printer_manager._run_slot_pipeline_pass``':
+    the presence pass derives THIS push's edges before the pipeline resolves the same push,
+    so the loss edge is already stamped when the release is decided.
+
+    ``?`` means the loss edge was never observed (a restart, a first-batch seed) or the
+    ledger could not be read — never "not feeding". A PEEK, never consuming, and guarded so
+    an unreadable ledger costs one field rather than the line.
     """
     try:
-        return "yes" if ams_presence.reseat_under_active_feed(printer_id, ams_id, tray_id) else "no"
+        fed = ams_presence.absent_under_active_feed(printer_id, ams_id, tray_id)
     except Exception:  # noqa: BLE001 — an unreadable ledger is unknown cause, never a crash
         return "?"
+    if fed is None:
+        return "?"
+    return "yes" if fed else "no"
 
 
 def _release_evidence(obs: TrayObservation, deps: PipelineDeps, spool: Spool | None, decision: Decision) -> str | None:
@@ -1745,7 +1857,11 @@ def _release_evidence(obs: TrayObservation, deps: PipelineDeps, spool: Spool | N
       from an incident on purpose: the AMS clears a drained slot's exist bit ~3 min BEFORE
       it declares the runout, so the incident does not exist yet, while the loss-edge feeder
       stamp does — ``ams_presence.on_tray_observations`` derives this push's edges before
-      the pipeline resolves the same push.
+      the pipeline resolves the same push. It is the LOSS-side stamp
+      (``absent_under_active_feed``), not the gain-side ``reseat_under_active_feed`` the
+      de-bounce adjudicates a return with: at a release the roll has not come back, so the
+      gain-side ledger is empty by construction and ``feeding=`` could only ever read ``no``
+      (:func:`_was_feeding`). ``?`` is an unobserved loss edge, never a negative.
     * ``spool``/``tagless``/``used_g``/``label_g`` — the subject and its grams: what a
       spurious release puts at risk, and whether the de-bounce could even take it back
       (only an untagged donor may).
@@ -1755,10 +1871,21 @@ def _release_evidence(obs: TrayObservation, deps: PipelineDeps, spool: Spool | N
     spool, a sub-window absence and ``feeding=no`` here is row T1; a long absence, or
     ``feeding=yes``, is a real departure.
 
-    ``_release_orphan`` deliberately does not emit this. An orphan release is a
-    DB-integrity event — the assignment outlived its spool row — with no grams to name and
-    no wire evidence to weigh, so the writer's own line already says everything true
-    about it.
+    TWO release lanes deliberately do NOT emit this, and both exclusions are about having
+    nothing true to say rather than about noise:
+
+    * :func:`_release_orphan` — an orphan release is a DB-integrity event (the assignment
+      outlived its spool row), with no grams to name and no wire evidence to weigh, so the
+      writer's own line already says everything true about it;
+    * the OPERATOR release, ``DELETE /api/v1/inventory/assignments/...``
+      (``release_spool_from_slot(reason="operator_clear")``). That route has no
+      ``TrayObservation`` at all — it is answering a human, not a push — so every field
+      above except the spool's grams would be a fabrication, and the one question this
+      record exists to answer ("was the departure real or a bit glitch?") is already
+      answered by the fact that a person asked for it. ``spool_binding``'s own
+      ``[slot-state] … release … reason=operator_clear`` line is the record for that lane.
+      The route is untouched by design: a diagnostic must never grow a second, evidence-less
+      shape to look complete.
 
     Returns the line, or ``None`` when the record could not be built. **A diagnostic that
     can raise is worse than no diagnostic at all** (cross-cutting invariant 10): the
@@ -2044,6 +2171,93 @@ async def _bind_minted(
     return decision, True
 
 
+async def _page_reused_core_swap(obs: TrayObservation, deps: PipelineDeps, departed: Spool) -> None:
+    """A reused-core swap (row 2.0) just concluded — WARN and page a human to verify it.
+
+    **The conclusion is not in question; the PREMISE is.** Doctrine rule 3 says a spent RFID
+    core can be refilled, so the table must be able to act on "a finished row's own tag reads
+    back over a loaded tray" — that is a physical impossibility argument, not a heuristic, and
+    hesitating would leave the fresh roll printing against a 0 g ledger. But doctrine rule 10
+    is operator ground truth on THIS farm: **no RFID tag has ever been reused here** — and it
+    was re-confirmed by the 2026-08-09 full-history audit, which found every respool prompt
+    the farm has ever raised to be a false positive. Both are true at once, and they resolve
+    into one instruction rather than a contradiction: the capability stays, and the FIRST
+    time it fires it is evidence to VERIFY, not a routine event to swallow.
+
+    So the swap always lands and it always pages. The two readings a human must choose
+    between are named in the message:
+
+    * a genuine first reuse — somebody refilled a Bambu core, which is supported and simply
+      has never happened here yet;
+    * a FALSE ``spent_at`` stamp — the roll never ran out, the ledger only thinks it did, and
+      the stamp needs root-causing. Rule 8's asymmetry is why this is the live hypothesis: a
+      missed stamp self-heals forward, a false one is permanent.
+
+    A departing row that was **never fed** (``weight_used`` < :data:`NEVER_FED_MAX_G`) is the
+    STRONGER form of the second reading and is called out by name: a roll that consumed
+    nothing cannot have run out, so "spent" and "0 g delivered" cannot both be true.
+
+    Reuses ``on_spent_contradiction`` rather than minting an event type: the fact reported is
+    exactly that event's — a row the ledger calls SPENT is seated and reading loaded — and a
+    second event for the same fact would split the operator's notification settings. No
+    dedup is applied: unlike the standing-state detector that lane was built for, this fires
+    on a TRANSITION that happens at most once per physical core, so there is nothing to
+    re-notify about. There is deliberately no un-spend lane here either (operator ruling
+    2026-08-09) — the page asks a human to look, it never edits the stamp.
+
+    Fully guarded (invariant 10): a page is not allowed to unwind a swap that has already
+    been decided, and the WARNING is emitted before anything that can fail.
+    """
+    printer_id, ams_id, tray_id = obs.slot
+    delivered = float(departed.weight_used or 0)
+    never_fed = delivered < NEVER_FED_MAX_G
+    contradiction = (
+        " and it was NEVER FED (a roll that consumed nothing cannot have run out, so the spent stamp is "
+        "the thing to doubt)"
+        if never_fed
+        else ""
+    )
+    logger.warning(
+        "[slot-state] printer=%d A%dT%d REUSED CORE: spent spool %d (tag %s, delivered %.1f g of %s g) read "
+        "LOADED over this slot%s. Either this is the first RFID-tag reuse on this farm, or that spent stamp "
+        "is false — verify. The swap was applied: the drained row keeps its spent_at and its grams, and the "
+        "successor is bound carrying the tag.",
+        printer_id,
+        ams_id,
+        tray_id,
+        departed.id,
+        departed.tag_uid or departed.tray_uuid or "-",
+        delivered,
+        "?" if departed.label_weight is None else f"{float(departed.label_weight):.0f}",
+        contradiction,
+    )
+    try:
+        from backend.app.models.printer import Printer
+        from backend.app.services.notification_service import notification_service
+        from backend.app.services.spool_recovery import runout_slot_desc
+
+        printer = await deps.db.get(Printer, printer_id)
+        label = f"{departed.material or 'filament'}, delivered {delivered:.0f} g"
+        if never_fed:
+            label += " — NEVER FED"
+        await notification_service.on_spent_contradiction(
+            printer_id,
+            (printer.name if printer is not None else None) or f"Printer {printer_id}",
+            departed.id,
+            label,
+            runout_slot_desc(encode_global_tray(ams_id, tray_id)) or f"AMS{ams_id}-T{tray_id}",
+            # The firmware's own figure, or its own "unknown" sentinel — never a fabricated
+            # fullness. Row 2.0's evidence is PRESENCE, not remain, so this is context for
+            # the reader rather than part of the argument.
+            obs.remain if isinstance(obs.remain, int) and 0 <= obs.remain <= 100 else -1,
+            deps.db,
+        )
+    except Exception:  # noqa: BLE001 — a page may never unwind a decided swap (invariant 10)
+        logger.exception(
+            "[slot-state] reused-core swap notification failed for printer %d A%dT%d", printer_id, ams_id, tray_id
+        )
+
+
 async def _apply_replace_spent(
     obs: TrayObservation,
     deps: PipelineDeps,
@@ -2077,6 +2291,10 @@ async def _apply_replace_spent(
       over a seated tray (G3, doctrine rule 3). An identity read is the strongest evidence
       the farm has, and it is self-pacing: the swap it performs mints the successor onto
       the slot, so the next push resolves by identity (row 2.1 KEEP) and cannot replay it.
+      It is also the ONE arm that pages on EVERY firing (:func:`_page_reused_core_swap`):
+      doctrine rule 10 says no tag has ever been reused on this farm, so the first time
+      this concludes, a human has to decide whether the premise finally changed or the
+      ``spent_at`` stamp behind it is false.
     * ``operator_recheck_swap`` — the no-tag answer PLUS a human's answer (rule 12).
 
     Everything after the pre-gates is shared verbatim — one disposal, one mint funnel, one
@@ -2166,6 +2384,10 @@ async def _apply_replace_spent(
         return decision, False
 
     departed = assignment.spool
+    # EVERY reused-core swap pages, before anything is disposed — the conclusion is
+    # unconditional, the verification is not (see :func:`_page_reused_core_swap`).
+    if decision.reason == _REUSED_CORE_SWAP_REASON:
+        await _page_reused_core_swap(obs, deps, departed)
     disposition = await spool_tagless.dispose_provisional_on_tag(deps.db, departed)
     if disposition == "kept":
         departed.archived_at = datetime.utcnow()  # keep the ledger row + its grams

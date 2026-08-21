@@ -599,7 +599,7 @@ class TestEchoConsume:
 
     async def test_empty_slot_never_arms(self, db_session, monkeypatch):
         # A re-read commanded on an EMPTY (state 9) slot produces no identify flap,
-        # so record_reread must NOT arm — a real insertion made right after a print
+        # so record_recheck_read must NOT arm — a real insertion made right after a print
         # ends is then recognized instantly, with no swallow.
         clear = AsyncMock()
         monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
@@ -608,7 +608,7 @@ class TestEchoConsume:
         _patch_pm(monkeypatch, status=_pstate([_tray(0, state=9)], gcode_state="IDLE"), client=client)
 
         # Directly: an empty slot never arms the flag.
-        ams_presence.record_reread(1, 0, 0)
+        ams_presence.record_recheck_read(1, 0, 0)
         assert ams_presence._echo_pending == {}
 
         # A real insertion gain moments later fires the re-read immediately.
@@ -1638,7 +1638,7 @@ class TestIdentifyFlapNotAQualifiedCycle:
 
     async def test_state9_commanded_identify_flap_is_not_a_qualified_cycle(self, db_session, monkeypatch):
         # THE incident pin (fails on pre-fix code — verified by mutation). A commanded
-        # identify on a SEATED-yet-unread (state 9) slot: record_reread never arms the
+        # identify on a SEATED-yet-unread (state 9) slot: record_recheck_read never arms the
         # echo there, so the old echo lane cannot see the flap — the leak. The AMS is
         # IDENTIFYING while the tray is unloaded, which is what now disqualifies the gain.
         client = MagicMock()
@@ -1720,7 +1720,7 @@ class TestIdentifyFlapNotAQualifiedCycle:
         )
 
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
-        ams_presence.record_reread(1, 0, 0)  # present slot → echo armed
+        ams_presence.record_recheck_read(1, 0, 0)  # present slot → echo armed
         assert (1, 0, 0) in ams_presence._echo_pending
         await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # identify flap loss
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # echo gain swallowed
@@ -2018,7 +2018,7 @@ class TestCauseBasedEdgeSuppressionWidened:
     NON-PHYSICAL causes were arming real actions — fresh-roll prompts for slots nobody
     touched, never-fed ``loaded_at`` re-stamps. The 2026-07-21 wave disqualified
     identify-explained edges but left three leaks: a read commanded on a state-9 tray
-    (``record_reread`` never arms there), a firmware-autonomous read whose IDENTIFYING
+    (``record_recheck_read`` never arms there), a firmware-autonomous read whose IDENTIFYING
     flag rises and falls between edges, and the print-start AMS engage transient.
 
     Doctrine rule 6 / invariant 6: suppression is BY CAUSE — never a timer or damper on
@@ -2396,6 +2396,54 @@ class TestReadAnsweredNoTag:
         # No discovery read was ever commanded here: silence is not evidence.
         assert self._ask() is False
 
+    async def test_a_physical_cycle_after_the_read_voids_its_no_tag_answer(self, monkeypatch):
+        """An answer describes the roll that was in the tray when it was GIVEN.
+
+        Somebody pulling that roll out and putting a different one in makes the answer a
+        statement about an object that is no longer there — so the slot owes a new question,
+        not a stale conclusion. The invalidation is BY CAUSE, which is the only kind rule 7
+        permits: there is deliberately no age ceiling here, and a slot nobody has touched for
+        a week still holds a perfectly good answer.
+
+        It matters because the 2026-08-19 wave widened this predicate's consumers from ONE
+        (row 5a: spent + tagged + bare) to every binding quadrant. A stamp that used to reach
+        almost nothing now reaches an operator's own hand-assigned row at row 4b′, where
+        ``tagged_swap_no_tag_read`` unlinks it and mints tagless in its place.
+        """
+        await _commanded_discovery_read(monkeypatch)
+        _age_slot_stamps(by=100.0)
+        assert self._ask() is True, "LIVENESS: the aged answer stands while nothing has moved"
+
+        # An UNQUALIFIED gain is a sub-5 s flap (rule 6's filter) and states nothing about
+        # identity, so it may not void an answer either.
+        ams_presence._note_gain(1, 0, 0, qualified=False)
+        assert self._ask() is True
+
+        ams_presence._note_gain(1, 0, 0, qualified=True)
+        assert self._ask() is False
+
+    async def test_a_reseat_after_a_discovery_read_still_suppresses_the_reads_own_0700_0081(self, monkeypatch):
+        """The voided answer must NOT be expressed by popping ``_discovery_read_at``.
+
+        That same stamp is what tells ``is_expected_read_failure`` that a
+        ``0700_2X00_0001_0081`` naming this slot is OUR OWN read reporting "no tag" rather
+        than a failing AMS reader (invariant 4's corollary — that code can never self-clear,
+        so a spurious one costs the operator a power-cycle). A read commanded moments before
+        a re-seat still owns its own expected failure, whatever the re-seat did to the
+        answer's validity.
+        """
+        await _commanded_discovery_read(monkeypatch)
+        attr, code = 0x07002000, 0x00010081  # 0700_2X00_0001_0081 naming AMS0 slot 0
+        assert ams_presence.is_expected_read_failure(1, attr, code) is True
+
+        ams_presence._note_gain(1, 0, 0, qualified=True)
+
+        assert self._ask() is False, "the answer is void — the roll it described has left"
+        assert ams_presence.is_expected_read_failure(1, attr, code) is True, (
+            "…but the read still owns the failure it provoked"
+        )
+        assert (1, 0, 0) in ams_presence._discovery_read_at
+
     async def test_a_fresh_read_has_not_answered_yet(self, monkeypatch):
         await _commanded_discovery_read(monkeypatch)
         assert self._ask() is False
@@ -2488,14 +2536,22 @@ class TestTheAnsweredReadClosesItsEntitlement:
             await db_session.commit()
 
         await self._answered_read(monkeypatch)
-        # A physical cycle and an occasion, both live: exactly what a further read needs.
-        ams_presence._physical_cycle_at[(1, 0, 0)] = ams_presence.time.monotonic()
+        # The cycle that CAUSED the read, in the ordering production produces it: somebody
+        # moved a roll, the standing-evidence arm spent a read on it, the read answered.
+        # (Re-pointed 2026-08-20. This used to stamp the cycle at ``monotonic()`` — i.e.
+        # AFTER the read — which since ``read_answered_no_tag`` gained its by-cause
+        # invalidation is no longer an answer at all but a NEW question: see
+        # ``test_a_physical_cycle_after_the_read_voids_its_no_tag_answer`` below. The claim
+        # this case makes has not changed — one closure, five binding states, no binding
+        # read — only the scaffolding that expressed it.)
+        ams_presence._physical_cycle_at[(1, 0, 0)] = ams_presence._discovery_read_at[(1, 0, 0)] - 1.0
         ams_presence.open_read_occasion(1, 0, 0)
-        assert ams_presence.identity_unanswered(1, 0, 0) is True
+        assert (1, 0, 0) in ams_presence._physical_cycle_at
         assert ams_presence._read_occasion_open(1, 0, 0) is True
 
         assert ams_presence.close_answered_read(1, 0, 0, tray_seated=True, tray_bare=True) is True
 
+        assert (1, 0, 0) not in ams_presence._physical_cycle_at
         assert ams_presence.identity_unanswered(1, 0, 0) is False
         assert ams_presence._read_occasion_open(1, 0, 0) is False
 
@@ -2548,6 +2604,50 @@ class TestTheAnsweredReadClosesItsEntitlement:
 
         assert ams_presence.identity_unanswered(1, 0, 0) is False
         assert ams_presence._read_occasion_open(1, 0, 0) is False
+
+    async def test_the_G7_configured_tagless_tray_closes_its_answer_too(self, db_session, monkeypatch, caplog):
+        """G7 — the commonest physical shape on this fleet, and the one this lane was blind to.
+
+        A third-party PETG roll reports ``tray_type: "PETG"``, ``tray_info_idx: "GFG02"``,
+        ``tag_uid: null``: CONFIGURED, and carrying NO CHIP. The observation pass used to
+        hand ``close_answered_read`` the ``tray_fields.tray_identity_asserted`` reading of
+        bare-ness, which counts ``tray_type`` and ``tray_info_idx`` as identity — so for this
+        tray the closure could never fire. Its entitlements stayed unspent,
+        ``_physical_cycle_at``/``_read_occasion_at`` lingered, and the next ``rfid_refresh``
+        read on a chipless tray raised an UNSUPPRESSED ``0700_0081``, which on a tagless slot
+        can never self-clear (invariant 4). Bare-ness here is the RFID PAIR and nothing else:
+        the question is "did the read find a chip?", and configuration is what the farm or
+        the firmware wrote INTO the tray, never what the tray said about itself.
+        """
+        g7 = {
+            "id": 0,
+            "state": 10,
+            "tray_type": "PETG",
+            "tray_info_idx": "GFG02",
+            "tray_color": "000000FF",
+            "tag_uid": "0000000000000000",
+            "tray_uuid": "0" * 32,
+            "remain": -1,
+        }
+        await self._answered_read(monkeypatch)
+        # The cycle that CAUSED the read: stamped BEFORE it, so the answer still describes
+        # the roll that was in the tray when the question was put.
+        ams_presence._physical_cycle_at[(1, 0, 0)] = ams_presence._discovery_read_at[(1, 0, 0)] - 1.0
+        ams_presence.open_read_occasion(1, 0, 0)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.ams_presence"):
+            await _push(1, [{"id": 0, "tray": [g7]}], db_session)  # first batch: seeds only
+            await _push(1, [{"id": 0, "tray": [g7]}], db_session)  # steady state: the closure
+
+        assert any("read answered NO TAG" in r.getMessage() for r in caplog.records), [
+            r.getMessage() for r in caplog.records
+        ]
+        assert ams_presence.identity_unanswered(1, 0, 0) is False
+        assert ams_presence._read_occasion_open(1, 0, 0) is False
+        # The discovery stamp is deliberately NOT popped by the closure: it is the same
+        # stamp that tells the notification path a filament-read failure on this slot is
+        # OUR OWN read's expected answer rather than a failing reader.
+        assert ams_presence.is_expected_read_failure(1, 0x07002000, 0x00010081) is True
 
     @pytest.mark.parametrize(("seated", "bare"), [(True, False), (False, True)], ids=["named_tray", "empty_tray"])
     async def test_it_spends_nothing_on_a_slot_whose_answer_belongs_elsewhere(self, monkeypatch, seated, bare):

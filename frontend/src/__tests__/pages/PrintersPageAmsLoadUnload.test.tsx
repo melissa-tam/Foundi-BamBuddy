@@ -1,11 +1,14 @@
 /**
- * Tests for the AMS slot load / unload buttons on PrintersPage (#891).
+ * Tests for the AMS load / unload verbs on PrintersPage (#891).
  *
  * The printer-card refactor in #1661 replaced the kebab "Slot options"
  * button with a hover card (FilamentHoverCard) whose actions render on
- * hover. Tests now `fireEvent.mouseEnter` on the slot trigger
+ * hover. Tests `fireEvent.mouseEnter` on the slot trigger
  * (`data-testid="filament-slot"`) and wait for the portaled card to
- * appear in document.body before clicking Load / Unload.
+ * appear in document.body before clicking Load.
+ *
+ * Unload is NOT a slot verb: `/ams/unload` takes no tray argument, so it lives
+ * once in each AMS unit's header (B4 slot-verb consolidation) and needs no hover.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -136,7 +139,7 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
     });
   });
 
-  it('Unload posts to /ams/unload (no body, no params)', async () => {
+  it('Unload renders ONCE per AMS unit and posts to /ams/unload (no body, no params)', async () => {
     const user = userEvent.setup();
     let unloadCalled = false;
 
@@ -154,13 +157,37 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
       expect(screen.getAllByTestId('filament-slot').length).toBeGreaterThan(0);
     });
 
-    const slots = screen.getAllByTestId('filament-slot');
-    await hoverSlot(slots[0]);
-    await user.click(screen.getByText('Unload'));
+    // One AMS unit with four slots — one Unload button, in the unit header. Four
+    // copies of a printer-level command (one per slot) implied a per-slot unload
+    // the wire cannot express.
+    const unloadButtons = screen.getAllByRole('button', { name: 'Unload' });
+    expect(unloadButtons).toHaveLength(1);
+
+    await user.click(unloadButtons[0]);
 
     await waitFor(() => {
       expect(unloadCalled).toBe(true);
     });
+  });
+
+  it('does not offer Unload inside a slot hover card', async () => {
+    server.use(
+      http.get('/api/v1/printers/:id/status', () => HttpResponse.json(mockIdleStatusWithAms)),
+    );
+
+    render(<PrintersPage />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId('filament-slot').length).toBeGreaterThan(0);
+    });
+
+    const slots = screen.getAllByTestId('filament-slot');
+    await hoverSlot(slots[0]);
+
+    // The card is open (Load is in it) and still only the header's single Unload
+    // exists — the hover card contributed none.
+    expect(screen.getByText('Load')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Unload' })).toHaveLength(1);
   });
 
   it('disables Load / Unload while the printer is RUNNING', async () => {
@@ -185,7 +212,7 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
     });
 
     expect(screen.getByText('Load').closest('button')).toBeDisabled();
-    expect(screen.getByText('Unload').closest('button')).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Unload' })).toBeDisabled();
   });
 
   it('external spool slot exposes Load and posts tray_id=254', async () => {
