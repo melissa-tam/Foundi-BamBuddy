@@ -8,13 +8,15 @@
  */
 import { describe, it, expect } from 'vitest';
 
-import { computeBackupGroups } from '../../utils/amsHelpers';
+import { computeBackupGroups, nearMissBackupSlots } from '../../utils/amsHelpers';
 
 function ams(id: number, tray: Array<{
   tray_type?: string | null;
   tray_sub_brands?: string | null;
   tray_color?: string | null;
   tray_info_idx?: string | null;
+  nozzle_temp_min?: number | null;
+  nozzle_temp_max?: number | null;
 }>) {
   return {
     id,
@@ -24,6 +26,8 @@ function ams(id: number, tray: Array<{
       tray_sub_brands: t.tray_sub_brands ?? null,
       tray_color: t.tray_color ?? null,
       tray_info_idx: t.tray_info_idx ?? null,
+      nozzle_temp_min: t.nozzle_temp_min ?? null,
+      nozzle_temp_max: t.nozzle_temp_max ?? null,
     })),
   };
 }
@@ -219,5 +223,166 @@ describe('computeBackupGroups', () => {
     );
     expect(groups[0].displayName).toBe('PLA Basic');
     expect(groups[0].trayColor).toBe('#1A1A1A');
+  });
+
+  it('does NOT pair slots whose nozzle-temperature windows differ', () => {
+    // The firmware's backup key is preset + colour + nozzle temps — a slot
+    // configured 220-260 does not back up one configured 190-230.
+    const groups = computeBackupGroups(
+      [
+        ams(0, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99', nozzle_temp_min: 220, nozzle_temp_max: 260 }]),
+        ams(1, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99', nozzle_temp_min: 190, nozzle_temp_max: 230 }]),
+      ],
+      {},
+      false,
+    );
+    expect(groups).toHaveLength(2);
+    expect(groups.every((g) => g.members.length === 1)).toBe(true);
+  });
+
+  it('pairs slots that both report no nozzle-temperature window', () => {
+    // "No window" is a value of its own: two trays without temps still pair.
+    const groups = computeBackupGroups(
+      [
+        ams(0, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99' }]),
+        ams(1, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99' }]),
+      ],
+      {},
+      false,
+    );
+    expect(groups).toHaveLength(1);
+    expect(groups[0].members).toHaveLength(2);
+  });
+
+  it('does NOT pair a slot reporting temps with one reporting none', () => {
+    const groups = computeBackupGroups(
+      [
+        ams(0, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99', nozzle_temp_min: 220, nozzle_temp_max: 260 }]),
+        ams(1, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99' }]),
+      ],
+      {},
+      false,
+    );
+    expect(groups).toHaveLength(2);
+  });
+});
+
+/**
+ * Tests for the 010-H2S near-miss badge: a slot with no firmware backup
+ * partner that HAS a same-filament neighbour the firmware excluded on an
+ * exact-match colour or nozzle-temp difference.
+ */
+describe('nearMissBackupSlots', () => {
+  function nearMiss(
+    units: ReturnType<typeof ams>[],
+    extruderMap: Record<string, number> = {},
+    isDualNozzle = false,
+  ): number[] {
+    const groups = computeBackupGroups(units, extruderMap, isDualNozzle);
+    return [...nearMissBackupSlots(groups, units)].sort((a, b) => a - b);
+  }
+
+  it('returns nothing for missing/empty AMS input', () => {
+    expect(nearMiss([])).toEqual([]);
+    expect([...nearMissBackupSlots([], undefined)]).toEqual([]);
+  });
+
+  it('flags both greys the firmware refused to pair (161616FF vs 000000FF)', () => {
+    // The incident shape: slot 2 ran dry twice with a full black roll in the
+    // AMS. Both slots are the lone member of their own group, and each is the
+    // other's near miss — so both light up.
+    expect(nearMiss([
+      ams(0, [
+        { tray_type: 'PETG', tray_color: '161616FF', tray_info_idx: 'GFG99' },
+        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG99' },
+      ]),
+    ])).toEqual([0, 1]);
+  });
+
+  it('flags a same-colour pair split only by nozzle temps', () => {
+    expect(nearMiss([
+      ams(0, [
+        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG99', nozzle_temp_min: 220, nozzle_temp_max: 260 },
+        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG99', nozzle_temp_min: 190, nozzle_temp_max: 230 },
+      ]),
+    ])).toEqual([0, 1]);
+  });
+
+  it('flags nothing on a multi-colour AMS with no similar neighbour', () => {
+    // The anti-noise case: four different colours of one preset must NOT all
+    // light up just because none of them has a peer.
+    expect(nearMiss([
+      ams(0, [
+        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG99' },
+        { tray_type: 'PETG', tray_color: 'FF0000FF', tray_info_idx: 'GFG99' },
+        { tray_type: 'PETG', tray_color: '00FF00FF', tray_info_idx: 'GFG99' },
+        { tray_type: 'PETG', tray_color: 'FFFFFFFF', tray_info_idx: 'GFG99' },
+      ]),
+    ])).toEqual([]);
+  });
+
+  it('flags nothing when the similar neighbour is a different preset', () => {
+    // Different presets are different filaments — no backup was ever possible,
+    // so there is nothing actionable to report.
+    expect(nearMiss([
+      ams(0, [
+        { tray_type: 'PETG', tray_color: '161616FF', tray_info_idx: 'GFG99' },
+        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG02' },
+      ]),
+    ])).toEqual([]);
+  });
+
+  it('flags nothing when the similar neighbour is on the other extruder side', () => {
+    // The firmware cannot cross extruders even with the global backup bit set.
+    expect(nearMiss(
+      [
+        ams(0, [{ tray_type: 'PETG', tray_color: '161616FF', tray_info_idx: 'GFG99' }]),
+        ams(1, [{ tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG99' }]),
+      ],
+      { '0': 0, '1': 1 },
+      true,
+    )).toEqual([]);
+  });
+
+  it('flags the same pair when both sit on the same extruder side', () => {
+    expect(nearMiss(
+      [
+        ams(0, [{ tray_type: 'PETG', tray_color: '161616FF', tray_info_idx: 'GFG99' }]),
+        ams(1, [{ tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG99' }]),
+      ],
+      { '0': 0, '1': 0 },
+      true,
+    )).toEqual([0, 4]);
+  });
+
+  it('ignores empty slots', () => {
+    expect(nearMiss([
+      ams(0, [
+        { tray_type: 'PETG', tray_color: '161616FF', tray_info_idx: 'GFG99' },
+        { tray_type: null, tray_color: null, tray_info_idx: null },
+      ]),
+    ])).toEqual([]);
+  });
+
+  it('flags nothing for slots with no configured preset', () => {
+    // A preset-less slot can never pair, so "no backup partner" is not news.
+    expect(nearMiss([
+      ams(0, [
+        { tray_type: 'PETG', tray_color: '161616FF' },
+        { tray_type: 'PETG', tray_color: '000000FF' },
+      ]),
+    ])).toEqual([]);
+  });
+
+  it('never flags a slot that already has a firmware peer', () => {
+    // Slots 0+1 pair; slot 2 is the lone grey beside them and is the only
+    // actionable one.
+    expect(nearMiss([
+      ams(0, [
+        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG99' },
+        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG99' },
+        { tray_type: 'PETG', tray_color: '161616FF', tray_info_idx: 'GFG99' },
+      ]),
+    ])).toEqual([2]);
   });
 });

@@ -1124,6 +1124,7 @@ export default {
     slot: {
       ranOut: 'Ran out — refill this slot',
       spentCore: 'Spent — replace roll',
+      noBackupSlot: 'No backup slot. Another slot holds this filament in a different tray colour.',
       wasFeeding: 'Was feeding this print',
     },
     activeJobSlot: {

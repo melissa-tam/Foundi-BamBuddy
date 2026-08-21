@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, cleanup } from '@testing-library/react';
 import { render } from '../utils';
 import { FilamentSlotCircle } from '../../components/FilamentSlotCircle';
 
@@ -197,6 +197,75 @@ describe('FilamentSlotCircle', () => {
     it('does not render the badge when outOfRotation is omitted', () => {
       render(<FilamentSlotCircle trayColor="FF0000" isEmpty={false} slotNumber={1} />);
       expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('no-backup-slot badge', () => {
+    /** Render the badge alone and hand back its resolved label. */
+    function renderLoneBadge() {
+      render(
+        <FilamentSlotCircle trayColor="161616" isEmpty={false} slotNumber={2} noBackupSlot />
+      );
+      const badge = screen.getByRole('img');
+      const label = badge.getAttribute('aria-label');
+      return { badge, label };
+    }
+
+    it('renders a labelled badge when noBackupSlot is true and the slot is loaded', () => {
+      const { badge, label } = renderLoneBadge();
+      expect(label).toBeTruthy();
+      // A raw key here would mean a missing locale entry.
+      expect(label).not.toBe('printers.slot.noBackupSlot');
+      // title carries the same text for hover/keyboard discovery.
+      expect(badge.getAttribute('title')).toBe(label);
+    });
+
+    it('states the reason for screen readers, never by colour alone (WCAG 1.4.1)', () => {
+      const { label } = renderLoneBadge();
+      // The sentence IS the badge's accessible name — the meaning never rides
+      // on the amber tone. Queried by role+name exactly as AT resolves it.
+      expect(screen.getByRole('img', { name: label as string })).toBeInTheDocument();
+    });
+
+    it('does not render the badge when noBackupSlot is false', () => {
+      render(
+        <FilamentSlotCircle trayColor="161616" isEmpty={false} slotNumber={2} noBackupSlot={false} />
+      );
+      expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    });
+
+    it('does not render the badge on an empty slot even when noBackupSlot is true', () => {
+      // An empty slot has no filament to back up — the badge would claim
+      // something about nothing.
+      render(<FilamentSlotCircle isEmpty={true} slotNumber={2} noBackupSlot />);
+      expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    });
+
+    it('coexists with the other three badges', () => {
+      const { label } = renderLoneBadge();
+      cleanup();
+
+      render(
+        <FilamentSlotCircle
+          trayColor="161616"
+          isEmpty={false}
+          slotNumber={2}
+          outOfRotation
+          ranOut
+          spentCore
+          noBackupSlot
+        />
+      );
+      const badges = screen.getAllByRole('img');
+      expect(badges).toHaveLength(4);
+      const labels = badges.map((b) => b.getAttribute('aria-label'));
+      // Four distinct, resolved labels — one corner each.
+      expect(new Set(labels).size).toBe(4);
+      expect(labels).toContain(label);
+      for (const each of labels) {
+        expect(each).toBeTruthy();
+        expect(each).not.toMatch(/^(printers|ams)\./);
+      }
     });
   });
 });

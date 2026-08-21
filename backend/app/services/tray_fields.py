@@ -378,6 +378,67 @@ def tray_unread(tray: object) -> bool:
     return tray_presence_from_dict(tray) is True and not tray_identity_asserted(tray)
 
 
+def normalize_color_for_id(raw: str | None) -> str:
+    """Canonicalise a hex colour for EXACT identity comparison.
+
+    Strips the leading ``#``, uppercases, and drops the alpha channel when the hex is
+    8 chars long (``RRGGBBAA``) so a fully-opaque 8-char hex matches a 6-char hex of
+    the same RGB. Empty / None → empty string.
+
+    THE colour normaliser for identity questions, and deliberately distinct from
+    ``utils.color_utils.colors_similar``: that one answers "is this the same
+    FILAMENT?" with a tolerance, this one answers "will the FIRMWARE treat these as
+    one backup group?", which is byte-exact. Conflating them is the 010-H2S class —
+    ``161616FF`` and ``000000FF`` are similar enough to be the same black PETG and
+    different enough that the firmware never paired the slots. Moved here from
+    ``filament_deficit`` (2026-08-21) because :func:`backup_group_key` and the tagless
+    canonicaliser both need it and a second spelling would drift.
+    """
+    s = (raw or "").strip().lstrip("#").upper()
+    if len(s) == 8:  # RRGGBBAA → strip alpha
+        s = s[:6]
+    return s
+
+
+def backup_group_key(tray: object) -> str | None:
+    """The firmware's auto-refill BACKUP-GROUP key for one tray — or None.
+
+    The AMS pairs slots into a backup group only on an exact preset / colour /
+    nozzle-temperature match (``bambu-ams-behavior`` §"Firmware auto-refill"), so two
+    trays back each other up if and only if this string is equal for both. ONE origin
+    for that rule: the deficit pricer's pooling map reads it, and the tagless
+    harmonise lane exists to make our own slots produce the same one.
+
+    Shape ``tray:<preset>|color:<RRGGBB>|temps:<min>-<max>``, where the preset is the
+    firmware's ``tray_info_idx`` when it has one and the configured ``tray_type``
+    otherwise, the colour goes through :func:`normalize_color_for_id` (byte-exact
+    after alpha/`#` normalisation — 161616FF and 000000FF are DIFFERENT groups), and
+    the temps are the tray's own reported range (``None`` when the tray reports none,
+    which still compares equal between two equally-silent trays).
+
+    ``None`` when the tray can belong to no group: a tray that asserts no identity at
+    all (bare or :func:`tray_unread`) and one the wire asserts is EMPTY
+    (:func:`tray_presence_from_dict` ``is False``) — neither is a peer for anything.
+    Presence UNKNOWN is not emptiness and still yields a key, because a configured
+    tray whose state the dialect will not report is still in the firmware's group.
+    """
+    if not isinstance(tray, dict):
+        return None
+    if not tray_identity_asserted(tray):
+        return None  # bare / unread — the firmware has nothing to pair
+    if tray_presence_from_dict(tray) is False:
+        return None  # wire-asserted empty
+    tray_type = asserted_str_field(tray, "tray_type") or str(tray.get("filament_type") or "").strip()
+    info_idx = asserted_str_field(tray, "tray_info_idx") or ""
+    preset = info_idx or tray_type
+    if not preset:
+        return None  # identity asserted by a tag alone — no configured filament to pair
+    color = normalize_color_for_id(tray.get("tray_color"))
+    tmin = parse_int_field(tray.get("nozzle_temp_min"))
+    tmax = parse_int_field(tray.get("nozzle_temp_max"))
+    return f"tray:{preset}|color:{color}|temps:{tmin}-{tmax}"
+
+
 def tray_presence_map(ams_payload: object) -> dict[tuple[int, int], bool | None]:
     """``{(ams_id, tray_id): present}`` for every tray in a live/merged AMS payload.
 

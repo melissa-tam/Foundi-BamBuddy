@@ -10,6 +10,12 @@ All notable changes to Bambuddy will be documented in this file.
 - **Minimum start-spool weight** — `min_start_spool_g` (default 120, 0=off): a spool below the floor can never START a print (it stays loaded as a mid-print refill donor). Blocked items stage with `waiting_reason="start_spool_below_minimum"` and release on spool swap / re-check / run resume; manual start returns 409 `start_spool_below_minimum` with the same Print-Anyway bypass as `insufficient_filament`.
 - `GET /printers/{id}/inventory-remain` now also returns a `first_loaded` map (per-slot ISO timestamp) so the client mirror orders like the dispatcher.
 
+- **Backup-group colour harmonisation** (2026-08-21) — `spool_tagless.canonical_default_identity` (ONE predicate replacing `override_generic_identity` / `default_temps_for_fingerprint`) canonicalises a tagless row onto the `tagless_default_filament` preset, exact colour AND temps; new reconcile-lane arm `maybe_harmonize_backup_identity` rewrites the farm's own tagless slots at idle so the firmware pairs them into one auto-refill backup group (010-H2S: Studio-written `161616FF` beside the farm's `000000FF` split the group for nine days). `tray_fields.backup_group_key` is the one origin for the firmware's grouping key; `filament_deficit` pools on it; dispatch logs `[spool-select] … NO firmware backup partner` and raises the new `backup_group_split` notification (6 h dedup) when the lane cannot act. Frontend: `computeBackupGroups` keys on temps too, and a bottom-left "No backup slot" badge (`nearMissBackupSlots`) marks a slot whose same-filament neighbour is excluded by colour/temps.
+- **`services/queue_transitions.py`** — `cancel_pending_items` and `claim_pending_for_dispatch`: queue-item status transitions as conditional `UPDATE … WHERE status='pending' RETURNING`, used by run abort, batch cancel, item cancel and the dispatcher's post-upload claim.
+
+### Fixed
+- Run abort / batch cancel / item cancel no longer overwrite a unit the scheduler committed as `printing` in the same second (lost update → cancelled-but-printing row → FOREIGN print, 010-H2S run 112); a cancel landing during the FTPS upload now refuses the dispatch and removes the uploaded file from the printer.
+
 ### Removed
 - `new_spool_detected` prompt machinery (WS event, 20 s identity-grace scheduler, PrintersPage banner) — superseded by silent auto-mint.
 - `prefer_lowest_filament` setting (schema, route whitelist, scheduler read, UI toggle) — superseded by `spool_selection_policy`.

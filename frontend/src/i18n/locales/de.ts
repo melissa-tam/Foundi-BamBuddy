@@ -1118,6 +1118,7 @@ export default {
     slot: {
       ranOut: 'Leer — dieses Fach neu befüllen',
       spentCore: 'Verbraucht — Rolle ersetzen',
+      noBackupSlot: 'Kein Backup-Fach. Ein anderes Fach enthält dieses Filament in einer anderen Farbe.',
       wasFeeding: 'Hat diesen Druck versorgt',
     },
     activeJobSlot: {

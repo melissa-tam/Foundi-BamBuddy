@@ -1,6 +1,7 @@
 """Integration tests for the production-run API: creation + lifecycle."""
 
 import zipfile
+from datetime import datetime, timezone
 
 import pytest
 from httpx import AsyncClient
@@ -247,6 +248,45 @@ class TestProductionRunLifecycle:
         assert resp.json()["status"] == "cancelled"
         items = await _pending_items(db_session, run_id)
         assert items and all(it.status == "cancelled" for it in items)
+        # Terminal rows: the shared cancel primitive stamps completed_at (the queue
+        # routes always did; run-abort joined them) and NULLs any hold token.
+        assert all(it.completed_at is not None for it in items)
+        assert all(it.waiting_reason is None for it in items)
+
+    async def test_abort_leaves_a_unit_dispatched_in_the_gap_printing(self, async_client, db_session, tmp_path):
+        """The 2026-08-20 lost update: abort must not overwrite a live dispatch.
+
+        Run 112 / item 865 on 010-H2S — the scheduler committed status='printing'
+        + started_at + ams_mapping one second before the operator aborted, and the
+        abort's stale ORM view wrote 'cancelled' over the status column alone. The
+        printer kept printing a job no farm unit claimed.
+        """
+        run_id = await self._create_run(async_client, db_session, tmp_path, "SKU035.01")
+        items = sorted(await _pending_items(db_session, run_id), key=lambda it: it.id)
+        assert len(items) >= 2
+        dispatched, still_pending = items[0], items[1]
+
+        dispatched.status = "printing"
+        dispatched.started_at = datetime(2026, 8, 20, 21, 21, 56, tzinfo=timezone.utc)
+        dispatched.ams_mapping = "[1]"
+        still_pending.waiting_reason = "filament_short"
+        await db_session.commit()
+
+        resp = await async_client.post(f"/api/v1/production-runs/{run_id}/abort")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "cancelled"
+
+        for item in (dispatched, still_pending):
+            await db_session.refresh(item)
+
+        assert dispatched.status == "printing"
+        assert dispatched.started_at is not None
+        assert dispatched.ams_mapping == "[1]"
+        assert dispatched.completed_at is None
+
+        assert still_pending.status == "cancelled"
+        assert still_pending.completed_at is not None
+        assert still_pending.waiting_reason is None
 
     async def test_invalid_transition_409(self, async_client, db_session, tmp_path):
         run_id = await self._create_run(async_client, db_session, tmp_path, "SKU033.01")

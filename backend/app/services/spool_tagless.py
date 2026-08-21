@@ -8,8 +8,13 @@ and the terminal-time identity reconcile were deleted, not re-homed. What remain
 everything AROUND that decision, in three groups:
 
 * **Minting + tagless defaults** — :func:`mint_tagless_spool`,
-  :func:`tagless_default_filament`, :func:`override_generic_identity`. The pipeline
+  :func:`tagless_default_filament`, :func:`canonical_default_identity`. The pipeline
   calls these to execute a MINT it decided on; the shapes are unchanged.
+  :func:`canonical_default_identity` is the ONE predicate for "is this the fleet's
+  default filament, spelled non-canonically?" — it replaced the three overlapping
+  helpers (``override_generic_identity``, ``default_temps_for_fingerprint`` and the
+  mint's inline override) in the 2026-08-21 backup-group wave, and it now covers the
+  COLOUR dimension the earlier helpers left split.
 * **Wire config (a sibling lane, NOT identity)** — :func:`maybe_autoconfigure_bare_tray`
   pushes the default filament to a BARE tray (spool present, ``tray_type`` empty,
   state 10/11) so the slot is usable, including mid-print where it joins the firmware
@@ -79,7 +84,12 @@ from backend.app.services.spool_tag_matcher import (
     parse_tray_fields,
     reapply_k_profile_if_drifted,
 )
-from backend.app.services.tray_fields import parse_int_field, tray_presence_from_dict
+from backend.app.services.tray_fields import (
+    backup_group_key,
+    normalize_color_for_id,
+    parse_int_field,
+    tray_presence_from_dict,
+)
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_ids import GENERIC_FILAMENT_IDS
 from backend.app.utils.filament_types import canonical_filament_type
@@ -436,72 +446,140 @@ def fingerprint_matches(spool: Spool, tray: dict) -> bool:
 def _fingerprint_matches_default(material: str | None, rgba: str | None, default: dict) -> bool:
     """True when a (material, rgba) pair fingerprint-matches the tagless default —
     same canonical material AND color within tolerance. The material+rgba twin of
-    :func:`fingerprint_matches` (a dict default has no tray shape), shared by the
-    generic-id mint override (W4.4) and :func:`default_temps_for_fingerprint`."""
+    :func:`fingerprint_matches` (a dict default has no tray shape), and the inner
+    match of :func:`canonical_default_identity`'s eligibility test."""
     if canonical_filament_type(material or "") != canonical_filament_type(default.get("material") or ""):
         return False
     return colors_similar(rgba or "", default.get("rgba") or "")
 
 
-async def default_temps_for_fingerprint(
-    db: AsyncSession, material: str | None, rgba: str | None
-) -> tuple[int, int] | None:
-    """The tagless default's ``(nozzle_temp_min, nozzle_temp_max)`` IFF a
-    (material, rgba) pair fingerprint-matches the configured default AND the default
-    carries both temps; else ``None``.
+def _base_filament_id(slicer_filament: str | None) -> str:
+    """The bare preset id from a stored or wire reference (``"GFG99_x"`` → ``"GFG99"``).
 
-    Public accessor over the single tagless-default JSON parser (:func:`_tagless_default`)
-    — the slicer resolver's middle nozzle-temp tier (row temps → THIS →
-    ``MATERIAL_TEMPS``) so a fingerprint-matched tagless slot inherits the default's
-    canonical range and stays a byte-identical firmware backup-group peer (W4)."""
-    default = await _tagless_default(db)
-    if default is None or not _fingerprint_matches_default(material, rgba, default):
-        return None
-    tmin = default.get("nozzle_temp_min")
-    tmax = default.get("nozzle_temp_max")
-    if tmin is None or tmax is None:
-        return None
-    try:
-        return (int(tmin), int(tmax))
-    except (TypeError, ValueError):
-        return None
-
-
-async def override_generic_identity(
-    db: AsyncSession, slicer_filament: str | None, material: str | None, rgba: str | None
-) -> dict | None:
-    """The tagless default's SPECIFIC identity to write instead of a GENERIC one.
-
-    Returns ``{"slicer_filament", "nozzle_temp_min", "nozzle_temp_max"}`` when
-    ``slicer_filament`` is a generic id (``GFG99`` …) AND the configured tagless
-    default carries a specific id AND ``(material, rgba)`` fingerprint-matches that
-    default; ``None`` otherwise (nothing to override).
-
-    Generic-id self-perpetuation is the 011-H2S no-auto-refill cause (2026-07-19):
-    the firmware's auto-refill backup group only pairs slots whose brand-class /
-    type / colour / nozzle temps match EXACTLY, so one slot configured ``GFG99``
-    beside a ``GFG02`` peer splits the group. A generic id enters the ledger from a
-    bare-tray auto-config or a legacy row and is then re-read and re-published
-    forever. This is the single override, consumed at BOTH ends of that loop: the
-    tagless mint (:func:`mint_tagless_spool`, so a re-read row stops carrying it)
-    and the wire resolver (``slicer_filament_resolver.resolve_slicer_filament``, so
-    a stale row already in the DB can no longer re-publish it). The temps ride along
-    deliberately — substituting the id while keeping a stale row's temps would still
-    split the group on the temperature dimension.
+    Mirrors the split ``slicer_filament_resolver`` does before it normalises, so the
+    canonicaliser reads a suffixed id the same way the resolver does — otherwise a
+    variant-suffixed generic id would look like an operator's specific preset and be
+    left to split the backup group.
     """
-    if not slicer_filament or slicer_filament not in _GENERIC_ID_VALUES:
+    sf = (slicer_filament or "").strip()
+    return sf.split("_", 1)[0] if "_" in sf else sf
+
+
+def _eligible_for_default_identity(
+    default: dict, *, slicer_filament: str | None, material: str | None, rgba: str | None
+) -> bool:
+    """Is this identity the tagless default's filament, merely spelled differently?
+
+    Three conditions, all necessary:
+
+    * the canonical MATERIAL matches the default's, and
+    * the COLOUR is within ``colors_similar``'s tolerance of the default's
+      (:func:`_fingerprint_matches_default`) — ``161616FF`` beside ``000000FF`` is one
+      black PETG with two spellings, ``FF0000FF`` is a different roll; and
+    * the stored PRESET id is not a different SPECIFIC one. Unstated (``""``/None) and
+      GENERIC (``GFG99`` …) ids both assert nothing about which preset the roll is, so
+      both are canonicalisable, and the default's own id is trivially so. A different
+      specific id — ``GFG00`` beside a ``GFG02`` default — is an OPERATOR STATEMENT and
+      is never rewritten on ANY dimension (doctrine rule 2).
+
+    Split out of :func:`canonical_default_identity` because the harmonise arm has to
+    ask "is this slot ours to canonicalise?" separately from "does anything differ?" —
+    one origin for the eligibility test, two questions asked of it.
+    """
+    if not _fingerprint_matches_default(material, rgba, default):
+        return False
+    stored = _base_filament_id(slicer_filament)
+    if not stored or stored in _GENERIC_ID_VALUES:
+        return True
+    return stored == (default.get("slicer_filament") or "").strip()
+
+
+def canonical_default_identity(
+    default: dict | None,
+    *,
+    slicer_filament: str | None,
+    material: str | None,
+    rgba: str | None,
+    nozzle_temp_min: int | None,
+    nozzle_temp_max: int | None,
+) -> dict | None:
+    """The tagless default's identity to write instead of the one given — or ``None``.
+
+    THE predicate for "is this the fleet's default filament, spelled non-canonically?"
+    and the single replacement for the three overlapping helpers this module used to
+    carry (``override_generic_identity``, ``default_temps_for_fingerprint`` and the
+    mint's own inline override): one question, four dimensions, one answer.
+
+    Returns the default's ``{slicer_filament, rgba, nozzle_temp_min, nozzle_temp_max}``
+    when the identity is ELIGIBLE (:func:`_eligible_for_default_identity`) **and** at
+    least one of the firmware's backup-group dimensions differs from the default's —
+    the preset id, the EXACT colour (through ``tray_fields.normalize_color_for_id``, so
+    ``161616FF`` differs from ``000000FF`` even though the two are ``colors_similar``),
+    or either nozzle temp. ``None`` means "nothing to do": already canonical, or not the
+    default's filament at all. A field the default does not carry comes back ``None`` —
+    every caller applies only what it is given, and never invents a dimension.
+
+    Why all four, and why the colour comparison is EXACT while eligibility is fuzzy:
+    the firmware pairs slots into an auto-refill backup group only on an exact
+    brand-class / type / colour / nozzle-temp match. 011-H2S (2026-07-19) proved the id
+    dimension — one slot left on generic ``GFG99`` beside a ``GFG02`` peer never got a
+    backup switch. 010-H2S (2026-08-21) proved the colour dimension: slots 1+2 carried
+    ``161616FF`` (a Bambu Studio / touchscreen slot edit that accepted the PETG-HF
+    preset's own default colour) while slots 3+4 carried the farm's ``000000FF``, and
+    the printer ran dry on slot 2 twice in 28 h with a full black roll one slot away —
+    ``hms-events`` shows 69 auto-switches inside the 1↔2 pair, 14 inside 3→4, and none
+    across. ``colors_similar`` answers "is this the same FILAMENT?" (eligibility);
+    byte-exact equality answers "will the FIRMWARE pair them?" (is a write owed).
+    Conflating the two is precisely how the farm harmonised the preset and temperature
+    dimensions for three weeks while leaving the colour dimension split.
+
+    Pure and synchronous: the caller supplies the parsed ``tagless_default_filament``
+    dict (:func:`tagless_default_filament`), so this stays a decision with no I/O and
+    the settings read happens once per lane instead of once per dimension. A ``None``
+    default (feature off) answers ``None``.
+    """
+    if not default:
         return None
-    default = await _tagless_default(db)
-    if default is None:
+    if not _eligible_for_default_identity(default, slicer_filament=slicer_filament, material=material, rgba=rgba):
         return None
-    specific = default.get("slicer_filament") or ""
-    if not specific or not _fingerprint_matches_default(material, rgba, default):
+
+    canon_id = (default.get("slicer_filament") or "").strip() or None
+    canon_rgba = (default.get("rgba") or "").strip() or None
+    canon_min = parse_int_field(default.get("nozzle_temp_min"))
+    canon_max = parse_int_field(default.get("nozzle_temp_max"))
+
+    differs = (
+        (canon_id is not None and _base_filament_id(slicer_filament) != canon_id)
+        or (canon_rgba is not None and normalize_color_for_id(rgba) != normalize_color_for_id(canon_rgba))
+        or (canon_min is not None and parse_int_field(nozzle_temp_min) != canon_min)
+        or (canon_max is not None and parse_int_field(nozzle_temp_max) != canon_max)
+    )
+    if not differs:
         return None
     return {
-        "slicer_filament": specific,
-        "nozzle_temp_min": default.get("nozzle_temp_min"),
-        "nozzle_temp_max": default.get("nozzle_temp_max"),
+        "slicer_filament": canon_id,
+        "rgba": canon_rgba,
+        "nozzle_temp_min": canon_min,
+        "nozzle_temp_max": canon_max,
     }
+
+
+def _tray_canonical_delta(default: dict | None, tray: dict) -> dict | None:
+    """:func:`canonical_default_identity` for a LIVE tray dict.
+
+    The ONE mapping from wire fields to the predicate's arguments, so the reconcile
+    walk's ADOPTION test and the harmonise arm's WIRE step can never read the same tray
+    differently — the two answers have to agree or the arm writes to a slot the walk has
+    just declared settled, forever.
+    """
+    return canonical_default_identity(
+        default,
+        slicer_filament=(tray.get("tray_info_idx") or "").strip(),
+        material=_tray_material(tray),
+        rgba=(tray.get("tray_color") or "").strip(),
+        nozzle_temp_min=parse_int_field(tray.get("nozzle_temp_min")),
+        nozzle_temp_max=parse_int_field(tray.get("nozzle_temp_max")),
+    )
 
 
 # --- setting helpers --------------------------------------------------------
@@ -593,15 +671,33 @@ async def mint_tagless_spool(
         slicer_filament_name = parsed.slicer_filament_name
         nozzle_temp_min = parsed.nozzle_temp_min
         nozzle_temp_max = parsed.nozzle_temp_max
-        # Generic-id self-perpetuation guard (W4.4): a tray re-reporting the GENERIC
-        # id an earlier bare-tray auto-config wrote mints the tagless default's
-        # SPECIFIC id/name/temps instead — see :func:`override_generic_identity`.
-        _override = await override_generic_identity(db, slicer_filament, material, rgba)
-        if _override is not None:
-            slicer_filament = _override["slicer_filament"]
-            slicer_filament_name = None
-            nozzle_temp_min = _override["nozzle_temp_min"]
-            nozzle_temp_max = _override["nozzle_temp_max"]
+        # CANONICAL-IDENTITY guard: a tray re-reporting the GENERIC id an earlier
+        # bare-tray auto-config wrote, or the near-black colour a touchscreen slot edit
+        # left behind, mints the tagless default's OWN identity instead — id, colour and
+        # temps together (:func:`canonical_default_identity`). All four dimensions,
+        # because a row born canonical on three of them is still not a firmware
+        # backup-group peer: 010-H2S ran dry twice in 28 h on rows that matched the
+        # default's preset and temps and carried 161616FF for its colour.
+        _canon = canonical_default_identity(
+            await _tagless_default(db),
+            slicer_filament=slicer_filament,
+            material=material,
+            rgba=rgba,
+            nozzle_temp_min=nozzle_temp_min,
+            nozzle_temp_max=nozzle_temp_max,
+        )
+        if _canon is not None:
+            if _canon["slicer_filament"] and _canon["slicer_filament"] != slicer_filament:
+                slicer_filament = _canon["slicer_filament"]
+                # The builtin NAME belonged to the id we just replaced; re-deriving it
+                # is the resolver's job, and a stale name would realign the id back.
+                slicer_filament_name = None
+            if _canon["rgba"]:
+                rgba = _canon["rgba"]
+            if _canon["nozzle_temp_min"] is not None:
+                nozzle_temp_min = _canon["nozzle_temp_min"]
+            if _canon["nozzle_temp_max"] is not None:
+                nozzle_temp_max = _canon["nozzle_temp_max"]
         # Only a POSITIVE reported net weight overrides the model default.
         label_weight = parsed.label_weight if parsed.label_weight > 0 else None
         source = "tray"
@@ -2415,6 +2511,41 @@ def on_ams_command_result(printer_id: int, echo: dict) -> None:
 # --- D3b: bare-tray auto-config --------------------------------------------
 
 
+def _own_tagless_slot(tray: dict, assignment: SpoolAssignment | None) -> bool:
+    """Is this slot a seated, non-RFID tray bound to a LIVE row THIS module minted?
+
+    The shared eligibility both wire-config arms rest on — :func:`maybe_autoconfigure_bare_tray`
+    (bare tray, nothing configured) and :func:`maybe_harmonize_backup_identity`
+    (configured tray whose identity drifted from the default). Neither arm may write to
+    a slot that is not ours:
+
+    * ``tray_present`` — a write to an empty slot configures nothing and a write to an
+      unknown one is a guess;
+    * no valid RFID tag — a config write racing a firmware tag read is the 2026-07-18
+      HMS ``0700_0081`` class;
+    * a binding, holding a spool, whose ``data_origin`` is this module's own
+      :data:`DATA_ORIGIN` — an operator- or RFID-bound row is somebody's STATEMENT
+      about that slot and is never overwritten;
+    * not spent — a spent row is the durable "ran dry" latch, released only by a
+      qualified physical cycle (W1). The bare arm reaches that transition ABOVE this
+      predicate, which is why it can call it afterwards without losing the branch.
+
+    Deliberately NOT here: everything that needs a printer id or the DB (the
+    identify/drying defers, the write-epoch latch, the settle gates, the retry cadence,
+    the tagless-default setting). Those are per-arm OCCASION gates, not "is this slot
+    ours", and folding them in would hide a refusal behind an eligibility answer.
+    """
+    if not tray_present(tray):
+        return False
+    if is_valid_tag(tray.get("tag_uid", "") or "", tray.get("tray_uuid", "") or ""):
+        return False
+    if assignment is None or assignment.spool is None:
+        return False
+    if assignment.spool.data_origin != DATA_ORIGIN:
+        return False
+    return assignment.spool.spent_at is None
+
+
 async def maybe_autoconfigure_bare_tray(
     db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, tray: dict, *, force: bool = False
 ) -> bool:
@@ -2518,9 +2649,12 @@ async def maybe_autoconfigure_bare_tray(
         await _replace_row_after_cycle(db, printer_id, ams_id, tray_id, tray, assignment.spool)
         return True
 
-    if assignment is not None and (assignment.spool is None or assignment.spool.data_origin != DATA_ORIGIN):
+    if assignment is not None and not _own_tagless_slot(tray, assignment):
         # Operator- or RFID-bound slot (or an orphan) — never overwrite. Only our
-        # OWN auto-minted default is eligible for a self-healing re-push.
+        # OWN auto-minted default is eligible for a self-healing re-push. Shared with
+        # the harmonise arm (:func:`_own_tagless_slot`) so "ours" has one definition;
+        # the spent half of that predicate is already decided above, where a qualified
+        # cycle takes the replace transition instead of returning.
         return False
 
     # Settle before the FIRST mint on this slot (F1): a bare tray whose spool was
@@ -2603,6 +2737,179 @@ async def maybe_autoconfigure_bare_tray(
         # (failed / slow push) — re-push, don't re-mint.
         spool = assignment.spool
 
+    _note_autoconfig_attempt(printer_id, ams_id, tray_id)
+    await _push_config(db, spool, printer_id, ams_id, tray_id, tray)
+    return True
+
+
+# --- backup-group identity harmonisation -----------------------------------
+
+
+def _row_backup_group_key(spool: Spool) -> str | None:
+    """The ledger row's own :func:`tray_fields.backup_group_key`, for the log line.
+
+    The row is rendered through the SAME key the wire side is, so the two halves of a
+    harmonise INFO line are directly comparable and the operator can see which of the
+    three dimensions is split. Never a decision input — the decision is
+    :func:`canonical_default_identity`.
+    """
+    return backup_group_key(
+        {
+            "tray_type": spool.material or "",
+            "tray_info_idx": spool.slicer_filament or "",
+            "tray_color": spool.rgba or "",
+            "nozzle_temp_min": spool.nozzle_temp_min,
+            "nozzle_temp_max": spool.nozzle_temp_max,
+        }
+    )
+
+
+async def maybe_harmonize_backup_identity(
+    db: AsyncSession,
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    tray: dict,
+    assignment: SpoolAssignment | None,
+) -> bool:
+    """Re-align a CONFIGURED tagless slot onto the tagless default's EXACT identity.
+
+    :func:`maybe_autoconfigure_bare_tray`'s sibling on the opposite predicate: that arm
+    gives an unconfigured tray a usable identity, this one fixes a configured tray whose
+    identity is the default's filament spelled differently — so the firmware will
+    actually pair the slots into one auto-refill backup group.
+
+    INCIDENT (010-H2S, 2026-08-21). Slots 1+2 carried tray colour ``161616FF`` — a Bambu
+    Studio / touchscreen slot edit that accepted the PETG-HF preset's own default colour
+    — while slots 3+4 carried the farm's ``000000FF``. Same material, same preset, same
+    temps, ``colors_similar`` to each other, and the firmware pairs on an EXACT colour
+    match, so the two pairs were separate groups: ``hms-events`` shows 69 auto-switches
+    inside 1↔2, 14 inside 3→4, and none across. The printer ran dry on slot 2 twice in
+    28 h with a full black roll one slot away and AMS Filament Backup ON. The farm had
+    been harmonising the PRESET dimension since the 011-H2S ``GFG99`` fix and the TEMPS
+    dimension since W4; the colour dimension had no lane at all, and a slot the operator
+    edited on the touchscreen could never come back.
+
+    TWO ORDERED STEPS, both driven by the one predicate
+    (:func:`canonical_default_identity`):
+
+    * **ROW** — when the ledger row itself is off-canonical, write the default's four
+      identity fields onto it. Rows minted from a tray inherit whatever the tray read,
+      which is how ``161616FF`` got into the ledger in the first place; leaving the row
+      wrong means every future re-push re-publishes the split.
+    * **WIRE** — when the live tray still reads something other than the (now canonical)
+      identity, publish it through :func:`_push_config`, the module's ONE wire write.
+
+    Every guard the bare arm carries applies, for the same reasons and in the same order:
+    ownership (:func:`_own_tagless_slot`), the tagless-default setting, the
+    identify/drying hardware defers, the write-epoch latch, the settle gate, the retry
+    cadence and the strike ladder. Two placements are deliberate. The ROW step runs ABOVE
+    the wire guards because correcting the ledger is a DB write that risks nothing on the
+    wire and must not be held hostage to a slot the firmware is refusing. The wire-delta
+    test runs above the DEFER logging, so a settled, already-canonical slot stays silent
+    every pass instead of narrating a deferral it does not need.
+
+    Refuses outright when the row is not the default's filament
+    (:func:`_eligible_for_default_identity`): a different colour, a different material or
+    a different SPECIFIC preset is an operator statement, and harmonising it would push
+    OUR guess over THEIR answer (doctrine rule 2). Returns True when a config push was
+    attempted this pass.
+    """
+    if not (tray.get("tray_type") or "").strip():
+        return False  # bare — maybe_autoconfigure_bare_tray owns that shape
+    if not _own_tagless_slot(tray, assignment):
+        return False
+    spool = assignment.spool  # narrowed by _own_tagless_slot
+    default = await _tagless_default(db)
+    if default is None:
+        return False  # setting cleared → feature off
+    if not _eligible_for_default_identity(
+        default, slicer_filament=spool.slicer_filament, material=spool.material, rgba=spool.rgba
+    ):
+        return False  # not the default's filament — not ours to canonicalise
+
+    # (i) ROW — make the ledger the canonical identity before anything reads it again.
+    canon = canonical_default_identity(
+        default,
+        slicer_filament=spool.slicer_filament,
+        material=spool.material,
+        rgba=spool.rgba,
+        nozzle_temp_min=spool.nozzle_temp_min,
+        nozzle_temp_max=spool.nozzle_temp_max,
+    )
+    if canon is not None:
+        changes: list[str] = []
+        for field in ("slicer_filament", "rgba", "nozzle_temp_min", "nozzle_temp_max"):
+            new = canon[field]
+            if new is None:
+                continue  # the default does not carry this dimension — nothing to state
+            old = getattr(spool, field)
+            if old == new:
+                continue
+            setattr(spool, field, new)
+            if field == "slicer_filament":
+                spool.slicer_filament_name = None  # the builtin name belonged to the old id
+            changes.append(f"{field} {old!r}→{new!r}")
+        if changes:
+            await db.commit()
+            logger.info(
+                "[tagless] harmonise printer=%d AMS%d-T%d spool=%d row: %s",
+                printer_id,
+                ams_id,
+                tray_id,
+                spool.id,
+                ", ".join(changes),
+            )
+
+    # (ii) WIRE — the tray's own reading, judged by the SAME predicate the reconcile
+    # walk's adoption test uses, so the two can never disagree about this slot.
+    if _tray_canonical_delta(default, tray) is None:
+        return False  # the firmware already reports the canonical identity
+
+    if ams_presence.identify_in_flight(printer_id, ams_id, tray_id) or ams_presence.unit_drying(printer_id, ams_id):
+        logger.debug(
+            "Deferring backup-group harmonise for printer %d AMS%d-T%d: AMS identify/drying in progress",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return False
+    if _autoconfig_latched(printer_id, ams_id, tray_id):
+        return False  # this slot's write epoch ended — the wire refused, or never reflected
+    if _config_settling(printer_id, ams_id, tray_id):
+        logger.debug(
+            "Deferring backup-group harmonise for printer %d AMS%d-T%d: slot identity still settling",
+            printer_id,
+            ams_id,
+            tray_id,
+        )
+        return False
+
+    key = (printer_id, ams_id, tray_id)
+    if not _autoconfig_window.allow(key):
+        return False  # still inside the shared re-push cadence
+
+    epoch = _autoconfig_epochs.get(key, _AutoconfigEpoch())
+    if epoch.publishes >= _AUTOCONFIG_MAX_PUBLISHES:
+        _end_autoconfig_epoch(
+            printer_id,
+            ams_id,
+            tray_id,
+            epoch,
+            verdict="config_unadopted",
+            detail="the canonical identity was written and the tray still reports its own",
+        )
+        return False
+
+    logger.info(
+        "[tagless] harmonise printer=%d AMS%d-T%d spool=%d wire: tray reads %s vs canonical %s — pushing",
+        printer_id,
+        ams_id,
+        tray_id,
+        spool.id,
+        backup_group_key(tray),
+        _row_backup_group_key(spool),
+    )
     _note_autoconfig_attempt(printer_id, ams_id, tray_id)
     await _push_config(db, spool, printer_id, ams_id, tray_id, tray)
     return True
@@ -2829,6 +3136,10 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
     This is the state-derived backstop for both. Each scheduler tick it walks the
     live merged AMS of every active printer and re-drives the owning service
     functions: :func:`maybe_autoconfigure_bare_tray` for a still-bare slot,
+    :func:`maybe_harmonize_backup_identity` for a CONFIGURED tagless slot whose
+    identity has drifted off the tagless default (the 010-H2S backup-group split —
+    the bare arm's sibling on the opposite predicate, sharing its ownership test,
+    cadence, epoch ladder and busy backoff),
     ``spool_tag_matcher.reapply_k_profile_if_drifted`` for a Bambu-tagged bound one,
     and ``ams_presence.maybe_command_owed_identify`` for a slot whose owed DISCOVERY
     read the event-driven identify lanes never got to (2026-07-25: six hours behind a
@@ -2869,6 +3180,13 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
         return 0
 
     from backend.app.models.printer import Printer  # local import: cycle avoidance
+
+    # ONE settings read per pass for the walk's ADOPTION test (A.5): a configured slot
+    # whose live tray is off-canonical has NOT adopted our config, and calling it adopted
+    # would re-arm its write epoch every 30 s against a firmware that keeps refusing —
+    # the shape-28 storm, re-created from the other end. The arms below read the setting
+    # themselves; they run for at most a handful of slots per pass.
+    tagless_default = await _tagless_default(db)
 
     pushed = 0
     printer_ids = (await db.execute(select(Printer.id).where(Printer.is_active.is_(True)))).scalars().all()
@@ -2920,12 +3238,23 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
                 # abandon every printer after this one).
                 try:
                     configured = bool((tray.get("tray_type") or "").strip())
-                    if configured:
+                    own_tagless = configured and _own_tagless_slot(tray, assignment)
+                    if configured and (not own_tagless or _tray_canonical_delta(tagless_default, tray) is None):
                         # ADOPTION — and this walk is its RELIABLE observer: both
                         # bare-tray call sites pre-filter on an empty tray_type, so a
                         # slot that has taken the config stops reaching the lane
                         # entirely and would otherwise carry its strike count into a
                         # later bare episode.
+                        #
+                        # Adoption is DERIVED, never stored (2026-08-21): a non-empty
+                        # tray_type proves the firmware applied SOMETHING, which is the
+                        # whole answer for a slot that is not ours to canonicalise, but
+                        # for one that IS, the identity it applied has to be the one we
+                        # asked for. A tray still reading its own colour has not adopted
+                        # our config, and marking it adopted would re-arm the harmonise
+                        # arm's epoch every pass — an unbounded write loop against a
+                        # refusing firmware, which is the exact class the epoch ladder
+                        # exists to bound.
                         note_config_adopted(printer_id, ams_id, tray_id)
 
                     if tray_present(tray) and not configured and not is_valid_tag(tag_uid, tray_uuid):
@@ -2963,6 +3292,24 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
                         if await reapply_k_profile_if_drifted(
                             db, printer_id, ams_id, tray_id, tray, assignment.spool, state
                         ):
+                            pushed += 1
+                    elif own_tagless:
+                        # CONFIGURED but off-canonical — the 010-H2S backup-group split.
+                        # Same busy backoff as the bare arm and for the same reason: a
+                        # RUNNING/PAUSE AMS silently drops config writes, so skip the
+                        # PUBLISH and leave the retry window unburned rather than
+                        # re-firing every 30 s for hours. The callee owns every other
+                        # guard, and refuses in silence when the slot is already a peer.
+                        if printer_busy:
+                            logger.debug(
+                                "Slot-config reconcile: printer %d AMS%d-T%d backup-group harmonise skipped "
+                                "— printer is %s (a busy AMS ignores config writes)",
+                                printer_id,
+                                ams_id,
+                                tray_id,
+                                busy_state,
+                            )
+                        elif await maybe_harmonize_backup_identity(db, printer_id, ams_id, tray_id, tray, assignment):
                             pushed += 1
 
                     # OWED DISCOVERY READ — the identity twin of the config re-push

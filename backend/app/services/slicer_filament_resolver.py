@@ -17,7 +17,7 @@ Resolver outcomes:
   PFUS / PFCN cloud setting_id) — UNLESS the caller passes
   ``generic_fallback=True``, in which case the identity is re-composed from
   the spool's MATERIAL and re-resolved through this same function (so the
-  generic id it composes still passes the ``override_generic_identity``
+  generic id it composes still passes the ``canonical_default_identity``
   substitution). Without that flag the caller owns the generic-material
   fallback.
 - Returns ``(tray_info_idx, setting_id, sub_brand_override)`` otherwise.
@@ -56,39 +56,93 @@ logger = logging.getLogger(__name__)
 _KNOWN_MATERIALS = set(MATERIAL_TEMPS.keys()) | set(GENERIC_FILAMENT_IDS.keys())
 
 
-async def _resolve_nozzle_temps(
-    db: AsyncSession,
+async def _tagless_default(db: AsyncSession) -> dict | None:
+    """The parsed ``tagless_default_filament`` dict — read ONCE per resolve.
+
+    Lazy import: ``spool_tagless`` owns the single JSON parse, and keeping the import
+    function-local is what stops the resolver and that module forming a cycle. The read
+    is best-effort by design — both tiers that consume it have an always-valid fallback
+    below them, so a settings failure must degrade rather than raise into a slot write.
+    """
+    try:
+        from backend.app.services.spool_tagless import tagless_default_filament
+
+        return await tagless_default_filament(db)
+    except Exception as e:  # noqa: BLE001 — the un-canonicalised identity is a valid answer
+        logger.debug("Tagless-default lookup failed: %s", e)
+        return None
+
+
+def _canonical_identity(
+    default: dict | None,
+    *,
+    slicer_filament: str | None,
+    material: str | None,
+    rgba: str | None,
+    nozzle_temp_min: int | None,
+    nozzle_temp_max: int | None,
+) -> dict | None:
+    """``spool_tagless.canonical_default_identity``, guarded and lazily imported.
+
+    Both consumers below ask the SAME predicate the tagless mint and the slot-config
+    harmonise arm ask, so no write site can disagree with another about what the fleet's
+    default filament looks like.
+    """
+    try:
+        from backend.app.services.spool_tagless import canonical_default_identity
+
+        return canonical_default_identity(
+            default,
+            slicer_filament=slicer_filament,
+            material=material,
+            rgba=rgba,
+            nozzle_temp_min=nozzle_temp_min,
+            nozzle_temp_max=nozzle_temp_max,
+        )
+    except Exception as e:  # noqa: BLE001 — the un-canonicalised identity is a valid answer
+        logger.debug("Canonical-identity lookup failed for %r: %s", slicer_filament, e)
+        return None
+
+
+def _resolve_nozzle_temps(
     material: str | None,
     rgba: str | None,
     row_min: int | None,
     row_max: int | None,
+    *,
+    slicer_filament: str | None,
+    default: dict | None,
 ) -> tuple[int, int]:
     """The slot's nozzle temperature range, resolved in ONE place (W4).
 
-    Tier order, each temp independently: the spool ROW's temp when set → the
-    configured tagless default's pair when the spool's material+rgba fingerprint
-    matches the default → ``MATERIAL_TEMPS`` (final always-valid fallback). The
-    default tier is a best-effort enrichment behind a guard: it has an always-valid
-    fallback below it, so a settings-read failure degrades to MATERIAL_TEMPS rather
-    than raising into a slot write.
+    Tier order, each temp independently: the spool ROW's temp when set → the configured
+    tagless default's pair when the row's identity is CANONICALISABLE onto that default
+    (:func:`_canonical_identity`) → ``MATERIAL_TEMPS`` (final always-valid fallback).
+
+    The middle tier used to be a fingerprint match alone, blind to the stored preset.
+    It now rides the same eligibility every other canonicalisation site does, which
+    tightens exactly one case and deliberately: a row naming a DIFFERENT specific preset
+    (``GFG00`` beside a ``GFG02`` default) no longer inherits the default's temperatures.
+    That row is an operator statement, it is not a backup-group peer on the preset
+    dimension either, and lending it the default's temps only made it look like one.
+    An UNSTATED preset (``""``/None) stays eligible — it asserts nothing to contradict —
+    so the legacy-row shape this tier was written for is untouched.
     """
     temp_min, temp_max = row_min, row_max
     if temp_min is None or temp_max is None:
-        default_pair: tuple[int, int] | None = None
-        try:
-            # Lazy import: the single owner of the tagless-default JSON parse, kept
-            # function-local so the resolver and spool_tagless have no import cycle.
-            from backend.app.services.spool_tagless import default_temps_for_fingerprint
-
-            default_pair = await default_temps_for_fingerprint(db, material, rgba)
-        except Exception as e:  # noqa: BLE001 — best-effort; MATERIAL_TEMPS is the guaranteed fallback
-            logger.debug("Tagless-default temp lookup failed for %r/%r: %s", material, rgba, e)
-        if default_pair is not None:
-            d_min, d_max = default_pair
-            if temp_min is None:
-                temp_min = d_min
-            if temp_max is None:
-                temp_max = d_max
+        canon = _canonical_identity(
+            default,
+            slicer_filament=slicer_filament,
+            material=material,
+            rgba=rgba,
+            nozzle_temp_min=row_min,
+            nozzle_temp_max=row_max,
+        )
+        if canon is not None:
+            if temp_min is None and canon["nozzle_temp_min"] is not None:
+                temp_min = int(canon["nozzle_temp_min"])
+            if temp_max is None and canon["nozzle_temp_max"] is not None:
+                temp_max = int(canon["nozzle_temp_max"])
     if temp_min is None or temp_max is None:
         m_min, m_max = MATERIAL_TEMPS.get((material or "").upper(), (200, 240))
         if temp_min is None:
@@ -138,11 +192,13 @@ async def resolve_slicer_filament(
     function once. Default False keeps every caller that owns its own fallback
     byte-identical.
 
-    A resolved GENERIC id (``GFG99`` …) is finally re-composed as the configured
-    tagless default's SPECIFIC identity — id, setting_id and temps — when the
-    spool fingerprint-matches that default (``spool_tagless.override_generic_identity``),
-    so no write site can re-publish a generic id that splits the firmware's
-    auto-refill backup group.
+    A resolved id that is CANONICALISABLE onto the configured tagless default —
+    generic (``GFG99`` …) or the default's own — is finally re-composed as that
+    default's SPECIFIC identity (id, setting_id and temps) when the spool
+    fingerprint-matches it (``spool_tagless.canonical_default_identity``), so no write
+    site can re-publish an identity that splits the firmware's auto-refill backup
+    group. The COLOUR dimension of that same predicate is the ROW's, not this
+    function's — colour never was part of the resolver's return.
 
     Returns ``(tray_info_idx, setting_id, sub_brand_override, nozzle_temp_min,
     nozzle_temp_max)``. id/setting are empty when nothing resolved;
@@ -150,7 +206,17 @@ async def resolve_slicer_filament(
     available (cloud detail name or local preset name). The two temps are ALWAYS
     concrete ints (MATERIAL_TEMPS is the final fallback).
     """
-    temp_min, temp_max = await _resolve_nozzle_temps(db, material, rgba, nozzle_temp_min, nozzle_temp_max)
+    # ONE settings read per resolve, shared by the nozzle-temp tier and the canonical-id
+    # substitution below — the two used to fetch it independently.
+    default = await _tagless_default(db)
+    temp_min, temp_max = _resolve_nozzle_temps(
+        material,
+        rgba,
+        nozzle_temp_min,
+        nozzle_temp_max,
+        slicer_filament=slicer_filament,
+        default=default,
+    )
 
     tray_info_idx = ""
     setting_id = ""
@@ -291,34 +357,46 @@ async def resolve_slicer_filament(
         ):
             setting_id = ""
 
-    # Generic-id override (E3, 2026-07-20): a GENERIC resolved id (GFG99 …) that
-    # fingerprint-matches the configured tagless default is re-composed as the
-    # default's SPECIFIC identity — id, setting_id AND nozzle temps. The firmware's
-    # auto-refill backup group pairs slots only on an exact brand-class/type/colour/
-    # temps match, so a stale spool row carrying a leftover generic id re-published
-    # a GFG99 that split the group (011-H2S, live). Every write site routes through
-    # this resolver, so the substitution happens once here instead of at each caller.
-    # Best-effort: the tagless-default lookup is a settings read, and a failure must
-    # degrade to the resolved identity rather than raise into a slot write.
-    try:
-        from backend.app.services.spool_tagless import override_generic_identity
-
-        override = await override_generic_identity(db, tray_info_idx, material, rgba)
-    except Exception as e:  # noqa: BLE001 — the un-overridden identity is a valid answer
-        logger.debug("Generic-id override lookup failed for %r: %s", tray_info_idx, e)
-        override = None
-    if override is not None:
-        tray_info_idx = override["slicer_filament"]
+    # Canonical-identity substitution (E3, 2026-07-20; colour dimension 2026-08-21): a
+    # resolved id that is CANONICALISABLE onto the configured tagless default — generic
+    # (GFG99 …) or the default's own — is re-composed as the default's SPECIFIC identity:
+    # id, setting_id AND nozzle temps. The firmware's auto-refill backup group pairs
+    # slots only on an exact brand-class/type/colour/temps match, so a stale spool row
+    # carrying a leftover generic id re-published a GFG99 that split the group (011-H2S,
+    # live). Every write site routes through this resolver, so the substitution happens
+    # once here instead of at each caller. The COLOUR half of the same predicate belongs
+    # to the ROW rather than to this function: colour is not part of the resolver's
+    # contract (the wire takes ``spool.rgba`` directly at the write site), so
+    # ``spool_tagless.maybe_harmonize_backup_identity`` is what canonicalises it.
+    #
+    # Gated on a non-empty resolved id: composing one from nothing is ``generic_fallback``'s
+    # job below, and the write site's own keep-the-live-specific-preset tier must outrank
+    # it. Best-effort — a lookup failure degrades to the resolved identity rather than
+    # raising into a slot write.
+    canon = (
+        _canonical_identity(
+            default,
+            slicer_filament=tray_info_idx,
+            material=material,
+            rgba=rgba,
+            nozzle_temp_min=temp_min,
+            nozzle_temp_max=temp_max,
+        )
+        if tray_info_idx
+        else None
+    )
+    if canon is not None and canon["slicer_filament"]:
+        tray_info_idx = canon["slicer_filament"]
         setting_id = filament_id_to_setting_id(tray_info_idx)
-        if override["nozzle_temp_min"] is not None:
-            temp_min = int(override["nozzle_temp_min"])
-        if override["nozzle_temp_max"] is not None:
-            temp_max = int(override["nozzle_temp_max"])
+        if canon["nozzle_temp_min"] is not None:
+            temp_min = int(canon["nozzle_temp_min"])
+        if canon["nozzle_temp_max"] is not None:
+            temp_max = int(canon["nozzle_temp_max"])
 
     # Generic-material fallback (2026-07-26), opt-in: the SINGLE exit for every shape
     # that resolved no id — an empty/NULL slicer_filament and a sanitised-away value
     # both arrive here. The composed generic id is deliberately NOT returned directly:
-    # re-entering routes it through override_generic_identity above, which is the only
+    # re-entering routes it through the canonical-identity substitution above, the only
     # thing that turns a fingerprint-matching row into the fleet's SPECIFIC id instead
     # of a GFG99 that splits the firmware's auto-refill backup group. Re-entry is one
     # level deep (generic_fallback=False) and only from a non-empty composed id, so it

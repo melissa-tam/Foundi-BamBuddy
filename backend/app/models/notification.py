@@ -123,6 +123,9 @@ class NotificationProvider(Base):
     on_zero_gram_charge = Column(
         Boolean, default=True
     )  # A print COMPLETED on a tagless feeder and charged zero grams — the only gram source for that tray failed
+    on_backup_group_split = Column(
+        Boolean, default=True
+    )  # A dispatch picked a tray with NO firmware backup partner while a near-identical tray sat beside it
     on_storage_low = Column(
         Boolean, default=True
     )  # Printer USB storage FAILURE — auto-cleanup could not free space, FTPS/USB unreachable, or the drive dropped mid-print (successful cleanups are silent)

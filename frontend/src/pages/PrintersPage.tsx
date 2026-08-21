@@ -127,7 +127,7 @@ import { SkipObjectsModal, SkipObjectsIcon } from '../components/SkipObjectsModa
 import { FileUploadModal } from '../components/FileUploadModal';
 import { PrintModal } from '../components/PrintModal';
 import { PrinterInfoModal } from '../components/PrinterInfoModal';
-import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, isBambuLabSpool, getEmptySlotKind, type EmptySlotKind } from '../utils/amsHelpers';
+import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, isBambuLabSpool, getEmptySlotKind, computeBackupGroups, nearMissBackupSlots, type EmptySlotKind } from '../utils/amsHelpers';
 import { slotPresence } from '../utils/spoolBindingStatus';
 import { remainingGrams, remainingFraction } from '../utils/spoolGrams';
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
@@ -2071,6 +2071,24 @@ function PrinterCard({
     }
   }, [status?.ams]);
   const amsData = (status?.ams && status.ams.length > 0) ? status.ams : cachedAmsData.current;
+
+  const isDualNozzle = printer.nozzle_count === 2 || status?.temperatures?.nozzle_2 !== undefined;
+
+  // Slots the firmware will NOT back up despite a same-filament roll on the same
+  // extruder side (010-H2S: slot 2 ran dry twice on 161616FF with a full
+  // 000000FF roll in slot 4 and AMS Filament Backup ON — the firmware pairs on
+  // an exact colour/temp match, the farm's matcher on RGB tolerance). Computed
+  // once per card and read by both AMS slot render sites below — the external
+  // holder is deliberately not among them, because AMS backup never spans the
+  // vt_tray. Empty while Filament Backup is off: the badge names a gap in a
+  // feature that isn't running.
+  const noBackupPartnerSlots = useMemo(() => {
+    if (status?.ams_filament_backup !== true) return new Set<number>();
+    return nearMissBackupSlots(
+      computeBackupGroups(amsData, amsExtruderMap, isDualNozzle),
+      amsData,
+    );
+  }, [status?.ams_filament_backup, amsData, amsExtruderMap, isDualNozzle]);
 
   // Cache tray_now to prevent flickering when undefined values come in
   // Valid tray IDs: 0-253 for AMS, 254 for external spool
@@ -4317,7 +4335,6 @@ function PrinterCard({
               const nozzleHeating = status.temperatures.nozzle_heating || status.temperatures.nozzle_2_heating || false;
               const bedHeating = status.temperatures.bed_heating || false;
               const chamberHeating = status.temperatures.chamber_heating || false;
-              const isDualNozzle = printer.nozzle_count === 2 || status.temperatures.nozzle_2 !== undefined;
               const availableHeaterKinds: HeaterSensorKind[] = (() => {
                 const kinds: HeaterSensorKind[] = ['nozzle'];
                 if (status.temperatures.nozzle_2 !== undefined) kinds.push('nozzle_2');
@@ -5061,7 +5078,6 @@ function PrinterCard({
               // Separate regular AMS (4-tray) from HT AMS (1-tray)
               const regularAms = amsData.filter(ams => ams.tray.length > 1);
               const htAms = amsData.filter(ams => ams.tray.length === 1);
-              const isDualNozzle = printer.nozzle_count === 2 || status?.temperatures?.nozzle_2 !== undefined;
               const filamentSlotClass = 'min-w-14';
               // #1762 (comment 2): while a print is running/paused, overlay a small
               // "P1 / P2 / P3" pill on each slot referenced by the active print's
@@ -5341,6 +5357,7 @@ function PrinterCard({
                                       outOfRotation={!!inventoryAssignment?.spool?.feed_fault_at}
                                       ranOut={slotRanOutFlag}
                                       spentCore={spentCoreFlag}
+                                      noBackupSlot={noBackupPartnerSlots.has(globalTrayId)}
                                     />
                                     <div className="text-[9px] text-white font-bold truncate">
                                       {tray?.tray_type || t(emptySlotLabelKey(emptyKind))}
@@ -5633,6 +5650,7 @@ function PrinterCard({
                               outOfRotation={!!htInventoryAssignment?.spool?.feed_fault_at}
                               ranOut={htSlotRanOut}
                               spentCore={htSpentCore}
+                              noBackupSlot={noBackupPartnerSlots.has(globalTrayId)}
                             />
                             <div className="text-[9px] text-white font-bold truncate">
                               {tray?.tray_type || t(emptySlotLabelKey(emptyKind))}

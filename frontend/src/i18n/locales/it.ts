@@ -1118,6 +1118,7 @@ export default {
     slot: {
       ranOut: 'Esaurito — ricarica questo slot',
       spentCore: 'Terminata — sostituisci la bobina',
+      noBackupSlot: 'Nessuno slot di backup. Un altro slot contiene questo filamento in un colore diverso.',
       wasFeeding: 'Stava alimentando questa stampa',
     },
     activeJobSlot: {

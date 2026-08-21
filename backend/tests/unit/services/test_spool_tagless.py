@@ -593,7 +593,19 @@ class TestDryingDefers:
         assert env.apply.await_count == 1  # processed immediately — window was never armed
 
 
-# --- W4: mint temp stamping + generic-id override --------------------------
+# --- W4: mint temp stamping + canonical-identity adoption ------------------
+
+# The production tagless default (verified live 2026-07-25) — ONE shape for the mint
+# cases and the predicate cases below.
+_CANONICAL_DEFAULT = {
+    "brand": "Bambu Lab",
+    "material": "PETG",
+    "subtype": "HF",
+    "rgba": "000000FF",
+    "slicer_filament": "GFG02",
+    "nozzle_temp_min": 230,
+    "nozzle_temp_max": 270,
+}
 
 
 class TestMintIdentityW4:
@@ -665,23 +677,52 @@ class TestMintIdentityW4:
         spool = await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PLA", color="00FF00FF"))
         assert spool.slicer_filament == "GFL99"  # kept - no fingerprint match, no override
 
-    async def test_default_temps_for_fingerprint(self, db_session, env):
-        env.settings["tagless_default_filament"] = json.dumps(
-            {
-                "brand": "Bambu Lab",
-                "material": "PETG",
-                "subtype": "HF",
-                "rgba": "000000FF",
-                "nozzle_temp_min": 230,
-                "nozzle_temp_max": 270,
-            }
+    async def test_tray_off_canonical_colour_mints_the_defaults_colour(self, db_session, env, monkeypatch):
+        """010-H2S (2026-08-21) INCIDENT PIN, mint side. A tray edited on the
+        touchscreen reports 161616FF — the PETG-HF preset's own default colour, and
+        ``colors_similar`` to the farm's 000000FF. Minting the TRAY's colour is how that
+        value entered the ledger on slots 1+2, and the firmware pairs backup slots on an
+        EXACT colour match, so those two slots could never back up 3+4."""
+        env.settings["tagless_default_filament"] = json.dumps(_CANONICAL_DEFAULT)
+        parsed = SimpleNamespace(
+            material="PETG",
+            subtype="HF",
+            color_name=None,
+            rgba="161616FF",
+            core_weight=250,
+            slicer_filament="GFG02",
+            slicer_filament_name="Bambu PETG HF",
+            nozzle_temp_min=230,
+            nozzle_temp_max=270,
+            label_weight=0,
         )
-        # Fingerprint match (PETG / near-black) -> the default's pair.
-        assert await spool_tagless.default_temps_for_fingerprint(db_session, "PETG", "000000FF") == (230, 270)
-        # Different material -> None.
-        assert await spool_tagless.default_temps_for_fingerprint(db_session, "PLA", "000000FF") is None
-        # Far colour -> None.
-        assert await spool_tagless.default_temps_for_fingerprint(db_session, "PETG", "FF0000FF") is None
+        monkeypatch.setattr(spool_tagless, "parse_tray_fields", AsyncMock(return_value=parsed))
+        spool = await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PETG", color="161616FF"))
+        assert spool.rgba == "000000FF"  # all four dimensions, not three
+        assert spool.slicer_filament == "GFG02"
+        assert spool.slicer_filament_name == "Bambu PETG HF"  # id unchanged -> name kept
+        assert (spool.nozzle_temp_min, spool.nozzle_temp_max) == (230, 270)
+
+    async def test_tray_far_colour_keeps_its_own(self, db_session, env, monkeypatch):
+        """Not a widening: a colour OUTSIDE ``colors_similar``'s tolerance is a different
+        roll, and claiming the default's identity for it is the same wrong answer in
+        reverse."""
+        env.settings["tagless_default_filament"] = json.dumps(_CANONICAL_DEFAULT)
+        parsed = SimpleNamespace(
+            material="PETG",
+            subtype="HF",
+            color_name=None,
+            rgba="FF0000FF",
+            core_weight=250,
+            slicer_filament="GFG02",
+            slicer_filament_name=None,
+            nozzle_temp_min=230,
+            nozzle_temp_max=270,
+            label_weight=0,
+        )
+        monkeypatch.setattr(spool_tagless, "parse_tray_fields", AsyncMock(return_value=parsed))
+        spool = await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PETG", color="FF0000FF"))
+        assert spool.rgba == "FF0000FF"
 
 
 # --- W1: bare-tray spent-binding guard -------------------------------------
@@ -1001,48 +1042,103 @@ class TestTaglessReplay:
         assert not hasattr(spool_tagless, "_fresh_prompt_unanswered")
 
 
-# --- E1: shared generic-identity override ----------------------------------
+# --- E1: the shared canonical-identity predicate ----------------------------
 
 
-class TestGenericIdentityOverride:
-    """The ONE generic->specific substitution, consumed by the mint AND the wire
-    resolver. Its mint-side behaviour is pinned by TestMintIdentityW4 above (which
-    now runs through this helper); these cases pin the helper's own contract."""
+class TestCanonicalDefaultIdentity:
+    """The ONE canonicalisation predicate, consumed by the mint, the wire resolver AND
+    the slot-config harmonise arm. Its mint-side behaviour is pinned by
+    TestMintIdentityW4 above (which runs through this predicate); these cases pin the
+    predicate's own contract, one per firmware backup-group dimension.
 
-    _DEFAULT = {
-        "brand": "Bambu Lab",
-        "material": "PETG",
-        "subtype": "HF",
-        "rgba": "000000FF",
-        "slicer_filament": "GFG02",
-        "nozzle_temp_min": 230,
-        "nozzle_temp_max": 270,
-    }
+    Pure and synchronous — the caller supplies the parsed default dict, so there is no
+    settings fixture here and nothing to await."""
 
-    async def test_generic_id_matching_fingerprint_overrides(self, db_session, env):
-        env.settings["tagless_default_filament"] = json.dumps(self._DEFAULT)
-        out = await spool_tagless.override_generic_identity(db_session, "GFG99", "PETG", "000000FF")
-        assert out == {"slicer_filament": "GFG02", "nozzle_temp_min": 230, "nozzle_temp_max": 270}
+    def _canon(self, **kw):
+        base = {
+            "slicer_filament": "GFG02",
+            "material": "PETG",
+            "rgba": "000000FF",
+            "nozzle_temp_min": 230,
+            "nozzle_temp_max": 270,
+        }
+        base.update(kw)
+        return spool_tagless.canonical_default_identity(_CANONICAL_DEFAULT, **base)
 
-    async def test_specific_id_is_never_overridden(self, db_session, env):
-        env.settings["tagless_default_filament"] = json.dumps(self._DEFAULT)
-        assert await spool_tagless.override_generic_identity(db_session, "GFG02", "PETG", "000000FF") is None
-        assert await spool_tagless.override_generic_identity(db_session, "", "PETG", "000000FF") is None
-        assert await spool_tagless.override_generic_identity(db_session, None, "PETG", "000000FF") is None
+    def test_off_canonical_colour_is_rewritten(self):
+        """010-H2S INCIDENT PIN. Everything matches the default except the EXACT colour:
+        161616FF is ``colors_similar`` to 000000FF (so it IS this filament) and not equal
+        to it (so the firmware will never pair the slots)."""
+        assert self._canon(rgba="161616FF") == {
+            "slicer_filament": "GFG02",
+            "rgba": "000000FF",
+            "nozzle_temp_min": 230,
+            "nozzle_temp_max": 270,
+        }
 
-    async def test_non_matching_fingerprint_keeps_generic(self, db_session, env):
-        env.settings["tagless_default_filament"] = json.dumps(self._DEFAULT)
-        # Different material and far colour each veto the substitution.
-        assert await spool_tagless.override_generic_identity(db_session, "GFL99", "PLA", "000000FF") is None
-        assert await spool_tagless.override_generic_identity(db_session, "GFG99", "PETG", "FF0000FF") is None
+    def test_generic_id_still_substitutes(self):
+        """011-H2S (2026-07-19) behaviour, unchanged by the merge of the three helpers."""
+        out = self._canon(slicer_filament="GFG99", nozzle_temp_min=220, nozzle_temp_max=260)
+        assert out["slicer_filament"] == "GFG02"
+        assert (out["nozzle_temp_min"], out["nozzle_temp_max"]) == (230, 270)
 
-    async def test_feature_off_or_default_without_id(self, db_session, env):
-        env.settings["tagless_default_filament"] = ""  # operator turned it off
-        assert await spool_tagless.override_generic_identity(db_session, "GFG99", "PETG", "000000FF") is None
-        env.settings["tagless_default_filament"] = json.dumps(
-            {"brand": "Bambu Lab", "material": "PETG", "rgba": "000000FF"}  # no slicer_filament
+    def test_a_different_specific_preset_is_an_operator_statement(self):
+        """GFG00 beside a GFG02 default is somebody's answer, not our guess to overwrite
+        — on ANY dimension, including the colour and temps that DO differ here."""
+        assert self._canon(slicer_filament="GFG00", rgba="161616FF", nozzle_temp_min=None) is None
+
+    def test_temps_only_drift_returns_the_canonical_pair(self):
+        assert self._canon(nozzle_temp_min=None, nozzle_temp_max=None) == {
+            "slicer_filament": "GFG02",
+            "rgba": "000000FF",
+            "nozzle_temp_min": 230,
+            "nozzle_temp_max": 270,
+        }
+
+    def test_already_canonical_is_none(self):
+        assert self._canon() is None
+        # A 6-char hex of the same RGB is the same colour to the firmware.
+        assert self._canon(rgba="000000") is None
+
+    def test_unstated_id_is_canonicalisable(self):
+        """A legacy row storing no preset asserts nothing to contradict — it is the shape
+        the resolver's nozzle-temp tier was written for and stays eligible."""
+        out = self._canon(slicer_filament="", nozzle_temp_min=None, nozzle_temp_max=None)
+        assert out is not None and out["slicer_filament"] == "GFG02"
+
+    def test_non_matching_material_or_far_colour_is_none(self):
+        assert self._canon(material="PLA", slicer_filament="GFL99") is None
+        assert self._canon(rgba="FF0000FF", slicer_filament="GFG99") is None
+
+    def test_feature_off_or_default_without_id(self):
+        assert (
+            spool_tagless.canonical_default_identity(
+                None,
+                slicer_filament="GFG99",
+                material="PETG",
+                rgba="000000FF",
+                nozzle_temp_min=220,
+                nozzle_temp_max=260,
+            )
+            is None
         )
-        assert await spool_tagless.override_generic_identity(db_session, "GFG99", "PETG", "000000FF") is None
+        # A default carrying no preset id states nothing on that dimension; the colour
+        # and temps it DOES carry are still canonicalised.
+        no_id = {"brand": "Bambu Lab", "material": "PETG", "rgba": "000000FF"}
+        out = spool_tagless.canonical_default_identity(
+            no_id,
+            slicer_filament="GFG99",
+            material="PETG",
+            rgba="161616FF",
+            nozzle_temp_min=220,
+            nozzle_temp_max=260,
+        )
+        assert out == {
+            "slicer_filament": None,
+            "rgba": "000000FF",
+            "nozzle_temp_min": None,
+            "nozzle_temp_max": None,
+        }
 
 
 # --- E3: one-shot slot-identity reconcile ----------------------------------

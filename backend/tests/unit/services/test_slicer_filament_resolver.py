@@ -25,6 +25,35 @@ import pytest
 
 from backend.app.services.slicer_filament_resolver import resolve_slicer_filament
 
+# The production tagless default (verified live 2026-07-25).
+_TAGLESS_DEFAULT = {
+    "brand": "Bambu Lab",
+    "material": "PETG",
+    "subtype": "HF",
+    "rgba": "000000FF",
+    "slicer_filament": "GFG02",
+    "nozzle_temp_min": 230,
+    "nozzle_temp_max": 270,
+}
+
+
+@pytest.fixture
+def tagless_default(monkeypatch):
+    """Serve the real configured default through the real settings reader.
+
+    The canonicalisation collaborator is no longer stubbed: after the three helpers
+    merged into ONE predicate, stubbing it would pin the caller against a mock of the
+    very decision under test. The setting is the only input it has, so driving it from
+    there exercises the whole chain the write sites use.
+    """
+    raw = json.dumps(_TAGLESS_DEFAULT)
+
+    async def fake_get_setting(db, key):
+        return raw if key == "tagless_default_filament" else None
+
+    monkeypatch.setattr("backend.app.api.routes.settings.get_setting", fake_get_setting)
+    return _TAGLESS_DEFAULT
+
 
 @pytest.mark.asyncio
 async def test_pfus_cloud_unavailable_preserves_setting_id():
@@ -173,11 +202,10 @@ class TestNozzleTempResolution:
         assert (tmin, tmax) == (245, 265)  # the spool row overrides every lower tier
 
     @pytest.mark.asyncio
-    async def test_default_fingerprint_tier(self, monkeypatch):
-        # No row temps, fingerprint matches the default -> the default's pair.
-        from backend.app.services import spool_tagless
-
-        monkeypatch.setattr(spool_tagless, "default_temps_for_fingerprint", AsyncMock(return_value=(230, 270)))
+    async def test_default_fingerprint_tier(self, tagless_default):
+        # No row temps, the row canonicalises onto the default -> the default's pair.
+        # An UNSTATED preset asserts nothing to contradict, so it stays eligible: this
+        # is the legacy-row shape the tier was written for.
         db = MagicMock()
         _, _, _, tmin, tmax = await resolve_slicer_filament(
             db=db, current_user=None, slicer_filament="", slicer_filament_name=None, material="PETG", rgba="000000FF"
@@ -185,11 +213,8 @@ class TestNozzleTempResolution:
         assert (tmin, tmax) == (230, 270)
 
     @pytest.mark.asyncio
-    async def test_material_temps_fallback(self, monkeypatch):
+    async def test_material_temps_fallback(self, tagless_default):
         # No row temps, no fingerprint match -> MATERIAL_TEMPS.
-        from backend.app.services import spool_tagless
-
-        monkeypatch.setattr(spool_tagless, "default_temps_for_fingerprint", AsyncMock(return_value=None))
         db = MagicMock()
         _, _, _, tmin, tmax = await resolve_slicer_filament(
             db=db, current_user=None, slicer_filament="", slicer_filament_name=None, material="PETG", rgba="FF0000FF"
@@ -197,11 +222,25 @@ class TestNozzleTempResolution:
         assert (tmin, tmax) == (220, 260)  # MATERIAL_TEMPS["PETG"]
 
     @pytest.mark.asyncio
-    async def test_partial_row_temp_fills_from_material(self, monkeypatch):
-        # Only min set on the row -> max fills from MATERIAL_TEMPS (independent tiers).
-        from backend.app.services import spool_tagless
+    async def test_a_different_specific_preset_does_not_inherit_default_temps(self, tagless_default):
+        """The one case the merge of the three helpers tightened, deliberately: a row
+        naming GFG00 beside a GFG02 default is an operator statement. It is not a
+        backup-group peer on the preset dimension either, so lending it the default's
+        temperatures only made it look like one."""
+        db = MagicMock()
+        _, _, _, tmin, tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament="GFG00",
+            slicer_filament_name=None,
+            material="PETG",
+            rgba="000000FF",
+        )
+        assert (tmin, tmax) == (220, 260)  # MATERIAL_TEMPS, not the default's 230/270
 
-        monkeypatch.setattr(spool_tagless, "default_temps_for_fingerprint", AsyncMock(return_value=None))
+    @pytest.mark.asyncio
+    async def test_partial_row_temp_fills_from_material(self, tagless_default):
+        # Only min set on the row -> max fills from MATERIAL_TEMPS (independent tiers).
         db = MagicMock()
         _, _, _, tmin, tmax = await resolve_slicer_filament(
             db=db,
@@ -209,6 +248,7 @@ class TestNozzleTempResolution:
             slicer_filament="",
             slicer_filament_name=None,
             material="PETG",
+            rgba="FF0000FF",  # far colour -> the default tier is out, MATERIAL_TEMPS owns it
             nozzle_temp_min=235,
         )
         assert (tmin, tmax) == (235, 260)
@@ -219,18 +259,16 @@ class TestGenericIdOverride:
     re-publish it — the firmware's auto-refill backup group pairs slots only on an
     exact brand-class/type/colour/TEMPS match, and 011-H2S's trays 1-2 sat on GFG99
     beside GFG02 peers, splitting the group. Every write site routes through this
-    resolver, so the substitution belongs here (one chokepoint, all consumers)."""
+    resolver, so the substitution belongs here (one chokepoint, all consumers).
 
-    _DEFAULT = {"slicer_filament": "GFG02", "nozzle_temp_min": 230, "nozzle_temp_max": 270}
-
-    def _override(self, monkeypatch, value):
-        from backend.app.services import spool_tagless
-
-        monkeypatch.setattr(spool_tagless, "override_generic_identity", AsyncMock(return_value=value))
+    Since 2026-08-21 the substitution is ``spool_tagless.canonical_default_identity``,
+    the ONE predicate the mint and the slot-config harmonise arm also ask. Its COLOUR
+    dimension is deliberately NOT visible here: colour is not part of the resolver's
+    return (the write site takes ``spool.rgba`` directly), so the row is what carries
+    it — see ``test_spool_tagless_reconcile.TestBackupGroupHarmonise``."""
 
     @pytest.mark.asyncio
-    async def test_generic_id_is_replaced_with_the_defaults_id_and_temps(self, monkeypatch):
-        self._override(monkeypatch, self._DEFAULT)
+    async def test_generic_id_is_replaced_with_the_defaults_id_and_temps(self, tagless_default):
         db = MagicMock()
         tray_info_idx, setting_id, _sub, tmin, tmax = await resolve_slicer_filament(
             db=db,
@@ -249,8 +287,7 @@ class TestGenericIdOverride:
         assert (tmin, tmax) == (230, 270)
 
     @pytest.mark.asyncio
-    async def test_no_default_or_no_fingerprint_match_passes_through(self, monkeypatch):
-        self._override(monkeypatch, None)  # helper vetoed (feature off / different filament)
+    async def test_no_fingerprint_match_passes_through(self, tagless_default):
         db = MagicMock()
         tray_info_idx, setting_id, _sub, tmin, tmax = await resolve_slicer_filament(
             db=db,
@@ -258,7 +295,7 @@ class TestGenericIdOverride:
             slicer_filament="GFG99",
             slicer_filament_name=None,
             material="PETG",
-            rgba="FF0000FF",
+            rgba="FF0000FF",  # a different roll — not the default's filament
             nozzle_temp_min=220,
             nozzle_temp_max=260,
         )
@@ -267,11 +304,31 @@ class TestGenericIdOverride:
         assert (tmin, tmax) == (220, 260)
 
     @pytest.mark.asyncio
+    async def test_feature_off_passes_through(self, monkeypatch):
+        async def fake_get_setting(db, key):
+            return "" if key == "tagless_default_filament" else None
+
+        monkeypatch.setattr("backend.app.api.routes.settings.get_setting", fake_get_setting)
+        db = MagicMock()
+        tray_info_idx, _setting, _sub, tmin, tmax = await resolve_slicer_filament(
+            db=db,
+            current_user=None,
+            slicer_filament="GFG99",
+            slicer_filament_name=None,
+            material="PETG",
+            rgba="000000FF",
+            nozzle_temp_min=220,
+            nozzle_temp_max=260,
+        )
+        assert tray_info_idx == "GFG99"
+        assert (tmin, tmax) == (220, 260)
+
+    @pytest.mark.asyncio
     async def test_lookup_failure_degrades_to_the_resolved_identity(self, monkeypatch):
         from backend.app.services import spool_tagless
 
         monkeypatch.setattr(
-            spool_tagless, "override_generic_identity", AsyncMock(side_effect=RuntimeError("settings down"))
+            spool_tagless, "tagless_default_filament", AsyncMock(side_effect=RuntimeError("settings down"))
         )
         db = MagicMock()
         tray_info_idx, setting_id, _sub, tmin, tmax = await resolve_slicer_filament(
@@ -310,7 +367,7 @@ class TestGenericIdOverride:
             return default if key == "tagless_default_filament" else None
 
         monkeypatch.setattr("backend.app.api.routes.settings.get_setting", fake_get_setting)
-        assert spool_tagless.override_generic_identity  # the resolver's real collaborator
+        assert spool_tagless.canonical_default_identity  # the resolver's real collaborator
         db = MagicMock()
         tray_info_idx, setting_id, _sub, tmin, tmax = await resolve_slicer_filament(
             db=db,

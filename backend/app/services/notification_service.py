@@ -2310,6 +2310,66 @@ class NotificationService:
             variables=variables,
         )
 
+    async def on_backup_group_split(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        slot: str,
+        partner_slot: str,
+        dimension: str,
+        picked_value: str,
+        partner_value: str,
+        db: AsyncSession,
+    ):
+        """Fire when a dispatch picked a tray the firmware can pair with NOTHING.
+
+        AMS Filament Backup groups slots only on an EXACT preset / colour / nozzle-temp
+        match; the farm's matcher calls two colours within 40 per channel the same
+        filament. Those two readings disagreeing is 010-H2S 2026-08-21: slot 2 carried
+        ``161616FF`` (a Studio/touchscreen edit that took the PETG-HF preset default)
+        beside slot 4's ``000000FF``, the farm dispatched onto slot 2 believing slot 4
+        backed it up, and the printer ran out twice in 28 h with a full black roll one
+        slot over. 69 auto-switches happened inside one colour pair, 14 inside the
+        other, none across.
+
+        Its own event rather than a reuse of the runout copy: nothing has failed yet and
+        nothing is held — this reports a DEGRADED backup on a print that is running
+        fine, and the operator action is a one-field edit on the printer, not a rescue.
+        The farm deliberately does not act on it: the reconcile lane already harmonises
+        the slots the farm OWNS (its own tagless rows), and rewriting an RFID or
+        operator-bound tray to make a group pair would be the farm overruling a human
+        about what is physically in a slot.
+
+        One page per condition per window — the caller (``print_scheduler``) owns the
+        dedup, keyed on the two backup-group keys rather than on the printer, because
+        the condition is STANDING and re-derives at every dispatch onto that slot.
+        """
+        providers = await self._get_providers_for_event(db, "on_backup_group_split", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "slot": slot,
+            "partner_slot": partner_slot,
+            "dimension": dimension,
+            "picked_value": picked_value,
+            "partner_value": partner_value,
+        }
+
+        title, message = await self._build_message_from_template(db, "backup_group_split", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "backup_group_split",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
     async def on_zero_gram_charge(
         self,
         printer_id: int | None,
