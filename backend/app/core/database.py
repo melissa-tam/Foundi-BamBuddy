@@ -3462,6 +3462,14 @@ async def run_migrations(conn):
         # anywhere said so. Doctrine rule 4 makes tagless gram tracking mandatory,
         # which makes a silent no-op a defect, not a shrug.
         ("on_zero_gram_charge", "1", "TRUE"),
+        # Backup-group split (010-H2S 2026-08-21, shape 33): a dispatch picked a tray
+        # the firmware can pair with NOTHING, while a tray holding what the farm's own
+        # matcher calls the same filament sat beside it — differing only in a dimension
+        # the firmware compares byte-exactly (colour 161616FF vs 000000FF, or the
+        # nozzle-temp range). AMS Filament Backup was ON and never switched, and the
+        # printer ran out twice in 28 h with a full roll one slot over. The farm cannot
+        # rewrite an RFID or operator-bound tray, so the operator is the fix.
+        ("on_backup_group_split", "1", "TRUE"),
         # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
         ("on_storage_low", "1", "TRUE"),
         # Cooldown escalation: post-print eject cooldown is running long (bed still

@@ -49,7 +49,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.services.filament_requirements import extract_filament_requirements
-from backend.app.services.tray_fields import tray_presence_map, tray_unread
+from backend.app.services.tray_fields import backup_group_key, tray_presence_map, tray_unread
 
 logger = logging.getLogger(__name__)
 
@@ -159,19 +159,6 @@ async def _warnings_disabled(db: AsyncSession) -> bool:
         return False
 
 
-def _normalize_color_for_id(raw: str | None) -> str:
-    """Canonicalise a hex colour for identity comparison.
-
-    Strips the leading ``#``, uppercases, and drops the alpha channel when
-    the hex is 8 chars long (``RRGGBBAA``) so a fully-opaque 8-char hex
-    matches a 6-char hex of the same RGB. Empty / None → empty string.
-    """
-    s = (raw or "").strip().lstrip("#").upper()
-    if len(s) == 8:  # RRGGBBAA → strip alpha
-        s = s[:6]
-    return s
-
-
 def _live_tray_presence(printer_id: int) -> dict[tuple[int, int], bool | None]:
     """``{(ams_id, tray_id) → tri-state presence}`` from the printer's LIVE trays.
 
@@ -239,11 +226,16 @@ def _live_tray_identities(printer_id: int) -> dict[tuple[int, int], str]:
     """Map ``(ams_id, tray_id) → material identity`` from the printer's LIVE trays.
 
     Mirrors how AMS Filament Backup actually works: the firmware pools by each
-    tray's *configured* filament (its ``tray_info_idx``/``tray_type`` + colour)
-    and switches on physical runout — regardless of whether the software holds
-    an inventory binding for the spool (bindings auto-create for RFID spools
-    only). So the pooling identity must come from the live tray, not from a
-    ``Spool`` row.
+    tray's *configured* filament and switches on physical runout — regardless of
+    whether the software holds an inventory binding for the spool (bindings
+    auto-create for RFID spools only). So the pooling identity must come from the
+    live tray, not from a ``Spool`` row.
+
+    The identity itself is ``tray_fields.backup_group_key`` — the ONE origin for the
+    firmware's grouping rule (preset + EXACT colour + nozzle temps). It used to be an
+    inline f-string here that omitted the temperature dimension, which over-pooled:
+    two trays agreeing on preset and colour but not on temps are NOT peers, and this
+    map's whole job is to say who backs up whom.
 
     Reads ``printer_manager.get_status(printer_id).raw_data["ams"]`` — the same
     live-status surface ``capability_gate.loaded_filament_types`` reads. The
@@ -278,16 +270,14 @@ def _live_tray_identities(printer_id: int) -> dict[tuple[int, int], str]:
         for tray in unit.get("tray") or []:
             if not isinstance(tray, dict):
                 continue
-            tray_type = (tray.get("tray_type") or tray.get("filament_type") or "").strip()
-            if not tray_type:
-                continue  # empty/blank slot — nothing loaded
+            key = backup_group_key(tray)
+            if key is None:
+                continue  # empty/blank slot — nothing the firmware can pair
             try:
                 tray_id = int(tray["id"])
             except (KeyError, TypeError, ValueError):
                 continue
-            info_idx = (tray.get("tray_info_idx") or "").strip()
-            color = _normalize_color_for_id(tray.get("tray_color"))
-            identities[(ams_id, tray_id)] = f"tray:{info_idx or tray_type}|color:{color}"
+            identities[(ams_id, tray_id)] = key
     return identities
 
 

@@ -1118,6 +1118,7 @@ export default {
     slot: {
       ranOut: 'Épuisé — rechargez cet emplacement',
       spentCore: 'Terminée — remplacez la bobine',
+      noBackupSlot: 'Aucun emplacement de secours. Un autre emplacement contient ce filament dans une autre couleur.',
       wasFeeding: 'Alimentait cette impression',
     },
     activeJobSlot: {

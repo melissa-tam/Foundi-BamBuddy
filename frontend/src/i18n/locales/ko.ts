@@ -1081,6 +1081,7 @@ export default {
     slot: {
       ranOut: '소진됨 — 이 슬롯을 보충하세요',
       spentCore: '다 씀 — 롤을 교체하세요',
+      noBackupSlot: '백업 슬롯 없음. 다른 슬롯에 같은 필라먼트가 다른 색상으로 있습니다.',
       wasFeeding: '이 프린트에 공급 중이었음',
     },
     activeJobSlot: {

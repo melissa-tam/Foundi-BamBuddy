@@ -20,6 +20,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.settings import Settings
 from backend.app.models.smart_plug import SmartPlug
+from backend.app.services import notify_dedup
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
     cleanup_downloaded_3mf,
@@ -32,6 +33,8 @@ from backend.app.services.dispatch_kick import DispatchKick, dispatch_kick
 from backend.app.services.eject import progress as dispatch_progress
 from backend.app.services.farm_staging import build_staged_reason, maybe_release_periodic
 from backend.app.services.filament_deficit import (
+    _extruder_side_for_ams,
+    _get_printer_backup_context,
     compute_deficit_for_queue_item,
     live_unread_slots,
     request_unread_reads,
@@ -42,6 +45,7 @@ from backend.app.services.printer_manager import (
     supports_drying,
     supports_drying_while_printing,
 )
+from backend.app.services.queue_transitions import claim_pending_for_dispatch
 from backend.app.services.smart_plug_manager import smart_plug_manager
 from backend.app.services.spool_selection import (
     DEFAULT_MIN_START_SPOOL_G,
@@ -51,6 +55,7 @@ from backend.app.services.spool_selection import (
     WAITING_REASON_UNREAD_PENDING,
     MatchOutcome,
     SlotInventory,
+    backup_partner_gap,
     build_slot_inventory,
     colors_are_similar,
     dominant_start_block,
@@ -614,6 +619,9 @@ class PrintScheduler:
                             item.printer_id,
                             outcome.mapping,
                         )
+                        # Advisory: does the picked tray actually have a firmware
+                        # backup partner? (010-H2S shape 33 — never blocks dispatch.)
+                        await self._warn_backup_group_gap(db, item.printer_id, outcome.mapping)
 
                     # Filament-deficit pre-dispatch check (#1496). If the
                     # assigned spool can't satisfy any required slot grams,
@@ -897,6 +905,9 @@ class PrintScheduler:
                                 assigned_printer_id,
                                 assigned_mapping,
                             )
+                            # Advisory: does the picked tray actually have a firmware
+                            # backup partner? (010-H2S shape 33 — never blocks dispatch.)
+                            await self._warn_backup_group_gap(db, assigned_printer_id, assigned_mapping)
                         if item.waiting_reason != "no_usb_drive":
                             item.waiting_reason = None
                         logger.info(
@@ -2475,6 +2486,135 @@ class PrintScheduler:
         result = await db.execute(select(Printer).where(Printer.id == printer_id))
         return result.scalar_one_or_none()
 
+    async def _warn_backup_group_gap(self, db: AsyncSession, printer_id: int, mapping: list[int] | None) -> None:
+        """WARN (and page once) when this dispatch's tray has no firmware backup partner.
+
+        Wiring only — the rule is ``spool_selection.backup_partner_gap``. This reads the
+        printer's live trays, scopes the peer set to the picked tray's extruder side
+        (the firmware cannot cross extruders even with backup ON), and hands the pure
+        function one picked tray plus its peers per mapped requirement slot. Only the
+        AMS units are read, so the external ``vt_tray`` holder is excluded by
+        construction — the same deliberate scope ``filament_deficit._live_tray_identities``
+        takes, because AMS Filament Backup never spans it. ``slot=`` in the WARN is the
+        REQUIREMENT slot (the mapping position), matching the matcher's own
+        ``[spool-select] slot=…`` trace; the human AMS slot name is in the operator copy.
+
+        Why it exists (010-H2S 2026-08-21, incident shape 33): the firmware pairs backup
+        slots byte-exactly on preset / colour / nozzle temps, the farm's matcher pairs
+        filaments within 40 per colour channel, and where those two readings disagree
+        the farm dispatches believing in a backup that does not exist. The reconcile
+        lane rewrites the farm's OWN tagless slots onto the canonical identity; this
+        covers the residue it cannot touch — an RFID or operator-bound tray, a refused
+        AMS write, or a dispatch that lands before the first idle window.
+
+        Advisory by construction. It never blocks, re-routes or re-matches: a split
+        group is a degraded runout rescue, not an unsafe print, and the operator's
+        one-field edit on the printer is the fix. The whole body is guarded to a DEBUG
+        line (invariant 10 — no farm-side check may crash a dispatch path), and it stands
+        down silently whenever the printer state is missing or backup is not explicitly
+        ON, because with backup OFF there is no group to be split.
+
+        The WARN fires on every dispatch that sees the gap (it is the triage record);
+        only the page is deduped, on the two backup-group KEYS rather than the printer,
+        so fixing one pair does not mute a second one — ``notify_dedup`` is the right
+        clock because this is an alert-class event, not a state decision.
+        """
+        try:
+            if not mapping:
+                return
+            backup_on, ams_extruder_map, is_dual = await _get_printer_backup_context(printer_id)
+            if not backup_on:
+                return
+
+            from backend.app.services.spool_recovery import runout_slot_desc
+            from backend.app.services.spool_respool import decode_global_tray, encode_global_tray
+
+            status = printer_manager.get_status(printer_id)
+            raw = getattr(status, "raw_data", None)
+            if not isinstance(raw, dict):
+                return
+
+            # Live trays by (ams_id, tray_id), each stamped with its own global id.
+            # Copies, never the live dicts: this lane must not mutate printer state.
+            trays: dict[tuple[int, int], dict] = {}
+            for unit in raw.get("ams") or []:
+                if not isinstance(unit, dict):
+                    continue
+                try:
+                    ams_id = int(unit["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                for tray in unit.get("tray") or []:
+                    if not isinstance(tray, dict):
+                        continue
+                    try:
+                        tray_id = int(tray["id"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    gtid = encode_global_tray(ams_id, tray_id)
+                    if gtid is None:
+                        continue
+                    trays[(ams_id, tray_id)] = {**tray, "global_tray_id": gtid}
+            if not trays:
+                return
+
+            for slot_id, picked_gtid in enumerate(mapping, start=1):
+                if not isinstance(picked_gtid, int) or picked_gtid < 0:
+                    continue
+                picked_ams, picked_tray = decode_global_tray(picked_gtid)
+                if picked_ams is None or picked_tray is None:
+                    continue
+                picked = trays.get((picked_ams, picked_tray))
+                if picked is None:
+                    continue
+                side = _extruder_side_for_ams(picked_ams, ams_extruder_map, is_dual)
+                others = [
+                    tray
+                    for (ams_id, tray_id), tray in trays.items()
+                    if (ams_id, tray_id) != (picked_ams, picked_tray)
+                    and _extruder_side_for_ams(ams_id, ams_extruder_map, is_dual) == side
+                ]
+                gap = backup_partner_gap(picked, others)
+                if gap is None:
+                    continue
+
+                logger.warning(
+                    "[spool-select] printer=%d slot=%d picked gtid=%d has NO firmware backup partner — "
+                    "gtid=%d is the same filament but differs in %s (%s vs %s)",
+                    printer_id,
+                    slot_id,
+                    picked_gtid,
+                    gap.partner_global_tray_id,
+                    gap.dimension,
+                    gap.picked_value,
+                    gap.partner_value,
+                )
+
+                if not notify_dedup.allow(
+                    "backup_group_split",
+                    f"{printer_id}:{gap.picked_key}|{gap.partner_key}",
+                    time.time(),
+                    6 * 3600.0,
+                ):
+                    continue
+                printer = await self._get_printer(db, printer_id)
+                await notification_service.on_backup_group_split(
+                    printer_id=printer_id,
+                    printer_name=(printer.name if printer else "") or f"Printer {printer_id}",
+                    slot=runout_slot_desc(picked_gtid) or f"tray {picked_gtid}",
+                    partner_slot=runout_slot_desc(gap.partner_global_tray_id) or f"tray {gap.partner_global_tray_id}",
+                    dimension=gap.dimension,
+                    picked_value=gap.picked_value,
+                    partner_value=gap.partner_value,
+                    db=db,
+                )
+        except Exception:
+            logger.debug(
+                "[spool-select] backup-partner check failed for printer %s (dispatch unaffected)",
+                printer_id,
+                exc_info=True,
+            )
+
     async def _compute_deficit_safe(
         self,
         db: AsyncSession,
@@ -3360,23 +3500,82 @@ class PrintScheduler:
         # If we crash after this commit but before start_print(), the item will be
         # in "printing" status without actually printing - but that's safer than
         # accidentally reprinting the same file hours later.
-        item.status = "printing"
-        item.started_at = datetime.now(timezone.utc)
-        # Cleared to dispatch: drop any stale hold token. Dropped HERE, in the same
-        # write that commits the dispatch, and not at the capability gate further up
-        # — every gate BELOW that gate re-reads ``waiting_reason`` to tell a NEW hold
-        # from one already standing, and clearing it early made each of them look new
-        # on every tick (re-notifying an operator once per tick about one unchanged
-        # hold). Every non-dispatch exit from here on either sets its own reason or
-        # goes through ``_fail_queue_item``, which NULLs it.
-        item.waiting_reason = None
-        # Record what this dispatch actually feeds from. Before this line the field is
-        # the operator's INSTRUCTION (a pin, or nothing); from here on it is the
-        # RECORD of the decision that ran, which is what the ledger, usage tracking
-        # and recovery lanes read back for a printing/completed unit. Written here —
-        # past the USB and capability holds — so a held unit keeps its pin and no
-        # decision can ever be re-read as one on a later tick.
-        item.ams_mapping = json.dumps(ams_mapping) if ams_mapping else None
+        #
+        # The write is the canonical transition (``queue_transitions``), not four ORM
+        # assignments: ``item`` was loaded before a multi-second FTPS upload, so "it
+        # was pending" is a stale read of a row other sessions can move. An operator
+        # cancel landing in that gap used to be overwritten straight back to
+        # 'printing' and the print sent anyway. ``pending`` now lives in the UPDATE's
+        # WHERE, so the database decides. The columns and their reasons are unchanged:
+        #   - ``waiting_reason`` is cleared to dispatch, HERE and not at the capability
+        #     gate further up — every gate BELOW that gate re-reads ``waiting_reason``
+        #     to tell a NEW hold from one already standing, and clearing it early made
+        #     each of them look new on every tick (re-notifying an operator once per
+        #     tick about one unchanged hold). Every non-dispatch exit from here on
+        #     either sets its own reason or goes through ``_fail_queue_item``, which
+        #     NULLs it.
+        #   - ``ams_mapping`` records what this dispatch actually feeds from. Before
+        #     this write the field is the operator's INSTRUCTION (a pin, or nothing);
+        #     from here on it is the RECORD of the decision that ran, which is what the
+        #     ledger, usage tracking and recovery lanes read back for a
+        #     printing/completed unit. Written here — past the USB and capability holds
+        #     — so a held unit keeps its pin and no decision can ever be re-read as one
+        #     on a later tick.
+        item_id = item.id
+        claimed = await claim_pending_for_dispatch(
+            db,
+            item_id=item_id,
+            started_at=datetime.now(timezone.utc),
+            ams_mapping=json.dumps(ams_mapping) if ams_mapping else None,
+        )
+        if not claimed:
+            # Someone moved the row while we were uploading — an operator cancel
+            # (queue/batch/run abort), or any other terminal. Not a failure of THIS
+            # unit and not ours to mark: the actor that moved it owns its lifecycle,
+            # so nothing terminal, no retry burn, no quarantine contribution. Nothing
+            # is held to release either — the upload's in-flight marker exited with
+            # its context manager, the stagger slot frees in ``_start_print_by_id``'s
+            # finally, and the post-dispatch printer hold is only taken once the print
+            # command has actually gone out.
+            #
+            # The upload itself IS undone, for the same "prevent phantom prints" reason
+            # the send-failure branch below deletes its own: a cancelled unit's file
+            # left sitting on the USB is one screen-tap away from being started as a
+            # FOREIGN print, which is precisely the class this transition exists to
+            # close. Best-effort — a delete that fails is named in the warning, never
+            # raised, because the row is already someone else's business.
+            current_status = await db.scalar(select(PrintQueueItem.status).where(PrintQueueItem.id == item_id))
+            try:
+                removed = bool(
+                    await delete_file_async(
+                        printer.ip_address,
+                        printer.access_code,
+                        remote_path,
+                        printer_model=printer.model,
+                    )
+                )
+            except Exception as cleanup_err:  # noqa: BLE001 — best-effort, must not raise
+                removed = False
+                logger.debug("Queue item %s: USB cleanup after a refused claim failed: %s", item_id, cleanup_err)
+            logger.warning(
+                "Queue item %s: left 'pending' during dispatch (now %r) — print command NOT sent; "
+                "uploaded file %s %s printer %s",
+                item_id,
+                current_status,
+                remote_filename,
+                "removed from" if removed else "COULD NOT BE REMOVED from",
+                item.printer_id,
+            )
+            # Discard this dispatch's uncommitted work (the archive link, and a
+            # transient library row it was about to reap) rather than letting the
+            # session close decide: none of it describes a print that will happen.
+            await db.rollback()
+            return
+        # The UPDATE ran with ``synchronize_session=False`` and this fork's sessions
+        # do not expire on commit, so the in-memory row still says 'pending'. Every
+        # read below (and the ``dispatch_subtask_id`` stamp, which writes through this
+        # same instance) must see the row the database now holds.
+        await db.refresh(item)
         await db.commit()
 
         for cleanup_path in cleanup_disk_paths:

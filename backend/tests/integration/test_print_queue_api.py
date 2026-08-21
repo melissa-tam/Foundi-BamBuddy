@@ -962,6 +962,57 @@ class TestQueueCancelEndpoint:
 
         response = await async_client.post(f"/api/v1/queue/{item.id}/cancel")
         assert response.status_code == 400
+        assert "printing" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_cancel_pending_item_is_terminal_and_drops_its_hold_token(
+        self, async_client: AsyncClient, queue_item_factory, db_session
+    ):
+        """A cancelled unit never flows through farm_policy.on_terminal."""
+        item = await queue_item_factory(status="pending", waiting_reason="filament_short")
+
+        response = await async_client.post(f"/api/v1/queue/{item.id}/cancel")
+        assert response.status_code == 200
+
+        await db_session.refresh(item)
+        assert item.status == "cancelled"
+        assert item.completed_at is not None
+        assert item.waiting_reason is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_cancel_refuses_when_the_item_dispatches_in_the_gap(
+        self, async_client: AsyncClient, queue_item_factory, db_session, monkeypatch
+    ):
+        """The status read before the write is a candidate, not a fact.
+
+        Simulates the 2026-08-20 race by moving the row to 'printing' after the
+        route has loaded it as pending and before the UPDATE runs: the WHERE
+        clause must refuse, and the 400 must name the status the DB holds NOW —
+        not the stale one the request read.
+        """
+        from backend.app.api.routes import print_queue as print_queue_routes
+        from backend.app.services import queue_transitions
+
+        item = await queue_item_factory(status="pending")
+        real_cancel = queue_transitions.cancel_pending_items
+
+        async def _dispatch_then_cancel(db, *, item_ids):
+            from sqlalchemy import select as _select
+
+            from backend.app.models.print_queue import PrintQueueItem as _Item
+
+            racing = (await db.execute(_select(_Item).where(_Item.id == item.id))).scalar_one()
+            racing.status = "printing"
+            await db.flush()
+            return await real_cancel(db, item_ids=item_ids)
+
+        monkeypatch.setattr(print_queue_routes, "cancel_pending_items", _dispatch_then_cancel)
+
+        response = await async_client.post(f"/api/v1/queue/{item.id}/cancel")
+        assert response.status_code == 400
+        assert "printing" in response.json()["detail"]
 
 
 class TestQueueLibraryFileSupport:
@@ -2489,6 +2540,47 @@ class TestAbortedStatusNormalisation:
         # Verify batch status
         batch_response = await async_client.get(f"/api/v1/queue/batches/{batch_id}")
         assert batch_response.json()["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_cancel_batch_counts_only_rows_that_transitioned(
+        self, async_client: AsyncClient, printer_factory, archive_factory, db_session
+    ):
+        """A dispatched unit in the batch is left printing and is NOT counted."""
+        from sqlalchemy import select
+
+        from backend.app.models.print_queue import PrintQueueItem
+
+        printer = await printer_factory()
+        archive = await archive_factory()
+        response = await async_client.post(
+            "/api/v1/queue/",
+            json={"printer_id": printer.id, "archive_id": archive.id, "quantity": 3},
+        )
+        batch_id = response.json()["batch_id"]
+
+        items = sorted(
+            (await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.batch_id == batch_id)))
+            .scalars()
+            .all(),
+            key=lambda it: it.id,
+        )
+        assert len(items) == 3
+        dispatched = items[0]
+        dispatched.status = "printing"
+        await db_session.commit()
+
+        response = await async_client.delete(f"/api/v1/queue/batches/{batch_id}")
+        assert response.status_code == 200
+        assert response.json()["message"] == "Batch cancelled, 2 pending items cancelled"
+
+        await db_session.refresh(dispatched)
+        assert dispatched.status == "printing"
+        assert dispatched.completed_at is None
+        for item in items[1:]:
+            await db_session.refresh(item)
+            assert item.status == "cancelled"
+            assert item.completed_at is not None
 
     @pytest.mark.asyncio
     @pytest.mark.integration

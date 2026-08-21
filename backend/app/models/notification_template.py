@@ -266,6 +266,19 @@ DEFAULT_TEMPLATES = [
         "title_template": "Print charged no filament — {printer_name}",
         "body_template": "{printer_name} completed '{job_name}' and charged 0 g, but {slot} is fed by tagless spool #{spool_id} ({spool_material}), whose only gram source is the print's 3MF. The ledger for that roll is now short by this print. Check that the archive for this print has its 3MF attached.",
     },
+    # 010-H2S 2026-08-21 (shape 33): the firmware pairs backup slots only on an EXACT
+    # preset / colour / nozzle-temp match, while the farm's matcher calls colours within
+    # 40/channel one filament. Slot 2 at 161616FF and slot 4 at 000000FF were one
+    # filament to the farm and two groups to the printer, which therefore never
+    # auto-switched. The copy names BOTH slots and the exact dimension because the fix
+    # is a one-field edit on the printer, and it must not promise a farm reaction: the
+    # farm cannot rewrite an RFID or operator-bound tray.
+    {
+        "event_type": "backup_group_split",
+        "name": "AMS Backup Group Split",
+        "title_template": "No backup slot for the active print — {printer_name}",
+        "body_template": "{printer_name}: {slot} is printing and has no backup slot. {partner_slot} holds the same filament with a different tray {dimension} ({picked_value} vs {partner_value}); the printer will not switch to it on runout. Set both slots to the same tray {dimension} on the printer.",
+    },
     {
         "event_type": "storage_low",
         "name": "USB Storage Low (auto-cleanup)",

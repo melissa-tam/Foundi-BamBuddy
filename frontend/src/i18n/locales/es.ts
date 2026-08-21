@@ -1118,6 +1118,7 @@ export default {
     slot: {
       ranOut: 'Agotada — rellena esta ranura',
       spentCore: 'Gastada — reemplaza el rollo',
+      noBackupSlot: 'Sin ranura de respaldo. Otra ranura tiene este filamento en otro color.',
       wasFeeding: 'Estaba alimentando esta impresión',
     },
     activeJobSlot: {

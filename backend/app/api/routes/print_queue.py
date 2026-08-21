@@ -38,6 +38,7 @@ from backend.app.schemas.print_queue import (
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.queue_builder import create_queue_items
+from backend.app.services.queue_transitions import cancel_pending_items
 from backend.app.utils.printer_models import normalize_printer_model, normalize_printer_model_id
 from backend.app.utils.threemf_tools import (
     extract_bed_type_from_3mf,
@@ -898,20 +899,19 @@ async def cancel_batch(
     if not batch:
         raise HTTPException(404, "Batch not found")
 
-    # Cancel all pending queue items in this batch
+    # Cancel all pending queue items in this batch. The ids read here are only
+    # candidates — `cancel_pending_items` re-checks `pending` inside the UPDATE, so
+    # an item the scheduler dispatched between this SELECT and the write stays
+    # `printing` instead of being silently overwritten (see queue_transitions).
     result = await db.execute(
-        select(PrintQueueItem).where(and_(PrintQueueItem.batch_id == batch_id, PrintQueueItem.status == "pending"))
+        select(PrintQueueItem.id).where(and_(PrintQueueItem.batch_id == batch_id, PrintQueueItem.status == "pending"))
     )
-    pending_items = result.scalars().all()
-    cancelled_count = 0
-    for item in pending_items:
-        item.status = "cancelled"
-        cancelled_count += 1
+    cancelled = await cancel_pending_items(db, item_ids=list(result.scalars().all()))
 
     batch.status = "cancelled"
     await db.commit()
 
-    return {"message": f"Batch cancelled, {cancelled_count} pending items cancelled"}
+    return {"message": f"Batch cancelled, {len(cancelled)} pending items cancelled"}
 
 
 async def _build_batch_response(db: AsyncSession, batch: PrintBatch) -> PrintBatchResponse:
@@ -1237,11 +1237,18 @@ async def cancel_queue_item(
         if item.created_by_id != user.id:
             raise HTTPException(403, "You can only cancel your own queue items")
 
-    if item.status not in ("pending",):
-        raise HTTPException(400, f"Cannot cancel item with status '{item.status}'")
+    # No pre-check: the status read above is a candidate, not a fact. The UPDATE's
+    # WHERE is the precondition, so an item the scheduler dispatched between the
+    # SELECT and the write refuses here instead of landing cancelled-but-printing
+    # (see queue_transitions). An empty result IS the 400 this route always meant.
+    if not await cancel_pending_items(db, item_ids=[item.id]):
+        # Re-read: the status that actually blocked the cancel is the one in the DB
+        # now, not the one this session loaded (that is the whole point).
+        current = (
+            await db.execute(select(PrintQueueItem.status).where(PrintQueueItem.id == item_id))
+        ).scalar_one_or_none()
+        raise HTTPException(400, f"Cannot cancel item with status '{current or item.status}'")
 
-    item.status = "cancelled"
-    item.completed_at = datetime.now(timezone.utc)
     await db.commit()
 
     logger.info("Cancelled queue item %s", item_id)

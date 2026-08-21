@@ -1117,6 +1117,7 @@ export default {
     slot: {
       ranOut: '切れました — このスロットを補充',
       spentCore: '使い切り — ロールを交換',
+      noBackupSlot: 'バックアップスロットなし。別のスロットに同じフィラメントが別の色で入っています。',
       wasFeeding: 'この印刷に供給していました',
     },
     activeJobSlot: {

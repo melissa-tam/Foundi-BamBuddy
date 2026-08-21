@@ -14,6 +14,7 @@ Fixture/mocking style mirrors ``test_spool_tagless.py`` (settings dict + patched
 """
 
 import json
+import logging
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -187,10 +188,23 @@ def _state(trays, *, ams_id=0, wrapped=False, gcode_state="IDLE", tray_now=255):
     )
 
 
-async def _seed_spool(db, *, data_origin="ams_auto", spent=False, tag_uid=None):
+async def _seed_spool(
+    db,
+    *,
+    data_origin="ams_auto",
+    spent=False,
+    tag_uid=None,
+    rgba="000000FF",
+    slicer_filament=None,
+    nozzle_temp_min=None,
+    nozzle_temp_max=None,
+):
     spool = Spool(
         material="PETG",
-        rgba="000000FF",
+        rgba=rgba,
+        slicer_filament=slicer_filament,
+        nozzle_temp_min=nozzle_temp_min,
+        nozzle_temp_max=nozzle_temp_max,
         data_origin=data_origin,
         tag_uid=tag_uid,
         tray_uuid=_BAMBU_UUID if tag_uid else None,
@@ -884,9 +898,7 @@ class TestSpentSwapParkArm:
 
     _PAST = _T0 + spool_tagless._SPENT_SWAP_PARK_AFTER_S + 1.0
 
-    async def test_a_parked_spent_slot_tells_the_operator_once_per_episode(
-        self, db_session, printer_factory, env
-    ):
+    async def test_a_parked_spent_slot_tells_the_operator_once_per_episode(self, db_session, printer_factory, env):
         printer = await printer_factory(name="004-H2S")
         await _seed_assignment(db_session, printer.id, 0, 2, spent=True)
         manager = _FakeManager({printer.id: _state([_present_tray(2)])})
@@ -1107,3 +1119,227 @@ class TestSchedulerRegistration:
             mock_session.return_value.__aenter__ = AsyncMock(return_value=mock_db)
             mock_session.return_value.__aexit__ = AsyncMock(return_value=False)
             await PrintScheduler().check_queue()  # must not raise
+
+
+# --- 010-H2S: the backup-group harmonise arm -------------------------------
+
+_TAGLESS_DEFAULT = {
+    "brand": "Bambu Lab",
+    "material": "PETG",
+    "subtype": "HF",
+    "rgba": "000000FF",
+    "slicer_filament": "GFG02",
+    "nozzle_temp_min": 230,
+    "nozzle_temp_max": 270,
+}
+
+
+def _configured_tray(tray_id=0, *, color="161616FF", info_idx="GFG02", tmin=230, tmax=270, state=11, tag=False):
+    """A CONFIGURED tagless tray. Default colour is the incident's ``161616FF`` — what a
+    Bambu Studio / touchscreen slot edit leaves behind when it accepts the PETG-HF
+    preset's own default colour."""
+    return {
+        "id": tray_id,
+        "state": state,
+        "tray_type": "PETG",
+        "tray_sub_brands": "PETG HF",
+        "tray_color": color,
+        "tray_info_idx": info_idx,
+        "nozzle_temp_min": tmin,
+        "nozzle_temp_max": tmax,
+        "tag_uid": _BAMBU_TAG if tag else _ZERO_TAG,
+        "tray_uuid": _BAMBU_UUID if tag else _ZERO_UUID,
+    }
+
+
+class _Clock:
+    """Drives the shared retry window so consecutive walks are one call apart, not 30 s."""
+
+    def __init__(self):
+        self.t = 1_000.0
+
+    def __call__(self):
+        return self.t
+
+    def tick(self):
+        self.t += spool_tagless._AUTOCONFIG_RETRY_S + 1.0
+
+
+class TestBackupGroupHarmonise:
+    """010-H2S (2026-08-21) INCIDENT PINS. The printer ran out on slot 2 twice in 28 h
+    with black PETG loaded in slot 4 and AMS Filament Backup ON, and the firmware never
+    auto-switched: slots 1+2 carried tray colour ``161616FF``, slots 3+4 carried the
+    farm's ``000000FF``, and the firmware pairs backup slots only on an EXACT colour
+    match. ``hms-events`` proves the split — 69 auto-switches inside 1<->2, 14 inside
+    3->4, none across the pair.
+
+    The farm already harmonised the PRESET dimension (the 011-H2S GFG99 fix) and the
+    TEMPS dimension (W4). This arm is the third: it exists so a slot an operator edited
+    on the touchscreen can come back to the fleet's identity on its own."""
+
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        c = _Clock()
+        monkeypatch.setattr("backend.app.utils.retry_window.monotonic", c)
+        return c
+
+    @staticmethod
+    async def _walk(db, printer_id, tray, manager_state=None, *, now=_T0):
+        manager = _FakeManager({printer_id: manager_state or _state([tray])})
+        return await spool_tagless.reconcile_slot_config(db, manager=manager, now=now)
+
+    async def test_off_canonical_colour_is_rewritten_and_pushed(self, db_session, printer_factory, env):
+        """THE PIN. Row and tray both read ``161616FF``: the row is corrected to the
+        default's ``000000FF`` and that identity is published to the slot, which is what
+        puts it back in one backup group with its peers."""
+        env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
+        printer = await printer_factory()
+        spool = await _seed_assignment(
+            db_session, printer.id, rgba="161616FF", slicer_filament="GFG02", nozzle_temp_min=230, nozzle_temp_max=270
+        )
+
+        assert await self._walk(db_session, printer.id, _configured_tray()) == 1
+
+        await db_session.refresh(spool)
+        assert spool.rgba == "000000FF"
+        env.apply.assert_awaited_once()
+        kw = env.apply.await_args.kwargs
+        assert (kw["printer_id"], kw["ams_id"], kw["tray_id"]) == (printer.id, 0, 0)
+        assert kw["spool"].id == spool.id
+
+    async def test_a_canonical_slot_is_silent_and_marks_adoption(self, db_session, printer_factory, env):
+        """Liveness's other half: a slot already in the fleet's group is written to
+        never, and its write epoch is closed rather than left to accumulate strikes."""
+        env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
+        printer = await printer_factory()
+        await _seed_assignment(
+            db_session, printer.id, rgba="000000FF", slicer_filament="GFG02", nozzle_temp_min=230, nozzle_temp_max=270
+        )
+
+        assert await self._walk(db_session, printer.id, _configured_tray(color="000000FF")) == 0
+        env.apply.assert_not_awaited()
+        assert spool_tagless._autoconfig_epochs == {}
+
+    async def test_rfid_tray_is_never_touched(self, db_session, printer_factory, env):
+        """A config write racing a firmware tag read is the 2026-07-18 HMS 0700_0081
+        class — the arm's ownership test excludes a tagged tray before anything else."""
+        env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
+        printer = await printer_factory()
+        spool = await _seed_assignment(db_session, printer.id, rgba="161616FF", tag_uid=_BAMBU_TAG)
+
+        assert await self._walk(db_session, printer.id, _configured_tray(tag=True)) == 0
+        await db_session.refresh(spool)
+        assert spool.rgba == "161616FF"  # the row is not ours to rewrite either
+        env.apply.assert_not_awaited()
+
+    async def test_operator_bound_row_is_never_touched(self, db_session, printer_factory, env):
+        """An operator- or RFID-bound row is somebody's STATEMENT about that slot."""
+        env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
+        printer = await printer_factory()
+        spool = await _seed_assignment(db_session, printer.id, data_origin="manual", rgba="161616FF")
+
+        assert await self._walk(db_session, printer.id, _configured_tray()) == 0
+        await db_session.refresh(spool)
+        assert spool.rgba == "161616FF"
+        env.apply.assert_not_awaited()
+
+    async def test_a_different_specific_preset_is_left_alone(self, db_session, printer_factory, env):
+        """GFG00 beside a GFG02 default is an operator statement (doctrine rule 2) — not
+        canonicalised on the preset dimension, and therefore not on colour either."""
+        env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
+        printer = await printer_factory()
+        spool = await _seed_assignment(db_session, printer.id, rgba="161616FF", slicer_filament="GFG00")
+
+        assert await self._walk(db_session, printer.id, _configured_tray(info_idx="GFG00")) == 0
+        await db_session.refresh(spool)
+        assert (spool.rgba, spool.slicer_filament) == ("161616FF", "GFG00")
+        env.apply.assert_not_awaited()
+
+    async def test_spent_row_stays_latched(self, db_session, printer_factory, env):
+        """W1: a spent binding is the durable 'ran dry' latch. Harmonising a dead roll's
+        identity would re-push config for a slot waiting on a physical swap."""
+        env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
+        printer = await printer_factory()
+        spool = await _seed_assignment(db_session, printer.id, spent=True, rgba="161616FF")
+
+        assert await self._walk(db_session, printer.id, _configured_tray()) == 0
+        await db_session.refresh(spool)
+        assert spool.rgba == "161616FF"
+        env.apply.assert_not_awaited()
+
+    async def test_busy_printer_skips_the_publish_without_burning_the_window(self, db_session, printer_factory, env):
+        """Same backoff as the bare arm: a RUNNING/PAUSE AMS silently drops config
+        writes, so the pass skips the PUBLISH and leaves the cadence unarmed — the first
+        settled walk pushes immediately instead of waiting one out."""
+        env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, rgba="161616FF", slicer_filament="GFG02")
+        tray = _configured_tray()
+
+        busy = _state([tray], gcode_state="RUNNING")
+        assert await self._walk(db_session, printer.id, tray, busy) == 0
+        env.apply.assert_not_awaited()
+        assert (printer.id, 0, 0) not in spool_tagless._autoconfig_window
+
+        assert await self._walk(db_session, printer.id, tray, now=_PAST_WINDOW) == 1
+        env.apply.assert_awaited_once()
+
+    async def test_a_latched_epoch_stops_the_arm(self, db_session, printer_factory, env, clock):
+        """The wire's own verdict. A ``result:"fail"`` ack ends the slot's write epoch,
+        and nothing writes to it again until a presence/identity edge re-arms it —
+        exactly as for the bare arm, because it is the same epoch."""
+        env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, rgba="161616FF", slicer_filament="GFG02")
+        tray = _configured_tray()
+
+        assert await self._walk(db_session, printer.id, tray) == 1
+        spool_tagless.on_ams_command_result(
+            printer.id, {"command": "ams_filament_setting", "result": "fail", "ams_id": 0, "tray_id": 0}
+        )
+
+        clock.tick()
+        assert await self._walk(db_session, printer.id, tray, now=_PAST_WINDOW) == 0
+        assert env.apply.await_count == 1
+
+    async def test_three_unadopted_pushes_end_the_epoch(self, db_session, printer_factory, env, clock, caplog):
+        """The strike ladder, on this arm. A tray that keeps reporting its own colour has
+        NOT adopted our config — which is exactly why adoption must be derived from the
+        identity the firmware reflects rather than from a non-empty ``tray_type``.
+        Without that, the lane would re-publish every 30 s forever (shape 28)."""
+        env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, rgba="161616FF", slicer_filament="GFG02")
+        tray = _configured_tray()
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_tagless"):
+            for i in range(spool_tagless._AUTOCONFIG_MAX_PUBLISHES):
+                assert await self._walk(db_session, printer.id, tray, now=_T0 + i * 100.0) == 1
+                clock.tick()
+            assert env.apply.await_count == spool_tagless._AUTOCONFIG_MAX_PUBLISHES
+
+            # A fourth eligible walk: the ladder ends the epoch instead of publishing.
+            assert await self._walk(db_session, printer.id, tray, now=_T0 + 1000.0) == 0
+            clock.tick()
+            assert await self._walk(db_session, printer.id, tray, now=_T0 + 2000.0) == 0
+
+        assert env.apply.await_count == spool_tagless._AUTOCONFIG_MAX_PUBLISHES
+        stops = [r for r in caplog.records if "auto-config STOPPED" in r.message]
+        assert len(stops) == 1
+        assert "still reports its own" in stops[0].getMessage()
+
+    async def test_a_reflected_identity_marks_adoption_and_stops_the_arm(self, db_session, printer_factory, env, clock):
+        """The success path the ladder is measured against: once the tray reports the
+        canonical identity the epoch closes, the arm goes quiet, and a LATER episode
+        starts with a full ladder instead of inheriting stale strikes."""
+        env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, rgba="161616FF", slicer_filament="GFG02")
+
+        assert await self._walk(db_session, printer.id, _configured_tray()) == 1
+        clock.tick()
+
+        # The firmware now reflects what we asked for.
+        assert await self._walk(db_session, printer.id, _configured_tray(color="000000FF"), now=_PAST_WINDOW) == 0
+        assert env.apply.await_count == 1
+        assert spool_tagless._autoconfig_epochs == {}

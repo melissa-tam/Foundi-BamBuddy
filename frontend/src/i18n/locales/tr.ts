@@ -1118,6 +1118,7 @@ export default {
     slot: {
       ranOut: 'Bitti — bu yuvayı doldurun',
       spentCore: 'Tükendi — ruloyu değiştirin',
+      noBackupSlot: 'Yedek yuva yok. Başka bir yuvada bu filament farklı renkte bulunuyor.',
       wasFeeding: 'Bu baskıyı besliyordu',
     },
     activeJobSlot: {

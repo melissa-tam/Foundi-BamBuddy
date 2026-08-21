@@ -299,10 +299,15 @@ class TestFilamentDeficitBackupAware:
         """Patch ``printer_manager.get_status`` + ``get_model`` for the test.
 
         ``trays`` is a list of ``(ams_id, tray_id, tray_type, tray_info_idx,
-        tray_color)`` describing the LIVE AMS trays the firmware reports; they
-        are grouped into the ``raw_data['ams']`` shape the real MQTT layer
+        tray_color)``, optionally extended with ``(nozzle_temp_min,
+        nozzle_temp_max)``, describing the LIVE AMS trays the firmware reports;
+        they are grouped into the ``raw_data['ams']`` shape the real MQTT layer
         produces (string ids, one unit per ams_id). Passing ``None`` builds a
         state with no AMS structure at all.
+
+        The temps are optional because they are the dimension the pooling key
+        gained in 2026-08-21: a 5-tuple leaves them unreported, which is what
+        most fixtures here mean, and two equally-silent trays still pool.
         """
         from types import SimpleNamespace
         from unittest.mock import patch as _patch
@@ -310,16 +315,19 @@ class TestFilamentDeficitBackupAware:
         raw_data: dict = {}
         if trays is not None:
             units: dict[int, dict] = {}
-            for ams_id, tray_id, tray_type, info_idx, color in trays:
+            for spec in trays:
+                ams_id, tray_id, tray_type, info_idx, color = spec[:5]
+                temps = spec[5:]
                 unit = units.setdefault(ams_id, {"id": str(ams_id), "tray": []})
-                unit["tray"].append(
-                    {
-                        "id": str(tray_id),
-                        "tray_type": tray_type,
-                        "tray_info_idx": info_idx,
-                        "tray_color": color,
-                    }
-                )
+                tray: dict = {
+                    "id": str(tray_id),
+                    "tray_type": tray_type,
+                    "tray_info_idx": info_idx,
+                    "tray_color": color,
+                }
+                if temps:
+                    tray["nozzle_temp_min"], tray["nozzle_temp_max"] = temps
+                unit["tray"].append(tray)
             raw_data["ams"] = list(units.values())
 
         fake_state = SimpleNamespace(
@@ -408,6 +416,80 @@ class TestFilamentDeficitBackupAware:
         deficit = await self._run(db_session, item, printer_id=printer.id, backup_on=True, model="X1C", trays=trays)
         assert len(deficit) == 1
         assert deficit[0].slot_id == 1
+
+    # ---- (b2) the firmware's other two grouping dimensions -------------------
+    @pytest.mark.asyncio
+    async def test_backup_on_unbound_tray_near_colour_still_short(self, db_session, printer_factory, tmp_path):
+        """010-H2S (2026-08-21): the pooling key is the FIRMWARE's, and the firmware
+        compares colour byte-exactly. ``161616FF`` is close enough to ``000000FF`` to be
+        the same black PETG and NOT close enough for the AMS to pair the slots — on that
+        printer, 69 auto-switches inside the 1<->2 pair, 14 inside 3->4, none across. A
+        pricer that pooled them would promise a backup the hardware will not deliver."""
+        printer = await printer_factory(model="X1C")
+        archive = await _setup_archive_3mf(
+            db_session, tmp_path, [{"id": "1", "type": "PETG", "color": "#000000", "used_g": "400.0"}]
+        )
+        bound250 = await _spool(db_session, label_weight=1000, weight_used=750.0)  # 250 g
+        bound100 = await _spool(db_session, label_weight=1000, weight_used=900.0)  # 100 g
+        await _assign(db_session, printer_id=printer.id, spool_id=bound250.id, ams_id=0, tray_id=0)
+        await _assign(db_session, printer_id=printer.id, spool_id=bound100.id, ams_id=0, tray_id=1)
+        item = await _queue_item(db_session, printer_id=printer.id, archive=archive, ams_mapping=[0])
+
+        trays = [
+            (0, 0, "PETG", "GFG02", "000000FF"),
+            (0, 1, "PETG", "GFG02", "000000FF"),
+            (0, 2, "PETG", "GFG02", "161616FF"),  # unbound, near-black — a DIFFERENT group
+        ]
+        deficit = await self._run(db_session, item, printer_id=printer.id, backup_on=True, model="X1C", trays=trays)
+        assert len(deficit) == 1
+        assert deficit[0].slot_id == 1
+
+    @pytest.mark.asyncio
+    async def test_backup_on_unbound_tray_different_temps_still_short(self, db_session, printer_factory, tmp_path):
+        """Same preset, same colour, different NOZZLE TEMPS — the fourth dimension the
+        firmware matches on and the one the pooling key used to omit. The unbound tray
+        cannot back the pool, so the deficit stands."""
+        printer = await printer_factory(model="X1C")
+        archive = await _setup_archive_3mf(
+            db_session, tmp_path, [{"id": "1", "type": "PETG", "color": "#000000", "used_g": "400.0"}]
+        )
+        bound250 = await _spool(db_session, label_weight=1000, weight_used=750.0)  # 250 g
+        bound100 = await _spool(db_session, label_weight=1000, weight_used=900.0)  # 100 g
+        await _assign(db_session, printer_id=printer.id, spool_id=bound250.id, ams_id=0, tray_id=0)
+        await _assign(db_session, printer_id=printer.id, spool_id=bound100.id, ams_id=0, tray_id=1)
+        item = await _queue_item(db_session, printer_id=printer.id, archive=archive, ams_mapping=[0])
+
+        trays = [
+            (0, 0, "PETG", "GFG02", "000000FF", 230, 270),
+            (0, 1, "PETG", "GFG02", "000000FF", 230, 270),
+            (0, 2, "PETG", "GFG02", "000000FF", 220, 260),  # unbound, off-temps
+        ]
+        deficit = await self._run(db_session, item, printer_id=printer.id, backup_on=True, model="X1C", trays=trays)
+        assert len(deficit) == 1
+        assert deficit[0].slot_id == 1
+
+    @pytest.mark.asyncio
+    async def test_backup_on_identical_temps_pool_together(self, db_session, printer_factory, tmp_path):
+        """The liveness half of the case above: trays agreeing on all four dimensions —
+        temps included and reported — still pool, so adding the dimension tightened the
+        key without breaking it."""
+        printer = await printer_factory(model="X1C")
+        archive = await _setup_archive_3mf(
+            db_session, tmp_path, [{"id": "1", "type": "PETG", "color": "#000000", "used_g": "400.0"}]
+        )
+        bound250 = await _spool(db_session, label_weight=1000, weight_used=750.0)
+        bound100 = await _spool(db_session, label_weight=1000, weight_used=900.0)
+        await _assign(db_session, printer_id=printer.id, spool_id=bound250.id, ams_id=0, tray_id=0)
+        await _assign(db_session, printer_id=printer.id, spool_id=bound100.id, ams_id=0, tray_id=1)
+        item = await _queue_item(db_session, printer_id=printer.id, archive=archive, ams_mapping=[0])
+
+        trays = [
+            (0, 0, "PETG", "GFG02", "000000FF", 230, 270),
+            (0, 1, "PETG", "GFG02", "000000FF", 230, 270),
+            (0, 2, "PETG", "GFG02", "000000FF", 230, 270),  # unbound peer opens the pool
+        ]
+        deficit = await self._run(db_session, item, printer_id=printer.id, backup_on=True, model="X1C", trays=trays)
+        assert deficit == []
 
     # ---- (c) all bound, pool sufficient (+ colour-alpha normalisation) -------
     @pytest.mark.asyncio

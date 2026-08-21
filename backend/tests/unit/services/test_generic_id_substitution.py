@@ -6,7 +6,7 @@ slot on the same printer got ``GFG02`` in the same pass. A generic id splits the
 firmware's auto-refill backup group — it pairs slots only on an exact brand-class /
 type / colour / nozzle-temps match — which is the 011-H2S "refused to auto-switch on
 runout" cause the 2026-07-19 wave was supposed to have closed with ONE substitution
-chokepoint (``spool_tagless.override_generic_identity``, applied inside
+chokepoint (``spool_tagless.canonical_default_identity`` (renamed 2026-08-21 from ``override_generic_identity``), applied inside
 ``resolve_slicer_filament``).
 
 The escape: every offending row carries ``slicer_filament = ''`` (fleet-wide, NO row

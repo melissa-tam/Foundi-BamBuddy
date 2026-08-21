@@ -49,6 +49,7 @@ from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
+from backend.app.services.queue_transitions import cancel_pending_items
 from backend.app.services.sku_catalog import median_cycle_seconds
 from backend.app.utils.printer_models import (
     is_dual_nozzle_model,
@@ -841,20 +842,36 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
         for pid in sorted({it.printer_id for it in run.queue_items if it.printer_id is not None}):
             await release_filament_staged(db, pid)
 
-    for item in run.queue_items:
-        if item.status != "pending":
-            continue
-        if action == "pause":
-            item.manual_start = True
-        elif action == "resume":
-            item.manual_start = False
-        elif action == "abort":
-            item.status = "cancelled"
-            # Terminal-transition hygiene (W4b): a run-abort cancels PENDING items
-            # directly (they never flow through farm_policy.on_terminal), so any
-            # scheduler hold token (filament_short, capability block, stagger_hold…)
-            # must be cleared here or it survives on a cancelled row forever.
-            item.waiting_reason = None
+    if action == "abort":
+        # The pending→cancelled transition is decided at the STORAGE boundary, not
+        # from these in-memory statuses: this session may have loaded the run before
+        # the scheduler committed a dispatch, and an ORM write would then overwrite
+        # `status` alone and leave a cancelled row wearing the dispatcher's
+        # started_at/ams_mapping while the printer really prints it (prod 2026-08-20,
+        # run 112 / item 865 on 010-H2S). `cancel_pending_items` re-checks `pending`
+        # inside the UPDATE, so a unit that dispatched in the gap stays `printing` —
+        # which is what "abort cancels the run's PENDING items" always claimed to
+        # mean. Terminal-transition hygiene (W4b — waiting_reason cleared so no
+        # scheduler hold token survives on a terminal row) lives in the primitive.
+        cancelled_ids = await cancel_pending_items(
+            db, item_ids=[it.id for it in run.queue_items if it.status == "pending"]
+        )
+        # synchronize_session=False + expire_on_commit=False: the ORM copies below
+        # are stale until something repopulates them. Expire the rows that moved so
+        # the closing _load_run's selectinload refreshes them from the DB.
+        by_id = {it.id: it for it in run.queue_items}
+        for item_id in cancelled_ids:
+            item = by_id.get(item_id)
+            if item is not None:
+                db.expire(item)
+    else:
+        for item in run.queue_items:
+            if item.status != "pending":
+                continue
+            if action == "pause":
+                item.manual_start = True
+            elif action == "resume":
+                item.manual_start = False
 
     run.status = {"pause": "paused", "resume": "active", "abort": "cancelled"}[action]
     if action == "resume":

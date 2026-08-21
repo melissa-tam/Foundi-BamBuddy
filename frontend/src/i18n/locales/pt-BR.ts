@@ -1118,6 +1118,7 @@ export default {
     slot: {
       ranOut: 'Acabou — reabasteça este slot',
       spentCore: 'Gasta — substitua o rolo',
+      noBackupSlot: 'Sem slot de backup. Outro slot tem este filamento em outra cor.',
       wasFeeding: 'Estava alimentando esta impressão',
     },
     activeJobSlot: {

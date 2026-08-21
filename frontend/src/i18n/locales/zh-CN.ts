@@ -1118,6 +1118,7 @@ export default {
     slot: {
       ranOut: '已用完——请补充此槽位',
       spentCore: '已用尽——请更换料卷',
+      noBackupSlot: '没有备用料槽。另一个料槽装有相同线材，但颜色不同。',
       wasFeeding: '曾为此次打印供料',
     },
     activeJobSlot: {

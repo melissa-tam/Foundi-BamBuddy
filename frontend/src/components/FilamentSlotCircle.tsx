@@ -35,12 +35,20 @@
  *                runout PAUSE (when the green active ring has cleared).
  *   spentCore  - True when the assigned spool is hardware-certain spent
  *                (Spool.spent_at != null; W6) — the core needs replacing.
- *                Renders a distinct badge (bottom-right). All three badges carry
- *                an icon glyph + aria-label + title (never colour-only).
+ *                Renders a distinct badge (bottom-right).
+ *   noBackupSlot - True when AMS Filament Backup is on and this slot has no
+ *                firmware backup partner even though a same-filament roll sits
+ *                on the same extruder side, excluded by an exact-match colour
+ *                or nozzle-temp difference (`amsHelpers.nearMissBackupSlots`;
+ *                010-H2S ran dry twice on 161616FF beside a full 000000FF
+ *                roll). Renders the last free corner badge (bottom-left) and is
+ *                suppressed on empty slots — an empty slot has no filament to
+ *                back up. All four badges carry an icon glyph + aria-label +
+ *                title (never colour-only).
  */
 
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, AlertCircle, RotateCcw } from 'lucide-react';
+import { AlertTriangle, AlertCircle, RotateCcw, Unlink } from 'lucide-react';
 import type { EmptySlotKind } from '../utils/amsHelpers';
 
 interface FilamentSlotCircleProps {
@@ -52,6 +60,7 @@ interface FilamentSlotCircleProps {
   outOfRotation?: boolean;
   ranOut?: boolean;
   spentCore?: boolean;
+  noBackupSlot?: boolean;
 }
 
 function isLightFilamentColor(hex: string): boolean {
@@ -62,7 +71,7 @@ function isLightFilamentColor(hex: string): boolean {
   return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6;
 }
 
-export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, slotNumber, outOfRotation, ranOut, spentCore }: FilamentSlotCircleProps) {
+export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, slotNumber, outOfRotation, ranOut, spentCore, noBackupSlot }: FilamentSlotCircleProps) {
   const { t } = useTranslation();
   // Unknown-presence slots get a quieter border than wire-asserted empty so they
   // read as "the printer has not said" rather than "definitely no spool".
@@ -78,6 +87,11 @@ export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, sl
   const outOfRotationLabel = t('ams.outOfRotation');
   const ranOutLabel = t('printers.slot.ranOut');
   const spentCoreLabel = t('printers.slot.spentCore');
+  const noBackupSlotLabel = t('printers.slot.noBackupSlot');
+  // An empty slot has no filament to back up — the badge would be a claim about
+  // nothing. The three sibling badges describe a spool, this one describes the
+  // filament in the tray, so it is the only one gated on isEmpty.
+  const showNoBackupSlot = !!noBackupSlot && !isEmpty;
   return (
     <div
       className={`relative w-3.5 h-3.5 rounded-full mx-auto mb-0.5 border-2 flex items-center justify-center${
@@ -152,6 +166,22 @@ export function FilamentSlotCircle({ trayColor, trayType, isEmpty, emptyKind, sl
           className="absolute -bottom-1 -right-1 flex items-center justify-center w-2.5 h-2.5 rounded-full bg-purple-500 ring-1 ring-bambu-dark"
         >
           <RotateCcw className="w-[7px] h-[7px] text-white" aria-hidden="true" strokeWidth={3} />
+        </span>
+      )}
+      {showNoBackupSlot && (
+        // "No firmware backup partner" badge — the last free corner
+        // (bottom-left). Shares the jam badge's amber tone deliberately: four
+        // badges in one 14 px circle need ONE tone system, and the corner plus
+        // the Unlink glyph already tell them apart. Not colour-only: the glyph
+        // carries the meaning and aria-label + title carry the sentence to
+        // screen readers and on hover/focus.
+        <span
+          role="img"
+          aria-label={noBackupSlotLabel}
+          title={noBackupSlotLabel}
+          className="absolute -bottom-1 -left-1 flex items-center justify-center w-2.5 h-2.5 rounded-full bg-amber-400 ring-1 ring-bambu-dark"
+        >
+          <Unlink className="w-[7px] h-[7px] text-black" aria-hidden="true" strokeWidth={3} />
         </span>
       )}
     </div>
