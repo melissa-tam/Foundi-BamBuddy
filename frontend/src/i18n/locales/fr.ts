@@ -230,6 +230,7 @@ export default {
     deleteTitle: 'Supprimer cette série ?',
     deleteBody: '"{{name}}" et son historique d\'unités seront définitivement supprimés, et ses plateaux ne compteront plus dans les statistiques du SKU. Cette action est irréversible.',
     deleteFailed: 'Échec de la suppression de la série',
+    deleteHasPrintingUnits: 'La série imprime encore des unités sur {{printers}}. Arrêtez-les ou attendez la fin, puis supprimez.',
     firstArticle: {
       sectionTitle: 'Validation de la première pièce',
       requireLabel: 'Exiger la validation de la première pièce',

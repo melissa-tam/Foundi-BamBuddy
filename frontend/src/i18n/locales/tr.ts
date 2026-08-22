@@ -230,6 +230,7 @@ export default {
     deleteTitle: 'Bu çalışma silinsin mi?',
     deleteBody: '"{{name}}" ve birim geçmişi kalıcı olarak kaldırılacak ve plakaları artık SKU istatistiklerine sayılmayacak. Bu işlem geri alınamaz.',
     deleteFailed: 'Çalışma silinemedi',
+    deleteHasPrintingUnits: 'Çalışmada {{printers}} üzerinde hâlâ basılan birimler var. Bunları durdurun veya bitmelerini bekleyin, sonra silin.',
     firstArticle: {
       sectionTitle: 'İlk parça onayı',
       requireLabel: 'İlk parça onayını zorunlu kıl',

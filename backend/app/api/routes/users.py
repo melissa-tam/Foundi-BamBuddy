@@ -41,6 +41,7 @@ from backend.app.services.email_service import (
     get_smtp_settings,
     send_email,
 )
+from backend.app.services.queue_transitions import delete_user_items_unless_printing, printing_units_conflict
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -369,6 +370,11 @@ async def delete_user(
     If delete_items=True, all archives, queue items, and library files created by
     this user will also be deleted. Otherwise, these items will become "ownerless"
     (created_by_id set to NULL by the foreign key constraint).
+
+    delete_items=True is refused WHOLESALE with a structured 409
+    (``user_has_printing_units``) while any of the user's queue items is still
+    printing — deleting the row would not stop the print, it would only sever the
+    farm's one link to it. Nothing is deleted on that path.
     """
     result = await db.execute(select(User).where(User.id == user_id).options(selectinload(User.groups)))
     user = result.scalar_one_or_none()
@@ -407,9 +413,27 @@ async def delete_user(
         )
 
     if delete_items:
-        # Delete all items created by this user
+        # Delete all items created by this user.
+        #
+        # The queue items go FIRST, and through the storage-boundary transition,
+        # because a live print outlives the account that queued it: the
+        # PrintQueueItem row is the only durable link between a running print and
+        # the farm, so destroying it strands the printer on a plate nobody will
+        # eject (production 2026-08-22 — the full account is on
+        # ``queue_transitions.delete_items_unless_printing``). This delete is
+        # FLEET-WIDE and spans every run the user ever queued, so it carries that
+        # hazard at a wider radius than the run delete does. Refused wholesale,
+        # before anything else here is destroyed, so the rollback is clean.
+        _deleted, still_printing = await delete_user_items_unless_printing(db, user_id=user_id)
+        if still_printing:
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=await printing_units_conflict(
+                    db, still_printing, code="user_has_printing_units", subject="This user"
+                ),
+            )
         await db.execute(delete(PrintArchive).where(PrintArchive.created_by_id == user_id))
-        await db.execute(delete(PrintQueueItem).where(PrintQueueItem.created_by_id == user_id))
         await db.execute(delete(LibraryFile).where(LibraryFile.created_by_id == user_id))
         await db.execute(delete(PrintBatch).where(PrintBatch.created_by_id == user_id))
     else:

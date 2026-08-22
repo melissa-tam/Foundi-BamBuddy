@@ -230,6 +230,7 @@ export default {
     deleteTitle: '이 실행을 삭제하시겠습니까?',
     deleteBody: '"{{name}}" 및 해당 유닛 기록이 영구적으로 삭제되며, 해당 플레이트는 더 이상 SKU 통계에 집계되지 않습니다. 이 작업은 되돌릴 수 없습니다.',
     deleteFailed: '실행을 삭제하지 못했습니다',
+    deleteHasPrintingUnits: '실행에 {{printers}}에서 아직 인쇄 중인 유닛이 있습니다. 중지하거나 완료될 때까지 기다린 후 삭제하세요.',
     firstArticle: {
       sectionTitle: '초도품 승인',
       requireLabel: '초도품 승인 요구',

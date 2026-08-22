@@ -27,6 +27,7 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
+from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.sku import SkuFile
 from backend.app.services import spool_selection
@@ -49,7 +50,11 @@ from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
-from backend.app.services.queue_transitions import cancel_pending_items
+from backend.app.services.queue_transitions import (
+    cancel_pending_items,
+    delete_items_unless_printing,
+    printing_units_conflict,
+)
 from backend.app.services.sku_catalog import median_cycle_seconds
 from backend.app.utils.printer_models import (
     is_dual_nozzle_model,
@@ -60,7 +65,6 @@ from backend.app.utils.printer_models import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from backend.app.models.print_queue import PrintQueueItem
     from backend.app.models.user import User
     from backend.app.schemas.production_run import RunCreate
 
@@ -1069,7 +1073,18 @@ async def delete_production_run(db: AsyncSession, run_id: int) -> None:
     (``print_queue.archive_id``), never the reverse, so removing the items and
     batch cannot reach into archive history.
 
-    Raises 404 (unknown run) and 409 (non-terminal run) as HTTPExceptions.
+    A run whose units are still PRINTING is refused wholesale, because the
+    ``PrintQueueItem`` row is the only durable link between a live print and the
+    farm — the full reasoning, and the 2026-08-22 incident that installed it,
+    live on ``queue_transitions.delete_items_unless_printing``. A terminal run
+    status is not a substitute for that check: aborting a run cancels its PENDING
+    units and deliberately lets in-progress plates finish, so 'cancelled' and
+    'still printing' are a normal combination, and it is exactly the combination
+    that caused the incident.
+
+    Raises 404 (unknown run) and 409 as HTTPExceptions. There are two distinct
+    409s: a plain-string one for a non-terminal run (abort it first) and the
+    structured ``run_has_printing_units`` one for live units.
     """
     run = await _load_run(db, run_id)
     if run.status not in ("cancelled", "completed"):
@@ -1077,8 +1092,24 @@ async def delete_production_run(db: AsyncSession, run_id: int) -> None:
             status_code=409,
             detail=f"Cannot delete a run in status '{run.status}'; abort it first",
         )
-    # Explicit child delete (no batch→item cascade); archives stay intact.
-    for item in list(run.queue_items):
-        await db.delete(item)
+
+    # Explicit child delete (no batch→item cascade); archives stay intact. The
+    # ``printing`` precondition is evaluated by the DELETE itself, so a unit that
+    # dispatches inside this very request cannot be deleted out from under the
+    # printer that is running it.
+    _deleted, still_printing = await delete_items_unless_printing(db, batch_id=run.id)
+    if still_printing:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=await printing_units_conflict(db, still_printing, code="run_has_printing_units", subject="Run"),
+        )
+
+    # The bulk DELETE ran with ``synchronize_session=False`` (the module's stated
+    # caller obligation), so ``run.queue_items`` still holds the now-deleted
+    # children. Deleting the batch with that stale collection loaded would make
+    # SQLAlchemy try to NULL their ``batch_id`` and fail its row-count check;
+    # reloading the relationship leaves the cascade nothing to do.
+    await db.refresh(run, ["queue_items"])
     await db.delete(run)
     await db.commit()

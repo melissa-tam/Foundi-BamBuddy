@@ -422,6 +422,164 @@ class TestProductionRunDelete:
     async def test_delete_unknown_404(self, async_client):
         assert (await async_client.delete("/api/v1/production-runs/987654")).status_code == 404
 
+    async def test_delete_run_with_a_printing_unit_409_names_the_printers(
+        self, async_client, db_session, tmp_path, printer_factory
+    ):
+        """A live unit refuses the delete, and the 409 names printers, not ids."""
+        printer = await printer_factory(name="001-H2S", model="H2S")
+        run_id = await self._make_run(async_client, db_session, tmp_path, "SKU045.01")
+        items = sorted(await _pending_items(db_session, run_id), key=lambda it: it.id)
+        items[0].status = "printing"
+        items[0].printer_id = printer.id
+        items[0].started_at = datetime(2026, 8, 22, 2, 30, 0, tzinfo=timezone.utc)
+        await db_session.commit()
+        printing_id = items[0].id
+
+        # Terminal run status is a separate precondition — satisfy it so the
+        # printing check is what this test is actually exercising.
+        from backend.app.models.print_batch import PrintBatch
+
+        batch = (await db_session.execute(select(PrintBatch).where(PrintBatch.id == run_id))).scalar_one()
+        batch.status = "cancelled"
+        await db_session.commit()
+
+        resp = await async_client.delete(f"/api/v1/production-runs/{run_id}")
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["code"] == "run_has_printing_units"
+        assert detail["printers"] == ["001-H2S"]
+        assert "001-H2S" in detail["message"]
+
+        # Nothing was deleted — not the live unit, not its terminal siblings.
+        db_session.expire_all()
+        surviving = await _pending_items(db_session, run_id)
+        assert {it.id for it in surviving} == {it.id for it in items}
+        assert next(it for it in surviving if it.id == printing_id).status == "printing"
+        assert (await async_client.get(f"/api/v1/production-runs/{run_id}")).status_code == 200
+
+    async def test_delete_run_whose_units_are_all_terminal_204(
+        self, async_client, db_session, tmp_path, printer_factory
+    ):
+        """Terminal units are queue history: the delete still removes them (204)."""
+        from backend.app.models.print_batch import PrintBatch
+
+        printer = await printer_factory(name="004-H2S", model="H2S")
+        run_id = await self._make_run(async_client, db_session, tmp_path, "SKU046.01")
+        items = sorted(await _pending_items(db_session, run_id), key=lambda it: it.id)
+        for item, status_ in zip(items, ("completed", "failed"), strict=False):
+            item.status = status_
+            item.printer_id = printer.id
+        batch = (await db_session.execute(select(PrintBatch).where(PrintBatch.id == run_id))).scalar_one()
+        batch.status = "completed"
+        await db_session.commit()
+
+        resp = await async_client.delete(f"/api/v1/production-runs/{run_id}")
+        assert resp.status_code == 204, resp.text
+
+        db_session.expire_all()
+        assert await _pending_items(db_session, run_id) == []
+        assert (
+            await db_session.execute(select(PrintBatch).where(PrintBatch.id == run_id))
+        ).scalar_one_or_none() is None
+
+    async def test_abort_then_delete_leaves_the_printing_units_alive(
+        self, async_client, db_session, tmp_path, printer_factory
+    ):
+        """The 2026-08-22 incident sequence: abort at 02:34:31, delete at 02:34:36.
+
+        Run 114 was aborted and hard-deleted five seconds later while three units
+        were still printing on 001/002/003-H2S. The delete removed those rows, so
+        when each print finished hours later ``resolve_terminal_item`` found no
+        printing candidate, classified the terminal FOREIGN, raised the plate gate
+        and armed no eject — three printers idle for ~27 printer-hours.
+
+        Abort is the CORRECT first step and stays 200: it cancels the pending
+        units and deliberately lets in-progress plates finish. It is the delete
+        that must refuse, which is why a terminal run status can never stand in
+        for this check.
+        """
+        printers = [await printer_factory(name=f"00{n}-H2S", model="H2S") for n in (1, 2, 3)]
+        run_id = await self._make_run(async_client, db_session, tmp_path, "SKU047.01", target_units=3)
+        items = sorted(await _pending_items(db_session, run_id), key=lambda it: it.id)
+        assert len(items) == 3
+        for item, printer in zip(items, printers, strict=True):
+            item.status = "printing"
+            item.printer_id = printer.id
+        await db_session.commit()
+        live_ids = {it.id for it in items}
+
+        assert (await async_client.post(f"/api/v1/production-runs/{run_id}/abort")).status_code == 200
+
+        resp = await async_client.delete(f"/api/v1/production-runs/{run_id}")
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["code"] == "run_has_printing_units"
+        assert detail["printers"] == ["001-H2S", "002-H2S", "003-H2S"]
+
+        # All three units survive, still printing, still correlatable.
+        db_session.expire_all()
+        surviving = await _pending_items(db_session, run_id)
+        assert {it.id for it in surviving} == live_ids
+        assert all(it.status == "printing" for it in surviving)
+
+    async def test_a_unit_dispatched_in_the_gap_is_not_deleted(
+        self, async_client, db_session, tmp_path, printer_factory, test_engine, monkeypatch
+    ):
+        """The race the primitive exists for: dispatch lands between load and delete.
+
+        ``delete_production_run`` loads the run, and only then deletes. The
+        scheduler sets ``status='printing'`` and COMMITS before it sends the print
+        command, so a unit can go live inside that gap — invisible to any guard
+        that reads the loaded ORM rows. Here a SECOND session commits exactly that
+        flip after the run load, and the DELETE's own WHERE clause is the only
+        thing standing between it and the 2026-08-22 outcome.
+        """
+        from sqlalchemy.ext.asyncio import AsyncSession as _Session, async_sessionmaker as _maker
+
+        from backend.app.models.print_batch import PrintBatch
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services import production_run as production_run_service
+
+        printer = await printer_factory(name="010-H2S", model="H2S")
+        run_id = await self._make_run(async_client, db_session, tmp_path, "SKU048.01")
+        items = sorted(await _pending_items(db_session, run_id), key=lambda it: it.id)
+        racing_id = items[0].id
+        # A terminal run whose units are still pending — the run load sees them
+        # pending, exactly as the request did on 2026-08-22.
+        batch = (await db_session.execute(select(PrintBatch).where(PrintBatch.id == run_id))).scalar_one()
+        batch.status = "cancelled"
+        await db_session.commit()
+
+        real_delete = production_run_service.delete_items_unless_printing
+        maker = _maker(test_engine, class_=_Session, expire_on_commit=False)
+
+        async def _dispatch_then_delete(db, *, batch_id):
+            async with maker() as scheduler:
+                racing = (
+                    await scheduler.execute(select(PrintQueueItem).where(PrintQueueItem.id == racing_id))
+                ).scalar_one()
+                racing.status = "printing"
+                racing.printer_id = printer.id
+                racing.started_at = datetime(2026, 8, 22, 2, 34, 33, tzinfo=timezone.utc)
+                await scheduler.commit()
+            return await real_delete(db, batch_id=batch_id)
+
+        monkeypatch.setattr(production_run_service, "delete_items_unless_printing", _dispatch_then_delete)
+
+        resp = await async_client.delete(f"/api/v1/production-runs/{run_id}")
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["code"] == "run_has_printing_units"
+
+        # The unit that raced in survives — and so does the whole run, because the
+        # refusal rolls back rather than deleting the rest.
+        db_session.expire_all()
+        surviving = await _pending_items(db_session, run_id)
+        assert {it.id for it in surviving} == {it.id for it in items}
+        assert next(it for it in surviving if it.id == racing_id).status == "printing"
+        assert (
+            await db_session.execute(select(PrintBatch).where(PrintBatch.id == run_id))
+        ).scalar_one_or_none() is not None
+
     async def test_delete_requires_auth_401(self, async_client):
         await _enable_auth(async_client)
         # Auth enabled + no credentials → 401 (the permission dep runs first).

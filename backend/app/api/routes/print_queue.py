@@ -1096,7 +1096,11 @@ async def delete_queue_item(
             raise HTTPException(403, "You can only delete your own queue items")
 
     if item.status == "printing":
-        raise HTTPException(400, "Cannot delete item that is currently printing")
+        # 409, not 400: the request is well-formed, it conflicts with the row's
+        # current state. Matches the archive delete (``archives.py``) and the run
+        # delete, which refuse the identical condition — this endpoint was the
+        # only one of the three still answering 400.
+        raise HTTPException(409, "Cannot delete item that is currently printing")
 
     await db.delete(item)
     await db.commit()

@@ -88,3 +88,57 @@ def derive_remote_filename(filename: str) -> str:
         else:
             break
     return f"{stem}.3mf".replace(" ", "_")
+
+
+def print_identity_key(filename: str) -> str:
+    """The one "is this the same print?" key.
+
+    Basename → repeatedly strip a trailing ``.gcode.3mf`` / ``.3mf`` / ``.gcode``
+    → remove a remaining ``.gcode`` token (the splicer names files
+    ``<project>.gcode_L1-NN_spliced.3mf`` and the firmware drops that token from
+    its echo) → fold spaces to underscores → lower-case.
+
+    THE single normaliser for every "did this printer just finish the file we
+    think it did?" comparison — terminal-status correlation
+    (``farm_correlation._payload_names`` / ``_item_names``) and the foreign
+    auto-eject identity check (``eject.manual._canonical_names``) both key on it.
+    Before 2026-08-22 those two carried private variants, neither of which could
+    see this farm's corpus: production names such as
+    ``Rotary_tool_top_surfaces_PCO-M12-2525.gcode_L1-90_spliced.3mf`` come back
+    from the printer as ``Rotary_tool_top_surfaces_PCO-M12-2525_L1-90_spliced``
+    — the mid-stem ``.gcode`` token gone and spaces already underscored — so the
+    foreign-plate rescue never fired once in five days of FOREIGN terminals.
+
+    Deliberately NOT a fuzzy match: it removes ONE known token and folds ONE
+    known separator. No edit distance, no prefix matching, no similarity score.
+    Two names that differ by any real token still key differently, which is what
+    keeps ``matched_by_name`` from crediting a foreign print to a farm unit.
+
+    Distinct from :func:`derive_remote_filename`, which must keep producing the
+    ACTUAL SD-card filename (post-print cleanup matches on it). This key is
+    lossy on purpose and must never be used to name a file. Space folding
+    mirrors that function exactly — no surrounding whitespace strip — because
+    the echo the printer returns is derived from the uploaded name, so any strip
+    here would desynchronise the two sides.
+
+    Raises ``TypeError`` on non-string input for the same reason
+    :func:`derive_remote_filename` does: a duck-typed object returning truthy
+    sentinels from ``endswith`` never escapes the strip loop, and the resulting
+    unbounded allocation has cgroup-OOM'd the test runner under mocks.
+    """
+    if not isinstance(filename, str):
+        raise TypeError(f"print_identity_key requires str, got {type(filename).__name__}")
+    # Lower-case up front so the suffix/token matching below is case-insensitive
+    # (a ``.3MF`` upload keys the same as a ``.3mf`` one); the result is identical
+    # to folding case last for every all-lowercase-suffix name.
+    stem = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    while True:
+        if stem.endswith(".gcode.3mf"):
+            stem = stem[:-10]
+        elif stem.endswith(".3mf"):
+            stem = stem[:-4]
+        elif stem.endswith(".gcode"):
+            stem = stem[:-6]
+        else:
+            break
+    return stem.replace(".gcode", "", 1).replace(" ", "_")

@@ -686,21 +686,35 @@ class TestManualEjectForeignFallbackLastFarmItem:
 
 
 class TestCanonicalNames:
-    """The underscore/extension canonicalisation that makes a screen-started print's
-    UNDERSCORED USB echo compare equal to the farm's SPACED library/archive name —
-    the fold farm_correlation._normalize_name deliberately does NOT do."""
+    """The identity key that makes a screen-started print's UNDERSCORED, ``.gcode``-less
+    USB echo compare equal to the farm's SPACED, token-bearing library/archive name.
+    One key only — shared with farm_correlation, which carried a blinder variant until
+    2026-08-22."""
 
     async def test_underscored_echo_matches_spaced_stored_name(self):
         # (async only to satisfy the module-level asyncio pytestmark; the fn is pure.)
         echoed = manual._canonical_names(".6_nozzle_(Battery_holders_X2)", None)
         stored = manual._canonical_names(".6 nozzle (Battery holders X2).gcode.3mf")
         assert echoed == stored
-        assert echoed == {".6_nozzle_(Battery_holders_X2).3mf"}
+        assert echoed == {".6_nozzle_(battery_holders_x2)"}
+
+    async def test_spliced_corpus_echo_matches_stored_name(self):
+        # The 2026-08-22 production defect: the splicer writes a MID-STEM ``.gcode``
+        # token and the firmware drops it from the echo. Real pair from the logs.
+        echoed = manual._canonical_names("Rotary_tool_top_surfaces_PCO-M12-2525_L1-90_spliced", None)
+        stored = manual._canonical_names("Rotary_tool_top_surfaces_PCO-M12-2525.gcode_L1-90_spliced.3mf")
+        assert echoed == stored
+        assert echoed == {"rotary_tool_top_surfaces_pco-m12-2525_l1-90_spliced"}
+
+    async def test_emits_exactly_one_key_per_name(self):
+        # Not two forms: every call site is an identity comparison, so a stricter
+        # member alongside the relaxed one could never decide anything extra.
+        assert len(manual._canonical_names("Widget A.gcode_L1-5_spliced.3mf")) == 1
 
     async def test_blanks_skipped_and_basename_stripped(self):
         assert manual._canonical_names(None, "") == set()
-        # A path-prefixed name is basename-stripped before canonicalising.
-        assert manual._canonical_names("/data/Widget A.3mf") == {"Widget_A.3mf"}
+        # A path-prefixed name is basename-stripped before keying.
+        assert manual._canonical_names("/data/Widget A.3mf") == {"widget_a"}
 
 
 class TestIdentifyFarmFileForeign:
@@ -727,6 +741,56 @@ class TestIdentifyFarmFileForeign:
             assert result.profile_id == prof.id
             assert result.threshold_c == 30.0
             assert result.print_name == "Foreign Widget"
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_spliced_production_name_is_identified(self, db_session, seed_geometry):
+        """THE 2026-08-22 REGRESSION GUARD. Gate (a) refused this farm's entire corpus:
+        the splicer writes a MID-STEM ``.gcode`` token that the firmware drops from its
+        echo, so the rescue never fired once across 19 FOREIGN terminals in 5 days.
+        Real name pair, straight from the production logs."""
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "IDSPL", gate="SUB-F")  # H2S -> validated
+            prof = EjectProfile(name="idspl-ep", cooldown_temp_c=30.0, max_part_height_mm=42.0)
+            db_session.add(prof)
+            await db_session.flush()
+            lf = await _mk_library_file(db_session, "Rotary_tool_top_surfaces_PCO-M12-2525.gcode_L1-90_spliced.3mf")
+            await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, eject_profile_id=prof.id)
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            result = await manual.identify_farm_file_foreign(
+                db_session,
+                printer.id,
+                subtask_name="Rotary_tool_top_surfaces_PCO-M12-2525_L1-90_spliced",
+                filename=None,
+            )
+            assert result is not None
+            assert result.profile_id == prof.id
+            assert result.threshold_c == 30.0
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_spliced_name_near_miss_is_not_identified(self, db_session, seed_geometry):
+        """The widened key is still not fuzzy: a DIFFERENT layer range is a different
+        print and must not be swept as the farm's own plate."""
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "IDSPLN", gate="SUB-F")
+            prof = EjectProfile(name="idspln-ep", cooldown_temp_c=30.0, max_part_height_mm=42.0)
+            db_session.add(prof)
+            await db_session.flush()
+            lf = await _mk_library_file(db_session, "Rotary_tool_top_surfaces_PCO-M12-2525.gcode_L1-90_spliced.3mf")
+            await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, eject_profile_id=prof.id)
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            result = await manual.identify_farm_file_foreign(
+                db_session,
+                printer.id,
+                subtask_name="Rotary_tool_top_surfaces_PCO-M12-2525_L1-91_spliced",
+                filename=None,
+            )
+            assert result is None
         finally:
             source.unlink(missing_ok=True)
 

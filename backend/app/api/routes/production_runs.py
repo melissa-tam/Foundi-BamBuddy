@@ -119,9 +119,19 @@ async def delete_run(
 ):
     """Hard-delete a cancelled/completed run and all its queue items (204).
 
-    Returns 404 for an unknown run and 409 when the run is still active or
-    paused (abort it first). Print archives are preserved — see
-    ``delete_production_run``.
+    Returns 404 for an unknown run and 409 for either of TWO distinct conflicts:
+
+    - the run is still active or paused — abort it first (plain-string detail);
+    - the run still has units PRINTING — structured detail
+      ``{code: "run_has_printing_units", message, printers}``, naming the printers
+      still running them. Nothing is deleted on this path.
+
+    The two are independent, and the second is not implied by the first: aborting
+    a run cancels its pending units and deliberately lets in-progress plates
+    finish, so a 'cancelled' run with live units is the normal post-abort state —
+    and the very state that stranded three printers on 2026-08-22.
+
+    Print archives are preserved — see ``delete_production_run``.
     """
     await delete_production_run(db, run_id)
 

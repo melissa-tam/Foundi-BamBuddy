@@ -230,6 +230,7 @@ export default {
     deleteTitle: 'Excluir esta execução?',
     deleteBody: '"{{name}}" e seu histórico de unidades serão removidos permanentemente, e suas placas deixarão de contar nas estatísticas do SKU. Esta ação não pode ser desfeita.',
     deleteFailed: 'Falha ao excluir a execução',
+    deleteHasPrintingUnits: 'A execução ainda tem unidades imprimindo em {{printers}}. Pare-as ou aguarde a conclusão e então exclua.',
     firstArticle: {
       sectionTitle: 'Aprovação da primeira peça',
       requireLabel: 'Exigir aprovação da primeira peça',

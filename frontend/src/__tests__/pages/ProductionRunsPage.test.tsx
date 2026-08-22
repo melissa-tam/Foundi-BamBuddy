@@ -9,6 +9,9 @@
  *   both blocked; no POST fires).
  * - Abort requires the confirmation dialog: clicking Abort does not POST,
  *   confirming does.
+ * - The delete refusal (409 run_has_printing_units) renders inline from its
+ *   CODE via i18n — never the backend's English message — is announced through
+ *   InlineAlert's role="alert", and leaves the Delete control enabled.
  */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
@@ -734,5 +737,75 @@ describe('ProductionRunsPage', () => {
     await waitFor(() => expect(posted).not.toBeNull());
     expect(typeof posted!.scheduled_start_at).toBe('string');
     expect(new Date(posted!.scheduled_start_at as string).getTime()).toBeGreaterThan(Date.now());
+  });
+  // -------------------------------------------------------------------------
+  // Delete refusal: units still printing (2026-08-22 incident, run 114)
+  // -------------------------------------------------------------------------
+
+  it('renders the printing-units 409 from its code, not the English message', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () => HttpResponse.json([run({ status: 'cancelled' })])),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+      http.delete('*/api/v1/production-runs/:id', () =>
+        HttpResponse.json(
+          {
+            detail: {
+              code: 'run_has_printing_units',
+              // Deliberately NOT the localized sentence: if the page rendered
+              // `message` instead of looking the code up in i18n, this test
+              // fails — which is the whole point of the structured 409.
+              message: 'backend english fallback',
+              printers: ['001-H2S', '002-H2S', '003-H2S'],
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<ProductionRunsPage />);
+    await screen.findByText('WID-001 run');
+
+    await user.click(screen.getByRole('button', { name: /delete/i }));
+    expect(await screen.findByText('Delete this run?')).toBeInTheDocument();
+    const confirmButtons = screen.getAllByRole('button', { name: /^delete$/i });
+    await user.click(confirmButtons[confirmButtons.length - 1]);
+
+    // Announced (InlineAlert carries role="alert"): the refusal appears only
+    // after the click, so without the live region it reads as a dead button.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      'Run still has units printing on 001-H2S, 002-H2S, 003-H2S. Stop them or wait for them to finish, then delete.',
+    );
+    expect(alert).not.toHaveTextContent('backend english fallback');
+
+    // The Delete control stays enabled and in the tab order: the backend owns
+    // this invariant, and a disabled button would make its own explanation
+    // unreachable by keyboard.
+    const afterFailure = screen.getAllByRole('button', { name: /^delete$/i });
+    expect(afterFailure[afterFailure.length - 1]).toBeEnabled();
+  });
+
+  it('falls back to the server message for an uncoded delete failure', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () => HttpResponse.json([run({ status: 'cancelled' })])),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+      http.delete('*/api/v1/production-runs/:id', () =>
+        HttpResponse.json({ detail: "Cannot delete a run in status 'active'; abort it first" }, { status: 409 }),
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<ProductionRunsPage />);
+    await screen.findByText('WID-001 run');
+
+    await user.click(screen.getByRole('button', { name: /delete/i }));
+    await screen.findByText('Delete this run?');
+    const confirmButtons = screen.getAllByRole('button', { name: /^delete$/i });
+    await user.click(confirmButtons[confirmButtons.length - 1]);
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('abort it first');
   });
 });

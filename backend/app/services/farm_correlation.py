@@ -24,11 +24,23 @@ any) the finish belongs to, returning one of five verdicts:
                          means "not this item" regardless of name, because an
                          operator re-printing the SAME file locally mints a fresh id
                          with an identical name (S4/S9). The exact comparison: the
-                         payload's ``subtask_name`` and ``filename`` are
-                         basename-stripped of the ``.gcode.3mf`` / ``.3mf`` /
-                         ``.gcode`` extension and lower-cased, and must intersect the
-                         same normalization of the item's ``archive.print_name`` /
-                         ``archive.filename`` / ``library_file.filename``.
+                         payload's ``subtask_name`` and ``filename`` are run
+                         through ``utils.filename.print_identity_key`` — basename,
+                         trailing ``.gcode.3mf``/``.3mf``/``.gcode`` stripped, the
+                         splicer's mid-stem ``.gcode`` token removed, spaces folded
+                         to underscores, lower-cased — and must intersect the same
+                         key over the item's ``archive.print_name`` /
+                         ``archive.filename`` / ``library_file.filename``. That key
+                         is shared with the foreign auto-eject identity check
+                         (``eject.manual._canonical_names``) so the two answers to
+                         "is this the same print?" cannot drift. It is MORE
+                         permissive than the pre-2026-08-22 private variant, which
+                         folded neither spaces nor the mid-stem ``.gcode`` token and
+                         so could not match this farm's spliced corpus at all. The
+                         widening is bounded by the ``dispatch_subtask_id IS NULL``
+                         precondition: an item the farm dispatched with a stamped key
+                         is claimable by id equality ONLY, so a more permissive name
+                         key can never re-attribute one.
 - ``fallback``         — the terminal carried no ``subtask_id`` at all (firmware
                          that resets it on cancel, or an upgrade-day row dispatched
                          before ``dispatch_subtask_id`` existed) AND there is exactly
@@ -71,6 +83,7 @@ from sqlalchemy import select
 
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
+from backend.app.utils.filename import print_identity_key
 from backend.app.utils.printer_models import normalize_printer_model
 
 if TYPE_CHECKING:
@@ -126,30 +139,19 @@ class DispatchDonor:
     item_id: int
 
 
-def _normalize_name(name: str | None) -> str | None:
-    """Basename, extension-stripped, lower-cased — or None if empty.
-
-    Strips a leading path (``/`` or ``\\``) and one trailing 3MF/gcode extension so
-    a printer-reported ``subtask_name`` ("SKU007.01") and a stored filename
-    ("SKU007.01.gcode.3mf") compare equal.
-    """
-    if not name:
-        return None
-    base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    lower = base.lower()
-    for ext in (".gcode.3mf", ".3mf", ".gcode"):
-        if lower.endswith(ext):
-            lower = lower[: -len(ext)]
-            break
-    lower = lower.strip()
-    return lower or None
-
-
 def _payload_names(payload: dict) -> set[str]:
-    """Normalized names the terminal payload carries (subtask_name + filename)."""
+    """The print-identity keys the terminal payload carries (subtask_name + filename).
+
+    Keyed by :func:`print_identity_key` — the ONE "is this the same print?" key,
+    shared with the foreign auto-eject identity check so the two answers cannot
+    drift. A non-``str`` payload value is skipped rather than crashing the
+    correlation of a real terminal event."""
     names: set[str] = set()
     for key in ("subtask_name", "filename"):
-        normalized = _normalize_name(payload.get(key))
+        raw = payload.get(key)
+        if not isinstance(raw, str) or not raw:
+            continue
+        normalized = print_identity_key(raw)
         if normalized:
             names.add(normalized)
     return names
@@ -165,15 +167,17 @@ async def _item_names(db: AsyncSession, item: PrintQueueItem) -> set[str]:
 
         archive = await db.get(PrintArchive, item.archive_id)
         if archive is not None:
-            for candidate in (_normalize_name(archive.print_name), _normalize_name(archive.filename)):
-                if candidate:
-                    names.add(candidate)
+            for raw in (archive.print_name, archive.filename):
+                if raw:
+                    candidate = print_identity_key(raw)
+                    if candidate:
+                        names.add(candidate)
     if item.library_file_id is not None:
         from backend.app.models.library import LibraryFile
 
         library_file = await db.get(LibraryFile, item.library_file_id)
-        if library_file is not None:
-            candidate = _normalize_name(library_file.filename)
+        if library_file is not None and library_file.filename:
+            candidate = print_identity_key(library_file.filename)
             if candidate:
                 names.add(candidate)
     return names

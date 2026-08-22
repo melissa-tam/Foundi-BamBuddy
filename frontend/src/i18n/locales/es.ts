@@ -230,6 +230,7 @@ export default {
     deleteTitle: '¿Eliminar esta tanda?',
     deleteBody: '"{{name}}" y su historial de unidades se eliminarán de forma permanente, y sus placas dejarán de contar para las estadísticas del SKU. Esta acción no se puede deshacer.',
     deleteFailed: 'No se pudo eliminar la tanda',
+    deleteHasPrintingUnits: 'La tanda todavía tiene unidades imprimiéndose en {{printers}}. Detenlas o espera a que terminen y elimínala después.',
     firstArticle: {
       sectionTitle: 'Aprobación de primera pieza',
       requireLabel: 'Exigir aprobación de la primera pieza',
