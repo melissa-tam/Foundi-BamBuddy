@@ -110,6 +110,86 @@ class TestResolveTerminalItemVerdicts:
         assert res.verdict == "matched_by_name"
         assert res.item.id == item.id
 
+    async def test_spliced_corpus_name_rescues_unstamped_item(self, db_session):
+        """2026-08-22: the splicer writes a MID-STEM ``.gcode`` token that the firmware
+        drops from its echo, so the pre-unification normaliser could not match a single
+        file in this farm's corpus. Real name pair from the production logs."""
+        lf = await _add_library_file(db_session, "Rotary_tool_top_surfaces_PCO-M12-2525.gcode_L1-90_spliced.3mf")
+        item = await _add_item(db_session, printer_id=1, dispatch_subtask_id=None, library_file_id=lf.id)
+        res = await resolve_terminal_item(
+            db_session,
+            1,
+            {"subtask_id": "ECHOED-1", "subtask_name": "Rotary_tool_top_surfaces_PCO-M12-2525_L1-90_spliced"},
+        )
+        assert res.verdict == "matched_by_name"
+        assert res.item.id == item.id
+
+    async def test_spaced_library_name_rescues_underscored_echo(self, db_session):
+        """The other half of the corpus: the library stores the SPACED display name and
+        the printer echoes the underscored USB one."""
+        lf = await _add_library_file(
+            db_session, ".6 Half Shell_sharp_top_surfaces_painted_seams_Toprightv2.gcode_L1-88_spliced.3mf"
+        )
+        item = await _add_item(db_session, printer_id=1, dispatch_subtask_id=None, library_file_id=lf.id)
+        res = await resolve_terminal_item(
+            db_session,
+            1,
+            {
+                "subtask_id": "ECHOED-2",
+                "subtask_name": ".6_Half_Shell_sharp_top_surfaces_painted_seams_Toprightv2_L1-88_spliced",
+            },
+        )
+        assert res.verdict == "matched_by_name"
+        assert res.item.id == item.id
+
+    async def test_near_miss_layer_range_does_not_attribute(self, db_session):
+        """ATTRIBUTION SAFETY. Unifying the normaliser made this path MORE permissive
+        (it gained space folding and ``.gcode``-token removal) — it did NOT make it
+        fuzzy. Two spliced plates of the SAME project differing only by layer range are
+        different prints, and ``matched_by_name`` mutates farm state, so a near miss
+        must resolve foreign and leave the unit alone."""
+        lf = await _add_library_file(db_session, "Rotary_tool_top_surfaces_PCO-M12-2525.gcode_L1-90_spliced.3mf")
+        item = await _add_item(db_session, printer_id=1, dispatch_subtask_id=None, library_file_id=lf.id)
+        res = await resolve_terminal_item(
+            db_session,
+            1,
+            {"subtask_id": "FOREIGN-9", "subtask_name": "Rotary_tool_top_surfaces_PCO-M12-2525_L1-91_spliced"},
+        )
+        assert res.verdict == "foreign"
+        assert res.item is None
+        await db_session.refresh(item)
+        assert item.status == "printing"  # never handed over
+
+    async def test_near_miss_never_crosses_between_two_farm_files(self, db_session):
+        """Two DISTINCT library files whose keys differ by one real token: an echo
+        naming the other one must not be credited to this unit."""
+        lf = await _add_library_file(db_session, "Widget A.gcode_L1-90_spliced.3mf")
+        item = await _add_item(db_session, printer_id=1, dispatch_subtask_id=None, library_file_id=lf.id)
+        res = await resolve_terminal_item(
+            db_session, 1, {"subtask_id": "ECHOED-3", "subtask_name": "Widget_B_L1-90_spliced"}
+        )
+        assert res.verdict == "foreign"
+        assert res.item is None
+        await db_session.refresh(item)
+        assert item.status == "printing"
+
+    async def test_widened_key_cannot_reattribute_a_stamped_item(self, db_session):
+        """The blast-radius BOUND that makes the widening acceptable: name matching
+        applies ONLY to items with ``dispatch_subtask_id IS NULL``. A stamped item whose
+        name now keys equal to the echo is still claimable by id equality alone — an
+        operator re-printing the same file locally mints a fresh id (S4/S9)."""
+        lf = await _add_library_file(db_session, "Rotary_tool_top_surfaces_PCO-M12-2525.gcode_L1-90_spliced.3mf")
+        item = await _add_item(db_session, printer_id=1, dispatch_subtask_id="SUB-1", library_file_id=lf.id)
+        res = await resolve_terminal_item(
+            db_session,
+            1,
+            {"subtask_id": "OTHER", "subtask_name": "Rotary_tool_top_surfaces_PCO-M12-2525_L1-90_spliced"},
+        )
+        assert res.verdict == "foreign"
+        assert res.item is None
+        await db_session.refresh(item)
+        assert item.status == "printing"
+
     async def test_fallback_single_candidate_no_payload_id(self, db_session):
         # Upgrade-day / firmware-no-echo: no subtask_id on the terminal, one printing
         # item (here with a NULL dispatch_subtask_id) → best-effort fallback.

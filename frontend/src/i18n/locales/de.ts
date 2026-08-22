@@ -230,6 +230,7 @@ export default {
     deleteTitle: 'Diesen Lauf löschen?',
     deleteBody: '"{{name}}" und der zugehörige Einheitenverlauf werden dauerhaft entfernt und die Platten zählen nicht mehr zur SKU-Statistik. Dies kann nicht rückgängig gemacht werden.',
     deleteFailed: 'Lauf konnte nicht gelöscht werden',
+    deleteHasPrintingUnits: 'Der Lauf hat noch Einheiten im Druck auf {{printers}}. Stoppen Sie sie oder warten Sie, bis sie fertig sind, und löschen Sie dann.',
     firstArticle: {
       sectionTitle: 'Erstmuster-Freigabe',
       requireLabel: 'Erstmuster-Freigabe verlangen',

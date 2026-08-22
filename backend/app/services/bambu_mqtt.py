@@ -820,6 +820,20 @@ class BambuMQTTClient:
         self._finish_photo_captured: bool = False
         self._last_valid_progress: float = 0.0  # Last non-zero progress (firmware resets on cancel)
         self._last_valid_layer_num: int = 0  # Last non-zero layer (firmware resets on cancel)
+        # Stale-predecessor gate for the two "last valid" captures above. The firmware
+        # keeps republishing the PREVIOUS job's layer/percent for the seconds a new job
+        # spends heating and levelling, so a reading arriving just after a print start
+        # is not yet evidence about THIS job (see the guards in _update_state).
+        # `_prev_job_*` is that predecessor's final reading, captured at print start;
+        # the `_seen` flags say whether this job has posted a reading of its own yet.
+        # Both flags initialise TRUE — open. A Bambuddy restart that adopts a print
+        # mid-flight never fires is_new_print (the #1304 guard suppresses it on the
+        # first push after startup), so a gate defaulting closed would silently stop
+        # tracking layers for the whole adopted job.
+        self._prev_job_layer: int = 0
+        self._prev_job_progress: float = 0.0
+        self._job_layer_baseline_seen: bool = True
+        self._job_progress_baseline_seen: bool = True
         # The subtask_id minted for the most recent start_print() command. The
         # printer echoes it back in status, but often not within the first few
         # seconds — so on_print_start uses this as the id source when the
@@ -2998,6 +3012,23 @@ class BambuMQTTClient:
         logger.info("[%s] [EVIDENCE] requesting pushall: %s", self.serial_number, reason)
         return True
 
+    @staticmethod
+    def _stale_predecessor_reading(reading: float, prev_job_final: float, baseline_seen: bool) -> bool:
+        """True while ``reading`` is still the PREVIOUS job's republished value.
+
+        The test is "at or above the predecessor's FINAL reading", never a magnitude
+        (``<= 1``) or a duration. A genuine job's early readings are strictly below
+        whatever its predecessor ended on, so the gate releases on the very first
+        genuine reading even when the 0 and 1 frames are never observed. A magnitude
+        test can miss its window entirely and then track NOTHING for the whole job —
+        charging a real print 0 g. That silent absence is strictly worse than the
+        over-charge this guard exists to stop, so do not "simplify" it.
+
+        ``prev_job_final == 0`` (an eject, or a predecessor itself stopped at layer 0)
+        means there is nothing to confuse this job with: the gate is open immediately.
+        """
+        return not baseline_seen and prev_job_final > 0 and reading >= prev_job_final
+
     def _update_state(self, data: dict):
         """Update printer state from message data."""
         _previous_state = self.state.state
@@ -3016,12 +3047,37 @@ class BambuMQTTClient:
         if "subtask_id" in data:
             self.state.subtask_id = data["subtask_id"]
         if "mc_percent" in data:
-            # Save last non-zero progress for usage tracking (firmware resets to 0 on cancel)
-            if self.state.progress > 0:
-                self._last_valid_progress = self.state.progress
-            self.state.progress = float(data["mc_percent"])
-            # THIS push carried the value — stamp its recency (see progress_wire_at).
-            self.state.progress_wire_at = time.monotonic()
+            new_progress = float(data["mc_percent"])
+            # Discard the predecessor's percent (2026-08-22 — same wire behaviour as the
+            # layer_num gate below, and `state.progress` is never reset at print start,
+            # so this lane leans on the gate entirely). A discarded reading must not
+            # stamp progress_wire_at either: that stamp means "this push reported on the
+            # job running now", and the eject runtime watchdog reads it as fresh evidence.
+            if self._stale_predecessor_reading(new_progress, self._prev_job_progress, self._job_progress_baseline_seen):
+                logger.debug(
+                    "[%s] discarding predecessor mc_percent %s (prev job ended at %s)",
+                    self.serial_number,
+                    new_progress,
+                    self._prev_job_progress,
+                )
+            else:
+                releasing = not self._job_progress_baseline_seen
+                self._job_progress_baseline_seen = True
+                # Save last non-zero progress for usage tracking (firmware resets to 0 on cancel)
+                # — but NEVER on the reading that releases the gate. `state.progress` is not
+                # reset at print start (deliberately: it feeds the operator's printer card),
+                # so at that instant it still holds the PREDECESSOR's percent, and saving it
+                # here would launder in exactly the value the guard just refused. The layer
+                # lane needs no such clause only because `state.layer_num` IS reset to 0 at
+                # print start, which makes its equivalent save a no-op on the same reading.
+                # Drop this clause and a layer-0 stop reports last_progress=100, which flips
+                # eject.monitor.deposited_nothing() to False — the plate gate raised over a
+                # clean bed, i.e. half the original incident straight back (mutation-verified).
+                if self.state.progress > 0 and not releasing:
+                    self._last_valid_progress = self.state.progress
+                self.state.progress = new_progress
+                # THIS push carried the value — stamp its recency (see progress_wire_at).
+                self.state.progress_wire_at = time.monotonic()
         if "mc_remaining_time" in data:
             self.state.remaining_time = int(data["mc_remaining_time"])
         if "mc_print_line_number" in data:
@@ -3043,14 +3099,32 @@ class BambuMQTTClient:
             self.state.mc_print_sub_stage = new_sub_stage
         if "layer_num" in data:
             new_layer = int(data["layer_num"])
-            old_layer = self.state.layer_num
-            # Save last non-zero layer for usage tracking (firmware resets to 0 on cancel)
-            if old_layer > 0:
-                self._last_valid_layer_num = old_layer
-            self.state.layer_num = new_layer
-            # Trigger layer change callback if layer increased
-            if new_layer > old_layer and self.on_layer_change:
-                self.on_layer_change(new_layer)
+            # Discard the predecessor's layer. Wire behaviour (raw capture, 2026-08-22):
+            # after a print start the firmware keeps republishing the LAST job's layer
+            # for the seconds this one spends heating and levelling — printer 3 was
+            # still publishing its finished job's layer metadata hours later. The
+            # `old_layer > 0` guard below cannot tell that republish apart from the
+            # cancel-reset it was written for, so on 002/003-H2S a print an operator
+            # stopped at layer 0 carried `_last_valid_layer_num = 167` (the plate total)
+            # into its terminal: 417.9 g charged to a roll that deposited nothing, and
+            # eject.monitor.deposited_nothing() raised the plate gate on a clean bed.
+            if self._stale_predecessor_reading(new_layer, self._prev_job_layer, self._job_layer_baseline_seen):
+                logger.debug(
+                    "[%s] discarding predecessor layer_num %s (prev job ended at %s)",
+                    self.serial_number,
+                    new_layer,
+                    self._prev_job_layer,
+                )
+            else:
+                self._job_layer_baseline_seen = True
+                old_layer = self.state.layer_num
+                # Save last non-zero layer for usage tracking (firmware resets to 0 on cancel)
+                if old_layer > 0:
+                    self._last_valid_layer_num = old_layer
+                self.state.layer_num = new_layer
+                # Trigger layer change callback if layer increased
+                if new_layer > old_layer and self.on_layer_change:
+                    self.on_layer_change(new_layer)
         if "total_layer_num" in data:
             # Some firmware (P1S observed) resets `total_layer_num` to 0 at
             # print end — same shape as the `layer_num` reset guarded above.
@@ -4123,6 +4197,31 @@ class BambuMQTTClient:
         if is_new_print or is_file_change:
             # Clear any old HMS errors when a new print starts
             self.state.hms_errors = []
+            # Remember the predecessor's final layer/percent BEFORE they are cleared —
+            # the firmware republishes them while this job heats and levels, so the
+            # handlers need them to tell a leftover reading from a real one (2026-08-22
+            # incident; see the guards in this method).
+            #
+            # The `max` is load-bearing, not belt-and-braces. This block runs AFTER the
+            # field handlers at the top of _update_state, so a start push that itself
+            # carries a genuine `layer_num: 0` / `mc_percent: 0` has ALREADY zeroed the
+            # live field and moved the predecessor's true final value into `_last_valid_*`.
+            # Capturing the live field alone would then arm the gate at 0 — and a gate
+            # armed at 0 is disabled for the WHOLE job, letting the next stale republish
+            # through: the same incident by another door (verified by trace, both lanes).
+            # `_last_valid_*` is exactly "the predecessor's last non-zero reading" at this
+            # instant, and both operands are read before the resets below zero them. It
+            # cannot over-arm: a new job's early readings are strictly below its
+            # predecessor's final ones, so the gate still releases on the first real one.
+            #
+            # `state.progress` is deliberately NOT reset here: it feeds
+            # GET /printers/{id}/status and the printer card, so zeroing it would change
+            # what operators see at a job switch. The percent lane compensates with the
+            # gate-releasing clause in its handler instead.
+            self._prev_job_layer = max(self.state.layer_num, self._last_valid_layer_num)
+            self._prev_job_progress = max(self.state.progress, self._last_valid_progress)
+            self._job_layer_baseline_seen = False
+            self._job_progress_baseline_seen = False
             # Reset layer tracking for new print (needed for layer-based timelapse)
             self.state.layer_num = 0
             # Reset total_layers so the previous print's value can't bleed into

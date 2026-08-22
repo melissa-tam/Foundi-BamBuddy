@@ -230,6 +230,7 @@ export default {
     deleteTitle: 'Delete this run?',
     deleteBody: '"{{name}}" and its unit history will be permanently removed, and its plates will no longer count toward SKU statistics. This cannot be undone.',
     deleteFailed: 'Failed to delete run',
+    deleteHasPrintingUnits: 'Run still has units printing on {{printers}}. Stop them or wait for them to finish, then delete.',
     firstArticle: {
       sectionTitle: 'First article approval',
       requireLabel: 'Require first-article approval',

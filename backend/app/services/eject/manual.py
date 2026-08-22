@@ -58,7 +58,7 @@ from backend.app.services.eject import remote as eject_remote
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
 from backend.app.services.eject.monitor import _latest_started_item, _resolve_eject_threshold, eject_cooldown_monitor
 from backend.app.services.printer_manager import printer_manager
-from backend.app.utils.filename import derive_remote_filename
+from backend.app.utils.filename import print_identity_key
 from backend.app.utils.threemf_tools import list_gcode_plate_ids, read_plate_gcode_header
 
 if TYPE_CHECKING:
@@ -650,20 +650,29 @@ class ForeignFarmFile:
 
 
 def _canonical_names(*names: str | None) -> set[str]:
-    """The set of canonical (``derive_remote_filename``) forms of ``names``, blanks
-    skipped. Folds spaces→underscores and normalises the 3MF/gcode suffix so a
-    screen-started print's UNDERSCORED USB echo and the farm's SPACED library/archive
-    filename compare equal — the extension/underscore canonicalisation
-    ``farm_correlation._normalize_name`` deliberately does NOT do."""
+    """The set of :func:`print_identity_key` forms of ``names``, blanks skipped.
+
+    ONE key, not two: every call site below is an identity comparison
+    (``isdisjoint`` / set intersection), and a stricter form adds nothing there —
+    if two names key equal under the strict form they key equal under this one, so
+    emitting both would only carry a redundant member that can never decide a
+    comparison the relaxed member does not already decide.
+
+    The key folds spaces→underscores, normalises the 3MF/gcode suffix AND drops the
+    splicer's mid-stem ``.gcode`` token, so a screen-started print's UNDERSCORED USB
+    echo (``…PCO-M12-2525_L1-90_spliced``) compares equal to the farm's stored
+    ``…PCO-M12-2525.gcode_L1-90_spliced.3mf``. Without that token removal this gate
+    refused every production plate — the whole corpus carries it (2026-08-22)."""
     out: set[str] = set()
     for name in names:
         if not name:
             continue
-        base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
         try:
-            out.add(derive_remote_filename(base))
+            key = print_identity_key(name)
         except TypeError:  # non-str duck type — skip rather than crash the identity check
             continue
+        if key:
+            out.add(key)
     return out
 
 
@@ -703,10 +712,11 @@ async def identify_farm_file_foreign(
     Returns a :class:`ForeignFarmFile` (profile + release threshold) ONLY when ALL of:
 
       (a) the echoed ``subtask_name``/``filename`` matches a file the farm has
-          dispatched to THIS printer, both sides canonicalised through
-          ``derive_remote_filename`` (a screen-started print echoes the UNDERSCORED
-          USB name; the farm library stores the SPACED display name — only this
-          canonicalisation makes them compare equal);
+          dispatched to THIS printer, both sides keyed through
+          :func:`print_identity_key` (a screen-started print echoes the UNDERSCORED
+          USB name with the splicer's mid-stem ``.gcode`` token dropped; the farm
+          library stores the SPACED, token-bearing display name — only that key
+          makes them compare equal);
       (b) the printer model's geometry row is hardware-``validated`` (production eject
           never runs on an unvalidated model);
       (c) a suggested eject profile exists for this printer;
@@ -717,32 +727,74 @@ async def identify_farm_file_foreign(
     checks run BEFORE the donor resolution (which may FTPS re-fetch) so the common
     negative — a genuinely foreign print — exits fast without touching the wire. The
     helper opens no session of its own (the caller owns ``db``, per convention) and
-    cleans up any temp re-fetch it makes."""
+    cleans up any temp re-fetch it makes.
+
+    EVERY refusal logs its own gate and the values it refused on. The caller
+    (``main._foreign_auto_eject``) only logs on an EXCEPTION, so a clean ``None``
+    used to leave no trace anywhere — which is exactly how gate (a) refusing the
+    entire production corpus went unnoticed for weeks (2026-08-22). Grep
+    ``identify_farm_file_foreign: printer`` to see which gate is refusing."""
     # (a) name match against farm-dispatched files on this printer — the strongest,
     # cheapest signal, so it gates everything else.
     echoed = _canonical_names(subtask_name, filename)
     if not echoed:
+        logger.info(
+            "identify_farm_file_foreign: printer %s NOT identified — gate (a) no echoed name "
+            "(subtask_name=%r, filename=%r)",
+            printer_id,
+            subtask_name,
+            filename,
+        )
         return None
-    if echoed.isdisjoint(await _farm_dispatched_names(db, printer_id)):
+    dispatched = await _farm_dispatched_names(db, printer_id)
+    if echoed.isdisjoint(dispatched):
+        logger.info(
+            "identify_farm_file_foreign: printer %s NOT identified — gate (a) name mismatch; "
+            "echoed=%s vs %d farm-dispatched name(s)=%s",
+            printer_id,
+            sorted(echoed),
+            len(dispatched),
+            sorted(dispatched),
+        )
         return None
 
     printer = await db.get(Printer, printer_id)
     if printer is None:
+        logger.info(
+            "identify_farm_file_foreign: printer %s NOT identified — gate (a) printer row missing",
+            printer_id,
+        )
         return None
 
     # (b) model geometry must be hardware-validated (fail-closed, never auto-eject an
     # unvalidated model's envelope).
     try:
         await get_geometry_required(db, printer.model, require_validated=True)
-    except GeometryUnavailable:
+    except GeometryUnavailable as exc:
+        logger.info(
+            "identify_farm_file_foreign: printer %s NOT identified — gate (b) geometry unusable (model=%r): %s",
+            printer_id,
+            printer.model,
+            exc,
+        )
         return None
 
     # (c) a profile to sweep with — the printer's usual eject profile.
     profile_id = await _suggest_eject_profile_id(db, printer_id)
     if profile_id is None:
+        logger.info(
+            "identify_farm_file_foreign: printer %s NOT identified — gate (c) no eject profile to "
+            "suggest (no prior eject-profiled unit on this printer)",
+            printer_id,
+        )
         return None
     profile = await db.get(EjectProfile, profile_id)
     if profile is None:
+        logger.info(
+            "identify_farm_file_foreign: printer %s NOT identified — gate (c) suggested eject profile %s row missing",
+            printer_id,
+            profile_id,
+        )
         return None
 
     # (d) donor resolves + part height within the profile's guard. _resolve_foreign_source
@@ -751,10 +803,24 @@ async def identify_farm_file_foreign(
     # re-resolves the donor fresh at release time, exactly like the manual confirm).
     try:
         source = await _resolve_foreign_source(db, printer)
-    except ManualEjectError:
+    except ManualEjectError as exc:
+        logger.info(
+            "identify_farm_file_foreign: printer %s NOT identified — gate (d) donor unresolvable (%s): %s",
+            printer_id,
+            exc.code,
+            exc,
+        )
         return None
     try:
         if source.max_z > profile.max_part_height_mm:
+            logger.info(
+                "identify_farm_file_foreign: printer %s NOT identified — gate (d) part height %.1fmm "
+                "exceeds profile %s guard %.1fmm",
+                printer_id,
+                source.max_z,
+                profile_id,
+                profile.max_part_height_mm,
+            )
             return None
     finally:
         # DEPOSIT the re-fetched donor (Phase D1) so the LATER auto-eject dispatch

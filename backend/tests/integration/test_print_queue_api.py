@@ -387,6 +387,36 @@ class TestPrintQueueAPI:
         response = await async_client.delete("/api/v1/queue/9999")
         assert response.status_code == 404
 
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_delete_printing_queue_item_409(
+        self, async_client: AsyncClient, queue_item_factory, db_session, test_engine
+    ):
+        """A printing item refuses deletion with 409, and survives.
+
+        409 rather than 400: the request is well-formed and conflicts with the
+        row's state. This endpoint was the last of the three that refuse this
+        exact condition still answering 400 — the archive delete and the run
+        delete both use 409.
+        """
+        from sqlalchemy import select as _select
+        from sqlalchemy.ext.asyncio import AsyncSession as _Session, async_sessionmaker as _maker
+
+        from backend.app.models.print_queue import PrintQueueItem as _Item
+
+        item = await queue_item_factory(status="printing")
+
+        response = await async_client.delete(f"/api/v1/queue/{item.id}")
+        assert response.status_code == 409, response.text
+        assert "printing" in response.json()["detail"]
+
+        # The row is what links the running print back to the farm: it must still
+        # be there after the refusal.
+        async with _maker(test_engine, class_=_Session, expire_on_commit=False)() as fresh:
+            survivor = (await fresh.execute(_select(_Item).where(_Item.id == item.id))).scalar_one_or_none()
+        assert survivor is not None
+        assert survivor.status == "printing"
+
 
 class TestQueueStartEndpoint:
     """Tests for the /queue/{item_id}/start endpoint."""

@@ -1010,6 +1010,107 @@ class TestUserItemsCountAndDeletion(TestOwnershipPermissionsSetup):
         )
         assert archive_response.status_code == 404
 
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_delete_user_with_items_refused_while_a_unit_is_printing(
+        self, async_client: AsyncClient, auth_setup, archive_factory, printer_factory, db_session
+    ):
+        """delete_items=true must not destroy a live print's only farm link.
+
+        The 2026-08-22 class at a wider radius than the run delete: this path is
+        fleet-wide and spans every run the user ever queued. Deleting the row does
+        not stop the print — it only makes the finished print unattributable, so
+        the plate gate goes up with no eject armed. Refused WHOLESALE: the user,
+        their archive and the live unit all survive.
+        """
+        from sqlalchemy import select
+
+        from backend.app.models.print_queue import PrintQueueItem
+
+        headers = {"Authorization": f"Bearer {auth_setup['admin_token']}"}
+        printer = await printer_factory(name="007-H2S", model="H2S")
+
+        create_response = await async_client.post(
+            "/api/v1/users/",
+            headers=headers,
+            json={"username": "deleteprintinguser", "password": "Password123!"},
+        )
+        assert create_response.status_code in (200, 201), create_response.text
+        user_id = create_response.json()["id"]
+
+        archive = await archive_factory(printer.id, created_by_id=user_id)
+        archive_id = archive.id
+        item = PrintQueueItem(
+            printer_id=printer.id,
+            archive_id=archive_id,
+            created_by_id=user_id,
+            status="printing",
+            position=1,
+        )
+        db_session.add(item)
+        await db_session.commit()
+        await db_session.refresh(item)
+        item_id = item.id
+
+        response = await async_client.delete(f"/api/v1/users/{user_id}?delete_items=true", headers=headers)
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        assert detail["code"] == "user_has_printing_units"
+        assert detail["printers"] == ["007-H2S"]
+        assert "007-H2S" in detail["message"]
+
+        # Nothing on the path was destroyed — the refusal rolled the whole thing back.
+        db_session.expire_all()
+        survivor = (
+            await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))
+        ).scalar_one_or_none()
+        assert survivor is not None
+        assert survivor.status == "printing"
+        assert (await async_client.get(f"/api/v1/archives/{archive_id}", headers=headers)).status_code == 200
+        assert (await async_client.get(f"/api/v1/users/{user_id}", headers=headers)).status_code == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_delete_user_with_items_removes_terminal_queue_items(
+        self, async_client: AsyncClient, auth_setup, archive_factory, printer_factory, db_session
+    ):
+        """The permitted half of the same path still deletes: terminal units go."""
+        from sqlalchemy import select
+
+        from backend.app.models.print_queue import PrintQueueItem
+
+        headers = {"Authorization": f"Bearer {auth_setup['admin_token']}"}
+        printer = await printer_factory(name="008-H2S", model="H2S")
+
+        create_response = await async_client.post(
+            "/api/v1/users/",
+            headers=headers,
+            json={"username": "deleteterminaluser", "password": "Password123!"},
+        )
+        assert create_response.status_code in (200, 201), create_response.text
+        user_id = create_response.json()["id"]
+
+        archive = await archive_factory(printer.id, created_by_id=user_id)
+        item = PrintQueueItem(
+            printer_id=printer.id,
+            archive_id=archive.id,
+            created_by_id=user_id,
+            status="completed",
+            position=1,
+        )
+        db_session.add(item)
+        await db_session.commit()
+        await db_session.refresh(item)
+        item_id = item.id
+
+        response = await async_client.delete(f"/api/v1/users/{user_id}?delete_items=true", headers=headers)
+        assert response.status_code == 204, response.text
+
+        db_session.expire_all()
+        assert (
+            await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))
+        ).scalar_one_or_none() is None
+
 
 class TestReadIDORClosure(TestOwnershipPermissionsSetup):
     """Regression tests pinning maziggy/bambuddy-security #2 — IDOR on

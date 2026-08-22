@@ -230,6 +230,7 @@ export default {
     deleteTitle: 'Eliminare questa tiratura?',
     deleteBody: '"{{name}}" e la relativa cronologia delle unità verranno rimossi in modo permanente e le sue piastre non conteranno più nelle statistiche dello SKU. Questa azione non può essere annullata.',
     deleteFailed: 'Impossibile eliminare la tiratura',
+    deleteHasPrintingUnits: 'La tiratura ha ancora unità in stampa su {{printers}}. Interrompile o attendi che finiscano, poi elimina.',
     firstArticle: {
       sectionTitle: 'Approvazione del primo pezzo',
       requireLabel: 'Richiedi l\'approvazione del primo pezzo',

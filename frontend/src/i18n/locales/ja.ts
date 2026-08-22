@@ -230,6 +230,7 @@ export default {
     deleteTitle: 'このランを削除しますか？',
     deleteBody: '「{{name}}」とそのユニット履歴は完全に削除され、そのプレートは今後 SKU の統計に計上されなくなります。この操作は元に戻せません。',
     deleteFailed: 'ランの削除に失敗しました',
+    deleteHasPrintingUnits: 'このランには {{printers}} で印刷中のユニットがまだあります。停止するか、終了を待ってから削除してください。',
     firstArticle: {
       sectionTitle: '初品承認',
       requireLabel: '初品承認を必須にする',

@@ -8177,3 +8177,349 @@ class TestProgressWireRecency:
         mqtt_client._process_message({"print": {"mc_percent": 0, "gcode_state": "RUNNING"}})
         assert mqtt_client.state.progress == 0.0
         assert mqtt_client.state.progress_wire_at > 0.0
+
+
+class TestPredecessorReadingGate:
+    """The stale-predecessor gate on ``layer_num`` / ``mc_percent`` (incident 2026-08-22).
+
+    Wire behaviour: after a print starts, the firmware keeps republishing the PREVIOUS
+    job's layer/percent for the seconds the new one spends heating and levelling. The
+    old "last non-zero value" capture could not tell that republish apart from the
+    cancel-reset it was written for, so on 002/003-H2S a print an operator stopped at
+    layer 0 reported ``last_layer_num=167`` — the plate total — and was charged the whole
+    plate (417.9 g each), while ``eject.monitor.deposited_nothing()`` read the same stale
+    pair and raised the plate gate over a clean bed.
+
+    Everything here drives the real ``_process_message`` entry point and asserts on the
+    real ``on_print_complete`` payload, because that payload IS what the two victims
+    (usage tracking and the plate gate) consume.
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(ip_address="192.168.1.100", serial_number="TEST123", access_code="12345678")
+
+    @staticmethod
+    def _capture_terminals(client) -> list:
+        """Collect every on_print_complete payload the client emits."""
+        seen: list = []
+        client.on_print_complete = seen.append
+        return seen
+
+    @staticmethod
+    def _push(client, **fields) -> None:
+        client._process_message({"print": fields})
+
+    @classmethod
+    def _run_predecessor(cls, client, *, layers=(), percents=(), file="prev_job.gcode.3mf") -> None:
+        """Drive a complete predecessor job, leaving its final readings on the wire state.
+
+        The first push is the client's first ever, so the #1304 guard suppresses
+        ``is_new_print`` for it — which is exactly how a real predecessor is observed.
+        """
+        cls._push(client, gcode_state="RUNNING", gcode_file=file)
+        for layer in layers:
+            cls._push(client, layer_num=layer)
+        for percent in percents:
+            cls._push(client, mc_percent=percent)
+        cls._push(client, gcode_state="FINISH")
+
+    @classmethod
+    def _start_new_print(cls, client, file="new_job.gcode.3mf") -> None:
+        cls._push(client, gcode_state="RUNNING", gcode_file=file)
+
+    # ---- (a) the incident ------------------------------------------------------
+
+    def test_stale_predecessor_layer_is_not_charged_to_the_new_print(self, mqtt_client):
+        """A print stopped at layer 0 reports layer 0 — not the predecessor's plate total."""
+        terminals = self._capture_terminals(mqtt_client)
+        self._run_predecessor(mqtt_client, layers=(100, 167))
+        assert mqtt_client.state.layer_num == 167  # predecessor's final layer is still on the wire
+
+        self._start_new_print(mqtt_client)
+        assert mqtt_client._prev_job_layer == 167
+        assert mqtt_client._job_layer_baseline_seen is False
+
+        self._push(mqtt_client, layer_num=167)  # the firmware's stale republish
+        assert mqtt_client.state.layer_num == 0, "a predecessor reading must not become this job's layer"
+        assert mqtt_client._last_valid_layer_num == 0
+
+        self._push(mqtt_client, layer_num=0)  # this job's own first reading
+        assert mqtt_client._job_layer_baseline_seen is True
+        self._push(mqtt_client, layer_num=1)
+
+        self._push(mqtt_client, gcode_state="FAILED")  # operator stop, nothing deposited
+        assert len(terminals) == 2
+        assert terminals[-1]["last_layer_num"] == 0
+
+    def test_the_incident_pair_now_reads_as_deposited_nothing(self, mqtt_client):
+        """End to end: the terminal payload makes the plate gate see an empty bed again."""
+        from backend.app.services.eject.monitor import deposited_nothing
+
+        terminals = self._capture_terminals(mqtt_client)
+        self._run_predecessor(mqtt_client, layers=(100, 167), percents=(60, 100))
+        self._start_new_print(mqtt_client)
+        self._push(mqtt_client, layer_num=167, mc_percent=100)  # stale republish of both
+        self._push(mqtt_client, layer_num=0, mc_percent=0)
+        self._push(mqtt_client, gcode_state="FAILED")
+
+        payload = terminals[-1]
+        assert payload["last_layer_num"] == 0
+        assert payload["last_progress"] == 0.0
+        assert (
+            deposited_nothing(
+                is_dry_run=False,
+                last_layer_num=payload["last_layer_num"],
+                last_progress=payload["last_progress"],
+            )
+            is True
+        )
+
+    # ---- (b) a genuine partial print still reports its layer --------------------
+
+    def test_a_genuine_partial_print_still_reports_its_last_layer(self, mqtt_client):
+        terminals = self._capture_terminals(mqtt_client)
+        self._run_predecessor(mqtt_client, layers=(100, 167))
+        self._start_new_print(mqtt_client)
+
+        for layer in range(1, 41):  # real layers 1..40
+            self._push(mqtt_client, layer_num=layer)
+        assert mqtt_client.state.layer_num == 40
+
+        self._push(mqtt_client, layer_num=0)  # firmware zeroes the layer on cancel
+        self._push(mqtt_client, gcode_state="FAILED")
+
+        assert terminals[-1]["last_layer_num"] == 40
+
+    # ---- (c) anti-starvation ----------------------------------------------------
+
+    def test_gate_releases_even_when_the_zero_and_one_frames_are_never_seen(self, mqtt_client):
+        """The gate compares against the predecessor's FINAL layer, never a magnitude.
+
+        A "<= 1" test would still be closed here and would then track NO layers at all for
+        the whole job — charging a real print 0 g. That silent absence is strictly worse
+        than the over-charge this guard exists to stop.
+        """
+        terminals = self._capture_terminals(mqtt_client)
+        self._run_predecessor(mqtt_client, layers=(100, 167))
+        self._start_new_print(mqtt_client)
+
+        self._push(mqtt_client, layer_num=2)  # first reading ever observed for this job
+        assert mqtt_client._job_layer_baseline_seen is True
+        assert mqtt_client.state.layer_num == 2
+
+        for layer in range(3, 41):
+            self._push(mqtt_client, layer_num=layer)
+        self._push(mqtt_client, layer_num=0)
+        self._push(mqtt_client, gcode_state="FAILED")
+
+        assert terminals[-1]["last_layer_num"] == 40
+
+    # ---- (d) clean predecessor --------------------------------------------------
+
+    def test_a_predecessor_that_ended_at_layer_zero_leaves_the_gate_open(self, mqtt_client):
+        """The eject control case: an eject file prints no layers, so there is nothing to confuse.
+
+        Printer 001 came through the incident clean for exactly this reason.
+        """
+        terminals = self._capture_terminals(mqtt_client)
+        self._run_predecessor(mqtt_client, layers=(0,), file="eject_p1.gcode.3mf")
+        assert mqtt_client.state.layer_num == 0
+
+        self._start_new_print(mqtt_client)
+        assert mqtt_client._prev_job_layer == 0
+
+        # With no predecessor value to shadow it, even a high first reading is this job's.
+        self._push(mqtt_client, layer_num=167)
+        assert mqtt_client.state.layer_num == 167
+
+        self._push(mqtt_client, layer_num=0)
+        self._push(mqtt_client, gcode_state="FAILED")
+        assert terminals[-1]["last_layer_num"] == 167
+
+    def test_a_predecessor_stopped_at_layer_zero_leaves_the_gate_open(self, mqtt_client):
+        """The second control case: the follow-up cancel on 002/003 was clean because its own
+        predecessor was a layer-0 stop."""
+        self._run_predecessor(mqtt_client, layers=(0,))
+        self._start_new_print(mqtt_client)
+        assert mqtt_client._prev_job_layer == 0
+        self._push(mqtt_client, layer_num=5)
+        assert mqtt_client.state.layer_num == 5
+
+    # ---- (e) mid-print adoption -------------------------------------------------
+
+    def test_mid_print_adoption_tracks_layers_exactly_as_before(self, mqtt_client):
+        """A restart that adopts a print never fires is_new_print (#1304), so the gate must
+        default OPEN — otherwise the adopted job would track no layers at all."""
+        terminals = self._capture_terminals(mqtt_client)
+        assert mqtt_client._job_layer_baseline_seen is True
+        assert mqtt_client._job_progress_baseline_seen is True
+
+        # First push after startup: RUNNING mid-print, already at layer 120.
+        self._push(mqtt_client, gcode_state="RUNNING", gcode_file="adopted.gcode.3mf", layer_num=120, mc_percent=70)
+        assert mqtt_client.state.layer_num == 120, "the adopted job's layer must be tracked immediately"
+        assert mqtt_client._prev_job_layer == 0, "is_new_print never fired, so nothing was captured"
+
+        self._push(mqtt_client, layer_num=121, mc_percent=71)
+        self._push(mqtt_client, layer_num=122, mc_percent=72)
+        self._push(mqtt_client, layer_num=0, mc_percent=0)  # cancel reset
+        self._push(mqtt_client, gcode_state="FAILED")
+
+        assert terminals[-1]["last_layer_num"] == 122
+        assert terminals[-1]["last_progress"] == 72.0
+
+    # ---- (f) the same guard on the progress lane --------------------------------
+
+    def test_stale_predecessor_progress_is_not_charged_to_the_new_print(self, mqtt_client):
+        """Mirror of (a). This lane matters on its own: spoolman_tracking reconstructs a
+        layer from ``last_progress`` when ``last_layer_num`` is 0, so a leaked 100 % would
+        re-charge the whole plate through the other door."""
+        terminals = self._capture_terminals(mqtt_client)
+        self._run_predecessor(mqtt_client, percents=(60, 100))
+        assert mqtt_client.state.progress == 100.0
+
+        self._start_new_print(mqtt_client)
+        assert mqtt_client._prev_job_progress == 100.0
+        assert mqtt_client._job_progress_baseline_seen is False
+
+        self._push(mqtt_client, mc_percent=100)  # the firmware's stale republish
+        assert mqtt_client._last_valid_progress == 0.0
+
+        self._push(mqtt_client, mc_percent=0)  # this job's own first reading
+        assert mqtt_client._job_progress_baseline_seen is True
+        assert mqtt_client.state.progress == 0.0
+        assert mqtt_client._last_valid_progress == 0.0, "the releasing reading must not save the predecessor's percent"
+
+        self._push(mqtt_client, mc_percent=1)
+        self._push(mqtt_client, gcode_state="FAILED")
+        assert terminals[-1]["last_progress"] == 0.0
+
+    def test_a_discarded_percent_does_not_stamp_the_recency_clock(self, mqtt_client):
+        """progress_wire_at means "this push reported on the job running NOW" — the eject
+        runtime watchdog reads it as fresh evidence, so a refused reading must not date it."""
+        self._run_predecessor(mqtt_client, percents=(60, 100))
+        self._start_new_print(mqtt_client)
+        stamped = mqtt_client.state.progress_wire_at
+
+        self._push(mqtt_client, mc_percent=100)  # discarded
+        assert mqtt_client.state.progress_wire_at == stamped
+
+        self._push(mqtt_client, mc_percent=0)  # accepted
+        assert mqtt_client.state.progress_wire_at > stamped
+
+    def test_progress_gate_releases_without_a_zero_frame(self, mqtt_client):
+        """Mirror of (c) for the progress lane."""
+        terminals = self._capture_terminals(mqtt_client)
+        self._run_predecessor(mqtt_client, percents=(60, 100))
+        self._start_new_print(mqtt_client)
+
+        self._push(mqtt_client, mc_percent=3)  # first reading ever observed for this job
+        assert mqtt_client._job_progress_baseline_seen is True
+        assert mqtt_client.state.progress == 3.0
+
+        for percent in (10, 25, 40):
+            self._push(mqtt_client, mc_percent=percent)
+        self._push(mqtt_client, mc_percent=0)  # cancel reset
+        self._push(mqtt_client, gcode_state="FAILED")
+
+        assert terminals[-1]["last_progress"] == 40.0
+
+    def test_a_genuine_partial_print_still_reports_its_last_percent(self, mqtt_client):
+        """Mirror of (b) for the progress lane."""
+        terminals = self._capture_terminals(mqtt_client)
+        self._run_predecessor(mqtt_client, percents=(60, 100))
+        self._start_new_print(mqtt_client)
+
+        for percent in (1, 12, 33, 40):
+            self._push(mqtt_client, mc_percent=percent)
+        self._push(mqtt_client, mc_percent=0)
+        self._push(mqtt_client, gcode_state="FAILED")
+
+        assert terminals[-1]["last_progress"] == 40.0
+
+    # ---- the gate never suppresses the callback it guards ------------------------
+
+    def test_a_discarded_layer_does_not_fire_the_layer_change_callback(self, mqtt_client):
+        """The layer-change hook drives layer-based timelapse capture — a predecessor's
+        republished layer must not trigger a frame for a job that has not reached it."""
+        self._run_predecessor(mqtt_client, layers=(100, 167))
+        self._start_new_print(mqtt_client)
+
+        fired: list = []
+        mqtt_client.on_layer_change = fired.append
+
+        self._push(mqtt_client, layer_num=167)  # discarded
+        assert fired == []
+
+        self._push(mqtt_client, layer_num=1)  # accepted
+        assert fired == [1]
+
+    # ---- the capture itself must not be poisoned by the start push ---------------
+
+    def test_a_start_push_carrying_a_genuine_zero_still_arms_the_gate(self, mqtt_client):
+        """The capture reads ``max(live field, _last_valid_*)`` for a reason.
+
+        The field handlers run BEFORE the print-start block inside ``_update_state``, so a
+        start push that itself carries a genuine ``layer_num: 0`` has already zeroed the
+        live field and moved the predecessor's real final layer into ``_last_valid_layer_num``.
+        Capturing the live field alone would arm the gate at 0 — and a gate armed at 0 is
+        disabled for the WHOLE job, which is the original incident by another door.
+        """
+        self._run_predecessor(mqtt_client, layers=(100, 167), percents=(60, 100))
+
+        # The start push carries this job's own honest zeros.
+        self._push(mqtt_client, gcode_state="RUNNING", gcode_file="new_job.gcode.3mf", layer_num=0, mc_percent=0)
+        assert mqtt_client._prev_job_layer == 167, "the gate must arm on the predecessor's real final layer"
+        assert mqtt_client._prev_job_progress == 100.0
+
+        # ...so the republish that follows is still recognised as the predecessor's.
+        self._push(mqtt_client, layer_num=167, mc_percent=100)
+        assert mqtt_client.state.layer_num == 0
+        assert mqtt_client.state.progress == 0.0
+
+    def test_zero_bearing_start_push_then_layer_zero_stop_charges_nothing(self, mqtt_client):
+        """Full incident replay through the zero-bearing-start-push door, both lanes.
+
+        Sequence matters: the operator stopped at layer 0, so the genuine readings are
+        0 then 1. A 1-then-2 sequence would report 1 either way and prove nothing.
+        """
+        from backend.app.services.eject.monitor import deposited_nothing
+
+        terminals = self._capture_terminals(mqtt_client)
+        self._run_predecessor(mqtt_client, layers=(100, 167), percents=(60, 100))
+        self._push(mqtt_client, gcode_state="RUNNING", gcode_file="new_job.gcode.3mf", layer_num=0, mc_percent=0)
+        self._push(mqtt_client, layer_num=167, mc_percent=100)  # stale republish
+        self._push(mqtt_client, layer_num=0, mc_percent=0)  # this job's own readings
+        self._push(mqtt_client, layer_num=1, mc_percent=1)
+        self._push(mqtt_client, gcode_state="FAILED")  # operator stop at layer 0
+
+        payload = terminals[-1]
+        assert payload["last_layer_num"] == 0
+        assert payload["last_progress"] == 0.0
+        assert (
+            deposited_nothing(
+                is_dry_run=False,
+                last_layer_num=payload["last_layer_num"],
+                last_progress=payload["last_progress"],
+            )
+            is True
+        )
+
+    def test_a_zero_bearing_start_push_does_not_over_arm_a_genuine_print(self, mqtt_client):
+        """The max-capture must not suppress a real print's layers: the gate still releases
+        on the first genuine reading, and a partial print reports its true last layer."""
+        terminals = self._capture_terminals(mqtt_client)
+        self._run_predecessor(mqtt_client, layers=(100, 167), percents=(60, 100))
+        self._push(mqtt_client, gcode_state="RUNNING", gcode_file="new_job.gcode.3mf", layer_num=0, mc_percent=0)
+
+        for layer in range(1, 41):
+            self._push(mqtt_client, layer_num=layer, mc_percent=layer)
+        assert mqtt_client.state.layer_num == 40
+
+        self._push(mqtt_client, layer_num=0, mc_percent=0)  # cancel reset
+        self._push(mqtt_client, gcode_state="FAILED")
+
+        assert terminals[-1]["last_layer_num"] == 40
+        assert terminals[-1]["last_progress"] == 40.0

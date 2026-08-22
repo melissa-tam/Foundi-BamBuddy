@@ -230,6 +230,7 @@ export default {
     deleteTitle: '刪除此執行？',
     deleteBody: '「{{name}}」及其單元歷史記錄將被永久刪除，其列印板將不再計入 SKU 統計。此操作無法復原。',
     deleteFailed: '刪除執行失敗',
+    deleteHasPrintingUnits: '該執行在 {{printers}} 上仍有單元正在列印。請先停止或等待其完成，然後再刪除。',
     firstArticle: {
       sectionTitle: '首件核准',
       requireLabel: '要求首件核准',

@@ -1,9 +1,10 @@
 """Unit tests for the canonical queue-item transitions.
 
-Both halves of one race live here: ``cancel_pending_items`` (pending→cancelled)
-and ``claim_pending_for_dispatch`` (pending→printing). The point of either is
-that it is correct under CONCURRENCY, so the central test of each drives two
-independent sessions over a FILE-backed SQLite database. The suite's usual in-memory DB shares a single
+All three transitions live here: ``cancel_pending_items`` (pending→cancelled),
+``claim_pending_for_dispatch`` (pending→printing), and the delete pair
+``delete_items_unless_printing`` / ``delete_user_items_unless_printing``. The
+point of every one of them is that it is correct under CONCURRENCY, so the
+central test of each drives two independent sessions over a FILE-backed SQLite database. The suite's usual in-memory DB shares a single
 connection between every session, which cannot reproduce the race at all — the
 "other" session would see this one's uncommitted work.
 
@@ -12,6 +13,11 @@ abort request loaded the run BEFORE the scheduler committed the dispatch, so it
 saw the unit as pending and wrote ``status='cancelled'`` a second later. The ORM
 emitted only the changed column, leaving the row cancelled while wearing the
 dispatcher's ``started_at`` and ``ams_mapping`` — and the printer kept printing.
+
+The delete pair pins the same race one step further along (2026-08-22, run 114 on
+001/002/003-H2S): there the request DELETED the rows of three units that were
+still printing, and since the row is the only durable link between a live print
+and the farm, all three finished as FOREIGN jobs behind a raised plate gate.
 """
 
 from __future__ import annotations
@@ -25,7 +31,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import backend.app.models  # noqa: F401 — registers every table on Base.metadata
 from backend.app.core.database import Base
 from backend.app.models.print_queue import PrintQueueItem
-from backend.app.services.queue_transitions import cancel_pending_items, claim_pending_for_dispatch
+from backend.app.services.queue_transitions import (
+    cancel_pending_items,
+    claim_pending_for_dispatch,
+    delete_items_unless_printing,
+    delete_user_items_unless_printing,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -272,3 +283,135 @@ class TestDispatchClaimRace:
         assert after.status == "cancelled"
         assert after.completed_at is not None
         assert after.started_at is None
+
+
+_BATCH_ID = 114  # the incident's run; no PrintBatch row is needed for a column filter
+_OTHER_BATCH_ID = 115
+_USER_ID = 7
+_OTHER_USER_ID = 8
+
+
+async def _seed_batch(session_factory, batch_id: int, *statuses: str) -> list[int]:
+    """Create one queue item per status inside *batch_id*; return their ids."""
+    async with session_factory() as db:
+        items = [PrintQueueItem(status=status, position=i, batch_id=batch_id) for i, status in enumerate(statuses)]
+        db.add_all(items)
+        await db.commit()
+        return [item.id for item in items]
+
+
+async def _surviving(session_factory) -> list[int]:
+    async with session_factory() as db:
+        return sorted((await db.execute(select(PrintQueueItem.id))).scalars().all())
+
+
+class TestDeleteUnlessPrinting:
+    async def test_terminal_items_are_deleted_and_nothing_is_reported(self, session_factory):
+        ids = await _seed_batch(session_factory, _BATCH_ID, "completed", "failed", "cancelled", "pending")
+
+        async with session_factory() as db:
+            deleted, still_printing = await delete_items_unless_printing(db, batch_id=_BATCH_ID)
+            await db.commit()
+
+        assert deleted == len(ids)
+        assert still_printing == []
+        assert await _surviving(session_factory) == []
+
+    async def test_a_printing_unit_refuses_and_nothing_is_lost(self, session_factory):
+        ids = await _seed_batch(session_factory, _BATCH_ID, "printing", "completed", "pending")
+
+        async with session_factory() as db:
+            _deleted, still_printing = await delete_items_unless_printing(db, batch_id=_BATCH_ID)
+            assert still_printing == [ids[0]]
+            # The caller's obligation: the DELETE already ran against this
+            # transaction, so only a rollback keeps the terminal siblings.
+            await db.rollback()
+
+        assert await _surviving(session_factory) == sorted(ids)
+
+    async def test_the_scope_is_the_batch_and_nothing_wider(self, session_factory):
+        mine = await _seed_batch(session_factory, _BATCH_ID, "completed")
+        theirs = await _seed_batch(session_factory, _OTHER_BATCH_ID, "completed", "printing")
+
+        async with session_factory() as db:
+            deleted, still_printing = await delete_items_unless_printing(db, batch_id=_BATCH_ID)
+            await db.commit()
+
+        assert (deleted, still_printing) == (1, [])
+        assert await _surviving(session_factory) == sorted(theirs)
+        assert mine[0] not in theirs
+
+
+class TestDeleteUnlessPrintingRace:
+    async def test_a_unit_dispatched_in_the_gap_is_not_deleted(self, session_factory):
+        """The 2026-08-22 incident, reproduced over two real connections.
+
+        Run 114 was aborted at 02:34:31 and deleted at 02:34:36 with three units
+        printing on 001/002/003-H2S. Session A is the delete request: it loads the
+        run, and while it is still holding that view session B — the scheduler —
+        commits a dispatch. A guard reading A's loaded rows cannot see that write;
+        the DELETE's own WHERE clause can, which is the whole point.
+        """
+        ids = await _seed_batch(session_factory, _BATCH_ID, "pending", "completed")
+        dispatched_id = ids[0]
+
+        async with session_factory() as session_a, session_factory() as session_b:
+            # A loads the run's items while the unit is genuinely pending.
+            loaded = (
+                await session_a.execute(select(PrintQueueItem).where(PrintQueueItem.id == dispatched_id))
+            ).scalar_one()
+            assert loaded.status == "pending"
+
+            # B is the scheduler: status + started_at, COMMITTED before the print
+            # command goes out (print_scheduler._start_print).
+            racing = (
+                await session_b.execute(select(PrintQueueItem).where(PrintQueueItem.id == dispatched_id))
+            ).scalar_one()
+            racing.status = "printing"
+            racing.started_at = datetime(2026, 8, 22, 2, 34, 33, tzinfo=timezone.utc)
+            await session_b.commit()
+
+            # expire_on_commit=False everywhere in this fork: A's copy still SAYS
+            # pending, and that is precisely what must not decide.
+            assert loaded.status == "pending"
+            _deleted, still_printing = await delete_items_unless_printing(session_a, batch_id=_BATCH_ID)
+            assert still_printing == [dispatched_id]
+            await session_a.rollback()
+
+        assert await _surviving(session_factory) == sorted(ids)
+        after = await _row(session_factory, dispatched_id)
+        assert after.status == "printing"
+        assert after.started_at is not None
+
+
+class TestDeleteUserItemsUnlessPrinting:
+    async def test_terminal_items_go_and_other_users_are_untouched(self, session_factory):
+        async with session_factory() as db:
+            mine = PrintQueueItem(status="completed", position=0, created_by_id=_USER_ID)
+            theirs = PrintQueueItem(status="completed", position=1, created_by_id=_OTHER_USER_ID)
+            db.add_all([mine, theirs])
+            await db.commit()
+            theirs_id = theirs.id
+
+        async with session_factory() as db:
+            deleted, still_printing = await delete_user_items_unless_printing(db, user_id=_USER_ID)
+            await db.commit()
+
+        assert (deleted, still_printing) == (1, [])
+        assert await _surviving(session_factory) == [theirs_id]
+
+    async def test_a_printing_unit_refuses_the_whole_user_delete(self, session_factory):
+        async with session_factory() as db:
+            live = PrintQueueItem(status="printing", position=0, created_by_id=_USER_ID)
+            done = PrintQueueItem(status="completed", position=1, created_by_id=_USER_ID)
+            db.add_all([live, done])
+            await db.commit()
+            ids = sorted([live.id, done.id])
+            live_id = live.id
+
+        async with session_factory() as db:
+            _deleted, still_printing = await delete_user_items_unless_printing(db, user_id=_USER_ID)
+            assert still_printing == [live_id]
+            await db.rollback()
+
+        assert await _surviving(session_factory) == ids
