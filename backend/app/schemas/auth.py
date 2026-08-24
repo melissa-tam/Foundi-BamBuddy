@@ -628,3 +628,30 @@ class EncryptionStatusResponse(BaseModel):
     # B2: number of rows skipped during the last legacy re-encryption migration.
     # Filled from backend.app.core.database.get_migration_error_count().
     migration_error_count: int = 0
+
+
+class UserDeleteImpact(BaseModel):
+    """What ``DELETE /users/{id}?delete_items=true`` would destroy.
+
+    The pre-flight the delete-confirm dialog renders, replacing the older
+    ``items-count`` endpoint that answered only three of these and answered one of
+    them wrongly: it filtered ``LibraryFile.deleted_at IS NULL``, so a user with
+    trashed uploads was told fewer files would go than actually did.
+
+    ``dependent_skus`` is the count of distinct SKUs that reference one of this
+    user's library files. It is here because ``sku_files`` carries no owner of its
+    own — the SKU catalog is farm-wide, and a library file is CASCADE-deleted out
+    from under it — so the number of SKUs the deletion silently breaks is
+    invisible on every other count.
+
+    ``currently_printing`` is the refusal forecast: how many live units the delete
+    would be blocked by right now. Non-zero means the request will 409, so the
+    dialog can say so instead of failing on submit.
+    """
+
+    archives: int
+    library_files: int
+    queue_items: int
+    production_runs: int
+    dependent_skus: int
+    currently_printing: int

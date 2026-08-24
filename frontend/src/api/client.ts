@@ -3625,6 +3625,28 @@ export interface UserUpdate {
   group_ids?: number[];
 }
 
+/**
+ * Everything a destructive user delete would reach, counted server-side.
+ *
+ * Replaces the old `items-count` shape, which counted only the three row types
+ * the user owns AND filtered soft-deleted library files out — so the confirm
+ * dialog under-reported what the delete would destroy. Two of these fields are
+ * not the user's own work at all:
+ *   - `dependent_skus`   SKUs whose pinned file this user uploaded. Production
+ *                        SKUs pin files from a shared catalog, so deleting one
+ *                        operator's files breaks another operator's SKUs.
+ *   - `currently_printing` printing queue items that make the destructive
+ *                        delete fail closed with `user_has_printing_units`.
+ */
+export interface UserDeleteImpact {
+  archives: number;
+  library_files: number;
+  queue_items: number;
+  production_runs: number;
+  dependent_skus: number;
+  currently_printing: number;
+}
+
 export interface SetupRequest {
   auth_enabled: boolean;
   admin_username?: string;
@@ -4018,8 +4040,8 @@ export const api = {
     request<void>(`/users/${id}?delete_items=${deleteItems}`, {
       method: 'DELETE',
     }),
-  getUserItemsCount: (id: number) =>
-    request<{ archives: number; queue_items: number; library_files: number }>(`/users/${id}/items-count`),
+  getUserDeleteImpact: (id: number) =>
+    request<UserDeleteImpact>(`/users/${id}/delete-impact`),
   changePassword: (currentPassword: string, newPassword: string) =>
     request<{ message: string }>('/users/me/change-password', {
       method: 'POST',

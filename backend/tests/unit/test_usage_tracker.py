@@ -233,7 +233,11 @@ class TestOnPrintComplete:
 
         # db returns: guard(archive.started_at, usage-count), then archive,
         # queue_item(None), assignment, spool for the 3MF path.
-        db = _mock_db_sequential([archive, None, archive, None, assignment, spool])
+        # The third None is _resolve_run_context's durable ARCHIVE plate tier: this
+        # session carries no plate_id, so the archive row is asked for the plate the
+        # printer stated at print start. None keeps the plate unknown, as before —
+        # the call sequence grew, the case did not.
+        db = _mock_db_sequential([archive, None, None, archive, None, assignment, spool])
 
         filament_usage = [{"slot_id": 1, "used_g": 15.0, "type": "PLA", "color": "#FF0000"}]
 
@@ -325,7 +329,11 @@ class TestOnPrintComplete:
 
         # db returns: guard(archive.started_at, usage-count), then archive,
         # queue_item(None), assignment, spool for the 3MF path.
-        db = _mock_db_sequential([archive, None, archive, None, assignment, spool])
+        # The third None is _resolve_run_context's durable ARCHIVE plate tier: this
+        # session carries no plate_id, so the archive row is asked for the plate the
+        # printer stated at print start. None keeps the plate unknown, as before —
+        # the call sequence grew, the case did not.
+        db = _mock_db_sequential([archive, None, None, archive, None, assignment, spool])
 
         filament_usage = [{"slot_id": 1, "used_g": 15.0, "type": "PLA", "color": "#FF0000"}]
 
@@ -2268,6 +2276,11 @@ class TestFindThreemfByFilename:
         # Archive returns a match
         archive = MagicMock()
         archive.id = 35
+        # The row must NAME the print: identity is now compared in Python on the
+        # returned rows rather than expressed as a SQL LIKE pattern, so a row with no
+        # real filename identifies nothing. Archives are matched on ``filename``, the
+        # one field the previous SQL consulted.
+        archive.filename = "BMCU-BADGE.3mf"
         archive.file_path = "archives/35/BMCU-BADGE.3mf"
         archive_result = MagicMock()
         archive_result.scalars.return_value.all.return_value = [archive]

@@ -184,7 +184,10 @@ class TestCostCalculation:
         )
 
         # db returns: archive, queue_item(None), assignment, spool
-        db = _mock_db_sequential([None, archive, None, assignment, spool])
+        # The second None is _resolve_run_context's durable ARCHIVE plate tier: the
+        # session carries no plate_id, so the archive row is asked for the plate the
+        # printer stated at print start. None keeps the plate unknown, as before.
+        db = _mock_db_sequential([None, None, archive, None, assignment, spool])
 
         # 20g used from 3MF
         filament_usage = [{"slot_id": 1, "used_g": 20.0, "type": "PLA", "color": "#FF0000"}]
@@ -241,7 +244,10 @@ class TestCostCalculation:
         )
 
         # db returns: archive, queue_item(None), assignment, spool
-        db = _mock_db_sequential([None, archive, None, assignment, spool])
+        # The second None is _resolve_run_context's durable ARCHIVE plate tier: the
+        # session carries no plate_id, so the archive row is asked for the plate the
+        # printer stated at print start. None keeps the plate unknown, as before.
+        db = _mock_db_sequential([None, None, archive, None, assignment, spool])
 
         # 30g used from 3MF
         filament_usage = [{"slot_id": 1, "used_g": 30.0, "type": "PLA", "color": "#FF0000"}]
@@ -298,7 +304,10 @@ class TestCostCalculation:
         )
 
         # db returns: archive, queue_item(None), assignment, spool
-        db = _mock_db_sequential([None, archive, None, assignment, spool])
+        # The second None is _resolve_run_context's durable ARCHIVE plate tier: the
+        # session carries no plate_id, so the archive row is asked for the plate the
+        # printer stated at print start. None keeps the plate unknown, as before.
+        db = _mock_db_sequential([None, None, archive, None, assignment, spool])
 
         filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": "#FF0000"}]
 
@@ -351,7 +360,10 @@ class TestCostCalculation:
         )
 
         # db returns: archive, queue_item(None), assignment, spool
-        db = _mock_db_sequential([None, archive, None, assignment, spool])
+        # The second None is _resolve_run_context's durable ARCHIVE plate tier: the
+        # session carries no plate_id, so the archive row is asked for the plate the
+        # printer stated at print start. None keeps the plate unknown, as before.
+        db = _mock_db_sequential([None, None, archive, None, assignment, spool])
 
         # 40g total, but only 50% used
         filament_usage = [{"slot_id": 1, "used_g": 40.0, "type": "PLA", "color": "#FF0000"}]
@@ -457,7 +469,10 @@ class TestCostCalculation:
 
         # db returns: archive, assignment1, spool1, assignment2, spool2
         # ams_mapping is provided, so no queue item lookup is performed
-        db = _mock_db_sequential([None, archive, assignment1, spool1, assignment2, spool2])
+        # The second None is _resolve_run_context's durable ARCHIVE plate tier: the
+        # session carries no plate_id, so the archive row is asked for the plate the
+        # printer stated at print start. None keeps the plate unknown, as before.
+        db = _mock_db_sequential([None, None, archive, assignment1, spool1, assignment2, spool2])
 
         # Two filaments used
         filament_usage = [
@@ -557,6 +572,10 @@ class TestCostAggregation:
         responses = []
         # Idempotency guard: started_at -> None (guard skips, one execute consumed).
         responses.append(("scalar_one_or_none", None))
+        # _resolve_run_context's durable ARCHIVE plate tier: the session carries no
+        # plate_id, so the archive row is asked for the plate the printer stated at
+        # print start. None keeps the plate unknown, as before.
+        responses.append(("scalar_one_or_none", None))
         # 1. select(PrintArchive) → archive
         responses.append(("scalar_one_or_none", archive))
         # 2. select(PrintQueueItem) → None
@@ -649,6 +668,10 @@ class TestCostAggregation:
         responses = []
         # Idempotency guard: started_at -> None (guard skips, one execute consumed).
         responses.append(("scalar_one_or_none", None))
+        # _resolve_run_context's durable ARCHIVE plate tier: the session carries no
+        # plate_id, so the archive row is asked for the plate the printer stated at
+        # print start. None keeps the plate unknown, as before.
+        responses.append(("scalar_one_or_none", None))
         responses.append(("scalar_one_or_none", archive))
         responses.append(("scalar_one_or_none", None))  # queue item
         responses.append(("scalar_one_or_none", assignment))
@@ -730,6 +753,8 @@ class TestCostAggregation:
 
         responses = [
             ("scalar_one_or_none", None),  # idempotency guard: started_at -> None (skip)
+            # _resolve_run_context's durable ARCHIVE plate tier (session has no plate_id).
+            ("scalar_one_or_none", None),
             ("scalar_one_or_none", archive),
             ("scalar_one_or_none", None),  # queue item
             ("scalar_one_or_none", assignment),
@@ -817,6 +842,8 @@ class TestCostAggregation:
 
         responses = [
             ("scalar_one_or_none", None),  # idempotency guard: started_at -> None (skip)
+            # _resolve_run_context's durable ARCHIVE plate tier (session has no plate_id).
+            ("scalar_one_or_none", None),
             ("scalar_one_or_none", archive),
             ("scalar_one_or_none", None),
             ("scalar_one_or_none", assignment),
@@ -883,7 +910,10 @@ class TestCostAggregation:
             tray_now=0,
         )
 
-        db = _mock_db_sequential([None, None, archive_new, None, assignment_new, spool_new])
+        # No session here, so _resolve_run_context queries twice: the archive-linked
+        # queue item (None) and then the durable ARCHIVE plate tier (None — the plate
+        # stays unknown, as it was before that tier existed).
+        db = _mock_db_sequential([None, None, None, archive_new, None, assignment_new, spool_new])
 
         with (
             patch("backend.app.core.config.settings") as mock_settings,

@@ -471,7 +471,7 @@ class TestArchivesAPI:
         # in production; SQLite test config doesn't enable foreign_keys=ON
         # by default so archive_id may still be set, but the row itself
         # remains for audit). The thumbnail_path was cleared eagerly by
-        # _null_print_log_thumbnail_paths before db.delete(archive).
+        # null_print_log_thumbnail_paths before db.delete(archive).
         refetch = await db_session.execute(select(PrintLogEntry).where(PrintLogEntry.id == run_id))
         survivor = refetch.scalar_one()
         assert survivor.thumbnail_path is None, (

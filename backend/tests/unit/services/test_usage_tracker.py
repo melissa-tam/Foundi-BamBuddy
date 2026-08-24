@@ -861,6 +861,11 @@ class TestSpoolAssignmentSnapshot:
                 # Idempotency guard: started_at load + usage-count (non-int -> no rows).
                 MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),
                 MagicMock(),
+                # _resolve_run_context's durable ARCHIVE plate tier: this session
+                # carries plate_id=None, so it asks the archive row for the plate the
+                # printer stated at start. None here keeps this test's premise (the
+                # plate is unknown) — it is the sequence that changed, not the case.
+                MagicMock(scalar_one_or_none=MagicMock(return_value=None)),
                 MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),
                 MagicMock(scalar_one_or_none=MagicMock(return_value=None)),
                 MagicMock(scalar_one_or_none=MagicMock(return_value=None)),
@@ -1462,6 +1467,11 @@ class TestForeignPrintCharging:
         db.execute = AsyncMock(
             side_effect=[
                 MagicMock(scalar_one_or_none=MagicMock(return_value=None)),  # idempotency: started_at None
+                # _resolve_run_context's durable ARCHIVE plate tier — the foreign
+                # session has plate_id=None, so the archive row is asked for the plate
+                # the printer stated at print start. None keeps this test foreign and
+                # plate-less; only the call sequence changed.
+                MagicMock(scalar_one_or_none=MagicMock(return_value=None)),
                 MagicMock(scalar_one_or_none=MagicMock(return_value=archive)),  # _track archive
                 MagicMock(scalar_one_or_none=MagicMock(return_value=None)),  # no queue item
                 MagicMock(scalar_one_or_none=MagicMock(return_value=assign)),  # live assignment

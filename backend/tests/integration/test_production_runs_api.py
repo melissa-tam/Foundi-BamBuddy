@@ -132,6 +132,35 @@ class TestProductionRunCreate:
         items = await _pending_items(db_session, resp.json()["id"])
         assert items and all(it.eject_profile_id == eject for it in items)
 
+    async def test_missing_library_file_422(self, async_client, db_session, tmp_path):
+        """A SKU file whose library file is gone must refuse at CREATION.
+
+        ``library_file_id`` is what the scheduler uploads and what
+        ``locate_3mf_for_print`` resolves the donor from, so a run created over a
+        missing row can only fail or wait forever at dispatch — every unit sitting
+        on ``library_file_missing`` with nothing the operator can act on. The row
+        goes missing legitimately: deleting a library file CASCADEs its
+        ``sku_files`` rows away, and on SQLite (which enforces no FK at all, the
+        farm's production engine) the link survives the file it points at.
+        """
+        from sqlalchemy import delete as sa_delete
+
+        from backend.app.models.library import LibraryFile
+
+        eject = await _make_eject_profile(async_client, name="ep-missing-file")
+        _, file_link_id = await _make_sku_with_file(
+            async_client, db_session, tmp_path, code="SKU017.01", name="missing.gcode.3mf"
+        )
+        await db_session.execute(sa_delete(LibraryFile).where(LibraryFile.filename == "missing.gcode.3mf"))
+        await db_session.commit()
+
+        resp = await async_client.post(
+            "/api/v1/production-runs",
+            json={"sku_file_id": file_link_id, "target_units": 1, "target_model": "H2S", "eject_profile_id": eject},
+        )
+        assert resp.status_code == 422, resp.text
+        assert "no library file" in resp.json()["detail"]
+
     async def test_no_eject_profile_422(self, async_client, db_session, tmp_path):
         _, file_link_id = await _make_sku_with_file(async_client, db_session, tmp_path, code="SKU016.01")
         resp = await async_client.post(

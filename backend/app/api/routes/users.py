@@ -4,7 +4,7 @@ from typing import Annotated
 import jwt as _jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,26 +22,24 @@ from backend.app.core.auth import (
 )
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
-from backend.app.models.api_key import APIKey
-from backend.app.models.archive import PrintArchive
 from backend.app.models.group import Group
-from backend.app.models.library import LibraryFile
-from backend.app.models.long_lived_token import LongLivedToken
-from backend.app.models.oidc_provider import UserOIDCLink
-from backend.app.models.print_batch import PrintBatch
-from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.settings import Settings
 from backend.app.models.user import User
-from backend.app.models.user_otp_code import UserOTPCode
-from backend.app.models.user_totp import UserTOTP
-from backend.app.schemas.auth import ChangePasswordRequest, GroupBrief, UserCreate, UserResponse, UserUpdate
+from backend.app.schemas.auth import (
+    ChangePasswordRequest,
+    GroupBrief,
+    UserCreate,
+    UserDeleteImpact,
+    UserResponse,
+    UserUpdate,
+)
+from backend.app.services import user_deletion
 from backend.app.services.email_service import (
     create_welcome_email_from_template,
     generate_secure_password,
     get_smtp_settings,
     send_email,
 )
-from backend.app.services.queue_transitions import delete_user_items_unless_printing, printing_units_conflict
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -315,46 +313,31 @@ async def update_user(
     return _user_to_response(user)
 
 
-@router.get("/{user_id}/items-count")
-async def get_user_items_count(
+@router.get("/{user_id}/delete-impact", response_model=UserDeleteImpact)
+async def get_user_delete_impact(
     user_id: int,
     _: User | None = RequirePermissionIfAuthEnabled(Permission.USERS_READ),
     db: AsyncSession = Depends(get_db),
-):
-    """Get count of items created by this user. Read-only — gated on
-    ``USERS_READ`` only."""
-    # Verify user exists
-    result = await db.execute(select(User).where(User.id == user_id))
-    if not result.scalar_one_or_none():
+) -> UserDeleteImpact:
+    """Pre-flight for the delete-confirm dialog. Read-only — gated on ``USERS_READ``.
+
+    Shaped after ``GET /archives/{id}/delete-impact`` and for the same reason: one
+    cheap dedicated endpoint, rather than making the much larger user LIST run
+    these counts per row. The counts themselves are ``services.user_deletion``'s,
+    so the dialog and the delete describe the same estate.
+
+    Replaces ``items-count``, which reported three of these six numbers and got
+    one of them wrong — it filtered out soft-deleted library files, which the
+    delete destroys along with everything else, and it said nothing about SKUs or
+    about live prints that would refuse the request outright.
+    """
+    result = await db.execute(select(User.id).where(User.id == user_id))
+    if result.scalar_one_or_none() is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
-
-    # Count archives
-    archives_result = await db.execute(select(func.count(PrintArchive.id)).where(PrintArchive.created_by_id == user_id))
-    archives_count = archives_result.scalar() or 0
-
-    # Count queue items
-    queue_result = await db.execute(
-        select(func.count(PrintQueueItem.id)).where(PrintQueueItem.created_by_id == user_id)
-    )
-    queue_items_count = queue_result.scalar() or 0
-
-    # Count library files
-    library_result = await db.execute(
-        select(func.count(LibraryFile.id)).where(
-            LibraryFile.created_by_id == user_id,
-            LibraryFile.deleted_at.is_(None),
-        )
-    )
-    library_files_count = library_result.scalar() or 0
-
-    return {
-        "archives": archives_count,
-        "queue_items": queue_items_count,
-        "library_files": library_files_count,
-    }
+    return await user_deletion.delete_impact(db, user_id=user_id)
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -365,16 +348,20 @@ async def delete_user(
     current_user: User | None = RequirePermissionIfAuthEnabled(Permission.USERS_DELETE),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a user.
+    """Delete a user, and with ``delete_items=true`` everything they created.
 
-    If delete_items=True, all archives, queue items, and library files created by
-    this user will also be deleted. Otherwise, these items will become "ownerless"
-    (created_by_id set to NULL by the foreign key constraint).
+    The route decides only whether this user MAY be deleted — they exist, they are
+    not the last admin, they are not the caller. The deletion itself is
+    ``services.user_deletion.delete_user``: which rows go, which are merely
+    disowned, which dependent rows the engine will not cascade for us, when the
+    bytes leave disk, and the wholesale refusal that protects a live print. None of
+    that is routing, and while it lived here it was a list of raw multi-table
+    DELETEs whose guard asked a narrower question than its statements did.
 
-    delete_items=True is refused WHOLESALE with a structured 409
-    (``user_has_printing_units``) while any of the user's queue items is still
-    printing — deleting the row would not stop the print, it would only sever the
-    farm's one link to it. Nothing is deleted on that path.
+    ``delete_items=true`` is refused WHOLESALE with a structured 409
+    (``user_has_printing_units``) while ANY live print is running off a row in
+    scope — the user's own queued units, or another operator's print running off
+    this user's archive or library file. Nothing is deleted on that path.
     """
     result = await db.execute(select(User).where(User.id == user_id).options(selectinload(User.groups)))
     user = result.scalar_one_or_none()
@@ -412,73 +399,7 @@ async def delete_user(
             detail="Cannot delete your own account",
         )
 
-    if delete_items:
-        # Delete all items created by this user.
-        #
-        # The queue items go FIRST, and through the storage-boundary transition,
-        # because a live print outlives the account that queued it: the
-        # PrintQueueItem row is the only durable link between a running print and
-        # the farm, so destroying it strands the printer on a plate nobody will
-        # eject (production 2026-08-22 — the full account is on
-        # ``queue_transitions.delete_items_unless_printing``). This delete is
-        # FLEET-WIDE and spans every run the user ever queued, so it carries that
-        # hazard at a wider radius than the run delete does. Refused wholesale,
-        # before anything else here is destroyed, so the rollback is clean.
-        _deleted, still_printing = await delete_user_items_unless_printing(db, user_id=user_id)
-        if still_printing:
-            await db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=await printing_units_conflict(
-                    db, still_printing, code="user_has_printing_units", subject="This user"
-                ),
-            )
-        await db.execute(delete(PrintArchive).where(PrintArchive.created_by_id == user_id))
-        await db.execute(delete(LibraryFile).where(LibraryFile.created_by_id == user_id))
-        await db.execute(delete(PrintBatch).where(PrintBatch.created_by_id == user_id))
-    else:
-        # Explicitly set created_by_id to NULL for all items (ensures consistent behavior
-        # across different database backends, including SQLite without foreign key support).
-        # PrintBatch carries the same created_by_id FK with ondelete=SET NULL — admin-deleted
-        # users would otherwise leave dangling created_by_id on SQLite (#1295 review nit).
-        from sqlalchemy import update
-
-        await db.execute(update(PrintArchive).where(PrintArchive.created_by_id == user_id).values(created_by_id=None))
-        await db.execute(
-            update(PrintQueueItem).where(PrintQueueItem.created_by_id == user_id).values(created_by_id=None)
-        )
-        await db.execute(update(LibraryFile).where(LibraryFile.created_by_id == user_id).values(created_by_id=None))
-        await db.execute(update(PrintBatch).where(PrintBatch.created_by_id == user_id).values(created_by_id=None))
-
-    # Drop API keys owned by this user. The model declares ON DELETE CASCADE
-    # so Postgres handles this automatically, but SQLite ships with FK
-    # enforcement off (the project's existing pattern — same reason the
-    # blocks above set created_by_id = NULL by hand). Without an explicit
-    # DELETE here, deleting a user on SQLite would leave their API keys
-    # with a dangling user_id and ``_user_from_api_key`` would return None,
-    # silently degrading the keys to anonymous (and locking them out of
-    # /cloud/* — but the rest of the API would still accept them, which is
-    # exactly the orphan-key state the CASCADE was meant to prevent).
-    await db.execute(delete(APIKey).where(APIKey.user_id == user_id))
-
-    # Drop OIDC links, MFA state, and long-lived camera-stream tokens
-    # owned by this user. Same SQLite/FK pattern as APIKey above. Without
-    # these, deleting a user on SQLite leaves:
-    #   - UserOIDCLink: the OIDC callback finds the orphan link, fails to
-    #     resolve the (now missing) user, and falls through to
-    #     "account_inactive" instead of triggering auto_create (#1285).
-    #   - UserTOTP: MFA secrets persist in the DB after the owning user.
-    #   - UserOTPCode: pending email OTP codes linger.
-    #   - LongLivedToken: per-user camera-stream tokens whose secret_hash
-    #     is still valid — verify() would happily match them by lookup
-    #     prefix even though the user is gone.
-    await db.execute(delete(UserOIDCLink).where(UserOIDCLink.user_id == user_id))
-    await db.execute(delete(UserTOTP).where(UserTOTP.user_id == user_id))
-    await db.execute(delete(UserOTPCode).where(UserOTPCode.user_id == user_id))
-    await db.execute(delete(LongLivedToken).where(LongLivedToken.user_id == user_id))
-
-    await db.delete(user)
-    await db.commit()
+    await user_deletion.delete_user(db, user=user, delete_items=delete_items)
 
 
 @router.post("/me/change-password", response_model=dict)

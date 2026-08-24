@@ -39,7 +39,7 @@ from backend.app.core.database import async_session
 from backend.app.core.tasks import spawn_background_task
 from backend.app.models.archive import PrintArchive
 from backend.app.models.printer import Printer
-from backend.app.services.archive import ArchiveService, peek_plate_index_in_3mf, swap_plate_suffix
+from backend.app.services.archive import ArchiveService, plate_indices_in_3mf, swap_plate_suffix
 from backend.app.services.bambu_ftp import (
     FileNotOnPrinterError,
     cache_3mf_download,
@@ -52,6 +52,7 @@ from backend.app.services.bambu_ftp import (
 )
 from backend.app.services.farm_correlation import DispatchDonor, resolve_terminal_item
 from backend.app.services.printer_manager import parse_plate_id, printer_manager
+from backend.app.utils.filename import print_identity_key
 
 logger = logging.getLogger(__name__)
 
@@ -283,8 +284,21 @@ async def locate_3mf_for_print(
     # If still not found, try listing directories to find matching file
     # Different printer models use different directory structures
     if not downloaded_filename and (filename or subtask_name):
-        search_term = (subtask_name or filename).lower().replace(".gcode", "").replace(".3mf", "")
-        logger.info("Direct FTP download failed, searching directories for '%s'", search_term)
+        # ONE normaliser on BOTH sides — ``print_identity_key``, the fork's single
+        # "is this the same print?" key. The private construction that stood here
+        # could not match this farm's corpus at all: it dropped ``.gcode`` with an
+        # unanchored replace on the SEARCH side but normalised the CANDIDATE with
+        # spaces→underscores and lower-case only, leaving that side's mid-stem token
+        # in place. Library files are named
+        # ``Rotary_tool_top_surfaces_PCO-M12-2525.gcode_L1-90_spliced.3mf`` and the
+        # printer echoes ``Rotary_tool_top_surfaces_PCO-M12-2525_L1-90_spliced``, so
+        # the surviving ``.gcode`` sat INSIDE the candidate and broke contiguity —
+        # the substring test could never be true for a spliced file, which is most
+        # of what this farm prints. Same defect ``print_identity_key`` was created
+        # to fix in terminal correlation and foreign-eject identity on 2026-08-22;
+        # this module simply did not import it.
+        search_key = print_identity_key(subtask_name or filename)
+        logger.info("Direct FTP download failed, searching directories for '%s'", search_key)
         for search_dir in ("/cache", "/model", "/data", "/data/Metadata", "/"):
             if downloaded_filename:
                 break
@@ -301,49 +315,66 @@ async def locate_3mf_for_print(
                         threemf_files[:5],
                         "..." if len(threemf_files) > 5 else "",
                     )
-                for f in dir_files:
-                    if f.get("is_directory"):
-                        continue
-                    fname = f.get("name", "")
-                    # Normalize both for comparison (spaces and underscores are equivalent)
-                    fname_normalized = fname.lower().replace(" ", "_")
-                    search_normalized = search_term.replace(" ", "_")
-                    if fname.endswith(".3mf") and search_normalized in fname_normalized:
-                        logger.info("Found matching file in %s: %s", search_dir, fname)
-                        temp_path = app_settings.archive_dir / "temp" / fname
-                        temp_path.parent.mkdir(parents=True, exist_ok=True)
-                        remote_full_path = posixpath.join(search_dir, fname)
-                        downloaded = await _download(
-                            printer,
-                            remote_full_path,
-                            temp_path,
-                            retry_settings,
-                            f"Download 3MF from {remote_full_path}",
-                        )
-                        if downloaded:
-                            downloaded_filename = fname
-                            logger.info("Found and downloaded from %s: %s", search_dir, fname)
-                            cache_3mf_download(printer.id, fname, temp_path)
-                            break
+                # Exact key first, containment second — both on the SAME normalised
+                # form. Equality is the answer whenever the printer's echo and the
+                # stored file are the same print, and testing it first stops a
+                # longer neighbour (``…_L1-88_spliced_v2.3mf``) from winning the
+                # listing order over the file that actually matches. Containment
+                # stays as the loose tier for an echo that carries only part of the
+                # stored name; it is strictly WIDER than what it replaces, whose
+                # loose tier was broken on one side and matched nothing here.
+                names = [
+                    f.get("name", "")
+                    for f in dir_files
+                    if not f.get("is_directory") and f.get("name", "").endswith(".3mf")
+                ]
+                exact = [n for n in names if print_identity_key(n) == search_key]
+                loose = [n for n in names if search_key and n not in exact and search_key in print_identity_key(n)]
+                for fname in exact + loose:
+                    logger.info("Found matching file in %s: %s", search_dir, fname)
+                    temp_path = app_settings.archive_dir / "temp" / fname
+                    temp_path.parent.mkdir(parents=True, exist_ok=True)
+                    remote_full_path = posixpath.join(search_dir, fname)
+                    downloaded = await _download(
+                        printer,
+                        remote_full_path,
+                        temp_path,
+                        retry_settings,
+                        f"Download 3MF from {remote_full_path}",
+                    )
+                    if downloaded:
+                        downloaded_filename = fname
+                        logger.info("Found and downloaded from %s: %s", search_dir, fname)
+                        cache_3mf_download(printer.id, fname, temp_path)
+                        break
             except Exception as e:  # noqa: BLE001 — an unlistable directory is just not the one
                 logger.debug("Failed to list %s: %s", search_dir, e)
 
     expected_plate = parse_plate_id(filename)
 
-    # Validate the downloaded 3MF actually matches the plate that's running
+    # Validate the downloaded 3MF actually CONTAINS the plate that's running
     # (#1204): subtask_name lags across consecutive plates of the same model,
     # so the first FTP candidate (built from subtask_name) can land on the
-    # previous plate's still-resident upload. Cross-check the slice_info
-    # plate index against the plate parsed from gcode_file (always fresh —
-    # it's the field whose change triggered this callback).
+    # previous plate's still-resident upload. Cross-check the plate parsed from
+    # gcode_file (always fresh — it's the field whose change triggered this
+    # callback) against every plate index the slice_info declares.
+    #
+    # CONTAINMENT, not equality with the first block: a multi-plate upload
+    # declares plate 1 first whichever plate is running, so "is this file's first
+    # plate the running plate?" is false for every multi-plate 3MF this farm
+    # prints. It threw away 57 correct files in 30 days — and a discarded 3MF is a
+    # print charged ZERO grams on a tagless tray, whose ledger then reads fuller
+    # than the roll is. A stale name still fails this test the same way it always
+    # did: it fetches a DIFFERENT upload, whose index set does not contain the
+    # running plate. An empty set is "unreadable", not "absent" — accept it.
     if downloaded_filename and temp_path:
-        actual_plate = peek_plate_index_in_3mf(temp_path) if expected_plate is not None else None
-        if expected_plate is not None and actual_plate is not None and actual_plate != expected_plate:
+        declared_plates = plate_indices_in_3mf(temp_path) if expected_plate is not None else set()
+        if expected_plate is not None and declared_plates and expected_plate not in declared_plates:
             logger.warning(
-                "[CALLBACK] 3MF plate mismatch: downloaded %s reports plate %s but printer is "
+                "[CALLBACK] 3MF plate mismatch: downloaded %s declares plates %s but printer is "
                 "running plate %s — subtask_name=%r appears stale, retrying with corrected name",
                 downloaded_filename,
-                actual_plate,
+                sorted(declared_plates),
                 expected_plate,
                 subtask_name,
             )
@@ -363,7 +394,24 @@ async def locate_3mf_for_print(
                                 f"Re-download 3MF from {remote_path}",
                                 non_retry_exceptions=(FileNotOnPrinterError,),
                             )
-                            if downloaded and peek_plate_index_in_3mf(retry_temp_path) == expected_plate:
+                            # DELIBERATE EXCEPTION to plate_indices_in_3mf's "an empty
+                            # set means UNKNOWN, so accept" contract: here an
+                            # unreadable retry file yields an empty set and is
+                            # REJECTED. Do not "correct" this to match the helper.
+                            #
+                            # The contract's rule protects a file already in hand —
+                            # discarding it on an unreadable answer throws away the
+                            # only gram source a tagless roll has. This branch is the
+                            # opposite situation: it must positively confirm a
+                            # REPLACEMENT before swapping it in. Accepting an
+                            # unreadable one would attach a 3MF to the archive, and
+                            # attaching pops ``no_3mf_available``
+                            # (``ArchiveService.attach_3mf_to_archive``), which
+                            # SUPPRESSES the zero-gram page — the farm would go quiet
+                            # about a print it still cannot price. Rejecting keeps the
+                            # loss loud and costs nothing: an unreadable slice_info
+                            # yields no filament data either way.
+                            if downloaded and expected_plate in plate_indices_in_3mf(retry_temp_path):
                                 logger.info(
                                     "[CALLBACK] Re-download succeeded with corrected name %s "
                                     "(plate %s) — replacing wrong file",

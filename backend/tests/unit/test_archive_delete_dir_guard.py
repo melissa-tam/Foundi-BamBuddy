@@ -1,6 +1,6 @@
 """Guard tests for the directory an archive delete is allowed to rmtree.
 
-``ArchiveService._resolve_archive_dir_for_delete`` resolves a DB column
+``archive.resolve_archive_dir_for_delete`` resolves a DB column
 (``PrintArchive.file_path``) into a directory that is then handed to
 ``shutil.rmtree`` — including from the unattended archive-purge sweeper. The
 old rule only demanded "at least one level under archive_dir", which the
@@ -20,7 +20,7 @@ import pytest
 
 from backend.app.models.archive import PrintArchive
 from backend.app.services import archive as archive_module
-from backend.app.services.archive import ArchiveService
+from backend.app.services.archive import ArchiveService, resolve_archive_dir_for_delete
 
 
 @pytest.fixture
@@ -65,7 +65,7 @@ class TestResolveArchiveDirForDelete:
         _seed_file(archive_root, rel)
         archive = await _add_archive(db_session, rel)
 
-        resolved = ArchiveService(db_session)._resolve_archive_dir_for_delete(archive)
+        resolved = resolve_archive_dir_for_delete(archive)
 
         assert resolved == (archive_root / "archive/7/20260814_120000_part")
 
@@ -75,7 +75,7 @@ class TestResolveArchiveDirForDelete:
         _seed_file(archive_root, rel)
         archive = await _add_archive(db_session, rel)
 
-        resolved = ArchiveService(db_session)._resolve_archive_dir_for_delete(archive)
+        resolved = resolve_archive_dir_for_delete(archive)
 
         assert resolved == (archive_root / "archive/unassigned/20260814_120000_part")
 
@@ -100,7 +100,7 @@ class TestResolveArchiveDirForDelete:
         archive = await _add_archive(db_session, rel)
 
         with caplog.at_level("WARNING", logger="backend.app.services.archive"):
-            resolved = ArchiveService(db_session)._resolve_archive_dir_for_delete(archive)
+            resolved = resolve_archive_dir_for_delete(archive)
 
         assert resolved is None
         # Never a silent skip: the refusal names the archive and the path.
@@ -115,12 +115,12 @@ class TestResolveArchiveDirForDelete:
         _seed_file(archive_root, rel)
         archive = await _add_archive(db_session, rel)
 
-        assert ArchiveService(db_session)._resolve_archive_dir_for_delete(archive) is None
+        assert resolve_archive_dir_for_delete(archive) is None
 
     async def test_refuses_empty_file_path(self, db_session, archive_root: Path):
         archive = await _add_archive(db_session, "")
 
-        assert ArchiveService(db_session)._resolve_archive_dir_for_delete(archive) is None
+        assert resolve_archive_dir_for_delete(archive) is None
 
 
 class TestDeleteArchiveHonoursTheGuard:
