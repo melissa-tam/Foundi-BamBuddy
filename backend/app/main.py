@@ -3222,6 +3222,13 @@ async def on_print_start(printer_id: int, data: dict):
                     subtask_id=subtask_id,
                     filament_type=mqtt_filament_meta.get("filament_type"),
                     filament_color=mqtt_filament_meta.get("filament_color"),
+                    # The plate this print is running, recorded while the printer is
+                    # still saying so. A fallback archive is precisely the row that
+                    # will have no 3MF of its own, so it is the row that most needs
+                    # the plate durably: a late retry may attach the file hours
+                    # later, and by completion neither a session nor a queue item
+                    # can answer for a print the farm did not dispatch.
+                    plate_id=lookup.expected_plate,
                     extra_data={"no_3mf_available": True, "original_subtask": subtask_name, "_print_data": data},
                 )
 
@@ -3327,6 +3334,20 @@ async def on_print_start(printer_id: int, data: dict):
         )
 
         if archive:
+            # Stamp the plate this print is running (see PrintArchive.plate_id).
+            #
+            # ``lookup.expected_plate`` and NOT ``resolved_plate_id``: the two agree
+            # for a farm dispatch — both come from the queue item, the donor by way
+            # of ``resolve_dispatch_donor`` — but ``resolve_active_plate_id`` filters
+            # ``status == "printing"`` queue items and so answers None for every
+            # print the farm did not dispatch, which is the population this column
+            # exists for. The lookup's value is the contract's order in one place:
+            # the donor's plate when a unit dispatched this print, else the plate
+            # parsed from the printer's own ``gcode_file`` echo.
+            if archive.plate_id != lookup.expected_plate:
+                archive.plate_id = lookup.expected_plate
+                await db.commit()
+
             # Track this active print (use both original filename and downloaded filename)
             _active_prints[(printer_id, downloaded_filename)] = archive.id
             if filename and filename != downloaded_filename:

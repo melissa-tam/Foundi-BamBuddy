@@ -206,10 +206,28 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
     upp = sku_file.units_per_plate or 1
     n_plates = plates_needed(data.target_units, upp)
 
+    # A SKU file whose library file is GONE can only produce a run that fails or
+    # waits forever at dispatch: ``library_file_id`` is what the scheduler uploads
+    # and what ``locate_3mf_for_print`` resolves the donor from, and nothing
+    # downstream can invent it. Tolerating the None here (as this did until the
+    # 2026-08-22 user-delete audit) produced a run whose every unit sat on
+    # ``library_file_missing`` with no explanation the operator could act on, so
+    # the refusal belongs at creation, beside the 422 for unknown printers. The
+    # row goes missing legitimately: deleting a library file CASCADEs its
+    # ``sku_files`` rows away, and a SKU's file can also be trashed by hand.
+    if sku_file.library_file is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"SKU file {sku_file.id} has no library file — it was deleted. "
+                "Re-attach a file to the SKU before starting a run."
+            ),
+        )
+
     # Cache SJF print time + capability filament hint from the file metadata.
     cached_print_time = None
     required_filament_types = None
-    meta = sku_file.library_file.file_metadata if sku_file.library_file else None
+    meta = sku_file.library_file.file_metadata
     if meta:
         cached_print_time = meta.get("print_time_seconds")
         ftype = meta.get("filament_type")

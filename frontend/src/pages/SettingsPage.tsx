@@ -8,7 +8,7 @@ import { formatDateOnly } from '../utils/date';
 import { getCurrencySymbol, SUPPORTED_CURRENCIES } from '../utils/currency';
 import { checkPasswordComplexity } from '../utils/password';
 import { PRESET_CATEGORIES, parsePresetTriple } from '../utils/temperatureFanPresets';
-import type { APIKey, AppSettings, AppSettingsUpdate, SmartPlug, SmartPlugStatus, NotificationProvider, NotificationTemplate, UpdateStatus, GitHubBackupStatus, CloudAuthStatus, UserCreate, UserUpdate, UserResponse, StorageUsageResponse } from '../api/client';
+import type { APIKey, AppSettings, AppSettingsUpdate, SmartPlug, SmartPlugStatus, NotificationProvider, NotificationTemplate, UpdateStatus, GitHubBackupStatus, CloudAuthStatus, UserCreate, UserUpdate, UserResponse, UserDeleteImpact, StorageUsageResponse } from '../api/client';
 import { Card, CardContent, CardDensityProvider, CardHeader } from '../components/Card';
 import { Modal } from '../components/ui/Modal';
 import { SlicerBundlesPanel } from '../components/SlicerBundlesPanel';
@@ -41,6 +41,8 @@ import { OIDCProviderSettings } from '../components/OIDCProviderSettings';
 import { SecurityStatusCard } from '../components/SecurityStatusCard';
 import { APIBrowser } from '../components/APIBrowser';
 import { InfoHint } from '../components/ui/InfoHint';
+import { InlineAlert } from '../components/ui/InlineAlert';
+import { printingUnitPrinters } from '../utils/printingUnitsRefusal';
 import { virtualPrinterApi, spoolbuddyApi } from '../api/client';
 import { defaultNavItems, getDefaultView, setDefaultView } from '../components/Layout';
 import { availableLanguages } from '../i18n';
@@ -160,6 +162,9 @@ const STORAGE_FALLBACK_COLORS = [
 const getStorageColor = (key: string, index: number) =>
   STORAGE_CATEGORY_COLORS[key] || STORAGE_FALLBACK_COLORS[index % STORAGE_FALLBACK_COLORS.length];
 
+/** The 409 code the backend raises when a delete would reach a live print. */
+const USER_PRINTING_REFUSAL_CODE = 'user_has_printing_units';
+
 export function SettingsPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -245,7 +250,9 @@ export function SettingsPage() {
   const [showEditUserModal, setShowEditUserModal] = useState(false);
   const [editingUserId, setEditingUserId] = useState<number | null>(null);
   const [deleteUserId, setDeleteUserId] = useState<number | null>(null);
-  const [deleteUserItemCounts, setDeleteUserItemCounts] = useState<{ archives: number; queue_items: number; library_files: number } | null>(null);
+  const [deleteUserImpact, setDeleteUserImpact] = useState<UserDeleteImpact | null>(null);
+  /** The pre-flight failed — distinct from "it returned all zeros". */
+  const [deleteUserImpactFailed, setDeleteUserImpactFailed] = useState(false);
   const [deleteUserLoading, setDeleteUserLoading] = useState(false);
   const [userFormData, setUserFormData] = useState<{
     username: string;
@@ -625,16 +632,28 @@ export function SettingsPage() {
     },
   });
 
+  /** Close the delete-user modal and drop everything scoped to that one user. */
+  const closeDeleteUserModal = () => {
+    setDeleteUserId(null);
+    setDeleteUserImpact(null);
+    setDeleteUserImpactFailed(false);
+  };
+
   const deleteUserMutation = useMutation({
     mutationFn: ({ id, deleteItems }: { id: number; deleteItems: boolean }) => api.deleteUser(id, deleteItems),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['users'] });
       showToast(t('settings.toast.userDeleted'));
-      setDeleteUserId(null);
-      setDeleteUserItemCounts(null);
+      closeDeleteUserModal();
     },
     onError: (error: Error) => {
-      showToast(error.message, 'error');
+      // The `user_has_printing_units` refusal names printers the operator has
+      // to walk up to — it renders persistently in the still-open modal
+      // (InlineAlert below) instead of a toast that fades before it is read.
+      // Everything else keeps the toast.
+      if (printingUnitPrinters(error, USER_PRINTING_REFUSAL_CODE) === null) {
+        showToast(error.message, 'error');
+      }
     },
   });
 
@@ -648,20 +667,50 @@ export function SettingsPage() {
     },
   });
 
-  // Function to initiate user deletion with item count check
+  // Open the delete-user modal and pre-flight what the delete would reach.
   const handleDeleteUserClick = async (userId: number) => {
     setDeleteUserId(userId);
+    setDeleteUserImpact(null);
+    setDeleteUserImpactFailed(false);
+    // A refusal from a previous attempt is about that attempt, not this one.
+    deleteUserMutation.reset();
     setDeleteUserLoading(true);
     try {
-      const counts = await api.getUserItemsCount(userId);
-      setDeleteUserItemCounts(counts);
+      setDeleteUserImpact(await api.getUserDeleteImpact(userId));
     } catch {
-      // If we can't get counts, just proceed without showing item options
-      setDeleteUserItemCounts({ archives: 0, queue_items: 0, library_files: 0 });
+      // "Could not check" is NOT "owns nothing". Zero-filling the impact here
+      // would render the bare confirm, which reads as a user with no items —
+      // the dialog lying to the admin, which is the defect this whole flow
+      // exists to fix. Leave the impact unknown and say so; the delete stays
+      // available, because the server is the one that decides.
+      setDeleteUserImpactFailed(true);
     } finally {
       setDeleteUserLoading(false);
     }
   };
+
+  /** The pre-flight came back and this user owns rows the delete can destroy. */
+  const deleteUserOwnsItems =
+    deleteUserImpact !== null &&
+    deleteUserImpact.archives +
+      deleteUserImpact.library_files +
+      deleteUserImpact.queue_items +
+      deleteUserImpact.production_runs >
+      0;
+  /** Offer "delete their items" vs "keep them" — known items, or an unknown we
+   *  must not resolve on the admin's behalf by assuming there are none. */
+  const deleteUserNeedsItemChoice = deleteUserOwnsItems || deleteUserImpactFailed;
+
+  /** Printers named by a live `user_has_printing_units` refusal, else null. */
+  const deleteUserRefusalPrinters = printingUnitPrinters(
+    deleteUserMutation.error,
+    USER_PRINTING_REFUSAL_CODE,
+  );
+  const deleteUserRefusalAlert = deleteUserRefusalPrinters ? (
+    <InlineAlert severity="error">
+      {t('settings.deleteUserStillPrinting', { printers: deleteUserRefusalPrinters.join(', ') })}
+    </InlineAlert>
+  ) : null;
 
   const deleteGroupMutation = useMutation({
     mutationFn: (id: number) => api.deleteGroup(id),
@@ -6920,10 +6969,7 @@ export function SettingsPage() {
       {/* Delete User Confirmation Modal */}
       {deleteUserId !== null && (
         <Modal
-          onClose={() => {
-            setDeleteUserId(null);
-            setDeleteUserItemCounts(null);
-          }}
+          onClose={closeDeleteUserModal}
           labelledBy="delete-user-modal-title"
           size="sm"
         >
@@ -6935,24 +6981,65 @@ export function SettingsPage() {
             </CardHeader>
             <CardContent className="space-y-3">
               {deleteUserLoading ? (
-                <div className="flex items-center justify-center py-4">
+                <div
+                  role="status"
+                  className="flex items-center justify-center gap-2 py-4 text-sm text-bambu-gray"
+                >
                   <div className="animate-spin rounded-full h-6 w-6 border-2 border-bambu-green border-t-transparent" />
+                  <span>{t('settings.deleteUserChecking')}</span>
                 </div>
-              ) : deleteUserItemCounts && (deleteUserItemCounts.archives + deleteUserItemCounts.queue_items + deleteUserItemCounts.library_files > 0) ? (
+              ) : deleteUserNeedsItemChoice ? (
                 <>
-                  <p className="text-white">{t('settings.userHasCreated')}</p>
-                  <ul className="list-disc list-inside text-bambu-gray space-y-1">
-                    {deleteUserItemCounts.archives > 0 && (
-                      <li>{deleteUserItemCounts.archives} archive{deleteUserItemCounts.archives !== 1 ? 's' : ''}</li>
-                    )}
-                    {deleteUserItemCounts.queue_items > 0 && (
-                      <li>{deleteUserItemCounts.queue_items} queue item{deleteUserItemCounts.queue_items !== 1 ? 's' : ''}</li>
-                    )}
-                    {deleteUserItemCounts.library_files > 0 && (
-                      <li>{deleteUserItemCounts.library_files} library file{deleteUserItemCounts.library_files !== 1 ? 's' : ''}</li>
-                    )}
-                  </ul>
-                  <p className="text-bambu-gray text-sm">{t('settings.userItemsQuestion')}</p>
+                  {/* The pre-flight failed. "Could not check" is not "owns
+                      nothing", so the admin keeps BOTH delete choices and is
+                      told the preview is missing. */}
+                  {deleteUserImpactFailed && (
+                    <InlineAlert severity="warning">
+                      {t('settings.deleteUserImpactUnavailable')}
+                    </InlineAlert>
+                  )}
+                  {deleteUserImpact && (
+                    <>
+                      {/* What the delete reaches BEYOND this user's own rows —
+                          the shop's SKUs, and prints running right now. Above
+                          the list, not inside it: the list is this user's work,
+                          and these two are the part the admin did not ask for
+                          and cannot undo. */}
+                      {deleteUserImpact.dependent_skus > 0 && (
+                        <InlineAlert severity="warning">
+                          {t('settings.deleteUserDependentSkus', { count: deleteUserImpact.dependent_skus })}
+                        </InlineAlert>
+                      )}
+                      {deleteUserImpact.currently_printing > 0 && (
+                        <InlineAlert severity="warning">
+                          {t('settings.deleteUserPrintingNow', { count: deleteUserImpact.currently_printing })}
+                        </InlineAlert>
+                      )}
+                      <p className="text-white">{t('settings.userHasCreated')}</p>
+                      <ul className="list-disc list-inside text-bambu-gray space-y-1">
+                        {deleteUserImpact.archives > 0 && (
+                          <li>{t('settings.deleteUserArchives', { count: deleteUserImpact.archives })}</li>
+                        )}
+                        {deleteUserImpact.library_files > 0 && (
+                          <li>{t('settings.deleteUserLibraryFiles', { count: deleteUserImpact.library_files })}</li>
+                        )}
+                        {deleteUserImpact.queue_items > 0 && (
+                          <li>{t('settings.deleteUserQueueItems', { count: deleteUserImpact.queue_items })}</li>
+                        )}
+                        {deleteUserImpact.production_runs > 0 && (
+                          <li>{t('settings.deleteUserProductionRuns', { count: deleteUserImpact.production_runs })}</li>
+                        )}
+                      </ul>
+                      <p className="text-bambu-gray text-sm">{t('settings.userItemsQuestion')}</p>
+                    </>
+                  )}
+                  {/* Before the buttons in DOM order: a screen-reader user
+                      hears the constraint before the choices. The confirm stays
+                      ENABLED while something prints — a poll snapshot is stale
+                      in both directions, and a disabled control leaves the tab
+                      order taking its own explanation with it. The server
+                      decides and explains. */}
+                  {deleteUserRefusalAlert}
                   <div className="flex flex-col gap-2">
                     <Button
                       variant="danger"
@@ -6972,10 +7059,7 @@ export function SettingsPage() {
                     </Button>
                     <Button
                       variant="ghost"
-                      onClick={() => {
-                        setDeleteUserId(null);
-                        setDeleteUserItemCounts(null);
-                      }}
+                      onClick={closeDeleteUserModal}
                       disabled={deleteUserMutation.isPending}
                       className="justify-center"
                     >
@@ -6984,16 +7068,16 @@ export function SettingsPage() {
                   </div>
                 </>
               ) : (
+                /* This user owns nothing the delete can destroy, so the only
+                   action is `delete_items=false` — which destroys nothing and
+                   can never raise the printing-units refusal. No alert here. */
                 <>
                   <p className="text-white">{t('settings.deleteUserConfirm')}</p>
                   <p className="text-bambu-gray text-sm">{t('settings.actionCannotBeUndone')}</p>
                   <div className="flex gap-2 justify-end">
                     <Button
                       variant="ghost"
-                      onClick={() => {
-                        setDeleteUserId(null);
-                        setDeleteUserItemCounts(null);
-                      }}
+                      onClick={closeDeleteUserModal}
                       disabled={deleteUserMutation.isPending}
                     >
                       {t('common.cancel')}

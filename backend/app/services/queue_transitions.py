@@ -41,6 +41,15 @@ Both supported engines carry UPDATE/DELETE…RETURNING — SQLite ≥ 3.35 (the
 embedded Python 3.13 ships 3.45+) and Postgres — so there is deliberately no
 dialect fallback path to drift out of sync with this one.
 
+Two query builders sit beside the transitions —
+:func:`printing_items_referencing` and :func:`live_prints_blocking` — for the
+deletes that destroy a queue item's BACKING ROW rather than the item: an
+archive, a library file, a batch. Those statements live in the services that own
+those tables, but the question they must ask first is this module's ("what does
+the QUEUE say?"), and asking it twice in two shapes is how the guard and the
+number shown to the operator drift apart. They are query builders, not
+transitions: nothing here writes another table's rows.
+
 **Caller obligation:** the UPDATE runs with ``synchronize_session=False``, so ORM
 instances the caller already holds keep their pre-transition attribute values
 (the fork's sessions are ``expire_on_commit=False``, so a commit does not clear
@@ -56,7 +65,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import Exists, delete, select, update
 
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
@@ -64,6 +73,7 @@ from backend.app.models.printer import Printer
 if TYPE_CHECKING:
     from sqlalchemy import ColumnElement
     from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.orm import InstrumentedAttribute
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +279,75 @@ async def _delete_unless_printing(
             still_printing,
         )
     return len(deleted_ids), still_printing
+
+
+def printing_items_referencing(ref_col: InstrumentedAttribute[int | None]) -> Exists:
+    """A correlated ``EXISTS`` over ``printing`` queue items whose *ref_col* names the outer row.
+
+    The predicate a bulk delete of a queue item's BACKING ROW puts in its own
+    WHERE, so the database evaluates "is a print still running off this row?"
+    and performs the delete as one statement — the same construction the three
+    transitions above use, moved one table outwards. ``ref_col`` is the
+    ``PrintQueueItem`` column that points at the table being deleted from
+    (``archive_id``, ``library_file_id``, ``batch_id``); the outer table is read
+    off that column's DECLARED foreign key rather than passed in, so the
+    correlation can only ever name the table the schema says the column
+    references.
+
+    **It must be negated as a correlated NOT EXISTS, never rewritten as
+    ``NOT IN (subquery)``.** The two look interchangeable and are not: SQL's
+    ``NOT IN`` is ``<> ALL``, and a single NULL among the subquery's rows makes
+    every comparison UNKNOWN, so the predicate is never true and the DELETE
+    silently matches nothing. Every one of these columns is nullable BY DESIGN —
+    ``print_queue`` rows carry either ``archive_id`` or ``library_file_id`` and
+    NULL the other, and ``batch_id`` is NULL on every un-batched item — so one
+    ordinary row is enough to turn the whole delete into a no-op that raises
+    nothing, logs nothing, and returns 204. That is precisely the class of
+    invisible failure this module exists to remove, which is why the shape is
+    fixed here once instead of being spelled out at each call site.
+
+    Raises ``ValueError`` when *ref_col* declares no single foreign key: there is
+    then no outer row to correlate to, and a predicate that silently correlated
+    to nothing would be the no-op again.
+    """
+    foreign_keys = ref_col.property.columns[0].foreign_keys
+    if len(foreign_keys) != 1:
+        raise ValueError(
+            f"printing_items_referencing({ref_col}) needs exactly one declared foreign key "
+            f"to name the outer row; found {len(foreign_keys)}"
+        )
+    target = next(iter(foreign_keys)).column
+    return (
+        select(1)
+        .select_from(PrintQueueItem)
+        .where(PrintQueueItem.status == "printing", ref_col == target)
+        # Explicit: the outer table is a CORRELATION, not a second FROM. Left to
+        # auto-correlation this reads identically until some caller nests it
+        # somewhere the guess differs, and then it is a cross join that matches
+        # every row.
+        .correlate(target.table)
+        .exists()
+    )
+
+
+async def live_prints_blocking(db: AsyncSession, *, scope: ColumnElement[bool]) -> list[int]:
+    """The ids of ``printing`` queue items that satisfy *scope*.
+
+    ONE origin for "which live prints stand in the way of this delete?", so the
+    guard a caller enforces and the number it reports to the operator beforehand
+    can never disagree. Three callers ask it of three different scopes: the
+    archive delete route (one archive), its ``delete-impact`` pre-flight (the
+    same archive), and ``user_deletion`` (a union across every archive, library
+    file and batch the user owns).
+
+    Read this AFTER the delete, inside the SAME transaction, when the answer must
+    be authoritative: a row that appears between the caller's read and its write
+    is exactly the race the module is about, and only a post-delete read sees it.
+    Read BEFORE, as the pre-flight endpoints do, it is a forecast — honest at the
+    instant it was taken and never a substitute for the guard.
+    """
+    result = await db.execute(select(PrintQueueItem.id).where(scope, PrintQueueItem.status == "printing"))
+    return sorted(row[0] for row in result.all())
 
 
 async def printing_units_conflict(

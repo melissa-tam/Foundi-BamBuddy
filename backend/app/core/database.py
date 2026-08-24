@@ -4619,6 +4619,27 @@ async def run_migrations(conn):
         "ON slot_recheck_intent (printer_id, ams_id, tray_id)",
     )
 
+    # Migration (2026-08-23): the plate a print actually ran, stored ON the print.
+    #
+    # Filament accounting needs it and had nowhere to read it from for a print the
+    # farm did not dispatch. ``usage_tracker._resolve_run_context`` re-derived the
+    # plate at completion from the live print session or the dispatched queue item;
+    # a Bambu Studio LAN print or a screen start has neither, so it resolved None,
+    # and on a multi-plate 3MF a None plate means "summing every plate would charge
+    # the whole file to this one run" — so the charge is skipped. 24 prints in the
+    # 30 days to 2026-08-23 were skipped for exactly that, on top of the 68 that had
+    # no 3MF at all. The printer states the plate on every push (``gcode_file`` =
+    # ``/data/Metadata/plate_3.gcode``) and ``on_print_start`` already parses it; it
+    # simply had no column to put it in and re-derivation could not reach it hours
+    # later at completion.
+    #
+    # NULLable with no default and no backfill: NULL means "print start could not
+    # tell", which is exactly what every pre-existing row honestly is. The value is
+    # unknowable for them — an archive that knows its plate holds no 3MF and one
+    # holding a 3MF never recorded a plate — and inventing a figure would replace a
+    # visible hole with an invisible wrong number.
+    await _safe_execute(conn, "ALTER TABLE print_archives ADD COLUMN plate_id INTEGER")
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),

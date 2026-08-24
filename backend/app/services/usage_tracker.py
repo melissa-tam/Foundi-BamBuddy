@@ -682,20 +682,77 @@ async def _resolve_run_context(
     2. the queue item whose ``dispatch_subtask_id`` equals the terminal payload's
        ``subtask_id`` (the id Bambuddy minted for this exact dispatch), any status;
     3. the queue item linked to this ``archive_id`` (accepting any terminal status
-       the scheduler may already have stamped — see ``_RUN_CONTEXT_STATUSES``).
+       the scheduler may already have stamped — see ``_RUN_CONTEXT_STATUSES``);
+    4. the ARCHIVE's own ``plate_id``, stamped at print start from the printer's
+       ``gcode_file`` echo.
 
     ``resolve_active_plate_id`` in farm_correlation is deliberately NOT reused: it
     filters ``status == "printing"``, which is wrong at completion (the row is
     already terminal by the time usage runs).
+
+    **Why tier 4 had to exist.** Tiers 1–3 are all FARM state: a session the farm
+    opened, a queue item the farm dispatched. A print the farm did not dispatch —
+    a Bambu Studio LAN print, a screen start, a large share of this farm's work —
+    matches none of them, so every such completion resolved ``plate_id=None`` and
+    ``_track_from_3mf`` then refused to charge a multi-plate file rather than sum
+    every plate into one run (24 refusals in the 30 days to 2026-08-23). The
+    printer had been stating the plate on every push the whole time. Tier 4 is that
+    statement, read once at print start when the printer is still saying it and
+    stored on the row, because by completion the echo is long gone.
+
+    Tier 4 answers the PLATE only. The AMS mapping stays farm state — an archive
+    row records no dispatch decision — so a foreign print's mapping is still None
+    and the observational lanes downstream price it.
+
+    Each tier logs which one answered (``tier=session|queue_item|archive|none``),
+    in the style of ``spool_respool._mark_tray_spent``: a plate that resolves from
+    the wrong tier is the difference between charging one plate and charging none,
+    and the log is where that is diagnosable after the fact.
     """
     # 1. Session fast path — print-start captured both values, no query needed.
     if session is not None:
-        return session.plate_id, session.ams_mapping
+        if session.plate_id is not None:
+            _log_plate_tier(printer_id, archive_id, session.plate_id, "session")
+            return session.plate_id, session.ams_mapping
+        plate_id = await _archive_plate_id(db, archive_id)
+        _log_plate_tier(printer_id, archive_id, plate_id, "archive" if plate_id is not None else "none")
+        return plate_id, session.ams_mapping
 
     item = await _resolve_run_item(db, (data.get("subtask_id") or "").strip() or None, archive_id)
-    if item is None:
-        return None, None
-    return item.plate_id, _parse_ams_mapping(item.ams_mapping)
+    ams_mapping = _parse_ams_mapping(item.ams_mapping) if item is not None else None
+    if item is not None and item.plate_id is not None:
+        _log_plate_tier(printer_id, archive_id, item.plate_id, "queue_item")
+        return item.plate_id, ams_mapping
+
+    plate_id = await _archive_plate_id(db, archive_id)
+    _log_plate_tier(printer_id, archive_id, plate_id, "archive" if plate_id is not None else "none")
+    return plate_id, ams_mapping
+
+
+def _log_plate_tier(printer_id: int, archive_id: int | None, plate_id: int | None, tier: str) -> None:
+    """One line naming which tier of :func:`_resolve_run_context` answered."""
+    logger.info(
+        "[UsageTracker] printer %s archive %s: printed plate %s (tier=%s)",
+        printer_id,
+        archive_id,
+        plate_id if plate_id is not None else "UNKNOWN",
+        tier,
+    )
+
+
+async def _archive_plate_id(db: AsyncSession, archive_id: int | None) -> int | None:
+    """The plate stamped on this archive row at print start, or None.
+
+    The one durable answer for a print no farm queue item claims. Read as a scalar
+    rather than through the ORM row because the caller wants exactly this column
+    and may hold no archive instance at all.
+    """
+    if not archive_id:
+        return None
+    from backend.app.models.archive import PrintArchive
+
+    result = await db.execute(select(PrintArchive.plate_id).where(PrintArchive.id == archive_id))
+    return result.scalar_one_or_none()
 
 
 async def _resolve_run_item(db: AsyncSession, subtask_id: str | None, archive_id: int | None):
@@ -1271,6 +1328,9 @@ async def on_print_complete(
                 status=status,
                 print_name=print_name,
                 ams_mapping=ams_mapping,
+                subtask_id=terminal_subtask,
+                state=state,
+                last_loaded_tray=getattr(state, "last_loaded_tray", None),
             )
         except Exception:  # noqa: BLE001 — a guard that breaks the thing it guards is worse than the silence
             logger.exception("[UsageTracker] zero-gram check failed for printer %s archive %s", printer_id, archive_id)
@@ -1286,6 +1346,9 @@ async def _warn_zero_gram_tagless_charge(
     status: str,
     print_name: str,
     ams_mapping: list[int] | None,
+    subtask_id: str | None = None,
+    state=None,
+    last_loaded_tray: int | None = None,
 ) -> None:
     """WARN + notify when a completed print charged 0 g on a tagless feeder (C6).
 
@@ -1308,12 +1371,46 @@ async def _warn_zero_gram_tagless_charge(
     * **AMS feeders only** (``ams_id != 255``). An external holder is excluded for
       the same reason its runouts never stamp spent (scenario T14): the left/right
       vt-tray attribution convention is unconfirmed.
-    * **The DISPATCH MAPPING is the only feeder witness** — never the change log or
-      ``last_loaded_tray``. Both of those observe what is physically in the feed
-      path, and a motion-only job (an eject sweep, an empty-bed dry-run) runs with
-      the previous print's roll still loaded, so both would name that production
-      slot for a job whose zero grams are correct. The mapping is a decision, and a
-      motion-only job decides no AMS slot at all.
+    * **Which witnesses may name the feeder depends on whether the FARM DISPATCHED
+      this print.** The dispatch ``ams_mapping`` is a DECISION and a motion-only job
+      (an eject sweep, an empty-bed dry-run) decides no AMS slot at all, which is
+      what makes it the safe default: the observational witnesses
+      (``tray_change_log``, ``last_loaded_tray``) report what is physically in the
+      feed path, and a motion-only job runs with the PREVIOUS print's roll still
+      loaded, so naming a feeder from those would page for a job whose zero grams
+      are correct. Production shows that guard doing its job
+      (``'eject_production_item890' … (mapping=None)``).
+
+      But a print STARTED FROM THE SCREEN or from Bambu Studio decides no mapping
+      either, and its zero grams are the loss this event exists for — so
+      ``dispatch_only`` silenced the entire population it was written to catch. The
+      widening therefore needs a discriminator that separates "no mapping because
+      nothing fed" from "no mapping because the farm never decided one", and it is
+      **attribution**: the observational witnesses are admitted only for an archive
+      that still has no slicer data (``extra_data["no_3mf_available"]``) AND that
+      ``_resolve_run_item`` cannot tie to any dispatched queue unit.
+
+      "Is it an eject" would be the WRONG test, and dangerously close to right. An
+      eject genuinely never archives — ``on_print_start`` returns before the archive
+      body for any pending-eject or eject-named start — but a **dry-run does**:
+      production ``desktop-g6cgc9k`` carries archives 733/734 on printer 2,
+      2026-08-18, ``print_name='DRY-RUN single-pass-dwell-jitter'``, 6.4 MB of
+      captured 3MF. Only its successful FTPS fetch keeps it out of the flagged
+      population, so a single transient failure would hand a motion-only job the
+      observational witnesses and page for the previous print's roll. Attribution
+      excludes it for the right reason — a dry-run is farm-dispatched and owns a
+      queue item — and excludes every future farm-dispatched motion job nobody has
+      thought of yet, while a screen start or a Studio print has no item by
+      definition.
+
+      The flag stays TRUTHFUL over the print's life: ``ArchiveService`` pops
+      ``no_3mf_available`` from ``extra_data`` the moment a late retry attaches the
+      captured 3MF (``archive.attach_3mf_to_archive``), so a print that was rescued
+      no longer matches and falls back to ``dispatch_only``. A rescued print also
+      charges its grams and never reaches here at all.
+
+      Cause-based throughout: nothing here reads the print's size, duration or
+      name.
     * **A tagless feeder must actually be identified.** If no AMS slot resolves to a
       tagless spool, the zero is either explainable or unattributable, and an
       unattributable page names nothing an operator can act on — so it stays an INFO
@@ -1352,22 +1449,26 @@ async def _warn_zero_gram_tagless_charge(
     # helper would degrade to the material anyway — and there are already two copies
     # of it in the tree without this adding a third.
 
-    # The DISPATCH MAPPING alone — see ``_print_feeder_keys``. The observational
-    # witnesses (tray_change_log, last_loaded_tray) both derive from ``tray_now``,
-    # which reports the filament physically in the path, and an eject sweep or an
-    # empty-bed dry-run runs with the previous print's roll still loaded. Naming a
-    # feeder from those would page after every single eject, for a job whose zero
-    # grams are correct.
-    feeder_keys = _print_feeder_keys(ams_mapping, witnesses="dispatch_only")
+    # ATTRIBUTION decides the witnesses: a print with no slicer data that no
+    # dispatched unit claims is a screen/Studio start, whose only feeder witnesses
+    # are observational. Anything the farm DISPATCHED keeps ``dispatch_only`` —
+    # including a dry-run, which unlike an eject really does archive (prod archives
+    # 733/734) and would otherwise false-page on the previous print's roll the first
+    # time its 3MF fetch failed. See the docstring.
+    lost_its_3mf = await _archive_lost_its_3mf(db, archive_id)
+    undispatched = lost_its_3mf and (await _resolve_run_item(db, subtask_id, archive_id)) is None
+    witnesses: Witnesses = "all" if undispatched else "dispatch_only"
+    feeder_keys = _print_feeder_keys(ams_mapping, state, last_loaded_tray, witnesses=witnesses)
     ams_keys = sorted(key for key in feeder_keys if key[0] != 255)
     if not ams_keys:
         logger.info(
             "[UsageTracker] printer %s archive %s: '%s' completed charging 0 g and no AMS feeder could be "
-            "named (mapping=%s) — nothing to attribute the shortfall to",
+            "named (mapping=%s, witnesses=%s) — nothing to attribute the shortfall to",
             printer_id,
             archive_id,
             print_name,
             ams_mapping,
+            witnesses,
         )
         return
 
@@ -1436,6 +1537,25 @@ async def _warn_zero_gram_tagless_charge(
     await notify_dedup.record_sent(db, _ZERO_CHARGE_SCOPE, key)
 
 
+async def _archive_lost_its_3mf(db: AsyncSession, archive_id: int | None) -> bool:
+    """Whether this archive is a print whose source 3MF was never captured.
+
+    ``main.on_print_start`` writes ``extra_data["no_3mf_available"]`` on the
+    fallback archive it creates when the FTPS capture found nothing, and
+    ``ArchiveService.attach_3mf_to_archive`` POPS that key the moment a late retry
+    lands the file — so the flag reads "this print still has no slicer data", not
+    "it once didn't". No archive id means no archive row: an eject sweep, which
+    ``on_print_start`` returns from before archiving anything.
+    """
+    if not archive_id:
+        return False
+    from backend.app.models.archive import PrintArchive
+
+    result = await db.execute(select(PrintArchive.extra_data).where(PrintArchive.id == archive_id))
+    extra = result.scalar_one_or_none()
+    return bool(isinstance(extra, dict) and extra.get("no_3mf_available"))
+
+
 async def _dispatch_donor_for_completion(db: AsyncSession, subtask_id: str | None, archive_id: int | None):
     """The on-disk source 3MF the farm dispatched for this completing print, or None.
 
@@ -1464,72 +1584,146 @@ async def _dispatch_donor_for_completion(db: AsyncSession, subtask_id: str | Non
     return await farm_correlation.resolve_item_donor(db, item)
 
 
+async def _3mf_by_print_identity(
+    db: AsyncSession,
+    base_dir,
+    *,
+    search_key: str,
+    printer_id: int | None,
+    exclude_archive_id: int | None,
+    context: str,
+):
+    """The on-disk 3MF for a print identified by ``search_key``, or None.
+
+    ONE implementation for the two lanes that ask this — :func:`_resolve_3mf_fallback`
+    (an archive exists but holds no file) and :func:`_find_3mf_by_filename`
+    (auto-archive is off, so there is no archive at all). They are the same question
+    asked from two states, and a second copy would let them disagree about which
+    file a roll is charged from.
+
+    **Identity is adjudicated in PYTHON, on the rows the query returns.** These lanes
+    used to express it as ``ilike(f"%{search_base}.%")``, which is wrong twice over:
+
+    * ``LIKE`` treats ``_`` as a single-character WILDCARD, and this farm's names are
+      mostly underscores — ``print_identity_key`` even folds every space to one — so
+      the "identity" key silently became a fuzzy pattern at the exact point that
+      decides which file's grams a roll is charged. A pattern also inherits whatever
+      an operator typed into a filename, which is not a thing to hand to SQL.
+    * It could not match this corpus anyway. ``print_identity_key`` strips the
+      mid-stem ``.gcode`` token; the STORED name keeps it
+      (``…PCO-M12-2525.gcode_L1-90_spliced.3mf``), so a pattern with the token
+      removed cannot match a path that still has it, wildcards or not. Both lanes
+      missed every spliced file — and this is the lane that rescues a foreign print
+      whose own 3MF is already deleted from the printer, which is exactly the case
+      the print-start plate fix cannot help with.
+
+    So the SQL keeps only predicates that cannot exclude a true match (``.3mf``,
+    not-trashed, a real ``file_path``, the printer, the row itself) and orders
+    newest-first; the name comparison happens on the returned rows, first hit wins.
+    Deliberately NO ``LIMIT``: a limit applied before the comparison makes
+    non-matching rows invisible and can step over the true answer — the query-shape
+    ruling of 2026-08-20, from the shape-32 resurrection, where an eligibility
+    filter ahead of ``LIMIT 1`` silently answered with the newest row that passed.
+    The scan is small and bounded by the estate: production carries 46 library rows
+    and 786 archives.
+
+    Library rows are matched on the ORIGINAL ``filename`` as well as the storage
+    ``file_path``, because a library file may be stored under a generated name that
+    could never equal a print key. Archive rows are matched on ``filename`` alone —
+    the one field the previous SQL consulted — so this stays strictly TIGHTER than
+    what it replaces rather than reaching for new ways to match.
+    """
+    from pathlib import Path
+
+    from backend.app.models.archive import PrintArchive
+    from backend.app.models.library import LibraryFile
+    from backend.app.utils.filename import print_identity_key
+
+    def _identifies(*names: str | None) -> bool:
+        # print_identity_key takes the basename itself, so a full storage path is a
+        # valid argument here. The isinstance check is not decoration: that function
+        # raises TypeError on a non-string by design, and this comparison now runs
+        # per ROW inside the try — so one row carrying a non-string name would abort
+        # the whole lookup and silently degrade to "no file found", which is exactly
+        # the invisible-hole failure this module keeps having to close. A name that
+        # is not a string simply does not identify anything.
+        return any(isinstance(name, str) and name and print_identity_key(name) == search_key for name in names)
+
+    # 1. Library files — a human-added copy of the same print.
+    try:
+        lib_result = await db.execute(
+            LibraryFile.active().where(LibraryFile.file_path.ilike("%.3mf")).order_by(LibraryFile.created_at.desc())
+        )
+        for lib_file in lib_result.scalars().all():
+            if not _identifies(lib_file.filename, lib_file.file_path):
+                continue
+            lib_path = Path(lib_file.file_path)
+            candidate = lib_path if lib_path.is_absolute() else base_dir / lib_file.file_path
+            if candidate.exists() and candidate.suffix == ".3mf":
+                logger.info("[UsageTracker] %s: found library file %s for '%s'", context, candidate, search_key)
+                return candidate
+    except Exception as e:  # noqa: BLE001 — a lookup failure just means "no file this way"
+        logger.debug("[UsageTracker] %s: library lookup failed: %s", context, e)
+
+    # 2. A previous archive of the same print that kept its own copy.
+    try:
+        stmt = (
+            select(PrintArchive)
+            .where(PrintArchive.file_path != "")
+            .where(PrintArchive.file_path.isnot(None))
+            .order_by(PrintArchive.created_at.desc())
+        )
+        if printer_id is not None:
+            stmt = stmt.where(PrintArchive.printer_id == printer_id)
+        if exclude_archive_id is not None:
+            stmt = stmt.where(PrintArchive.id != exclude_archive_id)
+        prev_result = await db.execute(stmt)
+        for prev_archive in prev_result.scalars().all():
+            if not _identifies(prev_archive.filename):
+                continue
+            candidate = base_dir / prev_archive.file_path
+            if candidate.exists() and candidate.suffix == ".3mf":
+                logger.info(
+                    "[UsageTracker] %s: found previous archive %s file for '%s'",
+                    context,
+                    prev_archive.id,
+                    search_key,
+                )
+                return candidate
+    except Exception as e:  # noqa: BLE001 — a lookup failure just means "no file this way"
+        logger.debug("[UsageTracker] %s: previous archive lookup failed: %s", context, e)
+
+    return None
+
+
 async def _resolve_3mf_fallback(archive, db: AsyncSession, base_dir):
     """Try to find a 3MF file from library or a previous archive when the current archive has none.
 
     This handles fallback archives (FTP download failed) where the 3MF may already exist
     locally from a library upload or a previous successful print of the same file.
     """
-    from pathlib import Path
+    # The print's identity through the fork's ONE "is this the same print?" key. The
+    # private replace-chain that stood here was one of three hand-rolled copies of
+    # that normalisation — the others being :func:`_find_3mf_by_filename` and
+    # ``foreign_archive``'s directory search, whose copy normalised its two sides
+    # DIFFERENTLY and so could not match this farm's corpus at all.
+    from backend.app.utils.filename import print_identity_key
 
-    from backend.app.models.archive import PrintArchive
-    from backend.app.models.library import LibraryFile
-
-    # Derive search name from archive filename (e.g. "benchy.3mf" or "benchy.gcode.3mf")
     search_name = archive.filename or archive.print_name
     if not search_name:
         return None
-    # Normalize: strip path parts, get base name
-    search_name = search_name.split("/")[-1]
-    search_base = search_name.replace(".gcode.3mf", "").replace(".gcode", "").replace(".3mf", "")
-    if not search_base:
+    search_key = print_identity_key(search_name)
+    if not search_key:
         return None
 
-    # 1. Try library files matching the name (match base name at file boundary)
-    try:
-        lib_result = await db.execute(
-            LibraryFile.active()
-            .where(LibraryFile.file_path.ilike(f"%/{search_base}.%") | LibraryFile.file_path.ilike(f"{search_base}.%"))
-            .where(LibraryFile.file_path.ilike("%.3mf"))
-            .order_by(LibraryFile.created_at.desc())
-            .limit(3)
-        )
-        for lib_file in lib_result.scalars().all():
-            lib_path = Path(lib_file.file_path)
-            candidate = lib_path if lib_path.is_absolute() else base_dir / lib_file.file_path
-            if candidate.exists() and candidate.suffix == ".3mf":
-                logger.info("[UsageTracker] 3MF fallback: found library file %s for archive %s", candidate, archive.id)
-                return candidate
-    except Exception as e:
-        logger.debug("[UsageTracker] 3MF fallback: library lookup failed: %s", e)
-
-    # 2. Try previous archives with the same filename that have a valid file_path
-    try:
-        prev_result = await db.execute(
-            select(PrintArchive)
-            .where(PrintArchive.id != archive.id)
-            .where(PrintArchive.printer_id == archive.printer_id)
-            .where(PrintArchive.file_path != "")
-            .where(PrintArchive.file_path.isnot(None))
-            .where(
-                PrintArchive.filename.ilike(f"%{search_base}.%") | PrintArchive.filename.ilike(f"{search_base}.%"),
-            )
-            .order_by(PrintArchive.created_at.desc())
-            .limit(3)
-        )
-        for prev_archive in prev_result.scalars().all():
-            candidate = base_dir / prev_archive.file_path
-            if candidate.exists() and candidate.suffix == ".3mf":
-                logger.info(
-                    "[UsageTracker] 3MF fallback: found previous archive %s file for archive %s",
-                    prev_archive.id,
-                    archive.id,
-                )
-                return candidate
-    except Exception as e:
-        logger.debug("[UsageTracker] 3MF fallback: previous archive lookup failed: %s", e)
-
-    return None
+    return await _3mf_by_print_identity(
+        db,
+        base_dir,
+        search_key=search_key,
+        printer_id=archive.printer_id,
+        exclude_archive_id=archive.id,
+        context="3MF fallback",
+    )
 
 
 async def _find_3mf_by_filename(
@@ -1543,60 +1737,23 @@ async def _find_3mf_by_filename(
     Used when auto-archive is disabled and there's no archive_id, but we still
     need the 3MF slicer data for filament usage tracking.
     """
-    from pathlib import Path
+    # Same one normaliser and the same resolver as :func:`_resolve_3mf_fallback` —
+    # this is that lane's auto-archive-off twin and must not key a print's identity
+    # differently from it.
+    from backend.app.utils.filename import print_identity_key
 
-    from backend.app.models.archive import PrintArchive
-    from backend.app.models.library import LibraryFile
-
-    search_name = filename.split("/")[-1] if "/" in filename else filename
-    search_base = search_name.replace(".gcode.3mf", "").replace(".gcode", "").replace(".3mf", "")
-    if not search_base:
+    search_key = print_identity_key(filename)
+    if not search_key:
         return None
 
-    # 1. Try library files matching the name
-    try:
-        lib_result = await db.execute(
-            LibraryFile.active()
-            .where(LibraryFile.file_path.ilike(f"%/{search_base}.%") | LibraryFile.file_path.ilike(f"{search_base}.%"))
-            .where(LibraryFile.file_path.ilike("%.3mf"))
-            .order_by(LibraryFile.created_at.desc())
-            .limit(3)
-        )
-        for lib_file in lib_result.scalars().all():
-            lib_path = Path(lib_file.file_path)
-            candidate = lib_path if lib_path.is_absolute() else base_dir / lib_file.file_path
-            if candidate.exists() and candidate.suffix == ".3mf":
-                logger.info("[UsageTracker] 3MF (no-archive): found library file %s for '%s'", candidate, filename)
-                return candidate
-    except Exception as e:
-        logger.debug("[UsageTracker] 3MF (no-archive): library lookup failed: %s", e)
-
-    # 2. Try previous archives with a valid 3MF file_path
-    try:
-        prev_result = await db.execute(
-            select(PrintArchive)
-            .where(PrintArchive.printer_id == printer_id)
-            .where(PrintArchive.file_path != "")
-            .where(PrintArchive.file_path.isnot(None))
-            .where(
-                PrintArchive.filename.ilike(f"%{search_base}.%") | PrintArchive.filename.ilike(f"{search_base}.%"),
-            )
-            .order_by(PrintArchive.created_at.desc())
-            .limit(3)
-        )
-        for prev_archive in prev_result.scalars().all():
-            candidate = base_dir / prev_archive.file_path
-            if candidate.exists() and candidate.suffix == ".3mf":
-                logger.info(
-                    "[UsageTracker] 3MF (no-archive): found previous archive %s file for '%s'",
-                    prev_archive.id,
-                    filename,
-                )
-                return candidate
-    except Exception as e:
-        logger.debug("[UsageTracker] 3MF (no-archive): previous archive lookup failed: %s", e)
-
-    return None
+    return await _3mf_by_print_identity(
+        db,
+        base_dir,
+        search_key=search_key,
+        printer_id=printer_id,
+        exclude_archive_id=None,
+        context="3MF (no-archive)",
+    )
 
 
 async def _track_from_3mf(
@@ -1657,6 +1814,12 @@ async def _track_from_3mf(
 
     file_path: Path | None = threemf_path
     archive: PrintArchive | None = None
+    # Which of the four sources produced the gram data, logged once below. These
+    # tiers answered SILENTLY until now: a print charged from a previous archive's
+    # same-named copy and one charged from its own 3MF are indistinguishable in the
+    # log, and they are not equally trustworthy — the fallback tier matches on a
+    # NAME, so it can hand back a different slicing of the same project.
+    file_tier = "caller" if file_path is not None else "none"
 
     if file_path is None and archive_id:
         result = await db.execute(select(PrintArchive).where(PrintArchive.id == archive_id))
@@ -1670,10 +1833,13 @@ async def _track_from_3mf(
             candidate = app_settings.base_dir / archive.file_path
             if candidate.exists():
                 file_path = candidate
+                file_tier = "archive_file"
 
         # Fallback: find 3MF from library or a previous archive with the same filename
         if file_path is None:
             file_path = await _resolve_3mf_fallback(archive, db, app_settings.base_dir)
+            if file_path is not None:
+                file_tier = "name_fallback"
 
     # Last resort: the DISPATCH DONOR — the file the farm itself uploaded for this
     # unit. The print-start capture (``farm_correlation.resolve_dispatch_donor`` →
@@ -1690,6 +1856,7 @@ async def _track_from_3mf(
         donor = await _dispatch_donor_for_completion(db, subtask_id, archive_id)
         if donor is not None:
             file_path = donor.local_path
+            file_tier = "dispatch_donor"
             if plate_id is None:
                 plate_id = donor.plate_id
             logger.info(
@@ -1704,6 +1871,15 @@ async def _track_from_3mf(
     if file_path is None:
         logger.info("[UsageTracker] 3MF: no file available for archive %s, skipping", archive_id)
         return []
+
+    logger.info(
+        "[UsageTracker] 3MF: printer %s archive %s charging from %s (tier=%s), plate %s",
+        printer_id,
+        archive_id,
+        file_path,
+        file_tier,
+        plate_id if plate_id is not None else "UNKNOWN",
+    )
 
     # Unknown printed plate on a multi-plate 3MF: with no plate_id the extractor
     # sums EVERY plate, charging the whole file to this one run. Skip 3MF tracking
@@ -1720,6 +1896,41 @@ async def _track_from_3mf(
                 file_path,
                 plate_count,
                 printer_id,
+            )
+            return []
+
+    # VALIDITY, not trust: the plate must be one this FILE declares.
+    #
+    # The archive tier of ``_resolve_run_context`` reads a plate parsed from the
+    # printer's ``gcode_file`` echo, and that echo has a known degenerate shape — a
+    # manual screen RESTART echoes ``subtask_name="project_file"`` with only
+    # ``/data/Metadata/plate_N.gcode`` — so it can name a plate belonging to some
+    # other print. The file tiers above are name-matched too, so any of them can
+    # hand back a slicing that never held this plate. Checking containment costs
+    # nothing: B1's index set is already how the print-start capture validates the
+    # same file, and the answer is read off the same ``slice_info`` block.
+    #
+    # A miss REFUSES rather than falling back to a plate-less charge. That is the
+    # behaviour this already had — ``extract_filament_usage_from_3mf`` returns []
+    # for a plate the file does not declare — made explicit and diagnosable;
+    # downgrading to None instead would let a single-plate file be charged as if it
+    # were the plate that is missing, which is a wrong number where there is
+    # currently an honest zero. An EMPTY set is "unreadable", never "absent", and
+    # proceeds untouched.
+    if plate_id is not None:
+        from backend.app.services.archive import plate_indices_in_3mf
+
+        declared_plates = plate_indices_in_3mf(file_path)
+        if declared_plates and plate_id not in declared_plates:
+            logger.warning(
+                "[UsageTracker] 3MF: printer %s archive %s resolved plate %s but %s declares plates %s "
+                "(tier=%s) — refusing to charge from a file that never held this plate",
+                printer_id,
+                archive_id,
+                plate_id,
+                file_path,
+                sorted(declared_plates),
+                file_tier,
             )
             return []
 

@@ -15,7 +15,13 @@ class SpoolUsageHistory(Base):
     spool_id: Mapped[int] = mapped_column(ForeignKey("spool.id", ondelete="CASCADE"))
     printer_id: Mapped[int | None] = mapped_column(ForeignKey("printers.id", ondelete="SET NULL"))
     print_name: Mapped[str | None] = mapped_column(String(500))
-    archive_id: Mapped[int | None] = mapped_column(ForeignKey("print_archives.id"), nullable=True)
+    # SET NULL, not the default NO ACTION: the gram ledger is the AUTHORITATIVE
+    # record of what a spool actually consumed and must outlive the archive the
+    # figure was derived from. Left as NO ACTION, deleting an archive raises
+    # IntegrityError on Postgres and silently dangles on SQLite (which enforces no
+    # FK at all) — so ``services.user_deletion`` performs the SET NULL explicitly
+    # and this declaration says what that statement is carrying out.
+    archive_id: Mapped[int | None] = mapped_column(ForeignKey("print_archives.id", ondelete="SET NULL"), nullable=True)
     weight_used: Mapped[float] = mapped_column(Float, default=0)
     percent_used: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="completed")  # completed/failed/aborted

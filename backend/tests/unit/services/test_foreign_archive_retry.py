@@ -535,8 +535,19 @@ def _mismatch_lane(cached: Path, available: dict[str, bytes]):
 
 
 def _library_donor(tmp_path: Path) -> tuple[Path, bytes]:
-    """A multi-plate library file the cache serves for a print running plate 3."""
-    payload = _three_mf_bytes(tmp_path, plates=(1, 3))
+    """A borrowed library file the cache serves for a print running plate 3 — and
+    which genuinely does NOT hold that plate.
+
+    ``plates=(1,)``, a single-plate Studio upload, is #1204's real shape: a stale
+    ``subtask_name`` names the PREVIOUS plate's separate upload, so the fetched file
+    contains plate 1 and nothing else. It was ``(1, 3)`` until 2026-08-23, which
+    made these two tests assert the defect rather than the guard — a file declaring
+    plate 1 FIRST but containing plate 3 is the correct file for a printer running
+    plate 3, and ``plate_indices_in_3mf`` now accepts it. What these two pin is
+    unchanged and unrelated to which file is right: whichever branch the correction
+    takes, the BORROWED file must survive it.
+    """
+    payload = _three_mf_bytes(tmp_path, plates=(1,))
     library_file = tmp_path / "library_files" / "abcd.3mf"
     library_file.parent.mkdir(parents=True, exist_ok=True)
     library_file.write_bytes(payload)

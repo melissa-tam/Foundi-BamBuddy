@@ -45,6 +45,21 @@ class PrintArchive(Base):
     # Printer model this file was sliced for (extracted from 3MF metadata)
     sliced_for_model: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
+    # Which plate of the source 3MF this print ran, 1-indexed, or NULL when the
+    # print start could not tell. Stamped once by ``main.on_print_start`` from the
+    # dispatch donor's plate, else from the ``plate_N.gcode`` the printer echoes.
+    #
+    # "Which plate did this print run" is an attribute of the PRINT, and until this
+    # column it was stored nowhere: usage finalization re-derived it from the live
+    # session or the queue item, and a print the farm did not dispatch has neither.
+    # A completing foreign print therefore resolved plate=None on a multi-plate 3MF,
+    # where summing every plate would over-charge the run, so the charge was skipped
+    # entirely — 24 such skips in the 30 days to 2026-08-23, each one a real print
+    # charging zero grams. It is also why the losses before this column cannot be
+    # repaired: the archives that know their plate hold no 3MF, and the ones holding
+    # a 3MF never recorded a plate.
+    plate_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # Print result
     status: Mapped[str] = mapped_column(String(20), default="completed")
     started_at: Mapped[datetime | None] = mapped_column(DateTime)

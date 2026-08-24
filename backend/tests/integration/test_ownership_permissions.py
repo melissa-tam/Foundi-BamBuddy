@@ -6,6 +6,8 @@ Tests the ownership permission model where users can have:
 - Ownerless items (created_by_id = null) require *_all permission
 """
 
+from datetime import datetime, timezone
+
 import pytest
 from httpx import AsyncClient
 
@@ -917,31 +919,97 @@ class TestAuthDisabledPermissions:
 
 
 class TestUserItemsCountAndDeletion(TestOwnershipPermissionsSetup):
-    """Tests for user items count endpoint and deletion with items."""
+    """Tests for the user delete-impact endpoint and deletion with items."""
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_get_user_items_count(
+    async def test_get_user_delete_impact(
         self, async_client: AsyncClient, auth_setup, archive_factory, printer_factory, db_session
     ):
-        """Verify items count endpoint returns correct counts."""
+        """The pre-flight reports every count the delete would act on.
+
+        Replaces ``items-count``, which is gone: it answered three of these six
+        and under-reported one of them (it hid soft-deleted library files, which
+        the delete destroys along with everything else). Counted against a direct
+        SELECT rather than a literal, so the endpoint and the database cannot
+        agree only by coincidence.
+        """
+        from sqlalchemy import func, select
+
+        from backend.app.models.archive import PrintArchive
+        from backend.app.models.library import LibraryFile
+        from backend.app.models.sku import Sku, SkuFile
+
         printer = await printer_factory()
         user_id = auth_setup["operator_user"]["id"]
 
-        # Create some items for the operator
         await archive_factory(printer.id, created_by_id=user_id)
         await archive_factory(printer.id, created_by_id=user_id)
 
+        # One live upload and one already in the trash. The trashed row is the
+        # specific thing the old endpoint's ``deleted_at IS NULL`` filter hid.
+        live = LibraryFile(
+            filename="live.gcode.3mf",
+            file_path="library/live.3mf",
+            file_type="gcode.3mf",
+            file_size=1,
+            created_by_id=user_id,
+        )
+        trashed = LibraryFile(
+            filename="trashed.gcode.3mf",
+            file_path="library/trashed.3mf",
+            file_type="gcode.3mf",
+            file_size=1,
+            created_by_id=user_id,
+            deleted_at=datetime.now(timezone.utc),
+        )
+        sku = Sku(code="SKU900.01", name="impact thing")
+        db_session.add_all([live, trashed, sku])
+        await db_session.commit()
+        db_session.add(SkuFile(sku_id=sku.id, library_file_id=live.id, plate_index=1))
+        await db_session.commit()
+
+        response = await async_client.get(
+            f"/api/v1/users/{user_id}/delete-impact",
+            headers={"Authorization": f"Bearer {auth_setup['admin_token']}"},
+        )
+        assert response.status_code == 200, response.text
+        impact = response.json()
+
+        expected_archives = (
+            await db_session.execute(
+                select(func.count()).select_from(PrintArchive).where(PrintArchive.created_by_id == user_id)
+            )
+        ).scalar_one()
+        expected_files = (
+            await db_session.execute(
+                select(func.count()).select_from(LibraryFile).where(LibraryFile.created_by_id == user_id)
+            )
+        ).scalar_one()
+
+        assert impact["archives"] == expected_archives >= 2
+        assert impact["library_files"] == expected_files == 2
+        assert impact["dependent_skus"] == 1
+        assert impact["currently_printing"] == 0
+        assert set(impact) == {
+            "archives",
+            "library_files",
+            "queue_items",
+            "production_runs",
+            "dependent_skus",
+            "currently_printing",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_items_count_endpoint_is_gone(self, async_client: AsyncClient, auth_setup):
+        """Delete, don't deprecate — the endpoint that under-reported has no successor URL."""
+        user_id = auth_setup["operator_user"]["id"]
         response = await async_client.get(
             f"/api/v1/users/{user_id}/items-count",
             headers={"Authorization": f"Bearer {auth_setup['admin_token']}"},
         )
-
-        assert response.status_code == 200
-        counts = response.json()
-        assert counts["archives"] >= 2
-        assert "queue_items" in counts
-        assert "library_files" in counts
+        assert response.status_code == 404
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1068,6 +1136,89 @@ class TestUserItemsCountAndDeletion(TestOwnershipPermissionsSetup):
         assert survivor.status == "printing"
         assert (await async_client.get(f"/api/v1/archives/{archive_id}", headers=headers)).status_code == 200
         assert (await async_client.get(f"/api/v1/users/{user_id}", headers=headers)).status_code == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_delete_user_refused_by_another_operators_print_on_this_users_files(
+        self, async_client: AsyncClient, auth_setup, archive_factory, printer_factory, db_session
+    ):
+        """The cross-user severance: the blocker is not the deleted user's own row.
+
+        The guard the route used to carry asked "is any queue item THIS USER
+        created printing?" while its DELETEs asked "does any queue item reference
+        THIS USER's rows?". Those are different sets and routinely so — ``SkuFile``
+        has no owner, ``create_production_run`` takes ``created_by_id`` from
+        whoever STARTED the run, and the queue route explicitly permits cross-user
+        queueing under ``LIBRARY_READ_ALL``. So operator B's live print habitually
+        runs off user A's library file, and deleting A severed it with the guard
+        reporting nothing at all.
+
+        Everything survives: A's archive and library file, B's printing unit, and
+        both users.
+        """
+        from sqlalchemy import select
+
+        from backend.app.models.library import LibraryFile
+        from backend.app.models.print_queue import PrintQueueItem
+
+        headers = {"Authorization": f"Bearer {auth_setup['admin_token']}"}
+        printer = await printer_factory(name="009-H2S", model="H2S")
+
+        owner = await async_client.post(
+            "/api/v1/users/", headers=headers, json={"username": "fileowner", "password": "Password123!"}
+        )
+        assert owner.status_code in (200, 201), owner.text
+        owner_id = owner.json()["id"]
+        printer_operator_id = auth_setup["operator_user"]["id"]
+
+        # A owns the artefacts...
+        archive = await archive_factory(printer.id, created_by_id=owner_id)
+        library_file = LibraryFile(
+            filename="shared.gcode.3mf",
+            file_path="library/shared.3mf",
+            file_type="gcode.3mf",
+            file_size=1,
+            created_by_id=owner_id,
+        )
+        db_session.add(library_file)
+        await db_session.commit()
+        await db_session.refresh(library_file)
+
+        # ...and B is the one printing off them.
+        item = PrintQueueItem(
+            printer_id=printer.id,
+            library_file_id=library_file.id,
+            created_by_id=printer_operator_id,
+            status="printing",
+            position=1,
+        )
+        db_session.add(item)
+        await db_session.commit()
+        await db_session.refresh(item)
+        item_id, archive_id, library_file_id = item.id, archive.id, library_file.id
+
+        # The forecast agrees with the guard BEFORE the request is made.
+        impact = await async_client.get(f"/api/v1/users/{owner_id}/delete-impact", headers=headers)
+        assert impact.status_code == 200, impact.text
+        assert impact.json()["currently_printing"] == 1
+
+        response = await async_client.delete(f"/api/v1/users/{owner_id}?delete_items=true", headers=headers)
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        assert detail["code"] == "user_has_printing_units"
+        assert detail["printers"] == ["009-H2S"]
+        assert "009-H2S" in detail["message"]
+
+        db_session.expire_all()
+        survivor = (
+            await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))
+        ).scalar_one_or_none()
+        assert survivor is not None and survivor.status == "printing"
+        assert (
+            await db_session.execute(select(LibraryFile).where(LibraryFile.id == library_file_id))
+        ).scalar_one_or_none() is not None
+        assert (await async_client.get(f"/api/v1/archives/{archive_id}", headers=headers)).status_code == 200
+        assert (await async_client.get(f"/api/v1/users/{owner_id}", headers=headers)).status_code == 200
 
     @pytest.mark.asyncio
     @pytest.mark.integration

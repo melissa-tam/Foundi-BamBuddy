@@ -29,7 +29,7 @@ import {
   X,
   Zap,
 } from 'lucide-react';
-import { api, ApiError } from '../api/client';
+import { api } from '../api/client';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
@@ -45,6 +45,7 @@ import {
   ScheduledChip,
 } from '../components/RunBadges';
 import { isScheduled } from '../utils/productionRuns';
+import { printingUnitPrinters } from '../utils/printingUnitsRefusal';
 import { RunRescheduleDialog } from '../components/RunRescheduleDialog';
 import { ScheduledStartField } from '../components/ScheduledStartField';
 import { useAuth } from '../contexts/AuthContext';
@@ -61,25 +62,6 @@ const ESCALATE_MAX = 10;
  *  user without settings:read — the policy still starts at sane defaults). */
 const RETRY_FALLBACK = 1;
 const ESCALATE_FALLBACK = 2; // must match backend farm_escalate_consecutive_failures default
-
-/**
- * Printer names carried by the `run_has_printing_units` 409, or null for any
- * other failure.
- *
- * Keyed off the stable `code`, never off the message: the backend's sentence is
- * only an English fallback for non-UI clients, so matching on it would break the
- * moment anyone rewords it and would silently show English in every other
- * locale. The names are what the operator can act on — an item id names nothing
- * they can walk up to.
- */
-function printingUnitPrinters(error: Error): string[] | null {
-  if (!(error instanceof ApiError) || error.code !== 'run_has_printing_units') return null;
-  const raw: unknown = error.detail?.printers;
-  if (!Array.isArray(raw)) return null;
-  const entries: unknown[] = raw;
-  const names = entries.filter((entry): entry is string => typeof entry === 'string');
-  return names.length > 0 ? names : null;
-}
 
 /** Clamp a numeric string to [min, max], returning `fallback` when unparseable. */
 function clampInt(raw: string, min: number, max: number, fallback: number): number {
@@ -1304,7 +1286,7 @@ export function ProductionRunsPage() {
           {deleteMutation.error && (
             <InlineAlert severity="error">
               {(() => {
-                const printers = printingUnitPrinters(deleteMutation.error);
+                const printers = printingUnitPrinters(deleteMutation.error, 'run_has_printing_units');
                 return printers
                   ? t('productionRuns.deleteHasPrintingUnits', { printers: printers.join(', ') })
                   : deleteMutation.error.message || t('productionRuns.deleteFailed');

@@ -6,13 +6,14 @@ import os
 import re
 import shutil
 import zipfile
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
 from defusedxml import ElementTree as ET
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import ColumnElement, and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import settings
@@ -25,7 +26,7 @@ from backend.app.utils.threemf_tools import extract_nozzle_mapping_from_3mf
 
 logger = logging.getLogger(__name__)
 
-# Deletion guard for the archive estate — see _resolve_archive_dir_for_delete.
+# Deletion guard for the archive estate — see resolve_archive_dir_for_delete.
 # A per-print archive directory is exactly ``<printer_id|"unassigned">/<archive>``
 # under ``settings.archive_dir``; these first-level names belong to other estates
 # that share the same root and are never an archive's own directory.
@@ -79,34 +80,63 @@ def resolve_display_stem(filename: str) -> str:
     return Path(name).stem
 
 
-def peek_plate_index_in_3mf(file_path: Path) -> int | None:
-    """Return the plate index recorded inside a Bambu 3MF, or None.
+def plate_indices_in_3mf(file_path: Path) -> set[int]:
+    """Every plate index a Bambu 3MF declares; an EMPTY set when it declares none.
 
-    Reads only ``Metadata/slice_info.config`` to keep this cheap — used by
-    the print-start callback to verify that the 3MF we just downloaded over
-    FTP actually matches the plate the printer is running (#1204). The full
+    Reads only ``Metadata/slice_info.config`` to keep this cheap — the full
     ThreeMFParser does much more work and runs later inside ArchiveService.
+
+    **Why a set and not the first index.** This answers the question the
+    print-start callback actually asks: *does the file I just fetched contain the
+    plate this printer is running?* (#1204). Its predecessor
+    ``peek_plate_index_in_3mf`` answered a narrower one — ``root.find(".//plate")``,
+    the FIRST ``<plate>`` block — which is a valid proxy for containment only when
+    the upload holds exactly one plate. Bambu Studio's per-plate "Send to printer"
+    produces exactly those, which is why the proxy survived; this farm's spliced
+    ladder files do not. A multi-plate 3MF declaring plate 1 first answers ``1``
+    for every plate it holds, so ``foreign_archive`` compared 1 against the
+    ``plate_3.gcode`` the printer echoed, concluded the NAME was stale and threw
+    the correct file away. Production ``desktop-g6cgc9k``, the 30 days to
+    2026-08-23: 68 fallback archives with no 3MF at all, 57 of them (84 %) logged
+    as this "reports plate 1 but printer is running plate 3" mismatch. On a tagless
+    tray the slicer 3MF is the ONLY gram source — the AMS answers ``remain: -1``
+    always — so each of those is a print charged zero grams against a roll that
+    really turned, and an under-charged roll reads FULLER than it is, clears the
+    150 g start floor and starts a print it cannot finish.
+
+    Containment keeps #1204's own scenario intact: a genuinely stale
+    ``subtask_name`` fetches a DIFFERENT, single-plate upload, whose index set
+    simply does not contain the running plate, and it is refused exactly as before.
+    A file that does contain the plate is now accepted and priced AT that plate,
+    which is what it always should have been.
+
+    An empty set means "this file declares no readable plate index" — a missing or
+    malformed ``slice_info.config``, an unreadable ZIP, a plate block with no
+    ``index`` metadata. Callers must read that as UNKNOWN and accept the file, never
+    as "does not contain the plate": refusing on an unreadable answer is how the
+    only gram source gets discarded, which is the bleed above.
     """
+    indices: set[int] = set()
     try:
         with zipfile.ZipFile(file_path, "r") as zf:
             if "Metadata/slice_info.config" not in zf.namelist():
-                return None
+                return indices
             content = zf.read("Metadata/slice_info.config").decode()
             root = ET.fromstring(content)
-            plate = root.find(".//plate")
-            if plate is None:
-                return None
-            for meta in plate.findall("metadata"):
-                if meta.get("key") == "index":
+            for plate in root.findall(".//plate"):
+                for meta in plate.findall("metadata"):
+                    if meta.get("key") != "index":
+                        continue
                     value = meta.get("value")
                     if value:
                         try:
-                            return int(value)
+                            indices.add(int(value))
                         except ValueError:
-                            return None
+                            pass
+                    break
     except Exception:
-        return None
-    return None
+        return set()
+    return indices
 
 
 _PLATE_SUFFIX_RE = re.compile(r"^(.*?)(\s*-\s*Plate\s+|_plate_)(\d+)$", re.IGNORECASE)
@@ -1117,10 +1147,11 @@ class ProjectPageParser:
             return False
 
 
-async def _null_print_log_thumbnail_paths(db: AsyncSession, archive_id: int) -> None:
-    """NULL thumbnail_path on PrintLogEntry rows linked to *archive_id*.
+async def null_print_log_thumbnail_paths(db: AsyncSession, archive_ids: Sequence[int]) -> None:
+    """NULL thumbnail_path on PrintLogEntry rows linked to any of *archive_ids*.
 
-    Called from both soft- and hard-delete paths before the archive's files
+    Called from both soft- and hard-delete paths (one id) and from the user
+    delete (every archive the departing user owns) before those archives' files
     leave disk. The FK on PrintLogEntry.archive_id is ON DELETE SET NULL so
     log rows survive the archive — without this clear, their cached
     thumbnail_path would still point at a deleted file and the print-log
@@ -1132,29 +1163,42 @@ async def _null_print_log_thumbnail_paths(db: AsyncSession, archive_id: int) -> 
 
     from backend.app.models.print_log import PrintLogEntry
 
-    await db.execute(sa_update(PrintLogEntry).where(PrintLogEntry.archive_id == archive_id).values(thumbnail_path=None))
+    ids = list(archive_ids)
+    if not ids:
+        return
+    await db.execute(sa_update(PrintLogEntry).where(PrintLogEntry.archive_id.in_(ids)).values(thumbnail_path=None))
 
 
-async def _delete_related_queue_items(db: AsyncSession, archive_id: int) -> int:
-    """Delete every queue item pointing at *archive_id* (#1734).
+async def delete_related_queue_items(db: AsyncSession, scope: ColumnElement[bool]) -> int:
+    """Delete every queue item *scope* selects (#1734).
 
-    Called from ``soft_delete_archive``. Hard-delete is covered by the
-    ``ON DELETE CASCADE`` on ``print_queue.archive_id`` — same end state
-    via the FK. Pre-#1734 this helper merely flipped pending rows to
-    ``status='cancelled'`` while leaving every other status alone and
-    leaving the rows in the DB, which surprised users who expected the
-    queue lines to disappear when their backing archive went away. Worse,
-    a Send-All archive backed N queue items (one per plate, #1733) — soft-
-    deleting that archive left N "cancelled" rows behind, none of which
-    could ever dispatch.
+    Called from ``soft_delete_archive`` with ``archive_id == <one archive>``, and
+    from ``user_deletion`` with an ``IN`` over every archive / library file the
+    departing user owns. Hard-delete of a single archive is covered by the
+    ``ON DELETE CASCADE`` on ``print_queue.archive_id`` — same end state via the
+    FK, on Postgres; SQLite enforces no FK at all (``core.database`` sets only
+    WAL / busy_timeout / synchronous), which is why the user delete performs the
+    cascade by hand rather than trusting the declaration.
 
-    Now we delete unconditionally regardless of status. ``printing`` rows
-    are blocked one layer up at the route (``delete_archive`` returns 409
-    when a related row is mid-print) so we never delete an actively-
-    running queue row out from under the dispatcher. Completed / failed
-    / cancelled rows go too — they're queue history, not print history.
-    PrintLogEntry rows are the authoritative print history and are
+    Pre-#1734 this helper merely flipped pending rows to ``status='cancelled'``
+    while leaving every other status alone and leaving the rows in the DB, which
+    surprised users who expected the queue lines to disappear when their backing
+    archive went away. Worse, a Send-All archive backed N queue items (one per
+    plate, #1733) — soft-deleting that archive left N "cancelled" rows behind,
+    none of which could ever dispatch.
+
+    Now we delete unconditionally regardless of status. ``printing`` rows are
+    blocked one layer up — the archive route 409s when a related row is
+    mid-print, and ``user_deletion`` refuses the whole request — so we never
+    delete an actively-running queue row out from under the dispatcher.
+    Completed / failed / cancelled rows go too — they're queue history, not
+    print history. PrintLogEntry rows are the authoritative print history and are
     untouched (FK ``ON DELETE SET NULL``).
+
+    *scope* is a raw SQL predicate rather than an id because the two callers
+    delete by two different columns; it must never be widened into "which queue
+    items may go" — that question belongs to ``queue_transitions``, and this
+    helper is only the FK cascade the engine did not run.
 
     Returns the number of rows removed so the caller can report it.
     """
@@ -1162,37 +1206,36 @@ async def _delete_related_queue_items(db: AsyncSession, archive_id: int) -> int:
 
     from backend.app.models.print_queue import PrintQueueItem
 
-    result = await db.execute(sa_delete(PrintQueueItem).where(PrintQueueItem.archive_id == archive_id))
+    result = await db.execute(sa_delete(PrintQueueItem).where(scope))
     return result.rowcount or 0
 
 
-async def _count_related_queue_items(db: AsyncSession, archive_id: int) -> tuple[int, int]:
+async def count_related_queue_items(db: AsyncSession, archive_id: int) -> tuple[int, int]:
     """Return ``(total, printing)`` queue items linked to *archive_id*.
 
     Used by the archive GET response so the frontend delete-confirm modal
     can surface how much the deletion will wipe out, and by the delete
     route so it can 409 when a related row is currently printing (#1734).
+
+    The ``printing`` half is NOT a second count query: it is the length of
+    ``queue_transitions.live_prints_blocking``, the one origin for "which live
+    prints stand in the way of this delete?". The archive route's 409 and the
+    user delete's wholesale refusal must be answering the same question — a
+    private COUNT here is how the two would quietly come to disagree about what
+    ``printing`` means.
     """
     from sqlalchemy import func as sa_func, select as sa_select
 
     from backend.app.models.print_queue import PrintQueueItem
+    from backend.app.services.queue_transitions import live_prints_blocking
 
     total = (
         await db.execute(
             sa_select(sa_func.count()).select_from(PrintQueueItem).where(PrintQueueItem.archive_id == archive_id)
         )
     ).scalar_one()
-    printing = (
-        await db.execute(
-            sa_select(sa_func.count())
-            .select_from(PrintQueueItem)
-            .where(
-                PrintQueueItem.archive_id == archive_id,
-                PrintQueueItem.status == "printing",
-            )
-        )
-    ).scalar_one()
-    return int(total or 0), int(printing or 0)
+    printing = await live_prints_blocking(db, scope=PrintQueueItem.archive_id == archive_id)
+    return int(total or 0), len(printing)
 
 
 @dataclass(frozen=True)
@@ -1210,6 +1253,90 @@ class IngestedThreeMF:
     display_stem: str
     metadata: dict
     columns: dict[str, Any]
+
+
+def resolve_archive_dir_for_delete(archive: PrintArchive) -> Path | None:
+    """Return the on-disk directory that backs *archive*, or ``None`` when
+    nothing may be removed from disk.
+
+    The ONE path-resolution rule for every archive deletion lane (soft
+    delete, hard delete, and the unattended purge sweeper behind them).
+    The directory it returns is handed straight to ``shutil.rmtree``, so
+    it must be a per-print archive directory and nothing else:
+    :meth:`_ingest_3mf` is the only writer of ``PrintArchive.file_path``
+    and always lands the file at
+    ``archive_dir/<printer_id|"unassigned">/<timestamp_stem>/<file>``,
+    i.e. the parent is EXACTLY two parts under ``archive_dir``. A mere
+    "deep enough" test is not sufficient because other estates live inside
+    ``archive_dir`` at that same depth — the managed library
+    (``archive/library/files``) holds user uploads that no archive lane may
+    ever delete, and ``archive/temp`` is shared 3MF scratch space.
+    """
+    if not archive.file_path or not archive.file_path.strip():
+        logger.error(
+            f"SECURITY: Refusing to delete files for archive {archive.id} - "
+            f"file_path is empty or invalid: '{archive.file_path}'"
+        )
+        return None
+
+    file_path = settings.base_dir / archive.file_path
+    if not file_path.exists():
+        return None
+
+    archive_dir = file_path.parent
+    try:
+        relative_path = archive_dir.resolve().relative_to(settings.archive_dir.resolve())
+    except ValueError:
+        logger.error(
+            f"SECURITY: Refusing to delete archive {archive.id} - "
+            f"path {archive_dir} is outside archive directory {settings.archive_dir}"
+        )
+        return None
+
+    parts = relative_path.parts
+    if len(parts) != _ARCHIVE_DIR_DEPTH or parts[0].lower() in _RESERVED_ARCHIVE_SUBDIRS:
+        logger.warning(
+            "SECURITY: Refusing to delete files for archive %s - path %s is not a "
+            "per-print archive directory (expected <printer>/<archive> directly under %s)",
+            archive.id,
+            archive_dir,
+            settings.archive_dir,
+        )
+        return None
+    return archive_dir
+
+
+def purge_paths(paths: Iterable[Path]) -> None:
+    """Remove *paths* from disk — directories recursively, files individually.
+
+    The bytes half of every archive/library deletion lane, and it runs AFTER the
+    caller has committed, never before. The ordering is the whole point: a DB
+    commit that fails (SQLite has ONE writer and the MQTT callback lane writes
+    continuously, so ``busy_timeout`` expiry is a normal outcome here) must leave
+    the files where they are, because a row without its bytes is a 404 the user
+    can see and re-derive from, while bytes without a row are invisible to every
+    sweeper the fork has — the library trash sweeper walks ROWS, so orphaned
+    bytes are never collected by anything, ever. That is the leak
+    ``DELETE /users/{id}?delete_items=true`` shipped: raw multi-table DELETEs
+    that bypassed both file-removing services entirely.
+
+    Callers must therefore resolve what they intend to remove BEFORE the DB
+    statements run (the row carries the path) and call this once afterwards.
+    ``delete_archive`` / ``soft_delete_archive`` below are the pattern.
+
+    Best-effort by construction: a path that has already gone, or that the OS
+    refuses (a Windows file handle still open on a thumbnail), is logged and
+    skipped rather than raising back into a caller whose transaction is already
+    committed and cannot be undone.
+    """
+    for path in paths:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.exists():
+                path.unlink()
+        except OSError as e:
+            logger.warning("purge_paths: failed to remove %s: %s", path, e)
 
 
 class ArchiveService:
@@ -1723,6 +1850,8 @@ class ArchiveService:
         checkbox in the delete dialog — that path calls ``delete_archive``
         instead and removes the row entirely.
         """
+        from backend.app.models.print_queue import PrintQueueItem
+
         archive = await self.get_archive(archive_id)
         if not archive:
             return False
@@ -1731,66 +1860,15 @@ class ArchiveService:
             # the first soft-delete pass so there is nothing left on disk.
             return True
 
-        dir_to_delete = self._resolve_archive_dir_for_delete(archive)
+        dir_to_delete = resolve_archive_dir_for_delete(archive)
 
-        await _null_print_log_thumbnail_paths(self.db, archive_id)
-        await _delete_related_queue_items(self.db, archive_id)
+        await null_print_log_thumbnail_paths(self.db, [archive_id])
+        await delete_related_queue_items(self.db, PrintQueueItem.archive_id == archive_id)
         archive.deleted_at = datetime.now(timezone.utc)
         await self.db.commit()
 
-        if dir_to_delete:
-            shutil.rmtree(dir_to_delete, ignore_errors=True)
+        purge_paths([dir_to_delete] if dir_to_delete else [])
         return True
-
-    def _resolve_archive_dir_for_delete(self, archive: PrintArchive) -> Path | None:
-        """Return the on-disk directory that backs *archive*, or ``None`` when
-        nothing may be removed from disk.
-
-        The ONE path-resolution rule for every archive deletion lane (soft
-        delete, hard delete, and the unattended purge sweeper behind them).
-        The directory it returns is handed straight to ``shutil.rmtree``, so
-        it must be a per-print archive directory and nothing else:
-        :meth:`_ingest_3mf` is the only writer of ``PrintArchive.file_path``
-        and always lands the file at
-        ``archive_dir/<printer_id|"unassigned">/<timestamp_stem>/<file>``,
-        i.e. the parent is EXACTLY two parts under ``archive_dir``. A mere
-        "deep enough" test is not sufficient because other estates live inside
-        ``archive_dir`` at that same depth — the managed library
-        (``archive/library/files``) holds user uploads that no archive lane may
-        ever delete, and ``archive/temp`` is shared 3MF scratch space.
-        """
-        if not archive.file_path or not archive.file_path.strip():
-            logger.error(
-                f"SECURITY: Refusing to delete files for archive {archive.id} - "
-                f"file_path is empty or invalid: '{archive.file_path}'"
-            )
-            return None
-
-        file_path = settings.base_dir / archive.file_path
-        if not file_path.exists():
-            return None
-
-        archive_dir = file_path.parent
-        try:
-            relative_path = archive_dir.resolve().relative_to(settings.archive_dir.resolve())
-        except ValueError:
-            logger.error(
-                f"SECURITY: Refusing to delete archive {archive.id} - "
-                f"path {archive_dir} is outside archive directory {settings.archive_dir}"
-            )
-            return None
-
-        parts = relative_path.parts
-        if len(parts) != _ARCHIVE_DIR_DEPTH or parts[0].lower() in _RESERVED_ARCHIVE_SUBDIRS:
-            logger.warning(
-                "SECURITY: Refusing to delete files for archive %s - path %s is not a "
-                "per-print archive directory (expected <printer>/<archive> directly under %s)",
-                archive.id,
-                archive_dir,
-                settings.archive_dir,
-            )
-            return None
-        return archive_dir
 
     async def delete_archive(self, archive_id: int) -> bool:
         """Delete an archive and its files."""
@@ -1800,14 +1878,14 @@ class ArchiveService:
 
         # Resolve the directory to delete BEFORE committing the DB change. A
         # refused resolution vetoes the rmtree only — the row still goes.
-        dir_to_delete = self._resolve_archive_dir_for_delete(archive)
+        dir_to_delete = resolve_archive_dir_for_delete(archive)
 
         # NULL stale thumbnail_path on linked PrintLogEntries before the FK
         # SET-NULL cascade fires. The on-disk file is about to be removed by
         # the rmtree below, so the path on any surviving log entry (archive_id
         # gets SET NULL by the FK) would otherwise point at a missing file
         # and produce 404 storms in the print-log view (#1348-followup).
-        await _null_print_log_thumbnail_paths(self.db, archive_id)
+        await null_print_log_thumbnail_paths(self.db, [archive_id])
 
         # Delete database record FIRST — if the commit fails (e.g. database locked
         # during concurrent bulk deletes), the files stay on disk and nothing is lost.
@@ -1815,8 +1893,7 @@ class ArchiveService:
         await self.db.commit()
 
         # Only delete files AFTER the DB commit succeeds to avoid orphaned records
-        if dir_to_delete:
-            shutil.rmtree(dir_to_delete, ignore_errors=True)
+        purge_paths([dir_to_delete] if dir_to_delete else [])
 
         return True
 

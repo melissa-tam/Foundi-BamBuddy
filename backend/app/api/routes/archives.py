@@ -1502,9 +1502,9 @@ async def get_archive_delete_impact(
     user, can_read_all = auth_result
     service = ArchiveService(db)
     archive = _ensure_archive_visible(await service.get_archive(archive_id), user, can_read_all)
-    from backend.app.services.archive import _count_related_queue_items
+    from backend.app.services.archive import count_related_queue_items
 
-    total, printing = await _count_related_queue_items(db, archive.id)
+    total, printing = await count_related_queue_items(db, archive.id)
     return {"related_queue_items": total, "currently_printing": printing}
 
 
@@ -1959,7 +1959,7 @@ async def delete_archive(
 
     Both delete paths now cascade to related ``print_queue`` rows (#1734) —
     hard delete via the ``ON DELETE CASCADE`` FK, soft delete via the
-    ``_delete_related_queue_items`` helper. A 409 guard blocks the delete
+    ``delete_related_queue_items`` helper. A 409 guard blocks the delete
     when any related queue item is currently mid-print so the dispatcher
     doesn't lose its metadata trail under the running print.
     """
@@ -1980,9 +1980,9 @@ async def delete_archive(
     # Both soft and hard delete are gated — an in-flight print needs its
     # backing archive to stay around for the metadata trail (filament,
     # plate, ams_mapping). The user can stop the print first, then retry.
-    from backend.app.services.archive import _count_related_queue_items
+    from backend.app.services.archive import count_related_queue_items
 
-    _related_total, related_printing = await _count_related_queue_items(db, archive_id)
+    _related_total, related_printing = await count_related_queue_items(db, archive_id)
     if related_printing > 0:
         raise HTTPException(
             409,
