@@ -940,6 +940,7 @@ async def dispatch_foreign_eject(
     profile_id: int,
     source_path: Path,
     plate_id: int,
+    max_z_override: float | None = None,
 ) -> None:
     """Build + FTPS-upload + dispatch a part-present eject for a FOREIGN plate.
 
@@ -952,9 +953,11 @@ async def dispatch_foreign_eject(
     restart-durable, so a mid-eject restart leaves the plate gate raised (fail-closed).
 
     Geometry is fail-closed (``require_validated=True``); the caller owns cleanup of
-    ``source_path`` (it may be a temp FTPS re-fetch). Raises :class:`EjectDispatchError`
-    on any precondition (409) or transport (502) failure, leaving nothing registered
-    unless ``start_print`` was accepted.
+    ``source_path`` (it may be a temp FTPS re-fetch). ``max_z_override`` is the
+    operator's confirmed part height, superseding the donor header in the build — the
+    donor may be an assumed fallback rather than the print on the plate. Raises
+    :class:`EjectDispatchError` on any precondition (409) or transport (502) failure,
+    leaving nothing registered unless ``start_print`` was accepted.
     """
     printer = await db.get(Printer, printer_id)
     if printer is None:
@@ -973,7 +976,9 @@ async def dispatch_foreign_eject(
 
     eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=None, phase="building")
     try:
-        built = await build_part_present_eject_file(Path(source_path), plate_id, profile, geometry)
+        built = await build_part_present_eject_file(
+            Path(source_path), plate_id, profile, geometry, max_z_override=max_z_override
+        )
     except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=None, phase="failed")
         raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc

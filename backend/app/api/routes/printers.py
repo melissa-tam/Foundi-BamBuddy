@@ -480,6 +480,11 @@ async def get_printer_status(
             model_mismatch=printer_manager.is_model_mismatch(printer_id),
             model_mismatch_reason=printer_manager.model_mismatch_reason(printer_id),
             eject_watch=_eject_watch_payload(printer_id),
+            # The plate gate is Bambuddy-side state (a DB-rehydrated in-memory set), so it
+            # is reportable regardless of the MQTT session — same as the two sticky flags
+            # above. Load-bearing: the disconnected "Mark plate as occupied" affordance
+            # renders off this field, and must not offer itself on an already-gated plate.
+            awaiting_plate_clear=printer_manager.is_awaiting_plate_clear(printer_id),
         )
 
     # Determine cover URL if there's an active print (including paused)
@@ -2906,6 +2911,53 @@ async def clear_plate(
     printer_manager.set_awaiting_plate_clear(printer_id, False)
 
     return {"success": True, "message": "Plate cleared, next print will start shortly"}
+
+
+@router.post("/{printer_id}/mark-plate-occupied")
+async def mark_plate_occupied(
+    printer_id: int,
+    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CLEAR_PLATE),
+    db: AsyncSession = Depends(get_db),
+):
+    """Declare that a part is on the build plate, blocking dispatch until it is cleared.
+
+    The inverse of ``clear-plate``, and a statement about the PLATE, not about the
+    printer — which is why a DISCONNECTED printer is deliberately allowed. That is the
+    lane's whole point: a printer in maintenance (``is_active=False`` tears the MQTT
+    session down) can finish a print the farm never observes, and on reactivation the
+    kick-driven scheduler may dispatch within ~1 s. Pre-declaring while disconnected
+    closes that reconnect race; the only other net is the printer's own vision check.
+    Persistence works while disconnected (the writer's DB write is independent of MQTT),
+    the WebSocket broadcast simply no-ops with no live state to send, and the reconnect's
+    status push carries the flag.
+
+    The gate is raised SOURCE-LESS (``source_subtask_id=None``) ⇒ human-clear-only: no
+    watch is armed here (an eject cannot run on a disconnected printer, and a connected
+    one has the one-step "Eject plate…" lane), so nothing auto-clears it but an
+    id-confirmed eject. Two inherited behaviours, identical to a native vision gate: a
+    restart re-arm degrades it to an escalation-only hold, and startup hygiene may clear
+    it when ``require_plate_clear`` is off AND no farm work targets this printer.
+
+    404 unknown printer; 409 while the printer is RUNNING/PAUSE (an unknown state passes
+    — a disconnected printer reports none); 400 when the gate is already raised
+    (deliberately mirroring ``clear-plate``'s already-in-that-state strictness rather
+    than answering 409, so the pair reads the same way).
+    """
+    result = await db.execute(select(Printer).where(Printer.id == printer_id))
+    printer = result.scalar_one_or_none()
+    if not printer:
+        raise HTTPException(404, "Printer not found")
+
+    state = printer_manager.get_status(printer_id)
+    if state and state.state in ("RUNNING", "PAUSE"):
+        raise HTTPException(409, f"Printer is printing or paused (state={state.state})")
+
+    if printer_manager.is_awaiting_plate_clear(printer_id):
+        raise HTTPException(400, "Printer is already awaiting plate clear")
+
+    printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=None)
+
+    return {"success": True, "message": "Plate marked as occupied — dispatch to this printer is blocked until cleared"}
 
 
 @router.post("/{printer_id}/clear-quarantine")

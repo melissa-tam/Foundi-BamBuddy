@@ -95,6 +95,7 @@ async def build_part_present_eject_file(
     plate_id: int,
     profile: EjectProfile,
     geometry: ModelGeometry,
+    max_z_override: float | None = None,
 ) -> BuiltEject:
     """Build a standalone PART-PRESENT, MOTION-ONLY eject-only ``.gcode.3mf`` for ``plate_id``.
 
@@ -122,13 +123,20 @@ async def build_part_present_eject_file(
     :func:`get_or_build_eject_file` (latency Phase C2); the cheap gcode
     generation+validation stays here (the cache key needs the final gcode text).
 
+    ``max_z_override`` is the operator's confirmed part height (the foreign "Eject now"
+    confirm dialog): when given it supersedes the donor header, because that donor may
+    be an ASSUMED fallback rather than the print actually on the plate. It feeds the
+    generator AND the validator exactly as a parsed height does — the profile's
+    ``max_part_height_mm`` guard stays the one authority on a refusable height, so no
+    validation is duplicated here.
+
     Returns a :class:`BuiltEject` — the temp ``.gcode.3mf`` path (caller cleans it
     up) plus the runtime the block is expected to take. The estimate is taken from
     the EJECT BLOCK text, which is exactly what replaces the plate G-code, i.e.
     exactly what the printer executes; anything else in the archive is inert. Raises
     :class:`EjectGenerationError` on any failure.
     """
-    max_z = _parse_max_z_height(Path(source_path), plate_id)
+    max_z = max_z_override if max_z_override is not None else _parse_max_z_height(Path(source_path), plate_id)
     if max_z is None:
         raise EjectGenerationError("Could not parse max_z_height from the 3MF gcode header")
 

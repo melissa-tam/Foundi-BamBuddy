@@ -328,6 +328,131 @@ class TestPrintersAPI:
         assert response.status_code == 404
 
     # ========================================================================
+    # Declare-occupied: the standalone plate-gate raise (disconnected lane)
+    # ========================================================================
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_mark_plate_occupied_on_disconnected_printer(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """POST /{id}/mark-plate-occupied raises a source-less gate on a DISCONNECTED
+        printer — the maintenance lane, and the reason the route has no connected guard.
+
+        Pins the persisted shape too: the gate writer must land ``awaiting_plate_clear``
+        True with ``plate_gate_subtask_id`` NULL, because a source-less gate is the
+        human-clear-only shape nothing may auto-clear.
+        """
+        import asyncio
+
+        from backend.app.models.printer import Printer
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Declare Printer", model="H2S")
+        printer_id = printer.id
+        # The writer persists on the manager's loop (it is called from sync contexts in
+        # production), so the test must lend it this loop and then wait for the commit.
+        previous_loop = printer_manager._loop
+        printer_manager.set_event_loop(asyncio.get_running_loop())
+        try:
+            response = await async_client.post(f"/api/v1/printers/{printer_id}/mark-plate-occupied")
+            assert response.status_code == 200, response.text
+            assert response.json()["success"] is True
+            assert printer_manager.is_awaiting_plate_clear(printer_id) is True
+
+            row = None
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                db_session.expire_all()
+                row = await db_session.get(Printer, printer_id)
+                if row is not None and row.awaiting_plate_clear:
+                    break
+            assert row is not None and row.awaiting_plate_clear is True
+            assert row.plate_gate_subtask_id is None
+        finally:
+            # Detach the loop BEFORE clearing, so the teardown clear schedules no
+            # further persist onto a loop this test is about to leave.
+            printer_manager._loop = previous_loop
+            printer_manager.set_awaiting_plate_clear(printer_id, False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_mark_plate_occupied_unknown_printer_404(self, async_client: AsyncClient):
+        response = await async_client.post("/api/v1/printers/9999/mark-plate-occupied")
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_mark_plate_occupied_refuses_while_printing(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """A RUNNING printer 409s and its gate is untouched — a plate mid-print is not
+        the operator's to declare anything about."""
+        from backend.app.services.bambu_mqtt import PrinterState
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Busy Declare Printer")
+        state = PrinterState()
+        state.connected = True
+        state.state = "RUNNING"
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_status = MagicMock(return_value=state)
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/mark-plate-occupied")
+            mock_pm.set_awaiting_plate_clear.assert_not_called()
+
+        assert response.status_code == 409
+        assert printer_manager.is_awaiting_plate_clear(printer.id) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_mark_plate_occupied_already_raised_400(self, async_client: AsyncClient, printer_factory, db_session):
+        """Already gated → 400, mirroring clear-plate's already-in-that-state strictness."""
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Gated Declare Printer")
+        printer_manager.set_awaiting_plate_clear(printer.id, True, source_subtask_id=None)
+        try:
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/mark-plate-occupied")
+            assert response.status_code == 400
+        finally:
+            printer_manager.set_awaiting_plate_clear(printer.id, False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_disconnected_status_reports_the_plate_gate(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """A disconnected printer's status MUST carry ``awaiting_plate_clear``.
+
+        Load-bearing for the disconnected declare affordance: the gate is Bambuddy-side
+        state (a DB-rehydrated in-memory set), so it is reportable with no MQTT session,
+        and the menu item that raises it must not offer itself on an already-gated plate.
+        """
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Offline Gated Printer")
+        printer_manager.set_awaiting_plate_clear(printer.id, True, source_subtask_id=None)
+        try:
+            with patch.object(printer_manager, "get_status", return_value=None):
+                response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["connected"] is False
+            assert body["awaiting_plate_clear"] is True
+        finally:
+            printer_manager.set_awaiting_plate_clear(printer.id, False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_eject_rejects_non_positive_part_height(self, async_client: AsyncClient, printer_factory, db_session):
+        """``max_z_height_mm`` is the operator's typed part height — the ``gt=0`` floor is
+        route-level validation, so a zero never reaches the eject service at all."""
+        printer = await printer_factory(name="Eject Body Printer")
+        response = await async_client.post(f"/api/v1/printers/{printer.id}/eject", json={"max_z_height_mm": 0})
+        assert response.status_code == 422
+
+    # ========================================================================
     # File download endpoint — non-ASCII filename regression (#1245)
     # ========================================================================
 

@@ -875,20 +875,22 @@ export default {
       cleared: '플레이트 비워짐',
       notCleared: '플레이트 미비움',
       inUse: '플레이트 사용 중',
-      markClearedCancelsEject: '플레이트를 비움으로 표시하면 대기 중인 자동 배출이 취소됩니다.'
+      markClearedCancelsEject: '플레이트를 비움으로 표시하면 대기 중인 자동 배출이 취소됩니다.',
+      markOccupied: '플레이트 점유로 표시',
+      markOccupiedSuccess: '플레이트를 점유로 표시했습니다 — 비울 때까지 디스패치가 차단됩니다'
     },
     // 수동 배출(W2) + 새 스풀 알림(W6)
     eject: {
       now: '지금 배출',
+      menuEjectPlate: '플레이트 배출…',
       dispatched: '배출을 시작했습니다',
       confirmTitle: '베드가 뜨거운 상태에서 배출할까요?',
       confirmBody: '베드가 {{bed}}°C로 해제 임계값 {{threshold}}°C보다 높습니다. 지금 배출하면 베드가 뜨거운 상태에서 부품을 쓸어냅니다. 계속할까요?',
       foreignTitle: '외부 프린트를 배출할까요?',
-      foreignBody: '이 프린트는 팜에서 전송한 것이 아닙니다(Bambu Studio에서 수동으로 전송됨). 쓸어내기는 아래에서 선택한 배출 프로파일을 사용합니다. 먼저 감지된 부품 높이가 올바른지 확인하세요.',
+      foreignBody: '이 프린트는 팜에서 전송한 것이 아닙니다. 쓸어내기는 아래에서 선택한 배출 프로파일을 사용합니다 — 감지된 값이 올바르지 않으면 부품 높이를 수정하세요.',
       foreignPrintNameLabel: '프린트',
       foreignUnknownPrint: '알 수 없음',
-      foreignPartHeightLabel: '감지된 부품 높이',
-      foreignPartHeightValue: '{{height}} mm',
+      foreignPartHeightEditLabel: '부품 높이 (mm)',
       foreignProfileLabel: '배출 프로파일',
       foreignSuggested: '권장',
       foreignNoProfiles: '사용 가능한 배출 프로파일이 없습니다',
