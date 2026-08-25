@@ -7,7 +7,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -683,6 +683,230 @@ class TestManualEjectForeignFallbackLastFarmItem:
         assert "No farm-known finished unit" in str(exc.value)
         strict.assert_not_called()
         fallback.assert_not_called()
+
+
+class TestManualEjectDeclareOccupied:
+    """The one-step "Eject plate…" lane: with the gate DOWN, ``declare_occupied`` is the
+    operator STATING that a part is on the plate — the service raises the gate itself
+    (source-less ⇒ human-clear-only) and continues into the foreign flow instead of
+    409ing ``no_plate_gate``. The connected + busy guards precede it, so the flag can
+    never raise a disconnected or printing printer's gate, and the raise is NEVER rolled
+    back when the flow that follows it 409s."""
+
+    @staticmethod
+    def _gate_down(status, raiser):
+        """The declare lane's patch set: connected, gate DOWN, and the canonical gate
+        writer spied — patched, never live, because the real one mutates process-global
+        manager state that would leak into every later test."""
+        return (
+            patch.object(manual.printer_manager, "is_connected", return_value=True),
+            patch.object(manual.printer_manager, "get_status", return_value=status),
+            patch.object(manual.printer_manager, "is_awaiting_plate_clear", return_value=False),
+            patch.object(manual.printer_manager, "set_awaiting_plate_clear", raiser),
+        )
+
+    async def test_flag_false_keeps_todays_no_plate_gate_409(self, db_session):
+        printer = await _mk_printer(db_session, "DCOFF", gate=None)
+        await db_session.commit()
+        raiser = MagicMock()
+        c1, c2, c3, c4 = self._gate_down(_state("FINISH"), raiser)
+        with c1, c2, c3, c4, pytest.raises(manual.ManualEjectError) as exc:
+            await manual.manual_eject(db_session, printer.id)
+        assert exc.value.code == "no_plate_gate"
+        raiser.assert_not_called()
+
+    async def test_running_printer_refuses_before_the_declaration(self, db_session):
+        # Lane partition: the busy guard runs FIRST, so a declaration can never gate a
+        # printer that is mid-print (its plate is not free to declare anything about).
+        printer = await _mk_printer(db_session, "DCRUN", gate=None)
+        await db_session.commit()
+        raiser = MagicMock()
+        c1, c2, c3, c4 = self._gate_down(_state("RUNNING"), raiser)
+        with c1, c2, c3, c4, pytest.raises(manual.ManualEjectError) as exc:
+            await manual.manual_eject(db_session, printer.id, declare_occupied=True)
+        assert exc.value.code == "printer_busy"
+        raiser.assert_not_called()
+
+    async def test_disconnected_printer_refuses_before_the_declaration(self, db_session):
+        # The other half of the partition: a disconnected printer's plate is declared
+        # through the standalone mark-plate-occupied route, never through an eject.
+        printer = await _mk_printer(db_session, "DCNC", gate=None)
+        await db_session.commit()
+        raiser = MagicMock()
+        with (
+            patch.object(manual.printer_manager, "is_connected", return_value=False),
+            patch.object(manual.printer_manager, "set_awaiting_plate_clear", raiser),
+            pytest.raises(manual.ManualEjectError) as exc,
+        ):
+            await manual.manual_eject(db_session, printer.id, declare_occupied=True)
+        assert exc.value.code == "not_connected"
+        raiser.assert_not_called()
+
+    async def test_gate_raised_once_and_kept_when_no_donor_resolves(self, db_session):
+        # The no-rollback pin: the donor 409 propagates unchanged AND the gate the
+        # declaration raised stands — the plate is occupied whatever the eject concludes.
+        printer = await _mk_printer(db_session, "DCNOD", gate=None)
+        await db_session.commit()
+        raiser = MagicMock()
+        c1, c2, c3, c4 = self._gate_down(_state("FINISH", bed=25.0), raiser)
+        with (
+            c1,
+            c2,
+            c3,
+            c4,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            pytest.raises(manual.ManualEjectError) as exc,
+        ):
+            await manual.manual_eject(db_session, printer.id, declare_occupied=True)
+        assert exc.value.code == "no_eligible_unit"
+        raiser.assert_called_once_with(printer.id, True, source_subtask_id=None)
+
+    async def test_gate_raised_then_fallback_donor_drives_the_confirm_prompt(self, db_session):
+        # The whole point of the lane: a plate the farm never gated still reaches the
+        # foreign confirm prompt, carrying the last farm item's on-disk donor.
+        source = _make_source_3mf()  # plate_1, max_z 18.0mm
+        try:
+            printer = await _mk_printer(db_session, "DCDON", gate=None)
+            prof = EjectProfile(name="dcdon-ep", cooldown_temp_c=30.0)
+            db_session.add(prof)
+            await db_session.flush()
+            lf = await _mk_ondisk_library_file(db_session, filename="Farm Widget.gcode.3mf", file_path=str(source))
+            await _mk_farm_item(
+                db_session,
+                printer_id=printer.id,
+                library_file_id=lf.id,
+                eject_profile_id=prof.id,
+                plate_id=1,
+            )
+            await db_session.commit()
+            raiser = MagicMock()
+            c1, c2, c3, c4 = self._gate_down(_state("FINISH", bed=25.0), raiser)
+            with (
+                c1,
+                c2,
+                c3,
+                c4,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                pytest.raises(manual.ForeignPlateEject) as exc,
+            ):
+                await manual.manual_eject(db_session, printer.id, declare_occupied=True)
+            assert exc.value.print_name == "Farm Widget.gcode.3mf"
+            assert exc.value.max_z_height_mm == 18.0
+            assert exc.value.suggested_eject_profile_id == prof.id
+            raiser.assert_called_once_with(printer.id, True, source_subtask_id=None)
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_confirm_leg_with_the_gate_up_never_double_raises(self, db_session):
+        # The dialog's confirm sends the flag again; by then the first call's raise is
+        # up, so the branch is skipped entirely and the sweep dispatches.
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "DCCFM", gate="SUB-F")
+            prof = EjectProfile(name="dccfm-ep", cooldown_temp_c=30.0)
+            db_session.add(prof)
+            await db_session.flush()
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            raiser = MagicMock()
+            dispatch = AsyncMock()
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))  # gate already UP
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.printer_manager, "set_awaiting_plate_clear", raiser),
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
+            ):
+                result = await manual.manual_eject(
+                    db_session, printer.id, eject_profile_id=prof.id, declare_occupied=True
+                )
+            assert result == {"mode": "dispatched", "queue_item_id": None}
+            raiser.assert_not_called()
+            dispatch.assert_awaited_once()
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_stale_gate_key_is_nulled_so_a_dead_gate_cannot_steer_the_eject(self, db_session):
+        # The failed-persist shape: the in-memory gate is DOWN while the row still
+        # carries a key. Without nulling it the declaration would resolve THAT key's
+        # queue item and sweep a print that is not on this plate.
+        printer = await _mk_printer(db_session, "DCSTALE", gate="STALE-1")
+        await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="STALE-1")
+        await db_session.commit()
+        raiser = MagicMock()
+        farm_known_dispatch = AsyncMock()
+        c1, c2, c3, c4 = self._gate_down(_state("FINISH", bed=25.0), raiser)
+        with (
+            c1,
+            c2,
+            c3,
+            c4,
+            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            patch.object(manual.eject_remote, "dispatch_part_present_eject", farm_known_dispatch),
+            pytest.raises(manual.ManualEjectError) as exc,
+        ):
+            await manual.manual_eject(db_session, printer.id, declare_occupied=True)
+        # The FOREIGN unresolvable message (not the farm-known one) proves the stale key
+        # steered nothing, and no farm-known sweep was dispatched off it.
+        assert exc.value.code == "no_eligible_unit"
+        assert "Could not resolve the file" in str(exc.value)
+        farm_known_dispatch.assert_not_called()
+        assert printer.plate_gate_subtask_id is None
+
+
+class TestManualEjectHeightOverride:
+    """The operator's corrected part height rides the CONFIRM leg only and reaches the
+    build unchanged — the profile's own guard stays the validation authority."""
+
+    async def test_confirm_leg_forwards_the_override_to_the_dispatch(self, db_session):
+        source = _make_source_3mf()  # the donor header says 18.0mm
+        try:
+            printer = await _mk_printer(db_session, "HOVR", gate="SUB-F")
+            prof = EjectProfile(name="hovr-ep", cooldown_temp_c=30.0)
+            db_session.add(prof)
+            await db_session.flush()
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            dispatch = AsyncMock()
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
+            ):
+                result = await manual.manual_eject(
+                    db_session, printer.id, eject_profile_id=prof.id, max_z_override=42.5
+                )
+            assert result == {"mode": "dispatched", "queue_item_id": None}
+            assert dispatch.await_args.kwargs["max_z_override"] == 42.5
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_prompt_leg_still_carries_the_parsed_donor_height(self, db_session):
+        # The first (no-profile) leg is byte-identical: the 409's height is the dialog's
+        # PREFILL, so an override arriving there is inert — nothing is built yet.
+        source = _make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "HOVRP", gate="SUB-F")
+            await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
+            await db_session.commit()
+            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
+                pytest.raises(manual.ForeignPlateEject) as exc,
+            ):
+                await manual.manual_eject(db_session, printer.id, max_z_override=99.0)
+            assert exc.value.max_z_height_mm == 18.0
+        finally:
+            source.unlink(missing_ok=True)
 
 
 class TestCanonicalNames:

@@ -1,5 +1,6 @@
 /**
- * W2 manual "Eject now" + W3 cooldown tooltip on the Printers page.
+ * W2 manual "Eject now" + W3 cooldown tooltip + on-demand "Eject plate…" on the
+ * Printers page.
  *
  * - The Eject now button appears beside mark-cleared whenever the plate gate is
  *   raised (same predicate as showClearPlateButton) and the user can control
@@ -8,15 +9,29 @@
  *   re-calls the endpoint with allow_hot=true.
  * - While a cooldown eject watch is armed, the mark-cleared button carries the
  *   "marking clears cancels the pending auto-eject" hint (W3).
+ * - The overflow menu's "Eject plate…" declares the plate occupied
+ *   (`declare_occupied: true`) and lands in the same foreign-plate confirm, where
+ *   the detected part height is editable; cancelling leaves the gate raised.
+ * - "Mark plate as occupied" is the disconnected-only lane (an eject needs a
+ *   live session), and a confirm-leg failure renders inside the dialog rather
+ *   than as a toast.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { render } from '../utils';
 import { server } from '../mocks/server';
 import { PrintersPage } from '../../pages/PrintersPage';
+
+/** Wire shape of the eject request body (client.ts always sends all four). */
+interface EjectBody {
+  allow_hot: boolean;
+  eject_profile_id: number | null;
+  declare_occupied: boolean;
+  max_z_height_mm: number | null;
+}
 
 const printer = {
   id: 1,
@@ -49,6 +64,15 @@ function statusFinish(extra: Record<string, unknown> = {}) {
     vt_tray: [],
     ...extra,
   };
+}
+
+/** Connected, idle, gate DOWN — the state the on-demand eject is offered in. */
+function statusIdle(extra: Record<string, unknown> = {}) {
+  return statusFinish({ state: 'IDLE', awaiting_plate_clear: false, ...extra });
+}
+
+async function openActionsMenu(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole('button', { name: 'More' }));
 }
 
 function mount(status: Record<string, unknown>) {
@@ -118,7 +142,7 @@ describe('PrintersPage manual eject (W2) + cooldown tooltip (W3)', () => {
   });
 
   it('opens the foreign-plate confirm on a foreign_plate 409 with the suggested profile preselected, then ejects with that profile', async () => {
-    const ejectCalls: Array<{ allow_hot: boolean; eject_profile_id: number | null }> = [];
+    const ejectCalls: EjectBody[] = [];
     mount(statusFinish());
     server.use(
       http.get('/api/v1/eject-profiles', () =>
@@ -128,7 +152,7 @@ describe('PrintersPage manual eject (W2) + cooldown tooltip (W3)', () => {
         ]),
       ),
       http.post('/api/v1/printers/:id/eject', async ({ request }) => {
-        const body = (await request.json()) as { allow_hot: boolean; eject_profile_id: number | null };
+        const body = (await request.json()) as EjectBody;
         ejectCalls.push(body);
         if (body.eject_profile_id === null) {
           return HttpResponse.json(
@@ -154,22 +178,34 @@ describe('PrintersPage manual eject (W2) + cooldown tooltip (W3)', () => {
     const ejectBtn = await screen.findByRole('button', { name: /eject now/i });
     await user.click(ejectBtn);
 
-    // Foreign-plate dialog opens with the print name + detected height.
+    // Foreign-plate dialog opens with the print name + the detected height
+    // prefilled into the (editable) part-height field.
     expect(await screen.findByText('Eject a foreign print?')).toBeInTheDocument();
     expect(screen.getByText('manual_widget.3mf')).toBeInTheDocument();
-    expect(screen.getByText('24.6 mm')).toBeInTheDocument();
+    expect(screen.getByLabelText('Part height (mm)')).toHaveValue(24.6);
     await waitFor(() => expect(ejectCalls).toHaveLength(1));
-    expect(ejectCalls[0]).toEqual({ allow_hot: false, eject_profile_id: null });
+    expect(ejectCalls[0]).toEqual({
+      allow_hot: false,
+      eject_profile_id: null,
+      declare_occupied: false,
+      max_z_height_mm: null,
+    });
 
     // The suggested profile (id 9) is preselected in the picker.
     const select = await screen.findByLabelText('Eject profile');
     await waitFor(() => expect((select as HTMLSelectElement).value).toBe('9'));
 
-    // Confirm → re-call with allow_hot=false + the chosen profile id.
+    // Confirm → re-call with allow_hot=false + the chosen profile id, and the
+    // (unedited) prefilled height as the explicit override.
     const ejectButtons = screen.getAllByRole('button', { name: /eject now/i });
     await user.click(ejectButtons[ejectButtons.length - 1]);
     await waitFor(() => expect(ejectCalls).toHaveLength(2));
-    expect(ejectCalls[1]).toEqual({ allow_hot: false, eject_profile_id: 9 });
+    expect(ejectCalls[1]).toEqual({
+      allow_hot: false,
+      eject_profile_id: 9,
+      declare_occupied: false,
+      max_z_height_mm: 24.6,
+    });
   });
 
   it('shows the cancels-eject hint on the mark-cleared button while a cooldown watch is armed', async () => {
@@ -178,5 +214,264 @@ describe('PrintersPage manual eject (W2) + cooldown tooltip (W3)', () => {
     expect(
       await screen.findByTitle('Marking the plate cleared cancels the pending auto-eject.'),
     ).toBeInTheDocument();
+  });
+});
+
+describe('on-demand "Eject plate…" (declare-occupied)', () => {
+  beforeEach(() => {
+    localStorage.removeItem('printerCardSize');
+  });
+
+  const foreignDetail = {
+    code: 'foreign_plate',
+    message: 'This plate was not dispatched by the farm.',
+    print_name: 'orphan_part.3mf',
+    max_z_height_mm: 18,
+    suggested_eject_profile_id: 7,
+  };
+
+  it('offers the item on a connected, idle printer with the gate down', async () => {
+    mount(statusIdle());
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await screen.findByText('H2S-Alpha');
+    await openActionsMenu(user);
+    expect(await screen.findByRole('button', { name: /eject plate/i })).toBeInTheDocument();
+  });
+
+  it('hides the item when the plate gate is already raised', async () => {
+    mount(statusFinish());
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await screen.findByText('H2S-Alpha');
+    await openActionsMenu(user);
+    expect(screen.queryByRole('button', { name: /eject plate/i })).not.toBeInTheDocument();
+  });
+
+  it('hides the item while the printer is printing', async () => {
+    mount(statusIdle({ state: 'RUNNING' }));
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await screen.findByText('H2S-Alpha');
+    await openActionsMenu(user);
+    expect(screen.queryByRole('button', { name: /eject plate/i })).not.toBeInTheDocument();
+  });
+
+  it('hides the item while the printer is disconnected', async () => {
+    mount(statusIdle({ connected: false }));
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await screen.findByText('H2S-Alpha');
+    await openActionsMenu(user);
+    expect(screen.queryByRole('button', { name: /eject plate/i })).not.toBeInTheDocument();
+  });
+
+  it('declares the plate occupied, prefills the detected height, and sends the corrected value', async () => {
+    const ejectCalls: EjectBody[] = [];
+    mount(statusIdle());
+    server.use(
+      http.get('/api/v1/eject-profiles', () =>
+        HttpResponse.json([{ id: 7, name: 'Alpha profile' }]),
+      ),
+      http.post('/api/v1/printers/:id/eject', async ({ request }) => {
+        const body = (await request.json()) as EjectBody;
+        ejectCalls.push(body);
+        if (body.eject_profile_id === null) {
+          return HttpResponse.json({ detail: foreignDetail }, { status: 409 });
+        }
+        return HttpResponse.json({ mode: 'dispatched', queue_item_id: null });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await screen.findByText('H2S-Alpha');
+    await openActionsMenu(user);
+    await user.click(await screen.findByRole('button', { name: /eject plate/i }));
+
+    // The declaration rides the very first call — the server raises the gate.
+    await waitFor(() => expect(ejectCalls).toHaveLength(1));
+    expect(ejectCalls[0]).toEqual({
+      allow_hot: false,
+      eject_profile_id: null,
+      declare_occupied: true,
+      max_z_height_mm: null,
+    });
+
+    // …and the familiar foreign-plate confirm carries the detected height.
+    expect(await screen.findByText('Eject a foreign print?')).toBeInTheDocument();
+    expect(screen.getByText('orphan_part.3mf')).toBeInTheDocument();
+    const height = screen.getByLabelText('Part height (mm)');
+    expect(height).toHaveValue(18);
+
+    // The operator measures the real part and corrects the detected value. An
+    // empty height must not reach the backend — `max_z` sets the sweep lift.
+    await user.clear(height);
+    const confirmWhileBlank = screen.getAllByRole('button', { name: /eject now/i });
+    expect(confirmWhileBlank[confirmWhileBlank.length - 1]).toBeDisabled();
+    await user.type(height, '25');
+
+    const ejectButtons = screen.getAllByRole('button', { name: /eject now/i });
+    await user.click(ejectButtons[ejectButtons.length - 1]);
+    await waitFor(() => expect(ejectCalls).toHaveLength(2));
+    expect(ejectCalls[1]).toEqual({
+      allow_hot: false,
+      eject_profile_id: 7,
+      declare_occupied: true,
+      max_z_height_mm: 25,
+    });
+  });
+
+  it('leaves the gate raised when the operator cancels the confirm', async () => {
+    // The server raises the gate before it 409s and never rolls it back, so the
+    // status endpoint reports it from the eject call onwards.
+    let gateRaised = false;
+    mount(statusIdle());
+    server.use(
+      http.get('/api/v1/printers/:id/status', () =>
+        HttpResponse.json(statusIdle({ awaiting_plate_clear: gateRaised })),
+      ),
+      http.get('/api/v1/eject-profiles', () =>
+        HttpResponse.json([{ id: 7, name: 'Alpha profile' }]),
+      ),
+      http.post('/api/v1/printers/:id/eject', () => {
+        gateRaised = true;
+        return HttpResponse.json({ detail: foreignDetail }, { status: 409 });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await screen.findByText('H2S-Alpha');
+    await openActionsMenu(user);
+    await user.click(await screen.findByRole('button', { name: /eject plate/i }));
+    expect(await screen.findByText('Eject a foreign print?')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    await waitFor(() =>
+      expect(screen.queryByText('Eject a foreign print?')).not.toBeInTheDocument(),
+    );
+
+    // The plate IS occupied: the card now offers the gate's own affordances,
+    // and mark-cleared is the undo.
+    expect(
+      await screen.findByRole('button', { name: /mark plate as cleared/i }),
+    ).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /eject now/i })).toBeInTheDocument();
+  });
+});
+
+describe('"Mark plate as occupied" (disconnected lane)', () => {
+  beforeEach(() => {
+    localStorage.removeItem('printerCardSize');
+  });
+
+  it('offers the item on a disconnected printer with the gate down', async () => {
+    mount(statusIdle({ connected: false }));
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await screen.findByText('H2S-Alpha');
+    await openActionsMenu(user);
+    expect(
+      await screen.findByRole('button', { name: /mark plate as occupied/i }),
+    ).toBeInTheDocument();
+  });
+
+  it('hides the item while the printer is connected', async () => {
+    mount(statusIdle());
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await screen.findByText('H2S-Alpha');
+    await openActionsMenu(user);
+    expect(
+      screen.queryByRole('button', { name: /mark plate as occupied/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('hides the item when the disconnected printer already reports the gate', async () => {
+    mount(statusIdle({ connected: false, awaiting_plate_clear: true }));
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await screen.findByText('H2S-Alpha');
+    await openActionsMenu(user);
+    expect(
+      screen.queryByRole('button', { name: /mark plate as occupied/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('posts the declaration and confirms it with a toast', async () => {
+    let posted = 0;
+    mount(statusIdle({ connected: false }));
+    server.use(
+      http.post('/api/v1/printers/:id/mark-plate-occupied', () => {
+        posted += 1;
+        return HttpResponse.json({ success: true, message: 'Plate marked as occupied' });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await screen.findByText('H2S-Alpha');
+    await openActionsMenu(user);
+    await user.click(await screen.findByRole('button', { name: /mark plate as occupied/i }));
+
+    await waitFor(() => expect(posted).toBe(1));
+    expect(
+      await screen.findByText('Plate marked as occupied — dispatch blocked until cleared'),
+    ).toBeInTheDocument();
+  });
+});
+
+describe('foreign-eject confirm-leg failures', () => {
+  beforeEach(() => {
+    localStorage.removeItem('printerCardSize');
+  });
+
+  it('renders the failure inside the still-open dialog instead of toasting it', async () => {
+    mount(statusFinish());
+    server.use(
+      http.get('/api/v1/eject-profiles', () =>
+        HttpResponse.json([{ id: 7, name: 'Alpha profile' }]),
+      ),
+      http.post('/api/v1/printers/:id/eject', async ({ request }) => {
+        const body = (await request.json()) as EjectBody;
+        if (body.eject_profile_id === null) {
+          return HttpResponse.json(
+            {
+              detail: {
+                code: 'foreign_plate',
+                message: 'This plate was not dispatched by the farm.',
+                print_name: 'orphan_part.3mf',
+                max_z_height_mm: 12,
+                suggested_eject_profile_id: 7,
+              },
+            },
+            { status: 409 },
+          );
+        }
+        // Plain-string 409 detail — the generator's own part-height guard.
+        return HttpResponse.json(
+          { detail: 'Part height 12.0 mm exceeds the profile limit of 10.0 mm' },
+          { status: 409 },
+        );
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await user.click(await screen.findByRole('button', { name: /eject now/i }));
+    expect(await screen.findByText('Eject a foreign print?')).toBeInTheDocument();
+
+    const ejectButtons = screen.getAllByRole('button', { name: /eject now/i });
+    await user.click(ejectButtons[ejectButtons.length - 1]);
+
+    const dialog = await screen.findByRole('dialog');
+    expect(
+      await within(dialog).findByText(/exceeds the profile limit of 10\.0 mm/i),
+    ).toBeInTheDocument();
+    // The dialog stays open so the height can be corrected and retried…
+    expect(within(dialog).getByText('Eject a foreign print?')).toBeInTheDocument();
+    // …and the message is rendered exactly once (no duplicate toast).
+    expect(screen.getAllByText(/exceeds the profile limit of 10\.0 mm/i)).toHaveLength(1);
   });
 });

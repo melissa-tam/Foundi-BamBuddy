@@ -222,6 +222,48 @@ class TestBuildPartPresentEjectFile:
         assert "FARM EJECT BLOCK" in gcode
 
 
+class TestBuildPartPresentHeightOverride:
+    """The operator's confirmed part height (the foreign "Eject now" confirm dialog)
+    supersedes the donor header — that donor may be the ASSUMED last-farm-item fallback
+    rather than the print actually on the plate. It feeds the same generator + validator
+    as a parsed height, so the profile's ``max_part_height_mm`` guard remains the one
+    authority on what is refusable and no validation is duplicated at the build."""
+
+    @pytest.mark.asyncio
+    async def test_override_supersedes_the_parsed_header(self):
+        src = _make_3mf()  # header says 18 mm
+        parsed = overridden = None
+        try:
+            parsed = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            overridden = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY, max_z_override=30.0)
+            parsed_gcode = _read_plate_gcode(parsed.path)
+            overridden_gcode = _read_plate_gcode(overridden.path)
+        finally:
+            src.unlink(missing_ok=True)
+            for artifact in (parsed, overridden):
+                if artifact:
+                    artifact.path.unlink(missing_ok=True)
+
+        # Clearance is 10 mm, so the lift/return height is part + 10: the donor's 18 mm
+        # builds Z28, the operator's 30 mm builds Z40 from the SAME donor file.
+        assert "G1 Z28 F900" in parsed_gcode
+        assert "G1 Z40 F900" in overridden_gcode
+        assert "G1 Z28 F900" not in overridden_gcode
+
+    @pytest.mark.asyncio
+    async def test_override_above_the_profile_guard_is_refused_by_the_build(self):
+        # The donor itself (18 mm) is well within the 42 mm guard, so the refusal can
+        # only be the override — reaching the caller as EjectGenerationError, which the
+        # foreign dispatch turns into the dialog's inline 409.
+        src = _make_3mf()
+        try:
+            with pytest.raises(EjectGenerationError) as exc:
+                await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY, max_z_override=99.0)
+            assert "99" in str(exc.value)
+        finally:
+            src.unlink(missing_ok=True)
+
+
 class TestBuiltEjectDropSpan:
     """The bed-drop phase budget the build hands to the runtime watchdog.
 

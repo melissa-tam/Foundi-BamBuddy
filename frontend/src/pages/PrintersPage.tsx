@@ -81,6 +81,7 @@ import {
   LogIn,
   LogOut,
   MoreHorizontal,
+  Ban,
   SlidersHorizontal,
   Stethoscope,
   LineChart as LineChartIcon,
@@ -98,6 +99,8 @@ import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { Modal } from '../components/ui/Modal';
+import { FormField, Input } from '../components/ui/Field';
+import { InlineAlert } from '../components/ui/InlineAlert';
 import { BulkPrinterToolbar, type PrinterState } from '../components/BulkPrinterToolbar';
 import { FileManagerModal } from '../components/FileManagerModal';
 import { EmbeddedCameraViewer } from '../components/EmbeddedCameraViewer';
@@ -1809,20 +1812,36 @@ function PrinterCard({
     bed_c: number;
     threshold_c: number;
     ejectProfileId: number | null;
+    // Carried through the hot re-call exactly like the profile id: without them
+    // a hot-confirmed eject would silently revert to the parsed donor height
+    // (and drop the operator's declaration).
+    declareOccupied: boolean;
+    maxZHeightMm: number | null;
   } | null>(null);
   // W2 foreign-plate eject: the plate-clear gate was raised by a print the farm
-  // did not dispatch (sent manually from Bambu Studio). The backend 409s with
-  // `foreign_plate` + the detected print name/height and a suggested profile;
-  // we stash it here to drive a warn+confirm dialog with an eject-profile picker.
+  // did not dispatch (sent manually from Bambu Studio), or the operator asked
+  // for an on-demand eject and the server raised the gate itself. The backend
+  // 409s with `foreign_plate` + the detected print name/height and a suggested
+  // profile; we stash it here to drive a warn+confirm dialog with an
+  // eject-profile picker.
   const [foreignEjectConfirm, setForeignEjectConfirm] = useState<{
     message: string;
     printName: string | null;
     maxZHeightMm: number;
     suggestedEjectProfileId: number | null;
+    declareOccupied: boolean;
   } | null>(null);
   // Operator's profile override inside the foreign-plate dialog; null falls back
   // to the suggested profile, then the first available profile (derived, below).
   const [foreignEjectProfileId, setForeignEjectProfileId] = useState<number | null>(null);
+  // Operator-editable part height (mm) in the foreign-plate dialog, seeded from
+  // the 409's detected value. Kept as the raw input string so the field can be
+  // cleared and retyped; the confirm gate parses it.
+  const [foreignEjectHeight, setForeignEjectHeight] = useState('');
+  // Confirm-leg failure text, rendered inside the still-open foreign dialog
+  // (a toast would vanish while the operator is reading the height they must
+  // correct). Cleared on any edit, on close, and on success.
+  const [foreignEjectError, setForeignEjectError] = useState<string | null>(null);
   const [deleteArchives, setDeleteArchives] = useState(true);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showFileManager, setShowFileManager] = useState(false);
@@ -2385,20 +2404,54 @@ function PrinterCard({
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
   });
 
+  // Operator declaration that this printer's plate is occupied — raises the
+  // plate-clear gate so dispatch is held. Serves the disconnected/maintenance
+  // lane, where no websocket frame will follow: the optimistic flip covers the
+  // acting tab, and ['printers'] has to be invalidated by hand because the fleet
+  // list's badge refetch normally rides a `printer_status` frame
+  // (useWebSocket.ts:29-32) that a disconnected printer never emits. No default
+  // success toast — the menu item passes one per call.
+  const markPlateOccupiedMutation = useMutation({
+    mutationFn: () => api.markPlateOccupied(printer.id),
+    onSuccess: () => {
+      queryClient.setQueryData(['printerStatus', printer.id], (old: PrinterStatus | undefined) =>
+        old ? { ...old, awaiting_plate_clear: true } : old
+      );
+      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
+      queryClient.invalidateQueries({ queryKey: ['queue', printer.id] });
+      queryClient.invalidateQueries({ queryKey: ['printers'] });
+    },
+    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
+  });
+
   // W2 manual eject: trigger the part-present eject for this printer's
-  // farm-known completed unit. The mutate arg is `{allowHot, ejectProfileId?}` —
-  // the first click sends allowHot=false with no profile. A `bed_hot` 409 opens
-  // the hot-bed confirm (which re-mutates with allowHot=true, carrying the same
-  // profile id); a `foreign_plate` 409 opens the profile-picker confirm. Any
-  // other error (or a bed_hot on the confirmed call) surfaces as a toast and
+  // farm-known completed unit. The mutate arg is
+  // `{allowHot, ejectProfileId?, declareOccupied?, maxZHeightMm?}` — the first
+  // click sends allowHot=false with no profile. A `bed_hot` 409 opens the
+  // hot-bed confirm (which re-mutates with allowHot=true, carrying the same
+  // profile id, declaration and height); a `foreign_plate` 409 opens the
+  // profile-picker confirm. A confirm-leg failure renders inside that dialog;
+  // any other error (or a bed_hot on the confirmed call) surfaces as a toast and
   // closes both dialogs.
   const ejectMutation = useMutation({
-    mutationFn: (vars: { allowHot: boolean; ejectProfileId?: number | null }) =>
-      api.ejectNow(printer.id, vars.allowHot, vars.ejectProfileId ?? null),
+    mutationFn: (vars: {
+      allowHot: boolean;
+      ejectProfileId?: number | null;
+      declareOccupied?: boolean;
+      maxZHeightMm?: number | null;
+    }) =>
+      api.ejectNow(
+        printer.id,
+        vars.allowHot,
+        vars.ejectProfileId ?? null,
+        vars.declareOccupied ?? false,
+        vars.maxZHeightMm ?? null,
+      ),
     onSuccess: () => {
       setEjectHotConfirm(null);
       setForeignEjectConfirm(null);
       setForeignEjectProfileId(null);
+      setForeignEjectError(null);
       showToast(t('printers.eject.dispatched'));
       queryClient.invalidateQueries({ queryKey: ['printers'] });
       queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
@@ -2417,6 +2470,8 @@ function PrinterCard({
               bed_c: bed,
               threshold_c: threshold,
               ejectProfileId: vars.ejectProfileId ?? null,
+              declareOccupied: vars.declareOccupied ?? false,
+              maxZHeightMm: vars.maxZHeightMm ?? null,
             });
             return;
           }
@@ -2424,17 +2479,40 @@ function PrinterCard({
         if (error.code === 'foreign_plate') {
           const maxZ = Number(error.detail.max_z_height_mm);
           const suggested = error.detail.suggested_eject_profile_id;
+          const detectedHeight = Number.isFinite(maxZ) ? maxZ : 0;
           setForeignEjectProfileId(null);
+          setForeignEjectError(null);
+          // Prefill at the dialog's own precision (step 0.1) so the field never
+          // opens on a float artifact the operator would have to retype.
+          setForeignEjectHeight(
+            detectedHeight > 0 ? String(Math.round(detectedHeight * 10) / 10) : ''
+          );
           setForeignEjectConfirm({
             message:
               typeof error.detail.message === 'string' ? error.detail.message : error.message,
             printName:
               typeof error.detail.print_name === 'string' ? error.detail.print_name : null,
-            maxZHeightMm: Number.isFinite(maxZ) ? maxZ : 0,
+            maxZHeightMm: detectedHeight,
             suggestedEjectProfileId: typeof suggested === 'number' ? suggested : null,
+            declareOccupied: vars.declareOccupied ?? false,
           });
+          if (vars.declareOccupied) {
+            // The server RAISED the gate before it 409'd, and does not roll that
+            // back — reflect it so the card's gate buttons show behind the
+            // dialog (they are the operator's undo if this is cancelled).
+            queryClient.setQueryData(['printerStatus', printer.id], (old: PrinterStatus | undefined) =>
+              old ? { ...old, awaiting_plate_clear: true } : old
+            );
+            queryClient.invalidateQueries({ queryKey: ['printers'] });
+          }
           return;
         }
+      }
+      // Confirm leg: the dialog stays open on these, so the failure belongs
+      // inside it (the operator corrects the height or profile and retries).
+      if (foreignEjectConfirm && vars.ejectProfileId != null) {
+        setForeignEjectError(error.message || t('printers.toast.failedToSendCommand'));
+        return;
       }
       setEjectHotConfirm(null);
       showToast(error.message || t('printers.toast.failedToSendCommand'), 'error');
@@ -2456,6 +2534,11 @@ function PrinterCard({
     foreignEjectConfirm?.suggestedEjectProfileId ??
     ejectProfiles[0]?.id ??
     null;
+  // Parsed operator height. `max_z` sets the sweep clearance/lift, so a blank or
+  // non-positive value must not reach the backend — the confirm button gates on
+  // this. The upper bound stays the generator's own profile guard (409).
+  const foreignHeightMm = Number(foreignEjectHeight);
+  const foreignHeightValid = foreignEjectHeight.trim() !== '' && Number.isFinite(foreignHeightMm) && foreignHeightMm > 0;
 
   // Farm one-click recovery: clears the plate hold, lifts quarantine, and resumes
   // any paused production run on this printer in a single action. Replaces the
@@ -3503,6 +3586,58 @@ function PrinterCard({
               ? t('printers.maintenance.menuEnter')
               : t('printers.maintenance.menuExit')}
           </button>
+          {/* On-demand eject of a plate the farm never gated — e.g. a print that
+              finished while the printer was in maintenance, so no terminal was
+              ever observed. Declares the plate occupied server-side and falls
+              straight into the existing foreign-plate confirm via its 409, so
+              there is no toast here: the dialog IS the feedback. Cancelling that
+              dialog leaves the gate raised by design (the plate is occupied);
+              "Mark plate as cleared" is the undo. */}
+          {status?.connected && !isPrintingOrPaused && !needsPlateClear && (
+            <button
+              className={`w-full px-4 py-2 text-left text-sm flex items-center gap-2 ${
+                hasPermission('printers:control')
+                  ? 'hover:bg-bambu-dark-tertiary'
+                  : 'opacity-50 cursor-not-allowed'
+              }`}
+              disabled={ejectMutation.isPending || !hasPermission('printers:control')}
+              onClick={() => {
+                if (!hasPermission('printers:control')) return;
+                setShowMenu(false);
+                ejectMutation.mutate({ allowHot: false, declareOccupied: true });
+              }}
+              title={!hasPermission('printers:control') ? t('printers.permission.noControl') : undefined}
+            >
+              <Wind className="w-4 h-4" />
+              {t('printers.eject.menuEjectPlate')}
+            </button>
+          )}
+          {/* Disconnected/maintenance lane: an eject needs a live session, so the
+              declaration is all this state supports — and it is what closes the
+              reconnect race, since a reactivated printer is dispatchable within
+              ~1 s of the kick-driven scheduler. Hidden while `status` is still
+              undefined so a loading card never offers it. */}
+          {status && status.connected === false && !needsPlateClear && (
+            <button
+              className={`w-full px-4 py-2 text-left text-sm flex items-center gap-2 ${
+                hasPermission('printers:clear_plate')
+                  ? 'hover:bg-bambu-dark-tertiary'
+                  : 'opacity-50 cursor-not-allowed'
+              }`}
+              disabled={markPlateOccupiedMutation.isPending || !hasPermission('printers:clear_plate')}
+              onClick={() => {
+                if (!hasPermission('printers:clear_plate')) return;
+                setShowMenu(false);
+                markPlateOccupiedMutation.mutate(undefined, {
+                  onSuccess: () => showToast(t('printers.plateStatus.markOccupiedSuccess')),
+                });
+              }}
+              title={!hasPermission('printers:clear_plate') ? t('printers.permission.noControl') : undefined}
+            >
+              <Ban className="w-4 h-4" />
+              {t('printers.plateStatus.markOccupied')}
+            </button>
+          )}
           <button
             className="w-full px-4 py-2 text-left text-sm hover:bg-bambu-dark-tertiary flex items-center gap-2"
             onClick={() => {
@@ -6774,6 +6909,8 @@ function PrinterCard({
             ejectMutation.mutate({
               allowHot: true,
               ejectProfileId: ejectHotConfirm.ejectProfileId,
+              declareOccupied: ejectHotConfirm.declareOccupied,
+              maxZHeightMm: ejectHotConfirm.maxZHeightMm,
             })
           }
           onCancel={() => setEjectHotConfirm(null)}
@@ -6791,6 +6928,7 @@ function PrinterCard({
           onClose={() => {
             setForeignEjectConfirm(null);
             setForeignEjectProfileId(null);
+            setForeignEjectError(null);
           }}
           labelledBy="foreign-eject-title"
           widthClass="max-w-md"
@@ -6818,17 +6956,37 @@ function PrinterCard({
                 {foreignEjectConfirm.printName || t('printers.eject.foreignUnknownPrint')}
               </dd>
             </div>
-            <div className="flex justify-between gap-3">
-              <dt className="text-bambu-gray flex-shrink-0">
-                {t('printers.eject.foreignPartHeightLabel')}
-              </dt>
-              <dd className="text-white text-right">
-                {t('printers.eject.foreignPartHeightValue', {
-                  height: Math.round(foreignEjectConfirm.maxZHeightMm * 10) / 10,
-                })}
-              </dd>
-            </div>
           </dl>
+          {/* Editable part height. The prefill is parsed from the donor 3MF,
+              which for a plate the farm never dispatched can be wrong (or
+              absent → 0). `max_z` sets the sweep clearance/lift, so an
+              understated value risks sweep-path contact — the operator checks it
+              against the real part before confirming. */}
+          <FormField
+            id={`foreign-eject-height-${printer.id}`}
+            label={t('printers.eject.foreignPartHeightEditLabel')}
+            labelClassName="block text-xs text-bambu-gray mb-1"
+            className="mb-4"
+          >
+            {(field) => (
+              <div className="flex items-center gap-2">
+                <Input
+                  {...field}
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  value={foreignEjectHeight}
+                  onChange={(e) => {
+                    setForeignEjectHeight(e.target.value);
+                    setForeignEjectError(null);
+                  }}
+                  disabled={ejectMutation.isPending}
+                  className="text-sm disabled:opacity-50"
+                />
+                <span className="text-xs text-bambu-gray flex-shrink-0">mm</span>
+              </div>
+            )}
+          </FormField>
           <div className="mb-4">
             <label
               htmlFor="foreign-eject-profile"
@@ -6839,9 +6997,10 @@ function PrinterCard({
             <select
               id="foreign-eject-profile"
               value={foreignSelectedProfileId ?? ''}
-              onChange={(e) =>
-                setForeignEjectProfileId(e.target.value ? Number(e.target.value) : null)
-              }
+              onChange={(e) => {
+                setForeignEjectProfileId(e.target.value ? Number(e.target.value) : null);
+                setForeignEjectError(null);
+              }}
               disabled={ejectMutation.isPending || ejectProfiles.length === 0}
               className="w-full px-3 py-2 rounded-lg text-sm bg-bambu-dark border border-bambu-dark-tertiary text-white focus:outline-none focus:border-bambu-green disabled:opacity-50"
             >
@@ -6859,12 +7018,18 @@ function PrinterCard({
               )}
             </select>
           </div>
+          {foreignEjectError && (
+            <InlineAlert severity="error" className="mb-4 text-xs">
+              {foreignEjectError}
+            </InlineAlert>
+          )}
           <div className="flex gap-2">
             <button
               type="button"
               onClick={() => {
                 setForeignEjectConfirm(null);
                 setForeignEjectProfileId(null);
+                setForeignEjectError(null);
               }}
               disabled={ejectMutation.isPending}
               className="flex-1 px-3 py-2 rounded-lg text-xs font-medium bg-bambu-dark text-bambu-gray hover:bg-bambu-dark-tertiary transition-colors disabled:opacity-50"
@@ -6877,9 +7042,11 @@ function PrinterCard({
                 ejectMutation.mutate({
                   allowHot: false,
                   ejectProfileId: foreignSelectedProfileId,
+                  declareOccupied: foreignEjectConfirm.declareOccupied,
+                  maxZHeightMm: foreignHeightMm,
                 })
               }
-              disabled={ejectMutation.isPending || foreignSelectedProfileId === null}
+              disabled={ejectMutation.isPending || foreignSelectedProfileId === null || !foreignHeightValid}
               className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors disabled:opacity-50"
             >
               {ejectMutation.isPending ? (

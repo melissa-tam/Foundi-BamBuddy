@@ -10,7 +10,7 @@ motion, the same class as stop/pause; no new permission for zero differentiation
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.auth import RequirePermissionIfAuthEnabled
@@ -27,10 +27,19 @@ class EjectNowBody(BaseModel):
     confirm — the UI re-calls with it True after the operator acknowledges the
     live-bed-vs-threshold dialog raised by a 409 ``bed_hot``. ``eject_profile_id`` is
     the operator's chosen profile for the foreign-plate confirm — the UI re-calls with
-    it after a 409 ``foreign_plate`` prompt to dispatch the sweep."""
+    it after a 409 ``foreign_plate`` prompt to dispatch the sweep.
+
+    ``declare_occupied`` is the one-step "Eject plate…" lane: the operator states a part
+    is on a plate the farm never gated, so the service raises the gate itself instead of
+    409ing ``no_plate_gate``. ``max_z_height_mm`` is the operator's confirmed part
+    height for the foreign confirm — it supersedes the donor's parsed header (which is
+    only the dialog's prefill). ``gt=0`` is the floor; the profile's
+    ``max_part_height_mm`` guard remains the ceiling and surfaces as a 409."""
 
     allow_hot: bool = False
     eject_profile_id: int | None = None
+    declare_occupied: bool = False
+    max_z_height_mm: float | None = Field(default=None, gt=0)
 
 
 @router.post("/{printer_id}/eject")
@@ -49,11 +58,27 @@ async def eject_now(
     supplied — the UI re-calls with a chosen profile to sweep it; other 409s carry a
     stable ``code`` + actionable ``message``. On success returns the eject mode
     (``released_watch`` when an armed watch was signalled, ``dispatched`` otherwise).
+
+    With ``declare_occupied`` true and NO gate raised, the service raises the plate gate
+    itself (source-less ⇒ human-clear-only) and continues into the foreign flow — so the
+    409 ``foreign_plate`` prompt this normally answers with arrives on a printer that is
+    now gated. That raise stands even if the operator abandons the dialog; the plate is
+    occupied either way, and "Mark plate as cleared" is the undo. ``max_z_height_mm``
+    (>0) rides the confirm call and supersedes the donor's parsed part height.
     """
     allow_hot = bool(body.allow_hot) if body is not None else False
     eject_profile_id = body.eject_profile_id if body is not None else None
+    declare_occupied = bool(body.declare_occupied) if body is not None else False
+    max_z_override = body.max_z_height_mm if body is not None else None
     try:
-        return await manual_eject(db, printer_id, allow_hot=allow_hot, eject_profile_id=eject_profile_id)
+        return await manual_eject(
+            db,
+            printer_id,
+            allow_hot=allow_hot,
+            eject_profile_id=eject_profile_id,
+            declare_occupied=declare_occupied,
+            max_z_override=max_z_override,
+        )
     except ForeignPlateEject as exc:
         raise HTTPException(
             status_code=409,

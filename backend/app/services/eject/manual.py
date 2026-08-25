@@ -265,7 +265,13 @@ async def _resolve_manual_eject_item(db: AsyncSession, printer_id: int) -> int |
 
 
 async def manual_eject(
-    db: AsyncSession, printer_id: int, *, allow_hot: bool = False, eject_profile_id: int | None = None
+    db: AsyncSession,
+    printer_id: int,
+    *,
+    allow_hot: bool = False,
+    eject_profile_id: int | None = None,
+    declare_occupied: bool = False,
+    max_z_override: float | None = None,
 ) -> dict:
     """Trigger a part-present eject on ``printer_id`` — farm-known unit OR foreign plate.
 
@@ -281,6 +287,16 @@ async def manual_eject(
       ``no_eligible_unit``; a genuine foreign plate with no ``eject_profile_id`` raises
       :class:`ForeignPlateEject` (the confirm prompt), and with one dispatches the eject
       returning ``{"mode": "dispatched", "queue_item_id": None}``.
+
+    ``declare_occupied`` is the one-step "Eject plate…" lane: with NO gate raised it is
+    the operator STATING that a part is on the plate, so this raises the gate itself and
+    continues instead of 409ing ``no_plate_gate``. It only ever acts on a gate-DOWN
+    printer that already passed the connected + not-busy guards above.
+
+    ``max_z_override`` is the operator's confirmed part height. It reaches the build ONLY
+    on the foreign confirm leg — the farm-known path's height comes from its own
+    dispatched donor, which is the file the farm itself put on that plate, so there is
+    nothing there for an operator figure to correct.
     """
     printer = await db.get(Printer, printer_id)
     if printer is None:
@@ -293,9 +309,27 @@ async def manual_eject(
         raise ManualEjectError("printer_busy", "Printer is printing or paused; cannot eject now", status_code=409)
 
     if not printer_manager.is_awaiting_plate_clear(printer_id):
-        raise ManualEjectError(
-            "no_plate_gate", "Printer is not awaiting plate clear; nothing to eject", status_code=409
-        )
+        if not declare_occupied:
+            raise ManualEjectError(
+                "no_plate_gate", "Printer is not awaiting plate clear; nothing to eject", status_code=409
+            )
+        # One-step "Eject plate…": the operator states the plate is occupied, so raise the
+        # gate here and fall through into the foreign flow. Source-less (``None``) ⇒
+        # human-clear-only, the same shape as the native vision trip's raise in
+        # ``farm_correlation``. The raise is NEVER rolled back — not on an unresolvable
+        # donor, not on the bed_hot confirm, not on an abandoned dialog: the plate IS
+        # occupied whatever happens next, and "Mark plate as cleared" is the visible undo.
+        printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=None)
+        # That writer persists asynchronously, so a PREVIOUSLY failed persist can leave a
+        # stale key on the row this call already loaded — which would steer
+        # ``_resolve_manual_eject_item`` and the farm-known check in
+        # ``_manual_eject_foreign`` onto a print that is not on this plate. NULL it here
+        # to match the gate we just raised.
+        printer.plate_gate_subtask_id = None
+        logger.info("manual_eject: printer %s plate declared occupied by operator (source-less gate)", printer_id)
+
+    # The confirm (second) call passes the flag again, but the gate it raised is now up —
+    # the branch above is skipped, so the declaration can never double-raise.
 
     if eject_remote.peek_pending_eject(printer_id) is not None:
         raise ManualEjectError("eject_in_flight", "An eject is already in flight on this printer", status_code=409)
@@ -304,7 +338,14 @@ async def manual_eject(
     if queue_item_id is None:
         # No farm-known finished unit → the foreign-plate two-step flow (or a firm 409
         # for a farm-known-but-ineligible gate like an unapproved first article).
-        return await _manual_eject_foreign(db, printer, state, allow_hot=allow_hot, eject_profile_id=eject_profile_id)
+        return await _manual_eject_foreign(
+            db,
+            printer,
+            state,
+            allow_hot=allow_hot,
+            eject_profile_id=eject_profile_id,
+            max_z_override=max_z_override,
+        )
 
     threshold = await _resolve_eject_threshold(queue_item_id)
     if threshold is None:
@@ -569,6 +610,7 @@ async def _manual_eject_foreign(
     *,
     allow_hot: bool,
     eject_profile_id: int | None,
+    max_z_override: float | None = None,
 ) -> dict:
     """The foreign-plate branch of ``manual_eject`` (called when no farm-known unit
     resolves). A farm-known-but-ineligible gate (a queue item stamped with the gate's
@@ -577,7 +619,12 @@ async def _manual_eject_foreign(
     — the strict archive resolver first, then the on-disk last-farm-item fallback for the
     screen-RESTART shape the strict resolver can't tie (:func:`_resolve_foreign_source_from_last_farm_item`)
     — and with no ``eject_profile_id`` the confirm prompt (:class:`ForeignPlateEject`) is
-    raised; with one the eject is dispatched via ``dispatch_foreign_eject``."""
+    raised; with one the eject is dispatched via ``dispatch_foreign_eject``.
+
+    ``max_z_override`` applies to the CONFIRM leg only: the prompt still carries the
+    donor's parsed ``max_z`` (it is the dialog's prefill), and the operator's corrected
+    figure supersedes it in the build. That correction matters most where the donor is
+    the ASSUMED last-farm-item fallback rather than the print actually on the plate."""
     gate = printer.plate_gate_subtask_id
     if gate:
         known = await db.execute(select(PrintQueueItem.id).where(PrintQueueItem.dispatch_subtask_id == gate).limit(1))
@@ -621,6 +668,7 @@ async def _manual_eject_foreign(
             profile_id=eject_profile_id,
             source_path=source.donor_path,
             plate_id=source.plate_id,
+            max_z_override=max_z_override,
         )
     finally:
         _safe_unlink(source.tmp_path)

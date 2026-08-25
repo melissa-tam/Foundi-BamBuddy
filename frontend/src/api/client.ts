@@ -4146,6 +4146,18 @@ export const api = {
     request<{ success: boolean; message: string }>(`/printers/${printerId}/clear-plate`, {
       method: 'POST',
     }),
+  // Operator statement that the plate is OCCUPIED: raises the plate-clear gate
+  // so dispatch to this printer is held. Unlike the other printer commands this
+  // one is served while the printer is DISCONNECTED — that is its purpose. A
+  // print that finished with the session down (maintenance mode tears MQTT
+  // down) leaves the farm with no gate, and a reactivated printer is
+  // dispatchable within ~1 s of the kick-driven scheduler; declaring the plate
+  // occupied first closes that reconnect race. `clearPlate` is the undo.
+  markPlateOccupied: (printerId: number) =>
+    request<{ success: boolean; message: string }>(
+      `/printers/${printerId}/mark-plate-occupied`,
+      { method: 'POST' }
+    ),
   // Farm manual eject (W2): trigger the part-present eject sweep for a
   // farm-known completed unit. Call with allowHot=false first; the backend 409s
   // with `{code:'bed_hot', bed_c, threshold_c}` when the bed is above the
@@ -4154,14 +4166,27 @@ export const api = {
   // plate gate was raised by a print the farm did not dispatch (sent manually
   // from Bambu Studio); the caller confirms an eject profile and re-invokes
   // with `ejectProfileId` set. 200 → `{mode}` ('released_watch' | 'dispatched').
+  // `declareOccupied` is the on-demand lane: the server raises the gate itself
+  // and continues into that same foreign flow, so the usual `foreign_plate` 409
+  // follows. The raise is NOT rolled back by the 409 or by the operator
+  // cancelling the dialog — the plate is occupied either way.
+  // `maxZHeightMm` supersedes the part height parsed from the donor 3MF (the
+  // operator can correct a wrong or absent detected value in that dialog).
   ejectNow: (
     printerId: number,
     allowHot: boolean = false,
     ejectProfileId?: number | null,
+    declareOccupied: boolean = false,
+    maxZHeightMm?: number | null,
   ) =>
     request<EjectNowResponse>(`/printers/${printerId}/eject`, {
       method: 'POST',
-      body: JSON.stringify({ allow_hot: allowHot, eject_profile_id: ejectProfileId ?? null }),
+      body: JSON.stringify({
+        allow_hot: allowHot,
+        eject_profile_id: ejectProfileId ?? null,
+        declare_occupied: declareOccupied,
+        max_z_height_mm: maxZHeightMm ?? null,
+      }),
     }),
   // Farm one-click recovery: lift the plate-clear hold, clear quarantine, and
   // resume any paused production run on this printer in a single operator action
