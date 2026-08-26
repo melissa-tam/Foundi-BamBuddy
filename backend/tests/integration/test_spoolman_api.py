@@ -1276,6 +1276,62 @@ class TestLinkSpoolMqttConfigure:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_link_spool_publishes_the_spools_own_preset_not_a_generic(
+        self, async_client: AsyncClient, spoolman_settings, mock_spoolman_client, printer_factory
+    ):
+        """This lane built the whole wire identity by hand: the generic-material id ONLY
+        (never the spool's own ``slicer_filament``), an empty ``setting_id``, and a nozzle
+        maximum taken unconditionally from the material table. It now goes through
+        ``slot_identity.resolve_slot_identity``, the same builder the internal-inventory
+        lane uses, so a given filament lands byte-identical on both.
+
+        Spoolman mode is OFF in production — this test is the only verification the lane
+        gets, and it is not a substitute for a live probe.
+        """
+        printer = await printer_factory()
+        mock_spoolman_client.get_spool = AsyncMock(
+            return_value={
+                "id": 5,
+                "remaining_weight": 800.0,
+                "used_weight": 200.0,
+                "spool_weight": None,
+                "filament": {
+                    "id": 1,
+                    "name": "PLA Silk",
+                    "material": "PLA",
+                    "color_hex": "00FF00",
+                    "vendor": {"id": 1, "name": "Bambu Lab"},
+                    "weight": 1000,
+                },
+                "extra": {"bambu_slicer_filament": '"GFA01"'},
+                "location": None,
+                "comment": None,
+                "archived": False,
+            }
+        )
+
+        mqtt_mock = MagicMock()
+        with patch("backend.app.api.routes.spoolman.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mqtt_mock
+            mock_pm.get_status.return_value = None
+            response = await async_client.post(
+                "/api/v1/spoolman/spools/5/link",
+                json={
+                    "tray_uuid": "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4",
+                    "printer_id": printer.id,
+                    "ams_id": 0,
+                    "tray_id": 1,
+                },
+            )
+
+        assert response.status_code == 200
+        call_kwargs = mqtt_mock.ams_set_filament_setting.call_args.kwargs
+        assert call_kwargs["tray_info_idx"] == "GFA01", "pre-fix this lane published the GFL99 generic bucket"
+        assert call_kwargs["setting_id"] == "GFSA01", "pre-fix setting_id was hardcoded empty"
+        assert call_kwargs["tray_color"] == "00FF00FF"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_link_spool_no_printer_context_no_mqtt(
         self, async_client: AsyncClient, spoolman_settings, mock_spoolman_client
     ):

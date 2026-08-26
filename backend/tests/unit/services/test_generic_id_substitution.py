@@ -1,4 +1,4 @@
-"""Generic-id substitution at the AMS write site — ``inventory.apply_spool_to_slot_via_mqtt``.
+"""Generic-id substitution at the AMS write site — ``slot_identity.apply_spool_to_slot_via_mqtt``.
 
 2026-07-25 PROD (011-H2S, printer id 9): three slots were published
 ``tray_info_idx=GFG99, setting_id=GFSG99`` every ~30 s for 13 minutes while a fourth
@@ -27,8 +27,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.app.api.routes.inventory import apply_spool_to_slot_via_mqtt
 from backend.app.models.spool import Spool
+from backend.app.services.slot_identity import apply_spool_to_slot_via_mqtt
 
 pytestmark = pytest.mark.asyncio
 

@@ -907,7 +907,7 @@ async def auto_assign_spool(
 
     # Reconcile slot_preset_mappings so the AMS slot card stops surfacing the
     # previous spool's preset name. Shared with the manual-assign path
-    # (inventory.apply_spool_to_slot_via_mqtt). Outside the try above so a
+    # (slot_identity.apply_spool_to_slot_via_mqtt). Outside the try above so a
     # transient MQTT failure doesn't leave the display row stale.
     from backend.app.services.slot_preset_writer import upsert_slot_preset_for_spool
 

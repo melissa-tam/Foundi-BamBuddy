@@ -3,7 +3,7 @@ card's displayed preset name.
 
 Three call sites must keep this row in sync with the currently-assigned spool:
 
-- ``api.routes.inventory.apply_spool_to_slot_via_mqtt`` (internal manual assign)
+- ``services.slot_identity.apply_spool_to_slot_via_mqtt`` (internal manual assign)
 - ``services.spool_tag_matcher.auto_assign_spool`` (internal RFID auto-assign)
 - ``main.auto_sync_spoolman_ams_trays`` (Spoolman RFID-driven sync)
 

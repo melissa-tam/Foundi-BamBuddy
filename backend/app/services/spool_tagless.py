@@ -76,7 +76,13 @@ from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import ams_presence, spool_respool
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.spool_binding import bind_spool_to_slot, bound_elsewhere, last_released_from_slot_stmt
+from backend.app.services.slot_identity import apply_spool_to_slot_via_mqtt
+from backend.app.services.spool_binding import (
+    bind_spool_to_slot,
+    bound_elsewhere,
+    last_released_from_slot_stmt,
+    release_spool_from_slot,
+)
 from backend.app.services.spool_tag_matcher import (
     auto_assign_spool,
     is_bambu_tag,
@@ -108,6 +114,13 @@ DATA_ORIGIN = "ams_auto"
 # specific id is configured. A tray re-reporting one of these is untrustworthy for
 # minting a fresh identity (W4 generic-id override).
 _GENERIC_ID_VALUES = frozenset(GENERIC_FILAMENT_IDS.values())
+
+# Release reason for the OPERATOR lane's roll swap (:func:`_replace_row_after_cycle`):
+# the departing row is retired and its successor takes the slot in the same
+# transaction. Distinct from the wire lane's release reasons so a ``[slot-state]``
+# line names which lane retired the roll — a departure that is a REPLACEMENT and one
+# that leaves a slot empty are different events to anyone reading the log.
+_CYCLE_REPLACE_REASON = "cycle_replace"
 
 # Re-push cadence for a BARE tray whose default-filament config has not yet
 # landed on the printer (failed / slow MQTT). The trigger persists across AMS
@@ -887,8 +900,6 @@ async def _push_config(db: AsyncSession, spool: Spool, printer_id: int, ams_id: 
     slot whose own identity is still unresolved (:func:`_config_settling`). Returns
     False without publishing when the slot is settling or the push fails.
     """
-    from backend.app.api.routes.inventory import apply_spool_to_slot_via_mqtt
-
     if _config_settling(printer_id, ams_id, tray_id):
         logger.debug(
             "Deferring tagless config push for printer %d AMS%d-T%d: slot identity still settling",
@@ -1018,6 +1029,17 @@ async def _replace_row_after_cycle(
     config.
     Optional ``new_fields`` (brand/label_weight/cost_per_kg/note) ride the new row.
     Commits; broadcasts ``spool_auto_assigned(origin="tagless")``. Returns the new spool.
+
+    **The ARCHIVE stamp lands before the unbind, and that ordering is load-bearing.**
+    The departure goes through ``spool_binding.release_spool_from_slot`` — the ONE
+    unbind writer — so it leaves the same three artefacts every other departure does:
+    the ``last_location_*`` residue, a cleared fresh-roll prompt, and the ``[slot-state]``
+    forensic line. That residue is also a de-bounce DONOR, and a donor here would be the
+    shape-32 resurrection: a retired row reclaimed onto the brand-new roll that just
+    replaced it. What forbids it is ``slot_pipeline._debounce_candidate``'s ARCHIVED
+    refusal, which can only fire if the stamp is already on the row when the release
+    writes it — same transaction, archive first. Do not reorder these two statements,
+    and do not move the archive into the branch below.
     """
     departed.archived_at = datetime.utcnow()  # keep the ledger row + its grams
     res = await db.execute(
@@ -1029,8 +1051,7 @@ async def _replace_row_after_cycle(
     )
     old = res.scalar_one_or_none()
     if old is not None:
-        await db.delete(old)
-        await db.flush()
+        await release_spool_from_slot(db, old, reason=_CYCLE_REPLACE_REASON)
 
     default = await _tagless_default(db)
     tray_configured = bool(tray and (tray.get("tray_type") or "").strip())

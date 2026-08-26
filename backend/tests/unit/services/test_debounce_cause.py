@@ -588,3 +588,66 @@ async def test_a_tagged_donor_is_never_de_bounced(db_session, printer_factory):
     assert (
         await db_session.scalar(select(SpoolAssignment.spool_id).where(SpoolAssignment.printer_id == printer.id))
     ) != donor.id
+
+
+@pytest.mark.asyncio
+async def test_a_row_the_operator_lane_retired_is_never_de_bounced_onto_its_own_slot(db_session, printer_factory):
+    """The operator lane's roll swap leaves a breadcrumb, and the ARCHIVE stamp is what
+    stops that breadcrumb resurrecting the retired roll onto its replacement.
+
+    ``spool_tagless._replace_row_after_cycle`` unbinds through
+    ``spool_binding.release_spool_from_slot`` — the ONE unbind writer — so the departure
+    finally leaves the residue, the cleared prompt and the forensic line every other
+    departure leaves. That residue is also a de-bounce DONOR, and for the instant between
+    the release and the successor's bind the retired row IS this slot's newest one. A donor
+    there is shape 32 exactly: a dead row reclaimed onto the brand-new roll that replaced
+    it, with nothing downstream able to heal it.
+
+    What forbids it is the ARCHIVED refusal, and it can only fire because the stamp is
+    written BEFORE the release, in the same transaction. The mutation check below is the
+    point of this test: with the stamp cleared the row IS handed over, so the ordering is
+    load-bearing and not incidental. The departed row here is deliberately NOT spent — the
+    "New roll" verb answers a prompt raised at 70 % of label, so ``archived_at`` is the
+    only thing standing between that lane and the resurrection.
+    """
+    printer = await printer_factory()
+    departed = Spool(
+        material="PETG",
+        rgba="000000FF",
+        label_weight=1000,
+        weight_used=980.0,
+        data_origin="ams_auto",
+    )
+    departed.k_profiles = []
+    departed.assignments = []
+    db_session.add(departed)
+    await db_session.flush()
+    db_session.add(SpoolAssignment(spool_id=departed.id, printer_id=printer.id, ams_id=0, tray_id=3))
+    await db_session.commit()
+
+    successor = await spool_tagless._replace_row_after_cycle(db_session, printer.id, 0, 3, {"id": 3, **_PETG}, departed)
+    await db_session.refresh(departed)
+
+    assert successor.id != departed.id
+    assert departed.archived_at is not None, "the retired row keeps its ledger, archived"
+    assert (
+        departed.last_location_printer_id,
+        departed.last_location_ams_id,
+        departed.last_location_tray_id,
+    ) == (printer.id, 0, 3), "the unbind went through the writer, so the residue is stamped"
+
+    obs = _obs(printer.id, 3)
+    assert await slot_pipeline._debounce_candidate(db_session, obs) is None
+
+    # The stamp is the whole containment: clear it and this row is a donor again.
+    departed.archived_at = None
+    await db_session.commit()
+    assert await slot_pipeline._debounce_candidate(db_session, obs) is departed
+    departed.archived_at = datetime.utcnow()
+    await db_session.commit()
+
+    # End to end: a qualifying gain on that slot must not resolve onto the retired row.
+    _seed_gain(printer.id, 0, 3, absent_for=25.0)
+    transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session))
+    assert transitions[0].decision.kind is not DecisionKind.RECLAIM
+    assert transitions[0].decision.spool_id != departed.id

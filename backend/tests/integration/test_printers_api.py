@@ -1508,7 +1508,7 @@ class TestConfigureAMSSlotAPI:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/0/0/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL99",
                     "tray_type": "PLA",
                     "tray_sub_brands": "PLA Basic",
@@ -1538,7 +1538,7 @@ class TestConfigureAMSSlotAPI:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/2/3/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL05",
                     "tray_type": "PLA",
                     "tray_sub_brands": "PLA Basic",
@@ -1572,7 +1572,7 @@ class TestConfigureAMSSlotAPI:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/2/3/configure",
-                params={
+                json={
                     "tray_info_idx": "PFUS9ac902733670a9",
                     "tray_type": "PLA",
                     "tray_sub_brands": "Devil Design PLA",
@@ -1623,7 +1623,7 @@ class TestConfigureAMSSlotAPI:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/2/3/configure",
-                params={
+                json={
                     "tray_info_idx": "PFUS9ac902733670a9",
                     "tray_type": "PLA",
                     "tray_sub_brands": "Devil Design PLA",
@@ -1668,7 +1668,7 @@ class TestConfigureAMSSlotAPI:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/2/3/configure",
-                params={
+                json={
                     "tray_info_idx": "PFUS9ac902733670a9",
                     "tray_type": "PLA",
                     "tray_sub_brands": "Devil Design PLA",
@@ -1703,7 +1703,7 @@ class TestConfigureAMSSlotAPI:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/2/3/configure",
-                params={
+                json={
                     "tray_info_idx": "",
                     "tray_type": "PETG",
                     "tray_sub_brands": "PETG Basic",
@@ -1743,7 +1743,7 @@ class TestConfigureAMSSlotAPI:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/128/0/configure",
-                params={
+                json={
                     "tray_info_idx": "PFUSa8fb76f9733e3c",
                     "tray_type": "ABS",
                     "tray_sub_brands": "Sting3D ABS",
@@ -3100,7 +3100,7 @@ class TestConfigureAmsSlotPersistsKProfile:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/0/3/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL05",
                     "tray_type": "PLA",
                     "tray_sub_brands": "Bambu PLA Metal",
@@ -3167,7 +3167,7 @@ class TestConfigureAmsSlotPersistsKProfile:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/0/3/configure",
-                params={
+                json={
                     "tray_info_idx": "PFUSdev01",
                     "tray_type": "PLA",
                     "tray_sub_brands": "Devil Design PLA",
@@ -3219,7 +3219,7 @@ class TestConfigureAmsSlotPersistsKProfile:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/0/3/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL05",
                     "tray_type": "PLA",
                     "tray_sub_brands": "PLA Basic",
@@ -3278,7 +3278,7 @@ class TestConfigureAmsSlotPersistsKProfile:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/0/3/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL05",
                     "tray_type": "PLA",
                     "tray_sub_brands": "PLA Basic",
@@ -3337,7 +3337,7 @@ class TestConfigureAmsSlotPersistsKProfile:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/0/3/configure",
-                params={
+                json={
                     "tray_info_idx": "PFUSdev01",
                     "tray_type": "PLA",
                     "tray_sub_brands": "Devil Design PLA",
@@ -3393,7 +3393,7 @@ class TestConfigureAmsSlotPersistsKProfile:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/0/3/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL05",
                     "tray_type": "PLA",
                     "tray_sub_brands": "PLA Basic",
@@ -3451,7 +3451,7 @@ class TestConfigureAmsSlotPersistsKProfile:
             # First call with cali_idx=5
             await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/0/3/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL05",
                     "tray_type": "PLA",
                     "tray_sub_brands": "PLA Basic",
@@ -3465,7 +3465,7 @@ class TestConfigureAmsSlotPersistsKProfile:
             # Second call with cali_idx=10 (same slot/spool/extruder/nozzle)
             await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/0/3/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL05",
                     "tray_type": "PLA",
                     "tray_sub_brands": "PLA Matte",
@@ -3533,7 +3533,7 @@ class TestConfigureAmsSlotPersistsKProfile:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/255/0/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL05",
                     "tray_type": "PLA",
                     "tray_sub_brands": "PLA Basic",
@@ -3596,7 +3596,7 @@ class TestConfigureAmsSlotPersistsKProfile:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/2/3/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL05",
                     "tray_type": "PLA",
                     "tray_sub_brands": "PLA Basic",
@@ -3669,7 +3669,7 @@ class TestConfigureAmsSlotPersistsKProfile:
 
             response = await async_client.post(
                 f"/api/v1/printers/{printer.id}/slots/0/3/configure",
-                params={
+                json={
                     "tray_info_idx": "GFL05",
                     "tray_type": "PLA",
                     "tray_sub_brands": "PLA Basic",

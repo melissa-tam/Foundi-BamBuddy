@@ -65,7 +65,7 @@ def env(monkeypatch):
     monkeypatch.setattr("backend.app.api.routes.settings.get_setting", fake_get_setting)
 
     apply = AsyncMock(return_value=True)
-    monkeypatch.setattr("backend.app.api.routes.inventory.apply_spool_to_slot_via_mqtt", apply)
+    monkeypatch.setattr("backend.app.services.spool_tagless.apply_spool_to_slot_via_mqtt", apply)
 
     ws = AsyncMock()
     monkeypatch.setattr(spool_tagless.ws_manager, "broadcast", ws)

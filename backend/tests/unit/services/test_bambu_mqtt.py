@@ -6027,6 +6027,35 @@ class TestAmsFilamentSettingExternalSpoolEncoding:
         assert cmd["tray_info_idx"] == ""
         assert cmd["tray_type"] == ""
 
+    def test_reset_publishes_the_blank_identity_field_for_field(self, mqtt_client):
+        """A reset IS a filament setting — the BLANK identity — so it publishes through
+        ``ams_set_filament_setting`` instead of assembling a second copy of the
+        external-spool id convention and the wire-safety refusal.
+
+        The payload is pinned whole rather than by the two fields the sibling case
+        samples: the delegation is only safe while every field still matches, and a
+        reset that quietly changes shape is a regression no partial assertion catches.
+        ``setting_id`` must be ABSENT — the publisher omits the key for a blank value,
+        which is what the hand-rolled reset did by never including it.
+        """
+        mqtt_client.state.raw_data = {}
+
+        assert mqtt_client.reset_ams_slot(ams_id=1, tray_id=2)
+
+        assert self._published(mqtt_client) == {
+            "command": "ams_filament_setting",
+            "ams_id": 1,
+            "tray_id": 2,
+            "slot_id": 2,
+            "tray_info_idx": "",
+            "tray_type": "",
+            "tray_sub_brands": "",
+            "tray_color": "00000000",
+            "nozzle_temp_min": 0,
+            "nozzle_temp_max": 0,
+            "sequence_id": "0",
+        }
+
     def test_regular_ams_tray_unchanged(self, mqtt_client):
         """Regular AMS slots (ams_id <= 3) keep their existing encoding."""
         mqtt_client.state.raw_data = {"vt_tray": []}
