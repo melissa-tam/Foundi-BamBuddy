@@ -20,10 +20,13 @@ class TaglessDefaultFilament(BaseModel):
     rgba: str
     slicer_filament: str | None = None
     # Nozzle temperature range (W4). Optional so an operator-edited blob without
-    # them still validates; the shipped default carries the live RFID-read Bambu
-    # PETG HF range so a tagless slot's wire identity is a byte-identical firmware
-    # backup-group peer on all four dimensions (brand-class / type / colour /
-    # nozzle-temp-range) of same-filament Bambu slots.
+    # them still validates. The shipped 230/270 is Bambu STUDIO's GFG02 profile range
+    # (``nozzle_temperature_range_low``/``_high`` in "Bambu PETG HF @base.json"); the
+    # RFID tags themselves read 230-260 (102 of 102 temp-bearing tagged GFG02 rows,
+    # and the live wire on 2026-08-25). The two are allowed to differ: the firmware
+    # groups backup slots on preset + colour ONLY (``tray_fields.backup_group_key``),
+    # so a tagless slot written with the slicer range is still a backup-group peer of
+    # a tagged slot reading the tag range — 010-H2S carries both in one firmware group.
     nozzle_temp_min: int | None = None
     nozzle_temp_max: int | None = None
 
@@ -32,8 +35,8 @@ class TaglessDefaultFilament(BaseModel):
 # JSON string because settings are persisted as strings. Empty string clears the
 # setting (feature off — no default is pushed to bare trays). Ships the SPECIFIC
 # Bambu PETG HF slicer id (GFG02) + its 230/270 nozzle range so bare-tray pushes
-# resolve a full 4-dimension identity instead of falling to the generic GFG99 —
-# a mismatch that split the firmware auto-refill backup group (2026-07-19 incident).
+# resolve a complete wire identity instead of falling to the generic GFG99 — a PRESET
+# mismatch that split the firmware auto-refill backup group (2026-07-19 incident).
 _DEFAULT_TAGLESS_FILAMENT_JSON = TaglessDefaultFilament(
     brand="Bambu Lab",
     material="PETG",

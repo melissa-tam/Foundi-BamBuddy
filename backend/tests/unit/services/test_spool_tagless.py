@@ -698,7 +698,7 @@ class TestMintIdentityW4:
         )
         monkeypatch.setattr(spool_tagless, "parse_tray_fields", AsyncMock(return_value=parsed))
         spool = await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PETG", color="161616FF"))
-        assert spool.rgba == "000000FF"  # all four dimensions, not three
+        assert spool.rgba == "000000FF"  # the colour is canonicalised too, not just the preset
         assert spool.slicer_filament == "GFG02"
         assert spool.slicer_filament_name == "Bambu PETG HF"  # id unchanged -> name kept
         assert (spool.nozzle_temp_min, spool.nozzle_temp_max) == (230, 270)
@@ -1049,7 +1049,7 @@ class TestCanonicalDefaultIdentity:
     """The ONE canonicalisation predicate, consumed by the mint, the wire resolver AND
     the slot-config harmonise arm. Its mint-side behaviour is pinned by
     TestMintIdentityW4 above (which runs through this predicate); these cases pin the
-    predicate's own contract, one per firmware backup-group dimension.
+    predicate's own contract, one per identity field it canonicalises.
 
     Pure and synchronous — the caller supplies the parsed default dict, so there is no
     settings fixture here and nothing to await."""

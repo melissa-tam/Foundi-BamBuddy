@@ -3466,7 +3466,7 @@ async def run_migrations(conn):
         # the firmware can pair with NOTHING, while a tray holding what the farm's own
         # matcher calls the same filament sat beside it — differing only in a dimension
         # the firmware compares byte-exactly (colour 161616FF vs 000000FF, or the
-        # nozzle-temp range). AMS Filament Backup was ON and never switched, and the
+        # preset id). AMS Filament Backup was ON and never switched, and the
         # printer ran out twice in 28 h with a full roll one slot over. The farm cannot
         # rewrite an RFID or operator-bound tray, so the operator is the fix.
         ("on_backup_group_split", "1", "TRUE"),
@@ -3720,9 +3720,10 @@ async def run_migrations(conn):
     )
     await conn.execute(text("DELETE FROM settings WHERE key = 'prefer_lowest_filament'"))
 
-    # Migration (W4): normalize the shipped tagless-default filament to a full
-    # 4-dimension wire identity (GFG02 Bambu PETG HF + nozzle range 230/270) so every
-    # bare-tray config push emits a byte-identical firmware backup-group peer. ONLY
+    # Migration (W4): normalize the shipped tagless-default filament to a complete wire
+    # identity (GFG02 Bambu PETG HF + nozzle range 230/270) so every bare-tray config
+    # push emits the fleet's one canonical identity — of which the PRESET half is what
+    # makes the slot a firmware backup-group peer (grouping is preset + colour). ONLY
     # rewrites a row still holding the UNEDITED old default (Bambu Lab / PETG / HF /
     # 000000FF / no slicer_filament); an operator-customised row is untouched.
     # Semantic JSON compare (the frontend's JSON.stringify key order differs from

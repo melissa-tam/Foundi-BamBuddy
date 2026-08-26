@@ -1500,8 +1500,8 @@ async def assign_spoolman_slot(
             # internal-mode route via the same helper so the two flows can't
             # drift again.
             # W4: consume the resolver's COMPLETE wire identity (id/setting/sub-brand
-            # AND the resolved nozzle-temp range) so this Spoolman write site emits an
-            # identical 4-dimension identity to the internal-inventory route for a
+            # AND the resolved nozzle-temp range) so this Spoolman write site emits a
+            # wire identity identical to the internal-inventory route's for a
             # same-identity spool.
             tray_info_idx, setting_id, sub_brand_override, temp_min, temp_max = await resolve_slicer_filament(
                 db=db,

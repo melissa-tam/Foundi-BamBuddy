@@ -2323,8 +2323,9 @@ class NotificationService:
     ):
         """Fire when a dispatch picked a tray the firmware can pair with NOTHING.
 
-        AMS Filament Backup groups slots only on an EXACT preset / colour / nozzle-temp
-        match; the farm's matcher calls two colours within 40 per channel the same
+        AMS Filament Backup groups slots only on an EXACT preset + colour match (nozzle
+        temperature is not a dimension of it — measured 2026-08-25 off the firmware's own
+        ``filam_bak`` groups); the farm's matcher calls two colours within 40 per channel the same
         filament. Those two readings disagreeing is 010-H2S 2026-08-21: slot 2 carried
         ``161616FF`` (a Studio/touchscreen edit that took the PETG-HF preset default)
         beside slot 4's ``000000FF``, the farm dispatched onto slot 2 believing slot 4

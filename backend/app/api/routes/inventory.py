@@ -139,7 +139,8 @@ async def apply_spool_to_slot_via_mqtt(
     # W4: the resolver returns the COMPLETE wire identity — id/setting/sub-brand AND
     # the resolved nozzle-temp range (spool-row temps → tagless-default fingerprint →
     # MATERIAL_TEMPS) — so this write site and the Spoolman route can't diverge on
-    # any of the four firmware backup-group dimensions.
+    # any part of the wire identity. (The firmware's backup grouping itself is preset
+    # + colour; the temps ride along so a slot's identity is uniform, not to group it.)
     tray_info_idx, setting_id, sub_brand_override, temp_min, temp_max = await resolve_slicer_filament(
         db=db,
         current_user=current_user,

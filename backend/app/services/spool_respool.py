@@ -78,6 +78,8 @@ from backend.app.services.spool_tag_matcher import (
     parse_tray_fields,
 )
 from backend.app.services.tray_fields import (
+    TRAYS_PER_AMS_UNIT,
+    filam_bak_groups,
     normalized_tag_uid,
     normalized_tray_uuid,
     parse_filam_bak,
@@ -238,6 +240,7 @@ def _reset_state() -> None:
     _jump_seen.clear()
     _spent_dedup.clear()
     _filam_bak_groups.clear()
+    _wide_filam_bak_logged.clear()
     _last_contradiction_scan_at = None
 
 
@@ -1438,35 +1441,47 @@ def _update_stable_feeder(printer_id: int, current: int) -> None:
         _stable_feeder[printer_id] = current
 
 
-# Last-seen firmware auto-refill BACKUP GROUPS per printer, as membership lists.
-# Refreshed by the per-push sampler whenever a push carries the field and left standing
-# when it does not: firmware clears and refills `filam_bak` on every report it appears
-# in, but `bambu_mqtt` preserves only ams / vt_tray / ams_extruder_map / mapping across
-# raw_data replacement, so an incremental push that omits it would otherwise read as
-# "no groups". Machine-scoped, NOT AMS-scoped — the field is top-level or per-EXTRUDER
-# on the wire, never per AMS unit (see `tray_fields.parse_filam_bak`). Process-lifetime
-# like the other edge dicts; a restart simply re-learns it from the next push carrying
-# one, and until then the corroboration below fails safe.
-_filam_bak_groups: dict[int, list[list[int]]] = {}
+# Last-seen firmware auto-refill BACKUP GROUPS per printer, one slot-index SET per
+# group (`tray_fields.filam_bak_groups` owns the mask expansion). Refreshed by the
+# per-push sampler whenever a push carries the field and left standing when it does not:
+# firmware clears and refills `filam_bak` on every report it appears in, but `bambu_mqtt`
+# preserves only ams / vt_tray / ams_extruder_map / mapping across raw_data replacement,
+# so an incremental push that omits it would otherwise read as "no groups". An entry
+# present but EMPTY is the honest "reported, and there are no groups" (008-H2C reports
+# exactly that); a missing entry is "never reported". Machine-scoped, NOT AMS-scoped —
+# the field is top-level or per-EXTRUDER on the wire, never per AMS unit (see
+# `tray_fields.parse_filam_bak`). Process-lifetime like the other edge dicts; a restart
+# simply re-learns it from the next push carrying one, and until then the corroboration
+# below fails safe.
+_filam_bak_groups: dict[int, list[set[int]]] = {}
+
+# Printers whose backup groups have already been logged carrying a bit outside AMS unit
+# 0. One line per printer for the process lifetime: the point is to CAPTURE the
+# observation that resolves the encoding question once, not to trace it.
+_wide_filam_bak_logged: set[int] = set()
 
 
 def _note_filam_bak(printer_id: int, state) -> None:
     """Refresh the cached backup groups from this push, if it carries any.
 
     Sync, pure in-memory, no DB and no awaits — it rides :func:`sample_status_push` on
-    the ~1 Hz status callback. Reads BOTH wire shapes and keeps each as its OWN group,
-    because "same group" is the question the corroboration asks: the flat machine-level
-    ``print.filam_bak`` is one group, and each entry of
-    ``print.device.extruder.info[]`` is a separate one (a dual-nozzle machine's two
-    nozzles do not back each other up). A push carrying neither leaves the cache alone.
+    the ~1 Hz status callback. Reads BOTH wire shapes: the flat machine-level
+    ``print.filam_bak`` and each entry of ``print.device.extruder.info[]`` (a dual-nozzle
+    machine reports per EXTRUDER, and two nozzles do not back each other up). Every
+    ELEMENT of either array is one group's slot bitmask, so the groups from all carriers
+    pool into one flat list of membership sets. A push carrying neither shape leaves the
+    cache alone; a push carrying an EMPTY one overwrites with no groups, which is a real
+    answer and not the same as silence.
     """
     raw = getattr(state, "raw_data", None)
     if not isinstance(raw, dict):
         return
-    groups: list[list[int]] = []
+    carried = False
+    masks: list[int] = []
     flat = parse_filam_bak(raw)
     if flat is not None:
-        groups.append(flat)
+        carried = True
+        masks.extend(flat)
     device = raw.get("device")
     extruder = device.get("extruder") if isinstance(device, dict) else None
     info = extruder.get("info") if isinstance(extruder, dict) else None
@@ -1474,9 +1489,62 @@ def _note_filam_bak(printer_id: int, state) -> None:
         for entry in info:
             per_extruder = parse_filam_bak(entry)
             if per_extruder is not None:
-                groups.append(per_extruder)
-    if groups:
-        _filam_bak_groups[printer_id] = groups
+                carried = True
+                masks.extend(per_extruder)
+    if not carried:
+        return
+    groups = filam_bak_groups(masks)
+    _filam_bak_groups[printer_id] = groups
+    _log_wide_filam_bak(printer_id, masks, groups, state)
+
+
+def _log_wide_filam_bak(printer_id: int, masks: list[int], groups: list[set[int]], state) -> None:
+    """INFO once per printer when a backup group claims a bit outside AMS unit 0.
+
+    ``filam_bak``'s bit index is confirmed to be the SLOT within AMS unit 0 and
+    UNMEASURED beyond it — every multi-AMS printer sampled 2026-08-25 reported no groups
+    at all, so no capture has yet discriminated a global tray id (``ams_id * 4 +
+    tray_id``) from a per-unit slot. A bit ≥ 4 is the first observation that can: this
+    line records the raw masks beside the identity of every live tray, and the two
+    readings name different trays. Until it appears,
+    :func:`_backup_swap_corroborated` declines outside AMS 0 rather than guessing.
+
+    Sync, no DB, no awaits and fully guarded — it rides the ~1 Hz status callback
+    (invariant 10).
+    """
+    if printer_id in _wide_filam_bak_logged:
+        return
+    if not any(bit >= TRAYS_PER_AMS_UNIT for group in groups for bit in group):
+        return
+    _wide_filam_bak_logged.add(printer_id)
+    try:
+        identities: list[str] = []
+        raw = getattr(state, "raw_data", None)
+        units = raw.get("ams") if isinstance(raw, dict) else None
+        for unit in units if isinstance(units, list) else []:
+            if not isinstance(unit, dict):
+                continue
+            ams_id = unit.get("id")
+            trays = unit.get("tray")
+            for tray in trays if isinstance(trays, list) else []:
+                if not isinstance(tray, dict):
+                    continue
+                identities.append(
+                    f"{ams_id}/{tray.get('id')}={tray.get('tray_info_idx') or tray.get('tray_type') or '-'}"
+                    f":{tray.get('tray_color') or '-'}:{tray.get('state')}"
+                )
+        logger.info(
+            "[RESPOOL] filam_bak encoding sample on printer %d: masks=%s groups=%s live trays=[%s]. "
+            "A bit >= %d is out of AMS unit 0 — comparing it against the tray identities says whether "
+            "the bit indexes a global tray id (ams_id*4+tray_id) or a per-unit slot.",
+            printer_id,
+            masks,
+            [sorted(group) for group in groups],
+            ", ".join(identities),
+            TRAYS_PER_AMS_UNIT,
+        )
+    except Exception:  # noqa: BLE001 — an observation may never break the status callback
+        logger.debug("[RESPOOL] filam_bak encoding sample failed for printer %s", printer_id, exc_info=True)
 
 
 def _backup_swap_corroborated(printer_id: int, departed: int, arrived: int) -> bool | None:
@@ -1486,22 +1554,37 @@ def _backup_swap_corroborated(printer_id: int, departed: int, arrived: int) -> b
     push has ever carried ``filam_bak`` for this printer). The caller treats ``None``
     and ``False`` alike — no stamp — but they are different facts and the log says which.
 
-    Both trays must appear in the SAME list. That is the literal meaning of a backup
+    Both trays must appear in the SAME group. That is the literal meaning of a backup
     group: the firmware switched from one enrolled tray to another enrolled tray, which
     is the auto-refill it performs precisely because the first ran dry. A feeder change
     ACROSS groups is something else (a tool change, a dispatch remap) and must never
     spend a spool.
 
-    Encoding safety: ``departed``/``arrived`` are global tray ids, and `filam_bak`'s own
-    encoding is unconfirmed. If it turns out to be per-unit slot ids, every tray outside
-    AMS 0 has a global id ≥ 4 that no slot id can equal, so this returns ``False`` and we
-    decline to stamp. The unconfirmed reading can therefore only cost a stamp, never
-    fabricate one — which is the direction this whole workstream fails in.
+    Encoding safety: ``departed``/``arrived`` are GLOBAL tray ids and are decoded through
+    :func:`decode_global_tray`, while a group's members are BIT INDICES whose meaning is
+    confirmed only for AMS unit 0 (``tray_fields.parse_filam_bak``). A pair that does not
+    resolve entirely inside AMS 0 is therefore declined outright, with the reason named —
+    the unmeasured reading can cost a stamp, never fabricate one, which is the direction
+    this whole workstream fails in.
     """
     groups = _filam_bak_groups.get(printer_id)
-    if not groups:
+    if groups is None:
         return None
-    return any(departed in group and arrived in group for group in groups)
+    dep_ams, dep_slot = decode_global_tray(departed)
+    arr_ams, arr_slot = decode_global_tray(arrived)
+    if dep_ams != 0 or arr_ams != 0 or dep_slot is None or arr_slot is None:
+        logger.warning(
+            "[RESPOOL] backup-swap corroboration declined on printer %d (tray %d -> %d): the pair resolves to "
+            "AMS unit(s) %s/%s and filam_bak's bit index is confirmed only for AMS unit 0, so a match here "
+            "would assert an encoding nothing has measured.",
+            printer_id,
+            departed,
+            arrived,
+            dep_ams,
+            arr_ams,
+        )
+        return False
+    return any(dep_slot in group and arr_slot in group for group in groups)
 
 
 def _swap_stamp_permitted(printer_id: int, state, departed: int, arrived: int) -> bool:

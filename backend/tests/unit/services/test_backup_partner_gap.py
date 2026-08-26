@@ -3,9 +3,14 @@
 010-H2S ran out on slot 2 twice in 28 h with black PETG loaded in slot 4 and AMS
 Filament Backup ON. The firmware never auto-switched because slot 2's tray colour was
 ``161616FF`` and slot 4's ``000000FF`` — the firmware pairs backup slots only on an
-EXACT preset / colour / nozzle-temp match, while the farm's matcher
-(``colors_are_similar``, ≤40 per channel) calls them the same filament and dispatched
-onto slot 2 believing slot 4 backed it up (incident shape 33).
+EXACT preset + colour match, while the farm's matcher (``colors_are_similar``, ≤40 per
+channel) calls them the same filament and dispatched onto slot 2 believing slot 4 backed
+it up (incident shape 33).
+
+Since the firmware's key has exactly two dimensions and a near miss has already agreed
+on the preset, a gap can only ever be a COLOUR gap. Nozzle temperature was carried as a
+third dimension between 2026-08-21 and 2026-08-25 and is not one — the firmware's own
+``filam_bak`` masks put a slot at 230-260 in one group with slots at 230-270.
 
 The reconcile lane harmonises the farm's OWN tagless slots onto the canonical identity.
 These tests pin the VISIBILITY lane for the residue it cannot fix — an RFID or
@@ -75,8 +80,8 @@ class TestBackupPartnerGapRule:
         assert gap.partner_value == "#000000"
         assert gap.partner_global_tray_id == 3
         # The two keys the caller dedups on are the ones the verdict rests on.
-        assert gap.picked_key == "tray:GFG02|color:161616|temps:230-270"
-        assert gap.partner_key == "tray:GFG02|color:000000|temps:230-270"
+        assert gap.picked_key == "tray:GFG02|color:161616"
+        assert gap.partner_key == "tray:GFG02|color:000000"
 
     def test_real_partner_wins_over_a_near_miss(self):
         """A tray sharing the key means the runout self-heals — no warning, even though
@@ -98,19 +103,15 @@ class TestBackupPartnerGapRule:
         picked = _tray(1, color=_NEAR_BLACK)
         assert backup_partner_gap(picked, [_tray(3, color=_BLACK, info_idx="GFG99")]) is None
 
-    def test_temps_gap_on_an_identical_colour(self):
-        """Byte-identical colour, different nozzle-temp range — still two groups."""
-        gap = backup_partner_gap(_tray(1), [_tray(3, tmax=260)])
-        assert gap is not None
-        assert gap.dimension == "temps"
-        assert (gap.picked_value, gap.partner_value) == ("230-270", "230-260")
-
-    def test_silent_temps_render_as_question_marks(self):
-        """A tray that reports no range must not page an operator about ``None-None``."""
-        gap = backup_partner_gap(_tray(1, tmin=None, tmax=None), [_tray(3)])
-        assert gap is not None
-        assert gap.dimension == "temps"
-        assert gap.picked_value == "?-?"
+    def test_a_different_nozzle_temp_range_is_not_a_gap(self):
+        """Byte-identical preset and colour, different nozzle-temp range — ONE group, so
+        there is a real partner and nothing to page about. The firmware's own
+        ``filam_bak`` says so (010-H2S, mask ``[15]``: a tagged slot at 230-260 grouped
+        with three tagless slots at 230-270), and a tray reporting no range at all is a
+        partner on the same terms. Paging here would send an operator to edit a
+        temperature that changes nothing."""
+        assert backup_partner_gap(_tray(1), [_tray(3, tmax=260)]) is None
+        assert backup_partner_gap(_tray(1, tmin=None, tmax=None), [_tray(3)]) is None
 
     def test_unread_and_empty_peers_are_ignored(self):
         """A seated-but-unread tray and a wire-asserted-empty one are peers for nothing,

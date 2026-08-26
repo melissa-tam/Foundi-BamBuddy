@@ -2421,7 +2421,8 @@ async def _mint_from_spec(deps: PipelineDeps, obs: TrayObservation, spec: dict) 
 
     * ``source="tagless_default"`` → ``spool_tagless.mint_tagless_spool(default_filament=)``
       (data_origin ``ams_auto``, the default's slicer id + nozzle temps ride along so the
-      slot stays a byte-identical firmware backup-group peer);
+      slot presents the fleet's canonical wire identity — the PRESET half of which is
+      what makes it a firmware backup-group peer);
     * ``source="tray"`` WITH an identity → ``spool_tag_matcher.create_spool_from_tray``
       (the tagged auto-add lane: brand Bambu Lab, data_origin ``rfid_auto``);
     * ``source="tray"`` without one → ``mint_tagless_spool(tray=)``.

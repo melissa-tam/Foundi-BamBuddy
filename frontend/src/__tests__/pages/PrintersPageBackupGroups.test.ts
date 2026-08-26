@@ -1,8 +1,10 @@
 /**
- * Tests for #1762 — `computeBackupGroups` strict identity rule.
+ * Tests for #1762 — `computeBackupGroups` identity rule.
  *
- * Slots pair ONLY when they share the same Bambu preset ID
- * (`tray_info_idx`). User-tagged spools without a preset never pair.
+ * Slots pair ONLY when they share a preset (`tray_info_idx`, falling back to
+ * `tray_type`) AND a byte-equal normalised colour, on one extruder side.
+ * Nozzle temperature is NOT in the firmware's key — proven 2026-08-25 against
+ * the wire's own `filam_bak` groups, and pinned below.
  * Empty slots are skipped; non-empty slots without a peer come back as
  * 1-member entries so the modal can list them as "Slots without a peer".
  */
@@ -65,7 +67,11 @@ describe('computeBackupGroups', () => {
     expect(groups[0].members.map((m) => m.globalTrayId)).toEqual([0, 4]);
   });
 
-  it('STRICT rule: two slots without a preset never pair, even with matching material+colour', () => {
+  it('falls back to tray_type: two slots with no profile id pair on material + colour', () => {
+    // Mirrors the backend `tray_fields.backup_group_key` preset rule
+    // (`tray_info_idx or tray_type`). One rule, two spellings — a tray that
+    // grouped here but read presetless to the backend would make the badge and
+    // the `[spool-select]` backup WARN contradict each other.
     const groups = computeBackupGroups(
       [
         ams(0, [{ tray_type: 'PLA', tray_sub_brands: 'PLA Basic', tray_color: '#FF0000' }]),
@@ -75,10 +81,25 @@ describe('computeBackupGroups', () => {
       false,
     );
 
-    // Two lone slots — no pair.
+    expect(groups).toHaveLength(1);
+    expect(groups[0].members).toHaveLength(2);
+    expect(groups[0].presetId).toBe('PLA');
+  });
+
+  it('fallback preset is still material-strict: different tray_type never pairs', () => {
+    // The fallback widens WHERE the preset comes from, never what counts as a
+    // match: two materially-different spools sharing a colour are not backups.
+    const groups = computeBackupGroups(
+      [
+        ams(0, [{ tray_type: 'PLA', tray_color: '#FF0000' }]),
+        ams(1, [{ tray_type: 'PETG', tray_color: '#FF0000' }]),
+      ],
+      {},
+      false,
+    );
+
     expect(groups).toHaveLength(2);
     expect(groups.every((g) => g.members.length === 1)).toBe(true);
-    expect(groups.every((g) => g.presetId === null)).toBe(true);
   });
 
   it('does NOT group slots with different presets even if same material', () => {
@@ -225,23 +246,26 @@ describe('computeBackupGroups', () => {
     expect(groups[0].trayColor).toBe('#1A1A1A');
   });
 
-  it('does NOT pair slots whose nozzle-temperature windows differ', () => {
-    // The firmware's backup key is preset + colour + nozzle temps — a slot
-    // configured 220-260 does not back up one configured 190-230.
+  it('PAIRS slots whose nozzle-temperature windows differ — temps are not in the key', () => {
+    // The 010-H2S measurement: the firmware reported `filam_bak = [15]` for
+    // T0 (RFID-tagged, 230-260) beside T1-T3 (tagless, 230-270) — one group
+    // across differing windows. A temps dimension in this key was the false
+    // "No backup slot" badge on a slot the firmware had already grouped.
     const groups = computeBackupGroups(
       [
-        ams(0, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99', nozzle_temp_min: 220, nozzle_temp_max: 260 }]),
-        ams(1, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99', nozzle_temp_min: 190, nozzle_temp_max: 230 }]),
+        ams(0, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG02', nozzle_temp_min: 230, nozzle_temp_max: 260 }]),
+        ams(1, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG02', nozzle_temp_min: 230, nozzle_temp_max: 270 }]),
       ],
       {},
       false,
     );
-    expect(groups).toHaveLength(2);
-    expect(groups.every((g) => g.members.length === 1)).toBe(true);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].members).toHaveLength(2);
   });
 
   it('pairs slots that both report no nozzle-temperature window', () => {
-    // "No window" is a value of its own: two trays without temps still pair.
+    // A missing window is not a missing identity — grouping never depended on
+    // the field being reported at all.
     const groups = computeBackupGroups(
       [
         ams(0, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99' }]),
@@ -254,23 +278,28 @@ describe('computeBackupGroups', () => {
     expect(groups[0].members).toHaveLength(2);
   });
 
-  it('does NOT pair a slot reporting temps with one reporting none', () => {
+  it('pairs a slot reporting temps with one reporting none', () => {
+    // The asymmetry the old temps key created: an RFID roll carrying its tag's
+    // window beside a farm-configured tray that reports none is exactly the
+    // 010-H2S shape, and the firmware groups them.
     const groups = computeBackupGroups(
       [
-        ams(0, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99', nozzle_temp_min: 220, nozzle_temp_max: 260 }]),
-        ams(1, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG99' }]),
+        ams(0, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG02', nozzle_temp_min: 230, nozzle_temp_max: 260 }]),
+        ams(1, [{ tray_type: 'PETG', tray_color: '#000000', tray_info_idx: 'GFG02' }]),
       ],
       {},
       false,
     );
-    expect(groups).toHaveLength(2);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].members).toHaveLength(2);
   });
 });
 
 /**
  * Tests for the 010-H2S near-miss badge: a slot with no firmware backup
  * partner that HAS a same-filament neighbour the firmware excluded on an
- * exact-match colour or nozzle-temp difference.
+ * exact-match colour difference. Colour is the ONLY difference that can
+ * survive the scan, which is what the badge copy is allowed to state.
  */
 describe('nearMissBackupSlots', () => {
   function nearMiss(
@@ -299,13 +328,15 @@ describe('nearMissBackupSlots', () => {
     ])).toEqual([0, 1]);
   });
 
-  it('flags a same-colour pair split only by nozzle temps', () => {
+  it('flags NOTHING for a same-colour pair differing only in nozzle temps', () => {
+    // The false badge itself: the firmware groups these two (010-H2S T0 beside
+    // T1-T3), so neither slot is lone and neither is news.
     expect(nearMiss([
       ams(0, [
-        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG99', nozzle_temp_min: 220, nozzle_temp_max: 260 },
-        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG99', nozzle_temp_min: 190, nozzle_temp_max: 230 },
+        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG02', nozzle_temp_min: 230, nozzle_temp_max: 260 },
+        { tray_type: 'PETG', tray_color: '000000FF', tray_info_idx: 'GFG02', nozzle_temp_min: 230, nozzle_temp_max: 270 },
       ]),
-    ])).toEqual([0, 1]);
+    ])).toEqual([]);
   });
 
   it('flags nothing on a multi-colour AMS with no similar neighbour', () => {
@@ -364,14 +395,16 @@ describe('nearMissBackupSlots', () => {
     ])).toEqual([]);
   });
 
-  it('flags nothing for slots with no configured preset', () => {
-    // A preset-less slot can never pair, so "no backup partner" is not news.
+  it('flags a fallback-preset pair the firmware split on colour', () => {
+    // No profile id on either slot, so both key on `tray_type` — the same
+    // preset the backend's WARN would compare. The two greys still land in
+    // different groups, and the badge must agree with that WARN.
     expect(nearMiss([
       ams(0, [
         { tray_type: 'PETG', tray_color: '161616FF' },
         { tray_type: 'PETG', tray_color: '000000FF' },
       ]),
-    ])).toEqual([]);
+    ])).toEqual([0, 1]);
   });
 
   it('never flags a slot that already has a firmware peer', () => {
