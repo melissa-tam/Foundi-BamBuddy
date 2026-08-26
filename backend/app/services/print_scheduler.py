@@ -2500,8 +2500,8 @@ class PrintScheduler:
         ``[spool-select] slot=…`` trace; the human AMS slot name is in the operator copy.
 
         Why it exists (010-H2S 2026-08-21, incident shape 33): the firmware pairs backup
-        slots byte-exactly on preset / colour / nozzle temps, the farm's matcher pairs
-        filaments within 40 per colour channel, and where those two readings disagree
+        slots byte-exactly on preset and colour, the farm's matcher pairs filaments
+        within 40 per colour channel, and where those two readings disagree
         the farm dispatches believing in a backup that does not exist. The reconcile
         lane rewrites the farm's OWN tagless slots onto the canonical identity; this
         covers the residue it cannot touch — an RFID or operator-bound tray, a refused

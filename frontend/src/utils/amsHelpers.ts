@@ -543,12 +543,6 @@ export interface AmsTrayLike {
   tray_sub_brands: string | null | undefined;
   tray_color: string | null | undefined;
   tray_info_idx: string | null | undefined;
-  /** Slot nozzle-temperature window. Part of the firmware's backup identity —
-   *  see `computeBackupGroups`. Optional: not every caller-side tray shape
-   *  carries them, and a tray without them is not the same as one reporting a
-   *  window (both halves of that distinction are load-bearing in the key). */
-  nozzle_temp_min?: number | null;
-  nozzle_temp_max?: number | null;
 }
 
 export interface AmsUnitLike {
@@ -563,7 +557,9 @@ export interface AmsUnitLike {
 export interface BackupGroup {
   /** Stable key — same across renders for the same material+extruder. */
   key: string;
-  /** Bambu preset ID (tray_info_idx) when matched on preset; null otherwise. */
+  /** The preset the group is keyed on — `tray_info_idx`, or `tray_type` when
+   *  the slot reports no profile id (`presetOf`). Null for a slot that asserts
+   *  neither and therefore pairs with nothing. */
   presetId: string | null;
   /** 0 = right / single, 1 = left. Scoping field for dual-nozzle. */
   extruder: number;
@@ -587,36 +583,44 @@ function normalizeColorForId(raw: string | null | undefined): string {
 }
 
 /**
- * The nozzle-temperature half of a slot's backup identity, as `min-max`.
- * A missing bound renders EMPTY rather than as a placeholder number, so that
- * "no window reported" is its own value: two trays without temps share the key
- * `-`, and neither of them shares it with a tray reporting `220-260`.
+ * The preset half of a slot's backup identity: the firmware's `tray_info_idx`
+ * (e.g. "GFA00" — set even for manually-configured no-RFID spools), falling
+ * back to the configured `tray_type` when the slot reports no profile id.
+ *
+ * ONE spelling of the backend's `tray_fields.backup_group_key` preset rule. A
+ * tray that grouped under one spelling and read presetless under the other
+ * would let the badge and the backend's `[spool-select]` "no firmware backup
+ * partner" WARN contradict each other on the same hardware.
  */
-function trayTempKey(tray: AmsTrayLike): string {
-  const min = tray.nozzle_temp_min ?? '';
-  const max = tray.nozzle_temp_max ?? '';
-  return `${min}-${max}`;
+function presetOf(tray: AmsTrayLike): string {
+  return (tray.tray_info_idx || tray.tray_type || '').trim();
 }
 
 /**
  * Compute backup pairs for the AMS Backup modal (#1762).
  *
- * Identity rule (display-side sibling of the backend's live-tray-identity
- * pooling in `filament_deficit._live_tray_identities`): slots pair ONLY when
- * they share the same slot-configured preset (`tray_info_idx`, e.g. "GFA00" —
- * set even for manually-configured no-RFID spools), the same colour AND the
- * same nozzle-temperature window. The preset identifies the filament profile
- * (PETG HF, PLA Basic, etc.); the colour pins the variant — three PETG HF
- * spools in different colours absolutely don't back each other up; the temps
- * complete the firmware's own key (it groups on uniform identity: brand-class
- * / type / colour / nozzle temps, which is why a `GFG99` slot config splits a
- * backup group). Slots with no preset configured never pair here; pairing on
- * cosmetic name/colour match alone would let two visually-identical but
- * materially-different spools be treated as backups.
+ * The firmware groups slots for auto-refill on PRESET + COLOUR, and on nothing
+ * else. Display-side sibling of the backend's `tray_fields.backup_group_key`
+ * and of the live-tray-identity pooling in `filament_deficit`: two slots pair
+ * here if and only if they share a `presetOf` preset and a byte-equal
+ * normalised colour on the same extruder side. The preset identifies the
+ * filament profile (PETG HF, PLA Basic, etc.); the colour pins the variant —
+ * three PETG HF spools in different colours absolutely don't back each other
+ * up.
  *
- * Missing temps render as an empty half of the key: two trays that both report
- * no window still pair, and a tray reporting one never pairs with a tray that
- * reports none — absence of a window is not a match for a window.
+ * Nozzle temperature is NOT in the firmware's key. Proven 2026-08-25 by raw
+ * MQTT capture of the firmware's own `filam_bak` field (a list of per-group
+ * slot bitmasks): 010-H2S reported `[15]` — T0 (RFID-tagged, 230-260) grouped
+ * with T1-T3 (tagless, 230-270) despite the differing windows. The control is
+ * what pins colour INTO the key: 008-H2C with 9 loaded slots and backup ON
+ * reported `[]`, four of those slots sharing preset GFA00 and four sharing
+ * GFA01, every one a different colour, and no group formed. A temps dimension
+ * here was never measured against the wire and made the near-miss badge claim
+ * 010-H2S slot 1 had no partner while the firmware had it grouped with its
+ * three neighbours.
+ *
+ * A slot asserting no filament identity at all gets a unique-per-slot key, so
+ * "presetless" can never collapse into one shared group.
  *
  * Empty slots are skipped entirely. Every non-empty slot is returned — slots
  * without a peer come back as 1-member entries so the modal can list them as
@@ -653,23 +657,23 @@ export function computeBackupGroups(
     const extruder = isDualNozzle ? Number(amsExtruderMap?.[String(ams.id)] ?? 0) : 0;
     ams.tray.forEach((tray, slotIdx) => {
       if (!tray?.tray_type) return; // empty slot
-      const preset = (tray.tray_info_idx || '').trim();
+      const preset = presetOf(tray);
       const globalTrayId = getGlobalTrayId(ams.id, slotIdx, false);
       const member = { amsId: ams.id, slotIdx, globalTrayId };
 
       let key: string;
       let presetId: string | null;
       if (preset) {
-        // Same Bambu profile is necessary but NOT sufficient — different colours
-        // of the same PETG HF profile can't back each other up, and neither do
-        // two slots configured with different nozzle-temperature windows. Bake
-        // both into the identity key (colour normalised to strip alpha and
-        // case) so this mirrors the firmware's own grouping key.
+        // Same profile is necessary but NOT sufficient — different colours of
+        // one PETG HF profile can't back each other up. Colour is compared
+        // byte-exact after alpha/case normalisation, matching the firmware:
+        // 161616FF and 000000FF are DIFFERENT groups to it.
         const color = normalizeColorForId(tray.tray_color);
-        key = `preset:${preset}|color:${color}|temps:${trayTempKey(tray)}#${extruder}`;
+        key = `preset:${preset}|color:${color}#${extruder}`;
         presetId = preset;
       } else {
-        // No preset → never group with anything else. Unique-per-slot key.
+        // Nothing to pair on. Unique-per-slot key, so presetless slots never
+        // collapse into one shared group on an empty preset.
         key = `unmatched:${ams.id}:${slotIdx}#${extruder}`;
         presetId = null;
       }
@@ -721,23 +725,32 @@ interface BackupCandidateSlot {
  * twin of the backend `[spool-select]` "no firmware backup partner" WARN.
  *
  * The two identity rules disagree on purpose. The firmware pairs backup slots
- * on an EXACT preset + colour + nozzle-temp match (`computeBackupGroups`
- * mirrors it); the farm's own filament matcher pairs on preset plus an
- * RGB-TOLERANT colour comparison (`colorsAreSimilar`). Where they disagree the
- * operator sees a spare and the printer does not: 010-H2S ran slot 2
- * (`161616FF`) dry twice with a full black roll in slot 4 (`000000FF`) and AMS
- * Filament Backup ON, because the firmware read those two greys as different
- * filaments.
+ * on an EXACT preset + colour match (`computeBackupGroups` mirrors it and
+ * carries the wire evidence); the farm's own filament matcher pairs on preset
+ * plus an RGB-TOLERANT colour comparison (`colorsAreSimilar`). Where they
+ * disagree the operator sees a spare and the printer does not: 010-H2S ran
+ * slot 2 (`161616FF`) dry twice with a full black roll in slot 4 (`000000FF`)
+ * and AMS Filament Backup ON, because the firmware read those two greys as
+ * different filaments.
  *
  * A slot is returned when BOTH hold:
  *   - its backup group has exactly ONE member (no firmware peer at all), and
  *   - another non-empty slot on the SAME extruder side carries the same
- *     non-empty preset and a `colorsAreSimilar` colour, but lands in a
- *     DIFFERENT group key (its colour or its nozzle temps differ).
+ *     non-empty `presetOf` preset and a `colorsAreSimilar` colour, but lands
+ *     in a DIFFERENT group key.
+ *
+ * Those conditions already fix preset and extruder as equal, and a group key
+ * holds only preset, colour and extruder — so the surviving difference is
+ * always the colour. That is what entitles the badge copy
+ * (`printers.slot.noBackupSlot`) to name colour outright.
+ *
+ * The preset MUST be read through the same `presetOf` the group key used: a
+ * tray grouped by one spelling of the rule and skipped by the other would
+ * silently drop its own badge.
  *
  * The second condition is what keeps the badge actionable: a lone colour with
  * no similar neighbour is NOT returned, so a four-colour AMS lights nothing.
- * Slots with no configured preset never pair in the first place and are
+ * Slots asserting no filament identity never pair in the first place and are
  * skipped — "no backup partner" is not news for a slot that cannot have one.
  *
  * @param groups - Output of `computeBackupGroups` for the same status.
@@ -768,7 +781,7 @@ export function nearMissBackupSlots(
     const lone = group.members.length === 1;
     for (const member of group.members) {
       const tray = trayByGlobalId.get(member.globalTrayId);
-      const preset = (tray?.tray_info_idx || '').trim();
+      const preset = tray ? presetOf(tray) : '';
       if (!preset) continue;
       candidates.push({
         globalTrayId: member.globalTrayId,

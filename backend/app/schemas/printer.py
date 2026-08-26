@@ -245,6 +245,35 @@ class AmsLabelBody(BaseModel):
     ams_serial: str = Field(default="", max_length=50)
 
 
+class ConfigureAmsSlotBody(BaseModel):
+    """The filament configuration the operator states for one AMS slot.
+
+    Config payload, so it travels as a request body rather than as a dozen query
+    parameters. Every field here is an operator STATEMENT and outranks anything the
+    farm would infer — with one exception that is the point of the endpoint's
+    fallback ladder: an empty ``tray_info_idx`` states nothing, and the identity is
+    then composed by ``services.slot_identity.resolve_slot_identity`` exactly as it
+    is for every other lane that writes a slot.
+    """
+
+    # "GFL05", a "P…" local preset, or "" to let the identity resolver choose.
+    tray_info_idx: str = Field(default="", max_length=64)
+    tray_type: str = Field(..., min_length=1, max_length=32)
+    tray_sub_brands: str = Field(default="", max_length=128)
+    # RRGGBBAA / RRGGBB hex; normalised to 8 uppercase digits before it reaches the wire.
+    tray_color: str = Field(..., min_length=6, max_length=8, pattern=r"^[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$")
+    nozzle_temp_min: int = Field(..., ge=0, le=500)
+    nozzle_temp_max: int = Field(..., ge=0, le=500)
+    # -1 selects the firmware's default K (0.020) — see BambuClient.extrusion_cali_sel.
+    cali_idx: int = Field(default=-1, ge=-1)
+    nozzle_diameter: str = Field(default="0.4", max_length=8)
+    setting_id: str = Field(default="", max_length=64)
+    kprofile_filament_id: str = Field(default="", max_length=64)
+    kprofile_setting_id: str = Field(default="", max_length=64)
+    # 0.0 skips the direct extrusion_cali_set write.
+    k_value: float = Field(default=0.0, ge=0.0)
+
+
 class HmsActionBody(BaseModel):
     # Canonical hex identifier (HMSErrorResponse.full_code): 8 chars for
     # `print_error`-sourced faults, 16 chars for `hms[]`-array faults whose

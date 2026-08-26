@@ -22,6 +22,7 @@ from backend.app.models.spoolman_k_profile import SpoolmanKProfile
 from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.models.user import User
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.slot_identity import compose_sub_brands, resolve_slot_identity
 from backend.app.services.spoolman import (
     SpoolmanClientError,
     SpoolmanNotFoundError,
@@ -30,11 +31,7 @@ from backend.app.services.spoolman import (
     get_spoolman_client,
     init_spoolman_client,
 )
-from backend.app.utils.filament_ids import (
-    GENERIC_FILAMENT_IDS,
-    MATERIAL_TEMPS,
-    normalize_slicer_filament,
-)
+from backend.app.utils.filament_ids import normalize_slicer_filament
 from backend.app.utils.printer_models import extruder_for_ams, nozzle_for_ams_unit
 
 logger = logging.getLogger(__name__)
@@ -793,7 +790,7 @@ async def link_spool(
     spool_id: int,
     request: LinkSpoolRequest,
     db: AsyncSession = Depends(get_db),
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.FILAMENTS_UPDATE),
+    current_user: User | None = RequirePermissionIfAuthEnabled(Permission.FILAMENTS_UPDATE),
 ):
     """Link a Spoolman spool to an AMS tag by setting Spoolman extra.tag."""
     sm = await get_spoolman_settings(db)
@@ -905,30 +902,30 @@ async def link_spool(
 
             mqtt_client = printer_manager.get_client(p_id)
             if mqtt_client:
-                tray_type = mapped.get("material") or ""
-                brand = mapped.get("brand") or ""
-                subtype = mapped.get("subtype") or ""
-                if brand:
-                    tray_sub_brands = f"{brand} {tray_type} {subtype}".strip()
-                elif subtype:
-                    tray_sub_brands = f"{tray_type} {subtype}".strip()
-                else:
-                    tray_sub_brands = tray_type
-
-                tray_color = (mapped.get("rgba") or "808080FF").upper()
-                if len(tray_color) == 6:
-                    tray_color = tray_color + "FF"
-
-                material_upper = tray_type.upper().strip()
-                tray_info_idx = (
-                    GENERIC_FILAMENT_IDS.get(material_upper)
-                    or GENERIC_FILAMENT_IDS.get(material_upper.split("-")[0].split(" ")[0])
-                    or ""
+                # The whole wire identity from the ONE builder. This lane used to
+                # compose it by hand: the generic-material id ONLY (never the spool's
+                # own slicer_filament), an empty setting_id, and a nozzle range whose
+                # maximum came unconditionally from the material table — discarding
+                # Spoolman's own. A hand-composed identity is what splits the
+                # firmware's auto-refill backup group.
+                identity = await resolve_slot_identity(
+                    db=db,
+                    current_user=current_user,
+                    material=mapped.get("material"),
+                    slicer_filament=mapped.get("slicer_filament"),
+                    slicer_filament_name=mapped.get("slicer_filament_name"),
+                    rgba=mapped.get("rgba"),
+                    nozzle_temp_min=mapped.get("nozzle_temp_min"),
+                    nozzle_temp_max=mapped.get("nozzle_temp_max"),
+                    sub_brands=compose_sub_brands(mapped.get("brand"), mapped.get("material"), mapped.get("subtype")),
                 )
-                setting_id = ""
-                temp_defaults = MATERIAL_TEMPS.get(material_upper, (200, 240))
-                temp_min = mapped.get("nozzle_temp_min") or temp_defaults[0]
-                temp_max = temp_defaults[1]
+                tray_type = identity.tray_type
+                tray_sub_brands = identity.tray_sub_brands
+                tray_color = identity.tray_color
+                tray_info_idx = identity.tray_info_idx
+                setting_id = identity.setting_id
+                temp_min = identity.nozzle_temp_min
+                temp_max = identity.nozzle_temp_max
 
                 # Pull printer state via printer_manager (mqtt_client.printer_state
                 # was a non-existent attribute — the hasattr check silently

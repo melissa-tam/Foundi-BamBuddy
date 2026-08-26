@@ -225,8 +225,8 @@ class TestNozzleTempResolution:
     async def test_a_different_specific_preset_does_not_inherit_default_temps(self, tagless_default):
         """The one case the merge of the three helpers tightened, deliberately: a row
         naming GFG00 beside a GFG02 default is an operator statement. It is not a
-        backup-group peer on the preset dimension either, so lending it the default's
-        temperatures only made it look like one."""
+        backup-group peer on the preset dimension, so lending it the default's
+        temperatures only made its identity look canonical when it is not."""
         db = MagicMock()
         _, _, _, tmin, tmax = await resolve_slicer_filament(
             db=db,
@@ -257,7 +257,7 @@ class TestNozzleTempResolution:
 class TestGenericIdOverride:
     """E3 (2026-07-20): a stale spool row carrying a GENERIC id must not be able to
     re-publish it — the firmware's auto-refill backup group pairs slots only on an
-    exact brand-class/type/colour/TEMPS match, and 011-H2S's trays 1-2 sat on GFG99
+    exact preset + colour match, and 011-H2S's trays 1-2 sat on GFG99
     beside GFG02 peers, splitting the group. Every write site routes through this
     resolver, so the substitution belongs here (one chokepoint, all consumers).
 
@@ -277,8 +277,8 @@ class TestGenericIdOverride:
             slicer_filament_name=None,
             material="PETG",
             rgba="000000FF",
-            # Stale row temps: substituting the id alone would still split the backup
-            # group on the temperature dimension, so these must be replaced too.
+            # Stale row temps: the resolver returns the default's COMPLETE identity, so
+            # a substituted id never leaves a mismatched range behind on the wire.
             nozzle_temp_min=220,
             nozzle_temp_max=260,
         )

@@ -232,10 +232,17 @@ def _live_tray_identities(printer_id: int) -> dict[tuple[int, int], str]:
     live tray, not from a ``Spool`` row.
 
     The identity itself is ``tray_fields.backup_group_key`` — the ONE origin for the
-    firmware's grouping rule (preset + EXACT colour + nozzle temps). It used to be an
-    inline f-string here that omitted the temperature dimension, which over-pooled:
-    two trays agreeing on preset and colour but not on temps are NOT peers, and this
-    map's whole job is to say who backs up whom.
+    firmware's grouping rule, which is preset + EXACT colour and nothing else.
+
+    NOZZLE TEMPERATURE IS NOT A DIMENSION OF IT, and the history matters because it is
+    the kind of thing a reader restores as a regression fix. This map's identity was an
+    inline f-string of preset + colour until 2026-08-21, when it was moved to the shared
+    key AND given a temperature dimension on the strength of a documentation line nobody
+    had measured. That "fix" corrected no defect: it un-pooled real group-mates, so a
+    tagged slot's grams stopped backing the tagless slots the firmware actually switches
+    to. A raw-MQTT capture of the firmware's own ``filam_bak`` groups on 2026-08-25
+    settled it — 010-H2S puts a tagged slot reading 230-260 in ONE group with tagless
+    slots reading 230-270 — and the dimension was removed on that measurement.
 
     Reads ``printer_manager.get_status(printer_id).raw_data["ams"]`` — the same
     live-status surface ``capability_gate.loaded_filament_types`` reads. The

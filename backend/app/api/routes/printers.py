@@ -27,6 +27,7 @@ from backend.app.schemas.printer import (
     AmsLabelBody,
     AMSTray,
     AMSUnit,
+    ConfigureAmsSlotBody,
     DiagnosticRequest,
     FilaSwitchResponse,
     HmsActionBody,
@@ -64,6 +65,7 @@ from backend.app.services.printer_manager import (
     supports_drying,
     supports_drying_while_printing,
 )
+from backend.app.services.slot_identity import resolve_slot_identity
 from backend.app.services.spool_recovery import runout_slot_desc
 from backend.app.services.tray_fields import tray_presence_map
 from backend.app.utils.http import build_content_disposition
@@ -2229,18 +2231,7 @@ async def configure_ams_slot(
     printer_id: int,
     ams_id: int,
     tray_id: int,
-    tray_info_idx: str = Query(...),
-    tray_type: str = Query(...),
-    tray_sub_brands: str = Query(...),
-    tray_color: str = Query(...),
-    nozzle_temp_min: int = Query(...),
-    nozzle_temp_max: int = Query(...),
-    cali_idx: int = Query(-1),
-    nozzle_diameter: str = Query("0.4"),
-    setting_id: str = Query(""),
-    kprofile_filament_id: str = Query(""),
-    kprofile_setting_id: str = Query(""),
-    k_value: float = Query(0.0),
+    body: ConfigureAmsSlotBody,
     db: AsyncSession = Depends(get_db),
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
 ):
@@ -2250,29 +2241,33 @@ async def configure_ams_slot(
     1. ams_filament_setting - sets filament type, color, temperature
     2. extrusion_cali_sel - sets the K profile (pressure advance value)
 
+    The published identity is composed by ``services.slot_identity``, the ONE
+    builder every slot-writing lane shares — this endpoint used to carry a private
+    copy of the generic-filament table and compose its own fallback, which is how
+    two lanes come to publish two different identities for the same filament and
+    split the firmware's auto-refill backup group.
+
     Args:
         printer_id: Database ID of the printer
         ams_id: AMS unit ID (0-3 for regular AMS, 128-135 for HT AMS)
         tray_id: Tray ID within the AMS (0-3)
-        tray_info_idx: Filament ID short format (e.g., "GFL05") or user preset ID
-        tray_type: Filament type (e.g., "PLA", "PETG")
-        tray_sub_brands: Sub-brand/profile name (e.g., "PLA Basic", "PETG HF")
-        tray_color: Color in RRGGBBAA hex format (e.g., "FFFF00FF")
-        nozzle_temp_min: Minimum nozzle temperature
-        nozzle_temp_max: Maximum nozzle temperature
-        cali_idx: K profile calibration index (-1 for default 0.020)
-        nozzle_diameter: Nozzle diameter string (e.g., "0.4")
-        setting_id: Full setting ID with version (e.g., "GFSL05_07") - optional
-        kprofile_filament_id: K profile's filament_id for proper K profile linking
-        k_value: Direct K value to set (0.0 to skip direct K value setting)
+        body: The operator's stated filament configuration
     """
     logger = logging.getLogger(__name__)
+    tray_type = body.tray_type
+    cali_idx = body.cali_idx
+    nozzle_diameter = body.nozzle_diameter
+    kprofile_setting_id = body.kprofile_setting_id
+    k_value = body.k_value
+
     logger.info("[configure_ams_slot] printer_id=%s, ams_id=%s, tray_id=%s", printer_id, ams_id, tray_id)
     logger.info(
-        f"[configure_ams_slot] tray_info_idx={tray_info_idx!r}, tray_type={tray_type!r}, tray_sub_brands={tray_sub_brands!r}"
+        f"[configure_ams_slot] tray_info_idx={body.tray_info_idx!r}, tray_type={tray_type!r}, "
+        f"tray_sub_brands={body.tray_sub_brands!r}"
     )
     logger.info(
-        f"[configure_ams_slot] setting_id={setting_id!r}, kprofile_filament_id={kprofile_filament_id!r}, kprofile_setting_id={kprofile_setting_id!r}"
+        f"[configure_ams_slot] setting_id={body.setting_id!r}, kprofile_filament_id={body.kprofile_filament_id!r}, "
+        f"kprofile_setting_id={kprofile_setting_id!r}"
     )
 
     # Get MQTT client for this printer
@@ -2280,36 +2275,12 @@ async def configure_ams_slot(
     if not client:
         raise HTTPException(status_code=400, detail="Printer not connected")
 
-    # Resolve tray_info_idx for the MQTT command.
-    # Priority:
-    #   1. Use the provided tray_info_idx if set (including cloud-synced
-    #      custom presets like PFUS* / P*).
-    #   2. Reuse the slot's existing tray_info_idx if it's a specific
-    #      (non-generic) preset for the same material.
-    #   3. Fall back to a generic Bambu filament ID.
-    _GENERIC_FILAMENT_IDS = {
-        "PLA": "GFL99",
-        "PETG": "GFG99",
-        "ABS": "GFB99",
-        "ASA": "GFB98",
-        "PC": "GFC99",
-        "PA": "GFN99",
-        "NYLON": "GFN99",
-        "TPU": "GFU99",
-        "PVA": "GFS99",
-        "HIPS": "GFS98",
-        "PLA-CF": "GFL98",
-        "PETG-CF": "GFG98",
-        "PA-CF": "GFN98",
-        "PETG HF": "GFG96",
-    }
-    _GENERIC_ID_VALUES = set(_GENERIC_FILAMENT_IDS.values())
-    effective_tray_info_idx = tray_info_idx
-
-    if not tray_info_idx:
-        # No preset provided — try slot reuse or generic fallback
-        current_tray_info_idx = ""
-        current_tray_type = ""
+    # The live tray's own identity, read only when the operator stated none — it is
+    # the resolver's tier-3 hint (keep a specific preset already on the slot rather
+    # than overwriting it with a generic).
+    current_tray_info_idx = ""
+    current_tray_type = ""
+    if not body.tray_info_idx:
         state = printer_manager.get_status(printer_id)
         if state and state.raw_data:
             from backend.app.api.routes.inventory import _find_tray_in_ams_data
@@ -2336,31 +2307,32 @@ async def configure_ams_slot(
                     current_tray_info_idx = cur_tray.get("tray_info_idx", "")
                     current_tray_type = cur_tray.get("tray_type", "")
 
-        if (
-            current_tray_info_idx
-            and current_tray_info_idx not in _GENERIC_ID_VALUES
-            and current_tray_type
-            and current_tray_type.upper() == tray_type.upper()
-        ):
-            logger.info(
-                "[configure_ams_slot] Reusing slot's existing tray_info_idx=%r (same material %r)",
-                current_tray_info_idx,
-                tray_type,
-            )
-            effective_tray_info_idx = current_tray_info_idx
-        elif tray_type:
-            material = tray_type.upper().strip()
-            generic = (
-                _GENERIC_FILAMENT_IDS.get(material)
-                or _GENERIC_FILAMENT_IDS.get(material.split("-")[0].split(" ")[0])
-                or ""
-            )
-            if generic:
-                logger.info("[configure_ams_slot] Falling back to generic %r for material %r", generic, tray_type)
-                effective_tray_info_idx = generic
+    identity = await resolve_slot_identity(
+        db=db,
+        current_user=None,
+        material=tray_type,
+        slicer_filament=None,
+        slicer_filament_name=None,
+        rgba=body.tray_color,
+        nozzle_temp_min=body.nozzle_temp_min,
+        nozzle_temp_max=body.nozzle_temp_max,
+        sub_brands=body.tray_sub_brands,
+        stated_tray_info_idx=body.tray_info_idx,
+        stated_setting_id=body.setting_id,
+        current_tray_info_idx=current_tray_info_idx,
+        current_tray_type=current_tray_type,
+    )
+    tray_sub_brands = identity.tray_sub_brands
+    effective_tray_info_idx = identity.tray_info_idx
+    if effective_tray_info_idx != body.tray_info_idx:
+        logger.info(
+            "[configure_ams_slot] No preset stated — resolved tray_info_idx=%r for material %r",
+            effective_tray_info_idx,
+            tray_type,
+        )
 
     # Send filament setting + K-profile commands
-    filament_id_for_kprofile = kprofile_filament_id if kprofile_filament_id else effective_tray_info_idx
+    filament_id_for_kprofile = body.kprofile_filament_id if body.kprofile_filament_id else effective_tray_info_idx
 
     # Realign the slot's filament context to the K-profile's calibration
     # context. The printer's calibration table is keyed by (filament_id,
@@ -2378,20 +2350,20 @@ async def configure_ams_slot(
     # preset than the user's filament selection AND the kp's preset is a
     # valid tray_info_idx (GF* official, P* local — not PFUS* cloud-user
     # which the slicer rejects in tray_info_idx).
-    effective_setting_id = setting_id
+    effective_setting_id = identity.setting_id
     if (
-        kprofile_filament_id
-        and kprofile_filament_id != effective_tray_info_idx
-        and not kprofile_filament_id.startswith("PFUS")
+        body.kprofile_filament_id
+        and body.kprofile_filament_id != effective_tray_info_idx
+        and not body.kprofile_filament_id.startswith("PFUS")
     ):
         logger.info(
             "[configure_ams_slot] realigning slot filament context to kp: tray_info_idx %r → %r, setting_id %r → %r",
             effective_tray_info_idx,
-            kprofile_filament_id,
-            setting_id,
-            kprofile_setting_id or setting_id,
+            body.kprofile_filament_id,
+            effective_setting_id,
+            kprofile_setting_id or effective_setting_id,
         )
-        effective_tray_info_idx = kprofile_filament_id
+        effective_tray_info_idx = body.kprofile_filament_id
         if kprofile_setting_id:
             effective_setting_id = kprofile_setting_id
 
@@ -2404,11 +2376,11 @@ async def configure_ams_slot(
         ams_id=ams_id,
         tray_id=tray_id,
         tray_info_idx=effective_tray_info_idx,
-        tray_type=tray_type,
+        tray_type=identity.tray_type,
         tray_sub_brands=tray_sub_brands,
-        tray_color=tray_color,
-        nozzle_temp_min=nozzle_temp_min,
-        nozzle_temp_max=nozzle_temp_max,
+        tray_color=identity.tray_color,
+        nozzle_temp_min=identity.nozzle_temp_min,
+        nozzle_temp_max=identity.nozzle_temp_max,
         setting_id=effective_setting_id,
     )
 
@@ -2445,7 +2417,7 @@ async def configure_ams_slot(
             tray_id=global_tray_id,
             k_value=k_value,
             nozzle_diameter=nozzle_diameter,
-            nozzle_temp=nozzle_temp_max,
+            nozzle_temp=identity.nozzle_temp_max,
             filament_id=filament_id_for_kprofile,
             setting_id=kprofile_setting_id or "",
             name=tray_sub_brands or "",

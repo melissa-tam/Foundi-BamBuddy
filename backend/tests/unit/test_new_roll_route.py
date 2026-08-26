@@ -114,7 +114,7 @@ class TestNewRollTaglessLane:
         monkeypatch.setattr(spool_tagless.ws_manager, "broadcast", ws)
         _no_spoolman(monkeypatch)
         monkeypatch.setattr(
-            "backend.app.api.routes.inventory.apply_spool_to_slot_via_mqtt", AsyncMock(return_value=True)
+            "backend.app.services.spool_tagless.apply_spool_to_slot_via_mqtt", AsyncMock(return_value=True)
         )
         monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: _live_state())
         monkeypatch.setattr(spool_tagless.printer_manager, "get_client", lambda pid: None)
@@ -156,7 +156,7 @@ class TestNewRollTaglessLane:
         monkeypatch.setattr(spool_tagless.ws_manager, "broadcast", AsyncMock())
         _no_spoolman(monkeypatch)
         monkeypatch.setattr(
-            "backend.app.api.routes.inventory.apply_spool_to_slot_via_mqtt", AsyncMock(return_value=True)
+            "backend.app.services.spool_tagless.apply_spool_to_slot_via_mqtt", AsyncMock(return_value=True)
         )
         monkeypatch.setattr(spool_tagless.printer_manager, "get_status", lambda pid: _live_state())
         monkeypatch.setattr(spool_tagless.printer_manager, "get_client", lambda pid: None)

@@ -889,7 +889,7 @@ class TestRow4TaglessLane:
         assert decision.spool_id == 95
         assert decision.reason == "spent_swap_confirmed"
         # Firmware leftover config (the tray still reads the DEPARTED roll's
-        # fingerprint) → mint the clean 4-dimension default identity.
+        # fingerprint) → mint the fleet default's complete identity.
         assert decision.mint_spec["source"] == "tagless_default"
         assert decision.mint_spec["default_filament"] == TAGLESS_DEFAULT
 

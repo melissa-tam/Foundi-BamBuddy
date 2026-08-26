@@ -3,7 +3,7 @@
 The writer keeps PrintersPage's slot-card preset_name in sync with the
 currently-assigned spool from three different inventory paths:
 
-* internal manual assign (inventory.apply_spool_to_slot_via_mqtt)
+* internal manual assign (slot_identity.apply_spool_to_slot_via_mqtt)
 * internal RFID auto-assign (spool_tag_matcher.auto_assign_spool)
 * Spoolman RFID sync (main.auto_sync_spoolman_ams_trays)
 

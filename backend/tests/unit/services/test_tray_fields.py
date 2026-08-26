@@ -21,6 +21,7 @@ from backend.app.services.tray_fields import (
     TRAY_STATE_SEATED,
     TRAY_STATE_TRANSITIONAL,
     TRAY_STATE_UNREPORTED,
+    filam_bak_groups,
     parse_filam_bak,
     tray_presence,
 )
@@ -154,6 +155,43 @@ def test_parse_filam_bak_is_agnostic_to_where_the_field_lives():
     assert parse_filam_bak(top_level) == parse_filam_bak(per_extruder) == [4, 5]
     # An AMS unit block carries no such key on any observed firmware.
     assert parse_filam_bak({"id": 0, "humidity": "4", "tray": []}) is None
+
+
+def test_filam_bak_groups_expands_one_mask_per_group():
+    """Each element is a group's slot BITMASK — confirmed 2026-08-25 against production
+    occupancy: 001-H2S full reported ``[15]``, 002-H2S with T0..T2 reported ``[7]``,
+    004-H2S with T2+T3 reported ``[12]``, 012-H2S with T1..T3 reported ``[14]``."""
+    assert filam_bak_groups([15]) == [{0, 1, 2, 3}]
+    assert filam_bak_groups([7]) == [{0, 1, 2}]
+    assert filam_bak_groups([12]) == [{2, 3}]
+
+
+def test_filam_bak_groups_keeps_separate_masks_separate():
+    """Two masks are two groups, not one union: a printer that pairs 1+2 and 3+4 must not
+    read as a single four-slot group, which is the whole question the corroboration asks."""
+    assert filam_bak_groups([3, 12]) == [{0, 1}, {2, 3}]
+
+
+def test_filam_bak_groups_drops_a_mask_with_no_members():
+    """A group with no members is not a group. ``0`` is the firmware saying this lane has
+    no group at all — reading it as "slot 0, alone" would invent one."""
+    assert filam_bak_groups([0]) == []
+    assert filam_bak_groups([0, 3]) == [{0, 1}]
+
+
+def test_filam_bak_groups_has_nothing_to_expand():
+    """Empty and absent both expand to nothing HERE; the CALLER keeps them distinct
+    (a reported-but-groupless answer is evidence, silence is not)."""
+    assert filam_bak_groups([]) == []
+    assert filam_bak_groups(None) == []
+
+
+def test_filam_bak_groups_tolerates_garbage():
+    """It rides the ~1 Hz status callback (invariant 10), so a nonsensical int contributes
+    no members instead of raising — a negative one especially, whose two's-complement bits
+    are infinite."""
+    assert filam_bak_groups([-1]) == []
+    assert filam_bak_groups([-8, 5]) == [{0, 2}]
 
 
 def test_module_exports_the_vocabulary_by_name():

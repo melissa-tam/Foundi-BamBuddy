@@ -96,7 +96,7 @@ from sqlalchemy.orm import selectinload
 
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
-from backend.app.services.tray_fields import backup_group_key, normalize_color_for_id, parse_int_field
+from backend.app.services.tray_fields import backup_group_key, normalize_color_for_id
 from backend.app.utils.filament_types import canonical_filament_type
 
 if TYPE_CHECKING:
@@ -310,11 +310,12 @@ def colors_are_similar(color1: str | None, color2: str | None, threshold: int = 
 # WARN + one page — it never blocks or re-routes a dispatch, because a split
 # group is a degraded backup, not an unsafe print.
 # ---------------------------------------------------------------------------
-#: The dimension names :func:`backup_partner_gap` reports, in the order it tests
-#: them. They are rendered verbatim into operator copy ("a different tray
-#: colour"), so they are words, not tokens.
+#: The dimension :func:`backup_partner_gap` reports. Rendered verbatim into
+#: operator copy ("a different tray colour"), so it is a word, not a token — and
+#: there is exactly one of them, because the firmware's key has exactly two
+#: dimensions (``tray_fields.backup_group_key``) and a near miss has already
+#: agreed on the preset.
 GAP_DIMENSION_COLOUR = "colour"
-GAP_DIMENSION_TEMPS = "temps"
 
 
 @dataclass(frozen=True)
@@ -322,7 +323,7 @@ class BackupPartnerGap:
     """One near-miss backup partner for a picked tray — see :func:`backup_partner_gap`.
 
     ``partner_global_tray_id`` names the tray that WOULD have backed the picked one up
-    had a single dimension agreed; ``dimension`` is the first one that disagrees, with
+    had a single dimension agreed; ``dimension`` is the one that disagrees, with
     ``picked_value`` / ``partner_value`` its two sides, already formatted for a log line
     and for operator copy. ``picked_key`` / ``partner_key`` are the two
     ``tray_fields.backup_group_key`` strings the verdict rests on — carried so the caller
@@ -341,18 +342,16 @@ class BackupPartnerGap:
 def _same_backup_preset(picked: dict, other: dict, picked_key: str) -> bool:
     """True iff two trays agree on the PRESET dimension of the backup-group key.
 
-    Asked by substituting the picked tray's colour and temps into the other tray and
-    re-deriving the key: if the keys then agree, the only dimensions that COULD still
-    have differed were the substituted ones, so the presets are equal. Done that way
-    so the preset rule (the firmware's ``tray_info_idx`` when the tray has one, the
-    configured ``tray_type`` otherwise) is never spelled a second time — it lives in
+    Asked by substituting the picked tray's colour into the other tray and re-deriving
+    the key: if the keys then agree, the only dimension that COULD still have differed
+    was the substituted one, so the presets are equal. Done that way so the preset rule
+    (the firmware's ``tray_info_idx`` when the tray has one, the configured
+    ``tray_type`` otherwise) is never spelled a second time — it lives in
     ``tray_fields.backup_group_key`` and nowhere else, and a future change to it
     cannot silently drift this test out of agreement with the key it is testing.
     """
     probe = dict(other)
     probe["tray_color"] = picked.get("tray_color")
-    probe["nozzle_temp_min"] = picked.get("nozzle_temp_min")
-    probe["nozzle_temp_max"] = picked.get("nozzle_temp_max")
     return backup_group_key(probe) == picked_key
 
 
@@ -360,17 +359,6 @@ def _colour_value(tray: dict) -> str:
     """A tray's colour as the byte-exact comparison sees it (``#RRGGBB``, or ``?``)."""
     hexed = normalize_color_for_id(tray.get("tray_color"))
     return f"#{hexed}" if hexed else "?"
-
-
-def _temps_value(tray: dict) -> str:
-    """A tray's nozzle-temperature range as the key compares it (``min-max``).
-
-    A bound the tray does not report renders ``?`` rather than ``None``: silence is
-    what the operator has to go and look at, and ``None-None`` reads like a bug.
-    """
-    tmin = parse_int_field(tray.get("nozzle_temp_min"))
-    tmax = parse_int_field(tray.get("nozzle_temp_max"))
-    return f"{'?' if tmin is None else tmin}-{'?' if tmax is None else tmax}"
 
 
 def backup_partner_gap(picked: dict, others: list[dict]) -> BackupPartnerGap | None:
@@ -422,24 +410,15 @@ def backup_partner_gap(picked: dict, others: list[dict]) -> BackupPartnerGap | N
     if near_miss is None:
         return None
 
+    # The key has exactly two dimensions and :func:`_same_backup_preset` has already
+    # proven the preset one equal, so colour is the only disagreement left to name.
     other, other_key = near_miss
-    picked_colour, other_colour = _colour_value(picked), _colour_value(other)
-    if picked_colour != other_colour:
-        dimension, picked_value, partner_value = GAP_DIMENSION_COLOUR, picked_colour, other_colour
-    else:
-        # Preset and colour both agree while the keys do not, so the temps are the
-        # only dimension left — the key has exactly three.
-        dimension, picked_value, partner_value = (
-            GAP_DIMENSION_TEMPS,
-            _temps_value(picked),
-            _temps_value(other),
-        )
     gtid = other.get("global_tray_id")
     return BackupPartnerGap(
         partner_global_tray_id=gtid if isinstance(gtid, int) else None,
-        dimension=dimension,
-        picked_value=picked_value,
-        partner_value=partner_value,
+        dimension=GAP_DIMENSION_COLOUR,
+        picked_value=_colour_value(picked),
+        partner_value=_colour_value(other),
         picked_key=picked_key,
         partner_key=other_key,
     )

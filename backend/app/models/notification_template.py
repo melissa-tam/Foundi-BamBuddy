@@ -267,7 +267,7 @@ DEFAULT_TEMPLATES = [
         "body_template": "{printer_name} completed '{job_name}' and charged 0 g, but {slot} is fed by tagless spool #{spool_id} ({spool_material}), whose only gram source is the print's 3MF. The ledger for that roll is now short by this print. Check that the archive for this print has its 3MF attached.",
     },
     # 010-H2S 2026-08-21 (shape 33): the firmware pairs backup slots only on an EXACT
-    # preset / colour / nozzle-temp match, while the farm's matcher calls colours within
+    # preset + colour match, while the farm's matcher calls colours within
     # 40/channel one filament. Slot 2 at 161616FF and slot 4 at 000000FF were one
     # filament to the farm and two groups to the printer, which therefore never
     # auto-switched. The copy names BOTH slots and the exact dimension because the fix

@@ -39,9 +39,13 @@
  *   noBackupSlot - True when AMS Filament Backup is on and this slot has no
  *                firmware backup partner even though a same-filament roll sits
  *                on the same extruder side, excluded by an exact-match colour
- *                or nozzle-temp difference (`amsHelpers.nearMissBackupSlots`;
- *                010-H2S ran dry twice on 161616FF beside a full 000000FF
- *                roll). Renders the last free corner badge (bottom-left) and is
+ *                difference (`amsHelpers.nearMissBackupSlots`; 010-H2S ran dry
+ *                twice on 161616FF beside a full 000000FF roll). Colour is the
+ *                only difference this can report, which is what makes the
+ *                badge copy's "different tray colour" literally true — the
+ *                firmware groups on preset + colour and nothing else (nozzle
+ *                temperature was measured out of the key 2026-08-25).
+ *                Renders the last free corner badge (bottom-left) and is
  *                suppressed on empty slots — an empty slot has no filament to
  *                back up. All four badges carry an icon glyph + aria-label +
  *                title (never colour-only).

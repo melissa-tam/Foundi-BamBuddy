@@ -219,12 +219,23 @@ def parse_filam_bak(source: object) -> list[int] | None:
     every report, so ``[]`` means "nothing is enrolled right now". Elements that are not
     parseable ints are dropped rather than poisoning the list.
 
-    **Element encoding is UNCONFIRMED** — no source states whether the ints are global
-    tray ids (``ams_id * 4 + tray_id``) or per-unit slot ids, and both clients parse them
-    as bare ints with no bit-extraction. Consumers must therefore be written so that the
-    global-id reading can only UNDER-match: for any tray outside AMS 0 the two encodings
-    occupy disjoint value ranges, so a global-id comparison silently fails to corroborate
-    rather than corroborating something false.
+    **Each element is one GROUP's slot BITMASK** — bit N set means slot N is in that
+    group. Confirmed for AMS unit 0 on 2026-08-25 by raw-MQTT capture against five
+    production printers whose occupancy was independently known: 001-H2S with T0..T3
+    filled reported ``[15]`` (``0b1111``), 002-H2S with T0..T2 reported ``[7]``, 004-H2S
+    with T2+T3 reported ``[12]`` (``0b1100``), 012-H2S with T1..T3 reported ``[14]``.
+    The control is 008-H2C: 9 loaded slots, backup ON, four sharing preset ``GFA00`` and
+    four sharing ``GFA01`` but every one a DIFFERENT colour — and ``filam_bak`` is
+    ``[]``. The field therefore lists real GROUPS, not merely present or enrolled slots.
+    Expansion is :func:`filam_bak_groups`' job, not this one: a parser returns the wire's
+    own words.
+
+    RESIDUE — whether bit N indexes a GLOBAL tray id (``ams_id * 4 + tray_id``) or a
+    per-unit slot is still UNMEASURED, because every multi-AMS printer sampled reported
+    ``[]`` and nothing has ever discriminated the two readings. Consumers must decline
+    rather than guess for any tray outside AMS 0
+    (``spool_respool._backup_swap_corroborated``), so the unmeasured half can only cost a
+    corroboration, never fabricate one.
     """
     if not isinstance(source, dict):
         return None
@@ -237,6 +248,35 @@ def parse_filam_bak(source: object) -> list[int] | None:
         if value is not None:
             out.append(value)
     return out
+
+
+def filam_bak_groups(masks: list[int] | None) -> list[set[int]]:
+    """Expand parsed ``filam_bak`` masks into one slot-index set per backup GROUP.
+
+    THE one origin for the bit expansion — no consumer unpacks a mask itself, so the
+    encoding is spelled once and a future capture that refines it changes one function.
+    Each element of ``masks`` is a separate group (:func:`parse_filam_bak`).
+
+    A mask expanding to no members is DROPPED: a group with no members is not a group,
+    and ``0`` is the firmware saying "this lane has no group" rather than naming a slot.
+    ``None`` or an empty list in → ``[]`` out, which the caller must keep distinct from
+    "the field was never reported" — an asserted-but-groupless answer is evidence
+    (008-H2C reports exactly that).
+
+    Bits are scanned to 127, the same ceiling the exist-bit helpers above use. A
+    negative or otherwise nonsensical int contributes no members instead of raising:
+    this rides the ~1 Hz status callback (invariant 10).
+    """
+    if not masks:
+        return []
+    groups: list[set[int]] = []
+    for mask in masks:
+        if mask <= 0:
+            continue
+        members = {bit for bit in range(128) if (mask >> bit) & 1}
+        if members:
+            groups.append(members)
+    return groups
 
 
 def asserted_str_field(tray: dict, key: str) -> str | None:
@@ -403,18 +443,32 @@ def normalize_color_for_id(raw: str | None) -> str:
 def backup_group_key(tray: object) -> str | None:
     """The firmware's auto-refill BACKUP-GROUP key for one tray — or None.
 
-    The AMS pairs slots into a backup group only on an exact preset / colour /
-    nozzle-temperature match (``bambu-ams-behavior`` §"Firmware auto-refill"), so two
-    trays back each other up if and only if this string is equal for both. ONE origin
-    for that rule: the deficit pricer's pooling map reads it, and the tagless
+    The AMS pairs slots into a backup group on PRESET and COLOUR, and on nothing else,
+    so two trays back each other up if and only if this string is equal for both. ONE
+    origin for that rule: the deficit pricer's pooling map reads it, and the tagless
     harmonise lane exists to make our own slots produce the same one.
 
-    Shape ``tray:<preset>|color:<RRGGBB>|temps:<min>-<max>``, where the preset is the
-    firmware's ``tray_info_idx`` when it has one and the configured ``tray_type``
-    otherwise, the colour goes through :func:`normalize_color_for_id` (byte-exact
-    after alpha/`#` normalisation — 161616FF and 000000FF are DIFFERENT groups), and
-    the temps are the tray's own reported range (``None`` when the tray reports none,
-    which still compares equal between two equally-silent trays).
+    Shape ``tray:<preset>|color:<RRGGBB>``, where the preset is the firmware's
+    ``tray_info_idx`` when it has one and the configured ``tray_type`` otherwise, and
+    the colour goes through :func:`normalize_color_for_id` (byte-exact after alpha/`#`
+    normalisation — 161616FF and 000000FF are DIFFERENT groups).
+
+    NOZZLE TEMPERATURE IS NOT A GROUPING DIMENSION. It was TESTED, not assumed, and it
+    does not group — so it is not to be re-added. The firmware states its own grouping
+    in ``filam_bak`` (:func:`parse_filam_bak`), and a raw-MQTT capture of that field on
+    2026-08-25 read, against independently known occupancy::
+
+        001-H2S  T0,T1,T2,T3 occupied                filam_bak [15] = 0b1111  ONE group
+        002-H2S  T0,T1,T2 occupied                   filam_bak  [7] = 0b0111  ONE group
+        004-H2S  T2,T3 occupied                      filam_bak [12] = 0b1100  ONE group
+        012-H2S  T1,T2,T3 occupied                   filam_bak [14] = 0b1110  ONE group
+        010-H2S  T0 tagged 230-260 + T1,T2,T3
+                 tagless 230-270                     filam_bak [15] = 0b1111  ONE group
+
+    010-H2S is the decisive row: a slot reading 230-260 sits in ONE firmware group with
+    slots reading 230-270. The control that keeps colour IN the key is 008-H2C — 9
+    loaded slots, backup ON, four sharing ``GFA00`` and four sharing ``GFA01``, every
+    one a different colour, and ``filam_bak`` is ``[]``: no group formed at all.
 
     ``None`` when the tray can belong to no group: a tray that asserts no identity at
     all (bare or :func:`tray_unread`) and one the wire asserts is EMPTY
@@ -434,9 +488,7 @@ def backup_group_key(tray: object) -> str | None:
     if not preset:
         return None  # identity asserted by a tag alone — no configured filament to pair
     color = normalize_color_for_id(tray.get("tray_color"))
-    tmin = parse_int_field(tray.get("nozzle_temp_min"))
-    tmax = parse_int_field(tray.get("nozzle_temp_max"))
-    return f"tray:{preset}|color:{color}|temps:{tmin}-{tmax}"
+    return f"tray:{preset}|color:{color}"
 
 
 def tray_presence_map(ams_payload: object) -> dict[tuple[int, int], bool | None]:

@@ -6461,8 +6461,15 @@ class BambuMQTTClient:
         nozzle_temp_min: int,
         nozzle_temp_max: int,
         setting_id: str = "",
+        operation: str = "ams_filament_setting",
     ) -> bool:
         """Set AMS tray filament settings (type, color, temperature).
+
+        The ONE publisher of the ``ams_filament_setting`` command: every slot write
+        the fork performs — an identity from :mod:`~backend.app.services.slot_identity`
+        and :meth:`reset_ams_slot`'s blank one alike — lands on this wire through here,
+        so the external-spool id convention and the wire-safety refusal have a single
+        implementation rather than one per intent.
 
         Note: K value is set separately via extrusion_cali_sel command.
 
@@ -6476,6 +6483,9 @@ class BambuMQTTClient:
             nozzle_temp_min: Minimum nozzle temperature
             nozzle_temp_max: Maximum nozzle temperature
             setting_id: Full setting ID with version (e.g., "GFSL05_07") - optional
+            operation: The write's name in the wire-safety refusal log. A reset
+                publishes this same command with a blank identity but is its own
+                choke point to an operator reading the log, so it names itself.
 
         Returns:
             True if command was sent, False otherwise
@@ -6489,7 +6499,7 @@ class BambuMQTTClient:
         # filament-setting write into a drying unit fails the cycle (HMS 0700_C069);
         # into a slot mid-identify (or with our identify still in flight) it clobbers
         # the RFID read (HMS 0700_2x00_0001_0081).
-        if self._refuse_ams_write("ams_filament_setting", ams_id) is not None:
+        if self._refuse_ams_write(operation, ams_id) is not None:
             return False
 
         # Calculate mqtt IDs based on AMS type.
@@ -6556,6 +6566,12 @@ class BambuMQTTClient:
     def reset_ams_slot(self, ams_id: int, tray_id: int) -> bool:
         """Reset an AMS slot to empty/unconfigured state.
 
+        A reset IS a filament setting — the BLANK identity — so it publishes through
+        :meth:`ams_set_filament_setting` rather than assembling its own copy of the
+        external-spool id convention and the wire-safety refusal. It keeps its own
+        name in that refusal's log (``operation=``): to an operator reading the log
+        a reset is a distinct act, even though the command on the wire is the same.
+
         Args:
             ams_id: AMS unit ID (0-3 for regular AMS, 128-135 for HT AMS)
             tray_id: Tray ID within the AMS (0-3)
@@ -6563,63 +6579,21 @@ class BambuMQTTClient:
         Returns:
             True if command was sent, False otherwise
         """
-        if not self._client or not self.state.connected:
-            logger.warning("[%s] Cannot reset AMS slot: not connected", self.serial_number)
-            return False
-
-        # Wire-safety refusal via the shared _refuse_ams_write helper (drying →
-        # identifying → per-printer identify gate; it owns the WARNING log). A reset
-        # write is an ams_filament_setting under the hood: into a drying unit it fails
-        # the cycle (HMS 0700_C069); into a slot mid-identify (or with our identify
-        # still in flight) it clobbers the RFID read (HMS 0700_2x00_0001_0081).
-        if self._refuse_ams_write("reset_ams_slot", ams_id) is not None:
-            return False
-
-        # Calculate mqtt IDs based on AMS type — same convention as
-        # ams_set_filament_setting above. See its comment for the #1279 capture rationale.
-        if ams_id == 255:
-            vt_tray = self.state.raw_data.get("vt_tray", []) if self.state.raw_data else []
-            if len(vt_tray) > 1:
-                # Dual external slots (H2D): each ext slot is its own virtual AMS unit
-                mqtt_ams_id = 254 + tray_id
-                mqtt_tray_id = 0
-            else:
-                # Single external slot (X1C, P1S, A1): global tray_id=254.
-                mqtt_ams_id = 255
-                mqtt_tray_id = 254
-            slot_id = 0
-        elif ams_id <= 3:
-            mqtt_ams_id = ams_id
-            mqtt_tray_id = tray_id
-            slot_id = tray_id
-        else:
-            # AMS-HT: single tray per unit
-            mqtt_ams_id = ams_id
-            mqtt_tray_id = tray_id
-            slot_id = 0
-
-        command = {
-            "print": {
-                "command": "ams_filament_setting",
-                "ams_id": mqtt_ams_id,
-                "tray_id": mqtt_tray_id,
-                "slot_id": slot_id,
-                "tray_info_idx": "",
-                "tray_type": "",
-                "tray_sub_brands": "",
-                "tray_color": "00000000",
-                "nozzle_temp_min": 0,
-                "nozzle_temp_max": 0,
-                "sequence_id": "0",
-            }
-        }
-
-        command_json = json.dumps(command)
-        logger.info("[%s] Resetting AMS slot: AMS %s, tray %s", self.serial_number, ams_id, tray_id)
-        logger.debug("[%s] reset_ams_slot command: %s", self.serial_number, command_json)
-        self._client.publish(self.topic_publish, command_json, qos=1)
-        self._last_ams_cmd_time = time.monotonic()
-        return True
+        published = self.ams_set_filament_setting(
+            ams_id=ams_id,
+            tray_id=tray_id,
+            tray_info_idx="",
+            tray_type="",
+            tray_sub_brands="",
+            tray_color="00000000",
+            nozzle_temp_min=0,
+            nozzle_temp_max=0,
+            setting_id="",
+            operation="reset_ams_slot",
+        )
+        if published:
+            logger.info("[%s] Reset AMS slot: AMS %s, tray %s", self.serial_number, ams_id, tray_id)
+        return published
 
     def extrusion_cali_sel(
         self,

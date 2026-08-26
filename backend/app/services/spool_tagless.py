@@ -76,7 +76,13 @@ from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import ams_presence, spool_respool
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.spool_binding import bind_spool_to_slot, bound_elsewhere, last_released_from_slot_stmt
+from backend.app.services.slot_identity import apply_spool_to_slot_via_mqtt
+from backend.app.services.spool_binding import (
+    bind_spool_to_slot,
+    bound_elsewhere,
+    last_released_from_slot_stmt,
+    release_spool_from_slot,
+)
 from backend.app.services.spool_tag_matcher import (
     auto_assign_spool,
     is_bambu_tag,
@@ -108,6 +114,13 @@ DATA_ORIGIN = "ams_auto"
 # specific id is configured. A tray re-reporting one of these is untrustworthy for
 # minting a fresh identity (W4 generic-id override).
 _GENERIC_ID_VALUES = frozenset(GENERIC_FILAMENT_IDS.values())
+
+# Release reason for the OPERATOR lane's roll swap (:func:`_replace_row_after_cycle`):
+# the departing row is retired and its successor takes the slot in the same
+# transaction. Distinct from the wire lane's release reasons so a ``[slot-state]``
+# line names which lane retired the roll — a departure that is a REPLACEMENT and one
+# that leaves a slot empty are different events to anyone reading the log.
+_CYCLE_REPLACE_REASON = "cycle_replace"
 
 # Re-push cadence for a BARE tray whose default-filament config has not yet
 # landed on the printer (failed / slow MQTT). The trigger persists across AMS
@@ -508,30 +521,39 @@ def canonical_default_identity(
     THE predicate for "is this the fleet's default filament, spelled non-canonically?"
     and the single replacement for the three overlapping helpers this module used to
     carry (``override_generic_identity``, ``default_temps_for_fingerprint`` and the
-    mint's own inline override): one question, four dimensions, one answer.
+    mint's own inline override): one question, four fields, one answer.
 
     Returns the default's ``{slicer_filament, rgba, nozzle_temp_min, nozzle_temp_max}``
-    when the identity is ELIGIBLE (:func:`_eligible_for_default_identity`) **and** at
-    least one of the firmware's backup-group dimensions differs from the default's —
-    the preset id, the EXACT colour (through ``tray_fields.normalize_color_for_id``, so
-    ``161616FF`` differs from ``000000FF`` even though the two are ``colors_similar``),
-    or either nozzle temp. ``None`` means "nothing to do": already canonical, or not the
-    default's filament at all. A field the default does not carry comes back ``None`` —
-    every caller applies only what it is given, and never invents a dimension.
+    when the identity is ELIGIBLE (:func:`_eligible_for_default_identity`) **and** any
+    of those fields differs from the default's — the preset id, the EXACT colour
+    (through ``tray_fields.normalize_color_for_id``, so ``161616FF`` differs from
+    ``000000FF`` even though the two are ``colors_similar``), or either nozzle temp.
+    ``None`` means "nothing to do": already canonical, or not the default's filament at
+    all. A field the default does not carry comes back ``None`` — every caller applies
+    only what it is given, and never invents a field.
 
-    Why all four, and why the colour comparison is EXACT while eligibility is fuzzy:
+    Two of those four are the firmware's backup-group dimensions and two are not: the
+    AMS pairs slots on PRESET + COLOUR only (``tray_fields.backup_group_key``, measured
+    2026-08-25 off the firmware's own ``filam_bak`` groups). The nozzle temps are
+    written in the same breath because they are part of the fleet default's identity and
+    a slot carrying a stale range is a divergence an operator reads on the screen — NOT
+    because they group, and re-deriving a grouping claim from their presence here is the
+    mistake this paragraph exists to stop.
+
+    Why the colour comparison is EXACT while eligibility is fuzzy:
     the firmware pairs slots into an auto-refill backup group only on an exact
-    brand-class / type / colour / nozzle-temp match. 011-H2S (2026-07-19) proved the id
-    dimension — one slot left on generic ``GFG99`` beside a ``GFG02`` peer never got a
-    backup switch. 010-H2S (2026-08-21) proved the colour dimension: slots 1+2 carried
+    PRESET + COLOUR match. 011-H2S (2026-07-19) proved the preset dimension — one slot
+    left on generic ``GFG99`` beside a ``GFG02`` peer never got a backup switch.
+    010-H2S (2026-08-21) proved the colour dimension: slots 1+2 carried
     ``161616FF`` (a Bambu Studio / touchscreen slot edit that accepted the PETG-HF
     preset's own default colour) while slots 3+4 carried the farm's ``000000FF``, and
     the printer ran dry on slot 2 twice in 28 h with a full black roll one slot away —
     ``hms-events`` shows 69 auto-switches inside the 1↔2 pair, 14 inside 3→4, and none
     across. ``colors_similar`` answers "is this the same FILAMENT?" (eligibility);
     byte-exact equality answers "will the FIRMWARE pair them?" (is a write owed).
-    Conflating the two is precisely how the farm harmonised the preset and temperature
-    dimensions for three weeks while leaving the colour dimension split.
+    Conflating the two is precisely how the farm harmonised the preset for three weeks
+    (and the temperature range, which turned out to group nothing) while leaving the
+    colour dimension split.
 
     Pure and synchronous: the caller supplies the parsed ``tagless_default_filament``
     dict (:func:`tagless_default_filament`), so this stays a decision with no I/O and
@@ -674,10 +696,10 @@ async def mint_tagless_spool(
         # CANONICAL-IDENTITY guard: a tray re-reporting the GENERIC id an earlier
         # bare-tray auto-config wrote, or the near-black colour a touchscreen slot edit
         # left behind, mints the tagless default's OWN identity instead — id, colour and
-        # temps together (:func:`canonical_default_identity`). All four dimensions,
-        # because a row born canonical on three of them is still not a firmware
-        # backup-group peer: 010-H2S ran dry twice in 28 h on rows that matched the
-        # default's preset and temps and carried 161616FF for its colour.
+        # temps together (:func:`canonical_default_identity`). All four fields, because
+        # a row born canonical on the others is still not a firmware backup-group peer
+        # while its COLOUR is off: 010-H2S ran dry twice in 28 h on rows that matched the
+        # default's preset and carried 161616FF for its colour.
         _canon = canonical_default_identity(
             await _tagless_default(db),
             slicer_filament=slicer_filament,
@@ -878,8 +900,6 @@ async def _push_config(db: AsyncSession, spool: Spool, printer_id: int, ams_id: 
     slot whose own identity is still unresolved (:func:`_config_settling`). Returns
     False without publishing when the slot is settling or the push fails.
     """
-    from backend.app.api.routes.inventory import apply_spool_to_slot_via_mqtt
-
     if _config_settling(printer_id, ams_id, tray_id):
         logger.debug(
             "Deferring tagless config push for printer %d AMS%d-T%d: slot identity still settling",
@@ -1004,10 +1024,22 @@ async def _replace_row_after_cycle(
     provisional row instead of archiving an empty husk); the two must stay aligned.
     Default-mints from the configured tagless default
     when the tray is bare/absent OR still carries the departed row's config (firmware
-    leftover — :func:`fingerprint_matches`), so a physically-fresh roll gets a clean
-    4-dimension identity; else mints from the tray's own (genuinely different) config.
+    leftover — :func:`fingerprint_matches`), so a physically-fresh roll gets the fleet
+    default's complete identity; else mints from the tray's own (genuinely different)
+    config.
     Optional ``new_fields`` (brand/label_weight/cost_per_kg/note) ride the new row.
     Commits; broadcasts ``spool_auto_assigned(origin="tagless")``. Returns the new spool.
+
+    **The ARCHIVE stamp lands before the unbind, and that ordering is load-bearing.**
+    The departure goes through ``spool_binding.release_spool_from_slot`` — the ONE
+    unbind writer — so it leaves the same three artefacts every other departure does:
+    the ``last_location_*`` residue, a cleared fresh-roll prompt, and the ``[slot-state]``
+    forensic line. That residue is also a de-bounce DONOR, and a donor here would be the
+    shape-32 resurrection: a retired row reclaimed onto the brand-new roll that just
+    replaced it. What forbids it is ``slot_pipeline._debounce_candidate``'s ARCHIVED
+    refusal, which can only fire if the stamp is already on the row when the release
+    writes it — same transaction, archive first. Do not reorder these two statements,
+    and do not move the archive into the branch below.
     """
     departed.archived_at = datetime.utcnow()  # keep the ledger row + its grams
     res = await db.execute(
@@ -1019,8 +1051,7 @@ async def _replace_row_after_cycle(
     )
     old = res.scalar_one_or_none()
     if old is not None:
-        await db.delete(old)
-        await db.flush()
+        await release_spool_from_slot(db, old, reason=_CYCLE_REPLACE_REASON)
 
     default = await _tagless_default(db)
     tray_configured = bool(tray and (tray.get("tray_type") or "").strip())
@@ -2750,7 +2781,7 @@ def _row_backup_group_key(spool: Spool) -> str | None:
 
     The row is rendered through the SAME key the wire side is, so the two halves of a
     harmonise INFO line are directly comparable and the operator can see which of the
-    three dimensions is split. Never a decision input — the decision is
+    key's two dimensions is split. Never a decision input — the decision is
     :func:`canonical_default_identity`.
     """
     return backup_group_key(
@@ -2786,9 +2817,10 @@ async def maybe_harmonize_backup_identity(
     match, so the two pairs were separate groups: ``hms-events`` shows 69 auto-switches
     inside 1↔2, 14 inside 3→4, and none across. The printer ran dry on slot 2 twice in
     28 h with a full black roll one slot away and AMS Filament Backup ON. The farm had
-    been harmonising the PRESET dimension since the 011-H2S ``GFG99`` fix and the TEMPS
-    dimension since W4; the colour dimension had no lane at all, and a slot the operator
-    edited on the touchscreen could never come back.
+    been harmonising the PRESET dimension since the 011-H2S ``GFG99`` fix, and the
+    temperature range since W4 (which groups nothing — measured 2026-08-25); the colour
+    dimension had no lane at all, and a slot the operator edited on the touchscreen
+    could never come back.
 
     TWO ORDERED STEPS, both driven by the one predicate
     (:func:`canonical_default_identity`):

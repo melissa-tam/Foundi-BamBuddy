@@ -1,10 +1,10 @@
-"""Generic-id substitution at the AMS write site — ``inventory.apply_spool_to_slot_via_mqtt``.
+"""Generic-id substitution at the AMS write site — ``slot_identity.apply_spool_to_slot_via_mqtt``.
 
 2026-07-25 PROD (011-H2S, printer id 9): three slots were published
 ``tray_info_idx=GFG99, setting_id=GFSG99`` every ~30 s for 13 minutes while a fourth
 slot on the same printer got ``GFG02`` in the same pass. A generic id splits the
-firmware's auto-refill backup group — it pairs slots only on an exact brand-class /
-type / colour / nozzle-temps match — which is the 011-H2S "refused to auto-switch on
+firmware's auto-refill backup group — it pairs slots only on an exact preset + colour
+match — which is the 011-H2S "refused to auto-switch on
 runout" cause the 2026-07-19 wave was supposed to have closed with ONE substitution
 chokepoint (``spool_tagless.canonical_default_identity`` (renamed 2026-08-21 from ``override_generic_identity``), applied inside
 ``resolve_slicer_filament``).
@@ -27,8 +27,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.app.api.routes.inventory import apply_spool_to_slot_via_mqtt
 from backend.app.models.spool import Spool
+from backend.app.services.slot_identity import apply_spool_to_slot_via_mqtt
 
 pytestmark = pytest.mark.asyncio
 

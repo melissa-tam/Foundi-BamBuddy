@@ -1165,8 +1165,8 @@ def _tagless_mint_spec(
 
     Mirrors ``spool_tagless._replace_row_after_cycle``: mint from the configured
     tagless default when the tray is bare OR still carries the DEPARTED row's
-    config (firmware leftover after a runout — a physically fresh roll must get a
-    clean 4-dimension identity), else mint from the tray's own, genuinely
+    config (firmware leftover after a runout — a physically fresh roll must get the
+    fleet default's complete identity), else mint from the tray's own, genuinely
     different, configuration.
     """
     use_default = ctx.tagless_default is not None and (

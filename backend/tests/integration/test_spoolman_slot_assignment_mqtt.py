@@ -1038,3 +1038,94 @@ class TestSlicerFilamentResolutionParity:
             "filament_id_to_setting_id-derived so the slot detail modal "
             "doesn't render with empty fields."
         )
+
+
+class TestSpoolmanIdentityIsBuiltByTheSharedChokepoint:
+    """The Spoolman assign lane composes NOTHING of the wire identity itself.
+
+    It already called the resolver, but then re-implemented the generic fallback with a
+    raw ``GENERIC_FILAMENT_IDS`` lookup — which skips the canonical-identity substitution
+    the resolver's own ``generic_fallback=True`` re-entry performs — and carried its own
+    ``808080FF`` colour default beside the internal lane's ``FFFFFFFF``. Two lanes that
+    disagree about either field publish two identities for one filament, and the firmware
+    pairs auto-refill backup slots on an exact preset + colour match.
+
+    Spoolman mode is OFF in production, so these are the only verification this lane gets.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_generic_fallback_lands_the_fleet_defaults_specific_preset(
+        self, async_client: AsyncClient, slot_settings, test_printer, mock_spoolman_client, db_session
+    ):
+        """A Spoolman spool naming no preset, whose material and colour match the
+        configured tagless default, must publish that default's SPECIFIC id — the same
+        bytes the internal lane publishes for the same roll. The local lookup this
+        replaces could only ever produce the bare generic, which is a split group against
+        every slot already carrying the specific one (011-H2S)."""
+        mock_spoolman_client.get_spool = AsyncMock(
+            return_value={
+                **SAMPLE_SPOOL,
+                "filament": {**SAMPLE_SPOOL["filament"], "material": "PETG", "color_hex": "000000"},
+                "extra": {},
+            }
+        )
+
+        mqtt_mock = MagicMock()
+        mqtt_mock.ams_set_filament_setting = MagicMock()
+        mqtt_mock.extrusion_cali_sel = MagicMock()
+        mqtt_mock.printer_state = None
+
+        with patch("backend.app.api.routes.spoolman_inventory.printer_manager") as pm_mock:
+            pm_mock.get_client = MagicMock(return_value=mqtt_mock)
+            pm_mock.get_status = MagicMock(return_value=None)
+
+            response = await async_client.post(
+                "/api/v1/spoolman/inventory/slot-assignments",
+                json={
+                    "spoolman_spool_id": 10,
+                    "printer_id": test_printer.id,
+                    "ams_id": 0,
+                    "tray_id": 0,
+                },
+            )
+
+        assert response.status_code == 200
+        call_kwargs = mqtt_mock.ams_set_filament_setting.call_args[1]
+        assert call_kwargs["tray_info_idx"] == "GFG02", "the fleet default's preset, not a bare GFG99"
+        assert call_kwargs["setting_id"] == "GFSG02"
+        assert call_kwargs["nozzle_temp_min"] == 230
+        assert call_kwargs["nozzle_temp_max"] == 270
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_colour_reaches_the_wire_as_eight_uppercase_hex_digits(
+        self, async_client: AsyncClient, slot_settings, test_printer, mock_spoolman_client
+    ):
+        """Colour is a grouping DIMENSION, so its shape is not cosmetic: a lowercase or
+        6-digit value beside an 8-digit uppercase one is two colours to the AMS."""
+        mock_spoolman_client.get_spool = AsyncMock(
+            return_value={**SAMPLE_SPOOL, "filament": {**SAMPLE_SPOOL["filament"], "color_hex": "00ff00"}}
+        )
+
+        mqtt_mock = MagicMock()
+        mqtt_mock.ams_set_filament_setting = MagicMock()
+        mqtt_mock.extrusion_cali_sel = MagicMock()
+        mqtt_mock.printer_state = None
+
+        with patch("backend.app.api.routes.spoolman_inventory.printer_manager") as pm_mock:
+            pm_mock.get_client = MagicMock(return_value=mqtt_mock)
+            pm_mock.get_status = MagicMock(return_value=None)
+
+            response = await async_client.post(
+                "/api/v1/spoolman/inventory/slot-assignments",
+                json={
+                    "spoolman_spool_id": 10,
+                    "printer_id": test_printer.id,
+                    "ams_id": 0,
+                    "tray_id": 0,
+                },
+            )
+
+        assert response.status_code == 200
+        assert mqtt_mock.ams_set_filament_setting.call_args[1]["tray_color"] == "00FF00FF"

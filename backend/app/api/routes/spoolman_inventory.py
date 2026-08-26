@@ -49,7 +49,7 @@ from backend.app.services.location_service import (
     resolve_spoolman_location_string,
 )
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.slicer_filament_resolver import resolve_slicer_filament
+from backend.app.services.slot_identity import compose_sub_brands, resolve_slot_identity
 from backend.app.services.spoolman import (
     SpoolmanClient,
     SpoolmanClientError,
@@ -59,11 +59,7 @@ from backend.app.services.spoolman import (
     init_spoolman_client,
 )
 from backend.app.services.spoolman_tracking import get_fallback_spool_tag_for_slot
-from backend.app.utils.filament_ids import (
-    GENERIC_FILAMENT_IDS,
-    filament_id_to_setting_id,
-    normalize_slicer_filament,
-)
+from backend.app.utils.filament_ids import normalize_slicer_filament
 from backend.app.utils.printer_models import extruder_for_ams, nozzle_for_ams_unit
 
 logger = logging.getLogger(__name__)
@@ -1477,66 +1473,32 @@ async def assign_spoolman_slot(
     try:
         mqtt_client = printer_manager.get_client(body.printer_id)
         if mqtt_client:
-            tray_type = mapped.get("material") or ""
-            brand = mapped.get("brand") or ""
-            subtype = mapped.get("subtype") or ""
-            if brand:
-                tray_sub_brands = f"{brand} {tray_type} {subtype}".strip()
-            elif subtype:
-                tray_sub_brands = f"{tray_type} {subtype}".strip()
-            else:
-                tray_sub_brands = tray_type
-
-            tray_color = (mapped.get("rgba") or "808080FF").upper()
-            if len(tray_color) == 6:
-                tray_color = tray_color + "FF"
-
-            # #1713: resolve the spool's stored slicer_filament reference
-            # (cloud preset, local preset, GF-prefix builtin, or numeric
-            # LocalPreset id) to the printer-side tray_info_idx + setting_id.
-            # Previously the Spoolman path dropped slicer_filament on the
-            # floor and only the generic-material fallback fired; the user-
-            # configured profile never reached the printer. Shared with the
-            # internal-mode route via the same helper so the two flows can't
-            # drift again.
-            # W4: consume the resolver's COMPLETE wire identity (id/setting/sub-brand
-            # AND the resolved nozzle-temp range) so this Spoolman write site emits an
-            # identical 4-dimension identity to the internal-inventory route for a
-            # same-identity spool.
-            tray_info_idx, setting_id, sub_brand_override, temp_min, temp_max = await resolve_slicer_filament(
+            # The whole wire identity from the ONE builder, so a given filament lands
+            # byte-identical here and on the internal-inventory lane. This lane already
+            # called the resolver, but then re-implemented its generic fallback with a
+            # raw GENERIC_FILAMENT_IDS lookup instead of re-entering the resolver with
+            # ``generic_fallback=True`` — which skips the canonical-identity
+            # substitution and can publish a bare GFG99 that splits the firmware's
+            # auto-refill backup group — and carried its own colour default beside the
+            # internal lane's.
+            identity = await resolve_slot_identity(
                 db=db,
                 current_user=current_user,
+                material=mapped.get("material"),
                 slicer_filament=mapped.get("slicer_filament"),
                 slicer_filament_name=mapped.get("slicer_filament_name"),
-                material=tray_type,
                 rgba=mapped.get("rgba"),
                 nozzle_temp_min=mapped.get("nozzle_temp_min"),
                 nozzle_temp_max=mapped.get("nozzle_temp_max"),
+                sub_brands=compose_sub_brands(mapped.get("brand"), mapped.get("material"), mapped.get("subtype")),
             )
-            if sub_brand_override:
-                tray_sub_brands = sub_brand_override
-
-            material_upper = tray_type.upper().strip()
-            # Fall back to generic-material id when slicer_filament is empty
-            # or the resolver discarded an unresolvable value. Matches the
-            # internal-mode tail in inventory.py:_apply_spool_to_slot_inner.
-            if not tray_info_idx:
-                tray_info_idx = (
-                    GENERIC_FILAMENT_IDS.get(material_upper)
-                    or GENERIC_FILAMENT_IDS.get(material_upper.split("-")[0].split(" ")[0])
-                    or ""
-                )
-
-            # Ensure setting_id is always derivable from tray_info_idx. The
-            # local-preset path can leave it empty when the LP's setting JSON
-            # has no filament_id and falls through to the generic material id;
-            # without this fallback the slicer gets a half-configured slot
-            # (filament id without setting id) and the slot detail modal
-            # renders empty fields. Same pattern as the internal-mode tail.
-            if tray_info_idx and not setting_id:
-                setting_id = filament_id_to_setting_id(tray_info_idx)
-
-            # temp_min/temp_max already resolved by resolve_slicer_filament above (W4).
+            tray_type = identity.tray_type
+            tray_sub_brands = identity.tray_sub_brands
+            tray_color = identity.tray_color
+            tray_info_idx = identity.tray_info_idx
+            setting_id = identity.setting_id
+            temp_min = identity.nozzle_temp_min
+            temp_max = identity.nozzle_temp_max
 
             # Pull printer state from printer_manager. The previous
             # `mqtt_client.printer_state` access via hasattr always returned

@@ -324,6 +324,9 @@ def fake_clock(monkeypatch):
 
 
 def _swap_push(tray_now, *, units=(0, 1, 2), filam_bak=None, device_bak=None, subtask_id="job-A"):
+    """``filam_bak`` / ``device_bak`` carry the wire's own words: each element of either
+    array is one backup group's slot BITMASK (``[3]`` = slots 0+1, ``[9]`` = slots 0+3),
+    confirmed for AMS unit 0 on 2026-08-25 — see ``tray_fields.parse_filam_bak``."""
     state = MagicMock()
     state.state = "RUNNING"
     state.tray_now = tray_now
@@ -398,10 +401,10 @@ async def test_ambiguous_swap_with_filam_bak_group_stamps(
     wire["client"] = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[0, 1])
-    assert _sample(printer.id, 1, filam_bak=[0, 1]) == []
+    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[3])  # 0b0011 — slots 0+1
+    assert _sample(printer.id, 1, filam_bak=[3]) == []
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    stamped = await _drive_swap(own_session_factory, printer.id, 1, filam_bak=[0, 1])
+    stamped = await _drive_swap(own_session_factory, printer.id, 1, filam_bak=[3])
 
     assert stamped is not None and stamped.id == departed.id
     assert stamped.spent_at is not None
@@ -418,11 +421,11 @@ async def test_ambiguous_swap_with_group_not_pairing_the_trays_declines(
     wire["client"] = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[0, 3])
-    assert _sample(printer.id, 1, filam_bak=[0, 3]) == []
+    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[9])  # 0b1001 — slots 0+3, not 1
+    assert _sample(printer.id, 1, filam_bak=[9]) == []
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_respool"):
-        stamped = await _drive_swap(own_session_factory, printer.id, 1, filam_bak=[0, 3])
+        stamped = await _drive_swap(own_session_factory, printer.id, 1, filam_bak=[9])
 
     assert stamped is None
     await db_session.refresh(departed)
@@ -433,12 +436,14 @@ async def test_ambiguous_swap_with_group_not_pairing_the_trays_declines(
 @pytest.mark.asyncio
 async def test_per_extruder_filam_bak_shape_is_read(db_session, printer_factory, wire, fake_clock, own_session_factory):
     """Shape B: ``print.device.extruder.info[i].filam_bak``. A dual-nozzle machine
-    reports groups per EXTRUDER, and each extruder is its own group — two nozzles do not
-    back each other up."""
+    reports groups per EXTRUDER, and each extruder's masks stay their own groups — two
+    nozzles do not back each other up."""
     printer = await printer_factory(model="H2C")
     wire["client"] = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
-    groups = [[0, 1], [8, 9]]  # right nozzle pairs 0/1; left nozzle pairs 8/9
+    # Right nozzle pairs slots 0+1 (0b0011); left nozzle pairs 2+3 (0b1100). Both masks
+    # stay inside AMS unit 0, the only unit whose bit index is measured.
+    groups = [[3], [12]]
 
     _stable_feeder(printer.id, 0, fake_clock, device_bak=groups)
     assert _sample(printer.id, 1, device_bak=groups) == []
@@ -446,6 +451,57 @@ async def test_per_extruder_filam_bak_shape_is_read(db_session, printer_factory,
     stamped = await _drive_swap(own_session_factory, printer.id, 1, device_bak=groups)
 
     assert stamped is not None and stamped.id == departed.id
+
+
+def test_a_group_bit_outside_ams_unit_0_is_logged_once(caplog):
+    """The open question — does bit N index a global tray id or a per-unit slot? — can
+    only be answered by a group that reaches past slot 3, and every multi-AMS printer
+    sampled 2026-08-25 reported no groups at all. So the FIRST one to arrive gets a line
+    carrying the raw masks beside the live tray identities, exactly once per printer:
+    a sample this lane never emits leaves the question open forever, and one it emits at
+    ~1 Hz is a log nobody reads."""
+    printer_id = 4242
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_respool"):
+        _sample(printer_id, 0, filam_bak=[0x30])  # bits 4+5 — past AMS unit 0
+        _sample(printer_id, 0, filam_bak=[0x30])
+
+    lines = [r.getMessage() for r in caplog.records if "filam_bak encoding sample" in r.getMessage()]
+    assert len(lines) == 1
+    assert "masks=[48]" in lines[0]
+    assert "groups=[[4, 5]]" in lines[0]
+    assert "0/0=GFG02:00FF00FF:11" in lines[0], "the tray identities the two readings disagree about"
+
+
+def test_a_group_inside_ams_unit_0_is_not_logged(caplog):
+    """The measured case is not a question, and must not narrate itself every push."""
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_respool"):
+        _sample(4243, 0, filam_bak=[15])
+    assert not [r for r in caplog.records if "filam_bak encoding sample" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_a_pair_outside_ams_unit_0_declines_rather_than_guessing_the_encoding(
+    db_session, printer_factory, wire, fake_clock, caplog, own_session_factory
+):
+    """Bit N is the SLOT for AMS unit 0 and unmeasured beyond it — every multi-AMS
+    printer sampled 2026-08-25 reported no groups at all, so nothing discriminates a
+    global tray id from a per-unit slot. Trays 8 -> 9 are AMS unit 2, where a match would
+    assert that encoding. Decline, and say so."""
+    printer = await printer_factory(model="H2C")
+    wire["client"] = _client(model="H2C")
+    departed = await _bind(db_session, printer.id, 2, 0, weight_used=500.0)
+
+    _stable_feeder(printer.id, 8, fake_clock, filam_bak=[15])
+    assert _sample(printer.id, 9, filam_bak=[15]) == []
+    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_respool"):
+        stamped = await _drive_swap(own_session_factory, printer.id, 9, filam_bak=[15])
+
+    assert stamped is None
+    await db_session.refresh(departed)
+    assert departed.spent_at is None
+    assert "backup-swap corroboration declined" in caplog.text
+    assert "confirmed only for AMS unit 0" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -459,7 +515,7 @@ async def test_filam_bak_cache_survives_pushes_that_omit_it(
     wire["client"] = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[0, 1])
+    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[3])
     # Every push from here on omits the field.
     assert _sample(printer.id, 1) == []
     fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1

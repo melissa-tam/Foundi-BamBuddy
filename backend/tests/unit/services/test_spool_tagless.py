@@ -51,7 +51,7 @@ def env(monkeypatch):
     monkeypatch.setattr("backend.app.api.routes.settings.get_setting", fake_get_setting)
 
     apply = AsyncMock(return_value=True)
-    monkeypatch.setattr("backend.app.api.routes.inventory.apply_spool_to_slot_via_mqtt", apply)
+    monkeypatch.setattr("backend.app.services.spool_tagless.apply_spool_to_slot_via_mqtt", apply)
 
     ws = AsyncMock()
     monkeypatch.setattr(spool_tagless.ws_manager, "broadcast", ws)
@@ -456,9 +456,9 @@ class TestApplySpoolLazyLoadRegression:
         """The REAL callee behind the bare-tray push. A DB-loaded spool whose
         k_profiles relationship is NOT eager-loaded must publish the MQTT config
         without a greenlet/lazy-load crash (the deterministic bare-tray failure)."""
-        from backend.app.api.routes.inventory import apply_spool_to_slot_via_mqtt
         from backend.app.models.spool_k_profile import SpoolKProfile
         from backend.app.services.printer_manager import printer_manager
+        from backend.app.services.slot_identity import apply_spool_to_slot_via_mqtt
 
         printer = await printer_factory()
         spool = Spool(material="PETG", rgba="00FF00FF", data_origin="ams_auto")
@@ -511,7 +511,7 @@ class TestApplySpoolLazyLoadRegression:
         # ams_set_filament_setting refused (AMS busy identifying/drying) → apply returns
         # False and NEITHER extrusion_cali_sel NOR the slot-preset persist runs: the DB
         # preset row must not record a write that never reached the printer.
-        from backend.app.api.routes import inventory as inv
+        from backend.app.services import slot_identity
         from backend.app.services.printer_manager import printer_manager
 
         printer = await printer_factory()
@@ -535,9 +535,9 @@ class TestApplySpoolLazyLoadRegression:
         monkeypatch.setattr(printer_manager, "get_client", lambda pid: _RefusingClient())
         monkeypatch.setattr(printer_manager, "get_status", lambda pid: None)
         preset = AsyncMock()
-        monkeypatch.setattr("backend.app.services.slot_preset_writer.upsert_slot_preset_for_spool", preset)
+        monkeypatch.setattr("backend.app.services.slot_identity.upsert_slot_preset_for_spool", preset)
 
-        ok = await inv.apply_spool_to_slot_via_mqtt(
+        ok = await slot_identity.apply_spool_to_slot_via_mqtt(
             db=db_session, current_user=None, spool=spool, printer_id=printer.id, ams_id=0, tray_id=0
         )
         assert ok is False
@@ -698,7 +698,7 @@ class TestMintIdentityW4:
         )
         monkeypatch.setattr(spool_tagless, "parse_tray_fields", AsyncMock(return_value=parsed))
         spool = await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PETG", color="161616FF"))
-        assert spool.rgba == "000000FF"  # all four dimensions, not three
+        assert spool.rgba == "000000FF"  # the colour is canonicalised too, not just the preset
         assert spool.slicer_filament == "GFG02"
         assert spool.slicer_filament_name == "Bambu PETG HF"  # id unchanged -> name kept
         assert (spool.nozzle_temp_min, spool.nozzle_temp_max) == (230, 270)
@@ -1049,7 +1049,7 @@ class TestCanonicalDefaultIdentity:
     """The ONE canonicalisation predicate, consumed by the mint, the wire resolver AND
     the slot-config harmonise arm. Its mint-side behaviour is pinned by
     TestMintIdentityW4 above (which runs through this predicate); these cases pin the
-    predicate's own contract, one per firmware backup-group dimension.
+    predicate's own contract, one per identity field it canonicalises.
 
     Pure and synchronous — the caller supplies the parsed default dict, so there is no
     settings fixture here and nothing to await."""

@@ -124,7 +124,7 @@ def _resolve_nozzle_temps(
     tightens exactly one case and deliberately: a row naming a DIFFERENT specific preset
     (``GFG00`` beside a ``GFG02`` default) no longer inherits the default's temperatures.
     That row is an operator statement, it is not a backup-group peer on the preset
-    dimension either, and lending it the default's temps only made it look like one.
+    dimension, and lending it the default's temps only made its identity look canonical.
     An UNSTATED preset (``""``/None) stays eligible — it asserts nothing to contradict —
     so the legacy-row shape this tier was written for is untouched.
     """
@@ -361,7 +361,7 @@ async def resolve_slicer_filament(
     # resolved id that is CANONICALISABLE onto the configured tagless default — generic
     # (GFG99 …) or the default's own — is re-composed as the default's SPECIFIC identity:
     # id, setting_id AND nozzle temps. The firmware's auto-refill backup group pairs
-    # slots only on an exact brand-class/type/colour/temps match, so a stale spool row
+    # slots only on an exact preset + colour match, so a stale spool row
     # carrying a leftover generic id re-published a GFG99 that split the group (011-H2S,
     # live). Every write site routes through this resolver, so the substitution happens
     # once here instead of at each caller. The COLOUR half of the same predicate belongs
