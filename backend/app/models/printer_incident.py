@@ -70,6 +70,13 @@ RESOLVE_AUTO_RESUME = "auto_resume"
 RESOLVE_OBSERVED_RUNNING = "observed_running"
 RESOLVE_TERMINAL = "terminal"
 RESOLVE_OPERATOR = "operator"
+# The wire says the hold is over: the printer is live in a positive non-PAUSE state
+# AND no actionable AMS fault stands on it any more (``spool_recovery.
+# sweep_open_incidents``). Its own token rather than ``observed_running`` because it
+# is the ONLY close nobody performed — no resume, no terminal, no human — and 001-H2S
+# incident #60 (2026-08-29) sat open 15 h precisely because that close had no path.
+# ``resolve_source`` is free text, so the token needs no migration.
+RESOLVE_WIRE_CLEAR = "wire_clear"
 
 
 class PrinterIncident(Base):

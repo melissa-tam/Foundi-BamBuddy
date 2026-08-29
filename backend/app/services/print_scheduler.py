@@ -81,7 +81,13 @@ logger = logging.getLogger(__name__)
 # a post-print prompt) is NOT a valid "command landed" signal even though the
 # state value did change. SLICING is included because some firmwares park
 # briefly in SLICING between PREPARE and RUNNING while parsing the g-code.
-_ACTIVE_PRINT_STATES: frozenset[str] = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
+#
+# PUBLIC since 2026-08-29: ``farm_stall.check_dead_dispatch_claims`` asks the same
+# question ("is a print actually in flight on this printer?") to decide whether a
+# ``printing`` claim is dead, and a second spelling of this set is how the two would
+# come to disagree about PAUSE — which for that watch is the difference between
+# leaving a native-vision hold alone and double-dispatching onto an occupied plate.
+ACTIVE_PRINT_STATES: frozenset[str] = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
 
 # Dispatch precondition: the queued item's source file is gone from disk. Held as a
 # WAIT (see ``_hold_dispatch_precondition``) rather than failed — 2026-08-14, a farm
@@ -121,6 +127,61 @@ def _derive_estimated_time(archive, library_file) -> int | None:
         meta = library_file.file_metadata or {}
         return meta.get("print_time_seconds") or None
     return None
+
+
+def _busy_cause(
+    printer_id: int,
+    busy_claims: dict[int, list[tuple[int, datetime | None]]],
+    dispatch_hold_printers: set[int],
+    state,
+) -> str:
+    """Why this printer is in ``busy_printers`` — in terms an operator can act on.
+
+    The per-printer "not available" line is the farm's only recurring statement
+    about a printer that is taking no work, and for 15 hours on 2026-08-29 it said
+    ``connected=True, state=IDLE, awaiting_plate_clear=False`` once every 30 seconds
+    while naming NOTHING: not the dead ``printing`` claim that was actually holding
+    the printer, not its age, not the AMS fault standing on the wire. Every fact
+    needed to diagnose the incident was already in the process; none of it was in
+    the sentence.
+
+    Pure and DB-free (this runs inside the tick's own session): the claim identity
+    comes from the seed the caller already built, the fault from the live state.
+    Reports every cause that holds, because they stack — a dead claim on a printer
+    with a standing fault is a different story from either alone.
+    """
+    causes: list[str] = []
+    for claim_id, started_at in busy_claims.get(printer_id, []):
+        if started_at is None:
+            causes.append(f"printing claim item {claim_id} (age unknown)")
+            continue
+        stamped = started_at if started_at.tzinfo is not None else started_at.replace(tzinfo=timezone.utc)
+        age_min = (datetime.now(timezone.utc) - stamped).total_seconds() / 60.0
+        causes.append(f"printing claim item {claim_id} ({age_min:.0f} min)")
+    if printer_id in dispatch_hold_printers:
+        causes.append("post-dispatch hold")
+    if state is not None:
+        from backend.app.services.spool_recovery import live_candidates
+
+        faults = live_candidates(state)
+        if faults:
+            causes.append("standing fault " + ",".join(sorted(c.short_code for c in faults)))
+    return "; ".join(causes) if causes else "unattributed"
+
+
+def _incident_summary(printer_id: int) -> str:
+    """The printer's OPEN AMS incident as one log token, or ``-``.
+
+    Reads the projection cache (``printer_incidents.snapshot`` — sync, DB-free,
+    built for exactly this kind of read), so the diagnostic never costs a query.
+    """
+    from backend.app.services import printer_incidents
+
+    snap = printer_incidents.snapshot(printer_id)
+    if not snap:
+        return "-"
+    slot = snap.get("slot_desc")
+    return f"{snap.get('kind')}/{snap.get('status')}" + (f"@{slot}" if slot else "")
 
 
 def _present_candidates(loaded: list[dict]) -> list[dict]:
@@ -291,6 +352,34 @@ class PrintScheduler:
             except Exception:
                 logger.exception("Foreign-pause watch failed (non-fatal)")
 
+            # Wire-clear incident sweep (2026-08-29): close an ESCALATED AMS hold
+            # whose FAULT has cleared. No other lifecycle path could — a hold ended
+            # only on a resume, a job terminal or a restart — so an operator who
+            # cleared a jam on an idle printer left the hold (and its dispatch block)
+            # standing indefinitely. Runs BEFORE the attention nag so a cured
+            # incident closes in the very tick that would otherwise re-page about it,
+            # and before the dead-claim watch below, whose "nobody else owns this
+            # printer" guard it can only ever relax. Own guard, like every sibling.
+            try:
+                from backend.app.services.spool_recovery import sweep_open_incidents
+
+                await sweep_open_incidents()
+            except Exception:
+                logger.exception("Wire-clear incident sweep failed (non-fatal)")
+
+            # Dead dispatch-claim watch (2026-08-29): a unit still claiming
+            # 'printing' on a connected, demonstrably not-printing printer, whose
+            # print never started. Nothing else can retire such a row — no terminal
+            # echo ever comes for a print that never began — and it seeds
+            # busy_printers every tick, so the printer takes no work at all. Runs
+            # before the pending-item scan so a released unit dispatches THIS tick.
+            try:
+                from backend.app.services.farm_stall import check_dead_dispatch_claims
+
+                await check_dead_dispatch_claims(db)
+            except Exception:
+                logger.exception("Dead dispatch-claim watch failed (non-fatal)")
+
             # Attention-reminder nag (W3): the offline / pause-stall / recovery /
             # runout escalations each alert only ONCE per incident, so a printer left
             # PAUSEd needing a human went silent for hours (2026-07-20). Re-fire the
@@ -379,12 +468,24 @@ class PrintScheduler:
             # Without this guard, two pending items targeting the same printer
             # (e.g. a batch with quantity>1) both end up in 'printing' status —
             # surfaced via the "BUG: Multiple queue items" warning in on_print_complete.
+            #
+            # The claim IDENTITY is kept, not just the printer id: the diagnostic
+            # line at the end of the tick is the farm's only per-printer "why is
+            # this printer taking no work" statement, and printing it without the
+            # claim behind it is what let item 1010's dead claim print 1,800
+            # identical lines over 15 h while naming nothing an operator could act
+            # on (2026-08-29).
             busy_result = await db.execute(
-                select(PrintQueueItem.printer_id)
+                select(PrintQueueItem.id, PrintQueueItem.printer_id, PrintQueueItem.started_at)
                 .where(PrintQueueItem.status == "printing")
                 .where(PrintQueueItem.printer_id.is_not(None))
             )
-            busy_printers: set[int] = {pid for (pid,) in busy_result.all() if pid is not None}
+            busy_claims: dict[int, list[tuple[int, datetime | None]]] = {}
+            for claim_id, claim_pid, claim_started in busy_result.all():
+                if claim_pid is None:
+                    continue
+                busy_claims.setdefault(claim_pid, []).append((claim_id, claim_started))
+            busy_printers: set[int] = set(busy_claims)
 
             # Defense-in-depth (#1157): augment busy_printers with any printer
             # still in its post-dispatch hold window. Empirically, the DB seed
@@ -393,10 +494,13 @@ class PrintScheduler:
             # digesting the first project_file. The hold is keyed in-memory and
             # released by the watchdog on the success path, so it adds a layer
             # that doesn't depend on DB row visibility or completion-callback
-            # timing.
+            # timing. Recorded separately so the diagnostic can tell an in-flight
+            # dispatch apart from a standing claim.
+            dispatch_hold_printers: set[int] = set()
             for held_printer_id in list(self._dispatch_holds.keys()):
                 if self._printer_in_dispatch_hold(held_printer_id):
                     busy_printers.add(held_printer_id)
+                    dispatch_hold_printers.add(held_printer_id)
 
             # Power-stagger budget (#Phase4 / Phase E): how many more prints may
             # BEGIN heating this tick. Owned by the stagger_policy module: budget =
@@ -1060,11 +1164,14 @@ class PrintScheduler:
                     awaiting = printer_manager.is_awaiting_plate_clear(pid)
                     state_name = state.state if state else "NO_STATUS"
                     logger.info(
-                        "Queue: printer %d not available — connected=%s, state=%s, awaiting_plate_clear=%s",
+                        "Queue: printer %d not available — connected=%s, state=%s, awaiting_plate_clear=%s, "
+                        "cause=%s, incident=%s",
                         pid,
                         connected,
                         state_name,
                         awaiting,
+                        _busy_cause(pid, busy_claims, dispatch_hold_printers, state),
+                        _incident_summary(pid),
                     )
 
             # Auto-drying: start drying on idle printers that have no pending queue items
@@ -1808,6 +1915,32 @@ class PrintScheduler:
         state = printer_manager.get_status(printer_id)
         if not state:
             logger.debug("Printer %d: no status available", printer_id)
+            return False
+
+        # Standing AMS fault (2026-08-29): a printer whose wire still carries an
+        # ACTIONABLE fault takes no new print, whether or not an incident row exists
+        # for it yet. The scheduler never looked at live HMS, so on 001-H2S it
+        # dispatched item 1010 onto a printer with 0700_0006 (PTFE tube breakage)
+        # standing — one second after a terminal had closed the previous incident and
+        # one second before the next one opened. In that gap NO incident row existed,
+        # which is exactly why the gate reads the WIRE and not the incident store.
+        #
+        # Same classification the recovery entry gate uses (``live_candidates`` over
+        # the taxonomy — invariant 1, never a second code list), so it can only block
+        # where the alternative is dispatch-then-immediate-fault: informational codes
+        # are excluded by the taxonomy and never reach here. Function-level import:
+        # ``spool_recovery`` reaches back into this module (``scheduler``) at call
+        # time, and a module-level edge would close that loop.
+        from backend.app.services.spool_recovery import live_candidates
+
+        faults = live_candidates(state)
+        if faults:
+            logger.debug(
+                "Printer %d: not idle — standing AMS fault(s) %s (state=%s)",
+                printer_id,
+                sorted(c.short_code for c in faults),
+                state.state,
+            )
             return False
 
         # Plate-clear gate (unconditional — Phase 1, P1-B): if the printer finished/
@@ -3818,7 +3951,7 @@ class PrintScheduler:
                 return
             last_status = status
             _emit_observed_phase(status.state)
-            if status.state in _ACTIVE_PRINT_STATES:
+            if status.state in ACTIVE_PRINT_STATES:
                 # Printer is actively processing the job — release the
                 # post-dispatch hold so the next pending item for this printer
                 # can be evaluated normally. We do NOT accept arbitrary state
@@ -3847,7 +3980,7 @@ class PrintScheduler:
                     return
                 last_status = status
                 _emit_observed_phase(status.state)
-                if status.state in _ACTIVE_PRINT_STATES:
+                if status.state in ACTIVE_PRINT_STATES:
                     scheduler._release_dispatch_hold(printer_id)
                     return
 
@@ -3865,19 +3998,19 @@ class PrintScheduler:
         #                        recovery so the MQTT session gets a fresh client_id
         #                        on the half-broken-session path.
         async def _do_revert(db):
-            item = await db.get(PrintQueueItem, queue_item_id)
-            if not item or item.status != "printing":
-                return "already_moved_on"
-            item.status = "pending"
-            item.started_at = None
-            # Drop the dispatch RECORD written at start: that dispatch never landed,
-            # so the field must not describe it. Leaving it would also hand the next
-            # tick's matcher a decision dressed as an operator pin — the one thing the
-            # contract forbids. The retry re-decides from live state. printer_id
-            # pinning is deliberately left untouched.
-            item.ams_mapping = None
+            # ONE writer for "un-claim a printing row whose print never started":
+            # ``queue_transitions.release_unstarted_claim``. This used to be a
+            # hand-rolled ORM read-then-write of the identical transition, which is
+            # the exact shape that module exists to remove (a status read here, the
+            # print landing there, and a write that believes the read). The
+            # conditional UPDATE is also what makes the routing below honest: the
+            # bool IS "did this row move", so a row that raced to completed/cancelled
+            # can no longer be reported as reverted.
+            from backend.app.services.queue_transitions import release_unstarted_claim
+
+            released = await release_unstarted_claim(db, item_id=queue_item_id)
             await db.commit()
-            return "reverted"
+            return "reverted" if released else "already_moved_on"
 
         try:
             revert_outcome = await run_with_retry(_do_revert, label=f"watchdog revert item={queue_item_id}")

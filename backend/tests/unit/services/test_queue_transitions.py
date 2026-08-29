@@ -36,6 +36,7 @@ from backend.app.services.queue_transitions import (
     claim_pending_for_dispatch,
     delete_items_unless_printing,
     delete_user_items_unless_printing,
+    release_unstarted_claim,
 )
 
 pytestmark = pytest.mark.unit
@@ -415,3 +416,95 @@ class TestDeleteUserItemsUnlessPrinting:
             await db.rollback()
 
         assert await _surviving(session_factory) == ids
+
+
+class TestReleaseUnstartedClaim:
+    """``printing → pending``: un-claiming a dispatch that never landed.
+
+    The third face of the same lost update, and the only one whose loser is not a
+    person: 001-H2S 2026-08-29, item 1010 was committed ``printing`` at 01:25:13,
+    the print never started, and nothing could ever move the row again — no terminal
+    echo arrives for a print that never began. The printer sat out 15 hours.
+
+    The precondition matters as much here as anywhere else: the caller decides a
+    claim is dead over several ticks of evidence, and the print may genuinely land,
+    or complete, inside that window.
+    """
+
+    async def test_a_printing_claim_is_released_with_every_dispatch_column_cleared(self, session_factory):
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            item = (await db.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))).scalar_one()
+            item.started_at = _CLAIMED_AT
+            item.ams_mapping = "[1, -1]"
+            item.waiting_reason = "stagger_hold"
+            await db.commit()
+
+            assert await release_unstarted_claim(db, item_id=item_id) is True
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert after.status == "pending"
+        assert after.started_at is None
+        # The DECIDED mapping must not survive onto a pending row, where the same
+        # column means an operator PIN (2026-08-12 pin contract: never a cache).
+        assert after.ams_mapping is None
+        assert after.waiting_reason is None
+
+    @pytest.mark.parametrize("status", ["pending", "completed", "cancelled", "failed", "skipped"])
+    async def test_only_a_printing_row_moves(self, session_factory, status):
+        (item_id,) = await _seed(session_factory, status)
+        async with session_factory() as db:
+            assert await release_unstarted_claim(db, item_id=item_id) is False
+            await db.commit()
+
+        assert (await _row(session_factory, item_id)).status == status
+
+    async def test_an_unknown_id_is_refused(self, session_factory):
+        async with session_factory() as db:
+            assert await release_unstarted_claim(db, item_id=999_999) is False
+
+    async def test_a_row_that_raced_to_completed_is_untouched(self, session_factory):
+        """The race that matters: the watch decided over two ticks, and in the gap
+        ``on_print_complete`` moved the row. The caller's reading is stale, and the
+        WHERE clause — not the caller — is what decides."""
+        (item_id,) = await _seed(session_factory, "printing")
+
+        async with session_factory() as watch, session_factory() as terminal:
+            loaded = (await watch.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))).scalar_one()
+            assert loaded.status == "printing"
+
+            done = (await terminal.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))).scalar_one()
+            done.status = "completed"
+            done.completed_at = _CLAIMED_AT
+            await terminal.commit()
+
+            # expire_on_commit=False: the watch's copy still SAYS printing.
+            assert loaded.status == "printing"
+            assert await release_unstarted_claim(watch, item_id=item_id) is False
+            await watch.commit()
+
+        after = await _row(session_factory, item_id)
+        assert after.status == "completed"
+        assert after.completed_at is not None
+
+    async def test_a_second_call_is_a_no_op(self, session_factory):
+        """Idempotent by the same precondition: a released row is no longer
+        ``printing``, so a duplicate release from a retry or a second tick cannot
+        touch it — and, critically, cannot wipe the columns of the NEXT dispatch."""
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            assert await release_unstarted_claim(db, item_id=item_id) is True
+            await db.commit()
+
+            assert await release_unstarted_claim(db, item_id=item_id) is False
+            await db.commit()
+
+            # Re-dispatched: the fresh claim's columns stand.
+            assert await claim_pending_for_dispatch(db, item_id=item_id, started_at=_CLAIMED_AT, ams_mapping="[2]")
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert after.status == "printing"
+        assert after.ams_mapping == "[2]"
+        assert after.started_at is not None

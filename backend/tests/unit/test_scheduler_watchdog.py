@@ -13,6 +13,7 @@ belt-and-braces for slow transitions that also don't emit an early subtask_id
 tick.
 """
 
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -301,6 +302,78 @@ class TestWatchdogRevertsWhenStuck:
         # File landed (subtask_id advance proves this), so a forced reconnect
         # would trigger 0500_4003 mid-parse (#1150) — skip.
         client.force_reconnect_stale_session.assert_not_called()
+
+
+class TestRevertGoesThroughTheCanonicalTransition:
+    """2026-08-29: the revert used to be a hand-rolled ORM read-then-write of
+    ``printing → pending`` — the exact shape ``queue_transitions`` exists to remove,
+    and a second copy of a transition the farm now performs from two places (here
+    and ``farm_stall.check_dead_dispatch_claims``). It is one writer now."""
+
+    @pytest.mark.asyncio
+    async def test_the_revert_calls_release_unstarted_claim(self, db_session):
+        from backend.app.services import queue_transitions
+
+        real = queue_transitions.release_unstarted_claim
+        seen: list[int] = []
+
+        async def _spy(db, *, item_id):
+            seen.append(item_id)
+            return await real(db, item_id=item_id)
+
+        get_status = MagicMock(return_value=_status("FINISH", "OLD_SUBTASK"))
+        with (
+            patch("backend.app.services.print_scheduler.printer_manager.get_status", get_status),
+            patch("backend.app.services.print_scheduler.printer_manager.get_client", MagicMock(return_value=None)),
+            patch("backend.app.services.print_scheduler.async_session", db_session),
+            patch("backend.app.core.database.async_session", db_session),
+            patch.object(queue_transitions, "release_unstarted_claim", new=_spy),
+        ):
+            await PrintScheduler._watchdog_print_start(
+                queue_item_id=1,
+                printer_id=42,
+                pre_state="FINISH",
+                pre_subtask_id="OLD_SUBTASK",
+                timeout=0.2,
+                poll_interval=0.05,
+            )
+
+        assert seen == [1]
+
+    @pytest.mark.asyncio
+    async def test_the_revert_clears_every_dispatch_column(self, db_session):
+        """The transition owns which columns a revert resets — including
+        ``waiting_reason``, which the hand-rolled copy left behind."""
+        async with db_session() as db:
+            item = await db.get(PrintQueueItem, 1)
+            item.status = "printing"
+            item.started_at = datetime(2026, 8, 29, 1, 25, 13)
+            item.ams_mapping = "[0, -1, -1, -1]"
+            item.waiting_reason = "stagger_hold"
+            await db.commit()
+
+        get_status = MagicMock(return_value=_status("FINISH", "OLD_SUBTASK"))
+        with (
+            patch("backend.app.services.print_scheduler.printer_manager.get_status", get_status),
+            patch("backend.app.services.print_scheduler.printer_manager.get_client", MagicMock(return_value=None)),
+            patch("backend.app.services.print_scheduler.async_session", db_session),
+            patch("backend.app.core.database.async_session", db_session),
+        ):
+            await PrintScheduler._watchdog_print_start(
+                queue_item_id=1,
+                printer_id=42,
+                pre_state="FINISH",
+                pre_subtask_id="OLD_SUBTASK",
+                timeout=0.2,
+                poll_interval=0.05,
+            )
+
+        async with db_session() as db:
+            item = await db.get(PrintQueueItem, 1)
+            assert item.status == "pending"
+            assert item.started_at is None
+            assert item.ams_mapping is None
+            assert item.waiting_reason is None
 
 
 class TestWatchdogFallbackBehaviour:

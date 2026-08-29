@@ -184,6 +184,53 @@ class TestDispatchPartPresentEject:
             source.unlink(missing_ok=True)
 
 
+class TestStandingFaultDoesNotGateEjects:
+    """SCOPE pin for the 2026-08-29 dispatch gate: ``_is_printer_idle`` refuses PRINT
+    dispatch onto a printer whose wire carries an actionable AMS fault. An eject is
+    filament-less and motion-only, and gating it the same way would be a deadlock —
+    the plate stays occupied, so the fault's own printer can never be freed by the
+    sweep that would free it. This dispatcher is the ONE eject path (production, FA
+    and manual/foreign all funnel through it)."""
+
+    @staticmethod
+    def _ptfe_breakage_hms():
+        """``0700_0006`` — PTFE tube breakage, PHYSICAL class, the code that held
+        001-H2S. Actionable, so it blocks print dispatch."""
+        from backend.app.services.bambu_mqtt import HMSError
+
+        attr = 0x07000000 | ((0x20 + 3) << 8)
+        return HMSError(code="0x20006", attr=attr, module=7, severity=2, full_code=f"{attr:08X}00020006")
+
+    async def test_an_eject_still_dispatches_with_an_actionable_fault_standing(self, db_session, monkeypatch):
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            # The print-dispatch gate would refuse this printer outright...
+            from backend.app.services.print_scheduler import scheduler
+            from backend.app.services.printer_manager import printer_manager as pm
+
+            faulted = SimpleNamespace(state="IDLE", hms_errors=[self._ptfe_breakage_hms()], subtask_id="t")
+            monkeypatch.setattr(pm, "get_status", lambda _pid: faulted)
+            monkeypatch.setattr(pm, "is_quarantined", lambda _pid: False)
+            monkeypatch.setattr(pm, "is_model_mismatch", lambda _pid: False)
+            monkeypatch.setattr(pm, "is_awaiting_plate_clear", lambda _pid: False)
+            monkeypatch.setattr(pm, "is_connected", lambda _pid: True)
+            assert scheduler._is_printer_idle(printer.id) is False
+
+            # ...and the eject goes out anyway.
+            start = MagicMock(return_value=True)
+            c1, c2, c3 = _ftp_patches()
+            with c1, c2, c3, patch.object(printer_manager, "start_print", start):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=None
+                )
+            start.assert_called_once()
+            assert remote.peek_pending_eject(printer.id) is not None
+        finally:
+            remote.pop_pending_eject(printer.id)
+            source.unlink(missing_ok=True)
+
+
 class TestMatchesPendingEject:
     """The shared eject-terminal detection helper (single origin of the mismatch
     rule shared by farm_policy.on_terminal and the main.py start/complete callbacks).
