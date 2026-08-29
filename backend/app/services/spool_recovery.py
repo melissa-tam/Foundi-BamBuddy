@@ -110,6 +110,8 @@ Entries (all spawned guarded from ``main``, none ever raises):
 :func:`on_ams_fault` (per status push), :func:`note_demand_watch` (the per-push
 wire sampler that drives refill auto-resume and closes a hold the moment the
 printer runs again), :func:`on_observed_running`, :func:`on_job_terminal`,
+:func:`sweep_open_incidents` (the scheduler-tick close for a hold whose FAULT
+cleared — the one lifecycle path that did not exist before 2026-08-29),
 :func:`rearm_incidents_on_startup`, and :func:`clear_on_reinsert` (from the
 ``ams_presence`` presence-GAIN edge). ``clear_hms_errors()`` is NEVER called — the
 resume clears the firmware dialog itself and clearing would corrupt main.py's HMS
@@ -138,6 +140,7 @@ from backend.app.models.printer_incident import (
     RESOLVE_OBSERVED_RUNNING,
     RESOLVE_OPERATOR,
     RESOLVE_TERMINAL,
+    RESOLVE_WIRE_CLEAR,
     STATUS_ABORTED,
     STATUS_ESCALATED,
     STATUS_RECOVERING,
@@ -610,6 +613,25 @@ _blocked: dict[tuple[int, str], set[str]] = {}
 # one bounded reset again, which is safe.
 _stuck_resets: dict[tuple[int, str], int] = {}
 
+# incident_id -> the monotonic instant :func:`sweep_open_incidents` FIRST saw every
+# one of its close guards hold. The dwell that stops a momentary reading closing a
+# real hold: an incident closes only once the whole constellation (connected,
+# positive non-PAUSE state, ZERO actionable faults) has stood continuously for
+# :data:`_HOLD_OVER_DWELL_S`. Popped the instant any guard breaks, so the wait
+# restarts rather than accumulating across flaps.
+#
+# Process-lifetime by design (derive-don't-store): the dwell simply restarts after a
+# restart, which is the SAFE direction — the worst cost is one extra 120 s before a
+# curable incident closes, and the startup rearm already closes the clear-cut cases
+# without any dwell at all.
+_hold_over_since: dict[int, float] = {}
+
+# How long the close constellation must hold before the sweep acts. Sized against
+# the false positive that OPENED incident #60: a fault re-evaluated in the seconds
+# either side of a dispatch, on a printer momentarily reading a non-PAUSE state. A
+# code constant, not an operator knob (precedent: _EVAL_THROTTLE_S).
+_HOLD_OVER_DWELL_S = 120.0
+
 # --- W2 durable repeat-jam quarantine (code constants, NOT operator knobs) ----
 # A printer whose recovery escalates _JAM_QUARANTINE_THRESHOLD times within
 # _JAM_QUARANTINE_WINDOW_H hours is quarantined: a recurring AMS jam is hardware
@@ -670,6 +692,7 @@ def _reset_state() -> None:
     _guidance_sent.clear()
     _wire_sample.clear()
     _blocked.clear()
+    _hold_over_since.clear()
     printer_incidents._reset_state()
 
 
@@ -3094,6 +3117,115 @@ async def on_job_terminal(printer_id: int) -> bool:
         return False
 
 
+def _hold_over(incident, state) -> tuple[bool, str]:
+    """Does the printer's LIVE STATE say this incident's hold is over?
+
+    ONE predicate, two occasions — the startup rearm (:func:`rearm_incidents_on_startup`)
+    and the per-tick sweep (:func:`sweep_open_incidents`). They ask the identical
+    question about the identical evidence, and before this was extracted the rearm
+    was the only place that could answer it at all, which is why a hold whose fault
+    cleared while the process was UP had no close path (001-H2S incident #60,
+    2026-08-29: escalated 01:25, printer clean and IDLE by 15:30, still holding at
+    16:00 and blocking every future incident on that printer).
+
+    True only for a POSITIVE non-PAUSE state. ``""`` / ``UNKNOWN`` are not evidence
+    of anything (the printer has not reported), and ``PAUSE`` is the hold itself.
+    Returns ``(verdict, live state as reported)`` — the second element is what both
+    callers log, so the sentence they print names the same reading the verdict used.
+
+    Pure and DB-free; ``incident`` is taken so the call sites read as a question
+    about THIS hold rather than about the printer in the abstract.
+    """
+    live = (getattr(state, "state", None) or "") if state is not None else ""
+    return bool(live) and live.upper() not in ("", "UNKNOWN", "PAUSE"), live
+
+
+async def sweep_open_incidents(*, now: float | None = None) -> int:
+    """Close ESCALATED incidents the WIRE says are over. Returns the count closed.
+
+    The missing lifecycle path. An incident closes when the printer is seen RUNNING
+    (:func:`on_observed_running`), when its job reaches a terminal
+    (:func:`on_job_terminal`), when the refill auto-resume lands, or when a restart's
+    rearm finds the printer positive. Nothing closed an incident because its FAULT
+    CLEARED — so an operator who cleared a jam on an idle printer left the hold
+    standing until the next print happened to run (the 2026-08-19 fleet event: seven
+    printers held up to 426 min each), or forever when there was no next print,
+    because the hold is what blocks dispatch (001-H2S #60).
+
+    FIVE guards, every one required, evaluated in this order:
+
+    1. ``escalated`` only. A ``recovering`` row has a live driver — or, after a
+       restart, ``_reenter_recovering_incident``'s own lane — and closing it from
+       underneath would race the machine that is acting on it.
+    2. CONNECTED, with a live state. A cached state read during a disconnect is a
+       memory, not evidence; the printer must be speaking to us now.
+    3. :func:`_hold_over` — a positive non-PAUSE live state.
+    4. :func:`live_candidates` EMPTY. NOT "the incident's own code is gone": the
+       incident that motivated this carried the pair ``0700_8006`` + ``0700_0006``,
+       and a per-code test would have closed the hold with the sibling fault still
+       standing. Whole-printer, through the ONE taxonomy classifier the entry gate
+       uses (invariant 1 — never a new HMS frozenset). A physical fault still live on
+       an IDLE printer is a REAL hold and keeps holding.
+    5. Dwell — all four held continuously for :data:`_HOLD_OVER_DWELL_S`. The fault
+       that opened #60 was evaluated 78 ms after a dispatch, when the printer read
+       non-PAUSE for an instant; a level-triggered close with no dwell would make the
+       same mistake in the opposite direction.
+
+    Guarded end to end and per incident: this runs from the scheduler tick and must
+    never kill it (invariant 10).
+    """
+    now = _monotonic() if now is None else now
+    closed = 0
+    try:
+        from backend.app.core.database import async_session
+
+        async with async_session() as db:
+            open_rows = await printer_incidents.all_open(db)
+            live_ids = {inc.id for inc in open_rows}
+            for stale in [iid for iid in _hold_over_since if iid not in live_ids]:
+                _hold_over_since.pop(stale, None)
+
+            for incident in open_rows:
+                try:
+                    if incident.status != STATUS_ESCALATED:
+                        _hold_over_since.pop(incident.id, None)
+                        continue
+                    pid = incident.printer_id
+                    state = _get_state(pid) if printer_manager.is_connected(pid) else None
+                    over, live = _hold_over(incident, state)
+                    faults = live_candidates(state) if over else frozenset()
+                    if not over or faults:
+                        _hold_over_since.pop(incident.id, None)
+                        continue
+
+                    first = _hold_over_since.get(incident.id)
+                    if first is None:
+                        _hold_over_since[incident.id] = now
+                        continue
+                    if now - first < _HOLD_OVER_DWELL_S:
+                        continue
+
+                    await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_WIRE_CLEAR)
+                    cleared = await _clear_hold_projection(db, incident.item_id)
+                    _hold_over_since.pop(incident.id, None)
+                    closed += 1
+                    logger.info(
+                        "spool_recovery: printer %s incident %s (%s) closed — wire clear "
+                        "(state=%s, no actionable fault for %.0fs)%s",
+                        pid,
+                        incident.id,
+                        incident.kind,
+                        live,
+                        now - first,
+                        "; hold token cleared" if cleared else "",
+                    )
+                except Exception:  # noqa: BLE001 — one bad incident must not abort the sweep
+                    logger.exception("spool_recovery: wire-clear sweep failed for incident %s", incident.id)
+    except Exception:  # noqa: BLE001 — a scheduler-tick watch must never kill the tick
+        logger.exception("spool_recovery: wire-clear incident sweep failed")
+    return closed
+
+
 async def rearm_incidents_on_startup() -> int:
     """Reconcile incidents left open by a restart, then rehydrate the chip cache.
 
@@ -3103,7 +3235,12 @@ async def rearm_incidents_on_startup() -> int:
 
     * live state is a positive NON-PAUSE (RUNNING / FINISH / IDLE …) → the hold is
       over; close it ``observed_running``. Without this a stale open row would block
-      every future incident on that printer (one-open-per-printer);
+      every future incident on that printer (one-open-per-printer). The reading is
+      :func:`_hold_over`, shared with the per-tick :func:`sweep_open_incidents` — one
+      predicate, two occasions, so the restart and the running process can never
+      disagree about what "the hold is over" means. The startup occasion deliberately
+      needs no fault-liveness guard and no dwell: a restart re-derives every wire
+      fact from scratch, and a printer already running has answered the question;
     * live state is PAUSE → leave it OPEN. The hold is real; the hourly attention
       reminder re-arms off the incident and nags until a human clears it;
     * no live state at all (the printer has not reported yet) → leave it OPEN and
@@ -3126,8 +3263,8 @@ async def rearm_incidents_on_startup() -> int:
         async with async_session() as db:
             for incident in await printer_incidents.all_open(db):
                 st = _get_state(incident.printer_id)
-                live = (getattr(st, "state", None) or "") if st is not None else ""
-                if not live or live.upper() in ("", "UNKNOWN", "PAUSE"):
+                over, live = _hold_over(incident, st)
+                if not over:
                     if incident.status == STATUS_RECOVERING:
                         driverless.append((incident.id, incident.printer_id))
                     continue

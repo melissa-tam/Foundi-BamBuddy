@@ -1,7 +1,8 @@
 """Canonical queue-item status transitions, evaluated at the STORAGE boundary.
 
-Three transitions live here: ``pending → cancelled``, its mirror
-``pending → printing``, and the row's outright DELETION. The first exists as a
+Four transitions live here: ``pending → cancelled``, its mirror
+``pending → printing``, the un-claim ``printing → pending`` for a dispatch that
+never landed, and the row's outright DELETION. The first exists as a
 module because it had three hand-rolled copies (run abort, batch cancel,
 single-item cancel) and every one of them was a read-then-write over an ORM row
 loaded earlier in the request — a lost update waiting for a dispatch to land in
@@ -179,6 +180,57 @@ async def claim_pending_for_dispatch(
     # Deliberately silent on the miss: the dispatcher is the only caller and it
     # logs the refusal WITH the status it lost the row to, which is the line
     # triage actually needs. A second line here would only split that story.
+    return result.scalar_one_or_none() is not None
+
+
+async def release_unstarted_claim(db: AsyncSession, *, item_id: int) -> bool:
+    """Un-claim a ``printing`` row whose print never started: ``printing → pending``.
+
+    The inverse of :func:`claim_pending_for_dispatch`, and the only one of the four
+    transitions here that is not about a race between two humans-with-intent — it is
+    about a claim nobody ever redeemed. ``printing`` is an optimistic status: the
+    dispatcher writes it and COMMITS before the print command goes out, so a command
+    the printer never acts on leaves a row asserting a print that does not exist.
+    That row then seeds the scheduler's ``busy_printers`` set every tick, and the
+    printer takes no work for as long as the row stands. Production 2026-08-29,
+    001-H2S item 1010: dispatched into a standing AMS fault at 01:25:13, the print
+    never started, no terminal could ever arrive for it, and the printer sat out
+    15 hours with seven pending units behind it.
+
+    ``printing`` is in the WHERE for the reason the module exists: between the
+    caller's decision and this write the print may genuinely have landed, or
+    ``on_print_complete`` may have moved the row to a terminal. Returns True iff a
+    row actually moved; False means somebody else owns it now and the caller must
+    treat its own reading as stale.
+
+    **Every dispatch-shaped column is cleared, and ``ams_mapping`` deliberately so.**
+    On a ``printing`` row that value is the DECIDED mapping for a dispatch that is
+    being un-made; on a ``pending`` row the same column means an operator PIN
+    (2026-08-12 pin contract: "never a cache"). Leaving it would hand the next tick's
+    matcher its own previous decision dressed as a human's instruction — the one
+    thing that contract forbids. The accepted cost is narrow and stated: a pin an
+    operator set on this unit BEFORE it was dispatched is lost, and the matcher
+    re-decides from live trays. ``printer_id`` is left alone (it is an assignment,
+    not a dispatch record), as is the row's queue position.
+
+    Does not commit — the caller owns the transaction boundary, as with every
+    sibling here.
+    """
+    result = await db.execute(
+        update(PrintQueueItem)
+        .where(
+            PrintQueueItem.id == item_id,
+            PrintQueueItem.status == "printing",
+        )
+        .values(
+            status="pending",
+            started_at=None,
+            ams_mapping=None,
+            waiting_reason=None,
+        )
+        .returning(PrintQueueItem.id)
+        .execution_options(synchronize_session=False)
+    )
     return result.scalar_one_or_none() is not None
 
 

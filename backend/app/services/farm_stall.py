@@ -19,6 +19,13 @@ reconcile / operator resolves the true outcome.
   double-notify — and restarts its grace timer when such a pause later becomes
   unattended.
 
+* ``check_dead_dispatch_claims`` — the printer is CONNECTED and demonstrably NOT
+  printing, yet a unit still claims it. The one watch here that WRITES the queue
+  row's status, and the charter above survives it intact: ``printing → pending`` is
+  un-claiming a dispatch that never landed, not fabricating an outcome. Nothing else
+  could retire such a row — no terminal echo ever arrives for a print that never
+  began (2026-08-29, 001-H2S item 1010: 15 h, seven units queued behind it).
+
 Invoked as guarded calls from the scheduler's ``check_queue`` tick (mirroring the
 stagger consumer), so there is no new periodic loop / lifespan task. State (edge
 timestamps + notified sets) is module-level, matching the other event-edge
@@ -122,6 +129,7 @@ def _reset_state() -> None:
     _attention_first_seen.clear()
     _foreign_paused_at.clear()
     _foreign_notified.clear()
+    _dead_claim_since.clear()
 
 
 async def _grace_seconds(db: AsyncSession, key: str, default: int) -> float:
@@ -392,6 +400,177 @@ async def check_paused_prints(db: AsyncSession, *, manager=printer_manager, now:
 
 
 # --------------------------------------------------------------------------- #
+# The dead dispatch claim: a ``printing`` row whose print never started
+# --------------------------------------------------------------------------- #
+# item_id -> the ts every dead-claim guard was FIRST seen holding together. Popped
+# the moment any guard breaks, and pruned against the live ``printing`` set, so the
+# dwell measures one continuous dead shape rather than an accumulation of glimpses.
+#
+# Process-lifetime (derive-don't-store): a restart re-derives the whole shape from
+# the DB row plus the live wire on the next tick, and the dwell simply restarts —
+# the safe direction, worst cost one extra 120 s before a stranded unit is freed.
+_dead_claim_since: dict[int, float] = {}
+
+# Clock A: how old a claim must be before it can be called dead. Comfortably past
+# the dispatch watchdog's own full budget (90 s Phase A + 180 s Phase B = 270 s) plus
+# the slowest observed H2D digestion, so the watchdog is ALWAYS the first responder
+# and this watch only ever sees what it missed.
+_DEAD_CLAIM_MIN_AGE_S = 600.0
+# Clock B: how long the dead shape must hold continuously. A printer's live state and
+# subtask echo both flap around a dispatch; one poll is not evidence.
+_DEAD_CLAIM_DWELL_S = 120.0
+
+
+async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
+    """Release a ``printing`` claim whose print demonstrably never started.
+
+    ``printing`` is written optimistically: the dispatcher commits it BEFORE the
+    print command goes out, so that a crash in between leaves a unit wrongly marked
+    printing rather than one that silently reprints hours later. The cost of that
+    (correct) choice is a row that can outlive the dispatch it describes — and
+    nothing on the farm could ever retire one. No terminal echo will arrive for a
+    print that never began; the downtime reconcile is archive-scoped and an archive
+    row only reaches ``printing`` at PRINT START; the dispatch watchdog releases its
+    hold on any transition into an active state, PAUSE included. Production
+    2026-08-29 on 001-H2S: item 1010 was dispatched into a standing AMS fault at
+    01:25:13, the print never started, and the row seeded ``busy_printers`` every
+    30 s for 15 hours with seven pending units queued behind it.
+
+    Six guards, ALL required, because the failure mode of a wrong release is a
+    DOUBLE DISPATCH onto an occupied plate:
+
+    1. the printer is CONNECTED (an offline printer belongs to
+       :func:`check_stalled_prints`, which owns that story and its own token);
+    2. its live state exists and is NOT in
+       ``print_scheduler.ACTIVE_PRINT_STATES`` — one origin, imported at call time.
+       PAUSE counts as ACTIVE on purpose: a native-vision trip pauses at print start
+       with the plate occupied, and releasing that unit would re-dispatch onto it;
+    3. the print never started, EVIDENCE-LED: no ``PrintArchive`` on this printer
+       reads ``printing`` (hard disjointness with ``main.reconcile_stale_active_prints``
+       — the two reconcilers can never both act on one printer), and when the item
+       carries a ``dispatch_subtask_id``, the printer's live ``subtask_id`` differs
+       from it. That id test is CORROBORATION, never a precondition: a NULL id proves
+       nothing either way, and requiring one would strand exactly the rows that need
+       this most. A live subtask that MATCHES our dispatch id, on the other hand, is
+       proof the print landed — the watch stands down;
+    4. the claim is at least :data:`_DEAD_CLAIM_MIN_AGE_S` old, measured from
+       ``started_at`` (naive stamps read as UTC, as ``stagger`` does). A claim with no
+       ``started_at`` at all is left alone: without it the age is unknowable, and an
+       unknowable age is not evidence;
+    5. the dead shape has held for :data:`_DEAD_CLAIM_DWELL_S`;
+    6. nobody else owns the printer — no OPEN incident and no LIVE recovery task.
+       This is why the wire-clear sweep runs first in the tick: it can only ever
+       DELAY a release, never cause a wrong one.
+
+    The module's "never writes a terminal status" charter is intact — ``pending`` is
+    un-claiming, not an outcome. The unit goes back where it came from and the
+    scheduler re-dispatches it, so there is no new notification event: the
+    run-changed broadcast and the WARNING below are the operator surface.
+
+    Injectable ``manager``/``now`` (epoch seconds — it drives both clocks) for tests.
+    """
+    now = time.time() if now is None else now
+    from datetime import datetime, timezone
+
+    from backend.app.models.archive import PrintArchive
+    from backend.app.services import printer_incidents, spool_recovery
+    from backend.app.services.print_scheduler import ACTIVE_PRINT_STATES
+    from backend.app.services.queue_transitions import release_unstarted_claim
+
+    wall = datetime.fromtimestamp(now, tz=timezone.utc)
+
+    result = await db.execute(
+        select(PrintQueueItem).where(PrintQueueItem.status == "printing").where(PrintQueueItem.printer_id.is_not(None))
+    )
+    items = list(result.scalars().all())
+    live_ids = {item.id for item in items}
+    for stale in [iid for iid in _dead_claim_since if iid not in live_ids]:
+        _dead_claim_since.pop(stale, None)
+    if not items:
+        return
+
+    # Guard 3's disjointness half, read ONCE per tick: which printers the archive
+    # side believes are mid-print.
+    archive_printers = {
+        pid
+        for (pid,) in (
+            await db.execute(
+                select(PrintArchive.printer_id)
+                .where(PrintArchive.status == "printing")
+                .where(PrintArchive.printer_id.is_not(None))
+            )
+        ).all()
+    }
+
+    for item in items:
+        pid = item.printer_id
+        if pid is None:
+            continue
+        try:
+            if not manager.is_connected(pid) or item.waiting_reason == "printer_offline_stalled":
+                _dead_claim_since.pop(item.id, None)
+                continue
+
+            st = manager.get_status(pid)
+            live = (getattr(st, "state", None) or "").upper()
+            if not live or live in ACTIVE_PRINT_STATES:
+                _dead_claim_since.pop(item.id, None)
+                continue
+
+            if pid in archive_printers:
+                _dead_claim_since.pop(item.id, None)
+                continue
+
+            dispatch_id = (item.dispatch_subtask_id or "").strip()
+            live_subtask = (getattr(st, "subtask_id", None) or "").strip()
+            if dispatch_id and live_subtask and live_subtask == dispatch_id:
+                _dead_claim_since.pop(item.id, None)
+                continue
+
+            started_at = item.started_at
+            if started_at is None:
+                _dead_claim_since.pop(item.id, None)
+                continue
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            age_s = (wall - started_at).total_seconds()
+            if age_s < _DEAD_CLAIM_MIN_AGE_S:
+                _dead_claim_since.pop(item.id, None)
+                continue
+
+            if await printer_incidents.get_open(db, pid) is not None or spool_recovery.has_live_recovery(pid):
+                _dead_claim_since.pop(item.id, None)
+                continue
+
+            first = _dead_claim_since.get(item.id)
+            if first is None:
+                _dead_claim_since[item.id] = now
+                continue
+            if now - first < _DEAD_CLAIM_DWELL_S:
+                continue
+
+            if not await release_unstarted_claim(db, item_id=item.id):
+                # It moved between the query and the write — somebody else owns it.
+                _dead_claim_since.pop(item.id, None)
+                continue
+            await db.commit()
+            _dead_claim_since.pop(item.id, None)
+            await _notify_run_changed(db, item)
+            logger.warning(
+                "farm_stall: printer %s unit %s claimed 'printing' %.0f min ago but never started "
+                "(state=%s, dispatch subtask=%s, live subtask=%s) — released to 'pending' for re-dispatch",
+                pid,
+                item.id,
+                age_s / 60.0,
+                live,
+                dispatch_id or "-",
+                live_subtask or "-",
+            )
+        except Exception:  # noqa: BLE001 — one bad item must not abort the watch
+            logger.exception("farm_stall: dead-claim watch failed for printer %s item %s", pid, item.id)
+
+
+# --------------------------------------------------------------------------- #
 # WS2b: the foreign-print pause watch
 # --------------------------------------------------------------------------- #
 # printer_id -> the ts a FOREIGN print was first seen PAUSEd (episode start), and
@@ -515,6 +694,24 @@ _INCIDENT_REMINDER_DETAIL: dict[str, str] = {
     KIND_PHYSICAL: _PHYSICAL_REMINDER_DETAIL,
 }
 
+# The same three holds when the printer is NOT paused. Every line above asserts
+# "still PAUSED", which is simply false for the shape that motivated this arm: a
+# printer sitting IDLE, physically clean or not, still held by an escalated incident
+# and taking no work. Saying "still PAUSED" there would send an operator looking for
+# a paused job that does not exist — so the non-PAUSE copy states what IS true (a
+# standing hold, no work being taken) and what ends it (the fault clearing).
+_IDLE_HELD_SUFFIX = " The printer is not paused — it is idle and will take no work until the fault clears on the wire."
+_INCIDENT_REMINDER_DETAIL_UNPAUSED: dict[str, str] = {
+    KIND_JAM: "Spool jam STILL not recovered — the printer remains held for a human." + _IDLE_HELD_SUFFIX,
+    KIND_RUNOUT: (
+        "Filament runout STILL not resolved — the printer remains held awaiting a same-slot refill." + _IDLE_HELD_SUFFIX
+    ),
+    KIND_PHYSICAL: (
+        "A physical filament fault is STILL unresolved — the printer remains held and no swap can clear it."
+        + _IDLE_HELD_SUFFIX
+    ),
+}
+
 
 def _live_runout_slot(state) -> str | None:
     """Human name of the slot the firmware is CURRENTLY demanding filament in, from
@@ -569,6 +766,17 @@ async def _remind_open_incidents(
     The runout slot is re-decoded LIVE each tick (006-H2S 2026-07-26) so the nag
     SELF-CORRECTS when the firmware's demand moves, rather than repeating the slot
     that was right an hour ago.
+
+    **A hold does not have to be PAUSED to be a hold (2026-08-29).** This arm used to
+    skip any printer not reading ``PAUSE``, which silently exempted the worst shape
+    there is: 001-H2S incident #60 held an IDLE printer for 15 h with seven pending
+    units behind it and fired ZERO notifications — it was found by eye. The evidence
+    rule is now the same one the rearm uses: skip only when the printer is
+    DISCONNECTED or reports no state at all (``""`` / ``UNKNOWN``), because those are
+    absences of evidence rather than readings. Everything else nags, and with the
+    wire-clear sweep landing first, what survives to be nagged in a non-PAUSE state
+    is exactly a printer whose fault is still live (or one inside the sweep's 120 s
+    dwell, which the first-sighting seed absorbs).
     """
     from backend.app.models.printer import Printer
     from backend.app.services import printer_incidents
@@ -582,7 +790,8 @@ async def _remind_open_incidents(
             if not manager.is_connected(pid):
                 continue
             st = manager.get_status(pid)
-            if getattr(st, "state", None) != "PAUSE":
+            live = (getattr(st, "state", None) or "").upper()
+            if not live or live == "UNKNOWN":
                 continue
             held_keys.add(key)
 
@@ -606,22 +815,25 @@ async def _remind_open_incidents(
                 slot = _live_runout_slot(st) or runout_slot_desc(incident.slot_global_tray)
             elif incident.slot_global_tray is not None:
                 slot = runout_slot_desc(incident.slot_global_tray)
+            copy = _INCIDENT_REMINDER_DETAIL if live == "PAUSE" else _INCIDENT_REMINDER_DETAIL_UNPAUSED
             await notif.on_spool_recovery_failed(
                 printer_id=pid,
                 printer_name=printer_name,
                 job_name=job_name,
-                detail=_INCIDENT_REMINDER_DETAIL.get(incident.kind, _JAM_REMINDER_DETAIL),
+                detail=copy.get(incident.kind, _JAM_REMINDER_DETAIL),
                 db=db,
                 kind=incident.kind,
                 runout_slot=slot,
                 foreign=incident.item_id is None,
             )
             logger.warning(
-                "farm_stall: printer %s STILL held by %s incident %s (%d min%s) — attention reminder re-fired",
+                "farm_stall: printer %s STILL held by %s incident %s (%d min, state=%s%s) — "
+                "attention reminder re-fired",
                 pid,
                 incident.kind,
                 incident.id,
                 minutes,
+                live,
                 "" if incident.item_id is not None else ", foreign print",
             )
         except Exception:  # noqa: BLE001 — one bad printer must not abort the watch
