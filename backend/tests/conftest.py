@@ -101,6 +101,52 @@ def reset_plate_occupancy_authority():
     plate_occupancy.reset_for_tests()
 
 
+def _reset_printer_manager(pm):
+    """Drop every per-printer-id record the manager singleton carries."""
+    pm.disconnect_all(timeout=0)
+    pm._quarantined.clear()
+    pm._model_mismatch.clear()
+    pm._current_print_user.clear()
+    pm._loop = None
+
+
+@pytest.fixture(autouse=True)
+def reset_printer_manager_process_state():
+    """Start and leave every test with a bare ``printer_manager`` singleton.
+
+    ``POST /api/v1/printers/`` registers a REAL ``BambuMQTTClient`` in the
+    module-level manager, and nothing in the harness ever unregisters it.
+    Printer ids restart at 1 in every file's fresh DB, so a client one file
+    left behind answers a LATER file's lookup for the same id — and that
+    client's full-report ``asyncio.Event`` is created once and reused forever,
+    still bound to the loop of the file that made it. The USB pre-flight then
+    awaits a dead loop's Event and raises ``RuntimeError: <asyncio.locks.Event>
+    is bound to a different event loop`` — the ``test_capability_gate_api``
+    failure that only ever appeared in multi-file runs. Product code is right
+    (prod is one process, one loop, stable ids); this is harness hygiene, under
+    the same rule as ``reset_plate_occupancy_authority`` above.
+
+    Covers the singleton's per-printer-id process state: the
+    client/model/printer-info triple (through the canonical ``disconnect_all``),
+    the quarantine and model-mismatch caches, the current-print-user map, and
+    the cached loop — a leaked dead loop makes ``_schedule_async`` skip
+    silently. The nine ``_on_*`` callback slots are deliberately NOT reset:
+    ``ASGITransport`` never runs the app lifespan, so nothing wires them under
+    test, and clearing them here would break the first test that ever does
+    drive a real lifespan.
+
+    Teardown cost is real — paho's ``loop_stop()`` joins an untimed thread,
+    ~5 s per client that was mid-connect. The before-leg is unconditional, so
+    if a ``wired*`` fixture is ever made module-scoped this will wipe it
+    between that module's tests.
+    """
+    from backend.app.services.printer_manager import printer_manager
+
+    _reset_printer_manager(printer_manager)
+    yield
+    _reset_printer_manager(printer_manager)
+
+
 @pytest.fixture(autouse=True)
 def reset_spoolman_location_sync_cache():
     """Drop the per-URL Spoolman location-sync TTL cache between tests.
