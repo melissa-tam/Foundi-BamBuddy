@@ -327,8 +327,6 @@ class TestQuarantine:
         assert printer.quarantined is True
         assert printer.quarantine_reason
         assert printer_manager.is_quarantined(printer.id) is True
-        # cleanup shared in-memory singleton state
-        printer_manager.set_quarantined(printer.id, False)
 
     async def test_no_quarantine_when_a_recent_run_succeeded(self, db_session):
         batch, prof = await _mk_run(db_session, quantity=5, printer_ids=[0], require_fa=False, escalate=2)
@@ -725,31 +723,27 @@ class TestRecoverPrinter:
         printer_manager.set_quarantined(printer.id, True)
         plate_occupancy.hydrate_plate(printer.id, "SUB-REC1", EscalationOnly())
 
-        try:
-            summary = await farm_policy.recover_printer(db_session, printer.id)
+        summary = await farm_policy.recover_printer(db_session, printer.id)
 
-            assert summary["plate_cleared"] is True
-            assert summary["quarantine_cleared"] is True
-            assert summary["runs_resumed"] == [batch.id]
+        assert summary["plate_cleared"] is True
+        assert summary["quarantine_cleared"] is True
+        assert summary["runs_resumed"] == [batch.id]
 
-            await db_session.refresh(printer)
-            await db_session.refresh(batch)
-            await db_session.refresh(item)
-            assert printer.quarantined is False
-            assert printer.quarantine_reason is None
-            assert plate_occupancy.is_plate_occupied(printer.id) is False
-            assert printer_manager.is_quarantined(printer.id) is False
-            assert batch.status == "active"
-            assert item.manual_start is False  # resume un-staged the pending item
+        await db_session.refresh(printer)
+        await db_session.refresh(batch)
+        await db_session.refresh(item)
+        assert printer.quarantined is False
+        assert printer.quarantine_reason is None
+        assert plate_occupancy.is_plate_occupied(printer.id) is False
+        assert printer_manager.is_quarantined(printer.id) is False
+        assert batch.status == "active"
+        assert item.manual_start is False  # resume un-staged the pending item
 
-            # Idempotent: a second call is a no-op with no error.
-            summary2 = await farm_policy.recover_printer(db_session, printer.id)
-            assert summary2["plate_cleared"] is False
-            assert summary2["quarantine_cleared"] is False
-            assert summary2["runs_resumed"] == []
-        finally:
-            # Clean up shared in-memory singleton state.
-            printer_manager.set_quarantined(printer.id, False)
+        # Idempotent: a second call is a no-op with no error.
+        summary2 = await farm_policy.recover_printer(db_session, printer.id)
+        assert summary2["plate_cleared"] is False
+        assert summary2["quarantine_cleared"] is False
+        assert summary2["runs_resumed"] == []
 
     async def test_recover_drops_the_plate_the_eject_and_the_dispatch_lease(self, db_session):
         """Recover means "an operator inspected the machine", which outranks every
