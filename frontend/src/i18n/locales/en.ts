@@ -912,15 +912,12 @@ export default {
     },
     // Manual eject (W2) + new-spool prompt (W6)
     eject: {
-      now: 'Eject now',
-      menuEjectPlate: 'Eject plate…',
+      action: 'Eject plate',
       dispatched: 'Eject started',
       confirmTitle: 'Eject while bed is hot?',
       confirmBody: 'The bed is {{bed}}°C — above the {{threshold}}°C release threshold. Ejecting now sweeps the part off while the bed is still hot. Continue?',
       confirm: 'Eject now',
       cancel: 'Cancel',
-      foreignTitle: 'Eject a foreign print?',
-      foreignBody: 'This print wasn\'t dispatched by the farm. The sweep uses the eject profile you select below — correct the part height if the detected value is wrong.',
       foreignPrintNameLabel: 'Print',
       foreignUnknownPrint: 'Unknown',
       foreignPartHeightEditLabel: 'Part height (mm)',
@@ -928,6 +925,31 @@ export default {
       foreignSuggested: 'suggested',
       foreignNoProfiles: 'No eject profiles available',
       foreignConfirm: 'Eject now',
+      // Eject dialog — one dialog, three origins. The title names which plate
+      // the operator is about to sweep; the body is the same check either way.
+      dialog: {
+        foreignTitle: 'Eject plate — print not dispatched by the farm',
+        farmUnitTitle: 'Eject plate — {{name}}',
+        declaredTitle: 'Eject plate',
+        body: 'The sweep is built from the part height and the eject profile below. Check both against the plate before starting.',
+        heightRequired: 'Part height unknown. Enter the tallest point of the part on the plate.',
+      },
+      // Structured refusals from POST /printers/{id}/eject, one key per code.
+      error: {
+        jobActive: 'Printer is running a job. Wait for it to finish or stop it, then eject.',
+        dispatchInFlight: 'A queued unit is being sent to this printer. Retry in a few seconds.',
+        ejectInFlightPending: 'Eject sent {{age}} s ago; waiting for the printer to start it.',
+        ejectInFlightPendingNoAge: 'Eject already sent; waiting for the printer to start it.',
+        ejectInFlightStarted: 'Eject running for {{age}} s.',
+        ejectInFlightStartedNoAge: 'Eject running.',
+        bedUnreadable: 'Bed temperature unavailable. Retry in a few seconds.',
+        noDonor: 'No file available to build the eject. Mark plate as cleared and remove the part by hand.',
+        firstArticle: 'First article awaiting approval. Approve or reject it from the run.',
+        notConnected: 'Printer is offline. Connect it, then eject.',
+        dispatchFailed: 'Eject command failed: {{message}}',
+        profileNotFound: 'Eject profile no longer exists. Pick another.',
+        noPlateGate: 'Plate is marked clear. Use Eject plate to declare it occupied.',
+      },
     },
     // Queue info
     queue: {

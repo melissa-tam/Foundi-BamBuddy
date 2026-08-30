@@ -881,13 +881,12 @@ export default {
     },
     // 수동 배출(W2) + 새 스풀 알림(W6)
     eject: {
-      now: '지금 배출',
-      menuEjectPlate: '플레이트 배출…',
+      action: '플레이트 배출',
       dispatched: '배출을 시작했습니다',
       confirmTitle: '베드가 뜨거운 상태에서 배출할까요?',
       confirmBody: '베드가 {{bed}}°C로 해제 임계값 {{threshold}}°C보다 높습니다. 지금 배출하면 베드가 뜨거운 상태에서 부품을 쓸어냅니다. 계속할까요?',
-      foreignTitle: '외부 프린트를 배출할까요?',
-      foreignBody: '이 프린트는 팜에서 전송한 것이 아닙니다. 쓸어내기는 아래에서 선택한 배출 프로파일을 사용합니다 — 감지된 값이 올바르지 않으면 부품 높이를 수정하세요.',
+      confirm: '지금 배출',
+      cancel: '취소',
       foreignPrintNameLabel: '프린트',
       foreignUnknownPrint: '알 수 없음',
       foreignPartHeightEditLabel: '부품 높이 (mm)',
@@ -895,8 +894,28 @@ export default {
       foreignSuggested: '권장',
       foreignNoProfiles: '사용 가능한 배출 프로파일이 없습니다',
       foreignConfirm: '지금 배출',
-      confirm: '지금 배출',
-      cancel: '취소'
+      dialog: {
+        foreignTitle: '플레이트 배출 — 팜에서 전송하지 않은 프린트',
+        farmUnitTitle: '플레이트 배출 — {{name}}',
+        declaredTitle: '플레이트 배출',
+        body: '쓸어내기는 아래의 부품 높이와 배출 프로파일로 생성됩니다. 시작하기 전에 둘 다 플레이트와 대조하세요.',
+        heightRequired: '부품 높이를 알 수 없습니다. 플레이트에 있는 부품의 가장 높은 지점을 입력하세요.'
+      },
+      error: {
+        jobActive: '프린터가 작업을 실행 중입니다. 완료를 기다리거나 중지한 뒤 배출하세요.',
+        dispatchInFlight: '대기열의 유닛을 이 프린터로 전송하는 중입니다. 몇 초 뒤에 다시 시도하세요.',
+        ejectInFlightPending: '{{age}}초 전에 배출을 전송했습니다. 프린터가 시작하기를 기다리는 중입니다.',
+        ejectInFlightPendingNoAge: '배출을 이미 전송했습니다. 프린터가 시작하기를 기다리는 중입니다.',
+        ejectInFlightStarted: '배출이 {{age}}초째 실행 중입니다.',
+        ejectInFlightStartedNoAge: '배출이 실행 중입니다.',
+        bedUnreadable: '베드 온도를 읽을 수 없습니다. 몇 초 뒤에 다시 시도하세요.',
+        noDonor: '배출을 생성할 파일이 없습니다. 플레이트를 비움으로 표시하고 부품을 손으로 제거하세요.',
+        firstArticle: '초도품이 승인 대기 중입니다. 런에서 승인하거나 거부하세요.',
+        notConnected: '프린터가 오프라인입니다. 연결한 뒤 배출하세요.',
+        dispatchFailed: '배출 명령이 실패했습니다: {{message}}',
+        profileNotFound: '배출 프로파일이 더 이상 존재하지 않습니다. 다른 프로파일을 선택하세요.',
+        noPlateGate: '플레이트가 비움으로 표시되어 있습니다. 점유 상태로 선언하려면 플레이트 배출을 사용하세요.'
+      }
     },
     queue: {
       inQueue: '대기열에 {{count}}개',
