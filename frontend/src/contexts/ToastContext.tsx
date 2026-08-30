@@ -237,8 +237,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                     // An action carrying its own onClick handles activation
                     // programmatically (e.g. in-app SPA navigation via
                     // react-router). Prevent the default new-tab open so we don't
-                    // ALSO follow href. Actions with only an href (external links,
-                    // e.g. the sponsor prompt) keep the default new-tab behavior.
+                    // ALSO follow href. Actions with only an href (external
+                    // links) keep the default new-tab behavior.
                     if (toast.action?.onClick) {
                       e.preventDefault();
                       toast.action.onClick();

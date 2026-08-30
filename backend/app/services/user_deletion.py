@@ -62,13 +62,14 @@ returned **282 violations** across seven foreign keys: 126
 ``print_queue.library_file_id``, 51 ``print_log_entries.created_by_id``, 51
 ``print_log_entries.archive_id``, 27 ``spool_usage_history.archive_id``, 23
 ``print_batches.library_file_id``, 3 ``spool_usage_history.spool_id`` and 1
-``sponsor_toast_state.user_id``. Every one of those columns is a row in the
-declaration tables below — including the ``sponsor_toast_state`` orphan, which is
-a single row and is exactly the FK that neither ``delete_items`` branch handled
-before this module existed. So the dangling references this module prevents are
-not hypothetical; they are the accumulated residue of the raw multi-table DELETEs
-it replaces. ``sku_files`` is clean at 0, which is what the CASCADE looks like
-when nothing has yet deleted a library file out from under a SKU.
+``sponsor_toast_state.user_id``. Every one of those columns that still exists is
+a row in the declaration tables below (``sponsor_toast_state`` was dropped with
+the sponsor toast, 2026-08-30 — it was per-user nag state, and its single
+dangling row went with the table). So the dangling references this module
+prevents are not hypothetical; they are the accumulated residue of the raw
+multi-table DELETEs it replaces. ``sku_files`` is clean at 0, which is what the
+CASCADE looks like when nothing has yet deleted a library file out from under a
+SKU.
 
 Turning the enforcement ON (``PRAGMA foreign_keys = ON``) is deliberately NOT
 part of this change: with 282 standing violations the flip would start failing
@@ -117,7 +118,6 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.project_bom import ProjectBOMItem
 from backend.app.models.sku import SkuFile
 from backend.app.models.slot_recheck import SlotRecheckIntent
-from backend.app.models.sponsor_toast_state import SponsorToastState
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.models.user import User
 from backend.app.models.user_otp_code import UserOTPCode
@@ -431,13 +431,11 @@ async def _delete_user_aggregate_rows(db: AsyncSession, user_id: int) -> None:
     MFA secrets and pending codes behind the account; and a ``LongLivedToken``
     keeps a camera-stream secret_hash that ``verify()`` still matches by prefix.
 
-    Three of these were unhandled by BOTH branches until this module existed.
-    ``SponsorToastState`` is CASCADE and joins the deletes — per-user UI state with
-    nothing to attribute. The other two are SET NULL and join the updates below:
-    ``PrintLogEntry`` is the authoritative print history and is never deleted by a
-    user delete, only de-attributed; and ``SlotRecheckIntent.requested_by`` is SET
-    NULL by deliberate design, because deleting an operator must not erase a slot's
-    identity history.
+    Two of these were unhandled by BOTH branches until this module existed. Both
+    are SET NULL and join the updates below: ``PrintLogEntry`` is the authoritative
+    print history and is never deleted by a user delete, only de-attributed; and
+    ``SlotRecheckIntent.requested_by`` is SET NULL by deliberate design, because
+    deleting an operator must not erase a slot's identity history.
     """
     for model, column in (
         (APIKey, APIKey.user_id),
@@ -445,7 +443,6 @@ async def _delete_user_aggregate_rows(db: AsyncSession, user_id: int) -> None:
         (UserTOTP, UserTOTP.user_id),
         (UserOTPCode, UserOTPCode.user_id),
         (LongLivedToken, LongLivedToken.user_id),
-        (SponsorToastState, SponsorToastState.user_id),
     ):
         await db.execute(delete(model).where(column == user_id))
 

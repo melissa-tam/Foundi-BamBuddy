@@ -4457,11 +4457,6 @@ export default {
     sectionTitle: 'Independente e financiado pela comunidade',
     tagline: 'O Bambuddy é gratuito e continua assim porque há quem escolha apoiá-lo. Sem VC, sem dependência de nuvem.',
     viewSupporters: 'Ver apoiadores',
-    toastPrints: 'Você concluiu {{count}} impressões com o Bambuddy. O Bambuddy continua gratuito graças a quem o apoia.',
-    toastCost: 'Você acompanhou {{total}} de filamento com o Bambuddy. Veja quem mantém o projeto independente.',
-    toastArchives: '{{count}} impressões arquivadas com o Bambuddy. Veja quem o mantém independente.',
-    toastAnniversary: 'Um ano com o Bambuddy! Veja quem mantém o projeto independente.',
-    toastVersionUpdate: 'Atualizado para v{{version}}. O Bambuddy continua gratuito graças a quem o apoia.',
   },
 
   // Library (K Profiles)

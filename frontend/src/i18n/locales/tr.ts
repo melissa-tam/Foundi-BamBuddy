@@ -4459,11 +4459,6 @@ export default {
     sectionTitle: 'Bağımsız ve topluluk destekli',
     tagline: 'Bambuddy ücretsizdir ve böyle kalır çünkü insanlar onu desteklemeyi seçer. VC yok, bulut bağımlılığı yok.',
     viewSupporters: 'Destekçileri görüntüle',
-    toastPrints: 'Bambuddy ile {{count}} baskı tamamladın. Bambuddy, destekçileri sayesinde ücretsiz kalıyor.',
-    toastCost: 'Bambuddy ile {{total}} kadar filament takip ettin. Projeyi bağımsız tutanları gör.',
-    toastArchives: '{{count}} baskı Bambuddy ile arşivlendi. Bağımsız kalmasını sağlayanları gör.',
-    toastAnniversary: 'Bambuddy ile bir yılı doldurdun! Projeyi bağımsız tutanları gör.',
-    toastVersionUpdate: 'v{{version}} sürümüne güncellendi. Bambuddy, destekçileri sayesinde ücretsiz kalıyor.',
   },
 
   // Kütüphane (K Profilleri)

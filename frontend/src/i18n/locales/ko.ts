@@ -4268,11 +4268,6 @@ export default {
     sectionTitle: '독립적·커뮤니티 후원',
     tagline: 'Bambuddy는 무료이며, 자발적으로 후원하는 사용자 덕분에 계속 무료로 유지됩니다. VC도 없고, 클라우드 종속도 없습니다.',
     viewSupporters: '후원자 보기',
-    toastPrints: 'Bambuddy로 {{count}}회 인쇄를 완료했습니다. Bambuddy는 후원자 덕분에 무료로 유지됩니다.',
-    toastCost: 'Bambuddy로 {{total}}만큼의 필라멘트를 추적했습니다. 프로젝트를 독립적으로 유지하는 사람들을 만나보세요.',
-    toastArchives: 'Bambuddy로 {{count}}회 인쇄를 아카이브했습니다. 독립성을 지지하는 사람들을 만나보세요.',
-    toastAnniversary: 'Bambuddy와 함께한 지 1년입니다! 프로젝트를 독립적으로 유지하는 사람들을 만나보세요.',
-    toastVersionUpdate: 'v{{version}}로 업데이트되었습니다. Bambuddy는 후원자 덕분에 무료로 유지됩니다.'
   },
   library: {
     title: '필라멘트 라이브러리',

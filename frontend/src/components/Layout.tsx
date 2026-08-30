@@ -11,7 +11,6 @@ import { api, supportApi, pendingUploadsApi, type Permission } from '../api/clie
 import { getIconByName } from './IconPicker';
 import { useIsSidebarCompact } from '../hooks/useIsSidebarCompact';
 import { useColorCatalogVersion } from '../hooks/useColorCatalogVersion';
-import { useSponsorPrompt } from '../hooks/useSponsorPrompt';
 import { useUnknownTagPrompt } from '../hooks/useUnknownTagPrompt';
 import { useRespoolPrompt } from '../hooks/useRespoolPrompt';
 import { useTaglessFreshPrompt } from '../hooks/useTaglessFreshPrompt';
@@ -121,9 +120,6 @@ export function Layout() {
     queryFn: api.getSettings,
     staleTime: 5 * 60 * 1000, // 5 minutes
   });
-
-  // Sponsor-prompt toast — fires once per session post-auth if a milestone is eligible.
-  useSponsorPrompt(settings?.currency ?? 'EUR');
 
   // Unknown-spool prompt — raises a per-slot persistent toast when the AMS
   // reports a tag with no inventory match (only when `auto_add_unknown_rfid` is

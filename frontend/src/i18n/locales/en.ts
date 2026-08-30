@@ -4489,11 +4489,6 @@ export default {
     sectionTitle: 'Independent & community-funded',
     tagline: 'Bambuddy is free and stays that way because people choose to support it. No VC, no cloud lock-in.',
     viewSupporters: 'View supporters',
-    toastPrints: "You've completed {{count}} prints with Bambuddy. Bambuddy stays free thanks to its supporters.",
-    toastCost: "You've tracked {{total}} in filament with Bambuddy. See who keeps the project independent.",
-    toastArchives: '{{count}} prints archived with Bambuddy. See who keeps it independent.',
-    toastAnniversary: 'One year with Bambuddy! See who keeps the project independent.',
-    toastVersionUpdate: 'Updated to v{{version}}. Bambuddy stays free thanks to its supporters.',
   },
 
   // Library (K Profiles)

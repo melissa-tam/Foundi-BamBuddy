@@ -8103,20 +8103,3 @@ export const bugReportApi = {
       method: 'POST',
     }),
 };
-
-export interface SponsorPromptCheckResponse {
-  show: boolean;
-  milestone?: string;
-  family?: 'prints' | 'cost' | 'archives' | 'anniversary' | 'version-update';
-  threshold?: number;
-  payload?: Record<string, unknown>;
-}
-
-export const sponsorPromptApi = {
-  check: () => request<SponsorPromptCheckResponse>('/sponsor-prompt/check'),
-  dismiss: (milestone: string) =>
-    request<void>('/sponsor-prompt/dismiss', {
-      method: 'POST',
-      body: JSON.stringify({ milestone }),
-    }),
-};

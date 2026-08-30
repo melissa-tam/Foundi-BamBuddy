@@ -4641,6 +4641,16 @@ async def run_migrations(conn):
     # visible hole with an invisible wrong number.
     await _safe_execute(conn, "ALTER TABLE print_archives ADD COLUMN plate_id INTEGER")
 
+    # Migration (2026-08-30): drop the sponsor-toast state table.
+    #
+    # The in-app "Bambuddy stays free thanks to its supporters" toast and its
+    # whole lane (check/dismiss routes, trigger service, hook) were removed; this
+    # table held nothing but which nag milestones had already fired per user, so
+    # it has no reader left and nothing to preserve. Dropping it also retires the
+    # ``sponsor_toast_state.user_id`` dangling row that PRAGMA foreign_key_check
+    # reported on the live farm DB (see ``services.user_deletion``).
+    await _safe_execute(conn, "DROP TABLE IF EXISTS sponsor_toast_state")
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),
