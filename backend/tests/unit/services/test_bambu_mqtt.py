@@ -10,6 +10,21 @@ import time
 
 import pytest
 
+from backend.app.services.plate_occupancy import plate_occupancy
+
+
+@pytest.fixture(autouse=True)
+def _clean_occupancy_authority():
+    """Isolate the module-singleton occupancy authority.
+
+    The terminal payloads this module produces are what ``DepositEvidence`` reads to
+    decide whether the plate gate goes up, so the records and the injected callables
+    must not leak between tests (or in from another module).
+    """
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
+
 
 class TestTimelapseTracking:
     """Tests for timelapse state tracking during prints."""
@@ -8216,8 +8231,10 @@ class TestPredecessorReadingGate:
     old "last non-zero value" capture could not tell that republish apart from the
     cancel-reset it was written for, so on 002/003-H2S a print an operator stopped at
     layer 0 reported ``last_layer_num=167`` — the plate total — and was charged the whole
-    plate (417.9 g each), while ``eject.monitor.deposited_nothing()`` read the same stale
-    pair and raised the plate gate over a clean bed.
+    plate (417.9 g each), while the deposit test read the same stale pair and raised the
+    plate gate over a clean bed. (That test was ``eject.monitor.deposited_nothing()``
+    until the 2026-08-30 cut-over; it is now ``DepositEvidence.deposited`` on the
+    occupancy authority, which is the ONE origin for the judgement.)
 
     Everything here drives the real ``_process_message`` entry point and asserts on the
     real ``on_print_complete`` payload, because that payload IS what the two victims
@@ -8283,9 +8300,16 @@ class TestPredecessorReadingGate:
         assert len(terminals) == 2
         assert terminals[-1]["last_layer_num"] == 0
 
-    def test_the_incident_pair_now_reads_as_deposited_nothing(self, mqtt_client):
-        """End to end: the terminal payload makes the plate gate see an empty bed again."""
-        from backend.app.services.eject.monitor import deposited_nothing
+    def test_the_incident_pair_now_reads_as_no_deposit(self, mqtt_client):
+        """End to end: the terminal payload makes the plate gate see an empty bed again.
+
+        Re-pinned onto ``DepositEvidence`` (2026-08-30), which replaced
+        ``eject.monitor.deposited_nothing`` as the one origin for this judgement. The
+        payload is fed to the classmethod WHOLE — exactly as ``main.on_print_complete``
+        does — so this test also pins that the client emits every key the evidence
+        reads, ``peaks_reliable`` included.
+        """
+        from backend.app.services.plate_occupancy import DepositEvidence
 
         terminals = self._capture_terminals(mqtt_client)
         self._run_predecessor(mqtt_client, layers=(100, 167), percents=(60, 100))
@@ -8297,14 +8321,13 @@ class TestPredecessorReadingGate:
         payload = terminals[-1]
         assert payload["last_layer_num"] == 0
         assert payload["last_progress"] == 0.0
-        assert (
-            deposited_nothing(
-                is_dry_run=False,
-                last_layer_num=payload["last_layer_num"],
-                last_progress=payload["last_progress"],
-            )
-            is True
-        )
+        # This client watched the print START, so its peaks ARE a measurement of this
+        # job — which is what lets the measured zero speak at all.
+        assert payload["peaks_reliable"] is True
+
+        evidence = DepositEvidence.from_terminal_payload(payload, is_dry_run=False)
+
+        assert evidence.deposited is False, "a layer-0 operator stop must not gate a clean bed"
 
     # ---- (b) a genuine partial print still reports its layer --------------------
 
@@ -8514,7 +8537,7 @@ class TestPredecessorReadingGate:
         Sequence matters: the operator stopped at layer 0, so the genuine readings are
         0 then 1. A 1-then-2 sequence would report 1 either way and prove nothing.
         """
-        from backend.app.services.eject.monitor import deposited_nothing
+        from backend.app.services.plate_occupancy import DepositEvidence
 
         terminals = self._capture_terminals(mqtt_client)
         self._run_predecessor(mqtt_client, layers=(100, 167), percents=(60, 100))
@@ -8527,14 +8550,11 @@ class TestPredecessorReadingGate:
         payload = terminals[-1]
         assert payload["last_layer_num"] == 0
         assert payload["last_progress"] == 0.0
-        assert (
-            deposited_nothing(
-                is_dry_run=False,
-                last_layer_num=payload["last_layer_num"],
-                last_progress=payload["last_progress"],
-            )
-            is True
-        )
+        assert payload["peaks_reliable"] is True
+
+        evidence = DepositEvidence.from_terminal_payload(payload, is_dry_run=False)
+
+        assert evidence.deposited is False, "a layer-0 operator stop must not gate a clean bed"
 
     def test_a_zero_bearing_start_push_does_not_over_arm_a_genuine_print(self, mqtt_client):
         """The max-capture must not suppress a real print's layers: the gate still releases
@@ -8552,3 +8572,87 @@ class TestPredecessorReadingGate:
 
         assert terminals[-1]["last_layer_num"] == 40
         assert terminals[-1]["last_progress"] == 40.0
+
+
+class TestDepositEvidenceOverRealTerminalPayloads:
+    """The fail-closed deposit rules, read off payloads this client actually emits.
+
+    ``DepositEvidence`` replaced ``eject.monitor.deposited_nothing`` on 2026-08-30 and
+    added the ``peaks_reliable`` limb, so the measured zero above is only ONE of four
+    answers. The other three all fail CLOSED, because absence of measurement is not
+    measurement of absence — the 2026-08-29 cascade, where six restart-adopted prints
+    finished ``completed``, reported zeroed peaks (they live in process memory and the
+    client was born mid-print), were read as "nothing on the plate", and the next unit
+    dispatched onto the finished part 1-5 s later.
+
+    Driven through the real ``_process_message`` so the payload's KEYS are pinned too:
+    a client that stopped emitting ``peaks_reliable`` would silently land every
+    terminal on the fail-closed side, which the classmethod's default is designed to
+    survive but which is a regression worth catching here.
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(ip_address="192.168.1.100", serial_number="TEST123", access_code="12345678")
+
+    @staticmethod
+    def _terminal_payload(client, *, final_state: str, observe_start: bool) -> dict:
+        """Run a job to *final_state* and return the emitted terminal payload.
+
+        ``observe_start`` False models the restart-recovery attach: the #1304 guard
+        suppresses ``is_new_print`` on a client's first ever push, so the peaks never
+        become a measurement of this job.
+        """
+        seen: list = []
+        client.on_print_complete = seen.append
+        if observe_start:
+            client._process_message({"print": {"gcode_state": "IDLE"}})
+        client._process_message({"print": {"gcode_state": "RUNNING", "gcode_file": "job.gcode.3mf"}})
+        client._process_message({"print": {"gcode_state": final_state}})
+        return seen[-1]
+
+    def test_a_dry_run_never_deposits(self, mqtt_client):
+        """The eject dry-run file is motion-only by design — there is nothing to leave
+        behind, whatever the printer reports."""
+        from backend.app.services.plate_occupancy import DepositEvidence
+
+        payload = self._terminal_payload(mqtt_client, final_state="FINISH", observe_start=True)
+
+        assert DepositEvidence.from_terminal_payload(payload, is_dry_run=True).deposited is False
+
+    def test_a_completed_print_always_deposits(self, mqtt_client):
+        """Peaks are irrelevant to a job the printer itself says it finished — this is
+        the limb that would have gated all six of the 2026-08-29 plates."""
+        from backend.app.services.plate_occupancy import DepositEvidence
+
+        payload = self._terminal_payload(mqtt_client, final_state="FINISH", observe_start=True)
+
+        assert payload["status"] == "completed"
+        assert payload["last_layer_num"] == 0  # zero layers observed...
+        assert DepositEvidence.from_terminal_payload(payload, is_dry_run=False).deposited is True
+
+    def test_unknown_peaks_deposit(self, mqtt_client):
+        """A client born mid-print re-tracks from an unknown baseline and can honestly
+        report zeros for a print that is physically three-quarters done."""
+        from backend.app.services.plate_occupancy import DepositEvidence
+
+        payload = self._terminal_payload(mqtt_client, final_state="FAILED", observe_start=False)
+
+        assert payload["peaks_reliable"] is False
+        assert payload["status"] != "completed"
+        assert DepositEvidence.from_terminal_payload(payload, is_dry_run=False).deposited is True
+
+    def test_a_payload_with_no_peaks_reliable_key_fails_closed(self):
+        """An older client, a virtual printer that has not caught up, or any payload
+        shaped before the key existed must all land on the fail-closed side."""
+        from backend.app.services.plate_occupancy import DepositEvidence
+
+        evidence = DepositEvidence.from_terminal_payload(
+            {"status": "failed", "last_layer_num": 0, "last_progress": 0.0},
+            is_dry_run=False,
+        )
+
+        assert evidence.peaks_reliable is False
+        assert evidence.deposited is True

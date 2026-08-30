@@ -26,9 +26,20 @@ from sqlalchemy import select
 import backend.app.services.print_scheduler as ps_module
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services import print_scheduler as sched_mod, spool_selection
+from backend.app.services.plate_occupancy import DispatchLease, plate_occupancy
 from backend.app.services.print_scheduler import PrintScheduler
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _clean_authority():
+    """Each planned dispatch mints a printer LEASE on the process-wide occupancy
+    authority; start every case from an unclaimed fleet so a leftover claim cannot
+    silently make a printer undispatchable."""
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 @pytest.fixture
@@ -83,7 +94,7 @@ def _make_fake_start(*, order, sessions, delays):
     simulating a slow FTPS upload.
     """
 
-    async def _fake_start(session, item, *, ams_mapping=None):
+    async def _fake_start(session, item, *, ams_mapping=None, lease=None):
         sessions.append(id(session))
         delay = delays.get(item.printer_id, 0.0)
         if delay:
@@ -181,7 +192,7 @@ async def test_task_exception_does_not_kill_gather_or_sibling(pd_scheduler, db_s
     # Neutralise the farm-policy hook the failure path funnels through.
     monkeypatch.setattr("backend.app.services.farm_policy.on_terminal", AsyncMock())
 
-    async def _start(session, item, *, ams_mapping=None):
+    async def _start(session, item, *, ams_mapping=None, lease=None):
         if item.printer_id == a_id:
             raise RuntimeError("boom during upload")
         item.status = "printing"
@@ -229,14 +240,74 @@ async def test_idempotency_guard_skips_non_pending_item(pd_scheduler, db_session
 async def test_plan_dispatch_one_printer_once_guard(pd_scheduler):
     """_plan_dispatch drops a duplicate entry for a printer already in the plan.
 
-    Each entry also carries the mapping DECIDED for that printer this tick (the
-    2026-08-12 contract keeps it off the item until the print starts), so the plan is
-    asserted as (item, printer, mapping) triples.
+    Each entry carries the mapping DECIDED for that printer this tick (the
+    2026-08-12 contract keeps it off the item until the print starts) AND the printer
+    LEASE minted when the dispatch was planned (2026-08-30: ``commit_dispatch``
+    checks it by ``is`` identity, so the dispatch phase must hand back the very
+    object the plan holds). The plan is asserted as (item, printer, lease, mapping).
     """
     plan: list[ps_module._PlannedDispatch] = []
     planned: set[int] = set()
-    pd_scheduler._plan_dispatch(plan, planned, item_id=10, printer_id=5, ams_mapping=[3])
-    pd_scheduler._plan_dispatch(plan, planned, item_id=11, printer_id=5, ams_mapping=[0])  # duplicate printer
-    pd_scheduler._plan_dispatch(plan, planned, item_id=12, printer_id=6, ams_mapping=None)
-    assert [(e.item_id, e.printer_id, e.ams_mapping) for e in plan] == [(10, 5, [3]), (12, 6, None)]
+
+    lease_five = pd_scheduler._claim_dispatch_lease(5, 10)
+    lease_six = pd_scheduler._claim_dispatch_lease(6, 12)
+    assert isinstance(lease_five, DispatchLease)
+    assert isinstance(lease_six, DispatchLease)
+    # A printer already claimed refuses a SECOND claim outright — that is the first
+    # line of defence, and it means the duplicate below can only ever be reached with
+    # a lease the printer does not hold. Build it directly so the PLAN guard is what
+    # this test exercises.
+    assert pd_scheduler._claim_dispatch_lease(5, 11) == "dispatch_in_flight"
+    duplicate_lease = DispatchLease(
+        unit_id=11, pre_state=None, pre_subtask=None, min_hold_s=60.0, max_hold_s=180.0, minted_at_mono=0.0
+    )
+
+    pd_scheduler._plan_dispatch(plan, planned, item_id=10, printer_id=5, lease=lease_five, ams_mapping=[3])
+    pd_scheduler._plan_dispatch(
+        plan, planned, item_id=11, printer_id=5, lease=duplicate_lease, ams_mapping=[0]
+    )  # duplicate printer
+    pd_scheduler._plan_dispatch(plan, planned, item_id=12, printer_id=6, lease=lease_six, ams_mapping=None)
+
+    assert [(e.item_id, e.printer_id, e.lease, e.ams_mapping) for e in plan] == [
+        (10, 5, lease_five, [3]),
+        (12, 6, lease_six, None),
+    ]
     assert planned == {5, 6}
+    # The duplicate is dropped from the PLAN and nothing else happens: the guard must
+    # NOT release printer 5's claim. ``release_dispatch`` is printer-scoped and carries
+    # no lease identity, so releasing here would drop the INCUMBENT's lease — item 10's,
+    # the entry that survived and is about to dispatch — and hand printer 5 to the next
+    # tick while a dispatch onto it was still in flight.
+    assert plate_occupancy.snapshot(5).lease_unit_id == 10
+    assert plate_occupancy.snapshot(6).lease_unit_id == 12
+
+
+async def test_the_plan_hands_its_lease_to_the_dispatch_phase(pd_scheduler, db_session, printer_factory, monkeypatch):
+    """The claim minted at PLAN time is the object ``_start_print_by_id`` receives —
+    the identity ``commit_dispatch`` checks at the point of no return."""
+    p = await printer_factory(model="H2S")
+    p_id = p.id
+    monkeypatch.setattr(ps_module.printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(state="IDLE")))
+
+    seen: list = []
+
+    async def _record(item_id, printer_id, sem, ams_mapping=None, lease=None):
+        seen.append((item_id, printer_id, ams_mapping, lease))
+
+    monkeypatch.setattr(pd_scheduler, "_start_print_by_id", AsyncMock(side_effect=_record))
+
+    item = await _pinned_item(db_session, printer_id=p_id, pos=1)
+    item_id = item.id
+
+    await pd_scheduler.check_queue()
+
+    assert len(seen) == 1
+    seen_item_id, seen_printer_id, seen_mapping, seen_lease = seen[0]
+    assert (seen_item_id, seen_printer_id, seen_mapping) == (item_id, p_id, [0])
+    assert isinstance(seen_lease, DispatchLease)
+    assert seen_lease.unit_id == item_id
+    assert seen_lease.pre_state == "IDLE"
+    # And it is the claim the authority actually holds for that printer — a
+    # different object there is what ``lease_unknown`` exists to catch.
+    assert plate_occupancy.snapshot(p_id).lease_unit_id == item_id
+    assert plate_occupancy.commit_dispatch(p_id, seen_lease) is None

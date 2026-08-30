@@ -1,4 +1,15 @@
-"""Tests for the shared part-present eject dispatcher (eject.remote)."""
+"""Tests for the shared part-present eject dispatcher (eject.remote).
+
+Since the 2026-08-30 cut-over this module holds NO eject state of its own: the one
+pending-eject record per printer lives in the ``plate_occupancy`` authority. Every test
+therefore SEEDS through the authority's transitions — ``hydrate_plate`` + ``claim_for_eject``
+for a LIVE record (the shape a dispatch leaves behind), ``hydrate_eject`` for one rebuilt
+at startup — and ASSERTS through its queries (``pending_eject_view`` / ``eject_identity``).
+
+What stays here are the two DISPATCHERS and the two TIMERS that bound a dispatched sweep:
+the START deadline (did the printer ever begin it?) and the RUNTIME watchdog (is it still
+running long past its estimate?).
+"""
 
 import asyncio
 import contextlib
@@ -18,9 +29,30 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.eject import remote
+from backend.app.services.plate_occupancy import (
+    CooldownEject,
+    EscalationOnly,
+    Evidence,
+    OccupancyView,
+    PendingEject,
+    plate_occupancy,
+)
 from backend.app.services.printer_manager import printer_manager
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _reset_occupancy():
+    """Every test starts on an empty fleet and leaves no timer armed.
+
+    ``reset_for_tests`` also un-wires every injected callable, so a transition driven
+    from a test fans out into no persist, no broadcast, no kick and no watch."""
+    plate_occupancy.reset_for_tests()
+    yield
+    for printer_id in list(remote._start_deadlines) + list(remote._runtime_watchdogs):
+        remote.cancel_eject_timers(printer_id)
+    plate_occupancy.reset_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +112,24 @@ async def _seed(db, source: Path):
     return printer, item
 
 
+def _gate(printer_id: int, *, source: str | None = "SUB-GATE", policy=None) -> None:
+    """Raise the plate gate the way a restart rebuild does — no persist, no kick.
+
+    An eject is refused ``not_occupied`` on a clear plate, so every dispatch test needs
+    a deposit on the plate before the sweep it dispatches can be legal at all."""
+    plate_occupancy.hydrate_plate(printer_id, source, policy or EscalationOnly())
+
+
+def _claim(printer_id: int, pending: PendingEject) -> PendingEject:
+    """Seed a LIVE claimed eject on an occupied plate — what a dispatch leaves behind."""
+    if not plate_occupancy.is_plate_occupied(printer_id):
+        _gate(printer_id)
+    assert plate_occupancy.claim_for_eject(printer_id, pending, Evidence()) is None
+    claimed = plate_occupancy.pending_eject_view(printer_id)
+    assert claimed is not None
+    return claimed
+
+
 def _ftp_patches(*, connected=True, upload=True, started=True):
     return (
         patch.object(printer_manager, "is_connected", return_value=connected),
@@ -88,25 +138,37 @@ def _ftp_patches(*, connected=True, upload=True, started=True):
     )
 
 
+class TestVocabularyReExport:
+    """The eject lane keeps ONE import site for the vocabulary it dispatches with, even
+    though the definitions moved into the authority."""
+
+    def test_pending_eject_is_the_authoritys_type(self):
+        assert remote.PendingEject is PendingEject
+
+
 class TestDispatchPartPresentEject:
-    async def test_success_registers_pending_and_starts_all_off(self, db_session):
+    async def test_success_claims_the_printer_and_starts_all_off(self, db_session):
         source = _make_source_3mf()
         try:
             printer, item = await _seed(db_session, source)
+            _gate(printer.id)
             start = MagicMock(return_value=True)
             c1, c2, c3 = _ftp_patches()
             with c1, c2, c3, patch.object(printer_manager, "start_print", start):
                 await remote.dispatch_part_present_eject(
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=555
                 )
-            # Pending registered with the typed identity...
-            pending = remote.peek_pending_eject(printer.id)
+            # The printer is CLAIMED with the typed identity...
+            pending = plate_occupancy.pending_eject_view(printer.id)
             assert (pending.purpose, pending.run_id, pending.queue_item_id) == ("production", 555, item.id)
-            # ...carrying the build's runtime estimate for the terminal-side guard,
+            # ...carrying the build's runtime estimate for the in-flight watchdog,
             # and NOT yet started (that stamp lands on the printer's start echo).
             assert pending.expected_runtime_s is not None
             assert pending.expected_runtime_s > 0
             assert pending.started_at is None
+            # A claim is a LIVE dispatch by definition: stamped now, never hydrated.
+            assert pending.hydrated is False
+            assert pending.dispatched_at is not None
             # EVERY pre-print calibration OFF (never probe/shake with a part present).
             start.assert_called_once()
             kwargs = start.call_args.kwargs
@@ -118,13 +180,36 @@ class TestDispatchPartPresentEject:
             assert kwargs["use_ams"] is False
             assert kwargs["plate_id"] == 1
         finally:
-            remote.pop_pending_eject(printer.id)
             source.unlink(missing_ok=True)
 
-    async def test_not_connected_raises_409_no_pending(self, db_session):
+    async def test_success_leaves_an_identity_and_an_armed_start_deadline(self, db_session):
+        """The firmware silently ignores a ``project_file`` sent while it is busy, so a
+        dispatched eject that nothing bounds can never be observed to have failed — the
+        2026-08-30 "8 consecutive eject 409s" shape. Every accepted dispatch therefore
+        ends with BOTH the authority's identity and the deadline that retires it."""
         source = _make_source_3mf()
         try:
             printer, item = await _seed(db_session, source)
+            _gate(printer.id)
+            c1, c2, c3 = _ftp_patches()
+            with c1, c2, c3, patch.object(printer_manager, "start_print", MagicMock(return_value=True)):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=None
+                )
+            identity = plate_occupancy.eject_identity(printer.id)
+            assert identity is not None
+            assert (identity.purpose, identity.queue_item_id) == ("production", item.id)
+            assert identity.started_at is None
+            assert printer.id in remote._start_deadlines
+            assert not remote._start_deadlines[printer.id].done()
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_not_connected_raises_409_and_claims_nothing(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            _gate(printer.id)
             c1, c2, c3 = _ftp_patches(connected=False)
             with (
                 c1,
@@ -137,15 +222,16 @@ class TestDispatchPartPresentEject:
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
                 )
             assert exc.value.status_code == 409
-            assert remote.peek_pending_eject(printer.id) is None
+            assert "not connected" in str(exc.value).lower()
+            assert plate_occupancy.pending_eject_view(printer.id) is None
         finally:
-            remote.pop_pending_eject(printer.id)
             source.unlink(missing_ok=True)
 
-    async def test_upload_failure_raises_502_no_pending(self, db_session):
+    async def test_upload_failure_raises_502_and_claims_nothing(self, db_session):
         source = _make_source_3mf()
         try:
             printer, item = await _seed(db_session, source)
+            _gate(printer.id)
             c1, c2, c3 = _ftp_patches(upload=False)
             with (
                 c1,
@@ -158,15 +244,16 @@ class TestDispatchPartPresentEject:
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="fa", run_id=1
                 )
             assert exc.value.status_code == 502
-            assert remote.peek_pending_eject(printer.id) is None
+            assert plate_occupancy.pending_eject_view(printer.id) is None
+            assert printer.id not in remote._start_deadlines
         finally:
-            remote.pop_pending_eject(printer.id)
             source.unlink(missing_ok=True)
 
-    async def test_start_print_failure_raises_502(self, db_session):
+    async def test_start_print_failure_raises_502_and_claims_nothing(self, db_session):
         source = _make_source_3mf()
         try:
             printer, item = await _seed(db_session, source)
+            _gate(printer.id)
             c1, c2, c3 = _ftp_patches()
             with (
                 c1,
@@ -179,8 +266,123 @@ class TestDispatchPartPresentEject:
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
                 )
             assert exc.value.status_code == 502
+            # Nothing is claimed unless start_print was accepted.
+            assert plate_occupancy.pending_eject_view(printer.id) is None
+            assert printer.id not in remote._start_deadlines
         finally:
-            remote.pop_pending_eject(printer.id)
+            source.unlink(missing_ok=True)
+
+
+class TestDispatchRefusesBeforeItBuilds:
+    """The occupancy gate runs BEFORE the build, and its refusal token rides the error.
+
+    Building and uploading an eject costs seconds of FTPS work a refused sweep must not
+    spend, so ``ejectable`` is asked first; the claim afterwards re-runs the identical
+    gate, which is what still catches a race that opened during the upload. The
+    ``EjectDispatchError.code`` carries the authority's own refusal token verbatim, so
+    the operator is told WHICH condition held — one vocabulary from the state machine to
+    the dialog."""
+
+    async def test_job_active_refuses_without_building_or_uploading(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            _gate(printer.id)
+            build = AsyncMock()
+            upload = AsyncMock(return_value=True)
+            with (
+                patch.object(printer_manager, "is_connected", return_value=True),
+                patch.object(printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(state="RUNNING"))),
+                patch.object(remote, "build_part_present_eject_file", build),
+                patch("backend.app.services.bambu_ftp.upload_file_async", upload),
+                patch.object(printer_manager, "start_print", MagicMock(return_value=True)) as start,
+                pytest.raises(remote.EjectDispatchError) as exc,
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
+                )
+            assert exc.value.status_code == 409
+            assert exc.value.code == "job_active"
+            build.assert_not_awaited()
+            upload.assert_not_awaited()
+            start.assert_not_called()
+            assert plate_occupancy.pending_eject_view(printer.id) is None
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_clear_plate_refuses_not_occupied(self, db_session):
+        # No gate raised: there is nothing on the plate to sweep off it.
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            build = AsyncMock()
+            c1, c2, c3 = _ftp_patches()
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(remote, "build_part_present_eject_file", build),
+                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+                pytest.raises(remote.EjectDispatchError) as exc,
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
+                )
+            assert exc.value.status_code == 409
+            assert exc.value.code == "not_occupied"
+            build.assert_not_awaited()
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_a_live_eject_refuses_a_second_one(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            _claim(printer.id, PendingEject("production", 1, item.id, expected_runtime_s=83.0))
+            build = AsyncMock()
+            c1, c2, c3 = _ftp_patches()
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(remote, "build_part_present_eject_file", build),
+                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+                pytest.raises(remote.EjectDispatchError) as exc,
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
+                )
+            assert exc.value.code == "eject_in_flight"
+            build.assert_not_awaited()
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_the_foreign_dispatcher_refuses_on_the_same_gate(self, db_session):
+        source = _make_source_3mf()
+        try:
+            printer = Printer(name="FR", serial_number="FR1", ip_address="1.2.3.4", access_code="x", model="H2S")
+            db_session.add(printer)
+            await db_session.flush()
+            prof = EjectProfile(name="fr-ep")
+            db_session.add(prof)
+            await db_session.commit()
+            await db_session.refresh(printer)
+            await db_session.refresh(prof)
+            build = AsyncMock()
+            c1, c2, c3 = _ftp_patches()
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(remote, "build_part_present_eject_file", build),
+                pytest.raises(remote.EjectDispatchError) as exc,
+            ):
+                await remote.dispatch_foreign_eject(
+                    db_session, printer_id=printer.id, profile_id=prof.id, source_path=source, plate_id=1
+                )
+            assert exc.value.code == "not_occupied"
+            build.assert_not_awaited()
+        finally:
             source.unlink(missing_ok=True)
 
 
@@ -205,7 +407,8 @@ class TestStandingFaultDoesNotGateEjects:
         source = _make_source_3mf()
         try:
             printer, item = await _seed(db_session, source)
-            # The print-dispatch gate would refuse this printer outright...
+            # The print-dispatch gate would refuse this printer outright — and with the
+            # plate still CLEAR, the standing fault is the only thing that can refuse it.
             from backend.app.services.print_scheduler import scheduler
             from backend.app.services.printer_manager import printer_manager as pm
 
@@ -213,11 +416,14 @@ class TestStandingFaultDoesNotGateEjects:
             monkeypatch.setattr(pm, "get_status", lambda _pid: faulted)
             monkeypatch.setattr(pm, "is_quarantined", lambda _pid: False)
             monkeypatch.setattr(pm, "is_model_mismatch", lambda _pid: False)
-            monkeypatch.setattr(pm, "is_awaiting_plate_clear", lambda _pid: False)
             monkeypatch.setattr(pm, "is_connected", lambda _pid: True)
+            assert plate_occupancy.is_plate_occupied(printer.id) is False
             assert scheduler._is_printer_idle(printer.id) is False
+            # The per-tick DB-claim evidence is a keyword now; the fault refuses either way.
+            assert scheduler._is_printer_idle(printer.id, db_claim=True) is False
 
-            # ...and the eject goes out anyway.
+            # ...and the eject goes out anyway, once there is a deposit to sweep.
+            _gate(printer.id)
             start = MagicMock(return_value=True)
             c1, c2, c3 = _ftp_patches()
             with c1, c2, c3, patch.object(printer_manager, "start_print", start):
@@ -225,9 +431,8 @@ class TestStandingFaultDoesNotGateEjects:
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=None
                 )
             start.assert_called_once()
-            assert remote.peek_pending_eject(printer.id) is not None
+            assert plate_occupancy.eject_identity(printer.id) is not None
         finally:
-            remote.pop_pending_eject(printer.id)
             source.unlink(missing_ok=True)
 
 
@@ -238,57 +443,48 @@ class TestMatchesPendingEject:
 
     @staticmethod
     def _client(subtask):
-        from types import SimpleNamespace
-
         return SimpleNamespace(last_dispatch_subtask_id=subtask)
 
-    async def test_no_pending_registered_is_false(self):
+    async def test_no_eject_claimed_is_false(self):
         with patch.object(printer_manager, "get_client", return_value=self._client("SUB")):
             assert remote.matches_pending_eject(9001, "SUB") is False
 
     async def test_echo_absent_lenient_match(self):
-        remote.register_pending_eject(9002, remote.PendingEject("production", 1, 2))
-        try:
-            with patch.object(printer_manager, "get_client", return_value=self._client("SUB")):
-                assert remote.matches_pending_eject(9002, None) is True
-            # Never pops — the caller owns the pop.
-            assert remote.peek_pending_eject(9002) is not None
-        finally:
-            remote.pop_pending_eject(9002)
+        _claim(9002, PendingEject("production", 1, 2))
+        with patch.object(printer_manager, "get_client", return_value=self._client("SUB")):
+            assert remote.matches_pending_eject(9002, None) is True
+        # A pure QUERY: retiring the eject is the authority's business, never the matcher's.
+        assert plate_occupancy.pending_eject_view(9002) is not None
 
     async def test_echo_equal_matches(self):
-        remote.register_pending_eject(9003, remote.PendingEject("production", 1, 2))
-        try:
-            with patch.object(printer_manager, "get_client", return_value=self._client("SUB-E")):
-                assert remote.matches_pending_eject(9003, "SUB-E") is True
-        finally:
-            remote.pop_pending_eject(9003)
+        _claim(9003, PendingEject("production", 1, 2))
+        with patch.object(printer_manager, "get_client", return_value=self._client("SUB-E")):
+            assert remote.matches_pending_eject(9003, "SUB-E") is True
 
     async def test_echo_mismatch_both_truthy_is_false(self):
-        remote.register_pending_eject(9004, remote.PendingEject("production", 1, 2))
-        try:
-            with patch.object(printer_manager, "get_client", return_value=self._client("SUB-E")):
-                assert remote.matches_pending_eject(9004, "OTHER") is False
-            # Mismatch does NOT pop the registry — the real terminal still owns it.
-            assert remote.peek_pending_eject(9004) is not None
-        finally:
-            remote.pop_pending_eject(9004)
+        _claim(9004, PendingEject("production", 1, 2))
+        with patch.object(printer_manager, "get_client", return_value=self._client("SUB-E")):
+            assert remote.matches_pending_eject(9004, "OTHER") is False
+        # A mismatch does NOT retire the eject — the real terminal still owns it.
+        assert plate_occupancy.pending_eject_view(9004) is not None
 
     async def test_expected_absent_lenient_match(self):
-        remote.register_pending_eject(9005, remote.PendingEject("production", 1, 2))
-        try:
-            with patch.object(printer_manager, "get_client", return_value=self._client(None)):
-                assert remote.matches_pending_eject(9005, "SUB") is True
-        finally:
-            remote.pop_pending_eject(9005)
+        _claim(9005, PendingEject("production", 1, 2))
+        with patch.object(printer_manager, "get_client", return_value=self._client(None)):
+            assert remote.matches_pending_eject(9005, "SUB") is True
 
     async def test_no_client_lenient_match(self):
-        remote.register_pending_eject(9006, remote.PendingEject("production", 1, 2))
-        try:
-            with patch.object(printer_manager, "get_client", return_value=None):
-                assert remote.matches_pending_eject(9006, "SUB") is True
-        finally:
-            remote.pop_pending_eject(9006)
+        _claim(9006, PendingEject("production", 1, 2))
+        with patch.object(printer_manager, "get_client", return_value=None):
+            assert remote.matches_pending_eject(9006, "SUB") is True
+
+    async def test_a_hydrated_eject_is_matchable_too(self):
+        # A record rebuilt at startup is still the identity a terminal must be matched
+        # against — that is the whole reason the name check exists (W1/R2).
+        plate_occupancy.hydrate_eject(9007, PendingEject("production", 1, 32))
+        with patch.object(printer_manager, "get_client", return_value=None):
+            assert remote.matches_pending_eject(9007, None, subtask_name="eject_production_item32") is True
+            assert remote.matches_pending_eject(9007, None, subtask_name="OperatorLocalPrint") is False
 
 
 class TestEjectNameHelpers:
@@ -331,72 +527,58 @@ class TestEjectNameHelpers:
         assert remote.expected_eject_stem(pe) == "eject_production_item32"
         assert remote.expected_eject_stem(remote.PendingEject("fa", 1, 7)) == "eject_fa_item7"
 
+    def test_expected_stem_accepts_the_identity_projection(self):
+        # The matcher only ever holds the projection, never the record.
+        _claim(9010, PendingEject("production", 5, 32))
+        identity = plate_occupancy.eject_identity(9010)
+        assert remote.expected_eject_stem(identity) == "eject_production_item32"
+
 
 class TestMatchesPendingEjectNameTightening:
     """The tightened matcher (W1/R2): a truthy subtask_name whose stem != the
     pending's expected stem is a POSITIVE mismatch even when the id path is lenient
-    (post-restart, no client). Name-match alone with an empty registry is still
+    (post-restart, no client). Name-match alone with no claimed eject is still
     False — only the pending identity gates the resolution."""
 
     @staticmethod
     def _client(subtask):
-        from types import SimpleNamespace
-
         return SimpleNamespace(last_dispatch_subtask_id=subtask)
 
     async def test_name_mismatch_positive_mismatch_no_client(self):
         # Post-restart hole: no client (id lenient), but the echoed name is a foreign
         # job → the name check re-establishes the mismatch → NOT our eject.
-        remote.register_pending_eject(9101, remote.PendingEject("production", 1, 32))
-        try:
-            with patch.object(printer_manager, "get_client", return_value=None):
-                assert remote.matches_pending_eject(9101, "ANY", subtask_name="OperatorLocalPrint") is False
-                assert remote.peek_pending_eject(9101) is not None  # foreign — pending kept
-        finally:
-            remote.pop_pending_eject(9101)
+        _claim(9101, PendingEject("production", 1, 32))
+        with patch.object(printer_manager, "get_client", return_value=None):
+            assert remote.matches_pending_eject(9101, "ANY", subtask_name="OperatorLocalPrint") is False
+            assert plate_occupancy.pending_eject_view(9101) is not None  # foreign — eject kept
 
     async def test_name_matches_expected_stem_no_client(self):
-        remote.register_pending_eject(9102, remote.PendingEject("production", 1, 32))
-        try:
-            with patch.object(printer_manager, "get_client", return_value=None):
-                assert remote.matches_pending_eject(9102, None, subtask_name="eject_production_item32") is True
-        finally:
-            remote.pop_pending_eject(9102)
+        _claim(9102, PendingEject("production", 1, 32))
+        with patch.object(printer_manager, "get_client", return_value=None):
+            assert remote.matches_pending_eject(9102, None, subtask_name="eject_production_item32") is True
 
     async def test_missing_name_stays_lenient(self):
         # No name supplied → only the (lenient) id path applies.
-        remote.register_pending_eject(9103, remote.PendingEject("production", 1, 32))
-        try:
-            with patch.object(printer_manager, "get_client", return_value=self._client(None)):
-                assert remote.matches_pending_eject(9103, "SUB", subtask_name=None) is True
-        finally:
-            remote.pop_pending_eject(9103)
+        _claim(9103, PendingEject("production", 1, 32))
+        with patch.object(printer_manager, "get_client", return_value=self._client(None)):
+            assert remote.matches_pending_eject(9103, "SUB", subtask_name=None) is True
 
-    async def test_name_alone_empty_registry_never_matches(self):
+    async def test_name_alone_with_no_claimed_eject_never_matches(self):
         # is_eject_job_name is the suppress-only signal; matches_pending_eject still
-        # requires a registered pending identity.
+        # requires a claimed pending identity.
         with patch.object(printer_manager, "get_client", return_value=None):
             assert remote.matches_pending_eject(9104, "ANY", subtask_name="eject_production_item32") is False
 
     async def test_name_wrong_item_number_mismatches(self):
-        remote.register_pending_eject(9105, remote.PendingEject("production", 1, 32))
-        try:
-            with patch.object(printer_manager, "get_client", return_value=None):
-                # Right shape, wrong item id → foreign instance's eject → mismatch.
-                assert remote.matches_pending_eject(9105, None, subtask_name="eject_production_item99") is False
-        finally:
-            remote.pop_pending_eject(9105)
+        _claim(9105, PendingEject("production", 1, 32))
+        with patch.object(printer_manager, "get_client", return_value=None):
+            # Right shape, wrong item id → foreign instance's eject → mismatch.
+            assert remote.matches_pending_eject(9105, None, subtask_name="eject_production_item99") is False
 
 
 class TestManualEjectName:
     """The foreign-plate manual eject job stem ``eject_manual_p{printer_id}`` — parse
     round-trip + the printer-keyed name check in matches_pending_eject."""
-
-    @staticmethod
-    def _client(subtask):
-        from types import SimpleNamespace
-
-        return SimpleNamespace(last_dispatch_subtask_id=subtask)
 
     @pytest.mark.parametrize(
         "name,expected",
@@ -420,18 +602,15 @@ class TestManualEjectName:
     async def test_manual_pending_name_match_by_printer_id(self):
         # A manual pending has queue_item_id=None; the name check keys off the PRINTER
         # id, closing the old queue_item_id-None leniency for this purpose.
-        remote.register_pending_eject(9201, remote.PendingEject("manual", None, None))
-        try:
-            with patch.object(printer_manager, "get_client", return_value=None):
-                assert remote.matches_pending_eject(9201, None, subtask_name="eject_manual_p9201") is True
-                assert remote.matches_pending_eject(9201, None, subtask_name="eject_manual_p9999") is False
-                assert remote.matches_pending_eject(9201, None, subtask_name="OperatorLocalPrint") is False
-        finally:
-            remote.pop_pending_eject(9201)
+        _claim(9201, PendingEject("manual", None, None))
+        with patch.object(printer_manager, "get_client", return_value=None):
+            assert remote.matches_pending_eject(9201, None, subtask_name="eject_manual_p9201") is True
+            assert remote.matches_pending_eject(9201, None, subtask_name="eject_manual_p9999") is False
+            assert remote.matches_pending_eject(9201, None, subtask_name="OperatorLocalPrint") is False
 
 
 class TestDispatchForeignEject:
-    async def test_registers_manual_pending_and_starts_all_off(self, db_session):
+    async def test_claims_a_manual_pending_and_starts_all_off(self, db_session):
         source = _make_source_3mf()
         try:
             printer = Printer(name="FE", serial_number="FE1", ip_address="1.2.3.4", access_code="x", model="H2S")
@@ -442,13 +621,14 @@ class TestDispatchForeignEject:
             await db_session.commit()
             await db_session.refresh(printer)
             await db_session.refresh(prof)
+            _gate(printer.id)
             start = MagicMock(return_value=True)
             c1, c2, c3 = _ftp_patches()
             with c1, c2, c3, patch.object(printer_manager, "start_print", start):
                 await remote.dispatch_foreign_eject(
                     db_session, printer_id=printer.id, profile_id=prof.id, source_path=source, plate_id=1
                 )
-            pending = remote.peek_pending_eject(printer.id)
+            pending = plate_occupancy.pending_eject_view(printer.id)
             assert (pending.purpose, pending.run_id, pending.queue_item_id) == ("manual", None, None)
             # A manual sweep carries the estimate too (logged at its terminal), but
             # never gates the plate on it — an operator is standing at the machine.
@@ -462,12 +642,10 @@ class TestDispatchForeignEject:
             assert kwargs["vibration_cali"] is False
             assert kwargs["use_ams"] is False
         finally:
-            remote.pop_pending_eject(printer.id)
             source.unlink(missing_ok=True)
 
-    async def test_upload_failure_raises_502_no_pending(self, db_session):
+    async def test_upload_failure_raises_502_and_claims_nothing(self, db_session):
         source = _make_source_3mf()
-        printer_id = None
         try:
             printer = Printer(name="FEu", serial_number="FEu1", ip_address="1.2.3.4", access_code="x", model="H2S")
             db_session.add(printer)
@@ -477,7 +655,7 @@ class TestDispatchForeignEject:
             await db_session.commit()
             await db_session.refresh(printer)
             await db_session.refresh(prof)
-            printer_id = printer.id
+            _gate(printer.id)
             c1, c2, c3 = _ftp_patches(upload=False)
             with (
                 c1,
@@ -490,10 +668,8 @@ class TestDispatchForeignEject:
                     db_session, printer_id=printer.id, profile_id=prof.id, source_path=source, plate_id=1
                 )
             assert exc.value.status_code == 502
-            assert remote.peek_pending_eject(printer.id) is None
+            assert plate_occupancy.pending_eject_view(printer.id) is None
         finally:
-            if printer_id is not None:
-                remote.pop_pending_eject(printer_id)
             source.unlink(missing_ok=True)
 
     async def test_unknown_profile_raises_409(self, db_session):
@@ -503,12 +679,15 @@ class TestDispatchForeignEject:
             db_session.add(printer)
             await db_session.commit()
             await db_session.refresh(printer)
+            # Gated, so the occupancy check passes and the PROFILE is what refuses.
+            _gate(printer.id)
             c1, c2, c3 = _ftp_patches()
             with c1, c2, c3, pytest.raises(remote.EjectDispatchError) as exc:
                 await remote.dispatch_foreign_eject(
                     db_session, printer_id=printer.id, profile_id=987654, source_path=source, plate_id=1
                 )
             assert exc.value.status_code == 409
+            assert "profile" in str(exc.value).lower()
         finally:
             source.unlink(missing_ok=True)
 
@@ -528,6 +707,7 @@ class TestEjectUploadBareName:
         source = _make_source_3mf()
         try:
             printer, item = await _seed(db_session, source)
+            _gate(printer.id)
             start = MagicMock(return_value=True)
             upload = AsyncMock(return_value=True)
             c1, _c2, _c3 = _ftp_patches()  # only reuse the is_connected patch
@@ -546,7 +726,6 @@ class TestEjectUploadBareName:
             upload.assert_awaited_once()
             assert start.call_args.args[1] == f"eject_production_item{item.id}.3mf"
         finally:
-            remote.pop_pending_eject(printer.id)
             source.unlink(missing_ok=True)
 
 
@@ -562,6 +741,7 @@ class TestDispatchPartPresentEjectProfileGuard:
             await db_session.commit()
             await db_session.refresh(item)
             await db_session.refresh(printer)
+            _gate(printer.id)
             c1, c2, c3 = _ftp_patches()
             with (
                 c1,
@@ -590,6 +770,23 @@ class _FakeSleep:
 
     async def __call__(self, delay: float) -> None:
         self.delays.append(delay)
+
+
+class _DriverLog:
+    """Records what the authority hands its policy driver.
+
+    The driver is the ONE place a watch is armed, so recording its calls is how a test
+    pins that a transition did — or did NOT — arrange a hold."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str, OccupancyView]] = []
+
+    def __call__(self, printer_id: int, view: OccupancyView, cause: str) -> None:
+        self.calls.append((printer_id, cause, view))
+
+    @property
+    def causes(self) -> list[str]:
+        return [cause for _pid, cause, _view in self.calls]
 
 
 def _armed(pid_item: int = 5, **kw) -> remote.PendingEject:
@@ -626,49 +823,185 @@ class TestEjectAbortDeadline:
         assert remote.eject_abort_deadline_s(83.0) == 103.75
 
 
-class TestRuntimeWatchdogArming:
-    """The START echo is the only moment a deadline can be measured from."""
+class TestEjectStartEcho:
+    """The START echo is the only moment a deadline can be measured from — and it is
+    also what proves the firmware did not silently ignore our ``project_file``."""
 
-    async def test_mark_started_stamps_once_and_arms_one_watchdog(self):
+    async def test_start_echo_stamps_once_cancels_the_deadline_and_arms_one_watchdog(self):
         pid = 90001
-        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 5, expected_runtime_s=82.0))
-        try:
-            assert remote.peek_pending_eject(pid).started_at is None
-            remote.mark_pending_eject_started(pid)
-            first = remote.peek_pending_eject(pid).started_at
-            assert first is not None
-            assert pid in remote._runtime_watchdogs
-            armed_task = remote._runtime_watchdogs[pid]
-            # A duplicate/replayed start echo must NOT restart the clock — that would
-            # shorten a measured runtime back under the deadline — nor double-arm.
-            remote.mark_pending_eject_started(pid)
-            assert remote.peek_pending_eject(pid).started_at == first
-            assert remote._runtime_watchdogs[pid] is armed_task
-            # The rest of the identity survives the re-registration.
-            pending = remote.peek_pending_eject(pid)
-            assert (pending.purpose, pending.run_id, pending.queue_item_id) == ("production", 1, 5)
-            assert pending.expected_runtime_s == 82.0
-            assert pending.runtime_exceeded_at is None
-        finally:
-            await remote.cancel_runtime_watchdog(pid)
-            remote.pop_pending_eject(pid)
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0))
+        remote._arm_start_deadline(pid)
+        deadline = remote._start_deadlines[pid]
+        assert plate_occupancy.eject_identity(pid).started_at is None
 
-    async def test_mark_started_on_absent_pending_is_a_noop(self):
-        remote.mark_pending_eject_started(90002)  # must not raise
-        assert remote.peek_pending_eject(90002) is None
+        remote.on_eject_start_echo(pid)
+
+        first = plate_occupancy.eject_identity(pid).started_at
+        assert first is not None
+        # The sweep demonstrably started: the never-started timer has nothing to catch.
+        assert pid not in remote._start_deadlines
+        with contextlib.suppress(asyncio.CancelledError):
+            await deadline
+        assert deadline.cancelled()
+        assert pid in remote._runtime_watchdogs
+        armed_task = remote._runtime_watchdogs[pid]
+
+        # A duplicate/replayed start echo must NOT restart the clock — that would
+        # shorten a measured runtime back under the deadline — nor double-arm.
+        remote.on_eject_start_echo(pid)
+        assert plate_occupancy.eject_identity(pid).started_at == first
+        assert remote._runtime_watchdogs[pid] is armed_task
+
+        # The rest of the identity survives the stamp.
+        pending = plate_occupancy.pending_eject_view(pid)
+        assert (pending.purpose, pending.run_id, pending.queue_item_id) == ("production", 1, 5)
+        assert pending.expected_runtime_s == 82.0
+        assert pending.runtime_exceeded_at is None
+
+    async def test_start_echo_with_no_claimed_eject_is_a_noop(self):
+        remote.on_eject_start_echo(90002)  # must not raise
+        assert plate_occupancy.eject_identity(90002) is None
         assert 90002 not in remote._runtime_watchdogs
 
-    async def test_pending_without_an_estimate_never_arms(self):
+    async def test_a_pending_without_an_estimate_never_arms_a_watchdog(self):
         # A rehydrated post-restart pending carries no estimate: there is nothing to
         # judge against, and the startup reconciler already owns those gates.
         pid = 90003
-        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 5))
-        try:
-            remote.mark_pending_eject_started(pid)
-            assert remote.peek_pending_eject(pid).started_at is not None  # still stamped
-            assert pid not in remote._runtime_watchdogs
-        finally:
-            remote.pop_pending_eject(pid)
+        plate_occupancy.hydrate_eject(pid, PendingEject("production", 1, 5))
+
+        remote.on_eject_start_echo(pid)
+
+        assert plate_occupancy.eject_identity(pid).started_at is not None  # still stamped
+        assert pid not in remote._runtime_watchdogs
+
+
+class TestEjectStartDeadline:
+    """The 2026-08-30 "8 consecutive eject 409s" class (printer 4, 01:46-01:49).
+
+    The firmware silently IGNORES a ``project_file`` sent while it is busy — no error,
+    no terminal, nothing — so an eject dispatched into a print that had just started
+    simply never happens. Before this deadline existed such a pending stayed registered
+    forever, every later eject 409'd ``eject_in_flight``, and the operator ended up
+    hand-jogging the toolhead. The deadline is the ONLY signal that shape produces."""
+
+    async def test_an_eject_the_printer_never_started_expires_and_frees_the_printer(self):
+        from backend.app.services.eject import monitor as monitor_mod
+
+        pid = 90060
+        _gate(pid, source="SUB-DEAD", policy=CooldownEject(unit_id=5, run_id=1))
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=83.0))
+        sleep = _FakeSleep()
+
+        with patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify:
+            await remote._start_deadline(pid, sleep=sleep, timeout_s=remote.EJECT_START_TIMEOUT_S)
+
+        assert sleep.delays == [remote.EJECT_START_TIMEOUT_S]
+        # The dead pending is GONE — that is what unblocks every later eject...
+        assert plate_occupancy.eject_identity(pid) is None
+        # ...while the plate stays OCCUPIED, demoted to escalation-only: the sweep never
+        # ran, so the part is still on the bed and only a human can say otherwise.
+        view = plate_occupancy.snapshot(pid)
+        assert view.plate_occupied is True
+        assert isinstance(view.plate_policy, EscalationOnly)
+        assert view.plate_source_subtask_id == "SUB-DEAD"
+        notify.assert_awaited_once()
+        assert "never started" in notify.await_args.kwargs["source_detail"]
+        # The printer is ejectable again — the operator can simply eject now.
+        assert plate_occupancy.ejectable(pid, Evidence()) is None
+
+    async def test_a_started_eject_is_never_expired_by_a_late_deadline(self):
+        # The task can wake late or spuriously: the authority, not the timer, decides.
+        from backend.app.services.eject import monitor as monitor_mod
+
+        pid = 90061
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=83.0))
+        plate_occupancy.note_eject_started(pid)
+
+        with patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify:
+            await remote._start_deadline(pid, sleep=_FakeSleep(), timeout_s=1.0)
+
+        assert plate_occupancy.eject_identity(pid) is not None
+        notify.assert_not_awaited()
+
+    async def test_a_hydrated_eject_never_expires_on_the_start_deadline(self):
+        """Its ``started_at`` is None BY CONSTRUCTION, so an expiry keyed on that would
+        fire on every restart and discard a record the startup reconciler still owns."""
+        from backend.app.services.eject import monitor as monitor_mod
+
+        pid = 90062
+        _gate(pid)
+        plate_occupancy.hydrate_eject(pid, PendingEject("production", 1, 5))
+
+        with patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify:
+            await remote._start_deadline(pid, sleep=_FakeSleep(), timeout_s=1.0)
+
+        identity = plate_occupancy.eject_identity(pid)
+        assert identity is not None and identity.hydrated is True
+        notify.assert_not_awaited()
+
+
+class TestCancelEjectTimers:
+    """THE one deregistration point, called by the occupancy policy driver on every
+    transition that leaves the printer with no eject."""
+
+    async def test_cancels_both_timers_and_is_idempotent(self):
+        pid = 90070
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0))
+        remote.on_eject_start_echo(pid)
+        # The echo cancels the deadline it replaces, so arm a fresh one to prove BOTH
+        # lanes are dropped by one call.
+        remote._arm_start_deadline(pid)
+        deadline = remote._start_deadlines[pid]
+        watchdog = remote._runtime_watchdogs[pid]
+
+        remote.cancel_eject_timers(pid)
+        remote.cancel_eject_timers(pid)  # idempotent — never raises, never resurrects
+
+        assert pid not in remote._start_deadlines
+        assert pid not in remote._runtime_watchdogs
+        for task in (deadline, watchdog):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+
+    async def test_cancelling_when_nothing_is_armed_is_a_noop(self):
+        remote.cancel_eject_timers(90071)  # must not raise
+
+    async def test_retiring_the_eject_hands_the_driver_the_no_eject_view(self):
+        """The level-trigger the monitor's driver cancels both timers on: whatever
+        retires the eject (a matched terminal, an unverified resolve, a start expiry,
+        the reconciler's disposal, an operator recover), the view it sees carries
+        ``eject_present is False``."""
+        pid = 90072
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0))
+        driver = _DriverLog()
+        plate_occupancy.configure(policy_driver=driver)
+
+        assert plate_occupancy.resolve_eject(pid, "completed") is None
+
+        assert driver.causes == ["eject_completed"]
+        _pid, _cause, view = driver.calls[-1]
+        assert view.eject_present is False
+        assert view.plate_occupied is False
+
+    async def test_a_successor_sweep_gets_its_own_watchdog(self):
+        """A stale watchdog must never judge the NEXT sweep against the OLD deadline —
+        and the successor must not be left unwatched by a leftover registry entry."""
+        pid = 90073
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0))
+        remote.on_eject_start_echo(pid)
+        stale = remote._runtime_watchdogs[pid]
+
+        # The eject's terminal retires it, and the driver drops both timers.
+        assert plate_occupancy.resolve_eject(pid, "completed") is None
+        remote.cancel_eject_timers(pid)
+        with contextlib.suppress(asyncio.CancelledError):
+            await stale
+        assert stale.cancelled()
+
+        _claim(pid, PendingEject("production", 1, 6, expected_runtime_s=82.0))
+        remote.on_eject_start_echo(pid)
+        assert remote._runtime_watchdogs[pid] is not stale
 
 
 class TestRuntimeWatchdogFires:
@@ -686,39 +1019,71 @@ class TestRuntimeWatchdogFires:
         remote._runtime_watchdogs[pid] = task
         return task
 
-    async def test_marks_before_stopping_then_notifies_escalates_and_deregisters(self):
+    async def test_marks_before_stopping_then_notifies_and_deregisters(self):
         from backend.app.services.eject import monitor as monitor_mod
 
         pid = 90010
         armed = _armed()
-        remote.register_pending_eject(pid, armed)
+        _claim(pid, armed)
         sleep = _FakeSleep()
         mark_at_stop: list[object] = []
 
         def _stop(printer_id: int) -> bool:
             # Captured INSIDE the stop: a terminal racing the stop must already find
             # the mark set, or it would release the gate onto an unverified plate.
-            mark_at_stop.append(remote.peek_pending_eject(printer_id).runtime_exceeded_at)
+            mark_at_stop.append(plate_occupancy.pending_eject_view(printer_id).runtime_exceeded_at)
             return True
 
-        try:
-            with (
-                patch.object(printer_manager, "stop_print", MagicMock(side_effect=_stop)) as stop,
-                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
-                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
-            ):
-                await self._run(pid, armed, sleep)
-            assert sleep.delays == [103.75]  # the 83 s estimate's deadline
-            stop.assert_called_once_with(pid)
-            assert mark_at_stop and mark_at_stop[0] is not None
-            assert remote.peek_pending_eject(pid).runtime_exceeded_at is not None
-            notify.assert_awaited_once()
-            detail = notify.await_args.kwargs["source_detail"]
-            assert "STOPPED" in detail and "104" in detail and "83" in detail
-            escalate.assert_called_once_with(pid)
-            assert pid not in remote._runtime_watchdogs  # deregistered on exit
-        finally:
-            remote.pop_pending_eject(pid)
+        with (
+            patch.object(printer_manager, "stop_print", MagicMock(side_effect=_stop)) as stop,
+            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
+        ):
+            await self._run(pid, armed, sleep)
+        assert sleep.delays == [103.75]  # the 83 s estimate's deadline
+        stop.assert_called_once_with(pid)
+        assert mark_at_stop and mark_at_stop[0] is not None
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
+        notify.assert_awaited_once()
+        detail = notify.await_args.kwargs["source_detail"]
+        assert "STOPPED" in detail and "104" in detail and "83" in detail
+        assert pid not in remote._runtime_watchdogs  # deregistered on exit
+
+    async def test_the_stop_arms_no_hold_of_its_own(self):
+        """The escalation hold moved OUT of the kill path: while an eject owns the
+        printer the plate carries no watch BY CONSTRUCTION (an armed cooldown over a
+        plate a sweep is crossing is the double dispatch the authority forbids). The
+        hold arrives one step later, from the stopped sweep's ``unverified`` resolve."""
+        from backend.app.services.eject import monitor as monitor_mod
+
+        # The old kill-path entry point is gone; the driver is the one arming site.
+        assert not hasattr(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch")
+
+        pid = 90015
+        armed = _armed()
+        # The production shape: a cooldown plate, swept by the eject that plate armed.
+        _gate(pid, policy=CooldownEject(unit_id=5, run_id=1))
+        _claim(pid, armed)
+        driver = _DriverLog()
+        plate_occupancy.configure(policy_driver=driver)
+
+        with (
+            patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
+            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock),
+        ):
+            await self._run(pid, armed, _FakeSleep())
+
+        # The kill stamps the verdict and NOTHING else: every view the driver saw still
+        # has an eject on the printer, which is exactly "no watch may be armed here".
+        assert driver.causes == ["eject_runtime_exceeded"]
+        assert all(view.eject_present and view.plate_occupied for _pid, _c, view in driver.calls)
+
+        # ...and the hold appears only once the stopped sweep's terminal resolves it.
+        assert plate_occupancy.resolve_eject(pid, "unverified") is None
+        _pid, cause, view = driver.calls[-1]
+        assert cause == "eject_unverified"
+        assert view.eject_present is False
+        assert view.plate_occupied is True
+        assert isinstance(view.plate_policy, EscalationOnly)
 
     async def test_undelivered_stop_is_retried_exactly_once(self):
         # stop_print returning False means the command was NOT delivered (no live MQTT
@@ -728,45 +1093,37 @@ class TestRuntimeWatchdogFires:
 
         pid = 90011
         armed = _armed()
-        remote.register_pending_eject(pid, armed)
+        _claim(pid, armed)
         sleep = _FakeSleep()
-        try:
-            with (
-                patch.object(printer_manager, "stop_print", MagicMock(return_value=False)) as stop,
-                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
-                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
-            ):
-                await self._run(pid, armed, sleep)
-            assert stop.call_count == 2
-            assert sleep.delays == [103.75, remote._STOP_RETRY_DELAY_S]
-            assert remote.peek_pending_eject(pid).runtime_exceeded_at is not None
-            notify.assert_awaited_once()
-            escalate.assert_called_once_with(pid)
-        finally:
-            remote.pop_pending_eject(pid)
+        with (
+            patch.object(printer_manager, "stop_print", MagicMock(return_value=False)) as stop,
+            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
+        ):
+            await self._run(pid, armed, sleep)
+        assert stop.call_count == 2
+        assert sleep.delays == [103.75, remote._STOP_RETRY_DELAY_S]
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
+        notify.assert_awaited_once()
 
-    async def test_notify_failure_never_kills_the_escalation(self):
+    async def test_notify_failure_never_kills_the_watchdog(self):
         from backend.app.services.eject import monitor as monitor_mod
 
         pid = 90012
         armed = _armed()
-        remote.register_pending_eject(pid, armed)
-        try:
-            with (
-                patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
-                patch.object(
-                    monitor_mod,
-                    "_default_notify_plate_not_empty",
-                    new_callable=AsyncMock,
-                    side_effect=RuntimeError("smtp down"),
-                ),
-                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
-            ):
-                await self._run(pid, armed, _FakeSleep())
-            escalate.assert_called_once_with(pid)
-            assert pid not in remote._runtime_watchdogs
-        finally:
-            remote.pop_pending_eject(pid)
+        _claim(pid, armed)
+        with (
+            patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
+            patch.object(
+                monitor_mod,
+                "notify_plate_not_empty",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("smtp down"),
+            ),
+        ):
+            await self._run(pid, armed, _FakeSleep())
+        # The verdict still stands and the task still deregisters cleanly.
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
+        assert pid not in remote._runtime_watchdogs
 
     async def test_superseded_pending_stands_the_watchdog_down(self):
         # The eject this task was armed for resolved while it slept and a NEW one was
@@ -775,22 +1132,16 @@ class TestRuntimeWatchdogFires:
 
         pid = 90013
         armed = _armed(5)
-        successor = _armed(6)
-        remote.register_pending_eject(pid, successor)
-        try:
-            with (
-                patch.object(printer_manager, "stop_print", MagicMock(return_value=True)) as stop,
-                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
-                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
-            ):
-                await self._run(pid, armed, _FakeSleep())
-            stop.assert_not_called()
-            notify.assert_not_awaited()
-            escalate.assert_not_called()
-            assert remote.peek_pending_eject(pid).runtime_exceeded_at is None  # successor unmarked
-            assert pid not in remote._runtime_watchdogs
-        finally:
-            remote.pop_pending_eject(pid)
+        _claim(pid, _armed(6))
+        with (
+            patch.object(printer_manager, "stop_print", MagicMock(return_value=True)) as stop,
+            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
+        ):
+            await self._run(pid, armed, _FakeSleep())
+        stop.assert_not_called()
+        notify.assert_not_awaited()
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is None  # successor unmarked
+        assert pid not in remote._runtime_watchdogs
 
     async def test_resolved_pending_stands_the_watchdog_down(self):
         pid = 90014
@@ -799,36 +1150,21 @@ class TestRuntimeWatchdogFires:
         stop.assert_not_called()
         assert pid not in remote._runtime_watchdogs
 
-
-class TestRuntimeWatchdogCancellation:
-    """Cancellation is the NORMAL exit — a nominal eject never reaches the fire path."""
-
-    async def test_clear_pending_eject_cancels_and_removes_the_watchdog(self, db_session):
-        pid = 90020
-        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 5, expected_runtime_s=82.0))
-        remote.mark_pending_eject_started(pid)
-        task = remote._runtime_watchdogs[pid]
-        await remote.clear_pending_eject(db_session, pid)
-        assert task.cancelled()
-        assert pid not in remote._runtime_watchdogs
-        assert remote.peek_pending_eject(pid) is None
-
-    async def test_registering_a_new_eject_cancels_a_stale_watchdog(self):
-        pid = 90021
-        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 5, expected_runtime_s=82.0))
-        remote.mark_pending_eject_started(pid)
-        stale = remote._runtime_watchdogs[pid]
-        try:
-            # A stale watchdog would judge the NEW sweep against the OLD deadline.
-            remote.register_pending_eject(pid, remote.PendingEject("production", 1, 6, expected_runtime_s=82.0))
-            assert pid not in remote._runtime_watchdogs
-            with pytest.raises(asyncio.CancelledError):
-                await stale
-        finally:
-            remote.pop_pending_eject(pid)
-
-    async def test_cancelling_when_nothing_is_armed_is_a_noop(self):
-        await remote.cancel_runtime_watchdog(90022)  # must not raise
+    async def test_the_identity_check_reads_the_authority_not_a_captured_copy(self):
+        # ``_watchdog_still_owns`` returns the printer's CURRENT identity, because the
+        # record it must not act on is precisely one that changed underneath it.
+        pid = 90016
+        armed = _armed(5)
+        _claim(pid, armed)
+        current = remote._watchdog_still_owns(pid, armed)
+        assert current is not None
+        assert (current.purpose, current.queue_item_id, current.started_at) == (
+            armed.purpose,
+            armed.queue_item_id,
+            armed.started_at,
+        )
+        assert current.hydrated is False
+        assert remote._watchdog_still_owns(pid, _armed(6)) is None
 
 
 class TestKillDecisionTelemetry:
@@ -849,18 +1185,14 @@ class TestKillDecisionTelemetry:
         from backend.app.services.eject import monitor as monitor_mod
 
         armed = _armed()
-        remote.register_pending_eject(pid, armed)
-        try:
-            with (
-                patch.object(printer_manager, "get_client", MagicMock(return_value=client)),
-                patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
-                patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock),
-                patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch"),
-                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
-            ):
-                await TestRuntimeWatchdogFires._run(pid, armed, _FakeSleep())
-        finally:
-            remote.pop_pending_eject(pid)
+        _claim(pid, armed)
+        with (
+            patch.object(printer_manager, "get_client", MagicMock(return_value=client)),
+            patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
+            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+        ):
+            await TestRuntimeWatchdogFires._run(pid, armed, _FakeSleep())
         return next(r.getMessage() for r in caplog.records if "still running at" in r.getMessage())
 
     async def test_kill_line_carries_the_line_number_and_percent(self, caplog):
@@ -957,10 +1289,9 @@ def _watchdog_env(feed: _ProgressFeed, *, stop_delivered: bool = True):
         patch.object(printer_manager, "get_client", MagicMock(side_effect=feed)),
         patch.object(printer_manager, "stop_print", MagicMock(return_value=stop_delivered)) as stop,
         patch.object(printer_manager, "request_evidence_pushall", MagicMock(return_value=True)) as pushall,
-        patch.object(monitor_mod, "_default_notify_plate_not_empty", new_callable=AsyncMock) as notify,
-        patch.object(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch") as escalate,
+        patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
     ):
-        yield SimpleNamespace(stop=stop, pushall=pushall, notify=notify, escalate=escalate)
+        yield SimpleNamespace(stop=stop, pushall=pushall, notify=notify)
 
 
 def _spawn_watchdog(pid: int, armed: remote.PendingEject, clock: _FakeClock) -> asyncio.Task:
@@ -1014,55 +1345,48 @@ class TestRuntimeWatchdogPhaseEdges:
         # lines 42 s in, against a 30 s budget + 8 s margin. This is the incident shape.
         pid = 90040
         armed = _armed_with_drop()
-        remote.register_pending_eject(pid, armed)
+        _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(5.0, 0.0)])
-        try:
-            with (
-                _watchdog_env(feed) as env,
-                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
-            ):
-                await _spawn_watchdog(pid, armed, clock)
-            env.stop.assert_called_once_with(pid)
-            assert remote.peek_pending_eject(pid).runtime_exceeded_at is not None
-            message = _kill_line(caplog)
-            assert "stage=drop" in message and "stage=drop_late" not in message
-            detail = env.notify.await_args.kwargs["source_detail"]
-            assert "bed-drop" in detail and "under the heatbed" in detail
-            env.escalate.assert_called_once_with(pid)
-            assert pid not in remote._runtime_watchdogs
-            # Killed on the DROP deadline (t5 + 38 s), far short of the 103.75 s whole-job one.
-            assert clock.now - 1000.0 == pytest.approx(42.0)
-        finally:
-            remote.pop_pending_eject(pid)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        env.stop.assert_called_once_with(pid)
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
+        message = _kill_line(caplog)
+        assert "stage=drop" in message and "stage=drop_late" not in message
+        detail = env.notify.await_args.kwargs["source_detail"]
+        assert "bed-drop" in detail and "under the heatbed" in detail
+        assert pid not in remote._runtime_watchdogs
+        # Killed on the DROP deadline (t5 + 38 s), far short of the 103.75 s whole-job one.
+        assert clock.now - 1000.0 == pytest.approx(42.0)
 
     async def test_sweep_beacon_arriving_after_the_drop_deadline_still_stops(self, caplog):
         # The drop verifiably ran long. The sweep opens with rear positioning at lift
         # height, so the stop still lands before the toolhead can reach the plate.
         pid = 90041
         armed = _armed_with_drop()
-        remote.register_pending_eject(pid, armed)
+        _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(5.0, 0.0)] * 20 + [(50.0, 0.0)])
-        try:
-            with (
-                _watchdog_env(feed) as env,
-                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
-            ):
-                await _spawn_watchdog(pid, armed, clock)
-            env.stop.assert_called_once_with(pid)
-            assert "stage=drop_late" in _kill_line(caplog)
-            assert "bed-drop" in env.notify.await_args.kwargs["source_detail"]
-            assert remote.peek_pending_eject(pid).runtime_exceeded_at is not None
-        finally:
-            remote.pop_pending_eject(pid)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        env.stop.assert_called_once_with(pid)
+        assert "stage=drop_late" in _kill_line(caplog)
+        assert "bed-drop" in env.notify.await_args.kwargs["source_detail"]
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
 
-    async def test_healthy_phase_sequence_never_kills_and_cancels_on_resolution(self, db_session, caplog):
+    async def test_healthy_phase_sequence_never_kills_and_cancels_on_resolution(self, caplog):
         # 0 → 5 → 50 → 75: the drop cleared inside its budget, so no phase rule may fire.
         # The eject's terminal then cancels the task, which is the NORMAL exit.
         pid = 90042
         armed = _armed_with_drop()
-        remote.register_pending_eject(pid, armed)
+        _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(0.0, 0.0), (5.0, 0.0), (50.0, 0.0), (75.0, 0.0)])
         with (
@@ -1074,16 +1398,21 @@ class TestRuntimeWatchdogPhaseEdges:
                 if feed.reads >= 4:
                     break
                 await asyncio.sleep(0)
-            await remote.clear_pending_eject(db_session, pid)
+            # The matched terminal retires the eject; the policy driver's level-triggered
+            # timer hygiene then drops both timers.
+            assert plate_occupancy.resolve_eject(pid, "completed") is None
+            remote.cancel_eject_timers(pid)
             env.stop.assert_not_called()
             env.notify.assert_not_awaited()
         # LIVENESS: the lane really ran the sequence — a silent watchdog would satisfy
         # every "did not fire" assertion above without ever observing a phase edge.
         assert feed.reads >= 4
         assert [r for r in caplog.records if "bed-drop phase cleared" in r.getMessage()]
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
         assert task.cancelled()
         assert pid not in remote._runtime_watchdogs
-        assert remote.peek_pending_eject(pid) is None
+        assert plate_occupancy.pending_eject_view(pid) is None
 
     async def test_beacons_never_reflected_falls_back_to_the_whole_job_deadline(self, caplog):
         # mc_percent stuck at 0 while fresh: the firmware is publishing, but the beacons
@@ -1091,22 +1420,19 @@ class TestRuntimeWatchdogPhaseEdges:
         # and the whole-job deadline must still fire.
         pid = 90043
         armed = _armed_with_drop()
-        remote.register_pending_eject(pid, armed)
+        _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(0.0, 0.0)])
-        try:
-            with (
-                _watchdog_env(feed) as env,
-                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
-            ):
-                await _spawn_watchdog(pid, armed, clock)
-            fallbacks = [r for r in caplog.records if "phase beacons not reflected" in r.getMessage()]
-            assert len(fallbacks) == 1
-            env.stop.assert_called_once_with(pid)
-            assert "stage=total" in _kill_line(caplog)
-            assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)
-        finally:
-            remote.pop_pending_eject(pid)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        fallbacks = [r for r in caplog.records if "phase beacons not reflected" in r.getMessage()]
+        assert len(fallbacks) == 1
+        env.stop.assert_called_once_with(pid)
+        assert "stage=total" in _kill_line(caplog)
+        assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)
 
     async def test_stale_evidence_never_kills_and_asks_once_for_a_fresh_report(self, caplog):
         # One fresh sample opens the drop window, then the link goes quiet: every later
@@ -1115,57 +1441,48 @@ class TestRuntimeWatchdogPhaseEdges:
         # deadline as the backstop.
         pid = 90044
         armed = _armed_with_drop()
-        remote.register_pending_eject(pid, armed)
+        _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(5.0, 0.0), (5.0, None)])
-        try:
-            with (
-                _watchdog_env(feed) as env,
-                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
-            ):
-                await _spawn_watchdog(pid, armed, clock)
-            env.pushall.assert_called_once_with(pid, remote._EVIDENCE_REASON)
-            env.stop.assert_called_once_with(pid)
-            assert "stage=total" in _kill_line(caplog)  # NOT a drop kill
-            assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)
-        finally:
-            remote.pop_pending_eject(pid)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        env.pushall.assert_called_once_with(pid, remote._EVIDENCE_REASON)
+        env.stop.assert_called_once_with(pid)
+        assert "stage=total" in _kill_line(caplog)  # NOT a drop kill
+        assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)
 
     async def test_aged_out_sample_is_not_evidence_either(self, caplog):
         # Stamped after arming but far older than the freshness window: a link that went
         # silent mid-eject is not a phase report, so the drop rule must not fire on it.
         pid = 90045
         armed = _armed_with_drop()
-        remote.register_pending_eject(pid, armed)
+        _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(5.0, 0.0), (5.0, remote._PROGRESS_FRESH_S + 30.0)])
-        try:
-            with (
-                _watchdog_env(feed) as env,
-                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
-            ):
-                await _spawn_watchdog(pid, armed, clock)
-            assert "stage=total" in _kill_line(caplog)
-            env.stop.assert_called_once_with(pid)
-        finally:
-            remote.pop_pending_eject(pid)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        assert "stage=total" in _kill_line(caplog)
+        env.stop.assert_called_once_with(pid)
 
     async def test_superseded_pending_stands_the_edge_lane_down(self):
         # The eject this task was armed for resolved and a NEW one took the printer.
         pid = 90046
         armed = _armed_with_drop(5)
-        remote.register_pending_eject(pid, _armed_with_drop(6))
+        _claim(pid, _armed_with_drop(6))
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(5.0, 0.0)])
-        try:
-            with _watchdog_env(feed) as env:
-                await _spawn_watchdog(pid, armed, clock)
-            env.stop.assert_not_called()
-            env.notify.assert_not_awaited()
-            assert remote.peek_pending_eject(pid).runtime_exceeded_at is None
-            assert pid not in remote._runtime_watchdogs
-        finally:
-            remote.pop_pending_eject(pid)
+        with _watchdog_env(feed) as env:
+            await _spawn_watchdog(pid, armed, clock)
+        env.stop.assert_not_called()
+        env.notify.assert_not_awaited()
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is None
+        assert pid not in remote._runtime_watchdogs
 
 
 class TestRuntimeWatchdogDeadlineOnlyFallback:
@@ -1176,36 +1493,30 @@ class TestRuntimeWatchdogDeadlineOnlyFallback:
     async def test_no_drop_span_sleeps_straight_to_the_total_deadline(self, caplog):
         pid = 90050
         armed = _armed()  # drop_span_s defaults to None
-        remote.register_pending_eject(pid, armed)
+        _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(5.0, 0.0)])
-        try:
-            with (
-                _watchdog_env(feed) as env,
-                caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
-            ):
-                await _spawn_watchdog(pid, armed, clock)
-            assert clock.delays == [103.75]  # one sleep, no polling
-            env.stop.assert_called_once_with(pid)
-            assert "stage=total" in _kill_line(caplog)
-            # The pre-edge-lane operator wording is untouched for this stage.
-            detail = env.notify.await_args.kwargs["source_detail"]
-            assert "STOPPED mid-job" in detail and "104" in detail and "83" in detail
-        finally:
-            remote.pop_pending_eject(pid)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        assert clock.delays == [103.75]  # one sleep, no polling
+        env.stop.assert_called_once_with(pid)
+        assert "stage=total" in _kill_line(caplog)
+        # The pre-edge-lane operator wording is untouched for this stage.
+        detail = env.notify.await_args.kwargs["source_detail"]
+        assert "STOPPED mid-job" in detail and "104" in detail and "83" in detail
 
     async def test_a_drop_budget_that_cannot_beat_the_total_deadline_polls_nothing(self):
         # 100 s span + 20 s margin = 120 s, past the 103.75 s whole-job deadline: the
         # phase rule could never fire first, so arming it would only add failure modes.
         pid = 90051
         armed = _armed_with_drop(drop_span_s=100.0)
-        remote.register_pending_eject(pid, armed)
+        _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(5.0, 0.0)])
-        try:
-            with _watchdog_env(feed) as env:
-                await _spawn_watchdog(pid, armed, clock)
-            assert clock.delays == [103.75]
-            env.stop.assert_called_once_with(pid)
-        finally:
-            remote.pop_pending_eject(pid)
+        with _watchdog_env(feed) as env:
+            await _spawn_watchdog(pid, armed, clock)
+        assert clock.delays == [103.75]
+        env.stop.assert_called_once_with(pid)

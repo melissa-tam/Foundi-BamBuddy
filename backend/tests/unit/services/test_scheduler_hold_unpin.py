@@ -34,10 +34,22 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services import print_scheduler as sched_mod
 from backend.app.services.capability_gate import CapabilityDecision
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.print_scheduler import PrintScheduler, scheduler
 from backend.app.services.printer_manager import printer_manager
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _clean_authority():
+    """Every tick that plans a dispatch claims a printer LEASE on the process-wide
+    occupancy authority. A HELD unit never commits one (and ``_start_print_by_id``'s
+    finally releases it), but a leftover claim from a previous case would make the
+    printer undispatchable and turn a funnel test into a false pass."""
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 async def _mk_printer(db, name="HU"):
@@ -316,6 +328,10 @@ async def test_redistributes_to_healthy_printer_next_tick(cq_scheduler, db_sessi
     assert row.ams_mapping is None
     assert row.waiting_reason == "no_usb_drive"
     assert row.status == "pending"
+    # The PRINTER claim released with the pin: a dispatch that stopped at a hold
+    # never reached the print command, so the printer must go straight back to the
+    # queue rather than sit claimed for the full hold ceiling.
+    assert plate_occupancy.snapshot(sick_id).lease_unit_id is None
 
     tick["n"] = 2
     await cq_scheduler.check_queue()  # tick 2 — redistributes to the healthy printer
@@ -472,7 +488,7 @@ async def test_hold_unpin_guard_discarded_on_real_dispatch(cq_scheduler, db_sess
     # sourceless test units downstream of the gates).
     started: dict = {}
 
-    async def _start(db, it, *, ams_mapping=None):
+    async def _start(db, it, *, ams_mapping=None, lease=None):
         it.status = "printing"
         started["printer_id"] = it.printer_id
         await db.commit()

@@ -242,12 +242,15 @@ class TestStaggerLimitsStartsPerTick:
         sched = PrintScheduler()
         monkeypatch.setattr(ps.printer_manager, "is_connected", lambda pid: True)
         monkeypatch.setattr(ps.printer_manager, "is_quarantined", lambda pid: False)
-        monkeypatch.setattr(ps.printer_manager, "is_awaiting_plate_clear", lambda pid: False)
+        # No plate flag to patch any more: an empty occupancy authority (the autouse
+        # reset) IS "every plate clear, no eject, no lease".
         monkeypatch.setattr(ps.printer_manager, "get_status", lambda pid: SimpleNamespace(state="IDLE"))
 
         started: list[int] = []
 
-        async def fake_start(db, item, *, ams_mapping=None):
+        # ``lease`` is the printer claim the tick mints at PLAN time and hands to the
+        # dispatch; a fake that cannot accept it would never be called.
+        async def fake_start(db, item, *, ams_mapping=None, lease=None):
             item.status = "printing"
             item.started_at = datetime.now(timezone.utc)
             await db.commit()
@@ -287,12 +290,12 @@ class TestStaggerLimitsStartsPerTick:
         sched = PrintScheduler()
         monkeypatch.setattr(ps.printer_manager, "is_connected", lambda pid: True)
         monkeypatch.setattr(ps.printer_manager, "is_quarantined", lambda pid: False)
-        monkeypatch.setattr(ps.printer_manager, "is_awaiting_plate_clear", lambda pid: False)
+        # See the sibling test: the autouse occupancy reset is the "plates clear" setup.
         monkeypatch.setattr(ps.printer_manager, "get_status", lambda pid: SimpleNamespace(state="IDLE"))
 
         started: list[int] = []
 
-        async def fake_start(db, item, *, ams_mapping=None):
+        async def fake_start(db, item, *, ams_mapping=None, lease=None):
             item.status = "printing"
             item.started_at = datetime.now(timezone.utc)
             await db.commit()

@@ -1,52 +1,52 @@
-"""Manual "Eject now" — farm-known finished unit (W2) OR a confirmed foreign plate.
+"""Manual "Eject plate" — the operator's one way to sweep a plate, whatever put it there.
 
-An operator affordance to trigger the part-present eject sweep by hand — either to
-skip the cooldown wait (with an explicit hot-bed confirm) or to clear a plate the
-automatic watch could not. For a FARM-KNOWN part the target unit is resolved from the
-armed cooldown watch's identity or, failing that, from the last completed
-eject-profiled unit whose dispatch subtask raised the current plate gate; an unapproved
-first article still goes through the approval flow (never weakened into a blind sweep).
+The service answers with a VERDICT, never an exception. ``manual_eject`` returns exactly
+one :class:`EjectVerdict` over the closed
+:data:`~backend.app.schemas.printer.EjectOutcome`, and ``api/routes/printer_eject.py``
+owns the single verdict → HTTP map (the 2026-08-20 ``slot_recheck`` precedent). Before
+this rewrite the same lane raised three exception classes from four nesting levels, and
+one of them signalled no failure at all — it was the confirm dialog the whole feature
+exists to open, thrown as an error and reassembled by the caller from ``except`` ordering.
 
-When NO farm-known unit resolves, the gate may instead have been raised by a FOREIGN
-print (started in Bambu Studio, not farm-dispatched). That is a deliberate two-step
-confirm: the first call resolves the foreign print's donor file from the print archive
-and raises :class:`ForeignPlateEject` (carrying the print name, parsed max Z height,
-and a suggested profile) so the UI can render an eject-profile picker; the second call
-supplies the chosen ``eject_profile_id`` and dispatches the sweep. A farm-known-but-
-ineligible gate (e.g. an unapproved first article) is NEVER treated as foreign.
+The five outcomes:
 
-The MANUAL foreign path carries one extra, purely-local fallback the fail-closed AUTO
-path does NOT: a screen-RESTART of the farm's OWN USB file echoes a degenerate identity
-(empty ``subtask_id``, ``subtask_name="project_file"``), so the gate id is blank AND the
-auto-archive is the download-failed fallback row (``file_path=""``) — the strict archive
-resolver finds nothing usable. But the farm still KNOWS what is on the plate: the most-
-recently-started queue item on the printer carries the library/archive it was dispatched
-from. When the strict resolver 409s, :func:`_manual_eject_foreign` falls back to
-:func:`_resolve_foreign_source_from_last_farm_item` (on-disk donor only) before giving up;
-if THAT can't resolve either, the original 409 is re-raised unchanged.
+* ``dispatched`` / ``released_watch`` — the sweep is on its way. ``released_watch`` means
+  an armed cooldown watch was signalled instead of a parallel dispatch being raced
+  against it; the watch owns the single release path.
+* ``needs_input`` — the eject is asking the operator for the two things only they have:
+  the part height on the plate and the sweep profile. Not an error. Every refusal an
+  operator's input can CURE arrives here — a plate the farm never dispatched, a farm unit
+  with no eject profile, a gate naming a unit this lane may not sweep directly, and a
+  donor that is only a container.
+* ``bed_hot`` — a real live bed reading above the release threshold, with both numbers,
+  so the confirm dialog is built on measurements rather than a missing value.
+* ``refused`` — a state the operator's input cannot cure, carrying a closed
+  :data:`~backend.app.schemas.printer.EjectRefusalReason`. The occupancy refusals keep the
+  authority's own token spelling, so one vocabulary runs from the state machine to the
+  dialog.
 
-The service composes the existing eject primitives — it NEVER hand-rolls a dispatch.
-When a cooldown watch is armed it merely signals that watch's single ``_do_release``
-path (``request_release_now``) so there is no parallel dispatch race; otherwise it
-calls the shared ``eject_remote.dispatch_part_present_eject`` (farm-known) or
-``eject_remote.dispatch_foreign_eject`` (foreign plate) directly.
+**Ordering is the design.** The operator declares occupancy FIRST, before the eject's own
+precondition check: the 2026-08-30 cascade left printers gated behind sweeps that could
+never run, and the cure — "there is a part on this plate, sweep it" — has to be reachable
+while a unit is mid-upload. A declaration revokes that dispatch lease, so the unit unwinds
+instead of printing onto the declared plate, and the brief ``dispatch_in_flight`` while the
+scheduler unwinds is honest and self-clearing. The raise is NEVER rolled back — not on an
+unresolvable donor, not on the hot-bed confirm, not on an abandoned dialog: the plate IS
+occupied whatever happens next, and "Mark plate as cleared" is the visible undo.
 
-Ordered precondition checks each raise :class:`ManualEjectError` (a plain domain
-error carrying a stable machine code + HTTP status hint); the route translates them
-to ``HTTPException``. :class:`BedTooHot` fires only with a REAL live bed reading
-above the threshold and carries bed + threshold so the UI can show the confirm
-dialog with true numbers; an unreadable bed is its own ``bed_unreadable`` 409 (a
-retry-in-a-moment condition, never a confirm prompt built on a missing reading).
+Donor resolution lives in :mod:`backend.app.services.eject.donor` as a chain, and this
+module composes rather than resolves: the operator lane walks
+:data:`~backend.app.services.eject.donor.MANUAL_DONOR_CHAIN` (all three tiers, each one
+below the first confirmed by a human looking at the plate) while the unattended lane below
+walks :data:`~backend.app.services.eject.donor.AUTO_DONOR_CHAIN` (the strict tier alone).
 """
 
 from __future__ import annotations
 
 import logging
-import re
-import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import select
 
@@ -54,334 +54,262 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.schemas.printer import EjectOrigin, EjectOutcome, EjectRefusalReason
 from backend.app.services.eject import remote as eject_remote
+from backend.app.services.eject.donor import (
+    AUTO_DONOR_CHAIN,
+    MANUAL_DONOR_CHAIN,
+    DonorContext,
+    deposit_donor,
+    release_donor,
+    resolve_donor,
+)
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
-from backend.app.services.eject.monitor import _latest_started_item, _resolve_eject_threshold, eject_cooldown_monitor
+from backend.app.services.eject.monitor import _resolve_eject_threshold, eject_cooldown_monitor
+from backend.app.services.plate_occupancy import (
+    CooldownEject,
+    Evidence,
+    FirstArticleEject,
+    TransitionRefusal,
+    plate_occupancy,
+)
+from backend.app.services.plate_occupancy_store import latest_started_item
 from backend.app.services.printer_manager import printer_manager
 from backend.app.utils.filename import print_identity_key
-from backend.app.utils.threemf_tools import list_gcode_plate_ids, read_plate_gcode_header
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-# The single no_eligible_unit message (a farm-known-but-ineligible gate — e.g. an
-# unapproved first article — is NEVER weakened into a foreign sweep).
-_NO_ELIGIBLE_MSG = "No farm-known finished unit to eject on this printer (first articles use the approval flow)"
-# Shown when a foreign plate is the gate source but its donor file / plate / height
-# can't be resolved — the operator's only safe move is the by-hand clear.
-_FOREIGN_UNRESOLVABLE_MSG = (
-    "Could not resolve the file for the plate on this printer — use Mark plate as cleared and remove the part by hand"
-)
 
+# --------------------------------------------------------------------------- #
+# The verdict
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class EjectVerdict:
+    """What one "Eject plate" call concluded. The service's answer, whole.
 
-class ManualEjectError(RuntimeError):
-    """A manual eject could not be started.
+    Every field the route puts on the wire lives here, so the controller MAPS rather
+    than decides. Fields are per-outcome and the constructors below are the only way to
+    build one — a verdict cannot be assembled with the wrong fields set for its outcome.
 
-    ``code`` is a stable machine-readable reason (``not_found`` / ``not_connected``
-    / ``printer_busy`` / ``no_plate_gate`` / ``eject_in_flight`` / ``no_eligible_unit``
-    / ``bed_unreadable`` / ``profile_not_found`` / ``bed_hot`` / ``foreign_plate``) and
-    ``status_code`` the HTTP hint the route applies without this module importing
-    FastAPI.
+    ``mode`` is DERIVED, not stored: the 200 body's ``mode`` is the outcome itself for
+    the two success shapes, and a second stored spelling of one fact is how two lanes
+    come to disagree about which one happened.
     """
 
-    def __init__(self, code: str, message: str, *, status_code: int = 409) -> None:
-        super().__init__(message)
-        self.code = code
-        self.status_code = status_code
+    outcome: EjectOutcome
+    # dispatched / released_watch
+    queue_item_id: int | None = None
+    # needs_input
+    origin: EjectOrigin | None = None
+    print_name: str | None = None
+    max_z_height_mm: float | None = None
+    suggested_eject_profile_id: int | None = None
+    # bed_hot
+    bed_c: float | None = None
+    threshold_c: float | None = None
+    # refused
+    reason: EjectRefusalReason | None = None
+    started: bool | None = None
+    age_s: float | None = None
 
+    @property
+    def mode(self) -> str | None:
+        """The 200 body's ``mode`` — the outcome itself, for the two success shapes."""
+        return self.outcome if self.outcome in ("dispatched", "released_watch") else None
 
-class BedTooHot(ManualEjectError):
-    """A REAL live bed reading is above the release threshold and the caller did not
-    pass ``allow_hot`` — carries the live bed + threshold (both always finite floats)
-    so the UI can render the explicit hot-bed confirm dialog with true numbers. An
-    unreadable bed never raises this (it raises ``bed_unreadable`` instead)."""
+    @classmethod
+    def dispatched(cls, queue_item_id: int | None) -> EjectVerdict:
+        """The sweep was built, uploaded and started on the printer."""
+        return cls(outcome="dispatched", queue_item_id=queue_item_id)
 
-    def __init__(self, bed_c: float, threshold_c: float) -> None:
-        super().__init__(
-            "bed_hot",
-            f"Bed is {bed_c:.1f}°C, above the {threshold_c:.1f}°C eject threshold — confirm to eject hot",
-            status_code=409,
-        )
-        self.bed_c = bed_c
-        self.threshold_c = threshold_c
+    @classmethod
+    def released_watch(cls, queue_item_id: int) -> EjectVerdict:
+        """An armed cooldown watch was signalled to release now — no parallel dispatch."""
+        return cls(outcome="released_watch", queue_item_id=queue_item_id)
 
-
-class ForeignPlateEject(ManualEjectError):
-    """The raised plate gate came from a FOREIGN print (started in Bambu Studio, not
-    farm-dispatched) and the caller supplied no ``eject_profile_id`` — the FIRST call
-    of the two-step confirm. Carries the resolved foreign source so the route/UI can
-    render an eject-profile picker with the print name, the plate's parsed max Z
-    height, and a suggested profile (the printer's last eject-profiled unit). The
-    caller re-calls with a chosen ``eject_profile_id`` to actually dispatch."""
-
-    def __init__(
-        self,
+    @classmethod
+    def needs_input(
+        cls,
         *,
+        origin: EjectOrigin,
         print_name: str | None,
         max_z_height_mm: float | None,
         suggested_eject_profile_id: int | None,
-    ) -> None:
-        super().__init__(
-            "foreign_plate",
-            "This plate was started outside the farm — confirm an eject profile to sweep it, "
-            "or use Mark plate as cleared and remove the part by hand",
-            status_code=409,
+    ) -> EjectVerdict:
+        """The eject needs the operator's part height and sweep profile to proceed."""
+        return cls(
+            outcome="needs_input",
+            origin=origin,
+            print_name=print_name,
+            max_z_height_mm=max_z_height_mm,
+            suggested_eject_profile_id=suggested_eject_profile_id,
         )
-        self.print_name = print_name
-        self.max_z_height_mm = max_z_height_mm
-        self.suggested_eject_profile_id = suggested_eject_profile_id
+
+    @classmethod
+    def bed_hot(cls, bed_c: float, threshold_c: float) -> EjectVerdict:
+        """A REAL live bed reading above the release threshold; both numbers ride along."""
+        return cls(outcome="bed_hot", bed_c=bed_c, threshold_c=threshold_c)
+
+    @classmethod
+    def refused(
+        cls, reason: EjectRefusalReason, *, started: bool | None = None, age_s: float | None = None
+    ) -> EjectVerdict:
+        """A state the operator's input cannot cure.
+
+        ``started`` / ``age_s`` ride ``eject_in_flight`` alone, because "an eject is
+        already in flight" is two different situations to an operator: one the printer
+        has STARTED (and will finish on its own) and one it has not yet acknowledged.
+        """
+        return cls(outcome="refused", reason=reason, started=started, age_s=age_s)
+
+
+# The authority speaks in transition tokens; the eject lane speaks in refusal reasons.
+# Every token is spelling-identical except ``not_occupied``, which reaches the API under
+# the name it has always had there and now survives only for declare-less callers.
+_REFUSAL_REASONS: dict[TransitionRefusal, EjectRefusalReason] = {
+    "job_active": "job_active",
+    "dispatch_in_flight": "dispatch_in_flight",
+    "eject_in_flight": "eject_in_flight",
+    "not_occupied": "no_plate_gate",
+}
+
+
+def _occupancy_refusal(printer_id: int, refusal: TransitionRefusal) -> EjectVerdict:
+    """Turn an occupancy refusal into a verdict, enriching the one that needs facts."""
+    reason = _REFUSAL_REASONS.get(refusal)
+    if reason is None:
+        # Not reachable from ``ejectable`` / ``declare_occupied``, whose refusal sets are
+        # closed subsets of the map above. Fail loud rather than inventing a reason: a new
+        # token in the authority must be answered here deliberately, not swallowed.
+        raise AssertionError(f"eject lane has no refusal reason for occupancy token {refusal!r}")
+    if reason != "eject_in_flight":
+        return EjectVerdict.refused(reason)
+    identity = plate_occupancy.eject_identity(printer_id)
+    if identity is None:  # pragma: no cover — the refusal is derived from the same record
+        return EjectVerdict.refused(reason)
+    age_s = (
+        (datetime.now(timezone.utc) - identity.dispatched_at).total_seconds()
+        if identity.dispatched_at is not None
+        else None
+    )
+    return EjectVerdict.refused(reason, started=identity.started_at is not None, age_s=age_s)
+
+
+# --------------------------------------------------------------------------- #
+# Which farm unit — if any — does this plate belong to?
+# --------------------------------------------------------------------------- #
+#: Where a plate's farm identity sends the eject. A closed lane rather than a pair of
+#: booleans, so "an unapproved first article that is also directly sweepable" cannot be
+#: expressed. ``first_article`` is derived from it (2026-08-30 review F18: FA-ness is an
+#: EXPLICIT discriminator, never inferred from a refusal further down the flow).
+ItemLane = Literal["eject", "needs_input", "first_article", "none"]
 
 
 @dataclass(frozen=True)
-class _ForeignSource:
-    """A foreign plate's resolved eject donor: the on-disk (or FTPS re-fetched) source
-    ``.gcode.3mf``, its ejectable plate id, the plate's parsed ``max_z`` height, the
-    print name for the confirm dialog, and — when the donor was re-fetched — the temp
-    path the caller must clean up (``None`` when the donor was the on-disk archive)."""
+class ItemResolution:
+    """The farm unit this plate belongs to, and what may be done about it.
 
-    donor_path: Path
-    plate_id: int
-    max_z: float
-    print_name: str | None
-    tmp_path: Path | None
+    ``item`` is populated for every lane but ``none`` — including ``needs_input``, where
+    the unit cannot be swept directly but IS the donor anchor the operator's confirm
+    builds from.
+    """
 
+    lane: ItemLane
+    item: PrintQueueItem | None
 
-def _safe_unlink(path: Path | None) -> None:
-    """Best-effort delete of a temp donor file (no-op for None / on-disk archives)."""
-    if path is None:
-        return
-    from backend.app.services.bambu_ftp import cleanup_downloaded_3mf
-
-    cleanup_downloaded_3mf(path)
+    @property
+    def first_article(self) -> bool:
+        """The plate holds an unapproved first article; the approval flow owns it."""
+        return self.lane == "first_article"
 
 
-# --------------------------------------------------------------------------- #
-# Foreign-donor FTPS re-fetch cache (latency Phase D1)
-# --------------------------------------------------------------------------- #
-# The foreign "Eject now" flow resolves a donor 3MF TWICE: once on the confirm-409
-# (which may FTPS-download the donor) and again on the confirmed POST; the AUTO
-# foreign path (identify → cooldown watch → dispatch) fetches twice for the same
-# reason. This module-level TTL cache lets the FIRST resolve DEPOSIT the fetched temp
-# file and the SECOND resolve CONSUME it — turning two FTPS downloads into one.
-#
-# Key = ``(printer_id, gate_subtask)`` where ``gate_subtask`` is the printer's
-# ``plate_gate_subtask_id`` — the SAME gate both the 409 and the confirm operate on
-# (one gate per printer). A gate RE-RAISE for a DIFFERENT subtask yields a different
-# key, so a stale donor is never served for a new foreign print. Only the expensive
-# re-fetch (``tmp_path is not None``) is ever cached; an on-disk archive donor (nothing
-# to clean up) is a no-op deposit. Entries expire after ``_FOREIGN_DONOR_TTL_S`` and are
-# swept (files unlinked) lazily on every access. A CONSUMED entry is removed — the
-# consumer owns the file's lifecycle exactly as a fresh fetch does today.
-_FOREIGN_DONOR_TTL_S = 600.0  # ~10 min
-_foreign_donor_cache: dict[tuple[int, str], tuple[Path, float]] = {}
+async def _resolve_manual_eject_item(db: AsyncSession, printer_id: int, plate_source: str | None) -> ItemResolution:
+    """Resolve which farm unit ``printer_id``'s plate belongs to, and its lane.
+
+    The AUTHORITY answers first: the plate's own policy is what the farm decided this
+    deposit is for, and it is the same fact the armed watch was keyed on. A
+    :class:`~backend.app.services.plate_occupancy.CooldownEject` names the unit this plate
+    is cooling for; a
+    :class:`~backend.app.services.plate_occupancy.FirstArticleEject` names one held for
+    inspection, which must never be weakened into a blind sweep.
+
+    Failing a policy, two DB questions — deliberately separate, because they answer
+    different things:
+
+    1. "Is the gate the printer's LATEST start, and is that unit sweepable?" The
+       latest-start guard is what stops a foreign or screen-started print that finished
+       after the farm unit from lending its identity to the wrong plate.
+    2. "Does the gate name a farm unit AT ALL?" A farm-known plate is never treated as
+       foreign — it becomes an operator confirm against that unit's own donor.
+    """
+    policy = plate_occupancy.snapshot(printer_id).plate_policy
+    if isinstance(policy, FirstArticleEject):
+        return ItemResolution(lane="first_article", item=await db.get(PrintQueueItem, policy.unit_id))
+    if isinstance(policy, CooldownEject):
+        item = await db.get(PrintQueueItem, policy.unit_id)
+        if item is not None:
+            # A first article is a first article whatever policy the plate carries. The
+            # cooldown policy is never minted for one, so this can only fire on a
+            # contradictory record — and the approval flow still wins, because the red
+            # line is about the PART on the plate, not about how the farm labelled it.
+            if item.first_article:
+                return ItemResolution(lane="first_article", item=item)
+            return ItemResolution(lane="eject", item=item)
+        logger.warning(
+            "manual_eject: printer %s plate is cooling for unit %s but that queue row is gone — "
+            "falling back to the gate-matched ladder",
+            printer_id,
+            policy.unit_id,
+        )
+
+    if not plate_source:
+        return ItemResolution(lane="none", item=None)
+
+    latest = await latest_started_item(db, printer_id)
+    if latest is not None and latest.dispatch_subtask_id == plate_source:
+        if latest.first_article:
+            return ItemResolution(lane="first_article", item=latest)
+        if latest.status == "completed" and latest.eject_profile_id is not None:
+            return ItemResolution(lane="eject", item=latest)
+        return ItemResolution(lane="needs_input", item=latest)
+
+    result = await db.execute(
+        select(PrintQueueItem)
+        .where(PrintQueueItem.dispatch_subtask_id == plate_source)
+        .order_by(PrintQueueItem.id.desc())
+        .limit(1)
+    )
+    gate_item = result.scalar_one_or_none()
+    if gate_item is None:
+        return ItemResolution(lane="none", item=None)
+    return ItemResolution(lane="first_article" if gate_item.first_article else "needs_input", item=gate_item)
 
 
-def _foreign_cache_key(printer: Printer) -> tuple[int, str]:
-    """The cache key for ``printer``'s current foreign-plate gate."""
-    return (printer.id, printer.plate_gate_subtask_id or "")
-
-
-def _sweep_expired_donors(now: float) -> None:
-    """Unlink + drop every cache entry past its TTL (lazy sweep, on each access)."""
-    for key in [k for k, (_p, exp) in _foreign_donor_cache.items() if exp <= now]:
-        path, _exp = _foreign_donor_cache.pop(key)
-        _safe_unlink(path)
-
-
-def _foreign_cache_put(key: tuple[int, str], path: Path | None) -> None:
-    """DEPOSIT a re-fetched donor temp file under ``key`` (no-op for ``None``).
-
-    An existing entry for the key is unlinked first (never leak a superseded temp)."""
-    now = time.monotonic()
-    _sweep_expired_donors(now)
-    if path is None:
-        return
-    existing = _foreign_donor_cache.pop(key, None)
-    if existing is not None and existing[0] != path:
-        _safe_unlink(existing[0])
-    _foreign_donor_cache[key] = (path, now + _FOREIGN_DONOR_TTL_S)
-
-
-def _foreign_cache_take(key: tuple[int, str]) -> Path | None:
-    """CONSUME (pop) the cached donor for ``key`` — the caller now owns the file.
-
-    Returns the path when a live, on-disk entry exists; ``None`` on miss / expiry /
-    a vanished file (a stale entry is unlinked and dropped)."""
-    _sweep_expired_donors(time.monotonic())
-    entry = _foreign_donor_cache.pop(key, None)
-    if entry is None:
-        return None
-    path, _exp = entry
-    if not path.is_file():
-        _safe_unlink(path)
-        return None
-    return path
-
-
-def _thermal_gate(state, threshold: float, *, allow_hot: bool) -> None:
-    """The shared hot-bed precondition, reused by the farm-known and foreign paths.
+def _thermal_gate(state, threshold: float, *, allow_hot: bool) -> EjectVerdict | None:
+    """The shared hot-bed precondition. ``None`` means the bed is cool enough to sweep.
 
     ``allow_hot`` skips it entirely. An unreadable live bed is a retryable
-    ``bed_unreadable`` 409 (never a confirm dialog built on a missing reading); a real
-    reading above ``threshold`` raises :class:`BedTooHot` carrying live bed + threshold.
+    ``bed_unreadable`` refusal (never a confirm dialog built on a missing reading — the
+    UI would render ``Number(null)`` as "0 °C"); a real reading above ``threshold`` is a
+    ``bed_hot`` verdict carrying live bed + threshold.
     """
     if allow_hot:
-        return
+        return None
     bed = state.temperatures.get("bed") if state is not None and getattr(state, "connected", False) else None
     if bed is None:
-        raise ManualEjectError(
-            "bed_unreadable",
-            "Live bed temperature is unavailable; wait a few seconds for printer telemetry and retry",
-            status_code=409,
-        )
+        return EjectVerdict.refused("bed_unreadable")
     if bed > threshold:
-        raise BedTooHot(bed, threshold)
+        return EjectVerdict.bed_hot(bed, threshold)
+    return None
 
 
-async def _resolve_manual_eject_item(db: AsyncSession, printer_id: int) -> int | None:
-    """Resolve the farm-known unit to eject on ``printer_id``, or None if none eligible.
-
-    Prefers the armed PRODUCTION cooldown watch's ``queue_item_id`` (the unit the
-    watch is already cooling for). Falls back to the ``should_rearm``-style DB lookup:
-    the most-recently started unit, which must be a COMPLETED, eject-profiled,
-    NON-first-article unit whose ``dispatch_subtask_id`` matches the printer's
-    ``plate_gate_subtask_id`` (the gate this eject would clear). An unapproved first
-    article is deliberately excluded — it must use the approval flow."""
-    identity = eject_cooldown_monitor.active_watch_identity(printer_id)
-    if identity is not None and identity.purpose == "production" and identity.queue_item_id is not None:
-        return identity.queue_item_id
-
-    printer = await db.get(Printer, printer_id)
-    item = await _latest_started_item(db, printer_id)
-    if printer is None or item is None:
-        return None
-    if item.status != "completed" or item.eject_profile_id is None or item.first_article:
-        return None
-    if not printer.plate_gate_subtask_id or item.dispatch_subtask_id != printer.plate_gate_subtask_id:
-        return None
-    return item.id
-
-
-async def manual_eject(
-    db: AsyncSession,
-    printer_id: int,
-    *,
-    allow_hot: bool = False,
-    eject_profile_id: int | None = None,
-    declare_occupied: bool = False,
-    max_z_override: float | None = None,
-) -> dict:
-    """Trigger a part-present eject on ``printer_id`` — farm-known unit OR foreign plate.
-
-    Ordered 409 preconditions: printer known → connected → not RUNNING/PAUSE → plate
-    gate raised → no eject already in flight. Then a farm-known eligible unit is
-    resolved:
-
-    * **Farm-known unit** → thermal check (skipped by ``allow_hot``) then either signal
-      an armed cooldown watch's single release path or dispatch directly. Returns
-      ``{"mode": "released_watch"|"dispatched", "queue_item_id": int}``.
-    * **No farm-known unit** → the two-step FOREIGN-plate flow (``_manual_eject_foreign``):
-      a farm-known-but-ineligible gate (e.g. an unapproved first article) still 409s
-      ``no_eligible_unit``; a genuine foreign plate with no ``eject_profile_id`` raises
-      :class:`ForeignPlateEject` (the confirm prompt), and with one dispatches the eject
-      returning ``{"mode": "dispatched", "queue_item_id": None}``.
-
-    ``declare_occupied`` is the one-step "Eject plate…" lane: with NO gate raised it is
-    the operator STATING that a part is on the plate, so this raises the gate itself and
-    continues instead of 409ing ``no_plate_gate``. It only ever acts on a gate-DOWN
-    printer that already passed the connected + not-busy guards above.
-
-    ``max_z_override`` is the operator's confirmed part height. It reaches the build ONLY
-    on the foreign confirm leg — the farm-known path's height comes from its own
-    dispatched donor, which is the file the farm itself put on that plate, so there is
-    nothing there for an operator figure to correct.
-    """
-    printer = await db.get(Printer, printer_id)
-    if printer is None:
-        raise ManualEjectError("not_found", "Printer not found", status_code=404)
-    if not printer_manager.is_connected(printer_id):
-        raise ManualEjectError("not_connected", "Printer is not connected; cannot eject", status_code=409)
-
-    state = printer_manager.get_status(printer_id)
-    if state is not None and getattr(state, "state", None) in ("RUNNING", "PAUSE"):
-        raise ManualEjectError("printer_busy", "Printer is printing or paused; cannot eject now", status_code=409)
-
-    if not printer_manager.is_awaiting_plate_clear(printer_id):
-        if not declare_occupied:
-            raise ManualEjectError(
-                "no_plate_gate", "Printer is not awaiting plate clear; nothing to eject", status_code=409
-            )
-        # One-step "Eject plate…": the operator states the plate is occupied, so raise the
-        # gate here and fall through into the foreign flow. Source-less (``None``) ⇒
-        # human-clear-only, the same shape as the native vision trip's raise in
-        # ``farm_correlation``. The raise is NEVER rolled back — not on an unresolvable
-        # donor, not on the bed_hot confirm, not on an abandoned dialog: the plate IS
-        # occupied whatever happens next, and "Mark plate as cleared" is the visible undo.
-        printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=None)
-        # That writer persists asynchronously, so a PREVIOUSLY failed persist can leave a
-        # stale key on the row this call already loaded — which would steer
-        # ``_resolve_manual_eject_item`` and the farm-known check in
-        # ``_manual_eject_foreign`` onto a print that is not on this plate. NULL it here
-        # to match the gate we just raised.
-        printer.plate_gate_subtask_id = None
-        logger.info("manual_eject: printer %s plate declared occupied by operator (source-less gate)", printer_id)
-
-    # The confirm (second) call passes the flag again, but the gate it raised is now up —
-    # the branch above is skipped, so the declaration can never double-raise.
-
-    if eject_remote.peek_pending_eject(printer_id) is not None:
-        raise ManualEjectError("eject_in_flight", "An eject is already in flight on this printer", status_code=409)
-
-    queue_item_id = await _resolve_manual_eject_item(db, printer_id)
-    if queue_item_id is None:
-        # No farm-known finished unit → the foreign-plate two-step flow (or a firm 409
-        # for a farm-known-but-ineligible gate like an unapproved first article).
-        return await _manual_eject_foreign(
-            db,
-            printer,
-            state,
-            allow_hot=allow_hot,
-            eject_profile_id=eject_profile_id,
-            max_z_override=max_z_override,
-        )
-
-    threshold = await _resolve_eject_threshold(queue_item_id)
-    if threshold is None:
-        raise ManualEjectError("no_eligible_unit", "Unit has no eject profile; cannot eject", status_code=409)
-
-    _thermal_gate(state, threshold, allow_hot=allow_hot)
-
-    # Armed PRODUCTION watch → drive its single _do_release path (no parallel race).
-    identity = eject_cooldown_monitor.active_watch_identity(printer_id)
-    if identity is not None and identity.purpose == "production" and identity.queue_item_id == queue_item_id:
-        if eject_cooldown_monitor.request_release_now(printer_id):
-            logger.info(
-                "manual_eject: signalled immediate release on printer %s (watch armed, item %s)",
-                printer_id,
-                queue_item_id,
-            )
-            return {"mode": "released_watch", "queue_item_id": queue_item_id}
-
-    # No armed watch (the DB-fallback path) → dispatch directly. EjectDispatchError
-    # propagates for the route to translate to its status hint.
-    item = await db.get(PrintQueueItem, queue_item_id)
-    run_id = item.batch_id if item is not None else None
-    await eject_remote.dispatch_part_present_eject(
-        db, printer_id=printer_id, queue_item_id=queue_item_id, purpose="production", run_id=run_id
-    )
-    logger.info("manual_eject: dispatched part-present eject on printer %s for item %s", printer_id, queue_item_id)
-    return {"mode": "dispatched", "queue_item_id": queue_item_id}
-
-
-# --------------------------------------------------------------------------- #
-# Foreign-plate "Eject now" (warn + confirm with a selectable profile)
-# --------------------------------------------------------------------------- #
 async def _suggest_eject_profile_id(db: AsyncSession, printer_id: int) -> int | None:
-    """The eject profile to pre-select in the foreign-plate confirm dialog: the most
-    recently started eject-profiled unit on this printer (best guess of the operator's
-    usual profile), or None when the printer has never run an eject-profiled unit."""
+    """The eject profile to pre-select in the confirm dialog: the most recently started
+    eject-profiled unit on this printer (best guess of the operator's usual profile), or
+    None when the printer has never run an eject-profiled unit."""
     result = await db.execute(
         select(PrintQueueItem.eject_profile_id)
         .where(
@@ -395,291 +323,224 @@ async def _suggest_eject_profile_id(db: AsyncSession, printer_id: int) -> int | 
     return result.scalar_one_or_none()
 
 
-async def _fetch_foreign_donor(printer: Printer, filename: str | None) -> Path | None:
-    """FTPS re-fetch the foreign print's donor file by ``filename`` into a temp file.
+# --------------------------------------------------------------------------- #
+# The one entry point
+# --------------------------------------------------------------------------- #
+async def manual_eject(
+    db: AsyncSession,
+    printer_id: int,
+    *,
+    allow_hot: bool = False,
+    eject_profile_id: int | None = None,
+    declare_occupied: bool = False,
+    max_z_override: float | None = None,
+) -> EjectVerdict:
+    """Sweep the plate on ``printer_id``. Returns a verdict; raises only on infrastructure.
 
-    Walks the standard FTPS root/cache/model/data fan-out over one connection (the
-    printer's FTPS root IS the USB drive). Returns the temp :class:`Path` on success
-    (caller owns cleanup) or None when the name is missing / the file is unfetchable.
+    Order (binding):
+
+    1. the printer exists, and
+    2. is connected — the two facts nothing downstream can work without;
+    3. ``declare_occupied`` on a CLEAR plate raises the gate FIRST (revoking any dispatch
+       lease), and only then is the eject's own occupancy gate consulted, so the
+       operator's cure is reachable during an upload;
+    4. the plate's farm identity resolves — an unapproved first article is refused here
+       and nowhere else;
+    5. a sweepable farm unit takes the direct path (armed watch signalled, else built and
+       dispatched);
+    6. anything else becomes an operator confirm: donor chain → prompt → dispatch.
+
+    ``allow_hot`` is the explicit hot-bed override, ``eject_profile_id`` the operator's
+    chosen sweep profile (its presence is what turns the confirm's prompt leg into its
+    dispatch leg), and ``max_z_override`` their confirmed part height, which supersedes
+    the donor's parsed header in the build — the donor may be an assumed identity or a
+    bare container rather than the print actually on the plate.
     """
-    from backend.app.core.config import settings as app_settings
-    from backend.app.services.bambu_ftp import download_file_try_paths_async
+    printer = await db.get(Printer, printer_id)
+    if printer is None:
+        return EjectVerdict.refused("not_found")
+    if not printer_manager.is_connected(printer_id):
+        return EjectVerdict.refused("not_connected")
 
-    if not filename:
-        return None
-    remote_paths = [f"/{filename}", f"/cache/{filename}", f"/model/{filename}", f"/data/{filename}"]
-    temp_dir = app_settings.archive_dir / "temp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    temp_path = temp_dir / f"foreign_eject_{printer.id}_{Path(filename).name}"
-    try:
-        ok = await download_file_try_paths_async(
-            printer.ip_address,
-            printer.access_code,
-            remote_paths,
-            temp_path,
-            printer_model=printer.model,
-        )
-    except Exception as exc:  # noqa: BLE001 — any transport failure → unfetchable
-        logger.warning("manual_eject: FTPS re-fetch of foreign donor %r failed: %s", filename, exc)
-        _safe_unlink(temp_path)
-        return None
-    if not ok:
-        _safe_unlink(temp_path)
-        return None
-    return temp_path
+    state = printer_manager.get_status(printer_id)
+    ev = Evidence(live_state=getattr(state, "state", None))
 
+    # (3) Declare-first. The confirm leg passes the flag again, but by then the gate is
+    # up and this branch is skipped — a declaration can never double-raise, and it never
+    # re-declares a standing gate (which would wipe the source id the confirm is
+    # sweeping against).
+    if declare_occupied and not plate_occupancy.is_plate_occupied(printer_id):
+        refusal = plate_occupancy.declare_occupied(printer_id, ev)
+        if refusal is not None:
+            return _occupancy_refusal(printer_id, refusal)
+        logger.info("manual_eject: printer %s plate declared occupied by operator (source-less gate)", printer_id)
 
-def _resolve_foreign_plate_id(donor_path: Path, filename: str | None) -> int | None:
-    """Pick the ejectable plate id for a foreign donor, or None if unresolvable.
+    refusal = plate_occupancy.ejectable(printer_id, ev)
+    if refusal is not None:
+        return _occupancy_refusal(printer_id, refusal)
 
-    Prefers a ``plate_(\\d+)`` hint in the filename WHEN that plate actually carries
-    G-code; otherwise falls back to the single G-code-bearing plate. Returns None when
-    the file has no G-code plate or the hint is absent and the choice is ambiguous
-    (multiple G-code plates) — a blind sweep is never guessed."""
-    plates = list_gcode_plate_ids(donor_path)
-    if not plates:
-        return None
-    m = re.search(r"plate_(\d+)", str(filename or ""))
-    if m:
-        hinted = int(m.group(1))
-        if hinted in plates:
-            return hinted
-    if len(plates) == 1:
-        return plates[0]
-    return None
+    # The ONE reader of the gate's source id. ``Printer.plate_gate_subtask_id`` is
+    # write-only persistence since the 2026-08-30 cut-over: a failed persist leaves it
+    # holding a dead key, and steering the donor off that key would sweep for a print
+    # that is not on this plate.
+    plate_source = plate_occupancy.plate_source(printer_id)
 
+    resolution = await _resolve_manual_eject_item(db, printer_id, plate_source)
+    if resolution.first_article:
+        return EjectVerdict.refused("first_article")
 
-async def _resolve_foreign_source(db: AsyncSession, printer: Printer) -> _ForeignSource:
-    """Resolve a foreign plate's eject donor from the print archive that raised the gate.
+    if resolution.lane == "eject" and resolution.item is not None:
+        verdict = await _eject_farm_unit(db, printer_id, resolution.item, state=state, allow_hot=allow_hot)
+        if verdict is not None:
+            return verdict
+        # The unit carries no eject profile after all (today's "Unit has no eject profile"
+        # hard 409) — it is still the donor anchor, so it becomes an operator confirm.
 
-    (a) newest ``PrintArchive`` whose ``subtask_id`` == the printer's gate subtask AND
-    ``printer_id`` == this printer; (b) donor = the on-disk archive file if present,
-    else an FTPS re-fetch by ``filename``; (c) plate id from the filename hint / single
-    G-code plate; (d) ``max_z`` from the plate's G-code header. Any unresolved step
-    raises ``no_eligible_unit`` with the actionable by-hand-clear message (and cleans up
-    a temp re-fetch)."""
-    from backend.app.core.config import settings as app_settings
-
-    gate = printer.plate_gate_subtask_id
-    if not gate:
-        raise ManualEjectError("no_eligible_unit", _FOREIGN_UNRESOLVABLE_MSG, status_code=409)
-
-    result = await db.execute(
-        select(PrintArchive)
-        .where(PrintArchive.subtask_id == gate, PrintArchive.printer_id == printer.id)
-        .order_by(PrintArchive.id.desc())
-        .limit(1)
-    )
-    archive = result.scalar_one_or_none()
-    if archive is None:
-        raise ManualEjectError("no_eligible_unit", _FOREIGN_UNRESOLVABLE_MSG, status_code=409)
-
-    # (b) donor file — on disk if the archive copy exists, else a Phase-D1 cached
-    # re-fetch, else a fresh FTPS re-fetch. A download-failed archive carries
-    # file_path="" (the fallback row), so guard on is_file(), never bare exists()
-    # (base_dir/"" is a directory).
-    donor_path: Path | None = None
-    tmp_path: Path | None = None
-    if archive.file_path:
-        disk = app_settings.base_dir / archive.file_path
-        if disk.is_file():
-            donor_path = disk
-    if donor_path is None:
-        # A prior resolve (the confirm-409, or the auto path's identify) may have
-        # DEPOSITED the fetched donor for this exact gate — consume it and skip the
-        # second download entirely (caller owns the file, same as a fresh fetch).
-        tmp_path = _foreign_cache_take(_foreign_cache_key(printer))
-        if tmp_path is None:
-            tmp_path = await _fetch_foreign_donor(printer, archive.filename)
-        if tmp_path is None:
-            raise ManualEjectError("no_eligible_unit", _FOREIGN_UNRESOLVABLE_MSG, status_code=409)
-        donor_path = tmp_path
-
-    # (c) plate id, then (d) max_z — clean up a temp re-fetch on any failure.
-    plate_id = _resolve_foreign_plate_id(donor_path, archive.filename)
-    if plate_id is None:
-        _safe_unlink(tmp_path)
-        raise ManualEjectError("no_eligible_unit", _FOREIGN_UNRESOLVABLE_MSG, status_code=409)
-
-    header = read_plate_gcode_header(donor_path, plate_id)
-    raw = header.get("max_z_height")
-    try:
-        max_z = float(raw) if raw is not None else None
-    except (TypeError, ValueError):
-        max_z = None
-    if max_z is None:
-        _safe_unlink(tmp_path)
-        raise ManualEjectError("no_eligible_unit", _FOREIGN_UNRESOLVABLE_MSG, status_code=409)
-
-    return _ForeignSource(
-        donor_path=donor_path,
-        plate_id=plate_id,
-        max_z=max_z,
-        print_name=archive.print_name,
-        tmp_path=tmp_path,
-    )
-
-
-async def _resolve_foreign_source_from_last_farm_item(db: AsyncSession, printer: Printer) -> _ForeignSource | None:
-    """MANUAL-only donor fallback: resolve the plate from the printer's last farm item.
-
-    The strict :func:`_resolve_foreign_source` ties the donor to the *archive that
-    raised the gate*. That fails for the screen-RESTART incident shape — a blank gate
-    id + a download-failed fallback archive (``file_path=""``) carry no usable donor.
-    The farm still knows the plate's contents though: the most-recently-started queue
-    item on this printer records the library file / archive it was dispatched from.
-
-    Donor resolution is ON DISK ONLY (never an FTPS re-fetch — the strict path already
-    tried the wire; this is the last, purely-local fallback), in priority order:
-
-    * (a) ``item.archive_id`` → :class:`PrintArchive` whose ``file_path`` is non-empty
-      and exists on disk (``base_dir / file_path``);
-    * (b) else ``item.library_file_id`` → :class:`LibraryFile` resolved with the
-      established absolute-or-``base_dir`` pattern (``print_scheduler`` line ~1249);
-    * (c) neither on disk → ``None``.
-
-    Plate id prefers the item's own ``plate_id`` when the donor actually carries it,
-    else the filename-hint / single-G-code-plate resolution (never a blind guess); the
-    plate's ``max_z`` is parsed from its G-code header exactly like the strict resolver.
-    Any unresolved step returns ``None`` so the caller re-raises the ORIGINAL strict 409
-    (the by-hand-clear behaviour is unchanged when the plate is genuinely unresolvable).
-
-    The returned donor is always on disk, so ``tmp_path`` is ``None`` — there is nothing
-    for the caller to clean up. Used ONLY by :func:`_manual_eject_foreign`; the strict
-    resolver stays fail-closed for the AUTO foreign-eject path (a farm red line)."""
-    from backend.app.core.config import settings as app_settings
-    from backend.app.models.library import LibraryFile
-
-    item = await _latest_started_item(db, printer.id)
-    if item is None:
-        return None
-
-    # (a)/(b) donor on disk — the archived copy is preferred, else the library source.
-    donor_path: Path | None = None
-    display_name: str | None = None  # names the donor for the plate-id filename hint
-    print_name: str | None = None  # the operator-facing name for the confirm dialog
-    if item.archive_id is not None:
-        archive = await db.get(PrintArchive, item.archive_id)
-        if archive is not None and archive.file_path:
-            disk = app_settings.base_dir / archive.file_path
-            if disk.is_file():
-                donor_path = disk
-                display_name = archive.filename
-                print_name = archive.print_name or archive.filename
-    if donor_path is None and item.library_file_id is not None:
-        library_file = await db.get(LibraryFile, item.library_file_id)
-        if library_file is not None:
-            lib_path = Path(library_file.file_path)
-            resolved = lib_path if lib_path.is_absolute() else app_settings.base_dir / library_file.file_path
-            if resolved.is_file():
-                donor_path = resolved
-                display_name = library_file.filename
-                print_name = library_file.filename
-    if donor_path is None:
-        return None
-
-    # Plate id: the item's own plate when the donor actually carries it, else the
-    # filename-hint / single-G-code-plate resolution — never a blind guess.
-    plates = list_gcode_plate_ids(donor_path)
-    if not plates:
-        return None
-    if item.plate_id is not None and item.plate_id in plates:
-        plate_id = item.plate_id
+    origin: EjectOrigin
+    if resolution.item is not None:
+        origin = "farm_unit"
+    elif plate_source is None and declare_occupied:
+        origin = "declared"
     else:
-        plate_id = _resolve_foreign_plate_id(donor_path, display_name)
-        if plate_id is None:
-            return None
+        origin = "foreign"
+    return await _eject_by_confirm(
+        db,
+        printer,
+        state,
+        item=resolution.item,
+        plate_source=plate_source,
+        origin=origin,
+        allow_hot=allow_hot,
+        eject_profile_id=eject_profile_id,
+        max_z_override=max_z_override,
+    )
 
-    # max_z from the plate's G-code header, parsed exactly as _resolve_foreign_source.
-    header = read_plate_gcode_header(donor_path, plate_id)
-    raw = header.get("max_z_height")
-    try:
-        max_z = float(raw) if raw is not None else None
-    except (TypeError, ValueError):
-        max_z = None
-    if max_z is None:
+
+async def _eject_farm_unit(
+    db: AsyncSession, printer_id: int, item: PrintQueueItem, *, state, allow_hot: bool
+) -> EjectVerdict | None:
+    """The direct path for a sweepable farm unit, or ``None`` when it has no profile.
+
+    ``None`` is the ONE way out of this function that is not a verdict, and it means "this
+    unit cannot be swept from its own record" — the caller turns that into an operator
+    confirm built from the same unit's donor.
+
+    An armed cooldown watch is DRIVEN, not raced: the plate's own
+    :class:`~backend.app.services.plate_occupancy.CooldownEject` policy is the armed
+    watch's identity, so signalling that watch's single release path is what keeps two
+    dispatches off one printer.
+    """
+    threshold = await _resolve_eject_threshold(item.id)
+    if threshold is None:
         return None
 
-    return _ForeignSource(donor_path=donor_path, plate_id=plate_id, max_z=max_z, print_name=print_name, tmp_path=None)
+    hot = _thermal_gate(state, threshold, allow_hot=allow_hot)
+    if hot is not None:
+        return hot
+
+    policy = plate_occupancy.snapshot(printer_id).plate_policy
+    if isinstance(policy, CooldownEject) and policy.unit_id == item.id:
+        if eject_cooldown_monitor.request_release_now(printer_id):
+            logger.info(
+                "manual_eject: signalled immediate release on printer %s (watch armed, item %s)", printer_id, item.id
+            )
+            return EjectVerdict.released_watch(item.id)
+
+    # No armed watch (the DB-fallback path) → dispatch directly. EjectDispatchError
+    # propagates: a build or transport failure is infrastructure, not a verdict.
+    await eject_remote.dispatch_part_present_eject(
+        db, printer_id=printer_id, queue_item_id=item.id, purpose="production", run_id=item.batch_id
+    )
+    logger.info("manual_eject: dispatched part-present eject on printer %s for item %s", printer_id, item.id)
+    return EjectVerdict.dispatched(item.id)
 
 
-async def _manual_eject_foreign(
+async def _eject_by_confirm(
     db: AsyncSession,
     printer: Printer,
     state,
     *,
+    item: PrintQueueItem | None,
+    plate_source: str | None,
+    origin: EjectOrigin,
     allow_hot: bool,
     eject_profile_id: int | None,
-    max_z_override: float | None = None,
-) -> dict:
-    """The foreign-plate branch of ``manual_eject`` (called when no farm-known unit
-    resolves). A farm-known-but-ineligible gate (a queue item stamped with the gate's
-    subtask — e.g. an unapproved first article) is NEVER weakened into a foreign sweep:
-    it keeps today's ``no_eligible_unit`` 409. Otherwise the foreign donor is resolved
-    — the strict archive resolver first, then the on-disk last-farm-item fallback for the
-    screen-RESTART shape the strict resolver can't tie (:func:`_resolve_foreign_source_from_last_farm_item`)
-    — and with no ``eject_profile_id`` the confirm prompt (:class:`ForeignPlateEject`) is
-    raised; with one the eject is dispatched via ``dispatch_foreign_eject``.
+    max_z_override: float | None,
+) -> EjectVerdict:
+    """The operator confirm: donor chain → prompt → (profile + height) → dispatch.
 
-    ``max_z_override`` applies to the CONFIRM leg only: the prompt still carries the
-    donor's parsed ``max_z`` (it is the dialog's prefill), and the operator's corrected
-    figure supersedes it in the build. That correction matters most where the donor is
-    the ASSUMED last-farm-item fallback rather than the print actually on the plate."""
-    gate = printer.plate_gate_subtask_id
-    if gate:
-        known = await db.execute(select(PrintQueueItem.id).where(PrintQueueItem.dispatch_subtask_id == gate).limit(1))
-        if known.scalar_one_or_none() is not None:
-            raise ManualEjectError("no_eligible_unit", _NO_ELIGIBLE_MSG, status_code=409)
+    ONE lane for all three origins. A plate the farm never dispatched, a plate whose farm
+    unit this lane may not sweep from its own record, and a plate the operator declared
+    are the same problem — the farm cannot build a sweep it can vouch for on its own — and
+    the same cure: show what the farm DOES know, let the operator correct the height and
+    pick the profile, then sweep.
 
-    try:
-        source = await _resolve_foreign_source(db, printer)
-    except ManualEjectError as strict_err:
-        # The strict resolver (shared, fail-closed, with the AUTO path) could not tie the
-        # gate to a donor — the screen-RESTART incident: a blank gate id + a download-
-        # failed fallback archive. Try the on-disk last-farm-item fallback; if THAT can't
-        # resolve either, re-raise the ORIGINAL error so the 409 message/behaviour is
-        # unchanged when the plate is genuinely unresolvable.
-        source = await _resolve_foreign_source_from_last_farm_item(db, printer)
-        if source is None:
-            raise strict_err
+    The prompt leg DEPOSITS a re-fetched donor keyed by this gate so the confirm consumes
+    it instead of downloading again; the confirm leg always releases it.
+    """
+    ctx = DonorContext(db=db, printer=printer, plate_source=plate_source, item=item)
+    source = await resolve_donor(MANUAL_DONOR_CHAIN, ctx)
+    if source is None:
+        # Every tier declined: no gate archive, no last-item file on disk, and not one
+        # library slice for this model. There is nothing to repack, so the operator's only
+        # safe move is to clear the plate and lift the part off by hand.
+        logger.info("manual_eject: printer %s has no resolvable eject donor (every tier declined)", printer.id)
+        return EjectVerdict.refused("no_donor")
 
-    # First call (no profile chosen) → the confirm prompt. DEPOSIT the temp re-fetch
-    # (Phase D1) keyed by this gate so the confirm call consumes it instead of
-    # re-downloading; an on-disk archive donor (tmp_path=None) deposits nothing.
+    # Prompt leg — no profile chosen yet.
     if eject_profile_id is None:
-        _foreign_cache_put(_foreign_cache_key(printer), source.tmp_path)
-        suggested = await _suggest_eject_profile_id(db, printer.id)
-        raise ForeignPlateEject(
+        deposit_donor(printer.id, plate_source, source.tmp_path)
+        return EjectVerdict.needs_input(
+            origin=origin,
             print_name=source.print_name,
             max_z_height_mm=source.max_z,
-            suggested_eject_profile_id=suggested,
+            suggested_eject_profile_id=await _suggest_eject_profile_id(db, printer.id),
         )
 
     profile = await db.get(EjectProfile, eject_profile_id)
     if profile is None:
-        _safe_unlink(source.tmp_path)
-        raise ManualEjectError("profile_not_found", f"Eject profile {eject_profile_id} not found", status_code=404)
+        release_donor(source)
+        return EjectVerdict.refused("profile_not_found")
+
+    # A CONTAINER donor knows no height, and the sweep's clearance and lift are computed
+    # from one. Asking again is the correct answer, not an error: the operator has the
+    # part in front of them and the profile's own guard is still the ceiling.
+    if source.max_z is None and max_z_override is None:
+        deposit_donor(printer.id, plate_source, source.tmp_path)
+        logger.info(
+            "manual_eject: printer %s container-only donor confirmed without a part height — re-prompting",
+            printer.id,
+        )
+        return EjectVerdict.needs_input(
+            origin=origin,
+            print_name=None,
+            max_z_height_mm=None,
+            suggested_eject_profile_id=eject_profile_id,
+        )
 
     try:
-        _thermal_gate(state, profile.cooldown_temp_c, allow_hot=allow_hot)
+        hot = _thermal_gate(state, profile.cooldown_temp_c, allow_hot=allow_hot)
+        if hot is not None:
+            return hot
         await eject_remote.dispatch_foreign_eject(
             db,
             printer_id=printer.id,
             profile_id=eject_profile_id,
-            source_path=source.donor_path,
+            source_path=source.path,
             plate_id=source.plate_id,
             max_z_override=max_z_override,
         )
     finally:
-        _safe_unlink(source.tmp_path)
+        release_donor(source)
 
     logger.info(
-        "manual_eject: dispatched foreign-plate eject on printer %s (plate %s, profile %s)",
+        "manual_eject: dispatched operator-confirmed eject on printer %s (origin %s, plate %s, profile %s)",
         printer.id,
+        origin,
         source.plate_id,
         eject_profile_id,
     )
-    return {"mode": "dispatched", "queue_item_id": None}
+    return EjectVerdict.dispatched(None)
 
 
 # --------------------------------------------------------------------------- #
@@ -768,8 +629,12 @@ async def identify_farm_file_foreign(
       (b) the printer model's geometry row is hardware-``validated`` (production eject
           never runs on an unvalidated model);
       (c) a suggested eject profile exists for this printer;
-      (d) the foreign donor resolves and its parsed max Z height is within that
+      (d) the STRICT donor tier resolves and its parsed max Z height is within that
           profile's ``max_part_height_mm`` guard.
+
+    Gate (d) walks :data:`~backend.app.services.eject.donor.AUTO_DONOR_CHAIN` — the
+    gate-archive tier alone. The operator lane's assumed and container tiers are
+    deliberately unreachable here: this decides to sweep a plate with nobody watching.
 
     Any miss → None (the caller falls back to the escalation-only hold). The cheap
     checks run BEFORE the donor resolution (which may FTPS re-fetch) so the common
@@ -845,24 +710,22 @@ async def identify_farm_file_foreign(
         )
         return None
 
-    # (d) donor resolves + part height within the profile's guard. _resolve_foreign_source
-    # raises ManualEjectError when the donor/plate/height cannot be resolved → not
-    # identified. Clean up any temp re-fetch either way (the auto-eject dispatch
-    # re-resolves the donor fresh at release time, exactly like the manual confirm).
-    try:
-        source = await _resolve_foreign_source(db, printer)
-    except ManualEjectError as exc:
+    # (d) the strict donor resolves + part height within the profile's guard. Clean up
+    # any temp re-fetch either way (the auto-eject dispatch re-resolves the donor fresh at
+    # release time, exactly like the manual confirm).
+    plate_source = plate_occupancy.plate_source(printer_id)
+    source = await resolve_donor(
+        AUTO_DONOR_CHAIN, DonorContext(db=db, printer=printer, plate_source=plate_source, item=None)
+    )
+    if source is None:
         logger.info(
-            "identify_farm_file_foreign: printer %s NOT identified — gate (d) donor unresolvable (%s): %s",
-            printer_id,
-            exc.code,
-            exc,
+            "identify_farm_file_foreign: printer %s NOT identified — gate (d) strict donor unresolvable", printer_id
         )
         return None
     try:
-        if source.max_z > profile.max_part_height_mm:
+        if source.max_z is None or source.max_z > profile.max_part_height_mm:
             logger.info(
-                "identify_farm_file_foreign: printer %s NOT identified — gate (d) part height %.1fmm "
+                "identify_farm_file_foreign: printer %s NOT identified — gate (d) part height %s "
                 "exceeds profile %s guard %.1fmm",
                 printer_id,
                 source.max_z,
@@ -871,12 +734,12 @@ async def identify_farm_file_foreign(
             )
             return None
     finally:
-        # DEPOSIT the re-fetched donor (Phase D1) so the LATER auto-eject dispatch
-        # (dispatch_identified_foreign_eject, after the cooldown watch) consumes it
+        # DEPOSIT the re-fetched donor so the LATER auto-eject dispatch
+        # (``dispatch_identified_foreign_eject``, after the cooldown watch) consumes it
         # instead of downloading again. Keyed by the gate; expires with the TTL if the
         # cooldown outlives it (dispatch then re-fetches — fail-open). An on-disk donor
-        # (tmp_path=None) deposits nothing.
-        _foreign_cache_put(_foreign_cache_key(printer), source.tmp_path)
+        # deposits nothing.
+        deposit_donor(printer_id, plate_source, source.tmp_path)
 
     logger.info(
         "identify_farm_file_foreign: printer %s foreign plate IS the farm's own file "
@@ -887,36 +750,3 @@ async def identify_farm_file_foreign(
         source.max_z,
     )
     return ForeignFarmFile(profile_id=profile_id, threshold_c=profile.cooldown_temp_c, print_name=source.print_name)
-
-
-async def dispatch_identified_foreign_eject(*, printer_id: int, profile_id: int) -> None:
-    """``on_release`` for the auto foreign-eject watch: resolve the foreign donor FRESH
-    and dispatch the sweep exactly as ``_manual_eject_foreign``'s confirm call does
-    (minus the thermal gate — the cooldown watch already waited for the bed to reach
-    the threshold). Opens its own session (module convention); RAISES on any failure so
-    :func:`watch_bed_and_clear` counts a dispatch failure (retry, then stall after
-    three) rather than silently dropping the sweep."""
-    from backend.app.core.database import async_session
-
-    async with async_session() as db:
-        printer = await db.get(Printer, printer_id)
-        if printer is None:
-            raise ManualEjectError("not_found", "Printer not found", status_code=404)
-        source = await _resolve_foreign_source(db, printer)
-        try:
-            await eject_remote.dispatch_foreign_eject(
-                db,
-                printer_id=printer_id,
-                profile_id=profile_id,
-                source_path=source.donor_path,
-                plate_id=source.plate_id,
-            )
-            logger.info(
-                "dispatch_identified_foreign_eject: printer %s auto foreign-plate eject dispatched "
-                "(plate %s, profile %s)",
-                printer_id,
-                source.plate_id,
-                profile_id,
-            )
-        finally:
-            _safe_unlink(source.tmp_path)

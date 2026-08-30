@@ -40,12 +40,18 @@ from backend.app.services.filament_deficit import (
     request_unread_reads,
 )
 from backend.app.services.notification_service import notification_service
+from backend.app.services.plate_occupancy import (
+    ACTIVE_PRINT_STATES as _ACTIVE_PRINT_STATES,
+    DispatchLease,
+    Evidence,
+    plate_occupancy,
+)
 from backend.app.services.printer_manager import (
     printer_manager,
     supports_drying,
     supports_drying_while_printing,
 )
-from backend.app.services.queue_transitions import claim_pending_for_dispatch
+from backend.app.services.queue_transitions import claim_pending_for_dispatch, release_unstarted_claim
 from backend.app.services.smart_plug_manager import smart_plug_manager
 from backend.app.services.spool_selection import (
     DEFAULT_MIN_START_SPOOL_G,
@@ -79,15 +85,17 @@ logger = logging.getLogger(__name__)
 # dispatch watchdog (#1370): a transition into one of these states means the
 # print landed, anything else (e.g. FINISH -> IDLE after the user dismisses
 # a post-print prompt) is NOT a valid "command landed" signal even though the
-# state value did change. SLICING is included because some firmwares park
-# briefly in SLICING between PREPARE and RUNNING while parsing the g-code.
+# state value did change.
 #
-# PUBLIC since 2026-08-29: ``farm_stall.check_dead_dispatch_claims`` asks the same
-# question ("is a print actually in flight on this printer?") to decide whether a
-# ``printing`` claim is dead, and a second spelling of this set is how the two would
-# come to disagree about PAUSE — which for that watch is the difference between
-# leaving a native-vision hold alone and double-dispatching onto an occupied plate.
-ACTIVE_PRINT_STATES: frozenset[str] = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
+# RE-EXPORTED from the plate-occupancy authority since 2026-08-30, which is the
+# module that owns "what counts as an active job" (its ``job_active`` refusal on both
+# the dispatch and the eject side, and the transition its dispatch lease settles
+# against). The name stays here because ``farm_stall.check_dead_dispatch_claims``
+# imports it from this module at call time, and because a second SPELLING of the set
+# is how two lanes come to disagree about PAUSE — which for that watch is the
+# difference between leaving a native-vision hold alone and double-dispatching onto an
+# occupied plate.
+ACTIVE_PRINT_STATES = _ACTIVE_PRINT_STATES
 
 # Dispatch precondition: the queued item's source file is gone from disk. Held as a
 # WAIT (see ``_hold_dispatch_precondition``) rather than failed — 2026-08-14, a farm
@@ -132,7 +140,6 @@ def _derive_estimated_time(archive, library_file) -> int | None:
 def _busy_cause(
     printer_id: int,
     busy_claims: dict[int, list[tuple[int, datetime | None]]],
-    dispatch_hold_printers: set[int],
     state,
 ) -> str:
     """Why this printer is in ``busy_printers`` — in terms an operator can act on.
@@ -146,9 +153,10 @@ def _busy_cause(
     the sentence.
 
     Pure and DB-free (this runs inside the tick's own session): the claim identity
-    comes from the seed the caller already built, the fault from the live state.
-    Reports every cause that holds, because they stack — a dead claim on a printer
-    with a standing fault is a different story from either alone.
+    comes from the seed the caller already built, the occupancy from the authority's
+    in-memory record, the fault from the live state. Reports every cause that holds,
+    because they stack — a dead claim on a printer with a standing fault is a
+    different story from either alone.
     """
     causes: list[str] = []
     for claim_id, started_at in busy_claims.get(printer_id, []):
@@ -158,8 +166,21 @@ def _busy_cause(
         stamped = started_at if started_at.tzinfo is not None else started_at.replace(tzinfo=timezone.utc)
         age_min = (datetime.now(timezone.utc) - stamped).total_seconds() / 60.0
         causes.append(f"printing claim item {claim_id} ({age_min:.0f} min)")
-    if printer_id in dispatch_hold_printers:
-        causes.append("post-dispatch hold")
+    # Occupancy: which of the authority's three facts is holding this printer, and for
+    # how long. An eject in flight was invisible on this line before — a printer taking
+    # no work because a sweep is crossing its plate read exactly like one taking no work
+    # for no reason at all.
+    view = plate_occupancy.snapshot(printer_id)
+    if view.eject_purpose is not None:
+        age = f"{view.eject_age_s:.0f}s" if view.eject_age_s is not None else "age unknown"
+        started = "running" if view.eject_started else "not started"
+        hydrated = ", hydrated" if view.eject_hydrated else ""
+        causes.append(f"{view.eject_purpose} eject in flight ({started}, {age}{hydrated})")
+    if view.lease_unit_id is not None:
+        age = f"{view.lease_age_s:.0f}s" if view.lease_age_s is not None else "age unknown"
+        causes.append(f"dispatch lease unit {view.lease_unit_id} ({age})")
+    if view.plate_occupied:
+        causes.append(f"plate occupied ({type(view.plate_policy).__name__})")
     if state is not None:
         from backend.app.services.spool_recovery import live_candidates
 
@@ -209,7 +230,7 @@ def _present_candidates(loaded: list[dict]) -> list[dict]:
 
 @dataclass(frozen=True)
 class _PlannedDispatch:
-    """One (queue item, printer, decided mapping) dispatch planned by this tick.
+    """One (queue item, printer, lease, decided mapping) dispatch planned by this tick.
 
     The mapping travels WITH the plan instead of being persisted on the item first:
     ``ams_mapping`` is the operator's pin until the moment a print actually starts, so
@@ -218,10 +239,17 @@ class _PlannedDispatch:
     re-read as a pin on the next tick — the exact stale-materialised-decision shape
     the 2026-08-11 external-spool incident came from. ``_start_print`` records it on
     the item at the point of no return.
+
+    ``lease`` is the printer claim minted when this dispatch was PLANNED, and it
+    travels for a related reason: ``commit_dispatch`` checks it by ``is`` identity, so
+    the dispatch phase must hand back the very object the plan holds. A different
+    lease on that printer means the world moved under this dispatch — it was released,
+    or superseded — and it must unwind instead of printing.
     """
 
     item_id: int
     printer_id: int
+    lease: DispatchLease
     ams_mapping: list[int] | None
 
 
@@ -248,23 +276,24 @@ class PrintScheduler:
         self._min_drying_seconds = 1800  # 30 minutes minimum before humidity re-check can stop drying
         # Track which printers are currently auto-drying (printer_id -> start timestamp)
         self._drying_in_progress: dict[int, float] = {}
-        # Defensive in-memory dispatch hold (#1157): a printer that just received
-        # a project_file command must not get a second dispatch until either it
-        # transitions out of pre_state OR the hard timeout expires. The H2D Pro
-        # can take 80–210 s to flip FINISH→PREPARE after project_file, and
+        # The post-dispatch hold window (#1157), now expressed as the two bounds of the
+        # occupancy authority's DISPATCH LEASE. A printer that just received a
+        # project_file command must not get a second dispatch until either it
+        # transitions out of its pre-dispatch state OR the hard timeout expires: the
+        # H2D Pro can take 80–210 s to flip FINISH→PREPARE after project_file, and
         # during that window the DB busy_printers seed is empirically unreliable
-        # (multi-plate batches double-/triple-dispatched onto the same printer
-        # 30 s apart). Keyed by printer_id; cleared by the watchdog on success
-        # or revert.
-        # printer_id -> (monotonic_started_at, pre_state, pre_subtask_id)
-        self._dispatch_holds: dict[int, tuple[float, str, str | None]] = {}
-        # Minimum cooldown between dispatches to the same printer (covers the
-        # H2D's project_file digestion window).
+        # (multi-plate batches double-/triple-dispatched onto the same printer 30 s
+        # apart). The hold itself is no longer a dict here — the lease is one of the
+        # authority's three stored facts, settled on read, so the eject lane can see it
+        # too. These two numbers are what the scheduler contributes to it.
+        #
+        # Minimum cooldown between dispatches to the same printer (covers the H2D's
+        # project_file digestion window).
         self._dispatch_min_cooldown = 60.0
-        # Hard timeout — drop the hold even if we never observed a transition,
-        # so a lost MQTT session can't lock a printer out of the queue forever.
-        # Matches the watchdog timeout (90 s) plus a safety margin so the
-        # watchdog runs first on the unhappy path.
+        # Hard timeout — the lease expires even if we never observed a transition, so a
+        # lost MQTT session can't lock a printer out of the queue forever. Matches the
+        # watchdog timeout (90 s) plus a safety margin so the watchdog runs first on the
+        # unhappy path.
         self._dispatch_max_hold = 180.0
         # Queue-item ids whose scheduler-made pin was released by a hold gate
         # (USB pre-flight / capability) in _start_print. While an id is in here,
@@ -487,20 +516,16 @@ class PrintScheduler:
                 busy_claims.setdefault(claim_pid, []).append((claim_id, claim_started))
             busy_printers: set[int] = set(busy_claims)
 
-            # Defense-in-depth (#1157): augment busy_printers with any printer
-            # still in its post-dispatch hold window. Empirically, the DB seed
-            # above can miss in-flight items in a multi-plate batch — same-file
-            # plates were being dispatched 30 s apart while the H2D was still
-            # digesting the first project_file. The hold is keyed in-memory and
-            # released by the watchdog on the success path, so it adds a layer
-            # that doesn't depend on DB row visibility or completion-callback
-            # timing. Recorded separately so the diagnostic can tell an in-flight
-            # dispatch apart from a standing claim.
-            dispatch_hold_printers: set[int] = set()
-            for held_printer_id in list(self._dispatch_holds.keys()):
-                if self._printer_in_dispatch_hold(held_printer_id):
-                    busy_printers.add(held_printer_id)
-                    dispatch_hold_printers.add(held_printer_id)
+            # Defense-in-depth (#1157): augment busy_printers with every printer the
+            # occupancy authority claims — an unsettled dispatch LEASE or an eject in
+            # flight. Empirically, the DB seed above can miss in-flight items in a
+            # multi-plate batch: same-file plates were being dispatched 30 s apart while
+            # the H2D was still digesting the first project_file. The lease is
+            # in-memory and self-expiring (settled on read against the wire snapshot it
+            # was minted with), so it adds a layer that doesn't depend on DB row
+            # visibility or completion-callback timing — and it now covers the eject
+            # lane too, which the old hold set never saw.
+            busy_printers |= plate_occupancy.printers_with_lease_or_eject()
 
             # Power-stagger budget (#Phase4 / Phase E): how many more prints may
             # BEGIN heating this tick. Owned by the stagger_policy module: budget =
@@ -759,6 +784,14 @@ class PrintScheduler:
                     # through the marking — but keep the local for clarity and parity
                     # with the model path.
                     dispatch_printer_id = item.printer_id
+                    # Claim the printer for THIS unit before anything slow happens. A
+                    # refusal here means the world moved between the idle check and now
+                    # (an operator declared the plate, an eject claimed the printer) —
+                    # skip it this tick rather than upload onto a printer we do not own.
+                    dispatch_lease = self._claim_dispatch_lease(dispatch_printer_id, item.id)
+                    if not isinstance(dispatch_lease, DispatchLease):
+                        busy_printers.add(dispatch_printer_id)
+                        continue
                     # Plan the dispatch (latency Phase B): the slow FTPS upload +
                     # start command runs concurrently AFTER both selection loops
                     # finish (in _start_print_by_id on its own session), so one
@@ -769,7 +802,14 @@ class PrintScheduler:
                     # persisted; the decided mapping rides the PLAN (see
                     # _PlannedDispatch) rather than the item, so the pin survives until
                     # the print actually starts.
-                    self._plan_dispatch(dispatch_plan, planned_printers, item.id, dispatch_printer_id, outcome.mapping)
+                    self._plan_dispatch(
+                        dispatch_plan,
+                        planned_printers,
+                        item.id,
+                        dispatch_printer_id,
+                        dispatch_lease,
+                        outcome.mapping,
+                    )
                     busy_printers.add(dispatch_printer_id)
                     # Enter the module in-flight set (Phase E): this is the durable-
                     # across-kicks record of an admitted-but-not-yet-started heater
@@ -1044,8 +1084,19 @@ class PrintScheduler:
                         # the plan and is recorded when the print actually starts, so a
                         # unit held at a later gate keeps its operator pin intact.
                         await db.commit()
+                        # Claim the chosen printer before the slow work, as on the
+                        # pinned path. A refusal skips it this tick.
+                        assigned_lease = self._claim_dispatch_lease(assigned_printer_id, item.id)
+                        if not isinstance(assigned_lease, DispatchLease):
+                            busy_printers.add(assigned_printer_id)
+                            continue
                         self._plan_dispatch(
-                            dispatch_plan, planned_printers, item.id, assigned_printer_id, assigned_mapping
+                            dispatch_plan,
+                            planned_printers,
+                            item.id,
+                            assigned_printer_id,
+                            assigned_lease,
+                            assigned_mapping,
                         )
                         busy_printers.add(assigned_printer_id)
                         # Enter the module in-flight set + arm the ramp-watch (Phase
@@ -1147,7 +1198,9 @@ class PrintScheduler:
                 sem = asyncio.Semaphore(limit)
                 await asyncio.gather(
                     *(
-                        self._start_print_by_id(planned.item_id, planned.printer_id, sem, planned.ams_mapping)
+                        self._start_print_by_id(
+                            planned.item_id, planned.printer_id, sem, planned.ams_mapping, planned.lease
+                        )
                         for planned in dispatch_plan
                     ),
                     return_exceptions=True,
@@ -1170,7 +1223,7 @@ class PrintScheduler:
                         connected,
                         state_name,
                         awaiting,
-                        _busy_cause(pid, busy_claims, dispatch_hold_printers, state),
+                        _busy_cause(pid, busy_claims, state),
                         _incident_summary(pid),
                     )
 
@@ -1829,72 +1882,23 @@ class PrintScheduler:
         to the canonical ``spool_selection`` implementation."""
         return colors_are_similar(color1, color2, threshold)
 
-    def _mark_printer_dispatched(
-        self,
-        printer_id: int,
-        pre_state: str | None,
-        pre_subtask_id: str | None,
-    ) -> None:
-        """Record that a print command was just sent to ``printer_id``.
+    def _is_printer_idle(self, printer_id: int, *, db_claim: bool = False) -> bool:
+        """Check whether a printer may take a new dispatch.
 
-        Held until either the watchdog observes a state/subtask transition
-        (success path) or the hard timeout expires. See ``_dispatch_holds``.
+        Two halves. The HEALTH checks below are this module's own — connected,
+        quarantined, model-mismatched, and a standing AMS fault on the wire — and are
+        unchanged. OWNERSHIP is the plate-occupancy authority's: whether a plate carries
+        a deposit, an eject owns the printer, a dispatch is already in flight, or a job
+        is running is ONE question with one answer, and asking it here through
+        ``dispatchable`` is what makes the check the scheduler makes when it picks a
+        printer identical to the one that mints the claim.
+
+        ``db_claim`` is the caller's per-tick "a print_queue row on this printer already
+        reads printing" evidence. It exists to stop a double dispatch during the
+        IDLE→RUNNING lag, where that row is the only witness that a unit is already on
+        its way; the tick normally excludes such printers before it ever gets here, so
+        this is the belt.
         """
-        if not pre_state:
-            # No pre_state means we can't detect a transition — fall back to a
-            # pure time-based hold using empty string as a sentinel that won't
-            # match any real printer state.
-            pre_state = ""
-        self._dispatch_holds[printer_id] = (time.monotonic(), pre_state, pre_subtask_id)
-
-    def _release_dispatch_hold(self, printer_id: int) -> None:
-        """Drop the dispatch hold for ``printer_id`` (called by the watchdog)."""
-        self._dispatch_holds.pop(printer_id, None)
-
-    def _printer_in_dispatch_hold(self, printer_id: int) -> bool:
-        """True if ``printer_id`` is still inside its post-dispatch hold window.
-
-        Returns False (and clears the hold) once any of these are true:
-          - hard timeout (``_dispatch_max_hold``) has elapsed
-          - the printer has transitioned out of pre_state and we're past the
-            minimum cooldown
-          - the printer's subtask_id has advanced past pre_subtask_id and we're
-            past the minimum cooldown
-        Otherwise the printer is held — caller should treat it as busy.
-        """
-        entry = self._dispatch_holds.get(printer_id)
-        if not entry:
-            return False
-        started_at, pre_state, pre_subtask_id = entry
-        elapsed = time.monotonic() - started_at
-
-        if elapsed >= self._dispatch_max_hold:
-            self._dispatch_holds.pop(printer_id, None)
-            return False
-
-        # Without a pre_state we can't detect a transition — fall back to the
-        # min cooldown alone, then drop the hold.
-        if not pre_state:
-            if elapsed >= self._dispatch_min_cooldown:
-                self._dispatch_holds.pop(printer_id, None)
-                return False
-            return True
-
-        status = printer_manager.get_status(printer_id)
-        current_state = getattr(status, "state", None) if status else None
-        current_subtask_id = getattr(status, "subtask_id", None) if status else None
-        transitioned = (current_state is not None and current_state != pre_state) or (
-            pre_subtask_id is not None and current_subtask_id is not None and current_subtask_id != pre_subtask_id
-        )
-
-        if transitioned and elapsed >= self._dispatch_min_cooldown:
-            self._dispatch_holds.pop(printer_id, None)
-            return False
-
-        return True
-
-    def _is_printer_idle(self, printer_id: int) -> bool:
-        """Check if a printer is connected and idle."""
         if not printer_manager.is_connected(printer_id):
             logger.debug("Printer %d: not connected", printer_id)
             return False
@@ -1931,6 +1935,11 @@ class PrintScheduler:
         # are excluded by the taxonomy and never reach here. Function-level import:
         # ``spool_recovery`` reaches back into this module (``scheduler``) at call
         # time, and a module-level edge would close that loop.
+        #
+        # Deliberately NOT applied to the eject lane (2026-08-29 W4 gotcha d): this
+        # gate is scheduler-internal, the eject dispatcher never routes through it, and
+        # gating a filament-less sweep behind an AMS fault would deadlock the very
+        # plate that is holding the printer.
         from backend.app.services.spool_recovery import live_candidates
 
         faults = live_candidates(state)
@@ -1943,22 +1952,19 @@ class PrintScheduler:
             )
             return False
 
-        # Plate-clear gate (unconditional — Phase 1, P1-B): if the printer finished/
-        # failed a previous print and the plate hasn't been acknowledged clear, the
-        # queue must NOT dispatch the next job even if the printer reports IDLE. This
-        # no longer keys on the global require_plate_clear convenience toggle — the
-        # gate is only ever RAISED when it should be (farm work involved, or the
-        # toggle on), so honouring it here whenever set is the farm loop's safety
-        # contract, not a preference. After Auto Off cycles the printer it boots back
-        # into IDLE with no memory of the finish; the persisted flag survives (#961).
-        if printer_manager.is_awaiting_plate_clear(printer_id):
-            logger.debug(
-                "Printer %d: not idle — awaiting plate-clear acknowledgment (state=%s)",
-                printer_id,
-                state.state,
-            )
+        # Ownership, in one question. ``plate_occupied`` is the unconditional gate
+        # (Phase 1, P1-B) — it no longer keys on the global require_plate_clear
+        # convenience toggle, because the gate is only ever RAISED when it should be.
+        # After Auto Off cycles the printer it boots back into IDLE with no memory of
+        # the finish; the authority's record survives (#961, rebuilt at startup).
+        refusal = plate_occupancy.dispatchable(printer_id, Evidence(live_state=state.state, db_claim=db_claim))
+        if refusal is not None:
+            logger.debug("Printer %d: not idle — %s (state=%s)", printer_id, refusal, state.state)
             return False
 
+        # ``dispatchable`` refuses the ACTIVE states, but "not active" is not the same
+        # as "ready": "", UNKNOWN, OFFLINE and every other value the wire can hold must
+        # refuse too, so the positive test stays here.
         idle = state.state in ("IDLE", "FINISH", "FAILED")
         if not idle:
             logger.debug("Printer %d: not idle — state=%s", printer_id, state.state)
@@ -3082,26 +3088,146 @@ class PrintScheduler:
         except Exception as farm_err:  # noqa: BLE001 — policy must never break dispatch
             logger.warning("Queue item %s: farm policy hook (dispatch failure) failed: %s", item.id, farm_err)
 
+    @staticmethod
+    async def _cleanup_refused_upload(printer, remote_path: str, item_id: int, why: str) -> bool:
+        """Delete an uploaded file for a dispatch that will not run. True iff removed.
+
+        The ONE body both refusal paths share (the queue row moved during the upload;
+        the plate gate rose before the print command). A file left sitting on the USB
+        for a dispatch that never happened is one screen-tap away from being started as
+        a FOREIGN print — which is exactly the class these refusals exist to close.
+        Best-effort by design: a delete that fails is reported by the caller's warning,
+        never raised, because the dispatch is already being unwound.
+        """
+        try:
+            return bool(
+                await delete_file_async(
+                    printer.ip_address,
+                    printer.access_code,
+                    remote_path,
+                    printer_model=printer.model,
+                )
+            )
+        except Exception as cleanup_err:  # noqa: BLE001 — best-effort, must not raise
+            logger.debug("Queue item %s: USB cleanup after %s failed: %s", item_id, why, cleanup_err)
+            return False
+
+    async def _unwind_refused_commit(
+        self,
+        db: AsyncSession,
+        item: PrintQueueItem,
+        printer,
+        remote_path: str,
+        remote_filename: str,
+        refusal: str,
+    ) -> None:
+        """Un-make a dispatch the occupancy authority refused at the point of no return.
+
+        Reached when the plate gate ROSE between this dispatch's claim and its print
+        command — the 2026-08-30 01:06:57 shape on printer 4, where an operator declared
+        the plate occupied mid-upload and the dispatch erased the declaration and printed
+        onto it. Now the declaration REVOKES the lease, the commit refuses, and the
+        dispatch unwinds instead: the row goes back to ``pending`` for the next tick, the
+        uploaded file is removed so it cannot be screen-started as a foreign print, the
+        printer claim is dropped, and THE GATE IS LEFT STANDING — it is the operator's
+        statement, and it outranks a dispatch that has not happened.
+
+        ``release_unstarted_claim`` remains the one writer of ``printing → pending``;
+        this calls it and ``release_dispatch``, which is the standing division between
+        the row claim and the printer claim.
+        """
+        removed = await self._cleanup_refused_upload(printer, remote_path, item.id, "a refused commit")
+        released = await release_unstarted_claim(db, item_id=item.id)
+        await db.commit()
+        if released:
+            # The conditional UPDATE ran with ``synchronize_session=False`` and this
+            # fork's sessions do not expire on commit, so the in-memory row still reads
+            # 'printing' — the mirror image of the refresh the CLAIM does a few lines
+            # up. Without it every later read on this session (the caller's
+            # ``status == "printing"`` bookkeeping included) believes a dispatch that
+            # has just been unwound.
+            await db.refresh(item)
+        plate_occupancy.release_dispatch(item.printer_id, f"commit refused ({refusal})")
+        logger.warning(
+            "Queue item %s: plate gate rose mid-dispatch on printer %s (%s) — dispatch refused, gate left "
+            "standing; row %s, uploaded file %s %s the printer",
+            item.id,
+            item.printer_id,
+            refusal,
+            "returned to 'pending'" if released else "was already moved on",
+            remote_filename,
+            "removed from" if removed else "COULD NOT BE REMOVED from",
+        )
+        dispatch_progress.emit_queue_item_status(
+            item_id=item.id,
+            batch_id=item.batch_id,
+            printer_id=item.printer_id,
+            status="pending",
+            phase="assigned",
+        )
+
+    def _claim_dispatch_lease(self, printer_id: int, unit_id: int) -> DispatchLease | str:
+        """Claim ``printer_id`` for ``unit_id``'s dispatch, or the refusal that stopped it.
+
+        Returns the authority's own refusal TOKEN rather than a bare ``None`` so a
+        caller can say WHY it unwound: the difference between "the plate is occupied"
+        and "a dispatch is already in flight" is the whole diagnostic value of the
+        line it ends up in. Test with ``isinstance(result, DispatchLease)``.
+
+        Minted at PLAN time, before the upload — the seconds-long window between the
+        decision and the print command is where the 2026-08-30 declare-vs-dispatch race
+        lived, and only a claim that exists across it can be revoked by an operator.
+
+        The wire snapshot taken here is what settlement later measures against: a
+        committed lease counts as in flight until the printer moves off ``pre_state``
+        and the minimum cooldown has elapsed, or the hard ceiling expires.
+        """
+        status = printer_manager.get_status(printer_id)
+        pre_state = getattr(status, "state", None) if status else None
+        pre_subtask = getattr(status, "subtask_id", None) if status else None
+        lease = plate_occupancy.claim_for_dispatch(
+            printer_id,
+            unit_id,
+            pre_state=pre_state,
+            pre_subtask=pre_subtask,
+            min_hold_s=self._dispatch_min_cooldown,
+            max_hold_s=self._dispatch_max_hold,
+            # No ``db_claim``: the tick's busy set already excluded every printer that
+            # carries a printing row, and this unit's own row is still pending.
+            ev=Evidence(live_state=pre_state),
+        )
+        if not isinstance(lease, DispatchLease):
+            logger.info("Queue item %s: printer %s refused the dispatch claim (%s)", unit_id, printer_id, lease)
+        return lease
+
     def _plan_dispatch(
         self,
         dispatch_plan: list[_PlannedDispatch],
         planned_printers: set[int],
         item_id: int,
         printer_id: int,
+        lease: DispatchLease,
         ams_mapping: list[int] | None = None,
     ) -> None:
-        """Record a planned (queue_item, printer, decided mapping) dispatch.
+        """Record a planned (queue_item, printer, lease, decided mapping) dispatch.
 
         ``ams_mapping`` is THIS tick's decision for that printer — carried to the
         concurrent dispatch phase instead of being written to the item, so the
         operator's pin stays intact until a print actually starts (see
-        :class:`_PlannedDispatch`).
+        :class:`_PlannedDispatch`). ``lease`` travels the same way: the dispatch phase
+        hands it back to ``commit_dispatch`` at the point of no return, and the ``is``
+        identity check there is what makes a superseded claim detectable.
 
         One printer may appear at most once per tick's plan (point 6): the
         selection loop already guarantees this by adding each pick to
         busy_printers before the next candidate search, so a second entry for the
         same printer would be a selection bug — guard cheaply and drop it rather
-        than double-dispatch onto one machine.
+        than double-dispatch onto one machine. The duplicate's lease is deliberately
+        NOT released here: ``release_dispatch`` is printer-scoped and carries no lease
+        identity, so it would drop the INCUMBENT entry's claim — the one describing a
+        dispatch that IS going to happen. (The branch is unreachable in any case: a
+        second ``_claim_dispatch_lease`` on a printer that already holds an unsettled
+        lease is refused ``dispatch_in_flight``, so a duplicate can never carry one.)
         """
         if printer_id in planned_printers:
             logger.error(
@@ -3111,10 +3237,17 @@ class PrintScheduler:
             )
             return
         planned_printers.add(printer_id)
-        dispatch_plan.append(_PlannedDispatch(item_id=item_id, printer_id=printer_id, ams_mapping=ams_mapping))
+        dispatch_plan.append(
+            _PlannedDispatch(item_id=item_id, printer_id=printer_id, lease=lease, ams_mapping=ams_mapping)
+        )
 
     async def _start_print_by_id(
-        self, item_id: int, printer_id: int, sem: asyncio.Semaphore, ams_mapping: list[int] | None = None
+        self,
+        item_id: int,
+        printer_id: int,
+        sem: asyncio.Semaphore,
+        ams_mapping: list[int] | None = None,
+        lease: DispatchLease | None = None,
     ) -> None:
         """Run one planned dispatch concurrently on its OWN session (latency Phase B).
 
@@ -3131,6 +3264,11 @@ class PrintScheduler:
           ``_fail_queue_item`` path ``_start_print`` uses for its own failures. The
           hold paths inside ``_start_print`` (USB pre-flight / capability) leave
           the item pending by design and are NOT failures — they return normally.
+        - Claim hygiene: the printer LEASE minted at plan time is released on every
+          exit that did not reach the print command. Only a COMMITTED lease survives
+          this call, because only a committed one describes a print that is actually
+          on its way; leaving an uncommitted one standing would hold the printer out
+          of the queue for the full hold ceiling for a dispatch that never happened.
         """
         # Phase E: guarantee the stagger in-flight slot frees on EVERY exit path —
         # success (started_at/status flip lets the durable window record take
@@ -3152,7 +3290,7 @@ class PrintScheduler:
                     )
                     return
                 try:
-                    await self._start_print(session, item, ams_mapping=ams_mapping)
+                    await self._start_print(session, item, ams_mapping=ams_mapping, lease=lease)
                 except Exception as exc:  # noqa: BLE001 — one task must not kill the gather
                     logger.exception("Dispatch (printer %s): queue item %s crashed during start", printer_id, item_id)
                     try:
@@ -3178,8 +3316,22 @@ class PrintScheduler:
                     self._hold_unpinned_items.discard(item_id)
         finally:
             stagger_policy.note_dispatch_settled(item_id)
+            # An UNCOMMITTED lease describes a dispatch that did not happen — every
+            # early exit above (vanished item, no longer pending, a USB/capability
+            # hold, an upload failure, a crash) leaves one behind, and the printer
+            # must go back to the queue immediately rather than sit claimed for the
+            # full ceiling. A committed lease is the post-dispatch hold and stays.
+            if lease is not None and lease.committed_at_mono is None:
+                plate_occupancy.release_dispatch(printer_id, "dispatch did not reach the print command")
 
-    async def _start_print(self, db: AsyncSession, item: PrintQueueItem, *, ams_mapping: list[int] | None = None):
+    async def _start_print(
+        self,
+        db: AsyncSession,
+        item: PrintQueueItem,
+        *,
+        ams_mapping: list[int] | None = None,
+        lease: DispatchLease | None = None,
+    ):
         """Upload file and start print for a queue item.
 
         Supports two sources:
@@ -3195,6 +3347,12 @@ class PrintScheduler:
         cache). ``None`` = a mapping-free dispatch: nothing is sent and nothing is
         recorded, which is also what the hold paths above leave behind when they
         return early.
+
+        ``lease`` is the printer claim minted for this dispatch at plan time, committed
+        at the point of no return below. ``None`` means the caller planned no claim (a
+        direct call outside the tick), and one is minted here instead — so the plate
+        interlock holds for every dispatch, however it was reached, rather than only
+        for the ones that came through the scheduler's own plan.
         """
         logger.info("Starting queue item %s", item.id)
 
@@ -3665,31 +3823,11 @@ class PrintScheduler:
             # Someone moved the row while we were uploading — an operator cancel
             # (queue/batch/run abort), or any other terminal. Not a failure of THIS
             # unit and not ours to mark: the actor that moved it owns its lifecycle,
-            # so nothing terminal, no retry burn, no quarantine contribution. Nothing
-            # is held to release either — the upload's in-flight marker exited with
-            # its context manager, the stagger slot frees in ``_start_print_by_id``'s
-            # finally, and the post-dispatch printer hold is only taken once the print
-            # command has actually gone out.
-            #
-            # The upload itself IS undone, for the same "prevent phantom prints" reason
-            # the send-failure branch below deletes its own: a cancelled unit's file
-            # left sitting on the USB is one screen-tap away from being started as a
-            # FOREIGN print, which is precisely the class this transition exists to
-            # close. Best-effort — a delete that fails is named in the warning, never
-            # raised, because the row is already someone else's business.
+            # so nothing terminal, no retry burn, no quarantine contribution. The
+            # printer claim IS released (the dispatch it described is not happening),
+            # and the stagger slot frees in ``_start_print_by_id``'s finally.
             current_status = await db.scalar(select(PrintQueueItem.status).where(PrintQueueItem.id == item_id))
-            try:
-                removed = bool(
-                    await delete_file_async(
-                        printer.ip_address,
-                        printer.access_code,
-                        remote_path,
-                        printer_model=printer.model,
-                    )
-                )
-            except Exception as cleanup_err:  # noqa: BLE001 — best-effort, must not raise
-                removed = False
-                logger.debug("Queue item %s: USB cleanup after a refused claim failed: %s", item_id, cleanup_err)
+            removed = await self._cleanup_refused_upload(printer, remote_path, item_id, "a refused claim")
             logger.warning(
                 "Queue item %s: left 'pending' during dispatch (now %r) — print command NOT sent; "
                 "uploaded file %s %s printer %s",
@@ -3699,6 +3837,7 @@ class PrintScheduler:
                 "removed from" if removed else "COULD NOT BE REMOVED from",
                 item.printer_id,
             )
+            plate_occupancy.release_dispatch(item.printer_id, "queue row left pending during dispatch")
             # Discard this dispatch's uncommitted work (the archive link, and a
             # transient library row it was about to reap) rather than letting the
             # session close decide: none of it describes a print that will happen.
@@ -3728,8 +3867,32 @@ class PrintScheduler:
                     ),
                 )
 
-        # Clear the awaiting-plate-clear flag now that we're starting a new print
-        printer_manager.set_awaiting_plate_clear(item.printer_id, False)
+        # The point of no return. The dispatch lease minted at PLAN time is COMMITTED
+        # here, immediately before the print command goes out, which starts the
+        # echo-lag hold window — and, crucially, is the last moment anything can refuse.
+        #
+        # There is NO gate write on this path any more. The unconditional
+        # ``set_awaiting_plate_clear(False)`` that used to stand here is what erased the
+        # operator's 01:06:57 plate declaration on printer 4 on 2026-08-30: it landed
+        # between this dispatch's claim and its ``start_print``, and the dispatch simply
+        # overwrote it and printed onto the declared plate. A dispatch does not get to
+        # decide that a plate is empty; it only gets to be REFUSED by one that is not.
+        if lease is None:
+            # A lease-less caller (a direct call outside the tick). Mint one here so the
+            # plate interlock holds for every dispatch however it was reached; a refusal
+            # is carried through VERBATIM, because "the plate is occupied" and "a
+            # dispatch is already in flight" unwind the same way but read very
+            # differently in the line that reports it.
+            minted = self._claim_dispatch_lease(item.printer_id, item.id)
+            lease = minted if isinstance(minted, DispatchLease) else None
+            commit_refusal: str | None = None if lease is not None else str(minted)
+        else:
+            commit_refusal = None
+        if commit_refusal is None:
+            commit_refusal = plate_occupancy.commit_dispatch(item.printer_id, lease)
+        if commit_refusal is not None:
+            await self._unwind_refused_commit(db, item, printer, remote_path, remote_filename, commit_refusal)
+            return
         logger.info("Queue item %s: Status set to 'printing', sending print command...", item.id)
 
         # Capture state before dispatch so the watchdog can detect whether the
@@ -3797,11 +3960,13 @@ class PrintScheduler:
             if durable_path is not None:
                 cache_3mf_download(item.printer_id, remote_filename, durable_path)
 
-            # Hold the printer against further dispatches until the watchdog
-            # confirms the printer transitioned (or until the hard timeout).
-            # Prevents multi-plate batches from triple-dispatching onto the
-            # same H2D Pro while it digests the first project_file (#1157).
-            self._mark_printer_dispatched(item.printer_id, pre_state, pre_subtask_id)
+            # The printer is already held against further dispatches: the lease was
+            # COMMITTED immediately before the print command above, which started the
+            # echo-lag window (#1157 — multi-plate batches triple-dispatching onto one
+            # H2D Pro while it digested the first project_file). It settles on read
+            # once the printer moves off its pre-dispatch snapshot and the minimum
+            # cooldown has elapsed, or at the hard ceiling; there is nothing to mark
+            # here any more.
 
             # Watchdog: if the printer never transitions out of pre_state AND
             # never advances subtask_id, the MQTT publish was accepted locally but
@@ -3947,7 +4112,7 @@ class PrintScheduler:
                 # in-memory dispatch hold too so a fresh dispatch can retry
                 # once the printer comes back; the hard timeout would
                 # otherwise hold the printer unnecessarily.
-                scheduler._release_dispatch_hold(printer_id)
+                plate_occupancy.release_dispatch(printer_id, "dispatch watchdog")
                 return
             last_status = status
             _emit_observed_phase(status.state)
@@ -3959,7 +4124,7 @@ class PrintScheduler:
                 # the post-print prompt without accepting our project_file)
                 # would otherwise look like "command landed" and leave the
                 # queue item stuck in 'printing' forever (#1370).
-                scheduler._release_dispatch_hold(printer_id)
+                plate_occupancy.release_dispatch(printer_id, "dispatch watchdog")
                 return
             if pre_subtask_id is not None and status.subtask_id is not None and status.subtask_id != pre_subtask_id:
                 # Phase A exit — printer accepted the file (subtask_id flipped
@@ -3976,17 +4141,17 @@ class PrintScheduler:
                 await asyncio.sleep(poll_interval)
                 status = printer_manager.get_status(printer_id)
                 if not status:
-                    scheduler._release_dispatch_hold(printer_id)
+                    plate_occupancy.release_dispatch(printer_id, "dispatch watchdog")
                     return
                 last_status = status
                 _emit_observed_phase(status.state)
                 if status.state in ACTIVE_PRINT_STATES:
-                    scheduler._release_dispatch_hold(printer_id)
+                    plate_occupancy.release_dispatch(printer_id, "dispatch watchdog")
                     return
 
         # No active-state transition. Revert the item so the scheduler can retry.
         # Drop the in-memory hold so the retry isn't blocked by it.
-        scheduler._release_dispatch_hold(printer_id)
+        plate_occupancy.release_dispatch(printer_id, "dispatch watchdog")
 
         # Three outcomes from the revert attempt, each routed differently:
         #   "reverted":          row flipped from printing -> pending, run recovery

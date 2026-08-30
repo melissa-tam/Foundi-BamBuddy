@@ -8,7 +8,17 @@ from types import SimpleNamespace
 
 import pytest
 
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.printer_manager import printer_manager
+
+
+@pytest.fixture(autouse=True)
+def _clean_authority():
+    """``_is_printer_idle`` asks the plate-occupancy authority for OWNERSHIP, so the
+    idle-gate cases below start from an unclaimed, plate-clear fleet."""
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 def _wire(monkeypatch, reported, registered):
@@ -79,6 +89,7 @@ class TestSchedulerBlocksOnModelMismatch:
         monkeypatch.setattr(printer_manager, "is_connected", lambda pid: True)
         monkeypatch.setattr(printer_manager, "is_quarantined", lambda pid: False)
         monkeypatch.setattr(printer_manager, "is_model_mismatch", lambda pid: False)
-        monkeypatch.setattr(printer_manager, "is_awaiting_plate_clear", lambda pid: False)
+        # No plate stub: the gate is the authority's, and the autouse fixture leaves
+        # printer 1 with a clear plate and no claim on it.
         monkeypatch.setattr(printer_manager, "get_status", lambda pid: SimpleNamespace(state="IDLE"))
         assert scheduler._is_printer_idle(1) is True

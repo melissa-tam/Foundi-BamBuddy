@@ -88,7 +88,6 @@ from backend.app.services.archive import ArchiveService
 from backend.app.services.archive_purge import archive_purge_service
 from backend.app.services.bambu_ftp import clear_3mf_cache
 from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES, PrinterState
-from backend.app.services.eject.monitor import eject_cooldown_monitor
 from backend.app.services.foreign_archive import locate_3mf_for_print, maybe_schedule_foreign_3mf_retry
 from backend.app.services.github_backup import github_backup_service
 from backend.app.services.homeassistant import homeassistant_service
@@ -2593,18 +2592,17 @@ async def on_print_start(printer_id: int, data: dict):
         )
         # Eject-progress telemetry (C4): the sweep has started printing on the printer.
         from backend.app.services.eject import progress as _eject_progress
-        from backend.app.services.eject.remote import (
-            mark_pending_eject_started as _mark_pending_eject_started,
-            peek_pending_eject as _peek_pending_eject,
-        )
+        from backend.app.services.eject.remote import on_eject_start_echo as _on_eject_start_echo
+        from backend.app.services.plate_occupancy import plate_occupancy as _plate_occupancy
 
         # Runtime guard (2026-07-31): this echo is the only moment the sweep's own
         # execution clock starts. Idempotent — a duplicate start keeps the first stamp.
-        _mark_pending_eject_started(printer_id)
-        _pending = _peek_pending_eject(printer_id)
+        # It also cancels the never-started deadline and arms the runtime watchdog.
+        _on_eject_start_echo(printer_id)
+        _identity = _plate_occupancy.eject_identity(printer_id)
         _eject_progress.emit_eject_progress(
             printer_id=printer_id,
-            queue_item_id=_pending.queue_item_id if _pending is not None else None,
+            queue_item_id=_identity.queue_item_id if _identity is not None else None,
             phase="sweeping",
         )
         return
@@ -3928,9 +3926,15 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
         # → monitor → farm_policy) runs on genuine evidence (raises the plate gate,
         # arms the identity cooldown watch, runs the farm policy idempotently).
         # IDLE, or a subtask MISMATCH, keeps today's conservative 'aborted' (no proof
-        # of a clean finish; carries no progress/layer keys, so the terminal handler
-        # treats it as a no-deposit cancel — gate NOT raised — and the farm policy
-        # no-ops because a reconcile carries no operator-stop echo/membership).
+        # of a clean finish). Both shapes carry ``peaks_reliable: False``, and that is
+        # the honest statement rather than a formality: NOBODY observed this print's
+        # layer/progress peaks — they either never existed in this process or belong
+        # to a client born mid-print. The 'aborted' shape additionally carries no
+        # progress/layer keys at all, so before the occupancy authority it read as a
+        # no-deposit cancel and the gate was NOT raised. That fabricated "nothing on
+        # the plate" from an absence of measurement is exactly the 2026-08-29 hole:
+        # ``DepositEvidence`` now fails closed on unreliable peaks, so a reconciled
+        # terminal gates the plate and a human decides.
         _live_state = (state.state or "").upper()
         _state_subtask = (getattr(state, "subtask_id", None) or "").strip()
         _arch_subtask = (archive.subtask_id or "").strip()
@@ -3942,6 +3946,7 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
                 "subtask_id": state.subtask_id,
                 "last_progress": getattr(state, "progress", 0.0),
                 "last_layer_num": getattr(state, "layer_num", 0),
+                "peaks_reliable": False,
                 "raw_data": state.raw_data or {},
                 "_reconciled": True,
             }
@@ -3951,6 +3956,7 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
                 "filename": archive.filename,
                 "subtask_name": archive.print_name or "",
                 "subtask_id": archive.subtask_id or "",
+                "peaks_reliable": False,
                 "raw_data": state.raw_data or {},
                 "_reconciled": True,
             }
@@ -4241,12 +4247,14 @@ async def on_print_complete(printer_id: int, data: dict):
     _resolved_is_dry_run = False
     _resolved_first_article = False
     _resolved_is_farm = False
+    _resolved_eject_profile_id = None
+    _resolved_batch_id = None
     _farm_targets_printer = False
     _global_require_plate_clear = True
     try:
+        from backend.app.services import farm_correlation
         from backend.app.services.farm_correlation import (
             ATTRIBUTED_VERDICTS,
-            AUTO_CLEAR_VERDICTS,
             farm_work_targets_printer,
             resolve_terminal_item,
         )
@@ -4256,8 +4264,8 @@ async def on_print_complete(printer_id: int, data: dict):
             # queue item to bind and resolve_terminal_item would log a false FOREIGN
             # warning. Short-circuit to the 'eject' sentinel: deliberately NOT in
             # ATTRIBUTED_VERDICTS / AUTO_CLEAR_VERDICTS and NOT 'foreign', so
-            # _attributed and _auto_clear_ok both stay False and no gate branch fires
-            # — byte-for-byte the same downstream state the old false-FOREIGN verdict
+            # _attributed stays False and the eject branch below owns the plate —
+            # byte-for-byte the same downstream state the old false-FOREIGN verdict
             # produced (queue untouched, gate not raised), minus the warning. The
             # resolved_* defaults set just above already describe an eject terminal
             # (no item → no dry-run / first-article / farm flags).
@@ -4276,6 +4284,11 @@ async def on_print_complete(printer_id: int, data: dict):
                     "is_dry_run": bool(item is not None and item.is_dry_run),
                     "first_article": bool(item is not None and item.first_article),
                     "is_farm": bool(item is not None and item.eject_profile_id is not None),
+                    # The profile id and the run id ride along so the plate's POLICY
+                    # can be decided without a second read: the cooldown watch is
+                    # bound to this unit and its run.
+                    "eject_profile_id": item.eject_profile_id if item is not None else None,
+                    "batch_id": item.batch_id if item is not None else None,
                     "targets": await farm_work_targets_printer(db, printer_id),
                     "raw_rpc": raw_rpc,
                 }
@@ -4286,21 +4299,24 @@ async def on_print_complete(printer_id: int, data: dict):
             _resolved_is_dry_run = _c["is_dry_run"]
             _resolved_first_article = _c["first_article"]
             _resolved_is_farm = _c["is_farm"]
+            _resolved_eject_profile_id = _c["eject_profile_id"]
+            _resolved_batch_id = _c["batch_id"]
             _farm_targets_printer = _c["targets"]
             _global_require_plate_clear = True if _c["raw_rpc"] is None else _c["raw_rpc"].strip().lower() == "true"
     except Exception as e:  # noqa: BLE001 — a correlation failure must not crash the callback
         logger.warning("[CALLBACK] terminal correlation failed for printer %s: %s", printer_id, e)
         ATTRIBUTED_VERDICTS = frozenset()  # type: ignore[assignment]
-        AUTO_CLEAR_VERDICTS = frozenset()  # type: ignore[assignment]
+        from backend.app.services import farm_correlation  # noqa: PLC0415 — the disposition factory is still needed
 
     _attributed = _verdict in ATTRIBUTED_VERDICTS
-    _auto_clear_ok = _verdict in AUTO_CLEAR_VERDICTS
 
     # Farm no-deposit handling: a job that deposited NOTHING on the plate cannot
-    # have fouled the bed and is not a print failure. Two cases — a dry-run eject
-    # (deposits nothing by construction) and any print that reached terminal having
-    # produced zero layers AND zero progress (stopped in PREPARE/heating).
-    from backend.app.services.eject.monitor import deposited_nothing
+    # have fouled the bed and is not a print failure. ONE origin for that judgement
+    # — ``DepositEvidence`` in the occupancy authority — because a restart-recovered
+    # print reports zeroed peaks for a job it physically finished, and reading those
+    # zeros as "nothing on the plate" is the 2026-08-29 cascade (six prints, six
+    # ungated plates, six units recorded cancelled though they completed).
+    from backend.app.services.plate_occupancy import DepositEvidence, plate_occupancy
 
     # W6.4: auto RFID re-read sweep at the PRINT terminal so a mid-print AMS
     # refill (the firmware does not auto-read spools inserted during a print) is
@@ -4325,11 +4341,8 @@ async def on_print_complete(printer_id: int, data: dict):
         # decision table against them (a drifted-config KEEP refreshes the fingerprint,
         # an unresolved slot draws an owed identify). One decider, no idle-only twin.
 
-    no_deposit = deposited_nothing(
-        is_dry_run=_resolved_is_dry_run,
-        last_layer_num=data.get("last_layer_num"),
-        last_progress=data.get("last_progress"),
-    )
+    _evidence = DepositEvidence.from_terminal_payload(data, is_dry_run=_resolved_is_dry_run)
+    no_deposit = not _evidence.deposited
     # A NON-first-article no-deposit stop is benign — normalise the terminal status
     # to "cancelled" (mirroring the _user_stopped_printers override above) so the
     # queue records "cancelled" (not "failed"), farm_policy.on_terminal no-ops, and
@@ -4355,35 +4368,64 @@ async def on_print_complete(printer_id: int, data: dict):
     # back to a queue item. Matches resolve_terminal_item's own normalization.
     _payload_subtask = (data.get("subtask_id") or "").strip() or None
     if _final_status in ("completed", "failed", "aborted", "cancelled"):
-        if no_deposit or _is_eject_job:
-            # Nothing was deposited (dry-run eject, or stopped pre-first-layer), OR
-            # this terminal is our server-dispatched eject sweep (id- or name-matched)
-            # — the bed cannot be freshly fouled, so NEVER raise the plate-clear gate
-            # or arm a new watch. An eject-named terminal must never raise a gate even
-            # when it reports motion progress or is seen as foreign (dual-control): the
-            # gate CLEAR is owned by farm_policy's positive-identity path, not here.
+        if _is_eject_job:
+            # Our own server-dispatched sweep (id- or name-matched). The plate is
+            # farm_policy's business here, not this handler's: it matches the echo
+            # against the claimed eject and resolves it, which is the ONLY path that
+            # may drop a gate. An eject-named terminal must never raise one either,
+            # even when it reports motion progress or reads as foreign (dual-control).
             logger.info(
-                "[CALLBACK] printer %s: %s terminal (%s, layer=%s) — not gating queue",
+                "[CALLBACK] printer %s: eject-job terminal (%s, layer=%s) — plate owned by farm_policy",
                 printer_id,
-                "eject-job" if _is_eject_job else "no-deposit",
                 _final_status,
                 data.get("last_layer_num"),
             )
-        elif _verdict == "foreign":
-            # A print Bambuddy did NOT dispatch left material on the plate. Gate + watch
-            # + alert only when this printer is one the farm cares about (same condition
-            # as the generic branch below): the global toggle is on, the item is a
-            # farm/eject item, or farm work targets this printer. A pure-upstream
-            # toggle-off install with no farm involvement is left exactly as upstream
-            # would leave it (no gate) — the foreign path must not out-gate the generic.
-            if _global_require_plate_clear or _resolved_is_farm or _farm_targets_printer:
-                # Raise the gate SYNCHRONOUSLY (dispatch must be blocked NOW), keyed to
-                # the foreign subtask. Then hand the watch + notification to ONE
-                # background task: it decides between an AUTO eject (the plate is
-                # positively the farm's OWN file) and the escalation-only hold (truly
-                # foreign), and NEVER leaves the printer armless — an unarmed gated
-                # printer is precisely the silent stall this fixes.
-                printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=_payload_subtask)
+        else:
+            # ONE call into the authority for every non-eject terminal. The raise guard
+            # is unchanged (global toggle on, a farm/eject item, or farm work targeting
+            # this printer — a pure-upstream toggle-off install is left as upstream
+            # leaves it), and it rides ON the disposition so the authority never has to
+            # know what the guard is made of. Note the authority NEVER clears the plate
+            # here: a no-deposit terminal is not evidence that the plate is empty (it
+            # may be an operator stop over a part a previous job left), and clearing on
+            # one is how a standing gate silently disappeared.
+            _raise_gate = bool(_global_require_plate_clear or _resolved_is_farm or _farm_targets_printer)
+            plate_occupancy.note_terminal(
+                printer_id,
+                farm_correlation.terminal_disposition(
+                    verdict=_verdict,
+                    item_id=_resolved_item_id,
+                    eject_profile_id=_resolved_eject_profile_id,
+                    first_article=_resolved_first_article,
+                    batch_id=_resolved_batch_id,
+                    source_subtask_id=_payload_subtask,
+                    evidence=_evidence,
+                    raise_gate=_raise_gate,
+                ),
+            )
+            if no_deposit:
+                logger.info(
+                    "[CALLBACK] printer %s: no-deposit terminal (%s, layer=%s, peaks_reliable=%s) — not gating queue",
+                    printer_id,
+                    _final_status,
+                    data.get("last_layer_num"),
+                    _evidence.peaks_reliable,
+                )
+            elif not _raise_gate:
+                logger.info(
+                    "[CALLBACK] printer %s: terminal (%s) with deposit but no farm involvement and "
+                    "require_plate_clear off — not gating (upstream toggle-off behaviour)",
+                    printer_id,
+                    _final_status,
+                )
+            elif _verdict == "foreign":
+                # A print Bambuddy did NOT dispatch left material on the plate. The gate
+                # went up SYNCHRONOUSLY above under an escalation-only hold (dispatch
+                # must be blocked NOW, and never armless). Whether it may be swept
+                # automatically needs archive reads and an FTPS re-fetch, which this
+                # callback cannot wait on — so ONE background task identifies the plate
+                # and UPGRADES the policy to a foreign auto-eject when it proves to be
+                # the farm's own file. The escalation hold is the floor it falls back to.
                 logger.warning(
                     "[CALLBACK] printer %s: FOREIGN terminal (%s, subtask=%s) — gate raised, farm queue "
                     "untouched; deciding auto-eject vs escalation-only in background",
@@ -4413,19 +4455,23 @@ async def on_print_complete(printer_id: int, data: dict):
                         )
                         identified = None
 
-                    # 2. Identified → arm the auto foreign-eject cooldown watch.
+                    # 2. Identified → promote the plate's policy to the auto foreign
+                    #    eject. A refusal means the plate is no longer occupied (an
+                    #    operator cleared it while we identified), and a sweep onto an
+                    #    emptied plate is exactly what must not happen — so the hold
+                    #    that is already standing simply stays.
                     auto_temp = None
                     if identified is not None:
                         try:
-                            armed = eject_cooldown_monitor.start_foreign_eject_watch(
+                            promoted = farm_correlation.upgrade_to_foreign_auto_eject(
                                 printer_id, identified.profile_id, identified.threshold_c
                             )
                         except Exception:  # noqa: BLE001
                             logger.exception(
                                 "[CALLBACK] printer %s: arming foreign auto-eject watch failed", printer_id
                             )
-                            armed = False
-                        if armed:
+                            promoted = False
+                        if promoted:
                             auto_temp = identified.threshold_c
                             logger.warning(
                                 "[CALLBACK] printer %s: FOREIGN plate is the farm's own file — auto-eject armed "
@@ -4436,20 +4482,11 @@ async def on_print_complete(printer_id: int, data: dict):
                             )
                         else:
                             logger.info(
-                                "[CALLBACK] printer %s: a watch was already armed — foreign auto-eject not (re)armed",
+                                "[CALLBACK] printer %s: plate no longer gated — foreign auto-eject not armed",
                                 printer_id,
                             )
 
-                    # 3. Not identified / arming failed / a watch already existed →
-                    #    ensure the printer is NEVER armless: escalation-only hold
-                    #    (deduped against any watch already in flight).
-                    if auto_temp is None:
-                        try:
-                            eject_cooldown_monitor.start_escalation_only_watch(printer_id)
-                        except Exception:  # noqa: BLE001
-                            logger.exception("[CALLBACK] printer %s: arming escalation-only watch failed", printer_id)
-
-                    # 4. Foreign notification fires in BOTH outcomes; names the cooldown
+                    # 3. Foreign notification fires in BOTH outcomes; names the cooldown
                     #    target °C when auto-eject was armed.
                     try:
                         async with async_session() as _fdb:
@@ -4465,46 +4502,6 @@ async def on_print_complete(printer_id: int, data: dict):
                         logger.warning("[CALLBACK] printer %s: foreign-job notification failed: %s", printer_id, _fe)
 
                 spawn_background_task(_foreign_auto_eject(), name=f"foreign-auto-eject-{printer_id}")
-            else:
-                logger.info(
-                    "[CALLBACK] printer %s: FOREIGN terminal (%s) with deposit but no farm involvement and "
-                    "require_plate_clear off — not gating (upstream toggle-off behaviour)",
-                    printer_id,
-                    _final_status,
-                )
-        elif _global_require_plate_clear or _resolved_is_farm or _farm_targets_printer:
-            # Raise the gate only when it should matter: the global toggle is on, the
-            # finished item is a farm/eject item, or farm work targets this printer.
-            # A pure-upstream toggle-off install is unaffected (no farm work → never
-            # raised). Arm the identity cooldown auto-clear ONLY for an id-/name-
-            # confirmed eject completion; fallback/none don't arm (queue_item_id=None).
-            printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=_payload_subtask)
-            _armed = eject_cooldown_monitor.on_terminal_status(
-                printer_id,
-                _final_status,
-                queue_item_id=_resolved_item_id if _auto_clear_ok else None,
-            )
-            if not _armed and (_resolved_is_farm or _farm_targets_printer):
-                # The gate was raised for an unattributed ("none"-verdict) deposit — no
-                # cooldown watch armed (queue_item_id None, or a non-success terminal). Do
-                # NOT leave the printer armless: a gated, watch-less printer sits stalled
-                # until a restart's rearm arms the escalation-only hold (the exact silent
-                # stall this closes). Arm it now (self-deduped against any in-flight watch).
-                # Gated on farm involvement so a pure-upstream toggle-on install (global
-                # toggle only, no farm work) is left exactly as upstream would leave it.
-                if eject_cooldown_monitor.start_escalation_only_watch(printer_id):
-                    logger.info(
-                        "[CALLBACK] printer %s: unattributed deposit gated with no cooldown watch — "
-                        "arming escalation-only hold (no auto-clear)",
-                        printer_id,
-                    )
-        else:
-            logger.info(
-                "[CALLBACK] printer %s: terminal (%s) with deposit but no farm involvement and "
-                "require_plate_clear off — not gating (upstream toggle-off behaviour)",
-                printer_id,
-                _final_status,
-            )
 
     # Wake the scheduler on every terminal (completed AND failed): a freed printer
     # or a newly cleared gate should be re-used without waiting out the poll interval
@@ -6596,8 +6593,17 @@ async def lifespan(app: FastAPI):
     printer_manager.set_finish_photo_moment_callback(on_finish_photo_moment)
     printer_manager.set_ams_change_callback(on_ams_change)
 
-    # Rehydrate persisted awaiting-plate-clear gate (#961) so prompts survive restarts
-    await printer_manager.load_awaiting_plate_clear_from_db()
+    # Plate occupancy (#961 and its 2026-08-30 consolidation): wire the authority's
+    # four side effects and its policy driver FIRST, then rebuild the durable facts.
+    # The order is load-bearing — hydrating an occupied plate notifies its policy, and
+    # that notification is what re-arms the watch the restart lost, so a driver wired
+    # afterwards would leave every rebuilt gate armless.
+    from backend.app.services import plate_occupancy_store
+    from backend.app.services.eject.monitor import wire_policy_driver
+
+    plate_occupancy_store.wire_core()
+    wire_policy_driver()
+    await plate_occupancy_store.hydrate()
     await printer_manager.load_quarantine_from_db()
 
     # Plate-gate startup hygiene (Phase 1, P1-B): the plate gate now blocks dispatch
@@ -6605,23 +6611,33 @@ async def lifespan(app: FastAPI):
     # gate left on a NON-farm printer would strand it forever. Clear those stale
     # gates once at startup; a printer that farm work targets keeps its gate (the
     # cooldown re-arm below decides whether it may ever auto-clear).
+    #
+    # It runs AFTER hydrate() and reads the HYDRATED RECORDS, never the columns: the
+    # authority is the one answer to "is this plate occupied", and a second DB query
+    # here would be a second opinion that could disagree with it. The printers table
+    # supplies only the candidate list.
     try:
         from backend.app.api.routes.settings import get_setting
         from backend.app.models.printer import Printer as _HygPrinter
         from backend.app.services.farm_correlation import farm_work_targets_printer
+        from backend.app.services.plate_occupancy import plate_occupancy as _hyg_occupancy
 
         async with async_session() as _hyg_db:
             _raw_rpc = await get_setting(_hyg_db, "require_plate_clear")
             _toggle_on = True if _raw_rpc is None else _raw_rpc.strip().lower() == "true"
             if not _toggle_on:
-                _gated = await _hyg_db.execute(select(_HygPrinter.id).where(_HygPrinter.awaiting_plate_clear.is_(True)))
-                for (_pid,) in _gated.all():
+                _all = await _hyg_db.execute(select(_HygPrinter.id))
+                for (_pid,) in _all.all():
+                    if not _hyg_occupancy.is_plate_occupied(_pid):
+                        continue
                     if not await farm_work_targets_printer(_hyg_db, _pid):
-                        printer_manager.set_awaiting_plate_clear(_pid, False)
+                        _gate_source = _hyg_occupancy.plate_source(_pid)  # read before the clear NULLs it
+                        _hyg_occupancy.clear_plate(_pid)
                         logging.getLogger(__name__).info(
                             "Startup hygiene: cleared stale plate gate on non-farm printer %d "
-                            "(require_plate_clear off, no farm work targets it)",
+                            "(require_plate_clear off, no farm work targets it, gate source %r)",
                             _pid,
+                            _gate_source,
                         )
     except Exception as _he:  # noqa: BLE001 — hygiene must never block startup
         logging.getLogger(__name__).warning("Plate-gate startup hygiene failed: %s", _he)
@@ -6656,18 +6672,6 @@ async def lifespan(app: FastAPI):
     except Exception as _hpe:  # noqa: BLE001 — hygiene must never block startup
         logging.getLogger(__name__).warning("HMS vocabulary prune failed: %s", _hpe)
 
-    # Restart-safe eject terminal handling (W1): hydrate the in-memory pending-eject
-    # registry from durable per-unit stamps BEFORE re-arming cooldown watches, so
-    # rearm_on_startup skips any printer with an eject still in flight (no double
-    # dispatch / false 3-failure quarantine). Then spawn the reconciler to resolve
-    # ejects whose terminal we missed while the server was down.
-    try:
-        from backend.app.services.eject.remote import hydrate_pending_ejects_from_db
-
-        await hydrate_pending_ejects_from_db()
-    except Exception as _hydr_e:  # noqa: BLE001 — hydration must never block startup
-        logging.getLogger(__name__).warning("Pending-eject hydration failed: %s", _hydr_e)
-
     # AMS incidents (WS2b): reconcile holds left open by the restart, then rehydrate
     # the printer-card projection. A printer now running was resumed while we were
     # down (close it — a stale open row would block every future incident there); one
@@ -6676,14 +6680,14 @@ async def lifespan(app: FastAPI):
 
     await rearm_incidents_on_startup()
 
-    # Farm auto-eject: re-arm cooldown watches lost to the restart (a gate left
-    # set by a successful eject job would otherwise stall the queue forever).
-    await eject_cooldown_monitor.rearm_on_startup()
-
     # Reconcile ejects that reached terminal (or failed) during the downtime window:
-    # background task, polls each hydrated printer until connected, then acts on the
-    # missed outcome (clears the gate on FINISH, quarantines on FAILED, never clears
-    # a gate on guesswork). Lives in the eject monitor beside the state it owns.
+    # one background task per hydrated printer, each polling until its printer
+    # connects and then acting on the missed outcome (resolves the eject on FINISH,
+    # quarantines on FAILED, never clears a gate on guesswork). Lives in the eject
+    # monitor beside the watches it owns. The cooldown re-arm that used to run here is
+    # gone: ``hydrate()`` decided each rebuilt plate's POLICY, and the policy driver
+    # armed the watch for it, so a gate can no longer come back from a restart with
+    # nothing looking after it.
     from backend.app.services.eject.monitor import reconcile_pending_ejects_on_startup
 
     spawn_background_task(reconcile_pending_ejects_on_startup(), name="eject-pending-reconcile")

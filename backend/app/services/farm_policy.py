@@ -46,6 +46,7 @@ from backend.app.schemas.settings import AppSettings
 from backend.app.services import farm_correlation
 from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
 from backend.app.services.notification_service import notification_service
+from backend.app.services.plate_occupancy import FirstArticleEject, plate_occupancy
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
 from backend.app.utils.printer_models import is_bedslinger_model
@@ -257,7 +258,7 @@ async def on_terminal(
         #    ended (a standalone eject file can end FAILED at EOF even after a clean
         #    sweep). A positive echo MISMATCH = foreign; leave the pending eject for
         #    the real terminal and fall through.
-        if printer_id is not None and eject_remote.peek_pending_eject(printer_id) is not None:
+        if printer_id is not None and plate_occupancy.eject_identity(printer_id) is not None:
             if not eject_remote.matches_pending_eject(
                 printer_id, completed_subtask_id, subtask_name=completed_subtask_name
             ):
@@ -269,9 +270,14 @@ async def on_terminal(
                 )
                 # fall through to item-based policy
             else:
-                # Resolve the pending: pop the registry AND NULL the durable stamp
-                # atomically so a restart never re-hydrates a resolved eject (W1).
-                pending = await eject_remote.clear_pending_eject(db, printer_id)
+                # Read the record BEFORE resolving it — ``resolve_eject`` retires the
+                # pending, and every log line and branch below is keyed off what it
+                # said. The resolution itself (and the gate that rides on it) is the
+                # authority's: ``completed`` clears the plate, ``unverified`` leaves it
+                # occupied under an escalation-only hold.
+                pending = plate_occupancy.pending_eject_view(printer_id)
+                if pending is None:  # pragma: no cover — the identity check just saw it
+                    return
                 logger.info(
                     "farm_policy: %s eject job on printer %s ended '%s'", pending.purpose, printer_id, final_status
                 )
@@ -302,7 +308,10 @@ async def on_terminal(
                     # alone parks the printer). Purpose-independent: a stalling machine
                     # deserves stopping no matter who asked for the sweep. No
                     # notification here — the watchdog owns paging, so honouring the
-                    # mark can never double-alert.
+                    # mark can never double-alert. ``unverified`` is what keeps the
+                    # plate occupied AND re-attaches the escalation-only hold: the
+                    # policy driver arms it off the plate the resolve leaves behind,
+                    # which is why nothing is armed here by hand.
                     logger.warning(
                         "farm_policy: %s eject on printer %s ended '%s' after the in-flight watchdog stopped it "
                         "(ran %s vs expected %s) — sweep UNVERIFIED, plate stays gated for a human",
@@ -312,17 +321,15 @@ async def on_terminal(
                         f"{actual_s:.0f}s" if actual_s is not None else "n/a",
                         f"{pending.expected_runtime_s:.0f}s" if pending.expected_runtime_s is not None else "n/a",
                     )
-                    # Lazy import: the monitor imports farm_policy, so a module-level
-                    # import here is a cycle (same pattern as _dispatch_remote_eject).
-                    from backend.app.services.eject.monitor import eject_cooldown_monitor
-
-                    eject_cooldown_monitor.start_escalation_only_watch(printer_id)  # idempotent re-arm
+                    plate_occupancy.resolve_eject(printer_id, "unverified")
                     return
                 if pending.purpose == "fa":
                     if final_status == "completed":
+                        plate_occupancy.resolve_eject(printer_id, "completed")
                         if pending.run_id is not None:
                             await _finalize_remote_eject(db, pending.run_id, printer_id)
                     else:
+                        plate_occupancy.resolve_eject(printer_id, "unverified")
                         # Sweep unverified: do NOT approve or materialise plates. The
                         # gate stays set and the run stays awaiting_approval (a
                         # re-approve after recovery re-dispatches). Quarantine mirrors
@@ -344,11 +351,12 @@ async def on_terminal(
                     # gate exactly like production; any other terminal keeps the gate
                     # raised (fail-closed) and only WARNs.
                     if final_status == "completed":
-                        printer_manager.set_awaiting_plate_clear(printer_id, False)
+                        plate_occupancy.resolve_eject(printer_id, "completed")
                         logger.info(
                             "farm_policy: manual eject on printer %s completed — plate-clear gate released", printer_id
                         )
                     else:
+                        plate_occupancy.resolve_eject(printer_id, "unverified")
                         logger.warning(
                             "farm_policy: manual eject on printer %s ended '%s' — sweep unverified, "
                             "plate kept gated (no quarantine)",
@@ -358,7 +366,7 @@ async def on_terminal(
                     return
                 # production eject
                 if final_status == "completed":
-                    printer_manager.set_awaiting_plate_clear(printer_id, False)
+                    plate_occupancy.resolve_eject(printer_id, "completed")
                     logger.info(
                         "farm_policy: production eject on printer %s completed — plate-clear gate released", printer_id
                     )
@@ -368,6 +376,7 @@ async def on_terminal(
                 else:
                     # Sweep unverified: KEEP the gate, quarantine the printer, and
                     # pause the unit's run if it now has no available printers.
+                    plate_occupancy.resolve_eject(printer_id, "unverified")
                     await quarantine_printer(
                         db,
                         printer_id,
@@ -750,10 +759,13 @@ async def recover_printer(db: AsyncSession, printer_id: int) -> dict:
     the canonical service mutators — no new recovery logic, no dual path. Every
     step is idempotent, so a repeat call is a no-op returning the same shape.
 
-    1. Force-clear the plate-clear gate via the canonical setter, deliberately
-       WITHOUT the routine clear-plate route's live-connection / FINISH-FAILED
-       guard: recover is an explicit "I've handled the printer" override, gated by
-       its own UI confirm, distinct from the everyday empty-bed ack.
+    1. Force-clear everything the occupancy authority believes about the printer —
+       the plate gate, any registered eject, any dispatch lease — through
+       ``operator_recover``, deliberately WITHOUT the routine clear-plate route's
+       live-connection / FINISH-FAILED guard and without its eject-in-flight refusal:
+       recover MEANS "an operator inspected the machine", which outranks every stored
+       belief. It is gated by its own UI confirm and distinct from the everyday
+       empty-bed ack, and what it discarded is logged at WARNING for triage.
     2. Clear any farm quarantine on the printer.
     3. Resume every ``paused`` run that has a queue item on this printer (only
        paused runs — ``transition_run`` 409s otherwise, so filter first).
@@ -772,8 +784,8 @@ async def recover_printer(db: AsyncSession, printer_id: int) -> dict:
         raise HTTPException(status_code=404, detail="Printer not found")
 
     # 1. Plate-clear gate — explicit override, no connection/state guard.
-    plate_cleared = printer_manager.is_awaiting_plate_clear(printer_id)
-    printer_manager.set_awaiting_plate_clear(printer_id, False)
+    plate_cleared = plate_occupancy.is_plate_occupied(printer_id)
+    plate_occupancy.operator_recover(printer_id)
 
     # 2. Quarantine — idempotent; report whether it was actually set.
     quarantine_cleared = bool(printer.quarantined)
@@ -1051,7 +1063,7 @@ async def approve_first_article(db: AsyncSession, run_id: int, eject_remotely: b
     approve_printer_id = fa_item.printer_id if fa_item is not None else None
     printer_name: str | None = None
     if approve_printer_id is not None:
-        printer_manager.set_awaiting_plate_clear(approve_printer_id, False)
+        plate_occupancy.clear_plate(approve_printer_id)
         printer = await db.get(Printer, approve_printer_id)
         printer_name = printer.name if printer is not None else None
     run = await _load_run(db, run_id)
@@ -1099,7 +1111,11 @@ async def _finalize_remote_eject(db: AsyncSession, run_id: int, printer_id: int)
     run.first_article_state = "approved"
     await db.commit()
     broadcast_production_run_changed(run_id)
-    printer_manager.set_awaiting_plate_clear(printer_id, False)
+    # The gate itself was already dropped by ``resolve_eject("completed")`` in the
+    # terminal branch that called us — this is the belt for the reconciled path, where
+    # the same finalisation replays from a downtime FINISH. Idempotent: the authority
+    # answers ``not_occupied`` on an already-clear plate.
+    plate_occupancy.clear_plate(printer_id)
     printer = await db.get(Printer, printer_id)
     printer_name = printer.name if printer is not None else None
     run = await _load_run(db, run_id)
@@ -1129,7 +1145,7 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
     terminal arrives (``_finalize_remote_eject`` via ``on_terminal`` step 1).
     An unfinished eject is simply re-approvable, never a half state.
     """
-    from backend.app.services.eject.monitor import _resolve_eject_threshold, eject_cooldown_monitor
+    from backend.app.services.eject.monitor import _resolve_eject_threshold
 
     if fa_item is None or fa_item.printer_id is None:
         raise HTTPException(status_code=409, detail="First-article printer is unknown; cannot eject remotely")
@@ -1143,8 +1159,13 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
     bed = state.temperatures.get("bed") if state and getattr(state, "connected", False) else None
 
     if threshold is not None and (bed is None or bed > threshold):
-        armed = eject_cooldown_monitor.start_fa_eject_watch(fa_item.printer_id, fa_item.id, run.id)
-        if armed:
+        # Arm the deferred sweep by SWAPPING THE PLATE'S POLICY, not by spawning a
+        # watch: the plate is what the FA part sits on, so the FA eject is a property
+        # of that plate and the policy driver arms the watch off it. A re-approve while
+        # the deferred eject is still cooling is then a no-op by construction — the
+        # policy it would set is the one already standing.
+        refusal = plate_occupancy.set_policy(fa_item.printer_id, FirstArticleEject(unit_id=fa_item.id, run_id=run.id))
+        if refusal is None:
             logger.info(
                 "farm_policy: FA eject for run %s deferred — bed %s > release %.1f°C; cooldown watch armed",
                 run.id,
@@ -1152,10 +1173,12 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
                 threshold,
             )
             return
-        # A watch is already in flight on this printer (e.g. a re-approve while the
-        # deferred eject is still cooling) — nothing further to do; it will release.
-        logger.info("farm_policy: FA eject for run %s already pending on printer %s", run.id, fa_item.printer_id)
-        return
+        # ``not_occupied``: the plate this approval would sweep is not gated (an
+        # operator cleared it, or the gate never rose). There is nothing to eject.
+        raise HTTPException(
+            status_code=409,
+            detail="This printer's plate is not gated, so there is nothing to eject; approve without a remote eject",
+        )
 
     try:
         await eject_remote.dispatch_part_present_eject(

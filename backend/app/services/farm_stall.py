@@ -46,6 +46,7 @@ from backend.app.models.printer_incident import KIND_JAM, KIND_PHYSICAL, KIND_RU
 from backend.app.services import notify_dedup
 from backend.app.services.farm_correlation import WAITING_REASON_PLATE_VISION
 from backend.app.services.hms_errors import current_runout_demand
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_recovery import (
     RECOVERY_WAITING_REASONS,
@@ -554,6 +555,11 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
                 _dead_claim_since.pop(item.id, None)
                 continue
             await db.commit()
+            # The row claim and the PRINTER claim are two different things with two
+            # different writers, and un-making a dispatch means dropping both: the
+            # conditional UPDATE above releases the queue row, this releases the
+            # occupancy lease that would otherwise hold the printer out of the queue.
+            plate_occupancy.release_dispatch(pid, "dead dispatch claim")
             _dead_claim_since.pop(item.id, None)
             await _notify_run_changed(db, item)
             logger.warning(

@@ -13,6 +13,46 @@ from pydantic import BaseModel, Field, field_validator
 #: slot pipeline's whole model graph into every import of this module.
 RecheckOutcome = Literal["unchanged", "minted", "identified", "queued", "empty", "restored"]
 
+#: The CLOSED set of answers a manual eject can give. ``eject/manual.manual_eject``
+#: returns exactly one :class:`~backend.app.services.eject.manual.EjectVerdict` carrying
+#: one of these, and ``api/routes/printer_eject.py`` maps each to its HTTP shape — the
+#: 2026-08-20 ``slot_recheck`` precedent, applied to the lane whose control flow used to
+#: be three exception classes raised from four nesting levels.
+#:
+#: ``needs_input`` is the one that earns the type: it is NOT an error. It is the eject
+#: asking the operator for the one fact only they have (the part height) and the one
+#: choice only they can make (the sweep profile), and it reaches the wire as the same
+#: ``409 {"code": "foreign_plate"}`` the dialog has always opened on.
+EjectOutcome = Literal["dispatched", "released_watch", "needs_input", "bed_hot", "refused"]
+
+#: Who put the part on the plate, as far as the farm can tell. Decides the dialog's
+#: title and sentence only — the flow is identical for all three.
+EjectOrigin = Literal["foreign", "farm_unit", "declared"]
+
+#: The CLOSED set of reasons an eject is REFUSED — a state the operator's input cannot
+#: cure (anything it CAN cure is ``needs_input`` instead). Reaches the wire verbatim as
+#: the error ``code``, so the frontend maps codes to i18n keys and no English crosses
+#: the service boundary.
+#:
+#: The first four are the occupancy authority's own
+#: :data:`~backend.app.services.plate_occupancy.TransitionRefusal` tokens, kept
+#: spelling-identical on purpose: one refusal vocabulary from the state machine to the
+#: dialog. ``no_plate_gate`` is the authority's ``not_occupied`` under the name the API
+#: has always used for it, and survives only for declare-less callers — every UI surface
+#: declares occupancy, so it can no longer be reached from a printer card.
+EjectRefusalReason = Literal[
+    "job_active",
+    "dispatch_in_flight",
+    "eject_in_flight",
+    "not_connected",
+    "no_plate_gate",
+    "bed_unreadable",
+    "first_article",
+    "no_donor",
+    "not_found",
+    "profile_not_found",
+]
+
 
 class PrinterBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
@@ -313,6 +353,53 @@ class EjectWatchInfo(BaseModel):
     threshold_c: float
 
 
+class PlateInfo(BaseModel):
+    """The deposit standing on a printer's build plate, and what happens to it next."""
+
+    occupied: bool = False
+    # The subtask id of the job that raised the gate; None for a source-less raise
+    # (a printer-vision trip, an operator declaration) — those are human-clear-only.
+    source_subtask_id: str | None = None
+    # The policy class name: CooldownEject / FirstArticleEject / ForeignAutoEject /
+    # EscalationOnly. A NAME, not its parameters — the UI renders "what will happen to
+    # this plate", and the unit/profile behind it is already on the queue surfaces.
+    policy: str | None = None
+    since: datetime | None = None
+
+
+class PendingEjectInfo(BaseModel):
+    """An eject sweep this printer is claimed by, until its terminal arrives."""
+
+    purpose: str
+    # Has the printer echoed the sweep's PRINT START? False means "dispatched, not yet
+    # acknowledged" — the state that used to be indistinguishable from a running sweep
+    # and left operators guessing whether a 409 would ever clear.
+    started: bool = False
+    age_s: float | None = None
+    # Rebuilt from the durable stamp at startup rather than minted by a live dispatch:
+    # no watchdog, no verifiable identity, and an operator eject supersedes it.
+    hydrated: bool = False
+
+
+class PlateOccupancyInfo(BaseModel):
+    """What the plate-occupancy authority STORES for this printer.
+
+    Stored fields only, deliberately: the authority also projects an OWNER (none /
+    dispatch / job / eject), and that projection needs ``db_claim`` — a ``print_queue``
+    row read per scheduler tick, which the synchronous, session-less WebSocket
+    serializer can never supply. Publishing it from REST alone would make the two
+    transports disagree about the same printer, which is the exact flip the
+    ``eject_watch`` payload is careful to avoid. The UI derives its phase from
+    ``awaiting_plate_clear`` + ``state``, and needs no server-side owner.
+    """
+
+    plate: PlateInfo = PlateInfo()
+    eject: PendingEjectInfo | None = None
+    # Age of the dispatch lease this printer holds (a unit decided-but-not-yet-settled
+    # on the wire), or None when it holds none.
+    lease_age_s: float | None = None
+
+
 class PrintOptionsResponse(BaseModel):
     """AI detection and print options from xcam data."""
 
@@ -433,6 +520,11 @@ class PrinterStatus(BaseModel):
     # release threshold; the UI renders "Cooling to T °C (bed B °C)" while set.
     # None when no threshold-bearing watch is armed.
     eject_watch: EjectWatchInfo | None = None
+    # Plate-occupancy authority projection (2026-08-30). ADDITIVE beside
+    # ``awaiting_plate_clear``, which stays: nine frontend consumers read that boolean
+    # and it remains the phase input. This carries the WHY — which policy holds the
+    # plate, since when, and whether an eject is in flight and has actually started.
+    occupancy: PlateOccupancyInfo | None = None
     # AMS drying support
     supports_drying: bool = False
     # AMS "Print While Drying" — drying mid-print. Verified per Bambu wiki release notes;

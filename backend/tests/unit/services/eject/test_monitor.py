@@ -1,59 +1,153 @@
-"""State-transition tests for the cooldown-verified plate-clear monitor."""
+"""State-transition tests for the cooldown-verified plate-clear monitor.
+
+Since the 2026-08-30 cut-over the monitor decides NOTHING about which watch to
+arm: it is the plate-occupancy authority's injected POLICY DRIVER. The four
+``start_*_watch`` entry points, the ``_watching`` registry they deduped against
+and ``on_terminal_status`` are gone with the decision.
+
+So every arming test here drives a REAL transition through the authority
+(``note_terminal`` / ``hydrate_plate`` / ``hydrate_eject`` / ``set_policy`` /
+``clear_plate`` / ``claim_for_eject`` / ``resolve_eject``) with the monitor wired
+as ``policy_driver``, and asserts what the driver made of it — the watch record in
+``_armed``, ``active_watch`` and ``request_release_now``. Likewise both watch
+bodies read the gate from ``plate_occupancy.is_plate_occupied``, never from the
+injected manager (which now supplies the BED only), so the tests drop the gate
+through the authority rather than scripting a manager flag.
+"""
+
+from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
 
 import pytest
 
+from backend.app.services.eject import monitor as monitor_mod
 from backend.app.services.eject.monitor import (
     EjectCooldownMonitor,
-    _ActiveWatch,
-    deposited_nothing,
+    _ArmedWatch,
+    notify_plate_not_empty,
     should_auto_clear,
     should_rearm,
     watch_bed_and_clear,
     watch_gate_escalation_only,
 )
+from backend.app.services.plate_occupancy import (
+    CooldownEject,
+    DepositEvidence,
+    EscalationOnly,
+    Evidence,
+    FirstArticleEject,
+    ForeignAutoEject,
+    PendingEject,
+    TerminalDisposition,
+    plate_occupancy,
+)
 
 
-class TestDepositedNothing:
-    """Truth table for the no-deposit classifier used by the plate-clear gate."""
+@pytest.fixture(autouse=True)
+def _clean_occupancy():
+    """Every test starts with an empty fleet and NO injected callables.
 
-    def test_dry_run_is_always_no_deposit(self):
-        # is_dry_run wins regardless of any progress the non-print gcode reported.
-        assert deposited_nothing(is_dry_run=True, last_layer_num=None, last_progress=None) is True
-        assert deposited_nothing(is_dry_run=True, last_layer_num=5, last_progress=99.0) is True
+    ``reset_for_tests`` un-wires the policy driver too, so a test that does not
+    wire the monitor cannot arm a watch by accident — and one that does cannot
+    leak an armed watch into the next test.
+    """
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
-    def test_zero_layers_zero_progress_is_no_deposit(self):
-        assert deposited_nothing(is_dry_run=False, last_layer_num=0, last_progress=0) is True
 
-    def test_both_none_is_no_deposit(self):
-        assert deposited_nothing(is_dry_run=False, last_layer_num=None, last_progress=None) is True
+# --------------------------------------------------------------------------- #
+# Test doubles
+# --------------------------------------------------------------------------- #
+class _FakeTask:
+    """Stand-in for the ``asyncio.Task`` ``_arm`` spawns.
 
-    def test_zero_layers_but_progress_deposited(self):
-        # Lag-by-one guard: layer 0 but nonzero progress means a print started.
-        assert deposited_nothing(is_dry_run=False, last_layer_num=0, last_progress=3.2) is False
+    The driver only ever calls ``done()``/``cancel()`` on it, so a watch can be
+    armed, identified and cancelled without running any real DB work — which is
+    what lets a test assert the task OBJECT is the same one across a
+    re-notification (the idempotence pin)."""
 
-    def test_layers_produced_deposited(self):
-        assert deposited_nothing(is_dry_run=False, last_layer_num=5, last_progress=0) is False
-        assert deposited_nothing(is_dry_run=False, last_layer_num=5, last_progress=50.0) is False
+    def __init__(self, name: str | None) -> None:
+        self.name = name
+        self.cancelled = False
+        self._done = False
+
+    def done(self) -> bool:
+        return self._done
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self._done = True
+
+
+@pytest.fixture()
+def spawns(monkeypatch):
+    """Record every watch the monitor spawns, without running any of them."""
+    records: list[_FakeTask] = []
+
+    def _fake_spawn(coro, *, name=None):
+        coro.close()  # never run it — we only count and identify spawns
+        task = _FakeTask(name)
+        records.append(task)
+        return task
+
+    monkeypatch.setattr(monitor_mod, "spawn_background_task", _fake_spawn)
+    return records
+
+
+def _wire(monitor: EjectCooldownMonitor) -> None:
+    """Inject ``monitor`` as the authority's policy driver (what lifespan does)."""
+    plate_occupancy.configure(policy_driver=monitor.on_occupancy_change)
+
+
+def _deposit_evidence() -> DepositEvidence:
+    """A terminal that unambiguously left a part on the plate."""
+    return DepositEvidence(
+        final_status="completed",
+        is_dry_run=False,
+        peaks_reliable=True,
+        last_layer_num=42,
+        last_progress=100.0,
+    )
+
+
+def _occupy(printer_id: int, policy, *, source: str | None = "SUB-1") -> None:
+    """Raise the gate with ``policy`` the way a deposit-bearing terminal does."""
+    plate_occupancy.note_terminal(
+        printer_id,
+        TerminalDisposition(
+            queue_item_id=None,
+            source_subtask_id=source,
+            evidence=_deposit_evidence(),
+            policy=policy,
+            raise_gate=True,
+        ),
+    )
+
+
+def _gate_up(printer_id: int) -> None:
+    """Occupy the plate the short way, for the watch-body tests."""
+    assert plate_occupancy.declare_occupied(printer_id, Evidence()) is None
+
+
+def _pending(*, purpose="production", queue_item_id=42, run_id=None) -> PendingEject:
+    return PendingEject(purpose=purpose, run_id=run_id, queue_item_id=queue_item_id, expected_runtime_s=83.0)
 
 
 class _FakeManager:
-    """Scripted printer_manager: yields the next status per get_status call and
-    records set_awaiting_plate_clear calls.
+    """Scripted printer_manager: yields the next status per ``get_status`` call.
 
-    ``awaiting`` scripts the plate-clear gate the cooldown watch now checks at the
-    top of every poll: a bool constant (default True — gate raised for the whole
-    watch), or a list consumed one value per poll (last value repeats) so a test
-    can drop the gate mid-watch and prove the watch exits ``"cleared"``."""
+    The gate is NO LONGER read through the manager (the authority owns it), so
+    this supplies the BED only. ``on_status`` is the seam for the one test that
+    must drop the gate BETWEEN the top-of-poll check and ``_do_release``'s
+    re-check — the two happen either side of this sync call."""
 
-    def __init__(self, statuses, awaiting=True):
+    def __init__(self, statuses, on_status=None):
         self._statuses = list(statuses)
         self._i = 0
-        self.clear_calls = []
-        self._awaiting = awaiting
-        self._gate_i = 0
+        self._on_status = on_status
 
     def get_status(self, printer_id):
         if self._i < len(self._statuses):
@@ -61,17 +155,33 @@ class _FakeManager:
         else:
             s = self._statuses[-1] if self._statuses else None
         self._i += 1
+        if self._on_status is not None:
+            self._on_status()
         return s
 
-    def is_awaiting_plate_clear(self, printer_id):
-        if isinstance(self._awaiting, bool):
-            return self._awaiting
-        val = self._awaiting[self._gate_i] if self._gate_i < len(self._awaiting) else self._awaiting[-1]
-        self._gate_i += 1
-        return val
 
-    def set_awaiting_plate_clear(self, printer_id, awaiting):
-        self.clear_calls.append((printer_id, awaiting))
+class _ClearAfter:
+    """A ``sleep`` stand-in that clears the plate after N polls.
+
+    The watch's phase boundary is the plate-clear gate, checked at the top of
+    every poll, so dropping it from the sleep between polls is how a test scripts
+    "an operator (or the eject's own terminal) cleared the plate mid-watch".
+    ``gate_seen`` records the gate at each poll boundary, which is how a test
+    proves the watch itself never released it."""
+
+    def __init__(self, printer_id: int, after_polls: int):
+        self.printer_id = printer_id
+        self.after_polls = after_polls
+        self.calls = 0
+        self.gate_seen: list[bool] = []
+        self._cleared = False
+
+    async def __call__(self, _seconds):
+        self.calls += 1
+        self.gate_seen.append(plate_occupancy.is_plate_occupied(self.printer_id))
+        if self.calls >= self.after_polls and not self._cleared:
+            self._cleared = True
+            plate_occupancy.clear_plate(self.printer_id)
 
 
 def _status(bed, connected=True):
@@ -80,91 +190,6 @@ def _status(bed, connected=True):
 
 async def _noop_sleep(_seconds):
     return None
-
-
-class TestShouldAutoClear:
-    def test_completed_clears(self):
-        assert should_auto_clear("completed") is True
-
-    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled", "printing"])
-    def test_non_success_does_not_clear(self, status):
-        assert should_auto_clear(status) is False
-
-
-class TestShouldRearm:
-    """Startup re-arm decision: gate raised + last job completed + eject profile."""
-
-    def test_rearms_completed_eject_job_with_gate_set(self):
-        assert should_rearm(True, "completed", 5) is True
-
-    def test_no_rearm_when_gate_not_set(self):
-        assert should_rearm(False, "completed", 5) is False
-
-    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled", "printing", "pending", None])
-    def test_no_rearm_on_non_completed_status(self, status):
-        # Failures/stops presume an occupied plate — the gate stays for a human.
-        assert should_rearm(True, status, 5) is False
-
-    def test_no_rearm_without_eject_profile(self):
-        # Non-eject jobs keep the manual plate-clear flow untouched.
-        assert should_rearm(True, "completed", None) is False
-
-    def test_first_article_never_rearms(self):
-        # A completed first-article item carries an eject profile but its eject
-        # block is deliberately NOT injected — the part stays on the plate, so the
-        # gate must not auto-clear.
-        assert should_rearm(True, "completed", 5, first_article=True) is False
-        # Non-FA item with the same inputs still re-arms.
-        assert should_rearm(True, "completed", 5, first_article=False) is True
-
-
-class TestStartWatchDedup:
-    """Terminal-status and startup re-arm share _start_watch; it must not
-    double-spawn for a printer whose watch is already in flight."""
-
-    def test_second_start_is_a_noop(self, monkeypatch):
-        from backend.app.services.eject import monitor as monitor_mod
-
-        spawned = []
-
-        def fake_spawn(coro, *, name=None):
-            spawned.append(name)
-            coro.close()  # never run it — we only count spawns
-
-        monkeypatch.setattr(monitor_mod, "spawn_background_task", fake_spawn)
-        mon = EjectCooldownMonitor()
-        assert mon._start_watch(7, 100) is True
-        assert mon._start_watch(7, 100) is False  # dedup while in flight
-        assert mon._start_watch(8, 101) is True  # other printers unaffected
-        assert spawned == ["eject-cooldown-watch-7", "eject-cooldown-watch-8"]
-
-
-class TestResolveEjectThresholdFirstArticle:
-    """`_resolve_eject_threshold` must resolve first-article items to no-auto-clear
-    even though they carry an eject profile — and it keys off the SPECIFIC item id
-    (db.get), not the most-recently-started item on the printer (Phase 1)."""
-
-    async def test_first_article_resolves_to_none(self, db_session, monkeypatch):
-        import contextlib
-
-        from backend.app.models.print_queue import PrintQueueItem
-        from backend.app.services.eject import monitor as monitor_mod
-
-        @contextlib.asynccontextmanager
-        async def _fake_session():
-            yield db_session
-
-        monkeypatch.setattr("backend.app.core.database.async_session", _fake_session, raising=False)
-
-        # first_article short-circuits before the profile lookup, so eject_profile_id
-        # just has to be non-null (FK enforcement is off in tests).
-        item = PrintQueueItem(printer_id=7, eject_profile_id=5, first_article=True, status="printing")
-        db_session.add(item)
-        await db_session.commit()
-        await db_session.refresh(item)
-
-        threshold = await monitor_mod._resolve_eject_threshold(item.id)
-        assert threshold is None
 
 
 class _NotifyRecorder:
@@ -207,12 +232,365 @@ class _StallRecorder:
         self.reasons.append(reason)
 
 
+# --------------------------------------------------------------------------- #
+# Pure classifiers (unchanged by the cut-over)
+# --------------------------------------------------------------------------- #
+class TestShouldAutoClear:
+    def test_completed_clears(self):
+        assert should_auto_clear("completed") is True
+
+    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled", "printing"])
+    def test_non_success_does_not_clear(self, status):
+        assert should_auto_clear(status) is False
+
+
+class TestShouldRearm:
+    """Startup re-arm decision: gate raised + last job completed + eject profile.
+
+    Still exported and still the one rule — its CALLER moved to
+    ``plate_occupancy_store.hydrate()``, which turns the same answer into the
+    plate's hydrated policy instead of a watch."""
+
+    def test_rearms_completed_eject_job_with_gate_set(self):
+        assert should_rearm(True, "completed", 5) is True
+
+    def test_no_rearm_when_gate_not_set(self):
+        assert should_rearm(False, "completed", 5) is False
+
+    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled", "printing", "pending", None])
+    def test_no_rearm_on_non_completed_status(self, status):
+        # Failures/stops presume an occupied plate — the gate stays for a human.
+        assert should_rearm(True, status, 5) is False
+
+    def test_no_rearm_without_eject_profile(self):
+        # Non-eject jobs keep the manual plate-clear flow untouched.
+        assert should_rearm(True, "completed", None) is False
+
+    def test_first_article_never_rearms(self):
+        # A completed first-article item carries an eject profile but its eject
+        # block is deliberately NOT injected — the part stays on the plate, so the
+        # gate must not auto-clear.
+        assert should_rearm(True, "completed", 5, first_article=True) is False
+        # Non-FA item with the same inputs still re-arms.
+        assert should_rearm(True, "completed", 5, first_article=False) is True
+
+
+# --------------------------------------------------------------------------- #
+# The policy driver
+# --------------------------------------------------------------------------- #
+class TestPolicyDriverArming:
+    """``on_occupancy_change`` is the ONE arming path: the plate's policy decides
+    which watch runs, an eject or a clear plate means no watch at all, and a
+    re-notification carrying the SAME policy must never respawn."""
+
+    def test_legacy_arming_entry_points_are_gone(self):
+        """No second opinion about whether a plate is occupied may grow back."""
+        for name in (
+            "_watching",
+            "_start_watch",
+            "on_terminal_status",
+            "active_watch_identity",
+            "start_fa_eject_watch",
+            "start_foreign_eject_watch",
+            "start_escalation_only_watch",
+            "rearm_on_startup",
+        ):
+            assert not hasattr(EjectCooldownMonitor, name), name
+        for name in ("deposited_nothing", "_default_notify_plate_not_empty", "_latest_started_item"):
+            assert not hasattr(monitor_mod, name), name
+
+    def test_occupied_plate_arms_exactly_one_cooldown_watch(self, spawns):
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+
+        assert [t.name for t in spawns] == ["eject-cooldown-watch-7"]
+        armed = mon._armed[7]
+        assert armed.policy == CooldownEject(unit_id=42, run_id=9)
+        assert armed.queue_item_id == 42
+        assert armed.release_now is not None  # a releasing policy carries the manual channel
+        assert mon.request_release_now(7) is True
+
+    def test_same_policy_renotification_does_not_respawn(self, spawns):
+        """The authority fans out on EVERY transition; an identical policy is a no-op.
+
+        Respawning would lose the watch's elapsed cooldown, its plateau anchor and
+        its escalation state — which is why the record's identity IS the policy
+        (frozen dataclasses, structural equality)."""
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        first = mon._armed[7].task
+
+        # Two more notifications carrying the very same policy: a repeat terminal,
+        # and an explicit set_policy to an equal value.
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        assert plate_occupancy.set_policy(7, CooldownEject(unit_id=42, run_id=9)) is None
+
+        assert len(spawns) == 1
+        assert mon._armed[7].task is first  # the SAME task object, never a successor
+        assert first.cancelled is False
+
+    def test_policy_change_cancels_the_old_task_and_spawns_a_new_one(self, spawns):
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        plate_occupancy.hydrate_plate(7, "SUB-1", EscalationOnly())
+        escalation_task = mon._armed[7].task
+        assert escalation_task.name == "eject-gate-escalation-7"
+
+        assert plate_occupancy.set_policy(7, ForeignAutoEject(profile_id=5, threshold_c=33.0)) is None
+
+        assert escalation_task.cancelled is True
+        assert [t.name for t in spawns] == ["eject-gate-escalation-7", "eject-foreign-watch-7"]
+        assert mon._armed[7].task is spawns[1]
+        assert mon._armed[7].policy == ForeignAutoEject(profile_id=5, threshold_c=33.0)
+
+    def test_clear_plate_cancels_the_watch_and_arms_nothing(self, spawns):
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        task = mon._armed[7].task
+
+        assert plate_occupancy.clear_plate(7) is None
+
+        assert task.cancelled is True
+        assert 7 not in mon._armed
+        assert len(spawns) == 1  # nothing new was armed over the empty plate
+        assert mon.active_watch(7) is None
+        assert mon.request_release_now(7) is False
+
+    def test_a_transition_on_a_clear_plate_arms_nothing(self, spawns):
+        """A dispatch lease is not a plate: the driver runs and arms nothing."""
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+
+        lease = plate_occupancy.claim_for_dispatch(
+            7, 42, pre_state="IDLE", pre_subtask=None, min_hold_s=60.0, max_hold_s=180.0, ev=Evidence()
+        )
+        plate_occupancy.release_dispatch(7, "test")
+
+        assert not isinstance(lease, str)
+        assert spawns == []
+        assert mon._armed == {}
+
+    def test_hydrated_eject_arms_nothing_from_the_plate_policy(self, spawns):
+        """The startup reconciler owns a hydrated-eject printer — no watch beside it.
+
+        A cooldown watch armed over a plate a (possibly still running) sweep is
+        crossing is the double dispatch the legacy re-arm avoided by skipping such
+        printers outright."""
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+
+        plate_occupancy.hydrate_eject(7, _pending())
+        plate_occupancy.hydrate_plate(7, "SUB-1", CooldownEject(unit_id=42, run_id=9))
+
+        assert plate_occupancy.snapshot(7).eject_hydrated is True
+        assert plate_occupancy.snapshot(7).plate_occupied is True
+        assert spawns == []
+        assert mon._armed == {}
+
+    def test_live_eject_cancels_the_plate_watch(self, spawns):
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        cooldown_task = mon._armed[7].task
+
+        assert plate_occupancy.claim_for_eject(7, _pending(), Evidence()) is None
+
+        assert cooldown_task.cancelled is True
+        assert mon._armed == {}
+        assert len(spawns) == 1
+
+    def test_unverified_resolve_hands_the_plate_to_an_escalation_hold(self, spawns):
+        """The stopped-sweep path: farm_policy arms nothing by hand — this does.
+
+        ``resolve_eject("unverified")`` leaves the plate occupied under
+        EscalationOnly, and the policy driver arms the hold off THAT."""
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        assert plate_occupancy.claim_for_eject(7, _pending(), Evidence()) is None
+
+        assert plate_occupancy.resolve_eject(7, "unverified") is None
+
+        assert [t.name for t in spawns] == ["eject-cooldown-watch-7", "eject-gate-escalation-7"]
+        assert isinstance(mon._armed[7].policy, EscalationOnly)
+        assert mon.request_release_now(7) is False  # an escalation hold cannot release
+
+    def test_completed_resolve_leaves_no_watch(self, spawns):
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        assert plate_occupancy.claim_for_eject(7, _pending(), Evidence()) is None
+
+        assert plate_occupancy.resolve_eject(7, "completed") is None
+
+        assert plate_occupancy.is_plate_occupied(7) is False
+        assert mon._armed == {}
+        assert len(spawns) == 1  # only the original cooldown watch ever existed
+
+    @pytest.mark.parametrize(
+        ("policy", "task_name", "queue_item_id", "releasable"),
+        [
+            (CooldownEject(unit_id=42, run_id=9), "eject-cooldown-watch-7", 42, True),
+            (FirstArticleEject(unit_id=43, run_id=9), "eject-fa-watch-7", 43, True),
+            (ForeignAutoEject(profile_id=5, threshold_c=33.0), "eject-foreign-watch-7", None, True),
+            (EscalationOnly(), "eject-gate-escalation-7", None, False),
+        ],
+    )
+    def test_each_policy_arms_its_own_watch(self, spawns, policy, task_name, queue_item_id, releasable):
+        """The policy → watch mapping, including which policies can release at all."""
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+
+        _occupy(7, policy)
+
+        assert [t.name for t in spawns] == [task_name]
+        armed = mon._armed[7]
+        assert armed.queue_item_id == queue_item_id
+        assert (armed.release_now is not None) is releasable
+        assert mon.request_release_now(7) is releasable
+        if releasable:
+            assert armed.release_now.is_set()  # request_release_now signalled it
+
+    def test_release_now_is_unset_until_requested(self, spawns):
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+
+        assert mon._armed[7].release_now.is_set() is False
+        assert mon.request_release_now(7) is True
+        assert mon._armed[7].release_now.is_set() is True
+
+    def test_request_release_now_is_false_for_an_unarmed_printer(self):
+        assert EjectCooldownMonitor().request_release_now(7) is False
+
+
+class TestEjectTimerHygiene:
+    """Level-triggered: whenever no eject is registered, both eject timers are dropped."""
+
+    @pytest.fixture()
+    def cancelled(self, monkeypatch):
+        calls: list[int] = []
+        monkeypatch.setattr(monitor_mod.eject_remote, "cancel_eject_timers", calls.append)
+        return calls
+
+    def test_no_eject_present_cancels_the_timers(self, spawns, cancelled):
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+
+        _occupy(7, EscalationOnly())
+
+        assert cancelled == [7]
+
+    def test_an_eject_present_leaves_the_timers_alone(self, spawns, cancelled):
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        cancelled.clear()
+
+        assert plate_occupancy.claim_for_eject(7, _pending(), Evidence()) is None
+
+        assert cancelled == []  # the sweep's own timers must survive its claim
+
+    def test_every_eject_retirement_cancels_the_timers(self, spawns, cancelled):
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        assert plate_occupancy.claim_for_eject(7, _pending(), Evidence()) is None
+        cancelled.clear()
+
+        assert plate_occupancy.resolve_eject(7, "completed") is None
+
+        assert cancelled == [7]
+
+
+class TestPolicyDriverFailure:
+    """A policy that cannot arm leaves the plate ARMLESS — the one outcome
+    2026-07-18/07-21 forbids. The driver must therefore NEVER swallow: the
+    authority's repair to EscalationOnly depends on the exception escaping."""
+
+    def test_arm_failure_propagates_out_of_on_occupancy_change(self, monkeypatch):
+        mon = EjectCooldownMonitor()
+        _gate_up(1)  # driver not wired yet — just build the occupied view
+        view = plate_occupancy.snapshot(1)
+
+        def _boom(coro, *, name=None):
+            coro.close()
+            raise RuntimeError("spawn failed")
+
+        monkeypatch.setattr(monitor_mod, "spawn_background_task", _boom)
+
+        with pytest.raises(RuntimeError, match="spawn failed"):
+            mon.on_occupancy_change(1, view, "terminal")
+
+        assert mon._armed == {}  # nothing half-registered behind the failure
+
+    def test_a_failed_cooldown_arm_is_repaired_to_an_escalation_hold(self, monkeypatch):
+        """End-to-end never-armless floor: the authority repairs and re-calls."""
+        spawned: list[_FakeTask] = []
+
+        def _spawn(coro, *, name=None):
+            coro.close()
+            if name is not None and name.startswith("eject-cooldown-watch"):
+                raise RuntimeError("cooldown arm failed")
+            task = _FakeTask(name)
+            spawned.append(task)
+            return task
+
+        monkeypatch.setattr(monitor_mod, "spawn_background_task", _spawn)
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+
+        _occupy(1, CooldownEject(unit_id=42, run_id=9))
+
+        assert [t.name for t in spawned] == ["eject-gate-escalation-1"]
+        assert isinstance(mon._armed[1].policy, EscalationOnly)
+        assert isinstance(plate_occupancy.snapshot(1).plate_policy, EscalationOnly)
+        assert plate_occupancy.is_plate_occupied(1) is True  # the plate is never dropped by a repair
+
+
+# --------------------------------------------------------------------------- #
+# The watch bodies
+# --------------------------------------------------------------------------- #
+class TestResolveEjectThresholdFirstArticle:
+    """`_resolve_eject_threshold` must resolve first-article items to no-auto-clear
+    even though they carry an eject profile — and it keys off the SPECIFIC item id
+    (db.get), not the most-recently-started item on the printer (Phase 1)."""
+
+    async def test_first_article_resolves_to_none(self, db_session, monkeypatch):
+        import contextlib
+
+        from backend.app.models.print_queue import PrintQueueItem
+
+        @contextlib.asynccontextmanager
+        async def _fake_session():
+            yield db_session
+
+        monkeypatch.setattr("backend.app.core.database.async_session", _fake_session, raising=False)
+
+        # first_article short-circuits before the profile lookup, so eject_profile_id
+        # just has to be non-null (FK enforcement is off in tests).
+        item = PrintQueueItem(printer_id=7, eject_profile_id=5, first_article=True, status="printing")
+        db_session.add(item)
+        await db_session.commit()
+        await db_session.refresh(item)
+
+        threshold = await monitor_mod._resolve_eject_threshold(item.id)
+        assert threshold is None
+
+
 class TestWatchBedAndClear:
     """The reworked policy: bed ≤ threshold dispatches the eject (on_release) and
     the monitor NEVER clears the plate gate itself; plateau / cap / dispatch-retry
-    drive the stall/cap paths. Returns released|stalled|stale."""
+    drive the stall/cap paths. Returns released|stalled|cleared.
+
+    The gate is the plate-occupancy authority's — ``manager`` supplies the bed only."""
 
     async def test_releases_when_bed_reaches_threshold(self):
+        _gate_up(7)
         mgr = _FakeManager([_status(60), _status(40), _status(27)])
         rel, stall = _ReleaseRecorder(), _StallRecorder()
         outcome = await watch_bed_and_clear(
@@ -227,10 +605,11 @@ class TestWatchBedAndClear:
         )
         assert outcome == "released"
         assert rel.calls == 1  # dispatched exactly once
-        assert mgr.clear_calls == []  # monitor NEVER clears the gate now
+        assert plate_occupancy.is_plate_occupied(7) is True  # monitor NEVER clears the gate now
         assert stall.reasons == []
 
     async def test_releases_at_exact_threshold(self):
+        _gate_up(3)
         mgr = _FakeManager([_status(28.0)])
         rel = _ReleaseRecorder()
         outcome = await watch_bed_and_clear(
@@ -238,11 +617,12 @@ class TestWatchBedAndClear:
         )
         assert outcome == "released"
         assert rel.calls == 1
-        assert mgr.clear_calls == []
+        assert plate_occupancy.is_plate_occupied(3) is True
 
     async def test_dispatch_failure_retries_then_stalls_after_three(self):
         # on_release raises every time (dispatch keeps failing). The watch retries
         # on each poll; after the THIRD consecutive failure it stalls.
+        _gate_up(9)
         mgr = _FakeManager([_status(27)])  # always at threshold
         rel, stall = _ReleaseRecorder(raise_times=99), _StallRecorder()
         outcome = await watch_bed_and_clear(
@@ -258,9 +638,11 @@ class TestWatchBedAndClear:
         assert outcome == "stalled"
         assert rel.calls == 3  # retried until the third failure
         assert stall.reasons == ["eject dispatch failed ×3"]
+        assert plate_occupancy.is_plate_occupied(9) is True
 
     async def test_dispatch_failure_then_success_releases(self):
         # Two failures then the poll's retry succeeds → released, no stall.
+        _gate_up(9)
         mgr = _FakeManager([_status(27)])
         rel, stall = _ReleaseRecorder(raise_times=2), _StallRecorder()
         outcome = await watch_bed_and_clear(
@@ -280,6 +662,7 @@ class TestWatchBedAndClear:
     async def test_plateau_two_strikes_stalls(self):
         # Bed stuck at 50 (above 28); window 40s, epsilon 1.0. Boundaries at 40/80 →
         # two strikes (never cooled) → stalled, NO release.
+        _gate_up(3)
         mgr = _FakeManager([_status(50)] * 10)
         rel, stall = _ReleaseRecorder(), _StallRecorder()
         outcome = await watch_bed_and_clear(
@@ -297,11 +680,13 @@ class TestWatchBedAndClear:
         assert outcome == "stalled"
         assert rel.calls == 0  # never ejected onto a bed that won't cool
         assert len(stall.reasons) == 1
+        assert plate_occupancy.is_plate_occupied(3) is True
 
     async def test_plateau_reset_on_cooling_window_never_stalls(self):
         # Steady cool 0.6°C/poll with epsilon 1.0: a window that cools ≥ epsilon
         # resets the strike streak, so a steadily-cooling bed NEVER false-stalls —
         # it eventually crosses the threshold and releases.
+        _gate_up(4)
         temps = [60 - 0.6 * i for i in range(80)]
         mgr = _FakeManager([_status(t) for t in temps])
         rel, stall = _ReleaseRecorder(), _StallRecorder()
@@ -323,6 +708,7 @@ class TestWatchBedAndClear:
 
     async def test_rising_bed_counts_as_plateau_strike(self):
         # A bed that RISES (anchor - bed < 0 < epsilon) strikes twice → stalled.
+        _gate_up(3)
         mgr = _FakeManager([_status(50), _status(51), _status(52), _status(53), _status(54)])
         rel, stall = _ReleaseRecorder(), _StallRecorder()
         outcome = await watch_bed_and_clear(
@@ -344,6 +730,7 @@ class TestWatchBedAndClear:
         # Rule is `< epsilon` strikes, so cooling EXACTLY epsilon per window is a
         # reset (progress). Cool exactly 1.0/window with epsilon 1.0 → never stalls;
         # eventually crosses threshold and releases.
+        _gate_up(3)
         temps = [50 - 1.0 * i for i in range(40)]
         mgr = _FakeManager([_status(t) for t in temps])
         rel, stall = _ReleaseRecorder(), _StallRecorder()
@@ -366,7 +753,9 @@ class TestWatchBedAndClear:
         # stall_window_s=0 → plateau never evaluated; a stuck bed with no cap never
         # false-stalls and never ejects. The watch's lifetime is the gated phase, so
         # it ends only when the plate-clear gate drops ("cleared").
-        mgr = _FakeManager([_status(50)] * 5, awaiting=[True, True, True, False])
+        _gate_up(3)
+        mgr = _FakeManager([_status(50)] * 5)
+        sleep = _ClearAfter(3, after_polls=3)
         rel, stall = _ReleaseRecorder(), _StallRecorder()
         outcome = await watch_bed_and_clear(
             3,
@@ -374,7 +763,7 @@ class TestWatchBedAndClear:
             manager=mgr,
             escalate_s=100000,
             check_interval_s=20,
-            sleep=_noop_sleep,
+            sleep=sleep,
             stall_window_s=0,
             stall_epsilon_c=1.0,
             max_hold_s=0,
@@ -384,10 +773,12 @@ class TestWatchBedAndClear:
         assert outcome == "cleared"
         assert stall.reasons == []
         assert rel.calls == 0
+        assert sleep.gate_seen == [True, True, True]  # the watch itself never released it
 
     async def test_cap_fires_release_above_threshold(self):
         # No plateau watchdog (window 0); bed stuck at 50 above 28; cap 60s →
         # dispatch the eject anyway at the cap.
+        _gate_up(5)
         mgr = _FakeManager([_status(50)] * 10)
         rel, stall = _ReleaseRecorder(), _StallRecorder()
         outcome = await watch_bed_and_clear(
@@ -409,7 +800,9 @@ class TestWatchBedAndClear:
     async def test_cap_zero_never_forces_release(self):
         # max_hold_s=0 → no cap; a stuck bed with no plateau watchdog never ejects.
         # It runs until the plate-clear gate drops (phase end), never forcing a release.
-        mgr = _FakeManager([_status(50)] * 5, awaiting=[True, True, True, False])
+        _gate_up(5)
+        mgr = _FakeManager([_status(50)] * 5)
+        sleep = _ClearAfter(5, after_polls=3)
         rel = _ReleaseRecorder()
         outcome = await watch_bed_and_clear(
             5,
@@ -417,7 +810,7 @@ class TestWatchBedAndClear:
             manager=mgr,
             escalate_s=100000,
             check_interval_s=20,
-            sleep=_noop_sleep,
+            sleep=sleep,
             stall_window_s=0,
             max_hold_s=0,
             on_release=rel,
@@ -429,6 +822,7 @@ class TestWatchBedAndClear:
         # A poll that is BOTH the plateau's 2nd-strike boundary AND at the cap must
         # STALL (plateau first), not eject. window 40s → 2nd strike at 80s; cap 80s
         # coincides → plateau wins.
+        _gate_up(5)
         mgr = _FakeManager([_status(50)] * 10)
         rel, stall = _ReleaseRecorder(), _StallRecorder()
         outcome = await watch_bed_and_clear(
@@ -450,6 +844,7 @@ class TestWatchBedAndClear:
     async def test_none_status_survives_and_later_releases(self):
         # A None status tick = an unreadable bed, NOT a stop: the watch keeps polling
         # and the later readable crossing still dispatches the eject.
+        _gate_up(9)
         mgr = _FakeManager([None, None, _status(27)])
         rel = _ReleaseRecorder()
         outcome = await watch_bed_and_clear(
@@ -457,11 +852,12 @@ class TestWatchBedAndClear:
         )
         assert outcome == "released"
         assert rel.calls == 1
-        assert mgr.clear_calls == []  # monitor never clears the gate itself
+        assert plate_occupancy.is_plate_occupied(9) is True  # monitor never clears the gate itself
 
     async def test_disconnect_survives_and_later_releases(self):
         # A disconnected tick = an unreadable bed; the watch keeps polling and releases
         # once the printer reconnects with a bed at/below threshold.
+        _gate_up(9)
         mgr = _FakeManager([_status(60, connected=False), _status(60, connected=False), _status(27)])
         rel = _ReleaseRecorder()
         outcome = await watch_bed_and_clear(
@@ -469,12 +865,13 @@ class TestWatchBedAndClear:
         )
         assert outcome == "released"
         assert rel.calls == 1
-        assert mgr.clear_calls == []
+        assert plate_occupancy.is_plate_occupied(9) is True
 
     async def test_plateau_near_threshold_releases_not_quarantines(self):
         # Bed asymptotically settles at 30°C — it plateaus (won't cool further) but is
         # only 2°C above the 28°C threshold, within the 3°C eject margin. The two-armed
         # plateau RELEASES (equilibrated at ambient) instead of quarantining.
+        _gate_up(7)
         mgr = _FakeManager([_status(30)] * 10)
         rel, stall = _ReleaseRecorder(), _StallRecorder()
         outcome = await watch_bed_and_clear(
@@ -497,6 +894,7 @@ class TestWatchBedAndClear:
     async def test_plateau_far_above_threshold_still_quarantines(self):
         # Bed plateaus at 40°C, 12°C above the 28°C threshold and well past the 3°C
         # margin — genuinely stuck hot → quarantine, NO eject.
+        _gate_up(7)
         mgr = _FakeManager([_status(40)] * 10)
         rel, stall = _ReleaseRecorder(), _StallRecorder()
         outcome = await watch_bed_and_clear(
@@ -521,18 +919,42 @@ class TestWatchBedAndClear:
         # poll 2's status (27°C), but the gate-check at the top of poll 2 exits
         # "cleared" BEFORE that bed is ever read — so NO eject is dispatched onto the
         # now-empty plate (the eject-onto-cleared-plate latent bug is closed).
-        mgr = _FakeManager([_status(50), _status(27)], awaiting=[True, False])
+        _gate_up(7)
+        mgr = _FakeManager([_status(50), _status(27)])
+        rel = _ReleaseRecorder()
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=100000,
+            check_interval_s=20,
+            sleep=_ClearAfter(7, after_polls=1),
+            on_release=rel,
+        )
+        assert outcome == "cleared"
+        assert rel.calls == 0  # never ejected onto the cleared plate
+
+    async def test_the_gate_is_read_from_the_authority_not_the_manager(self):
+        """A manager that still answers "gate up" cannot keep a watch alive.
+
+        The gate moved to the plate-occupancy authority precisely so no second
+        store could disagree with it; a manager-shaped answer must be ignored."""
+        mgr = SimpleNamespace(
+            get_status=lambda pid: _status(27),
+            is_awaiting_plate_clear=lambda pid: True,  # the stale second opinion
+        )
         rel = _ReleaseRecorder()
         outcome = await watch_bed_and_clear(
             7, 28.0, manager=mgr, escalate_s=100000, check_interval_s=20, sleep=_noop_sleep, on_release=rel
         )
-        assert outcome == "cleared"
-        assert rel.calls == 0  # never ejected onto the cleared plate
+        assert outcome == "cleared"  # the authority says the plate is clear — that is final
+        assert rel.calls == 0
 
     async def test_escalates_once_then_keeps_watching_until_release(self):
         # Hot past the escalate window, THEN cools. escalate_s=40, interval=20 →
         # escalation fires at elapsed==40, watch continues, and the later crossing
         # still dispatches the eject (released).
+        _gate_up(5)
         mgr = _FakeManager([_status(60), _status(60), _status(60), _status(27)])
         notify, rel = _NotifyRecorder(), _ReleaseRecorder()
         outcome = await watch_bed_and_clear(
@@ -540,10 +962,12 @@ class TestWatchBedAndClear:
         )
         assert outcome == "released"  # watch did NOT stop at the escalate window
         assert rel.calls == 1
-        assert mgr.clear_calls == []
+        assert plate_occupancy.is_plate_occupied(5) is True
         assert notify.calls == [5]  # fired exactly once
+        assert notify.bed_calls == [60]  # the live bed at fire time rides along
 
     async def test_escalation_notify_failure_does_not_kill_watch(self):
+        _gate_up(6)
         mgr = _FakeManager([_status(60), _status(60), _status(60), _status(27)])
         notify, rel = _NotifyRecorder(raise_exc=True), _ReleaseRecorder()
         outcome = await watch_bed_and_clear(
@@ -557,102 +981,15 @@ class TestWatchBedAndClear:
         # A never-cooling bed that later goes offline does NOT end the watch — a
         # disconnected tick is survived (unreadable bed). The watch's lifetime is the
         # gated phase, so it ends only when the plate-clear gate drops ("cleared").
-        mgr = _FakeManager(
-            [_status(60), _status(60), _status(60, connected=False)],
-            awaiting=[True, True, True, False],
-        )
+        _gate_up(9)
+        mgr = _FakeManager([_status(60), _status(60), _status(60, connected=False)])
+        sleep = _ClearAfter(9, after_polls=3)
         notify = _NotifyRecorder()
         outcome = await watch_bed_and_clear(
-            9, 28.0, manager=mgr, escalate_s=100000, check_interval_s=20, sleep=_noop_sleep, notify=notify
+            9, 28.0, manager=mgr, escalate_s=100000, check_interval_s=20, sleep=sleep, notify=notify
         )
         assert outcome == "cleared"
-        assert mgr.clear_calls == []
-
-
-class TestOnTerminalStatusArming:
-    """Phase 1: the auto-clear watch arms ONLY with a positively correlated
-    queue_item_id AND a success terminal. Everything else leaves the gate alone."""
-
-    def _mon_with_recording_start(self, monkeypatch):
-        mon = EjectCooldownMonitor()
-        calls: list[tuple[int, int]] = []
-
-        def fake_start(pid, qid):
-            calls.append((pid, qid))
-            return True
-
-        monkeypatch.setattr(mon, "_start_watch", fake_start)
-        return mon, calls
-
-    def test_no_arm_without_queue_item_id(self, monkeypatch):
-        # A finish we could not attribute to a unit (foreign/none/fallback) passes
-        # queue_item_id=None — it must NOT auto-clear.
-        mon, calls = self._mon_with_recording_start(monkeypatch)
-        mon.on_terminal_status(7, "completed", queue_item_id=None)
-        assert calls == []
-
-    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled"])
-    def test_no_arm_on_non_success(self, status, monkeypatch):
-        mon, calls = self._mon_with_recording_start(monkeypatch)
-        mon.on_terminal_status(7, status, queue_item_id=42)
-        assert calls == []
-
-    def test_arms_on_completed_with_item(self, monkeypatch):
-        mon, calls = self._mon_with_recording_start(monkeypatch)
-        mon.on_terminal_status(7, "completed", queue_item_id=42)
-        assert calls == [(7, 42)]
-
-    def test_returns_false_without_queue_item_id(self, monkeypatch):
-        # No queue item → no arm, and the bool result the caller keys the escalation-only
-        # fallback off is False.
-        mon, calls = self._mon_with_recording_start(monkeypatch)
-        assert mon.on_terminal_status(7, "completed", queue_item_id=None) is False
-        assert calls == []
-
-    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled"])
-    def test_returns_false_on_non_success(self, status, monkeypatch):
-        mon, calls = self._mon_with_recording_start(monkeypatch)
-        assert mon.on_terminal_status(7, status, queue_item_id=42) is False
-        assert calls == []
-
-    def test_returns_true_when_it_arms(self, monkeypatch):
-        # Arms a cooldown watch → returns the _start_watch result (True here).
-        mon, calls = self._mon_with_recording_start(monkeypatch)
-        assert mon.on_terminal_status(7, "completed", queue_item_id=42) is True
-        assert calls == [(7, 42)]
-
-    def test_returns_false_when_start_watch_dedupes(self, monkeypatch):
-        # A watch already in flight → _start_watch returns False → on_terminal_status
-        # propagates that False (the caller then arms the escalation-only hold).
-        mon = EjectCooldownMonitor()
-        monkeypatch.setattr(mon, "_start_watch", lambda pid, qid: False)
-        assert mon.on_terminal_status(7, "completed", queue_item_id=42) is False
-
-
-class _FakeGateManager:
-    """Scripted gate/status source for the escalation-only watch. Advances one
-    scripted step per poll (both is_awaiting_plate_clear and get_status read the
-    same step) and records any set_awaiting_plate_clear call so a test can prove
-    the escalation watch NEVER releases the gate."""
-
-    def __init__(self, script):
-        self._script = list(script)  # [(awaiting: bool, status: SimpleNamespace | None), ...]
-        self._i = 0
-        self._current = (False, None)
-        self.clear_calls: list[tuple] = []
-
-    def is_awaiting_plate_clear(self, printer_id):
-        self._current = (
-            self._script[self._i] if self._i < len(self._script) else (self._script[-1:] or [(False, None)])[0]
-        )
-        self._i += 1
-        return self._current[0]
-
-    def get_status(self, printer_id):
-        return self._current[1]
-
-    def set_awaiting_plate_clear(self, printer_id, awaiting, source_subtask_id=None):
-        self.clear_calls.append((printer_id, awaiting, source_subtask_id))
+        assert sleep.gate_seen == [True, True, True]  # held the gate across the disconnect
 
 
 class TestWatchGateEscalationOnly:
@@ -661,200 +998,123 @@ class TestWatchGateEscalationOnly:
     gate itself."""
 
     async def test_exits_when_gate_cleared_externally(self):
-        mgr = _FakeGateManager([(True, _status(60)), (False, None)])
+        _gate_up(7)
+        sleep = _ClearAfter(7, after_polls=1)
         notify = _NotifyRecorder()
-        outcome = await watch_gate_escalation_only(
-            7, manager=mgr, escalate_s=100, check_interval_s=20, sleep=_noop_sleep, notify=notify
-        )
+        outcome = await watch_gate_escalation_only(7, escalate_s=100, check_interval_s=20, sleep=sleep, notify=notify)
         assert outcome == "cleared"
         assert notify.calls == []  # cleared before the escalation window
-        assert mgr.clear_calls == []  # the watch itself never releases
+        assert sleep.gate_seen == [True]  # the watch itself never released it
 
     async def test_escalates_once_then_exits_on_external_clear(self):
-        mgr = _FakeGateManager([(True, _status(60)), (True, _status(60)), (True, _status(60)), (False, None)])
+        _gate_up(9)
+        sleep = _ClearAfter(9, after_polls=3)
         notify = _NotifyRecorder()
-        outcome = await watch_gate_escalation_only(
-            9, manager=mgr, escalate_s=40, check_interval_s=20, sleep=_noop_sleep, notify=notify
-        )
+        outcome = await watch_gate_escalation_only(9, escalate_s=40, check_interval_s=20, sleep=sleep, notify=notify)
         assert outcome == "cleared"
         assert notify.calls == [9]  # fired exactly once
-        assert mgr.clear_calls == []
+        assert sleep.gate_seen == [True, True, True]
 
     async def test_cold_bed_does_not_release_gate(self):
         # The KEY difference from watch_bed_and_clear: even a fully cooled bed does
         # NOT auto-release a foreign gate — only the operator (external clear) does.
-        mgr = _FakeGateManager([(True, _status(20)), (True, _status(20)), (False, None)])
+        # The bed is irrelevant here by construction: this watch takes no ``manager``
+        # because it reads no temperature — its only question is whether the plate is
+        # still occupied.
+        _gate_up(5)
+        sleep = _ClearAfter(5, after_polls=3)
         notify = _NotifyRecorder()
-        outcome = await watch_gate_escalation_only(
-            5, manager=mgr, escalate_s=100, check_interval_s=20, sleep=_noop_sleep, notify=notify
-        )
+        outcome = await watch_gate_escalation_only(5, escalate_s=100, check_interval_s=20, sleep=sleep, notify=notify)
         assert outcome == "cleared"
-        assert mgr.clear_calls == []
+        assert sleep.gate_seen == [True, True, True]  # held throughout a cold bed
 
     async def test_disconnected_tick_keeps_polling_then_escalates_and_clears(self):
         # F3: a disconnected/stale tick no longer ABORTS the foreign-gate watch (the
         # old "stale" exit is gone — it stranded printers that briefly dropped off).
         # The gate is held for the whole PHASE: the watch keeps polling across the
         # disconnect, escalates ONCE, and exits only when the gate is cleared.
-        mgr = _FakeGateManager(
-            [
-                (True, _status(60)),  # tick 0 — elapsed 0
-                (True, _status(60, connected=False)),  # tick 1 — DISCONNECTED, must NOT abort
-                (True, _status(60)),  # tick 2 — elapsed 40 → escalation window
-                (False, None),  # tick 3 — operator clears the gate
-            ]
-        )
+        #
+        # Since the cut-over this is true BY CONSTRUCTION rather than by tolerance:
+        # the watch never consults the printer at all, so connectivity cannot end it.
+        # The pin stays because the PHASE-not-connectivity lifetime is the contract,
+        # however it is achieved.
+        _gate_up(4)
+        sleep = _ClearAfter(4, after_polls=3)
         notify = _NotifyRecorder()
-        outcome = await watch_gate_escalation_only(
-            4, manager=mgr, escalate_s=40, check_interval_s=20, sleep=_noop_sleep, notify=notify
-        )
+        outcome = await watch_gate_escalation_only(4, escalate_s=40, check_interval_s=20, sleep=sleep, notify=notify)
         assert outcome == "cleared"
         assert notify.calls == [4]  # escalated exactly once despite the mid-hold disconnect
-        assert mgr.clear_calls == []  # the watch itself never releases
+        assert sleep.gate_seen == [True, True, True]  # the watch itself never releases
 
     async def test_escalation_notify_failure_does_not_kill_watch(self):
-        mgr = _FakeGateManager([(True, _status(60)), (True, _status(60)), (True, _status(60)), (False, None)])
+        _gate_up(6)
+        sleep = _ClearAfter(6, after_polls=3)
         notify = _NotifyRecorder(raise_exc=True)
-        outcome = await watch_gate_escalation_only(
-            6, manager=mgr, escalate_s=40, check_interval_s=20, sleep=_noop_sleep, notify=notify
-        )
+        outcome = await watch_gate_escalation_only(6, escalate_s=40, check_interval_s=20, sleep=sleep, notify=notify)
         assert outcome == "cleared"
         assert notify.calls == [6]  # attempted once; exception swallowed
 
 
-async def _seed_printer(db_session, *, awaiting, gate_subtask_id, serial, quarantined=False):
-    from backend.app.models.printer import Printer
+class TestNotifyPlateNotEmpty:
+    """``notify_plate_not_empty`` is PUBLIC since the cut-over: three lanes outside
+    this module page through it (the escalation hold, the runtime watchdog's stop,
+    the start deadline), so it is one implementation with one name."""
 
-    printer = Printer(
-        name=f"P-{serial}",
-        serial_number=serial,
-        ip_address="10.0.0.1",
-        access_code="0000",
-        model="H2S",
-        awaiting_plate_clear=awaiting,
-        plate_gate_subtask_id=gate_subtask_id,
-        quarantined=quarantined,
-    )
-    db_session.add(printer)
-    await db_session.commit()
-    await db_session.refresh(printer)
-    return printer
-
-
-async def _seed_completed_eject_item(db_session, *, printer_id, dispatch_subtask_id):
-    from datetime import datetime, timezone
-
-    from backend.app.models.print_queue import PrintQueueItem
-
-    item = PrintQueueItem(
-        printer_id=printer_id,
-        eject_profile_id=1,
-        status="completed",
-        first_article=False,
-        dispatch_subtask_id=dispatch_subtask_id,
-        started_at=datetime.now(timezone.utc),
-    )
-    db_session.add(item)
-    await db_session.commit()
-    await db_session.refresh(item)
-    return item
-
-
-class TestRearmRequiresSubtaskMatch:
-    """rearm_on_startup only re-arms a COOLDOWN watch on a gate it can positively tie
-    to the eject job: the last-started item's dispatch_subtask_id must equal the
-    printer's persisted plate_gate_subtask_id (both non-null). A gate it CANNOT tie
-    (foreign / pre-migration NULL / mismatch) never auto-clears — but instead of being
-    left watch-less (a silent stall) it arms the escalation-only hold (F3). A
-    quarantined printer is excluded entirely."""
-
-    @staticmethod
-    def _patch(monkeypatch, db_session):
+    async def test_resolves_the_printer_name_and_forwards_the_source_detail(self, db_session, monkeypatch):
         import contextlib
 
-        from backend.app.services.eject import monitor as monitor_mod
+        from backend.app.models.printer import Printer
+        from backend.app.services.notification_service import notification_service
+
+        printer = Printer(
+            name="P-NOTIFY",
+            serial_number="NOTIFY-1",
+            ip_address="10.0.0.1",
+            access_code="0000",
+            model="H2S",
+        )
+        db_session.add(printer)
+        await db_session.commit()
+        await db_session.refresh(printer)
 
         @contextlib.asynccontextmanager
         async def _fake_session():
             yield db_session
 
         monkeypatch.setattr("backend.app.core.database.async_session", _fake_session, raising=False)
-        mon = EjectCooldownMonitor()
-        started: list[tuple[int, int]] = []
-        escalated: list[int] = []
-        monkeypatch.setattr(mon, "_start_watch", lambda pid, qid: started.append((pid, qid)) or True)
-        monkeypatch.setattr(mon, "start_escalation_only_watch", lambda pid: escalated.append(pid) or True)
-        return mon, started, escalated
+        seen: dict[str, object] = {}
 
-    async def test_rearms_when_subtask_matches(self, db_session, monkeypatch):
-        printer = await _seed_printer(db_session, awaiting=True, gate_subtask_id="SUB-1", serial="RE-1")
-        item = await _seed_completed_eject_item(db_session, printer_id=printer.id, dispatch_subtask_id="SUB-1")
-        mon, started, escalated = self._patch(monkeypatch, db_session)
-        rearmed = await mon.rearm_on_startup()
-        assert rearmed == 1
-        assert started == [(printer.id, item.id)]
-        assert escalated == []  # a cooldown re-arm never also arms escalation-only
+        async def _fake_notify(printer_id, printer_name, db, difference_percent=None, *, source_detail=""):
+            seen["args"] = (printer_id, printer_name, source_detail)
 
-    async def test_escalation_only_on_subtask_mismatch(self, db_session, monkeypatch):
-        # Gate-subtask mismatch → NOT cooldown-re-armed, but NOT left watch-less: the
-        # stranded plate arms the escalation-only hold instead (rearmed count stays 0).
-        printer = await _seed_printer(db_session, awaiting=True, gate_subtask_id="SUB-1", serial="RE-2")
-        await _seed_completed_eject_item(db_session, printer_id=printer.id, dispatch_subtask_id="SUB-2")
-        mon, started, escalated = self._patch(monkeypatch, db_session)
-        rearmed = await mon.rearm_on_startup()
-        assert rearmed == 0
-        assert started == []
-        assert escalated == [printer.id]
+        monkeypatch.setattr(notification_service, "on_plate_not_empty", _fake_notify)
 
-    async def test_escalation_only_on_null_gate_source(self, db_session, monkeypatch):
-        # A pre-migration / foreign gate has no source id — never auto-clears, but the
-        # gate must still escalate rather than sit silently → escalation-only armed.
-        printer = await _seed_printer(db_session, awaiting=True, gate_subtask_id=None, serial="RE-3")
-        await _seed_completed_eject_item(db_session, printer_id=printer.id, dispatch_subtask_id="SUB-9")
-        mon, started, escalated = self._patch(monkeypatch, db_session)
-        rearmed = await mon.rearm_on_startup()
-        assert rearmed == 0
-        assert started == []
-        assert escalated == [printer.id]
+        await notify_plate_not_empty(printer.id, source_detail="the sweep never started")
 
-    async def test_escalation_only_when_no_prior_item(self, db_session, monkeypatch):
-        # A gate raised with NO last-started item at all (e.g. a native-vision plate
-        # gate) still escalates rather than sitting watch-less.
-        printer = await _seed_printer(db_session, awaiting=True, gate_subtask_id="SUB-1", serial="RE-N")
-        mon, started, escalated = self._patch(monkeypatch, db_session)
-        rearmed = await mon.rearm_on_startup()
-        assert rearmed == 0
-        assert started == []
-        assert escalated == [printer.id]
-
-    async def test_no_rearm_when_printer_quarantined(self, db_session, monkeypatch):
-        # A quarantined printer is excluded from the query entirely — with a matching
-        # gate it re-arms NOTHING (not even escalation-only): its plate stays gated for
-        # a human and quarantine handling owns it.
-        printer = await _seed_printer(
-            db_session, awaiting=True, gate_subtask_id="SUB-1", serial="RE-Q", quarantined=True
-        )
-        await _seed_completed_eject_item(db_session, printer_id=printer.id, dispatch_subtask_id="SUB-1")
-        mon, started, escalated = self._patch(monkeypatch, db_session)
-        rearmed = await mon.rearm_on_startup()
-        assert rearmed == 0
-        assert started == []
-        assert escalated == []
+        assert seen["args"] == (printer.id, "P-NOTIFY", "the sweep never started")
 
 
-class TestActiveWatch:
-    """Phase 4.3c: the monitor exposes the in-flight cooldown watch's release
-    threshold so the UI can render the cooldown phase. The escalation-only
-    (foreign-gate) watch and a still-resolving watch expose None."""
+# --------------------------------------------------------------------------- #
+# The armed watch's own resolution (threshold publication + release binding)
+# --------------------------------------------------------------------------- #
+class TestArmedWatchResolution:
+    """Phase 4.3c: the armed watch publishes its release threshold so the UI can
+    render the cooldown phase. An escalation-only hold and a still-resolving watch
+    expose None. The record is dropped when the watch exits."""
 
     def test_none_when_nothing_armed(self):
         mon = EjectCooldownMonitor()
         assert mon.active_watch(7) is None
 
-    @pytest.mark.asyncio
-    async def test_cooldown_watch_exposes_threshold_then_clears(self, monkeypatch):
-        import backend.app.services.eject.monitor as monitor_mod
+    def _seed_armed(self, mon: EjectCooldownMonitor, printer_id: int, policy) -> None:
+        """Register the watch record the driver would have created, owned by THIS task.
 
+        ``_watch`` publishes its threshold only onto a record whose task is the
+        running one — that identity check is what stops a cancelled predecessor
+        from writing over its successor's threshold."""
+        mon._armed[printer_id] = _ArmedWatch(policy=policy, task=asyncio.current_task())
+
+    async def test_cooldown_watch_exposes_threshold_then_clears(self, monkeypatch):
         mon = EjectCooldownMonitor()
         seen: dict[str, float | None] = {}
 
@@ -874,31 +1134,40 @@ class TestActiveWatch:
         monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", fake_resolve)
         monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", fake_settings)
         monkeypatch.setattr(monitor_mod, "watch_bed_and_clear", fake_watch)
-        mon._watching[7] = None  # what _start_watch records before spawning
-        await mon._watch(7, 42)
+        self._seed_armed(mon, 7, CooldownEject(unit_id=42, run_id=None))
+
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
         assert seen["mid"] == 33.0
-        assert mon.active_watch(7) is None  # popped when the watch exits
+        assert mon.active_watch(7) is None  # record dropped when the watch exits
 
-    @pytest.mark.asyncio
-    async def test_non_eject_item_exposes_nothing(self, monkeypatch):
-        import backend.app.services.eject.monitor as monitor_mod
+    async def test_non_eject_item_holds_the_plate_with_an_escalation_watch(self, monkeypatch):
+        """A releasing policy over a unit with no usable eject profile must HOLD.
 
+        Returning into silence would leave the plate armless — the outcome
+        2026-07-18/07-21 forbids — so the watch falls back to the escalation hold."""
         mon = EjectCooldownMonitor()
+        held: list[int] = []
 
         async def fake_resolve(qid, *, for_first_article=False):
             return None  # not an eject job
 
+        async def fake_escalation(pid, **kwargs):
+            held.append(pid)
+            return "cleared"
+
         monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", fake_resolve)
-        mon._watching[7] = None
-        await mon._watch(7, 42)
+        monkeypatch.setattr(monitor_mod, "watch_gate_escalation_only", fake_escalation)
+        self._seed_armed(mon, 7, CooldownEject(unit_id=42, run_id=None))
+
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert held == [7]
         assert mon.active_watch(7) is None
 
-    @pytest.mark.asyncio
     async def test_fa_watch_resolves_fa_threshold_and_releases_into_fa_dispatch(self, monkeypatch):
-        """start_fa_eject_watch → _watch(purpose='fa'): the FA guard is skipped
+        """A FirstArticleEject policy → _watch(purpose='fa'): the FA guard is skipped
         (for_first_article=True) and the release action is the FA dispatcher."""
-        import backend.app.services.eject.monitor as monitor_mod
-
         mon = EjectCooldownMonitor()
         seen: dict[str, object] = {}
 
@@ -921,54 +1190,23 @@ class TestActiveWatch:
         monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", fake_settings)
         monkeypatch.setattr(monitor_mod, "watch_bed_and_clear", fake_watch)
         monkeypatch.setattr(monitor_mod, "_dispatch_fa_eject", fake_fa_dispatch)
-        mon._watching[7] = None  # what start_fa_eject_watch records before spawning
-        await mon._watch(7, 42, purpose="fa", run_id=9)
+        self._seed_armed(mon, 7, FirstArticleEject(unit_id=42, run_id=9))
+
+        await mon._watch(7, 42, purpose="fa", run_id=9, release_now=asyncio.Event())
+
         assert seen["resolve"] == (42, True)
         assert seen["threshold"] == 33.0
         assert seen["fa_dispatch"] == (7, 42, 9)
-        assert mon.active_watch(7) is None  # popped on exit
+        assert mon.active_watch(7) is None  # dropped on exit
 
-    @pytest.mark.asyncio
-    async def test_stall_settings_read_failure_falls_back_to_schema_defaults(self, monkeypatch):
-        """A settings-store failure at arm time must arm with schema defaults,
-        never kill the watch (a dead watch strands the plate-clear gate)."""
-        import backend.app.core.database as db_mod
-        import backend.app.services.eject.monitor as monitor_mod
-        from backend.app.schemas.settings import AppSettings
-
-        def broken_session():
-            raise RuntimeError("settings DB unavailable")
-
-        monkeypatch.setattr(db_mod, "async_session", broken_session)
-        window_s, epsilon, max_hold_s, margin = await monitor_mod._resolve_stall_settings()
-        fields = AppSettings.model_fields
-        assert window_s == int(fields["farm_cooldown_stall_window_minutes"].default) * 60
-        assert epsilon == float(fields["farm_cooldown_stall_epsilon_c"].default)
-        assert max_hold_s == int(fields["farm_cooldown_max_hold_minutes"].default) * 60
-        assert margin == float(fields["farm_cooldown_plateau_eject_margin_c"].default)
-
-    def test_start_fa_eject_watch_dedupes_against_inflight_watch(self, monkeypatch):
-        import backend.app.services.eject.monitor as monitor_mod
-
-        def fake_spawn(coro, name=None):
-            coro.close()
-            return None
-
-        monkeypatch.setattr(monitor_mod, "spawn_background_task", fake_spawn)
-        mon = EjectCooldownMonitor()
-        assert mon.start_fa_eject_watch(7, 42, 9) is True
-        assert mon.start_fa_eject_watch(7, 42, 9) is False  # deduped
-        mon._watching.pop(7, None)
-
-    @pytest.mark.asyncio
     async def test_foreign_watch_uses_direct_threshold_and_releases_into_foreign_dispatch(self, monkeypatch):
-        """start_foreign_eject_watch → _watch(purpose='foreign'): the threshold is
+        """A ForeignAutoEject policy → _watch(purpose='foreign'): the threshold is
         passed DIRECTLY (no queue item, so _resolve_eject_threshold is NEVER called),
         the watch exposes it, and the release action is the foreign-plate dispatcher
-        bound to the chosen profile (F5)."""
-        import backend.app.services.eject.manual as manual_mod
-        import backend.app.services.eject.monitor as monitor_mod
+        bound to the chosen profile (F5).
 
+        The dispatcher now lives in ``eject.remote`` (it moved out of ``eject.manual``
+        with the cut-over), so the binding is asserted against that module."""
         mon = EjectCooldownMonitor()
         seen: dict[str, object] = {}
 
@@ -991,59 +1229,49 @@ class TestActiveWatch:
         monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", fake_resolve)
         monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", fake_settings)
         monkeypatch.setattr(monitor_mod, "watch_bed_and_clear", fake_watch)
-        # The foreign on_release lazy-imports this name from the manual module.
-        monkeypatch.setattr(manual_mod, "dispatch_identified_foreign_eject", fake_foreign_dispatch)
-        mon._watching[7] = None  # what start_foreign_eject_watch records before spawning
-        await mon._watch(7, None, purpose="foreign", threshold_override=33.0, profile_id=5)
+        monkeypatch.setattr(monitor_mod.eject_remote, "dispatch_identified_foreign_eject", fake_foreign_dispatch)
+        self._seed_armed(mon, 7, ForeignAutoEject(profile_id=5, threshold_c=33.0))
+
+        await mon._watch(7, None, purpose="foreign", threshold_override=33.0, profile_id=5, release_now=asyncio.Event())
+
         assert seen["threshold"] == 33.0
         assert seen["mid"] == 33.0  # foreign watch exposes its release threshold to the UI
         assert seen["dispatch"] == (7, 5)
         assert "resolve_called" not in seen  # direct threshold skips _resolve_eject_threshold
-        assert mon.active_watch(7) is None  # popped on exit
+        assert mon.active_watch(7) is None  # dropped on exit
 
-    def test_start_foreign_eject_watch_dedupes_against_inflight_watch(self, monkeypatch):
-        import backend.app.services.eject.monitor as monitor_mod
+    async def test_stall_settings_read_failure_falls_back_to_schema_defaults(self, monkeypatch):
+        """A settings-store failure at arm time must arm with schema defaults,
+        never kill the watch (a dead watch strands the plate-clear gate)."""
+        import backend.app.core.database as db_mod
+        from backend.app.schemas.settings import AppSettings
 
-        def fake_spawn(coro, name=None):
-            coro.close()  # never run — avoid "never awaited" warnings
-            return None
+        def broken_session():
+            raise RuntimeError("settings DB unavailable")
 
-        monkeypatch.setattr(monitor_mod, "spawn_background_task", fake_spawn)
-        mon = EjectCooldownMonitor()
-        assert mon.start_foreign_eject_watch(7, 5, 33.0) is True
-        assert mon.active_watch(7) is None  # sentinel until the watch resolves (mirrors prod/FA)
-        assert mon.start_foreign_eject_watch(7, 5, 33.0) is False  # deduped
-        assert mon.start_escalation_only_watch(7) is False  # any other watch also deduped
-        mon._watching.pop(7, None)
-
-    def test_escalation_only_watch_has_no_threshold_and_dedupes(self, monkeypatch):
-        import backend.app.services.eject.monitor as monitor_mod
-
-        def fake_spawn(coro, name=None):
-            coro.close()  # never run — avoid "never awaited" warnings
-            return None
-
-        monkeypatch.setattr(monitor_mod, "spawn_background_task", fake_spawn)
-        mon = EjectCooldownMonitor()
-        assert mon.start_escalation_only_watch(7) is True
-        assert mon.active_watch(7) is None  # sentinel: gate held, no cooldown target
-        assert mon.start_escalation_only_watch(7) is False  # deduped
-        assert mon._start_watch(7, 42) is False  # cooldown watch also deduped
+        monkeypatch.setattr(db_mod, "async_session", broken_session)
+        window_s, epsilon, max_hold_s, margin = await monitor_mod._resolve_stall_settings()
+        fields = AppSettings.model_fields
+        assert window_s == int(fields["farm_cooldown_stall_window_minutes"].default) * 60
+        assert epsilon == float(fields["farm_cooldown_stall_epsilon_c"].default)
+        assert max_hold_s == int(fields["farm_cooldown_max_hold_minutes"].default) * 60
+        assert margin == float(fields["farm_cooldown_plateau_eject_margin_c"].default)
 
     def test_printer_state_payload_helper(self):
-        # printer_manager exposes the watch as {"threshold_c": t} / None.
+        # printer_manager exposes the armed watch as {"threshold_c": t} / None.
         from backend.app.services.eject.monitor import eject_cooldown_monitor
         from backend.app.services.printer_manager import _eject_watch_payload
 
         assert _eject_watch_payload(None) is None
         assert _eject_watch_payload(901) is None
-        eject_cooldown_monitor._watching[901] = 33.0
+        armed = _ArmedWatch(policy=CooldownEject(unit_id=1, run_id=None), task=_FakeTask("x"), threshold_c=33.0)
+        eject_cooldown_monitor._armed[901] = armed
         try:
             assert _eject_watch_payload(901) == {"threshold_c": 33.0}
-            eject_cooldown_monitor._watching[901] = None  # escalation-only sentinel
+            armed.threshold_c = None  # escalation-only hold / still resolving
             assert _eject_watch_payload(901) is None
         finally:
-            eject_cooldown_monitor._watching.pop(901, None)
+            eject_cooldown_monitor._armed.pop(901, None)
 
 
 class TestResolveStallSettings:
@@ -1062,7 +1290,6 @@ class TestResolveStallSettings:
 
     async def test_defaults_when_no_rows(self, db_session, monkeypatch):
         from backend.app.schemas.settings import AppSettings
-        from backend.app.services.eject import monitor as monitor_mod
 
         self._patch_session(monkeypatch, db_session)
         window_s, epsilon, max_hold_s, margin = await monitor_mod._resolve_stall_settings()
@@ -1074,7 +1301,6 @@ class TestResolveStallSettings:
 
     async def test_reads_settings_rows_and_converts_minutes(self, db_session, monkeypatch):
         from backend.app.api.routes.settings import set_setting
-        from backend.app.services.eject import monitor as monitor_mod
 
         self._patch_session(monkeypatch, db_session)
         await set_setting(db_session, "farm_cooldown_stall_window_minutes", "10")
@@ -1092,10 +1318,10 @@ class TestManualReleaseNow:
     """W2: an armed watch's release_now event drives an immediate manual eject
     through the SAME _do_release path, bypassing the cooldown threshold."""
 
-    @pytest.mark.asyncio
     async def test_preset_event_releases_even_hot(self):
         # Bed 60 is well ABOVE the 30 threshold — a normal poll would NOT release.
         # The pre-set release_now event fires the manual release on the first poll.
+        _gate_up(7)
         event = asyncio.Event()
         event.set()
         mgr = _FakeManager([_status(60)] * 3)
@@ -1114,9 +1340,9 @@ class TestManualReleaseNow:
         assert rel.calls == 1  # dispatched despite the hot bed
         assert not event.is_set()  # consumed
 
-    @pytest.mark.asyncio
     async def test_no_event_falls_through_to_threshold(self):
         # Without release_now, the same hot bed keeps cooling (no manual release).
+        _gate_up(7)
         mgr = _FakeManager([_status(60), _status(25)])
         rel = _ReleaseRecorder()
         outcome = await watch_bed_and_clear(
@@ -1131,10 +1357,11 @@ class TestDoReleaseGateGuard:
     boundary. If the gate dropped between the top-of-poll check and here, the watch
     exits 'cleared' and NEVER sweeps an already-emptied plate."""
 
-    @pytest.mark.asyncio
     async def test_gate_dropped_at_release_boundary_exits_cleared(self):
-        # awaiting: True at the top-of-poll check, False when _do_release re-checks.
-        mgr = _FakeManager([_status(20)], awaiting=[True, False])
+        # The gate is up at the top-of-poll check and dropped by the time _do_release
+        # re-checks — the bed read is the sync seam between the two.
+        _gate_up(3)
+        mgr = _FakeManager([_status(20)], on_status=lambda: plate_occupancy.clear_plate(3))
         rel = _ReleaseRecorder()
         outcome = await watch_bed_and_clear(
             3, 30.0, manager=mgr, escalate_s=100000, check_interval_s=20, sleep=_noop_sleep, on_release=rel
@@ -1142,41 +1369,13 @@ class TestDoReleaseGateGuard:
         assert outcome == "cleared"
         assert rel.calls == 0  # never swept the emptied plate
 
-    @pytest.mark.asyncio
     async def test_gate_up_throughout_releases_normally(self):
         # Sanity: gate stays up → the same bed ≤ threshold releases.
-        mgr = _FakeManager([_status(20)], awaiting=True)
+        _gate_up(3)
+        mgr = _FakeManager([_status(20)])
         rel = _ReleaseRecorder()
         outcome = await watch_bed_and_clear(
             3, 30.0, manager=mgr, escalate_s=100000, check_interval_s=20, sleep=_noop_sleep, on_release=rel
         )
         assert outcome == "released"
         assert rel.calls == 1
-
-
-class TestActiveWatchIdentityAndRelease:
-    """W2 accessors: active_watch keeps its float|None contract; the new identity +
-    release_now accessors expose the _ActiveWatch only for a real cooldown/FA watch."""
-
-    def test_active_watch_identity_only_for_active_watch(self):
-        mon = EjectCooldownMonitor()
-        assert mon.active_watch_identity(7) is None  # nothing armed
-        aw = _ActiveWatch(threshold_c=33.0, queue_item_id=42, purpose="production", release_now=asyncio.Event())
-        mon._watching[7] = aw
-        assert mon.active_watch(7) == 33.0  # unchanged contract
-        assert mon.active_watch_identity(7) is aw
-        # None sentinel (escalation-only / resolving) exposes no identity.
-        mon._watching[8] = None
-        assert mon.active_watch_identity(8) is None
-        assert mon.active_watch(8) is None
-
-    def test_request_release_now(self):
-        mon = EjectCooldownMonitor()
-        assert mon.request_release_now(7) is False  # nothing armed
-        aw = _ActiveWatch(threshold_c=33.0, queue_item_id=42, purpose="production", release_now=asyncio.Event())
-        mon._watching[7] = aw
-        assert mon.request_release_now(7) is True
-        assert aw.release_now.is_set()
-        # Escalation-only sentinel is not releasable.
-        mon._watching[9] = None
-        assert mon.request_release_now(9) is False

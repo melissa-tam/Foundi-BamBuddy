@@ -2,6 +2,19 @@
 
 from types import SimpleNamespace
 
+import pytest
+
+from backend.app.services.plate_occupancy import plate_occupancy
+
+
+@pytest.fixture(autouse=True)
+def _clean_authority():
+    """``_is_printer_idle`` asks the plate-occupancy authority for OWNERSHIP, so the
+    quarantine gate is only decisive against an unclaimed, plate-clear printer."""
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
+
 
 class TestSchedulerQuarantineExclusion:
     def test_quarantined_printer_is_not_idle(self, monkeypatch):
@@ -11,7 +24,6 @@ class TestSchedulerQuarantineExclusion:
         pm = sched_mod.printer_manager
         monkeypatch.setattr(pm, "is_connected", lambda pid: True)
         monkeypatch.setattr(pm, "get_status", lambda pid: SimpleNamespace(state="IDLE"))
-        monkeypatch.setattr(pm, "is_awaiting_plate_clear", lambda pid: False)
 
         # Baseline: a connected, idle, non-quarantined printer IS idle.
         monkeypatch.setattr(pm, "is_quarantined", lambda pid: False)

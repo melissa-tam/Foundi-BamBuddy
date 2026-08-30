@@ -620,6 +620,33 @@ export interface PrinterStatus {
   // Queue: printer is awaiting user ack that the build plate was cleared after a
   // finished/failed print. Persisted across restarts (#961).
   awaiting_plate_clear: boolean;
+  // Plate-occupancy authority (WS2): the single record behind
+  // `awaiting_plate_clear`, exposed so a client can see WHO owns the plate and
+  // whether an eject is in flight rather than inferring it from the flag.
+  // Absent on backends predating the authority; nothing renders it yet.
+  occupancy?: {
+    plate: {
+      occupied: boolean;
+      /** Subtask that deposited the part; null for an operator declaration. */
+      source_subtask_id: string | null;
+      /** Re-arm policy recorded with the deposit (e.g. auto-eject vs escalate). */
+      policy: string | null;
+      /** ISO timestamp the plate became occupied. */
+      since: string | null;
+    };
+    /** In-flight eject claim on this printer; null when none is owned. */
+    eject: {
+      purpose: string;
+      /** The printer echoed PRINT START for the sweep. */
+      started: boolean;
+      /** Seconds since the claim was taken; null when unknown. */
+      age_s: number | null;
+      /** Claim rebuilt from disk at startup (never arms the runtime watchdog). */
+      hydrated: boolean;
+    } | null;
+    /** Seconds since a dispatch lease was taken on this printer; null when none. */
+    lease_age_s: number | null;
+  };
   // Farm failure policy (Phase 3): quarantined printers are excluded from all
   // dispatch until an operator clears them.
   quarantined?: boolean;

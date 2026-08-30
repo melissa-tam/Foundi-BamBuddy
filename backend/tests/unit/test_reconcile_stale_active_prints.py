@@ -17,6 +17,9 @@ These tests cover:
   * `reconcile_stale_active_prints` — the orchestrator that queries the DB,
     runs the decision function, and synthesises `on_print_complete` for
     each stale archive.
+  * the DEPOSIT reading of those synthesised payloads — see
+    `TestReconciledTerminalsGateThePlate` for the 2026-08-29 restart-recovery
+    incident that changed it.
 """
 
 from types import SimpleNamespace
@@ -25,6 +28,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backend.app.main import _is_active_archive_stale
+from backend.app.services.plate_occupancy import DepositEvidence, plate_occupancy
+
+
+@pytest.fixture(autouse=True)
+def _clean_occupancy_authority():
+    """Isolate the module-singleton occupancy authority.
+
+    The synthesised terminals below are read by ``DepositEvidence`` to decide whether
+    the plate gate goes up, so no record (and no injected callable) may leak between
+    tests or in from another module.
+    """
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 def _state(
@@ -231,6 +248,9 @@ class TestReconcileStaleActivePrints:
         assert payload["status"] == "aborted"
         assert payload["filename"] == "ghost.3mf"
         assert payload["_reconciled"] is True
+        # NOBODY observed this print's layer/progress peaks — see
+        # TestReconciledTerminalsGateThePlate for what that now means.
+        assert payload["peaks_reliable"] is False
 
     @pytest.mark.asyncio
     async def test_non_stale_archive_does_not_synthesise(self):
@@ -275,6 +295,9 @@ class TestReconcileStaleActivePrints:
         assert payload["last_progress"] == 100.0
         assert payload["last_layer_num"] == 250
         assert payload["_reconciled"] is True
+        # The figures are the LIVE state's, not peaks this process tracked, so they
+        # are reported honestly as un-measured.
+        assert payload["peaks_reliable"] is False
 
     @pytest.mark.asyncio
     async def test_failed_matching_subtask_synthesises_failed(self):
@@ -295,6 +318,7 @@ class TestReconcileStaleActivePrints:
         payload = mock_complete.call_args[0][1]
         assert payload["status"] == "failed"
         assert payload["last_layer_num"] == 88
+        assert payload["peaks_reliable"] is False
 
     @pytest.mark.asyncio
     async def test_finish_mismatched_subtask_keeps_aborted(self):
@@ -317,6 +341,7 @@ class TestReconcileStaleActivePrints:
         payload = mock_complete.call_args[0][1]
         assert payload["status"] == "aborted"
         assert "last_progress" not in payload  # conservative — no fabricated evidence
+        assert payload["peaks_reliable"] is False
 
     @pytest.mark.asyncio
     async def test_on_print_complete_failure_does_not_block_rest(self):
@@ -342,3 +367,97 @@ class TestReconcileStaleActivePrints:
         # Only the second archive is recorded as reconciled (first raised).
         assert count == 1
         assert mock_complete.await_count == 2
+
+
+class TestReconciledTerminalsGateThePlate:
+    """The 2026-08-29 → 08-30 restart-recovery cascade, pinned at its source.
+
+    **This is a deliberate BEHAVIOUR FLIP, not a regression.** A reconciled terminal
+    is synthesised for a print NOBODY observed: either it finished inside an MQTT
+    disconnect window, or the client that would have tracked it was born mid-print.
+    Either way the layer/progress peaks live in PROCESS MEMORY and are not a
+    measurement of this job, which every reconcile payload now says outright with
+    ``peaks_reliable: False``.
+
+    Before the occupancy cut-over the ``aborted`` shape carried no progress or layer
+    keys at all, and the deposit test read those absent keys as zeros — "this print
+    produced nothing, so the plate is empty". That fabricated a measurement out of an
+    absence, and on the night of 2026-08-29 it cost the farm six plates across
+    printers 1-6: six prints that physically FINISHED were classified "no-deposit —
+    not gating queue", so no gate went up, no eject was armed, each unit recorded
+    ``cancelled`` though it had completed, and the next unit dispatched onto the
+    finished part 1-5 seconds later.
+
+    ``DepositEvidence`` now fails closed on unreliable peaks, so a reconciled
+    terminal GATES the plate and a human decides. The cost of the new behaviour is a
+    plate-clear click after a downtime reconcile; the cost of the old one was
+    printing into a finished part.
+    """
+
+    @staticmethod
+    async def _reconciled_payload(live_state) -> dict:
+        """Run one reconcile pass and hand back the payload it synthesised."""
+        from backend.app.main import reconcile_stale_active_prints
+
+        stale = _archive(subtask_id="ARCHIVE_ID", filename="ghost.3mf", print_name="ghost")
+        with patch("backend.app.main.printer_manager") as mock_pm:
+            mock_pm.get_status.return_value = live_state
+            with patch("backend.app.main.async_session") as mock_session:
+                session_ctx = AsyncMock()
+                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
+                mock_session.return_value.__aenter__.return_value = session_ctx
+                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
+                    await reconcile_stale_active_prints(printer_id=1)
+        return mock_complete.call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_the_aborted_shape_now_deposits_and_gates_the_plate(self):
+        """THE incident pin. An IDLE printer with an archive still reading ``printing``
+        is the restart-recovery shape, and its ``aborted`` synthesis used to read as
+        "nothing on the plate"."""
+        payload = await self._reconciled_payload(_state("IDLE", subtask_id="", subtask_name=""))
+
+        assert payload["status"] == "aborted"
+        assert payload["peaks_reliable"] is False
+        assert "last_layer_num" not in payload  # no fabricated evidence, either way
+
+        evidence = DepositEvidence.from_terminal_payload(payload, is_dry_run=False)
+
+        assert evidence.deposited is True, (
+            "an unobserved terminal must gate the plate — reading its absent peaks as "
+            "zeros is the 2026-08-29 cascade (six ungated plates, six units recorded "
+            "cancelled though they physically completed)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_reconciled_finish_deposits_on_the_completed_limb(self):
+        """A print the printer itself says it finished deposits regardless of peaks —
+        this is the limb that would have gated all six of that night's plates."""
+        payload = await self._reconciled_payload(
+            _state("FINISH", subtask_id="ARCHIVE_ID", subtask_name="ghost", progress=100.0, layer_num=250)
+        )
+
+        assert payload["status"] == "completed"
+        assert payload["peaks_reliable"] is False
+
+        assert DepositEvidence.from_terminal_payload(payload, is_dry_run=False).deposited is True
+
+    @pytest.mark.asyncio
+    async def test_a_reconciled_failure_deposits_too(self):
+        """A FAILED print stopped part-way has a partial part on the bed. With the
+        peaks un-measured there is nothing that could say otherwise."""
+        payload = await self._reconciled_payload(
+            _state("FAILED", subtask_id="ARCHIVE_ID", subtask_name="ghost", progress=42.0, layer_num=88)
+        )
+
+        assert payload["status"] == "failed"
+        assert DepositEvidence.from_terminal_payload(payload, is_dry_run=False).deposited is True
+
+    @pytest.mark.asyncio
+    async def test_a_reconciled_dry_run_still_never_deposits(self):
+        """The one exemption the fix did NOT widen: the eject dry-run file is
+        motion-only by design, so a dry run that ended during downtime must not gate
+        a plate it could not have put anything on."""
+        payload = await self._reconciled_payload(_state("IDLE", subtask_id="", subtask_name=""))
+
+        assert DepositEvidence.from_terminal_payload(payload, is_dry_run=True).deposited is False

@@ -26,10 +26,23 @@ import pytest
 from sqlalchemy import select
 
 from backend.app.models.print_queue import PrintQueueItem
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.print_scheduler import PrintScheduler
 from backend.app.services.spool_selection import WAITING_REASON_PINNED_UNAVAILABLE
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _clean_authority():
+    """Every tick that reaches a dispatch mints a printer LEASE on the process-wide
+    occupancy authority, and these cases stub ``_start_print_by_id`` — so nothing
+    runs the release in its finally. Reset, or the previous case's claim would make
+    printer 1 undispatchable for the next one."""
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
+
 
 REQUIREMENTS = [{"slot_id": 1, "type": "PLA", "color": "#FFFFFF", "tray_info_idx": "", "used_grams": 10.0}]
 # Two identified trays: gtid 0 (white PLA, the auto-match) and gtid 1 (blue PLA).
@@ -100,11 +113,13 @@ async def _item(maker):
 
 
 def _printer_manager():
+    """The HEALTH half of the idle gate. OWNERSHIP (plate / lease / eject) is the
+    plate-occupancy authority's answer, not the manager's, and the autouse fixture
+    leaves it clean — so there is no plate flag to stub here."""
     pm = MagicMock()
     pm.is_connected.return_value = True
     pm.is_quarantined.return_value = False
     pm.is_model_mismatch.return_value = False
-    pm.is_awaiting_plate_clear.return_value = False
     pm.request_evidence_pushall.return_value = True
     return pm
 
@@ -240,7 +255,7 @@ class TestTheRecordIsWrittenByTheDispatch:
         engine, maker = await _harness(ams_mapping=json.dumps([1]))
         scheduler, pm = PrintScheduler(), _printer_manager()
 
-        async def _fake_start(item_id, printer_id, sem, ams_mapping=None):
+        async def _fake_start(item_id, printer_id, sem, ams_mapping=None, lease=None):
             async with maker() as db:
                 item = await db.get(PrintQueueItem, item_id)
                 item.status = "printing"
@@ -261,7 +276,7 @@ class TestTheRecordIsWrittenByTheDispatch:
         engine, maker = await _harness(ams_mapping=json.dumps([1]))
         scheduler, pm = PrintScheduler(), _printer_manager()
 
-        async def _held(item_id, printer_id, sem, ams_mapping=None):
+        async def _held(item_id, printer_id, sem, ams_mapping=None, lease=None):
             return  # the hold paths return without touching the item's mapping
 
         try:

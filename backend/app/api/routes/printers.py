@@ -54,10 +54,12 @@ from backend.app.services.bambu_ftp import (
     list_files_async,
 )
 from backend.app.services.hms_errors import current_runout_demand, hms_error_payload, runout_hold_active
+from backend.app.services.plate_occupancy import Evidence, plate_occupancy
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
 from backend.app.services.printer_manager import (
     _eject_watch_payload,
     get_derived_status_name,
+    occupancy_payload,
     printer_manager,
     resolve_plate_id,
     supports_chamber_heater,
@@ -482,11 +484,13 @@ async def get_printer_status(
             model_mismatch=printer_manager.is_model_mismatch(printer_id),
             model_mismatch_reason=printer_manager.model_mismatch_reason(printer_id),
             eject_watch=_eject_watch_payload(printer_id),
-            # The plate gate is Bambuddy-side state (a DB-rehydrated in-memory set), so it
-            # is reportable regardless of the MQTT session — same as the two sticky flags
-            # above. Load-bearing: the disconnected "Mark plate as occupied" affordance
-            # renders off this field, and must not offer itself on an already-gated plate.
+            # The plate gate is Bambuddy-side state (the occupancy authority's own
+            # record, rebuilt from the DB at startup), so it is reportable regardless of
+            # the MQTT session — same as the two sticky flags above. Load-bearing: the
+            # disconnected "Mark plate as occupied" affordance renders off this field,
+            # and must not offer itself on an already-gated plate.
             awaiting_plate_clear=printer_manager.is_awaiting_plate_clear(printer_id),
+            occupancy=occupancy_payload(printer_id),
         )
 
     # Determine cover URL if there's an active print (including paused)
@@ -806,6 +810,9 @@ async def get_printer_status(
         developer_mode=state.developer_mode if state else None,
         ams_filament_backup=state.ams_filament_backup if state else None,
         awaiting_plate_clear=printer_manager.is_awaiting_plate_clear(printer_id),
+        # Same builder as the WS payload and the disconnected branch above, so the
+        # poll and the socket can never describe one printer's plate differently.
+        occupancy=occupancy_payload(printer_id),
         quarantined=printer.quarantined,
         quarantine_reason=printer.quarantine_reason,
         model_mismatch=printer_manager.is_model_mismatch(printer_id),
@@ -2880,7 +2887,20 @@ async def clear_plate(
             f"Printer is not awaiting plate-clear acknowledgment (state={state.state if state else 'unknown'})",
         )
 
-    printer_manager.set_awaiting_plate_clear(printer_id, False)
+    refusal = plate_occupancy.clear_plate(printer_id)
+    if refusal == "eject_in_flight":
+        # The gate IS that sweep's completion signal. Clearing it under the sweep would
+        # release the printer into a dispatch landing on a plate the toolhead is still
+        # crossing, so the operator is told to wait rather than silently overridden —
+        # ``recover_printer`` remains the explicit override.
+        raise HTTPException(
+            409,
+            {"code": "eject_in_flight", "message": "Eject in flight. The gate clears when the sweep completes."},
+        )
+    if refusal == "not_occupied":
+        # Reachable only via the FINISH/FAILED limb above (no gate raised, but the
+        # printer is sitting on a terminal state). Same 400 shape it has always had.
+        raise HTTPException(400, "Printer is not awaiting plate-clear acknowledgment")
 
     return {"success": True, "message": "Plate cleared, next print will start shortly"}
 
@@ -2910,10 +2930,15 @@ async def mark_plate_occupied(
     restart re-arm degrades it to an escalation-only hold, and startup hygiene may clear
     it when ``require_plate_clear`` is off AND no farm work targets this printer.
 
-    404 unknown printer; 409 while the printer is RUNNING/PAUSE (an unknown state passes
-    — a disconnected printer reports none); 400 when the gate is already raised
+    404 unknown printer; 409 while a job owns the printer (an unknown state passes — a
+    disconnected printer reports none); 400 when the gate is already raised
     (deliberately mirroring ``clear-plate``'s already-in-that-state strictness rather
     than answering 409, so the pair reads the same way).
+
+    "A job owns the printer" is the authority's ``ACTIVE_PRINT_STATES``, so PREPARE and
+    SLICING now refuse alongside RUNNING/PAUSE. That is one vocabulary rather than a
+    second spelling of "busy": a printer parked in PREPARE is about to deposit onto
+    this plate, and the declaration it would accept is about to be true anyway.
     """
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
     printer = result.scalar_one_or_none()
@@ -2921,13 +2946,24 @@ async def mark_plate_occupied(
         raise HTTPException(404, "Printer not found")
 
     state = printer_manager.get_status(printer_id)
-    if state and state.state in ("RUNNING", "PAUSE"):
-        raise HTTPException(409, f"Printer is printing or paused (state={state.state})")
-
-    if printer_manager.is_awaiting_plate_clear(printer_id):
+    # Read "already gated" BEFORE declaring, but REPORT it after: the declaration is
+    # idempotent on an occupied plate, so asking the authority first costs nothing and
+    # keeps the refusal PRECEDENCE this route has always had — a conflict the operator
+    # cannot act on (a job owns the printer, a sweep is crossing the plate) outranks
+    # "you already told me this". Reversing those two, as this route briefly did, makes
+    # a RUNNING printer that is also gated answer 400 where it has always answered 409.
+    already_gated = plate_occupancy.is_plate_occupied(printer_id)
+    refusal = plate_occupancy.declare_occupied(
+        printer_id, Evidence(live_state=getattr(state, "state", None) if state else None)
+    )
+    if refusal == "job_active":
+        raise HTTPException(409, f"Printer is printing or paused (state={state.state if state else 'unknown'})")
+    if refusal is not None:
+        # ``eject_in_flight``: a live sweep is already crossing this plate, so the
+        # declaration has nothing to add and the gate it would raise is already up.
+        raise HTTPException(409, {"code": refusal, "message": f"Cannot mark the plate occupied ({refusal})"})
+    if already_gated:
         raise HTTPException(400, "Printer is already awaiting plate clear")
-
-    printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=None)
 
     return {"success": True, "message": "Plate marked as occupied — dispatch to this printer is blocked until cleared"}
 

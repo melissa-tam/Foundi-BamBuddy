@@ -23,12 +23,24 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services.filament_deficit import FilamentDeficit, compute_deficit_for_queue_item
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.print_scheduler import PrintScheduler
 from backend.app.services.spool_selection import (
     START_BLOCK_BELOW_FLOOR,
     START_BLOCK_UNKNOWN_GRAMS,
     MatchOutcome,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clean_authority():
+    """``check_queue`` claims a printer LEASE on the process-wide occupancy authority
+    at PLAN time, and a stubbed dispatch never runs the release in
+    ``_start_print_by_id``'s finally. Start every case from an unclaimed fleet, or a
+    prior test's claim silently makes the next one's printer undispatchable."""
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 def _deficit(printer_id_override=None, ams_mapping_override=None, slots=1):
@@ -255,7 +267,7 @@ async def test_head_of_line_dispatches_to_second_printer_same_tick(
 
     started: dict = {}
 
-    async def _start(db, item, *, ams_mapping=None):
+    async def _start(db, item, *, ams_mapping=None, lease=None):
         item.status = "printing"
         started["printer_id"] = item.printer_id
         await db.commit()
@@ -511,7 +523,7 @@ async def test_model_loop_skips_start_blocked_candidate(cq_scheduler, db_session
 
     started: dict = {}
 
-    async def _start(db, item, *, ams_mapping=None):
+    async def _start(db, item, *, ams_mapping=None, lease=None):
         item.status = "printing"
         started["printer_id"] = item.printer_id
         await db.commit()
@@ -618,7 +630,7 @@ async def test_mixed_block_stages_generic_filament_short(cq_scheduler, db_sessio
 
 
 def _mk_start():
-    async def _start(db, item, *, ams_mapping=None):
+    async def _start(db, item, *, ams_mapping=None, lease=None):
         item.status = "printing"
         await db.commit()
 

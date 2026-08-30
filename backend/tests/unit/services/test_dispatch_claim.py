@@ -33,12 +33,22 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services import print_scheduler as ps_module
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.print_scheduler import scheduler
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_transitions import cancel_pending_items
 from backend.app.utils.filename import derive_remote_filename
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _clean_authority():
+    """``_start_print`` claims and commits a printer LEASE on the occupancy authority
+    (the singleton is process-wide), so every case starts from an unclaimed fleet."""
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 async def _seed_dispatchable(db, tmp_path, *, name="DC"):
@@ -87,7 +97,10 @@ def _dispatch_env(*, upload=None, delete=None):
         )
         stack.enter_context(patch.object(printer_manager, "get_client", MagicMock(return_value=None)))
         stack.enter_context(patch.object(printer_manager, "request_status_update", MagicMock(return_value=True)))
-        stack.enter_context(patch.object(printer_manager, "set_awaiting_plate_clear", MagicMock()))
+        # No plate write to stub any more: the dispatch path's unconditional
+        # ``set_awaiting_plate_clear(False)`` is gone (2026-08-30). ``_start_print``
+        # commits a LEASE on the occupancy authority instead, which the autouse
+        # fixture above keeps clean between cases.
         stack.enter_context(patch.object(printer_manager, "start_print", start))
         stack.enter_context(
             patch.object(ps_module, "get_ftp_retry_settings", AsyncMock(return_value=(False, 3, 1.0, 30.0)))
