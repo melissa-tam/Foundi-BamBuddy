@@ -4469,11 +4469,6 @@ export default {
     sectionTitle: '独立・コミュニティ運営',
     tagline: 'Bambuddyは無料で、これからも無料です。支援してくださる方々のおかげで、VCもクラウドロックインもありません。',
     viewSupporters: 'サポーター一覧',
-    toastPrints: 'Bambuddyで{{count}}件の印刷を完了しました。Bambuddyは支援者のおかげで無料で提供されています。',
-    toastCost: 'Bambuddyで{{total}}分のフィラメントを記録しました。プロジェクトを支えてくれている方々をご覧ください。',
-    toastArchives: '{{count}}件の印刷をBambuddyでアーカイブしました。独立を支えてくれている方々をご覧ください。',
-    toastAnniversary: 'Bambuddyとの1周年です！プロジェクトを支えてくれている方々をご覧ください。',
-    toastVersionUpdate: 'v{{version}}にアップデートされました。Bambuddyは支援者のおかげで無料で提供されています。',
   },
 
   // Library (K Profiles)

@@ -58,7 +58,6 @@ from backend.app.models.print_log import PrintLogEntry
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.sku import Sku, SkuFile
 from backend.app.models.slot_recheck import SlotRecheckIntent
-from backend.app.models.sponsor_toast_state import SponsorToastState
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.models.user import User
 from backend.app.services.user_deletion import delete_impact, delete_user
@@ -367,7 +366,7 @@ class TestDeclaredForeignKeyPolicies:
 
     @pytest.mark.parametrize("delete_items", [True, False])
     async def test_operator_attribution_is_handled_on_both_branches(self, session_factory, estate, delete_items):
-        """The three rows BOTH branches used to leave dangling."""
+        """The rows BOTH branches used to leave dangling."""
         user_id = await _seed_user(session_factory)
         async with session_factory() as db:
             db.add_all(
@@ -379,7 +378,6 @@ class TestDeclaredForeignKeyPolicies:
                         requested_at=datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc),
                         requested_by=user_id,
                     ),
-                    SponsorToastState(user_id=user_id, milestones_seen="[]"),
                     PrintLogEntry(status="completed", print_name="Unit", created_by_id=user_id),
                 ]
             )
@@ -393,8 +391,6 @@ class TestDeclaredForeignKeyPolicies:
             # SET NULL: deleting an operator must not erase a slot's identity history.
             assert len(intents) == 1 and intents[0].requested_by is None
             assert len(log) == 1 and log[0].created_by_id is None
-            # CASCADE: per-user UI state with nothing to attribute.
-            assert (await db.execute(select(SponsorToastState))).scalars().all() == []
 
     async def test_the_non_destructive_branch_disowns_instead_of_deleting(self, session_factory, estate):
         user_id = await _seed_user(session_factory)

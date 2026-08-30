@@ -4457,11 +4457,6 @@ export default {
     sectionTitle: '独立运营·社区支持',
     tagline: 'Bambuddy 完全免费，并将持续免费——这要感谢主动支持的用户。没有风投，也没有云端绑定。',
     viewSupporters: '查看支持者',
-    toastPrints: '你已经用 Bambuddy 完成了 {{count}} 次打印。Bambuddy 之所以免费，离不开支持者。',
-    toastCost: '你已经用 Bambuddy 追踪了 {{total}} 的耗材。看看是谁让项目保持独立。',
-    toastArchives: '用 Bambuddy 归档了 {{count}} 次打印。看看是谁让它保持独立。',
-    toastAnniversary: '与 Bambuddy 相伴一年了！看看是谁让项目保持独立。',
-    toastVersionUpdate: '已更新至 v{{version}}。Bambuddy 之所以免费，离不开支持者。',
   },
 
   // Library (K Profiles)
