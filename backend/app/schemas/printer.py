@@ -13,6 +13,46 @@ from pydantic import BaseModel, Field, field_validator
 #: slot pipeline's whole model graph into every import of this module.
 RecheckOutcome = Literal["unchanged", "minted", "identified", "queued", "empty", "restored"]
 
+#: The CLOSED set of answers a manual eject can give. ``eject/manual.manual_eject``
+#: returns exactly one :class:`~backend.app.services.eject.manual.EjectVerdict` carrying
+#: one of these, and ``api/routes/printer_eject.py`` maps each to its HTTP shape — the
+#: 2026-08-20 ``slot_recheck`` precedent, applied to the lane whose control flow used to
+#: be three exception classes raised from four nesting levels.
+#:
+#: ``needs_input`` is the one that earns the type: it is NOT an error. It is the eject
+#: asking the operator for the one fact only they have (the part height) and the one
+#: choice only they can make (the sweep profile), and it reaches the wire as the same
+#: ``409 {"code": "foreign_plate"}`` the dialog has always opened on.
+EjectOutcome = Literal["dispatched", "released_watch", "needs_input", "bed_hot", "refused"]
+
+#: Who put the part on the plate, as far as the farm can tell. Decides the dialog's
+#: title and sentence only — the flow is identical for all three.
+EjectOrigin = Literal["foreign", "farm_unit", "declared"]
+
+#: The CLOSED set of reasons an eject is REFUSED — a state the operator's input cannot
+#: cure (anything it CAN cure is ``needs_input`` instead). Reaches the wire verbatim as
+#: the error ``code``, so the frontend maps codes to i18n keys and no English crosses
+#: the service boundary.
+#:
+#: The first four are the occupancy authority's own
+#: :data:`~backend.app.services.plate_occupancy.TransitionRefusal` tokens, kept
+#: spelling-identical on purpose: one refusal vocabulary from the state machine to the
+#: dialog. ``no_plate_gate`` is the authority's ``not_occupied`` under the name the API
+#: has always used for it, and survives only for declare-less callers — every UI surface
+#: declares occupancy, so it can no longer be reached from a printer card.
+EjectRefusalReason = Literal[
+    "job_active",
+    "dispatch_in_flight",
+    "eject_in_flight",
+    "not_connected",
+    "no_plate_gate",
+    "bed_unreadable",
+    "first_article",
+    "no_donor",
+    "not_found",
+    "profile_not_found",
+]
+
 
 class PrinterBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)

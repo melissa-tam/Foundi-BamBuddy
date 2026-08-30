@@ -1168,24 +1168,36 @@ async def dispatch_identified_foreign_eject(*, printer_id: int, profile_id: int)
     It lives HERE, beside the dispatcher it calls, rather than in ``eject.manual``:
     with it there, the cooldown monitor had to reach into the manual-eject service at
     call time while that service imports the monitor at module load — a cycle held
-    open by a lazy import. The donor resolution it needs is still the manual lane's
-    (``manual`` imports this module at module level, so this reaches back lazily —
-    the one direction that edge can point).
+    open by a lazy import. Since the WS4 donor extraction the resolution it needs is
+    not the manual lane's at all: it walks :data:`AUTO_DONOR_CHAIN` — the gate-archive
+    tier ALONE. The operator lane's assumed (last-farm-item) and anonymous (container)
+    tiers must never reach an unattended sweep, and declaring that as a composition
+    rather than a call-site condition is what makes it unforgettable.
     """
     from backend.app.core.database import async_session
-    from backend.app.services.eject.manual import ManualEjectError, _resolve_foreign_source, _safe_unlink
+    from backend.app.services.eject.donor import AUTO_DONOR_CHAIN, DonorContext, release_donor, resolve_donor
 
     async with async_session() as db:
         printer = await db.get(Printer, printer_id)
         if printer is None:
-            raise ManualEjectError("not_found", "Printer not found", status_code=404)
-        source = await _resolve_foreign_source(db, printer)
+            raise EjectDispatchError(f"Printer {printer_id} not found; cannot eject", status_code=404, code="not_found")
+        source = await resolve_donor(
+            AUTO_DONOR_CHAIN,
+            DonorContext(db=db, printer=printer, plate_source=plate_occupancy.plate_source(printer_id), item=None),
+        )
+        if source is None:
+            # RAISES rather than returning: ``watch_bed_and_clear`` must count this as a
+            # dispatch failure (retry, then stall after three), never silently drop the
+            # sweep and leave the plate gated with nothing watching it.
+            raise EjectDispatchError(
+                "Could not resolve the donor file for the plate on this printer", status_code=409, code="no_donor"
+            )
         try:
             await dispatch_foreign_eject(
                 db,
                 printer_id=printer_id,
                 profile_id=profile_id,
-                source_path=source.donor_path,
+                source_path=source.path,
                 plate_id=source.plate_id,
             )
             logger.info(
@@ -1195,4 +1207,4 @@ async def dispatch_identified_foreign_eject(*, printer_id: int, profile_id: int)
                 profile_id,
             )
         finally:
-            _safe_unlink(source.tmp_path)
+            release_donor(source)

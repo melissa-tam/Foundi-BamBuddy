@@ -256,7 +256,7 @@ async def _startup_policy(
         )
         return EscalationOnly()
 
-    item = await _latest_started_item(db, printer_id)
+    item = await latest_started_item(db, printer_id)
     cooldown_rearmable = (
         item is not None
         and should_rearm(True, item.status, item.eject_profile_id, bool(item.first_article))
@@ -278,12 +278,18 @@ async def _startup_policy(
     return EscalationOnly()
 
 
-async def _latest_started_item(db: AsyncSession, printer_id: int) -> PrintQueueItem | None:
+async def latest_started_item(db: AsyncSession, printer_id: int) -> PrintQueueItem | None:
     """The most-recently-started queue unit on ``printer_id``, or None.
 
     The re-arm ladder's subject: the gate's source id must positively name THIS unit's
     dispatch, so a foreign or screen-started print that finished after the farm unit can
     never lend its identity to the wrong plate.
+
+    PUBLIC because the eject donor chain asks the same question for a different reason:
+    "what did the farm last put on this printer?" is the assumed identity behind
+    ``eject/donor.LastFarmItemFile``. One query, one answer — two spellings of "the
+    printer's last start" is exactly how the re-arm ladder and the donor lane would come
+    to disagree about which unit a plate belongs to.
     """
     result = await db.execute(
         select(PrintQueueItem)

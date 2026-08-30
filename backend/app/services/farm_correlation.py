@@ -200,7 +200,7 @@ class DispatchDonor:
     """The on-disk source ``.gcode.3mf`` a farm dispatch prints FROM, and its plate.
 
     "Donor" is the fork's word for the source file a derived artefact is built from
-    (``eject.manual._ForeignSource.donor_path``). Here it answers the question every
+    (``eject.donor.DonorSource.path``). Here it answers the question every
     consumer of a farm print asks in a slightly different way — the archive capture
     ("which 3MF do I attach?"), the eject builder ("which 3MF do I repack?") and the
     usage tracker ("which slice_info do I charge from?").
