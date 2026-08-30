@@ -27,6 +27,15 @@ we cannot attribute, and a gate whose persisted source we cannot tie to the ejec
 job on restart, never auto-eject — they wait for a human.
 ``watch_gate_escalation_only`` covers the foreign-deposit case: it holds the gate
 (never releases) and just escalates once, exiting when the operator clears it.
+
+**Since the 2026-08-30 cut-over the monitor decides nothing about WHICH watch to
+arm.** It is the plate-occupancy authority's injected POLICY DRIVER: the authority
+owns the plate and the policy attached to it, and calls
+:meth:`EjectCooldownMonitor.on_occupancy_change` after every transition; this module
+converts the policy into a running task. The four ``start_*_watch`` entry points and
+the ``_watching`` registry they deduped against are gone with it — a watch can no
+longer outlive, contradict, or double-arm against the plate it was arming for,
+because the plate is the only thing that decides it exists.
 """
 
 from __future__ import annotations
@@ -34,13 +43,22 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
 from backend.app.core.tasks import spawn_background_task
 from backend.app.schemas.settings import AppSettings
+from backend.app.services.eject import remote as eject_remote
+from backend.app.services.plate_occupancy import (
+    CooldownEject,
+    FirstArticleEject,
+    ForeignAutoEject,
+    OccupancyPolicy,
+    OccupancyView,
+    plate_occupancy,
+)
 from backend.app.services.printer_manager import printer_manager
 
 if TYPE_CHECKING:
@@ -50,22 +68,27 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class _ActiveWatch:
-    """The in-flight cooldown watch's identity + manual-release channel (W2).
+class _ArmedWatch:
+    """The one watch task armed for a printer's CURRENT occupancy policy.
 
-    Stored as the ``_watching`` value for an armed cooldown/FA watch (the
-    escalation-only foreign-gate watch and a still-resolving watch keep the ``None``
-    sentinel). ``active_watch()`` still exposes only ``threshold_c`` — the UI payload
-    is unchanged. ``release_now`` is set by ``request_release_now`` so a manual
-    "Eject now" fires the watch's single ``_do_release`` path instantly (no parallel
-    dispatch race)."""
+    ``policy`` is the record's identity: :meth:`EjectCooldownMonitor.on_occupancy_change`
+    respawns only when the desired policy differs from this one (the policy types are
+    frozen dataclasses, so equality is structural — a re-notification carrying the same
+    policy is a no-op, which is what keeps the driver idempotent under the authority's
+    fan-out on EVERY transition).
 
-    threshold_c: float | None
-    # None for the auto FOREIGN-plate eject watch (purpose="foreign"): it releases
-    # against a directly-passed threshold + eject profile, not a queue item.
-    queue_item_id: int | None
-    purpose: str
-    release_now: asyncio.Event
+    ``release_now`` is the manual-release channel for the three RELEASING policies
+    (cooldown / FA / foreign auto); an escalation-only hold has none, and
+    ``request_release_now`` answers False for it. ``threshold_c`` is filled in by the
+    watch task once it resolves — it is what the UI's ``eject_watch`` payload renders,
+    and it stays None for an escalation-only hold and while a threshold is resolving.
+    """
+
+    policy: OccupancyPolicy
+    task: asyncio.Task
+    queue_item_id: int | None = None
+    release_now: asyncio.Event | None = None
+    threshold_c: float | None = field(default=None)
 
 
 # Fallbacks for direct watch_bed_and_clear callers (tests / manual arms) — derived
@@ -102,19 +125,18 @@ def should_auto_clear(final_status: str) -> bool:
     return final_status in _SUCCESS_TERMINAL
 
 
-def deposited_nothing(*, is_dry_run: bool, last_layer_num: int | None, last_progress: float | None) -> bool:
-    """A terminal job left nothing on the plate: a dry-run eject (never deposits), OR a print
-    that reached terminal having produced zero layers AND zero progress. Uses the reset-surviving
-    peaks from the on_print_complete payload."""
-    return bool(is_dry_run) or ((last_layer_num or 0) == 0 and (last_progress or 0) == 0)
-
-
-async def _default_notify_plate_not_empty(printer_id: int, *, source_detail: str = "") -> None:
+async def notify_plate_not_empty(printer_id: int, *, source_detail: str = "") -> None:
     """Fire the plate-not-empty notification for a stuck-plate escalation.
+
+    The ONE implementation of "page a human: this plate is not empty". Public since
+    the 2026-08-30 cut-over, because three lanes OUTSIDE this module page through it —
+    the eject runtime watchdog's mid-flight stop, the eject start deadline, and the
+    occupancy store's last-rung escalation when a plate could not be given any policy
+    at all — alongside the escalation-only hold below, which is this module's own.
 
     Opens its own session (mirroring the rest of this module) and resolves the
     printer name for the message. ``source_detail`` disambiguates the escalation
-    source (Phase 3.3) — the two watches below bake in their own sentence via a
+    source (Phase 3.3) — the watches below bake in their own sentence via a
     ``functools.partial`` before handing this to the loop. Kept side-effect-only;
     callers wrap it so a notification failure never kills the watch.
     """
@@ -210,7 +232,9 @@ async def watch_bed_and_clear(
     ``escalate_s`` fires ONE ``notify`` (the ``cooldown_escalation`` event, NOT
     plate_not_empty; failures tolerated) with the live bed, then keeps polling.
     ``manager``, ``sleep``, ``notify``, ``on_release`` and ``on_stall`` are all
-    injectable for testing.
+    injectable for testing; ``manager`` supplies the BED reading only — whether the
+    plate is still occupied is read from the plate-occupancy authority, the one place
+    that knows.
     """
     if notify is None:
         # The escalation means "bed never reached the release threshold", NOT
@@ -239,7 +263,7 @@ async def watch_bed_and_clear(
         # branches can reach here after an await, during which an operator (or the
         # eject's own terminal) may have cleared the gate. Sweeping then would eject
         # onto an empty plate.
-        if not manager.is_awaiting_plate_clear(printer_id):
+        if not plate_occupancy.is_plate_occupied(printer_id):
             logger.info(
                 "Eject monitor: printer %s plate-clear gate cleared at release boundary (cause=%s) — no eject",
                 printer_id,
@@ -276,7 +300,7 @@ async def watch_bed_and_clear(
         # terminal, or an operator clearing the plate — the phase is over. Exit WITHOUT
         # dispatching so we never sweep an already-cleared plate (mirrors the foreign
         # gate watch). Checked at the TOP of every poll, before reading the bed.
-        if not manager.is_awaiting_plate_clear(printer_id):
+        if not plate_occupancy.is_plate_occupied(printer_id):
             logger.info(
                 "Eject monitor: printer %s plate-clear gate cleared mid-cooldown — watch exiting (no eject)",
                 printer_id,
@@ -407,7 +431,6 @@ async def watch_bed_and_clear(
 async def watch_gate_escalation_only(
     printer_id: int,
     *,
-    manager=printer_manager,
     escalate_s: int = _WATCH_ESCALATE_S,
     check_interval_s: int = _CHECK_INTERVAL_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -425,20 +448,23 @@ async def watch_gate_escalation_only(
     A disconnected/stale tick does NOT end the watch — its lifetime is the gated
     PHASE, not connectivity (mirroring ``watch_bed_and_clear``'s unreadable-bed
     tolerance). A printer that drops off mid-hold and comes back must still find its
-    stranded plate escalating, not silently un-watched. ``manager``, ``sleep`` and
-    ``notify`` are injectable for testing.
+    stranded plate escalating, not silently un-watched. ``sleep`` and ``notify`` are
+    injectable for testing; there is no ``manager`` here, unlike
+    :func:`watch_bed_and_clear`, because this watch reads no bed — its only question
+    is whether the plate is still occupied, and the plate-occupancy authority is the
+    one place that knows.
     """
     if notify is None:
         # Foreign-deposit escalation — distinct from the cooldown_timeout source: a
         # print the farm did not dispatch left a part on the plate.
         notify = functools.partial(
-            _default_notify_plate_not_empty,
+            notify_plate_not_empty,
             source_detail="A print the farm did not dispatch left a part on the plate. Clear the bed to resume dispatch.",
         )
     elapsed = 0
     escalated = False
     while True:
-        if not manager.is_awaiting_plate_clear(printer_id):
+        if not plate_occupancy.is_plate_occupied(printer_id):
             logger.info(
                 "Eject monitor: printer %s foreign-gate cleared externally — escalation watch exiting", printer_id
             )
@@ -482,20 +508,6 @@ def should_rearm(
     if first_article:
         return False
     return bool(awaiting_plate_clear) and item_status == "completed" and eject_profile_id is not None
-
-
-async def _latest_started_item(db, printer_id: int):
-    """The most-recently-started queue item on `printer_id`, or None."""
-    from backend.app.models.print_queue import PrintQueueItem
-
-    result = await db.execute(
-        select(PrintQueueItem)
-        .where(PrintQueueItem.printer_id == printer_id)
-        .where(PrintQueueItem.started_at.is_not(None))
-        .order_by(PrintQueueItem.started_at.desc())
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
 
 
 async def _resolve_eject_threshold(queue_item_id: int, *, for_first_article: bool = False) -> float | None:
@@ -664,26 +676,30 @@ async def _reconcile_one(
 ) -> None:
     """Reconcile ONE hydrated printer's pending eject against the live state (W1.2).
 
-    Polls until the printer reconnects (≤ ``max_wait_s``), then applies the decision
-    table: RUNNING/PAUSE+name-match → leave pending (the live terminal resolves it);
-    RUNNING/PAUSE+mismatch → drop pending, gate kept; FINISH+match → resolve as a
-    completed eject (production gate clear / FA finalise); FAILED+match → resolve as a
-    failed eject (quarantine, gate kept); IDLE / unverifiable / never reconnects →
-    drop pending, gate kept for a human (never clear a gate on guesswork)."""
+    Polls until the printer reconnects (<= ``max_wait_s``), then applies the decision
+    table: RUNNING/PAUSE+name-match -> the sweep is still in flight, so stamp its start
+    and leave it for the live terminal; RUNNING/PAUSE+mismatch -> drop the hydrated
+    eject, gate kept; FINISH+match -> replay the terminal as ``completed`` (production
+    gate clear / FA finalise); FAILED+match -> replay it as ``failed`` (quarantine, gate
+    kept); IDLE / unverifiable / never reconnects -> drop the hydrated eject, gate kept
+    for a human (never clear a gate on guesswork).
+
+    Every verdict acts through the plate-occupancy authority, so the PLATE half of each
+    decision is the authority's rule rather than this table's: dropping a hydrated eject
+    deliberately leaves the plate exactly as the durable columns rebuilt it.
+    """
     from backend.app.core.database import async_session
     from backend.app.services import farm_policy
-    from backend.app.services.eject import remote as eject_remote
 
     waited = 0
     while True:
-        if eject_remote.peek_pending_eject(printer_id) is None:
+        if plate_occupancy.eject_identity(printer_id) is None:
             return  # a live terminal callback already resolved it
         state = manager.get_status(printer_id)
         if state is not None and getattr(state, "connected", False):
             break
         if waited >= max_wait_s:
-            async with async_session() as db:
-                await eject_remote.clear_pending_eject(db, printer_id)
+            plate_occupancy.drop_hydrated_eject(printer_id, "printer never reconnected after restart")
             logger.warning(
                 "Eject monitor: printer %s never reconnected within %ss — pending eject dropped, gate kept for a human",
                 printer_id,
@@ -702,13 +718,16 @@ async def _reconcile_one(
 
     if live in ("RUNNING", "PAUSE"):
         if name_matches:
+            # The sweep survived the restart and is still executing. Stamp the START we
+            # never observed so the eject's age reads honestly on every operator
+            # surface; no watchdog arms off it (a hydrated record carries no estimate).
+            plate_occupancy.note_eject_started(printer_id)
             logger.info(
                 "Eject monitor: printer %s eject still in flight post-restart — leaving pending for the live terminal",
                 printer_id,
             )
             return
-        async with async_session() as db:
-            await eject_remote.clear_pending_eject(db, printer_id)
+        plate_occupancy.drop_hydrated_eject(printer_id, f"printer is running a non-eject job ({subtask_name!r})")
         logger.warning(
             "Eject monitor: printer %s is running a non-eject job (%r) post-restart — pending dropped, gate kept",
             printer_id,
@@ -717,7 +736,7 @@ async def _reconcile_one(
         return
 
     if name_matches and live == "FINISH":
-        # The eject FINISHed during downtime → resolve exactly as the live terminal
+        # The eject FINISHed during downtime -> resolve exactly as the live terminal
         # would (production: clear the gate; FA: finalise the approval).
         async with async_session() as db:
             await farm_policy.on_terminal(
@@ -734,7 +753,7 @@ async def _reconcile_one(
         return
 
     if name_matches and live == "FAILED":
-        # The eject FAILED during downtime → mirror the live failure branch:
+        # The eject FAILED during downtime -> mirror the live failure branch:
         # quarantine, gate kept (sweep unverified).
         async with async_session() as db:
             await farm_policy.on_terminal(
@@ -752,14 +771,36 @@ async def _reconcile_one(
 
     # IDLE / unknown state, or a terminal state whose name does not match: never
     # clear a gate on guesswork. Drop the pending and leave the gate for a human.
-    async with async_session() as db:
-        await eject_remote.clear_pending_eject(db, printer_id)
+    plate_occupancy.drop_hydrated_eject(
+        printer_id, f"unverifiable post-restart (state={live!r}, name={subtask_name!r})"
+    )
     logger.warning(
         "Eject monitor: printer %s eject unverifiable post-restart (state=%r, name=%r) — pending dropped, gate kept",
         printer_id,
         live,
         subtask_name,
     )
+
+
+def _hydrated_eject(printer_id: int) -> bool:
+    """True when this printer's eject came from the durable stamp, not a live dispatch."""
+    identity = plate_occupancy.eject_identity(printer_id)
+    return identity is not None and identity.hydrated
+
+
+async def _reconcile_one_guarded(
+    printer_id: int,
+    *,
+    manager,
+    poll_s: int,
+    max_wait_s: int,
+    sleep: Callable[[float], Awaitable[None]],
+) -> None:
+    """One printer's reconcile, wrapped so its failure cannot escape its own task."""
+    try:
+        await _reconcile_one(printer_id, manager=manager, poll_s=poll_s, max_wait_s=max_wait_s, sleep=sleep)
+    except Exception:  # noqa: BLE001 — one printer's reconcile must not abort the others
+        logger.exception("Eject monitor: pending-eject reconcile failed for printer %s", printer_id)
 
 
 async def reconcile_pending_ejects_on_startup(
@@ -771,214 +812,172 @@ async def reconcile_pending_ejects_on_startup(
 ) -> int:
     """Reconcile every hydrated pending eject after a restart (W1.2 background task).
 
-    Spawned from the lifespan AFTER ``hydrate_pending_ejects_from_db`` +
-    ``rearm_on_startup``. Returns the number of printers processed. Each printer is
-    wrapped so one failure never aborts the sweep. ``manager``/``sleep`` are injectable
-    for testing."""
-    from backend.app.services.eject import remote as eject_remote
+    Spawned from the lifespan AFTER ``plate_occupancy_store.hydrate()``. Returns the
+    number of printers it STARTED reconciling. ``manager``/``sleep`` are injectable for
+    testing.
 
-    printer_ids = eject_remote.pending_eject_printer_ids()
+    The printers are reconciled CONCURRENTLY, one background task each. Serially, a
+    single disconnected printer held every other printer behind its 900 s reconnect cap
+    while their plates sat gated and un-ejectable — on the night of 2026-08-30 three
+    printers were in that state at once, and the operator's only way out of the third
+    was to wait out the first two. The tasks share no state (each verdict is one
+    printer's own transition through the authority), so concurrency costs nothing but
+    the wake-ups.
+    """
+    printer_ids = [pid for pid in plate_occupancy.printers_with_lease_or_eject() if _hydrated_eject(pid)]
     if not printer_ids:
         return 0
-    processed = 0
     for printer_id in printer_ids:
-        try:
-            await _reconcile_one(printer_id, manager=manager, poll_s=poll_s, max_wait_s=max_wait_s, sleep=sleep)
-            processed += 1
-        except Exception:  # noqa: BLE001 — one printer's reconcile must not abort the sweep
-            logger.exception("Eject monitor: pending-eject reconcile failed for printer %s", printer_id)
-    return processed
+        spawn_background_task(
+            _reconcile_one_guarded(printer_id, manager=manager, poll_s=poll_s, max_wait_s=max_wait_s, sleep=sleep),
+            name=f"eject-pending-reconcile-{printer_id}",
+        )
+    return len(printer_ids)
 
 
 class EjectCooldownMonitor:
-    """Owns the per-printer cooldown watch tasks.
+    """The plate-occupancy authority's POLICY DRIVER: one watch task per occupied plate.
 
-    Watches are armed from two sites that share the same ``_start_watch`` →
-    ``_watch`` code path: the terminal-status callback (normal operation) and
-    ``rearm_on_startup`` (restart resilience — an app restart mid-cooldown must
-    not leave ``awaiting_plate_clear`` set forever and silently stall the farm).
+    Before the 2026-08-30 cut-over this class owned the decision as well as the task —
+    four ``start_*_watch`` entry points, called from six places, each deduping against
+    a ``_watching`` registry that was the farm's second opinion about whether a plate
+    was occupied. Now the authority owns the plate AND the policy attached to it, and
+    calls :meth:`on_occupancy_change` after every transition; this class only makes the
+    world match. That is what makes a watch impossible to leak, double-arm, or outlive
+    its plate: the record IS the plate's policy.
+
+    Registered at lifespan through :func:`wire_policy_driver`.
     """
 
     def __init__(self) -> None:
-        # printer_id -> release threshold (°C) of the in-flight watch, so a
-        # duplicate terminal callback doesn't spawn a second watcher for the
-        # same finish AND the UI can surface the cooldown phase (Phase 4.3c).
-        # None = watch armed but with no release threshold: either the
-        # escalation-only foreign-gate watch, or a cooldown watch still
-        # resolving its item's threshold.
-        # Value is an _ActiveWatch for an armed cooldown/FA watch, the None sentinel
-        # for an escalation-only / still-resolving watch, or (in direct-poke tests)
-        # a raw float threshold. active_watch() normalises all three to float | None.
-        self._watching: dict[int, _ActiveWatch | float | None] = {}
+        # printer_id -> the watch armed for that printer's CURRENT policy.
+        self._armed: dict[int, _ArmedWatch] = {}
+
+    # -- the injected driver ------------------------------------------------
+
+    def on_occupancy_change(self, printer_id: int, view: OccupancyView, cause: str) -> None:
+        """Make the running watch match ``view``'s policy. The authority's policy driver.
+
+        Called SYNCHRONOUSLY from inside the authority's fan-out, after every
+        transition, so it must return immediately — it only spawns and cancels.
+
+        Three rules:
+
+        * a plate that is CLEAR, or a printer an EJECT owns, carries no watch. A
+          hydrated eject counts: the startup reconciler owns those printers, and a
+          cooldown watch armed beside one is the double dispatch the legacy re-arm
+          avoided by skipping such printers outright;
+        * otherwise the plate's policy decides which watch runs;
+        * and it respawns only when that policy CHANGED — the fan-out fires on every
+          transition, and cancelling a healthy cooldown watch to start an identical one
+          would lose its elapsed cooldown, its plateau anchor and its escalation state.
+
+        Exceptions are deliberately NOT swallowed. A policy that fails to arm leaves the
+        plate ARMLESS, which is the one outcome 2026-07-18/07-21 forbids — so the
+        authority catches it, repairs the record to ``EscalationOnly`` and calls back;
+        swallowing here would report success for a plate nothing is looking after.
+        """
+        # Level-triggered timer hygiene: whenever no eject is registered on this
+        # printer, neither of the eject lane's two timers has anything left to bound.
+        # Routing every retirement (matched terminal, unverified resolve, start expiry,
+        # reconciler disposal, operator recover) through this one check is what stops a
+        # resolved eject leaving a task armed to stop a printer that already finished.
+        if not view.eject_present:
+            eject_remote.cancel_eject_timers(printer_id)
+
+        desired = self._desired_policy(view)
+        armed = self._armed.get(printer_id)
+        if desired is None:
+            if armed is not None:
+                self._cancel(printer_id, f"{cause} — plate no longer watchable")
+            return
+        if armed is not None and armed.policy == desired:
+            return
+        if armed is not None:
+            self._cancel(printer_id, f"{cause} — policy changed to {type(desired).__name__}")
+        self._arm(printer_id, desired)
+
+    @staticmethod
+    def _desired_policy(view: OccupancyView) -> OccupancyPolicy | None:
+        """Which watch this view calls for, or None for "no watch at all"."""
+        if not view.plate_occupied or view.eject_present:
+            return None
+        return view.plate_policy
+
+    def _arm(self, printer_id: int, policy: OccupancyPolicy) -> None:
+        """Spawn the watch for ``policy`` and record it. Raises if the spawn fails."""
+        release_now: asyncio.Event | None = None
+        queue_item_id: int | None = None
+        if isinstance(policy, CooldownEject):
+            release_now = asyncio.Event()
+            queue_item_id = policy.unit_id
+            coro = self._watch(printer_id, policy.unit_id, purpose="production", release_now=release_now)
+            name = f"eject-cooldown-watch-{printer_id}"
+        elif isinstance(policy, FirstArticleEject):
+            release_now = asyncio.Event()
+            queue_item_id = policy.unit_id
+            coro = self._watch(printer_id, policy.unit_id, purpose="fa", run_id=policy.run_id, release_now=release_now)
+            name = f"eject-fa-watch-{printer_id}"
+        elif isinstance(policy, ForeignAutoEject):
+            release_now = asyncio.Event()
+            coro = self._watch(
+                printer_id,
+                None,
+                purpose="foreign",
+                threshold_override=policy.threshold_c,
+                profile_id=policy.profile_id,
+                release_now=release_now,
+            )
+            name = f"eject-foreign-watch-{printer_id}"
+        else:
+            coro = self._escalation_only(printer_id)
+            name = f"eject-gate-escalation-{printer_id}"
+        task = spawn_background_task(coro, name=name)
+        self._armed[printer_id] = _ArmedWatch(
+            policy=policy, task=task, queue_item_id=queue_item_id, release_now=release_now
+        )
+        logger.info("Eject monitor: printer %s armed %s", printer_id, type(policy).__name__)
+
+    def _cancel(self, printer_id: int, reason: str) -> None:
+        """Cancel + deregister the armed watch (no-op when nothing is armed)."""
+        armed = self._armed.pop(printer_id, None)
+        if armed is None:
+            return
+        if not armed.task.done():
+            armed.task.cancel()
+        logger.info("Eject monitor: printer %s watch cancelled (%s)", printer_id, reason)
+
+    def _release_record(self, printer_id: int, task: asyncio.Task) -> None:
+        """Drop the record iff it still belongs to ``task`` (never a successor's)."""
+        armed = self._armed.get(printer_id)
+        if armed is not None and armed.task is task:
+            self._armed.pop(printer_id, None)
+
+    # -- queries ------------------------------------------------------------
 
     def active_watch(self, printer_id: int) -> float | None:
         """The in-flight cooldown watch's release threshold (°C), or None.
 
-        None both when no watch is armed and when the armed watch carries no
-        threshold (escalation-only / still resolving) — callers surface the
-        cooldown phase only when a real release temperature exists. Unchanged
-        contract: callers (and the UI ``eject_watch`` payload) still see float | None."""
-        entry = self._watching.get(printer_id)
-        if isinstance(entry, _ActiveWatch):
-            return entry.threshold_c
-        return entry  # None sentinel, or a raw float poked in by a test
-
-    def active_watch_identity(self, printer_id: int) -> _ActiveWatch | None:
-        """The in-flight cooldown/FA watch's full identity (item + release channel),
-        or None when nothing armed / escalation-only / still resolving (W2)."""
-        entry = self._watching.get(printer_id)
-        return entry if isinstance(entry, _ActiveWatch) else None
+        None both when no watch is armed and when the armed watch carries no threshold
+        (an escalation-only hold, or a cooldown watch still resolving its item's
+        profile) — callers surface the cooldown phase only when a real release
+        temperature exists. Unchanged contract: callers (and the UI ``eject_watch``
+        payload) still see ``float | None``."""
+        armed = self._armed.get(printer_id)
+        return armed.threshold_c if armed is not None else None
 
     def request_release_now(self, printer_id: int) -> bool:
-        """Signal an armed cooldown/FA watch to release immediately (manual "Eject
-        now"). Returns False when no releasable watch is armed (foreign gate / absent
-        / still resolving) — the caller then dispatches directly instead."""
-        entry = self._watching.get(printer_id)
-        if isinstance(entry, _ActiveWatch):
-            entry.release_now.set()
-            return True
-        return False
+        """Signal an armed RELEASING watch to sweep immediately (manual "Eject now").
 
-    def on_terminal_status(self, printer_id: int, final_status: str, queue_item_id: int | None = None) -> bool:
-        """Hook called once from ``main.on_print_complete`` for every terminal status.
-
-        Arms a background cooldown watch ONLY when the finished job was positively
-        correlated to a queue item (``queue_item_id`` is not None) AND completed
-        successfully; the watch then keys its release threshold off THAT item. A
-        terminal that could not be attributed to the dispatched unit (foreign/none,
-        or an upgrade-day NULL-key fallback → ``queue_item_id`` None) never
-        auto-clears — the plate-clear gate stays set for a human.
-
-        Returns ``True`` when a cooldown watch was armed (the ``_start_watch`` result),
-        ``False`` otherwise (non-success terminal, no queue item, or a watch already in
-        flight). The caller uses this to arm the escalation-only hold for an unattributed
-        deposit so a gated printer is never left watch-less."""
-        if not should_auto_clear(final_status) or queue_item_id is None:
+        Returns False when the armed watch cannot release (an escalation-only hold) or
+        nothing is armed — the caller then dispatches directly instead."""
+        armed = self._armed.get(printer_id)
+        if armed is None or armed.release_now is None:
             return False
-        return self._start_watch(printer_id, queue_item_id)
-
-    def start_escalation_only_watch(self, printer_id: int) -> bool:
-        """Arm the foreign-deposit gate watch: holds the gate (never auto-clears),
-        escalates once, and exits when the operator clears it or the printer goes
-        stale. Deduped against any in-flight watch on the same printer."""
-        if printer_id in self._watching:
-            return False
-        # Sentinel None: the foreign-gate watch never releases, so it exposes
-        # no cooldown threshold to the UI.
-        self._watching[printer_id] = None
-        spawn_background_task(self._escalation_only(printer_id), name=f"eject-gate-escalation-{printer_id}")
+        armed.release_now.set()
         return True
 
-    async def rearm_on_startup(self) -> int:
-        """Re-arm cooldown watches lost to a restart. Returns the count re-armed.
-
-        For every printer whose persisted ``awaiting_plate_clear`` gate is set,
-        re-spawn the COOLDOWN watch iff the most-recently-started job was a successful
-        eject job (see :func:`should_rearm`) AND that item's ``dispatch_subtask_id``
-        matches the printer's persisted ``plate_gate_subtask_id`` (both non-null).
-        A gate whose source we cannot positively tie to the eject job — a foreign
-        deposit, or a pre-migration NULL-source gate — never auto-clears on restart.
-        But it must NOT be left watch-less: a stranded gate with no watch escalates
-        NOTHING and silently stalls the farm (the exact failure this closes). So every
-        such gate instead arms the ESCALATION-ONLY hold — it never auto-clears, but it
-        escalates + notifies until a human clears the plate. The return count is the
-        number of COOLDOWN watches re-armed (escalation-only holds are not counted)."""
-        from backend.app.core.database import async_session
-        from backend.app.models.printer import Printer
-        from backend.app.services.eject import remote as eject_remote
-
-        rearmed = 0
-        async with async_session() as db:
-            result = await db.execute(
-                select(Printer.id, Printer.plate_gate_subtask_id)
-                .where(Printer.awaiting_plate_clear.is_(True))
-                .where(Printer.quarantined.is_(False))
-            )
-            for printer_id, gate_subtask_id in result.all():
-                # A printer with a hydrated pending eject is owned by the reconciler
-                # (W1.2): its eject is still in flight (or finished during downtime),
-                # so re-arming a cooldown watch here would double-dispatch. Skip it.
-                if eject_remote.peek_pending_eject(printer_id) is not None:
-                    logger.info(
-                        "Eject monitor: printer %s has a hydrated pending eject — rearm skipped (reconciler owns it)",
-                        printer_id,
-                    )
-                    continue
-                item = await _latest_started_item(db, printer_id)
-                cooldown_rearmable = (
-                    item is not None
-                    and should_rearm(True, item.status, item.eject_profile_id, getattr(item, "first_article", False))
-                    and bool(gate_subtask_id)
-                    and item.dispatch_subtask_id == gate_subtask_id
-                )
-                if cooldown_rearmable:
-                    if self._start_watch(printer_id, item.id):
-                        rearmed += 1
-                    continue
-                # Not positively tie-able to the eject job (item None / not a completed
-                # eject / gate-subtask mismatch): NEVER auto-clear — but the gate must
-                # not sit watch-less and silently stall the farm. Arm the escalation-
-                # only hold (deduped against any watch already in flight) so a stranded
-                # plate still escalates + notifies until a human clears it.
-                logger.info(
-                    "Eject monitor: printer %s gate NOT cooldown-re-armed (item=%s, gate=%r, last dispatch=%r) "
-                    "— arming escalation-only hold (no auto-clear)",
-                    printer_id,
-                    item.id if item is not None else None,
-                    gate_subtask_id,
-                    item.dispatch_subtask_id if item is not None else None,
-                )
-                self.start_escalation_only_watch(printer_id)
-        if rearmed:
-            logger.info("Eject monitor: re-armed %d cooldown watch(es) after restart", rearmed)
-        return rearmed
-
-    def _start_watch(self, printer_id: int, queue_item_id: int) -> bool:
-        """Spawn the identity-bound cooldown watch unless one is already in flight."""
-        if printer_id in self._watching:
-            return False
-        # Threshold not resolved yet (needs the item's profile/override) — the
-        # spawned watch records it once known so active_watch() can expose it.
-        self._watching[printer_id] = None
-        spawn_background_task(self._watch(printer_id, queue_item_id), name=f"eject-cooldown-watch-{printer_id}")
-        return True
-
-    def start_fa_eject_watch(self, printer_id: int, queue_item_id: int, run_id: int | None) -> bool:
-        """Arm the cooldown-gated eject for an APPROVED first article.
-
-        The FA remote eject must obey the same thermal policy as production —
-        an approval minutes after FINISH would otherwise sweep a hot plate now
-        that the eject file is motion-only. Same dedupe/threshold-exposure as
-        the production watch; releases into ``_dispatch_fa_eject``."""
-        if printer_id in self._watching:
-            return False
-        self._watching[printer_id] = None
-        spawn_background_task(
-            self._watch(printer_id, queue_item_id, purpose="fa", run_id=run_id),
-            name=f"eject-fa-watch-{printer_id}",
-        )
-        return True
-
-    def start_foreign_eject_watch(self, printer_id: int, profile_id: int, threshold_c: float) -> bool:
-        """Arm an AUTO eject watch for a FOREIGN plate positively identified as the
-        farm's OWN file (2026-07-18 decision).
-
-        Like the production cooldown watch it holds the plate gate and dispatches an
-        eject once the live bed reaches ``threshold_c`` — but it carries NO queue item.
-        The release dispatches a foreign-plate sweep (``dispatch_identified_foreign_eject``,
-        the same primitive the manual foreign "Eject now" uses) against the chosen
-        ``profile_id``; the gate-clear stays owned by the eject job's own terminal.
-        Deduped against any in-flight watch. Deliberately NOT restart-durable (mirrors
-        the manual foreign eject): after a restart ``rearm_on_startup`` degrades this to
-        an escalation-only hold rather than re-deriving the foreign identity."""
-        if printer_id in self._watching:
-            return False
-        self._watching[printer_id] = None
-        spawn_background_task(
-            self._watch(printer_id, None, purpose="foreign", threshold_override=threshold_c, profile_id=profile_id),
-            name=f"eject-foreign-watch-{printer_id}",
-        )
-        return True
+    # -- watch bodies -------------------------------------------------------
 
     async def _watch(
         self,
@@ -989,6 +988,7 @@ class EjectCooldownMonitor:
         run_id: int | None = None,
         threshold_override: float | None = None,
         profile_id: int | None = None,
+        release_now: asyncio.Event,
     ) -> None:
         try:
             if threshold_override is not None:
@@ -997,15 +997,26 @@ class EjectCooldownMonitor:
                 threshold: float | None = threshold_override
             else:
                 threshold = await _resolve_eject_threshold(queue_item_id, for_first_article=purpose == "fa")
-                if threshold is None:
-                    # Not an eject job — leave the manual plate-clear behaviour intact.
-                    return
-            # Record the full watch identity so active_watch() still exposes the
-            # threshold AND a manual "Eject now" can drive this watch's release_now.
-            release_now = asyncio.Event()
-            self._watching[printer_id] = _ActiveWatch(
-                threshold_c=threshold, queue_item_id=queue_item_id, purpose=purpose, release_now=release_now
-            )
+            if threshold is None:
+                # A releasing policy over a unit that carries no usable eject profile
+                # (a deleted profile row, an FA item under a production policy). The
+                # plate is still occupied, and a plate with no watch is the armless
+                # gate 2026-07-18/07-21 forbids — so hold and escalate instead of
+                # returning into silence.
+                logger.warning(
+                    "Eject monitor: printer %s %s policy resolved NO release threshold (item %s) — "
+                    "holding the plate with an escalation-only watch instead",
+                    printer_id,
+                    purpose,
+                    queue_item_id,
+                )
+                await watch_gate_escalation_only(printer_id)
+                return
+            armed = self._armed.get(printer_id)
+            if armed is not None and armed.task is asyncio.current_task():
+                # Publish the resolved threshold so active_watch() (and the UI's
+                # eject_watch payload) can render the cooldown phase.
+                armed.threshold_c = threshold
             # Resolve the plateau/cap policy once at arm; bind the eject dispatch and
             # the stall reaction to THIS unit so the watch stays identity-scoped.
             stall_window_s, stall_epsilon_c, max_hold_s, plateau_eject_margin_c = await _resolve_stall_settings()
@@ -1014,12 +1025,8 @@ class EjectCooldownMonitor:
                     _dispatch_fa_eject, printer_id=printer_id, queue_item_id=queue_item_id, run_id=run_id
                 )
             elif purpose == "foreign":
-                # Lazy import: manual.py imports monitor at module load, so importing it
-                # at module top here would be a circular import.
-                from backend.app.services.eject.manual import dispatch_identified_foreign_eject
-
                 on_release = functools.partial(
-                    dispatch_identified_foreign_eject, printer_id=printer_id, profile_id=profile_id
+                    eject_remote.dispatch_identified_foreign_eject, printer_id=printer_id, profile_id=profile_id
                 )
             else:
                 on_release = functools.partial(
@@ -1037,19 +1044,34 @@ class EjectCooldownMonitor:
                 on_stall=on_stall,
                 release_now=release_now,
             )
+        except asyncio.CancelledError:
+            raise  # the driver cancelled us because the policy changed — not a failure
         except Exception:  # noqa: BLE001 — a watch failure must not crash the callback loop
             logger.exception("Eject monitor: cooldown watch for printer %s failed", printer_id)
         finally:
-            self._watching.pop(printer_id, None)
+            self._release_record(printer_id, asyncio.current_task())
 
     async def _escalation_only(self, printer_id: int) -> None:
         try:
             await watch_gate_escalation_only(printer_id)
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 — a watch failure must not crash the callback loop
             logger.exception("Eject monitor: foreign-gate escalation watch for printer %s failed", printer_id)
         finally:
-            self._watching.pop(printer_id, None)
+            self._release_record(printer_id, asyncio.current_task())
 
 
 # Module-level singleton, mirroring the other service singletons.
 eject_cooldown_monitor = EjectCooldownMonitor()
+
+
+def wire_policy_driver() -> None:
+    """Inject the monitor as the authority's policy driver. Called once at lifespan.
+
+    Only the ``policy_driver`` slot is filled: ``configure`` leaves an omitted callable
+    untouched, so this and ``plate_occupancy_store.wire_core`` wire independently. It
+    must run BEFORE ``hydrate()``, because hydrating an occupied plate notifies its
+    policy and that notification is what re-arms the watch a restart lost.
+    """
+    plate_occupancy.configure(policy_driver=eject_cooldown_monitor.on_occupancy_change)

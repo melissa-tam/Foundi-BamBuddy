@@ -8,17 +8,38 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.app.services.plate_occupancy import (
+    CooldownEject,
+    Evidence,
+    PendingEject,
+    plate_occupancy,
+)
 from backend.app.services.printer_manager import (
     PrinterManager,
     get_derived_status_name,
     has_stg_cur_idle_bug,
     init_printer_connections,
+    occupancy_payload,
     parse_plate_id,
     printer_state_to_dict,
     supports_chamber_temp,
     supports_drying,
     supports_drying_while_printing,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clean_occupancy_authority():
+    """Isolate the module-singleton occupancy authority.
+
+    Since the 2026-08-30 cut-over the manager's plate answers come from
+    ``plate_occupancy``, so a record left behind by one test would leak into every
+    later ``printer_state_to_dict`` assertion. ``reset_for_tests`` also un-wires the
+    injected callables, which keeps these tests free of the DB / websocket lanes.
+    """
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 class TestPrinterManager:
@@ -1154,20 +1175,20 @@ class TestPrinterStateToDict:
         result = printer_state_to_dict(mock_state)
         assert result["awaiting_plate_clear"] is False
 
-    def test_awaiting_plate_clear_surfaced_when_set(self, mock_state):
-        """With printer_id, awaiting_plate_clear reflects PrinterManager state.
+    def test_awaiting_plate_clear_surfaced_when_occupied(self, mock_state):
+        """With printer_id, awaiting_plate_clear reflects the occupancy authority.
 
         Regression: PR #939 left this flag off the WebSocket payload, so the
-        "Clear Plate" button only appeared after the 30 s REST fallback poll.
+        "Clear Plate" button only appeared after the 30 s REST fallback poll. The
+        flag SURVIVED the 2026-08-30 cut-over — only its source moved, from the
+        manager's in-memory set to ``plate_occupancy.is_plate_occupied`` — so the
+        key must keep riding the payload.
         """
-        from backend.app.services.printer_manager import printer_manager
+        assert plate_occupancy.declare_occupied(12345, Evidence()) is None
 
-        printer_manager.set_awaiting_plate_clear(12345, True)
-        try:
-            result = printer_state_to_dict(mock_state, printer_id=12345)
-            assert result["awaiting_plate_clear"] is True
-        finally:
-            printer_manager.set_awaiting_plate_clear(12345, False)
+        result = printer_state_to_dict(mock_state, printer_id=12345)
+
+        assert result["awaiting_plate_clear"] is True
 
     def test_sdcard_true_rides_ws_payload(self, mock_state):
         """sdcard=True must ride the WS dict (F8) — REST already carries it, so
@@ -1996,3 +2017,168 @@ class TestOpenIncidentProjection:
             "slot_desc": "AMS A slot 3",
             "created_at": "2026-08-09T12:00:00",
         }
+
+
+class TestOccupancyProjection:
+    """WS3: the manager's plate answers are projections of the occupancy authority.
+
+    The manager used to be the second of five stores answering "who owns this
+    printer" — an in-memory set plus a DB writer plus a loader. Since the 2026-08-30
+    cut-over it OWNS nothing here: ``is_awaiting_plate_clear`` asks the one authority
+    that does, and there is no setter at all (every raise and clear is a named
+    transition on ``plate_occupancy``).
+    """
+
+    def _state(self):
+        state = MagicMock()
+        state.connected = True
+        state.state = "IDLE"
+        state.temperatures = {}
+        state.hms_errors = []
+        state.raw_data = {}
+        state.stg_cur = -1
+        state.firmware_version = None
+        state.gcode_file = ""
+        state.subtask_name = ""
+        return state
+
+    def _occupy(self, printer_id: int) -> None:
+        assert plate_occupancy.declare_occupied(printer_id, Evidence()) is None
+
+    # -- the projection itself ------------------------------------------------
+
+    def test_is_awaiting_plate_clear_tracks_the_authority_both_ways(self):
+        """A thin projection of ``plate_occupancy.is_plate_occupied`` — nothing else.
+
+        Pinned as an equality against the authority rather than against a literal, so
+        a future store that starts caching the answer fails here immediately.
+        """
+        from backend.app.services.printer_manager import printer_manager
+
+        assert printer_manager.is_awaiting_plate_clear(4242) is False
+        assert printer_manager.is_awaiting_plate_clear(4242) == plate_occupancy.is_plate_occupied(4242)
+
+        self._occupy(4242)
+        assert printer_manager.is_awaiting_plate_clear(4242) is True
+        assert printer_manager.is_awaiting_plate_clear(4242) == plate_occupancy.is_plate_occupied(4242)
+
+        assert plate_occupancy.clear_plate(4242) is None
+        assert printer_manager.is_awaiting_plate_clear(4242) is False
+        assert printer_manager.is_awaiting_plate_clear(4242) == plate_occupancy.is_plate_occupied(4242)
+
+    def test_the_manager_has_no_plate_writer_left(self):
+        """The five-stores problem is only solved while the second store stays gone.
+
+        A re-introduced setter (or the in-memory set / DB writer / loader behind it)
+        would give the plate a second writer and re-open every seam the cut-over
+        closed, so their ABSENCE is the contract.
+        """
+        from backend.app.services.printer_manager import printer_manager
+
+        for gone in (
+            "set_awaiting_plate_clear",
+            "_awaiting_plate_clear",
+            "_persist_awaiting_plate_clear",
+            "load_awaiting_plate_clear_from_db",
+        ):
+            assert not hasattr(printer_manager, gone), f"{gone} must stay deleted — the authority owns the plate"
+
+    # -- occupancy_payload ----------------------------------------------------
+
+    def test_payload_is_none_without_a_printer_id(self):
+        assert occupancy_payload(None) is None
+        assert occupancy_payload(0) is None
+
+    def test_payload_shape_on_an_untouched_printer(self):
+        """The full key set, so REST and WS cannot drift apart on an empty record."""
+        payload = occupancy_payload(4242)
+
+        assert payload == {
+            "plate": {"occupied": False, "source_subtask_id": None, "policy": None, "since": None},
+            "eject": None,
+            "lease_age_s": None,
+        }
+
+    def test_payload_carries_the_plate_source_and_its_policy_class_name(self):
+        """``policy`` is the class NAME: the UI renders "what happens to this plate
+        next", and the unit / profile behind it already has its own surfaces."""
+        from datetime import datetime
+
+        plate_occupancy.hydrate_plate(4242, "SUB-1", CooldownEject(unit_id=11, run_id=3))
+
+        plate = occupancy_payload(4242)["plate"]
+
+        assert plate["occupied"] is True
+        assert plate["source_subtask_id"] == "SUB-1"
+        assert plate["policy"] == "CooldownEject"
+        assert isinstance(plate["since"], datetime)
+
+    def test_payload_renders_a_pending_eject(self):
+        """The eject sub-dict is the operator's only view of a sweep in flight."""
+        self._occupy(4242)
+        assert (
+            plate_occupancy.claim_for_eject(
+                4242,
+                PendingEject(purpose="production", run_id=3, queue_item_id=11),
+                Evidence(),
+            )
+            is None
+        )
+
+        eject = occupancy_payload(4242)["eject"]
+
+        assert eject["purpose"] == "production"
+        assert eject["started"] is False  # no START echo yet
+        assert eject["hydrated"] is False  # a claim is a LIVE dispatch by definition
+        assert isinstance(eject["age_s"], float)
+
+        plate_occupancy.note_eject_started(4242)
+        assert occupancy_payload(4242)["eject"]["started"] is True
+
+    def test_payload_reports_a_lease_age_while_a_dispatch_is_in_flight(self):
+        from backend.app.services.plate_occupancy import DispatchLease
+
+        lease = plate_occupancy.claim_for_dispatch(
+            4242,
+            unit_id=11,
+            pre_state="IDLE",
+            pre_subtask="",
+            min_hold_s=60.0,
+            max_hold_s=180.0,
+            ev=Evidence(live_state="IDLE"),
+        )
+
+        assert isinstance(lease, DispatchLease)
+        assert isinstance(occupancy_payload(4242)["lease_age_s"], float)
+
+    def test_payload_never_publishes_the_owner_projection(self):
+        """REST and WS must not disagree.
+
+        ``OccupancyView.owner`` is derived partly from ``db_claim`` — a per-tick queue
+        read this SYNCHRONOUS serializer cannot do — so publishing it here would make
+        the socket push and the poll describe the same printer differently.
+        """
+        self._occupy(4242)
+
+        payload = occupancy_payload(4242)
+
+        assert "owner" not in payload
+        assert "owner" not in payload["plate"]
+        assert plate_occupancy.snapshot(4242).owner == "none"  # the view still has it
+
+    # -- and the WS serializer carries it -------------------------------------
+
+    def test_printer_state_to_dict_carries_the_occupancy_key(self):
+        """One builder, three construction sites: the WS dict must be the same value
+        both REST status branches serve."""
+        self._occupy(4242)
+
+        result = printer_state_to_dict(self._state(), printer_id=4242)
+
+        assert result["occupancy"] == occupancy_payload(4242)
+        # awaiting_plate_clear STAYS beside it — the cut-over moved the source, not
+        # the key, and every existing client reads the boolean.
+        assert result["awaiting_plate_clear"] is True
+
+    def test_occupancy_is_none_when_no_printer_id_is_supplied(self):
+        assert printer_state_to_dict(self._state())["occupancy"] is None

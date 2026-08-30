@@ -1,13 +1,26 @@
-"""Manual "Eject now" service (W2) — ordered preconditions + execution paths."""
+"""Manual "Eject now" service (W2) — ordered preconditions + execution paths.
 
-import asyncio
+Since the 2026-08-30 cut-over the plate gate, the pending eject and the armed
+cooldown watch are all ONE record held by ``plate_occupancy``, so these tests drive
+state through the authority's transitions instead of patching three stores:
+
+* the gate is seeded with ``hydrate_plate`` (or raised by the service's own
+  ``declare_occupied``) and read back with ``is_plate_occupied`` / ``snapshot``;
+* "a cooldown watch is armed for unit N" is now "the plate's policy IS
+  ``CooldownEject(unit_id=N)``" — the monitor's ``active_watch_identity`` and its
+  ``_ActiveWatch`` record are gone, and only ``request_release_now`` is still stubbed
+  (it is the manual lane's single signal into the running watch);
+* an eject in flight is a claimed ``PendingEject``, and a HYDRATED one deliberately
+  does NOT refuse an operator (see the 2026-08-30 dead-end test below).
+"""
+
 import os
 import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -18,7 +31,13 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.eject import manual, remote as eject_remote
-from backend.app.services.eject.monitor import _ActiveWatch
+from backend.app.services.plate_occupancy import (
+    CooldownEject,
+    EscalationOnly,
+    Evidence,
+    PendingEject,
+    plate_occupancy,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -57,16 +76,33 @@ def _state(state="FINISH", *, bed=25.0, connected=True):
     return SimpleNamespace(state=state, connected=connected, temperatures={"bed": bed})
 
 
-def _prod_identity(qid):
-    return _ActiveWatch(threshold_c=30.0, queue_item_id=qid, purpose="production", release_now=asyncio.Event())
+def _gate_up(printer_id, *, gate="SUB-1", policy=None):
+    """Seed an OCCUPIED plate on ``printer_id`` through the authority.
+
+    ``policy`` is what happens to that plate next; the escalation-only default is the
+    "no watch is armed" shape, and a :class:`CooldownEject` is the armed-watch shape
+    the manual lane's fast path keys on."""
+    plate_occupancy.hydrate_plate(printer_id, gate, policy or EscalationOnly())
 
 
-def _connected_awaiting(status):
-    """The three printer_manager patches that pass the connect/busy/gate gates."""
+def _cooldown(printer_id, unit_id, *, gate="SUB-1", run_id=None):
+    """Seed the plate with an armed PRODUCTION cooldown policy for ``unit_id``."""
+    _gate_up(printer_id, gate=gate, policy=CooldownEject(unit_id=unit_id, run_id=run_id))
+
+
+def _claim_eject(printer_id, pending):
+    """Claim the (already gated) plate for a LIVE eject — the in-flight shape."""
+    assert plate_occupancy.claim_for_eject(printer_id, pending, Evidence()) is None
+
+
+def _connected(status):
+    """The two printer_manager patches that pass the connect + busy gates.
+
+    The plate gate is no longer one of them: it is real occupancy state, seeded with
+    :func:`_gate_up`, because the service reads it from the authority."""
     return (
         patch.object(manual.printer_manager, "is_connected", return_value=True),
         patch.object(manual.printer_manager, "get_status", return_value=status),
-        patch.object(manual.printer_manager, "is_awaiting_plate_clear", return_value=True),
     )
 
 
@@ -90,50 +126,87 @@ class TestManualEjectPreconditions:
     async def test_busy_409(self, db_session):
         printer = await _mk_printer(db_session, "BUSY")
         await db_session.commit()
-        with (
-            patch.object(manual.printer_manager, "is_connected", return_value=True),
-            patch.object(manual.printer_manager, "get_status", return_value=_state("RUNNING")),
-            pytest.raises(manual.ManualEjectError) as exc,
-        ):
+        c1, c2 = _connected(_state("RUNNING"))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id)
         assert exc.value.code == "printer_busy"
 
     async def test_no_plate_gate_409(self, db_session):
         printer = await _mk_printer(db_session, "NG")
         await db_session.commit()
-        with (
-            patch.object(manual.printer_manager, "is_connected", return_value=True),
-            patch.object(manual.printer_manager, "get_status", return_value=_state("FINISH")),
-            patch.object(manual.printer_manager, "is_awaiting_plate_clear", return_value=False),
-            pytest.raises(manual.ManualEjectError) as exc,
-        ):
+        c1, c2 = _connected(_state("FINISH"))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id)
         assert exc.value.code == "no_plate_gate"
 
-    async def test_eject_in_flight_409(self, db_session):
+    async def test_live_eject_in_flight_409_carries_started_and_age(self, db_session):
+        """A LIVE eject owns the printer. The refusal now ships the two facts the
+        operator needs to tell the two situations apart: whether the printer has
+        STARTED the sweep (and will therefore finish it on its own) and how long ago
+        it was dispatched."""
         printer = await _mk_printer(db_session, "INF")
         await db_session.commit()
-        eject_remote.register_pending_eject(printer.id, eject_remote.PendingEject("production", None, 5))
-        c1, c2, c3 = _connected_awaiting(_state("FINISH"))
-        try:
-            with c1, c2, c3, pytest.raises(manual.ManualEjectError) as exc:
-                await manual.manual_eject(db_session, printer.id)
-            assert exc.value.code == "eject_in_flight"
-        finally:
-            eject_remote.pop_pending_eject(printer.id)
+        _gate_up(printer.id)
+        _claim_eject(printer.id, PendingEject("production", None, 5))
 
-    async def test_no_eligible_unit_409(self, db_session):
-        # No armed watch and no DB-resolvable unit → no_eligible_unit.
-        printer = await _mk_printer(db_session, "NE")
+        c1, c2 = _connected(_state("FINISH"))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
+            await manual.manual_eject(db_session, printer.id)
+        assert exc.value.code == "eject_in_flight"
+        assert exc.value.status_code == 409
+        assert exc.value.extra["started"] is False  # dispatched, never echoed a start
+        assert isinstance(exc.value.extra["age_s"], float)
+        assert exc.value.extra["age_s"] >= 0.0
+
+    async def test_started_live_eject_reports_started_true(self, db_session):
+        printer = await _mk_printer(db_session, "INFSTART")
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH"))
+        _gate_up(printer.id)
+        _claim_eject(printer.id, PendingEject("production", None, 5))
+        plate_occupancy.note_eject_started(printer.id)
+
+        c1, c2 = _connected(_state("FINISH"))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
+            await manual.manual_eject(db_session, printer.id)
+        assert exc.value.code == "eject_in_flight"
+        assert exc.value.extra["started"] is True
+
+    async def test_hydrated_eject_supersedes_instead_of_refusing_20260830(self, db_session):
+        """THE 2026-08-30 DEAD-END PIN (printer 4, 01:46-01:49, eight consecutive
+        ``eject_in_flight`` 409s until the operator hand-jogged the toolhead).
+
+        A HYDRATED eject was rebuilt from a durable timestamp: it has no start echo,
+        no runtime estimate and no watchdog, so the farm has already ADMITTED it cannot
+        verify that sweep. Refusing an operator in order to protect such a record is
+        backwards — the operator's eject is allowed through and supersedes it
+        downstream at ``claim_for_eject``."""
+        printer = await _mk_printer(db_session, "HYD", gate="SUB-1")
+        item = await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1")
+        await db_session.commit()
+        _gate_up(printer.id, gate="SUB-1")
+        plate_occupancy.hydrate_eject(printer.id, PendingEject("production", None, 999))
+        assert plate_occupancy.eject_identity(printer.id).hydrated is True
+
+        dispatch = AsyncMock()
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-            pytest.raises(manual.ManualEjectError) as exc,
+            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            patch.object(manual.eject_remote, "dispatch_part_present_eject", dispatch),
         ):
+            result = await manual.manual_eject(db_session, printer.id)
+
+        assert result == {"mode": "dispatched", "queue_item_id": item.id}
+        dispatch.assert_awaited_once()
+
+    async def test_no_eligible_unit_409(self, db_session):
+        # No cooldown policy and no DB-resolvable unit → no_eligible_unit.
+        printer = await _mk_printer(db_session, "NE")
+        await db_session.commit()
+        _gate_up(printer.id)
+        c1, c2 = _connected(_state("FINISH"))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id)
         assert exc.value.code == "no_eligible_unit"
 
@@ -142,28 +215,53 @@ class TestManualEjectPreconditions:
         printer = await _mk_printer(db_session, "FA", gate="SUB-1")
         await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1", first_article=True)
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH"))
-        with (
-            c1,
-            c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-            pytest.raises(manual.ManualEjectError) as exc,
-        ):
+        _gate_up(printer.id, gate="SUB-1")
+        c1, c2 = _connected(_state("FINISH"))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id)
         assert exc.value.code == "no_eligible_unit"
+
+
+class TestManualEjectItemResolution:
+    """``_resolve_manual_eject_item`` prefers the PLATE'S OWN cooldown policy — the
+    unit the authority says this plate is cooling for — over the DB lookup."""
+
+    async def test_cooldown_policy_names_the_unit(self, db_session):
+        printer = await _mk_printer(db_session, "RESPOL", gate="SUB-1")
+        # A DB-resolvable unit exists and is deliberately a DIFFERENT id, so the
+        # assertion can only pass through the policy.
+        await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1")
+        await db_session.commit()
+        _cooldown(printer.id, 4321)
+
+        assert await manual._resolve_manual_eject_item(db_session, printer.id) == 4321
+
+    async def test_falls_back_to_the_gate_matched_db_unit(self, db_session):
+        printer = await _mk_printer(db_session, "RESDB", gate="SUB-1")
+        item = await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1")
+        await db_session.commit()
+        _gate_up(printer.id, gate="SUB-1")
+
+        assert await manual._resolve_manual_eject_item(db_session, printer.id) == item.id
+
+    async def test_gate_key_mismatch_resolves_nothing(self, db_session):
+        printer = await _mk_printer(db_session, "RESMIS", gate="SUB-1")
+        await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="OTHER")
+        await db_session.commit()
+        _gate_up(printer.id, gate="SUB-1")
+
+        assert await manual._resolve_manual_eject_item(db_session, printer.id) is None
 
 
 class TestManualEjectThermal:
     async def test_bed_hot_carries_temps(self, db_session):
         printer = await _mk_printer(db_session, "HOT")
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=50.0))
+        _cooldown(printer.id, 555)
+        c1, c2 = _connected(_state("FINISH", bed=50.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=_prod_identity(555)),
             patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
             pytest.raises(manual.BedTooHot) as exc,
         ):
@@ -175,12 +273,11 @@ class TestManualEjectThermal:
     async def test_allow_hot_bypasses_thermal(self, db_session):
         printer = await _mk_printer(db_session, "HOTOK")
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=50.0))
+        _cooldown(printer.id, 555)
+        c1, c2 = _connected(_state("FINISH", bed=50.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=_prod_identity(555)),
             patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=True),
             patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
         ):
@@ -193,12 +290,11 @@ class TestManualEjectThermal:
         # built on a missing reading (frontend would render Number(null) → "0°C").
         printer = await _mk_printer(db_session, "NOBED")
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=None))
+        _cooldown(printer.id, 555)
+        c1, c2 = _connected(_state("FINISH", bed=None))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=_prod_identity(555)),
             patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
             pytest.raises(manual.ManualEjectError) as exc,
         ):
@@ -211,12 +307,11 @@ class TestManualEjectThermal:
         # The explicit override still proceeds with no reading — unchanged behavior.
         printer = await _mk_printer(db_session, "NOBEDOK")
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=None))
+        _cooldown(printer.id, 555)
+        c1, c2 = _connected(_state("FINISH", bed=None))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=_prod_identity(555)),
             patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=True),
             patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
         ):
@@ -225,16 +320,18 @@ class TestManualEjectThermal:
 
 
 class TestManualEjectExecution:
-    async def test_watch_armed_signals_release_only(self, db_session):
+    async def test_armed_cooldown_policy_signals_release_only(self, db_session):
+        """The plate's own policy IS the armed watch's identity: a ``CooldownEject``
+        for this unit means a watch is running, so the manual eject drives THAT
+        watch's single release path instead of racing it with a parallel dispatch."""
         printer = await _mk_printer(db_session, "WARM")
         await db_session.commit()
+        _cooldown(printer.id, 555)
         dispatch = AsyncMock()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=_prod_identity(555)),
             patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=True) as req,
             patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
             patch.object(manual.eject_remote, "dispatch_part_present_eject", dispatch),
@@ -244,17 +341,37 @@ class TestManualEjectExecution:
         req.assert_called_once_with(printer.id)
         dispatch.assert_not_called()  # NO parallel dispatch
 
+    async def test_unreleasable_armed_watch_falls_through_to_a_direct_dispatch(self, db_session):
+        """``request_release_now`` answers False when the armed record has no release
+        channel (nothing armed yet, or an escalation-only hold). The manual lane must
+        then dispatch itself rather than silently doing nothing."""
+        printer = await _mk_printer(db_session, "WCOLD", gate="SUB-1")
+        item = await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1")
+        await db_session.commit()
+        _cooldown(printer.id, item.id, gate="SUB-1")
+        dispatch = AsyncMock()
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=False),
+            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            patch.object(manual.eject_remote, "dispatch_part_present_eject", dispatch),
+        ):
+            result = await manual.manual_eject(db_session, printer.id)
+        assert result == {"mode": "dispatched", "queue_item_id": item.id}
+        dispatch.assert_awaited_once()
+
     async def test_no_watch_dispatches(self, db_session):
         printer = await _mk_printer(db_session, "DISP", gate="SUB-1")
         item = await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1")
         await db_session.commit()
+        _gate_up(printer.id, gate="SUB-1")
         dispatch = AsyncMock()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
             patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
             patch.object(manual.eject_remote, "dispatch_part_present_eject", dispatch),
         ):
@@ -314,14 +431,9 @@ class TestManualEjectForeignPlate:
             await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="OTHER", eject_profile_id=77)
             await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
             await db_session.commit()
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                pytest.raises(manual.ForeignPlateEject) as exc,
-            ):
+            _gate_up(printer.id, gate="SUB-F")
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, pytest.raises(manual.ForeignPlateEject) as exc:
                 await manual.manual_eject(db_session, printer.id)
             assert exc.value.code == "foreign_plate"
             assert exc.value.status_code == 409
@@ -340,15 +452,10 @@ class TestManualEjectForeignPlate:
             await db_session.flush()
             await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
             await db_session.commit()
+            _gate_up(printer.id, gate="SUB-F")
             dispatch = AsyncMock()
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
-            ):
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch):
                 result = await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
             assert result == {"mode": "dispatched", "queue_item_id": None}
             dispatch.assert_awaited_once()
@@ -367,14 +474,9 @@ class TestManualEjectForeignPlate:
             await db_session.flush()
             await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
             await db_session.commit()
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=45.0))
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                pytest.raises(manual.BedTooHot) as exc,
-            ):
+            _gate_up(printer.id, gate="SUB-F")
+            c1, c2 = _connected(_state("FINISH", bed=45.0))
+            with c1, c2, pytest.raises(manual.BedTooHot) as exc:
                 await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
             assert exc.value.threshold_c == 30.0
             assert exc.value.bed_c == 45.0
@@ -384,14 +486,9 @@ class TestManualEjectForeignPlate:
     async def test_null_gate_refuses_not_foreign(self, db_session):
         printer = await _mk_printer(db_session, "FGN0", gate=None)
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-        with (
-            c1,
-            c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-            pytest.raises(manual.ManualEjectError) as exc,
-        ):
+        _gate_up(printer.id, gate=None)
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id)
         assert exc.value.code == "no_eligible_unit"
         assert not isinstance(exc.value, manual.ForeignPlateEject)
@@ -399,14 +496,9 @@ class TestManualEjectForeignPlate:
     async def test_no_archive_refuses(self, db_session):
         printer = await _mk_printer(db_session, "FGNA", gate="SUB-F")
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-        with (
-            c1,
-            c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-            pytest.raises(manual.ManualEjectError) as exc,
-        ):
+        _gate_up(printer.id, gate="SUB-F")
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id)
         assert exc.value.code == "no_eligible_unit"
 
@@ -416,12 +508,11 @@ class TestManualEjectForeignPlate:
         printer = await _mk_printer(db_session, "FGFF", gate="SUB-F")
         await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path="", filename="gone.gcode.3mf")
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        _gate_up(printer.id, gate="SUB-F")
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
             patch(
                 "backend.app.services.bambu_ftp.download_file_try_paths_async",
                 AsyncMock(return_value=False),
@@ -513,29 +604,18 @@ class TestManualEjectForeignFallbackLastFarmItem:
                 plate_id=1,
             )
             await db_session.commit()
+            _gate_up(printer.id, gate=gate or None)
             # First call (no profile) → the confirm prompt, carrying the item's donor.
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                pytest.raises(manual.ForeignPlateEject) as exc,
-            ):
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, pytest.raises(manual.ForeignPlateEject) as exc:
                 await manual.manual_eject(db_session, printer.id)
             assert exc.value.code == "foreign_plate"
             assert exc.value.print_name == "Farm Widget.gcode.3mf"
             assert exc.value.max_z_height_mm == 18.0
             # Second call (profile chosen) → dispatch the sweep with the fallback donor.
             dispatch = AsyncMock()
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
-            ):
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch):
                 result = await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
             assert result == {"mode": "dispatched", "queue_item_id": None}
             dispatch.assert_awaited_once()
@@ -573,27 +653,16 @@ class TestManualEjectForeignFallbackLastFarmItem:
                 plate_id=1,
             )
             await db_session.commit()
+            _gate_up(printer.id, gate=None)
             # Confirm prompt names the ARCHIVE donor (its print_name), not the library.
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                pytest.raises(manual.ForeignPlateEject) as exc,
-            ):
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, pytest.raises(manual.ForeignPlateEject) as exc:
                 await manual.manual_eject(db_session, printer.id)
             assert exc.value.print_name == "Arch Widget"
             # And the dispatch uses the archive path, not the library path.
             dispatch = AsyncMock()
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
-            ):
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch):
                 await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id)
             assert dispatch.await_args.kwargs["source_path"] == source_arch
         finally:
@@ -604,14 +673,9 @@ class TestManualEjectForeignFallbackLastFarmItem:
         # No queue item at all → fallback returns None → the ORIGINAL strict 409.
         printer = await _mk_printer(db_session, "FBNONE", gate="")
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-        with (
-            c1,
-            c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-            pytest.raises(manual.ManualEjectError) as exc,
-        ):
+        _gate_up(printer.id, gate=None)
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id)
         assert exc.value.code == "no_eligible_unit"
         assert "Could not resolve the file" in str(exc.value)
@@ -625,14 +689,9 @@ class TestManualEjectForeignFallbackLastFarmItem:
         )
         await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, plate_id=1)
         await db_session.commit()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-        with (
-            c1,
-            c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-            pytest.raises(manual.ManualEjectError) as exc,
-        ):
+        _gate_up(printer.id, gate=None)
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id)
         assert exc.value.code == "no_eligible_unit"
         assert "Could not resolve the file" in str(exc.value)
@@ -645,14 +704,9 @@ class TestManualEjectForeignFallbackLastFarmItem:
             lf = await _mk_ondisk_library_file(db_session, filename="Bare.gcode.3mf", file_path=str(bare))
             await _mk_farm_item(db_session, printer_id=printer.id, library_file_id=lf.id, plate_id=1)
             await db_session.commit()
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                pytest.raises(manual.ManualEjectError) as exc,
-            ):
+            _gate_up(printer.id, gate=None)
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
                 await manual.manual_eject(db_session, printer.id)
             assert exc.value.code == "no_eligible_unit"
             assert "Could not resolve the file" in str(exc.value)
@@ -666,14 +720,13 @@ class TestManualEjectForeignFallbackLastFarmItem:
         printer = await _mk_printer(db_session, "FBFA", gate="SUB-1")
         await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1", first_article=True)
         await db_session.commit()
+        _gate_up(printer.id, gate="SUB-1")
         strict = AsyncMock()
         fallback = AsyncMock()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
             patch.object(manual, "_resolve_foreign_source", strict),
             patch.object(manual, "_resolve_foreign_source_from_last_farm_item", fallback),
             pytest.raises(manual.ManualEjectError) as exc,
@@ -686,80 +739,94 @@ class TestManualEjectForeignFallbackLastFarmItem:
 
 
 class TestManualEjectDeclareOccupied:
-    """The one-step "Eject plate…" lane: with the gate DOWN, ``declare_occupied`` is the
-    operator STATING that a part is on the plate — the service raises the gate itself
-    (source-less ⇒ human-clear-only) and continues into the foreign flow instead of
-    409ing ``no_plate_gate``. The connected + busy guards precede it, so the flag can
-    never raise a disconnected or printing printer's gate, and the raise is NEVER rolled
-    back when the flow that follows it 409s."""
-
-    @staticmethod
-    def _gate_down(status, raiser):
-        """The declare lane's patch set: connected, gate DOWN, and the canonical gate
-        writer spied — patched, never live, because the real one mutates process-global
-        manager state that would leak into every later test."""
-        return (
-            patch.object(manual.printer_manager, "is_connected", return_value=True),
-            patch.object(manual.printer_manager, "get_status", return_value=status),
-            patch.object(manual.printer_manager, "is_awaiting_plate_clear", return_value=False),
-            patch.object(manual.printer_manager, "set_awaiting_plate_clear", raiser),
-        )
+    """The one-step "Eject plate…" lane: with the plate CLEAR, ``declare_occupied`` is
+    the operator STATING that a part is on it — the service raises the gate itself
+    through ``plate_occupancy.declare_occupied`` (source-less ⇒ human-clear-only) and
+    continues into the foreign flow instead of 409ing ``no_plate_gate``. The connected
+    + busy guards precede it, so the flag can never declare a disconnected or printing
+    printer's plate, and the raise is NEVER rolled back when the flow that follows
+    409s."""
 
     async def test_flag_false_keeps_todays_no_plate_gate_409(self, db_session):
         printer = await _mk_printer(db_session, "DCOFF", gate=None)
         await db_session.commit()
-        raiser = MagicMock()
-        c1, c2, c3, c4 = self._gate_down(_state("FINISH"), raiser)
-        with c1, c2, c3, c4, pytest.raises(manual.ManualEjectError) as exc:
+        c1, c2 = _connected(_state("FINISH"))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id)
         assert exc.value.code == "no_plate_gate"
-        raiser.assert_not_called()
+        assert plate_occupancy.is_plate_occupied(printer.id) is False
 
     async def test_running_printer_refuses_before_the_declaration(self, db_session):
         # Lane partition: the busy guard runs FIRST, so a declaration can never gate a
         # printer that is mid-print (its plate is not free to declare anything about).
         printer = await _mk_printer(db_session, "DCRUN", gate=None)
         await db_session.commit()
-        raiser = MagicMock()
-        c1, c2, c3, c4 = self._gate_down(_state("RUNNING"), raiser)
-        with c1, c2, c3, c4, pytest.raises(manual.ManualEjectError) as exc:
+        c1, c2 = _connected(_state("RUNNING"))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id, declare_occupied=True)
         assert exc.value.code == "printer_busy"
-        raiser.assert_not_called()
+        assert plate_occupancy.is_plate_occupied(printer.id) is False
+
+    async def test_preparing_printer_is_refused_by_the_authority(self, db_session):
+        """PREPARE/SLICING clear the service's own RUNNING/PAUSE busy guard but are
+        still an ACTIVE job to the authority, so the declaration itself refuses
+        ``job_active`` and the refusal token becomes the error code."""
+        printer = await _mk_printer(db_session, "DCPREP", gate=None)
+        await db_session.commit()
+        c1, c2 = _connected(_state("PREPARE"))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
+            await manual.manual_eject(db_session, printer.id, declare_occupied=True)
+        assert exc.value.code == "job_active"
+        assert exc.value.status_code == 409
+        assert plate_occupancy.is_plate_occupied(printer.id) is False
 
     async def test_disconnected_printer_refuses_before_the_declaration(self, db_session):
         # The other half of the partition: a disconnected printer's plate is declared
         # through the standalone mark-plate-occupied route, never through an eject.
         printer = await _mk_printer(db_session, "DCNC", gate=None)
         await db_session.commit()
-        raiser = MagicMock()
         with (
             patch.object(manual.printer_manager, "is_connected", return_value=False),
-            patch.object(manual.printer_manager, "set_awaiting_plate_clear", raiser),
             pytest.raises(manual.ManualEjectError) as exc,
         ):
             await manual.manual_eject(db_session, printer.id, declare_occupied=True)
         assert exc.value.code == "not_connected"
-        raiser.assert_not_called()
+        assert plate_occupancy.is_plate_occupied(printer.id) is False
 
     async def test_gate_raised_once_and_kept_when_no_donor_resolves(self, db_session):
         # The no-rollback pin: the donor 409 propagates unchanged AND the gate the
         # declaration raised stands — the plate is occupied whatever the eject concludes.
         printer = await _mk_printer(db_session, "DCNOD", gate=None)
         await db_session.commit()
-        raiser = MagicMock()
-        c1, c2, c3, c4 = self._gate_down(_state("FINISH", bed=25.0), raiser)
-        with (
-            c1,
-            c2,
-            c3,
-            c4,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-            pytest.raises(manual.ManualEjectError) as exc,
-        ):
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
+        with c1, c2, pytest.raises(manual.ManualEjectError) as exc:
             await manual.manual_eject(db_session, printer.id, declare_occupied=True)
         assert exc.value.code == "no_eligible_unit"
-        raiser.assert_called_once_with(printer.id, True, source_subtask_id=None)
+        view = plate_occupancy.snapshot(printer.id)
+        assert view.plate_occupied is True
+        assert view.plate_source_subtask_id is None  # source-less ⇒ human-clear-only
+        assert isinstance(view.plate_policy, EscalationOnly)
+
+    async def test_declaration_revokes_a_dispatch_lease_standing_on_the_printer(self, db_session):
+        """The 2026-08-30 01:06:57 shape: the operator's declaration landed between the
+        scheduler's claim and its ``start_print``. The declaration now REVOKES that
+        lease, so the dispatch unwinds instead of printing onto the declared plate."""
+        printer = await _mk_printer(db_session, "DCLEASE", gate=None)
+        await db_session.commit()
+        lease = plate_occupancy.claim_for_dispatch(
+            printer.id,
+            77,
+            pre_state="FINISH",
+            pre_subtask=None,
+            min_hold_s=60.0,
+            max_hold_s=180.0,
+            ev=Evidence(live_state="FINISH"),
+        )
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
+        with c1, c2, pytest.raises(manual.ManualEjectError):
+            await manual.manual_eject(db_session, printer.id, declare_occupied=True)
+        assert plate_occupancy.is_plate_occupied(printer.id) is True
+        assert plate_occupancy.commit_dispatch(printer.id, lease) == "lease_revoked"
 
     async def test_gate_raised_then_fallback_donor_drives_the_confirm_prompt(self, db_session):
         # The whole point of the lane: a plate the farm never gated still reaches the
@@ -779,21 +846,14 @@ class TestManualEjectDeclareOccupied:
                 plate_id=1,
             )
             await db_session.commit()
-            raiser = MagicMock()
-            c1, c2, c3, c4 = self._gate_down(_state("FINISH", bed=25.0), raiser)
-            with (
-                c1,
-                c2,
-                c3,
-                c4,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                pytest.raises(manual.ForeignPlateEject) as exc,
-            ):
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, pytest.raises(manual.ForeignPlateEject) as exc:
                 await manual.manual_eject(db_session, printer.id, declare_occupied=True)
             assert exc.value.print_name == "Farm Widget.gcode.3mf"
             assert exc.value.max_z_height_mm == 18.0
             assert exc.value.suggested_eject_profile_id == prof.id
-            raiser.assert_called_once_with(printer.id, True, source_subtask_id=None)
+            assert plate_occupancy.is_plate_occupied(printer.id) is True
+            assert plate_occupancy.plate_source(printer.id) is None
         finally:
             source.unlink(missing_ok=True)
 
@@ -808,42 +868,35 @@ class TestManualEjectDeclareOccupied:
             await db_session.flush()
             await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
             await db_session.commit()
-            raiser = MagicMock()
+            _gate_up(printer.id, gate="SUB-F")
             dispatch = AsyncMock()
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))  # gate already UP
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.printer_manager, "set_awaiting_plate_clear", raiser),
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
-            ):
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch):
                 result = await manual.manual_eject(
                     db_session, printer.id, eject_profile_id=prof.id, declare_occupied=True
                 )
             assert result == {"mode": "dispatched", "queue_item_id": None}
-            raiser.assert_not_called()
             dispatch.assert_awaited_once()
+            # The standing gate is untouched — a re-declaration would have wiped its
+            # source id and its row copy, which is how the confirm leg would lose the
+            # very archive it is sweeping.
+            assert plate_occupancy.plate_source(printer.id) == "SUB-F"
+            assert printer.plate_gate_subtask_id == "SUB-F"
         finally:
             source.unlink(missing_ok=True)
 
     async def test_stale_gate_key_is_nulled_so_a_dead_gate_cannot_steer_the_eject(self, db_session):
-        # The failed-persist shape: the in-memory gate is DOWN while the row still
+        # The failed-persist shape: the authority's plate is CLEAR while the row still
         # carries a key. Without nulling it the declaration would resolve THAT key's
         # queue item and sweep a print that is not on this plate.
         printer = await _mk_printer(db_session, "DCSTALE", gate="STALE-1")
         await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="STALE-1")
         await db_session.commit()
-        raiser = MagicMock()
         farm_known_dispatch = AsyncMock()
-        c1, c2, c3, c4 = self._gate_down(_state("FINISH", bed=25.0), raiser)
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            c4,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
             patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
             patch.object(manual.eject_remote, "dispatch_part_present_eject", farm_known_dispatch),
             pytest.raises(manual.ManualEjectError) as exc,
@@ -855,6 +908,7 @@ class TestManualEjectDeclareOccupied:
         assert "Could not resolve the file" in str(exc.value)
         farm_known_dispatch.assert_not_called()
         assert printer.plate_gate_subtask_id is None
+        assert plate_occupancy.is_plate_occupied(printer.id) is True  # the raise stands
 
 
 class TestManualEjectHeightOverride:
@@ -870,15 +924,10 @@ class TestManualEjectHeightOverride:
             await db_session.flush()
             await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
             await db_session.commit()
+            _gate_up(printer.id, gate="SUB-F")
             dispatch = AsyncMock()
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
-            ):
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch):
                 result = await manual.manual_eject(
                     db_session, printer.id, eject_profile_id=prof.id, max_z_override=42.5
                 )
@@ -895,14 +944,9 @@ class TestManualEjectHeightOverride:
             printer = await _mk_printer(db_session, "HOVRP", gate="SUB-F")
             await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
             await db_session.commit()
-            c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
-            with (
-                c1,
-                c2,
-                c3,
-                patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
-                pytest.raises(manual.ForeignPlateEject) as exc,
-            ):
+            _gate_up(printer.id, gate="SUB-F")
+            c1, c2 = _connected(_state("FINISH", bed=25.0))
+            with c1, c2, pytest.raises(manual.ForeignPlateEject) as exc:
                 await manual.manual_eject(db_session, printer.id, max_z_override=99.0)
             assert exc.value.max_z_height_mm == 18.0
         finally:
@@ -1136,9 +1180,11 @@ class TestForeignDonorCache:
 
     async def _fetching_printer(self, db, name, gate="SUB-F", filename="gone.gcode.3mf"):
         """A printer + a download-failed fallback archive (file_path="") so the donor
-        resolves via the FTPS re-fetch path (the branch the cache covers)."""
+        resolves via the FTPS re-fetch path (the branch the cache covers), with its
+        plate declared occupied so the manual lane gets past the gate check."""
         printer = await _mk_printer(db, name, gate=gate)
         await _mk_archive(db, printer_id=printer.id, subtask=gate, file_path="", filename=filename)
+        _gate_up(printer.id, gate=gate)
         return printer
 
     async def test_409_deposits_and_confirm_consumes_no_second_fetch(self, db_session):
@@ -1149,12 +1195,10 @@ class TestForeignDonorCache:
         await db_session.commit()
         fetch = _FetchCounter(_donor_bytes())
         # First call (no profile) → the confirm prompt; the donor is fetched + deposited.
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
             patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
             pytest.raises(manual.ForeignPlateEject),
         ):
@@ -1163,12 +1207,10 @@ class TestForeignDonorCache:
         assert len(manual._foreign_donor_cache) == 1  # deposited
         # Second call (profile chosen) → CONSUMES the deposit; NO second fetch.
         dispatch = AsyncMock()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
             patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
             patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
         ):
@@ -1185,12 +1227,10 @@ class TestForeignDonorCache:
         await db_session.flush()
         await db_session.commit()
         fetch = _FetchCounter(_donor_bytes())
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
             patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
             pytest.raises(manual.ForeignPlateEject),
         ):
@@ -1202,12 +1242,10 @@ class TestForeignDonorCache:
         manual._foreign_donor_cache[key] = (deposited_path, -1.0)
         assert deposited_path.is_file()
         dispatch = AsyncMock()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
             patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
             patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
         ):
@@ -1222,12 +1260,10 @@ class TestForeignDonorCache:
         await db_session.flush()
         await db_session.commit()
         fetch = _FetchCounter(_donor_bytes())
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
             patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
             pytest.raises(manual.ForeignPlateEject),
         ):
@@ -1238,12 +1274,10 @@ class TestForeignDonorCache:
         await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-B", file_path="", filename="b.gcode.3mf")
         await db_session.commit()
         dispatch = AsyncMock()
-        c1, c2, c3 = _connected_awaiting(_state("FINISH", bed=25.0))
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
         with (
             c1,
             c2,
-            c3,
-            patch.object(manual.eject_cooldown_monitor, "active_watch_identity", return_value=None),
             patch("backend.app.services.bambu_ftp.download_file_try_paths_async", fetch),
             patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch),
         ):
@@ -1280,15 +1314,22 @@ class TestForeignDonorCache:
             assert identified is not None
             assert fetch.calls == 1  # identify fetched + deposited
             dispatch = AsyncMock()
-            with patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch):
-                await manual.dispatch_identified_foreign_eject(printer_id=printer.id, profile_id=identified.profile_id)
+            with patch.object(eject_remote, "dispatch_foreign_eject", dispatch):
+                await eject_remote.dispatch_identified_foreign_eject(
+                    printer_id=printer.id, profile_id=identified.profile_id
+                )
         assert fetch.calls == 1  # dispatch consumed the deposit — no second fetch
         dispatch.assert_awaited_once()
 
 
 class TestDispatchIdentifiedForeignEject:
     """The auto foreign-eject on_release: resolve the donor fresh and dispatch the
-    foreign-plate sweep exactly as the manual confirm does (no thermal gate)."""
+    foreign-plate sweep exactly as the manual confirm does (no thermal gate).
+
+    The entry point MOVED to ``eject.remote`` at the 2026-08-30 cut-over (it sits
+    beside the dispatcher it calls, so the monitor no longer has to reach into the
+    manual-eject service through a lazy import); the donor resolution it drives is
+    still this module's, which is why the pin lives here."""
 
     async def test_dispatches_foreign_eject_for_gate_source(self, db_session, monkeypatch):
         import contextlib
@@ -1306,11 +1347,37 @@ class TestDispatchIdentifiedForeignEject:
             # dispatch_identified_foreign_eject opens its OWN session — back it with db_session.
             monkeypatch.setattr("backend.app.core.database.async_session", _fake_session, raising=False)
             dispatch = AsyncMock()
-            with patch.object(manual.eject_remote, "dispatch_foreign_eject", dispatch):
-                await manual.dispatch_identified_foreign_eject(printer_id=printer.id, profile_id=5)
+            with patch.object(eject_remote, "dispatch_foreign_eject", dispatch):
+                await eject_remote.dispatch_identified_foreign_eject(printer_id=printer.id, profile_id=5)
             dispatch.assert_awaited_once()
             assert dispatch.await_args.kwargs["printer_id"] == printer.id
             assert dispatch.await_args.kwargs["profile_id"] == 5
             assert dispatch.await_args.kwargs["plate_id"] == 1
         finally:
             source.unlink(missing_ok=True)
+
+
+class TestDeletedWatchRegistrySymbols:
+    """Absence pin: the armed-watch registry the manual lane used to consult is gone.
+
+    ``active_watch_identity`` and ``_ActiveWatch`` were the monitor's second opinion
+    about which unit a plate was cooling for — one of the five stores the 2026-08-30
+    cut-over collapsed. The plate's own ``CooldownEject`` policy is now that fact, and a
+    re-appearance here means the manual lane can disagree with the authority again."""
+
+    async def test_monitor_no_longer_exposes_a_watch_identity_registry(self):
+        from backend.app.services.eject import monitor as monitor_mod
+
+        assert not hasattr(monitor_mod, "_ActiveWatch"), "eject.monitor._ActiveWatch must stay deleted"
+        for name in (
+            "active_watch_identity",
+            "_watching",
+            "start_escalation_only_watch",
+            "start_fa_eject_watch",
+            "start_foreign_eject_watch",
+            "on_terminal_status",
+            "rearm_on_startup",
+        ):
+            assert not hasattr(monitor_mod.eject_cooldown_monitor, name), (
+                f"EjectCooldownMonitor.{name} must stay deleted"
+            )

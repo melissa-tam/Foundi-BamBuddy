@@ -313,6 +313,53 @@ class EjectWatchInfo(BaseModel):
     threshold_c: float
 
 
+class PlateInfo(BaseModel):
+    """The deposit standing on a printer's build plate, and what happens to it next."""
+
+    occupied: bool = False
+    # The subtask id of the job that raised the gate; None for a source-less raise
+    # (a printer-vision trip, an operator declaration) — those are human-clear-only.
+    source_subtask_id: str | None = None
+    # The policy class name: CooldownEject / FirstArticleEject / ForeignAutoEject /
+    # EscalationOnly. A NAME, not its parameters — the UI renders "what will happen to
+    # this plate", and the unit/profile behind it is already on the queue surfaces.
+    policy: str | None = None
+    since: datetime | None = None
+
+
+class PendingEjectInfo(BaseModel):
+    """An eject sweep this printer is claimed by, until its terminal arrives."""
+
+    purpose: str
+    # Has the printer echoed the sweep's PRINT START? False means "dispatched, not yet
+    # acknowledged" — the state that used to be indistinguishable from a running sweep
+    # and left operators guessing whether a 409 would ever clear.
+    started: bool = False
+    age_s: float | None = None
+    # Rebuilt from the durable stamp at startup rather than minted by a live dispatch:
+    # no watchdog, no verifiable identity, and an operator eject supersedes it.
+    hydrated: bool = False
+
+
+class PlateOccupancyInfo(BaseModel):
+    """What the plate-occupancy authority STORES for this printer.
+
+    Stored fields only, deliberately: the authority also projects an OWNER (none /
+    dispatch / job / eject), and that projection needs ``db_claim`` — a ``print_queue``
+    row read per scheduler tick, which the synchronous, session-less WebSocket
+    serializer can never supply. Publishing it from REST alone would make the two
+    transports disagree about the same printer, which is the exact flip the
+    ``eject_watch`` payload is careful to avoid. The UI derives its phase from
+    ``awaiting_plate_clear`` + ``state``, and needs no server-side owner.
+    """
+
+    plate: PlateInfo = PlateInfo()
+    eject: PendingEjectInfo | None = None
+    # Age of the dispatch lease this printer holds (a unit decided-but-not-yet-settled
+    # on the wire), or None when it holds none.
+    lease_age_s: float | None = None
+
+
 class PrintOptionsResponse(BaseModel):
     """AI detection and print options from xcam data."""
 
@@ -433,6 +480,11 @@ class PrinterStatus(BaseModel):
     # release threshold; the UI renders "Cooling to T °C (bed B °C)" while set.
     # None when no threshold-bearing watch is armed.
     eject_watch: EjectWatchInfo | None = None
+    # Plate-occupancy authority projection (2026-08-30). ADDITIVE beside
+    # ``awaiting_plate_clear``, which stays: nine frontend consumers read that boolean
+    # and it remains the phase input. This carries the WHY — which policy holds the
+    # plate, since when, and whether an eject is in flight and has actually started.
+    occupancy: PlateOccupancyInfo | None = None
     # AMS drying support
     supports_drying: bool = False
     # AMS "Print While Drying" — drying mid-print. Verified per Bambu wiki release notes;

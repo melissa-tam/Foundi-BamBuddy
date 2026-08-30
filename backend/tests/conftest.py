@@ -82,6 +82,26 @@ def mfa_encryption_isolation(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def reset_plate_occupancy_authority():
+    """Start and leave every test with an empty, UN-WIRED occupancy authority.
+
+    ``plate_occupancy`` is a process singleton: the plate gate, the pending eject
+    and the dispatch lease are ONE record per printer, read by dispatch admission,
+    the eject lanes and the status payloads alike. A record (or a wired
+    persist/broadcast/kick/policy-driver callable) left standing by one test
+    module silently decides another module's behaviour — the exact order-dependent
+    leak that made ``test_capability_gate_api`` fail only inside a multi-file run.
+    One shared reset here covers every module, incl. ones that never mention the
+    authority; per-file copies of this fixture are deliberately gone (one origin).
+    """
+    from backend.app.services.plate_occupancy import plate_occupancy
+
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def reset_spoolman_location_sync_cache():
     """Drop the per-URL Spoolman location-sync TTL cache between tests.
 

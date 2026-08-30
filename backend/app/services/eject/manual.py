@@ -45,6 +45,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -56,7 +57,9 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.eject import remote as eject_remote
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
-from backend.app.services.eject.monitor import _latest_started_item, _resolve_eject_threshold, eject_cooldown_monitor
+from backend.app.services.eject.monitor import _resolve_eject_threshold, eject_cooldown_monitor
+from backend.app.services.plate_occupancy import CooldownEject, Evidence, plate_occupancy
+from backend.app.services.plate_occupancy_store import _latest_started_item
 from backend.app.services.printer_manager import printer_manager
 from backend.app.utils.filename import print_identity_key
 from backend.app.utils.threemf_tools import list_gcode_plate_ids, read_plate_gcode_header
@@ -84,12 +87,20 @@ class ManualEjectError(RuntimeError):
     / ``bed_unreadable`` / ``profile_not_found`` / ``bed_hot`` / ``foreign_plate``) and
     ``status_code`` the HTTP hint the route applies without this module importing
     FastAPI.
+
+    ``extra`` carries reason-specific facts the UI needs to write a useful sentence —
+    the route merges it into the 409 detail beside ``code``/``message``. It exists
+    because "an eject is already in flight" is two different situations to an
+    operator: one the printer has started (and will finish on its own) and one it has
+    not yet acknowledged, which is why ``eject_in_flight`` ships ``started`` and
+    ``age_s``.
     """
 
-    def __init__(self, code: str, message: str, *, status_code: int = 409) -> None:
+    def __init__(self, code: str, message: str, *, status_code: int = 409, extra: dict | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.extra = extra or {}
 
 
 class BedTooHot(ManualEjectError):
@@ -243,15 +254,16 @@ def _thermal_gate(state, threshold: float, *, allow_hot: bool) -> None:
 async def _resolve_manual_eject_item(db: AsyncSession, printer_id: int) -> int | None:
     """Resolve the farm-known unit to eject on ``printer_id``, or None if none eligible.
 
-    Prefers the armed PRODUCTION cooldown watch's ``queue_item_id`` (the unit the
-    watch is already cooling for). Falls back to the ``should_rearm``-style DB lookup:
+    Prefers the plate's own COOLDOWN policy — the unit the authority says this plate is
+    cooling for, which is the same fact the armed watch was keyed on and now has one
+    home. Falls back to the ``should_rearm``-style DB lookup:
     the most-recently started unit, which must be a COMPLETED, eject-profiled,
     NON-first-article unit whose ``dispatch_subtask_id`` matches the printer's
     ``plate_gate_subtask_id`` (the gate this eject would clear). An unapproved first
     article is deliberately excluded — it must use the approval flow."""
-    identity = eject_cooldown_monitor.active_watch_identity(printer_id)
-    if identity is not None and identity.purpose == "production" and identity.queue_item_id is not None:
-        return identity.queue_item_id
+    policy = plate_occupancy.snapshot(printer_id).plate_policy
+    if isinstance(policy, CooldownEject):
+        return policy.unit_id
 
     printer = await db.get(Printer, printer_id)
     item = await _latest_started_item(db, printer_id)
@@ -308,31 +320,58 @@ async def manual_eject(
     if state is not None and getattr(state, "state", None) in ("RUNNING", "PAUSE"):
         raise ManualEjectError("printer_busy", "Printer is printing or paused; cannot eject now", status_code=409)
 
-    if not printer_manager.is_awaiting_plate_clear(printer_id):
+    if not plate_occupancy.is_plate_occupied(printer_id):
         if not declare_occupied:
             raise ManualEjectError(
                 "no_plate_gate", "Printer is not awaiting plate clear; nothing to eject", status_code=409
             )
         # One-step "Eject plate…": the operator states the plate is occupied, so raise the
-        # gate here and fall through into the foreign flow. Source-less (``None``) ⇒
-        # human-clear-only, the same shape as the native vision trip's raise in
-        # ``farm_correlation``. The raise is NEVER rolled back — not on an unresolvable
+        # gate here and fall through into the foreign flow. The authority raises it
+        # source-less ⇒ human-clear-only under an escalation hold, the same shape as the
+        # native vision trip's raise in ``farm_correlation``, and REVOKES any dispatch
+        # lease standing on the printer so a unit mid-upload unwinds instead of printing
+        # onto the declared plate. The raise is NEVER rolled back — not on an unresolvable
         # donor, not on the bed_hot confirm, not on an abandoned dialog: the plate IS
         # occupied whatever happens next, and "Mark plate as cleared" is the visible undo.
-        printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=None)
-        # That writer persists asynchronously, so a PREVIOUSLY failed persist can leave a
-        # stale key on the row this call already loaded — which would steer
+        state_for_declare = printer_manager.get_status(printer_id)
+        declare_refusal = plate_occupancy.declare_occupied(
+            printer_id,
+            Evidence(live_state=getattr(state_for_declare, "state", None) if state_for_declare else None),
+        )
+        if declare_refusal is not None:
+            raise ManualEjectError(
+                declare_refusal, f"Cannot declare this plate occupied ({declare_refusal})", status_code=409
+            )
+        # The gate the authority just raised carries no source id. NULL the loaded row's
+        # copy to match, so a stale key from a previously failed persist cannot steer
         # ``_resolve_manual_eject_item`` and the farm-known check in
-        # ``_manual_eject_foreign`` onto a print that is not on this plate. NULL it here
-        # to match the gate we just raised.
+        # ``_manual_eject_foreign`` onto a print that is not on this plate. (WS4 moves the
+        # donor chain onto ``plate_source`` and deletes this line with the staleness it
+        # patches.)
         printer.plate_gate_subtask_id = None
         logger.info("manual_eject: printer %s plate declared occupied by operator (source-less gate)", printer_id)
 
     # The confirm (second) call passes the flag again, but the gate it raised is now up —
     # the branch above is skipped, so the declaration can never double-raise.
 
-    if eject_remote.peek_pending_eject(printer_id) is not None:
-        raise ManualEjectError("eject_in_flight", "An eject is already in flight on this printer", status_code=409)
+    identity = plate_occupancy.eject_identity(printer_id)
+    if identity is not None and not identity.hydrated:
+        # A LIVE eject owns this printer. A HYDRATED one deliberately does not refuse:
+        # the farm has already admitted it cannot verify that record (no start echo, no
+        # watchdog, no estimate), the startup reconciler is disposing of it, and
+        # ``claim_for_eject`` supersedes it — refusing an operator to protect it is the
+        # 2026-08-30 "8 consecutive 409s" dead end.
+        age_s = (
+            (datetime.now(timezone.utc) - identity.dispatched_at).total_seconds()
+            if identity.dispatched_at is not None
+            else None
+        )
+        raise ManualEjectError(
+            "eject_in_flight",
+            "An eject is already in flight on this printer",
+            status_code=409,
+            extra={"started": identity.started_at is not None, "age_s": age_s},
+        )
 
     queue_item_id = await _resolve_manual_eject_item(db, printer_id)
     if queue_item_id is None:
@@ -354,8 +393,10 @@ async def manual_eject(
     _thermal_gate(state, threshold, allow_hot=allow_hot)
 
     # Armed PRODUCTION watch → drive its single _do_release path (no parallel race).
-    identity = eject_cooldown_monitor.active_watch_identity(printer_id)
-    if identity is not None and identity.purpose == "production" and identity.queue_item_id == queue_item_id:
+    # The plate's own policy is the identity: a cooldown watch exists exactly when the
+    # plate carries a CooldownEject for this unit.
+    armed_policy = plate_occupancy.snapshot(printer_id).plate_policy
+    if isinstance(armed_policy, CooldownEject) and armed_policy.unit_id == queue_item_id:
         if eject_cooldown_monitor.request_release_now(printer_id):
             logger.info(
                 "manual_eject: signalled immediate release on printer %s (watch armed, item %s)",
@@ -887,36 +928,3 @@ async def identify_farm_file_foreign(
         source.max_z,
     )
     return ForeignFarmFile(profile_id=profile_id, threshold_c=profile.cooldown_temp_c, print_name=source.print_name)
-
-
-async def dispatch_identified_foreign_eject(*, printer_id: int, profile_id: int) -> None:
-    """``on_release`` for the auto foreign-eject watch: resolve the foreign donor FRESH
-    and dispatch the sweep exactly as ``_manual_eject_foreign``'s confirm call does
-    (minus the thermal gate — the cooldown watch already waited for the bed to reach
-    the threshold). Opens its own session (module convention); RAISES on any failure so
-    :func:`watch_bed_and_clear` counts a dispatch failure (retry, then stall after
-    three) rather than silently dropping the sweep."""
-    from backend.app.core.database import async_session
-
-    async with async_session() as db:
-        printer = await db.get(Printer, printer_id)
-        if printer is None:
-            raise ManualEjectError("not_found", "Printer not found", status_code=404)
-        source = await _resolve_foreign_source(db, printer)
-        try:
-            await eject_remote.dispatch_foreign_eject(
-                db,
-                printer_id=printer_id,
-                profile_id=profile_id,
-                source_path=source.donor_path,
-                plate_id=source.plate_id,
-            )
-            logger.info(
-                "dispatch_identified_foreign_eject: printer %s auto foreign-plate eject dispatched "
-                "(plate %s, profile %s)",
-                printer_id,
-                source.plate_id,
-                profile_id,
-            )
-        finally:
-            _safe_unlink(source.tmp_path)

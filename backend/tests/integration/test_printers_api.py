@@ -295,7 +295,13 @@ class TestPrintersAPI:
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_recover_printer_returns_summary(self, async_client: AsyncClient, printer_factory, db_session):
-        """POST /{id}/recover clears the plate gate + quarantine and returns a summary."""
+        """POST /{id}/recover clears the plate gate + quarantine and returns a summary.
+
+        Recover is the explicit operator override: it drops EVERYTHING the occupancy
+        authority believes about the printer (plate, eject claim, dispatch lease) with
+        none of clear-plate's guards, because "an operator inspected the machine"
+        outranks every stored belief."""
+        from backend.app.services.plate_occupancy import Evidence, PendingEject, plate_occupancy
         from backend.app.services.printer_manager import printer_manager
 
         printer = await printer_factory(name="Recover Printer", model="H2S")
@@ -303,7 +309,14 @@ class TestPrintersAPI:
         printer.quarantine_reason = "boom"
         await db_session.commit()
         printer_manager.set_quarantined(printer.id, True)
-        printer_manager.set_awaiting_plate_clear(printer.id, True)
+        assert plate_occupancy.declare_occupied(printer.id, Evidence()) is None
+        # An eject claim that would REFUSE a routine clear-plate must not survive either.
+        assert (
+            plate_occupancy.claim_for_eject(
+                printer.id, PendingEject(purpose="manual", run_id=None, queue_item_id=None), Evidence()
+            )
+            is None
+        )
 
         try:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/recover")
@@ -315,10 +328,11 @@ class TestPrintersAPI:
 
             await db_session.refresh(printer)
             assert printer.quarantined is False
+            assert plate_occupancy.is_plate_occupied(printer.id) is False
+            assert plate_occupancy.eject_identity(printer.id) is None
             assert printer_manager.is_awaiting_plate_clear(printer.id) is False
         finally:
             printer_manager.set_quarantined(printer.id, False)
-            printer_manager.set_awaiting_plate_clear(printer.id, False)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -339,41 +353,39 @@ class TestPrintersAPI:
         """POST /{id}/mark-plate-occupied raises a source-less gate on a DISCONNECTED
         printer — the maintenance lane, and the reason the route has no connected guard.
 
-        Pins the persisted shape too: the gate writer must land ``awaiting_plate_clear``
-        True with ``plate_gate_subtask_id`` NULL, because a source-less gate is the
-        human-clear-only shape nothing may auto-clear.
+        Pins the persisted shape too: the durable mirror must land
+        ``awaiting_plate_clear`` True with ``plate_gate_subtask_id`` NULL, because a
+        source-less gate is the human-clear-only shape nothing may auto-clear. The
+        mirror is now the authority's injected ``persist`` callable
+        (``plate_occupancy_store``), wired here the way lifespan wires it.
         """
         import asyncio
 
         from backend.app.models.printer import Printer
-        from backend.app.services.printer_manager import printer_manager
+        from backend.app.services import plate_occupancy_store
+        from backend.app.services.plate_occupancy import EscalationOnly, plate_occupancy
 
         printer = await printer_factory(name="Declare Printer", model="H2S")
         printer_id = printer.id
-        # The writer persists on the manager's loop (it is called from sync contexts in
-        # production), so the test must lend it this loop and then wait for the commit.
-        previous_loop = printer_manager._loop
-        printer_manager.set_event_loop(asyncio.get_running_loop())
-        try:
-            response = await async_client.post(f"/api/v1/printers/{printer_id}/mark-plate-occupied")
-            assert response.status_code == 200, response.text
-            assert response.json()["success"] is True
-            assert printer_manager.is_awaiting_plate_clear(printer_id) is True
+        plate_occupancy.configure(persist=plate_occupancy_store.persist_occupancy)
 
-            row = None
-            for _ in range(100):
-                await asyncio.sleep(0.02)
-                db_session.expire_all()
-                row = await db_session.get(Printer, printer_id)
-                if row is not None and row.awaiting_plate_clear:
-                    break
-            assert row is not None and row.awaiting_plate_clear is True
-            assert row.plate_gate_subtask_id is None
-        finally:
-            # Detach the loop BEFORE clearing, so the teardown clear schedules no
-            # further persist onto a loop this test is about to leave.
-            printer_manager._loop = previous_loop
-            printer_manager.set_awaiting_plate_clear(printer_id, False)
+        response = await async_client.post(f"/api/v1/printers/{printer_id}/mark-plate-occupied")
+        assert response.status_code == 200, response.text
+        assert response.json()["success"] is True
+        assert plate_occupancy.is_plate_occupied(printer_id) is True
+        # Source-less ⇒ human-clear-only: no id to sweep against, escalation floor.
+        assert plate_occupancy.plate_source(printer_id) is None
+        assert isinstance(plate_occupancy.snapshot(printer_id).plate_policy, EscalationOnly)
+
+        row = None
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            db_session.expire_all()
+            row = await db_session.get(Printer, printer_id)
+            if row is not None and row.awaiting_plate_clear:
+                break
+        assert row is not None and row.awaiting_plate_clear is True
+        assert row.plate_gate_subtask_id is None
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -383,65 +395,230 @@ class TestPrintersAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_mark_plate_occupied_refuses_while_printing(
-        self, async_client: AsyncClient, printer_factory, db_session
+    @pytest.mark.parametrize("live_state", ["RUNNING", "PAUSE", "PREPARE", "SLICING"])
+    async def test_mark_plate_occupied_refuses_while_a_job_owns_the_printer(
+        self, async_client: AsyncClient, printer_factory, db_session, live_state
     ):
-        """A RUNNING printer 409s and its gate is untouched — a plate mid-print is not
-        the operator's to declare anything about."""
+        """A printer a JOB owns 409s and its gate is untouched — a plate mid-print is
+        not the operator's to declare anything about.
+
+        "A job owns the printer" is the authority's ``ACTIVE_PRINT_STATES``, so PREPARE
+        and SLICING refuse alongside RUNNING/PAUSE: a printer parked in PREPARE is about
+        to deposit onto this plate anyway. Only ``get_status`` is patched — the gate
+        read is the authority's own projection and must answer honestly."""
         from backend.app.services.bambu_mqtt import PrinterState
+        from backend.app.services.plate_occupancy import plate_occupancy
         from backend.app.services.printer_manager import printer_manager
 
-        printer = await printer_factory(name="Busy Declare Printer")
+        printer = await printer_factory(name=f"Busy Declare Printer {live_state}")
         state = PrinterState()
         state.connected = True
-        state.state = "RUNNING"
+        state.state = live_state
 
-        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
-            mock_pm.get_status = MagicMock(return_value=state)
+        with patch.object(printer_manager, "get_status", return_value=state):
             response = await async_client.post(f"/api/v1/printers/{printer.id}/mark-plate-occupied")
-            mock_pm.set_awaiting_plate_clear.assert_not_called()
 
         assert response.status_code == 409
+        assert plate_occupancy.is_plate_occupied(printer.id) is False
         assert printer_manager.is_awaiting_plate_clear(printer.id) is False
 
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_mark_plate_occupied_already_raised_400(self, async_client: AsyncClient, printer_factory, db_session):
         """Already gated → 400, mirroring clear-plate's already-in-that-state strictness."""
-        from backend.app.services.printer_manager import printer_manager
+        from backend.app.services.plate_occupancy import Evidence, plate_occupancy
 
         printer = await printer_factory(name="Gated Declare Printer")
-        printer_manager.set_awaiting_plate_clear(printer.id, True, source_subtask_id=None)
-        try:
-            response = await async_client.post(f"/api/v1/printers/{printer.id}/mark-plate-occupied")
-            assert response.status_code == 400
-        finally:
-            printer_manager.set_awaiting_plate_clear(printer.id, False)
+        assert plate_occupancy.declare_occupied(printer.id, Evidence()) is None
+
+        response = await async_client.post(f"/api/v1/printers/{printer.id}/mark-plate-occupied")
+        assert response.status_code == 400
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_disconnected_status_reports_the_plate_gate(
+    async def test_disconnected_status_reports_the_plate_gate_and_occupancy(
         self, async_client: AsyncClient, printer_factory, db_session
     ):
         """A disconnected printer's status MUST carry ``awaiting_plate_clear``.
 
         Load-bearing for the disconnected declare affordance: the gate is Bambuddy-side
-        state (a DB-rehydrated in-memory set), so it is reportable with no MQTT session,
-        and the menu item that raises it must not offer itself on an already-gated plate.
+        state (the occupancy authority's record, rebuilt from the DB at startup), so it
+        is reportable with no MQTT session, and the menu item that raises it must not
+        offer itself on an already-gated plate.
+
+        ``occupancy`` rides ALONGSIDE that boolean — additive, never a replacement —
+        and carries the WHY. It publishes STORED fields only: no ``owner``, because
+        that projection needs a per-tick queue read the WS serializer cannot do, and
+        publishing it from REST alone would make the two transports disagree.
         """
+        from backend.app.services.plate_occupancy import EscalationOnly, plate_occupancy
         from backend.app.services.printer_manager import printer_manager
 
         printer = await printer_factory(name="Offline Gated Printer")
-        printer_manager.set_awaiting_plate_clear(printer.id, True, source_subtask_id=None)
-        try:
-            with patch.object(printer_manager, "get_status", return_value=None):
-                response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
-            assert response.status_code == 200, response.text
-            body = response.json()
-            assert body["connected"] is False
-            assert body["awaiting_plate_clear"] is True
-        finally:
-            printer_manager.set_awaiting_plate_clear(printer.id, False)
+        plate_occupancy.hydrate_plate(printer.id, None, EscalationOnly())
+
+        with patch.object(printer_manager, "get_status", return_value=None):
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["connected"] is False
+        assert body["awaiting_plate_clear"] is True
+
+        occupancy = body["occupancy"]
+        assert occupancy["plate"]["occupied"] is True
+        assert occupancy["plate"]["source_subtask_id"] is None
+        assert occupancy["plate"]["policy"] == "EscalationOnly"
+        assert occupancy["plate"]["since"] is not None
+        assert occupancy["eject"] is None
+        assert occupancy["lease_age_s"] is None
+        assert "owner" not in occupancy, "owner is a projection REST must not publish alone."
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_connected_status_reports_the_occupancy_projection(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """The CONNECTED status branch carries the same ``occupancy`` object, built by
+        the same one builder — the poll and the socket may never describe one printer's
+        plate differently. An in-flight eject is published as a dispatched-but-not-yet
+        -started claim, the state that used to be indistinguishable from a running
+        sweep and left operators guessing whether a 409 would ever clear."""
+        from backend.app.services.bambu_mqtt import PrinterState
+        from backend.app.services.plate_occupancy import CooldownEject, Evidence, PendingEject, plate_occupancy
+
+        printer = await printer_factory(name="Occupied Connected Printer")
+        plate_occupancy.hydrate_plate(printer.id, "SUB-42", CooldownEject(unit_id=11, run_id=3))
+        assert (
+            plate_occupancy.claim_for_eject(
+                printer.id, PendingEject(purpose="production", run_id=3, queue_item_id=11), Evidence()
+            )
+            is None
+        )
+
+        state = PrinterState()
+        state.connected = True
+        state.state = "IDLE"
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_status = MagicMock(return_value=state)
+            mock_pm.is_awaiting_plate_clear = MagicMock(return_value=True)
+            mock_pm.is_model_mismatch = MagicMock(return_value=False)
+            mock_pm.model_mismatch_reason = MagicMock(return_value=None)
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["awaiting_plate_clear"] is True
+        occupancy = body["occupancy"]
+        assert occupancy["plate"]["occupied"] is True
+        assert occupancy["plate"]["source_subtask_id"] == "SUB-42"
+        assert occupancy["plate"]["policy"] == "CooldownEject"
+        assert occupancy["eject"]["purpose"] == "production"
+        assert occupancy["eject"]["started"] is False
+        assert occupancy["eject"]["hydrated"] is False
+        assert occupancy["eject"]["age_s"] is not None
+        assert "owner" not in occupancy
+
+    # ========================================================================
+    # Clear-plate: the operator's plate acknowledgment
+    # ========================================================================
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_clear_plate_releases_the_gate(self, async_client: AsyncClient, printer_factory, db_session):
+        """The everyday ack: a gated, connected printer's plate is released."""
+        from backend.app.services.plate_occupancy import Evidence, plate_occupancy
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Clear Plate Printer")
+        assert plate_occupancy.declare_occupied(printer.id, Evidence()) is None
+
+        with patch.object(printer_manager, "is_connected", return_value=True):
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/clear-plate")
+
+        assert response.status_code == 200, response.text
+        assert plate_occupancy.is_plate_occupied(printer.id) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_clear_plate_409s_while_a_live_eject_owns_the_printer(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """A LIVE sweep refuses the ack with a structured 409.
+
+        The gate IS that sweep's completion signal: clearing it under the toolhead
+        would release the printer into a dispatch landing on a plate the sweep is
+        still crossing. The operator is told to wait rather than silently overridden —
+        ``recover`` remains the explicit override."""
+        from backend.app.services.plate_occupancy import Evidence, PendingEject, plate_occupancy
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Sweeping Printer")
+        assert plate_occupancy.declare_occupied(printer.id, Evidence()) is None
+        assert (
+            plate_occupancy.claim_for_eject(
+                printer.id, PendingEject(purpose="manual", run_id=None, queue_item_id=None), Evidence()
+            )
+            is None
+        )
+
+        with patch.object(printer_manager, "is_connected", return_value=True):
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/clear-plate")
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == {
+            "code": "eject_in_flight",
+            "message": "Eject in flight. The gate clears when the sweep completes.",
+        }
+        assert plate_occupancy.is_plate_occupied(printer.id) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_clear_plate_is_allowed_under_a_HYDRATED_eject(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """A HYDRATED eject must NOT refuse the ack — the 2026-08-30 dead-end.
+
+        A rehydrated pending has no start echo, no watchdog and no verifiable identity;
+        the farm has already admitted it cannot verify that sweep. Letting it block the
+        operator's only cure is what left printer 4 gated with the operator hand-jogging
+        the toolhead."""
+        from backend.app.services.plate_occupancy import Evidence, PendingEject, plate_occupancy
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Rehydrated Eject Printer")
+        assert plate_occupancy.declare_occupied(printer.id, Evidence()) is None
+        plate_occupancy.hydrate_eject(printer.id, PendingEject(purpose="production", run_id=1, queue_item_id=2))
+        assert plate_occupancy.snapshot(printer.id).eject_hydrated is True
+
+        with patch.object(printer_manager, "is_connected", return_value=True):
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/clear-plate")
+
+        assert response.status_code == 200, response.text
+        assert plate_occupancy.is_plate_occupied(printer.id) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_clear_plate_400s_when_nothing_is_gated(self, async_client: AsyncClient, printer_factory, db_session):
+        """No gate, but a terminal state on the wire → the unchanged 400 shape.
+
+        Reachable only through the FINISH/FAILED limb (the route accepts the ack from a
+        printer sitting on a terminal state even with no gate raised), where the
+        authority answers ``not_occupied``."""
+        from backend.app.services.plate_occupancy import plate_occupancy
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Ungated Printer")
+        assert plate_occupancy.is_plate_occupied(printer.id) is False
+
+        with (
+            patch.object(printer_manager, "is_connected", return_value=True),
+            patch.object(printer_manager, "get_status", return_value=SimpleNamespace(state="FINISH")),
+        ):
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/clear-plate")
+
+        assert response.status_code == 400, response.text
+        assert "not awaiting plate-clear" in response.json()["detail"]
 
     @pytest.mark.asyncio
     @pytest.mark.integration

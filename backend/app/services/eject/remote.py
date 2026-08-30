@@ -1,4 +1,4 @@
-"""Shared part-present eject dispatcher + the pending-eject registry.
+"""Shared part-present eject dispatcher + the two timers that bound a dispatched sweep.
 
 The eject sweep is a SEPARATE, server-dispatched, motion-only job — used by two
 callers that share this ONE path:
@@ -11,29 +11,34 @@ callers that share this ONE path:
 Both build a standalone motion-only ``.gcode.3mf`` (``build_part_present_eject_file``),
 FTPS-upload it and ``project_file``-dispatch it via ``printer_manager.start_print``
 with EVERY pre-print calibration OFF (never bed-probe / shake with a part on the
-plate), then register a :class:`PendingEject` so the terminal handler can match the
-job's echoed ``subtask_id`` and act on completion. The plate-clear gate is NOT
-cleared here — it drops only when the eject job's terminal arrives.
+plate), then CLAIM the printer through the plate-occupancy authority
+(``claim_for_eject``) so the terminal handler can match the job's echoed
+``subtask_id`` and act on completion. The plate-clear gate is NOT cleared here — it
+drops only when the eject job's terminal is positively matched.
+
+Since the 2026-08-30 cut-over this module holds NO eject state of its own: the one
+pending-eject record per printer lives in ``services/plate_occupancy`` (the authority)
+and its durable mirror is written by ``plate_occupancy_store``. What stays here are
+the two DISPATCHERS and the two TIMERS that bound a dispatched sweep — the start
+deadline (did the printer ever begin it?) and the runtime watchdog (is it still
+running long past its estimate?) — both of which write their verdicts back through
+the authority's transitions.
 
 Failures raise :class:`EjectDispatchError` (a plain domain error carrying an HTTP
-status hint); the FA route wraps it in an ``HTTPException`` while the monitor lets
-it propagate as a dispatch failure it retries.
+status hint plus a stable machine ``code``); the FA route wraps it in an
+``HTTPException`` while the monitor lets it propagate as a dispatch failure it retries.
 """
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-
-from sqlalchemy import select
 
 from backend.app.core.tasks import spawn_background_task
 from backend.app.models.eject_profile import EjectProfile
@@ -47,6 +52,14 @@ from backend.app.services.eject.generator import (
     PHASE_BEACON_SWEEP_PCT,
 )
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
+from backend.app.services.plate_occupancy import (
+    EjectIdentity,
+    EjectPurpose,
+    Evidence,
+    PendingEject,
+    TransitionRefusal,
+    plate_occupancy,
+)
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.usb_storage import upload_in_flight
 
@@ -55,62 +68,46 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-EjectPurpose = Literal["fa", "production", "manual"]
-
-
-@dataclass(frozen=True)
-class PendingEject:
-    """An in-flight server-dispatched eject awaiting its terminal status.
-
-    Held in-memory (``_pending_eject``) for the live-callback fast path AND mirrored
-    durably onto the owning queue unit's ``eject_dispatched_at`` stamp so a restart
-    between dispatch and terminal can rehydrate the entry (W1). The plate gate is
-    persisted independently and only auto-clears once the eject's terminal (live or
-    reconciled) is positively matched.
-
-    ``expected_runtime_s`` (from the build) and ``started_at`` (stamped when the
-    printer echoes the sweep's START) are what the in-flight runtime watchdog arms
-    on — see :func:`_runtime_watchdog`. Both default to None and BOTH are None on a
-    rehydrated entry: the durable mirror is a single timestamp column on the queue
-    unit, not the built artifact, so a restart between dispatch and terminal cannot
-    reconstruct either. The watchdog then never arms, which is the intended degrade —
-    a post-restart eject already falls into the unverifiable-path handling
-    (``rearm_on_startup`` degrades those gates to escalation-only holds).
-
-    ``drop_span_s`` (also from the build) is the bed-drop phase's own budget and arms
-    the watchdog's EDGE lane, which bounds that phase alone instead of the whole job.
-    None — a drop-less profile, or a rehydrated entry — leaves the watchdog on the
-    whole-job deadline only.
-
-    ``runtime_exceeded_at`` is that watchdog's verdict, and the watchdog is the ONE
-    authority on eject runtime: it stamps this mark the moment a deadline passes
-    (before it even sends the stop, so a terminal racing in must already see it). The
-    terminal handler only HONORS the mark — it never re-computes a runtime judgement of
-    its own, so the machine cannot be stopped on one criterion and then judged on
-    another.
-    """
-
-    purpose: EjectPurpose
-    run_id: int | None
-    queue_item_id: int | None
-    expected_runtime_s: float | None = None
-    started_at: datetime | None = None
-    runtime_exceeded_at: datetime | None = None
-    drop_span_s: float | None = None
-
-
-# printer_id -> the one in-flight eject on that printer.
-_pending_eject: dict[int, PendingEject] = {}
+# Re-exported so the eject lane's own callers keep one import site for the vocabulary
+# they dispatch with. The definitions live in the authority — this module stores none
+# of it.
+__all__ = [
+    "EJECT_START_TIMEOUT_S",
+    "EjectDispatchError",
+    "EjectPurpose",
+    "PendingEject",
+    "dispatch_foreign_eject",
+    "dispatch_identified_foreign_eject",
+    "dispatch_part_present_eject",
+    "expected_eject_stem",
+    "is_eject_job_name",
+    "matches_pending_eject",
+    "on_eject_start_echo",
+    "parse_eject_job_name",
+]
 
 # printer_id -> the armed runtime watchdog for that printer's in-flight eject.
 # One entry at most: an eject is one-per-printer by construction, and every path
 # that ends an eject (resolution, or a new dispatch) drops the entry.
 _runtime_watchdogs: dict[int, asyncio.Task] = {}
 
-# Rows whose durable eject stamp is older than this at startup are treated as a
-# crash that never cleared and are dropped (NULLed) with a WARNING rather than
-# rehydrated — no eject stays "in flight" across a day-long outage.
-_PENDING_EJECT_STALE_TTL_H = 24
+# printer_id -> the armed START-deadline timer for that printer's dispatched eject.
+_start_deadlines: dict[int, asyncio.Task] = {}
+
+# How long a dispatched eject may go without the printer echoing its PRINT START
+# before the farm concludes the sweep will never happen.
+#
+# The firmware silently IGNORES a ``project_file`` sent while it is busy — no error,
+# no terminal, nothing — which is how the 2026-08-30 ejects on printers 2/3/4
+# (``eject_manual_p2`` / ``p3`` / ``p4``, dispatched into prints that had just
+# started) stayed registered forever and made every later eject 409
+# ``eject_in_flight``, until the operator hand-jogged the toolhead.
+#
+# The fleet's start echo is ~45 s from dispatch (44 s and 43 s measured on
+# 2026-08-30), so 4× that tolerates a slow FTPS pass plus a missed status push and
+# still frees the printer inside three minutes. A pending past this deadline with no
+# start echo is DEAD: nothing else about that shape produces a signal.
+EJECT_START_TIMEOUT_S = 180.0
 
 # How far past its estimate an eject may run before the watchdog STOPS the job.
 #
@@ -247,65 +244,131 @@ def is_eject_job_name(name: str | None) -> bool:
     return parse_eject_job_name(name) is not None
 
 
-def expected_eject_stem(pending: PendingEject) -> str:
-    """The eject job stem THIS pending eject was dispatched under."""
+def expected_eject_stem(pending: PendingEject | EjectIdentity) -> str:
+    """The eject job stem THIS pending eject was dispatched under.
+
+    Accepts the record or its identity projection — both carry the two fields the
+    stem is minted from, and the matcher only ever holds the projection.
+    """
     return f"eject_{pending.purpose}_item{pending.queue_item_id}"
 
 
-def register_pending_eject(printer_id: int, pending: PendingEject) -> None:
-    # A watchdog left over from a previous eject on this printer must never survive
-    # into the new one — it would judge THIS sweep against the PREVIOUS deadline and
-    # stop a healthy job. Cancelling here is the synchronous half (this function is
-    # called off the dispatch path, which cannot await); the coroutine's own
-    # ``finally`` deregisters, and its identity re-check is the belt for a cancel
-    # that lands after the deadline already elapsed.
-    stale = _runtime_watchdogs.pop(printer_id, None)
-    if stale is not None:
-        stale.cancel()
-    _pending_eject[printer_id] = pending
+# --------------------------------------------------------------------------- #
+# Start echo + the two timers that bound a dispatched sweep
+# --------------------------------------------------------------------------- #
+def on_eject_start_echo(printer_id: int) -> None:
+    """The printer echoed PRINT START for the eject sweep on ``printer_id``.
 
-
-def pop_pending_eject(printer_id: int) -> PendingEject | None:
-    return _pending_eject.pop(printer_id, None)
-
-
-def peek_pending_eject(printer_id: int) -> PendingEject | None:
-    return _pending_eject.get(printer_id)
-
-
-def pending_eject_printer_ids() -> list[int]:
-    """Printer ids that currently have a pending eject (live or hydrated)."""
-    return list(_pending_eject.keys())
-
-
-def mark_pending_eject_started(printer_id: int) -> None:
-    """Stamp the pending eject on ``printer_id`` with the moment the sweep STARTED.
-
-    Called from the print-START callback, i.e. when the printer has echoed that it
-    began executing the eject file — not when we uploaded or commanded it. Only that
-    edge measures machine time: upload + job spin-up vary with file size and FTPS
+    Called from the print-START callback — i.e. when the printer says it BEGAN
+    executing the eject file, not when we uploaded or commanded it. Only that edge
+    measures machine time: upload + job spin-up vary with file size and FTPS
     conditions and would otherwise be charged to the sweep.
 
-    IDEMPOTENT by first-write-wins: a duplicate/replayed start echo keeps the
-    original stamp, so a chatty printer can never shorten a measured runtime into
-    looking nominal. A no-op when nothing is registered (a non-eject start, or a
-    hydrated entry whose printer re-echoes).
+    Three duties, in order:
 
-    This edge also ARMS the in-flight runtime watchdog, because it is the first
-    moment a deadline can be measured from. Two cases never arm: a pending with no
-    ``expected_runtime_s`` (a rehydrated post-restart entry — there is no estimate to
-    judge against, and the startup reconciler already owns those gates fail-closed),
-    and a printer that already has a watchdog registered."""
-    pending = _pending_eject.get(printer_id)
-    if pending is None or pending.started_at is not None:
+    1. stamp the start through the authority (:meth:`note_eject_started`, first-write
+       -wins, so a replayed echo can never shorten a measured runtime);
+    2. cancel the START DEADLINE — the sweep demonstrably started, so the "the
+       firmware ignored our project_file" timer has nothing left to catch;
+    3. ARM the in-flight runtime watchdog, this being the first moment a deadline can
+       be measured from.
+
+    The watchdog arms on the FIRST echo only, and only for a verifiable sweep: a
+    pending whose ``started_at`` was already stamped is a duplicate echo, a pending
+    with no ``expected_runtime_s`` is a rehydrated post-restart record (nothing to
+    judge against — the startup reconciler owns those, fail-closed), and a printer
+    that already carries a watchdog is not given a second one.
+    """
+    before = plate_occupancy.eject_identity(printer_id)
+    if before is None:
         return
-    started = dataclasses.replace(pending, started_at=datetime.now(timezone.utc))
-    _pending_eject[printer_id] = started
-    if started.expected_runtime_s is None or printer_id in _runtime_watchdogs:
+    plate_occupancy.note_eject_started(printer_id)
+    _cancel_start_deadline(printer_id)
+
+    after = plate_occupancy.eject_identity(printer_id)
+    if after is None or after.started_at is None or before.started_at is not None:
+        # Not the first echo (or the record went away under us) — never re-arm.
+        return
+    pending = plate_occupancy.pending_eject_view(printer_id)
+    if pending is None or pending.expected_runtime_s is None or printer_id in _runtime_watchdogs:
         return
     _runtime_watchdogs[printer_id] = spawn_background_task(
-        _runtime_watchdog(printer_id, started), name=f"eject-runtime-watchdog-{printer_id}"
+        _runtime_watchdog(printer_id, pending), name=f"eject-runtime-watchdog-{printer_id}"
     )
+
+
+def _arm_start_deadline(printer_id: int) -> None:
+    """Arm (replacing any predecessor) the never-started deadline for ``printer_id``."""
+    _cancel_start_deadline(printer_id)
+    _start_deadlines[printer_id] = spawn_background_task(
+        _start_deadline(printer_id), name=f"eject-start-deadline-{printer_id}"
+    )
+
+
+def _cancel_start_deadline(printer_id: int) -> None:
+    """Cancel + deregister ``printer_id``'s start deadline, if one is armed."""
+    task = _start_deadlines.pop(printer_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def cancel_eject_timers(printer_id: int) -> None:
+    """Drop both timers for ``printer_id``. Synchronous, idempotent, never raises.
+
+    THE one deregistration point, called from the occupancy policy driver on every
+    transition that leaves the printer with no eject — a matched terminal, an
+    unverified resolve, a start expiry, the startup reconciler's disposal, an
+    operator recover. Routing all of them through one level-triggered check is what
+    stops a resolved eject leaving a task armed to stop a printer that already
+    finished; the watchdog's own identity re-check remains the belt for a cancel that
+    lands after its deadline has already elapsed.
+    """
+    _cancel_start_deadline(printer_id)
+    watchdog = _runtime_watchdogs.pop(printer_id, None)
+    if watchdog is not None and not watchdog.done():
+        watchdog.cancel()
+
+
+async def _start_deadline(
+    printer_id: int,
+    *,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    timeout_s: float = EJECT_START_TIMEOUT_S,
+) -> None:
+    """Retire an eject the printer never started, and page a human.
+
+    See :data:`EJECT_START_TIMEOUT_S` for why the shape exists at all. The authority
+    decides whether the expiry actually fires (it refuses on a started or hydrated
+    record), so this task can wake late or spuriously without consequence — a False
+    return means somebody else already resolved the eject and there is nothing to
+    say."""
+    try:
+        await sleep(timeout_s)
+        if not plate_occupancy.expire_eject_start(printer_id):
+            return
+        logger.warning(
+            "eject.remote: printer %s never echoed a PRINT START for its eject within %.0fs — the firmware "
+            "ignores a project_file sent while it is busy, so the sweep never ran; pending dropped and the "
+            "plate stays gated for a human",
+            printer_id,
+            timeout_s,
+        )
+        from backend.app.services.eject.monitor import notify_plate_not_empty
+
+        await notify_plate_not_empty(
+            printer_id,
+            source_detail=(
+                f"the eject sweep was dispatched but the printer never started it within {timeout_s:.0f}s — "
+                "the plate has NOT been swept. Clear it by hand, or eject again now that the printer is free."
+            ),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — a deadline failure must never escape the task
+        logger.exception("eject.remote: eject start deadline failed for printer %s", printer_id)
+    finally:
+        if _start_deadlines.get(printer_id) is asyncio.current_task():
+            _start_deadlines.pop(printer_id, None)
 
 
 def _live_phase_telemetry(printer_id: int) -> tuple[int | None, float | None, float | None]:
@@ -333,20 +396,22 @@ def _live_phase_telemetry(printer_id: int) -> tuple[int | None, float | None, fl
     )
 
 
-def _elapsed_since_start_s(pending: PendingEject) -> float:
+def _elapsed_since_start_s(pending: PendingEject | EjectIdentity) -> float:
     """Seconds of machine time since the printer echoed this eject's START (0.0 if unstamped)."""
     if pending.started_at is None:
         return 0.0
     return (datetime.now(timezone.utc) - pending.started_at).total_seconds()
 
 
-def _watchdog_still_owns(printer_id: int, armed: PendingEject) -> PendingEject | None:
-    """The registered pending IF it is still the eject this watchdog was armed for.
+def _watchdog_still_owns(printer_id: int, armed: PendingEject) -> EjectIdentity | None:
+    """The printer's eject IDENTITY iff it is still the eject this watchdog armed for.
 
     None means resolved or superseded — a terminal was handled while we slept, or a new
     eject was dispatched onto the printer. Stopping on either would abort someone else's
-    job, so every rule re-checks this before it can act."""
-    current = peek_pending_eject(printer_id)
+    job, so every rule re-checks this before it can act. Compared against the authority
+    (never a copy this task holds), because the record it must not act on is precisely
+    one that changed underneath it."""
+    current = plate_occupancy.eject_identity(printer_id)
     if current is None or (current.queue_item_id, current.purpose, current.started_at) != (
         armed.queue_item_id,
         armed.purpose,
@@ -380,7 +445,7 @@ def _stop_source_detail(stage: EjectStopStage, elapsed_s: float, expected_s: flo
 
 async def _stop_and_page(
     printer_id: int,
-    current: PendingEject,
+    current: EjectIdentity,
     armed: PendingEject,
     *,
     sleep: Callable[[float], Awaitable[None]],
@@ -388,17 +453,24 @@ async def _stop_and_page(
     elapsed_s: float,
     progress: float | None,
 ) -> None:
-    """Stamp the runtime verdict, stop the job mid-flight, page the operator, escalate.
+    """Stamp the runtime verdict, stop the job mid-flight, page the operator.
 
     The ONE kill path — every rule in :func:`_runtime_watchdog` ends here, so the
     ordering guarantees below hold whichever deadline fired. ``progress`` is the sample
-    the deciding rule acted on (None when there was none)."""
+    the deciding rule acted on (None when there was none).
+
+    No escalation watch is armed here, unlike the pre-cut-over code: while an eject
+    owns the printer the plate carries no watch by construction (an armed cooldown
+    over a plate a sweep is crossing is the double-dispatch the authority exists to
+    forbid). The escalation hold arrives one step later and from one place — the
+    stopped sweep's terminal resolves ``unverified``, which puts the plate under
+    ``EscalationOnly`` and the policy driver arms the hold off THAT."""
     # Stamp the mark FIRST. A terminal racing this task must find the verdict already
     # set: the mark is what keeps the plate gated, so a terminal that slipped past an
     # unmarked pending would release the gate onto a plate the printer was about to be
     # stopped over.
     fired_at = datetime.now(timezone.utc)
-    _pending_eject[printer_id] = dataclasses.replace(current, runtime_exceeded_at=fired_at)
+    plate_occupancy.note_eject_runtime_exceeded(printer_id, fired_at, stage)
     line_number, _percent, _wire_at = _live_phase_telemetry(printer_id)
     logger.warning(
         "eject.remote: eject on printer %s still running at %.0fs (expected %.0fs, stage=%s, bed-drop span %s, "
@@ -435,10 +507,10 @@ async def _stop_and_page(
 
     # Lazy import: the monitor imports this module, so a module-level import here
     # is a cycle (same precedent as farm_policy's monitor imports).
-    from backend.app.services.eject.monitor import _default_notify_plate_not_empty, eject_cooldown_monitor
+    from backend.app.services.eject.monitor import notify_plate_not_empty
 
     try:
-        await _default_notify_plate_not_empty(
+        await notify_plate_not_empty(
             printer_id,
             source_detail=_stop_source_detail(
                 stage,
@@ -449,9 +521,6 @@ async def _stop_and_page(
         )
     except Exception:  # noqa: BLE001 — a notify failure must never kill the watchdog
         logger.exception("eject.remote: mid-flight abort notification failed for printer %s", printer_id)
-    # Re-escalate on the standard cadence if the alert is ignored. Self-deduping,
-    # so an escalation-only watch already holding this gate is left alone.
-    eject_cooldown_monitor.start_escalation_only_watch(printer_id)
 
 
 async def _runtime_watchdog(
@@ -480,8 +549,9 @@ async def _runtime_watchdog(
       stall too short to overrun the whole job (~59 s on the production profile). It
       fires only on FRESH samples; stale evidence advances nothing.
 
-    The normal exit is CANCELLATION: :func:`clear_pending_eject` cancels this task the
-    instant the eject's terminal is consumed, so a nominal sweep never reaches a kill.
+    The normal exit is CANCELLATION: :func:`cancel_eject_timers` — driven off the
+    occupancy transition that retires the eject — cancels this task the instant the
+    eject's terminal is consumed, so a nominal sweep never reaches a kill.
     The identity re-check on every wake-up is the belt for the races cancellation loses
     (a terminal handled between wake-up and re-check, or a new eject dispatched onto the
     printer). ``sleep`` and ``clock`` are injectable together — they must come from the
@@ -654,18 +724,6 @@ async def _watch_phase_edges(
             return
 
 
-async def cancel_runtime_watchdog(printer_id: int) -> None:
-    """Cancel and deregister ``printer_id``'s runtime watchdog, if one is armed."""
-    task = _runtime_watchdogs.pop(printer_id, None)
-    if task is None or task.done():
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass  # Expected — the eject resolved before its abort deadline.
-
-
 def matches_pending_eject(
     printer_id: int, completed_subtask_id: str | None, *, subtask_name: str | None = None
 ) -> bool:
@@ -686,11 +744,11 @@ def matches_pending_eject(
       ANY terminal would otherwise consume a HYDRATED pending and clear our gate — the
       name check re-establishes positive identity from the echoed job name.
 
-    Name evidence alone (empty registry) NEVER makes this return True — see
-    :func:`is_eject_job_name` for the suppress-only name signal. This function NEVER
-    pops the registry; callers own the pop.
+    Name evidence alone (no claimed eject) NEVER makes this return True — see
+    :func:`is_eject_job_name` for the suppress-only name signal. This function is a
+    pure QUERY: retiring the eject is the authority's business, never the matcher's.
     """
-    pending = peek_pending_eject(printer_id)
+    pending = plate_occupancy.eject_identity(printer_id)
     if pending is None:
         return False
     client = printer_manager.get_client(printer_id)
@@ -711,128 +769,66 @@ def matches_pending_eject(
     return not (id_mismatch or name_mismatch)
 
 
-async def persist_pending_eject(db: AsyncSession, printer_id: int, pending: PendingEject) -> None:
-    """Stamp ``eject_dispatched_at`` on the eject's owning queue unit (durable mirror).
-
-    Same-session write on the caller's ``db`` (NOT a new/fire-and-forget session),
-    committed here so the mirror is durable the instant dispatch is accepted. A
-    missing / queue-item-less pending is a no-op (nothing to mirror)."""
-    if pending.queue_item_id is None:
-        return
-    item = await db.get(PrintQueueItem, pending.queue_item_id)
-    if item is None:
-        return
-    item.eject_dispatched_at = datetime.now(timezone.utc)
-    await db.commit()
-
-
-async def clear_pending_eject(db: AsyncSession, printer_id: int) -> PendingEject | None:
-    """Resolve the pending eject on ``printer_id``: pop the in-memory registry AND
-    NULL every in-flight eject stamp on that printer (atomic with resolution).
-
-    Printer-scoped NULL (not just the popped entry's item) so a crash that stamped
-    more than one row for a printer can't leave an orphan stamp behind. Returns the
-    popped :class:`PendingEject` (or None). Commits only when a stamp was cleared.
-
-    This is also where the in-flight runtime watchdog is cancelled: EVERY consumed
-    eject terminal funnels through here, so one cancel covers all of them and no
-    resolved eject can leave a task waiting to stop a printer that already finished."""
-    pending = pop_pending_eject(printer_id)
-    await cancel_runtime_watchdog(printer_id)
-    result = await db.execute(
-        select(PrintQueueItem).where(
-            PrintQueueItem.printer_id == printer_id,
-            PrintQueueItem.eject_dispatched_at.is_not(None),
-        )
-    )
-    changed = False
-    for item in result.scalars().all():
-        item.eject_dispatched_at = None
-        changed = True
-    if changed:
-        await db.commit()
-    return pending
-
-
-async def hydrate_pending_ejects_from_db() -> int:
-    """Rebuild the in-memory pending-eject registry from durable stamps at startup.
-
-    Selects every ``eject_dispatched_at IS NOT NULL`` unit (newest first) and rebuilds
-    :class:`PendingEject` keyed by ``printer_id`` (``purpose`` from ``first_article``,
-    ``run_id`` from ``batch_id``). Stamps older than ``_PENDING_EJECT_STALE_TTL_H`` are
-    dropped (NULLed) with a WARNING; if two unresolved rows resolve to one printer
-    (only possible via a crash between cycles), the newest stamp is kept and the rest
-    NULLed with a WARNING — the registry is one-per-printer by construction. Returns
-    the number of pending ejects rehydrated."""
-    from backend.app.core.database import async_session
-
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=_PENDING_EJECT_STALE_TTL_H)
-    hydrated = 0
-    async with async_session() as db:
-        result = await db.execute(
-            select(PrintQueueItem)
-            .where(PrintQueueItem.eject_dispatched_at.is_not(None))
-            .order_by(PrintQueueItem.eject_dispatched_at.desc())
-        )
-        rows = list(result.scalars().all())
-        seen_printers: set[int] = set()
-        changed = False
-        for item in rows:
-            stamp = item.eject_dispatched_at
-            if stamp is not None and stamp.tzinfo is None:
-                stamp = stamp.replace(tzinfo=timezone.utc)
-            if stamp is None or stamp < cutoff:
-                logger.warning(
-                    "eject.remote: dropping stale pending-eject stamp on item %s (dispatched %s, TTL %sh)",
-                    item.id,
-                    item.eject_dispatched_at,
-                    _PENDING_EJECT_STALE_TTL_H,
-                )
-                item.eject_dispatched_at = None
-                changed = True
-                continue
-            if item.printer_id is None:
-                logger.warning("eject.remote: dropping pending-eject stamp on item %s — no printer_id", item.id)
-                item.eject_dispatched_at = None
-                changed = True
-                continue
-            if item.printer_id in seen_printers:
-                logger.warning(
-                    "eject.remote: multiple pending ejects for printer %s — NULLing older stamp on item %s",
-                    item.printer_id,
-                    item.id,
-                )
-                item.eject_dispatched_at = None
-                changed = True
-                continue
-            seen_printers.add(item.printer_id)
-            register_pending_eject(
-                item.printer_id,
-                PendingEject(
-                    purpose="fa" if item.first_article else "production",
-                    run_id=item.batch_id,
-                    queue_item_id=item.id,
-                ),
-            )
-            hydrated += 1
-        if changed:
-            await db.commit()
-    if hydrated:
-        logger.info("eject.remote: hydrated %d pending eject(s) from durable stamps", hydrated)
-    return hydrated
-
-
 class EjectDispatchError(RuntimeError):
     """A part-present eject could not be dispatched.
 
     Carries an HTTP ``status_code`` hint (409 precondition / 502 transport) so the
     FA route can translate it to an ``HTTPException`` without this module importing
     FastAPI. The monitor ignores the hint and treats any raise as a dispatch failure.
+
+    ``code`` is the stable machine-readable reason the UI branches on. It carries the
+    authority's own :data:`~backend.app.services.plate_occupancy.TransitionRefusal`
+    token verbatim when an occupancy check refused the sweep (``job_active``,
+    ``dispatch_in_flight``, ``eject_in_flight``, ``not_occupied``), so the operator
+    is told which of them held — one refusal vocabulary, from the state machine to
+    the dialog. Everything else keeps the generic default.
     """
 
-    def __init__(self, message: str, *, status_code: int = 409) -> None:
+    def __init__(self, message: str, *, status_code: int = 409, code: str = "eject_dispatch_failed") -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
+
+
+# The refusal → operator sentence map for the eject lane. The authority speaks only
+# in tokens (no English in the core — the 2026-08-20 ``slot_recheck`` precedent), so
+# the copy lives here, at the boundary that raises. WS4 folds this into the route's
+# one verdict→copy map; until then the message rides the error and the token rides
+# ``EjectDispatchError.code``, so the wire contract is already the final one.
+_EJECT_REFUSAL_MESSAGES: dict[str, str] = {
+    "job_active": "Printer is running a job; wait for it to finish or stop it, then eject",
+    "dispatch_in_flight": "A queued unit is being sent to this printer; retry in a few seconds",
+    "eject_in_flight": "An eject is already in flight on this printer",
+    "not_occupied": "Printer is not awaiting plate clear; nothing to eject",
+}
+
+
+def _refusal_error(refusal: TransitionRefusal) -> EjectDispatchError:
+    """The 409 for an occupancy refusal, carrying the refusal token as its ``code``."""
+    return EjectDispatchError(
+        _EJECT_REFUSAL_MESSAGES.get(refusal, f"Eject refused ({refusal})"),
+        status_code=409,
+        code=refusal,
+    )
+
+
+def _live_evidence(printer_id: int) -> Evidence:
+    """The wire snapshot the eject lane checks against.
+
+    ``db_claim`` is deliberately absent: a ``printing`` queue row on an IDLE printer
+    is the 2026-08-29 dead-claim class, released only after 600 s of age plus a
+    120 s dwell, and refusing an eject on it would lock the operator out of a
+    provably idle plate for ≥12 minutes — strictly worse than the behaviour this
+    replaces, where the eject lane never read the queue row at all. The dispatch
+    LEASE is the seconds-long window an eject can physically collide with, and the
+    authority derives that from its own record.
+
+    The eject lane is also ungated by live HMS, deliberately (2026-08-29 W4): an
+    eject is filament-less, and holding the plate behind an AMS fault would deadlock
+    the very plate that holds the printer.
+    """
+    state = printer_manager.get_status(printer_id)
+    return Evidence(live_state=getattr(state, "state", None) if state is not None else None)
 
 
 async def _resolve_source_path(db: AsyncSession, item: PrintQueueItem) -> Path:
@@ -865,11 +861,16 @@ async def dispatch_part_present_eject(
     Resolves the profile / geometry / source file from ``queue_item_id`` and the
     target printer, builds the standalone eject-only file, uploads it (honouring the
     FTP retry settings) and starts it with EVERY pre-print calibration OFF, then
-    registers a :class:`PendingEject`. Does NOT touch the plate-clear gate — that
+    CLAIMS the printer for the sweep. Does NOT touch the plate-clear gate — that
     clears only when the eject job's terminal arrives.
 
+    The occupancy check runs BEFORE the build, because building and uploading an
+    eject costs seconds of FTPS work that a refused sweep must not spend; the claim
+    afterwards re-runs the identical gate, so a race that opened during the upload is
+    still caught.
+
     Raises :class:`EjectDispatchError` on any precondition (409) or transport (502)
-    failure, leaving no half state (nothing is registered unless ``start_print``
+    failure, leaving no half state (nothing is claimed unless ``start_print``
     was accepted).
     """
     item = await db.get(PrintQueueItem, queue_item_id)
@@ -883,6 +884,11 @@ async def dispatch_part_present_eject(
         raise EjectDispatchError("Eject printer not found", status_code=409)
     if not printer_manager.is_connected(printer.id):
         raise EjectDispatchError("Printer is not connected; cannot eject remotely", status_code=409)
+
+    ev = _live_evidence(printer_id)
+    refusal = plate_occupancy.ejectable(printer_id, ev)
+    if refusal is not None:
+        raise _refusal_error(refusal)
 
     # Fail-closed on a model with no geometry row or a row not hardware-validated —
     # a production eject must never drive an unvalidated envelope.
@@ -916,13 +922,13 @@ async def dispatch_part_present_eject(
     # The eject file's FTPS upload transiently drops the H2S sdcard flag; mark the
     # printer upload-in-flight so the USB-drop verifier ignores that dispatch blip.
     async with upload_in_flight(printer.id):
-        await _upload_start_register_eject(
-            db,
+        await _upload_start_claim_eject(
             printer=printer,
             eject_path=built.path,
             job_stem=f"eject_{purpose}_item{queue_item_id}",
             plate_id=plate_id,
             pending=pending,
+            ev=ev,
         )
     logger.info(
         "eject.remote: dispatched %s eject for item %s (run %s) on printer %s",
@@ -947,23 +953,29 @@ async def dispatch_foreign_eject(
     The two-step "Eject now" confirm for a plate the farm did not dispatch (started
     from Bambu Studio): the manual-eject service resolved the donor ``source_path`` +
     ``plate_id`` from the foreign print's archive and picked an ``eject_profile_id``,
-    and this shares ``dispatch_part_present_eject``'s upload→start→register tail. It is
-    NOT queue-item-bound — it registers a ``purpose="manual"`` :class:`PendingEject`
-    with ``queue_item_id=None``. That no-op mirror is DELIBERATE: a manual eject is not
-    restart-durable, so a mid-eject restart leaves the plate gate raised (fail-closed).
+    and this shares ``dispatch_part_present_eject``'s upload→start→claim tail. It is
+    NOT queue-item-bound — it claims a ``purpose="manual"`` :class:`PendingEject`
+    with ``queue_item_id=None``. Having no durable mirror is DELIBERATE: a manual eject
+    is not restart-durable, so a mid-eject restart leaves the plate gate raised
+    (fail-closed).
 
     Geometry is fail-closed (``require_validated=True``); the caller owns cleanup of
     ``source_path`` (it may be a temp FTPS re-fetch). ``max_z_override`` is the
     operator's confirmed part height, superseding the donor header in the build — the
     donor may be an assumed fallback rather than the print on the plate. Raises
     :class:`EjectDispatchError` on any precondition (409) or transport (502) failure,
-    leaving nothing registered unless ``start_print`` was accepted.
+    leaving nothing claimed unless ``start_print`` was accepted.
     """
     printer = await db.get(Printer, printer_id)
     if printer is None:
         raise EjectDispatchError("Eject printer not found", status_code=409)
     if not printer_manager.is_connected(printer.id):
         raise EjectDispatchError("Printer is not connected; cannot eject remotely", status_code=409)
+
+    ev = _live_evidence(printer_id)
+    refusal = plate_occupancy.ejectable(printer_id, ev)
+    if refusal is not None:
+        raise _refusal_error(refusal)
 
     try:
         geometry = await get_geometry_required(db, printer.model, require_validated=True)
@@ -996,13 +1008,13 @@ async def dispatch_foreign_eject(
     # Same as the production path: the FTPS upload transiently drops the H2S sdcard
     # flag; mark the printer upload-in-flight so the USB-drop verifier ignores the blip.
     async with upload_in_flight(printer.id):
-        await _upload_start_register_eject(
-            db,
+        await _upload_start_claim_eject(
             printer=printer,
             eject_path=built.path,
             job_stem=f"eject_manual_p{printer_id}",
             plate_id=plate_id,
             pending=pending,
+            ev=ev,
         )
     logger.info(
         "eject.remote: dispatched manual (foreign-plate) eject on printer %s (plate %s, profile %s)",
@@ -1012,24 +1024,35 @@ async def dispatch_foreign_eject(
     )
 
 
-async def _upload_start_register_eject(
-    db: AsyncSession,
+async def _upload_start_claim_eject(
     *,
     printer: Printer,
     eject_path: Path,
     job_stem: str,
     plate_id: int,
     pending: PendingEject,
+    ev: Evidence,
 ) -> None:
     """Shared eject tail: FTPS-upload the built eject file (honouring the FTP retry
-    settings), start it with EVERY pre-print calibration OFF, then register + durably
-    mirror the pending eject. The built ``eject_path`` is always cleaned up; nothing is
-    registered unless ``start_print`` was accepted. Raises :class:`EjectDispatchError`
-    (502) on upload / start failure.
+    settings), start it with EVERY pre-print calibration OFF, then CLAIM the printer
+    for the sweep and arm its start deadline. The built ``eject_path`` is always
+    cleaned up; nothing is claimed unless ``start_print`` was accepted. Raises
+    :class:`EjectDispatchError` (502) on upload / start failure.
 
     The ``start_print`` file, the MQTT ``project_file`` param (plate path, keyed by
     ``plate_id``) and the eventual SD cleanup all key off the SAME ``remote_filename``
     (the bare ``job_stem``).
+
+    ``ev`` is the PRE-DISPATCH wire snapshot, carried down from the dispatcher rather
+    than re-read here on purpose: by the time this claims, the printer may already
+    have accepted the sweep, and a freshly-read ACTIVE state would make our own eject
+    refuse its own claim with ``job_active``. Every refusal that matters — a dispatch
+    lease minted during the upload, another eject — is derived from the authority's
+    record, not from ``ev``, so the race this exists to catch is still caught.
+
+    The durable mirror is no longer written here: the authority's persist callable
+    writes ``print_queue.eject_dispatched_at`` off the claim transition, which is what
+    makes the in-memory record and its durable half impossible to disagree.
     """
     from backend.app.services.bambu_ftp import (
         cleanup_downloaded_3mf,
@@ -1111,8 +1134,65 @@ async def _upload_start_register_eject(
 
     eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="sent")
 
-    register_pending_eject(printer.id, pending)
-    # Durable mirror: stamp the owning unit so the eject survives a restart between
-    # here and its terminal (W1). A manual/foreign eject has no queue item, so this is
-    # a deliberate no-op — the gate stays raised across a restart (fail-closed).
-    await persist_pending_eject(db, printer.id, pending)
+    # Claim the printer. The gate this passed before the build is re-run here, so a
+    # dispatch lease or another eject that appeared during the upload still refuses —
+    # and then the sweep we just started must be stopped, because the file IS on the
+    # printer and the firmware may act on it.
+    refusal = plate_occupancy.claim_for_eject(printer.id, pending, ev)
+    if refusal is not None:
+        logger.warning(
+            "eject.remote: printer %s claim refused (%s) AFTER the eject start was accepted — "
+            "stopping the sweep; the printer was taken by something else during the upload",
+            printer.id,
+            refusal,
+        )
+        printer_manager.stop_print(printer.id)
+        eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="failed")
+        raise _refusal_error(refusal)
+
+    # The firmware silently ignores a project_file sent while it is busy, so a claim
+    # that never sees a PRINT START echo is a sweep that will never happen. Arm the
+    # deadline that says so (cancelled by the start echo, superseded by a new claim).
+    _arm_start_deadline(printer.id)
+
+
+async def dispatch_identified_foreign_eject(*, printer_id: int, profile_id: int) -> None:
+    """``on_release`` for the AUTO foreign-eject watch: resolve the foreign donor FRESH
+    and dispatch the sweep exactly as the manual foreign confirm does (minus the thermal
+    gate — the cooldown watch already waited for the bed to reach the threshold).
+
+    Opens its own session (module convention); RAISES on any failure so
+    ``watch_bed_and_clear`` counts a dispatch failure (retry, then stall after three)
+    rather than silently dropping the sweep.
+
+    It lives HERE, beside the dispatcher it calls, rather than in ``eject.manual``:
+    with it there, the cooldown monitor had to reach into the manual-eject service at
+    call time while that service imports the monitor at module load — a cycle held
+    open by a lazy import. The donor resolution it needs is still the manual lane's
+    (``manual`` imports this module at module level, so this reaches back lazily —
+    the one direction that edge can point).
+    """
+    from backend.app.core.database import async_session
+    from backend.app.services.eject.manual import ManualEjectError, _resolve_foreign_source, _safe_unlink
+
+    async with async_session() as db:
+        printer = await db.get(Printer, printer_id)
+        if printer is None:
+            raise ManualEjectError("not_found", "Printer not found", status_code=404)
+        source = await _resolve_foreign_source(db, printer)
+        try:
+            await dispatch_foreign_eject(
+                db,
+                printer_id=printer_id,
+                profile_id=profile_id,
+                source_path=source.donor_path,
+                plate_id=source.plate_id,
+            )
+            logger.info(
+                "eject.remote: printer %s auto foreign-plate eject dispatched (plate %s, profile %s)",
+                printer_id,
+                source.plate_id,
+                profile_id,
+            )
+        finally:
+            _safe_unlink(source.tmp_path)

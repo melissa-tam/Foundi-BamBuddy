@@ -285,10 +285,6 @@ class PrinterManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         # Track who started the current print (Issue #206)
         self._current_print_user: dict[int, dict] = {}  # {printer_id: {"user_id": int, "username": str}}
-        # Track printers awaiting plate-clear acknowledgment after a finished/failed print.
-        # Persisted to DB (printers.awaiting_plate_clear) so the gate survives restarts/power
-        # cycles — see issue #961. Loaded into this set at startup via load_awaiting_plate_clear_from_db().
-        self._awaiting_plate_clear: set[int] = set()
         # Printers quarantined by the farm failure policy (Phase 3). DB-backed
         # (printers.quarantined) is the source of truth; this set is the fast
         # in-memory cache the synchronous scheduler idle-gate consults. Kept in
@@ -318,59 +314,21 @@ class PrinterManager:
         self._current_print_user.pop(printer_id, None)
 
     def is_awaiting_plate_clear(self, printer_id: int) -> bool:
-        """Return True when the printer finished/failed a print and is waiting for the
-        user to acknowledge the plate is cleared before the queue may dispatch the next job.
+        """Return True when the printer's build plate carries a deposit the queue must
+        not dispatch onto — a finished/failed print, a printer-vision trip, or an
+        operator's declaration — until it is acknowledged clear.
+
+        A thin PROJECTION of the plate-occupancy authority since the 2026-08-30
+        cut-over. The manager used to own this as an in-memory set plus a DB writer
+        plus a loader, which made it the second of five stores answering "who owns
+        this printer"; it now answers by asking the one that does. Fourteen readers
+        (the scheduler idle gate, both status payloads, the eject watches, the routes)
+        are unchanged by construction, and there is no setter here at all — every
+        raise and clear goes through a named transition on the authority.
         """
-        return printer_id in self._awaiting_plate_clear
+        from backend.app.services.plate_occupancy import plate_occupancy
 
-    def set_awaiting_plate_clear(self, printer_id: int, awaiting: bool, source_subtask_id: str | None = None):
-        """Set/clear the awaiting-plate-clear gate and persist it to DB.
-
-        ``source_subtask_id`` records WHICH print raised the gate (the payload
-        subtask_id at terminal) into ``printers.plate_gate_subtask_id``. Stored only
-        while ``awaiting`` is True; clearing the gate NULLs it. The cooldown monitor's
-        restart re-arm reads that column to decide whether a persisted gate may
-        auto-clear — a gate raised with no source (None) is human-clear-only (Phase 1).
-
-        Persisted so the gate survives Bambuddy/printer restarts (#961): after Auto Off
-        cycles the printer, the printer boots into IDLE with no memory of the previous
-        finish, and without persistence the queue would bypass the confirmation prompt.
-
-        Also broadcasts an updated ``printer_status`` over the WebSocket (#1128).
-        ``awaiting_plate_clear`` is a Bambuddy-side flag — toggling it does not
-        produce an MQTT push from the printer, so without an explicit broadcast
-        any UI subscriber that's NOT the originating tab would stay stale until
-        the next coincidental status refresh. The plate-clear button on the
-        printer card disappeared "immediately" only because of an optimistic
-        React Query cache update on the click path; clearing the flag through
-        any other route (an admin script, a second tab, an automation that
-        hits ``POST /printers/{id}/clear-plate`` directly) silently broke the
-        UI without it. Centralised here so every current AND future caller is
-        covered without each one having to remember to broadcast.
-        """
-        if awaiting:
-            self._awaiting_plate_clear.add(printer_id)
-        else:
-            was_awaiting = printer_id in self._awaiting_plate_clear
-            self._awaiting_plate_clear.discard(printer_id)
-            if was_awaiting:
-                # Gate released (manual clear / eject-verified completion / FA
-                # approve / startup hygiene all funnel through here): the printer can
-                # dispatch again, so wake the scheduler immediately (latency Phase A).
-                # Transition-guarded — only a real True→False change kicks, so a
-                # redundant clear never re-fires. Lazy import keeps this manager a
-                # leaf w.r.t. the scheduler; guarded so a kick can't break the gate.
-                try:
-                    from backend.app.services.dispatch_kick import dispatch_kick
-
-                    dispatch_kick.kick("plate_gate_release", printer_id)
-                except Exception:
-                    logger.debug("dispatch kick failed on plate-gate release (non-fatal)", exc_info=True)
-        # Only create the coroutine when there is a loop to run it on — otherwise Python
-        # emits "coroutine was never awaited" warnings (e.g. in sync unit tests).
-        if self._loop and self._loop.is_running():
-            self._schedule_async(self._persist_awaiting_plate_clear(printer_id, awaiting, source_subtask_id))
-            self._schedule_async(self._broadcast_status_change(printer_id))
+        return plate_occupancy.is_plate_occupied(printer_id)
 
     async def _broadcast_status_change(self, printer_id: int) -> None:
         """Emit a ``printer_status`` WebSocket update for this printer (#1128).
@@ -413,46 +371,6 @@ class PrinterManager:
                 e,
             )
 
-    async def _persist_awaiting_plate_clear(
-        self, printer_id: int, awaiting: bool, source_subtask_id: str | None = None
-    ):
-        from backend.app.core.database import run_with_retry
-
-        async def _do(db):
-            printer = await db.get(Printer, printer_id)
-            if printer is not None:
-                printer.awaiting_plate_clear = awaiting
-                # The gate's source is meaningful only while it's raised; clearing
-                # NULLs it so a later re-arm can't mistake a stale id for a live gate.
-                printer.plate_gate_subtask_id = source_subtask_id if awaiting else None
-                await db.commit()
-
-        try:
-            await run_with_retry(_do, label=f"persist awaiting_plate_clear printer={printer_id}")
-        except Exception as e:
-            logger.warning("Failed to persist awaiting_plate_clear for printer %d: %s", printer_id, e)
-
-    async def load_awaiting_plate_clear_from_db(self):
-        """Rehydrate the awaiting-plate-clear set from the printers table on startup.
-
-        Only the boolean gate is cached in memory (the fast synchronous scheduler
-        gate consults it). The gate's source subtask id lives in
-        ``printers.plate_gate_subtask_id`` and is read straight from the DB by the
-        cooldown monitor's ``rearm_on_startup`` — the sole consumer — so there is no
-        second in-memory copy to keep in sync.
-        """
-        from backend.app.core.database import async_session
-
-        try:
-            async with async_session() as db:
-                result = await db.execute(select(Printer.id).where(Printer.awaiting_plate_clear.is_(True)))
-                ids = {row[0] for row in result.all()}
-                self._awaiting_plate_clear = ids
-                if ids:
-                    logger.info("Loaded %d printer(s) awaiting plate-clear acknowledgment: %s", len(ids), sorted(ids))
-        except Exception as e:
-            logger.warning("Failed to load awaiting_plate_clear from DB: %s", e)
-
     def is_quarantined(self, printer_id: int) -> bool:
         """Return True when the printer is quarantined by the farm failure policy.
 
@@ -467,8 +385,9 @@ class PrinterManager:
         DB persistence is owned by the caller (farm_policy / the clear-quarantine
         route) inside its own transaction, so this method only touches the fast
         in-memory set the synchronous scheduler gate consults plus the WebSocket
-        broadcast — mirroring how ``set_awaiting_plate_clear`` keeps subscribers
-        in sync for a Bambuddy-side flag the printer never pushes over MQTT.
+        broadcast — the same shape the plate-occupancy authority uses to keep
+        subscribers in sync for a Bambuddy-side flag the printer never pushes over
+        MQTT (there, ``_broadcast_status_change`` is the injected broadcast callable).
         """
         if quarantined:
             self._quarantined.add(printer_id)
@@ -1132,6 +1051,44 @@ def _eject_watch_payload(printer_id: int | None) -> dict | None:
     return {"threshold_c": threshold} if threshold is not None else None
 
 
+def occupancy_payload(printer_id: int | None) -> dict | None:
+    """The plate-occupancy authority's STORED state for this printer, or None.
+
+    ONE builder for all three status construction sites (the WS serializer below and
+    both REST branches), so the socket push and the poll can never describe the same
+    printer differently.
+
+    Stored fields only — no ``owner``. The owner projection is derived partly from
+    ``db_claim``, a per-tick queue read this synchronous serializer cannot do, so
+    publishing it here would make WS and REST disagree (the flip ``eject_watch`` is
+    careful to avoid). ``policy`` is the policy's CLASS NAME: the UI renders "what
+    happens to this plate next", and the unit/profile behind it already has surfaces.
+    """
+    if not printer_id:
+        return None
+    from backend.app.services.plate_occupancy import plate_occupancy
+
+    view = plate_occupancy.snapshot(printer_id)
+    eject = None
+    if view.eject_purpose is not None:
+        eject = {
+            "purpose": view.eject_purpose,
+            "started": view.eject_started,
+            "age_s": view.eject_age_s,
+            "hydrated": view.eject_hydrated,
+        }
+    return {
+        "plate": {
+            "occupied": view.plate_occupied,
+            "source_subtask_id": view.plate_source_subtask_id,
+            "policy": type(view.plate_policy).__name__ if view.plate_policy is not None else None,
+            "since": view.plate_since,
+        },
+        "eject": eject,
+        "lease_age_s": view.lease_age_s,
+    }
+
+
 def _open_incident_payload(printer_id: int | None) -> dict | None:
     """The printer's OPEN AMS incident as ``{kind, status, slot_desc, created_at}``,
     or None. A projection of the durable row, cached in memory (WS2b) — a cache miss
@@ -1452,6 +1409,11 @@ def printer_state_to_dict(
         # escalation-only watch) is armed. Lazy import: the monitor imports this
         # module at import time, so the reverse edge must resolve at call time.
         "eject_watch": _eject_watch_payload(printer_id),
+        # Plate-occupancy authority projection (2026-08-30), additive beside
+        # awaiting_plate_clear above: which policy holds the plate, since when, and
+        # whether an eject is in flight and has actually started. STORED fields only —
+        # see occupancy_payload for why there is no owner here.
+        "occupancy": occupancy_payload(printer_id),
         # Open AMS incident (WS2b): {kind, status, slot_desc, created_at} or null.
         # A FOREIGN print's hold has no queue row and therefore no waiting_reason
         # chip anywhere in the UI — this is the only place it can be seen. Read from

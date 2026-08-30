@@ -1136,6 +1136,23 @@ class PlateOccupancy:
         record = self._records.get(printer_id)
         return record is not None and record.plate is not None
 
+    def pending_eject_view(self, printer_id: int) -> PendingEject | None:
+        """The FULL pending eject this printer holds, or None. A read-only peek.
+
+        :meth:`eject_identity` is the IDENTITY projection — what the watchdog and the
+        terminal matcher compare against — and it deliberately carries no build
+        figures. The runtime watchdog needs those figures (``expected_runtime_s``,
+        ``drop_span_s``) to compute its deadlines, and the eject terminal logs them
+        beside the measured runtime, so this hands back the record itself.
+
+        Safe to expose because :class:`PendingEject` is frozen: a caller can read it
+        but cannot mutate the record through it. Prefer :meth:`eject_identity`
+        wherever identity alone answers the question — this exists for the two
+        consumers that genuinely need the build figures.
+        """
+        record = self._records.get(printer_id)
+        return record.eject if record is not None else None
+
     def eject_identity(self, printer_id: int) -> EjectIdentity | None:
         """What the watchdog and terminal matching compare against, or None."""
         record = self._records.get(printer_id)

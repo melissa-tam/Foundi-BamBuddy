@@ -18,13 +18,28 @@ sweep that clears the plate.
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from backend.app.services import print_scheduler as sched_mod
 from backend.app.services.bambu_mqtt import HMSError
+from backend.app.services.plate_occupancy import (
+    CooldownEject,
+    EscalationOnly,
+    Evidence,
+    PendingEject,
+    plate_occupancy,
+)
 from backend.app.services.print_scheduler import scheduler
+
+
+@pytest.fixture(autouse=True)
+def _clean_authority():
+    """The idle gate and the busy diagnostic both read the plate-occupancy
+    authority, whose singleton is process-wide — start every case unclaimed."""
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 def _ptfe_breakage_hms(ams_id: int = 0, tray_id: int = 3) -> HMSError:
@@ -43,15 +58,24 @@ def _state(live: str = "IDLE", hms: list | None = None):
     return SimpleNamespace(state=live, hms_errors=hms or [], subtask_id="task-1")
 
 
+def _evidence(live: str | None = None) -> Evidence:
+    """The derived facts a caller hands the authority — never stored by it."""
+    return Evidence(live_state=live)
+
+
 @pytest.fixture
 def healthy_printer(monkeypatch):
     """A printer that passes every OTHER idle gate, so the fault gate is what
-    decides."""
+    decides.
+
+    Nothing stubs the plate here any more: OWNERSHIP is the plate-occupancy
+    authority's answer, and the autouse fixture leaves every printer plate-clear and
+    unclaimed.
+    """
     pm = sched_mod.printer_manager
     monkeypatch.setattr(pm, "is_connected", lambda pid: True)
     monkeypatch.setattr(pm, "is_quarantined", lambda pid: False)
     monkeypatch.setattr(pm, "is_model_mismatch", lambda pid: False)
-    monkeypatch.setattr(pm, "is_awaiting_plate_clear", lambda pid: False)
     return pm
 
 
@@ -94,7 +118,6 @@ class TestIsPrinterIdleFaultGate:
         monkeypatch.setattr(pm, "is_connected", lambda pid: True)
         monkeypatch.setattr(pm, "is_quarantined", lambda pid: False)
         monkeypatch.setattr(pm, "is_model_mismatch", lambda pid: False)
-        monkeypatch.setattr(pm, "is_awaiting_plate_clear", lambda pid: False)
         monkeypatch.setattr(pm, "get_status", lambda pid: _state("IDLE", [_ptfe_breakage_hms()]))
         assert scheduler._is_printer_idle(4242) is False
 
@@ -143,11 +166,19 @@ class TestEjectLaneStaysUngated:
 
 
 class TestBusyDiagnostic:
-    """W5: the per-printer "not available" line names the blocker."""
+    """W5: the per-printer "not available" line names the blocker.
+
+    The ``dispatch_hold_printers`` argument is gone with the scheduler's private
+    hold dict (2026-08-30): the occupancy causes — an eject in flight, a dispatch
+    lease, a deposit on the plate — are now read from the authority's ``snapshot``,
+    which is also why an eject is finally VISIBLE on this line. A printer taking no
+    work because a sweep is crossing its plate used to read exactly like one taking
+    no work for no reason at all.
+    """
 
     def test_a_printing_claim_is_named_with_its_id_and_age(self):
         started = datetime.now(timezone.utc) - timedelta(minutes=42)
-        cause = sched_mod._busy_cause(7, {7: [(1010, started)]}, set(), _state("IDLE", []))
+        cause = sched_mod._busy_cause(7, {7: [(1010, started)]}, _state("IDLE", []))
 
         assert "printing claim item 1010" in cause
         assert "42 min" in cause
@@ -156,29 +187,70 @@ class TestBusyDiagnostic:
         """The fork stores ``started_at`` tz-naive; a naive stamp read as local time
         would report a wildly wrong age (the number an operator would act on)."""
         started = (datetime.now(timezone.utc) - timedelta(minutes=15)).replace(tzinfo=None)
-        cause = sched_mod._busy_cause(7, {7: [(1010, started)]}, set(), None)
+        cause = sched_mod._busy_cause(7, {7: [(1010, started)]}, None)
 
         assert "15 min" in cause
 
     def test_a_claim_with_no_started_at_says_so_rather_than_guessing(self):
-        cause = sched_mod._busy_cause(7, {7: [(1010, None)]}, set(), None)
+        cause = sched_mod._busy_cause(7, {7: [(1010, None)]}, None)
 
         assert "age unknown" in cause
 
     def test_a_post_dispatch_hold_is_named(self):
-        assert sched_mod._busy_cause(7, {}, {7}, None) == "post-dispatch hold"
+        """The old "post-dispatch hold" line, re-pinned onto the lease that replaced
+        it — and it now names the UNIT the printer is being held for, which the
+        boolean set could never do."""
+        lease = plate_occupancy.claim_for_dispatch(
+            7, 1010, pre_state="FINISH", pre_subtask="t-1", min_hold_s=60.0, max_hold_s=180.0, ev=_evidence()
+        )
+        assert plate_occupancy.commit_dispatch(7, lease) is None
+
+        cause = sched_mod._busy_cause(7, {}, None)
+        assert "dispatch lease unit 1010" in cause
+
+    def test_an_eject_in_flight_is_named(self):
+        """New surface, same incident family: the eject lane was invisible here."""
+        plate_occupancy.hydrate_plate(7, "task-1", EscalationOnly())
+        assert (
+            plate_occupancy.claim_for_eject(
+                7, PendingEject(purpose="production", run_id=3, queue_item_id=1010), _evidence()
+            )
+            is None
+        )
+
+        cause = sched_mod._busy_cause(7, {}, None)
+        assert "production eject in flight" in cause
+        assert "not started" in cause
+
+    def test_an_occupied_plate_is_named_with_the_policy_holding_it(self):
+        plate_occupancy.hydrate_plate(7, "task-1", CooldownEject(unit_id=1010, run_id=3))
+
+        cause = sched_mod._busy_cause(7, {}, None)
+        assert "plate occupied (CooldownEject)" in cause
 
     def test_a_standing_fault_is_named_and_causes_stack(self):
         """A dead claim on a printer with a standing fault is a different story from
         either alone — which is exactly the 001-H2S shape."""
         started = datetime.now(timezone.utc) - timedelta(hours=15)
-        cause = sched_mod._busy_cause(7, {7: [(1010, started)]}, set(), _state("IDLE", [_ptfe_breakage_hms()]))
+        cause = sched_mod._busy_cause(7, {7: [(1010, started)]}, _state("IDLE", [_ptfe_breakage_hms()]))
 
         assert "printing claim item 1010" in cause
         assert "standing fault 0700_0006" in cause
 
+    def test_every_holding_cause_stacks_on_one_line(self):
+        """They stack because they are different stories: a dead claim on a printer
+        whose plate is also occupied is not either one alone."""
+        plate_occupancy.hydrate_plate(7, "task-1", EscalationOnly())
+        started = datetime.now(timezone.utc) - timedelta(hours=15)
+
+        cause = sched_mod._busy_cause(7, {7: [(1010, started)]}, _state("IDLE", [_ptfe_breakage_hms()]))
+
+        assert "printing claim item 1010" in cause
+        assert "plate occupied (EscalationOnly)" in cause
+        assert "standing fault 0700_0006" in cause
+
     def test_an_unattributed_busy_printer_says_so(self):
-        assert sched_mod._busy_cause(7, {}, set(), _state("IDLE", [])) == "unattributed"
+        assert sched_mod._busy_cause(7, {}, _state("IDLE", [])) == "unattributed"
 
     def test_the_incident_summary_reads_the_projection_cache(self):
         from backend.app.services import printer_incidents

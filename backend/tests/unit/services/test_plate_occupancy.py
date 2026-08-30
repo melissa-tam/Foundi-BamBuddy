@@ -163,6 +163,20 @@ class TestDepositEvidence:
                 True,
             ),
             (
+                # The measured non-deposit needs BOTH peaks at zero. A layer counter
+                # still reading 0 while progress has moved is the firmware's own
+                # lag-by-one on the first layer — material is already going down, so
+                # the disjunction (not the conjunction) is what decides.
+                "cancelled at layer 0 but with progress — the first layer is down",
+                {"final_status": "cancelled", "peaks_reliable": True, "last_layer_num": 0, "last_progress": 3.2},
+                True,
+            ),
+            (
+                "cancelled with layers but no progress reading — the same rule mirrored",
+                {"final_status": "cancelled", "peaks_reliable": True, "last_layer_num": 4, "last_progress": 0.0},
+                True,
+            ),
+            (
                 "failed with reliable zero peaks — nothing was ever laid down",
                 {"final_status": "failed", "peaks_reliable": True, "last_layer_num": 0, "last_progress": 0.0},
                 False,

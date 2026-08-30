@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 import backend.app.services.stagger as stagger_mod
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.settings import Settings
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.stagger import StaggerPolicy, stagger_policy
 
 # --------------------------------------------------------------------------- #
@@ -27,10 +28,14 @@ from backend.app.services.stagger import StaggerPolicy, stagger_policy
 
 @pytest.fixture(autouse=True)
 def _reset_policy():
-    """Every test starts from a clean in-flight set / ramp-watch / tunable cache."""
+    """Every test starts from a clean in-flight set / ramp-watch / tunable cache —
+    and an unclaimed fleet, since the settle-integration case below runs the real
+    ``_start_print_by_id``, whose finally releases the occupancy DISPATCH LEASE."""
     stagger_policy.reset()
+    plate_occupancy.reset_for_tests()
     yield
     stagger_policy.reset()
+    plate_occupancy.reset_for_tests()
 
 
 class FakeStatus:
@@ -335,13 +340,18 @@ async def test_settle_guaranteed_when_start_print_raises(test_engine, monkeypatc
     monkeypatch.setattr(sched, "_start_print", AsyncMock(side_effect=RuntimeError("boom")))
     monkeypatch.setattr(sched, "_fail_queue_item", AsyncMock())
 
-    # Simulate the plan step entering the in-flight set.
+    # Simulate the plan step: the stagger in-flight slot AND the printer claim.
     stagger_policy.note_dispatch_planned(printer_id=7, item_id=item_id)
     assert stagger_policy.in_flight_count == 1
+    lease = sched._claim_dispatch_lease(7, item_id)
+    assert lease is not None
 
     import asyncio
 
-    await sched._start_print_by_id(item_id, 7, asyncio.Semaphore(1))
+    await sched._start_print_by_id(item_id, 7, asyncio.Semaphore(1), None, lease)
 
-    # Despite the crash, the finally settled the slot.
+    # Despite the crash, the finally settled the slot — and released the UNCOMMITTED
+    # claim, which describes a dispatch that did not happen. Leaving it standing
+    # would hold the printer out of the queue for the full hold ceiling.
     assert stagger_policy.in_flight_count == 0
+    assert plate_occupancy.snapshot(7).lease_unit_id is None

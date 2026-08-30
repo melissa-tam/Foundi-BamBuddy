@@ -14,7 +14,18 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.print_scheduler import PrintScheduler
+
+
+@pytest.fixture(autouse=True)
+def _clean_authority():
+    """A successful dispatch COMMITS a printer lease on the process-wide occupancy
+    authority; a second dispatch onto a still-claimed printer would be refused. Start
+    every case from an unclaimed fleet."""
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 @pytest.fixture
@@ -153,7 +164,9 @@ async def _dispatch_library_item(ctx, *, archive_failure=False, unlink_side_effe
         patch("backend.app.services.print_scheduler.printer_manager.is_connected", MagicMock(return_value=True)),
         patch("backend.app.services.print_scheduler.printer_manager.get_status", MagicMock(return_value=None)),
         patch("backend.app.services.print_scheduler.printer_manager.start_print", ctx.start_print),
-        patch("backend.app.services.print_scheduler.printer_manager.set_awaiting_plate_clear", MagicMock()),
+        # No plate write to stub: the dispatch path's unconditional
+        # ``set_awaiting_plate_clear(False)`` was deleted on 2026-08-30. The only
+        # occupancy write a healthy dispatch makes is COMMITTING its printer lease.
         patch(
             "backend.app.services.print_scheduler.get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0, 1.0))
         ),

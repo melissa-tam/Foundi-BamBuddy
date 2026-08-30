@@ -96,8 +96,15 @@ async def eject_now(
             detail={"code": "bed_hot", "bed_c": exc.bed_c, "threshold_c": exc.threshold_c},
         ) from exc
     except eject_remote.EjectDispatchError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        # ``code`` carries the occupancy authority's own refusal token when an
+        # occupancy check refused the sweep (``job_active``, ``dispatch_in_flight``,
+        # ``eject_in_flight``, ``not_occupied``), so the dialog branches on the same
+        # vocabulary the state machine speaks. (WS4 folds every eject error into ONE
+        # verdict → copy map; this keeps the wire shape it will land on.)
+        raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": str(exc)}) from exc
     except ManualEjectError as exc:
         if exc.status_code == 404:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": str(exc)}) from exc
+        raise HTTPException(
+            status_code=exc.status_code, detail={"code": exc.code, "message": str(exc), **exc.extra}
+        ) from exc

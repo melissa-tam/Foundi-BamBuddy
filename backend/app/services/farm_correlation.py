@@ -83,6 +83,15 @@ from sqlalchemy import select
 
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
+from backend.app.services.plate_occupancy import (
+    CooldownEject,
+    DepositEvidence,
+    EscalationOnly,
+    ForeignAutoEject,
+    OccupancyPolicy,
+    TerminalDisposition,
+    plate_occupancy,
+)
 from backend.app.utils.filename import print_identity_key
 from backend.app.utils.printer_models import normalize_printer_model
 
@@ -113,6 +122,77 @@ class TerminalResolution:
 
     item: PrintQueueItem | None
     verdict: Verdict
+
+
+def terminal_disposition(
+    *,
+    verdict: str,
+    item_id: int | None,
+    eject_profile_id: int | None,
+    first_article: bool,
+    batch_id: int | None,
+    source_subtask_id: str | None,
+    evidence: DepositEvidence,
+    raise_gate: bool,
+) -> TerminalDisposition:
+    """Classify one terminal into the single value the occupancy authority consumes.
+
+    The correlation rules live in this module, so the mapping from a VERDICT to "what
+    happens to the plate next" lives here too — the authority stays free of the
+    correlation lane and the terminal handler stays free of policy. It assembles, it
+    does not decide: every input is already resolved by the caller.
+
+    The policy ladder, in order:
+
+    * an id- or name-confirmed finish of a farm unit that carries an eject profile and
+      is not a first article → :class:`CooldownEject` on THAT unit. ``fallback`` is
+      deliberately excluded (it is in ``ATTRIBUTED_VERDICTS`` but not in
+      ``AUTO_CLEAR_VERDICTS``): a finish attributed only because it was the sole
+      printing unit may not arm an automatic sweep;
+    * a FIRST ARTICLE → :class:`EscalationOnly`. It carries a profile, but the part
+      holds on the plate for inspection and the approval flow arms its own FA eject;
+    * everything else — a foreign print, an unattributed deposit, a failure, a unit
+      with no eject profile → :class:`EscalationOnly`, the never-armless floor. The
+      foreign lane may UPGRADE that to :class:`ForeignAutoEject` afterwards, once its
+      background identification proves the plate is the farm's own file; it is not
+      decided here because the identification needs I/O this factory must not do.
+
+    ``raise_gate`` is the caller's existing raise guard (the global
+    ``require_plate_clear`` toggle, or farm involvement), carried through so a non-farm
+    terminal on a toggle-off install still raises nothing — and so the authority never
+    has to know what that guard is made of.
+    """
+    policy: OccupancyPolicy
+    if verdict in AUTO_CLEAR_VERDICTS and item_id is not None and eject_profile_id is not None and not first_article:
+        policy = CooldownEject(unit_id=item_id, run_id=batch_id)
+    else:
+        policy = EscalationOnly()
+    return TerminalDisposition(
+        queue_item_id=item_id,
+        source_subtask_id=source_subtask_id,
+        evidence=evidence,
+        policy=policy,
+        raise_gate=raise_gate,
+    )
+
+
+def upgrade_to_foreign_auto_eject(printer_id: int, profile_id: int, threshold_c: float) -> bool:
+    """Swap a foreign plate's escalation hold for an AUTO eject once it is identified.
+
+    The foreign branch raises its gate SYNCHRONOUSLY under :class:`EscalationOnly` (a
+    deposit must block dispatch NOW), then identifies the plate in the background —
+    that identification opens archives and re-fetches donors over FTPS, which the
+    terminal callback cannot wait on. When it proves the plate is the farm's OWN file,
+    this promotes the policy and the driver swaps the escalation hold for the cooldown
+    watch that will sweep it.
+
+    Returns True when the promotion landed. False means the authority refused
+    ``not_occupied`` — an operator cleared the plate while we were identifying it, and
+    an auto-eject onto a plate somebody already emptied is exactly what must not happen.
+    """
+    return (
+        plate_occupancy.set_policy(printer_id, ForeignAutoEject(profile_id=profile_id, threshold_c=threshold_c)) is None
+    )
 
 
 @dataclass(frozen=True)
@@ -489,7 +569,6 @@ async def on_native_plate_detection(db: AsyncSession, printer_id: int, short_cod
     """
     from backend.app.models.printer import Printer
     from backend.app.services.notification_service import notification_service
-    from backend.app.services.printer_manager import printer_manager
 
     result = await db.execute(
         select(PrintQueueItem)
@@ -515,8 +594,10 @@ async def on_native_plate_detection(db: AsyncSession, printer_id: int, short_cod
         )
         return False
 
-    # (a) human-clear-only gate, (b) flag the unit.
-    printer_manager.set_awaiting_plate_clear(printer_id, True, source_subtask_id=None)
+    # (a) human-clear-only gate, (b) flag the unit. The authority raises it source-less
+    # under EscalationOnly — a vision trip fires MID-JOB and has no job identity behind
+    # it to sweep against, so only a human can clear what the printer just saw.
+    plate_occupancy.note_plate_detected(printer_id, ",".join(sorted(short_codes)))
     item.waiting_reason = WAITING_REASON_PLATE_VISION
     await db.commit()
 

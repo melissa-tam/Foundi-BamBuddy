@@ -452,10 +452,10 @@ def escalate_occupancy(printer_id: int, error: BaseException) -> None:
 
 async def _page_plate_not_empty(printer_id: int) -> None:
     """Fire the plate-not-empty notification, reusing the monitor's one implementation."""
-    from backend.app.services.eject.monitor import _default_notify_plate_not_empty
+    from backend.app.services.eject.monitor import notify_plate_not_empty
 
     try:
-        await _default_notify_plate_not_empty(printer_id, source_detail=_ESCALATION_SOURCE_DETAIL)
+        await notify_plate_not_empty(printer_id, source_detail=_ESCALATION_SOURCE_DETAIL)
     except Exception:
         logger.warning("[occupancy-store] p%d: plate-not-empty escalation failed", printer_id, exc_info=True)
 

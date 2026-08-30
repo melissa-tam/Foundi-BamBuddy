@@ -18,6 +18,35 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+def _occupancy():
+    """The authority singleton (imported lazily so module import order stays free)."""
+    from backend.app.services.plate_occupancy import plate_occupancy
+
+    return plate_occupancy
+
+
+def _plate_policy(printer_id: int):
+    """What the authority says will happen to this printer's plate next, or None."""
+    return _occupancy().snapshot(printer_id).plate_policy
+
+
+def _claim_eject(printer_id: int, *, purpose="production", run_id=1, queue_item_id=2, source_subtask_id="SUB-P", **kw):
+    """Put a LIVE server-dispatched eject on ``printer_id``, the way a dispatch does.
+
+    A claim is only legal on an occupied plate (``ejectable``), which is the real
+    sequence: a terminal gates the plate, the eject dispatcher then claims the
+    printer for the sweep. Returns the claimed :class:`PendingEject`.
+    """
+    from backend.app.services.plate_occupancy import CooldownEject, Evidence, PendingEject
+
+    occupancy = _occupancy()
+    occupancy.hydrate_plate(printer_id, source_subtask_id, CooldownEject(unit_id=queue_item_id or 0, run_id=run_id))
+    pending = PendingEject(purpose=purpose, run_id=run_id, queue_item_id=queue_item_id, **kw)
+    refusal = occupancy.claim_for_eject(printer_id, pending, Evidence())
+    assert refusal is None, f"eject claim refused: {refusal}"
+    return pending
+
+
 class TestPrintStartLogic:
     """Test print start callback logic without database integration."""
 
@@ -73,8 +102,13 @@ class TestPlateClearGate:
         """Patch on_print_complete's collaborators and back its DB access with the
         REAL test engine so the Phase-1 terminal correlation runs for real (the old
         MagicMock single-item lookup can't satisfy resolve_terminal_item). Returns a
-        namespace exposing the mocked printer_manager, eject monitor and notification
-        service so a test can assert on the gate/arm/notify calls."""
+        namespace exposing the mocked printer_manager and notification service.
+
+        The plate gate is NO LONGER a printer_manager call to assert on: the terminal
+        handler makes ONE ``plate_occupancy.note_terminal`` call, so a test reads the
+        outcome off the authority (``is_plate_occupied`` / ``snapshot``) instead of off
+        a mock's call list — and the "which watch was armed?" question is now "which
+        POLICY does the plate carry?"."""
         from types import SimpleNamespace
 
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -96,21 +130,23 @@ class TestPlateClearGate:
         mock_pm = stack.enter_context(patch("backend.app.main.printer_manager"))
         mock_pm.get_printer.return_value = None
         mock_pm.get_current_print_user.return_value = None
-        # Real methods under test — track each call so the test can assert on it.
-        mock_pm.set_awaiting_plate_clear = MagicMock()
         mock_pm.clear_current_print_user = MagicMock()
-        # The farm eject monitor is patched so no real background watch spawns; the
-        # test asserts whether auto-clear (on_terminal_status) was armed.
-        mock_monitor = stack.enter_context(patch("backend.app.main.eject_cooldown_monitor"))
-        mock_monitor.on_terminal_status = MagicMock()
-        mock_monitor.start_escalation_only_watch = MagicMock()
-        mock_monitor.start_foreign_eject_watch = MagicMock()
-        return SimpleNamespace(pm=mock_pm, monitor=mock_monitor, notif=mock_notif, maker=maker)
+        return SimpleNamespace(pm=mock_pm, notif=mock_notif, maker=maker)
 
     @staticmethod
-    async def _seed_printing_item(maker, *, serial, dispatch_subtask_id=None, is_dry_run=False):
-        """Seed a connected printer with one printing (non-farm) queue item and
-        return (printer_id, item_id)."""
+    async def _seed_printing_item(
+        maker,
+        *,
+        serial,
+        dispatch_subtask_id=None,
+        is_dry_run=False,
+        eject_profile_id=None,
+        first_article=False,
+        batch_id=None,
+    ):
+        """Seed a connected printer with one printing queue item and return
+        (printer_id, item_id). ``eject_profile_id`` makes it a FARM unit — the input
+        that decides whether its plate gets a cooldown policy or an escalation hold."""
         from datetime import datetime, timezone
 
         from backend.app.models.print_queue import PrintQueueItem
@@ -126,8 +162,10 @@ class TestPlateClearGate:
             item = PrintQueueItem(
                 printer_id=printer.id,
                 status="printing",
-                first_article=False,
+                first_article=first_article,
                 is_dry_run=is_dry_run,
+                eject_profile_id=eject_profile_id,
+                batch_id=batch_id,
                 dispatch_subtask_id=dispatch_subtask_id,
                 started_at=datetime.now(timezone.utc),
             )
@@ -179,7 +217,7 @@ class TestPlateClearGate:
         tasks_before = set(asyncio.all_tasks())
 
         with ExitStack() as stack:
-            env = self._setup_mocks(stack, test_engine)
+            self._setup_mocks(stack, test_engine)
 
             from backend.app.main import on_print_complete
 
@@ -190,6 +228,7 @@ class TestPlateClearGate:
                     "filename": "/data/Metadata/test.gcode",
                     "subtask_name": "Test",
                     "timelapse_was_active": False,
+                    "peaks_reliable": True,
                     "last_layer_num": 10,
                     "last_progress": 55.0,
                 },
@@ -197,26 +236,33 @@ class TestPlateClearGate:
 
             await self._drain(tasks_before)
 
-        true_calls = [c for c in env.pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
-        assert true_calls, "Gate must be raised for a deposit-bearing terminal (toggle defaults on)."
+        from backend.app.services.plate_occupancy import EscalationOnly
+
+        assert _occupancy().is_plate_occupied(1), "Gate must be raised for a deposit-bearing terminal (toggle on)."
+        # Never armless: an unattributed deposit always carries the escalation floor.
+        assert isinstance(_plate_policy(1), EscalationOnly)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "payload_extra, ids",
         [
-            ({"last_layer_num": 0, "last_progress": 0}, "zero-layer-print"),
-            ({}, "no-progress-data"),
+            ({"peaks_reliable": True, "last_layer_num": 0, "last_progress": 0}, "zero-layer-print"),
+            ({"peaks_reliable": True}, "no-progress-data"),
         ],
     )
     async def test_plate_clear_gate_not_raised_for_no_deposit_finish(self, payload_extra, ids, test_engine):
         """A print that reached terminal having deposited nothing (zero layers AND
-        zero progress) must NOT raise the plate-clear gate: the bed cannot be fouled."""
+        zero progress) must NOT raise the plate-clear gate: the bed cannot be fouled.
+
+        The MEASURED zero is now what says so — ``peaks_reliable`` rides the payload
+        because a client born mid-print reports zeros for a job it never watched, and
+        those zeros are an absence of measurement, not a measurement of absence."""
         from contextlib import ExitStack
 
         tasks_before = set(asyncio.all_tasks())
 
         with ExitStack() as stack:
-            env = self._setup_mocks(stack, test_engine)
+            self._setup_mocks(stack, test_engine)
 
             from backend.app.main import on_print_complete
 
@@ -233,8 +279,47 @@ class TestPlateClearGate:
 
             await self._drain(tasks_before)
 
-        true_calls = [c for c in env.pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
-        assert true_calls == [], f"Gate must stay clear for a no-deposit finish; got {len(true_calls)} raise(s)."
+        assert not _occupancy().is_plate_occupied(1), "Gate must stay clear for a MEASURED no-deposit finish."
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload_extra, ids",
+        [
+            ({"peaks_reliable": False, "last_layer_num": 0, "last_progress": 0}, "restart-recovered-zeros"),
+            ({}, "peaks_reliable-absent"),
+        ],
+    )
+    async def test_plate_clear_gate_raised_when_peaks_are_not_reliable(self, payload_extra, ids, test_engine):
+        """The same zeros WITHOUT a reliable measurement fail CLOSED and gate the plate.
+
+        2026-08-29: layer/progress peaks live in the MQTT client's process memory, so a
+        client born mid-print (a redeploy, a host reboot) reports zeros for a print that
+        is three-quarters done. Six such terminals were read as "nothing on the plate".
+        An absent ``peaks_reliable`` key (an older client, a virtual printer) lands on
+        the same fail-closed side."""
+        from contextlib import ExitStack
+
+        tasks_before = set(asyncio.all_tasks())
+
+        with ExitStack() as stack:
+            self._setup_mocks(stack, test_engine)
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                1,
+                {
+                    "status": "failed",
+                    "filename": "/data/Metadata/test.gcode",
+                    "subtask_name": "Test",
+                    "timelapse_was_active": False,
+                    **payload_extra,
+                },
+            )
+
+            await self._drain(tasks_before)
+
+        assert _occupancy().is_plate_occupied(1), "Unmeasured peaks must gate the plate, not clear it."
 
     @pytest.mark.asyncio
     async def test_plate_clear_gate_not_raised_for_dry_run(self, test_engine):
@@ -260,6 +345,7 @@ class TestPlateClearGate:
                     "subtask_name": "Test",
                     "subtask_id": "DR-1",
                     "timelapse_was_active": False,
+                    "peaks_reliable": True,
                     "last_layer_num": 3,
                     "last_progress": 12.0,
                 },
@@ -267,8 +353,7 @@ class TestPlateClearGate:
 
             await self._drain(tasks_before)
 
-        true_calls = [c for c in env.pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
-        assert true_calls == [], f"Gate must stay clear for a dry-run finish; got {len(true_calls)} raise(s)."
+        assert not _occupancy().is_plate_occupied(pid), "Gate must stay clear for a dry-run finish."
 
     @pytest.mark.asyncio
     async def test_plate_clear_gate_not_raised_for_unknown_status(self, test_engine):
@@ -279,7 +364,7 @@ class TestPlateClearGate:
         tasks_before = set(asyncio.all_tasks())
 
         with ExitStack() as stack:
-            env = self._setup_mocks(stack, test_engine)
+            self._setup_mocks(stack, test_engine)
 
             from backend.app.main import on_print_complete
 
@@ -295,10 +380,7 @@ class TestPlateClearGate:
 
             await self._drain(tasks_before)
 
-        true_calls = [c for c in env.pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
-        assert true_calls == [], (
-            f"Gate must not be raised for an unrecognised terminal status; raised {len(true_calls)} time(s)."
-        )
+        assert not _occupancy().is_plate_occupied(1), "Gate must not be raised for an unrecognised terminal status."
 
     @pytest.mark.asyncio
     async def test_foreign_terminal_leaves_item_and_raises_gate(self, test_engine):
@@ -335,17 +417,18 @@ class TestPlateClearGate:
 
             await self._settle_foreign(tasks_before)
 
+        from backend.app.services.plate_occupancy import EscalationOnly
+
         # 1. Farm unit untouched — still printing (a foreign print never marks it done).
         async with env.maker() as s:
             refetched = await s.get(PrintQueueItem, iid)
             assert refetched.status == "printing"
         # 2. Gate raised, keyed to the FOREIGN subtask.
-        env.pm.set_awaiting_plate_clear.assert_any_call(pid, True, source_subtask_id="FOREIGN-9")
-        # 3. Not the farm's own file → auto-clear NOT armed, auto-eject NOT armed;
-        #    escalation-only watch started instead.
-        env.monitor.on_terminal_status.assert_not_called()
-        env.monitor.start_foreign_eject_watch.assert_not_called()
-        env.monitor.start_escalation_only_watch.assert_called_once_with(pid)
+        assert _occupancy().is_plate_occupied(pid)
+        assert _occupancy().plate_source(pid) == "FOREIGN-9"
+        # 3. Not the farm's own file → the plate keeps the ESCALATION-ONLY policy it was
+        #    raised under: neither the queue-bound cooldown nor a foreign auto-eject.
+        assert isinstance(_plate_policy(pid), EscalationOnly)
         # 4. Foreign notification fired WITHOUT an auto-eject temperature (not the farm's file).
         env.notif.on_foreign_job_detected.assert_awaited()
         assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject_temp_c") is None
@@ -386,10 +469,9 @@ class TestPlateClearGate:
 
             await self._settle_foreign(tasks_before)
 
-        true_calls = [c for c in env.pm.set_awaiting_plate_clear.call_args_list if c.args[1] is True]
-        assert true_calls == [], "Toggle-off foreign with no farm involvement must NOT gate."
-        env.monitor.start_escalation_only_watch.assert_not_called()
-        env.monitor.start_foreign_eject_watch.assert_not_called()
+        assert not _occupancy().is_plate_occupied(1), "Toggle-off foreign with no farm involvement must NOT gate."
+        # No gate ⇒ no policy at all: nothing is armed over a plate the farm never claimed.
+        assert _plate_policy(1) is None
         env.notif.on_foreign_job_detected.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -434,17 +516,18 @@ class TestPlateClearGate:
 
             await self._settle_foreign(tasks_before)
 
+        from backend.app.services.plate_occupancy import ForeignAutoEject
+
         # Farm unit untouched.
         async with env.maker() as s:
             refetched = await s.get(PrintQueueItem, iid)
             assert refetched.status == "printing"
         # Gate raised keyed to the foreign subtask.
-        env.pm.set_awaiting_plate_clear.assert_any_call(pid, True, source_subtask_id="FOREIGN-9")
-        # AUTO foreign-eject watch armed with the identified profile + threshold; NOT
-        # escalation-only, NOT the queue-bound auto-clear.
-        env.monitor.start_foreign_eject_watch.assert_called_once_with(pid, 7, 33.0)
-        env.monitor.start_escalation_only_watch.assert_not_called()
-        env.monitor.on_terminal_status.assert_not_called()
+        assert _occupancy().is_plate_occupied(pid)
+        assert _occupancy().plate_source(pid) == "FOREIGN-9"
+        # The escalation hold the gate went up under was UPGRADED to the AUTO foreign
+        # eject with the identified profile + threshold — not the queue-bound cooldown.
+        assert _plate_policy(pid) == ForeignAutoEject(profile_id=7, threshold_c=33.0)
         # Notification fired naming the cooldown target °C.
         env.notif.on_foreign_job_detected.assert_awaited()
         assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject_temp_c") == 33.0
@@ -493,7 +576,11 @@ class TestEjectJobCallbacks:
     archive) must be exempt from the no-deposit status rewrite and the user-facing
     print notification, must NOT create archives at start, yet its farm terminal
     hook + SD-card cleanup must still fire. A dry-run (a queue item, NOT a
-    PendingEject) keeps its existing no-deposit path."""
+    PendingEject) keeps its existing no-deposit path.
+
+    The pending eject now lives in the occupancy authority (there is no eject
+    registry any more), so a sweep is set up the way a dispatch sets one up: the
+    plate is gated, then the printer is CLAIMED for the eject."""
 
     @staticmethod
     async def _seed_printer(maker, serial):
@@ -524,40 +611,39 @@ class TestEjectJobCallbacks:
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
         from backend.app.models.archive import PrintArchive
-        from backend.app.services.eject import remote
 
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         pid = await self._seed_printer(maker, "EJ-START")
-        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 2))
+        _claim_eject(pid)
         tasks_before = set(asyncio.all_tasks())
-        try:
-            with ExitStack() as stack:
-                stack.enter_context(patch("backend.app.main.async_session", maker))
-                stack.enter_context(patch("backend.app.core.database.async_session", maker))
-                mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
-                mock_notif.on_print_start = AsyncMock()
-                mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
-                mock_ws.send_print_start = AsyncMock()
+        with ExitStack() as stack:
+            stack.enter_context(patch("backend.app.main.async_session", maker))
+            stack.enter_context(patch("backend.app.core.database.async_session", maker))
+            mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+            mock_notif.on_print_start = AsyncMock()
+            mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+            mock_ws.send_print_start = AsyncMock()
 
-                from backend.app.main import on_print_start
+            from backend.app.main import on_print_start
 
-                await on_print_start(
-                    pid,
-                    {
-                        "filename": "eject_production_item2.gcode.3mf",
-                        "subtask_name": "eject_production_item2",
-                        "subtask_id": "SUB-E",
-                    },
-                )
-                await self._settle(tasks_before)
+            await on_print_start(
+                pid,
+                {
+                    "filename": "eject_production_item2.gcode.3mf",
+                    "subtask_name": "eject_production_item2",
+                    "subtask_id": "SUB-E",
+                },
+            )
+            await self._settle(tasks_before)
 
-            async with maker() as s:
-                count = await s.scalar(select(func.count(PrintArchive.id)).where(PrintArchive.printer_id == pid))
-            assert count == 0, "An eject job start must NOT create an archive."
-            mock_notif.on_print_start.assert_not_called()
-            mock_ws.send_print_start.assert_not_called()  # early-returned before the WS emit
-        finally:
-            remote.pop_pending_eject(pid)
+        async with maker() as s:
+            count = await s.scalar(select(func.count(PrintArchive.id)).where(PrintArchive.printer_id == pid))
+        assert count == 0, "An eject job start must NOT create an archive."
+        mock_notif.on_print_start.assert_not_called()
+        mock_ws.send_print_start.assert_not_called()  # early-returned before the WS emit
+        # The start echo is also the sweep's clock: it stamps the authority's record.
+        identity = _occupancy().eject_identity(pid)
+        assert identity is not None and identity.started_at is not None
 
     @pytest.mark.asyncio
     async def test_eject_completed_no_rewrite_notification_suppressed_farm_finalises(self, test_engine):
@@ -569,59 +655,56 @@ class TestEjectJobCallbacks:
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
         from backend.app.services.bambu_ftp import DeleteResult
-        from backend.app.services.eject import remote
 
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         pid = await self._seed_printer(maker, "EJ-DONE")
-        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 2))
+        _claim_eject(pid)
         tasks_before = set(asyncio.all_tasks())
-        try:
-            with ExitStack() as stack:
-                stack.enter_context(patch("backend.app.main.async_session", maker))
-                stack.enter_context(patch("backend.app.core.database.async_session", maker))
-                mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
-                mock_notif.on_print_complete = AsyncMock()
-                mock_notif.on_queue_completed = AsyncMock()
-                mock_notif._get_providers_for_event = AsyncMock(return_value=[])
-                stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
-                mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
-                mock_ws.send_print_complete = AsyncMock()
-                mock_ws.broadcast = AsyncMock()
-                stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-                mock_del = stack.enter_context(
-                    patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
-                )
-                mock_del.return_value = DeleteResult.DELETED
-                farm_hook = stack.enter_context(
-                    patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
-                )
+        with ExitStack() as stack:
+            stack.enter_context(patch("backend.app.main.async_session", maker))
+            stack.enter_context(patch("backend.app.core.database.async_session", maker))
+            mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+            mock_notif.on_print_complete = AsyncMock()
+            mock_notif.on_queue_completed = AsyncMock()
+            mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+            stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+            mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+            mock_ws.send_print_complete = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+            stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+            mock_del = stack.enter_context(
+                patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
+            )
+            mock_del.return_value = DeleteResult.DELETED
+            farm_hook = stack.enter_context(
+                patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
+            )
 
-                from backend.app.main import on_print_complete
+            from backend.app.main import on_print_complete
 
-                await on_print_complete(
-                    pid,
-                    {
-                        "status": "completed",
-                        "filename": "eject_production_item2.gcode.3mf",
-                        "subtask_name": "eject_production_item2",
-                        "subtask_id": "SUB-E",
-                        "timelapse_was_active": False,
-                        "last_layer_num": 0,
-                        "last_progress": 0,
-                    },
-                )
-                await self._settle(tasks_before)
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "eject_production_item2.gcode.3mf",
+                    "subtask_name": "eject_production_item2",
+                    "subtask_id": "SUB-E",
+                    "timelapse_was_active": False,
+                    "peaks_reliable": True,
+                    "last_layer_num": 0,
+                    "last_progress": 0,
+                },
+            )
+            await self._settle(tasks_before)
 
-            # Farm hook ran with the UN-rewritten 'completed' status + the echo id.
-            farm_hook.assert_awaited_once()
-            assert farm_hook.await_args.args[3] == "completed"
-            assert farm_hook.await_args.kwargs["completed_subtask_id"] == "SUB-E"
-            # No "Print Complete/Stopped" notification for the sweep.
-            mock_notif.on_print_complete.assert_not_awaited()
-            # SD-card cleanup of the uploaded eject file still happened.
-            mock_del.assert_awaited()
-        finally:
-            remote.pop_pending_eject(pid)
+        # Farm hook ran with the UN-rewritten 'completed' status + the echo id.
+        farm_hook.assert_awaited_once()
+        assert farm_hook.await_args.args[3] == "completed"
+        assert farm_hook.await_args.kwargs["completed_subtask_id"] == "SUB-E"
+        # No "Print Complete/Stopped" notification for the sweep.
+        mock_notif.on_print_complete.assert_not_awaited()
+        # SD-card cleanup of the uploaded eject file still happened.
+        mock_del.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_dry_run_terminal_untouched_not_treated_as_eject(self, test_engine):
@@ -633,12 +716,20 @@ class TestEjectJobCallbacks:
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
         from backend.app.services.bambu_ftp import DeleteResult
-        from backend.app.services.eject import remote
 
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-        pid = await self._seed_printer(maker, "DRY-EJ")
-        # Explicitly NO PendingEject registered for this printer.
-        assert remote.peek_pending_eject(pid) is None
+        # A REAL dry-run unit, correlated by its dispatch id. The dry-run flag is the
+        # only thing that can suppress the deposit here: this terminal reports
+        # ``completed``, and a completed print deposits its part whatever its peaks say
+        # (the 2026-08-29 rule — six restart-recovered prints finished ``completed``
+        # with zeroed peaks and were wrongly read as having left nothing behind). The
+        # eject dry-run file is motion-only, so it is the one ``completed`` job that
+        # genuinely cannot deposit.
+        pid, _iid = await TestPlateClearGate._seed_printing_item(
+            maker, serial="DRY-EJ", dispatch_subtask_id="DR-1", is_dry_run=True
+        )
+        # Explicitly NO PendingEject claimed on this printer.
+        assert _occupancy().eject_identity(pid) is None
         tasks_before = set(asyncio.all_tasks())
         with ExitStack() as stack:
             stack.enter_context(patch("backend.app.main.async_session", maker))
@@ -670,8 +761,12 @@ class TestEjectJobCallbacks:
                     "subtask_name": "dryrun",
                     "subtask_id": "DR-1",
                     "timelapse_was_active": False,
-                    "last_layer_num": 0,
-                    "last_progress": 0,
+                    # Deliberately NON-zero peaks: the dry-run flag alone must carry the
+                    # non-deposit verdict. If this test could still pass on measured
+                    # zeros it would not be pinning the dry-run rule at all.
+                    "peaks_reliable": True,
+                    "last_layer_num": 4,
+                    "last_progress": 12.5,
                 },
             )
             await self._settle(tasks_before)
@@ -694,14 +789,12 @@ class TestEjectJobCallbacks:
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
         from backend.app.services.bambu_ftp import DeleteResult
-        from backend.app.services.eject import remote
-        from backend.app.services.printer_manager import printer_manager
 
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         pid = await self._seed_printer(maker, "EJ-NAME")
-        # Empty registry on purpose — only the echoed NAME identifies this as an eject.
-        assert remote.peek_pending_eject(pid) is None
-        assert not printer_manager.is_awaiting_plate_clear(pid)
+        # No claimed eject on purpose — only the echoed NAME identifies this as an eject.
+        assert _occupancy().eject_identity(pid) is None
+        assert not _occupancy().is_plate_occupied(pid)
         tasks_before = set(asyncio.all_tasks())
         with ExitStack() as stack:
             stack.enter_context(patch("backend.app.main.async_session", maker))
@@ -744,8 +837,9 @@ class TestEjectJobCallbacks:
         assert farm_hook.await_args.kwargs["completed_subtask_name"] == "eject_production_item2"
         mock_notif.on_print_complete.assert_not_awaited()
         mock_notif.on_foreign_job_detected.assert_not_awaited()
-        # Gate NEVER raised for an eject-named terminal.
-        assert not printer_manager.is_awaiting_plate_clear(pid)
+        # Gate NEVER raised for an eject-named terminal (the gate block is skipped
+        # outright — an eject terminal is farm_policy's business, not this handler's).
+        assert not _occupancy().is_plate_occupied(pid)
 
     @pytest.mark.asyncio
     async def test_eject_terminal_skips_ams_reread_sweep(self, test_engine):
@@ -755,65 +849,9 @@ class TestEjectJobCallbacks:
 
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-        from backend.app.services.eject import remote
-
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         pid = await self._seed_printer(maker, "EJ-SWEEP")
-        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 2))
-        tasks_before = set(asyncio.all_tasks())
-        try:
-            with ExitStack() as stack:
-                stack.enter_context(patch("backend.app.main.async_session", maker))
-                stack.enter_context(patch("backend.app.core.database.async_session", maker))
-                mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
-                mock_notif.on_print_complete = AsyncMock()
-                mock_notif.on_queue_completed = AsyncMock()
-                mock_notif._get_providers_for_event = AsyncMock(return_value=[])
-                stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
-                mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
-                mock_ws.send_print_complete = AsyncMock()
-                mock_ws.broadcast = AsyncMock()
-                stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-                stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock))
-                stack.enter_context(patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock))
-                sweep = stack.enter_context(
-                    patch("backend.app.services.ams_presence.on_printer_terminal", new_callable=AsyncMock)
-                )
-
-                from backend.app.main import on_print_complete
-
-                await on_print_complete(
-                    pid,
-                    {
-                        "status": "completed",
-                        "filename": "eject_production_item2.gcode.3mf",
-                        "subtask_name": "eject_production_item2",
-                        "subtask_id": "SUB-E",
-                        "timelapse_was_active": False,
-                        "last_layer_num": 0,
-                        "last_progress": 0,
-                    },
-                )
-                await self._settle(tasks_before)
-
-            sweep.assert_not_awaited()
-        finally:
-            remote.pop_pending_eject(pid)
-
-    @pytest.mark.asyncio
-    async def test_print_terminal_schedules_ams_reread_sweep(self, test_engine):
-        """A NON-eject terminal DOES schedule the AMS RFID re-read sweep (once) — the
-        mid-print-refill recognition path. Proves the eject exemption does not
-        suppress the sweep for ordinary prints."""
-        from contextlib import ExitStack
-
-        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-        from backend.app.services.eject import remote
-
-        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-        pid = await self._seed_printer(maker, "PRINT-SWEEP")
-        assert remote.peek_pending_eject(pid) is None  # NOT an eject
+        _claim_eject(pid)
         tasks_before = set(asyncio.all_tasks())
         with ExitStack() as stack:
             stack.enter_context(patch("backend.app.main.async_session", maker))
@@ -835,8 +873,58 @@ class TestEjectJobCallbacks:
 
             from backend.app.main import on_print_complete
 
-            # No-deposit dry-run-style terminal (no PendingEject, non-eject name): keeps
-            # the gate untouched but STILL schedules the sweep (guard is `not _is_eject_job`).
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "eject_production_item2.gcode.3mf",
+                    "subtask_name": "eject_production_item2",
+                    "subtask_id": "SUB-E",
+                    "timelapse_was_active": False,
+                    "peaks_reliable": True,
+                    "last_layer_num": 0,
+                    "last_progress": 0,
+                },
+            )
+            await self._settle(tasks_before)
+
+        sweep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_print_terminal_schedules_ams_reread_sweep(self, test_engine):
+        """A NON-eject terminal DOES schedule the AMS RFID re-read sweep (once) — the
+        mid-print-refill recognition path. Proves the eject exemption does not
+        suppress the sweep for ordinary prints."""
+        from contextlib import ExitStack
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await self._seed_printer(maker, "PRINT-SWEEP")
+        assert _occupancy().eject_identity(pid) is None  # NOT an eject
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            stack.enter_context(patch("backend.app.main.async_session", maker))
+            stack.enter_context(patch("backend.app.core.database.async_session", maker))
+            mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+            mock_notif.on_print_complete = AsyncMock()
+            mock_notif.on_queue_completed = AsyncMock()
+            mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+            stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+            mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+            mock_ws.send_print_complete = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+            stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+            stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock))
+            stack.enter_context(patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock))
+            sweep = stack.enter_context(
+                patch("backend.app.services.ams_presence.on_printer_terminal", new_callable=AsyncMock)
+            )
+
+            from backend.app.main import on_print_complete
+
+            # An ordinary print terminal (no claimed eject, non-eject name) schedules the
+            # sweep — the guard is `not _is_eject_job` and nothing else.
             await on_print_complete(
                 pid,
                 {
@@ -854,12 +942,10 @@ class TestEjectJobCallbacks:
         sweep.assert_awaited_once_with(pid)
 
     @pytest.mark.asyncio
-    async def test_registry_eject_skips_correlation_no_false_foreign_or_archive_warning(
-        self, test_engine, capture_logs
-    ):
-        """W5: a registry-matched eject terminal never calls resolve_terminal_item (so
-        it cannot log the false-FOREIGN warning for the farm's own sweep) and skips the
-        archive lookup (which always misses for a sweep, so no "Could not find archive"
+    async def test_claimed_eject_skips_correlation_no_false_foreign_or_archive_warning(self, test_engine, capture_logs):
+        """W5: a CLAIMED-eject terminal never calls resolve_terminal_item (so it cannot
+        log the false-FOREIGN warning for the farm's own sweep) and skips the archive
+        lookup (which always misses for a sweep, so no "Could not find archive"
         warning). farm_policy.on_terminal still finalises the sweep as 'completed'."""
         from contextlib import ExitStack
 
@@ -867,66 +953,63 @@ class TestEjectJobCallbacks:
 
         from backend.app.services import farm_correlation
         from backend.app.services.bambu_ftp import DeleteResult
-        from backend.app.services.eject import remote
 
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         pid = await self._seed_printer(maker, "EJ-NOCORR")
-        remote.register_pending_eject(pid, remote.PendingEject("production", 1, 2))
+        _claim_eject(pid)
         resolver_spy = AsyncMock(wraps=farm_correlation.resolve_terminal_item)
         tasks_before = set(asyncio.all_tasks())
-        try:
-            with ExitStack() as stack:
-                stack.enter_context(patch("backend.app.main.async_session", maker))
-                stack.enter_context(patch("backend.app.core.database.async_session", maker))
-                stack.enter_context(patch("backend.app.services.farm_correlation.resolve_terminal_item", resolver_spy))
-                mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
-                mock_notif.on_print_complete = AsyncMock()
-                mock_notif.on_queue_completed = AsyncMock()
-                mock_notif._get_providers_for_event = AsyncMock(return_value=[])
-                stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
-                mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
-                mock_ws.send_print_complete = AsyncMock()
-                mock_ws.broadcast = AsyncMock()
-                stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-                mock_del = stack.enter_context(
-                    patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
-                )
-                mock_del.return_value = DeleteResult.DELETED
-                farm_hook = stack.enter_context(
-                    patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
-                )
+        with ExitStack() as stack:
+            stack.enter_context(patch("backend.app.main.async_session", maker))
+            stack.enter_context(patch("backend.app.core.database.async_session", maker))
+            stack.enter_context(patch("backend.app.services.farm_correlation.resolve_terminal_item", resolver_spy))
+            mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+            mock_notif.on_print_complete = AsyncMock()
+            mock_notif.on_queue_completed = AsyncMock()
+            mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+            stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+            mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+            mock_ws.send_print_complete = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+            stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+            mock_del = stack.enter_context(
+                patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
+            )
+            mock_del.return_value = DeleteResult.DELETED
+            farm_hook = stack.enter_context(
+                patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
+            )
 
-                from backend.app.main import on_print_complete
+            from backend.app.main import on_print_complete
 
-                await on_print_complete(
-                    pid,
-                    {
-                        "status": "completed",
-                        "filename": "eject_production_item2.gcode.3mf",
-                        "subtask_name": "eject_production_item2",
-                        "subtask_id": "SUB-E",
-                        "timelapse_was_active": False,
-                        "last_layer_num": 0,
-                        "last_progress": 0,
-                    },
-                )
-                await self._settle(tasks_before)
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "eject_production_item2.gcode.3mf",
+                    "subtask_name": "eject_production_item2",
+                    "subtask_id": "SUB-E",
+                    "timelapse_was_active": False,
+                    "peaks_reliable": True,
+                    "last_layer_num": 0,
+                    "last_progress": 0,
+                },
+            )
+            await self._settle(tasks_before)
 
-            # The resolver was never consulted for our own sweep → no false FOREIGN.
-            resolver_spy.assert_not_awaited()
-            warnings = " ".join(r.getMessage() for r in capture_logs.get_warnings())
-            assert "FOREIGN" not in warnings, warnings
-            assert "Could not find archive" not in warnings, warnings
-            # The sweep was still finalised (un-rewritten 'completed').
-            farm_hook.assert_awaited_once()
-            assert farm_hook.await_args.args[3] == "completed"
-        finally:
-            remote.pop_pending_eject(pid)
+        # The resolver was never consulted for our own sweep → no false FOREIGN.
+        resolver_spy.assert_not_awaited()
+        warnings = " ".join(r.getMessage() for r in capture_logs.get_warnings())
+        assert "FOREIGN" not in warnings, warnings
+        assert "Could not find archive" not in warnings, warnings
+        # The sweep was still finalised (un-rewritten 'completed').
+        farm_hook.assert_awaited_once()
+        assert farm_hook.await_args.args[3] == "completed"
 
     @pytest.mark.asyncio
-    async def test_named_eject_empty_registry_skips_correlation_and_archive_warning(self, test_engine, capture_logs):
-        """W5 + W1 name evidence: an eject-NAMED terminal with an EMPTY registry
-        (is_eject_job_name path — a restart lost the registry) is still recognised as
+    async def test_named_eject_no_claim_skips_correlation_and_archive_warning(self, test_engine, capture_logs):
+        """W5 + W1 name evidence: an eject-NAMED terminal with NO claimed eject
+        (is_eject_job_name path — a restart lost the claim) is still recognised as
         our sweep before correlation. resolve_terminal_item is not called and no
         FOREIGN / no "Could not find archive" warning fires; the farm hook still runs."""
         from contextlib import ExitStack
@@ -935,11 +1018,10 @@ class TestEjectJobCallbacks:
 
         from backend.app.services import farm_correlation
         from backend.app.services.bambu_ftp import DeleteResult
-        from backend.app.services.eject import remote
 
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         pid = await self._seed_printer(maker, "EJ-NAME-NOCORR")
-        assert remote.peek_pending_eject(pid) is None  # empty registry — only the NAME identifies it
+        assert _occupancy().eject_identity(pid) is None  # no claim — only the NAME identifies it
         resolver_spy = AsyncMock(wraps=farm_correlation.resolve_terminal_item)
         tasks_before = set(asyncio.all_tasks())
         with ExitStack() as stack:
@@ -972,8 +1054,9 @@ class TestEjectJobCallbacks:
                     "status": "completed",
                     "filename": "eject_production_item2.gcode.3mf",
                     "subtask_name": "eject_production_item2",
-                    "subtask_id": "FOREIGN-SUB",  # not a registry id — name carries the identification
+                    "subtask_id": "FOREIGN-SUB",  # not a claimed id — the name identifies it
                     "timelapse_was_active": False,
+                    "peaks_reliable": True,
                     "last_layer_num": 0,
                     "last_progress": 0,
                 },
@@ -987,6 +1070,250 @@ class TestEjectJobCallbacks:
         mock_notif.on_foreign_job_detected.assert_not_awaited()
         farm_hook.assert_awaited_once()
         assert farm_hook.await_args.args[3] == "completed"
+
+
+class TestOccupancyLiveness:
+    """The cutover's LIVENESS pins: the state machine must still MOVE.
+
+    Every one of these is a silent-stall shape — nothing raises, nothing logs an
+    error, the farm just stops doing the next thing — so each is named for the
+    incident it re-creates:
+
+    * a restart-recovered print's genuine FINISH read as "deposited nothing", so no
+      gate, no eject, and the unit recorded ``cancelled`` (2026-08-29, six printers);
+    * an eject the firmware silently ignored, whose claim then made every later eject
+      409 ``eject_in_flight`` forever (2026-08-30, printer 4, 01:46-01:49);
+    * a clean sweep whose completion must actually release the printer back into the
+      queue (the production loop itself);
+    * a watchdog-stopped sweep echoing ``completed``, which must NOT release it
+      (2026-07-31 gouged plate).
+    """
+
+    @staticmethod
+    async def _settle(tasks_before):
+        """Await the callback's background tasks to completion (they spawn their own)."""
+        for _ in range(3):
+            new = asyncio.all_tasks() - tasks_before - {asyncio.current_task()}
+            if not new:
+                return
+            await asyncio.wait(new, timeout=5)
+
+    @staticmethod
+    def _eject_terminal_mocks(stack, maker):
+        """The collaborator patches an eject terminal needs, with the REAL farm_policy.
+
+        farm_policy.on_terminal is what OWNS an eject terminal now (the handler's gate
+        block skips eject jobs entirely), so these two pins deliberately do not mock it
+        — only the idle deep-park it may call afterwards, which is a printer command."""
+        stack.enter_context(patch("backend.app.main.async_session", maker))
+        stack.enter_context(patch("backend.app.core.database.async_session", maker))
+        mock_notif = stack.enter_context(patch("backend.app.main.notification_service"))
+        mock_notif.on_print_complete = AsyncMock()
+        mock_notif.on_queue_completed = AsyncMock()
+        mock_notif.on_foreign_job_detected = AsyncMock()
+        mock_notif._get_providers_for_event = AsyncMock(return_value=[])
+        stack.enter_context(patch("backend.app.main.smart_plug_manager")).on_print_complete = AsyncMock()
+        mock_ws = stack.enter_context(patch("backend.app.main.ws_manager"))
+        mock_ws.send_print_complete = AsyncMock()
+        mock_ws.broadcast = AsyncMock()
+        stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
+        stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock))
+        stack.enter_context(patch("backend.app.services.farm_policy._maybe_idle_deep_park", new_callable=AsyncMock))
+        return mock_notif
+
+    @staticmethod
+    def _eject_terminal_payload(status="completed"):
+        return {
+            "status": status,
+            "filename": "eject_production_item2.gcode.3mf",
+            "subtask_name": "eject_production_item2",
+            "subtask_id": "SUB-E",
+            "timelapse_was_active": False,
+            "peaks_reliable": True,
+            "last_layer_num": 0,
+            "last_progress": 0,
+        }
+
+    # -- (a) 2026-08-29 restart-recovery cascade ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_restart_recovered_completed_terminal_gates_and_arms_20260829_cascade(self, test_engine):
+        """A restart-recovered unit's genuine ``completed`` gates the plate, ARMS the
+        cooldown eject, and records the unit ``completed`` — never ``cancelled``.
+
+        The 2026-08-29 → 08-30 cascade in one payload: the MQTT client was born
+        mid-print, so its layer/progress peaks are zeros it never measured
+        (``peaks_reliable=False``). Six such terminals on printers 1-6 were classified
+        "no-deposit — not gating queue": the status was rewritten to ``cancelled``
+        though the part was physically finished, no gate went up, no eject was armed,
+        and the next unit dispatched onto the finished part 1-5 s later. Absence of
+        measurement is not measurement of absence, so all three outcomes below must
+        hold on evidence the farm does NOT have."""
+        from contextlib import ExitStack
+
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.plate_occupancy import CooldownEject
+
+        tasks_before = set(asyncio.all_tasks())
+
+        with ExitStack() as stack:
+            env = TestPlateClearGate._setup_mocks(stack, test_engine)
+            stack.enter_context(patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock))
+            pid, iid = await TestPlateClearGate._seed_printing_item(
+                env.maker,
+                serial="RESTART-RECOVERED",
+                dispatch_subtask_id="RECOVERED-1",
+                eject_profile_id=7,
+            )
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                pid,
+                {
+                    "status": "completed",
+                    "filename": "unit.gcode.3mf",
+                    "subtask_name": "unit",
+                    "subtask_id": "RECOVERED-1",  # == the unit's dispatch id → 'matched'
+                    "timelapse_was_active": False,
+                    # The whole incident: peaks the client never observed.
+                    "peaks_reliable": False,
+                    "last_layer_num": 0,
+                    "last_progress": 0,
+                },
+            )
+
+            await TestPlateClearGate._drain(tasks_before)
+
+        # 1. The unit is recorded COMPLETED — the no-deposit rewrite must not fire.
+        async with env.maker() as s:
+            item = await s.get(PrintQueueItem, iid)
+        assert item.status == "completed", "A finished print recorded as cancelled is the 08-29 cascade."
+        # 2. The plate is GATED, keyed to the job that produced the deposit.
+        assert _occupancy().is_plate_occupied(pid), "A completed print deposits; the gate must go up."
+        assert _occupancy().plate_source(pid) == "RECOVERED-1"
+        # 3. The policy is ARMED — an id-matched farm unit with an eject profile gets
+        #    the cooldown sweep, not merely an escalation hold.
+        assert _plate_policy(pid) == CooldownEject(unit_id=iid, run_id=None)
+
+    # -- (b) 2026-08-30 ejects the firmware silently ignored ----------------------
+
+    @pytest.mark.asyncio
+    async def test_eject_never_echoed_start_frees_the_printer_20260830_stuck_pendings(self):
+        """An eject the printer never STARTED is retired, and the printer is ejectable again.
+
+        The firmware silently ignores a ``project_file`` sent while it is busy — no
+        error, no terminal, nothing — so a dispatched eject can simply never happen. On
+        2026-08-30 those claims stayed registered forever and every later eject 409'd
+        ``eject_in_flight`` (8 consecutive on printer 4, 01:46-01:49) until the operator
+        hand-jogged the toolhead. The start deadline is the ONLY signal that shape
+        produces, so it must free the printer while KEEPING the plate gated: the sweep
+        never ran, the part is still there."""
+        from backend.app.services.eject import remote
+        from backend.app.services.plate_occupancy import EscalationOnly, Evidence
+
+        pid = 4101
+        _claim_eject(pid, purpose="manual", run_id=None, queue_item_id=None)
+        assert _occupancy().ejectable(pid, Evidence(live_state="IDLE")) == "eject_in_flight"
+
+        slept: list[float] = []
+
+        async def _sleep(seconds):
+            slept.append(seconds)
+
+        with patch("backend.app.services.eject.monitor.notify_plate_not_empty", new_callable=AsyncMock) as paged:
+            await remote._start_deadline(pid, sleep=_sleep, timeout_s=1.0)
+
+        assert slept == [1.0], "The deadline must WAIT the timeout before concluding anything."
+        # The printer is free: the claim is gone and a new eject may be dispatched.
+        assert _occupancy().eject_identity(pid) is None
+        assert _occupancy().ejectable(pid, Evidence(live_state="IDLE")) is None
+        # The plate is NOT released — nothing swept it — and it escalates to a human.
+        assert _occupancy().is_plate_occupied(pid)
+        assert isinstance(_plate_policy(pid), EscalationOnly)
+        paged.assert_awaited_once()
+
+    # -- (d) the production loop's own release edge -------------------------------
+
+    @pytest.mark.asyncio
+    async def test_completed_eject_terminal_clears_the_plate_and_kicks_the_scheduler(self, test_engine):
+        """A matched eject terminal that COMPLETED clears the plate, wakes the
+        scheduler, and leaves the printer dispatchable — the loop's only release edge.
+
+        This is the pin that fails if the eject terminal ever stops reaching
+        ``resolve_eject``: nothing errors, the farm simply parks with a swept plate
+        it still believes is occupied."""
+        from contextlib import ExitStack
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from backend.app.services.plate_occupancy import Evidence
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await TestEjectJobCallbacks._seed_printer(maker, "EJ-RELEASE")
+
+        kicks: list[tuple[int, str]] = []
+        _occupancy().configure(kick=lambda printer_id, cause: kicks.append((printer_id, cause)))
+        _claim_eject(pid)
+        _occupancy().note_eject_started(pid)
+        assert kicks == [], "Claiming a sweep is not a release edge — the scheduler must NOT be woken."
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            self._eject_terminal_mocks(stack, maker)
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(pid, self._eject_terminal_payload("completed"))
+            await self._settle(tasks_before)
+
+        assert not _occupancy().is_plate_occupied(pid), "A matched, completed sweep releases the gate."
+        assert _occupancy().eject_identity(pid) is None
+        assert kicks == [(pid, "eject_completed")], f"The scheduler must be kicked on the release edge; got {kicks}"
+        assert _occupancy().dispatchable(pid, Evidence(live_state="IDLE")) is None
+
+    # -- (e) 2026-07-31 gouged plate: the watchdog's verdict outranks the echo ------
+
+    @pytest.mark.asyncio
+    async def test_watchdog_stopped_eject_reporting_completed_keeps_the_plate_gated_20260731(self, test_engine):
+        """A watchdog-stopped sweep whose terminal echoes ``completed`` must NOT release.
+
+        2026-07-31: an ejected part lodged under the heatbed, the bed-drop stalled, the
+        returned-high sweep gouged the plate — and the job still reported ``completed``.
+        The runtime mark is stamped BEFORE the stop is even sent, so a terminal racing
+        it must already see the verdict and HONOR it: gate kept, escalation-only, and
+        deliberately NO quarantine (an obstruction is not a hardware fault)."""
+        from contextlib import ExitStack
+        from datetime import datetime, timezone
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from backend.app.models.printer import Printer
+        from backend.app.services.plate_occupancy import EscalationOnly
+
+        maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+        pid = await TestEjectJobCallbacks._seed_printer(maker, "EJ-WATCHDOG")
+
+        _claim_eject(pid)
+        _occupancy().note_eject_started(pid)
+        _occupancy().note_eject_runtime_exceeded(pid, datetime.now(timezone.utc), "drop")
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            self._eject_terminal_mocks(stack, maker)
+
+            from backend.app.main import on_print_complete
+
+            # The printer says the sweep finished cleanly. It is not to be believed.
+            await on_print_complete(pid, self._eject_terminal_payload("completed"))
+            await self._settle(tasks_before)
+
+        assert _occupancy().is_plate_occupied(pid), "A stopped sweep leaves the part SOMEWHERE — never release."
+        assert isinstance(_plate_policy(pid), EscalationOnly)
+        assert _occupancy().eject_identity(pid) is None, "The unverified eject is still retired."
+        async with maker() as s:
+            printer = await s.get(Printer, pid)
+        assert printer.quarantined is False, "An obstruction suspicion must not quarantine the printer."
 
 
 class TestPrintCompleteLogic:

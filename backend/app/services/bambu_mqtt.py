@@ -3083,7 +3083,7 @@ class BambuMQTTClient:
                 # lane needs no such clause only because `state.layer_num` IS reset to 0 at
                 # print start, which makes its equivalent save a no-op on the same reading.
                 # Drop this clause and a layer-0 stop reports last_progress=100, which flips
-                # eject.monitor.deposited_nothing() to False — the plate gate raised over a
+                # plate_occupancy.DepositEvidence.deposited to True — the plate gate raised over a
                 # clean bed, i.e. half the original incident straight back (mutation-verified).
                 if self.state.progress > 0 and not releasing:
                     self._last_valid_progress = self.state.progress
@@ -3119,7 +3119,7 @@ class BambuMQTTClient:
             # cancel-reset it was written for, so on 002/003-H2S a print an operator
             # stopped at layer 0 carried `_last_valid_layer_num = 167` (the plate total)
             # into its terminal: 417.9 g charged to a roll that deposited nothing, and
-            # eject.monitor.deposited_nothing() raised the plate gate on a clean bed.
+            # plate_occupancy.DepositEvidence read a deposit and raised the plate gate on a clean bed.
             if self._stale_predecessor_reading(new_layer, self._prev_job_layer, self._job_layer_baseline_seen):
                 logger.debug(
                     "[%s] discarding predecessor layer_num %s (prev job ended at %s)",

@@ -29,7 +29,18 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.print_scheduler import WAITING_REASON_LIBRARY_FILE_MISSING, PrintScheduler
+
+
+@pytest.fixture(autouse=True)
+def _clean_authority():
+    """A dispatch that reaches the print command claims a printer LEASE on the
+    process-wide occupancy authority; a HELD one never gets that far. Start clean so
+    neither leaks into the next case."""
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 @pytest.fixture
@@ -141,7 +152,8 @@ async def _dispatch(ctx):
         patch("backend.app.services.print_scheduler.printer_manager.is_connected", MagicMock(return_value=True)),
         patch("backend.app.services.print_scheduler.printer_manager.get_status", MagicMock(return_value=None)),
         patch("backend.app.services.print_scheduler.printer_manager.start_print", ctx.start_print),
-        patch("backend.app.services.print_scheduler.printer_manager.set_awaiting_plate_clear", MagicMock()),
+        # The dispatch path's unconditional plate write is gone (2026-08-30): there is
+        # nothing to stub, and a HOLD writes nothing to the authority either.
         patch(
             "backend.app.services.print_scheduler.get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0, 1.0))
         ),
@@ -200,6 +212,10 @@ async def test_missing_library_file_holds_the_item_pending(case_factory):
     ctx.upload.assert_not_awaited()
     ctx.start_print.assert_not_called()
     ctx.waiting_notify.assert_awaited_once()
+    # And nothing was claimed: the hold sits far above the point of no return, so
+    # the printer keeps neither a dispatch lease nor a plate write from this pass.
+    assert plate_occupancy.snapshot(ctx.printer_id).lease_unit_id is None
+    assert plate_occupancy.is_plate_occupied(ctx.printer_id) is False
 
 
 @pytest.mark.asyncio

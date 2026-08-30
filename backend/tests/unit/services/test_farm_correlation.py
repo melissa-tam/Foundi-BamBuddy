@@ -10,6 +10,9 @@ reference arbitrary printer/sku ids without seeding those parents.
 """
 
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
@@ -21,8 +24,32 @@ from backend.app.services.farm_correlation import (
     on_native_plate_detection,
     resolve_active_plate_id,
     resolve_terminal_item,
+    terminal_disposition,
+    upgrade_to_foreign_auto_eject,
+)
+from backend.app.services.plate_occupancy import (
+    CooldownEject,
+    DepositEvidence,
+    EscalationOnly,
+    Evidence,
+    ForeignAutoEject,
+    plate_occupancy,
 )
 from backend.app.services.printer_manager import printer_manager
+
+
+@pytest.fixture(autouse=True)
+def _clean_occupancy_authority():
+    """Isolate the module-singleton occupancy authority between tests.
+
+    ``on_native_plate_detection`` now raises the gate through
+    ``plate_occupancy.note_plate_detected``, so a record left behind would leak into
+    the next test's gate assertion. ``reset_for_tests`` also un-wires the injected
+    callables, keeping these DB tests clear of the websocket / scheduler lanes.
+    """
+    plate_occupancy.reset_for_tests()
+    yield
+    plate_occupancy.reset_for_tests()
 
 
 async def _add_item(
@@ -411,32 +438,76 @@ async def _add_eject_item(db, *, printer_id, status="printing", eject_profile_id
 
 class TestNativePlateDetection:
     """Native pre-print vision capture (Phase 3.3): a NEW plate-occupancy HMS code
-    while a farm unit is printing → human-clear-only gate + flagged unit."""
+    while a farm unit is printing → human-clear-only gate + flagged unit.
+
+    The gate now goes up through ``plate_occupancy.note_plate_detected``, so the
+    assertions read the authority directly as well as through the manager's
+    projection: a vision trip fires MID-JOB with no job identity behind it, so the
+    plate must be SOURCE-LESS and under ``EscalationOnly`` — the shape no auto-clear
+    rule can ever release.
+    """
+
+    @staticmethod
+    def _assert_human_clear_only_gate(printer_id: int) -> None:
+        view = plate_occupancy.snapshot(printer_id)
+        assert view.plate_occupied is True
+        assert view.plate_source_subtask_id is None  # no identity to sweep against
+        assert isinstance(view.plate_policy, EscalationOnly)
+        # The manager's projection is the same fact, read the way the UI reads it.
+        assert printer_manager.is_awaiting_plate_clear(printer_id) is True
 
     async def test_farm_item_gets_gate_and_flag(self, db_session):
         batch = await _add_farm_batch(db_session)  # sku_file_id set == farm
         item = await _add_eject_item(db_session, printer_id=11, batch_id=batch.id)
-        try:
-            flagged = await on_native_plate_detection(db_session, 11, {"0300_8017"})
-            assert flagged is True
-            await db_session.refresh(item)
-            assert item.waiting_reason == "plate_not_empty_printer_detected"
-            assert item.status == "printing"  # NEVER terminal
-            # Human-clear-only gate raised via the canonical setter.
-            assert printer_manager.is_awaiting_plate_clear(11) is True
-        finally:
-            printer_manager.set_awaiting_plate_clear(11, False)
+
+        flagged = await on_native_plate_detection(db_session, 11, {"0300_8017"})
+
+        assert flagged is True
+        await db_session.refresh(item)
+        assert item.waiting_reason == "plate_not_empty_printer_detected"
+        assert item.status == "printing"  # NEVER terminal
+        self._assert_human_clear_only_gate(11)
+
+    async def test_the_plate_not_empty_notification_still_fires(self, db_session):
+        """Side effect (c) is unchanged by the cut-over: the operator is paged with
+        the printer-vision ``source_detail``, which is what tells them to clear the
+        bed and Resume ON THE SCREEN rather than waiting for the farm to sweep."""
+        batch = await _add_farm_batch(db_session)
+        await _add_eject_item(db_session, printer_id=16, batch_id=batch.id)
+
+        with patch(
+            "backend.app.services.notification_service.notification_service.on_plate_not_empty",
+            new_callable=AsyncMock,
+        ) as notify:
+            assert await on_native_plate_detection(db_session, 16, {"0500_806E"}) is True
+
+        notify.assert_awaited_once()
+        assert notify.await_args.args[0] == 16
+        assert "heatbed" in notify.await_args.kwargs["source_detail"]
+
+    async def test_repeated_trips_do_not_re_stamp_the_gate(self, db_session):
+        """The trip re-fires on repeated pushes. Re-stamping ``since`` would churn the
+        fan-out and lie to the operator about when the plate became occupied."""
+        batch = await _add_farm_batch(db_session)
+        await _add_eject_item(db_session, printer_id=17, batch_id=batch.id)
+
+        assert await on_native_plate_detection(db_session, 17, {"0300_8017"}) is True
+        first_since = plate_occupancy.snapshot(17).plate_since
+
+        assert await on_native_plate_detection(db_session, 17, {"0300_8017"}) is True
+
+        assert plate_occupancy.snapshot(17).plate_since == first_since
 
     async def test_eject_profile_item_is_farm(self, db_session):
         # A non-sku batch but an item carrying an eject_profile_id still counts as farm.
         item = await _add_eject_item(db_session, printer_id=12, eject_profile_id=7)
-        try:
-            flagged = await on_native_plate_detection(db_session, 12, {"0300_8006"})
-            assert flagged is True
-            await db_session.refresh(item)
-            assert item.waiting_reason == "plate_not_empty_printer_detected"
-        finally:
-            printer_manager.set_awaiting_plate_clear(12, False)
+
+        flagged = await on_native_plate_detection(db_session, 12, {"0300_8006"})
+
+        assert flagged is True
+        await db_session.refresh(item)
+        assert item.waiting_reason == "plate_not_empty_printer_detected"
+        self._assert_human_clear_only_gate(12)
 
     async def test_non_farm_printer_no_gate(self, db_session):
         # A plain (non-farm) printing item → no gate, no flag.
@@ -445,11 +516,13 @@ class TestNativePlateDetection:
         assert flagged is False
         await db_session.refresh(item)
         assert item.waiting_reason is None
+        assert plate_occupancy.is_plate_occupied(13) is False
         assert printer_manager.is_awaiting_plate_clear(13) is False
 
     async def test_nothing_printing_no_gate(self, db_session):
         flagged = await on_native_plate_detection(db_session, 14, {"0300_8017"})
         assert flagged is False
+        assert plate_occupancy.is_plate_occupied(14) is False
         assert printer_manager.is_awaiting_plate_clear(14) is False
 
     async def test_plate_offset_808c_triggers_reaction(self, db_session):
@@ -457,15 +530,14 @@ class TestNativePlateDetection:
         and drives the same human-clear-only gate + waiting_reason as 0300_8017."""
         batch = await _add_farm_batch(db_session)
         item = await _add_eject_item(db_session, printer_id=15, batch_id=batch.id)
-        try:
-            flagged = await on_native_plate_detection(db_session, 15, {"0500_808C"})
-            assert flagged is True
-            await db_session.refresh(item)
-            assert item.waiting_reason == "plate_not_empty_printer_detected"
-            assert item.status == "printing"
-            assert printer_manager.is_awaiting_plate_clear(15) is True
-        finally:
-            printer_manager.set_awaiting_plate_clear(15, False)
+
+        flagged = await on_native_plate_detection(db_session, 15, {"0500_808C"})
+
+        assert flagged is True
+        await db_session.refresh(item)
+        assert item.waiting_reason == "plate_not_empty_printer_detected"
+        assert item.status == "printing"
+        self._assert_human_clear_only_gate(15)
 
     def test_808c_is_in_plate_occupancy_set(self):
         """0500_808C joined the single-origin plate-occupancy frozenset, so BOTH the
@@ -484,3 +556,120 @@ class TestNativePlateDetection:
         # All four native-vision codes are pinned members.
         assert {"0300_8017", "0300_8006", "0500_806E", "0500_808C"} <= _HMS_PLATE_OCCUPANCY_CODES
         assert "0500_806E" in _HMS_PLATE_OCCUPANCY_CODES
+
+
+def _evidence(*, status: str = "completed") -> DepositEvidence:
+    """A terminal that unambiguously deposited a part."""
+    return DepositEvidence(
+        final_status=status,
+        is_dry_run=False,
+        peaks_reliable=True,
+        last_layer_num=120,
+        last_progress=100.0,
+    )
+
+
+def _disposition(**overrides):
+    """The happy shape: an id-confirmed farm unit with an eject profile."""
+    kwargs = {
+        "verdict": "matched",
+        "item_id": 11,
+        "eject_profile_id": 3,
+        "first_article": False,
+        "batch_id": 7,
+        "source_subtask_id": "SUB-1",
+        "evidence": _evidence(),
+        "raise_gate": True,
+    }
+    kwargs.update(overrides)
+    return terminal_disposition(**kwargs)
+
+
+class TestTerminalDisposition:
+    """The verdict → plate-policy ladder (WS3).
+
+    The correlation rules live in this module, so the mapping from a VERDICT to
+    "what happens to the plate next" lives here too — the occupancy authority stays
+    free of the correlation lane and the terminal handler stays free of policy. The
+    factory ASSEMBLES; every input is already resolved by the caller.
+    """
+
+    @pytest.mark.parametrize("verdict", ["matched", "matched_by_name"])
+    def test_an_id_or_name_confirmed_farm_unit_arms_the_cooldown_sweep(self, verdict):
+        disposition = _disposition(verdict=verdict)
+
+        assert disposition.policy == CooldownEject(unit_id=11, run_id=7)
+
+    def test_the_cooldown_policy_carries_a_null_run_for_an_unbatched_unit(self):
+        assert _disposition(batch_id=None).policy == CooldownEject(unit_id=11, run_id=None)
+
+    def test_fallback_never_arms_an_automatic_sweep(self):
+        """``fallback`` is in ``ATTRIBUTED_VERDICTS`` but deliberately NOT in
+        ``AUTO_CLEAR_VERDICTS``: a finish attributed only because it was the sole
+        printing unit was never id-confirmed, so it may not sweep the plate."""
+        assert isinstance(_disposition(verdict="fallback").policy, EscalationOnly)
+
+    @pytest.mark.parametrize("verdict", ["foreign", "none"])
+    def test_an_unattributed_terminal_escalates(self, verdict):
+        """A print the farm did not dispatch (or could not attribute) lands on the
+        never-armless floor. The foreign lane may UPGRADE this afterwards, once its
+        background identification proves the plate is the farm's own file."""
+        assert isinstance(_disposition(verdict=verdict, item_id=None).policy, EscalationOnly)
+
+    def test_a_first_article_escalates_even_though_it_carries_a_profile(self):
+        """The part holds on the plate for inspection; the approval flow arms its own
+        FA eject."""
+        assert isinstance(_disposition(first_article=True).policy, EscalationOnly)
+
+    def test_a_unit_with_no_eject_profile_escalates(self):
+        assert isinstance(_disposition(eject_profile_id=None).policy, EscalationOnly)
+
+    def test_a_matched_verdict_with_no_item_escalates(self):
+        assert isinstance(_disposition(item_id=None).policy, EscalationOnly)
+
+    @pytest.mark.parametrize("raise_gate", [True, False])
+    def test_raise_gate_is_carried_through_verbatim(self, raise_gate):
+        """The caller's raise guard (the global ``require_plate_clear`` toggle, or
+        farm involvement) rides ON the disposition, so the authority never has to
+        know what that guard is made of — and a non-farm terminal on a toggle-off
+        install still raises nothing."""
+        assert _disposition(raise_gate=raise_gate).raise_gate is raise_gate
+
+    def test_the_identity_and_the_evidence_ride_along_unchanged(self):
+        evidence = _evidence(status="failed")
+
+        disposition = _disposition(source_subtask_id="SUB-9", evidence=evidence)
+
+        assert disposition.queue_item_id == 11
+        assert disposition.source_subtask_id == "SUB-9"
+        assert disposition.evidence is evidence
+
+
+class TestUpgradeToForeignAutoEject:
+    """The foreign lane's promotion, once its background identification lands."""
+
+    def test_an_identified_foreign_plate_is_promoted_to_an_auto_sweep(self):
+        """The foreign branch raises its gate SYNCHRONOUSLY under ``EscalationOnly``
+        (a deposit must block dispatch NOW) and identifies the plate afterwards —
+        that work opens archives and re-fetches donors over FTPS, which the terminal
+        callback cannot wait on."""
+        assert plate_occupancy.declare_occupied(21, Evidence()) is None
+
+        assert upgrade_to_foreign_auto_eject(21, profile_id=4, threshold_c=33.0) is True
+
+        assert plate_occupancy.snapshot(21).plate_policy == ForeignAutoEject(profile_id=4, threshold_c=33.0)
+
+    def test_a_cleared_plate_refuses_the_promotion(self):
+        """False means the authority refused ``not_occupied`` — an operator cleared
+        the plate while we were identifying it, and an auto-eject onto a plate
+        somebody already emptied is exactly what must not happen."""
+        assert plate_occupancy.declare_occupied(22, Evidence()) is None
+        assert plate_occupancy.clear_plate(22) is None
+
+        assert upgrade_to_foreign_auto_eject(22, profile_id=4, threshold_c=33.0) is False
+
+        assert plate_occupancy.snapshot(22).plate_policy is None
+
+    def test_a_printer_that_never_had_a_plate_refuses_too(self):
+        assert upgrade_to_foreign_auto_eject(23, profile_id=4, threshold_c=33.0) is False
+        assert plate_occupancy.is_plate_occupied(23) is False
