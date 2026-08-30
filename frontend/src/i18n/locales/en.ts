@@ -907,6 +907,7 @@ export default {
       notCleared: 'Plate not Clear',
       inUse: 'Plate in Use',
       markClearedCancelsEject: 'Marking the plate cleared cancels the pending auto-eject.',
+      ejectInFlight: 'Eject in flight. The gate clears when the sweep completes.',
       markOccupied: 'Mark plate as occupied',
       markOccupiedSuccess: 'Plate marked as occupied — dispatch blocked until cleared',
     },
@@ -916,7 +917,7 @@ export default {
       dispatched: 'Eject started',
       confirmTitle: 'Eject while bed is hot?',
       confirmBody: 'The bed is {{bed}}°C — above the {{threshold}}°C release threshold. Ejecting now sweeps the part off while the bed is still hot. Continue?',
-      confirm: 'Eject now',
+      confirm: 'Eject plate',
       cancel: 'Cancel',
       foreignPrintNameLabel: 'Print',
       foreignUnknownPrint: 'Unknown',
@@ -924,7 +925,7 @@ export default {
       foreignProfileLabel: 'Eject profile',
       foreignSuggested: 'suggested',
       foreignNoProfiles: 'No eject profiles available',
-      foreignConfirm: 'Eject now',
+      foreignConfirm: 'Eject plate',
       // Eject dialog — one dialog, three origins. The title names which plate
       // the operator is about to sweep; the body is the same check either way.
       dialog: {

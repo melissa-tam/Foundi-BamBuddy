@@ -876,6 +876,7 @@ export default {
       notCleared: '플레이트 미비움',
       inUse: '플레이트 사용 중',
       markClearedCancelsEject: '플레이트를 비움으로 표시하면 대기 중인 자동 배출이 취소됩니다.',
+      ejectInFlight: '배출 진행 중. 스윕이 완료되면 게이트가 해제됩니다.',
       markOccupied: '플레이트 점유로 표시',
       markOccupiedSuccess: '플레이트를 점유로 표시했습니다 — 비울 때까지 디스패치가 차단됩니다'
     },
@@ -885,7 +886,7 @@ export default {
       dispatched: '배출을 시작했습니다',
       confirmTitle: '베드가 뜨거운 상태에서 배출할까요?',
       confirmBody: '베드가 {{bed}}°C로 해제 임계값 {{threshold}}°C보다 높습니다. 지금 배출하면 베드가 뜨거운 상태에서 부품을 쓸어냅니다. 계속할까요?',
-      confirm: '지금 배출',
+      confirm: '플레이트 배출',
       cancel: '취소',
       foreignPrintNameLabel: '프린트',
       foreignUnknownPrint: '알 수 없음',
@@ -893,7 +894,7 @@ export default {
       foreignProfileLabel: '배출 프로파일',
       foreignSuggested: '권장',
       foreignNoProfiles: '사용 가능한 배출 프로파일이 없습니다',
-      foreignConfirm: '지금 배출',
+      foreignConfirm: '플레이트 배출',
       dialog: {
         foreignTitle: '플레이트 배출 — 팜에서 전송하지 않은 프린트',
         farmUnitTitle: '플레이트 배출 — {{name}}',

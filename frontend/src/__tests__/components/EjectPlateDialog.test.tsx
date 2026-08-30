@@ -74,7 +74,7 @@ function mount(overrides: Overrides = {}) {
 
 /** The dialog's confirm — distinct from the Cancel beside it. */
 function confirmButton() {
-  return within(screen.getByRole('dialog')).getByRole('button', { name: 'Eject now' });
+  return within(screen.getByRole('dialog')).getByRole('button', { name: 'Eject plate' });
 }
 
 describe('EjectPlateDialog — accessible name per origin', () => {

@@ -2376,7 +2376,15 @@ function PrinterCard({
       queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
       queryClient.invalidateQueries({ queryKey: ['queue', printer.id] });
     },
-    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
+    // clear-plate is refused while an eject owns the printer (the sweep's own
+    // terminal clears the gate) — that refusal gets real copy, not backend English.
+    onError: (error: Error) =>
+      showToast(
+        error instanceof ApiError && error.code === 'eject_in_flight'
+          ? t('printers.plateStatus.ejectInFlight')
+          : error.message || t('printers.toast.failedToSendCommand'),
+        'error'
+      ),
   });
 
   // Operator declaration that this printer's plate is occupied — raises the

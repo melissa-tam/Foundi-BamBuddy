@@ -7,6 +7,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { render } from '../utils';
 import { server } from '../mocks/server';
@@ -78,5 +79,26 @@ describe('PrintersPage clear-plate affordance (global toggle off)', () => {
     expect(
       screen.queryByRole('button', { name: /mark plate as cleared/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it('shows the eject-in-flight copy when clear-plate is refused because an eject owns the printer', async () => {
+    mountWith({ awaiting: true });
+    server.use(
+      http.post('/api/v1/printers/:id/clear-plate', () =>
+        HttpResponse.json(
+          { detail: { code: 'eject_in_flight', message: 'An eject is already in flight on this printer' } },
+          { status: 409 },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+
+    await user.click(await screen.findByRole('button', { name: /mark plate as cleared/i }));
+
+    // The i18n'd refusal, never the backend English.
+    expect(
+      await screen.findByText('Eject in flight. The gate clears when the sweep completes.'),
+    ).toBeInTheDocument();
   });
 });

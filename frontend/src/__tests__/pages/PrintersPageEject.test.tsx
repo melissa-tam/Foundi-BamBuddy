@@ -38,7 +38,7 @@ interface EjectBody {
 /** The one action name every door carries. */
 const EJECT_ACTION = 'Eject plate';
 /** The confirm button inside either dialog — deliberately a different word. */
-const EJECT_CONFIRM = 'Eject now';
+const EJECT_CONFIRM = 'Eject plate';
 /** Title of the eject dialog for a plate the farm never dispatched. */
 const FOREIGN_TITLE = 'Eject plate — print not dispatched by the farm';
 
@@ -131,7 +131,7 @@ const foreignDetail = {
   suggested_eject_profile_id: 7,
 };
 
-/** The eject dialog's confirm (the last "Eject now" on screen). */
+/** The eject dialog's confirm (the last "Eject plate" on screen). */
 function dialogConfirm() {
   return within(screen.getByRole('dialog')).getByRole('button', { name: EJECT_CONFIRM });
 }
@@ -213,7 +213,9 @@ describe('door 2 — the expanded card\'s raised-gate banner', () => {
     await waitFor(() => expect(ejectCalls).toHaveLength(1));
     expect(ejectCalls[0].allow_hot).toBe(false);
 
-    await user.click(screen.getByRole('button', { name: EJECT_CONFIRM }));
+    // One action name means "Eject plate" also sits on the door behind the modal —
+    // scope the click to the confirm dialog.
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: EJECT_CONFIRM }));
     await waitFor(() => expect(ejectCalls).toHaveLength(2));
     expect(ejectCalls[1].allow_hot).toBe(true);
   });
