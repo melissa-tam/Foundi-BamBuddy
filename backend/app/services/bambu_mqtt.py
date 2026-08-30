@@ -820,6 +820,18 @@ class BambuMQTTClient:
         self._finish_photo_captured: bool = False
         self._last_valid_progress: float = 0.0  # Last non-zero progress (firmware resets on cancel)
         self._last_valid_layer_num: int = 0  # Last non-zero layer (firmware resets on cancel)
+        # Are the two peaks above EVIDENCE about this job, or just an unknown baseline?
+        # They are process memory, so they only measure a job whose PRINT START THIS
+        # client observed. A client born mid-print — the restart-recovery attach below,
+        # where the #1304 first-push guard suppresses on_print_start — re-tracks from
+        # whatever the printer happens to be reporting now and can honestly report zeros
+        # for a print that is physically three-quarters done. On the night of 2026-08-29
+        # six such prints finished `completed` and were each read as "produced zero
+        # layers → nothing on the plate": no gate, no eject, and the next unit dispatched
+        # onto the finished part. False therefore means "do not read these peaks as
+        # measurement" — absence of measurement is not measurement of absence — and only
+        # a print start observed HERE (below) may set it True.
+        self._peaks_reliable: bool = False
         # Stale-predecessor gate for the two "last valid" captures above. The firmware
         # keeps republishing the PREVIOUS job's layer/percent for the seconds a new job
         # spends heating and levelling, so a reading arriving just after a print start
@@ -4242,6 +4254,11 @@ class BambuMQTTClient:
             # Reset last valid progress/layer for usage tracking
             self._last_valid_progress = 0.0
             self._last_valid_layer_num = 0
+            # This client watched THIS job start, so from here its peaks measure this
+            # job and a zero reading at the terminal is a real zero (see the flag's
+            # rationale at __init__). Set only here: the restart-recovery attach below
+            # deliberately leaves it False, which is the whole point of the flag.
+            self._peaks_reliable = True
             # A new print starts fresh: any operator-cancel echo belonged to the
             # PREVIOUS print (Phase 3.1). Clear so it can't leak into this print's
             # completion classification.
@@ -4412,6 +4429,11 @@ class BambuMQTTClient:
                     # Last valid progress/layer before firmware reset (for partial usage tracking)
                     "last_progress": self._last_valid_progress,
                     "last_layer_num": self._last_valid_layer_num,
+                    # Whether the two peaks above may be read as a MEASUREMENT of this
+                    # job: False when this client never saw the job start (restart
+                    # recovery), so a consumer deciding "did this leave a part on the
+                    # plate?" must fail closed instead of trusting a zero.
+                    "peaks_reliable": self._peaks_reliable,
                     # Operator-cancel echo seen during this print (Phase 3.1): lets the
                     # terminal-status handler classify a screen-stop and skip retry /
                     # quarantine for it. False on a genuine failure or normal finish.
