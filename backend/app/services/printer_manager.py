@@ -1063,6 +1063,13 @@ def occupancy_payload(printer_id: int | None) -> dict | None:
     publishing it here would make WS and REST disagree (the flip ``eject_watch`` is
     careful to avoid). ``policy`` is the policy's CLASS NAME: the UI renders "what
     happens to this plate next", and the unit/profile behind it already has surfaces.
+
+    Every value here must be JSON-primitive — ``since`` is emitted as an ISO string,
+    the same as ``printer_incidents._payload``'s ``created_at``. Only the REST branches
+    get FastAPI's encoder; the WS lane serializes this dict with a bare ``json.dumps``,
+    so a raw ``datetime`` here kills every ``printer_status`` broadcast AND the initial
+    status send on connect (clients then reconnect-loop) for as long as ANY printer
+    holds a raised plate gate.
     """
     if not printer_id:
         return None
@@ -1082,7 +1089,7 @@ def occupancy_payload(printer_id: int | None) -> dict | None:
             "occupied": view.plate_occupied,
             "source_subtask_id": view.plate_source_subtask_id,
             "policy": type(view.plate_policy).__name__ if view.plate_policy is not None else None,
-            "since": view.plate_since,
+            "since": view.plate_since.isoformat() if view.plate_since is not None else None,
         },
         "eject": eject,
         "lease_age_s": view.lease_age_s,
