@@ -32,9 +32,9 @@ BEACONS (:data:`PHASE_BEACON_LIFTED` / :data:`PHASE_BEACON_SWEEP` /
 :data:`PHASE_BEACON_PARK`). ``mc_percent`` is entirely M73-driven and resets to 0 at
 job start, so those three commands are the ONLY in-band phase signal the wire carries
 (``mc_print_line_number`` is absent on the H2S). The watchdog times the EDGES between
-them against :attr:`EjectRuntimeSegments.drop_span_s`, which bounds the bed-drop phase
-on its own — the sweep is provably unreached while ``mc_percent`` sits below the sweep
-beacon.
+them against the per-phase spans of :class:`EjectRuntimeSegments`, so each phase is
+bounded on its own: the sweep is provably unreached while ``mc_percent`` sits below the
+sweep beacon, and provably OVER once it reaches the park beacon.
 
 Two optional tunings narrow the sweep: an X sub-band (``sweep_x_min_mm`` /
 ``sweep_x_max_mm``) confines the lanes to part of the bed width instead of the
@@ -189,6 +189,33 @@ M18
 
 M73 P100 R0"""
 
+# Seconds of job-completion tail the estimator deliberately does NOT count, and which a
+# post-sweep deadline must therefore tolerate before it may call a job wedged.
+#
+# It lives here, beside :data:`COMPLETION_EPILOGUE` (which holds the two ``M400 S180``
+# dwells) and the ``M622``/``M623`` skip rule in :func:`estimate_runtime_segments`, so the
+# fact and its numeric compensation can only ever change together.
+#
+# EVIDENCE (30 days of rotated prod logs, read 2026-08-31):
+#
+# * 24 watchdog kills since the M73 beacons shipped (2026-08-18). 23 fired with the
+#   bed-drop phase already OBSERVED clear 46-56 s earlier; the 24th ran the beacon-blind
+#   fallback (no phase attribution). Not one fired inside the phase the drop guard bounds.
+# * Healthy ejects run ``ran ≈ expected ± 3 s``. A bimodal slow mode adds >=25-30 s
+#   ENTIRELY AFTER the drop clears (drop-clear→terminal: healthy 23-27 s, killed 49-59 s
+#   and TRUNCATED by the kill, so 25-30 s is a floor, not the size of the tail).
+# * The mode appears on every printer in the fleet and in all three profile eras, which
+#   is why the allowance is flat rather than derived per profile: it models firmware
+#   behaviour, not geometry.
+#
+# THE MEASUREMENT ABOVE IS THE AUTHORITY. The SIZING hypothesis is one firing of the
+# conditional air-purification purge (``M400 S180`` = 180 s) plus chime/publish slop
+# (~20 s) — a hypothesis this constant does not depend on and cannot confirm. The
+# instrument that settles it is the ``ran Ns (expected Ns)`` terminal INFO once
+# post-sweep ejects are allowed to run to FINISH: a mode at +25-35 s refutes the purge,
+# a mode near +180 s confirms it.
+UNMODELLED_EPILOGUE_ALLOWANCE_S = 200.0
+
 
 class EjectGenerationError(ValueError):
     """Raised when an eject block cannot be safely generated for the inputs."""
@@ -219,22 +246,32 @@ def block_start_marker(profile: EjectProfile) -> str:
 
 @dataclass(frozen=True)
 class EjectRuntimeSegments:
-    """One eject block's commanded time, split at the M73 phase beacons.
+    """One eject block's commanded time, split at all three M73 phase beacons.
 
     The split exists because the whole-job deadline can only catch a stall big enough
     to overrun the ENTIRE eject's margin. ``drop_span_s`` bounds the bed-drop phase by
     itself, which is the phase that stalls (2026-07-31 gouged plate, 2026-08-15 009-H2S)
     and the one that must be caught BEFORE the sweep touches the plate.
 
-    ``pre_s`` and ``sweep_s`` carry no share of :data:`EJECT_RUNTIME_OVERHEAD_S` — the
-    overhead is job spin-up plus the finish chime, neither of which belongs to a phase —
-    so only ``total_s`` includes it.
+    ``sweep_span_s`` bounds the PLATE-CONTACT phase the same way, and ``tail_s`` is what
+    remains once the toolhead can no longer reach the part. The boundary between them is
+    :data:`PHASE_BEACON_PARK`, which :func:`generate_eject_gcode` emits at exactly ONE
+    site — immediately above the park move, unconditionally, with the assist on or off —
+    so a reported percent at/above it can never describe a job still executing sweep
+    lanes. Every rule that treats the post-park window as harmless rests on that single
+    unconditional emission; a second emission site, or one behind a profile flag, would
+    silently make a mid-sweep job look finished.
+
+    ``pre_s``, ``drop_span_s``, ``sweep_span_s`` and ``tail_s`` carry no share of
+    :data:`EJECT_RUNTIME_OVERHEAD_S` — the overhead is job spin-up plus the finish chime,
+    neither of which belongs to a phase — so only ``total_s`` includes it.
     """
 
     pre_s: float  # motion before the M73 P5 beacon (prologue lift, unmeasurable Z aside)
     drop_span_s: float  # commanded time between the P5 and P50 beacons (motion + M400 S dwells)
-    sweep_s: float  # the P50 beacon onward (sweep, park, epilogue)
-    total_s: float  # pre + drop_span + sweep + EJECT_RUNTIME_OVERHEAD_S
+    sweep_span_s: float  # commanded time between the P50 and P75 beacons (the sweep lanes)
+    tail_s: float  # the P75 beacon onward (park + completion epilogue)
+    total_s: float  # pre + drop_span + sweep_span + tail + EJECT_RUNTIME_OVERHEAD_S
 
 
 def estimate_runtime_s(gcode: str) -> float:
@@ -255,20 +292,23 @@ def estimate_runtime_segments(gcode: str) -> EjectRuntimeSegments:
     :data:`EJECT_RUNTIME_OVERHEAD_S` constant absorbs the difference and the guard
     margins absorb the rest.
 
-    Segment boundaries are the two EXACT beacon lines :data:`PHASE_BEACON_LIFTED` and
-    :data:`PHASE_BEACON_SWEEP` (after comment stripping). Matching the literal — not
-    "any M73" — is what keeps the epilogue's stock ``M73 P100 R0`` and the
-    :data:`PHASE_BEACON_PARK` marker inside ``sweep_s`` where they belong. Boundaries
-    only ever advance, so a repeated beacon cannot reopen a closed segment. M73 itself
-    contributes no time (it falls through the motion branches, as it always has).
+    Segment boundaries are the three EXACT beacon lines :data:`PHASE_BEACON_LIFTED`,
+    :data:`PHASE_BEACON_SWEEP` and :data:`PHASE_BEACON_PARK` (after comment stripping).
+    Matching the literal — not "any M73" — is what keeps the epilogue's stock
+    ``M73 P100 R0`` inside ``tail_s`` where it belongs. Boundaries only ever advance, so
+    a repeated beacon cannot reopen a closed segment. M73 itself contributes no time (it
+    falls through the motion branches, as it always has).
 
     Domain rules baked in:
 
-    * **``M622``/``M623`` conditional blocks are skipped entirely.** The stock
-      finish tail's air-purification blocks each hold an ``M400 S180``; those fire
-      only when the firmware set ``print_finish_air_filt_flag``, which no farm
-      printer does. Counting them would add 360 s to every estimate and make the
-      guard structurally unable to fire.
+    * **``M622``/``M623`` conditional blocks are skipped entirely.** The stock finish
+      tail's air-purification blocks each hold an ``M400 S180``, and whether either
+      fires is decided by ``print_finish_air_filt_flag`` — firmware state this process
+      cannot read, on the wire or anywhere else. Counting both would add 360 s to every
+      estimate and make the guard structurally unable to fire, so the estimate is the
+      floor: what the machine was told to do MINUS whatever the firmware may add here.
+      :data:`UNMODELLED_EPILOGUE_ALLOWANCE_S` is that omission's numeric compensation and
+      carries the measurement behind its size.
     * **``G28`` (any dialect — ``G28 X Y``, the dual-nozzle torque forms
       ``G28 X T300`` / ``G28 Y T300``) zeroes X and Y and leaves Z UNKNOWN.** The
       eject prologue never homes Z (a part sits on the plate), so the block's Z
@@ -283,8 +323,8 @@ def estimate_runtime_segments(gcode: str) -> EjectRuntimeSegments:
     * A move emitted before any feedrate has been seen contributes no time
       (defensive — the generator always emits an explicit F).
     """
-    # Index 0 = pre, 1 = drop span, 2 = sweep; the beacons advance `segment`.
-    segments = [0.0, 0.0, 0.0]
+    # Index 0 = pre, 1 = drop span, 2 = sweep span, 3 = tail; the beacons advance `segment`.
+    segments = [0.0, 0.0, 0.0, 0.0]
     segment = 0
     feed_mm_min: float | None = None
     # None = position not yet known on that axis (see the G28/unknown-axis rules).
@@ -310,6 +350,9 @@ def estimate_runtime_segments(gcode: str) -> EjectRuntimeSegments:
             continue
         if code == PHASE_BEACON_SWEEP:
             segment = max(segment, 2)
+            continue
+        if code == PHASE_BEACON_PARK:
+            segment = max(segment, 3)
             continue
 
         tokens = code.split()
@@ -352,12 +395,13 @@ def estimate_runtime_segments(gcode: str) -> EjectRuntimeSegments:
         if feed_mm_min and squared > 0:
             segments[segment] += math.sqrt(squared) / feed_mm_min * 60.0
 
-    pre_s, drop_span_s, sweep_s = segments
+    pre_s, drop_span_s, sweep_span_s, tail_s = segments
     return EjectRuntimeSegments(
         pre_s=pre_s,
         drop_span_s=drop_span_s,
-        sweep_s=sweep_s,
-        total_s=pre_s + drop_span_s + sweep_s + EJECT_RUNTIME_OVERHEAD_S,
+        sweep_span_s=sweep_span_s,
+        tail_s=tail_s,
+        total_s=pre_s + drop_span_s + sweep_span_s + tail_s + EJECT_RUNTIME_OVERHEAD_S,
     )
 
 

@@ -49,7 +49,9 @@ from backend.app.services.eject.dispatch import build_part_present_eject_file
 from backend.app.services.eject.generator import (
     EJECT_RUNTIME_OVERHEAD_S,
     PHASE_BEACON_LIFTED_PCT,
+    PHASE_BEACON_PARK_PCT,
     PHASE_BEACON_SWEEP_PCT,
+    UNMODELLED_EPILOGUE_ALLOWANCE_S,
 )
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
 from backend.app.services.plate_occupancy import (
@@ -165,8 +167,21 @@ _STOP_RETRY_DELAY_S = 5.0
 
 # Why a mid-flight stop fired. "total" = the whole-job deadline (the original rule);
 # "drop" = the bed-drop phase overran with the sweep still unreached; "drop_late" = the
-# sweep beacon did arrive, but only after the drop phase had already overrun.
-EjectStopStage = Literal["total", "drop", "drop_late"]
+# sweep beacon did arrive, but only after the drop phase had already overrun; "epilogue"
+# = the sweep was OBSERVED complete and the job then failed to finish its firmware tail.
+#
+# There is deliberately no "sweep" token: the sweep lane MEASURES this wave and does not
+# kill (the P50→P75 distribution it logs is what arms a calibrated sweep kill next wave),
+# so a job overrunning its sweep budget is still stopped by the whole-job deadline under
+# "total" — today's timing, unchanged.
+EjectStopStage = Literal["total", "drop", "drop_late", "epilogue"]
+
+# Where the phase poller is in the block. Typed beside the stop vocabulary because the
+# two are read together: the phase decides which deadline binds, and the deadline names
+# the stage a kill is attributed to. Each is handled by its OWN branch that terminates
+# the iteration — a phase falling through into another phase's rules is how a percent
+# at the PARK beacon could be answered with a bed-drop kill.
+_WatchPhase = Literal["await_p5", "await_p50", "await_p75", "epilogue", "deadline_only"]
 
 # Reason string for the evidence pushall requested when the phase lane goes blind.
 _EVIDENCE_REASON = "eject_phase_beacon_stale"
@@ -189,11 +204,58 @@ def _drop_margin_s(drop_span_s: float) -> float:
     return _clamped_margin_s(drop_span_s, EJECT_DROP_MARGIN_FRAC, EJECT_DROP_MARGIN_MIN_S, EJECT_DROP_MARGIN_MAX_S)
 
 
+def _sweep_margin_s(sweep_span_s: float) -> float:
+    """Grace added to the sweep phase's budget before the overrun is REPORTED (25%, [8 s, 20 s]).
+
+    Borrows the drop lane's triple on purpose. The P50→P75 span has never been measured
+    — the five kills that read 50% were "mid-sweep or stale", indistinguishable before
+    the park beacon was consumed — so no calibrated figure exists yet and inventing one
+    would be a third constant with no evidence behind it. Nothing is stopped on this
+    number this wave: it only decides when a WARNING is worth emitting, and the
+    distribution those warnings produce is what a calibrated floor will be set from.
+    """
+    return _clamped_margin_s(sweep_span_s, EJECT_DROP_MARGIN_FRAC, EJECT_DROP_MARGIN_MIN_S, EJECT_DROP_MARGIN_MAX_S)
+
+
 def eject_abort_deadline_s(expected_runtime_s: float) -> float:
     """Seconds of execution after which an eject is aborted mid-flight.
 
     ``expected`` plus a margin of 25% of the estimate, clamped to [20 s, 60 s]."""
     return expected_runtime_s + _abort_margin_s(expected_runtime_s)
+
+
+def _binding_deadline(
+    phase: _WatchPhase,
+    *,
+    armed_at: float,
+    total_deadline_s: float,
+    t75: float | None,
+    tail_s: float | None,
+) -> tuple[float, EjectStopStage]:
+    """The ONE deadline in force for ``phase``, as (monotonic instant, stage it kills under).
+
+    Evaluated once per poll, before any phase rule runs, so exactly one rule can ever
+    decide that an eject has run out of time — and ``total_deadline_s`` is a parameter
+    that is never mutated, which is what keeps "the whole-job deadline" meaning the same
+    number from arming to kill.
+
+    In every phase but ``epilogue`` that number is the whole-job deadline, unchanged
+    since 2026-07-31: a job whose sweep may still be crossing the plate gets today's
+    timing exactly, whether or not the beacons are reaching us.
+
+    ``epilogue`` is entered ONLY on fresh wire evidence that the sweep completed, and it
+    is the one window where the deadline loosens: the estimator does not model the
+    firmware's job-completion tail (see :data:`UNMODELLED_EPILOGUE_ALLOWANCE_S`), so a
+    job that has provably finished sweeping and is merely slow to report FINISH was
+    being killed by a deadline measuring work it had already done. The ``max`` is the
+    invariant that this replacement can only ever LOOSEN — at a smaller future allowance
+    it silently reverts to the whole-job rule rather than becoming tighter than it.
+    Missing figures fail closed the same way (the whole-job deadline still binds).
+    """
+    whole_job_at = armed_at + total_deadline_s
+    if phase == "epilogue" and t75 is not None and tail_s is not None:
+        return max(whole_job_at, t75 + tail_s + UNMODELLED_EPILOGUE_ALLOWANCE_S), "epilogue"
+    return whole_job_at, "total"
 
 
 # The canonical eject-job-name convention, minted at dispatch. Two shapes:
@@ -421,25 +483,74 @@ def _watchdog_still_owns(printer_id: int, armed: PendingEject) -> EjectIdentity 
     return current
 
 
-def _stop_source_detail(stage: EjectStopStage, elapsed_s: float, expected_s: float, drop_span_s: float | None) -> str:
-    """The operator-facing 'why the plate is not empty' sentence for a mid-flight stop."""
-    if stage == "total":
-        return (
-            f"the eject sweep was STOPPED mid-job after {elapsed_s:.0f}s against an expected "
-            f"{expected_s:.0f}s — it may have stalled against an obstruction. "
-            "Check under the heatbed and inspect the build plate before clearing it."
-        )
-    budget = f"{drop_span_s:.0f}s" if drop_span_s is not None else "its"
+def _stop_reason(
+    stage: EjectStopStage,
+    *,
+    fired_deadline_s: float,
+    phase_elapsed_s: float,
+    expected_s: float,
+    drop_span_s: float | None,
+    sweep_span_s: float | None,
+) -> tuple[str, str]:
+    """(diagnostic clause for the kill WARNING, operator sentence for the page).
+
+    THE one origin of kill copy. Both renderings say the same thing to two audiences, so
+    a stage cannot be honest in the log and wrong in the page — which is what the single
+    hardcoded "suspect an under-bed obstruction" clause was, for every stage that is not
+    a bed-drop kill.
+
+    ``drop_span_s`` and ``sweep_span_s`` are the budgets that were IN FORCE when the
+    deadline fired, NOT the build's figures: a phase budget is in force only once that
+    phase has been OBSERVED to open. That is what separates the two "total" kills — a
+    sweep budget in force can only have been armed by an on-time P50 edge, so the
+    bed-drop phase demonstrably cleared and blaming an under-bed obstruction would be a
+    guess contradicted by the wire. With no beacons observed there is no such evidence
+    and the historical obstruction wording stands.
+
+    ``phase_elapsed_s`` is measured from the edge that opened the phase named by
+    ``stage``; where no phase was ever observed it is the whole job's elapsed time,
+    because then the whole job IS the only phase the farm can speak about.
+    """
+    drop_budget = f"{drop_span_s:.0f}s" if drop_span_s is not None else "its"
     if stage == "drop":
         return (
-            f"the eject was STOPPED DURING the bed-drop phase after {elapsed_s:.0f}s — the bed drop ran past its "
-            f"{budget} budget and the sweep had not started, so the bed may be stalled against an obstruction. "
-            "Check under the heatbed and inspect the build plate before clearing it."
+            f"the bed-drop phase has run {phase_elapsed_s:.0f}s against a {drop_budget} budget with the sweep "
+            "still unreached — suspect an under-bed obstruction or Z steps lost during the bed-drop",
+            f"the eject was STOPPED DURING the bed-drop phase, {phase_elapsed_s:.0f}s into a drop budgeted at "
+            f"{drop_budget} with the sweep not yet started, so the bed may be stalled against an obstruction. "
+            "Check under the heatbed and inspect the build plate before clearing it.",
+        )
+    if stage == "drop_late":
+        return (
+            f"the sweep beacon arrived only after the bed-drop phase overran its {drop_budget} budget "
+            f"({phase_elapsed_s:.0f}s in) — a long drop is the lost-steps signature, and the sweep opens with "
+            "rear positioning at lift height, so this stop still precedes plate contact",
+            f"the eject was STOPPED AFTER a bed-drop phase that overran ({phase_elapsed_s:.0f}s in, against a "
+            f"{drop_budget} bed-drop budget) — a drop that runs long can lose Z steps and return the bed too "
+            "high for the sweep. Check under the heatbed and inspect the build plate before clearing it.",
+        )
+    if stage == "epilogue":
+        return (
+            f"the bed-drop and sweep phases both cleared on the wire; the job then sat {phase_elapsed_s:.0f}s "
+            f"past its park beacon without finishing its firmware tail (deadline {fired_deadline_s:.0f}s)",
+            f"the eject's sweep COMPLETED and the job then failed to finish, {phase_elapsed_s:.0f}s past the "
+            "point where the sweep was reported done — the part was swept but the plate has NOT been verified. "
+            "Inspect the build plate before clearing it.",
+        )
+    if sweep_span_s is not None:
+        return (
+            f"the bed-drop phase cleared on budget and the job was still sweeping {phase_elapsed_s:.0f}s after "
+            f"the sweep beacon (budget {sweep_span_s:.0f}s) when the whole-job deadline "
+            f"({fired_deadline_s:.0f}s) fired — suspect a part that did not release",
+            f"the eject sweep was STOPPED at its whole-job deadline after {phase_elapsed_s:.0f}s of sweeping "
+            f"(a {sweep_span_s:.0f}s sweep budget) — the bed-drop phase had already cleared, so the part may "
+            "not have released from the plate. Inspect the build plate before clearing it.",
         )
     return (
-        f"the eject was STOPPED AFTER a bed-drop phase that overran ({elapsed_s:.0f}s in, against a {budget} "
-        "bed-drop budget) — a drop that runs long can lose Z steps and return the bed too high for the sweep. "
-        "Check under the heatbed and inspect the build plate before clearing it."
+        "suspect an under-bed obstruction or Z steps lost during the bed-drop",
+        f"the eject sweep was STOPPED mid-job after {phase_elapsed_s:.0f}s against an expected "
+        f"{expected_s:.0f}s — it may have stalled against an obstruction. "
+        "Check under the heatbed and inspect the build plate before clearing it.",
     )
 
 
@@ -450,14 +561,22 @@ async def _stop_and_page(
     *,
     sleep: Callable[[float], Awaitable[None]],
     stage: EjectStopStage,
-    elapsed_s: float,
+    fired_deadline_s: float,
+    phase_elapsed_s: float,
     progress: float | None,
+    line_number: int | None,
+    drop_span_s: float | None,
+    sweep_span_s: float | None,
 ) -> None:
     """Stamp the runtime verdict, stop the job mid-flight, page the operator.
 
     The ONE kill path — every rule in :func:`_runtime_watchdog` ends here, so the
-    ordering guarantees below hold whichever deadline fired. ``progress`` is the sample
-    the deciding rule acted on (None when there was none).
+    ordering guarantees below hold whichever deadline fired. ``progress`` and
+    ``line_number`` are the deciding rule's OWN telemetry sample, handed down rather
+    than re-read here: a second read would report the state of the printer a moment
+    later than the one the kill was decided on, which is the one thing a post-incident
+    reader must be able to trust. ``drop_span_s`` / ``sweep_span_s`` are the budgets in
+    force at that moment (see :func:`_stop_reason`).
 
     No escalation watch is armed here, unlike the pre-cut-over code: while an eject
     owns the printer the plate carries no watch by construction (an armed cooldown
@@ -469,20 +588,36 @@ async def _stop_and_page(
     # set: the mark is what keeps the plate gated, so a terminal that slipped past an
     # unmarked pending would release the gate onto a plate the printer was about to be
     # stopped over.
+    #
+    # RECORDED REFUSAL: this stamp is unconditional across stages, so even an "epilogue"
+    # kill — where the wire said the sweep COMPLETED — resolves the eject `unverified`
+    # and leaves the plate gated under EscalationOnly. Deliberate, per the 2026-07-31
+    # contract: sweep motion complete is not part off plate, and a farm that clears a
+    # gate on a job it had to stop is judging on a criterion other than the one it
+    # stopped for.
+    elapsed_s = _elapsed_since_start_s(current)
+    diagnostic, source_detail = _stop_reason(
+        stage,
+        fired_deadline_s=fired_deadline_s,
+        phase_elapsed_s=phase_elapsed_s,
+        expected_s=armed.expected_runtime_s or 0.0,
+        drop_span_s=drop_span_s,
+        sweep_span_s=sweep_span_s,
+    )
     fired_at = datetime.now(timezone.utc)
     plate_occupancy.note_eject_runtime_exceeded(printer_id, fired_at, stage)
-    line_number, _percent, _wire_at = _live_phase_telemetry(printer_id)
     logger.warning(
-        "eject.remote: eject on printer %s still running at %.0fs (expected %.0fs, stage=%s, bed-drop span %s, "
-        "gcode line %s, %s%% done) — suspect an under-bed obstruction or Z steps lost during the bed-drop; "
-        "stopping the eject job mid-flight before the sweep can scrape the plate",
+        "eject.remote: eject on printer %s still running at %.0fs (expected %.0fs, stage=%s, deadline %.0fs, "
+        "bed-drop span %s, gcode line %s, %s%% done) — %s; stopping the eject job mid-flight",
         printer_id,
         elapsed_s,
         armed.expected_runtime_s,
         stage,
+        fired_deadline_s,
         armed.drop_span_s,
         line_number,
         progress,
+        diagnostic,
     )
 
     # Deliberately NOT via mark_printer_stopped_by_user: this is not an operator
@@ -510,15 +645,7 @@ async def _stop_and_page(
     from backend.app.services.eject.monitor import notify_plate_not_empty
 
     try:
-        await notify_plate_not_empty(
-            printer_id,
-            source_detail=_stop_source_detail(
-                stage,
-                elapsed_s,
-                armed.expected_runtime_s or 0.0,
-                armed.drop_span_s,
-            ),
-        )
+        await notify_plate_not_empty(printer_id, source_detail=source_detail)
     except Exception:  # noqa: BLE001 — a notify failure must never kill the watchdog
         logger.exception("eject.remote: mid-flight abort notification failed for printer %s", printer_id)
 
@@ -530,7 +657,7 @@ async def _runtime_watchdog(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    """Stop the eject on ``printer_id`` when it overruns — as a whole, or in its bed-drop phase.
+    """Stop the eject on ``printer_id`` when it overruns the deadline in force for its phase.
 
     This is the machine-stopping half of the 2026-07-31 gouged-plate response, and it
     acts DURING the job rather than at its terminal: the stall accrues in the bed
@@ -539,15 +666,23 @@ async def _runtime_watchdog(
     Judging the same evidence at the terminal — as the mechanism this replaces did —
     can only ever report a scrape that already happened.
 
-    Two deadlines, one kill path:
+    A deadline per phase, one kill path:
 
     * The WHOLE-JOB deadline (:func:`eject_abort_deadline_s`) is enforced on elapsed
-      time in every state and needs no evidence at all. It is the original rule and the
-      unconditional backstop.
+      time in every phase where the plate may still be at risk, and needs no evidence at
+      all. It is the original rule and the unconditional backstop.
     * The BED-DROP deadline needs ``drop_span_s`` plus the M73 phase beacons reflected
       in ``mc_percent``, and it is the only rule that can fire BEFORE the sweep on a
       stall too short to overrun the whole job (~59 s on the production profile). It
       fires only on FRESH samples; stale evidence advances nothing.
+    * The EPILOGUE deadline replaces the whole-job one ONLY after a fresh sample proves
+      the sweep completed. Until 2026-08-31 the whole-job deadline was the sole rule
+      left once the sweep began, and 23 of the 24 kills in the beacon era fired there —
+      after the phase they were protecting, on jobs whose parts had physically been
+      ejected — converting a successful sweep into a gated plate and a page. Patience
+      past that point costs downtime and risks nothing: no motion over the plate remains.
+    * The SWEEP phase is measured and never given patience (a part that fails to release
+      shows up as a sweep overrun): it keeps the whole-job deadline and only WARNs.
 
     The normal exit is CANCELLATION: :func:`cancel_eject_timers` — driven off the
     occupancy transition that retires the eject — cancels this task the instant the
@@ -570,21 +705,29 @@ async def _runtime_watchdog(
             current = _watchdog_still_owns(printer_id, armed)
             if current is None:
                 return
-            _line, percent, _wire_at = _live_phase_telemetry(printer_id)
+            line, percent, _wire_at = _live_phase_telemetry(printer_id)
+            # No phase was ever observed here, so no phase budget was in force and the
+            # whole job is the only span this kill can honestly speak about.
             await _stop_and_page(
                 printer_id,
                 current,
                 armed,
                 sleep=sleep,
                 stage="total",
-                elapsed_s=_elapsed_since_start_s(current),
+                fired_deadline_s=total_deadline_s,
+                phase_elapsed_s=_elapsed_since_start_s(current),
                 progress=percent,
+                line_number=line,
+                drop_span_s=None,
+                sweep_span_s=None,
             )
             return
         await _watch_phase_edges(
             printer_id,
             armed,
             drop_span_s=drop_span_s,
+            sweep_span_s=armed.sweep_span_s,
+            tail_s=armed.tail_s,
             expected_s=expected_s,
             total_deadline_s=total_deadline_s,
             armed_at=armed_at,
@@ -595,33 +738,57 @@ async def _runtime_watchdog(
         _runtime_watchdogs.pop(printer_id, None)
 
 
+def _phase_elapsed_s(
+    phase: _WatchPhase, now: float, *, t50: float | None, t75: float | None, current: EjectIdentity
+) -> float:
+    """Seconds since the observed edge that opened ``phase``.
+
+    Falls back to the whole job's elapsed time wherever no phase edge was ever observed,
+    because there the whole job IS the only span the farm can honestly speak about."""
+    if phase == "await_p75" and t50 is not None:
+        return now - t50
+    if phase == "epilogue" and t75 is not None:
+        return now - t75
+    return _elapsed_since_start_s(current)
+
+
 async def _watch_phase_edges(
     printer_id: int,
     armed: PendingEject,
     *,
     drop_span_s: float,
+    sweep_span_s: float | None,
+    tail_s: float | None,
     expected_s: float,
     total_deadline_s: float,
     armed_at: float,
     sleep: Callable[[float], Awaitable[None]],
     clock: Callable[[], float],
 ) -> None:
-    """Poll ``mc_percent`` and time the M73 phase edges (see :func:`_runtime_watchdog`).
+    """Poll ``mc_percent``, time the M73 phase edges, enforce the deadline each phase owns.
+
+    One branch per :data:`_WatchPhase`, each terminating the iteration. That shape is
+    load-bearing, not stylistic: the predecessor skipped the phase rules for a TUPLE of
+    states and let everything else fall through into the bed-drop branch, so a phase
+    added without also editing that tuple would have answered a percent at the PARK
+    beacon with a bed-drop kill.
 
     Returns on cancellation, on resolution/supersession, or after a kill; the caller owns
     deregistration."""
-    # "await_p5" → "await_p50" → "sweeping"; "deadline_only" is the beacon-dead fallback,
-    # where the whole-job deadline below is the only rule left.
-    phase = "await_p5"
-    # Monotonic time of the first fresh sample at/above the lifted beacon, and the
-    # deadline derived from it. Both stay None until that edge is observed.
+    phase: _WatchPhase = "await_p5"
+    # Monotonic time of the first fresh sample at/above each beacon, plus the budgets
+    # derived from them. Each stays None until its own edge is observed.
     t5: float | None = None
+    t50: float | None = None
+    t75: float | None = None
     drop_deadline: float | None = None
+    sweep_budget_deadline: float | None = None
     # No P5 by here means the beacons are not reaching us at all: it clears the fixed job
     # spin-up plus the whole-job grace, while a healthy block beacons within seconds of
     # its first move.
     p5_deadline = armed_at + EJECT_RUNTIME_OVERHEAD_S + _abort_margin_s(expected_s)
     asked_for_evidence = False
+    warned_sweep_overrun = False
 
     while True:
         await sleep(_PROGRESS_POLL_S)
@@ -629,7 +796,7 @@ async def _watch_phase_edges(
         current = _watchdog_still_owns(printer_id, armed)
         if current is None:
             return
-        _line, percent, progress_wire_at = _live_phase_telemetry(printer_id)
+        line_number, percent, progress_wire_at = _live_phase_telemetry(printer_id)
         # FRESH = published by a push that landed after this eject started AND recently
         # enough to describe the phase running now. Anything else is not evidence.
         fresh = (
@@ -638,21 +805,38 @@ async def _watch_phase_edges(
             and progress_wire_at >= armed_at
             and now - progress_wire_at <= _PROGRESS_FRESH_S
         )
+        # A phase budget is IN FORCE only from the edge that opened its phase — what
+        # :func:`_stop_reason` renders honest copy from.
+        drop_in_force = drop_span_s if phase in ("await_p50", "await_p75", "epilogue") else None
+        sweep_in_force = sweep_span_s if phase in ("await_p75", "epilogue") else None
 
-        # The whole-job deadline is unconditional — it holds in every state and needs no
-        # progress evidence, exactly as it did before the phase lane existed.
-        if now - armed_at >= total_deadline_s:
+        # ONE deadline-selection point, evaluated before any phase rule, so exactly one
+        # rule can decide that this eject has run out of time.
+        #
+        # ACCEPTED RESIDUE: an edge sample landing on the same poll tick as a deadline
+        # expiry resolves in the DEADLINE's favour, since the deadline is tested first.
+        # The window is one poll tick, and that bias stops a machine that may be in
+        # trouble rather than granting it the next phase's patience.
+        deadline_at, deadline_stage = _binding_deadline(
+            phase, armed_at=armed_at, total_deadline_s=total_deadline_s, t75=t75, tail_s=tail_s
+        )
+        if now >= deadline_at:
             await _stop_and_page(
                 printer_id,
                 current,
                 armed,
                 sleep=sleep,
-                stage="total",
-                elapsed_s=_elapsed_since_start_s(current),
+                stage=deadline_stage,
+                fired_deadline_s=deadline_at - armed_at,
+                phase_elapsed_s=_phase_elapsed_s(phase, now, t50=t50, t75=t75, current=current),
                 progress=percent,
+                line_number=line_number,
+                drop_span_s=drop_in_force,
+                sweep_span_s=sweep_in_force,
             )
             return
-        if phase in ("sweeping", "deadline_only"):
+
+        if phase == "deadline_only":
             continue
 
         if phase == "await_p5":
@@ -673,55 +857,134 @@ async def _watch_phase_edges(
                     now - armed_at,
                 )
                 phase = "deadline_only"
-                continue
-            else:
-                continue
-
-        # await_p50: the pre-sweep guarantee. A percent below the sweep beacon PROVES the
-        # printer is still executing drop-phase lines, so the plate is untouched and the
-        # stop lands before any lane can scrape it.
-        if not fresh:
-            if drop_deadline is not None and now > drop_deadline and not asked_for_evidence:
-                # Blind past the deadline: ask once for a fresh report rather than kill on
-                # silence. The whole-job deadline remains the backstop either way.
-                printer_manager.request_evidence_pushall(printer_id, _EVIDENCE_REASON)
-                asked_for_evidence = True
             continue
-        if percent >= PHASE_BEACON_SWEEP_PCT:
+
+        if phase == "await_p50":
+            # The pre-sweep guarantee. A percent below the sweep beacon PROVES the
+            # printer is still executing drop-phase lines, so the plate is untouched and
+            # the stop lands before any lane can scrape it.
+            if not fresh:
+                if drop_deadline is not None and now > drop_deadline and not asked_for_evidence:
+                    # Blind past the deadline: ask once for a fresh report rather than
+                    # kill on silence. The whole-job deadline remains the backstop.
+                    printer_manager.request_evidence_pushall(printer_id, _EVIDENCE_REASON)
+                    asked_for_evidence = True
+                continue
+            if percent >= PHASE_BEACON_SWEEP_PCT:
+                if drop_deadline is not None and now > drop_deadline:
+                    # The sweep DID start, but only after the drop overran — a drop that
+                    # runs long is the lost-steps signature, and the sweep opens with
+                    # rear positioning at lift height, so the stop still precedes plate
+                    # contact. That is exactly what a post-park kill could NOT claim,
+                    # which is why the sweep lane below never mirrors this rule.
+                    await _stop_and_page(
+                        printer_id,
+                        current,
+                        armed,
+                        sleep=sleep,
+                        stage="drop_late",
+                        fired_deadline_s=drop_deadline - armed_at,
+                        phase_elapsed_s=now - t5 if t5 is not None else 0.0,
+                        progress=percent,
+                        line_number=line_number,
+                        drop_span_s=drop_span_s,
+                        sweep_span_s=None,
+                    )
+                    return
+                logger.info(
+                    "eject.remote: printer %s bed-drop phase cleared in <=%.1fs (budget %.0fs, deadline %.0fs) "
+                    "— sweeping",
+                    printer_id,
+                    now - t5 if t5 is not None else 0.0,
+                    drop_span_s,
+                    drop_span_s + _drop_margin_s(drop_span_s),
+                )
+                t50 = now
+                if sweep_span_s is None:
+                    # Nothing left to time (a rehydrated pending carries no build
+                    # figures), so the whole-job deadline is the only rule that remains.
+                    phase = "deadline_only"
+                    continue
+                sweep_budget_deadline = t50 + sweep_span_s + _sweep_margin_s(sweep_span_s)
+                phase = "await_p75"
+                continue
             if drop_deadline is not None and now > drop_deadline:
-                # The sweep DID start, but only after the drop overran — a drop that runs
-                # long is the lost-steps signature, and the sweep opens with rear
-                # positioning at lift height, so the stop still precedes plate contact.
                 await _stop_and_page(
                     printer_id,
                     current,
                     armed,
                     sleep=sleep,
-                    stage="drop_late",
-                    elapsed_s=_elapsed_since_start_s(current),
+                    stage="drop",
+                    fired_deadline_s=drop_deadline - armed_at,
+                    phase_elapsed_s=now - t5 if t5 is not None else 0.0,
                     progress=percent,
+                    line_number=line_number,
+                    drop_span_s=drop_span_s,
+                    sweep_span_s=None,
                 )
                 return
-            logger.info(
-                "eject.remote: printer %s bed-drop phase cleared in <=%.1fs (budget %.0fs, deadline %.0fs) — sweeping",
-                printer_id,
-                now - t5 if t5 is not None else 0.0,
-                drop_span_s,
-                drop_span_s + _drop_margin_s(drop_span_s),
-            )
-            phase = "sweeping"
             continue
-        if drop_deadline is not None and now > drop_deadline:
-            await _stop_and_page(
-                printer_id,
-                current,
-                armed,
-                sleep=sleep,
-                stage="drop",
-                elapsed_s=_elapsed_since_start_s(current),
-                progress=percent,
-            )
-            return
+
+        if phase == "await_p75":
+            # The sweep is the hazard phase — a part that fails to release presents as a
+            # sweep overrun — so it is never given patience: the whole-job deadline
+            # selected above stays binding here, which is today's stuck-part timing
+            # unchanged, and this lane only MEASURES (no calibrated floor exists yet:
+            # the P50→P75 span had never been observed before this wave). That backstop
+            # also bounds the fabricated-late-t50 shape: a link blind from P5 that comes
+            # back at P50 anchors t50 late and would otherwise hand a nearly-finished
+            # sweep a whole fresh budget.
+            if not fresh:
+                continue
+            if percent >= PHASE_BEACON_PARK_PCT:
+                overran = sweep_budget_deadline is not None and now > sweep_budget_deadline
+                # Timed from t50, so it UNDERSTATES the true span exactly as the drop
+                # measurement does. This line IS the P50→P75 distribution a calibrated
+                # sweep kill will be armed from.
+                #
+                # A late arrival is RECORDED, never killed — deliberately asymmetric with
+                # `drop_late`, which stops a job whose sweep is about to begin and so
+                # still pre-empts plate contact. By the park beacon the contact has
+                # happened; stopping the job here would cost the plate a verified eject
+                # and buy nothing back.
+                logger.log(
+                    logging.WARNING if overran else logging.INFO,
+                    "eject.remote: printer %s sweep phase cleared in <=%.1fs (budget %.0fs)%s — epilogue",
+                    printer_id,
+                    now - t50 if t50 is not None else 0.0,
+                    sweep_span_s,
+                    " but OVERRAN it" if overran else "",
+                )
+                # A fresh sample at/above the park beacon is the ONLY thing that buys
+                # patience, and it can be read as THIS job's progress because
+                # ``bambu_mqtt._stale_predecessor_reading`` discards a republished
+                # predecessor percent — withholding ``progress_wire_at`` with it — until
+                # the job publishes a reading strictly below its predecessor's final. A
+                # finished print's 100% therefore cannot present here as a park beacon.
+                #
+                # Anchoring at ``t75 = now`` REVERSES this module's understating-span
+                # bias into a patience-maximising one: the true edge fell earlier, so the
+                # epilogue window starts later than it should. Taken deliberately —
+                # every other span biases against a false kill because the plate is at
+                # risk, and past the park beacon the only thing exposed is downtime.
+                t75 = now
+                phase = "epilogue"
+                continue
+            if sweep_budget_deadline is not None and now > sweep_budget_deadline and not warned_sweep_overrun:
+                warned_sweep_overrun = True
+                logger.warning(
+                    "eject.remote: printer %s sweep phase running %.0fs against a %.0fs budget — the part may "
+                    "not have released; no phase kill fires here, the whole-job deadline governs",
+                    printer_id,
+                    now - t50 if t50 is not None else 0.0,
+                    sweep_span_s,
+                )
+            continue
+
+        # epilogue: the sweep is over, so nothing here can protect the plate any more.
+        # The only question left is whether the job ever finishes, and the epilogue
+        # deadline selected above is what answers it.
+        continue
 
 
 def matches_pending_eject(
@@ -918,6 +1181,8 @@ async def dispatch_part_present_eject(
         queue_item_id=queue_item_id,
         expected_runtime_s=built.expected_runtime_s,
         drop_span_s=built.drop_span_s,
+        sweep_span_s=built.sweep_span_s,
+        tail_s=built.tail_s,
     )
     # The eject file's FTPS upload transiently drops the H2S sdcard flag; mark the
     # printer upload-in-flight so the USB-drop verifier ignores that dispatch blip.
@@ -1004,6 +1269,8 @@ async def dispatch_foreign_eject(
         queue_item_id=None,
         expected_runtime_s=built.expected_runtime_s,
         drop_span_s=built.drop_span_s,
+        sweep_span_s=built.sweep_span_s,
+        tail_s=built.tail_s,
     )
     # Same as the production path: the FTPS upload transiently drops the H2S sdcard
     # flag; mark the printer upload-in-flight so the USB-drop verifier ignores the blip.
