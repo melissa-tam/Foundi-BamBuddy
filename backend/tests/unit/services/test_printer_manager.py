@@ -3,6 +3,7 @@
 Tests printer connection management, status tracking, and print control.
 """
 
+import json
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2101,7 +2102,11 @@ class TestOccupancyProjection:
 
     def test_payload_carries_the_plate_source_and_its_policy_class_name(self):
         """``policy`` is the class NAME: the UI renders "what happens to this plate
-        next", and the unit / profile behind it already has its own surfaces."""
+        next", and the unit / profile behind it already has its own surfaces.
+
+        ``since`` is an ISO STRING, not the authority's ``datetime`` — see
+        :class:`TestOccupancyPayloadIsJsonSerializable` for why that is load-bearing.
+        """
         from datetime import datetime
 
         plate_occupancy.hydrate_plate(4242, "SUB-1", CooldownEject(unit_id=11, run_id=3))
@@ -2111,7 +2116,9 @@ class TestOccupancyProjection:
         assert plate["occupied"] is True
         assert plate["source_subtask_id"] == "SUB-1"
         assert plate["policy"] == "CooldownEject"
-        assert isinstance(plate["since"], datetime)
+        assert isinstance(plate["since"], str)
+        # Round-trips: the value is a real ISO-8601 instant, not just some string.
+        assert datetime.fromisoformat(plate["since"]) == plate_occupancy.snapshot(4242).plate_since
 
     def test_payload_renders_a_pending_eject(self):
         """The eject sub-dict is the operator's only view of a sweep in flight."""
@@ -2182,3 +2189,78 @@ class TestOccupancyProjection:
 
     def test_occupancy_is_none_when_no_printer_id_is_supplied(self):
         assert printer_state_to_dict(self._state())["occupancy"] is None
+
+
+class TestOccupancyPayloadIsJsonSerializable:
+    """``printer_state_to_dict`` output must survive a BARE ``json.dumps``.
+
+    The two lanes that serve this dict do not agree on what "serializable" means.
+    The REST branches go through FastAPI's ``jsonable_encoder``, which quietly turns
+    a ``datetime`` into an ISO string; the WS lane hands the same dict to starlette's
+    ``send_json`` → ``json.dumps``, which raises ``TypeError``. So a non-primitive
+    value here is invisible on every REST probe and fatal on the socket: it kills
+    each ``printer_status`` / AMS-change broadcast AND the initial status send at
+    ``api/routes/websocket.py``, so clients reconnect-loop for as long as the value
+    is present. Shipped that way on 2026-08-30 with ``plate.since``, which is present
+    exactly while a printer holds a raised plate gate.
+
+    The pin is therefore the CLASS, not the field: a fully-populated status dict is
+    dumped with the stdlib encoder, so ANY future raw ``datetime``, ``Decimal``,
+    ``Enum``, dataclass or ``Path`` added anywhere in this serializer fails here
+    rather than in production at 1 Hz.
+    """
+
+    def _state(self):
+        """A REAL ``PrinterState`` — a MagicMock would serialize nothing meaningfully
+        and would fail this assertion for reasons that have nothing to do with the bug."""
+        from backend.app.services.bambu_mqtt import PrinterState
+
+        state = PrinterState()
+        state.connected = True
+        state.state = "FINISH"
+        state.subtask_name = "SKU007.01"
+        state.gcode_file = "/data/Metadata/plate_3.gcode"
+        return state
+
+    def test_status_dict_of_a_gated_printer_with_an_eject_in_flight_json_dumps(self):
+        """The exact prod shape: plate gate raised (so ``since`` is set) AND a sweep
+        claimed on the same printer, which is every unit of a running farm loop."""
+        plate_occupancy.hydrate_plate(4242, "SUB-1", CooldownEject(unit_id=11, run_id=3))
+        assert (
+            plate_occupancy.claim_for_eject(
+                4242,
+                PendingEject(purpose="production", run_id=3, queue_item_id=11),
+                Evidence(),
+            )
+            is None
+        )
+
+        payload = printer_state_to_dict(self._state(), printer_id=4242, model="H2S")
+
+        # Guard the guard: if the occupancy record were empty this test would pass
+        # while proving nothing.
+        assert payload["occupancy"]["plate"]["since"] is not None
+        assert payload["occupancy"]["eject"] is not None
+
+        encoded = json.dumps(payload)  # the WS lane, verbatim — TypeError before the fix
+
+        assert json.loads(encoded)["occupancy"] == payload["occupancy"]
+
+    def test_the_emitted_since_is_an_iso_8601_string(self):
+        """It round-trips to the authority's own instant, so the wire keeps the fact
+        rather than merely keeping ``json.dumps`` quiet with ``str()`` or ``default=``."""
+        from datetime import datetime
+
+        plate_occupancy.hydrate_plate(4242, "SUB-1", CooldownEject(unit_id=11, run_id=3))
+
+        since = printer_state_to_dict(self._state(), printer_id=4242)["occupancy"]["plate"]["since"]
+
+        assert isinstance(since, str)
+        assert datetime.fromisoformat(since) == plate_occupancy.snapshot(4242).plate_since
+
+    def test_an_empty_record_still_json_dumps(self):
+        """The other side of the branch: ``since`` is None on an unoccupied plate."""
+        payload = printer_state_to_dict(self._state(), printer_id=4242)
+
+        assert payload["occupancy"]["plate"]["since"] is None
+        assert json.loads(json.dumps(payload))["occupancy"]["plate"]["since"] is None
