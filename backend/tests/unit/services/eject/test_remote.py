@@ -1520,3 +1520,265 @@ class TestRuntimeWatchdogDeadlineOnlyFallback:
             await _spawn_watchdog(pid, armed, clock)
         assert clock.delays == [103.75]
         env.stop.assert_called_once_with(pid)
+
+
+def _armed_with_phases(
+    pid_item: int = 5,
+    *,
+    drop_span_s: float = 30.0,
+    sweep_span_s: float | None = 20.0,
+    tail_s: float | None = 15.0,
+    **kw,
+) -> remote.PendingEject:
+    """A started production pending carrying ALL the build's phase budgets.
+
+    83 s expected → a 103.75 s whole-job deadline; 30 s drop → an 8 s margin (the floor)
+    → the drop deadline lands 38 s after the observed P5 edge; 20 s sweep → the same 8 s
+    floor → the sweep BUDGET line lands 28 s after the observed P50 edge (a line that
+    only warns); 15 s tail → the epilogue deadline lands 215 s after the observed P75."""
+    kw.setdefault("expected_runtime_s", 83.0)
+    kw.setdefault("started_at", datetime.now(timezone.utc))
+    return remote.PendingEject(
+        "production", 1, pid_item, drop_span_s=drop_span_s, sweep_span_s=sweep_span_s, tail_s=tail_s, **kw
+    )
+
+
+def _records(caplog, needle: str) -> list:
+    return [r for r in caplog.records if needle in r.getMessage()]
+
+
+class TestBindingDeadline:
+    """The ONE deadline-selection point. Whichever phase the poller is in, exactly one
+    deadline is in force, and the whole-job figure it is derived from is never mutated."""
+
+    async def test_every_phase_but_the_epilogue_holds_the_whole_job_deadline(self):
+        for phase in ("await_p5", "await_p50", "await_p75", "deadline_only"):
+            assert remote._binding_deadline(
+                phase, armed_at=1000.0, total_deadline_s=103.75, t75=1050.0, tail_s=15.0
+            ) == (1103.75, "total")
+
+    async def test_the_epilogue_deadline_is_anchored_on_the_observed_park_edge(self):
+        deadline, stage = remote._binding_deadline(
+            "epilogue", armed_at=1000.0, total_deadline_s=103.75, t75=1060.0, tail_s=15.0
+        )
+        assert (deadline, stage) == (1060.0 + 15.0 + remote.UNMODELLED_EPILOGUE_ALLOWANCE_S, "epilogue")
+
+    async def test_the_epilogue_deadline_can_only_ever_loosen(self):
+        # The invariant behind the `max`: at a smaller future allowance the epilogue rule
+        # must silently revert to the whole-job deadline rather than become TIGHTER than
+        # the rule it replaces — a patient window that kills sooner is the one outcome
+        # this change may never produce.
+        deadline, stage = remote._binding_deadline(
+            "epilogue", armed_at=1000.0, total_deadline_s=900.0, t75=1005.0, tail_s=1.0
+        )
+        assert (deadline, stage) == (1900.0, "epilogue")
+        assert deadline >= 1000.0 + 900.0
+
+    async def test_missing_build_figures_fail_closed_onto_the_whole_job_deadline(self):
+        assert remote._binding_deadline(
+            "epilogue", armed_at=1000.0, total_deadline_s=103.75, t75=1060.0, tail_s=None
+        ) == (1103.75, "total")
+        assert remote._binding_deadline(
+            "epilogue", armed_at=1000.0, total_deadline_s=103.75, t75=None, tail_s=15.0
+        ) == (1103.75, "total")
+
+
+class TestStopReasonCopy:
+    """One origin for kill copy, two renderings. Before it, every stage was paged as an
+    'under-bed obstruction' — already wrong for `drop_late`/`total`, and unusable for a
+    stage that fires after the wire says the sweep completed."""
+
+    def _reason(self, stage, **kw):
+        kw.setdefault("fired_deadline_s", 104.0)
+        kw.setdefault("phase_elapsed_s", 42.0)
+        kw.setdefault("expected_s", 83.0)
+        kw.setdefault("drop_span_s", None)
+        kw.setdefault("sweep_span_s", None)
+        return remote._stop_reason(stage, **kw)
+
+    async def test_a_drop_kill_names_the_bed_drop_budget_and_the_heatbed(self):
+        diagnostic, detail = self._reason("drop", drop_span_s=30.0)
+        assert "bed-drop" in diagnostic and "30s" in diagnostic
+        assert "bed-drop" in detail and "under the heatbed" in detail
+
+    async def test_a_drop_late_kill_says_the_sweep_started_after_the_overrun(self):
+        diagnostic, detail = self._reason("drop_late", drop_span_s=30.0)
+        assert "sweep beacon arrived only after" in diagnostic
+        assert "overran" in detail and "under the heatbed" in detail
+
+    async def test_a_beacon_blind_total_keeps_the_obstruction_wording(self):
+        # No phase was ever observed, so an obstruction is still the honest suspicion.
+        diagnostic, detail = self._reason("total", phase_elapsed_s=104.0)
+        assert "under-bed obstruction" in diagnostic
+        assert "STOPPED mid-job" in detail and "104" in detail and "83" in detail
+
+    async def test_a_total_that_fired_past_an_in_time_p50_blames_the_sweep_not_the_bed(self):
+        # The sweep budget can only have been armed by an on-time P50 edge, so the drop
+        # demonstrably cleared: pointing the operator under the heatbed would send them
+        # to a place the wire has already ruled out.
+        diagnostic, detail = self._reason("total", phase_elapsed_s=100.0, drop_span_s=30.0, sweep_span_s=20.0)
+        assert "cleared on budget" in diagnostic and "20s" in diagnostic
+        assert "did not release" in diagnostic
+        assert "under the heatbed" not in detail
+        assert "may not have released" in detail
+
+    async def test_an_epilogue_kill_says_both_phases_cleared_and_the_job_never_finished(self):
+        diagnostic, detail = self._reason("epilogue", phase_elapsed_s=215.0, fired_deadline_s=280.0)
+        assert "both cleared" in diagnostic and "firmware tail" in diagnostic
+        assert "280" in diagnostic
+        assert "sweep COMPLETED" in detail and "under the heatbed" not in detail
+
+
+class TestRuntimeWatchdogSweepLane:
+    """The sweep phase MEASURES and never kills (2026-08-31, principle 4).
+
+    A part that fails to release presents as a sweep overrun, so this phase is never
+    given patience: the whole-job deadline keeps today's exact stuck-part timing through
+    it, and the budget line only produces the P50→P75 distribution a calibrated sweep
+    kill will be armed from."""
+
+    @staticmethod
+    async def _run(pid: int, armed, samples, caplog) -> tuple:
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, samples)
+        _claim(pid, armed)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        return env, clock
+
+    async def test_a_sweep_running_past_its_budget_warns_once_and_never_kills_there(self, caplog):
+        # Percent parked at the sweep beacon: the sweep budget line (t50 + 28 s) passes
+        # at ~34 s, and nothing may fire there this wave.
+        env, clock = await self._run(90060, _armed_with_phases(), [(5.0, 0.0), (50.0, 0.0)], caplog)
+        warnings = _records(caplog, "sweep phase running")
+        assert len(warnings) == 1
+        assert "20s budget" in warnings[0].getMessage()
+        assert warnings[0].levelno == logging.WARNING
+        # The kill that DID happen is the whole-job backstop, not a sweep rule.
+        assert "stage=total" in _kill_line(caplog)
+        assert not _records(caplog, "stage=drop")
+        env.stop.assert_called_once_with(90060)
+
+    async def test_the_whole_job_deadline_is_still_enforced_inside_the_sweep_phase(self, caplog):
+        # The complement of the epilogue's patience: while the plate may still be under
+        # the toolhead, the stuck-part timing is EXACTLY what it was before this wave.
+        env, clock = await self._run(90061, _armed_with_phases(), [(5.0, 0.0), (50.0, 0.0)], caplog)
+        assert clock.now - 1000.0 == pytest.approx(104.0)
+        assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)
+        detail = env.notify.await_args.kwargs["source_detail"]
+        assert "may not have released" in detail and "under the heatbed" not in detail
+
+    async def test_a_park_beacon_after_the_budget_line_advances_with_a_warning(self, caplog):
+        # A 5 s sweep budget (+8 s floor) with the park beacon arriving at ~18 s: the
+        # overrun is recorded for the distribution and the job is NOT killed for it —
+        # deliberately asymmetric with drop_late, whose stop still precedes plate
+        # contact, while past the park beacon there is no contact left to pre-empt.
+        armed = _armed_with_phases(sweep_span_s=5.0)
+        samples = [(5.0, 0.0), (50.0, 0.0)] + [(50.0, 0.0)] * 8 + [(75.0, 0.0)]
+        env, clock = await self._run(90062, armed, samples, caplog)
+        cleared = _records(caplog, "sweep phase cleared")
+        assert len(cleared) == 1
+        assert cleared[0].levelno == logging.WARNING
+        assert "OVERRAN" in cleared[0].getMessage()
+        # It advanced rather than died: the only kill is the epilogue's own deadline.
+        assert "stage=epilogue" in _kill_line(caplog)
+        env.stop.assert_called_once_with(90062)
+
+    async def test_a_stale_park_beacon_never_opens_the_epilogue(self, caplog):
+        # Patience is bought by FRESH wire evidence only. A held-over percent proves
+        # nothing about the phase running now, so the job keeps the tight deadline.
+        armed = _armed_with_phases()
+        env, clock = await self._run(90063, armed, [(5.0, 0.0), (50.0, 0.0), (75.0, None)], caplog)
+        assert not _records(caplog, "sweep phase cleared")
+        assert not _records(caplog, "sweep phase running")  # the WARN is fresh-gated too
+        assert "stage=total" in _kill_line(caplog)
+        assert clock.now - 1000.0 == pytest.approx(104.0)
+
+    async def test_without_a_sweep_budget_both_new_lanes_stay_silent(self, caplog):
+        # A rehydrated pending carries no build figures. The drop lane still runs to
+        # completion (liveness) and the job then keeps exactly today's behaviour.
+        armed = _armed_with_phases(sweep_span_s=None, tail_s=None)
+        env, clock = await self._run(90064, armed, [(5.0, 0.0), (50.0, 0.0), (75.0, 0.0)], caplog)
+        assert _records(caplog, "bed-drop phase cleared")
+        assert not _records(caplog, "sweep phase")
+        assert "stage=total" in _kill_line(caplog)
+        assert clock.now - 1000.0 == pytest.approx(104.0)
+        detail = env.notify.await_args.kwargs["source_detail"]
+        assert "STOPPED mid-job" in detail and "under the heatbed" in detail
+
+
+class TestRuntimeWatchdogEpilogue:
+    """The one patient window, and the trap it must not fall into.
+
+    23 of the 24 kills in the beacon era fired AFTER the bed-drop phase had cleared, on
+    jobs whose parts were physically ejected: the whole-job deadline was expiring during
+    a firmware tail the estimator does not model. Past the park beacon no motion over the
+    plate remains, so the only thing a longer deadline exposes is downtime."""
+
+    @staticmethod
+    async def _run_to_park(pid: int, caplog, armed=None) -> tuple:
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (75.0, 0.0)])
+        armed = armed or _armed_with_phases()
+        _claim(pid, armed)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        return env, clock
+
+    async def test_a_park_beacon_sample_never_produces_a_drop_late_kill(self, caplog):
+        # PINS THE FALLTHROUGH TRAP: the predecessor skipped the phase rules for a TUPLE
+        # of states and let everything else fall into the bed-drop branch — where a
+        # percent at/above the SWEEP beacon arriving past the drop deadline is a
+        # drop_late kill. This is that exact shape: a 0.5 s drop budget (deadline t5 +
+        # 8.5 s), the link blind through the sweep, and the first sample back is the PARK
+        # beacon at ~12 s. Read by the drop lane it is a drop_late kill; read by the
+        # phase that actually owns it, it is proof the sweep is over.
+        pid = 90070
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (50.0, None), (50.0, None), (50.0, None), (75.0, 0.0)])
+        armed = _armed_with_phases(drop_span_s=0.5)
+        _claim(pid, armed)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        assert not _records(caplog, "stage=drop_late")
+        assert not _records(caplog, "stage=drop")
+        assert _records(caplog, "sweep phase cleared")
+        assert "stage=epilogue" in _kill_line(caplog)
+        env.stop.assert_called_once_with(pid)
+
+    async def test_the_epilogue_is_entered_on_the_first_fresh_park_sample(self, caplog):
+        await self._run_to_park(90071, caplog)
+        cleared = _records(caplog, "sweep phase cleared")
+        assert len(cleared) == 1
+        assert cleared[0].levelno == logging.INFO
+        assert "in <=2.0s" in cleared[0].getMessage() and "budget 20s" in cleared[0].getMessage()
+
+    async def test_the_whole_job_deadline_is_not_enforced_once_the_sweep_is_proven_done(self, caplog):
+        # The change itself: this job ran 118 s past the rule that used to kill it.
+        env, clock = await self._run_to_park(90072, caplog)
+        assert clock.now - 1000.0 > remote.eject_abort_deadline_s(83.0)
+        # Killed at the epilogue deadline instead: park edge (t=6 s) + 15 s tail + the
+        # 200 s allowance, caught on the following 2 s poll.
+        assert clock.now - 1000.0 == pytest.approx(222.0)
+
+    async def test_a_job_wedged_after_the_sweep_is_still_stopped_and_escalated(self, caplog):
+        # LIVENESS for the patient window: patience is bounded, the printer is freed, and
+        # the plate stays gated exactly as every other kill leaves it (the mark is what
+        # resolves the eject `unverified` → EscalationOnly).
+        env, clock = await self._run_to_park(90073, caplog)
+        env.stop.assert_called_once_with(90073)
+        assert plate_occupancy.pending_eject_view(90073).runtime_exceeded_at is not None
+        kill = _kill_line(caplog)
+        assert "stage=epilogue" in kill and "deadline 221s" in kill
+        detail = env.notify.await_args.kwargs["source_detail"]
+        assert "sweep COMPLETED" in detail and "under the heatbed" not in detail
+        assert 90073 not in remote._runtime_watchdogs

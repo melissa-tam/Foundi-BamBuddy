@@ -304,9 +304,9 @@ class PendingEject:
 
     ``expected_runtime_s`` (from the build) and ``started_at`` (stamped when the
     printer echoes the sweep's START) are what the in-flight runtime watchdog arms
-    on. ``drop_span_s`` (also from the build) is the bed-drop phase's own budget and
-    arms the watchdog's edge lane, which bounds that phase alone rather than the
-    whole job.
+    on. ``drop_span_s``, ``sweep_span_s`` and ``tail_s`` (also from the build) are the
+    per-phase budgets that arm the watchdog's edge lane, which bounds each phase on its
+    own rather than the whole job.
 
     ``runtime_exceeded_at`` is that watchdog's verdict, and the watchdog is the ONE
     authority on eject runtime: the mark is stamped the moment a deadline passes,
@@ -317,7 +317,7 @@ class PendingEject:
 
     ``hydrated`` marks a record rebuilt at startup from the queue unit's
     ``eject_dispatched_at`` stamp rather than minted by a live dispatch. Such a
-    record is None on ``expected_runtime_s``, ``started_at`` and ``drop_span_s`` by
+    record is None on ``expected_runtime_s``, ``started_at`` and every phase budget by
     construction — the durable mirror is a single timestamp column, not the built
     artifact — so no watchdog can arm and the farm has already admitted it cannot
     verify the sweep. That is why an operator eject SUPERSEDES a hydrated pending
@@ -331,6 +331,8 @@ class PendingEject:
     started_at: datetime | None = None
     runtime_exceeded_at: datetime | None = None
     drop_span_s: float | None = None
+    sweep_span_s: float | None = None
+    tail_s: float | None = None
     dispatched_at: datetime | None = None
     hydrated: bool = False
 
@@ -1141,8 +1143,8 @@ class PlateOccupancy:
 
         :meth:`eject_identity` is the IDENTITY projection — what the watchdog and the
         terminal matcher compare against — and it deliberately carries no build
-        figures. The runtime watchdog needs those figures (``expected_runtime_s``,
-        ``drop_span_s``) to compute its deadlines, and the eject terminal logs them
+        figures. The runtime watchdog needs those figures (``expected_runtime_s`` and
+        the per-phase budgets) to compute its deadlines, and the eject terminal logs them
         beside the measured runtime, so this hands back the record itself.
 
         Safe to expose because :class:`PendingEject` is frozen: a caller can read it

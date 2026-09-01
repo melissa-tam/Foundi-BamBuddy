@@ -53,11 +53,18 @@ class BuiltEject:
     drop-less block's pre-sweep motion is just the prologue lift, which cannot stall
     against an under-bed obstruction, so it carries None and the watchdog's edge lane
     stays disarmed rather than timing a phase that does not exist.
+
+    ``sweep_span_s`` and ``tail_s`` are the two post-drop budgets, and unlike the drop
+    they are unconditional: every generated block sweeps and every generated block ends
+    in the park + completion epilogue, so both are always figures rather than an
+    optional tuning's by-product.
     """
 
     path: Path
     expected_runtime_s: float
     drop_span_s: float | None
+    sweep_span_s: float
+    tail_s: float
 
 
 def _parse_max_z_height(source_path: Path, plate_id: int) -> float | None:
@@ -157,7 +164,7 @@ async def build_part_present_eject_file(
         raise EjectGenerationError(f"Failed to repack the part-present eject 3mf: {exc}") from exc
     logger.info(
         "eject.dispatch: built part-present eject from %s plate %s (max_z %.2fmm, profile %r) — expected runtime "
-        "%.0fs (pre %.0fs, bed-drop span %s, sweep %.0fs)",
+        "%.0fs (pre %.0fs, bed-drop span %s, sweep span %.0fs, tail %.0fs)",
         Path(source_path).name,
         plate_id,
         max_z,
@@ -165,6 +172,13 @@ async def build_part_present_eject_file(
         segments.total_s,
         segments.pre_s,
         f"{drop_span_s:.0f}s" if drop_span_s is not None else "off",
-        segments.sweep_s,
+        segments.sweep_span_s,
+        segments.tail_s,
     )
-    return BuiltEject(path=path, expected_runtime_s=segments.total_s, drop_span_s=drop_span_s)
+    return BuiltEject(
+        path=path,
+        expected_runtime_s=segments.total_s,
+        drop_span_s=drop_span_s,
+        sweep_span_s=segments.sweep_span_s,
+        tail_s=segments.tail_s,
+    )

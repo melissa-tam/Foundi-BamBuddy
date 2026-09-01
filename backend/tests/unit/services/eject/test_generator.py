@@ -14,6 +14,7 @@ from backend.app.services.eject.generator import (
     PHASE_BEACON_PARK,
     PHASE_BEACON_SWEEP,
     SWEEP_PHASE_MARKER,
+    UNMODELLED_EPILOGUE_ALLOWANCE_S,
     EjectGenerationError,
     estimate_runtime_s,
     estimate_runtime_segments,
@@ -840,9 +841,10 @@ class TestPhaseBeacons:
 
 
 class TestEstimateRuntimeSegments:
-    """The per-phase split behind the pre-sweep guarantee. The whole-job estimate can
-    only catch a stall that overruns the ENTIRE eject; drop_span_s bounds the phase that
-    actually stalls, on its own."""
+    """The per-phase split behind the pre-sweep guarantee and the post-sweep patience.
+    The whole-job estimate can only catch a stall that overruns the ENTIRE eject;
+    drop_span_s bounds the phase that actually stalls, sweep_span_s the phase that
+    touches the plate, and tail_s what remains once neither can happen again."""
 
     def test_segments_sum_to_the_total_for_every_golden(self):
         # Exact equality, not approx: the total IS the sum, computed by one walk. Any
@@ -853,8 +855,28 @@ class TestEstimateRuntimeSegments:
         for path in goldens:
             gcode = path.read_text()
             seg = estimate_runtime_segments(gcode)
-            assert seg.pre_s + seg.drop_span_s + seg.sweep_s + EJECT_RUNTIME_OVERHEAD_S == estimate_runtime_s(gcode)
+            assert (
+                seg.pre_s + seg.drop_span_s + seg.sweep_span_s + seg.tail_s + EJECT_RUNTIME_OVERHEAD_S
+                == estimate_runtime_s(gcode)
+            )
             assert seg.total_s == estimate_runtime_s(gcode)
+
+    def test_the_park_split_partitions_the_old_sweep_and_leaves_the_total_alone(self):
+        # Splitting at PHASE_BEACON_PARK is an ANALYSIS change only: it must move no
+        # commanded second into or out of the estimate the abort deadline is derived
+        # from. Removing the boundary line reproduces the pre-split walk exactly, so the
+        # two post-drop spans must merge back into one with the same total.
+        golden_dir = pathlib.Path(__file__).parent / "golden"
+        goldens = sorted(golden_dir.glob("*.gcode"))
+        assert goldens, "golden fixtures missing"
+        for path in goldens:
+            gcode = path.read_text()
+            assert PHASE_BEACON_PARK in gcode, f"{path.name} carries no park beacon"
+            unsplit = "\n".join(ln for ln in gcode.splitlines() if not ln.startswith(PHASE_BEACON_PARK))
+            seg, merged = estimate_runtime_segments(gcode), estimate_runtime_segments(unsplit)
+            assert seg.sweep_span_s + seg.tail_s == pytest.approx(merged.sweep_span_s), path.name
+            assert seg.total_s == pytest.approx(merged.total_s), path.name
+            assert seg.tail_s > 0.0, f"{path.name} scored an empty tail"
 
     def test_drop_span_holds_exactly_the_bed_drop_motion(self):
         # lift 40 → 290 → 40 at F900 = 500 mm of commanded travel, and nothing else in
@@ -879,26 +901,41 @@ class TestEstimateRuntimeSegments:
         # on the plate), so it scores 0 — and the overhead belongs to no phase.
         seg = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
         assert seg.pre_s == 0.0
-        assert seg.sweep_s > 0.0
+        assert seg.sweep_span_s > 0.0
 
-    def test_the_epilogue_beacon_never_opens_a_segment(self):
-        # Only the two exact beacon literals split. M73 P100 R0 (and the P75 marker)
-        # must stay inside sweep_s, or the sweep's time would leak out of the estimate.
-        gcode = "G28 X Y\nM73 P5\nG1 Z100 F900\nG1 Z50 F900\nM73 P50\nM73 P75\nM400 S3\nM73 P100 R0\nM400 S4\n"
+    def test_the_park_beacon_closes_the_sweep_and_the_epilogue_hundred_does_not(self):
+        # Only the three exact beacon literals split. M73 P100 R0 must stay inside
+        # tail_s: it is the stock epilogue's own progress line, not a phase boundary.
+        gcode = "G28 X Y\nM73 P5\nG1 Z100 F900\nG1 Z50 F900\nM73 P50\nM400 S3\nM73 P75\nM73 P100 R0\nM400 S4\n"
         seg = estimate_runtime_segments(gcode)
         assert seg.drop_span_s == pytest.approx(50.0 / 900.0 * 60.0, abs=0.01)
-        assert seg.sweep_s == pytest.approx(7.0)
+        assert seg.sweep_span_s == pytest.approx(3.0)
+        assert seg.tail_s == pytest.approx(4.0)
 
     def test_a_repeated_beacon_cannot_reopen_a_closed_segment(self):
         # Defensive: boundaries only advance, so a replayed P5 after the sweep opened
-        # cannot pull sweep motion back into the drop span.
+        # cannot pull sweep motion back into the drop span — and a replayed P50 after the
+        # park beacon cannot pull the firmware tail back into the sweep the watchdog
+        # treats as plate-contact time.
         gcode = "G28 X Y\nM73 P5\nG1 Z100 F900\nM73 P50\nM73 P5\nM400 S9\n"
         seg = estimate_runtime_segments(gcode)
         assert seg.drop_span_s == 0.0
-        assert seg.sweep_s == pytest.approx(9.0)
+        assert seg.sweep_span_s == pytest.approx(9.0)
+        replayed = estimate_runtime_segments("M73 P5\nM73 P50\nM73 P75\nM73 P50\nM400 S9\n")
+        assert replayed.sweep_span_s == 0.0
+        assert replayed.tail_s == pytest.approx(9.0)
 
     def test_a_conditional_dwell_is_excluded_from_every_segment(self):
-        gcode = "M73 P5\nM73 P50\nM622 J1\nM400 S180\nM623\nM400 S2\n"
+        gcode = "M73 P5\nM73 P50\nM622 J1\nM400 S180\nM623\nM400 S2\nM73 P75\nM622.1 S0\nM400 S180\nM623\nM400 S1\n"
         seg = estimate_runtime_segments(gcode)
         assert (seg.pre_s, seg.drop_span_s) == (0.0, 0.0)
-        assert seg.sweep_s == pytest.approx(2.0)
+        assert seg.sweep_span_s == pytest.approx(2.0)
+        # The tail's own conditional purge is the very omission
+        # UNMODELLED_EPILOGUE_ALLOWANCE_S compensates for — it must not appear here.
+        assert seg.tail_s == pytest.approx(1.0)
+
+    def test_the_epilogue_allowance_covers_the_purge_it_is_sized_against(self):
+        # Sized as one firing of the conditional air purge (M400 S180) plus chime and
+        # publish slop. The estimator deliberately counts neither, so an allowance below
+        # the purge could not absorb a single firing of it.
+        assert UNMODELLED_EPILOGUE_ALLOWANCE_S >= 180.0

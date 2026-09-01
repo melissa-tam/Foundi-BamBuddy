@@ -373,7 +373,15 @@ class TestRestartRoundTrip:
 
         plate_occupancy.claim_for_eject(
             printer.id,
-            PendingEject("production", None, item.id, expected_runtime_s=83.0, drop_span_s=30.0),
+            PendingEject(
+                "production",
+                None,
+                item.id,
+                expected_runtime_s=83.0,
+                drop_span_s=30.0,
+                sweep_span_s=20.0,
+                tail_s=15.0,
+            ),
             Evidence(),
         )
         await _drain(scheduled)
@@ -399,3 +407,8 @@ class TestRestartRoundTrip:
         rebuilt = plate_occupancy.pending_eject_view(printer.id)
         assert rebuilt.expected_runtime_s is None
         assert rebuilt.drop_span_s is None
+        # Every phase budget goes the same way, which is what disarms the sweep and
+        # epilogue lanes on a rehydrated pending: no schema carries them, and inventing
+        # one would let a post-restart record buy patience the farm cannot justify.
+        assert rebuilt.sweep_span_s is None
+        assert rebuilt.tail_s is None
