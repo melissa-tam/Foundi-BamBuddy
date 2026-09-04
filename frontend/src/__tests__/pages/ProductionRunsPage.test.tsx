@@ -51,6 +51,7 @@ function run(overrides: Partial<ProductionRun> = {}): ProductionRun {
     eject_profile_id: null,
     cooldown_temp_c_override: null,
     target_model: null,
+    target_printers: [],
     eta_seconds: 7200,
     printers: [{ id: 1, name: 'H2S-Alpha' }],
     scheduled_start_at: null,
@@ -505,7 +506,7 @@ describe('ProductionRunsPage', () => {
     render(<ProductionRunsPage />);
     await openDialog(user);
 
-    await user.click(screen.getByRole('radio', { name: /specific printers/i }));
+    await user.click(screen.getByRole('radio', { name: /selected printers/i }));
     // Check the H2C printer against the H2S file → warning.
     await user.click(await screen.findByRole('checkbox', { name: /H2C-Beta/i }));
     expect(await screen.findByText(/sliced for H2S but targets H2C/i)).toBeInTheDocument();
@@ -640,6 +641,158 @@ describe('ProductionRunsPage', () => {
       escalate_consecutive_failures: 4,
     });
     expect(posted).not.toHaveProperty('printer_ids');
+  });
+
+  // -------------------------------------------------------------------------
+  // Printers pool: a run targets a SET of printers and the scheduler places
+  // each unit on the next idle member. `target_printers` is the pool;
+  // `printers` only records where units have actually landed.
+  // -------------------------------------------------------------------------
+
+  it('names the model pool on the card, not the printers that ran it', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () =>
+        HttpResponse.json([
+          run({ target_model: 'H2S', printers: [{ id: 4, name: 'H2S-Delta' }] }),
+        ]),
+      ),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+    );
+
+    render(<ProductionRunsPage />);
+
+    expect(await screen.findByText(/Any H2S/)).toBeInTheDocument();
+    expect(screen.queryByText(/H2S-Delta/)).not.toBeInTheDocument();
+  });
+
+  it('names the pool members on the card of a printers-pool run', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () =>
+        HttpResponse.json([
+          run({
+            target_printers: [
+              { id: 1, name: 'H2S-Alpha' },
+              { id: 2, name: 'H2C-Beta' },
+            ],
+            printers: [{ id: 4, name: 'H2S-Delta' }],
+          }),
+        ]),
+      ),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+    );
+
+    render(<ProductionRunsPage />);
+
+    expect(await screen.findByText(/H2S-Alpha, H2C-Beta/)).toBeInTheDocument();
+    expect(screen.queryByText(/H2S-Delta/)).not.toBeInTheDocument();
+  });
+
+  it('falls back to the run printers on a legacy pinned run (no pool of either kind)', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () =>
+        HttpResponse.json([
+          run({ target_model: null, target_printers: [], printers: [{ id: 2, name: 'H2C-Beta' }] }),
+        ]),
+      ),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+    );
+
+    render(<ProductionRunsPage />);
+
+    expect(await screen.findByText(/H2C-Beta/)).toBeInTheDocument();
+  });
+
+  it('prefills Run again from the pool members, not from the printers that ran', async () => {
+    let posted: Record<string, unknown> | null = null;
+    const finished = run({
+      status: 'completed',
+      target_model: null,
+      target_printers: [
+        { id: 1, name: 'H2S-Alpha' },
+        { id: 2, name: 'H2C-Beta' },
+      ],
+      // Only one member ever got a unit; the POOL is what the dialog reopens.
+      printers: [{ id: 1, name: 'H2S-Alpha' }],
+    });
+    server.use(
+      http.get('*/api/v1/production-runs', () => HttpResponse.json([finished])),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+      twoModelFleet,
+      emptyEjectProfiles,
+      http.post('*/api/v1/production-runs', async ({ request }) => {
+        posted = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(finished, { status: 201 });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<ProductionRunsPage />);
+
+    await screen.findByText('WID-001 run');
+    await user.click(screen.getByRole('button', { name: /run again/i }));
+    const dialog = await screen.findByRole('dialog');
+
+    expect(within(dialog).getByRole('radio', { name: /selected printers/i })).toBeChecked();
+    expect(within(dialog).getByRole('checkbox', { name: /H2S-Alpha/i })).toBeChecked();
+    expect(within(dialog).getByRole('checkbox', { name: /H2C-Beta/i })).toBeChecked();
+
+    await user.click(within(dialog).getByRole('button', { name: /start run/i }));
+    await waitFor(() => expect(posted).not.toBeNull());
+    expect(posted).toMatchObject({ printer_ids: [1, 2] });
+  });
+
+  it('prefills Run again from `printers` when a legacy pinned run has no pool', async () => {
+    let posted: Record<string, unknown> | null = null;
+    const finished = run({
+      status: 'completed',
+      target_model: null,
+      target_printers: [],
+      printers: [{ id: 2, name: 'H2C-Beta' }],
+    });
+    server.use(
+      http.get('*/api/v1/production-runs', () => HttpResponse.json([finished])),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+      twoModelFleet,
+      emptyEjectProfiles,
+      http.post('*/api/v1/production-runs', async ({ request }) => {
+        posted = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(finished, { status: 201 });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<ProductionRunsPage />);
+
+    await screen.findByText('WID-001 run');
+    await user.click(screen.getByRole('button', { name: /run again/i }));
+    const dialog = await screen.findByRole('dialog');
+
+    expect(within(dialog).getByRole('checkbox', { name: /H2C-Beta/i })).toBeChecked();
+    expect(within(dialog).getByRole('checkbox', { name: /H2S-Alpha/i })).not.toBeChecked();
+
+    await user.click(within(dialog).getByRole('button', { name: /start run/i }));
+    await waitFor(() => expect(posted).not.toBeNull());
+    expect(posted).toMatchObject({ printer_ids: [2] });
+  });
+
+  it('labels the pool radio without absorbing its hint into the accessible name', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs', () => HttpResponse.json([])),
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+      twoModelFleet,
+      emptyEjectProfiles,
+    );
+
+    const user = userEvent.setup();
+    render(<ProductionRunsPage />);
+    await openDialog(user);
+
+    // Exact name: the InfoHint sits beside the <label>, never inside it.
+    expect(screen.getByRole('radio', { name: 'Selected printers' })).toBeInTheDocument();
+    // The mechanism lives in the hint, reachable by keyboard.
+    expect(
+      screen.getByRole('button', { name: /next idle printer among the selection/i }),
+    ).toBeInTheDocument();
   });
 
   // -------------------------------------------------------------------------

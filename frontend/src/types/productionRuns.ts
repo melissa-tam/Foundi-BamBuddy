@@ -151,10 +151,14 @@ export interface ProductionRun {
   /** Per-run cooldown override (°C) applied to eject generation, or null. */
   cooldown_temp_c_override: number | null;
   /** Target printer model for a model-targeted run, or null for a
-   *  specific-printers run (its printers are in `printers`). */
+   *  printers-pool run (its members are in `target_printers`). */
   target_model: string | null;
+  /** Members of a printers-pool run, in id order — the twin of `target_model`;
+   *  empty for model pools and for legacy pinned runs. */
+  target_printers: ProductionRunPrinter[];
   /** Estimated seconds remaining, or null when not computable. */
   eta_seconds: number | null;
+  /** Printers that have had a unit — `[]` for a fresh pool run. */
   printers: ProductionRunPrinter[];
   /** Derived deferred start (UTC ISO): the earliest not-yet-started plate's
    *  scheduled_time. Future => the run is "scheduled"; null/past => normal

@@ -78,6 +78,8 @@ import { QueueTimelineView } from '../components/QueueTimelineView';
 import { WaitingReason } from '../components/ui/WaitingReason';
 import { QueuePhaseChip } from '../components/QueuePhaseChip';
 import { waitingReasonText } from '../utils/waitingReason';
+import { describeQueueTarget, queueTargetSortKey } from '../utils/queueTarget';
+import type { QueueTarget } from '../utils/queueTarget';
 import { Modal } from '../components/ui/Modal';
 
 function formatWeight(g: number, useKg = false): string {
@@ -322,6 +324,7 @@ function SortableQueueItem({
   hasPermission,
   canModify,
   printerState,
+  printerNameById,
   t,
 }: {
   item: PrintQueueItem;
@@ -338,8 +341,15 @@ function SortableQueueItem({
   hasPermission: (permission: Permission) => boolean;
   canModify: (resource: 'queue' | 'archives' | 'library', action: 'update' | 'delete' | 'reprint', createdById: number | null | undefined) => boolean;
   printerState?: string | null;
+  /** Fleet names for the pool-target label, built once by the page. */
+  printerNameById: ReadonlyMap<number, string>;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
+  // What this unit dispatches against — pinned printer, printers pool, model
+  // pool, or nothing yet. One origin (`utils/queueTarget`), shared with the
+  // printer buckets and the timeline lanes.
+  const target = describeQueueTarget(item, t, printerNameById);
+
   // Fetch printer status every 30 seconds while printing to monitor progress
   const { data: status } = useQuery({
     queryKey: ['printerStatus', item.printer_id],
@@ -529,14 +539,14 @@ function SortableQueueItem({
           </div>
 
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm text-bambu-gray">
-            <span className={`flex items-center gap-1 sm:gap-1.5 ${item.printer_id === null && !item.target_model ? 'text-orange-700 dark:text-orange-400' : ''} ${item.target_model && !item.printer_id ? 'text-blue-700 dark:text-blue-400' : ''}`}>
+            <span className={`flex items-center gap-1 sm:gap-1.5 ${target.kind === 'unassigned' ? 'text-orange-700 dark:text-orange-400' : ''} ${target.kind === 'model' || target.kind === 'printers' ? 'text-blue-700 dark:text-blue-400' : ''}`}>
               <Printer className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
               <span className="truncate max-w-[120px] sm:max-w-none">
-              {item.target_model && !item.printer_id
-                ? `${t('queue.filter.any')} ${item.target_model}${item.target_location ? ` @ ${item.target_location}` : ''}${item.required_filament_types?.length ? ` (${item.required_filament_types.join(', ')})` : ''}`
-                : item.printer_id === null
-                  ? t('queue.filter.unassigned')
-                  : (item.printer_name || `${t('common.printer')} #${item.printer_id}`)}
+              {/* A pool target carries the unit's own narrowing suffixes; a
+                  pinned or unassigned row is the bare target. */}
+              {target.kind === 'model' || target.kind === 'printers'
+                ? `${target.label}${item.target_location ? ` @ ${item.target_location}` : ''}${item.required_filament_types?.length ? ` (${item.required_filament_types.join(', ')})` : ''}`
+                : target.label}
               </span>
             </span>
             {item.print_time_seconds && (
@@ -789,6 +799,8 @@ interface QueueRowRenderProps {
   hasPermission: (p: any) => boolean;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   canModify: (resource: any, action: any, createdById?: number | null) => boolean;
+  /** Fleet names for the pool-target label, built once by the page. */
+  printerNameById: ReadonlyMap<number, string>;
   t: (key: string, options?: Record<string, unknown>) => string;
   aggregateForRows: (rows: QueueRow[]) => { count: number; time: number; weight: number };
 }
@@ -807,6 +819,7 @@ function QueueRowRender(props: QueueRowRenderProps) {
     timeFormat,
     hasPermission,
     canModify,
+    printerNameById,
     t,
   } = props;
 
@@ -830,6 +843,7 @@ function QueueRowRender(props: QueueRowRenderProps) {
         onToggleSelect={() => handleToggleSelect(row.item.id)}
         hasPermission={hasPermission}
         canModify={canModify}
+        printerNameById={printerNameById}
         t={t}
       />
     );
@@ -854,6 +868,7 @@ function SortableBatchRow({
   timeFormat,
   hasPermission,
   canModify,
+  printerNameById,
   t,
   aggregateForRows,
 }: QueueRowRenderProps) {
@@ -1009,6 +1024,7 @@ function SortableBatchRow({
               onToggleSelect={() => handleToggleSelect(child.id)}
               hasPermission={hasPermission}
               canModify={canModify}
+              printerNameById={printerNameById}
               t={t}
             />
           ))}
@@ -1355,6 +1371,13 @@ export function QueuePage() {
     queryFn: () => api.getPrinters(),
   });
 
+  // Fleet names keyed by id — a printers-pool unit names its members by id
+  // only, so every row and bucket label resolves them through this one map.
+  const printerNameById = useMemo(
+    () => new Map((printers ?? []).map((p) => [p.id, p.name] as const)),
+    [printers],
+  );
+
   const sjfMutation = useMutation({
     mutationFn: (enabled: boolean) => api.updateSettings({ queue_shortest_first: enabled }),
     onSuccess: () => {
@@ -1613,10 +1636,11 @@ export function QueuePage() {
     // When SJF is enabled, override sort to match scheduler order
     if (settings?.queue_shortest_first) {
       return [...items].sort((a, b) => {
-        // Group by printer first (nulls = model-based, grouped by target_model)
-        const aPrinter = a.printer_id ?? -(a.target_model?.charCodeAt(0) ?? 0);
-        const bPrinter = b.printer_id ?? -(b.target_model?.charCodeAt(0) ?? 0);
-        if (aPrinter !== bPrinter) return aPrinter - bPrinter;
+        // Group by target first: pinned printers, then each pool lane, then
+        // unassigned (`utils/queueTarget`).
+        const aTarget = queueTargetSortKey(a);
+        const bTarget = queueTargetSortKey(b);
+        if (aTarget !== bTarget) return aTarget < bTarget ? -1 : 1;
         // Within same printer/model: jumped items first (starvation guard)
         const aJumped = a.been_jumped ? 1 : 0;
         const bJumped = b.been_jumped ? 1 : 0;
@@ -1873,46 +1897,14 @@ export function QueuePage() {
     setBatchCollapsed((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }));
   };
 
-  // Group by printer view. Items are bucketed by printer_id (null = model
-  // assignment or unassigned, keyed by target_model or "unassigned").
-  type PrinterBucket = {
-    key: string;
-    printerId: number | null;
-    targetModel: string | null;
-    label: string;
-    isUnassigned: boolean;
-    rows: QueueRow[];
-  };
+  // Group by target view. One bucket per distinct target — a pinned printer,
+  // a printers pool, a model pool, or unassigned (`utils/queueTarget`).
+  type PrinterBucket = QueueTarget & { rows: QueueRow[] };
 
   const printerBuckets = useMemo<PrinterBucket[]>(() => {
     const buckets = new Map<string, PrinterBucket>();
-    const bucketForItem = (item: PrintQueueItem): { key: string; label: string; printerId: number | null; targetModel: string | null; isUnassigned: boolean } => {
-      if (item.printer_id) {
-        return {
-          key: `printer:${item.printer_id}`,
-          label: item.printer_name || `Printer #${item.printer_id}`,
-          printerId: item.printer_id,
-          targetModel: null,
-          isUnassigned: false,
-        };
-      }
-      if (item.target_model) {
-        return {
-          key: `model:${item.target_model}`,
-          label: `${t('queue.filter.any')} ${item.target_model}`,
-          printerId: null,
-          targetModel: item.target_model,
-          isUnassigned: false,
-        };
-      }
-      return {
-        key: 'unassigned',
-        label: t('queue.filter.unassigned'),
-        printerId: null,
-        targetModel: null,
-        isUnassigned: true,
-      };
-    };
+    const bucketForItem = (item: PrintQueueItem): QueueTarget =>
+      describeQueueTarget(item, t, printerNameById);
 
     for (const row of groupedRows) {
       const representative = row.kind === 'item' ? row.item : row.items[0];
@@ -1924,11 +1916,12 @@ export function QueuePage() {
       buckets.get(meta.key)!.rows.push(row);
     }
     return Array.from(buckets.values()).sort((a, b) => {
-      if (a.isUnassigned && !b.isUnassigned) return 1;
-      if (!a.isUnassigned && b.isUnassigned) return -1;
+      const aUnassigned = a.kind === 'unassigned';
+      const bUnassigned = b.kind === 'unassigned';
+      if (aUnassigned !== bUnassigned) return aUnassigned ? 1 : -1;
       return a.label.localeCompare(b.label);
     });
-  }, [groupedRows, t]);
+  }, [groupedRows, printerNameById, t]);
 
   // #1818: printers whose queue is gated by a prior failure that's poisoning
   // downstream `require_previous_success` items. We surface a per-printer
@@ -2332,6 +2325,7 @@ export function QueuePage() {
                     hasPermission={hasPermission}
                     canModify={canModify}
                     printerState={item.printer_id ? printerStateMap[item.printer_id] : null}
+                    printerNameById={printerNameById}
                     t={t}
                   />
                 ))}
@@ -2462,6 +2456,7 @@ export function QueuePage() {
                           timeFormat={timeFormat}
                           hasPermission={hasPermission}
                           canModify={canModify}
+                          printerNameById={printerNameById}
                           t={t}
                           aggregateForRows={aggregateForRows}
                         />
@@ -2474,7 +2469,7 @@ export function QueuePage() {
                         return (
                           <div key={bucket.key}>
                             <div className="flex items-center gap-3 px-3 py-2 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-t-lg">
-                              <Printer className={`w-4 h-4 ${bucket.isUnassigned ? 'text-orange-700 dark:text-orange-400' : bucket.targetModel ? 'text-blue-700 dark:text-blue-400' : 'text-bambu-green'}`} />
+                              <Printer className={`w-4 h-4 ${bucket.kind === 'unassigned' ? 'text-orange-700 dark:text-orange-400' : bucket.kind === 'printer' ? 'text-bambu-green' : 'text-blue-700 dark:text-blue-400'}`} />
                               <span className="font-semibold text-white text-sm">{bucket.label}</span>
                               <span className="text-xs text-bambu-gray flex flex-wrap gap-x-3">
                                 <span>{t('queue.itemCount', { count: agg.count })}</span>
@@ -2498,6 +2493,7 @@ export function QueuePage() {
                                   timeFormat={timeFormat}
                                   hasPermission={hasPermission}
                                   canModify={canModify}
+                                  printerNameById={printerNameById}
                                   t={t}
                                   aggregateForRows={aggregateForRows}
                                 />
