@@ -119,6 +119,9 @@ class PrintQueueItemCreate(BaseModel):
 class PrintQueueItemUpdate(BaseModel):
     printer_id: int | None = None
     target_model: str | None = None  # Target printer model (mutually exclusive with printer_id)
+    # The PRINTERS pool. Set to a list to make the unit a printers pool, to null to
+    # clear it; mutually exclusive with printer_id and target_model.
+    target_printer_ids: list[int] | None = None
     target_location: str | None = None  # Target location filter (only used with target_model)
     filament_overrides: list[dict] | None = None  # Filament overrides for model-based assignment
     position: int | None = None
@@ -153,6 +156,8 @@ class PrintQueueItemResponse(BaseModel):
     id: int
     printer_id: int | None  # None = unassigned
     target_model: str | None = None  # Target printer model for model-based assignment
+    # The PRINTERS pool — decoded; ``services/dispatch_target.py`` is the codec.
+    target_printer_ids: list[int] | None = None
     target_location: str | None = None  # Target location filter for model-based assignment
     required_filament_types: list[str] | None = None  # Required filament types for model-based assignment
     filament_overrides: list[dict] | None = None  # Filament overrides for model-based assignment

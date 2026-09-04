@@ -3665,6 +3665,11 @@ async def run_migrations(conn):
     # single-event quarantine no longer falsely claims "1 consecutive failures".
     await _migrate_quarantine_template_reason_led(conn)
 
+    # Migration: drop the hardcoded "Any" from the default ``queue_job_assigned`` body
+    # now that callers pass the whole target noun phrase (a printers pool has no single
+    # model). See ``_migrate_queue_assigned_template_pool_label``.
+    await _migrate_queue_assigned_template_pool_label(conn)
+
     # Migration (WI-1, FIFO substrate): record when a spool FIRST entered service.
     # TIMESTAMP (not DATETIME) so the ADD COLUMN is valid on both SQLite and
     # Postgres for existing-DB upgrades — matches the adjacent ``spent_at``
@@ -4315,6 +4320,170 @@ async def run_migrations(conn):
                 [r[0] for r in _stale_mapped],
             )
 
+    # Cutover (2026-09-04, the printer-subset POOL wave): re-type every pending farm
+    # unit whose ``printer_id`` was a creation-time DERIVATION, once.
+    #
+    # ``printer_id`` on a PENDING row changed meaning in this release, exactly as
+    # ``ams_mapping`` did in the 08-12 cutover above. A run that targeted a SUBSET of
+    # the fleet used to round-robin its plates into hard ``printer_id`` values at
+    # creation time — a materialised placement decision, taken hours before any printer
+    # was asked whether it was free. It now holds an operator PIN and nothing else: a
+    # subset is a POOL (``target_printer_ids``), ``printer_id`` stays NULL while the unit
+    # waits, and the scheduler places each unit against live fleet state at dispatch.
+    #
+    # Every pre-release value is therefore mis-typed data — a derivation sitting in a
+    # column that now reads as a human's instruction — and left alone it is strictly
+    # worse than it was: the scheduler no longer re-searches a pin, so a unit whose
+    # round-robin happened to name a printer that is down, quarantined or busy waits for
+    # that one machine while five idle members of its own subset stand there.
+    #
+    # Decided per BATCH, not per row, and that is the one difference from 08-12: that
+    # migration cleared to NULL, this one WRITES a reconstruction, so the reconstruction
+    # has to be read off the only evidence that survived — the batch's own units. Two
+    # shapes, in this order:
+    #   * ANY unit of the batch (any status) carrying a target_model means the run was a
+    #     MODEL run all along, and these pinned pending rows are ``top_up_run``'s
+    #     mis-pinned replacements of failed units (the latent bug this wave also fixes).
+    #     They become that model pool — never a printers pool, which would silently
+    #     narrow a whole-fleet run down to whichever machines happened to fail on it.
+    #   * otherwise the batch was a SUBSET run, and its pool is the DISTINCT printer_ids
+    #     across ALL of its units, any status: the round-robin touched every member of
+    #     the subset once ``n_plates >= len(subset)``, so the units themselves are the
+    #     record of what the operator selected.
+    #
+    # HONEST LIMITS, stated here and in the summary log line because a reconstruction
+    # that overstates itself is worse than none:
+    #   1. a x1 run's recoverable set is the ONE printer it was pinned to — a
+    #      single-plate run cannot witness the rest of its subset, so it becomes a
+    #      one-member pool. Identical behaviour to today, no worse.
+    #   2. an operator's manual PATCH pin on a farm unit is INDISTINGUISHABLE from the
+    #      creation-time derivation (same column, same value, no provenance), and is
+    #      converted with the rest. A pending farm row can carry a real pin again only
+    #      after this release.
+    # Non-farm queue items are untouched: the ``print_batches.sku_file_id`` join is what
+    # scopes this to production runs, and a standalone or plain-batch item's printer_id
+    # was always the operator's own choice.
+    #
+    # Executed through an ORM session joined to this connection as a SAVEPOINT (the
+    # ``repair_runout_reclaim_20260813`` shape below) so the new positions come from
+    # ``queue_builder.allocate_queue_positions`` — the ONE position rule, which also
+    # holds the Postgres advisory lock for the scope. A hand-rolled ``MAX(position)+1``
+    # here would be a second implementation of it, free to drift. Each batch takes ONE
+    # contiguous block in the NULL scope, its rows ordered by their OLD position (then
+    # old printer_id, then id) so the round-robin's interleaving survives as queue
+    # order; the block lands AFTER any existing NULL-scope pending rows (there are none
+    # on production today). Marker written in the same transaction, so a second boot is
+    # a no-op; fully guarded, so a cutover that cannot run never takes startup down.
+    _pool_cutover_marker = "migration_pool_pinned_farm_units_20260904"
+    _pool_cutover_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _pool_cutover_marker})
+    ).scalar()
+    if not _pool_cutover_done:
+        _pool_log_tag = f"[MIGRATION] {_pool_cutover_marker}:"
+        try:
+            from sqlalchemy import select as _pool_select
+            from sqlalchemy.ext.asyncio import AsyncSession as _PoolAsyncSession
+
+            from backend.app.models.print_batch import PrintBatch as _PoolPrintBatch
+            from backend.app.models.print_queue import PrintQueueItem as _PoolQueueItem
+            from backend.app.services.dispatch_target import DispatchTarget as _PoolDispatchTarget
+            from backend.app.services.queue_builder import allocate_queue_positions as _pool_allocate_positions
+
+            _pool_session = _PoolAsyncSession(bind=conn, join_transaction_mode="create_savepoint")
+            try:
+                _pool_candidates = (
+                    (
+                        await _pool_session.execute(
+                            _pool_select(_PoolQueueItem)
+                            .join(_PoolPrintBatch, _PoolQueueItem.batch_id == _PoolPrintBatch.id)
+                            .where(
+                                _PoolQueueItem.status == "pending",
+                                _PoolQueueItem.printer_id.is_not(None),
+                                _PoolQueueItem.target_model.is_(None),
+                                _PoolQueueItem.target_printer_ids.is_(None),
+                                _PoolPrintBatch.sku_file_id.is_not(None),
+                            )
+                            .order_by(_PoolQueueItem.position, _PoolQueueItem.printer_id, _PoolQueueItem.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                _pool_by_batch = {}
+                for _pool_row in _pool_candidates:
+                    _pool_by_batch.setdefault(_pool_row.batch_id, []).append(_pool_row)
+
+                for _pool_batch_id in sorted(_pool_by_batch):
+                    _pool_batch_rows = _pool_by_batch[_pool_batch_id]
+                    # The whole batch, any status: a completed unit is as good a witness
+                    # of the run's target as a pending one, and on a model run it is
+                    # usually the ONLY witness left.
+                    _pool_siblings = (
+                        await _pool_session.execute(
+                            _pool_select(_PoolQueueItem.printer_id, _PoolQueueItem.target_model)
+                            .where(_PoolQueueItem.batch_id == _pool_batch_id)
+                            .order_by(_PoolQueueItem.id)
+                        )
+                    ).all()
+                    _pool_stated_model = next(
+                        (_model.strip() for _pid, _model in _pool_siblings if _model and _model.strip()),
+                        None,
+                    )
+                    if _pool_stated_model:
+                        _pool_target = _PoolDispatchTarget.for_model(_pool_stated_model)
+                    else:
+                        _pool_target = _PoolDispatchTarget.printers(
+                            {_pid for _pid, _model in _pool_siblings if _pid is not None}
+                        )
+                    _pool_start = await _pool_allocate_positions(
+                        _pool_session, printer_id=None, count=len(_pool_batch_rows)
+                    )
+                    # ``fields()`` returns ALL THREE target columns with the non-owned
+                    # ones None, so the old printer_id is cleared by the same write that
+                    # states the new target — a row can never end up claiming two kinds.
+                    _pool_fields = _pool_target.fields()
+                    for _pool_offset, _pool_row in enumerate(_pool_batch_rows):
+                        _pool_row.position = _pool_start + _pool_offset
+                        for _pool_column, _pool_value in _pool_fields.items():
+                            setattr(_pool_row, _pool_column, _pool_value)
+                    logger.info(
+                        "%s batch %s → %s (kind=%s) re-typed ids=%s",
+                        _pool_log_tag,
+                        _pool_batch_id,
+                        _pool_target.describe(),
+                        _pool_target.kind.value,
+                        [_pool_row.id for _pool_row in _pool_batch_rows],
+                    )
+                await _pool_session.execute(
+                    text(
+                        "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                    ),
+                    {"key": _pool_cutover_marker},
+                )
+                await _pool_session.commit()
+            except Exception:
+                await _pool_session.rollback()
+                raise
+            finally:
+                await _pool_session.close()
+            if _pool_candidates:
+                logger.info(
+                    "%s %d pending farm unit(s) across %d batch(es) re-typed from creation-time pins to pools "
+                    "(one-time; a pending printer_id is an operator pin from here on). Honest limits: a x1 "
+                    "run's recoverable set is the ONE printer it was pinned to, and a manual operator pin made "
+                    "before this release is indistinguishable from the derivation and was converted with the rest",
+                    _pool_log_tag,
+                    len(_pool_candidates),
+                    len(_pool_by_batch),
+                )
+        except Exception:  # noqa: BLE001 — a cutover must never take startup down for every install
+            logger.exception(
+                "[MIGRATION] %s failed and was rolled back (non-fatal); the marker stays unwritten so a "
+                "later boot retries it",
+                _pool_cutover_marker,
+            )
+
     # Repair (2026-08-13, the release-before-runout resurrection incident): retire the
     # seven DEAD ledger rows that were re-bound onto freshly-loaded rolls, once.
     #
@@ -4621,8 +4790,7 @@ async def run_migrations(conn):
     )
     await _safe_execute(
         conn,
-        "CREATE INDEX IF NOT EXISTS ix_slot_recheck_intent_slot "
-        "ON slot_recheck_intent (printer_id, ams_id, tray_id)",
+        "CREATE INDEX IF NOT EXISTS ix_slot_recheck_intent_slot ON slot_recheck_intent (printer_id, ams_id, tray_id)",
     )
 
     # Migration (2026-08-23): the plate a print actually ran, stored ON the print.
@@ -4717,6 +4885,42 @@ async def _migrate_quarantine_template_reason_led(conn) -> None:
                 "AND is_default = :isdef AND body_template = :old"
             ),
             {"new": _QUARANTINE_TEMPLATE_NEW_BODY, "old": _QUARANTINE_TEMPLATE_OLD_BODY, "isdef": True},
+        )
+
+
+# The exact pre-pool default body — the migration only rewrites a row still holding
+# this text (an untouched default), never a user-customised template.
+_QUEUE_ASSIGNED_TEMPLATE_OLD_BODY = "{job_name} assigned to {printer} (from Any {target_model} queue)"
+_QUEUE_ASSIGNED_TEMPLATE_NEW_BODY = "{job_name} assigned to {printer} (from {target_model} queue)"
+
+
+async def _migrate_queue_assigned_template_pool_label(conn) -> None:
+    """Drop the hardcoded "Any" from the default ``queue_job_assigned`` body.
+
+    The template's ``{target_model}`` placeholder used to be filled with a bare model
+    name, so the copy supplied the article itself. A unit can now be targeted at a
+    PRINTERS pool, which has no single model, so callers pass the whole noun phrase
+    instead — ``"Any H2S"`` or ``"Any of 001-H2S, 003-H2S"`` (``DispatchTarget.describe``,
+    the one phrasing). Left as it was, an install would render "from Any Any of
+    001-H2S, 003-H2S queue".
+
+    ``seed_notification_templates`` only INSERTS missing event types — it never updates
+    an existing row — so installs that already seeded the old default keep the wrong
+    copy without this backfill. Updates ONLY the untouched default row (``is_default``
+    set AND body still equal to the old default text); a template an admin customised is
+    left alone. Bound parameters keep it SQLite + Postgres safe (``is_default`` adapts to
+    1 / true per dialect).
+    """
+    from sqlalchemy import text
+
+    async with conn.begin_nested():
+        await conn.execute(
+            text(
+                "UPDATE notification_templates SET body_template = :new "
+                "WHERE event_type = 'queue_job_assigned' "
+                "AND is_default = :isdef AND body_template = :old"
+            ),
+            {"new": _QUEUE_ASSIGNED_TEMPLATE_NEW_BODY, "old": _QUEUE_ASSIGNED_TEMPLATE_OLD_BODY, "isdef": True},
         )
 
 
