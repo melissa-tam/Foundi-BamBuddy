@@ -3137,6 +3137,12 @@ class PrintScheduler:
         the row claim and the printer claim.
         """
         removed = await self._cleanup_refused_upload(printer, remote_path, item.id, "a refused commit")
+        # Read the printer BEFORE the release: on a POOL row (target_model /
+        # target_printer_ids) the release sends the unit back to the pool by clearing
+        # ``printer_id``, so every read after the refresh below would be None — and
+        # the printer claim being dropped, the warning being triaged and the progress
+        # event all name the printer this dispatch was ON.
+        refused_printer_id = item.printer_id
         released = await release_unstarted_claim(db, item_id=item.id)
         await db.commit()
         if released:
@@ -3147,12 +3153,12 @@ class PrintScheduler:
             # ``status == "printing"`` bookkeeping included) believes a dispatch that
             # has just been unwound.
             await db.refresh(item)
-        plate_occupancy.release_dispatch(item.printer_id, f"commit refused ({refusal})")
+        plate_occupancy.release_dispatch(refused_printer_id, f"commit refused ({refusal})")
         logger.warning(
             "Queue item %s: plate gate rose mid-dispatch on printer %s (%s) — dispatch refused, gate left "
             "standing; row %s, uploaded file %s %s the printer",
             item.id,
-            item.printer_id,
+            refused_printer_id,
             refusal,
             "returned to 'pending'" if released else "was already moved on",
             remote_filename,
@@ -3161,7 +3167,7 @@ class PrintScheduler:
         dispatch_progress.emit_queue_item_status(
             item_id=item.id,
             batch_id=item.batch_id,
-            printer_id=item.printer_id,
+            printer_id=refused_printer_id,
             status="pending",
             phase="assigned",
         )
@@ -3818,6 +3824,7 @@ class PrintScheduler:
             item_id=item_id,
             started_at=datetime.now(timezone.utc),
             ams_mapping=json.dumps(ams_mapping) if ams_mapping else None,
+            printer_id=item.printer_id,
         )
         if not claimed:
             # Someone moved the row while we were uploading — an operator cancel

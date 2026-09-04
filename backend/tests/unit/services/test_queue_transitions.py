@@ -187,6 +187,9 @@ class TestEmptyInput:
 
 
 _CLAIMED_AT = datetime(2026, 8, 21, 9, 15, 0, tzinfo=timezone.utc)
+# The printer the dispatch ran on. Required on the claim since the 2026-09-04
+# pool-target wave: a POOL unit's row learns its printer HERE and nowhere earlier.
+_DISPATCH_PRINTER_ID = 4
 
 
 class TestDispatchClaim:
@@ -200,7 +203,13 @@ class TestDispatchClaim:
             item.ams_mapping = "[3, -1]"  # the operator's PIN, pre-dispatch
             await db.commit()
 
-            assert await claim_pending_for_dispatch(db, item_id=item_id, started_at=_CLAIMED_AT, ams_mapping="[1, -1]")
+            assert await claim_pending_for_dispatch(
+                db,
+                item_id=item_id,
+                started_at=_CLAIMED_AT,
+                ams_mapping="[1, -1]",
+                printer_id=_DISPATCH_PRINTER_ID,
+            )
             await db.commit()
 
         after = await _row(session_factory, item_id)
@@ -209,6 +218,36 @@ class TestDispatchClaim:
         assert after.waiting_reason is None
         # The pin has become the RECORD of the mapping that actually ran.
         assert after.ams_mapping == "[1, -1]"
+        # And the same sentence about ``printer_id``: on a pending row it was an
+        # operator pin (here: nothing), from this write on it records where the
+        # dispatch went. A pool unit's row learns its printer at exactly this point.
+        assert after.printer_id == _DISPATCH_PRINTER_ID
+
+    async def test_a_pool_units_printer_is_written_by_the_claim(self, session_factory):
+        """The pool row arrives unassigned and leaves carrying the dispatch record.
+
+        The target columns are untouched: they say what the unit may run on, and the
+        claim records where it did — the two never merge into one another.
+        """
+        async with session_factory() as db:
+            item = PrintQueueItem(status="pending", position=0, target_printer_ids="[1,4,5]")
+            db.add(item)
+            await db.commit()
+            item_id = item.id
+            assert item.printer_id is None
+
+            assert await claim_pending_for_dispatch(
+                db,
+                item_id=item_id,
+                started_at=_CLAIMED_AT,
+                ams_mapping=None,
+                printer_id=_DISPATCH_PRINTER_ID,
+            )
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert after.printer_id == _DISPATCH_PRINTER_ID
+        assert after.target_printer_ids == "[1,4,5]"
 
     async def test_a_mapping_free_dispatch_nulls_the_column(self, session_factory):
         (item_id,) = await _seed(session_factory, "pending")
@@ -217,7 +256,13 @@ class TestDispatchClaim:
             item.ams_mapping = "[3, -1]"
             await db.commit()
 
-            assert await claim_pending_for_dispatch(db, item_id=item_id, started_at=_CLAIMED_AT, ams_mapping=None)
+            assert await claim_pending_for_dispatch(
+                db,
+                item_id=item_id,
+                started_at=_CLAIMED_AT,
+                ams_mapping=None,
+                printer_id=_DISPATCH_PRINTER_ID,
+            )
             await db.commit()
 
         assert (await _row(session_factory, item_id)).ams_mapping is None
@@ -229,7 +274,13 @@ class TestDispatchClaim:
             await db.commit()
             cancelled_at = (await _row(session_factory, item_id)).completed_at
 
-            assert not await claim_pending_for_dispatch(db, item_id=item_id, started_at=_CLAIMED_AT, ams_mapping="[1]")
+            assert not await claim_pending_for_dispatch(
+                db,
+                item_id=item_id,
+                started_at=_CLAIMED_AT,
+                ams_mapping="[1]",
+                printer_id=_DISPATCH_PRINTER_ID,
+            )
             await db.commit()
 
         after = await _row(session_factory, item_id)
@@ -237,20 +288,34 @@ class TestDispatchClaim:
         assert after.completed_at == cancelled_at
         assert after.started_at is None
         assert after.ams_mapping is None
+        assert after.printer_id is None
 
     async def test_an_already_printing_item_is_refused(self, session_factory):
         """Double-dispatch protection falls out of the same precondition."""
         (item_id,) = await _seed(session_factory, "printing")
         async with session_factory() as db:
-            assert not await claim_pending_for_dispatch(db, item_id=item_id, started_at=_CLAIMED_AT, ams_mapping="[1]")
+            assert not await claim_pending_for_dispatch(
+                db,
+                item_id=item_id,
+                started_at=_CLAIMED_AT,
+                ams_mapping="[1]",
+                printer_id=_DISPATCH_PRINTER_ID,
+            )
             await db.commit()
 
         after = await _row(session_factory, item_id)
         assert after.started_at is None  # the second claim wrote nothing
+        assert after.printer_id is None
 
     async def test_an_unknown_id_is_refused(self, session_factory):
         async with session_factory() as db:
-            assert not await claim_pending_for_dispatch(db, item_id=999_999, started_at=_CLAIMED_AT, ams_mapping=None)
+            assert not await claim_pending_for_dispatch(
+                db,
+                item_id=999_999,
+                started_at=_CLAIMED_AT,
+                ams_mapping=None,
+                printer_id=_DISPATCH_PRINTER_ID,
+            )
 
 
 class TestDispatchClaimRace:
@@ -276,7 +341,11 @@ class TestDispatchClaimRace:
             # still SAYS pending, and that is precisely what must not decide.
             assert loaded.status == "pending"
             assert not await claim_pending_for_dispatch(
-                dispatcher, item_id=item_id, started_at=_CLAIMED_AT, ams_mapping="[1]"
+                dispatcher,
+                item_id=item_id,
+                started_at=_CLAIMED_AT,
+                ams_mapping="[1]",
+                printer_id=_DISPATCH_PRINTER_ID,
             )
             await dispatcher.commit()
 
@@ -418,6 +487,28 @@ class TestDeleteUserItemsUnlessPrinting:
         assert await _surviving(session_factory) == ids
 
 
+async def _seed_claimed_pool_row(
+    session_factory,
+    *,
+    target_model: str | None = None,
+    target_printer_ids: str | None = None,
+) -> int:
+    """A ``printing`` row as the dispatcher leaves it: the printer recorded, plus
+    whatever target it was dispatched FROM (none = a pinned unit)."""
+    async with session_factory() as db:
+        item = PrintQueueItem(
+            status="printing",
+            position=0,
+            printer_id=_DISPATCH_PRINTER_ID,
+            started_at=_CLAIMED_AT,
+            target_model=target_model,
+            target_printer_ids=target_printer_ids,
+        )
+        db.add(item)
+        await db.commit()
+        return item.id
+
+
 class TestReleaseUnstartedClaim:
     """``printing → pending``: un-claiming a dispatch that never landed.
 
@@ -450,6 +541,47 @@ class TestReleaseUnstartedClaim:
         # column means an operator PIN (2026-08-12 pin contract: never a cache).
         assert after.ams_mapping is None
         assert after.waiting_reason is None
+
+    async def test_a_model_targeted_row_goes_back_to_the_pool(self, session_factory):
+        """On a POOL row ``printer_id`` was the dispatch RECORD, so un-making the
+        dispatch un-makes it: leaving it would hand the next tick a scheduler decision
+        wearing the shape of an operator PIN."""
+        item_id = await _seed_claimed_pool_row(session_factory, target_model="H2S")
+
+        async with session_factory() as db:
+            assert await release_unstarted_claim(db, item_id=item_id) is True
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert after.status == "pending"
+        assert after.printer_id is None
+        assert after.target_model == "H2S"  # the TARGET is untouched — only the record goes
+
+    async def test_a_printer_subset_row_goes_back_to_the_pool(self, session_factory):
+        item_id = await _seed_claimed_pool_row(session_factory, target_printer_ids="[1,4,5]")
+
+        async with session_factory() as db:
+            assert await release_unstarted_claim(db, item_id=item_id) is True
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert after.status == "pending"
+        assert after.printer_id is None
+        assert after.target_printer_ids == "[1,4,5]"
+
+    async def test_a_pinned_row_keeps_its_pin(self, session_factory):
+        """No pool target ⇒ the ``printer_id`` predates the dispatch and is a human's
+        instruction. An unwound claim must not silently unpin the unit."""
+        item_id = await _seed_claimed_pool_row(session_factory)
+
+        async with session_factory() as db:
+            assert await release_unstarted_claim(db, item_id=item_id) is True
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert after.status == "pending"
+        assert after.printer_id == _DISPATCH_PRINTER_ID
+        assert (after.target_model, after.target_printer_ids) == (None, None)
 
     @pytest.mark.parametrize("status", ["pending", "completed", "cancelled", "failed", "skipped"])
     async def test_only_a_printing_row_moves(self, session_factory, status):
@@ -501,7 +633,13 @@ class TestReleaseUnstartedClaim:
             await db.commit()
 
             # Re-dispatched: the fresh claim's columns stand.
-            assert await claim_pending_for_dispatch(db, item_id=item_id, started_at=_CLAIMED_AT, ams_mapping="[2]")
+            assert await claim_pending_for_dispatch(
+                db,
+                item_id=item_id,
+                started_at=_CLAIMED_AT,
+                ams_mapping="[2]",
+                printer_id=_DISPATCH_PRINTER_ID,
+            )
             await db.commit()
 
         after = await _row(session_factory, item_id)

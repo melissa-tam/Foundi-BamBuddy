@@ -1081,6 +1081,11 @@ async def run_migrations(conn):
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN nozzle_mapping TEXT")
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN nozzles_info TEXT")
 
+    # Migration: target_printer_ids on print_queue — the printer POOL target
+    # (2026-09-04 pool-target wave). Canonical JSON int list; see the column's
+    # comment block in models/print_queue.py and services/dispatch_target.py.
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN target_printer_ids TEXT")
+
     # Migration: Add target_parts_count column to projects for tracking total parts needed
     await _safe_execute(conn, "ALTER TABLE projects ADD COLUMN target_parts_count INTEGER")
 
