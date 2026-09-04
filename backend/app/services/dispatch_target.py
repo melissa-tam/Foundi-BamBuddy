@@ -206,10 +206,11 @@ class DispatchTarget:
     def matches(self, printer_id: int, printer_model: str | None) -> bool:
         """Is this printer a member of the target? Membership only — see the class docstring.
 
-        The MODEL comparison mirrors ``print_scheduler._find_idle_printer_for_model``
-        (normalise the TARGET, compare case-insensitively against the printer's stored
-        model) and ``farm_correlation.farm_model_work_pending``, which already mirror
-        each other. A printer with no model recorded matches NOTHING: an unknown model
+        The MODEL comparison is the scheduler's own (normalise the TARGET, compare
+        case-insensitively against the printer's stored model): both
+        ``print_scheduler._find_idle_printer_for_target`` (through :meth:`printer_filter`)
+        and ``farm_correlation.farm_work_slated_for`` (through this method) ask it here,
+        so the two answers cannot drift. A printer with no model recorded matches NOTHING: an unknown model
         is not a wildcard, and treating it as one would dispatch a model-targeted unit
         onto a machine nobody has identified.
         """
@@ -226,10 +227,10 @@ class DispatchTarget:
         """The SAME predicate as :meth:`matches`, expressed as SQL over ``Printer``.
 
         One predicate, two dialects — the Python and SQL membership tests must never
-        drift (``farm_correlation.farm_model_work_pending``'s docstring documents that
-        hazard: it does its model comparison in Python precisely BECAUSE no SQL-side
-        normalisation existed, so that the scheduler's answer and its own could not
-        disagree). Here both spellings live in one class, side by side, and a test
+        drift. Before this object existed the deep-park's Python model comparison and
+        the scheduler's SQL one were two hand-kept mirrors, with a docstring warning
+        that no SQL-side normalisation existed to keep them honest. Here both spellings
+        live in one class, side by side, and a test
         asserts they select the same printers.
 
         UNASSIGNED renders ``false()`` rather than raising: a caller filtering a query

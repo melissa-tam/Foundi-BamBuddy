@@ -11,9 +11,9 @@ failure:
 
 * ``TestPrinterFilterAgreesWithMatches`` drives the Python predicate and the SQL
   predicate over the SAME seeded printers and asserts they select the same ids.
-  ``farm_correlation.farm_model_work_pending`` documents that hazard from the other
-  side (it does its model comparison in Python precisely because no SQL-side
-  normalisation existed); this object carries both spellings, so the drift is testable
+  The deep-park's Python model comparison and the scheduler's SQL one used to be two
+  hand-kept mirrors (no SQL-side normalisation existed to keep them honest); this
+  object carries both spellings, so the drift is testable
   here instead of only being avoidable.
 * ``TestForRun`` pins the model normalisation as a MIRROR of
   ``production_run.create_production_run`` — a run's stored ``target_model`` and this
@@ -201,8 +201,8 @@ class TestMatches:
         assert DispatchTarget.for_model("H2S").matches(1, "h2s") is True
 
     def test_a_display_name_target_matches_the_stored_short_name(self):
-        """The normalisation runs on the TARGET, mirroring
-        ``print_scheduler._find_idle_printer_for_model``."""
+        """The normalisation runs on the TARGET — the rule
+        ``print_scheduler._find_idle_printer_for_target`` inherits through ``printer_filter``."""
         assert DispatchTarget.for_model("Bambu Lab H2S").matches(1, "H2S") is True
 
     def test_a_different_model_never_matches(self):

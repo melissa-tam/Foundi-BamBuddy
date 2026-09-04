@@ -30,7 +30,7 @@ import type { PrintQueueItem } from '../api/client';
 
 /**
  * Filters queue items based on printer compatibility (filament types and colors).
- * Mirrors backend _find_idle_printer_for_model() logic.
+ * Mirrors the filament-compatibility half of the backend's _find_idle_printer_for_target() logic.
  * @param items - Array of queue items to filter
  * @param loadedFilamentTypes - Set of loaded filament types (e.g., "PLA", "PETG")
  * @param loadedFilaments - Set of loaded filament type+color pairs (e.g., "PLA:ffffff", "PETG:ff0000")

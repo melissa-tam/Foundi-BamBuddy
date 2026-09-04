@@ -233,6 +233,27 @@ async def test_migrated_rows_land_after_existing_null_scope_pending_work(engine)
 
 
 @pytest.mark.asyncio
+async def test_clears_the_old_schedulers_transient_pick_from_pending_pool_rows(engine):
+    """A pre-cutover MODEL unit held mid-dispatch still carries the old scheduler's
+    pick; the pending-row invariant says a pool row carries no printer until its
+    dispatch claims one. The pool columns are untouched; a PRINTING row keeps its
+    dispatch record; a plain pinned row (no pool) is not a pool row and keeps its pin."""
+    async with engine.begin() as conn:
+        farm = await _add_batch(conn, sku_file_id=1)
+        held_model = await _add_item(conn, batch_id=farm, printer_id=4, target_model="H2S", position=1)
+        held_pool = await _add_item(conn, batch_id=None, printer_id=5, target_printer_ids="[5,6]", position=2)
+        printing = await _add_item(conn, batch_id=farm, printer_id=6, target_model="H2S", status="printing", position=3)
+        plain_pin = await _add_item(conn, batch_id=None, printer_id=7, position=4)
+        await run_migrations(conn)
+
+    async with engine.connect() as conn:
+        assert (await _target(conn, held_model))[:3] == (None, "H2S", None)
+        assert (await _target(conn, held_pool))[:3] == (None, None, "[5,6]")
+        assert (await _target(conn, printing))[:3] == (6, "H2S", None)
+        assert (await _target(conn, plain_pin))[:3] == (7, None, None)
+
+
+@pytest.mark.asyncio
 async def test_records_a_durable_marker_so_it_runs_once(engine):
     async with engine.begin() as conn:
         await run_migrations(conn)

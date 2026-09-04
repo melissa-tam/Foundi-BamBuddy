@@ -4454,6 +4454,24 @@ async def run_migrations(conn):
                         _pool_target.kind.value,
                         [_pool_row.id for _pool_row in _pool_batch_rows],
                     )
+                # The other half of the same meaning change: a pending POOL row (model or
+                # printer subset) that still carries a printer_id. Before this release the
+                # scheduler wrote its pick onto the pending row and relied on three un-pin
+                # guards to take it back; a unit held mid-dispatch at restart (USB gone,
+                # capability block) keeps that stale pick. Nothing on the new dispatch path
+                # reads it, but ``farm_work_targets_printer`` (the plate-gate raise rule) and
+                # the run response's assigned-printer list both would — as a BOUND unit. The
+                # old queue API refused printer_id together with target_model, so on a
+                # pending row the pair can only ever be the old scheduler's transient pick,
+                # never an operator's; clearing it is what the pending-row invariant says
+                # the row should have read all along.
+                _pool_stale_pick = await _pool_session.execute(
+                    text(
+                        "UPDATE print_queue SET printer_id = NULL "
+                        "WHERE status = 'pending' AND printer_id IS NOT NULL "
+                        "AND (target_model IS NOT NULL OR target_printer_ids IS NOT NULL)"
+                    )
+                )
                 await _pool_session.execute(
                     text(
                         "INSERT INTO settings (key, value) SELECT :key, 'true' "
@@ -4467,6 +4485,13 @@ async def run_migrations(conn):
                 raise
             finally:
                 await _pool_session.close()
+            if _pool_stale_pick.rowcount:
+                logger.info(
+                    "%s cleared the old scheduler's transient printer_id from %d pending pool row(s) "
+                    "(a pending pool row carries no printer until its dispatch claims one)",
+                    _pool_log_tag,
+                    _pool_stale_pick.rowcount,
+                )
             if _pool_candidates:
                 logger.info(
                     "%s %d pending farm unit(s) across %d batch(es) re-typed from creation-time pins to pools "
