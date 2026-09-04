@@ -174,6 +174,7 @@ _REFUSAL_REASONS: dict[TransitionRefusal, EjectRefusalReason] = {
     "dispatch_in_flight": "dispatch_in_flight",
     "eject_in_flight": "eject_in_flight",
     "not_occupied": "no_plate_gate",
+    "z_unreferenced": "z_unreferenced",
 }
 
 
@@ -363,7 +364,14 @@ async def manual_eject(
         return EjectVerdict.refused("not_connected")
 
     state = printer_manager.get_status(printer_id)
-    ev = Evidence(live_state=getattr(state, "state", None))
+    # ``z_reference`` comes from the eject lane's ONE origin so the manual dialog and
+    # the automatic cooldown lane refuse a lost-Z printer on the same evidence — the
+    # manual door is the one an operator reaches for after a reboot, so it is the one
+    # that most needs the refusal to be reachable.
+    ev = Evidence(
+        live_state=getattr(state, "state", None),
+        z_reference=eject_remote.z_reference_evidence(printer_id),
+    )
 
     # (3) Declare-first. The confirm leg passes the flag again, but by then the gate is
     # up and this branch is skipped — a declaration can never double-raise, and it never

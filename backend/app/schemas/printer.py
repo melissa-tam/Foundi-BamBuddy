@@ -40,10 +40,14 @@ EjectOrigin = Literal["foreign", "farm_unit", "declared"]
 #: dialog. ``no_plate_gate`` is the authority's ``not_occupied`` under the name the API
 #: has always used for it, and survives only for declare-less callers — every UI surface
 #: declares occupancy, so it can no longer be reached from a printer card.
+#: ``z_unreferenced`` (2026-09-04) is the fifth authority token: the printer rebooted
+#: with a part on the plate, so its Z frame is fiction and no sweep may run against it
+#: until a human removes the part and marks the plate cleared.
 EjectRefusalReason = Literal[
     "job_active",
     "dispatch_in_flight",
     "eject_in_flight",
+    "z_unreferenced",
     "not_connected",
     "no_plate_gate",
     "bed_unreadable",

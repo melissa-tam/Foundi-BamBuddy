@@ -53,6 +53,7 @@ from backend.app.schemas.settings import AppSettings
 from backend.app.services.eject import remote as eject_remote
 from backend.app.services.plate_occupancy import (
     CooldownEject,
+    EscalationOnly,
     FirstArticleEject,
     ForeignAutoEject,
     OccupancyPolicy,
@@ -180,6 +181,39 @@ async def _default_notify_cooldown_escalation(
         )
 
 
+async def _hold_for_human(printer_id: int, exc: eject_remote.EjectDispatchError, *, cause: str) -> str:
+    """Page, then convert the plate to an escalation-only hold. Returns ``"stalled"``.
+
+    The reaction to a TERMINAL eject refusal — a state no amount of retrying can cure
+    (:data:`~backend.app.services.eject.remote._TERMINAL_REFUSALS`; today: a printer
+    that rebooted with a part on the plate, whose Z frame is fiction). Burning the
+    watch's three dispatch attempts against it would only delay the page by a minute
+    and teach the log nothing.
+
+    **The order is load-bearing.** ``set_policy`` fans out through the authority to
+    :meth:`EjectCooldownMonitor.on_occupancy_change`, which cancels the watch task this
+    coroutine is running INSIDE — so a page issued after it dies at its first await and
+    the operator is never told. Page first, transition second; a test pins exactly that.
+
+    Never a strike and never a quarantine: ``on_stall`` is deliberately NOT called. The
+    printer is healthy and its plate is held by a hold that a human resolves; taking it
+    out of rotation as well would punish the machine for the farm's own safety refusal.
+    """
+    logger.warning(
+        "Eject monitor: printer %s eject refused TERMINALLY (%s, cause=%s) — paging and holding the plate "
+        "for a human; no retry, no quarantine",
+        printer_id,
+        exc.code,
+        cause,
+    )
+    try:
+        await notify_plate_not_empty(printer_id, source_detail=eject_remote.terminal_refusal_detail(exc.code))
+    except Exception:  # noqa: BLE001 — a notify failure must not stop the hold below
+        logger.exception("Eject monitor: terminal-refusal page for printer %s failed", printer_id)
+    plate_occupancy.set_policy(printer_id, EscalationOnly())
+    return "stalled"
+
+
 async def watch_bed_and_clear(
     printer_id: int,
     threshold_c: float,
@@ -255,9 +289,11 @@ async def watch_bed_and_clear(
 
         Returns ``"released"`` on success (or when no dispatcher is wired),
         ``"retry"`` to keep polling after a dispatch failure (< 3 so far),
-        ``"stalled"`` once THREE consecutive failures trip the stall path, or
-        ``"cleared"`` when the plate-clear gate dropped between the top-of-poll check
-        and here (W2/W3 hardening — never sweep an already-emptied plate)."""
+        ``"stalled"`` once THREE consecutive failures trip the stall path OR a TERMINAL
+        refusal holds the plate for a human (:func:`_hold_for_human` — page then
+        escalation-only, no strike, no quarantine), or ``"cleared"`` when the
+        plate-clear gate dropped between the top-of-poll check and here (W2/W3
+        hardening — never sweep an already-emptied plate)."""
         nonlocal release_failures
         # Re-check the gate at the release boundary: the escalate/plateau/manual
         # branches can reach here after an await, during which an operator (or the
@@ -274,7 +310,9 @@ async def watch_bed_and_clear(
             return "released"
         try:
             await on_release()
-        except Exception:  # noqa: BLE001 — a dispatch failure retries, never kills the watch
+        except Exception as exc:  # noqa: BLE001 — a dispatch failure retries, never kills the watch
+            if isinstance(exc, eject_remote.EjectDispatchError) and exc.terminal:
+                return await _hold_for_human(printer_id, exc, cause=cause)
             release_failures += 1
             logger.exception(
                 "Eject monitor: printer %s eject dispatch failed (attempt %d, cause=%s)",

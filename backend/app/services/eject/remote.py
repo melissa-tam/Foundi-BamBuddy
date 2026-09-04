@@ -86,6 +86,8 @@ __all__ = [
     "matches_pending_eject",
     "on_eject_start_echo",
     "parse_eject_job_name",
+    "redrive_eject_stop",
+    "z_reference_evidence",
 ]
 
 # printer_id -> the armed runtime watchdog for that printer's in-flight eject.
@@ -174,7 +176,12 @@ _STOP_RETRY_DELAY_S = 5.0
 # kill (the P50→P75 distribution it logs is what arms a calibrated sweep kill next wave),
 # so a job overrunning its sweep budget is still stopped by the whole-job deadline under
 # "total" — today's timing, unchanged.
-EjectStopStage = Literal["total", "drop", "drop_late", "epilogue"]
+#
+# "power_loss" is the one stage NO deadline produces: it is the pause-recovery lane
+# re-driving a kill the watchdog already decided but could not deliver, because the
+# printer was off the wire when it fired (2026-09-04 outage). The stage exists so the
+# kill's copy can say what actually happened rather than borrowing a deadline's wording.
+EjectStopStage = Literal["total", "drop", "drop_late", "epilogue", "power_loss"]
 
 # Where the phase poller is in the block. Typed beside the stop vocabulary because the
 # two are read together: the phase decides which deadline binds, and the deadline names
@@ -511,6 +518,14 @@ def _stop_reason(
     ``stage``; where no phase was ever observed it is the whole job's elapsed time,
     because then the whole job IS the only phase the farm can speak about.
     """
+    if stage == "power_loss":
+        # No deadline fired and no phase was timed: the printer LEFT THE WIRE with a
+        # sweep in flight, so every runtime figure describes a machine nobody was
+        # watching. Saying anything about spans here would be inventing evidence.
+        return (
+            "eject interrupted by a power loss; sweep unverified",
+            "power_loss_eject_interrupted",
+        )
     drop_budget = f"{drop_span_s:.0f}s" if drop_span_s is not None else "its"
     if stage == "drop":
         return (
@@ -554,29 +569,23 @@ def _stop_reason(
     )
 
 
-async def _stop_and_page(
+async def _stamp_stop_and_page(
     printer_id: int,
-    current: EjectIdentity,
-    armed: PendingEject,
     *,
     sleep: Callable[[float], Awaitable[None]],
     stage: EjectStopStage,
-    fired_deadline_s: float,
-    phase_elapsed_s: float,
-    progress: float | None,
-    line_number: int | None,
-    drop_span_s: float | None,
-    sweep_span_s: float | None,
+    diagnostic: str,
+    source_detail: str,
+    situation: str,
 ) -> None:
     """Stamp the runtime verdict, stop the job mid-flight, page the operator.
 
-    The ONE kill path — every rule in :func:`_runtime_watchdog` ends here, so the
-    ordering guarantees below hold whichever deadline fired. ``progress`` and
-    ``line_number`` are the deciding rule's OWN telemetry sample, handed down rather
-    than re-read here: a second read would report the state of the printer a moment
-    later than the one the kill was decided on, which is the one thing a post-incident
-    reader must be able to trust. ``drop_span_s`` / ``sweep_span_s`` are the budgets in
-    force at that moment (see :func:`_stop_reason`).
+    THE one kill path. Both entries — the runtime watchdog's deadlines
+    (:func:`_stop_and_page`) and the pause-recovery lane's re-drive
+    (:func:`redrive_eject_stop`) — end here, so the ordering guarantees hold whatever
+    decided the kill. Callers supply the RENDERED copy (``diagnostic`` / ``source_detail``
+    from :func:`_stop_reason`) and a ``situation`` clause for the log; nothing here
+    re-derives a judgement of its own.
 
     No escalation watch is armed here, unlike the pre-cut-over code: while an eject
     owns the printer the plate carries no watch by construction (an armed cooldown
@@ -587,7 +596,8 @@ async def _stop_and_page(
     # Stamp the mark FIRST. A terminal racing this task must find the verdict already
     # set: the mark is what keeps the plate gated, so a terminal that slipped past an
     # unmarked pending would release the gate onto a plate the printer was about to be
-    # stopped over.
+    # stopped over. First-write-wins in the authority, so a re-drive over an already
+    # stamped pending is a no-op here and the stop below is what actually gets redone.
     #
     # RECORDED REFUSAL: this stamp is unconditional across stages, so even an "epilogue"
     # kill — where the wire said the sweep COMPLETED — resolves the eject `unverified`
@@ -595,30 +605,8 @@ async def _stop_and_page(
     # contract: sweep motion complete is not part off plate, and a farm that clears a
     # gate on a job it had to stop is judging on a criterion other than the one it
     # stopped for.
-    elapsed_s = _elapsed_since_start_s(current)
-    diagnostic, source_detail = _stop_reason(
-        stage,
-        fired_deadline_s=fired_deadline_s,
-        phase_elapsed_s=phase_elapsed_s,
-        expected_s=armed.expected_runtime_s or 0.0,
-        drop_span_s=drop_span_s,
-        sweep_span_s=sweep_span_s,
-    )
-    fired_at = datetime.now(timezone.utc)
-    plate_occupancy.note_eject_runtime_exceeded(printer_id, fired_at, stage)
-    logger.warning(
-        "eject.remote: eject on printer %s still running at %.0fs (expected %.0fs, stage=%s, deadline %.0fs, "
-        "bed-drop span %s, gcode line %s, %s%% done) — %s; stopping the eject job mid-flight",
-        printer_id,
-        elapsed_s,
-        armed.expected_runtime_s,
-        stage,
-        fired_deadline_s,
-        armed.drop_span_s,
-        line_number,
-        progress,
-        diagnostic,
-    )
+    plate_occupancy.note_eject_runtime_exceeded(printer_id, datetime.now(timezone.utc), stage)
+    logger.warning("eject.remote: %s — %s; stopping the eject job mid-flight", situation, diagnostic)
 
     # Deliberately NOT via mark_printer_stopped_by_user: this is not an operator
     # stop, and nothing downstream may read the echoed status as intent. The mark
@@ -648,6 +636,100 @@ async def _stop_and_page(
         await notify_plate_not_empty(printer_id, source_detail=source_detail)
     except Exception:  # noqa: BLE001 — a notify failure must never kill the watchdog
         logger.exception("eject.remote: mid-flight abort notification failed for printer %s", printer_id)
+
+
+async def _stop_and_page(
+    printer_id: int,
+    current: EjectIdentity,
+    armed: PendingEject,
+    *,
+    sleep: Callable[[float], Awaitable[None]],
+    stage: EjectStopStage,
+    fired_deadline_s: float,
+    phase_elapsed_s: float,
+    progress: float | None,
+    line_number: int | None,
+    drop_span_s: float | None,
+    sweep_span_s: float | None,
+) -> None:
+    """The runtime watchdog's entry into the kill path.
+
+    Renders the deadline's own evidence into copy and hands it to
+    :func:`_stamp_stop_and_page`. ``progress`` and ``line_number`` are the deciding
+    rule's OWN telemetry sample, handed down rather than re-read here: a second read
+    would report the state of the printer a moment later than the one the kill was
+    decided on, which is the one thing a post-incident reader must be able to trust.
+    ``drop_span_s`` / ``sweep_span_s`` are the budgets in force at that moment (see
+    :func:`_stop_reason`)."""
+    diagnostic, source_detail = _stop_reason(
+        stage,
+        fired_deadline_s=fired_deadline_s,
+        phase_elapsed_s=phase_elapsed_s,
+        expected_s=armed.expected_runtime_s or 0.0,
+        drop_span_s=drop_span_s,
+        sweep_span_s=sweep_span_s,
+    )
+    situation = (
+        f"eject on printer {printer_id} still running at {_elapsed_since_start_s(current):.0f}s "
+        f"(expected {armed.expected_runtime_s or 0.0:.0f}s, stage={stage}, deadline {fired_deadline_s:.0f}s, "
+        f"bed-drop span {armed.drop_span_s}, gcode line {line_number}, {progress}% done)"
+    )
+    await _stamp_stop_and_page(
+        printer_id,
+        sleep=sleep,
+        stage=stage,
+        diagnostic=diagnostic,
+        source_detail=source_detail,
+        situation=situation,
+    )
+
+
+async def redrive_eject_stop(
+    printer_id: int,
+    *,
+    stage: EjectStopStage,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> bool:
+    """Re-drive the ONE eject kill path for a pending sweep whose stop never landed.
+
+    True iff a pending eject was found and the kill was re-driven; False when the
+    printer holds no eject (nothing to stop, and nothing to say).
+
+    The 2026-09-04 outage is the shape this exists for: the runtime watchdog fired
+    while the printer was off the wire, BOTH ``stop_print`` sends returned False, the
+    task logged and exited — and nothing re-sent on reconnect. The pending and its
+    ``runtime_exceeded_at`` stayed registered, so every later eject on that printer
+    refused ``eject_in_flight`` forever.
+
+    It is a RE-DRIVE, never a second implementation: the stamp-before-stop ordering,
+    the single ``_STOP_RETRY_DELAY_S`` retry and the page all come from
+    :func:`_stamp_stop_and_page`, and the stamp is first-write-wins, so re-driving a
+    pending the watchdog already marked keeps the ORIGINAL verdict time and merely
+    redoes the delivery. Nothing here resolves the eject: the stopped job's terminal
+    resolves ``unverified`` through ``farm_policy.on_terminal``, which is still the one
+    ``resolve_eject`` caller in the codebase.
+
+    An eject is NEVER resumed (the 2026-07-31 gouged-plate class): a sweep whose
+    machine state is unknown may only be stopped."""
+    if plate_occupancy.pending_eject_view(printer_id) is None:
+        return False
+    diagnostic, source_detail = _stop_reason(
+        stage,
+        fired_deadline_s=0.0,
+        phase_elapsed_s=0.0,
+        expected_s=0.0,
+        drop_span_s=None,
+        sweep_span_s=None,
+    )
+    await _stamp_stop_and_page(
+        printer_id,
+        sleep=sleep,
+        stage=stage,
+        diagnostic=diagnostic,
+        source_detail=source_detail,
+        situation=f"re-driving the eject stop on printer {printer_id} (stage={stage})",
+    )
+    return True
 
 
 async def _runtime_watchdog(
@@ -1042,15 +1124,25 @@ class EjectDispatchError(RuntimeError):
     ``code`` is the stable machine-readable reason the UI branches on. It carries the
     authority's own :data:`~backend.app.services.plate_occupancy.TransitionRefusal`
     token verbatim when an occupancy check refused the sweep (``job_active``,
-    ``dispatch_in_flight``, ``eject_in_flight``, ``not_occupied``), so the operator
-    is told which of them held — one refusal vocabulary, from the state machine to
-    the dialog. Everything else keeps the generic default.
+    ``dispatch_in_flight``, ``eject_in_flight``, ``not_occupied``,
+    ``z_unreferenced``), so the operator is told which of them held — one refusal
+    vocabulary, from the state machine to the dialog. Everything else keeps the
+    generic default.
+
+    ``terminal`` says whether RETRYING can ever help. It is set from
+    :data:`_TERMINAL_REFUSALS` in :func:`_refusal_error` — a property of the refusal
+    VOCABULARY, never a flag a raiser chooses — so an automatic lane (the cooldown
+    watch) can tell "come back in 20 s" apart from "a human must act", without
+    sniffing tokens at the point of failure.
     """
 
-    def __init__(self, message: str, *, status_code: int = 409, code: str = "eject_dispatch_failed") -> None:
+    def __init__(
+        self, message: str, *, status_code: int = 409, code: str = "eject_dispatch_failed", terminal: bool = False
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.terminal = terminal
 
 
 # The refusal → operator sentence map for the eject lane. The authority speaks only
@@ -1063,7 +1155,39 @@ _EJECT_REFUSAL_MESSAGES: dict[str, str] = {
     "dispatch_in_flight": "A queued unit is being sent to this printer; retry in a few seconds",
     "eject_in_flight": "An eject is already in flight on this printer",
     "not_occupied": "Printer is not awaiting plate clear; nothing to eject",
+    "z_unreferenced": (
+        "Printer restarted with a part on the plate and its Z reference is lost — remove the part by hand "
+        "and Mark plate cleared"
+    ),
 }
+
+# Refusals no amount of waiting can cure. Terminal-ness is a property of the refusal
+# VOCABULARY, declared here beside the copy, rather than a flag each raiser sets: the
+# automatic lanes (the cooldown watch above all) must be able to tell a transient
+# conflict — a job finishing, an upload landing, a sweep completing — from a state that
+# needs a HUMAN, and deriving that at each raise is how the two drift apart.
+#
+# A terminal refusal is therefore not a retry strike: the cooldown watch pages and
+# converts the plate to an escalation hold instead of burning its three dispatch
+# attempts against a wall.
+_TERMINAL_REFUSALS: frozenset[TransitionRefusal] = frozenset({"z_unreferenced"})
+
+# The ``notify_plate_not_empty`` source_detail a terminal refusal escalates under —
+# beside the vocabulary it belongs to, so a lane that must page for one of these never
+# has to know which one it got. Same token style as the event's existing
+# ``printer_vision`` / ``camera_cv`` / ``cooldown_timeout`` details.
+_TERMINAL_REFUSAL_DETAILS: dict[TransitionRefusal, str] = {
+    "z_unreferenced": "z_reference_lost_after_reboot",
+}
+
+
+def terminal_refusal_detail(code: str) -> str:
+    """The escalation ``source_detail`` for a terminal refusal ``code``.
+
+    Falls back to the token itself, so a refusal added to :data:`_TERMINAL_REFUSALS`
+    without its copy pages under a name a reader can still grep — never silently under
+    another refusal's wording."""
+    return _TERMINAL_REFUSAL_DETAILS.get(code, code)  # type: ignore[arg-type]
 
 
 def _refusal_error(refusal: TransitionRefusal) -> EjectDispatchError:
@@ -1072,7 +1196,36 @@ def _refusal_error(refusal: TransitionRefusal) -> EjectDispatchError:
         _EJECT_REFUSAL_MESSAGES.get(refusal, f"Eject refused ({refusal})"),
         status_code=409,
         code=refusal,
+        terminal=refusal in _TERMINAL_REFUSALS,
     )
+
+
+def z_reference_evidence(printer_id: int) -> bool | None:
+    """Is this printer's Z frame still trustworthy? ``False`` = it is fiction.
+
+    THE one origin of :attr:`~backend.app.services.plate_occupancy.Evidence.z_reference`,
+    consumed by BOTH eject Evidence builders (this module's :func:`_live_evidence` and
+    the manual lane's), so the manual "Eject plate" dialog refuses with the same
+    sentence the automatic lane pages with.
+
+    Sync and DB-free by construction — it reads ``printer_incidents.snapshot``, the
+    same process-cache projection the printer card's chip renders — so it can be called
+    from the pre-flight of a dispatcher without an await.
+
+    Returns ``False`` ONLY on an open ``z_reference_lost`` incident (a printer that
+    rebooted with a part on its plate: the firmware's Z datum after boot is a
+    fabrication and every absolute Z move in the eject block would execute against it —
+    002-H2S drove the bed past the Z floor that way on 2026-09-04). Otherwise ``None``:
+    the farm has no positive evidence that Z IS referenced, and claiming True would be
+    inventing one. ``None`` passes the gate, so absence of the hold is absence of the
+    refusal — exactly today's behaviour."""
+    from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
+    from backend.app.services import printer_incidents
+
+    incident = printer_incidents.snapshot(printer_id)
+    if incident is not None and incident.get("kind") == KIND_Z_REFERENCE_LOST:
+        return False
+    return None
 
 
 def _live_evidence(printer_id: int) -> Evidence:
@@ -1088,10 +1241,16 @@ def _live_evidence(printer_id: int) -> Evidence:
 
     The eject lane is also ungated by live HMS, deliberately (2026-08-29 W4): an
     eject is filament-less, and holding the plate behind an AMS fault would deadlock
-    the very plate that holds the printer.
+    the very plate that holds the printer. ``z_reference`` is the deliberate exception
+    and is not an HMS gate at all: it is a durable HOLD saying the machine's own
+    coordinate frame is wrong, which is the one condition under which the sweep's
+    motion is the hazard.
     """
     state = printer_manager.get_status(printer_id)
-    return Evidence(live_state=getattr(state, "state", None) if state is not None else None)
+    return Evidence(
+        live_state=getattr(state, "state", None) if state is not None else None,
+        z_reference=z_reference_evidence(printer_id),
+    )
 
 
 async def _resolve_source_path(db: AsyncSession, item: PrintQueueItem) -> Path:

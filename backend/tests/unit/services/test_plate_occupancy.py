@@ -1038,11 +1038,43 @@ class TestGatePriorities:
             ("nothing declared", None, po.Evidence(), "not_occupied"),
             ("a stale printing row is never an eject refusal", "plate", po.Evidence(db_claim=True), None),
             ("a declared plate on an idle printer", "plate", po.Evidence(live_state=IDLE), None),
+            (
+                # The 2026-09-04 002-H2S shape: the reboot destroyed the Z datum, so
+                # every absolute Z move in the block would run against a fiction.
+                "a lost Z reference",
+                "plate",
+                po.Evidence(live_state=IDLE, z_reference=False),
+                "z_unreferenced",
+            ),
+            (
+                # ...but the wire still comes first: telling an operator to remove a
+                # part by hand from a plate that is mid-print is the wrong machine.
+                "the wire outranks the Z frame",
+                "plate",
+                po.Evidence(live_state=RUNNING, z_reference=False),
+                "job_active",
+            ),
+            ("an unanswered Z frame passes", "plate", po.Evidence(live_state=IDLE, z_reference=None), None),
+            ("a re-established Z frame passes", "plate", po.Evidence(live_state=IDLE, z_reference=True), None),
         ],
     )
     def test_ejectable_table(self, label, setup, ev, expected, clock):
         self._setup(setup, clock)
         assert po.plate_occupancy.ejectable(1, ev) == expected, label
+
+    def test_the_z_frame_never_refuses_a_unit_dispatch(self):
+        """``dispatchable`` is untouched: a lost Z frame is re-established by the next
+        print's OWN start-gcode, which homes every axis on an empty plate. Refusing the
+        dispatch would hold the printer for a condition the dispatch itself cures."""
+        assert po.plate_occupancy.dispatchable(1, po.Evidence(live_state=IDLE, z_reference=False)) is None
+
+    def test_claim_for_eject_is_gated_by_the_same_rule(self):
+        """The claim runs AFTER the upload, so a hold that appeared meanwhile must still
+        refuse — the pre-flight and the claim are one gate, not two."""
+        _occupy(1)
+        refusal = po.plate_occupancy.claim_for_eject(1, _pending(), po.Evidence(live_state=IDLE, z_reference=False))
+        assert refusal == "z_unreferenced"
+        assert po.plate_occupancy.pending_eject_view(1) is None
 
     def test_the_owner_projection(self, clock):
         assert po.plate_occupancy.snapshot(1, po.Evidence(live_state=IDLE)).owner == "none"
