@@ -94,7 +94,8 @@ export default {
       anyModel: 'Beliebiger {{model}}-Drucker',
       modelSelect: 'Druckermodell',
       modelMismatchWarning: 'Die Datei wurde für {{fileModel}} geslict, zielt aber auf {{model}} — die Fähigkeitsprüfung hält nicht passende Drucker zurück',
-      specificPrinters: 'Bestimmte Drucker',
+      specificPrinters: 'Ausgewählte Drucker',
+      specificPrintersHint: 'Einheiten werden an den nächsten freien Drucker der Auswahl gesendet.',
       ejectProfile: 'Auswurfprofil',
       noEjectProfile: 'Keines',
       skuDefault: 'SKU-Standard',
@@ -1744,6 +1745,7 @@ export default {
       allStatus: 'Alle Status',
       allLocations: 'Alle Standorte',
       any: 'Beliebig',
+      anyOf: 'Beliebig aus',
     },
     // Sort
     sort: {

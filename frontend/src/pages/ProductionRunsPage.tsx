@@ -35,6 +35,7 @@ import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { Modal } from '../components/ui/Modal';
 import { InlineAlert } from '../components/ui/InlineAlert';
+import { InfoHint } from '../components/ui/InfoHint';
 import { inputClass } from '../components/ui/Field';
 import { FirstArticleBanner } from '../components/FirstArticleBanner';
 import {
@@ -525,16 +526,21 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
                     </select>
                   )}
                 </div>
-                <label className="flex items-center gap-2 text-sm text-white cursor-pointer">
-                  <input
-                    type="radio"
-                    name="run-printer-mode"
-                    checked={mode === 'specific'}
-                    onChange={() => setMode('specific')}
-                    className="accent-bambu-green"
-                  />
-                  {t('productionRuns.fields.specificPrinters')}
-                </label>
+                {/* The hint is a SIBLING of the label, never inside it, so the
+                    radio's accessible name stays the visible label alone. */}
+                <div className="flex items-center gap-1.5">
+                  <label className="flex items-center gap-2 text-sm text-white cursor-pointer">
+                    <input
+                      type="radio"
+                      name="run-printer-mode"
+                      checked={mode === 'specific'}
+                      onChange={() => setMode('specific')}
+                      className="accent-bambu-green"
+                    />
+                    {t('productionRuns.fields.specificPrinters')}
+                  </label>
+                  <InfoHint text={t('productionRuns.fields.specificPrintersHint')} />
+                </div>
               </div>
 
               {mode === 'specific' && (
@@ -821,9 +827,16 @@ function RunCard({
             </div>
             <p className="text-sm text-bambu-gray mt-0.5">
               {run.sku_code}
-              {run.printers.length > 0 && (
+              {/* The run's TARGET, not where its units happen to have landed:
+                  a model pool, a printers pool, or — for a legacy pinned run
+                  that carries neither — the printers it was pinned to. */}
+              {run.target_model ? (
+                <span> · {t('productionRuns.fields.anyModel', { model: run.target_model })}</span>
+              ) : run.target_printers.length > 0 ? (
+                <span> · {run.target_printers.map((p) => p.name).join(', ')}</span>
+              ) : run.printers.length > 0 ? (
                 <span> · {run.printers.map((p) => p.name).join(', ')}</span>
-              )}
+              ) : null}
             </p>
           </div>
           <div className="flex items-center gap-1 shrink-0">
@@ -1050,8 +1063,10 @@ export function ProductionRunsPage() {
     setDialogOpen(true);
   };
 
-  // Run again (F9): reopen the dialog seeded from a finished run. Model-targeted
-  // runs carry target_model (no printers); specific-printer runs carry printers.
+  // Run again (F9): reopen the dialog seeded from a finished run. A model pool
+  // carries target_model; a printers pool carries target_printers. A legacy
+  // pinned run carries neither, so its members come from `printers` — the
+  // printers that actually ran it.
   const openRunAgain = (run: ProductionRun) => {
     startMutation.reset();
     const hasModel = run.target_model != null && run.target_model !== '';
@@ -1059,7 +1074,11 @@ export function ProductionRunsPage() {
       skuFileId: run.sku_file_id,
       targetUnits: run.target_units,
       mode: hasModel ? 'model' : 'specific',
-      printerIds: hasModel ? [] : run.printers.map((p) => p.id),
+      printerIds: hasModel
+        ? []
+        : run.target_printers.length > 0
+          ? run.target_printers.map((p) => p.id)
+          : run.printers.map((p) => p.id),
       targetModel: run.target_model ?? null,
       ejectProfileId: run.eject_profile_id,
       cooldownOverride: run.cooldown_temp_c_override,

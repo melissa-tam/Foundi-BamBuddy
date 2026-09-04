@@ -957,6 +957,9 @@ export function PrintModal({
             const updateData: PrintQueueItemUpdate = {
               printer_id: null,
               target_model: targetModel,
+              // Targets are three-way exclusive: naming a model clears any
+              // printers pool the item carried.
+              target_printer_ids: null,
               target_location: targetLocation,
               filament_overrides: filamentOverridesArray || null,
               require_previous_success: scheduleOptions.requirePreviousSuccess,
@@ -1020,6 +1023,9 @@ export function PrintModal({
               const updateData: PrintQueueItemUpdate = {
                 printer_id: printerId,
                 target_model: null,
+                // Targets are three-way exclusive: pinning a printer clears any
+                // printers pool the item carried.
+                target_printer_ids: null,
                 target_location: null,
                 require_previous_success: scheduleOptions.requirePreviousSuccess,
                 auto_off_after: scheduleOptions.autoOffAfter,
