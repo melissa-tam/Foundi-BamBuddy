@@ -4,9 +4,11 @@ import { formatDuration, parseUTCDate } from '../utils/date';
 import type { PrintQueueItem, Printer } from '../api/client';
 import { api } from '../api/client';
 import { Button } from './Button';
+import { describeQueueTarget } from '../utils/queueTarget';
+import type { QueueTargetKind } from '../utils/queueTarget';
 
 /** Gantt-style 24h-rolling timeline. One horizontal swimlane per printer
- *  (plus one per active target_model and one for unassigned items). Each
+ *  (plus one per active pool target and one for unassigned items). Each
  *  pending or printing job is rendered as a colored bar positioned by its
  *  predicted start time, width = predicted duration. A vertical NOW line
  *  marks current time. Hover a bar for details, click to edit/stop. */
@@ -39,10 +41,9 @@ interface QueueTimelineViewProps {
 interface LaneDescriptor {
   key: string;
   label: string;
-  /** null for model-based / unassigned lanes. */
-  printerId: number | null;
-  /** Set for model-based lanes (`Any X1C`). */
-  targetModel: string | null;
+  /** Which target shape this lane represents — the fleet lanes are always
+   *  `printer`; the rest come from the items' own targets. */
+  kind: QueueTargetKind;
 }
 
 function formatHour(date: Date): string {
@@ -71,6 +72,13 @@ export function QueueTimelineView({
   // time, so the timeline reads "next 24h from now."
   const [windowOffsetMs, setWindowOffsetMs] = useState(0);
 
+  // Fleet names keyed by id — a printers-pool unit names its members by id
+  // only, so the lane label resolves them through this one map.
+  const printerNameById = useMemo(
+    () => new Map(printers.map((p) => [p.id, p.name] as const)),
+    [printers],
+  );
+
   // Round the window start down to the previous full hour so the axis ticks
   // land on whole hours.
   const rangeStartMs = useMemo(() => {
@@ -97,11 +105,8 @@ export function QueueTimelineView({
     // Chain-end timestamp per lane (where the next pending item's bar starts).
     const chainEndByLane = new Map<string, number>();
 
-    const laneKeyOf = (item: PrintQueueItem): string => {
-      if (item.printer_id != null) return `printer:${item.printer_id}`;
-      if (item.target_model) return `model:${item.target_model}`;
-      return 'unassigned';
-    };
+    const laneKeyOf = (item: PrintQueueItem): string =>
+      describeQueueTarget(item, t, printerNameById).key;
 
     for (const item of queueItems) {
       if (item.status === 'printing') {
@@ -167,63 +172,54 @@ export function QueueTimelineView({
       }
     }
     return result;
-  }, [queueItems, printerStatuses, nowMs]);
+  }, [queueItems, printerStatuses, nowMs, printerNameById, t]);
 
-  // Lanes: every printer + every distinct target_model with queue activity
+  // Lanes: every printer + every distinct pool target with queue activity
   // + an "unassigned" lane if needed. Printers that have NO events queued
   // still get a lane so users see idle capacity.
   const lanes = useMemo<LaneDescriptor[]>(() => {
     const list: LaneDescriptor[] = [];
+    // A fleet lane is the target a unit pinned to that printer would carry, so
+    // it is described through the same origin — its key must match the one
+    // `eventsByLane` computes from the items.
     for (const p of printers) {
-      list.push({
-        key: `printer:${p.id}`,
-        label: p.name,
-        printerId: p.id,
-        targetModel: null,
-      });
+      list.push(
+        describeQueueTarget(
+          { printer_id: p.id, printer_name: p.name, target_model: null, target_printer_ids: null },
+          t,
+          printerNameById,
+        ),
+      );
     }
-    const modelLanesAdded = new Set<string>();
-    let hasUnassigned = false;
+    // Pool lanes (a printers pool or a model pool) appear only when they carry
+    // work; unassigned stays last so the fleet reads top-down.
+    const poolLanesAdded = new Set<string>();
+    let unassignedLane: LaneDescriptor | null = null;
     for (const ev of events) {
-      if (ev.item.printer_id != null) continue;
-      if (ev.item.target_model) {
-        const k = `model:${ev.item.target_model}`;
-        if (!modelLanesAdded.has(k)) {
-          modelLanesAdded.add(k);
-          list.push({
-            key: k,
-            label: `${t('queue.filter.any')} ${ev.item.target_model}`,
-            printerId: null,
-            targetModel: ev.item.target_model,
-          });
-        }
-      } else {
-        hasUnassigned = true;
+      const target = describeQueueTarget(ev.item, t, printerNameById);
+      if (target.kind === 'printer') continue;
+      if (target.kind === 'unassigned') {
+        unassignedLane = target;
+        continue;
+      }
+      if (!poolLanesAdded.has(target.key)) {
+        poolLanesAdded.add(target.key);
+        list.push(target);
       }
     }
-    if (hasUnassigned) {
-      list.push({
-        key: 'unassigned',
-        label: t('queue.filter.unassigned'),
-        printerId: null,
-        targetModel: null,
-      });
-    }
+    if (unassignedLane) list.push(unassignedLane);
     return list;
-  }, [printers, events, t]);
+  }, [printers, printerNameById, events, t]);
 
   const eventsByLane = useMemo(() => {
     const map = new Map<string, ScheduleEvent[]>();
     for (const ev of events) {
-      let key: string;
-      if (ev.item.printer_id != null) key = `printer:${ev.item.printer_id}`;
-      else if (ev.item.target_model) key = `model:${ev.item.target_model}`;
-      else key = 'unassigned';
+      const key = describeQueueTarget(ev.item, t, printerNameById).key;
       if (!map.has(key)) map.set(key, []);
       map.get(key)!.push(ev);
     }
     return map;
-  }, [events]);
+  }, [events, printerNameById, t]);
 
   const hourTicks = useMemo(() => {
     const ticks: { ms: number; pct: number; label: string }[] = [];
@@ -352,11 +348,11 @@ export function QueueTimelineView({
                 <div key={lane.key} className="flex border-b border-bambu-dark-tertiary/40 last:border-b-0">
                   <div className="w-32 sm:w-40 shrink-0 px-3 py-3 border-r border-bambu-dark-tertiary flex items-center gap-2">
                     <PrinterIcon className={`w-3.5 h-3.5 shrink-0 ${
-                      lane.printerId == null && lane.targetModel == null
+                      lane.kind === 'unassigned'
                         ? 'text-orange-400'
-                        : lane.targetModel
-                          ? 'text-blue-400'
-                          : 'text-bambu-green'
+                        : lane.kind === 'printer'
+                          ? 'text-bambu-green'
+                          : 'text-blue-400'
                     }`} />
                     <span className="text-sm text-white truncate">{lane.label}</span>
                   </div>

@@ -5,6 +5,8 @@ import zipfile
 import pytest
 from sqlalchemy import select
 
+from backend.app.services.dispatch_target import decode_printer_ids
+
 _PLATE_GCODE = (
     "; HEADER_BLOCK_START\n"
     "; max_z_height: 20.00\n"
@@ -183,6 +185,48 @@ class TestFirstArticleEndpoints:
         assert payload["first_article_state"] == "pending_print"
         assert payload["status"] == "active"
         assert payload["first_article_reject_reason"] is None
+
+    async def test_printer_pool_gated_run_stays_a_pool_through_approval(
+        self, async_client, db_session, tmp_path, printer_factory
+    ):
+        """A ``printer_ids`` run is a POOL at BOTH first-article materialisation points.
+
+        The FA plate used to be pinned to ``printer_ids[0]`` and the plates materialised
+        on approval continued that round-robin from index 1. Both are now the run's one
+        target: no unit carries a ``printer_id`` while it waits, and every unit names the
+        same pool.
+        """
+        p1 = await printer_factory(name="FA-POOL-1", model="H2S")
+        p2 = await printer_factory(name="FA-POOL-2", model="H2S")
+        body = await _create_run(
+            async_client,
+            db_session,
+            tmp_path,
+            "SKU216.01",
+            require_first_article=True,
+            target_model=None,
+            printer_ids=[p1.id, p2.id],
+        )
+        items = await _run_items(db_session, body["id"])
+        assert len(items) == 1  # only the FA plate exists while gated
+        fa = items[0]
+        assert fa.first_article is True
+        assert fa.printer_id is None
+        assert decode_printer_ids(fa.target_printer_ids) == {p1.id, p2.id}
+        assert fa.target_model is None
+
+        await _drive_fa_to_awaiting(db_session, body["id"])
+        r = await async_client.post(
+            f"/api/v1/production-runs/{body['id']}/first-article/approve", json={"eject_remotely": False}
+        )
+        assert r.status_code == 200, r.text
+
+        items = await _run_items(db_session, body["id"])
+        assert len(items) == 3  # FA + 2 materialised remaining plates
+        for it in items:
+            assert it.printer_id is None
+            assert decode_printer_ids(it.target_printer_ids) == {p1.id, p2.id}
+            assert it.target_model is None
 
     async def test_reject_reason_length_validation(self, async_client, db_session, tmp_path):
         body = await _create_run(async_client, db_session, tmp_path, "SKU215.01", require_first_article=True)

@@ -16,6 +16,7 @@ from backend.app.models.printer import Printer
 from backend.app.models.printer_model_geometry import PrinterModelGeometry
 from backend.app.models.sku import Sku, SkuFile
 from backend.app.services import farm_policy
+from backend.app.services.dispatch_target import decode_printer_ids, encode_printer_ids
 from backend.app.services.notification_service import notification_service
 from backend.app.services.plate_occupancy import (
     DispatchLease,
@@ -826,13 +827,16 @@ class TestRecoverPrinter:
         assert batch.first_article_state == "rejected"
 
 
-async def _mk_failed_item(db, batch, prof, *, printer_id=3, retry_count=0, target_model=None, pos=99):
+async def _mk_failed_item(
+    db, batch, prof, *, printer_id=3, retry_count=0, target_model=None, target_printer_ids=None, pos=99
+):
     item = PrintQueueItem(
         batch_id=batch.id,
         status="failed",
         first_article=False,
         printer_id=printer_id,
         target_model=target_model,
+        target_printer_ids=target_printer_ids,
         eject_profile_id=prof.id,
         plate_id=1,
         retry_count=retry_count,
@@ -953,7 +957,7 @@ class TestFailurePolicyBatchGate:
 
 
 class TestRetryRebalance:
-    """Retry rebalance (Phase 1, F7): model-targeted retries return to the pool."""
+    """Retry rebalance (Phase 1, F7): POOL retries return to the pool."""
 
     async def test_model_targeted_retry_returns_to_unassigned_pool(self, db_session):
         batch, prof = await _mk_run(db_session, quantity=2, target_model="H2S", require_fa=False)
@@ -971,6 +975,28 @@ class TestRetryRebalance:
         created = await farm_policy.create_retry_if_absent(db_session, item)
         assert created is not None
         assert created.printer_id == 7  # operator-pinned run keeps its printer
+
+    async def test_printer_pool_retry_returns_to_pool(self, db_session):
+        """A printers-pool unit's retry goes back to the POOL, not to the printer
+        that just failed it: on the failed row ``printer_id`` is the attribution
+        RECORD of where this attempt ran, and copying it would pin the chain to the
+        machine the scheduler should now avoid."""
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[7, 9], require_fa=False)
+        item = await _mk_failed_item(
+            db_session,
+            batch,
+            prof,
+            printer_id=7,
+            target_model=None,
+            target_printer_ids=encode_printer_ids([7, 9]),
+            pos=1,
+        )
+
+        created = await farm_policy.create_retry_if_absent(db_session, item)
+        assert created is not None
+        assert created.printer_id is None
+        assert decode_printer_ids(created.target_printer_ids) == {7, 9}
+        assert created.target_model is None
 
 
 class TestRetryRaceLoser:

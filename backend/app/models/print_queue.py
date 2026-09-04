@@ -21,6 +21,33 @@ class PrintQueueItem(Base):
     # Target location filter for model-based assignment (only used with target_model)
     # When set, only printers in this location are considered
     target_location: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Target printer POOL: canonical JSON int list, e.g. '[1,3,5]' (NULL = no pool).
+    #
+    # A unit names its dispatch target in exactly one of four ways, and
+    # ``services/dispatch_target.py`` is the ONE codec and discriminator over them —
+    # never parse or write this column anywhere else:
+    #   PINNED     printer_id set, no pool column   -> the operator named the machine
+    #   MODEL      target_model set                 -> any printer of that model
+    #   PRINTERS   target_printer_ids set (this)    -> any printer IN the set
+    #   UNASSIGNED nothing set                      -> never dispatched
+    #
+    # PENDING-ROW INVARIANT: on a ``pending`` row ``printer_id`` is an operator PIN and
+    # nothing else. The scheduler's chosen printer for a POOL unit is written only at
+    # the ``pending -> printing`` claim (``queue_transitions.claim_pending_for_dispatch``),
+    # exactly as the decided ``ams_mapping`` rides, and ``release_unstarted_claim``
+    # clears it again on a pool row. So a ``printer_id`` beside a pool target is a
+    # dispatch RECORD, never an instruction.
+    #
+    # DOCUMENTED DENORMALISATION (3NF exception). The set is per-row, bounded by the
+    # fleet, and is never a selective SQL predicate — the scheduler already holds every
+    # pending item in memory and tests membership there. A child table would put a
+    # lazy-load on that hot path, which loads pending items with NO eager loading, so
+    # the first membership test inside the async tick would raise ``MissingGreenlet``.
+    # The accepted integrity cost is stated rather than designed away: a deleted
+    # printer's id lingers in the JSON (there is no FK CASCADE here, unlike
+    # ``printer_id``) and ``DispatchTarget.matches`` simply never matches it — a pool
+    # narrows itself as machines are retired, which is the safe direction.
+    target_printer_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Required filament types for model-based assignment (JSON array, e.g., '["PLA", "PETG"]')
     # Used by scheduler to validate printer has compatible filaments loaded
     required_filament_types: Mapped[str | None] = mapped_column(Text, nullable=True)

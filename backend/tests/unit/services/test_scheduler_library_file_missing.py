@@ -84,7 +84,12 @@ async def case_factory(tmp_path):
             await db.flush()
 
             item = PrintQueueItem(
-                printer_id=printer.id,
+                # A POOL unit (``target_model`` set) carries NO ``printer_id`` while it
+                # is pending: on a pending row that column is an operator PIN and
+                # nothing else, and the scheduler's pick rides the dispatch plan
+                # instead (``services/dispatch_target``). A user-pinned unit
+                # (``target_model=None``) is the one that carries a printer here.
+                printer_id=None if target_model else printer.id,
                 library_file_id=library_file.id,
                 status="pending",
                 target_model=target_model,
@@ -119,7 +124,12 @@ async def case_factory(tmp_path):
 
 
 async def _dispatch(ctx):
-    """Run one ``_start_print`` pass against a fresh session, as the tick does."""
+    """Run one ``_start_print`` pass against a fresh session, as the tick does.
+
+    The printer is passed in exactly as the tick's plan passes it, which is the only
+    way a POOL unit's dispatch learns one — its pending row carries no ``printer_id``.
+    For a user-pinned unit the argument is the pin, so both cases run one code path.
+    """
     scheduler = PrintScheduler()
 
     async def archive_print(
@@ -178,7 +188,7 @@ async def _dispatch(ctx):
             stack.enter_context(patcher)
         async with ctx.session_maker() as db:
             item = await db.get(PrintQueueItem, ctx.queue_item_id)
-            await scheduler._start_print(db, item)
+            await scheduler._start_print(db, item, printer_id=ctx.printer_id)
     return scheduler
 
 
@@ -255,11 +265,16 @@ async def test_restoring_the_file_dispatches_on_the_next_pass_and_clears_the_rea
 
 
 @pytest.mark.asyncio
-async def test_model_targeted_item_unpins_so_the_fleet_is_re_searched(case_factory):
-    """A model-targeted unit releases the pin the scheduler made this tick.
+async def test_pool_item_never_carries_the_pick_so_the_fleet_is_re_searched(case_factory):
+    """A POOL unit comes out of the hold with no printer on its row — as it went in.
 
-    Same rule as the USB hold: the pin was the model path's choice, not a human's,
-    so a printer that cannot serve this unit must not become its permanent home.
+    Rewritten for the 2026-09-04 invariant: this used to assert that the hold RELEASED
+    a pin the model path had written. There is no such write any more. The scheduler's
+    pick rides the dispatch plan (``_start_print(printer_id=…)``) and lands on the row
+    only at the ``pending → printing`` claim, so a unit stopped at a hold gate leaves
+    ``printer_id`` NULL because it was never set — which is what makes the next tick
+    re-search the whole fleet, and what no longer depends on a hold gate remembering to
+    undo something.
     """
     ctx = await case_factory(file_on_disk=False, target_model="H2S")
 

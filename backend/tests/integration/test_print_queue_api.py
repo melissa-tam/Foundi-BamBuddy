@@ -418,6 +418,219 @@ class TestPrintQueueAPI:
         assert survivor.status == "printing"
 
 
+class TestQueuePrintersPool:
+    """The PRINTERS pool on the queue API surface (2026-09-04 subset-as-pool wave).
+
+    A run over a SUBSET of the fleet no longer round-robins its plates into hard
+    ``printer_id`` pins: the units carry ``target_printer_ids`` and the scheduler places
+    them. So the API has to SHOW the pool, list a pool unit under every member printer's
+    column the way an "Any H2S" unit is listed today, and let an operator re-target one
+    without a 400 dead end.
+    """
+
+    @pytest.fixture
+    async def printer_factory(self, db_session):
+        """Factory to create test printers."""
+        _counter = [0]
+
+        async def _create_printer(**kwargs):
+            from backend.app.models.printer import Printer
+
+            _counter[0] += 1
+            counter = _counter[0]
+
+            defaults = {
+                "name": f"Test Printer {counter}",
+                "ip_address": f"192.168.1.{100 + counter}",
+                "serial_number": f"TESTSERIAL{counter:04d}",
+                "access_code": "12345678",
+                "model": "X1C",
+            }
+            defaults.update(kwargs)
+
+            printer = Printer(**defaults)
+            db_session.add(printer)
+            await db_session.commit()
+            await db_session.refresh(printer)
+            return printer
+
+        return _create_printer
+
+    @pytest.fixture
+    async def archive_factory(self, db_session):
+        """Factory to create test archives."""
+        _counter = [0]
+
+        async def _create_archive(**kwargs):
+            from backend.app.models.archive import PrintArchive
+
+            _counter[0] += 1
+            counter = _counter[0]
+
+            defaults = {
+                "filename": f"pool_print_{counter}.3mf",
+                "print_name": f"Pool Print {counter}",
+                "file_path": f"/tmp/pool_print_{counter}.3mf",
+                "file_size": 1024,
+                "content_hash": f"poolhash{counter:08d}",
+                "status": "completed",
+            }
+            defaults.update(kwargs)
+
+            archive = PrintArchive(**defaults)
+            db_session.add(archive)
+            await db_session.commit()
+            await db_session.refresh(archive)
+            return archive
+
+        return _create_archive
+
+    @pytest.fixture
+    async def queue_item_factory(self, db_session, archive_factory):
+        """Factory to create test queue items. ``printer_id`` is passed through
+        verbatim — including None — because a pool unit's is deliberately NULL."""
+        _counter = [0]
+
+        async def _create_queue_item(**kwargs):
+            from backend.app.models.print_queue import PrintQueueItem
+
+            _counter[0] += 1
+            counter = _counter[0]
+
+            if "archive_id" not in kwargs:
+                archive = await archive_factory()
+                kwargs["archive_id"] = archive.id
+
+            defaults = {
+                "status": "pending",
+                "position": counter,
+                "printer_id": None,
+            }
+            defaults.update(kwargs)
+
+            item = PrintQueueItem(**defaults)
+            db_session.add(item)
+            await db_session.commit()
+            await db_session.refresh(item)
+            return item
+
+        return _create_queue_item
+
+    @pytest.fixture
+    async def fleet(self, printer_factory, queue_item_factory):
+        """Two printers of one model plus an outsider, and one unit of each target kind."""
+        from backend.app.services.dispatch_target import encode_printer_ids
+
+        first = await printer_factory(model="X1C")
+        second = await printer_factory(model="X1C")
+        outsider = await printer_factory(model="P1S")
+
+        pool_item = await queue_item_factory(target_printer_ids=encode_printer_ids([first.id, second.id]))
+        model_item = await queue_item_factory(target_model="X1C")
+        pinned_item = await queue_item_factory(printer_id=first.id)
+        return first, second, outsider, pool_item, model_item, pinned_item
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_pool_unit_is_listed_under_every_member_printer(self, async_client: AsyncClient, fleet):
+        """A member printer's column shows the pool unit beside its pinned and
+        model-targeted work; a non-member's does not.
+
+        The SQL arm that admits pool rows is a SUPERSET admitter — membership lives in a
+        JSON set the query cannot test — so this is really the post-filter's test: the
+        pool row reaches Python for every printer and only membership drops it.
+        """
+        first, second, outsider, pool_item, model_item, pinned_item = fleet
+
+        first_ids = {row["id"] for row in (await async_client.get(f"/api/v1/queue/?printer_id={first.id}")).json()}
+        assert first_ids == {pool_item.id, model_item.id, pinned_item.id}
+
+        second_ids = {row["id"] for row in (await async_client.get(f"/api/v1/queue/?printer_id={second.id}")).json()}
+        assert second_ids == {pool_item.id, model_item.id}, "the pin belongs to the first printer alone"
+
+        outsider_ids = {
+            row["id"] for row in (await async_client.get(f"/api/v1/queue/?printer_id={outsider.id}")).json()
+        }
+        assert outsider_ids == set(), "a non-member sees neither the pool nor another model's work"
+
+        unassigned_ids = {row["id"] for row in (await async_client.get("/api/v1/queue/?printer_id=-1")).json()}
+        assert unassigned_ids == {pool_item.id, model_item.id}, "a pool unit's printer_id is NULL while it waits"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_response_carries_the_decoded_pool(self, async_client: AsyncClient, fleet):
+        first, second, _outsider, pool_item, _model_item, pinned_item = fleet
+
+        body = (await async_client.get(f"/api/v1/queue/{pool_item.id}")).json()
+        assert body["target_printer_ids"] == sorted([first.id, second.id])
+        assert body["printer_id"] is None
+
+        pinned_body = (await async_client.get(f"/api/v1/queue/{pinned_item.id}")).json()
+        assert pinned_body["target_printer_ids"] is None, "no pool target, no column — never an empty list"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_patch_rejects_two_targets_at_once(self, async_client: AsyncClient, fleet):
+        """A unit has exactly ONE target, so a body naming two is refused rather than
+        silently leaving the row claiming two kinds."""
+        first, second, _outsider, _pool_item, _model_item, pinned_item = fleet
+
+        response = await async_client.patch(
+            f"/api/v1/queue/{pinned_item.id}",
+            json={"printer_id": first.id, "target_printer_ids": [second.id]},
+        )
+        assert response.status_code == 400, response.text
+        assert "at most one" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_patch_pins_a_pool_unit_when_the_pool_is_cleared_in_the_same_body(
+        self, async_client: AsyncClient, fleet
+    ):
+        """Re-targeting is not a dead end: clearing the pool in the same PATCH that
+        names a printer is how an operator pins a pool unit."""
+        first, _second, _outsider, pool_item, _model_item, _pinned_item = fleet
+
+        response = await async_client.patch(
+            f"/api/v1/queue/{pool_item.id}",
+            json={"printer_id": first.id, "target_printer_ids": None, "target_model": None},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["printer_id"] == first.id
+        assert body["target_printer_ids"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_patch_turns_a_pinned_unit_into_a_canonical_pool(self, async_client: AsyncClient, fleet):
+        """The stored form is canonical — sorted and deduped — because the column is a
+        SET; the codec owns that rule and the response reads it straight back."""
+        first, second, _outsider, _pool_item, _model_item, pinned_item = fleet
+
+        response = await async_client.patch(
+            f"/api/v1/queue/{pinned_item.id}",
+            json={"printer_id": None, "target_printer_ids": [second.id, first.id, first.id]},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["target_printer_ids"] == sorted([first.id, second.id])
+        assert body["printer_id"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_patch_rejects_a_pool_naming_a_printer_that_does_not_exist(self, async_client: AsyncClient, fleet):
+        """A pool with a phantom member is a unit that can never dispatch, and it would
+        fail silently — the scheduler simply never finds that member."""
+        first, _second, _outsider, _pool_item, _model_item, pinned_item = fleet
+
+        response = await async_client.patch(
+            f"/api/v1/queue/{pinned_item.id}",
+            json={"printer_id": None, "target_printer_ids": [first.id, 999999]},
+        )
+        assert response.status_code == 400, response.text
+        assert "999999" in response.json()["detail"]
+
+
 class TestQueueStartEndpoint:
     """Tests for the /queue/{item_id}/start endpoint."""
 

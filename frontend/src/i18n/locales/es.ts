@@ -94,7 +94,8 @@ export default {
       anyModel: 'Cualquier impresora {{model}}',
       modelSelect: 'Modelo de impresora',
       modelMismatchWarning: 'El archivo se laminó para {{fileModel}} pero apunta a {{model}} — la comprobación de capacidad retendrá las impresoras no coincidentes',
-      specificPrinters: 'Impresoras específicas',
+      specificPrinters: 'Impresoras seleccionadas',
+      specificPrintersHint: 'Las unidades se envían a la siguiente impresora libre de la selección.',
       ejectProfile: 'Perfil de expulsión',
       noEjectProfile: 'Ninguno',
       skuDefault: 'Predeterminado del SKU',
@@ -1744,6 +1745,7 @@ export default {
       allStatus: 'Todos los estados',
       allLocations: 'Todas las ubicaciones',
       any: 'Cualquiera',
+      anyOf: 'Cualquiera de',
     },
     // Sort
     sort: {

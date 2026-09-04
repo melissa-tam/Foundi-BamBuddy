@@ -123,12 +123,25 @@ class TestCapabilityGateBlockSurfacesReason:
             ),
         )
 
+        # The printer is passed exactly as the tick's plan passes it: on a pending row
+        # ``printer_id`` is an operator PIN, never the scheduler's pick, so a POOL unit's
+        # dispatch learns its printer only from this argument
+        # (``services/dispatch_target``). Today this run's units are pinned at creation
+        # and the argument equals the pin.
+        target_before = item.printer_id
+
         # Drive the single dispatch path. The gate must BLOCK (not fail).
-        await scheduler._start_print(db_session, item)
+        await scheduler._start_print(db_session, item, printer_id=printer.id)
 
         await db_session.refresh(item)
         assert item.status == "pending"  # not failed — re-evaluated later
         assert item.waiting_reason and "nozzle mismatch" in item.waiting_reason
+        # A capability BLOCK writes ONLY the reason. It neither records the printer it
+        # was blocked on nor releases a pin — so whatever the row carried at creation is
+        # exactly what it carries now. Asserted as "unchanged" rather than against a
+        # literal, because that is the invariant in both worlds: the pin today, and
+        # NULL once a subset run mints pool units.
+        assert item.printer_id == target_before
 
         # The reason is visible through the queue API with no frontend change.
         listing = await async_client.get("/api/v1/queue/")
@@ -207,12 +220,14 @@ class TestCapabilityGateBlockSurfacesReason:
             ),
         )
 
-        await scheduler._start_print(db_session, item)
+        target_before = item.printer_id  # see the sibling test above
+        await scheduler._start_print(db_session, item, printer_id=printer.id)
 
         await db_session.refresh(item)
         assert item.status == "pending"
         assert item.waiting_reason and "nozzle mismatch" in item.waiting_reason
         assert "right" in item.waiting_reason
+        assert item.printer_id == target_before  # the hold writes only the reason
 
 
 @pytest.mark.asyncio
@@ -248,9 +263,11 @@ class TestStaggerLimitsStartsPerTick:
 
         started: list[int] = []
 
-        # ``lease`` is the printer claim the tick mints at PLAN time and hands to the
-        # dispatch; a fake that cannot accept it would never be called.
-        async def fake_start(db, item, *, ams_mapping=None, lease=None):
+        # ``printer_id`` and ``lease`` are what the tick hands a planned dispatch: the
+        # decided printer (a pending row's own ``printer_id`` is an operator PIN, never
+        # the scheduler's pick) and the claim minted at PLAN time. A fake that cannot
+        # accept them would never be called.
+        async def fake_start(db, item, *, printer_id=None, ams_mapping=None, lease=None):
             item.status = "printing"
             item.started_at = datetime.now(timezone.utc)
             await db.commit()
@@ -295,7 +312,7 @@ class TestStaggerLimitsStartsPerTick:
 
         started: list[int] = []
 
-        async def fake_start(db, item, *, ams_mapping=None, lease=None):
+        async def fake_start(db, item, *, printer_id=None, ams_mapping=None, lease=None):
             item.status = "printing"
             item.started_at = datetime.now(timezone.utc)
             await db.commit()

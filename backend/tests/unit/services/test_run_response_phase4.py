@@ -9,7 +9,7 @@ resume clears it; every mutation site fires ONE ``production_run_changed``
 broadcast (spied per call site). FK enforcement is off in the test engine.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,6 +24,7 @@ from backend.app.models.printer import Printer
 from backend.app.models.sku import Sku, SkuFile
 from backend.app.services import farm_policy, farm_stall, production_run
 from backend.app.services.capability_gate import CapabilityDecision, evaluate_capability as _real_evaluate_capability
+from backend.app.services.dispatch_target import encode_printer_ids
 from backend.app.services.filament_deficit import FilamentDeficit
 from backend.app.services.notification_service import notification_service
 from backend.app.services.print_scheduler import scheduler as _scheduler
@@ -733,6 +734,49 @@ class TestPrinterEligibility:
         ids = {s["printer_id"] for s in resp["printer_states"]}
         assert ids == {h2s_a.id, h2s_b.id}
 
+    async def test_printer_pool_run_lists_its_active_members(self, db_session, elig_env):
+        """``target_printers`` and ``printer_states`` answer DIFFERENT questions.
+
+        ``target_printers`` is what the OPERATOR chose — the whole subset, an
+        inactive member included, because deactivating a printer does not edit the
+        run's target. ``printer_states`` is what the SCHEDULER can currently use, so
+        it drops the inactive member (``RunPrinterState`` has no inactive dimension
+        and the scheduler never dispatches to one) and never adds a same-model
+        printer that is not IN the pool.
+        """
+        batch = await _mk_run(db_session, quantity=1)
+        member_a = await _mk_printer(db_session, name="H2S-A")
+        member_b = Printer(
+            name="H2S-B",
+            serial_number="SN-poolB",
+            ip_address="192.0.2.7",
+            access_code="1",
+            model="H2S",
+            is_active=False,
+        )
+        non_member = Printer(
+            name="H2S-C", serial_number="SN-poolC", ip_address="192.0.2.6", access_code="1", model="H2S", is_active=True
+        )
+        db_session.add_all([member_b, non_member])
+        await db_session.flush()
+        await _add(
+            db_session,
+            batch,
+            printer_id=None,
+            target_printer_ids=encode_printer_ids([member_a.id, member_b.id]),
+            status="pending",
+        )
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run, detail=True)
+        assert {s["printer_id"] for s in resp["printer_states"]} == {member_a.id}
+        assert resp["target_printers"] == [
+            {"id": pid, "name": name} for pid, name in sorted([(member_a.id, "H2S-A"), (member_b.id, "H2S-B")])
+        ]
+        # No unit has landed anywhere yet, so nothing is "assigned".
+        assert resp["printers"] == []
+
     async def test_per_printer_exception_defaults_and_no_raise(self, db_session, elig_env):
         elig_env.deficit.side_effect = RuntimeError("malformed 3MF")
         batch = await _mk_run(db_session, quantity=1)
@@ -823,3 +867,53 @@ class TestRunAgainPrefillFields:
         assert resp["eject_profile_id"] is None
         assert resp["cooldown_temp_c_override"] is None
         assert resp["target_model"] is None
+
+
+class TestPoolRunParallelism:
+    """The ETA divisor for a POOL run is its TARGET's size, not its history.
+
+    ``median_cycle × remaining_plates ÷ distinct_printers`` used to divide by the
+    printers that had already RUN a unit. That was equivalent while a subset run
+    pinned its plates at creation (the operator's two printers were on the rows from
+    unit 1); once a subset became a pool, the same expression answered "÷1" until a
+    plate had landed on each member and quoted double the truth. No existing test
+    seeded a cycle estimate, so the pin lives here, against ``build_run_response``.
+    """
+
+    async def test_subset_run_divides_by_its_whole_pool(self, db_session):
+        batch = await _mk_run(db_session, quantity=4)
+        a = await _mk_printer(db_session, name="POOL-A")
+        b = await _mk_printer(db_session, name="POOL-B")
+        pool = encode_printer_ids([a.id, b.id])
+        # Two finished plates on ONE member give a 600 s median cycle; both landed
+        # rows carry that printer as their dispatch RECORD, and the pool columns.
+        base = datetime.now(timezone.utc)
+        await _add(
+            db_session,
+            batch,
+            printer_id=a.id,
+            target_printer_ids=pool,
+            status="completed",
+            started_at=base,
+            pos=1,
+        )
+        await _add(
+            db_session,
+            batch,
+            printer_id=a.id,
+            target_printer_ids=pool,
+            status="completed",
+            started_at=base + timedelta(seconds=600),
+            pos=2,
+        )
+        # Two plates still waiting in the pool — no printer on the row.
+        await _add(db_session, batch, printer_id=None, target_printer_ids=pool, status="pending", pos=3)
+        await _add(db_session, batch, printer_id=None, target_printer_ids=pool, status="pending", pos=4)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run, detail=True)
+        # Both members are the scheduler's universe for the remaining plates.
+        assert {s["printer_id"] for s in resp["printer_states"]} == {a.id, b.id}
+        # 600 s × 2 remaining ÷ 2 members. History-only counting would say 1200.
+        assert resp["eta_seconds"] == pytest.approx(600.0)

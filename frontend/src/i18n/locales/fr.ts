@@ -94,7 +94,8 @@ export default {
       anyModel: 'Toute imprimante {{model}}',
       modelSelect: 'Modèle d\'imprimante',
       modelMismatchWarning: 'Le fichier a été découpé pour {{fileModel}} mais vise {{model}} — le contrôle de compatibilité bloquera les imprimantes non concordantes',
-      specificPrinters: 'Imprimantes spécifiques',
+      specificPrinters: 'Imprimantes sélectionnées',
+      specificPrintersHint: 'Les unités sont envoyées à la prochaine imprimante libre de la sélection.',
       ejectProfile: 'Profil d\'éjection',
       noEjectProfile: 'Aucun',
       skuDefault: 'Défaut du SKU',
@@ -1744,6 +1745,7 @@ export default {
       allStatus: 'Tous les statuts',
       allLocations: 'Tous les emplacements',
       any: 'Tout',
+      anyOf: "L'une de",
     },
     // Sort
     sort: {

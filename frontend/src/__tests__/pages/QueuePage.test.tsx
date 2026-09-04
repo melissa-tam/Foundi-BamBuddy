@@ -816,3 +816,102 @@ describe('QueuePage farm surfaces (Phase 4)', () => {
     expect(btn).not.toHaveAttribute('title', 'Ask a queue admin to release these items');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Printers-pool targets. A unit created against a SET of printers stays unpinned
+// until the scheduler places it, so both the row and the by-printer bucket name
+// the POOL rather than a printer — one origin, `utils/queueTarget`.
+// ---------------------------------------------------------------------------
+describe('QueuePage printers-pool targets', () => {
+  const poolFleet = [
+    { ...mockPrinters[0], id: 1, name: 'H2S-Alpha', model: 'H2S' },
+    { ...mockPrinters[0], id: 2, name: 'H2C-Beta', model: 'H2C' },
+  ];
+
+  const poolItem = {
+    ...mockQueueItems[0],
+    id: 40,
+    printer_id: null,
+    printer_name: null,
+    target_printer_ids: [1, 2],
+    archive_name: 'Pool Unit',
+  };
+
+  const pinnedItem = {
+    ...mockQueueItems[0],
+    id: 41,
+    printer_id: 2,
+    printer_name: 'H2C-Beta',
+    archive_name: 'Pinned Unit',
+  };
+
+  /** Printer names also fill the filter <select>; only rendered rows and
+   *  bucket headers say anything about targets. */
+  const namedOutsideFilter = (name: string) =>
+    screen.getAllByText(name).filter((el) => el.tagName !== 'OPTION');
+
+  beforeEach(() => {
+    vi.mocked(localStorage.getItem).mockImplementation((key: string) => {
+      if (key === 'queue.historyCollapsed') return 'false';
+      if (key === 'queue.viewMode') return 'list';
+      return null;
+    });
+    server.use(http.get('/api/v1/printers/', () => HttpResponse.json(poolFleet)));
+  });
+
+  it('names every pool member on the row', async () => {
+    server.use(http.get('/api/v1/queue/', () => HttpResponse.json([poolItem])));
+
+    render(<QueuePage />);
+
+    await screen.findByText('Pool Unit');
+    expect(screen.getByText('Any of H2S-Alpha, H2C-Beta')).toBeInTheDocument();
+  });
+
+  it('falls back to #id for a pool member no longer in the fleet', async () => {
+    server.use(
+      http.get('/api/v1/queue/', () =>
+        HttpResponse.json([{ ...poolItem, target_printer_ids: [1, 99] }]),
+      ),
+    );
+
+    render(<QueuePage />);
+
+    await screen.findByText('Pool Unit');
+    expect(screen.getByText('Any of H2S-Alpha, #99')).toBeInTheDocument();
+  });
+
+  it('leaves a pinned row naming its own printer', async () => {
+    server.use(http.get('/api/v1/queue/', () => HttpResponse.json([pinnedItem])));
+
+    render(<QueuePage />);
+
+    await screen.findByText('Pinned Unit');
+    // The printer-filter <select> also lists the fleet; only the row counts.
+    expect(namedOutsideFilter('H2C-Beta')).toHaveLength(1);
+    expect(screen.queryByText(/Any of/)).not.toBeInTheDocument();
+  });
+
+  it('buckets a pool unit under its own lane, apart from a pinned unit', async () => {
+    server.use(http.get('/api/v1/queue/', () => HttpResponse.json([poolItem, pinnedItem])));
+
+    const user = userEvent.setup();
+    render(<QueuePage />);
+
+    await screen.findByText('Pool Unit');
+    // Flat list: the pool label appears once, on the row itself.
+    expect(screen.getAllByText('Any of H2S-Alpha, H2C-Beta')).toHaveLength(1);
+
+    await user.click(screen.getByRole('button', { name: 'By Printer' }));
+
+    // Grouped: the row plus its own bucket header — the pool is a lane, not
+    // merged into the pinned printer's bucket or into unassigned.
+    await waitFor(() =>
+      expect(screen.getAllByText('Any of H2S-Alpha, H2C-Beta')).toHaveLength(2),
+    );
+    // The pinned unit keeps its own bucket: its row plus that bucket's header.
+    expect(namedOutsideFilter('H2C-Beta')).toHaveLength(2);
+    // A pool is a target, so nothing lands in the unassigned bucket.
+    expect(namedOutsideFilter('Unassigned')).toHaveLength(0);
+  });
+});

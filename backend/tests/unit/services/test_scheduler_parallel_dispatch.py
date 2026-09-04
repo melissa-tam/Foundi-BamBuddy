@@ -94,15 +94,17 @@ def _make_fake_start(*, order, sessions, delays):
     simulating a slow FTPS upload.
     """
 
-    async def _fake_start(session, item, *, ams_mapping=None, lease=None):
+    async def _fake_start(session, item, *, printer_id=None, ams_mapping=None, lease=None):
+        # The tick hands the dispatch its printer (the row may not carry one — a
+        # pending row's printer_id is an operator PIN, never the scheduler's pick).
         sessions.append(id(session))
-        delay = delays.get(item.printer_id, 0.0)
+        delay = delays.get(printer_id, 0.0)
         if delay:
             await asyncio.sleep(delay)
         item.status = "printing"
         item.started_at = datetime.now(timezone.utc)
         await session.commit()
-        order.append(item.printer_id)
+        order.append(printer_id)
 
     return _fake_start
 
@@ -192,8 +194,8 @@ async def test_task_exception_does_not_kill_gather_or_sibling(pd_scheduler, db_s
     # Neutralise the farm-policy hook the failure path funnels through.
     monkeypatch.setattr("backend.app.services.farm_policy.on_terminal", AsyncMock())
 
-    async def _start(session, item, *, ams_mapping=None, lease=None):
-        if item.printer_id == a_id:
+    async def _start(session, item, *, printer_id=None, ams_mapping=None, lease=None):
+        if printer_id == a_id:
             raise RuntimeError("boom during upload")
         item.status = "printing"
         await session.commit()
