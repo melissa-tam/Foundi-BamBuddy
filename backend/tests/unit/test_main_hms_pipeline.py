@@ -58,6 +58,8 @@ def _state(hms: list, layer_num: int = 0, tray_now: int = 255) -> SimpleNamespac
     _WIRE_AT[0] += 1.0
     return SimpleNamespace(
         connected=True,
+        connection_epoch=1,
+        disconnected_at=None,
         state="IDLE",
         progress=0,
         layer_num=layer_num,
@@ -112,14 +114,14 @@ async def _drain_tasks() -> None:
 def _reset_state():
     notify_dedup._reset_state()
     hms_edges._reset_state()  # the edge-triggered state consumers ride this ledger
-    main_module._printer_last_connected.clear()
-    main_module._printer_reconciled_since_connect.clear()
+    main_module._printer_offline_edge_at.clear()
+    main_module._printer_reconciled_epoch.clear()
     main_module._last_status_broadcast.clear()
     yield
     notify_dedup._reset_state()
     hms_edges._reset_state()
-    main_module._printer_last_connected.clear()
-    main_module._printer_reconciled_since_connect.clear()
+    main_module._printer_offline_edge_at.clear()
+    main_module._printer_reconciled_epoch.clear()
     main_module._last_status_broadcast.clear()
 
 
@@ -854,9 +856,7 @@ class TestMovedConsumersRideTheAppearanceEdge:
     async def test_plate_occupancy_fires_on_an_edge_notify_dedup_calls_stale(self):
         with (
             _Harness() as h,
-            patch(
-                "backend.app.services.farm_correlation.on_native_plate_detection", new=AsyncMock()
-            ) as plate_hook,
+            patch("backend.app.services.farm_correlation.on_native_plate_detection", new=AsyncMock()) as plate_hook,
         ):
             await _stale_then_reappear(5, _PLATE_OCCUPANCY)
 
@@ -997,17 +997,13 @@ class TestSpentStampingStillHappensEndToEnd:
 
         with _Harness(), _runout_lane_on(sessions):
             await _warm_up(printer.id)
-            await main_module.on_printer_status_change(
-                printer.id, _state([_UNRESCUED_RUNOUT], layer_num=1, tray_now=0)
-            )
+            await main_module.on_printer_status_change(printer.id, _state([_UNRESCUED_RUNOUT], layer_num=1, tray_now=0))
             await _drain_tasks()
 
         await db_session.refresh(spool)
         assert spool.spent_at is not None
 
-    async def test_lane_b_auto_switch_stamps_the_slot_the_firmware_named(
-        self, db_session, printer_factory, sessions
-    ):
+    async def test_lane_b_auto_switch_stamps_the_slot_the_firmware_named(self, db_session, printer_factory, sessions):
         """The firmware's own auto-switch statement, plain case: attr 0x07002200 names
         AMS0 slot 3 (tray 2), so that roll is stamped and the slot now FEEDING — which a
         tray_now inference would have picked — stays untouched."""

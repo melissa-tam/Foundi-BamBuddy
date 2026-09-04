@@ -367,13 +367,16 @@ _stage22_finish_frames: dict[int, bytes] = {}
 # grab (Bambu printers allow only one RTSP client at a time).
 _stage22_finish_in_flight: dict[int, asyncio.Event] = {}
 
-# Per-printer "connected" edge tracker. Used by `on_printer_status_change`
-# to fire `reconcile_stale_active_prints` exactly once per (re)connection
-# (#1542 follow-up — power-cycle ghost prints). The value is True after
-# the first connected status update for that connection; transitions back
-# to False whenever we observe `state.connected = False` so the next
-# reconnect re-arms reconciliation. Keyed by printer_id.
-_printer_reconciled_since_connect: dict[int, bool] = {}
+# printer_id -> the MQTT SESSION we have already reconciled for, so
+# `reconcile_stale_active_prints` runs exactly once per (re)connection
+# (#1542 follow-up — power-cycle ghost prints). A BOOKMARK, not a definition: the
+# session boundary itself is the transport's fact (`PrinterState.connection_epoch`,
+# incremented in `_on_connect`), and this only remembers what this process already did
+# about it. Retiring the old boolean latch onto the epoch also removes its one blind
+# spot — it re-armed only when we OBSERVED a `state.connected = False` callback, so a
+# reconnect whose disconnect callback was suppressed (the stale-reconnect path, which
+# is exactly how the 2026-09-04 outage arrived) left reconciliation disarmed.
+_printer_reconciled_epoch: dict[int, int] = {}
 
 # Track expected prints from reprint/scheduled (skip auto-archiving for these)
 # {(printer_id, filename): archive_id}
@@ -451,15 +454,17 @@ _bed_cool_waiters: dict[int, dict] = {}
 # as "cancelled" (stopped by user) so the correct notification email is sent.
 _user_stopped_printers: set[int] = set()
 
-# Offline-notification edge state (#1752): fire `on_printer_offline` exactly
-# once when a printer transitions connected → disconnected. `_printer_last_connected`
-# holds the previous observation so we only fire on the True → False edge (a
-# False → False repeat doesn't notify; an initial False at startup doesn't
-# notify either, since there's no prior True). `_printer_offline_notify_tasks`
-# holds the per-printer pending asyncio task that fires the notification
-# after a debounce window — cancelled if the printer reconnects before the
-# window elapses, so transient MQTT blips don't flood the user.
-_printer_last_connected: dict[int, bool] = {}
+# Offline-notification edge state (#1752): fire `on_printer_offline` exactly once when a
+# printer transitions connected → disconnected. The EDGE is the transport's fact —
+# `PrinterState.disconnected_at` is stamped by `BambuMQTTClient.note_disconnected` on
+# that transition only, and kept across the following reconnect — so this dict is just
+# the bookmark of which outage we have already reacted to. A False→False repeat carries
+# the same stamp and notifies nothing; a printer that has never connected has no stamp
+# at all, so startup is silent, exactly as the previous boolean pair behaved.
+# `_printer_offline_notify_tasks` holds the per-printer pending asyncio task that fires
+# the notification after a debounce window — cancelled if the printer reconnects before
+# the window elapses, so transient MQTT blips don't flood the user.
+_printer_offline_edge_at: dict[int, float | None] = {}
 _printer_offline_notify_tasks: dict[int, asyncio.Task] = {}
 # Debounce: a printer must stay offline this long before we notify. Sized
 # against the staleness path (`bambu_mqtt.py::STALE_RECONNECT_COOLDOWN = 30s`)
@@ -1080,15 +1085,12 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     # fires again with the flag still False — reconcile then runs against
     # actual evidence.
     state_known = bool(state.state) and state.state.upper() not in ("", "UNKNOWN")
-    if state.connected and state_known and not _printer_reconciled_since_connect.get(printer_id, False):
-        _printer_reconciled_since_connect[printer_id] = True
+    if state.connected and state_known and _printer_reconciled_epoch.get(printer_id) != state.connection_epoch:
+        _printer_reconciled_epoch[printer_id] = state.connection_epoch
         spawn_background_task(
             reconcile_stale_active_prints(printer_id),
             name=f"reconcile-stale-prints-{printer_id}",
         )
-    elif not state.connected and _printer_reconciled_since_connect.get(printer_id, False):
-        # Re-arm so the next reconnect triggers reconciliation again.
-        _printer_reconciled_since_connect[printer_id] = False
 
     # Device-vs-declared model reconciliation (Phase 2). Evaluated on any connected
     # status change; acted on only at a STATE TRANSITION so the one-shot
@@ -1129,9 +1131,9 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     # by the print-failure notification (firmware reports gcode_state=FAILED
     # on reconnect of an interrupted print), so we don't add a symmetric
     # online event here.
-    prev_connected = _printer_last_connected.get(printer_id)
-    _printer_last_connected[printer_id] = state.connected
-    if prev_connected is True and not state.connected:
+    prev_edge_at = _printer_offline_edge_at.get(printer_id)
+    _printer_offline_edge_at[printer_id] = state.disconnected_at
+    if not state.connected and state.disconnected_at is not None and state.disconnected_at != prev_edge_at:
         existing = _printer_offline_notify_tasks.get(printer_id)
         if existing is None or existing.done():
             logging.getLogger(__name__).info(

@@ -489,6 +489,27 @@ class PrintOptions:
 @dataclass
 class PrinterState:
     connected: bool = False
+    # Monotonically increasing MQTT SESSION counter — the transport's own answer to
+    # "is this a new session?", incremented once per successful `_on_connect` (0 = never
+    # connected). The TRANSPORT owns this fact; consumers compare a remembered value.
+    #
+    # It exists because several farm lanes sample the wire per push and derive NEGATIVE
+    # edges from it ("a standing thing went away"), and a reconnect is not the firmware
+    # answering: a printer reboot WIPES the whole standing HMS list, so every such lane
+    # must re-seed rather than edge across the boundary. Printer 8 (010-H2S) resumed a
+    # print into an empty slot on 2026-09-04 because the runout code disappearing across
+    # a reboot read as a refill. Positive/appearance edges are deliberately NOT re-seeded
+    # here (`hms_edges` keeps its own first-frame seed) — a reboot cannot fabricate the
+    # APPEARANCE of a code that is not standing, and re-seeding there would suppress a
+    # genuine fault that fired during a network blip.
+    connection_epoch: int = 0
+    # WALL-CLOCK (time.time(), NOT monotonic — it is reported to humans as an outage
+    # duration and must survive being formatted into a notification) of the moment this
+    # printer's session was last observed to END; None = never disconnected in this
+    # process. KEPT across the reconnect on purpose: it is the outage-duration ANCHOR,
+    # so the recovery lane can say "power was lost for ~M min" after the printer is back.
+    # Stamped on the connected True->False EDGE by `note_disconnected`, the one writer.
+    disconnected_at: float | None = None
     state: str = "unknown"
     current_print: str | None = None
     subtask_name: str | None = None
@@ -1051,6 +1072,25 @@ class BambuMQTTClient:
     # force-close the socket before paho has time to reconnect.
     STALE_RECONNECT_COOLDOWN = 30.0
 
+    def note_disconnected(self) -> None:
+        """Record the end of this printer's MQTT session — THE one writer of
+        :attr:`PrinterState.disconnected_at`.
+
+        Every path that takes ``state.connected`` from True to False calls this instead
+        of assigning the flag: the disconnect callback, the two forced-reconnect paths,
+        the deliberate teardown, and ``printer_manager.mark_printer_offline`` (a smart-plug
+        power cut is exactly the outage this anchors). Spreading the stamp across those
+        five sites is how the anchor would end up missing on the one path that matters —
+        the 2026-09-04 fleet outage arrived as a STALE-reconnect, whose disconnect callback
+        returns early by design.
+
+        Stamped on the EDGE only, so a repeated "still offline" assertion cannot walk the
+        anchor forward and shrink a reported outage to nothing.
+        """
+        if self.state.connected:
+            self.state.disconnected_at = time.time()
+        self.state.connected = False
+
     def check_staleness(self) -> bool:
         """Check staleness and update connected state if stale. Returns True if connected."""
         if self.state.connected and self.is_stale():
@@ -1080,7 +1120,7 @@ class BambuMQTTClient:
                     self.serial_number,
                 )
             self._last_stale_reconnect = now
-            self.state.connected = False
+            self.note_disconnected()
             if self.on_state_change:
                 self.on_state_change(self.state)
             # Route based on caller thread — see force_reconnect_stale_session.
@@ -1114,7 +1154,7 @@ class BambuMQTTClient:
         #     from the dispatch path).
         logger.warning("[%s] Forcing MQTT reconnect: %s", self.serial_number, reason)
         self._stale_reconnecting = True
-        self.state.connected = False
+        self.note_disconnected()
         if self.on_state_change:
             self.on_state_change(self.state)
         self._reset_client_for_reconnect()
@@ -1184,6 +1224,10 @@ class BambuMQTTClient:
     def _on_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
             self.state.connected = True
+            # A new MQTT session begins here — including every paho auto-reconnect, which
+            # is what a printer reboot looks like from this side. Consumers that remember
+            # a per-printer wire sample compare this counter and RE-SEED when it moves.
+            self.state.connection_epoch += 1
             self._stale_reconnecting = False  # Clear stale-reconnect flag on successful connect
             # Reset per-connection warning state so warnings fire once per (re)connection
             self._ams_version_warned = set()
@@ -1229,7 +1273,7 @@ class BambuMQTTClient:
             if self.on_state_change:
                 self.on_state_change(self.state)
         else:
-            self.state.connected = False
+            self.note_disconnected()
 
     def _on_subscribe(self, client, userdata, mid, reason_code_list, properties=None):
         """Handle SUBACK responses to detect request topic subscription rejection."""
@@ -1305,7 +1349,7 @@ class BambuMQTTClient:
         self._request_topic_sub_mid = None
         self._request_topic_sub_time = 0.0
 
-        self.state.connected = False
+        self.note_disconnected()
         if self.on_state_change:
             self.on_state_change(self.state)
 
@@ -5162,7 +5206,7 @@ class BambuMQTTClient:
             self._disconnection_event.wait(timeout=timeout)
             self._client.loop_stop()
             self._client = None
-            self.state.connected = False
+            self.note_disconnected()
 
     @staticmethod
     def _command_verb(command: dict) -> str:

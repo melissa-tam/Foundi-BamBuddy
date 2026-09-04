@@ -285,6 +285,23 @@ DEFAULT_TEMPLATES = [
         "title_template": "USB storage low — {printer_name}",
         "body_template": "{printer_name}: {detail}",
     },
+    # Pause recovery (2026-09-04 fleet outage). The printer came back from a power cut
+    # holding the firmware's own recovery prompt and the farm could not answer it, so a
+    # human must. ``{reason}`` carries WHY in one sentence (the resume was refused, or
+    # the firmware declared it failed) and ``{outage}`` how long the power was out — the
+    # two facts an operator needs before deciding whether the part is still worth
+    # resuming. ``{outage}`` is a WHOLE sentence and may be empty: the hourly reminder
+    # re-fires this same template hours later, and the only duration it could name there
+    # is how long the HOLD has lasted, which is not what "power was lost for" means.
+    {
+        "event_type": "power_loss_recovery",
+        "name": "Power-Loss Recovery",
+        "title_template": "{printer_name} held at the power-loss prompt",
+        "body_template": (
+            "{printer_name}: '{job_name}' is held at the printer's power-loss prompt. "
+            "{reason}{outage} Resume or stop the job on the printer."
+        ),
+    },
     # Farm mid-print spool-jam auto-recovery (services/spool_recovery.py). NEW
     # event types so an existing install seeds them on restart (seeding only
     # INSERTs missing event types — see the seeder comment below).

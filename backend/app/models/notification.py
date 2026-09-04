@@ -129,6 +129,13 @@ class NotificationProvider(Base):
     on_storage_low = Column(
         Boolean, default=True
     )  # Printer USB storage FAILURE — auto-cleanup could not free space, FTPS/USB unreachable, or the drive dropped mid-print (successful cleanups are silent)
+    # ONE column for the whole pause-recovery lane (2026-09-04 fleet outage), carrying
+    # several truthful ``event_type``s rather than one column each: the per-outage fleet
+    # summary and the per-printer HOLD pages (a resume the firmware refused or failed,
+    # and a printer that rebooted with a part on its plate). Default TRUE — unlike the
+    # success-class toggles below, every message on this column asks a human for
+    # something; a power-loss resume that WORKS is a log line and never pages.
+    on_power_loss_recovery = Column(Boolean, default=True)
     # Autonomy posture (operator ruling 2026-08-10): a recovery that SUCCEEDED asked
     # nothing of a human, so it is a log line, not a page — both success-class
     # toggles therefore default OFF (the refill auto-resume notice rides

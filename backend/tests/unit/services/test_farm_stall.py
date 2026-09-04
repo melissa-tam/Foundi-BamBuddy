@@ -533,13 +533,19 @@ class TestAttentionReminders:
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
             mock_n.assert_not_awaited()
 
-    async def test_plate_vision_reason_refires_plate_not_empty(self, db_session):
+    async def test_a_plate_vision_token_alone_no_longer_nags(self, db_session):
+        """The LAST token-driven reminder went with the incident route (2026-09-04).
+
+        A token can only exist for a farm unit, so the token lane could never nag about
+        a foreign print left holding — the same blind spot WS2b removed for the AMS
+        kinds. The plate-vision nag now comes from the incident (below), which is what
+        gives it foreign-print parity."""
         await _add_paused_held(db_session, 9, "plate_not_empty_printer_detected")
         mgr = _FakeManager({9: True}, {9: _FakeState("PAUSE")})
         with patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock) as mock_n:
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
-            mock_n.assert_awaited_once()
+            mock_n.assert_not_awaited()
 
     async def test_notify_failure_does_not_abort_tick(self, db_session):
         # One bad printer's notify blowing up must not stop the other's reminder.
@@ -559,20 +565,19 @@ class TestAttentionReminders:
 
     async def test_reason_set_membership_pinned(self):
         # async only to satisfy the module-level asyncio mark; no awaits needed.
-        # WS2b: the AMS holds moved OUT of the token lane and are reminded from
-        # their open escalated incident instead (a foreign print has no token).
-        expected = {
-            "print_paused_stalled",
-            "plate_not_empty_printer_detected",
-        }
-        assert set(farm_stall._ATTENTION_REASONS) == expected
+        # WS2b moved the AMS holds OUT of the token lane; 2026-09-04 moved the last one
+        # (plate vision) with them, when the plate check became an incident kind. What
+        # remains is the generic pause-stall pager — the catch-all for a PAUSE nobody
+        # claimed, which by definition has no incident to read.
+        assert set(farm_stall._ATTENTION_REASONS) == {"print_paused_stalled"}
         # The dispatch dict IS the reason set — they cannot drift.
         assert set(farm_stall._ATTENTION_DISPATCH) == farm_stall._ATTENTION_REASONS
-        # ...and every incident kind has reminder copy, so a new kind cannot land
-        # silently.
-        from backend.app.models.printer_incident import KIND_JAM, KIND_PHYSICAL, KIND_RUNOUT
+        # ...and EVERY incident kind has reminder copy, so a new kind cannot land
+        # silently. Derived from the model's own kind sets rather than a literal, since
+        # a hand-listed expectation is exactly what let three kinds ship without copy.
+        from backend.app.models.printer_incident import AMS_FAULT_KINDS, PAUSE_CAUSE_KINDS
 
-        assert set(farm_stall._INCIDENT_REMINDER_DETAIL) == {KIND_JAM, KIND_RUNOUT, KIND_PHYSICAL}
+        assert set(farm_stall._INCIDENT_REMINDER_DETAIL) == AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS
 
 
 class TestSchedulerHookGuard:
@@ -1159,7 +1164,101 @@ class TestRemindOpenIncidentsNonPause:
             mock_n.assert_not_awaited()
 
     async def test_every_incident_kind_has_non_pause_copy(self):
-        """A new incident kind must not land with a hole where its nag should be."""
-        from backend.app.models.printer_incident import KIND_JAM, KIND_PHYSICAL, KIND_RUNOUT
+        """A new incident kind must not land with a hole where its nag should be.
 
-        assert set(farm_stall._INCIDENT_REMINDER_DETAIL_UNPAUSED) == {KIND_JAM, KIND_RUNOUT, KIND_PHYSICAL}
+        The lookup falls back to the JAM sentence, so a missing row does not fail
+        loudly — it nags an operator about a spool jam on a printer holding for a lost Z
+        reference. This is the pin that makes the omission impossible."""
+        from backend.app.models.printer_incident import AMS_FAULT_KINDS, PAUSE_CAUSE_KINDS
+
+        assert set(farm_stall._INCIDENT_REMINDER_DETAIL_UNPAUSED) == AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS
+
+
+class TestPauseCauseIncidentReminders:
+    """The three pause-cause kinds nag through their OWN notification event.
+
+    Copy alone is not enough: an AMS-fault event carrying power-loss text would page
+    whoever asked to hear about spool recoveries and stay silent for whoever asked about
+    outages, so the provider toggle would be lying about what it controls. Each kind
+    re-fires the event its own escalation raised, which is what keeps a reminder a
+    reminder rather than a new incident in disguise.
+    """
+
+    async def test_power_loss_fires_its_own_event(self, db_session):
+        await _add_incident_held(db_session, 41, "power_loss", code="0300_8007")
+        mgr = _FakeManager({41: True}, {41: _FakeState("PAUSE")})
+        with (
+            patch.object(notification_service, "on_power_loss_hold", new_callable=AsyncMock) as mock_pl,
+            patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_ams,
+        ):
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+
+        mock_ams.assert_not_awaited()
+        mock_pl.assert_awaited_once()
+        kwargs = mock_pl.await_args.kwargs
+        assert "STILL" in kwargs["reason"]
+        # The outage ended when the printer reconnected hours ago; the reminder knows
+        # only how long the HOLD has run, which is not what "power was lost for" means.
+        assert kwargs["outage_minutes"] is None
+
+    async def test_plate_vision_fires_plate_not_empty(self, db_session):
+        await _add_incident_held(db_session, 42, "plate_vision", code="0500_808C")
+        mgr = _FakeManager({42: True}, {42: _FakeState("IDLE")})
+        with patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+
+        mock_n.assert_awaited_once()
+        detail = mock_n.await_args.kwargs["source_detail"]
+        assert "STILL" in detail
+        # The print was STOPPED, so the old "Resume on the printer screen" instruction
+        # would send the operator to a job that no longer exists.
+        assert "Resume" not in detail
+
+    async def test_z_reference_lost_fires_its_own_event(self, db_session):
+        await _add_incident_held(db_session, 43, "z_reference_lost", code="0300_8007", item=False)
+        mgr = _FakeManager({43: True}, {43: _FakeState("IDLE")})
+        with (
+            patch.object(notification_service, "on_z_reference_lost", new_callable=AsyncMock) as mock_z,
+            patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_ams,
+        ):
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+
+        mock_ams.assert_not_awaited()
+        mock_z.assert_awaited_once()  # foreign (no queue unit) nags identically
+
+    async def test_the_ams_kinds_still_ride_the_ams_event(self, db_session):
+        """The negative half: nothing about the new branches may re-route a jam."""
+        await _add_incident_held(db_session, 44, "jam")
+        mgr = _FakeManager({44: True}, {44: _FakeState("PAUSE")})
+        with (
+            patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_ams,
+            patch.object(notification_service, "on_power_loss_hold", new_callable=AsyncMock) as mock_pl,
+        ):
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+
+        mock_pl.assert_not_awaited()
+        mock_ams.assert_awaited_once()
+
+
+class TestAttendedPauseDerivation:
+    """`_ATTENDED_PAUSE_REASONS` is DERIVED, so a new hold token cannot be born
+    un-attended and start double-notifying the moment it ships."""
+
+    async def test_every_incident_kinds_token_is_attended(self):
+        from backend.app.models.printer_incident import AMS_FAULT_KINDS, PAUSE_CAUSE_KINDS
+        from backend.app.services import printer_incidents
+
+        for kind in AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS:
+            assert printer_incidents.waiting_reason_for(kind) in farm_stall._ATTENDED_PAUSE_REASONS
+
+    async def test_the_recovering_token_stays_unattended(self):
+        """R1, unchanged: a spool-recovery pause is owned only while a LIVE recovery
+        task exists, not by the token string — a restart mid-recovery orphans the token,
+        and treating it as ownership would silence the watchdog forever."""
+        from backend.app.services import printer_incidents
+
+        assert printer_incidents.WAITING_REASON_RECOVERING not in farm_stall._ATTENDED_PAUSE_REASONS

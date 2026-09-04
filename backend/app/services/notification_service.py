@@ -2681,6 +2681,108 @@ class NotificationService:
             variables=variables,
         )
 
+    async def on_power_loss_hold(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        job_name: str,
+        outage_minutes: int | None,
+        reason: str,
+        db: AsyncSession,
+    ):
+        """Fire when a printer is HELD at the firmware's power-loss recovery prompt.
+
+        The 2026-09-04 outage shape: the printer rebooted mid-print, came back PAUSEd
+        offering ``0300_8007`` ("there was an unfinished print job when the printer lost
+        power … you can try resuming"), and the farm's answer did not take. Every branch
+        that reaches here has already tried — a resume the client refused
+        (``resume_refused``) or one the firmware itself declared failed via
+        ``0300_400D`` (``resume_failed``) — so the message states what happened and
+        hands the decision to a human at the machine.
+
+        ``reason`` is a whole sentence composed by the caller, not a token: the two
+        cases read differently to an operator and neither is "automatic resume is off"
+        (there is no such toggle — operator ruling 2026-09-04). ``outage_minutes`` comes
+        from ``PrinterState.disconnected_at``, the wall-clock anchor the transport keeps
+        across the reconnect, and is None when the caller cannot know it — the hourly
+        reminder re-fires this event hours later and the only duration it could name is
+        how long the HOLD has run, which is not what "power was lost for" means. The
+        sentence is then simply omitted rather than filled with a plausible wrong number.
+
+        Rides the ``on_power_loss_recovery`` provider toggle with its own truthful
+        ``event_type`` (the :meth:`on_runout_auto_resumed` precedent: one column may
+        carry several events when they are the same operator's concern). The hourly
+        reminder re-fires this same event with "STILL" copy, so a hold nobody clears
+        keeps nagging without a second event type.
+        """
+        providers = await self._get_providers_for_event(db, "on_power_loss_recovery", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "job_name": job_name,
+            "reason": reason,
+            "outage": f" Power was lost for ~{outage_minutes} min." if outage_minutes is not None else "",
+        }
+        title, message = await self._build_message_from_template(db, "power_loss_recovery", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "power_loss_hold",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_z_reference_lost(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        db: AsyncSession,
+    ):
+        """Fire when a printer rebooted with a part still on its plate.
+
+        A power cycle destroys the machine's Z datum, and the production eject homes X/Y
+        only — every absolute Z move in it then runs against a fiction. 002-H2S drove its
+        bed DOWN past the Z floor on 2026-09-04 doing exactly this (operator eyewitness).
+        The farm therefore refuses to eject and asks for the part by hand.
+
+        The instruction is the whole message and it is deliberately narrow: a human
+        cannot re-home Z with a part on the plate either (a bare ``G28`` probes the bed
+        centre, where the part is), so "remove it by hand, then Mark plate cleared" is
+        the only safe act — not "re-home the printer".
+
+        Composed in backend English rather than from the power-loss template, whose
+        every variable (job, outage duration, refused resume) is wrong here; it shares
+        the provider column because it is the same outage and the same operator, and
+        carries its own ``event_type``.
+        """
+        providers = await self._get_providers_for_event(db, "on_power_loss_recovery", printer_id)
+        if not providers:
+            return
+
+        variables = {"printer_name": printer_name}
+        title = f"{printer_name} restarted with a part on the plate"
+        message = (
+            f"{printer_name}: its Z reference is lost — remove the part by hand, then Mark plate cleared. "
+            "Ejects are refused until then."
+        )
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "z_reference_lost",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
     async def on_spool_recovery_failed(
         self,
         printer_id: int | None,

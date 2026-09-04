@@ -24,16 +24,18 @@ from backend.app.models.print_queue import PrintQueueItem
 
 # Imported at module level so the test-engine's create_all registers this new table
 # (conftest builds the schema from Base.metadata, not the models/__init__ list).
-from backend.app.models.printer_incident import PrinterIncident
+from backend.app.models.printer_incident import KIND_PLATE_VISION, PrinterIncident
 from backend.app.models.recovery_escalation import RecoveryEscalation
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import spool_recovery
+from backend.app.services import printer_incidents, spool_recovery
 from backend.app.services.bambu_mqtt import HMSError, PrinterState
-from backend.app.services.spool_recovery import (
+from backend.app.services.printer_incidents import (
     WAITING_REASON_FAILED,
     WAITING_REASON_RECOVERING,
     WAITING_REASON_RUNOUT,
+)
+from backend.app.services.spool_recovery import (
     clear_on_reinsert,
     on_ams_fault,
 )
@@ -3636,7 +3638,7 @@ async def test_physical_fault_escalates_immediately_and_never_swaps(
     failed.assert_awaited_once()
     assert failed.call_args.kwargs["kind"] == "physical"
     db_session.expunge_all()
-    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == spool_recovery.WAITING_REASON_PHYSICAL
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == printer_incidents.WAITING_REASON_PHYSICAL
 
 
 async def test_physical_outranks_a_mechanical_sibling(db_session, printer_factory, install_settings, monkeypatch):
@@ -3727,11 +3729,17 @@ async def test_the_running_edge_is_what_calls_it(db_session, printer_factory, mo
 
 
 async def test_a_hold_never_survives_a_non_recovery_token(db_session, printer_factory, monkeypatch):
-    """Only the tokens this module owns are cleared: a unit holding for a plate-vision
-    trip keeps its own reason, because a resume says nothing about that hold."""
+    """Only INCIDENT-owned tokens are cleared: a unit staged for low filament keeps its
+    own reason, because a resume says nothing about that hold.
+
+    The token used here was ``plate_not_empty_printer_detected`` until 2026-09-04, when
+    the plate check became an incident KIND and its token joined the owned set — so a
+    resume now legitimately clears it (pinned by the sibling test below). The class this
+    test protects is unchanged: a hold raised by an owner OUTSIDE the incident machine
+    (a filament deficit, a stagger wait, a capability block) must survive."""
     printer = await printer_factory()
     item = await _runout_held_item(db_session, printer.id)
-    item.waiting_reason = "plate_not_empty_printer_detected"
+    item.waiting_reason = "filament_unread_pending"
     await db_session.commit()
     state = _make_state(gcode_state="RUNNING", hms=[])
     _wire(monkeypatch, state, FakeClient(state))
@@ -3739,7 +3747,31 @@ async def test_a_hold_never_survives_a_non_recovery_token(db_session, printer_fa
     await spool_recovery.on_observed_running(printer.id)
 
     db_session.expunge_all()
-    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == "plate_not_empty_printer_detected"
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == "filament_unread_pending"
+
+
+async def test_every_incident_kinds_token_is_owned_and_cleared(db_session, printer_factory, monkeypatch):
+    """A resume clears the projection of EVERY incident kind, including the three
+    pause-cause kinds added 2026-09-04.
+
+    The owned-token set is derived from the one kind -> token table
+    (``printer_incidents._WAITING_REASON_BY_KIND``) rather than hand-listed, which is
+    what stops a newly registered kind from projecting a token nothing can clear — the
+    unit would then render a hold forever while the printer printed on."""
+    owned = set(printer_incidents._WAITING_REASON_BY_KIND.values())
+    assert owned <= printer_incidents.RECOVERY_WAITING_REASONS
+
+    printer = await printer_factory()
+    item = await _runout_held_item(db_session, printer.id)
+    item.waiting_reason = printer_incidents.waiting_reason_for(KIND_PLATE_VISION)
+    await db_session.commit()
+    state = _make_state(gcode_state="RUNNING", hms=[])
+    _wire(monkeypatch, state, FakeClient(state))
+
+    await spool_recovery.on_observed_running(printer.id)
+
+    db_session.expunge_all()
+    assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
 
 
 async def test_startup_closes_a_stale_hold_on_a_running_printer(db_session, printer_factory, monkeypatch):
@@ -3907,7 +3939,9 @@ class TestZombieRecoveringRearm:
         await spool_recovery.rearm_incidents_on_startup()
 
         db_session.expunge_all()
-        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == spool_recovery.WAITING_REASON_PHYSICAL
+        assert (
+            await db_session.get(PrintQueueItem, item.id)
+        ).waiting_reason == printer_incidents.WAITING_REASON_PHYSICAL
 
 
 # ===========================================================================
@@ -3936,7 +3970,7 @@ async def test_external_runout_projects_its_own_waiting_reason(
     db_session.expunge_all()
     assert (
         await db_session.get(PrintQueueItem, item.id)
-    ).waiting_reason == spool_recovery.WAITING_REASON_EXTERNAL_RUNOUT
+    ).waiting_reason == printer_incidents.WAITING_REASON_EXTERNAL_RUNOUT
     assert failed.call_args.kwargs["runout_slot"] == "the external spool holder"
 
 
@@ -3961,8 +3995,8 @@ def test_the_external_token_is_owned_and_attended():
     not double-escalate a hold that already alerted."""
     from backend.app.services import farm_stall
 
-    assert spool_recovery.WAITING_REASON_EXTERNAL_RUNOUT in spool_recovery.RECOVERY_WAITING_REASONS
-    assert spool_recovery.WAITING_REASON_EXTERNAL_RUNOUT in farm_stall._ATTENDED_PAUSE_REASONS
+    assert printer_incidents.WAITING_REASON_EXTERNAL_RUNOUT in printer_incidents.RECOVERY_WAITING_REASONS
+    assert printer_incidents.WAITING_REASON_EXTERNAL_RUNOUT in farm_stall._ATTENDED_PAUSE_REASONS
 
 
 async def test_a_later_different_fault_on_the_same_job_is_recovered(
@@ -4413,7 +4447,7 @@ class TestFarmItemAttribution:
         db_session.expunge_all()
         assert (
             await db_session.get(PrintQueueItem, item.id)
-        ).waiting_reason == spool_recovery.WAITING_REASON_EXTERNAL_RUNOUT
+        ).waiting_reason == printer_incidents.WAITING_REASON_EXTERNAL_RUNOUT
 
 
 class TestExternalRunoutLane:
@@ -4507,7 +4541,7 @@ class TestExternalFeedFaultLane:
         oor.assert_not_awaited()
         assert (
             await db_session.get(PrintQueueItem, item.id)
-        ).waiting_reason == spool_recovery.WAITING_REASON_EXTERNAL_FEED
+        ).waiting_reason == printer_incidents.WAITING_REASON_EXTERNAL_FEED
         assert "No AMS is involved" in failed.call_args.kwargs["detail"]
 
     async def test_the_same_fault_on_ams_hardware_still_swaps(
@@ -4601,8 +4635,8 @@ class TestExternalFeedFaultLane:
         must not double-escalate a hold that already alerted."""
         from backend.app.services import farm_stall
 
-        assert spool_recovery.WAITING_REASON_EXTERNAL_FEED in spool_recovery.RECOVERY_WAITING_REASONS
-        assert spool_recovery.WAITING_REASON_EXTERNAL_FEED in farm_stall._ATTENDED_PAUSE_REASONS
+        assert printer_incidents.WAITING_REASON_EXTERNAL_FEED in printer_incidents.RECOVERY_WAITING_REASONS
+        assert printer_incidents.WAITING_REASON_EXTERNAL_FEED in farm_stall._ATTENDED_PAUSE_REASONS
 
     def test_the_escalation_reason_has_operator_facing_copy(self):
         detail = spool_recovery._ESCALATE_DETAIL["external_feed_fault"]
@@ -4611,3 +4645,113 @@ class TestExternalFeedFaultLane:
     def test_it_never_counts_toward_the_ams_quarantine(self):
         assert "external_feed_fault" in spool_recovery._NON_QUARANTINE_REASONS
         assert "external_feed_fault" not in spool_recovery._JAM_QUARANTINE_REASONS
+
+
+# --- The printer-8 misread (2026-09-04 fleet outage) ------------------------
+# 010-H2S held an ESCALATED runout (slot 1 empty) when a power cut rebooted the whole
+# fleet. The reboot WIPED the standing HMS list; the wire sampler read the demand's
+# disappearance as a demand-CLEAR edge, `_refill_ready`'s `demand is None -> True`
+# confirmed it, and the farm resumed a print into an empty slot at 09:28:33. It ran
+# ~2 min and re-raised the runout. Nothing had been refilled.
+#
+# The distinguishing fact is on the wire the whole time: the reboot leaves the
+# firmware's own power-loss prompt `0300_8007` standing, which is what "the list was
+# wiped" looks like versus "the firmware answered".
+
+
+def _power_loss_prompt_hms():
+    """`0300_8007` — "There was an unfinished print job when the printer lost power."
+
+    The exact code every one of the 11 active printers raised first after the
+    2026-09-04 reconnect. attr>>16 == 0x0300, code == 0x8007."""
+    return HMSError(code="8007", attr=0x03000000, module=3, severity=3, full_code="0300000000008007")
+
+
+async def test_a_reboot_wiping_the_demand_is_not_a_refill(db_session, printer_factory, monkeypatch, _fast_resume):
+    """THE printer-8 PIN: a new MQTT session re-seeds the sampler, so the demand
+    vanishing across a reboot spawns NO resume."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    spawned = _capture_spawns(monkeypatch)
+    state = _runout_paused_state(tray_id=1)
+    state.connection_epoch = 4
+    _wire(monkeypatch, state, FakeClient(state))
+
+    spool_recovery.note_demand_watch(printer.id, state)  # seed: demand standing
+
+    # The reboot: everything the firmware was saying is gone, replaced by the
+    # power-loss prompt, and the transport has minted a new session.
+    state.hms_errors = [_power_loss_prompt_hms()]
+    state.connection_epoch = 5
+    spool_recovery.note_demand_watch(printer.id, state)
+
+    assert spawned == []
+
+
+async def test_the_demand_clear_edge_still_fires_within_one_session(db_session, printer_factory, monkeypatch):
+    """The liveness half: the epoch guard must not silence the real edge it sits on.
+
+    Same frames, same wiped list, same printer — only the session is unchanged, and the
+    resume spawns. A suppression fix that also suppresses the working case is
+    indistinguishable from the bug on absence metrics alone."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    spawned = _capture_spawns(monkeypatch)
+    state = _runout_paused_state(tray_id=1)
+    state.connection_epoch = 4
+    _wire(monkeypatch, state, FakeClient(state))
+
+    spool_recovery.note_demand_watch(printer.id, state)
+    state.hms_errors = []
+    spool_recovery.note_demand_watch(printer.id, state)
+
+    assert len(spawned) == 1
+    spawned[0].close()
+
+
+async def test_a_running_edge_still_closes_a_hold_across_a_reboot(db_session, printer_factory, monkeypatch):
+    """The epoch guard covers NEGATIVE edges only.
+
+    "The printer is RUNNING again" is positive evidence a reconnect cannot fabricate —
+    and it is how a hold the operator cleared during the outage gets closed. Suppressing
+    it on the session boundary would strand exactly those holds, because the sampler's
+    next sample would already read RUNNING and see no transition at all."""
+    printer = await printer_factory()
+    await _runout_held_item(db_session, printer.id)
+    spawned = _capture_spawns(monkeypatch)
+    state = _runout_paused_state(tray_id=1)
+    state.connection_epoch = 4
+    _wire(monkeypatch, state, FakeClient(state))
+
+    spool_recovery.note_demand_watch(printer.id, state)  # seed: PAUSEd
+    state.state = "RUNNING"
+    state.hms_errors = []
+    state.connection_epoch = 5  # the operator resumed it at the screen, then it reconnected
+    spool_recovery.note_demand_watch(printer.id, state)
+
+    assert len(spawned) == 1
+    assert await spawned[0] is True
+
+
+class TestRefillReadyUnderThePowerLossPrompt:
+    """`_refill_ready` is pure and DB-free; these pin the one branch the outage added."""
+
+    def test_no_demand_plus_the_standing_prompt_is_not_evidence(self):
+        state = _make_state(hms=[_power_loss_prompt_hms()], tray_now=255)
+        assert spool_recovery._refill_ready(state) is False
+
+    def test_a_gain_on_a_loaded_tray_is_admissible_while_the_prompt_stands(self):
+        """HARDWARE evidence, not the absence of a code. A gain on a non-demanded slot
+        resumes and the firmware simply re-declares the runout — bounded and
+        self-correcting, unlike a resume on an absence."""
+        state = _make_state(
+            hms=[_power_loss_prompt_hms()],
+            tray_now=255,
+            trays=[_ams_tray(0), _ams_tray(1)],
+        )
+        assert spool_recovery._refill_ready(state, (0, 1)) is True
+
+    def test_an_empty_list_with_no_prompt_still_reads_as_answered(self):
+        """The ordinary demand-clear path is untouched: with no prompt standing, an
+        absent demand is the firmware having answered."""
+        assert spool_recovery._refill_ready(_make_state(hms=[], tray_now=255)) is True

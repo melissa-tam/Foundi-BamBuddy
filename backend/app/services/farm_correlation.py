@@ -92,6 +92,7 @@ from backend.app.services.plate_occupancy import (
     TerminalDisposition,
     plate_occupancy,
 )
+from backend.app.services.printer_incidents import WAITING_REASON_PLATE_VISION
 from backend.app.utils.filename import print_identity_key
 from backend.app.utils.printer_models import normalize_printer_model
 
@@ -102,10 +103,11 @@ logger = logging.getLogger(__name__)
 
 Verdict = Literal["matched", "matched_by_name", "fallback", "foreign", "none"]
 
-# waiting_reason token for the native vision plate-occupancy hold. Single origin:
-# imported by farm_stall (skip set) and production_run (printer-state flag) so the
-# machine code has exactly one home and cannot drift.
-WAITING_REASON_PLATE_VISION = "plate_not_empty_printer_detected"
+# ``WAITING_REASON_PLATE_VISION`` used to be defined here. Its ORIGIN moved to
+# ``printer_incidents`` (2026-09-04) when the plate check became an incident KIND: the
+# token is a PROJECTION of that row, so it belongs with the kind -> token table rather
+# than in the correlation module that happened to raise the first one. It is imported
+# above under the same name for the callers that still read it from here.
 
 # Verdicts where the finish IS the dispatched unit — the caller updates that item's
 # terminal status and runs farm_policy attribution for it. ``fallback`` is included

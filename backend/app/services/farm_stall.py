@@ -42,17 +42,24 @@ from sqlalchemy import select
 
 from backend.app.core.websocket import broadcast_production_run_changed
 from backend.app.models.print_queue import PrintQueueItem
-from backend.app.models.printer_incident import KIND_JAM, KIND_PHYSICAL, KIND_RUNOUT, STATUS_ESCALATED
+from backend.app.models.printer_incident import (
+    KIND_JAM,
+    KIND_PHYSICAL,
+    KIND_PLATE_VISION,
+    KIND_POWER_LOSS,
+    KIND_RUNOUT,
+    KIND_Z_REFERENCE_LOST,
+    STATUS_ESCALATED,
+)
 from backend.app.services import notify_dedup
-from backend.app.services.farm_correlation import WAITING_REASON_PLATE_VISION
 from backend.app.services.hms_errors import current_runout_demand
 from backend.app.services.plate_occupancy import plate_occupancy
-from backend.app.services.printer_manager import printer_manager
-from backend.app.services.spool_recovery import (
+from backend.app.services.printer_incidents import (
     RECOVERY_WAITING_REASONS,
     WAITING_REASON_RECOVERING,
-    runout_slot_desc,
 )
+from backend.app.services.printer_manager import printer_manager
+from backend.app.services.spool_recovery import runout_slot_desc
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -95,12 +102,13 @@ WAITING_REASON_PAUSED = "print_paused_stalled"
 # on a hold a human already owns — and since WS2b the OPEN INCIDENT is the primary
 # ownership signal (it covers a foreign print, which has no token to read).
 #
-# DERIVED from spool_recovery's own token set rather than re-listed, so a new hold
+# DERIVED from the incident store's own token set rather than re-listed, so a new hold
 # token (the external-spool runout was one) cannot be born un-attended and start
-# double-notifying the moment it ships.
-_ATTENDED_PAUSE_REASONS: frozenset[str] = frozenset({WAITING_REASON_PLATE_VISION}) | (
-    RECOVERY_WAITING_REASONS - {WAITING_REASON_RECOVERING}
-)
+# double-notifying the moment it ships. The plate-vision token used to be unioned in by
+# hand here; since every incident KIND registers its token in one table
+# (``printer_incidents._WAITING_REASON_BY_KIND``), that hand-listing is gone and the
+# three pause-cause kinds are attended by construction.
+_ATTENDED_PAUSE_REASONS: frozenset[str] = RECOVERY_WAITING_REASONS - {WAITING_REASON_RECOVERING}
 
 _DEFAULT_GRACE_MINUTES = 30
 _DEFAULT_PAUSE_GRACE_MINUTES = 15
@@ -678,8 +686,13 @@ _RUNOUT_REMINDER_DETAIL = (
     "Filament runout STILL not resolved — the printer is still PAUSED awaiting a same-slot refill."
 )
 _PLATE_VISION_REMINDER_DETAIL = (
-    "Printer vision STILL reports foreign objects on the heatbed — the job is still PAUSED. "
-    "Clear the bed, then Resume on the printer screen."
+    "The printer's plate check STILL reports the bed is not empty — the print was stopped. "
+    "Clear the bed, then Mark plate cleared."
+)
+_POWER_LOSS_REMINDER_REASON = "The farm could not answer the prompt; it is STILL waiting."
+_Z_REFERENCE_REMINDER_DETAIL = (
+    "This printer STILL has a part on its plate after a restart — its Z reference is lost. "
+    "Remove the part by hand, then Mark plate cleared. Ejects are refused until then."
 )
 
 
@@ -693,11 +706,16 @@ _PHYSICAL_REMINDER_DETAIL = (
 )
 
 # incident kind -> the reminder's detail copy. One line per kind, so the nag reads
-# like the alert it repeats.
+# like the alert it repeats. EVERY kind must appear: the lookup below falls back to the
+# jam sentence, so a missing row does not fail loudly — it nags an operator about a
+# spool jam on a printer holding for a lost Z reference.
 _INCIDENT_REMINDER_DETAIL: dict[str, str] = {
     KIND_JAM: _JAM_REMINDER_DETAIL,
     KIND_RUNOUT: _RUNOUT_REMINDER_DETAIL,
     KIND_PHYSICAL: _PHYSICAL_REMINDER_DETAIL,
+    KIND_POWER_LOSS: _POWER_LOSS_REMINDER_REASON,
+    KIND_PLATE_VISION: _PLATE_VISION_REMINDER_DETAIL,
+    KIND_Z_REFERENCE_LOST: _Z_REFERENCE_REMINDER_DETAIL,
 }
 
 # The same three holds when the printer is NOT paused. Every line above asserts
@@ -716,6 +734,16 @@ _INCIDENT_REMINDER_DETAIL_UNPAUSED: dict[str, str] = {
         "A physical filament fault is STILL unresolved — the printer remains held and no swap can clear it."
         + _IDLE_HELD_SUFFIX
     ),
+    # The three pause-cause kinds hold an IDLE printer as their NORMAL shape — the farm
+    # stopped the print (plate check) or never had one running (a lost Z reference on an
+    # idle machine) — so their unpaused copy is not a variant of a paused sentence and
+    # deliberately does not borrow the "until the fault clears on the wire" suffix: no
+    # wire fact ends either hold, only the operator does.
+    KIND_POWER_LOSS: (
+        "This printer is STILL held at its power-loss prompt and will take no work until the prompt is answered."
+    ),
+    KIND_PLATE_VISION: _PLATE_VISION_REMINDER_DETAIL + " The printer is idle and will take no work until then.",
+    KIND_Z_REFERENCE_LOST: _Z_REFERENCE_REMINDER_DETAIL,
 }
 
 
@@ -729,23 +757,20 @@ def _live_runout_slot(state) -> str | None:
     return runout_slot_desc(demand[0] * 4 + demand[1])
 
 
-async def _remind_plate_vision(db, notif, printer_id, printer_name, job_name, minutes, *, state=None) -> None:
-    """Re-fire the native-vision plate hold's own event (WAITING_REASON_PLATE_VISION)."""
-    await notif.on_plate_not_empty(printer_id, printer_name, db, source_detail=_PLATE_VISION_REMINDER_DETAIL)
-
-
 # reason -> the callable that RE-FIRES that reason's original notification event.
 # This dict IS the single source of the remindable reason set (_ATTENTION_REASONS
 # below), so adding a reason is a one-line edit that cannot drift from the pin.
 #
-# The AMS holds (jam / runout / physical) are deliberately ABSENT: since WS2b they
-# are reminded from their OPEN ESCALATED INCIDENT (:func:`_remind_open_incidents`),
-# not from a queue item's token. A token can only exist for a farm print, so the
-# token lane could never nag about a foreign print left holding — which is exactly
-# the class of hold that sat silent for hours.
+# Every INCIDENT-backed hold is deliberately ABSENT: since WS2b they are reminded from
+# their OPEN ESCALATED INCIDENT (:func:`_remind_open_incidents`), not from a queue
+# item's token. A token can only exist for a farm print, so the token lane could never
+# nag about a foreign print left holding — exactly the class of hold that sat silent for
+# hours. The plate-vision row was the LAST token-driven reminder and went the same way
+# when the plate check became an incident kind (2026-09-04), which is what gives it
+# foreign-print parity for free. Only the generic pause-stall pager remains here: it is
+# the catch-all for a PAUSE nobody claimed, so by definition it has no incident to read.
 _ATTENTION_DISPATCH: dict[str, Callable[..., Awaitable[None]]] = {
     WAITING_REASON_PAUSED: _remind_paused,
-    WAITING_REASON_PLATE_VISION: _remind_plate_vision,
 }
 # The ESCALATED waiting_reason tokens a down-printer reminder re-fires for. Each of
 # these was already alerted ONCE by the code that set it and then left the printer
@@ -822,16 +847,39 @@ async def _remind_open_incidents(
             elif incident.slot_global_tray is not None:
                 slot = runout_slot_desc(incident.slot_global_tray)
             copy = _INCIDENT_REMINDER_DETAIL if live == "PAUSE" else _INCIDENT_REMINDER_DETAIL_UNPAUSED
-            await notif.on_spool_recovery_failed(
-                printer_id=pid,
-                printer_name=printer_name,
-                job_name=job_name,
-                detail=copy.get(incident.kind, _JAM_REMINDER_DETAIL),
-                db=db,
-                kind=incident.kind,
-                runout_slot=slot,
-                foreign=incident.item_id is None,
-            )
+            detail = copy.get(incident.kind, _JAM_REMINDER_DETAIL)
+            # The EVENT is chosen by kind, not just the copy. An AMS-fault event carrying
+            # power-loss text would page whoever asked to hear about spool recoveries and
+            # stay silent for whoever asked about outages — the toggle would be lying
+            # about what it controls. Each kind re-fires the event its own escalation
+            # raised, which is what keeps a reminder a reminder.
+            if incident.kind == KIND_POWER_LOSS:
+                await notif.on_power_loss_hold(
+                    printer_id=pid,
+                    printer_name=printer_name,
+                    job_name=job_name,
+                    # None, not `minutes`: `minutes` is how long the HOLD has run, and
+                    # the outage ended when the printer reconnected hours ago. The
+                    # sentence is dropped rather than filled with a plausible lie.
+                    outage_minutes=None,
+                    reason=detail,
+                    db=db,
+                )
+            elif incident.kind == KIND_PLATE_VISION:
+                await notif.on_plate_not_empty(pid, printer_name, db, source_detail=detail)
+            elif incident.kind == KIND_Z_REFERENCE_LOST:
+                await notif.on_z_reference_lost(printer_id=pid, printer_name=printer_name, db=db)
+            else:
+                await notif.on_spool_recovery_failed(
+                    printer_id=pid,
+                    printer_name=printer_name,
+                    job_name=job_name,
+                    detail=detail,
+                    db=db,
+                    kind=incident.kind,
+                    runout_slot=slot,
+                    foreign=incident.item_id is None,
+                )
             logger.warning(
                 "farm_stall: printer %s STILL held by %s incident %s (%d min, state=%s%s) — "
                 "attention reminder re-fired",
