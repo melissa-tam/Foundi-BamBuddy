@@ -1214,10 +1214,21 @@ export default {
       jam: 'Atasco del AMS',
       runout: 'Sin filamento',
       physical: 'Fallo de filamento',
-      power_loss: 'Corte de energía — reanude en la impresora',
-      plate_vision: 'Comprobación de la cama — despeje la cama y luego «Marcar cama como despejada»',
-      z_reference_lost: 'Reiniciada con una pieza en la cama — retírela a mano y luego «Marcar cama como despejada»',
+      power_loss: 'Corte de energía',
+      plate_vision: 'Comprobación de la cama',
+      z_reference_lost: 'Referencia Z perdida',
       recovering: 'Recuperando',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'Despeje la vía de filamento del AMS y reanude la impresión',
+      runout: 'Recargue la ranura solicitada; la impresión se reanuda sola',
+      physical: 'Despeje la vía del filamento en la impresora y reanude la impresión',
+      power_loss: 'Reanude en la impresora',
+      plate_vision: 'Despeje la cama y luego «Marcar cama como despejada»',
+      z_reference_lost: 'Reiniciada con una pieza en la cama — retírela a mano y luego «Marcar cama como despejada»',
     },
     // Fans
     fans: {

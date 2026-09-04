@@ -1213,10 +1213,21 @@ export default {
       jam: 'AMS詰まり',
       runout: 'フィラメント切れ',
       physical: 'フィラメント故障',
-      power_loss: '停電 — プリンター側で再開してください',
-      plate_vision: 'プレート検査 — ベッドを片付けてから「プレートをクリア済みにする」',
-      z_reference_lost: '部品がプレートに載ったまま再起動 — 手で取り除いてから「プレートをクリア済みにする」',
+      power_loss: '停電',
+      plate_vision: 'プレート検査',
+      z_reference_lost: 'Z基準喪失',
       recovering: '復旧中',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'AMSのフィラメント経路を解消してから印刷を再開してください',
+      runout: '要求されたスロットに補充してください。印刷は自動で再開します',
+      physical: 'プリンター側でフィラメント経路を解消してから印刷を再開してください',
+      power_loss: 'プリンター側で再開してください',
+      plate_vision: 'ベッドを片付けてから「プレートをクリア済みにする」',
+      z_reference_lost: '部品がプレートに載ったまま再起動 — 手で取り除いてから「プレートをクリア済みにする」',
     },
     // Fans
     fans: {

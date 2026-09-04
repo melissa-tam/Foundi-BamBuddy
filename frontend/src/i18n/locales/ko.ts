@@ -1172,10 +1172,21 @@ export default {
       jam: 'AMS 걸림',
       runout: '필라멘트 소진',
       physical: '필라멘트 고장',
-      power_loss: '정전 — 프린터에서 재개하세요',
-      plate_vision: '플레이트 검사 — 베드를 비운 뒤 ‘플레이트 비움으로 표시’',
-      z_reference_lost: '플레이트에 출력물이 있는 상태로 재시작됨 — 손으로 제거한 뒤 ‘플레이트 비움으로 표시’',
+      power_loss: '정전',
+      plate_vision: '플레이트 검사',
+      z_reference_lost: 'Z 기준 손실',
       recovering: '복구 중',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'AMS 필라멘트 경로를 정리한 뒤 출력을 재개하세요',
+      runout: '요청된 슬롯을 보충하세요. 출력은 자동으로 재개됩니다',
+      physical: '프린터에서 필라멘트 경로를 정리한 뒤 출력을 재개하세요',
+      power_loss: '프린터에서 재개하세요',
+      plate_vision: '베드를 비운 뒤 ‘플레이트 비움으로 표시’',
+      z_reference_lost: '플레이트에 출력물이 있는 상태로 재시작됨 — 손으로 제거한 뒤 ‘플레이트 비움으로 표시’',
     },
     fans: {
       partCooling: '파트 냉각 팬',

@@ -1214,10 +1214,21 @@ export default {
       jam: 'Inceppamento AMS',
       runout: 'Filamento esaurito',
       physical: 'Guasto filamento',
-      power_loss: 'Interruzione di corrente — riprendi sulla stampante',
-      plate_vision: 'Controllo del piatto — libera il piano, poi «Segna il piatto come liberato»',
-      z_reference_lost: 'Riavvio con un pezzo sul piatto — rimuovilo a mano, poi «Segna il piatto come liberato»',
+      power_loss: 'Interruzione di corrente',
+      plate_vision: 'Controllo del piatto',
+      z_reference_lost: 'Riferimento Z perso',
       recovering: 'Ripristino',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'Libera il percorso del filamento dell\'AMS, poi riprendi la stampa',
+      runout: 'Ricarica lo slot richiesto; la stampa riprende da sola',
+      physical: 'Libera il percorso del filamento sulla stampante, poi riprendi la stampa',
+      power_loss: 'Riprendi sulla stampante',
+      plate_vision: 'Libera il piano, poi «Segna il piatto come liberato»',
+      z_reference_lost: 'Riavvio con un pezzo sul piatto — rimuovilo a mano, poi «Segna il piatto come liberato»',
     },
     // Fans
     fans: {

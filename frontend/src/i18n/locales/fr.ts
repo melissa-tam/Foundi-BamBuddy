@@ -1214,10 +1214,21 @@ export default {
       jam: 'Bourrage AMS',
       runout: 'Filament épuisé',
       physical: 'Panne de filament',
-      power_loss: 'Coupure de courant — reprenez sur l\'imprimante',
-      plate_vision: 'Contrôle du plateau — dégagez le plateau, puis « Marquer le plateau comme dégagé »',
-      z_reference_lost: 'Redémarrage avec une pièce sur le plateau — retirez-la à la main, puis « Marquer le plateau comme dégagé »',
+      power_loss: 'Coupure de courant',
+      plate_vision: 'Contrôle du plateau',
+      z_reference_lost: 'Référence Z perdue',
       recovering: 'Récupération',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'Dégagez le chemin du filament de l\'AMS, puis reprenez l\'impression',
+      runout: 'Rechargez l\'emplacement demandé ; l\'impression reprend d\'elle-même',
+      physical: 'Dégagez le chemin du filament sur l\'imprimante, puis reprenez l\'impression',
+      power_loss: 'Reprenez sur l\'imprimante',
+      plate_vision: 'Dégagez le plateau, puis « Marquer le plateau comme dégagé »',
+      z_reference_lost: 'Redémarrage avec une pièce sur le plateau — retirez-la à la main, puis « Marquer le plateau comme dégagé »',
     },
     // Fans
     fans: {

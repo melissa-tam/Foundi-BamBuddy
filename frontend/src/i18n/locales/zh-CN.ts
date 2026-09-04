@@ -1214,10 +1214,21 @@ export default {
       jam: 'AMS 堵料',
       runout: '耗材用尽',
       physical: '耗材故障',
-      power_loss: '断电 — 请在打印机上继续',
-      plate_vision: '打印板检测 — 清理热床后点击“将打印板标记为已清理”',
-      z_reference_lost: '重启时打印板上仍有零件 — 手动取下后点击“将打印板标记为已清理”',
+      power_loss: '断电',
+      plate_vision: '打印板检测',
+      z_reference_lost: 'Z 基准丢失',
       recovering: '恢复中',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: '清理 AMS 送料通道，然后继续打印',
+      runout: '为所请求的槽位补充耗材；打印会自动继续',
+      physical: '在打印机上清理耗材通道，然后继续打印',
+      power_loss: '请在打印机上继续',
+      plate_vision: '清理热床后点击“将打印板标记为已清理”',
+      z_reference_lost: '重启时打印板上仍有零件 — 手动取下后点击“将打印板标记为已清理”',
     },
     // Fans
     fans: {

@@ -1214,10 +1214,21 @@ export default {
       jam: 'AMS sıkışması',
       runout: 'Filament bitti',
       physical: 'Filament arızası',
-      power_loss: 'Elektrik kesintisi — yazıcıdan sürdürün',
-      plate_vision: 'Plaka kontrolü — yatağı temizleyin, sonra “Plakayı temizlendi olarak işaretle”',
-      z_reference_lost: 'Plakada parça varken yeniden başlatıldı — elle çıkarın, sonra “Plakayı temizlendi olarak işaretle”',
+      power_loss: 'Elektrik kesintisi',
+      plate_vision: 'Plaka kontrolü',
+      z_reference_lost: 'Z referansı kayboldu',
       recovering: 'Kurtarılıyor',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'AMS filaman yolunu temizleyin, sonra yazdırmayı sürdürün',
+      runout: 'İstenen yuvayı doldurun; yazdırma kendiliğinden sürer',
+      physical: 'Yazıcıdaki filaman yolunu temizleyin, sonra yazdırmayı sürdürün',
+      power_loss: 'Yazıcıdan sürdürün',
+      plate_vision: 'Yatağı temizleyin, sonra “Plakayı temizlendi olarak işaretle”',
+      z_reference_lost: 'Plakada parça varken yeniden başlatıldı — elle çıkarın, sonra “Plakayı temizlendi olarak işaretle”',
     },
     // Fanlar
     fans: {

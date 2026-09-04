@@ -1214,10 +1214,21 @@ export default {
       jam: 'AMS-Stau',
       runout: 'Filament leer',
       physical: 'Filamentfehler',
-      power_loss: 'Stromausfall — am Drucker fortsetzen',
-      plate_vision: 'Plattenprüfung — Bett freiräumen, dann „Platte als freigegeben markieren“',
-      z_reference_lost: 'Nach Neustart liegt ein Teil auf der Platte — von Hand entfernen, dann „Platte als freigegeben markieren“',
+      power_loss: 'Stromausfall',
+      plate_vision: 'Plattenprüfung',
+      z_reference_lost: 'Z-Referenz verloren',
       recovering: 'Wiederherstellung',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'AMS-Filamentweg freimachen, dann Druck fortsetzen',
+      runout: 'Angeforderten Slot nachfüllen; der Druck läuft von selbst weiter',
+      physical: 'Filamentweg am Drucker freimachen, dann Druck fortsetzen',
+      power_loss: 'Am Drucker fortsetzen',
+      plate_vision: 'Bett freiräumen, dann „Platte als freigegeben markieren“',
+      z_reference_lost: 'Nach Neustart liegt ein Teil auf der Platte — von Hand entfernen, dann „Platte als freigegeben markieren“',
     },
     // Fans
     fans: {

@@ -1214,10 +1214,21 @@ export default {
       jam: 'Entupimento do AMS',
       runout: 'Filamento acabou',
       physical: 'Falha de filamento',
-      power_loss: 'Queda de energia — retome na impressora',
-      plate_vision: 'Verificação da placa — libere a mesa e depois «Marcar placa como liberada»',
-      z_reference_lost: 'Reiniciada com uma peça na placa — remova-a à mão e depois «Marcar placa como liberada»',
+      power_loss: 'Queda de energia',
+      plate_vision: 'Verificação da placa',
+      z_reference_lost: 'Referência Z perdida',
       recovering: 'Recuperando',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'Desobstrua o caminho do filamento do AMS e retome a impressão',
+      runout: 'Reabasteça o slot solicitado; a impressão retoma sozinha',
+      physical: 'Desobstrua o caminho do filamento na impressora e retome a impressão',
+      power_loss: 'Retome na impressora',
+      plate_vision: 'Libere a mesa e depois «Marcar placa como liberada»',
+      z_reference_lost: 'Reiniciada com uma peça na placa — remova-a à mão e depois «Marcar placa como liberada»',
     },
     // Fans
     fans: {
