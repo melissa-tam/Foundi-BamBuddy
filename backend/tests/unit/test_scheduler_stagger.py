@@ -107,7 +107,7 @@ async def test_stagger_held_model_item_gets_stagger_hold_token(cq_scheduler, db_
     """Budget exhausted → held item marked stagger_hold, not dispatched, not notified."""
     p = await printer_factory(model="H2S")
     monkeypatch.setattr(sched_mod.stagger_policy, "budget", AsyncMock(return_value=0))
-    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_model", AsyncMock(return_value=(p.id, None)))
+    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_target", AsyncMock(return_value=(p.id, None)))
     monkeypatch.setattr(cq_scheduler, "_compute_deficit_safe", AsyncMock(return_value=[]))  # not short
     start_mock = AsyncMock()
     monkeypatch.setattr(cq_scheduler, "_start_print", start_mock)
@@ -125,13 +125,23 @@ async def test_stagger_held_model_item_gets_stagger_hold_token(cq_scheduler, db_
 
 @pytest.mark.asyncio
 async def test_stagger_hold_cleared_on_dispatch(cq_scheduler, db_session, printer_factory, monkeypatch):
-    """A previously-held item clears the token when the window re-opens and it dispatches."""
+    """A previously-held item clears the token when the window re-opens and it dispatches.
+
+    The dispatched printer is asserted through the PLAN, not the row: a pending pool
+    row never carries the scheduler's pick (``services/dispatch_target`` — on a pending
+    row ``printer_id`` is an operator PIN), so the decision travels as
+    ``_start_print(printer_id=…)`` and would reach the row only at the
+    ``pending → printing`` claim, which this stub stands in for.
+    """
     p = await printer_factory(model="H2S")
     monkeypatch.setattr(sched_mod.stagger_policy, "budget", AsyncMock(return_value=5))  # budget available
-    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_model", AsyncMock(return_value=(p.id, None)))
+    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_target", AsyncMock(return_value=(p.id, None)))
     monkeypatch.setattr(cq_scheduler, "_compute_deficit_safe", AsyncMock(return_value=[]))
 
-    async def _start(db, item):
+    started: dict = {}
+
+    async def _start(db, item, *, printer_id=None, ams_mapping=None, lease=None):
+        started["printer_id"] = printer_id
         item.status = "printing"
         await db.commit()
 
@@ -145,7 +155,8 @@ async def test_stagger_hold_cleared_on_dispatch(cq_scheduler, db_session, printe
     await cq_scheduler.check_queue()
 
     row = await _row(db_session, item_id)
-    assert row.printer_id == p_id
+    assert started.get("printer_id") == p_id  # the pick rode the plan into the dispatch
+    assert row.printer_id is None  # and was never written to the pending row
     assert row.waiting_reason is None  # stale token cleared on assignment
 
 
@@ -159,14 +170,14 @@ async def test_deficit_staging_happens_even_while_budget_exhausted(
     b = await printer_factory(model="H2S")
     monkeypatch.setattr(sched_mod.stagger_policy, "budget", AsyncMock(return_value=0))  # window full
 
-    def _find(db, model, exclude, *a_, **k_):
+    def _find(db, target, exclude, *a_, **k_):
         if a.id not in exclude:
             return (a.id, None)
         if b.id not in exclude:
             return (b.id, None)
         return (None, "No idle H2S printers")
 
-    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_model", AsyncMock(side_effect=_find))
+    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_target", AsyncMock(side_effect=_find))
     monkeypatch.setattr(
         cq_scheduler,
         "_compute_deficit_safe",

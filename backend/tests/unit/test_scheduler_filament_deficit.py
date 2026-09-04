@@ -251,14 +251,14 @@ async def test_head_of_line_dispatches_to_second_printer_same_tick(
     a = await printer_factory(model="H2S")
     b = await printer_factory(model="H2S")
 
-    def _find(db, model, exclude, *a_, **k_):
+    def _find(db, target, exclude, *a_, **k_):
         if a.id not in exclude:
             return (a.id, None)
         if b.id not in exclude:
             return (b.id, None)
         return (None, "all printers busy")
 
-    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_model", AsyncMock(side_effect=_find))
+    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_target", AsyncMock(side_effect=_find))
 
     async def _deficit_for(db, item, *, printer_id_override=None, ams_mapping_override=None):
         return _deficit() if printer_id_override == a.id else []
@@ -267,9 +267,9 @@ async def test_head_of_line_dispatches_to_second_printer_same_tick(
 
     started: dict = {}
 
-    async def _start(db, item, *, ams_mapping=None, lease=None):
+    async def _start(db, item, *, printer_id=None, ams_mapping=None, lease=None):
         item.status = "printing"
-        started["printer_id"] = item.printer_id
+        started["printer_id"] = printer_id
         await db.commit()
 
     monkeypatch.setattr(cq_scheduler, "_start_print", AsyncMock(side_effect=_start))
@@ -278,7 +278,10 @@ async def test_head_of_line_dispatches_to_second_printer_same_tick(
     item_id, b_id = item.id, b.id
     await cq_scheduler.check_queue()
 
-    # Dispatched — to B (the printer with adequate filament), not the short A.
+    # Dispatched — to B (the printer with adequate filament), not the short A. The
+    # pick is read off the PLAN (``_start_print(printer_id=…)``): a pending pool row
+    # never carries it, so the row below is asserted UNPINNED for that reason and not
+    # because anything released it.
     assert started.get("printer_id") == b_id
     db_session.expire_all()
     row = (
@@ -286,7 +289,7 @@ async def test_head_of_line_dispatches_to_second_printer_same_tick(
             select(PrintQueueItem.printer_id, PrintQueueItem.manual_start).where(PrintQueueItem.id == item_id)
         )
     ).one()
-    assert row.printer_id == b_id
+    assert row.printer_id is None
     assert row.manual_start is False  # never staged
 
 
@@ -300,7 +303,7 @@ async def test_short_printer_excluded_from_later_candidate_search(
 
     excludes: list[set] = []
 
-    def _find(db, model, exclude, *a_, **k_):
+    def _find(db, target, exclude, *a_, **k_):
         excludes.append(set(exclude))
         if a.id not in exclude:
             return (a.id, None)
@@ -308,7 +311,7 @@ async def test_short_printer_excluded_from_later_candidate_search(
             return (b.id, None)
         return (None, "all printers busy")
 
-    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_model", AsyncMock(side_effect=_find))
+    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_target", AsyncMock(side_effect=_find))
 
     async def _deficit_for(db, item, *, printer_id_override=None, ams_mapping_override=None):
         return _deficit() if printer_id_override == a.id else []
@@ -333,14 +336,14 @@ async def test_all_candidates_short_stages_unpinned_with_one_notification(
     a = await printer_factory(model="H2S")
     b = await printer_factory(model="H2S")
 
-    def _find(db, model, exclude, *a_, **k_):
+    def _find(db, target, exclude, *a_, **k_):
         if a.id not in exclude:
             return (a.id, None)
         if b.id not in exclude:
             return (b.id, None)
         return (None, "No idle H2S printers")
 
-    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_model", AsyncMock(side_effect=_find))
+    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_target", AsyncMock(side_effect=_find))
     # Every candidate is short.
     monkeypatch.setattr(cq_scheduler, "_compute_deficit_safe", AsyncMock(return_value=_deficit()))
     start_mock = AsyncMock()
@@ -504,14 +507,14 @@ async def test_model_loop_skips_start_blocked_candidate(cq_scheduler, db_session
     a = await printer_factory(model="H2S")
     b = await printer_factory(model="H2S")
 
-    def _find(db, model, exclude, *a_, **k_):
+    def _find(db, target, exclude, *a_, **k_):
         if a.id not in exclude:
             return (a.id, None)
         if b.id not in exclude:
             return (b.id, None)
         return (None, "all printers busy")
 
-    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_model", AsyncMock(side_effect=_find))
+    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_target", AsyncMock(side_effect=_find))
 
     async def _outcome(db, printer_id, item):
         if printer_id == a.id:
@@ -523,9 +526,9 @@ async def test_model_loop_skips_start_blocked_candidate(cq_scheduler, db_session
 
     started: dict = {}
 
-    async def _start(db, item, *, ams_mapping=None, lease=None):
+    async def _start(db, item, *, printer_id=None, ams_mapping=None, lease=None):
         item.status = "printing"
-        started["printer_id"] = item.printer_id
+        started["printer_id"] = printer_id
         await db.commit()
 
     monkeypatch.setattr(cq_scheduler, "_start_print", AsyncMock(side_effect=_start))
@@ -533,6 +536,7 @@ async def test_model_loop_skips_start_blocked_candidate(cq_scheduler, db_session
     await _model_item(db_session)
     await cq_scheduler.check_queue()
 
+    # Read off the plan, not the row — the pick never lands on a pending row.
     assert started.get("printer_id") == b.id  # skipped A, ran on B
 
 
@@ -545,14 +549,14 @@ async def test_all_candidates_start_blocked_stages_with_start_min_reason(
     a = await printer_factory(model="H2S")
     b = await printer_factory(model="H2S")
 
-    def _find(db, model, exclude, *a_, **k_):
+    def _find(db, target, exclude, *a_, **k_):
         if a.id not in exclude:
             return (a.id, None)
         if b.id not in exclude:
             return (b.id, None)
         return (None, "No idle H2S printers")
 
-    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_model", AsyncMock(side_effect=_find))
+    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_target", AsyncMock(side_effect=_find))
     monkeypatch.setattr(
         cq_scheduler,
         "_compute_ams_mapping_for_printer",
@@ -590,14 +594,14 @@ async def test_mixed_block_stages_generic_filament_short(cq_scheduler, db_sessio
     a = await printer_factory(model="H2S")
     b = await printer_factory(model="H2S")
 
-    def _find(db, model, exclude, *a_, **k_):
+    def _find(db, target, exclude, *a_, **k_):
         if a.id not in exclude:
             return (a.id, None)
         if b.id not in exclude:
             return (b.id, None)
         return (None, "No idle H2S printers")
 
-    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_model", AsyncMock(side_effect=_find))
+    monkeypatch.setattr(cq_scheduler, "_find_idle_printer_for_target", AsyncMock(side_effect=_find))
 
     async def _outcome(db, printer_id, item):
         # A is start-blocked; B has a mapping (its block will be a true deficit).
@@ -630,7 +634,7 @@ async def test_mixed_block_stages_generic_filament_short(cq_scheduler, db_sessio
 
 
 def _mk_start():
-    async def _start(db, item, *, ams_mapping=None, lease=None):
+    async def _start(db, item, *, printer_id=None, ams_mapping=None, lease=None):
         item.status = "printing"
         await db.commit()
 
