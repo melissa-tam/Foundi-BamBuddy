@@ -45,6 +45,16 @@ still clears the full part top regardless of either tuning. A third tuning,
 z_offset floor — set it False to push exactly once (e.g. one mid-height lane
 for a tall part).
 
+A model whose SECOND hardware-ladder gate is open (``z_reference_validated``, default
+False everywhere) additionally opens its block with a contact-free Z RE-REFERENCE:
+the bed is driven to its bottom stop under the vendor's own guarded ``G380 S2``
+primitive with soft end stops off, the stop is DECLARED as ``z_travel_mm``, and only
+then does the XY re-engage run. It exists because the block's absolute Z moves rely on
+a RETAINED Z datum that a power cycle destroys (002-H2S, 2026-09-04, eyewitnessed: the
+bed drove past the Z floor). See :func:`z_reference_prologue_lines` for what each line
+rests on and, in particular, which parts are proven and which are hypotheses the ladder
+witnesses.
+
 An optional ``bed_drop_clearance_mm`` (NULL = off) adds a mechanical release
 assist after the bed heater is commanded off: the bed drives all the way DOWN
 to the machine bottom minus that clearance (bigger Z = bed farther from the
@@ -95,6 +105,23 @@ PARK_Z_MM = 10.0
 # nominal ejects executed in 80-83 s wall clock. Added once to every estimate — it
 # is deliberately generous, because the guard that consumes the estimate must
 # never fire on a healthy sweep.
+#
+# WHAT THE Z RE-REFERENCE PROLOGUE DOES AND DOES NOT CHANGE HERE (2026-09-04). The
+# calibration population above is entirely blocks WITHOUT that prologue, and it stays
+# valid for them: the constant is unchanged and every existing golden is byte-identical.
+# For a block WITH it, the drive's own commanded time is scored into ``reference_s`` and
+# flows into ``total_s``, so the whole-job deadline grows by the drive and by nothing
+# else — this constant is NOT re-fitted to cover it, because job spin-up and the finish
+# chime did not get longer.
+#
+# The residue that is honestly UNMEASURED: whatever fixed cost the firmware adds for
+# ``M211`` / ``G92`` / the ``G380`` guard's own settle, plus however early the guarded
+# drive terminates against the stop (which SHORTENS the real job while the estimate
+# counts the full commanded distance — see the domain rules). Both push in the same
+# direction as this constant's existing generosity, i.e. toward a deadline that is too
+# patient rather than too tight. The instrument that resolves it is the ladder's rung 2
+# and the terminal's ``ran Ns (expected Ns)`` line on the first flag-on model; no number
+# here is fitted to a block nobody has run yet.
 EJECT_RUNTIME_OVERHEAD_S = 25.0
 
 # The dual-nozzle homing forms (``DUAL_NOZZLE_HOME`` / ``DUAL_NOZZLE_FULL_HOME``)
@@ -114,17 +141,40 @@ BLOCK_END_MARKER = "; ===== FARM EJECT BLOCK END ====="
 SWEEP_PHASE_MARKER = "; --- sweep: push part off the front edge ---"
 
 # M73 PHASE BEACONS. ``mc_percent`` is M73-driven end to end and resets to 0 when the
-# eject job starts, so these three commands publish the block's phase boundaries over
+# eject job starts, so these commands publish the block's phase boundaries over
 # the only in-band channel the wire has (the H2S publishes no ``mc_print_line_number``).
 # The percentages are arbitrary ORDERED markers, not progress: the watchdog only asks
 # "is the reported percent still below the sweep beacon?". The completion epilogue's
 # stock ``M73 P100 R0`` closes the series and is emitted verbatim with it.
+PHASE_BEACON_REFERENCED_PCT = 2  # Z re-reference done (emitted ONLY by that prologue)
 PHASE_BEACON_LIFTED_PCT = 5  # prologue done, bed-drop phase begins
 PHASE_BEACON_SWEEP_PCT = 50  # bed-drop done, sweep begins
 PHASE_BEACON_PARK_PCT = 75  # sweep done, park begins
+PHASE_BEACON_REFERENCED = f"M73 P{PHASE_BEACON_REFERENCED_PCT}"
 PHASE_BEACON_LIFTED = f"M73 P{PHASE_BEACON_LIFTED_PCT}"
 PHASE_BEACON_SWEEP = f"M73 P{PHASE_BEACON_SWEEP_PCT}"
 PHASE_BEACON_PARK = f"M73 P{PHASE_BEACON_PARK_PCT}"
+
+# Extra relative travel (mm) commanded on the guarded Z re-reference drive, ON TOP of
+# the model's full ``z_travel_mm``.
+#
+# DERIVATION (not a measurement — there is nothing here to measure): the drive must be
+# guaranteed to REACH the bottom stop from wherever the firmware's post-boot frame
+# happens to think the bed is, so it must exceed the maximum remaining travel PLUS any
+# plausible error in that frame. Full travel covers the first term exactly. 50 mm covers
+# the second with room to spare: the largest standing offset the farm itself ever
+# creates is the idle deep park at 75% of ``z_travel`` (~255 mm on an H2S), and a frame
+# wrong by even that much still lands on the stop, because the drive is bottom-stop
+# guarded and simply stops when it arrives. Overshoot costs SECONDS, never damage —
+# undershoot silently declares a wrong frame, which is the failure this whole recipe
+# exists to prevent. The asymmetry is why the number is generous rather than tight.
+Z_REFERENCE_OVERTRAVEL_MM = 50.0
+
+# Feedrate (mm/min) of the guarded drive. The vendor's own value for exactly this move:
+# the stock H2S machine-start block issues ``G380 S2 Z32 F1200`` / ``G380 S2 Z-12 F1200``
+# under ";===== avoid end stop =====", and ``G380 S2 Z30 F1200 ; lower heatbed to move
+# toolhead" — copied rather than chosen.
+Z_REFERENCE_FEED_MM_MIN = 1200
 
 # Completion epilogue — the stock machine-end FINISH TAIL, copied verbatim from a
 # production H2S plate (foundi-FarmManager/Print Files/
@@ -221,6 +271,87 @@ class EjectGenerationError(ValueError):
     """Raised when an eject block cannot be safely generated for the inputs."""
 
 
+def z_reference_prologue_lines(geometry: ModelGeometry) -> list[str]:
+    """The contact-free Z RE-REFERENCE prologue for ``geometry``, or ``[]``.
+
+    Emitted ONLY when ``geometry.z_reference_validated`` is True — False for every
+    seeded model, so this returns ``[]`` everywhere until a model's own hardware ladder
+    flips the flag through ``PUT /model-geometry``. A default-constructed
+    :class:`~backend.app.services.eject.geometry.ModelGeometry` therefore cannot produce
+    a block (pinned by a test): a new motion must never appear by omission.
+
+    WHY IT EXISTS (2026-09-04, eyewitnessed on 002-H2S). The eject block homes X/Y only
+    — Z-homing probes the bed centre, under the part — so it relies on a RETAINED Z
+    datum. A power cycle destroys that datum, and the operator's post-outage eject drove
+    the bed DOWN past the Z floor because every absolute Z move ran against the
+    firmware's fabricated post-boot frame. Escalating to a human is not a recovery:
+    nobody can re-home Z with a part on the plate.
+
+    THE SEQUENCE, and what each line rests on::
+
+        M211 Z0                 ; soft end stop OFF — the frame is untrusted, and a
+                                ;   clamp against an untrusted frame IS the 002-H2S
+                                ;   failure (the move was refused/clipped, not the fall)
+        G91                     ; relative
+        G380 S2 Z<travel+50>    ; drive the bed DOWN, guarded
+        G90                     ; absolute again, before any G0/G1 can run
+        G92 Z<z_travel_mm>      ; declare the stop
+        M211 Z1                 ; soft end stop ON again, now against a real frame
+        M73 P2                  ; phase beacon: the drive is bounded by its own deadline
+
+    **The load-bearing safety argument is DIRECTION, not the guard.** +Z moves the bed
+    AWAY from the nozzle on every bed-on-Z model in the fleet, so this drive physically
+    cannot touch a part on the plate however far it travels or however wrong the frame
+    is. Everything else is a bonus.
+
+    **"``S2`` guards on the bottom end stop" is a HYPOTHESIS, not a proven fact.** The
+    vendor's stock H2S machine-start block supports it — ``G380 S2 Z32`` / ``G380 S2
+    Z-12`` appear under the literal comment ";===== avoid end stop =====", and ``G380 S2
+    Z30 F1200 ; lower heatbed to move toolhead" runs before any homing, which is only
+    sensible if the bed may already be sitting on that stop — but it does NOT prove it,
+    because the same block issues ``G380 S2 Z-12`` in the opposite direction, where a
+    bottom-stop guard would be meaningless. Rung 1 of the hardware ladder is this
+    hypothesis's only witness, which is why the flag exists at all.
+
+    **``G92 Z<z_travel_mm>`` is DECLARED, not measured**, and the declaration is safe by
+    a reachability argument rather than by calibration: every H2S in the fleet commands
+    ``G1 Z340`` on every eject today and reaches it, so the physical stop sits AT or
+    BEYOND ``z_travel_mm`` fleet-wide. Declaring the stop to be ``z_travel_mm``
+    therefore errs by ``≤ 0`` — i.e. strictly on the MORE-clearance side. The bottom-stop
+    height is a per-MACHINE assembly fact, so it is deliberately not a per-model measured
+    constant.
+
+    **NO ``G28 Z``, no probe, ever** (operator rule 2026-09-04): a part is on the plate.
+
+    Refuses (like the bed-drop assist) on a bedslinger — its bed carries no Z, so a
+    "drive the bed to its stop" recipe is a different recipe for a different ladder —
+    and on a model with no ``z_travel_mm``, since the declaration has nothing to say.
+    """
+    if not geometry.z_reference_validated:
+        return []
+    if is_bedslinger_model(geometry.model_key):
+        raise EjectGenerationError(
+            f"Z re-reference is enabled but {geometry.model_key!r} is a bedslinger (the gantry carries Z, "
+            "not the bed) — a gantry-Z reference is a different recipe and needs its own hardware ladder"
+        )
+    if geometry.z_travel_mm is None:
+        raise EjectGenerationError(
+            f"Z re-reference is enabled but model {geometry.model_key!r} has no z_travel_mm — the drive has "
+            "no stop to declare; set it via PUT /model-geometry"
+        )
+    drive_mm = geometry.z_travel_mm + Z_REFERENCE_OVERTRAVEL_MM
+    return [
+        "; --- Z re-reference: contact-free, bottom-stop guarded (bed moves AWAY from the part) ---",
+        "M211 Z0",
+        "G91",
+        f"G380 S2 Z{_fmt(drive_mm)} F{Z_REFERENCE_FEED_MM_MIN}",
+        "G90",
+        f"G92 Z{_fmt(geometry.z_travel_mm)}",
+        "M211 Z1",
+        f"{PHASE_BEACON_REFERENCED} ; phase beacon: Z re-referenced - eject runtime watchdog",
+    ]
+
+
 def _fmt(value: float) -> str:
     """Format a coordinate/temperature for G-code: trim trailing zeros, no exponent."""
     return f"{value:g}"
@@ -262,16 +393,24 @@ class EjectRuntimeSegments:
     unconditional emission; a second emission site, or one behind a profile flag, would
     silently make a mid-sweep job look finished.
 
-    ``pre_s``, ``drop_span_s``, ``sweep_span_s`` and ``tail_s`` carry no share of
-    :data:`EJECT_RUNTIME_OVERHEAD_S` — the overhead is job spin-up plus the finish chime,
-    neither of which belongs to a phase — so only ``total_s`` includes it.
+    ``reference_s`` is the guarded Z re-reference drive's own budget, and it is ``None``
+    for a block that does not emit :data:`PHASE_BEACON_REFERENCED` at all — i.e. every
+    block on every model whose ladder has not flipped ``z_reference_validated``.
+    ``None`` (rather than 0.0) is what lets the watchdog tell "this block has no such
+    phase" from "this block's drive is instant", so it disarms the lane instead of
+    arming a zero-length deadline.
+
+    ``reference_s``, ``pre_s``, ``drop_span_s``, ``sweep_span_s`` and ``tail_s`` carry no
+    share of :data:`EJECT_RUNTIME_OVERHEAD_S` — the overhead is job spin-up plus the
+    finish chime, neither of which belongs to a phase — so only ``total_s`` includes it.
     """
 
     pre_s: float  # motion before the M73 P5 beacon (prologue lift, unmeasurable Z aside)
     drop_span_s: float  # commanded time between the P5 and P50 beacons (motion + M400 S dwells)
     sweep_span_s: float  # commanded time between the P50 and P75 beacons (the sweep lanes)
     tail_s: float  # the P75 beacon onward (park + completion epilogue)
-    total_s: float  # pre + drop_span + sweep_span + tail + EJECT_RUNTIME_OVERHEAD_S
+    total_s: float  # every span above + EJECT_RUNTIME_OVERHEAD_S
+    reference_s: float | None = None  # block start → the M73 P2 beacon; None = no such phase
 
 
 def estimate_runtime_s(gcode: str) -> float:
@@ -292,12 +431,12 @@ def estimate_runtime_segments(gcode: str) -> EjectRuntimeSegments:
     :data:`EJECT_RUNTIME_OVERHEAD_S` constant absorbs the difference and the guard
     margins absorb the rest.
 
-    Segment boundaries are the three EXACT beacon lines :data:`PHASE_BEACON_LIFTED`,
-    :data:`PHASE_BEACON_SWEEP` and :data:`PHASE_BEACON_PARK` (after comment stripping).
-    Matching the literal — not "any M73" — is what keeps the epilogue's stock
-    ``M73 P100 R0`` inside ``tail_s`` where it belongs. Boundaries only ever advance, so
-    a repeated beacon cannot reopen a closed segment. M73 itself contributes no time (it
-    falls through the motion branches, as it always has).
+    Segment boundaries are the EXACT beacon lines :data:`PHASE_BEACON_REFERENCED`,
+    :data:`PHASE_BEACON_LIFTED`, :data:`PHASE_BEACON_SWEEP` and :data:`PHASE_BEACON_PARK`
+    (after comment stripping). Matching the literal — not "any M73" — is what keeps the
+    epilogue's stock ``M73 P100 R0`` inside ``tail_s`` where it belongs. Boundaries only
+    ever advance, so a repeated beacon cannot reopen a closed segment. M73 itself
+    contributes no time (it falls through the motion branches, as it always has).
 
     Domain rules baked in:
 
@@ -310,25 +449,44 @@ def estimate_runtime_segments(gcode: str) -> EjectRuntimeSegments:
       :data:`UNMODELLED_EPILOGUE_ALLOWANCE_S` is that omission's numeric compensation and
       carries the measurement behind its size.
     * **``G28`` (any dialect — ``G28 X Y``, the dual-nozzle torque forms
-      ``G28 X T300`` / ``G28 Y T300``) zeroes X and Y and leaves Z UNKNOWN.** The
-      eject prologue never homes Z (a part sits on the plate), so the block's Z
-      datum is whatever the finished print left behind and is not derivable here.
-    * **A move on an axis with no known prior position contributes 0 mm.** The
-      prologue's first ``G1 Z<lift> F900`` is exactly this case: real, but
-      unmeasurable. It becomes known afterwards, so the bed-drop pair that follows
-      — the move that stalled in the 2026-07-31 under-bed-obstruction incident —
-      IS fully counted.
+      ``G28 X T300`` / ``G28 Y T300``) zeroes X and Y.** It never homes Z in an eject
+      block (a part sits on the plate), so it leaves the Z position exactly as it found
+      it — UNKNOWN unless the Z re-reference prologue declared it (below).
+    * **``G91``/``G90`` switch the distance mode, and a ``G0/G1`` in relative mode is
+      counted as a DISPLACEMENT** (its parameters are deltas, not coordinates) rather
+      than differenced against the last position, which would score a 10 mm relative
+      step as a 330 mm move. The generator emits no relative ``G0/G1`` — the validator
+      forbids one outright — so this rule exists to keep the model HONEST about the
+      dialect it walks rather than to score anything the farm currently emits.
+    * **``G380 S2 Z<d>`` is a guarded relative move and is counted at its FULL commanded
+      distance.** That deliberately OVER-states it: the drive stops early, at the bottom
+      stop, by design — usually well before ``d``. Over-stating a drive is the safe
+      direction for a deadline (it can only be too patient), and there is no way to know
+      the remaining travel from here, because the frame it would be measured in is the
+      fabricated one this drive exists to replace.
+    * **``G92 Z<v>`` DECLARES the Z position** — after it, Z is known and subsequent
+      absolute Z moves are measurable. Before it, and in a block without it, Z is
+      unknown and the prologue's first ``G1 Z<lift> F900`` contributes 0 mm: real, but
+      unmeasurable. It becomes known after that move either way, so the bed-drop pair
+      that follows — the move that stalled in the 2026-07-31 under-bed-obstruction
+      incident — IS fully counted in both dialects.
+    * **A move on an axis with no known prior position contributes 0 mm.**
     * ``M400 S<n>`` outside a skipped block dwells ``n`` seconds; a bare ``M400``
       (queue drain) dwells 0.
     * A move emitted before any feedrate has been seen contributes no time
       (defensive — the generator always emits an explicit F).
     """
-    # Index 0 = pre, 1 = drop span, 2 = sweep span, 3 = tail; the beacons advance `segment`.
-    segments = [0.0, 0.0, 0.0, 0.0]
+    # Index 0 = the Z re-reference drive (or, in a block without that phase, the plain
+    # prologue), 1 = pre, 2 = drop span, 3 = sweep span, 4 = tail. The beacons advance
+    # `segment`; which of 0/1 the prologue landed in is resolved after the walk, from
+    # whether the P2 beacon was present at all.
+    segments = [0.0, 0.0, 0.0, 0.0, 0.0]
     segment = 0
+    saw_reference_beacon = False
     feed_mm_min: float | None = None
-    # None = position not yet known on that axis (see the G28/unknown-axis rules).
+    # None = position not yet known on that axis (see the G28/G92/unknown-axis rules).
     pos: dict[str, float | None] = {"X": None, "Y": None, "Z": None}
+    relative = False
     in_conditional = False
 
     for raw_line in gcode.splitlines():
@@ -345,18 +503,61 @@ def estimate_runtime_segments(gcode: str) -> EjectRuntimeSegments:
             if code.startswith("M623"):
                 in_conditional = False
             continue
-        if code == PHASE_BEACON_LIFTED:
+        if code == PHASE_BEACON_REFERENCED:
+            saw_reference_beacon = True
             segment = max(segment, 1)
             continue
-        if code == PHASE_BEACON_SWEEP:
+        if code == PHASE_BEACON_LIFTED:
             segment = max(segment, 2)
             continue
-        if code == PHASE_BEACON_PARK:
+        if code == PHASE_BEACON_SWEEP:
             segment = max(segment, 3)
+            continue
+        if code == PHASE_BEACON_PARK:
+            segment = max(segment, 4)
             continue
 
         tokens = code.split()
         word = tokens[0].upper()
+
+        if word == "G91":
+            relative = True
+            continue
+        if word == "G90":
+            relative = False
+            continue
+
+        if word == "G92":
+            # A declaration, not a motion: it costs no time and makes Z measurable.
+            for token in tokens[1:]:
+                axis = token[0].upper()
+                if axis in pos:
+                    try:
+                        pos[axis] = float(token[1:])
+                    except ValueError:
+                        pass
+            continue
+
+        if word == "G380":
+            # Guarded relative move — counted at its full commanded distance (see the
+            # domain rule above) and, being guarded, it moves the machine to a position
+            # this model cannot know. Z stays/becomes unknown; the ``G92`` that follows
+            # is what makes it knowable again.
+            distance = 0.0
+            for token in tokens[1:]:
+                axis = token[0].upper()
+                try:
+                    value = float(token[1:])
+                except ValueError:
+                    continue
+                if axis == "F":
+                    feed_mm_min = value
+                elif axis in pos:
+                    distance += abs(value)
+                    pos[axis] = None
+            if feed_mm_min and distance > 0:
+                segments[segment] += distance / feed_mm_min * 60.0
+            continue
 
         if word.startswith("G28"):
             pos["X"] = 0.0
@@ -376,8 +577,10 @@ def estimate_runtime_segments(gcode: str) -> EjectRuntimeSegments:
         if word not in ("G0", "G1"):
             continue
 
-        # Per-axis distance against the LAST KNOWN position; an axis whose prior
-        # position is unknown contributes 0 to this move and becomes known after it.
+        # Per-axis distance. In ABSOLUTE mode, against the LAST KNOWN position — an axis
+        # whose prior position is unknown contributes 0 and becomes known after the move.
+        # In RELATIVE mode the parameters ARE the displacement, and the resulting
+        # position is only knowable if the prior one was.
         squared = 0.0
         for token in tokens[1:]:
             axis = token[0].upper()
@@ -389,19 +592,36 @@ def estimate_runtime_segments(gcode: str) -> EjectRuntimeSegments:
                 feed_mm_min = value
             elif axis in pos:
                 prior = pos[axis]
-                if prior is not None:
-                    squared += (value - prior) ** 2
-                pos[axis] = value
+                if relative:
+                    squared += value**2
+                    pos[axis] = None if prior is None else prior + value
+                else:
+                    if prior is not None:
+                        squared += (value - prior) ** 2
+                    pos[axis] = value
         if feed_mm_min and squared > 0:
             segments[segment] += math.sqrt(squared) / feed_mm_min * 60.0
 
-    pre_s, drop_span_s, sweep_span_s, tail_s = segments
+    # Which of slots 0/1 held the prologue depends on whether the block has a Z
+    # re-reference phase at all. With the beacon present, slot 0 IS the guarded drive and
+    # slot 1 is the rest of the prologue. Without it, nothing ever advanced past 0, so
+    # the two sum to the prologue and the phase is reported as absent — the distinction
+    # the watchdog needs to disarm the lane rather than arm a zero-length deadline.
+    reference_s = segments[0] if saw_reference_beacon else None
+    pre_s = segments[1] if saw_reference_beacon else segments[0] + segments[1]
+    _, _, drop_span_s, sweep_span_s, tail_s = segments
     return EjectRuntimeSegments(
         pre_s=pre_s,
         drop_span_s=drop_span_s,
         sweep_span_s=sweep_span_s,
         tail_s=tail_s,
-        total_s=pre_s + drop_span_s + sweep_span_s + tail_s + EJECT_RUNTIME_OVERHEAD_S,
+        # Summed in this exact left-to-right order, with the new span as a leading 0.0
+        # when it is absent: adding zero is exact, so a block without the re-reference
+        # phase yields the SAME float — to the bit — that it did before this phase
+        # existed. ``sum()`` over the slot list does not (it differs by one ULP), and the
+        # invariant "the total IS the sum of the spans" is asserted with exact equality.
+        total_s=(reference_s or 0.0) + pre_s + drop_span_s + sweep_span_s + tail_s + EJECT_RUNTIME_OVERHEAD_S,
+        reference_s=reference_s,
     )
 
 
@@ -513,6 +733,11 @@ def generate_eject_gcode(
     # part still sits. Home X/Y only, then lift the bed clear of the part.
     lines.append("; --- prologue: re-engage motors, home X/Y (never Z) ---")
     lines.append("M17")
+    # Contact-free Z re-reference, BEFORE the XY re-engage: the drive ends with the bed
+    # at its bottom stop, so the toolhead's homing travel afterwards is as clear of the
+    # part as it can possibly be. Empty for every model whose ladder has not flipped
+    # ``z_reference_validated`` — i.e. everywhere, until one does.
+    lines.extend(z_reference_prologue_lines(geometry))
     if is_dual_nozzle_model(geometry.model_key):
         # Dual-nozzle firmware stall-loops on unparameterized homing (see
         # DUAL_NOZZLE_HOME) — home X then Y with the stock parameterized forms.
@@ -664,11 +889,12 @@ def generate_eject_gcode(
     # figure a post-incident reader needs about what the machine was told to do —
     # the bed-drop target above all — is here, per built file.
     logger.info(
-        "eject.generator: built block profile=%r model=%s max_z=%smm lift_z=%s drop_z=%s "
+        "eject.generator: built block profile=%r model=%s max_z=%smm z_ref=%s lift_z=%s drop_z=%s "
         "dwell=%s jitter=%s sweep_z=%s lanes=%d span=[%s, %s]",
         profile.name,
         geometry.model_key,
         _fmt(max_z_height),
+        "on" if geometry.z_reference_validated else "off",
         _fmt(lift_z),
         _fmt(drop_z) if drop_z is not None else "off",
         dwell_s if dwell_s is not None else "off",

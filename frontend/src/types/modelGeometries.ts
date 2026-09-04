@@ -36,6 +36,17 @@ export interface ModelGeometry {
   /** True only after the hardware ladder was operator-witnessed on this model.
    *  Production eject dispatch is blocked while false. */
   validated: boolean;
+  /** SECOND, independent ladder gate: may the eject block open with the
+   *  contact-free Z re-reference (bed driven to its bottom stop, the stop then
+   *  declared)? False on every seeded row — a model keeps today's eject recipe
+   *  until its own ladder witnesses the guarded drive WITH the operator's
+   *  plate-release aid installed. Distinct from `validated`, which says only that
+   *  the XY envelope is proven. */
+  z_reference_validated: boolean;
+  /** How far (mm) the bed rises off its PHYSICAL bottom stop while the printer is
+   *  held after a confirmed plate-check trip. A hardware number the code cannot
+   *  know, so it lives in the registry; 12 is the vendor's own value. */
+  hold_lift_mm: number;
   /** Derived (read-only): true when this model is a bed-slinger — the bed is
    *  FIXED in Z and the gantry carries the Z axis, so the bed-drop release
    *  assist is physically meaningless and unavailable on it. Computed by the
@@ -63,6 +74,10 @@ export interface ModelGeometryUpdate {
   max_part_height_mm?: number;
   z_travel_mm?: number | null;
   validated?: boolean;
+  z_reference_validated?: boolean;
+  /** Bounded 12..60 server-side; the column is non-nullable, so there is no
+   *  "clear it" case. */
+  hold_lift_mm?: number;
   notes?: string | null;
 }
 

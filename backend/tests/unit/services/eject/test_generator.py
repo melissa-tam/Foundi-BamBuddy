@@ -12,18 +12,27 @@ from backend.app.services.eject.generator import (
     EJECT_RUNTIME_OVERHEAD_S,
     PHASE_BEACON_LIFTED,
     PHASE_BEACON_PARK,
+    PHASE_BEACON_REFERENCED,
     PHASE_BEACON_SWEEP,
     SWEEP_PHASE_MARKER,
     UNMODELLED_EPILOGUE_ALLOWANCE_S,
+    Z_REFERENCE_OVERTRAVEL_MM,
     EjectGenerationError,
     estimate_runtime_s,
     estimate_runtime_segments,
     generate_eject_gcode,
+    z_reference_prologue_lines,
 )
+from backend.app.services.eject.geometry import ModelGeometry
 from backend.app.services.eject.remote import eject_abort_deadline_s
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
-from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
+from backend.tests.unit.services.eject.geometry_fixtures import (
+    H2C_GEOMETRY,
+    H2C_GEOMETRY_Z_REFERENCED,
+    H2S_GEOMETRY,
+    H2S_GEOMETRY_Z_REFERENCED,
+)
 
 
 def _profile(**overrides) -> EjectProfile:
@@ -851,15 +860,25 @@ class TestEstimateRuntimeSegments:
         # drift here means a second code path started scoring the block.
         golden_dir = pathlib.Path(__file__).parent / "golden"
         goldens = sorted(golden_dir.glob("*.gcode"))
-        assert len(goldens) == 9, f"expected 9 golden fixtures, found {len(goldens)}"
+        # 9 flag-off recipes + the 2 Z-re-reference variants (2026-09-04).
+        assert len(goldens) == 11, f"expected 11 golden fixtures, found {len(goldens)}"
         for path in goldens:
             gcode = path.read_text()
             seg = estimate_runtime_segments(gcode)
             assert (
-                seg.pre_s + seg.drop_span_s + seg.sweep_span_s + seg.tail_s + EJECT_RUNTIME_OVERHEAD_S
+                (seg.reference_s or 0.0)
+                + seg.pre_s
+                + seg.drop_span_s
+                + seg.sweep_span_s
+                + seg.tail_s
+                + EJECT_RUNTIME_OVERHEAD_S
                 == estimate_runtime_s(gcode)
-            )
+            ), path.name
             assert seg.total_s == estimate_runtime_s(gcode)
+            # A block with no Z re-reference phase reports its ABSENCE, never a zero
+            # span: the watchdog disarms that lane on None and would otherwise arm a
+            # zero-length deadline that fires on the first poll.
+            assert (seg.reference_s is None) == (not path.name.startswith("zref_")), path.name
 
     def test_the_park_split_partitions_the_old_sweep_and_leaves_the_total_alone(self):
         # Splitting at PHASE_BEACON_PARK is an ANALYSIS change only: it must move no
@@ -939,3 +958,172 @@ class TestEstimateRuntimeSegments:
         # publish slop. The estimator deliberately counts neither, so an allowance below
         # the purge could not absorb a single firing of it.
         assert UNMODELLED_EPILOGUE_ALLOWANCE_S >= 180.0
+
+
+class TestZReferencePrologue:
+    """The contact-free Z re-reference (2026-09-04, 002-H2S).
+
+    The eject homes X/Y only and relies on a RETAINED Z datum; a power cycle destroys
+    that datum, and the operator's post-outage eject drove the bed past the Z floor
+    because every absolute Z move ran against the firmware's fabricated frame. The
+    recipe is DORMANT per model until that model's own hardware ladder opens the gate."""
+
+    def test_it_is_off_for_a_default_constructed_geometry(self):
+        # The most important pin in this class: a NEW motion must never be able to
+        # appear by omission. Every transient geometry and every unmigrated fixture
+        # constructs without the flag, and none of them may produce the block.
+        bare = ModelGeometry(
+            model_key="H2S",
+            bed=(340.0, 320.0),
+            envelope=(0.0, 340.0, -16.0, 325.0),
+            max_part_height_mm=42.0,
+            validated=True,
+        )
+        assert bare.z_reference_validated is False
+        assert z_reference_prologue_lines(bare) == []
+        assert "G380" not in generate_eject_gcode(_profile(), 30.0, bare)
+
+    def test_a_seeded_registry_row_is_dormant(self):
+        assert H2S_GEOMETRY.z_reference_validated is False
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
+        for token in ("G380", "G91", "G92", "M211", PHASE_BEACON_REFERENCED):
+            assert token not in gcode, token
+
+    def test_the_block_is_emitted_verbatim_when_the_gate_is_open(self):
+        assert z_reference_prologue_lines(H2S_GEOMETRY_Z_REFERENCED) == [
+            "; --- Z re-reference: contact-free, bottom-stop guarded (bed moves AWAY from the part) ---",
+            "M211 Z0",
+            "G91",
+            "G380 S2 Z390 F1200",  # 340 travel + 50 overtravel
+            "G90",
+            "G92 Z340",  # the stop is DECLARED as z_travel_mm
+            "M211 Z1",
+            f"{PHASE_BEACON_REFERENCED} ; phase beacon: Z re-referenced - eject runtime watchdog",
+        ]
+
+    def test_the_drive_exceeds_full_travel_by_the_named_overtravel(self):
+        # The derivation, asserted rather than restated: the drive must reach the stop
+        # from wherever a fabricated frame thinks the bed is, so it must exceed FULL
+        # travel — and by enough to cover the largest offset the farm itself creates,
+        # the idle deep park at 75% of z_travel.
+        lines = z_reference_prologue_lines(H2S_GEOMETRY_Z_REFERENCED)
+        drive = next(ln for ln in lines if ln.startswith("G380"))
+        commanded = float(drive.split("Z")[1].split()[0])
+        assert commanded == H2S_GEOMETRY.z_travel_mm + Z_REFERENCE_OVERTRAVEL_MM
+        assert commanded > H2S_GEOMETRY.z_travel_mm
+        assert Z_REFERENCE_OVERTRAVEL_MM > 0
+
+    def test_the_drive_is_positive_z_which_is_the_load_bearing_safety_argument(self):
+        # +Z moves the bed AWAY from the nozzle on every bed-on-Z model, so the drive
+        # cannot touch a part however wrong the frame is. That — not the S2 guard, which
+        # is a hypothesis the ladder witnesses — is what makes this contact-free.
+        for geometry in (H2S_GEOMETRY_Z_REFERENCED, H2C_GEOMETRY_Z_REFERENCED):
+            drive = next(ln for ln in z_reference_prologue_lines(geometry) if ln.startswith("G380"))
+            assert float(drive.split("Z")[1].split()[0]) > 0, geometry.model_key
+
+    def test_it_never_homes_z(self):
+        # Operator rule 2026-09-04: no G28 Z, no probe, ever, with a part on the plate.
+        gcode = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY_Z_REFERENCED)
+        assert "G28 Z" not in gcode
+        assert not any(ln.strip() == "G28" for ln in gcode.splitlines())
+
+    def test_it_precedes_the_xy_home_in_both_dialects(self):
+        # The drive ends with the bed at its bottom stop, so the toolhead's homing
+        # travel afterwards is as clear of the part as it can be.
+        single = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY_Z_REFERENCED).splitlines()
+        assert single.index("M17") < single.index("G380 S2 Z390 F1200") < single.index("G28 X Y")
+        dual = generate_eject_gcode(_profile(), 30.0, H2C_GEOMETRY_Z_REFERENCED).splitlines()
+        assert dual.index("G380 S2 Z375 F1200") < dual.index(DUAL_NOZZLE_HOME[0])
+        # The dialect is composed with, never replaced by, the prologue.
+        for line in DUAL_NOZZLE_HOME:
+            assert line in dual
+
+    def test_a_generated_flag_on_block_validates(self):
+        for geometry in (H2S_GEOMETRY_Z_REFERENCED, H2C_GEOMETRY_Z_REFERENCED):
+            gcode = generate_eject_gcode(_profile(), 30.0, geometry)
+            result = validate_eject_gcode(gcode, _profile(), 30.0, geometry)
+            assert result.ok, (geometry.model_key, result.errors)
+
+    def test_it_composes_with_the_bed_drop_assist(self):
+        # Both are Z recipes on the same block; the re-reference declares the frame the
+        # drop then uses, so the drop's absolute target is finally a real coordinate.
+        geometry = H2S_GEOMETRY_Z_REFERENCED
+        gcode = generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, geometry)
+        lines = gcode.splitlines()
+        assert lines.index("G92 Z340") < lines.index("G1 Z290 F900")
+        assert validate_eject_gcode(gcode, _profile(bed_drop_clearance_mm=50.0), 30.0, geometry).ok
+
+    def test_it_is_refused_on_a_bedslinger(self):
+        # The bed carries no Z there (the gantry does), so "drive the bed to its stop"
+        # is a different recipe for a different ladder — stated, not borrowed.
+        slinger = replace(H2S_GEOMETRY_Z_REFERENCED, model_key="A2L", z_travel_mm=None)
+        slinger = replace(slinger, z_travel_mm=200.0)
+        with pytest.raises(EjectGenerationError, match="bedslinger"):
+            z_reference_prologue_lines(slinger)
+        with pytest.raises(EjectGenerationError, match="bedslinger"):
+            generate_eject_gcode(_profile(), 30.0, slinger)
+
+    def test_it_is_refused_without_a_z_travel_to_declare(self):
+        no_travel = replace(H2S_GEOMETRY_Z_REFERENCED, z_travel_mm=None)
+        with pytest.raises(EjectGenerationError, match="z_travel_mm"):
+            generate_eject_gcode(_profile(), 30.0, no_travel)
+
+    def test_the_declared_datum_is_exactly_z_travel(self):
+        # DECLARED, not measured: every H2S reaches a commanded Z340 today, so the
+        # physical stop sits AT or BEYOND z_travel and the frame error is <= 0 — i.e.
+        # strictly on the MORE-clearance side. Any other value throws that argument away.
+        for geometry in (H2S_GEOMETRY_Z_REFERENCED, H2C_GEOMETRY_Z_REFERENCED):
+            declaration = next(ln for ln in z_reference_prologue_lines(geometry) if ln.startswith("G92"))
+            assert declaration == f"G92 Z{geometry.z_travel_mm:g}"
+
+    def test_the_reference_span_is_the_commanded_drive_and_none_without_it(self):
+        on = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY_Z_REFERENCED))
+        # 390 mm at F1200 = 19.5 s, counted at the FULL commanded distance: the drive
+        # stops early against the stop, and over-stating it can only make a deadline
+        # more patient.
+        assert on.reference_s == pytest.approx(390.0 / 1200.0 * 60.0)
+        off = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
+        assert off.reference_s is None
+
+    def test_the_total_grows_by_the_drive_and_the_lift_it_makes_measurable(self):
+        on = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY_Z_REFERENCED))
+        off = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
+        # The drive itself...
+        assert on.reference_s == pytest.approx(19.5)
+        # ...plus the prologue lift, which was UNMEASURABLE before (no known Z) and is
+        # now a real 340 -> 40 mm move at F900. Both are commanded time the machine
+        # genuinely spends; neither is a re-fit of EJECT_RUNTIME_OVERHEAD_S.
+        assert off.pre_s == 0.0
+        assert on.pre_s == pytest.approx(300.0 / 900.0 * 60.0)
+        assert on.total_s == pytest.approx(off.total_s + on.reference_s + on.pre_s)
+        # The sweep and the tail are untouched: the recipe adds a prologue, not motion.
+        assert on.sweep_span_s == pytest.approx(off.sweep_span_s)
+        assert on.tail_s == pytest.approx(off.tail_s)
+
+    def test_a_relative_move_is_scored_as_a_displacement(self):
+        # The generator emits no relative G0/G1 (the validator forbids one), so this
+        # pins the estimator's DIALECT honesty rather than anything the farm emits:
+        # differencing a 10 mm relative step against the last absolute position would
+        # score it as a 330 mm move.
+        seg = estimate_runtime_segments("G90\nG92 Z340\nG91\nG1 Z10 F600\nG90\n")
+        assert seg.pre_s == pytest.approx(10.0 / 600.0 * 60.0)
+
+    def test_g92_makes_z_measurable_and_g380_makes_it_unknown_again(self):
+        # Without a declaration the first Z move is real but unmeasurable (0 mm); the
+        # guarded drive leaves the machine somewhere this model cannot know, and the
+        # G92 that follows is what makes it knowable.
+        undeclared = estimate_runtime_segments("G1 Z40 F900\nM73 P5\n")
+        assert undeclared.pre_s == 0.0
+        declared = estimate_runtime_segments("G92 Z340\nG1 Z40 F900\nM73 P5\n")
+        assert declared.pre_s == pytest.approx(300.0 / 900.0 * 60.0)
+        after_drive = estimate_runtime_segments("G92 Z340\nG91\nG380 S2 Z390 F1200\nG90\nG1 Z40 F900\nM73 P5\n")
+        # The G380's own 390 mm is counted; the move after it is not, Z being unknown.
+        assert after_drive.pre_s == pytest.approx(390.0 / 1200.0 * 60.0)
+
+    def test_the_build_line_names_the_gate(self, caplog):
+        with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):
+            generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY_Z_REFERENCED)
+            generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("z_ref=on" in m for m in messages)
+        assert any("z_ref=off" in m for m in messages)

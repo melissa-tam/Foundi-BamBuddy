@@ -1955,3 +1955,111 @@ class TestRedriveEjectStop:
         assert diagnostic == "eject interrupted by a power loss; sweep unverified"
         assert detail == "power_loss_eject_interrupted"
         assert "budget" not in diagnostic and "deadline" not in diagnostic
+
+
+def _armed_with_reference(pid_item: int = 5, *, reference_s: float = 19.5, **kw) -> remote.PendingEject:
+    """A started pending whose block carries the Z re-reference phase.
+
+    83 s expected → a 103.75 s whole-job deadline; a 19.5 s drive → the 8 s margin floor
+    → its own budget line lands at overhead(25) + 19.5 + 8 = 52.5 s after the start echo,
+    and P5 is no longer expected before overhead + 19.5 + abort margin(20.75) = 65.25 s."""
+    kw.setdefault("expected_runtime_s", 83.0)
+    kw.setdefault("started_at", datetime.now(timezone.utc))
+    kw.setdefault("drop_span_s", 30.0)
+    kw.setdefault("sweep_span_s", 20.0)
+    kw.setdefault("tail_s", 15.0)
+    return remote.PendingEject("production", 1, pid_item, reference_s=reference_s, **kw)
+
+
+class TestRuntimeWatchdogReferencePhase:
+    """The guarded Z re-reference drive's own lane (2026-09-04).
+
+    It MEASURES and WARNs; it never kills — two independent reasons, either sufficient.
+    EVIDENCE: no P2 span has been observed on hardware (the recipe is dormant until a
+    ladder opens it), and at the FIRST beacon a stuck percent cannot be told apart from
+    firmware that never reflects M73. MECHANISM (decisive): a stop there lands inside the
+    prologue's own unguarded window — soft end stops off, frame not yet declared — and
+    the drive moves the bed AWAY from the nozzle, so there is no plate contact to
+    pre-empt and nothing is bought by stopping early."""
+
+    @staticmethod
+    async def _run(pid: int, armed, samples, caplog, *, level=logging.INFO):
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, samples)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(level, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        return env, clock
+
+    async def test_a_block_without_the_phase_opens_where_it_always_did(self, caplog):
+        # reference_s None ⇒ the lane is DISARMED, not armed with a zero-length deadline.
+        env, _clock = await self._run(90080, _armed_with_phases(), [(5.0, 0.0), (50.0, 0.0), (75.0, 0.0)], caplog)
+        assert _records(caplog, "Z re-reference") == []
+        assert _records(caplog, "bed-drop phase cleared")
+
+    async def test_the_drive_clearing_advances_to_the_existing_prologue_phase(self, caplog):
+        env, _clock = await self._run(
+            90081, _armed_with_reference(), [(2.0, 0.0), (5.0, 0.0), (50.0, 0.0), (75.0, 0.0)], caplog
+        )
+        cleared = _records(caplog, "Z re-reference cleared")
+        assert len(cleared) == 1
+        assert cleared[0].levelno == logging.INFO
+        assert "budget 20s" in cleared[0].getMessage()  # 19.5 s, rendered %.0f
+        # ...and the phases after it run exactly as they do without the prologue.
+        assert _records(caplog, "bed-drop phase cleared")
+
+    async def test_a_drive_past_its_budget_warns_once_and_never_kills_there(self, caplog):
+        # Percent parked at 0: the drive's budget line (52.5 s) passes and NOTHING may
+        # fire there. The job is stopped later, by the whole-job backstop.
+        env, clock = await self._run(90082, _armed_with_reference(), [(0.0, 0.0)], caplog, level=logging.WARNING)
+        warnings = _records(caplog, "Z re-reference running")
+        assert len(warnings) == 1
+        assert "19s budget" in warnings[0].getMessage() or "20s budget" in warnings[0].getMessage()
+        assert "no phase kill fires here" in warnings[0].getMessage()
+        # The kill that DID happen is the whole-job backstop — never a reference stage.
+        kill = _kill_line(caplog)
+        assert "stage=total" in kill
+        assert clock.now - 1000.0 == pytest.approx(remote.eject_abort_deadline_s(83.0), abs=2.0)
+
+    async def test_dead_beacons_fall_back_exactly_as_they_do_today(self, caplog):
+        # Never a kill at the first beacon: a stuck percent there is indistinguishable
+        # from firmware that does not reflect M73, so the printer degrades to the
+        # deadline-only watchdog it would have had before this recipe existed.
+        env, _clock = await self._run(90083, _armed_with_reference(), [(0.0, 0.0)], caplog, level=logging.WARNING)
+        fallback = _records(caplog, "not reflected in mc_percent")
+        assert len(fallback) == 1
+        assert "Z re-reference budget" in fallback[0].getMessage()
+        assert "stage=total" in _kill_line(caplog)
+
+    async def test_the_p5_deadline_is_pushed_out_by_the_drive(self):
+        # Without this, enabling the prologue would look like beacon-death on EVERY job:
+        # the drive genuinely delays P5, so its budget must move the beacon-death line.
+        drive_s = 19.5
+        without = remote.EJECT_RUNTIME_OVERHEAD_S + remote._abort_margin_s(83.0)
+        with_drive = remote.EJECT_RUNTIME_OVERHEAD_S + drive_s + remote._abort_margin_s(83.0)
+        assert with_drive == pytest.approx(without + drive_s)
+
+    async def test_a_stale_sample_never_advances_the_phase(self, caplog):
+        # FRESH-only, like every other lane: a percent published before this eject
+        # started is not evidence that its drive completed.
+        env, _clock = await self._run(90084, _armed_with_reference(), [(2.0, None)], caplog, level=logging.WARNING)
+        assert _records(caplog, "Z re-reference cleared") == []
+
+    async def test_going_blind_asks_for_evidence_once_rather_than_judging_on_silence(self, caplog):
+        env, _clock = await self._run(90085, _armed_with_reference(), [(0.0, None)], caplog, level=logging.WARNING)
+        env.pushall.assert_called_once_with(90085, remote._EVIDENCE_REASON)
+
+    async def test_the_healthy_sequence_still_reaches_the_epilogue(self, caplog):
+        # LIVENESS: the added phase must not strand the poller short of the lanes that
+        # come after it (the 2026-08-08 lesson — a cured storm and a starved deadlock
+        # look identical on absence metrics).
+        env, _clock = await self._run(
+            90086, _armed_with_reference(), [(2.0, 0.0), (5.0, 0.0), (50.0, 0.0), (75.0, 0.0)], caplog
+        )
+        assert _records(caplog, "Z re-reference cleared")
+        assert _records(caplog, "bed-drop phase cleared")
+        assert _records(caplog, "sweep phase cleared")
+        assert "stage=epilogue" in _kill_line(caplog)

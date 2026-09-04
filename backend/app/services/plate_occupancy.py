@@ -319,9 +319,10 @@ class PendingEject:
 
     ``expected_runtime_s`` (from the build) and ``started_at`` (stamped when the
     printer echoes the sweep's START) are what the in-flight runtime watchdog arms
-    on. ``drop_span_s``, ``sweep_span_s`` and ``tail_s`` (also from the build) are the
-    per-phase budgets that arm the watchdog's edge lane, which bounds each phase on its
-    own rather than the whole job.
+    on. ``reference_s``, ``drop_span_s``, ``sweep_span_s`` and ``tail_s`` (also from the
+    build) are the per-phase budgets that arm the watchdog's edge lane, which bounds each
+    phase on its own rather than the whole job. ``reference_s`` is None for a block with
+    no Z re-reference phase — i.e. every block until a model's ladder opens that gate.
 
     ``runtime_exceeded_at`` is that watchdog's verdict, and the watchdog is the ONE
     authority on eject runtime: the mark is stamped the moment a deadline passes,
@@ -345,6 +346,7 @@ class PendingEject:
     expected_runtime_s: float | None = None
     started_at: datetime | None = None
     runtime_exceeded_at: datetime | None = None
+    reference_s: float | None = None
     drop_span_s: float | None = None
     sweep_span_s: float | None = None
     tail_s: float | None = None

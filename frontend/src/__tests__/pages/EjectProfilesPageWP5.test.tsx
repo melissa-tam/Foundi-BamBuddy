@@ -60,6 +60,10 @@ function geoRow(overrides: Partial<Record<string, unknown>> = {}) {
     max_part_height_mm: 42,
     z_travel_mm: 340,
     validated: true,
+    // The SECOND ladder gate ships CLOSED on every registry row, and the held-bed
+    // lift at the vendor's own 12 mm — the fixtures mirror the seed exactly.
+    z_reference_validated: false,
+    hold_lift_mm: 12,
     bedslinger: false,
     notes: null,
     updated_at: '2026-07-01T00:00:00Z',
@@ -329,5 +333,72 @@ describe('EjectProfilesPage geometry manager', () => {
     await user.click(screen.getByRole('button', { name: /^confirm$/i }));
     await waitFor(() => expect(putCalled).toBe(true));
     expect(putBody).toEqual({ validated: true });
+  });
+
+  it('routes the Z re-reference gate through its own confirm, citing the ladder', async () => {
+    // The flip that ACTIVATES the contact-free Z re-reference for a model. It is a
+    // SECOND, independent ladder gate — a proven XY envelope is not a witnessed Z
+    // stop — so it gets its own confirm rather than riding the validated one.
+    let putBody: Record<string, unknown> | null = null;
+    server.use(
+      http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
+      http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
+      http.get('*/api/v1/model-geometry', () => geometryList([geoRow()])),
+      http.put('*/api/v1/model-geometry/:modelKey', async ({ request }) => {
+        putBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(geoRow({ z_reference_validated: true }));
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+
+    await screen.findByText('H2S');
+    await user.click(screen.getByRole('button', { name: /edit geometry h2s/i }));
+
+    const dialog = await screen.findByRole('dialog');
+    // The gate renders as its own control, distinct from the envelope's.
+    await user.click(within(dialog).getByRole('switch', { name: 'Z re-reference validated' }));
+    await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
+
+    expect(await screen.findByText('Enable Z re-reference?')).toBeInTheDocument();
+    // The confirm names the ladder AND the operator's plate-release aid, which is the
+    // one piece of hardware rung 1 must be witnessed with.
+    expect(screen.getByText(/plate-release aid/i)).toBeInTheDocument();
+    expect(putBody).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: /^confirm$/i }));
+    await waitFor(() => expect(putBody).toEqual({ z_reference_validated: true }));
+  });
+
+  it('sends the held-bed lift as an ordinary numeric edit with no confirm', async () => {
+    // A clearance, not a gate: it unlocks no motion recipe, so it must not inherit the
+    // ladder confirm.
+    let putBody: Record<string, unknown> | null = null;
+    server.use(
+      http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
+      http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
+      http.get('*/api/v1/model-geometry', () => geometryList([geoRow()])),
+      http.put('*/api/v1/model-geometry/:modelKey', async ({ request }) => {
+        putBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(geoRow({ hold_lift_mm: 20 }));
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<EjectProfilesPage />);
+
+    await screen.findByText('H2S');
+    await user.click(screen.getByRole('button', { name: /edit geometry h2s/i }));
+
+    const dialog = await screen.findByRole('dialog');
+    const lift = within(dialog).getByLabelText('Bed lift while held (mm)');
+    expect(lift).toHaveValue(12); // seeded at the vendor's own value
+    await user.clear(lift);
+    await user.type(lift, '20');
+    await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
+
+    await waitFor(() => expect(putBody).toEqual({ hold_lift_mm: 20 }));
+    expect(screen.queryByRole('button', { name: /^confirm$/i })).not.toBeInTheDocument();
   });
 });
