@@ -7,6 +7,8 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from backend.app.services.dispatch_target import decode_printer_ids
+
 _PLATE_GCODE = (
     "; HEADER_BLOCK_START\n"
     "; max_z_height: 20.00\n"
@@ -210,7 +212,15 @@ class TestProductionRunCreate:
         )
         assert resp.status_code == 422
 
-    async def test_printer_ids_round_robin_assignment(self, async_client, db_session, tmp_path, printer_factory):
+    async def test_printer_ids_create_a_pool(self, async_client, db_session, tmp_path, printer_factory):
+        """``printer_ids`` is a POOL, not a creation-time round-robin.
+
+        Every plate is minted unplaced — the scheduler picks the next idle member at
+        dispatch time — so no pending row carries a ``printer_id`` (on a pending row
+        that column is an operator PIN and nothing else). ``printers`` lists where
+        units have LANDED, which is nowhere yet; ``target_printers`` is what the
+        operator chose.
+        """
         p1 = await printer_factory(name="P1", model="H2S")
         p2 = await printer_factory(name="P2", model="H2S")
         eject = await _make_eject_profile(async_client, name="ep-rr")
@@ -223,19 +233,47 @@ class TestProductionRunCreate:
                 "printer_ids": [p1.id, p2.id],
                 "eject_profile_id": eject,
                 # Disable the first-article gate so all 3 plates are created up
-                # front and their round-robin printer assignment is observable
-                # (a gated run defers the rest of its plates until FA approval).
+                # front (a gated run defers the rest until FA approval).
                 "require_first_article": False,
             },
         )
         assert resp.status_code == 201, resp.text
         items = await _pending_items(db_session, resp.json()["id"])
         assert len(items) == 3
-        assigned = sorted(it.printer_id for it in items)
-        # 3 plates round-robin over 2 printers → {p1,p1,p2} or {p1,p2,p2}
-        assert assigned in ([p1.id, p1.id, p2.id], [p1.id, p2.id, p2.id])
-        names = {p["id"] for p in resp.json()["printers"]}
-        assert names == {p1.id, p2.id}
+        for it in items:
+            assert it.printer_id is None
+            assert decode_printer_ids(it.target_printer_ids) == {p1.id, p2.id}
+            assert it.target_model is None
+        body = resp.json()
+        assert body["target_printers"] == [{"id": p1.id, "name": "P1"}, {"id": p2.id, "name": "P2"}]
+        assert body["printers"] == []
+
+    async def test_printer_pool_run_detail_lists_both_members(
+        self, async_client, db_session, tmp_path, printer_factory
+    ):
+        # The run-detail panel lists the scheduler's UNIVERSE for the pool, even
+        # though no plate has been placed on either member yet.
+        p1 = await printer_factory(name="POOL-1", model="H2S")
+        p2 = await printer_factory(name="POOL-2", model="H2S")
+        eject = await _make_eject_profile(async_client, name="ep-pool-detail")
+        _, file_link_id = await _make_sku_with_file(async_client, db_session, tmp_path, code="SKU022.01")
+        created = await async_client.post(
+            "/api/v1/production-runs",
+            json={
+                "sku_file_id": file_link_id,
+                "target_units": 2,
+                "printer_ids": [p1.id, p2.id],
+                "eject_profile_id": eject,
+                "require_first_article": False,
+            },
+        )
+        assert created.status_code == 201, created.text
+
+        detail = await async_client.get(f"/api/v1/production-runs/{created.json()['id']}")
+        assert detail.status_code == 200, detail.text
+        body = detail.json()
+        assert {s["printer_id"] for s in body["printer_states"]} == {p1.id, p2.id}
+        assert body["target_printers"] == [{"id": p1.id, "name": "POOL-1"}, {"id": p2.id, "name": "POOL-2"}]
 
 
 @pytest.mark.asyncio
@@ -926,6 +964,15 @@ class TestFarmPrinterStates:
     farm context surfaced on the Printers page."""
 
     async def _run_on_printers(self, async_client, db_session, tmp_path, code, printer_ids, *, target_units):
+        """Create a run and PLACE its units on the printers, as the scheduler would.
+
+        Every test in this class asserts a per-printer context, and a context is
+        resolved from a unit's ``printer_id``. Since ``printer_ids`` became a POOL
+        the creation call no longer writes one — a pool unit acquires its printer at
+        the dispatch claim — so the placement that these tests take as their premise
+        is done here explicitly instead of being a side effect of creation. The
+        pool-unit-without-a-printer case is its own test below.
+        """
         eject = await _make_eject_profile(async_client, name=f"ep-{code}")
         _, file_link_id = await _make_sku_with_file(
             async_client, db_session, tmp_path, code=code, name=f"{code}.gcode.3mf"
@@ -937,12 +984,17 @@ class TestFarmPrinterStates:
                 "target_units": target_units,
                 "printer_ids": printer_ids,
                 "eject_profile_id": eject,
-                # No FA gate so all plates are created and printer-assigned up front.
+                # No FA gate so all plates are created up front.
                 "require_first_article": False,
             },
         )
         assert resp.status_code == 201, resp.text
-        return resp.json()["id"]
+        run_id = resp.json()["id"]
+        items = sorted(await _pending_items(db_session, run_id), key=lambda i: i.id)
+        for offset, item in enumerate(items):
+            item.printer_id = printer_ids[offset % len(printer_ids)]
+        await db_session.commit()
+        return run_id
 
     async def test_printing_unit_context_shape(self, async_client, db_session, tmp_path, printer_factory):
         p = await printer_factory(name="FP1", model="H2S")
@@ -1051,3 +1103,34 @@ class TestFarmPrinterStates:
         states = await async_client.get("/api/v1/production-runs/printer-states")
         assert states.status_code == 200
         assert isinstance(states.json(), list)
+
+    async def test_pending_pool_unit_yields_no_printer_context(
+        self, async_client, db_session, tmp_path, printer_factory
+    ):
+        """Documented behaviour delta: a pool unit contributes a context only once it
+        has LANDED. Its pending row carries no ``printer_id`` at all, and the fleet
+        page answers "what is this printer doing" — a plate that may go to any member
+        of a pool is not yet any printer's work. (Contrast the helper above, which
+        places its units explicitly.)"""
+        p1 = await printer_factory(name="FP7", model="H2S")
+        p2 = await printer_factory(name="FP8", model="H2S")
+        eject = await _make_eject_profile(async_client, name="ep-SKU505.01")
+        _, file_link_id = await _make_sku_with_file(
+            async_client, db_session, tmp_path, code="SKU505.01", name="SKU505.01.gcode.3mf"
+        )
+        created = await async_client.post(
+            "/api/v1/production-runs",
+            json={
+                "sku_file_id": file_link_id,
+                "target_units": 2,
+                "printer_ids": [p1.id, p2.id],
+                "eject_profile_id": eject,
+                "require_first_article": False,
+            },
+        )
+        assert created.status_code == 201, created.text
+        items = await _pending_items(db_session, created.json()["id"])
+        assert items and all(it.printer_id is None for it in items)
+
+        rows = (await async_client.get("/api/v1/production-runs/printer-states")).json()
+        assert all(r["printer_id"] not in (p1.id, p2.id) for r in rows)

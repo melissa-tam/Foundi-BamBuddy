@@ -239,7 +239,9 @@ SAMPLE_DATA: dict[str, dict[str, str]] = {
     "queue_job_assigned": {
         "job_name": "Benchy.3mf",
         "printer": "Bambu X1C #1",
-        "target_model": "X1C",
+        # The caller passes ``DispatchTarget.describe()`` — the noun phrase WITH its
+        # article ("Any X1C", "Any of 001-H2S, 003-H2S"), not a bare model name.
+        "target_model": "Any X1C",
         "timestamp": "2024-01-15 14:30",
         "app_name": "Bambuddy",
     },
@@ -253,7 +255,8 @@ SAMPLE_DATA: dict[str, dict[str, str]] = {
     },
     "queue_job_waiting": {
         "job_name": "Benchy.3mf",
-        "target_model": "X1C",
+        # Same origin as ``queue_job_assigned`` above — ``DispatchTarget.describe()``.
+        "target_model": "Any X1C",
         "waiting_reason": "Printer1 (needs PLA)",
         "timestamp": "2024-01-15 14:30",
         "app_name": "Bambuddy",
