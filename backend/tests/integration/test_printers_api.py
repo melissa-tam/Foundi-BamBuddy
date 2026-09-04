@@ -541,6 +541,82 @@ class TestPrintersAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_clear_plate_closes_an_operator_resolved_hold(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """The operator's clear IS the resolution of a hold a human owns (2026-09-04).
+
+        A confirmed plate-check trip and a Z reference lost to a reboot are both held
+        as ``printer_incident`` rows whose ``RESOLVES_ON`` is ``operator`` — the wire
+        cannot see the part leave the plate, so nothing but this route (and the
+        recover override) may close them. The eject lane refuses ``z_unreferenced``
+        while the z hold stands, so a clear that left it open would strand the printer."""
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST, STATUS_ESCALATED
+        from backend.app.services import printer_incidents
+        from backend.app.services.plate_occupancy import Evidence, plate_occupancy
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Z Hold Printer")
+        assert plate_occupancy.declare_occupied(printer.id, Evidence()) is None
+        incident = await printer_incidents.open_new(
+            db_session,
+            printer_id=printer.id,
+            job_id="",
+            item_id=None,
+            kind=KIND_Z_REFERENCE_LOST,
+            code="power_loss",
+            codes="power_loss",
+            slot_global_tray=None,
+            status=STATUS_ESCALATED,
+        )
+        assert incident is not None
+        assert printer_incidents.snapshot(printer.id) is not None
+
+        with patch.object(printer_manager, "is_connected", return_value=True):
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/clear-plate")
+
+        assert response.status_code == 200, response.text
+        assert plate_occupancy.is_plate_occupied(printer.id) is False
+        assert printer_incidents.snapshot(printer.id) is None
+        db_session.expunge_all()
+        assert (await printer_incidents.get_open(db_session, printer.id)) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_clear_plate_leaves_a_wire_resolved_hold_standing(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """A runout hold is not answered by somebody clearing a plate — its lane owns it."""
+        from backend.app.models.printer_incident import KIND_RUNOUT, STATUS_ESCALATED
+        from backend.app.services import printer_incidents
+        from backend.app.services.plate_occupancy import Evidence, plate_occupancy
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name="Runout Hold Printer")
+        assert plate_occupancy.declare_occupied(printer.id, Evidence()) is None
+        incident = await printer_incidents.open_new(
+            db_session,
+            printer_id=printer.id,
+            job_id="J1",
+            item_id=None,
+            kind=KIND_RUNOUT,
+            code="0700_8011",
+            codes="runout:0700_8011",
+            slot_global_tray=1,
+            status=STATUS_ESCALATED,
+        )
+        assert incident is not None
+
+        with patch.object(printer_manager, "is_connected", return_value=True):
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/clear-plate")
+
+        assert response.status_code == 200, response.text
+        db_session.expunge_all()
+        still_open = await printer_incidents.get_open(db_session, printer.id)
+        assert still_open is not None and still_open.kind == KIND_RUNOUT
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_clear_plate_409s_while_a_live_eject_owns_the_printer(
         self, async_client: AsyncClient, printer_factory, db_session
     ):

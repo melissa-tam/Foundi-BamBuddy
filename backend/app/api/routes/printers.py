@@ -54,6 +54,7 @@ from backend.app.services.bambu_ftp import (
     list_files_async,
 )
 from backend.app.services.hms_errors import current_runout_demand, hms_error_payload, runout_hold_active
+from backend.app.services.pause_recovery import on_plate_cleared
 from backend.app.services.plate_occupancy import Evidence, plate_occupancy
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
 from backend.app.services.printer_manager import (
@@ -2901,6 +2902,11 @@ async def clear_plate(
         # Reachable only via the FINISH/FAILED limb above (no gate raised, but the
         # printer is sitting on a terminal state). Same 400 shape it has always had.
         raise HTTPException(400, "Printer is not awaiting plate-clear acknowledgment")
+
+    # The operator's clear IS the resolution of the two holds a human owns — a
+    # confirmed plate-check trip and a Z reference lost to a reboot (2026-09-04
+    # pause-recovery wave). Wire-resolved holds are left to their own lanes.
+    await on_plate_cleared(printer_id)
 
     return {"success": True, "message": "Plate cleared, next print will start shortly"}
 
