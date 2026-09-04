@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import broadcast_production_run_changed
@@ -37,6 +37,7 @@ from backend.app.services.capability_gate import (
     loaded_filament_types,
     read_live_nozzles,
 )
+from backend.app.services.dispatch_target import DispatchTarget, TargetKind, target_of
 from backend.app.services.eject.geometry import list_geometries
 from backend.app.services.farm_correlation import WAITING_REASON_PLATE_VISION
 from backend.app.services.farm_policy import (
@@ -56,11 +57,7 @@ from backend.app.services.queue_transitions import (
     printing_units_conflict,
 )
 from backend.app.services.sku_catalog import median_cycle_seconds
-from backend.app.utils.printer_models import (
-    is_dual_nozzle_model,
-    normalize_printer_model,
-    normalize_printer_model_id,
-)
+from backend.app.utils.printer_models import is_dual_nozzle_model
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -190,18 +187,19 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
             detail="A farm production run must eject: provide eject_profile_id or set the SKU's default",
         )
 
-    # Targets: printer_ids XOR target_model (schema-validated). Verify printers.
+    # Target: printer subset XOR model (schema-validated). Both are POOLS — the
+    # scheduler chooses the printer at dispatch time — so the target is ONE value
+    # object from here on and the model normalisation lives in ``DispatchTarget``
+    # (a second local copy is how two spellings of one model get minted). The 422
+    # stays: a pool naming a printer that does not exist can never be served.
     printer_ids: list[int] = list(data.printer_ids or [])
-    target_model_norm: str | None = None
     if printer_ids:
         found = await db.execute(select(Printer.id).where(Printer.id.in_(printer_ids)))
         existing_ids = {row[0] for row in found.all()}
         missing = [pid for pid in printer_ids if pid not in existing_ids]
         if missing:
             raise HTTPException(status_code=422, detail=f"Printer(s) not found: {missing}")
-    else:
-        raw = data.target_model or ""
-        target_model_norm = normalize_printer_model(raw) or normalize_printer_model_id(raw) or raw
+    target = DispatchTarget.for_run(printer_ids=printer_ids, target_model=data.target_model)
 
     upp = sku_file.units_per_plate or 1
     n_plates = plates_needed(data.target_units, upp)
@@ -261,8 +259,8 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
     db.add(batch)
     await db.flush()  # need batch.id for the items
 
-    # Fields shared by every plate item (the target — printer_id/target_model —
-    # and first_article/status/batch_id are set per branch below).
+    # Fields shared by every plate item (the target columns and
+    # first_article/status/batch_id are set per branch below).
     plate_fields = {
         "library_file_id": sku_file.library_file_id,
         "plate_id": sku_file.plate_index,
@@ -285,41 +283,34 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
         "scheduled_time": scheduled_start,
     }
 
+    # ``target.fields()`` is spread LAST in both branches: it writes all three target
+    # columns, so no earlier key can leave a second kind's column standing beside the
+    # one this target owns. Every plate is minted into the ONE pool position scope
+    # (``printer_id=None``) because no pool unit carries a printer while it waits —
+    # on a pending row ``printer_id`` is an operator PIN and nothing else, and the
+    # scheduler writes its pick at the pending→printing claim.
     if require_fa:
         # Gated run: create ONLY the first-article plate now; the remaining
         # plates are stored as a plan and materialised on approval (so the
         # scheduler can't dispatch plate 2 before plate 1 is approved).
-        fa_fields = {**base_fields, "first_article": True}
-        if printer_ids:
-            fa_fields["printer_id"] = printer_ids[0]
-            await create_queue_items(db, count=1, printer_id=printer_ids[0], fields=fa_fields)
-        else:
-            fa_fields["printer_id"] = None
-            fa_fields["target_model"] = target_model_norm
-            await create_queue_items(db, count=1, printer_id=None, fields=fa_fields)
+        await create_queue_items(
+            db,
+            count=1,
+            printer_id=None,
+            fields={**base_fields, "first_article": True, **target.fields()},
+        )
         batch.first_article_plan = build_first_article_plan(
             remaining=n_plates - 1,
             printer_ids=printer_ids or None,
-            target_model=target_model_norm,
+            target_model=target.model,
             base_fields=plate_fields,
         )
-    elif printer_ids:
-        # Round-robin the plates across the requested printers; each printer gets
-        # a contiguous position block (allocated per-printer scope).
-        assignments = [printer_ids[i % len(printer_ids)] for i in range(n_plates)]
-        for pid, count in Counter(assignments).items():
-            await create_queue_items(
-                db,
-                count=count,
-                printer_id=pid,
-                fields={**base_fields, "printer_id": pid, "first_article": False},
-            )
     else:
         await create_queue_items(
             db,
             count=n_plates,
             printer_id=None,
-            fields={**base_fields, "printer_id": None, "target_model": target_model_norm, "first_article": False},
+            fields={**base_fields, "first_article": False, **target.fields()},
         )
 
     await db.commit()
@@ -575,6 +566,11 @@ async def build_farm_printer_contexts(db: AsyncSession) -> list[dict]:
     runs is attributed to the run where it has a live unit (printing before
     pending), else its most recent run. Returns one dict per assigned printer,
     sorted by printer id — the ``FarmPrinterContext`` shape.
+
+    Per ASSIGNED printer, deliberately: a POOL unit contributes a context only once it
+    has LANDED on a printer, because its row carries no printer before then (the fleet
+    page explains a printer's current work, and a pending pool unit is not yet any
+    printer's work).
     """
     result = await db.execute(
         select(PrintBatch)
@@ -682,23 +678,25 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
     printers = [{"id": p.id, "name": p.name} for p in printer_rows]
     name_by_id = {p.id: p.name for p in printer_rows}
 
-    # Candidate printers for the per-printer blocked-state / eligibility panel.
-    # The pinned printers always count; for a model-targeted run whose staged
-    # items are UNPINNED (printer_id NULL, target_model set) there are NO pinned
-    # printers, so a run-detail panel built from ``printer_rows`` alone would be
-    # empty exactly when the operator needs the feedback. Union in every ACTIVE
-    # printer of the run's target model(s) — quarantined ones kept (they surface
-    # AS blocked). Explicit-printer runs carry no item ``target_model`` and are
-    # unchanged. The assigned-printer list (``printers``) + ETA stay pinned-only.
+    # Candidate printers for the per-printer blocked-state / eligibility panel: the
+    # SCHEDULER'S UNIVERSE for this run. A pool unit (model or printer subset) carries
+    # no ``printer_id`` at all while it waits, so a panel built from the landed rows
+    # alone would be empty exactly when the operator needs the feedback. Union in every
+    # ACTIVE printer any of the run's pool targets can land on — quarantined ones are
+    # KEPT (they surface AS blocked), inactive ones excluded, because ``RunPrinterState``
+    # has no inactive dimension and the scheduler never dispatches to one. Membership is
+    # decided by ``DispatchTarget.matches`` — the same predicate the scheduler uses — over
+    # ONE fleet-sized query of the active printers; this is already the detail/state union,
+    # so the list endpoint stays lean. The assigned-printer list (``printers``) stays
+    # landed-only.
     state_rows: list[Printer] = printer_rows
-    target_models = {normalize_printer_model(it.target_model) or it.target_model for it in items if it.target_model}
-    if target_models:
-        lowered = {m.lower() for m in target_models if m}
-        model_result = await db.execute(
-            select(Printer).where(func.lower(Printer.model).in_(lowered), Printer.is_active == True)  # noqa: E712
-        )
+    pool_targets = {t for t in (target_of(it) for it in items) if t.is_pool}
+    if pool_targets:
+        active_result = await db.execute(select(Printer).where(Printer.is_active == True))  # noqa: E712
         merged = {p.id: p for p in printer_rows}
-        merged.update({p.id: p for p in model_result.scalars().all()})
+        merged.update(
+            {p.id: p for p in active_result.scalars().all() if any(t.matches(p.id, p.model) for t in pool_targets)}
+        )
         state_rows = sorted(merged.values(), key=lambda p: p.id)
 
     printer_states, has_blocked_printers = _build_printer_states(state_rows, items)
@@ -746,12 +744,35 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
     prefill_eject_profile_id = next((it.eject_profile_id for it in items if it.eject_profile_id is not None), None)
     prefill_target_model = next((it.target_model for it in items if it.target_model), None)
 
+    # The printer subset the operator CHOSE, resolved to names — the prefill/display
+    # twin of ``target_model`` for a printers pool, empty for model pools and legacy
+    # pinned runs. Deliberately NOT ``printer_states``: the target lists what the
+    # operator picked (an inactive member included), the state panel lists what the
+    # scheduler can currently use. Ids with no printer row are skipped rather than
+    # rendered nameless — a deleted printer is not part of any live choice.
+    target_printers: list[dict] = []
+    printers_target = next((t for t in (target_of(it) for it in items) if t.kind is TargetKind.PRINTERS), None)
+    if printers_target is not None:
+        member_ids = sorted(printers_target.printer_ids)
+        member_rows = await db.execute(select(Printer.id, Printer.name).where(Printer.id.in_(member_ids)))
+        member_names = {row.id: row.name for row in member_rows.all()}
+        target_printers = [{"id": pid, "name": member_names[pid]} for pid in member_ids if pid in member_names]
+
     # ETA: median cycle × remaining plates ÷ distinct printers. Null when we
     # lack a cycle estimate or have no printer to run the remainder.
+    #
+    # A POOL run knows its parallelism from its TARGET, before a single plate has
+    # dispatched: counting only printers that already RAN a unit is history-only, and
+    # it regressed the subset case — a two-printer run used to know "2" at creation
+    # (its units were pinned then), but a pool run's first ETA would read "÷1" and
+    # quote double the truth until a plate had landed on each member. The union panel
+    # is exactly the set the scheduler may use, so its pool-matching size is the
+    # honest divisor; ``max`` keeps the landed count authoritative for a pinned run.
     rows = [{"printer_id": it.printer_id, "started_at": it.started_at} for it in items]
     median_cycle = median_cycle_seconds(rows)
     remaining_plates = plates_pending + plates_printing
-    distinct_printers = len(printers)
+    pool_capacity = sum(1 for p in state_rows if any(t.matches(p.id, p.model) for t in pool_targets))
+    distinct_printers = max(len(printers), pool_capacity)
     eta_seconds: float | None = None
     if median_cycle is not None and distinct_printers > 0 and remaining_plates > 0:
         eta_seconds = median_cycle * remaining_plates / distinct_printers
@@ -794,6 +815,7 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
         "eject_profile_id": prefill_eject_profile_id,
         "cooldown_temp_c_override": run.cooldown_temp_c_override,
         "target_model": prefill_target_model,
+        "target_printers": target_printers,
         "eta_seconds": eta_seconds,
         "printers": printers,
         "scheduled_start_at": scheduled_start_at,
@@ -1006,6 +1028,15 @@ async def top_up_run(db: AsyncSession, run: PrintBatch) -> int:
     keeps its chain productive). Cancelled/stopped and exhausted-failed chains ARE
     the deficit. A gated run that hasn't cleared its first-article gate defers its
     plates to the FA flow, so top-up is a deliberate no-op there.
+
+    The replacements' TARGET is copied from the template row's own target columns and
+    is never re-derived from where units happened to RUN. Deriving it from the
+    primaries' live ``printer_id`` (as this did until the pool cutover) silently
+    converted a MODEL run into a pinned one the moment its first plates dispatched:
+    the printers that happened to serve them became the replacement's hard pin, so a
+    top-up could no longer re-search the fleet and waited on a machine nobody chose.
+    A ``printer_id`` on a dispatched row is a RECORD; only the target columns are an
+    instruction.
     """
     # Never top up around an un-cleared first-article gate — the FA flow owns
     # plate creation while a run is gated (mirrors ``_maybe_complete_run``).
@@ -1060,17 +1091,12 @@ async def top_up_run(db: AsyncSession, run: PrintBatch) -> int:
         "first_article": False,
     }
 
-    # Distribute across the same printers the run used (round-robin), else model-based.
-    printer_ids = sorted({it.printer_id for it in primaries if it.printer_id is not None})
-    if printer_ids:
-        assignments = [printer_ids[i % len(printer_ids)] for i in range(deficit)]
-        for pid, count in Counter(assignments).items():
-            await create_queue_items(db, count=count, printer_id=pid, fields={**fields, "printer_id": pid})
-    else:
-        target_model = next((it.target_model for it in primaries if it.target_model), None)
-        await create_queue_items(
-            db, count=deficit, printer_id=None, fields={**fields, "printer_id": None, "target_model": target_model}
-        )
+    # Same target as the template row — spread LAST so no stale target column survives.
+    # ``target.printer_id`` is the position scope: None (the shared pool scope) for a
+    # pool template, the pin for a genuinely pinned one — the same scope rule as before.
+    target = target_of(template)
+    fields = {**fields, **target.fields()}
+    await create_queue_items(db, count=deficit, printer_id=target.printer_id, fields=fields)
     await db.commit()
     broadcast_production_run_changed(run.id)
     logger.info("production_run: topped up run %s with %d replacement plate(s)", run.id, deficit)

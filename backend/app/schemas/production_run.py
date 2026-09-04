@@ -80,11 +80,11 @@ class RunUnit(BaseModel):
 class RunCreate(BaseModel):
     """Create a production run.
 
-    Exactly one of ``printer_ids`` (assign to specific printers, round-robin
-    across plates) or ``target_model`` (model-based; scheduler assigns to any
-    idle matching printer) must be provided. ``eject_profile_id`` falls back to
-    the SKU's default when null; a farm run must eject, so both being null is a
-    422.
+    Exactly one of ``printer_ids`` (a POOL restricted to those printers — the
+    scheduler places each plate on the next idle member) or ``target_model``
+    (model-based; scheduler assigns to any idle matching printer) must be
+    provided. ``eject_profile_id`` falls back to the SKU's default when null; a
+    farm run must eject, so both being null is a 422.
     """
 
     sku_file_id: int
@@ -171,6 +171,11 @@ class RunResponse(BaseModel):
     eject_profile_id: int | None = None
     cooldown_temp_c_override: float | None = None
     target_model: str | None = None
+    # The prefill/display twin of ``target_model`` for a PRINTERS pool: the printer
+    # subset the operator chose, id-ordered with names. Empty for a model pool and
+    # for legacy pinned runs. Declared here because ``response_model`` strips any
+    # key the schema does not name.
+    target_printers: list[RunPrinterRef] = Field(default_factory=list)
     # median cycle × remaining plates ÷ distinct printers; null when unknown.
     eta_seconds: float | None = None
     printers: list[RunPrinterRef] = Field(default_factory=list)

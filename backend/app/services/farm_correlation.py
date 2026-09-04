@@ -77,12 +77,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
+from backend.app.services.dispatch_target import target_of
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     DepositEvidence,
@@ -93,7 +95,6 @@ from backend.app.services.plate_occupancy import (
     plate_occupancy,
 )
 from backend.app.utils.filename import print_identity_key
-from backend.app.utils.printer_models import normalize_printer_model
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -638,43 +639,48 @@ async def farm_work_targets_printer(db: AsyncSession, printer_id: int) -> bool:
     return result.first() is not None
 
 
-async def farm_model_work_pending(db: AsyncSession, printer_model: str | None) -> bool:
-    """True if any UNASSIGNED farm queue item is model-targeted at ``printer_model``.
+async def farm_work_slated_for(db: AsyncSession, *, printer_id: int, printer_model: str | None) -> bool:
+    """True if ANY farm work could next occupy this printer — bound OR pooled.
 
-    The sibling of :func:`farm_work_targets_printer` for work that names a MODEL
-    rather than a printer: a pending farm item with ``printer_id IS NULL`` and a
-    ``target_model`` the scheduler could land on any printer of that model — this
-    one included. Deliberately a separate function: ``farm_work_targets_printer``
-    drives plate-gate semantics (bound work only) and must not widen.
+    Two halves. The bound half is :func:`farm_work_targets_printer` verbatim. The
+    pool half asks the wider question that function must never ask: is there a
+    pending farm item with ``printer_id IS NULL`` whose POOL target — a model, or a
+    printer subset — this printer is a member of, i.e. work the scheduler may land
+    here on its next tick.
 
-    Matching mirrors ``print_scheduler._find_idle_printer_for_model``: the ITEM's
-    ``target_model`` is run through :func:`normalize_printer_model` and compared
-    case-insensitively against the printer's stored model. The comparison happens
-    in Python over the distinct target_model values because no SQL-side
-    normalisation exists — the scheduler normalises in Python too, so the two
-    answers cannot drift.
+    ``farm_work_targets_printer`` deliberately stays its own function: it drives
+    PLATE-GATE semantics, where "bound work" is the whole question, and widening it
+    to pooled work would raise a gate on every printer a pool merely touches.
 
-    Consumer: the idle deep-park (``farm_policy._maybe_idle_deep_park``). The park
-    is cosmetic, so an over-TRUE answer costs nothing but a skipped park; a
-    false NEGATIVE would park a bed the scheduler is about to print on.
+    Membership is decided by :meth:`DispatchTarget.matches` — the same predicate the
+    scheduler uses (``print_scheduler._find_idle_printer_for_target``) — over ONE
+    query of the DISTINCT ``(target_model, target_printer_ids)`` pairs, evaluated in
+    Python. The pairs are few (one per live run target) and the model comparison has
+    no SQL-side spelling, so one answer serves both dialects and cannot drift from
+    the scheduler's.
+
+    Consumer: the idle deep-park (``farm_policy._maybe_idle_deep_park``). The park is
+    cosmetic, so an over-TRUE answer costs nothing but a skipped park; a false
+    NEGATIVE parks a bed the scheduler is about to print on.
     """
-    if not printer_model or not printer_model.strip():
-        # No model on the printer row ⇒ nothing can be model-targeted at it. Answer
-        # False rather than scanning: an unknown model matches no target.
-        return False
+    if await farm_work_targets_printer(db, printer_id):
+        return True
 
     result = await db.execute(
-        select(PrintQueueItem.target_model)
+        select(PrintQueueItem.target_model, PrintQueueItem.target_printer_ids)
         .join(PrintBatch, PrintQueueItem.batch_id == PrintBatch.id)
         .where(PrintQueueItem.printer_id.is_(None))
         .where(PrintQueueItem.status == "pending")
-        .where(PrintQueueItem.target_model.is_not(None))
+        .where(or_(PrintQueueItem.target_model.is_not(None), PrintQueueItem.target_printer_ids.is_not(None)))
         .where(PrintBatch.sku_file_id.is_not(None))
         .distinct()
     )
-    wanted = printer_model.strip().lower()
-    for target_model in result.scalars().all():
-        normalized = normalize_printer_model(target_model) or target_model
-        if normalized and normalized.lower() == wanted:
+    for target_model, target_printer_ids in result.all():
+        # ``target_of`` reads exactly three attributes (its ``HasTargetColumns``
+        # protocol), so the column pair is a complete argument — no row needed.
+        target = target_of(
+            SimpleNamespace(printer_id=None, target_model=target_model, target_printer_ids=target_printer_ids)
+        )
+        if target.matches(printer_id, printer_model):
             return True
     return False

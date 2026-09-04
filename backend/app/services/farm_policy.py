@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import Counter
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -44,6 +43,7 @@ from backend.app.models.printer import Printer
 from backend.app.models.sku import SkuFile
 from backend.app.schemas.settings import AppSettings
 from backend.app.services import farm_correlation
+from backend.app.services.dispatch_target import DispatchTarget, target_of
 from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
 from backend.app.services.notification_service import notification_service
 from backend.app.services.plate_occupancy import FirstArticleEject, plate_occupancy
@@ -148,16 +148,19 @@ async def create_remaining_plates(db: AsyncSession, run: PrintBatch) -> int:
 
     remaining = int(plan.get("remaining") or 0)
     base = dict(plan.get("base_fields") or {})
-    printer_ids = plan.get("printer_ids")
-    target_model = plan.get("target_model")
 
     if remaining <= 0:
         run.first_article_plan = None
         await db.commit()
         return 0
 
+    # The plan's target is the run's target — the same POOL the first-article plate
+    # was minted into, not a position in a round-robin. Every stored target column is
+    # dropped from the template and re-written from the target itself.
+    target = DispatchTarget.from_plan(plan)
     base.pop("printer_id", None)
     base.pop("target_model", None)
+    base.pop("target_printer_ids", None)
     base.pop("first_article", None)
     # Approve-while-paused stages the materialised plates (manual_start=True) so
     # resume releases them together (R6, same class as R1); an active-run approval
@@ -168,20 +171,10 @@ async def create_remaining_plates(db: AsyncSession, run: PrintBatch) -> int:
         "status": "pending",
         "first_article": False,
         "manual_start": run.status == "paused",
+        **target.fields(),
     }
 
-    if printer_ids:
-        # Continue the round-robin from index 1 — index 0 seeded the FA plate.
-        assignments = [printer_ids[(i + 1) % len(printer_ids)] for i in range(remaining)]
-        for pid, count in Counter(assignments).items():
-            await create_queue_items(db, count=count, printer_id=pid, fields={**fields_common, "printer_id": pid})
-    else:
-        await create_queue_items(
-            db,
-            count=remaining,
-            printer_id=None,
-            fields={**fields_common, "printer_id": None, "target_model": target_model},
-        )
+    await create_queue_items(db, count=remaining, printer_id=target.printer_id, fields=fields_common)
 
     run.first_article_plan = None
     await db.commit()
@@ -201,24 +194,19 @@ async def create_new_first_article(db: AsyncSession, run: PrintBatch) -> PrintQu
     except (TypeError, ValueError):
         return None
     base = dict(plan.get("base_fields") or {})
-    printer_ids = plan.get("printer_ids")
-    target_model = plan.get("target_model")
+    target = DispatchTarget.from_plan(plan)
     base.pop("printer_id", None)
     base.pop("target_model", None)
+    base.pop("target_printer_ids", None)
     base.pop("first_article", None)
     fields = {
         **base,
         "batch_id": run.id,
         "status": "pending",
         "first_article": True,
+        **target.fields(),
     }
-    if printer_ids:
-        fields["printer_id"] = printer_ids[0]
-        items = await create_queue_items(db, count=1, printer_id=printer_ids[0], fields=fields)
-    else:
-        fields["printer_id"] = None
-        fields["target_model"] = target_model
-        items = await create_queue_items(db, count=1, printer_id=None, fields=fields)
+    items = await create_queue_items(db, count=1, printer_id=target.printer_id, fields=fields)
     # A fresh first article supersedes the previous rejection.
     run.first_article_reject_reason = None
     return items[0] if items else None
@@ -452,11 +440,11 @@ async def _maybe_idle_deep_park(db: AsyncSession, printer_id: int) -> None:
     terminal chain — a printer that never parks is a printer that is simply parked
     where the eject left it.
 
-    Skipped when: the setting is off; farm work (bound OR model-targeted) is slated
-    for the printer; the model is a bedslinger (the gantry carries Z — there is no
-    bed-on-Z travel to park into, the same physics that refuses the eject bed-drop);
-    or the model has no geometry row / no ``z_travel_mm`` (nothing to take a
-    percentage of).
+    Skipped when: the setting is off; farm work (bound, or pool work that can land
+    here) is slated for the printer; the model is a bedslinger (the gantry carries
+    Z — there is no bed-on-Z travel to park into, the same physics that refuses the
+    eject bed-drop); or the model has no geometry row / no ``z_travel_mm`` (nothing
+    to take a percentage of).
 
     Callers: the production-eject completed branch of :func:`on_terminal` only. The
     watchdog-killed branch returns before it (a stalled sweep must never command
@@ -470,14 +458,12 @@ async def _maybe_idle_deep_park(db: AsyncSession, printer_id: int) -> None:
         if not enabled:
             return
 
-        # Work bound to THIS printer, then work targeted at its MODEL that the
-        # scheduler could land here — either way the bed is about to be used.
-        if await farm_correlation.farm_work_targets_printer(db, printer_id):
-            return
         printer = await db.get(Printer, printer_id)
         if printer is None:
             return
-        if await farm_correlation.farm_model_work_pending(db, printer.model):
+        # Work bound to THIS printer, or POOL work the scheduler could land here —
+        # either way the bed is about to be used.
+        if await farm_correlation.farm_work_slated_for(db, printer_id=printer_id, printer_model=printer.model):
             return
 
         if is_bedslinger_model(printer.model):
@@ -604,9 +590,12 @@ async def create_retry_if_absent(
     stages the retry (``manual_start=True``) so it can't dispatch onto a paused run;
     the resume sweep releases it.
 
-    Rebalance (F7): a model-targeted unit's retry returns to the unassigned pool
-    (``printer_id=None``) so the scheduler can pick a healthy sibling of the same
-    model and recompute its AMS mapping — a printer-pinned unit keeps its pin
+    Rebalance (F7): the retry inherits the failed unit's TARGET, never its
+    ``printer_id``. A POOL unit's retry therefore returns to the pool
+    (``printer_id=None`` plus the pool's own columns) so the scheduler can pick a
+    healthy member and recompute its AMS mapping — the failed row's ``printer_id`` is
+    the attribution RECORD of where this attempt ran, and copying it would pin the
+    chain to the machine that just failed it. A genuinely PINNED unit keeps its pin
     (operator intent; the failing printer's own quarantine→pause→recover path owns
     that). The per-printer plate-clear gate is unaffected either way.
     """
@@ -614,10 +603,8 @@ async def create_retry_if_absent(
     if existing.first() is not None:
         return None  # already retried this failure event
 
-    retry_printer_id = None if item.target_model else item.printer_id
+    target = target_of(item)
     fields = {
-        "printer_id": retry_printer_id,
-        "target_model": item.target_model,
         "target_location": item.target_location,
         "required_filament_types": item.required_filament_types,
         "library_file_id": item.library_file_id,
@@ -632,6 +619,9 @@ async def create_retry_if_absent(
         "first_article": item.first_article,
         "retry_count": (item.retry_count or 0) + 1,
         "retry_of_id": item.id,
+        # Spread LAST: all three target columns, so the retry can never wear a
+        # leftover column from a kind it does not claim.
+        **target.fields(),
     }
     try:
         # SAVEPOINT (not a bare rollback): the unique-``retry_of_id`` violation of a
@@ -641,7 +631,7 @@ async def create_retry_if_absent(
         # objects and the caller's next attribute access would raise MissingGreenlet.
         # Precedent: services/location_service.py:74-106.
         async with db.begin_nested():
-            created = await create_queue_items(db, count=1, printer_id=retry_printer_id, fields=fields)
+            created = await create_queue_items(db, count=1, printer_id=target.printer_id, fields=fields)
             await db.flush()
         await db.commit()
     except IntegrityError:

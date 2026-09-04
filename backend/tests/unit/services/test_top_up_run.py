@@ -18,6 +18,7 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.sku import Sku, SkuFile
+from backend.app.services.dispatch_target import decode_printer_ids, encode_printer_ids
 from backend.app.services.production_run import _load_run, top_up_run, transition_run
 
 pytestmark = pytest.mark.asyncio
@@ -53,7 +54,19 @@ async def _mk_run(db, *, quantity, printer_id, gated=False):
     return batch, lib, prof
 
 
-async def _add(db, batch, *, printer_id, status, retry_of_id=None, retry_count=0, first_article=False, pos):
+async def _add(
+    db,
+    batch,
+    *,
+    printer_id,
+    status,
+    retry_of_id=None,
+    retry_count=0,
+    first_article=False,
+    pos,
+    target_model=None,
+    target_printer_ids=None,
+):
     it = PrintQueueItem(
         batch_id=batch.id,
         printer_id=printer_id,
@@ -62,6 +75,8 @@ async def _add(db, batch, *, printer_id, status, retry_of_id=None, retry_count=0
         library_file_id=None,
         plate_id=1,
         position=pos,
+        target_model=target_model,
+        target_printer_ids=target_printer_ids,
         retry_of_id=retry_of_id,
         retry_count=retry_count,
         completed_at=datetime.now(timezone.utc) if status in ("completed", "failed", "cancelled") else None,
@@ -173,6 +188,65 @@ class TestTopUpRun:
         second = await top_up_run(db_session, run)
         assert second == 0
         assert await _pending_count(db_session, batch.id) == 1  # not double-created
+
+
+class TestTopUpCopiesTheTemplateTarget:
+    """A replacement inherits the template's TARGET COLUMNS, never its printer_id.
+
+    The target is what the operator asked for; ``printer_id`` on a dispatched row is
+    only the RECORD of where that attempt ran. Deriving the replacement's placement
+    from the primaries' live ``printer_id`` (the pre-cutover behaviour) turned a pool
+    run into a pinned one the moment its first plates dispatched.
+    """
+
+    async def _one_replacement(self, db, batch):
+        run = await _load_run(db, batch.id)
+        assert await top_up_run(db, run) == 1
+        r = await db.execute(
+            select(PrintQueueItem).where(PrintQueueItem.batch_id == batch.id).where(PrintQueueItem.status == "pending")
+        )
+        pend = list(r.scalars().all())
+        assert len(pend) == 1
+        return pend[0]
+
+    async def test_printers_pool_run_tops_up_into_the_pool(self, db_session):
+        pool = encode_printer_ids([3, 7])
+        batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=None)
+        # Both primaries have DISPATCHED: printer_id is their attribution record.
+        await _add(db_session, batch, printer_id=3, status="completed", pos=1, target_printer_ids=pool)
+        await _add(db_session, batch, printer_id=7, status="cancelled", pos=2, target_printer_ids=pool)
+        await db_session.commit()
+
+        replacement = await self._one_replacement(db_session, batch)
+        assert replacement.printer_id is None
+        assert decode_printer_ids(replacement.target_printer_ids) == {3, 7}
+        assert replacement.target_model is None
+
+    async def test_model_run_whose_primaries_dispatched_tops_up_unpinned(self, db_session):
+        """The latent bug, pinned as fixed: a MODEL run's replacements must stay
+        model-targeted even after its primaries have landed on printers."""
+        batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=None)
+        await _add(db_session, batch, printer_id=3, status="completed", pos=1, target_model="H2S")
+        await _add(db_session, batch, printer_id=7, status="cancelled", pos=2, target_model="H2S")
+        await db_session.commit()
+
+        replacement = await self._one_replacement(db_session, batch)
+        assert replacement.printer_id is None
+        assert replacement.target_model == "H2S"
+        assert replacement.target_printer_ids is None
+
+    async def test_genuinely_pinned_template_still_tops_up_pinned(self, db_session):
+        # No pool columns at all → the printer_id IS the operator's pin, and the
+        # replacement keeps it.
+        batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=3)
+        await _add(db_session, batch, printer_id=3, status="completed", pos=1)
+        await _add(db_session, batch, printer_id=3, status="cancelled", pos=2)
+        await db_session.commit()
+
+        replacement = await self._one_replacement(db_session, batch)
+        assert replacement.printer_id == 3
+        assert replacement.target_model is None
+        assert replacement.target_printer_ids is None
 
 
 class TestTransitionResumeWiring:
