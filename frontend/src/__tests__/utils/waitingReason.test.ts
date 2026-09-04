@@ -57,6 +57,21 @@ describe('waitingReasonText', () => {
     );
   });
 
+  it('maps the two pause-recovery holds to operator copy, not a humanized token', () => {
+    // 2026-09-04 wave. Both tokens humanize into something that reads like a
+    // status and hides the only action that clears the hold: `power_loss_hold`
+    // → "Power loss hold" (the operator must resume ON the printer — nothing in
+    // this UI can), `z_reference_lost` → "Z reference lost" (reads as a
+    // calibration warning; the instruction is to lift the part off BY HAND,
+    // never with Eject plate).
+    expect(waitingReasonText('power_loss_hold', t)).toBe(
+      'productionRuns.detail.waiting.powerLossHold',
+    );
+    expect(waitingReasonText('z_reference_lost', t)).toBe(
+      'productionRuns.detail.waiting.zReferenceLost',
+    );
+  });
+
   it('humanizes an unmapped bare token instead of returning it raw', () => {
     // Not in the tier-1 map → falls through to the humanizer.
     expect(waitingReasonText('some_new_hold', t)).toBe('Some new hold');

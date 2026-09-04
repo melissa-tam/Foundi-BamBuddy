@@ -660,11 +660,16 @@ export interface PrinterStatus {
   // release threshold. Present while the farm waits for the bed to cool before
   // auto-clearing the plate gate; null/absent otherwise.
   eject_watch?: { threshold_c: number } | null;
-  // Open AMS incident (WS2b): a jam / runout / physical fault this printer is
-  // currently held by. Present for FOREIGN prints too — those have no queue unit,
-  // so this chip is the only place their hold is visible. Null/absent when clear.
+  // Open printer-hold incident (WS2b): the fault this printer is currently held
+  // by. Present for FOREIGN prints too — those have no queue unit, so this chip
+  // is the only place their hold is visible. Null/absent when clear.
+  // The kinds are the backend's `printer_incident` vocabulary verbatim
+  // (`models/printer_incident.py`) — the chip looks up `printers.incident.<kind>`
+  // by that exact string, so a kind added here needs its locale key in the same
+  // change (pinned by `__tests__/i18n/incidentKinds.test.ts`). The three
+  // pause-cause kinds joined the AMS three in the 2026-09-04 pause-recovery wave.
   open_incident?: {
-    kind: 'jam' | 'runout' | 'physical';
+    kind: 'jam' | 'runout' | 'physical' | 'power_loss' | 'plate_vision' | 'z_reference_lost';
     status: 'recovering' | 'escalated';
     slot_desc: string | null;
     created_at: string | null;

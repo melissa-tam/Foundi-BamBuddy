@@ -24,6 +24,7 @@ import {
   Pause,
   Play,
   RotateCcw,
+  ScanEye,
   Square,
   Zap,
 } from 'lucide-react';
@@ -250,9 +251,19 @@ function NotEligibleBanner({ printerStates }: { printerStates: RunPrinterState[]
 // Unit table row
 // ---------------------------------------------------------------------------
 
+/**
+ * `PrintQueueItem.stop_source` written by the FARM, not by a human: the
+ * plate-check trip the farm answers by stopping the print (stamped on the row
+ * before the stop command — 2026-09-04 pause-recovery wave). Every other value
+ * (`operator_ui`, `operator_screen`) is an operator act, so this one must not
+ * render "Stopped by operator" — nobody touched the printer.
+ */
+const FARM_VISION_ABORT = 'farm_vision_abort';
+
 function UnitRow({ unit }: { unit: RunUnit }) {
   const { t } = useTranslation();
   const waiting = waitingReasonText(unit.waiting_reason, t);
+  const farmStopped = unit.stop_source === FARM_VISION_ABORT;
   return (
     <tr className="border-b border-bambu-dark-tertiary/60 last:border-0">
       <td className="px-3 py-2 text-sm tabular-nums text-gray-400">#{unit.id}</td>
@@ -261,8 +272,16 @@ function UnitRow({ unit }: { unit: RunUnit }) {
           <UnitStatusPill status={unit.status} />
           {unit.stop_source && (
             <span className="inline-flex items-center gap-1 rounded-full border border-orange-500/30 bg-orange-500/15 px-2 py-0.5 text-xs font-medium text-orange-300">
-              <Hand className="h-3 w-3" aria-hidden="true" />
-              {t('productionRuns.detail.stoppedByOperator')}
+              {farmStopped ? (
+                <ScanEye className="h-3 w-3" aria-hidden="true" />
+              ) : (
+                <Hand className="h-3 w-3" aria-hidden="true" />
+              )}
+              {t(
+                farmStopped
+                  ? 'productionRuns.detail.stoppedByFarmVision'
+                  : 'productionRuns.detail.stoppedByOperator',
+              )}
             </span>
           )}
           {unit.first_article && (
