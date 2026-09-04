@@ -35,6 +35,12 @@ from backend.app.schemas.print_queue import (
     PrintQueueItemUpdate,
     PrintQueueReorder,
 )
+from backend.app.services.dispatch_target import (
+    TargetKind,
+    decode_printer_ids,
+    encode_printer_ids,
+    target_of,
+)
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.queue_builder import create_queue_items
@@ -167,6 +173,8 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
         "id": item.id,
         "printer_id": item.printer_id,
         "target_model": item.target_model,
+        # The PRINTERS pool — decoded; ``services/dispatch_target.py`` is the codec.
+        "target_printer_ids": sorted(decode_printer_ids(item.target_printer_ids)) or None,
         "target_location": item.target_location,
         "required_filament_types": required_filament_types_parsed,
         "filament_overrides": filament_overrides_parsed,
@@ -320,6 +328,7 @@ async def list_queue(
     if user is not None and not can_read_all:
         query = query.where(PrintQueueItem.created_by_id == user.id)
 
+    effective_model: str | None = None
     if printer_id is not None:
         if printer_id == -1:
             # Special value: filter for unassigned items
@@ -335,19 +344,32 @@ async def list_queue(
                 ).scalar_one_or_none()
                 effective_model = printer_row
 
+            # This printer's column shows three kinds of row, and only two of them can
+            # be selected EXACTLY in SQL:
+            #   * pinned here (``printer_id == printer_id``) — exact, never post-filtered;
+            #   * targeted at this printer's model — exact, never post-filtered;
+            #   * a PRINTERS pool holding this printer — a SUPERSET admitter. Membership
+            #     lives in a JSON set the SQL cannot test, so this arm admits EVERY pool
+            #     row and the Python post-filter below drops the ones this printer is not
+            #     a member of.
+            # The scan is affordable here and only here: this route is unpaginated and
+            # already enriches every row in Python. It must never migrate into a
+            # scheduler-tick path — the scheduler narrows with ``DispatchTarget.printer_filter``.
+            arms = [PrintQueueItem.printer_id == printer_id]
             if effective_model:
-                # Include both printer-specific items AND model-based (unassigned) items
-                query = query.where(
-                    or_(
-                        PrintQueueItem.printer_id == printer_id,
-                        and_(
-                            PrintQueueItem.printer_id.is_(None),
-                            func.lower(PrintQueueItem.target_model) == effective_model.lower(),
-                        ),
+                arms.append(
+                    and_(
+                        PrintQueueItem.printer_id.is_(None),
+                        func.lower(PrintQueueItem.target_model) == effective_model.lower(),
                     )
                 )
-            else:
-                query = query.where(PrintQueueItem.printer_id == printer_id)
+            arms.append(
+                and_(
+                    PrintQueueItem.printer_id.is_(None),
+                    PrintQueueItem.target_printer_ids.is_not(None),
+                )
+            )
+            query = query.where(or_(*arms))
     elif target_model:
         query = query.where(func.lower(PrintQueueItem.target_model) == target_model.lower())
     if status:
@@ -355,6 +377,17 @@ async def list_queue(
 
     result = await db.execute(query)
     items = result.scalars().all()
+    if printer_id is not None and printer_id != -1:
+        # Drop the pool rows the superset arm over-admitted. ``effective_model`` may be
+        # None (a printer with no model recorded); ``matches`` tolerates it, and for a
+        # PRINTERS target the model is not consulted at all.
+        kept = []
+        for item in items:
+            target = target_of(item)
+            if target.kind is TargetKind.PRINTERS and not target.matches(printer_id, effective_model):
+                continue
+            kept.append(item)
+        items = kept
     return [_enrich_response(item) for item in items]
 
 
@@ -614,7 +647,12 @@ async def add_to_queue(
     await db.refresh(item, ["archive", "printer", "library_file", "created_by", "batch"])
 
     source_name = f"archive {data.archive_id}" if data.archive_id else f"library file {data.library_file_id}"
-    target_desc = data.printer_id or (f"model {target_model_norm}" if target_model_norm else "unassigned")
+    # ONE phrasing of "where may this run?", from the one value object that owns it —
+    # the log line, the notification below and the queue UI must not describe a target
+    # three different ways. Names are supplied for the pinned case so the operator reads
+    # the machine's name rather than ``#7``.
+    target_names = {item.printer.id: item.printer.name} if item.printer else None
+    target_desc = target_of(item).describe(target_names)
     qty_desc = f" (×{quantity})" if quantity > 1 else ""
     logger.info("Added %s to queue for %s%s", source_name, target_desc, qty_desc)
 
@@ -643,12 +681,9 @@ async def add_to_queue(
         job_name = job_name.replace(".gcode.3mf", "").replace(".3mf", "")
         if quantity > 1:
             job_name = f"{job_name} ×{quantity}"
-        target = (
-            item.printer.name if item.printer else (f"Any {item.target_model}" if target_model_norm else "Unassigned")
-        )
         await notification_service.on_queue_job_added(
             job_name=job_name,
-            target=target,
+            target=target_desc,
             db=db,
             printer_id=item.printer_id,
             printer_name=item.printer.name if item.printer else None,
@@ -1024,17 +1059,35 @@ async def update_queue_item(
             or update_data["target_model"]
         )
 
-    # Cannot specify both printer_id and target_model
+    # A unit has exactly ONE target (services/dispatch_target.py: the four kinds are
+    # exclusive), so at most one of the three columns may end up truthy. The test is
+    # over the EFFECTIVE post-PATCH values, not the sent ones: a body that only sets
+    # target_printer_ids on a pinned row would otherwise sail through and leave the row
+    # claiming two kinds. Clearing the other column in the same body is how an operator
+    # re-targets a unit.
     new_printer_id = update_data.get("printer_id", item.printer_id)
     new_target_model = update_data.get("target_model", item.target_model)
-    if new_printer_id and new_target_model:
-        raise HTTPException(400, "Cannot specify both printer_id and target_model")
+    new_target_printer_ids = update_data.get(
+        "target_printer_ids", sorted(decode_printer_ids(item.target_printer_ids)) or None
+    )
+    if sum(1 for value in (new_printer_id, new_target_model, new_target_printer_ids) if value) > 1:
+        raise HTTPException(400, "Specify at most one of printer_id, target_model, target_printer_ids")
 
     # Validate new printer_id if being changed (and not None)
     if "printer_id" in update_data and update_data["printer_id"] is not None:
         result = await db.execute(select(Printer).where(Printer.id == update_data["printer_id"]))
         if not result.scalar_one_or_none():
             raise HTTPException(400, "Printer not found")
+
+    # Validate every member of a printers pool: a pool naming a printer that does not
+    # exist is a unit that can never dispatch, and it would fail silently (the scheduler
+    # simply never finds a member).
+    if update_data.get("target_printer_ids"):
+        requested = sorted({int(pid) for pid in update_data["target_printer_ids"]})
+        found = set((await db.execute(select(Printer.id).where(Printer.id.in_(requested)))).scalars().all())
+        missing = [pid for pid in requested if pid not in found]
+        if missing:
+            raise HTTPException(400, f"Printer(s) not found: {missing}")
 
     # Validate target_model has active printers
     if "target_model" in update_data and update_data["target_model"]:
@@ -1053,6 +1106,12 @@ async def update_queue_item(
         update_data["filament_overrides"] = (
             json.dumps(update_data["filament_overrides"]) if update_data["filament_overrides"] else None
         )
+
+    # Encode the printers pool through its ONE codec — canonical (sorted, deduped)
+    # form is a domain rule owned by services/dispatch_target.py, and an empty list or
+    # a null both clear the column (that module refuses to mint an empty-array spelling).
+    if "target_printer_ids" in update_data:
+        update_data["target_printer_ids"] = encode_printer_ids(update_data["target_printer_ids"])
 
     # Serialize H2C rack-swap nozzle pick (#1780) to JSON for TEXT column
     # storage; same Text-as-opaque-blob convention as ams_mapping above.
