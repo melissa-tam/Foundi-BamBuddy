@@ -168,7 +168,12 @@ class TestSchedulerPropagatesOwnerToPrinterManager:
     """`PrintScheduler._propagate_owner_to_printer_manager` looks up the
     user row by `created_by_id` and forwards it into
     `printer_manager.set_current_print_user` so the print-complete callback
-    can write the username into PrintLogEntry."""
+    can write the username into PrintLogEntry.
+
+    The printer is an argument, not a read off the row: a POOL unit's pending row
+    carries no ``printer_id`` (the dispatch's pick rides the plan — see
+    ``services/dispatch_target``), so ``_start_print`` hands its own local down. These
+    cases use pinned items, where the two are the same value."""
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -194,7 +199,7 @@ class TestSchedulerPropagatesOwnerToPrinterManager:
             lambda printer_id, uid, username: captured.append((printer_id, uid, username)),
         )
 
-        await PrintScheduler()._propagate_owner_to_printer_manager(db_session, queue_item)
+        await PrintScheduler()._propagate_owner_to_printer_manager(db_session, queue_item, queue_item.printer_id)
 
         assert captured == [(queue_item.printer_id, user.id, "clickeruser")]
 
@@ -216,7 +221,7 @@ class TestSchedulerPropagatesOwnerToPrinterManager:
             lambda *args: captured.append(args),
         )
 
-        await PrintScheduler()._propagate_owner_to_printer_manager(db_session, queue_item)
+        await PrintScheduler()._propagate_owner_to_printer_manager(db_session, queue_item, queue_item.printer_id)
         assert captured == []
 
     @pytest.mark.asyncio
@@ -243,5 +248,5 @@ class TestSchedulerPropagatesOwnerToPrinterManager:
         # Must not raise — the dispatch loop would otherwise lose the whole
         # queue item to an exception trace for what's effectively a missing
         # foreign key.
-        await PrintScheduler()._propagate_owner_to_printer_manager(db_session, queue_item)
+        await PrintScheduler()._propagate_owner_to_printer_manager(db_session, queue_item, queue_item.printer_id)
         assert captured == []
