@@ -132,6 +132,15 @@ class _WireSample:
     # Wall-clock seconds the last observed outage lasted, or None when this process
     # never saw its disconnect edge (a restart mid-outage, or a first-ever connect).
     outage_s: float | None
+    # Whether the LAST push showed the power-loss prompt standing. The driver spawns
+    # on the RISING edge of this only: a prompt that stands for hours (a hold the
+    # firmware refused to release, a foreign print nobody resumes) would otherwise
+    # spawn a fresh 15 s driver on every push once the previous one exited, each one
+    # re-reading the incident, re-logging "standing aside" and re-recording the
+    # printer into the summary — a driver every ~16 s for the whole hold. The first
+    # push after a restart has no previous sample, so it IS a rising edge: that is
+    # the restart-durability story (one re-derived decision, then the row decides).
+    at_prompt: bool = False
 
 
 @dataclass
@@ -199,12 +208,16 @@ def note_status_push(printer_id: int, state) -> None:
             # The session we just lost ended NOW; ``disconnected_at`` is kept across the
             # reconnect precisely so this subtraction is possible.
             outage_s = max(0.0, time.time() - float(anchor))
-        _seen[printer_id] = _WireSample(epoch=epoch, outage_s=outage_s)
+        at_prompt = power_loss_hold_active(state)
+        was_at_prompt = prev.at_prompt if prev is not None else False
+        _seen[printer_id] = _WireSample(epoch=epoch, outage_s=outage_s, at_prompt=at_prompt)
 
         if reconnected:
             _maybe_arm_z_reference_hold(printer_id, anchor)
 
-        if not power_loss_hold_active(state):
+        if not at_prompt or was_at_prompt:
+            # Level, not edge: the prompt either is not standing, or it was already
+            # standing at the last push and its one driver has decided (or is deciding).
             return
         task = _in_flight.get(printer_id)
         if task is not None and not task.done():

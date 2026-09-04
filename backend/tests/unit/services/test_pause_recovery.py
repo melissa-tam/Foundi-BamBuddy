@@ -547,6 +547,34 @@ class TestSampler:
 
         assert client.calls == [("resume",)]  # ONE driver, not five
 
+    async def test_a_prompt_that_keeps_standing_after_the_decision_spawns_nothing_more(self, monkeypatch, db_session):
+        """After the driver decided (here: the resume was refused -> a HOLD), the prompt
+        still stands on every later push. Those pushes are LEVEL, not edge: no new
+        driver, no second resume, no second page. A prompt that clears and comes
+        back is a new edge and earns a new decision."""
+        await _printer(db_session, 23)
+        state = _make_state()
+        client = FakeClient(state, resume_reaches_running=False)
+        _wire(monkeypatch, state, client)
+        paged = _spy(monkeypatch, "on_power_loss_hold")
+
+        await _drive(23, state)
+        assert client.calls == [("resume",)]
+        assert paged.await_count == 1
+
+        for _ in range(20):  # twenty more ~1 Hz pushes, the prompt still standing
+            pause_recovery.note_status_push(23, state)
+            assert pause_recovery._in_flight.get(23) is None
+        assert client.calls == [("resume",)]
+        assert paged.await_count == 1
+
+        # The prompt clears (operator resumed on the screen) and later re-appears:
+        # a fresh edge — but the hold row on disk makes the new driver stand aside.
+        cleared = _make_state(gcode_state="RUNNING", hms=[])
+        pause_recovery.note_status_push(23, cleared)
+        await _drive(23, state)
+        assert client.calls == [("resume",)]  # stood aside on the open incident
+
     async def test_a_restart_re_derives_from_the_wire_and_makes_one_attempt(self, monkeypatch, db_session):
         """Empty ``_in_flight`` plus a standing prompt is exactly what a restart sees;
         the incident row is what "already decided" means, and there is none yet."""
