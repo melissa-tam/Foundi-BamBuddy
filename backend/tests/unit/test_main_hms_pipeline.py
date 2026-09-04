@@ -854,15 +854,19 @@ async def _stale_then_reappear(printer_id: int, err: SimpleNamespace) -> None:
 @pytest.mark.asyncio
 class TestMovedConsumersRideTheAppearanceEdge:
     async def test_plate_occupancy_fires_on_an_edge_notify_dedup_calls_stale(self):
+        # The vision edge now drives ``pause_recovery.on_plate_vision_trip`` (the lane
+        # that records the trip and STOPS the print); ``on_native_plate_detection`` is
+        # deleted. It is SPAWNED rather than awaited — the lane sends a stop and can
+        # sleep for its retry, and the ~1 Hz status flow must not wait on either.
         with (
             _Harness() as h,
-            patch("backend.app.services.farm_correlation.on_native_plate_detection", new=AsyncMock()) as plate_hook,
+            patch("backend.app.services.pause_recovery.on_plate_vision_trip", new=AsyncMock()) as plate_hook,
         ):
             await _stale_then_reappear(5, _PLATE_OCCUPANCY)
+            await asyncio.sleep(0)  # let the fire-and-forget task run
 
         plate_hook.assert_awaited_once()
-        assert plate_hook.await_args.args[1] == 5
-        assert plate_hook.await_args.args[2] == {"0500_808C"}
+        assert plate_hook.await_args.args == (5, {"0500_808C"})
         # ...and the alert lane genuinely considered the code stale on that push.
         h.notify.on_printer_error.assert_not_awaited()
 

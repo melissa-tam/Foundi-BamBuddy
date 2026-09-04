@@ -1328,17 +1328,26 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
 
         # Native plate-occupancy capture (Phase 3.3). The H2-series pre-print vision
         # check (foreign-objects-on-heatbed / plate-marker) surfaces as an HMS code and
-        # PAUSEs the job on the printer. When such a code APPEARS and a farm unit is
-        # printing here, raise a human-clear-only plate gate + flag the unit so the loop
-        # shows the hold instead of silently stalling. Own session, fully guarded — the
-        # codes stay in hms_errors (they ARE faults).
+        # PAUSEs the job on the printer. Since 2026-09-04 the reaction is the
+        # pause-recovery lane's: it records the trip as a printer_incident, stamps the
+        # farm-abort mark on the printing row and STOPS the print, so a terminal exists
+        # for farm_policy to decide a re-check requeue or a confirmed hold from. The
+        # lane used to leave the unit `printing` forever behind a human-clear gate — 13
+        # trips, 22 operator stops, 0 requeues.
+        #
+        # Fire-and-forget, not awaited: the lane sends a stop and can sleep for its one
+        # retry, and the ~1 Hz status flow must not wait on either. Strong-referenced
+        # (spawn_background_task) for the same reason the runout hook above is — a
+        # weakly-held task can vanish mid-await with no traceback, and this one's
+        # failure mode is a print that was never stopped.
         _new_occupancy = edges.appeared_short & _HMS_PLATE_OCCUPANCY_CODES
         if _new_occupancy:
             try:
-                from backend.app.services.farm_correlation import on_native_plate_detection
+                from backend.app.services.pause_recovery import on_plate_vision_trip
 
-                async with async_session() as _plate_db:
-                    await on_native_plate_detection(_plate_db, printer_id, _new_occupancy)
+                spawn_background_task(
+                    on_plate_vision_trip(printer_id, set(_new_occupancy)), name=f"plate-vision-p{printer_id}"
+                )
             except Exception as _pe:  # noqa: BLE001 — capture must never crash the status flow
                 logging.getLogger(__name__).warning(
                     "[PLATE-VISION] native plate-occupancy capture failed for printer %s: %s", printer_id, _pe
@@ -1412,6 +1421,22 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     except Exception as _dwe:  # noqa: BLE001 — sampling must never crash the status flow
         logging.getLogger(__name__).warning(
             "[SPOOL-RECOVERY] incident wire sampler failed for printer %s: %s", printer_id, _dwe
+        )
+
+    # Power-loss prompt sampler (2026-09-04 fleet outage). Same shape and the same
+    # placement rationale as the sampler above: sync, in-memory, session-free, and
+    # OUTSIDE the "HMS present" branch because one of the two edges it derives — a
+    # RECONNECT — arrives on pushes that carry no HMS at all. It spawns at most one
+    # recovery driver per printer while the firmware's own recovery prompt stands, and
+    # arms the lost-Z-reference hold for a printer that came back from a FLEET outage
+    # with a part still on its plate.
+    try:
+        from backend.app.services.pause_recovery import note_status_push
+
+        note_status_push(printer_id, state)
+    except Exception as _ple:  # noqa: BLE001 — sampling must never crash the status flow
+        logging.getLogger(__name__).warning(
+            "[PAUSE-RECOVERY] power-loss sampler failed for printer %s: %s", printer_id, _ple
         )
 
     # Restart-replay HMS suppression (Phase D). Same one-shot shape as the runout
@@ -4197,9 +4222,22 @@ async def on_print_complete(printer_id: int, data: dict):
     # queue action); a SCREEN-stop WITH a deposit is normalised later, once the
     # no-deposit classification is known (a no-deposit screen-stop is handled by the
     # existing no-deposit path so a first article still retries).
-    from backend.app.services.farm_correlation import classify_stop
+    #
+    # The FARM's own abort outranks both operator signals, so the mark it stamped on the
+    # printing row BEFORE sending its stop is read here — ahead of every status rewrite
+    # that keys off the verdict, because the disposition is decided ONCE from the
+    # classification. A read failure degrades to the two operator signals (today's
+    # behaviour) rather than taking the callback down.
+    from backend.app.services.farm_correlation import classify_stop, printing_stop_mark
 
-    _stop_source = classify_stop(data, printer_id, _user_stopped_printers)
+    _farm_stop_mark = None
+    try:
+        async with async_session() as _mark_db:
+            _farm_stop_mark = await printing_stop_mark(_mark_db, printer_id)
+    except Exception as _fme:  # noqa: BLE001 — a mark read must never crash the callback
+        logger.warning("[CALLBACK] farm stop-mark read failed for printer %s: %s", printer_id, _fme)
+
+    _stop_source = classify_stop(data, printer_id, _user_stopped_printers, item_stop_source=_farm_stop_mark)
     if _stop_source == "operator_ui" and _raw_status in ("failed", "aborted"):
         logger.info(
             "[CALLBACK] Overriding status '%s' -> 'cancelled' for printer %s (print was stopped from queue by user)",
@@ -4349,7 +4387,16 @@ async def on_print_complete(printer_id: int, data: dict):
     # queue records "cancelled" (not "failed"), farm_policy.on_terminal no-ops, and
     # quarantine (keyed on "failed") excludes it. A first-article no-deposit stop
     # deliberately keeps "failed" so the run still retries its first article.
-    if no_deposit and not _resolved_first_article and not _is_eject_job:
+    if _stop_source == "farm_vision_abort" and _raw_status in ("failed", "aborted"):
+        # The FARM stopped this print (the pre-print plate check tripped and the lane
+        # sent print.stop). It is a stop, never a failure — including for a FIRST
+        # ARTICLE, whose no-deposit branch below deliberately keeps "failed" so a
+        # genuine failure still retries, and would otherwise route a farm abort into
+        # _on_item_failed plus a quarantine count for a plate the farm itself refused.
+        # The row already carries the mark; this only makes the recorded status agree
+        # with it.
+        data = {**data, "status": "cancelled"}
+    elif no_deposit and not _resolved_first_article and not _is_eject_job:
         data = {**data, "status": "cancelled"}
     elif _stop_source == "operator_screen" and not no_deposit and _raw_status in ("failed", "aborted"):
         # A printer-screen stop that DID deposit a part (the no-deposit branch above
@@ -4748,6 +4795,7 @@ async def on_print_complete(printer_id: int, data: dict):
     try:
         from backend.app.core.database import run_with_retry
         from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.farm_correlation import STOP_SOURCE_FARM_VISION_ABORT
 
         async def _update_queue_status(db):
             nonlocal queue_item_id, queue_status, queue_auto_off
@@ -4771,7 +4819,17 @@ async def on_print_complete(printer_id: int, data: dict):
                 # farm policy skips retry/quarantine for it. Only for a 'cancelled'
                 # verdict with a classified source — a reconcile-synthesised abort
                 # carries no echo/membership → stop_source stays NULL (unknown).
-                if queue_status == "cancelled" and _stop_source is not None:
+                #
+                # A FARM mark already on the row is never overwritten. It was stamped
+                # before the stop went out precisely so the terminal could HONOUR it,
+                # and the classifier above re-derives the same verdict from it — but the
+                # guard is the durable half of that contract and must not depend on the
+                # classification having succeeded.
+                if (
+                    queue_status == "cancelled"
+                    and _stop_source is not None
+                    and item.stop_source != STOP_SOURCE_FARM_VISION_ABORT
+                ):
                     item.stop_source = _stop_source
                 if queue_status == "failed" and not item.error_message:
                     item.error_message = _format_hms_error_summary(data.get("hms_errors") or [])

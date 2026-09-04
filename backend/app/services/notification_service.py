@@ -2783,6 +2783,73 @@ class NotificationService:
             variables=variables,
         )
 
+    async def on_power_loss_recovery_summary(
+        self,
+        *,
+        resumed: int,
+        held: int,
+        stopped_ejects: int,
+        held_by_fault: int,
+        outage_minutes: int | None,
+        db: AsyncSession,
+    ):
+        """Fire ONCE per outage: what the farm did about it, fleet-wide.
+
+        The 2026-09-04 shape is eleven printers reacting within a minute of each other,
+        and eleven per-printer pages would bury the one fact an operator needs at
+        07:00 — how many machines are running again and how many are waiting for hands.
+        The per-printer :meth:`on_power_loss_hold` still fires for each held printer
+        (it names the machine and the job); this is the covering page, and a RESUMED
+        printer appears ONLY here, because a resume asks nothing of anyone.
+
+        ``stopped_ejects`` and ``held_by_fault`` are counted separately from ``held``
+        on purpose: an interrupted sweep and a printer that was already holding an AMS
+        fault both need attention, but neither is a resume that failed, and rolling
+        them into one number would misdescribe what the operator will find.
+
+        Composed in backend English rather than from the ``power_loss_recovery``
+        template, whose variables (printer, job, refused resume) are all per-printer;
+        it rides the same provider column with its own ``event_type``, which is the
+        established one-column-several-events shape (:meth:`on_runout_auto_resumed`).
+        ``printer_id`` is None — an outage belongs to no single printer — so a
+        printer-scoped provider does not receive it.
+        """
+        providers = await self._get_providers_for_event(db, "on_power_loss_recovery")
+        if not providers:
+            return
+
+        attention = held + stopped_ejects + held_by_fault
+        title = f"Power restored — {resumed} printer(s) resumed, {attention} need attention"
+        parts = [f"{resumed} printer(s) resumed automatically."]
+        if held:
+            parts.append(f"{held} could not be resumed and are held at the printer's prompt.")
+        if stopped_ejects:
+            parts.append(f"{stopped_ejects} were mid-eject; those sweeps were stopped, not resumed.")
+        if held_by_fault:
+            parts.append(f"{held_by_fault} were already held by an open fault and were left alone.")
+        if outage_minutes is not None:
+            parts.append(f"Power was lost for ~{outage_minutes} min.")
+        message = " ".join(parts)
+
+        variables = {
+            "resumed": str(resumed),
+            "held": str(held),
+            "stopped_ejects": str(stopped_ejects),
+            "held_by_fault": str(held_by_fault),
+            "outage": f" Power was lost for ~{outage_minutes} min." if outage_minutes is not None else "",
+        }
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "power_loss_recovery_summary",
+            None,
+            None,
+            force_immediate=True,
+            variables=variables,
+        )
+
     async def on_spool_recovery_failed(
         self,
         printer_id: int | None,

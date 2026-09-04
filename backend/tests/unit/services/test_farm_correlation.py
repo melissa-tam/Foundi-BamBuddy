@@ -18,11 +18,13 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.farm_correlation import (
+    STOP_SOURCE_FARM_VISION_ABORT,
     classify_stop,
     farm_model_work_pending,
     farm_work_targets_printer,
-    on_native_plate_detection,
+    printing_stop_mark,
     resolve_active_plate_id,
+    resolve_printing_farm_item,
     resolve_terminal_item,
     terminal_disposition,
     upgrade_to_foreign_auto_eject,
@@ -37,19 +39,11 @@ from backend.app.services.plate_occupancy import (
 )
 from backend.app.services.printer_manager import printer_manager
 
-
-@pytest.fixture(autouse=True)
-def _clean_occupancy_authority():
-    """Isolate the module-singleton occupancy authority between tests.
-
-    ``on_native_plate_detection`` now raises the gate through
-    ``plate_occupancy.note_plate_detected``, so a record left behind would leak into
-    the next test's gate assertion. ``reset_for_tests`` also un-wires the injected
-    callables, keeping these DB tests clear of the websocket / scheduler lanes.
-    """
-    plate_occupancy.reset_for_tests()
-    yield
-    plate_occupancy.reset_for_tests()
+# The per-file occupancy reset that used to live here is GONE: the plate-vision
+# reaction it protected against moved to ``pause_recovery``, and conftest's autouse
+# ``reset_plate_occupancy_authority`` already starts and leaves every test with an
+# empty, un-wired authority. A second reset of one process singleton is exactly the
+# duplication the 2026-08-30 wave removed everywhere else.
 
 
 async def _add_item(
@@ -420,6 +414,95 @@ class TestClassifyStop:
     def test_false_echo_is_none(self):
         assert classify_stop({"user_cancel_observed": False}, 1, set()) is None
 
+    def test_the_farm_mark_outranks_the_cancel_echo(self):
+        """An MQTT ``print.stop`` plausibly produces the firmware's cancel echo — that
+        is unmeasured, so the mark must not depend on its absence. Relabelling the
+        farm's own abort ``operator_screen`` would route the unit into the operator-stop
+        disposition instead of the requeue the abort exists to produce."""
+        assert (
+            classify_stop({"user_cancel_observed": True}, 1, set(), item_stop_source="farm_vision_abort")
+            == "farm_vision_abort"
+        )
+
+    def test_the_farm_mark_outranks_ui_membership_too(self):
+        """The older rule was "membership WINS"; it is narrowed by exactly one case. A
+        human pressing Stop on a print the farm is already aborting has not changed why
+        the print ended — and the mark is on disk while the membership is a process
+        set."""
+        assert classify_stop({}, 1, {1}, item_stop_source="farm_vision_abort") == "farm_vision_abort"
+
+    def test_an_unrelated_mark_does_not_hijack_the_verdict(self):
+        """The precedence is keyed on the farm's OWN marker, not on "the row carries
+        some stop_source" — a stop_source left by an earlier terminal must not decide
+        this one."""
+        assert classify_stop({"user_cancel_observed": True}, 1, set(), item_stop_source="operator_ui") == (
+            "operator_screen"
+        )
+
+    def test_no_mark_is_the_pre_existing_behaviour(self):
+        assert classify_stop({}, 1, {1}, item_stop_source=None) == "operator_ui"
+
+
+class TestPrintingStopMark:
+    """The read that makes the durable mark visible to the classifier."""
+
+    async def test_it_returns_the_mark_on_the_printing_row(self, db_session):
+        item = await _add_item(db_session, printer_id=50)
+        item.stop_source = STOP_SOURCE_FARM_VISION_ABORT
+        await db_session.commit()
+
+        assert await printing_stop_mark(db_session, 50) == STOP_SOURCE_FARM_VISION_ABORT
+
+    async def test_an_unmarked_printing_row_answers_none(self, db_session):
+        await _add_item(db_session, printer_id=51)
+        assert await printing_stop_mark(db_session, 51) is None
+
+    async def test_a_terminal_row_is_not_read(self, db_session):
+        """Only what is ``printing`` NOW can carry a mark about the terminal arriving
+        now; a cancelled row's stop_source is last cycle's answer."""
+        item = await _add_item(db_session, printer_id=52, status="cancelled")
+        item.stop_source = STOP_SOURCE_FARM_VISION_ABORT
+        await db_session.commit()
+
+        assert await printing_stop_mark(db_session, 52) is None
+
+    async def test_it_only_reads_the_target_printer(self, db_session):
+        item = await _add_item(db_session, printer_id=53)
+        item.stop_source = STOP_SOURCE_FARM_VISION_ABORT
+        await db_session.commit()
+
+        assert await printing_stop_mark(db_session, 54) is None
+
+
+class TestResolvePrintingFarmItem:
+    """The ownership question, extracted from the deleted ``on_native_plate_detection``:
+    is the farm loop responsible for what is on this printer?"""
+
+    async def test_an_eject_profile_makes_it_a_farm_unit(self, db_session):
+        item = await _add_eject_item(db_session, printer_id=55, eject_profile_id=7)
+        assert (await resolve_printing_farm_item(db_session, 55)).id == item.id
+
+    async def test_a_sku_batch_makes_it_a_farm_unit(self, db_session):
+        batch = await _add_farm_batch(db_session)
+        item = await _add_eject_item(db_session, printer_id=56, batch_id=batch.id)
+        assert (await resolve_printing_farm_item(db_session, 56)).id == item.id
+
+    async def test_a_plain_print_is_not_a_farm_unit(self, db_session):
+        await _add_eject_item(db_session, printer_id=57)
+        assert await resolve_printing_farm_item(db_session, 57) is None
+
+    async def test_nothing_printing_is_none(self, db_session):
+        assert await resolve_printing_farm_item(db_session, 58) is None
+
+
+class TestPlateOccupancyCodeSet:
+    """The vision codes the capture hook and the failure-reason attribution share."""
+
+    def test_the_four_native_vision_codes_are_pinned_members(self):
+        from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
+
+        assert {"0300_8017", "0300_8006", "0500_806E", "0500_808C"} <= _HMS_PLATE_OCCUPANCY_CODES
+
 
 async def _add_eject_item(db, *, printer_id, status="printing", eject_profile_id=None, batch_id=None):
     item = PrintQueueItem(
@@ -434,128 +517,6 @@ async def _add_eject_item(db, *, printer_id, status="printing", eject_profile_id
     await db.commit()
     await db.refresh(item)
     return item
-
-
-class TestNativePlateDetection:
-    """Native pre-print vision capture (Phase 3.3): a NEW plate-occupancy HMS code
-    while a farm unit is printing → human-clear-only gate + flagged unit.
-
-    The gate now goes up through ``plate_occupancy.note_plate_detected``, so the
-    assertions read the authority directly as well as through the manager's
-    projection: a vision trip fires MID-JOB with no job identity behind it, so the
-    plate must be SOURCE-LESS and under ``EscalationOnly`` — the shape no auto-clear
-    rule can ever release.
-    """
-
-    @staticmethod
-    def _assert_human_clear_only_gate(printer_id: int) -> None:
-        view = plate_occupancy.snapshot(printer_id)
-        assert view.plate_occupied is True
-        assert view.plate_source_subtask_id is None  # no identity to sweep against
-        assert isinstance(view.plate_policy, EscalationOnly)
-        # The manager's projection is the same fact, read the way the UI reads it.
-        assert printer_manager.is_awaiting_plate_clear(printer_id) is True
-
-    async def test_farm_item_gets_gate_and_flag(self, db_session):
-        batch = await _add_farm_batch(db_session)  # sku_file_id set == farm
-        item = await _add_eject_item(db_session, printer_id=11, batch_id=batch.id)
-
-        flagged = await on_native_plate_detection(db_session, 11, {"0300_8017"})
-
-        assert flagged is True
-        await db_session.refresh(item)
-        assert item.waiting_reason == "plate_not_empty_printer_detected"
-        assert item.status == "printing"  # NEVER terminal
-        self._assert_human_clear_only_gate(11)
-
-    async def test_the_plate_not_empty_notification_still_fires(self, db_session):
-        """Side effect (c) is unchanged by the cut-over: the operator is paged with
-        the printer-vision ``source_detail``, which is what tells them to clear the
-        bed and Resume ON THE SCREEN rather than waiting for the farm to sweep."""
-        batch = await _add_farm_batch(db_session)
-        await _add_eject_item(db_session, printer_id=16, batch_id=batch.id)
-
-        with patch(
-            "backend.app.services.notification_service.notification_service.on_plate_not_empty",
-            new_callable=AsyncMock,
-        ) as notify:
-            assert await on_native_plate_detection(db_session, 16, {"0500_806E"}) is True
-
-        notify.assert_awaited_once()
-        assert notify.await_args.args[0] == 16
-        assert "heatbed" in notify.await_args.kwargs["source_detail"]
-
-    async def test_repeated_trips_do_not_re_stamp_the_gate(self, db_session):
-        """The trip re-fires on repeated pushes. Re-stamping ``since`` would churn the
-        fan-out and lie to the operator about when the plate became occupied."""
-        batch = await _add_farm_batch(db_session)
-        await _add_eject_item(db_session, printer_id=17, batch_id=batch.id)
-
-        assert await on_native_plate_detection(db_session, 17, {"0300_8017"}) is True
-        first_since = plate_occupancy.snapshot(17).plate_since
-
-        assert await on_native_plate_detection(db_session, 17, {"0300_8017"}) is True
-
-        assert plate_occupancy.snapshot(17).plate_since == first_since
-
-    async def test_eject_profile_item_is_farm(self, db_session):
-        # A non-sku batch but an item carrying an eject_profile_id still counts as farm.
-        item = await _add_eject_item(db_session, printer_id=12, eject_profile_id=7)
-
-        flagged = await on_native_plate_detection(db_session, 12, {"0300_8006"})
-
-        assert flagged is True
-        await db_session.refresh(item)
-        assert item.waiting_reason == "plate_not_empty_printer_detected"
-        self._assert_human_clear_only_gate(12)
-
-    async def test_non_farm_printer_no_gate(self, db_session):
-        # A plain (non-farm) printing item → no gate, no flag.
-        item = await _add_eject_item(db_session, printer_id=13)  # no eject profile, no farm batch
-        flagged = await on_native_plate_detection(db_session, 13, {"0300_8017"})
-        assert flagged is False
-        await db_session.refresh(item)
-        assert item.waiting_reason is None
-        assert plate_occupancy.is_plate_occupied(13) is False
-        assert printer_manager.is_awaiting_plate_clear(13) is False
-
-    async def test_nothing_printing_no_gate(self, db_session):
-        flagged = await on_native_plate_detection(db_session, 14, {"0300_8017"})
-        assert flagged is False
-        assert plate_occupancy.is_plate_occupied(14) is False
-        assert printer_manager.is_awaiting_plate_clear(14) is False
-
-    async def test_plate_offset_808c_triggers_reaction(self, db_session):
-        """C4: HMS 0500_808C (build-plate offset / debris) is a plate-occupancy code
-        and drives the same human-clear-only gate + waiting_reason as 0300_8017."""
-        batch = await _add_farm_batch(db_session)
-        item = await _add_eject_item(db_session, printer_id=15, batch_id=batch.id)
-
-        flagged = await on_native_plate_detection(db_session, 15, {"0500_808C"})
-
-        assert flagged is True
-        await db_session.refresh(item)
-        assert item.waiting_reason == "plate_not_empty_printer_detected"
-        assert item.status == "printing"
-        self._assert_human_clear_only_gate(15)
-
-    def test_808c_is_in_plate_occupancy_set(self):
-        """0500_808C joined the single-origin plate-occupancy frozenset, so BOTH the
-        main.py capture hook and the failure-reason attribution pick it up."""
-        from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
-
-        assert "0500_808C" in _HMS_PLATE_OCCUPANCY_CODES
-        assert {"0300_8017", "0300_8006"} <= _HMS_PLATE_OCCUPANCY_CODES
-
-    def test_806e_is_in_plate_occupancy_set(self):
-        """0500_806E — the native-vision code the H2S actually emits ("Foreign objects
-        detected on heatbed", live 2026-07-20, printer 8) — joined the single-origin
-        frozenset so the same capture hook + reason attribution pick it up (W4a)."""
-        from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
-
-        # All four native-vision codes are pinned members.
-        assert {"0300_8017", "0300_8006", "0500_806E", "0500_808C"} <= _HMS_PLATE_OCCUPANCY_CODES
-        assert "0500_806E" in _HMS_PLATE_OCCUPANCY_CODES
 
 
 def _evidence(*, status: str = "completed") -> DepositEvidence:
