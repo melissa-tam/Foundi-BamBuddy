@@ -66,7 +66,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Exists, delete, select, update
+from sqlalchemy import Exists, and_, case, delete, select, update
 
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
@@ -136,6 +136,7 @@ async def claim_pending_for_dispatch(
     item_id: int,
     started_at: datetime,
     ams_mapping: str | None,
+    printer_id: int,
 ) -> bool:
     """Claim a still-``pending`` item for THIS dispatch: ``pending → printing``.
 
@@ -157,6 +158,17 @@ async def claim_pending_for_dispatch(
     ``ams_mapping`` arrives already serialised (or ``None`` for a mapping-free
     dispatch): this module writes columns, it does not decide them.
 
+    ``printer_id`` is the printer THIS dispatch is running on, and this write is where
+    the column changes meaning. On a ``pending`` row ``printer_id`` is an operator PIN
+    and nothing else (2026-09-04 pool-target wave; the four target kinds and the
+    invariant live in ``services/dispatch_target.py``). From this write on it is the
+    RECORD of the printer the dispatch actually ran on: for a PINNED unit the two are
+    the same value, and for a POOL unit — one targeting a model or a printer subset —
+    this is the first time the row learns which machine took it. The scheduler decided
+    that; the module still only writes what it is handed. Required rather than
+    defaulted, so a future caller cannot dispatch a pool unit onto a row that never
+    records where it went.
+
     Does not commit — the caller owns the transaction boundary, and on the
     dispatch path that boundary is load-bearing: the status must be COMMITTED
     before the print command is sent, so that a crash in between leaves a unit
@@ -173,6 +185,7 @@ async def claim_pending_for_dispatch(
             started_at=started_at,
             waiting_reason=None,
             ams_mapping=ams_mapping,
+            printer_id=printer_id,
         )
         .returning(PrintQueueItem.id)
         .execution_options(synchronize_session=False)
@@ -210,8 +223,16 @@ async def release_unstarted_claim(db: AsyncSession, *, item_id: int) -> bool:
     matcher its own previous decision dressed as a human's instruction — the one
     thing that contract forbids. The accepted cost is narrow and stated: a pin an
     operator set on this unit BEFORE it was dispatched is lost, and the matcher
-    re-decides from live trays. ``printer_id`` is left alone (it is an assignment,
-    not a dispatch record), as is the row's queue position.
+    re-decides from live trays.
+
+    ``printer_id`` follows the same rule, decided per row by what the row TARGETS. A
+    POOL unit — one carrying ``target_model`` or ``target_printer_ids`` — goes back to
+    the pool: its ``printer_id`` was the RECORD of the dispatch now being un-made
+    (written by :func:`claim_pending_for_dispatch`), and leaving it would hand the next
+    tick a scheduler decision wearing the shape of an operator PIN, which is the one
+    thing the pending-row invariant forbids. A PINNED unit keeps its ``printer_id``:
+    there the value predates the dispatch and is a human's instruction, so an unwound
+    claim must not silently unpin it. The row's queue position is untouched either way.
 
     Does not commit — the caller owns the transaction boundary, as with every
     sibling here.
@@ -227,6 +248,20 @@ async def release_unstarted_claim(db: AsyncSession, *, item_id: int) -> bool:
             started_at=None,
             ams_mapping=None,
             waiting_reason=None,
+            # Evaluated by the database on the row's OWN target columns, in the same
+            # atomic statement — a Python branch would need the row read first, which
+            # is the read-then-write this module exists to remove. Plain CASE/AND/IS
+            # NULL: identical on SQLite and PostgreSQL.
+            printer_id=case(
+                (
+                    and_(
+                        PrintQueueItem.target_model.is_(None),
+                        PrintQueueItem.target_printer_ids.is_(None),
+                    ),
+                    PrintQueueItem.printer_id,
+                ),
+                else_=None,
+            ),
         )
         .returning(PrintQueueItem.id)
         .execution_options(synchronize_session=False)

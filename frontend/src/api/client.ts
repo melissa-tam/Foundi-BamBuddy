@@ -2150,6 +2150,11 @@ export interface PrintQueueItem {
   id: number;
   printer_id: number | null;  // null = unassigned
   target_model: string | null;  // Target printer model for model-based assignment
+  // Members of a printers-pool target (sorted, deduped by the backend); null or
+  // empty when the item is pinned, model-targeted or unassigned. The scheduler
+  // places the unit on the next idle member, so printer_id stays null until it
+  // is printing/terminal.
+  target_printer_ids: number[] | null;
   target_location: string | null;  // Target location filter for model-based assignment
   required_filament_types: string[] | null;  // Required filament types for model-based assignment
   waiting_reason: string | null;  // Why a model-based job hasn't started yet
@@ -2288,6 +2293,9 @@ export interface PrintBatchCreate {
 export interface PrintQueueItemUpdate {
   printer_id?: number | null;  // null = unassign
   target_model?: string | null;  // Target printer model (mutually exclusive with printer_id)
+  // Printers-pool target. The PATCH exclusivity check is three-way, so a body
+  // that sets printer_id or target_model must send this as null to clear it.
+  target_printer_ids?: number[] | null;
   target_location?: string | null;  // Target location filter (only used with target_model)
   filament_overrides?: Array<{ slot_id: number; type: string; color: string; color_name?: string; force_color_match?: boolean }> | null;
   position?: number;

@@ -94,7 +94,8 @@ export default {
       anyModel: '任意の {{model}} プリンター',
       modelSelect: 'プリンターモデル',
       modelMismatchWarning: 'このファイルは {{fileModel}} 用にスライスされていますが、対象は {{model}} です — 機能チェックが一致しないプリンターを保留します',
-      specificPrinters: '特定のプリンター',
+      specificPrinters: '選択したプリンター',
+      specificPrintersHint: 'ユニットは選択したプリンターのうち、次に空いたプリンターに送信されます。',
       ejectProfile: '取り出しプロファイル',
       noEjectProfile: 'なし',
       skuDefault: 'SKUのデフォルト',
@@ -1756,6 +1757,7 @@ export default {
       allStatus: 'すべてのステータス',
       allLocations: 'すべてのロケーション',
       any: 'すべて',
+      anyOf: 'いずれか',
     },
     // Sort
     sort: {

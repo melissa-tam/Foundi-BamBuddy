@@ -94,7 +94,8 @@ export default {
       anyModel: 'Any {{model}} printer',
       modelSelect: 'Printer model',
       modelMismatchWarning: 'The file was sliced for {{fileModel}} but targets {{model}} — the capability gate will hold mismatched printers',
-      specificPrinters: 'Specific printers',
+      specificPrinters: 'Selected printers',
+      specificPrintersHint: 'Units dispatch to the next idle printer among the selection.',
       ejectProfile: 'Eject profile',
       noEjectProfile: 'None',
       skuDefault: 'SKU default',
@@ -1772,6 +1773,7 @@ export default {
       allStatus: 'All Status',
       allLocations: 'All Locations',
       any: 'Any',
+      anyOf: 'Any of',
     },
     // Sort
     sort: {

@@ -94,7 +94,8 @@ export default {
       anyModel: 'Qualsiasi stampante {{model}}',
       modelSelect: 'Modello stampante',
       modelMismatchWarning: 'Il file è stato elaborato per {{fileModel}} ma è destinato a {{model}} — il controllo di compatibilità bloccherà le stampanti non corrispondenti',
-      specificPrinters: 'Stampanti specifiche',
+      specificPrinters: 'Stampanti selezionate',
+      specificPrintersHint: 'Le unità vengono inviate alla prima stampante libera della selezione.',
       ejectProfile: 'Profilo di espulsione',
       noEjectProfile: 'Nessuno',
       skuDefault: 'Predefinito dello SKU',
@@ -1757,6 +1758,7 @@ export default {
       allStatus: 'Tutti gli stati',
       allLocations: 'Tutte le posizioni',
       any: 'Qualsiasi',
+      anyOf: 'Qualsiasi tra',
     },
     // Sort
     sort: {

@@ -94,7 +94,8 @@ export default {
       anyModel: '任意 {{model}} 印表機',
       modelSelect: '印表機型號',
       modelMismatchWarning: '此檔案是為 {{fileModel}} 切片，但目標為 {{model}} — 能力檢查會攔截不相符的印表機',
-      specificPrinters: '指定印表機',
+      specificPrinters: '所選印表機',
+      specificPrintersHint: '單元將派送至所選印表機中下一台閒置的印表機。',
       ejectProfile: '取件設定檔',
       noEjectProfile: '無',
       skuDefault: 'SKU 預設',
@@ -1757,6 +1758,7 @@ export default {
       allStatus: '所有狀態',
       allLocations: '所有位置',
       any: '任意',
+      anyOf: '任一',
     },
     // Sort
     sort: {

@@ -94,7 +94,8 @@ export default {
       anyModel: 'Herhangi bir {{model}} yazıcı',
       modelSelect: 'Yazıcı modeli',
       modelMismatchWarning: 'Dosya {{fileModel}} için dilimlendi ancak {{model}} hedefleniyor — yeterlilik denetimi uyuşmayan yazıcıları tutacak',
-      specificPrinters: 'Belirli yazıcılar',
+      specificPrinters: 'Seçili yazıcılar',
+      specificPrintersHint: 'Birimler, seçimdeki bir sonraki boştaki yazıcıya gönderilir.',
       ejectProfile: 'Çıkarma profili',
       noEjectProfile: 'Yok',
       skuDefault: 'SKU varsayılanı',
@@ -1757,6 +1758,7 @@ export default {
       allStatus: 'Tüm Durumlar',
       allLocations: 'Tüm Konumlar',
       any: 'Herhangi',
+      anyOf: 'Şunlardan biri',
     },
     // Sıralama
     sort: {

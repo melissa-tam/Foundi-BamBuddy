@@ -63,7 +63,7 @@ async def test_assigned_printer_skip_sets_machine_code(scheduler, db_session, pr
 
 async def test_model_based_skip_sets_machine_code(scheduler, db_session, printer_factory, monkeypatch):
     printer = await printer_factory()
-    monkeypatch.setattr(scheduler, "_find_idle_printer_for_model", AsyncMock(return_value=(printer.id, None)))
+    monkeypatch.setattr(scheduler, "_find_idle_printer_for_target", AsyncMock(return_value=(printer.id, None)))
     item = PrintQueueItem(
         printer_id=None,
         target_model="H2S",

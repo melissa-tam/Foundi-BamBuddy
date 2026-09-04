@@ -94,7 +94,8 @@ export default {
       anyModel: '모든 {{model}} 프린터',
       modelSelect: '프린터 모델',
       modelMismatchWarning: '이 파일은 {{fileModel}}용으로 슬라이스되었지만 대상은 {{model}}입니다 — 기능 게이트가 일치하지 않는 프린터를 보류합니다',
-      specificPrinters: '특정 프린터',
+      specificPrinters: '선택한 프린터',
+      specificPrintersHint: '유닛은 선택한 프린터 중 다음으로 대기 중인 프린터로 전송됩니다.',
       ejectProfile: '배출 프로필',
       noEjectProfile: '없음',
       skuDefault: 'SKU 기본값',
@@ -1675,7 +1676,8 @@ export default {
       unassigned: '미할당',
       allStatus: '모든 상태',
       allLocations: '모든 위치',
-      any: '전체'
+      any: '전체',
+      anyOf: '다음 중 하나',
     },
     sort: {
       byPosition: '위치별 정렬',

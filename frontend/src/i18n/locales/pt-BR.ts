@@ -94,7 +94,8 @@ export default {
       anyModel: 'Qualquer impressora {{model}}',
       modelSelect: 'Modelo de impressora',
       modelMismatchWarning: 'O arquivo foi fatiado para {{fileModel}} mas tem como alvo {{model}} — a verificação de capacidade reterá as impressoras incompatíveis',
-      specificPrinters: 'Impressoras específicas',
+      specificPrinters: 'Impressoras selecionadas',
+      specificPrintersHint: 'As unidades são enviadas para a próxima impressora ociosa da seleção.',
       ejectProfile: 'Perfil de ejeção',
       noEjectProfile: 'Nenhum',
       skuDefault: 'Padrão do SKU',
@@ -1757,6 +1758,7 @@ export default {
       allStatus: 'Todos os Status',
       allLocations: 'Todos os Locais',
       any: 'Qualquer',
+      anyOf: 'Qualquer uma de',
     },
     // Sort
     sort: {

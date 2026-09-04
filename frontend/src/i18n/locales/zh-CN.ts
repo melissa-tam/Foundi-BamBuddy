@@ -94,7 +94,8 @@ export default {
       anyModel: '任意 {{model}} 打印机',
       modelSelect: '打印机型号',
       modelMismatchWarning: '该文件为 {{fileModel}} 切片，但目标是 {{model}} — 能力校验会拦截不匹配的打印机',
-      specificPrinters: '指定打印机',
+      specificPrinters: '所选打印机',
+      specificPrintersHint: '单元将派发到所选打印机中下一台空闲的打印机。',
       ejectProfile: '取件配置',
       noEjectProfile: '无',
       skuDefault: 'SKU 默认',
@@ -1757,6 +1758,7 @@ export default {
       allStatus: '所有状态',
       allLocations: '所有位置',
       any: '任意',
+      anyOf: '任一',
     },
     // Sort
     sort: {

@@ -121,6 +121,28 @@ class TestFailQueueItemHook:
         assert item.status == "failed"
         assert item.waiting_reason is None
 
+    async def test_records_the_passed_printer_on_a_pool_row(self, db_session):
+        """A POOL row learns its printer HERE or nowhere.
+
+        A unit targeting a model or a printer subset carries no ``printer_id`` while it
+        is pending — the scheduler's pick rides the dispatch plan
+        (``services/dispatch_target``). So on the failure path this is the only writer
+        the row ever sees, and ``farm_policy.on_terminal`` must be told the same
+        printer: its per-printer consecutive-failure count is what quarantines a sick
+        machine, and a failure attributed to ``None`` counts against nothing.
+        """
+        item = PrintQueueItem(printer_id=None, target_model="H2S", status="pending", plate_id=1, position=1)
+        db_session.add(item)
+        await db_session.commit()
+
+        with patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock) as mock_ot:
+            await scheduler._fail_queue_item(db_session, item, "boom", printer_id=7)
+            mock_ot.assert_awaited_once_with(db_session, 7, item.id, "failed")
+
+        await db_session.refresh(item)
+        assert item.status == "failed"
+        assert item.printer_id == 7  # the attribution record, written with the status
+
     async def test_dispatch_failure_on_non_farm_item_is_noop(self, db_session):
         item = PrintQueueItem(batch_id=None, printer_id=5, status="printing", plate_id=1, position=1)
         db_session.add(item)
@@ -227,6 +249,43 @@ class TestUsbPreflight:
         # downstream "no source" failure — proof it did NOT hold on USB.
         assert item.status == "failed"
         assert item.error_message == "No source file specified"
+
+
+@pytest.mark.asyncio
+class TestPoolUnitFailureAttribution:
+    """End to end: a POOL dispatch that fails records the printer it failed on.
+
+    The pending row carries no ``printer_id`` (the pick rides the plan), so every
+    failure site inside ``_start_print`` has to hand ``_fail_queue_item`` the local —
+    otherwise a whole run of pool units could fail on one sick machine and leave the
+    fleet's consecutive-failure counters at zero.
+    """
+
+    async def test_pool_dispatch_failure_lands_the_printer_on_the_row_and_the_hook(self, db_session):
+        printer = await _mk_printer(db_session, "POOL1")
+        item = PrintQueueItem(
+            printer_id=None,  # a pool row: no pin while pending
+            target_model="H2S",
+            status="pending",
+            plate_id=1,
+            position=1,
+        )
+        db_session.add(item)
+        await db_session.commit()
+        printer_id = printer.id
+
+        with (
+            _usb_preflight_env(status=SimpleNamespace(sdcard=True)),
+            patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock) as mock_ot,
+        ):
+            # Past the USB gate, then the "No source file specified" terminal.
+            await scheduler._start_print(db_session, item, printer_id=printer_id)
+
+        await db_session.refresh(item)
+        assert item.status == "failed"
+        assert item.error_message == "No source file specified"
+        assert item.printer_id == printer_id  # the row learned it here, and only here
+        mock_ot.assert_awaited_once_with(db_session, printer_id, item.id, "failed")
 
     async def test_status_missing_fails_open(self, db_session):
         printer = await _mk_printer(db_session, "USB4")
