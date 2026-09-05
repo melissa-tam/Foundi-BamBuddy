@@ -122,11 +122,18 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"  # Override with LOG_LEVEL env var or DEBUG=true
     log_to_file: bool = True  # Set to false to disable file logging
-    # How many daily-rotated bambuddy.log siblings the TimedRotatingFileHandler
-    # keeps (backupCount) AND the age window the NSSM service-log sweeper purges
+    # How many rotated bambuddy.log siblings the RotatingFileHandler keeps
+    # (backupCount) AND the age window the NSSM service-log sweeper purges
     # past. Override with the LOG_RETENTION_DAYS env var — applied at restart
-    # (deliberately NOT a DB setting).
+    # (deliberately NOT a DB setting). NOTE the double duty: for bambuddy.log this
+    # is a FILE count, not days, so tuning it moves both legs at once.
     log_retention_days: int = 30
+    # Byte ceiling per bambuddy.log file. With backupCount above, this is the hard
+    # on-disk cap: 30 x 25 MB plus the live file, ~775 MB. Sized from the live
+    # farm's ~20 MB/day so an ordinary day still fits in one file. Before this
+    # existed the count was the ONLY bound and one day reached 242 MB. Override
+    # with the LOG_MAX_BYTES env var — applied at restart (not a DB setting).
+    log_max_bytes: int = 25 * 1024 * 1024
 
     # API
     api_prefix: str = "/api/v1"

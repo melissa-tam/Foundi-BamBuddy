@@ -73,6 +73,27 @@ Name: "german"; MessagesFile: "compiler:Languages\German.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 Name: "firewallrule"; Description: "Add Windows Firewall rule for Bambuddy (port {#DefaultPort})"; GroupDescription: "Network:"
 
+[InstallDelete]
+; Wipe the app tree before [Files] re-extracts it. Every [Files] entry is
+; recursesubdirs ignoreversion, which overwrites but never removes, so a file
+; present in an old build and absent from the new one is orphaned forever --
+; measured on the live farm as 46 hashed frontend bundles / 295 MB in
+; {app}\app\static\assets where a fresh staging tree holds 2.
+;
+; Safe because of ordering: Inno processes [InstallDelete] as the first step of
+; installation, which is AFTER PrepareToInstall below has run nssm stop and
+; slept 1500 ms for python.exe to release its handles. Nothing user-owned lives
+; here: install-service.bat points DATA_DIR and LOG_DIR at {commonappdata}\
+; Bambuddy, and build.py stages the VERSION file inside the app tree so it comes
+; back with the rest. filesandordirs is the same directive [UninstallDelete]
+; already uses, scoped one level narrower.
+;
+; {app}\python is deliberately NOT wiped: 459 MB installed against 425 MB staged
+; is only ~34 MB of orphans, and reclaiming it would open a 425 MB
+; re-extraction gap on a production host on every upgrade. Recorded decision,
+; not an oversight -- it is an accepted unowned store.
+Type: filesandordirs; Name: "{app}\app"
+
 [Files]
 ; Embedded Python (entire tree)
 Source: "build\staging\python\*"; DestDir: "{app}\python"; Flags: recursesubdirs ignoreversion

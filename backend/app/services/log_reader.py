@@ -107,9 +107,14 @@ def _enumerate_log_files(log_file: Path, days: int) -> list[Path]:
 
     The current ``log_file`` is always first (and always scanned, even if it is
     missing on disk — the caller tolerates that). Rotated siblings written by the
-    ``TimedRotatingFileHandler`` (e.g. ``bambuddy.log.2026-07-17``) follow in
+    ``RotatingFileHandler`` (``bambuddy.log.1`` … ``bambuddy.log.N``) follow in
     descending mtime order. ``days`` bounds the walk: a sibling whose mtime is
     older than ``days`` days is dropped (the current file is exempt).
+
+    Ordering is by mtime and never by name, which is what makes the sibling
+    naming scheme an implementation detail of the handler: this walk read dated
+    ``bambuddy.log.2026-07-17`` names identically before the handler was swapped
+    for a byte-capped one.
     """
     files: list[Path] = [log_file]
     cutoff = time.time() - days * 86400
@@ -142,9 +147,8 @@ def read_log_entries(
     """Read and parse log entries from ``bambuddy.log`` and its rotations, newest first.
 
     The current ``bambuddy.log`` plus any rotated siblings (``bambuddy.log.*``,
-    e.g. ``bambuddy.log.2026-07-17`` written by the ``TimedRotatingFileHandler``)
-    are walked newest-first — the current file, then rotated siblings by
-    descending mtime. ``days`` bounds how far back the file walk goes: a rotated
+    e.g. ``bambuddy.log.1`` written by the ``RotatingFileHandler``) are walked
+    newest-first — the current file, then rotated siblings by descending mtime. ``days`` bounds how far back the file walk goes: a rotated
     sibling whose mtime is older than ``days`` days is skipped (the current file
     is always scanned). Scanning stops once ``limit`` matching entries are
     collected, both within and across files.

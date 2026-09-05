@@ -7,7 +7,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -290,14 +290,20 @@ root_logger.addHandler(console_handler)
 # File handler - only in production or if explicitly enabled
 if app_settings.log_to_file:
     log_file = app_settings.log_dir / "bambuddy.log"
-    # Time-based rotation (daily at midnight) instead of size-based: production
-    # is chatty enough that a 5MB×3 size window held only hours of history. Dated
-    # siblings look like ``bambuddy.log.2026-07-17``; ``backupCount`` keeps
-    # ``log_retention_days`` of them (applied at restart — the field is not a DB
-    # setting).
-    file_handler = TimedRotatingFileHandler(
+    # Size-based rotation with a real byte ceiling. Upstream's 5MB x 3 held only
+    # hours of history, so this fork moved to daily rotation -- but that bounded
+    # the file COUNT and nothing else: measured 34 siblings / 669 MB on the live
+    # farm, one of them 242 MB, i.e. ~7 GB of headroom on a production host.
+    # ``log_max_bytes`` x ``log_retention_days`` is now a hard on-disk cap. At the
+    # observed ~20 MB/day a 25 MB file still covers an ordinary day, so most days
+    # keep one file each and only a chatty day splits. Nothing reads the sibling
+    # NAMES -- log_reader._enumerate_log_files globs ``bambuddy.log.*`` and sorts
+    # by st_mtime, and every line already carries its own %(asctime)s -- so the
+    # dated filenames were carrying no information. Both fields are applied at
+    # restart; neither is a DB setting.
+    file_handler = RotatingFileHandler(
         log_file,
-        when="midnight",
+        maxBytes=app_settings.log_max_bytes,
         backupCount=app_settings.log_retention_days,
         encoding="utf-8",
     )
