@@ -418,14 +418,23 @@ async def close(
 ) -> PrinterIncident | None:
     """Close an incident (``resolved`` or ``aborted``) and drop it from the cache.
 
-    Idempotent: an already-closed incident is returned untouched, so two racing
-    resolvers cannot re-stamp a close time or double-log.
+    Returns the row when THIS CALL closed it, and ``None`` when it did not — a
+    missing row, or one somebody else had already closed. Idempotent either way: an
+    already-closed incident is left untouched, so two racing resolvers cannot
+    re-stamp a close time or double-log.
+
+    The return is the OWNERSHIP answer, mirroring :func:`mark_escalated`'s contract:
+    a caller about to write an outcome for this incident can tell "I closed it" from
+    "somebody else already had". 006-H2S 2026-09-04 is why it has to be tellable —
+    the observed-running closer freed a row from under a live recovery driver, and
+    the driver's own sinks went on writing the token, the page and the durable
+    escalation row for an incident they no longer owned.
     """
     incident = await db.get(PrinterIncident, incident_id)
     if incident is None:
         return None
     if incident.resolved_at is not None:
-        return incident
+        return None
     incident.status = status
     incident.resolved_at = datetime.utcnow()
     incident.resolve_source = source

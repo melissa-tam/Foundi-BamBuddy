@@ -110,11 +110,26 @@ class TestClose:
         closed = await printer_incidents.close(db_session, row.id, status=STATUS_RESOLVED, source="terminal")
         stamped = closed.resolved_at
 
-        again = await printer_incidents.close(db_session, row.id, status=STATUS_ABORTED, source="operator")
+        await printer_incidents.close(db_session, row.id, status=STATUS_ABORTED, source="operator")
 
         # A second resolver must not re-stamp the close time or rewrite the verdict.
+        db_session.expunge_all()
+        again = await db_session.get(PrinterIncident, row.id)
         assert again.resolved_at == stamped
         assert again.status == STATUS_RESOLVED
+
+    async def test_close_returns_none_when_it_did_not_close_the_row(self, db_session, printer_factory):
+        """The contract mirrors ``mark_escalated``: the return says whether THIS CALL
+        closed the row, so a caller can tell "I closed it" from "somebody else already
+        had". A recovery driver reads it to know whether it still owns the outcome it
+        is about to write (006-H2S 2026-09-04: the observed-running closer freed a row
+        from under a live driver, and both sinks wrote anyway)."""
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id)
+
+        assert await printer_incidents.close(db_session, row.id, status=STATUS_RESOLVED, source="terminal") is not None
+        assert await printer_incidents.close(db_session, row.id, status=STATUS_RESOLVED, source="terminal") is None
+        assert await printer_incidents.close(db_session, 987654, status=STATUS_RESOLVED, source="terminal") is None
 
     async def test_escalated_stays_open(self, db_session, printer_factory):
         """An escalation is a live HOLD, not a closed fault — that is what keeps the

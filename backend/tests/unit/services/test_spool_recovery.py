@@ -1034,7 +1034,9 @@ async def test_recovery_interrupted_escalation_does_not_stamp(
     _spy(monkeypatch, "on_spool_recovery_failed")
     calls = _spy_hold_stamp(monkeypatch)
     _wire(monkeypatch, _make_state(hms=[_runout_same_slot_hms()]), None)
-    runout_incident = replace(_incident(printer.id, step_timeout_s=0.05), kind=spool_recovery.KIND_RUNOUT)
+    runout_incident = await _owned_incident(
+        db_session, printer.id, kind=spool_recovery.KIND_RUNOUT, step_timeout_s=0.05
+    )
 
     await spool_recovery._escalate(runout_incident, "recovery_interrupted")
 
@@ -1224,7 +1226,9 @@ async def test_restart_clean_state_skips_unload(db_session, printer_factory, ins
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    await spool_recovery._run_recovery(_incident(printer.id, step_timeout_s=0.05, item_id=item.id))
+    await spool_recovery._run_recovery(
+        await _owned_incident(db_session, printer.id, step_timeout_s=0.05, item_id=item.id)
+    )
 
     assert ("unload",) not in client.calls  # short-circuited
     assert ("load", 1) in client.calls
@@ -1950,8 +1954,9 @@ async def test_loads_failed_without_a_confirmed_unload_escalates_candidate_loads
     client = FakeClient(state, load_after=9999)
     _wire(monkeypatch, state, client)
 
+    incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05, item_id=item.id)
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
-        await spool_recovery._run_recovery(_incident(printer.id, step_timeout_s=0.05, item_id=item.id))
+        await spool_recovery._run_recovery(incident)
 
     assert ("unload",) not in client.calls  # genuinely clean state → skipped
     assert ("load", 1) in client.calls
@@ -2364,9 +2369,13 @@ async def test_confirm_unloaded_ok_after_engaged_assist_returns_to_idle(monkeypa
 
 
 async def test_two_escalations_within_window_quarantines(db_session, printer_factory, install_settings, monkeypatch):
-    """Two recovery escalations for one printer within _JAM_QUARANTINE_WINDOW_H
+    """Two GENUINE recovery escalations for one printer within _JAM_QUARANTINE_WINDOW_H
     hours quarantine it, with failure_count == the in-window escalation count. The
-    first escalation (count 1) is under the threshold and does not."""
+    first escalation (count 1) is under the threshold and does not.
+
+    "Genuine" is now structural: each escalation owns its own incident row, and the
+    row is closed between them the way a lifecycle event closes it. Two escalations
+    against ONE still-open row is the 006-H2S duplicate, and F3 stands it down."""
     from backend.app.services import farm_policy
 
     install_settings()
@@ -2375,11 +2384,10 @@ async def test_two_escalations_within_window_quarantines(db_session, printer_fac
     q = AsyncMock(return_value=True)
     monkeypatch.setattr(farm_policy, "quarantine_printer", q)
 
-    incident = _incident(printer.id, step_timeout_s=0.05)
-    await spool_recovery._escalate(incident, "unload_failed")
+    await _genuine_escalation(db_session, printer.id, "unload_failed")
     q.assert_not_called()  # one escalation is under the threshold
 
-    await spool_recovery._escalate(incident, "stuck_reset_failed")
+    await _genuine_escalation(db_session, printer.id, "stuck_reset_failed")
     q.assert_awaited_once()
     assert q.await_args.kwargs["failure_count"] == 2
     assert "Repeated AMS jam" in q.await_args.args[2]  # positional reason text
@@ -2416,7 +2424,7 @@ async def test_two_escalations_outside_window_no_quarantine(db_session, printer_
     )
     await db_session.commit()
 
-    await spool_recovery._escalate(_incident(printer.id, step_timeout_s=0.05), "stuck_reset_failed")
+    await _genuine_escalation(db_session, printer.id, "stuck_reset_failed")
 
     q.assert_not_called()  # only one escalation is inside the window
     db_session.expunge_all()
@@ -2453,11 +2461,9 @@ class TestQuarantineReasonAllowlist:
         install_settings()
         printer = await printer_factory()
         _spy(monkeypatch, "on_spool_recovery_failed")
-        incident = _incident(printer.id, step_timeout_s=0.05)
-
-        await spool_recovery._escalate(incident, "jammed_tray_unresolved")
+        await _genuine_escalation(db_session, printer.id, "jammed_tray_unresolved")
         quarantine.assert_not_called()
-        await spool_recovery._escalate(incident, "jammed_tray_unresolved")
+        await _genuine_escalation(db_session, printer.id, "jammed_tray_unresolved")
 
         quarantine.assert_awaited_once()
         assert quarantine.await_args.kwargs["failure_count"] == 2
@@ -2470,10 +2476,8 @@ class TestQuarantineReasonAllowlist:
         install_settings()
         printer = await printer_factory()
         _spy(monkeypatch, "on_spool_recovery_failed")
-        incident = _incident(printer.id, step_timeout_s=0.05)
-
-        await spool_recovery._escalate(incident, "runout_needs_refill")
-        await spool_recovery._escalate(incident, "jammed_tray_unresolved")
+        await _genuine_escalation(db_session, printer.id, "runout_needs_refill")
+        await _genuine_escalation(db_session, printer.id, "jammed_tray_unresolved")
 
         quarantine.assert_not_called()  # ONE countable escalation, not two
 
@@ -2484,10 +2488,8 @@ class TestQuarantineReasonAllowlist:
         install_settings()
         printer = await printer_factory()
         _spy(monkeypatch, "on_spool_recovery_failed")
-        incident = _incident(printer.id, step_timeout_s=0.05)
-
-        await spool_recovery._escalate(incident, "external_feed_fault")
-        await spool_recovery._escalate(incident, "external_feed_fault")
+        await _genuine_escalation(db_session, printer.id, "external_feed_fault")
+        await _genuine_escalation(db_session, printer.id, "external_feed_fault")
 
         quarantine.assert_not_called()
 
@@ -2500,10 +2502,8 @@ class TestQuarantineReasonAllowlist:
         install_settings()
         printer = await printer_factory()
         _spy(monkeypatch, "on_spool_recovery_failed")
-        incident = _incident(printer.id, step_timeout_s=0.05)
-
-        await spool_recovery._escalate(incident, "unload_failed")
-        await spool_recovery._escalate(incident, "runout_needs_refill")
+        await _genuine_escalation(db_session, printer.id, "unload_failed")
+        await _genuine_escalation(db_session, printer.id, "runout_needs_refill")
 
         quarantine.assert_not_called()
 
@@ -2514,10 +2514,8 @@ class TestQuarantineReasonAllowlist:
         install_settings()
         printer = await printer_factory()
         _spy(monkeypatch, "on_spool_recovery_failed")
-        incident = _incident(printer.id, step_timeout_s=0.05)
-
         for reason in ("runout_needs_refill", "external_feed_fault", "ams_drying", "recovery_interrupted"):
-            await spool_recovery._escalate(incident, reason)
+            await _genuine_escalation(db_session, printer.id, reason)
 
         db_session.expunge_all()
         rows = (
@@ -4755,3 +4753,463 @@ class TestRefillReadyUnderThePowerLossPrompt:
         """The ordinary demand-clear path is untouched: with no prompt standing, an
         absent demand is the firmware having answered."""
         assert spool_recovery._refill_ready(_make_state(hms=[], tray_now=255)) is True
+
+
+# ===========================================================================
+# 006-H2S 2026-09-04: ONE jam became TWO recovery tasks and a false quarantine.
+#
+# The module states two facts about ownership: the OPEN INCIDENT row answers "is
+# this printer owned" (the DB partial unique index enforces it) and ``_active_tasks``
+# answers "is the machine ACTING right now". The observed-running closer only ever
+# asked the first. While a driver is in flight a RUNNING sample is an intermediate
+# reading of ITS OWN procedure — the W1 reset publishes a resume whose documented
+# outcomes include "re-faults and auto-PAUSEs after moving", and the swap round's
+# ``_resume_and_confirm`` publishes one too — so the closer freed the row from under
+# a live task, the re-PAUSE found no open incident, and a SECOND driver spawned onto
+# the same AMS: unload publishes in PAIRS 0.6 s apart, two "Spool out of rotation"
+# notifications, two escalations, two ledger rows and a "Repeated AMS jam escalations
+# (2 in 24h)" quarantine out of ONE jam.
+#
+# Every pin below drives the DRIVER and the SAMPLER on ONE state (memory
+# `liveness-paired-verification`). ``_capture_spawns`` cannot serve them: it captures
+# the closer WITHOUT scheduling it, so the closer would run only after the task ended
+# and the pins would pass for the wrong reason.
+# ===========================================================================
+
+
+def _assist_stall_hms():
+    """0700_0021 (006-H2S 17:22:31) — the AMS assist motor stalled. The taxonomy does
+    not classify it, so it is never a candidate; it is here because these pins
+    reproduce the WIRE the incident carried, not a curated pair of codes."""
+    return HMSError(code="0021", attr=0x07000000, module=7, severity=2, full_code="0700000000000021")
+
+
+def _feed_into_extruder_hms():
+    """0700_8006 (006-H2S 17:22:31) — unable to feed into the extruder. A
+    MECHANICAL_FEED trigger since the 2026-08-09 operator-ratified widening."""
+    return HMSError(code="8006", attr=0x07000000, module=7, severity=2, full_code="0700000000008006")
+
+
+def _schedule_spawns(monkeypatch):
+    """Spawn stub that SCHEDULES what the sync wire sampler fires and forgets.
+
+    Beside :func:`_capture_spawns`, which captures without scheduling — right for the
+    lanes whose gates a test drives by hand, and exactly wrong here: the closer must
+    run at the DRIVER's next ``asyncio.sleep`` yield, mid-procedure, as it did at
+    17:22:33. Keeps the (name, task) pairs so a pin can read what each one answered.
+    """
+    import backend.app.core.tasks as core_tasks
+
+    spawned: list[tuple[str | None, asyncio.Task]] = []
+
+    def _spawn(coro, name=None):
+        task = asyncio.get_running_loop().create_task(coro)
+        spawned.append((name, task))
+        return task
+
+    monkeypatch.setattr(core_tasks, "spawn_background_task", _spawn)
+    return spawned
+
+
+def _closer_answers(spawned) -> list:
+    """What every ``on_observed_running`` the sampler spawned returned."""
+    return [t.result() for name, t in spawned if (name or "").startswith("incident-running")]
+
+
+def _stand_aside_lines(caplog) -> int:
+    """How many times the closer deferred to a live driver (the F1 line)."""
+    return sum(1 for r in caplog.records if "closer stands aside" in r.getMessage())
+
+
+def _gate_refusals(caplog) -> int:
+    """How many re-entries the DURABLE open-incident gate refused (not the throttle)."""
+    return sum(1 for r in caplog.records if "already has an open incident" in r.getMessage())
+
+
+async def _incident_rows(db, printer_id) -> list:
+    """EVERY incident row for this printer, whatever its status."""
+    db.expunge_all()
+    res = await db.execute(select(PrinterIncident).where(PrinterIncident.printer_id == printer_id))
+    return list(res.scalars().all())
+
+
+async def _escalation_rows(db, printer_id) -> list:
+    db.expunge_all()
+    res = await db.execute(select(RecoveryEscalation).where(RecoveryEscalation.printer_id == printer_id))
+    return list(res.scalars().all())
+
+
+async def _open_incident_row(db, printer_id, *, kind=None, item_id=None, job_id="task-1"):
+    """A REAL open incident, the way the entry gate would have left it.
+
+    Since the outcome sinks verify OWNERSHIP at write time, an escalation or a
+    success against ``incident_id=0`` is now a stand-down — that is the contract, not
+    a harness detail — so every pin that asserts what a sink WRITES must own a row.
+    """
+    from backend.app.models.printer_incident import KIND_JAM, STATUS_RECOVERING
+
+    return await _seed_incident(
+        db,
+        printer_id,
+        job_id=job_id,
+        kind=kind or KIND_JAM,
+        status=STATUS_RECOVERING,
+        item_id=item_id,
+        code="0700_8010",
+        codes="mechanical_feed:0700_8010",
+    )
+
+
+async def _owned_incident(db, printer_id, *, kind=None, item_id=None, job_id="task-1", **incident_kw):
+    """A driver context over a REAL open row — :func:`_incident` with an owner."""
+    from backend.app.models.printer_incident import KIND_JAM
+
+    kind = kind or KIND_JAM
+    row = await _open_incident_row(db, printer_id, kind=kind, item_id=item_id, job_id=job_id)
+    return replace(
+        _incident(printer_id, item_id=item_id, **incident_kw),
+        incident_id=row.id,
+        job_id=job_id,
+        kind=kind,
+    )
+
+
+async def _close_row(db, printer_id):
+    """Close whatever this printer holds open, the way a lifecycle event would."""
+    db.expunge_all()
+    return await printer_incidents.close_open_for_printer(db, printer_id, source="terminal")
+
+
+async def _genuine_escalation(db, printer_id, reason, *, item_id=None):
+    """ONE genuine give-up: a fresh open row, the escalation, then the close.
+
+    Two of these is the honest shape of "two escalations inside the window". A
+    second ``_escalate`` against the SAME still-open row is not a second give-up —
+    it is the duplicate 006-H2S produced, and since F3 it stands down rather than
+    writing a second ledger row the quarantine would count.
+    """
+    incident = await _owned_incident(db, printer_id, step_timeout_s=0.05, item_id=item_id)
+    await spool_recovery._escalate(incident, reason)
+    await _close_row(db, printer_id)
+
+
+def _only_driver(slots: list) -> set:
+    """The distinct non-empty occupants of the printer's liveness slot."""
+    return {id(s) for s in slots if s is not None}
+
+
+class TestTheDriverOwnsItsOutcomeWhileItLives:
+    """The 006-H2S coupling, driven end to end: driver + per-push sampler + re-entry."""
+
+    async def test_the_w1_reset_running_edge_never_opens_a_second_incident(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """THE INCIDENT PIN (17:22:31 → 17:26:58).
+
+        PAUSE, ``ams_status_main == 1`` (wedged mid filament-change), tray_now 0,
+        ``0700_0021`` + ``0700_8006`` standing, a farm unit printing. The W1 reset
+        publishes its resume, the printer goes RUNNING for a moment and re-PAUSEs
+        with the fault still standing — and the per-push sampler turns that RUNNING
+        into an ``on_observed_running`` while the driver is still inside its reset
+        loop.
+
+        ONE fault must produce ONE incident, ONE driver, ONE unload, ONE escalation,
+        ONE ledger row, ONE page and NO quarantine.
+
+        The re-entry reaches the DURABLE gate, not the throttle: the autouse
+        ``_fast_timing`` fixture zeroes ``_EVAL_THROTTLE_S``, and the caplog
+        assertion below names the open-incident refusal so a throttled no-op could
+        never be mistaken for the fix.
+        """
+        install_settings(max_attempts=1, step_timeout_s=0.5)
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        _spy_ws(monkeypatch)
+        from backend.app.services import farm_policy
+
+        quarantine = AsyncMock(return_value=True)
+        monkeypatch.setattr(farm_policy, "quarantine_printer", quarantine)
+        spawned = _schedule_spawns(monkeypatch)
+
+        state = _make_state(tray_now=0, ams_status_main=1, hms=[_assist_stall_hms(), _feed_into_extruder_hms()])
+        client = FakeClient(state, unload_stuck=True)  # the AMS ignores the unload — the 006 shape
+
+        reentries: list[asyncio.Task] = []
+        driver_slots: list = []
+        row_open: list[bool] = []
+        running_polls = {"n": 0}
+
+        def _poll(_n, st):
+            # Sampled BEFORE the sampler runs, so a closer firing mid-poll cannot hide
+            # what the liveness slot and the row looked like while the driver was live.
+            driver_slots.append(spool_recovery._active_tasks.get(printer.id))
+            row_open.append(printer_incidents.snapshot(printer.id) is not None)
+            spool_recovery.note_demand_watch(printer.id, st)
+            if st.state != "RUNNING":
+                return
+            running_polls["n"] += 1
+            if running_polls["n"] == 2:
+                st.state = "PAUSE"  # 17:23:55 — re-PAUSEd, the fault still standing
+                reentries.append(asyncio.ensure_future(on_ams_fault(printer.id, st)))
+
+        _wire(monkeypatch, state, client, on_poll=_poll)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            task = await on_ams_fault(printer.id, state)
+            assert task is not None
+            await task
+            for pending in reentries:
+                second = await pending
+                if second is not None:
+                    await second  # await the duplicate driver, so its damage is visible
+            for _name, closer in spawned:
+                await closer
+
+        # One fault, one record, open for the whole run, and the re-entry refused.
+        assert len(await _incident_rows(db_session, printer.id)) == 1
+        assert row_open and all(row_open)
+        assert [t.result() for t in reentries] == [None]
+
+        # One driver in the liveness slot — and one AMS conversation.
+        assert _only_driver(driver_slots) == {id(task)}
+        assert client.calls.count(("unload",)) == 1
+
+        # One give-up, and NOT the 17:26:58 quarantine.
+        assert len(await _escalation_rows(db_session, printer.id)) == 1
+        failed.assert_awaited_once()
+        quarantine.assert_not_called()
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is not None
+
+        # The edge FIRED and was deferred — not "it never fired" — and the re-entry
+        # was refused by the DURABLE gate rather than by the throttle.
+        assert _stand_aside_lines(caplog) == 1
+        assert _closer_answers(spawned) == [False]
+        assert _gate_refusals(caplog) == 1
+
+    async def test_the_swap_rounds_own_resume_is_not_a_close_either(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """The sibling shape: ``_resume_and_confirm`` publishes a resume too. Phase 1
+        waits for RUNNING and phase 2 returns ``repause`` on a re-PAUSE with a
+        recoverable code — so an ordinary jam, with no wedge anywhere, produces the
+        same RUNNING edge under the same live driver.
+        """
+        install_settings(step_timeout_s=0.5)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 1)  # the replacement
+        _spy(monkeypatch, "on_spool_recovery_succeeded")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        _spy(monkeypatch, "on_spool_recovery_failed")
+        _spy_ws(monkeypatch)
+        spawned = _schedule_spawns(monkeypatch)
+
+        state = _make_state(tray_now=0, ams_status_main=0)  # no wedge: the reset is skipped
+        client = FakeClient(state)
+
+        reentries: list[asyncio.Task] = []
+        driver_slots: list = []
+        row_open: list[bool] = []
+        repaused = {"done": False}
+        running_polls = {"n": 0}
+
+        def _poll(_n, st):
+            live = spool_recovery._active_tasks.get(printer.id)
+            driver_slots.append(live)
+            # Sampled only while the driver HOLDS the liveness slot: the one close it
+            # must make itself is the success, and the handover poll after that
+            # legitimately finds the row gone.
+            if live is not None:
+                row_open.append(printer_incidents.snapshot(printer.id) is not None)
+            spool_recovery.note_demand_watch(printer.id, st)
+            if st.state != "RUNNING" or repaused["done"]:
+                return
+            running_polls["n"] += 1
+            if running_polls["n"] == 2:
+                repaused["done"] = True
+                st.state = "PAUSE"  # the first resume did not stick — the repause path
+                reentries.append(asyncio.ensure_future(on_ams_fault(printer.id, st)))
+
+        _wire(monkeypatch, state, client, on_poll=_poll)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            task = await on_ams_fault(printer.id, state)
+            assert task is not None
+            await task
+            for pending in reentries:
+                second = await pending
+                if second is not None:
+                    await second
+            for _name, closer in spawned:
+                await closer
+
+        # The driver's own repause path ran on a row it still OWNED at every step,
+        # and closed it itself at the success.
+        assert row_open and all(row_open)
+        assert [t.result() for t in reentries] == [None]
+        assert _only_driver(driver_slots) == {id(task)}
+        rows = await _incident_rows(db_session, printer.id)
+        assert [(r.status, r.resolve_source) for r in rows] == [("resolved", "observed_running")]
+        # TWO edges, both the driver's own: the resume that did not stick and the one
+        # after the extra pause/resume cycle. Every one of them was deferred.
+        answers = _closer_answers(spawned)
+        assert answers == [False, False]
+        assert _stand_aside_lines(caplog) == len(answers)
+
+    async def test_an_edge_deferred_during_the_escalation_is_re_read_at_the_handover(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """F2. ``note_demand_watch`` is EDGE-triggered, so an edge deferred while the
+        driver sits inside ``_escalate`` (tray snapshot, DB, page, quarantine, spent
+        stamp) has no second chance: the row would stay ESCALATED on a demonstrably
+        RUNNING printer until the 120 s sweep dwell, holding the chip, the hourly nag
+        and the queue token. The handover re-reads the LEVEL once instead of storing
+        the edge."""
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        _spy_ws(monkeypatch)
+
+        state = _make_state(tray_now=0, ams_status_main=0, trays=[_ams_tray(0)])  # only the jammed tray
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        answers: list[bool] = []
+
+        async def _page(**_kwargs):
+            # The operator presses Resume exactly while the driver is escalating.
+            state.state = "RUNNING"
+            answers.append(await spool_recovery.on_observed_running(printer.id))
+
+        from backend.app.services.notification_service import notification_service
+
+        monkeypatch.setattr(notification_service, "on_spool_recovery_failed", _page)
+
+        task = await on_ams_fault(printer.id, state)
+        assert task is not None
+        await task
+
+        assert answers == [False]  # the driver still owned the outcome
+        rows = await _incident_rows(db_session, printer.id)
+        assert [(r.status, r.resolve_source) for r in rows] == [("resolved", "observed_running")]
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+    async def test_escalating_a_row_a_terminal_already_closed_stands_down(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """F3. ``on_job_terminal`` closes a ``recovering`` row on an operator STOP
+        mid-round; the driver then times out its unload and escalates. Everything the
+        escalation writes — the queue token, the page, the durable ledger row that
+        feeds the 2-in-24 h quarantine — is a claim about an incident it no longer
+        owns."""
+        install_settings()
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        row = await _open_incident_row(db_session, printer.id, item_id=item.id)
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        from backend.app.services import farm_policy
+
+        quarantine = AsyncMock(return_value=True)
+        monkeypatch.setattr(farm_policy, "quarantine_printer", quarantine)
+        state = _make_state()
+        _wire(monkeypatch, state, FakeClient(state))
+
+        assert await spool_recovery.on_job_terminal(printer.id) is True
+
+        incident = replace(_incident(printer.id, step_timeout_s=0.05, item_id=item.id), incident_id=row.id)
+        with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
+            await spool_recovery._escalate(incident, "unload_failed")
+
+        assert any("escalation (unload_failed) stands down" in r.getMessage() for r in caplog.records)
+        failed.assert_not_awaited()
+        quarantine.assert_not_called()
+        assert await _escalation_rows(db_session, printer.id) == []
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+    async def test_succeeding_on_a_row_a_terminal_already_closed_stands_down(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """F3, the other sink. A success writes the swapped ``ams_mapping`` back onto
+        the unit, clears its hold token and pages "recovered" — all claims about an
+        incident somebody else has already given a verdict."""
+        install_settings()
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        row = await _open_incident_row(db_session, printer.id, item_id=item.id)
+        succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+        state = _make_state()
+        _wire(monkeypatch, state, FakeClient(state))
+
+        assert await spool_recovery.on_job_terminal(printer.id) is True
+
+        incident = replace(_incident(printer.id, step_timeout_s=0.05, item_id=item.id), incident_id=row.id)
+        with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
+            await spool_recovery._succeed(incident, 1)
+
+        assert any("success stands down" in r.getMessage() for r in caplog.records)
+        succeeded.assert_not_awaited()
+        db_session.expunge_all()
+        refreshed = await db_session.get(PrintQueueItem, item.id)
+        assert refreshed.ams_mapping == "[0, -1, -1, -1]"  # never rewritten
+
+    async def test_the_closer_still_closes_when_no_driver_is_live(self, db_session, printer_factory):
+        """THE LIVENESS PAIR (memory `liveness-paired-verification`). A cured storm and
+        a starved lane are identical on absence metrics, so the deferral is pinned
+        beside the thing it must NOT suppress: the 17:35:42 shape — an escalated hold
+        with no task alive — still closes on the next resume, and so does an R1 orphan
+        (a ``.done()`` task left in ``_active_tasks`` by a mid-recovery crash).
+
+        Green before the fix as well as after, deliberately: it pins preserved
+        behaviour, not the defect.
+        """
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        row = await _open_incident_row(db_session, printer.id, item_id=item.id)
+        db_session.expunge_all()
+        held = await db_session.get(PrintQueueItem, item.id)
+        held.waiting_reason = spool_recovery.WAITING_REASON_RECOVERING
+        await db_session.commit()
+
+        assert await spool_recovery.on_observed_running(printer.id) is True
+        rows = await _incident_rows(db_session, printer.id)
+        assert [(r.id, r.status, r.resolve_source) for r in rows] == [(row.id, "resolved", "observed_running")]
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+
+        # R1: a finished task in the slot is not a live driver.
+        second = await _open_incident_row(db_session, printer.id, job_id="task-2")
+        spool_recovery._active_tasks[printer.id] = _FakeRecoveryTask(done=True)
+        assert await spool_recovery.on_observed_running(printer.id) is True
+        rows = await _incident_rows(db_session, printer.id)
+        assert {r.id: r.status for r in rows}[second.id] == "resolved"
+
+    async def test_a_second_driver_over_a_live_one_is_logged_as_an_invariant_violation(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """F4. Observability, not a gate: entry exclusivity stays the DB's partial
+        unique index (the module's own design statement). But 17:23:55 produced no
+        line at all, and the 08-29 W5 lesson is that the one line naming the moment is
+        what turns a 15 h triage into a grep."""
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        _spy(monkeypatch, "on_spool_recovery_failed")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        _spy_ws(monkeypatch)
+        state = _make_state(tray_now=0, ams_status_main=0)
+        _wire(monkeypatch, state, FakeClient(state))
+
+        # A driver is already live for this printer when the entry gate spawns.
+        spool_recovery._active_tasks[printer.id] = _FakeRecoveryTask(done=False)
+        with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
+            task = await on_ams_fault(printer.id, state)
+            assert task is not None
+            await task
+
+        assert sum(1 for r in caplog.records if "invariant violated" in r.getMessage()) == 1
