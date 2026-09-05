@@ -21,8 +21,9 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.models.printer_incident import KIND_PLATE_VISION, STATUS_ESCALATED
 from backend.app.models.sku import Sku, SkuFile
-from backend.app.services import farm_policy, farm_stall, production_run
+from backend.app.services import farm_policy, farm_stall, printer_incidents, production_run
 from backend.app.services.capability_gate import CapabilityDecision, evaluate_capability as _real_evaluate_capability
 from backend.app.services.dispatch_target import encode_printer_ids
 from backend.app.services.filament_deficit import FilamentDeficit
@@ -162,26 +163,46 @@ class TestDerivedFields:
         state = resp["printer_states"][0]
         assert state["quarantined"] is True
 
-    async def test_stalled_and_vision_hold_flags_from_waiting_reason(self, db_session):
-        batch = await _mk_run(db_session, quantity=2)
-        p1 = await _mk_printer(db_session, name="P1")
-        p2 = await _mk_printer(db_session, name="P2")
-        await _add(db_session, batch, printer_id=p1.id, status="printing", waiting_reason="printer_offline_stalled")
-        await _add(
-            db_session,
-            batch,
-            printer_id=p2.id,
-            status="printing",
-            waiting_reason="plate_not_empty_printer_detected",
-            pos=2,
-        )
-        await db_session.commit()
-        run = await _load_run(db_session, batch.id)
-        resp = await build_run_response(db_session, run, detail=True)
-        by_id = {s["printer_id"]: s for s in resp["printer_states"]}
-        assert by_id[p1.id]["stalled"] is True and by_id[p1.id]["vision_hold"] is False
-        assert by_id[p2.id]["vision_hold"] is True and by_id[p2.id]["stalled"] is False
-        assert resp["has_blocked_printers"] is True
+    async def test_stalled_from_waiting_reason_and_vision_hold_from_the_incident(self, db_session):
+        """``stalled`` is a unit token; ``vision_hold`` is the printer's INCIDENT.
+
+        Since 2026-09-04 a plate-check trip stops the print, so the tripped unit goes
+        ``cancelled`` and its ``waiting_reason`` is cleared at the terminal while the
+        hold survives the requeue — printer-scoped, in ``printer_incident``. Deriving
+        the flag from a unit token could therefore only ever report a hold that had
+        already ended.
+        """
+        printer_incidents._reset_state()
+        try:
+            batch = await _mk_run(db_session, quantity=2)
+            p1 = await _mk_printer(db_session, name="P1")
+            p2 = await _mk_printer(db_session, name="P2")
+            await _add(db_session, batch, printer_id=p1.id, status="printing", waiting_reason="printer_offline_stalled")
+            await _add(db_session, batch, printer_id=p2.id, status="pending", pos=2)
+            await db_session.commit()
+            assert (
+                await printer_incidents.open_new(
+                    db_session,
+                    printer_id=p2.id,
+                    job_id="task-vision",
+                    item_id=None,
+                    kind=KIND_PLATE_VISION,
+                    code="0500_808C",
+                    codes="0500_808C",
+                    slot_global_tray=None,
+                    status=STATUS_ESCALATED,
+                )
+                is not None
+            )
+
+            run = await _load_run(db_session, batch.id)
+            resp = await build_run_response(db_session, run, detail=True)
+            by_id = {s["printer_id"]: s for s in resp["printer_states"]}
+            assert by_id[p1.id]["stalled"] is True and by_id[p1.id]["vision_hold"] is False
+            assert by_id[p2.id]["vision_hold"] is True and by_id[p2.id]["stalled"] is False
+            assert resp["has_blocked_printers"] is True
+        finally:
+            printer_incidents._reset_state()
 
     async def test_units_carry_retry_lineage_and_stop_source(self, db_session):
         batch = await _mk_run(db_session, quantity=2)

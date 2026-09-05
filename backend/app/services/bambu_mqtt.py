@@ -4381,12 +4381,29 @@ class BambuMQTTClient:
                 or (self.state.state == "FAILED" and self._previous_gcode_state in ("PREPARE", "SLICING"))
             )
         )
-        # For IDLE, only trigger if we just came from RUNNING (explicit abort/cancel)
+        # For IDLE, trigger from RUNNING (explicit abort/cancel) and from PAUSE.
+        #
+        # The PAUSE arm closes a hole this detector has always had: a ``print.stop``
+        # sent while the job is PAUSEd — which is where the firmware puts a job it
+        # halted itself — can land straight in IDLE without passing through RUNNING, so
+        # no terminal fired at all and the queue row sat ``printing`` forever. It is
+        # the shape the 2026-09-04 plate-check lane produces on every trip (the vision
+        # check pauses at layer 0 and the farm stops it there), and it is also how an
+        # operator screen-stop of a PAUSEd print has silently gone unrecorded until now.
+        #
+        # ``_was_running`` guards the PAUSE arm only: IDLE from PAUSE is a terminal
+        # exactly when there WAS a job (the flag is set on the first RUNNING push with
+        # a file and cleared when a completion fires), and without it a printer sitting
+        # PAUSE→IDLE with nothing loaded would fabricate a terminal. The RUNNING arm is
+        # deliberately left unguarded — it is today's behaviour, and adding the flag
+        # there would DROP terminals on the rare RUNNING push that carried no filename.
         if (
             self.state.state == "IDLE"
-            and self._previous_gcode_state == "RUNNING"
             and not self._completion_triggered
             and self.on_print_complete
+            and (
+                self._previous_gcode_state == "RUNNING" or (self._previous_gcode_state == "PAUSE" and self._was_running)
+            )
         ):
             should_trigger_completion = True
 
