@@ -669,7 +669,7 @@ def _register_driver(printer_id: int, task: asyncio.Task, *, incident_id: int) -
         logger.warning(
             "spool_recovery: printer %s: spawning a recovery driver while one is live — invariant violated (%s)",
             printer_id,
-            f"incident {incident_id} spawned over a live driver — a closer freed the row under it",
+            f"incident {incident_id} spawned over a live driver",
         )
     _active_tasks[printer_id] = task
 

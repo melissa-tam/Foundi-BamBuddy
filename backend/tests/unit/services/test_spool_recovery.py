@@ -4778,10 +4778,12 @@ class TestRefillReadyUnderThePowerLossPrompt:
 
 
 def _assist_stall_hms():
-    """0700_0021 (006-H2S 17:22:31) — the AMS assist motor stalled. The taxonomy does
-    not classify it, so it is never a candidate; it is here because these pins
-    reproduce the WIRE the incident carried, not a curated pair of codes."""
-    return HMSError(code="0021", attr=0x07000000, module=7, severity=2, full_code="0700000000000021")
+    """0700_0021 (006-H2S 17:22:31) — "AMS A slot 1 assist motor is stalled". The
+    real wire form is slot-attributed: attr tray byte 0x20 (AMS 0, tray 0) and code
+    word 0x00020021, which the taxonomy classifies MECHANICAL (extruder-side) — prod
+    logged it as ``mechanical_feed:0700_0021@0-0`` beside ``0700_8006``. These pins
+    reproduce that wire, not a curated pair of codes."""
+    return HMSError(code="0021", attr=0x07002000, module=7, severity=2, full_code="0700200000020021")
 
 
 def _feed_into_extruder_hms():
