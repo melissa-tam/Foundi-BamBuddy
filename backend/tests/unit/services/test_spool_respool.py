@@ -2263,11 +2263,32 @@ def recovery_own_sessions(test_engine, monkeypatch):
     return maker
 
 
-def _runout_incident(printer_id, *, external):
-    from backend.app.services import spool_recovery
+async def _runout_incident(db, printer_id, *, external):
+    """A runout driver context over a REAL open incident row.
 
+    Since 2026-09-04 every outcome sink verifies OWNERSHIP at write time —
+    ``_escalate`` stands down (no token, no page, no ledger row, no spent stamp) when
+    ``mark_escalated`` reports the row already closed or missing — so a pin that
+    asserts what an escalation WRITES must own a row. One open row per printer: the
+    caller closes it before minting the next.
+    """
+    from backend.app.models.printer_incident import STATUS_RECOVERING
+    from backend.app.services import printer_incidents, spool_recovery
+
+    row = await printer_incidents.open_new(
+        db,
+        printer_id=printer_id,
+        job_id="task-ext",
+        item_id=None,
+        kind=spool_recovery.KIND_RUNOUT,
+        code="07FF_8011" if external else "0700_8011",
+        codes="runout",
+        slot_global_tray=254 if external else 0,
+        status=STATUS_RECOVERING,
+    )
+    assert row is not None, "the printer already holds an open incident — close it first"
     return spool_recovery.RecoveryIncident(
-        incident_id=0,  # names no durable row: mark_escalated is a no-op for a missing one
+        incident_id=row.id,
         printer_id=printer_id,
         job_id="task-ext",
         codes=frozenset({"07FF_8011" if external else "0700_8011"}),
@@ -2310,13 +2331,23 @@ async def test_the_durable_escalation_lane_also_stands_down_for_the_external_hol
     monkeypatch.setattr(spool_respool, "mark_spent_on_runout_hold", stamps)
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
-        await spool_recovery._escalate(_runout_incident(printer.id, external=True), "external_spool_runout")
+        await spool_recovery._escalate(
+            await _runout_incident(db_session, printer.id, external=True), "external_spool_runout"
+        )
 
     stamps.assert_not_awaited()
     assert any("external_spool_runout" in m for m in caplog.messages), "the hold names its reason in the log"
 
     # Liveness: the AMS-slot hold on the same driver still carries the durable stamp.
-    await spool_recovery._escalate(_runout_incident(printer.id, external=False), "runout_needs_refill")
+    # The external hold is closed first — one open incident per printer — the way a
+    # lifecycle event would close it.
+    from backend.app.services import printer_incidents
+
+    db_session.expunge_all()
+    await printer_incidents.close_open_for_printer(db_session, printer.id, source="terminal")
+    await spool_recovery._escalate(
+        await _runout_incident(db_session, printer.id, external=False), "runout_needs_refill"
+    )
     stamps.assert_awaited_once()
 
 

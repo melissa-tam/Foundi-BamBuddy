@@ -491,10 +491,19 @@ class RecoveryIncident:
 # and ``_escalated`` never expired inside a process, so a later different fault on
 # the same job could never be recovered.
 
-# Live swap-driver tasks, for :func:`has_live_recovery` only — "is the machine
-# ACTING right now", which is a different question from "is this printer owned"
-# (that one is the open incident). Entry exclusivity is the DB's partial unique
-# index, never this dict.
+# Live swap-driver tasks: the LIVENESS authority — "is the machine ACTING right
+# now". The open incident row is the durable PROMISE ("this printer is owned, and
+# somebody will produce an outcome"), and entry exclusivity is the DB's partial
+# unique index, never this dict.
+#
+# Both questions have consumers and they are not interchangeable. The pause-stall
+# watchdog asks both. Every OUTCOME WRITER asks liveness too, because the row alone
+# cannot tell a driver that a closer freed it mid-procedure: while a driver lives it
+# owns the outcome, and after it hands over the closers do (006-H2S 2026-09-04).
+#
+# ``sweep_open_incidents`` reads a ``recovering`` row as "a live driver has this",
+# which is sound only because its ``_HOLD_OVER_DWELL_S`` dwell outlives any sink's
+# window — do not turn that reading into a third spelling of ownership.
 _active_tasks: dict[int, asyncio.Task] = {}
 
 # Flap bound: after this many RESOLVED jam incidents in ONE job, the next fault
@@ -544,10 +553,17 @@ _wire_sample: dict[int, tuple[str, tuple[int, int] | None, frozenset[str], int]]
 # still standing across a restart deserves one incident and one alert.
 _blocked: dict[tuple[int, str], set[str]] = {}
 
-# Per-job stuck-change reset budget: (printer_id, job_id) -> firmware resets
-# (resumes) already published this incident. Bounds the wedged-change reset to
+# Stuck-change reset budget: (printer_id, job_id) -> firmware resets (resumes)
+# already published for that JOB. Bounds the wedged-change reset to
 # _MAX_STUCK_RESETS; a frozen RecoveryIncident cannot carry a mutable counter, so
 # this follows the module's per-(printer, job) dict idiom.
+#
+# The key is the JOB, not the incident — which is deliberate and was load-bearing on
+# 006-H2S 2026-09-04: the duplicate driver found the budget already spent and skipped
+# straight to a second unload on one AMS. A per-incident key would have handed it a
+# fresh reset instead. The duplicate itself is gone (the closer now defers to a live
+# driver), and this bound stays job-scoped: one wedge per print gets one firmware
+# CONTINUE, whatever the incident bookkeeping around it.
 # Process-lifetime like the rest of this block — a post-restart re-fire gets its
 # one bounded reset again, which is safe.
 _stuck_resets: dict[tuple[int, str], int] = {}
@@ -633,6 +649,29 @@ def _reset_state() -> None:
     _blocked.clear()
     _hold_over_since.clear()
     printer_incidents._reset_state()
+
+
+def _register_driver(printer_id: int, task: asyncio.Task, *, incident_id: int) -> None:
+    """Take this printer's liveness slot for a freshly spawned recovery driver.
+
+    OBSERVABILITY, not a gate. Entry exclusivity stays the DB's partial unique index
+    (see the ``_active_tasks`` comment) — no liveness check is added to the entry
+    gate, because the durable row is the right authority and a second in-memory one
+    would only drift from it. But a driver spawning over a LIVE one means a closer
+    freed the open row from under that one, which is exactly the defect
+    :func:`on_observed_running`'s deferral closes, so if it ever returns it must be
+    one grep away: 006-H2S 17:23:55 produced no line at all, and the 08-29 W5 lesson
+    is that the single line naming the moment is the difference between a grep and a
+    15 h triage.
+    """
+    live = _active_tasks.get(printer_id)
+    if live is not None and not live.done():
+        logger.warning(
+            "spool_recovery: printer %s: spawning a recovery driver while one is live — invariant violated (%s)",
+            printer_id,
+            f"incident {incident_id} spawned over a live driver",
+        )
+    _active_tasks[printer_id] = task
 
 
 def has_live_recovery(printer_id: int) -> bool:
@@ -1476,7 +1515,7 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
             return None
 
         task = asyncio.create_task(_run_recovery(incident))
-        _active_tasks[printer_id] = task
+        _register_driver(printer_id, task, incident_id=incident.incident_id)
         return task
     except Exception:  # noqa: BLE001 — entry hook must never crash the status flow
         logger.exception("spool_recovery: on_ams_fault failed for printer %s", printer_id)
@@ -1729,6 +1768,21 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
         logger.exception("spool_recovery: recovery driver crashed for printer %s", pid)
     finally:
         _active_tasks.pop(pid, None)
+        # HANDOVER. :func:`on_observed_running` defers to a live driver, and the wire
+        # sampler that calls it is EDGE-triggered — so an edge deferred while this
+        # driver sat inside ``_escalate`` (tray snapshot, DB, page, quarantine, spent
+        # stamp — seconds) has no second chance, and would leave an ESCALATED row open
+        # on a demonstrably RUNNING printer with nothing left to close it but
+        # ``sweep_open_incidents``' 120 s dwell (and, for a code the firmware leaves
+        # standing, not even that): the chip lit, the hourly nag armed and the queue
+        # token held to the terminal — the pre-WS2b class.
+        #
+        # Derive-don't-store: nothing records "an edge was deferred"; the LEVEL is
+        # re-read once, here, where the slot is already free. A no-op when the row is
+        # already closed, and never a second closer — this IS the closer.
+        st = _get_state(pid)
+        if st is not None and getattr(st, "state", None) == "RUNNING":
+            await on_observed_running(pid)
 
 
 # --- step helpers -----------------------------------------------------------
@@ -1767,6 +1821,16 @@ async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
     ``fail`` — the reset did NOT free the AMS (still wedged at the deadline, or the
         resume send failed): the caller escalates ``stuck_reset_failed``.
     ``abort`` — live state was lost mid-reset (disconnect / external actor).
+
+    The resume this publishes is the driver's OWN, and the printer answers it on the
+    wire like any other: the per-push sampler sees a PAUSE→RUNNING transition and
+    would hand it to :func:`on_observed_running`. It must not close this incident —
+    RUNNING here is an intermediate reading of the procedure above (outcome (a)
+    re-faults and auto-PAUSEs from exactly that state, and (c) hangs RUNNING in an
+    incomplete change), so the closer defers while this driver is live and the
+    handover re-reads the level afterwards. 006-H2S 2026-09-04 is what happens
+    otherwise: the row closed at the resume, the re-PAUSE found no open incident, and
+    a second driver ran the swap round on the same AMS.
 
     Entry gate (else ``skipped``): the wedge must be LIVE — gcode_state PAUSE AND
     ``ams_status_main == 1`` (filament_change). Non-idle alone is NOT a wedge: only
@@ -2547,10 +2611,18 @@ async def _stamp_recovering(incident: RecoveryIncident) -> None:
         logger.exception("spool_recovery: stamp recovering failed for printer %s", incident.printer_id)
 
 
-async def _close_incident(incident: RecoveryIncident, *, status: str, source: str | None) -> None:
-    """Close the incident row. Best-effort — a bookkeeping failure must never turn a
-    finished recovery into a crash, and the startup sweep re-resolves a row left
-    open by one."""
+async def _close_incident(incident: RecoveryIncident, *, status: str, source: str | None) -> bool:
+    """Close the incident row. True when THIS CALL closed it.
+
+    False means the driver no longer owns this incident — another closer got there
+    first (an operator STOP through :func:`on_job_terminal`, a resume, the wire
+    sweep), or the bookkeeping failed. Callers that go on to WRITE an outcome read
+    it; :func:`_abort` deliberately does not, because its ``_blocked`` stamp and its
+    cleanup are correct whoever closed the row.
+
+    Best-effort — a bookkeeping failure must never turn a finished recovery into a
+    crash, and the startup sweep re-resolves a row left open by one.
+    """
     from backend.app.core.database import async_session
 
     if status == STATUS_ABORTED:
@@ -2559,11 +2631,12 @@ async def _close_incident(incident: RecoveryIncident, *, status: str, source: st
         _blocked.setdefault((incident.printer_id, incident.job_id), set()).add(incident.fingerprint)
     try:
         async with async_session() as db:
-            await printer_incidents.close(db, incident.incident_id, status=status, source=source)
+            return await printer_incidents.close(db, incident.incident_id, status=status, source=source) is not None
     except Exception:  # noqa: BLE001 — never crash the driver on bookkeeping
         logger.exception(
             "spool_recovery: closing incident %s failed for printer %s", incident.incident_id, incident.printer_id
         )
+        return False
 
 
 async def _mark_out_of_rotation(incident: RecoveryIncident, global_tray: int, *, notify: bool) -> None:
@@ -2675,7 +2748,18 @@ async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = T
     # the per-job flap cap, which ``printer_incidents.count_resolved`` reads back.
     # ``observed_running`` is the literal evidence: _resume_and_confirm watched the
     # printer reach RUNNING and hold it.
-    await _close_incident(incident, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
+    #
+    # It is also the OWNERSHIP test. Everything below is a claim about this incident
+    # — the swapped ``ams_mapping`` written back onto the unit, its hold token
+    # cleared, a "recovered" page — and a row somebody else already closed (an
+    # operator STOP mid-round, say) has had its verdict given by them.
+    if not await _close_incident(incident, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING):
+        logger.warning(
+            "spool_recovery: printer %s incident %s closed under the driver — success stands down",
+            incident.printer_id,
+            incident.incident_id,
+        )
+        return
 
     try:
         async with async_session() as db:
@@ -2781,7 +2865,26 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
         async with async_session() as db:
             # Hold FIRST — even if the stamp/notify below fails, the incident must
             # already read ESCALATED so nothing restarts recovery behind the operator.
-            await printer_incidents.mark_escalated(db, incident.incident_id)
+            #
+            # It doubles as the OWNERSHIP test, which is why its answer is read.
+            # ``mark_escalated`` returns None for a row that is already CLOSED, and
+            # every line below writes a claim about this incident: the unit's hold
+            # token, the operator page, and the durable ``recovery_escalation`` row
+            # that feeds the 2-in-24 h quarantine. Writing them for a row another
+            # closer already gave a verdict is how ONE 006-H2S jam produced two
+            # escalations, two pages, two ledger rows and "Repeated AMS jam
+            # escalations (2 in 24h)". Standing down here is also what makes that
+            # ledger one-row-per-incident by construction, for EVERY closer that can
+            # strike a live driver — no schema change, no incident key on the row.
+            row = await printer_incidents.mark_escalated(db, incident.incident_id)
+            if row is None:
+                logger.warning(
+                    "spool_recovery: printer %s incident %s closed under the driver — escalation (%s) stands down",
+                    incident.printer_id,
+                    incident.incident_id,
+                    reason,
+                )
+                return
             item = await db.get(PrintQueueItem, incident.item_id) if incident.item_id is not None else None
             if item is not None:
                 item.waiting_reason = token
@@ -2962,6 +3065,17 @@ async def _clear_oor_if_resumed_on_jammed_feeder(db: AsyncSession, incident: Rec
 # hourly attention reminder kept nagging about a print that had been running for
 # hours. The lifecycle below is source-AGNOSTIC — it reacts to the printer running
 # again, however that happened.
+#
+# ONE exception, and it is about WHO owns the outcome rather than about the source:
+# while a recovery driver is live, the driver owns it (006-H2S 2026-09-04). Behaviour
+# delta from that — small, bounded, and more honest than what it replaced: a screen
+# resume landing inside the driver's own confirm wait no longer closes the incident
+# as ``resolved``/``observed_running`` from underneath it. The driver observes the
+# same RUNNING itself, reads it as the external takeover it is, and ends the incident
+# as ``aborted``/``operator``, which additionally bars re-entry for that exact fault
+# (its fingerprint sits in ``_blocked``) until the wire re-arms it — the fault
+# clearing, or the printer pausing again. That is the truthful record of what
+# happened: a human took the printer, not "recovery succeeded".
 
 
 def _clearable(reason: str | None) -> bool:
@@ -2995,9 +3109,34 @@ async def on_observed_running(printer_id: int) -> bool:
     That breadth is the point — the pre-WS2b hold could only be cleared by the one
     path that set it.
 
+    It closes on ANY resume, from any source — UNLESS a recovery driver is live. A
+    RUNNING sample taken during any resume the driver ITSELF publishes (the W1
+    stuck-change reset, :func:`_resume_and_confirm`) is an intermediate reading of
+    that procedure, not the hold being over, and the driver consumes it. This is the
+    module's own ownership rule applied to its closers: the OPEN INCIDENT says who
+    owns the printer, ``_active_tasks`` says whether the machine is ACTING, and
+    closing a row from under a live driver destroys entry exclusivity — 006-H2S
+    2026-09-04, where the re-PAUSE then found no open incident and spawned a SECOND
+    driver onto one AMS (paired unloads, doubled pages, a false 2-in-24 h
+    quarantine). The deferred edge is not lost: ``_run_recovery``'s handover re-reads
+    the live LEVEL once the driver is done.
+
+    :func:`has_live_recovery` is ``.done()``-aware, so an R1 orphan (a token left by
+    a mid-recovery restart or crash) is not a live driver and never defers a close.
+    Pause-recovery incidents (``pause_recovery.py`` — power loss, plate vision) never
+    register in ``_active_tasks`` at all, so their screen-resume close is unchanged.
+
     Returns True when an incident was closed. Never raises (invariant 10).
     """
     try:
+        if has_live_recovery(printer_id):
+            logger.info(
+                "spool_recovery: printer %s RUNNING edge while a recovery driver is live — "
+                "the driver owns the outcome; closer stands aside",
+                printer_id,
+            )
+            return False
+
         from backend.app.core.database import async_session
 
         async with async_session() as db:
@@ -3343,7 +3482,7 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
             await _escalate(incident, escalate_reason)
             return None
         task = asyncio.create_task(_run_recovery(incident))
-        _active_tasks[printer_id] = task
+        _register_driver(printer_id, task, incident_id=incident_id)
         return task
     except Exception:  # noqa: BLE001 — startup hygiene must never block the lifespan
         logger.exception("spool_recovery: re-entering incident %s failed for printer %s", incident_id, printer_id)

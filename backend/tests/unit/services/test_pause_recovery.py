@@ -168,6 +168,23 @@ async def _drive(printer_id, state):
     await asyncio.sleep(0)
 
 
+async def _drain_z_arm(printer_id):
+    """Await the z-reference arm the reconnect edge fired and forgot, if it fired one.
+
+    It is spawned through ``core.tasks.spawn_background_task`` (not ``_in_flight``), so
+    a test used to sleep a fixed 10 ms for it — and on a loaded gate machine the arm's
+    DB writes took longer than that, the assertion ran first, and the incident opened
+    during TEARDOWN (ship run 20260904-225728-0603, this file's only red id). A no-op
+    when no arm was spawned: then nothing can open an incident, so there is no race.
+    """
+    import backend.app.core.tasks as core_tasks
+
+    name = f"z-reference-arm-p{printer_id}"
+    pending = [t for t in list(core_tasks._background_tasks) if t.get_name() == name and not t.done()]
+    if pending:
+        await asyncio.gather(*pending)
+
+
 async def _drain_summary():
     task = pause_recovery._summary_task
     if task is not None:
@@ -653,7 +670,7 @@ class TestOutageBurst:
 
         pause_recovery.note_status_push(22, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         pause_recovery.note_status_push(22, state)  # epoch advanced == the reconnect edge
-        await asyncio.sleep(0.01)
+        await _drain_z_arm(22)
 
         rows = await _open_incidents(db_session, 22)
         assert [r.kind for r in rows] == [KIND_Z_REFERENCE_LOST]
@@ -673,7 +690,7 @@ class TestOutageBurst:
 
         pause_recovery.note_status_push(23, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         pause_recovery.note_status_push(23, state)
-        await asyncio.sleep(0.01)
+        await _drain_z_arm(23)
 
         assert await _open_incidents(db_session, 23) == []
         page.assert_not_awaited()
@@ -687,7 +704,7 @@ class TestOutageBurst:
 
         pause_recovery.note_status_push(24, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         pause_recovery.note_status_push(24, state)
-        await asyncio.sleep(0.01)
+        await _drain_z_arm(24)
 
         assert await _open_incidents(db_session, 24) == []
 
@@ -701,7 +718,7 @@ class TestOutageBurst:
 
         pause_recovery.note_status_push(25, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         pause_recovery.note_status_push(25, state)
-        await asyncio.sleep(0.01)
+        await _drain_z_arm(25)
 
         assert await _open_incidents(db_session, 25) == []
 
@@ -718,7 +735,7 @@ class TestOutageBurst:
 
         pause_recovery.note_status_push(26, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         await _drive(26, state)
-        await asyncio.sleep(0.01)
+        await _drain_z_arm(26)
 
         assert [r.kind for r in await _open_incidents(db_session, 26)] == []
 
