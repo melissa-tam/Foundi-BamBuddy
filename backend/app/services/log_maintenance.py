@@ -5,15 +5,17 @@ The Windows service wrapper (NSSM) redirects the server's stdout/stderr to
 online by size (``AppRotateBytes``), but with NO count or age cap — the
 timestamped rotated siblings (e.g. ``service-stdout-2026-07-17_00-00-00.log``)
 accumulate forever. This sweeper age-purges those rotated siblings, mirroring
-the ``backupCount`` cap the ``TimedRotatingFileHandler`` already applies to
+the ``maxBytes`` x ``backupCount`` cap the ``RotatingFileHandler`` applies to
 ``bambuddy.log``.
 
 It deliberately NEVER touches ``bambuddy.log*`` — that rotation class is owned by
-the logging handler's ``backupCount`` — nor the two live NSSM names
-(``service-stdout.log`` / ``service-stderr.log``), which NSSM writes to directly.
+the logging handler — nor the two live NSSM names (``service-stdout.log`` /
+``service-stderr.log``), which NSSM writes to directly.
 
-Modeled on the ``archive_purge`` sweeper loop shape (start/stop scheduler +
-asyncio.sleep loop with CancelledError-aware teardown).
+Start/stop scheduler shape with CancelledError-aware teardown, as the other
+sweepers use — but work-first like ``library_integrity``, never sleep-first like
+``archive_purge``: at this interval the loop's order is what decides whether it
+ever runs at all. See ``_scheduler_loop``.
 """
 
 from __future__ import annotations
@@ -58,10 +60,23 @@ class LogMaintenanceService:
             logger.info("Stopped NSSM service-log maintenance sweeper")
 
     async def _scheduler_loop(self) -> None:
+        # INVARIANT: work FIRST, then sleep. At a 24 h cadence the deploy cycle is
+        # faster than the timer -- every install restarts the NSSM service, which
+        # restarts this loop, which restarts ``asyncio.sleep`` from zero. The farm
+        # rebuilds ~1.3x/day, so a sleep-first loop on this interval never reaches
+        # its first pass: measured 209 rotated service logs / 676 MB on the live
+        # farm with nothing ever purged. Any future scheduler whose interval can
+        # exceed the restart cadence must be written this way round -- see
+        # ``library_integrity`` for the same shape. (The short-interval sweepers,
+        # ``archive_purge`` and ``library_trash`` at 900 s, are unaffected: they
+        # fire ~70 times per restart cycle either way.)
         while True:
             try:
+                # ``purge_rotated_service_logs`` unlinks synchronously over a
+                # directory holding hundreds of files, so it runs off the event
+                # loop -- a startup pass must not stall request handling.
+                await asyncio.to_thread(self.purge_rotated_service_logs)
                 await asyncio.sleep(self._check_interval)
-                self.purge_rotated_service_logs()
             except asyncio.CancelledError:
                 break
             except Exception as e:  # pragma: no cover - defensive
@@ -74,7 +89,7 @@ class LogMaintenanceService:
         Only timestamped rotated siblings of ``service-stdout.log`` /
         ``service-stderr.log`` are eligible: the two active names are always
         preserved, and ``bambuddy.log*`` is never matched (that rotation is owned
-        by the ``TimedRotatingFileHandler``'s ``backupCount``). ``retention_days``
+        by the ``RotatingFileHandler``'s size cap). ``retention_days``
         defaults to :data:`settings.log_retention_days`. Returns the number of
         files deleted.
         """
