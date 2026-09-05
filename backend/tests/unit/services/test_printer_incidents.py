@@ -332,13 +332,13 @@ class TestWaitingReasonVocabulary:
         assert every_token <= printer_incidents.RECOVERY_WAITING_REASONS
 
     async def test_the_plate_vision_token_string_is_unchanged(self):
-        """Its ORIGIN moved from ``farm_correlation``; the STRING must not, or every
-        rendered surface and locale key that keys off it goes blank."""
+        """Its ORIGIN moved from ``farm_correlation`` (which keeps NO alias — one
+        origin, no dual path); the STRING must not move, or every rendered surface
+        and locale key that keys off it goes blank."""
         from backend.app.models.printer_incident import KIND_PLATE_VISION
-        from backend.app.services import farm_correlation
 
         assert printer_incidents.waiting_reason_for(KIND_PLATE_VISION) == "plate_not_empty_printer_detected"
-        assert farm_correlation.WAITING_REASON_PLATE_VISION is printer_incidents.WAITING_REASON_PLATE_VISION
+        assert printer_incidents.WAITING_REASON_PLATE_VISION == "plate_not_empty_printer_detected"
 
 
 class TestResolvesOnOperator:

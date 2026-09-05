@@ -135,6 +135,10 @@ def _fake_state(**overrides):
         # USB/SD presence — printer_state_to_dict reads state.sdcard unconditionally
         # (#F8). Omitting it raised AttributeError before reaching send_printer_status.
         "sdcard": None,
+        # Session boundary (2026-09-04 pause-recovery wave): printer_state_to_dict
+        # reads both unconditionally; the real PrinterState defaults them to 0 / None.
+        "connection_epoch": 0,
+        "disconnected_at": None,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
