@@ -94,9 +94,6 @@ from backend.app.services.plate_occupancy import (
     TerminalDisposition,
     plate_occupancy,
 )
-from backend.app.services.printer_incidents import (
-    WAITING_REASON_PLATE_VISION as WAITING_REASON_PLATE_VISION,  # noqa: PLC0414 — explicit re-export
-)
 from backend.app.utils.filename import print_identity_key
 
 if TYPE_CHECKING:
@@ -121,10 +118,9 @@ StopVerdict = Literal["farm_vision_abort", "operator_ui", "operator_screen"]
 # ``WAITING_REASON_PLATE_VISION`` used to be defined here. Its ORIGIN moved to
 # ``printer_incidents`` (2026-09-04) when the plate check became an incident KIND: the
 # token is a PROJECTION of that row, so it belongs with the kind -> token table rather
-# than in the correlation module that happened to raise the first one. The redundant
-# alias above is the explicit re-export for the callers that still read it from here
-# (``production_run``'s ``vision_hold``); nothing in THIS module reads it any more,
-# because the reaction it belonged to moved to ``pause_recovery``.
+# than in the correlation module that happened to raise the first one. Nothing reads
+# it from here any more (``production_run.vision_hold`` derives from the incident
+# snapshot), so there is no re-export either — one origin, one import path.
 
 # Verdicts where the finish IS the dispatched unit — the caller updates that item's
 # terminal status and runs farm_policy attribution for it. ``fallback`` is included
