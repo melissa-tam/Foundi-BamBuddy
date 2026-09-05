@@ -1,3 +1,8 @@
 # Force CRLF line endings for Windows batch files so cmd.exe can parse them
 # regardless of the user's core.autocrlf setting.
 *.bat text eol=crlf
+
+# Eject golden G-code is compared BYTE-IDENTICAL against the generator (test_golden_geometry).
+# A CRLF checkout under core.autocrlf=true fails every golden on a fresh tree or after a
+# merge materialises a new one (2026-09-04: the two zref_* goldens landed CRLF in the ship gate).
+backend/tests/unit/services/eject/golden/*.gcode text eol=lf
